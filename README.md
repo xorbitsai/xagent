@@ -142,6 +142,19 @@ Built for real production use:
 
 ---
 
+## Stay Ahead
+
+Xagent is actively developed and rapidly evolving.
+
+![Stay Ahead](./assets/xagent_stay_ahead.gif)
+
+**Follow our progress:**
+- ⭐ Star us on GitHub to stay updated
+- 🐛 Report issues and request features
+- 💬 Join our community discussions
+
+---
+
 ## 🏢 Deployment Options
 
 Xagent supports:

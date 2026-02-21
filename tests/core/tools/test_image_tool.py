@@ -434,10 +434,8 @@ class TestImageGenerationTool:
 
         # Check that the description contains model information
         description = generate_tool.description
-        assert (
-            "Available models and their descriptions (models with edit capabilities are marked with ✎):"
-            in description
-        )
+        assert "Available models" in description
+        assert "⭐[DEFAULT]" in description
         assert "model1:" in description
         assert "model2:" in description
         assert "Test model 1 description" in description
@@ -460,10 +458,7 @@ class TestImageGenerationTool:
 
         # Check that the description handles no models case
         description = generate_tool.description
-        assert (
-            "Available models and their descriptions (models with edit capabilities are marked with ✎):"
-            in description
-        )
+        assert "Available models" in description
         assert "No image models available" in description
 
     def test_model_info_text_generation(self, mock_workspace):

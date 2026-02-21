@@ -596,8 +596,20 @@ class WorkspaceFileOperations:
             raise ValueError(error_msg)
         else:
             # Relative path: resolve to specified directory
-            resolved_path = None
-            if default_dir == "input":
+            # Special handling: if path already starts with output/input/temp, use workspace root
+            path_str = str(path)
+            first_component = (
+                path_str.split("/")[0]
+                if "/" in path_str
+                else path_str.split("\\")[0]
+                if "\\" in path_str
+                else ""
+            )
+
+            if first_component in ["output", "input", "temp"]:
+                # Path already includes the directory prefix, resolve to workspace root
+                resolved_path = (self.workspace.workspace_dir / path).resolve()
+            elif default_dir == "input":
                 resolved_path = (self.workspace.input_dir / path).resolve()
             elif default_dir == "output":
                 resolved_path = (self.workspace.output_dir / path).resolve()

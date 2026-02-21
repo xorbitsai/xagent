@@ -186,12 +186,20 @@ class UserDefaultModelCreate(BaseModel):
     """User default model configuration creation schema"""
 
     model_id: int
-    config_type: str  # 'general', 'small_fast', 'visual', 'compact', 'embedding'
+    config_type: str  # 'general', 'small_fast', 'visual', 'compact', 'embedding', 'image', 'image_edit'
 
     @field_validator("config_type")
     @classmethod
     def validate_config_type(cls, v: str) -> str:
-        valid_types = {"general", "small_fast", "visual", "compact", "embedding"}
+        valid_types = {
+            "general",
+            "small_fast",
+            "visual",
+            "compact",
+            "embedding",
+            "image",
+            "image_edit",
+        }
         if v not in valid_types:
             raise ValueError(
                 f"Invalid config_type: {v}. Valid types are: {valid_types}"

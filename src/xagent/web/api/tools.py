@@ -163,7 +163,14 @@ async def get_available_tools(
     # Image tools
     image_models = tool_config.get_image_models()
     if image_models:
-        image_tools = create_image_tool(image_models, workspace=workspace)
+        default_generate_model = tool_config.get_image_generate_model()
+        default_edit_model = tool_config.get_image_edit_model()
+        image_tools = create_image_tool(
+            image_models,
+            workspace=workspace,
+            default_generate_model=default_generate_model,
+            default_edit_model=default_edit_model,
+        )
         for tool in image_tools:
             tools.append(_create_tool_info(tool, "image", image_models=image_models))
 

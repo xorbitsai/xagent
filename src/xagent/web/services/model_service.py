@@ -14,7 +14,9 @@ from xagent.core.model.image.base import BaseImageModel
 
 from ...core.model.chat.basic.base import BaseLLM
 from ...core.model.image.dashscope import DashScopeImageModel
+from ...core.model.image.gemini import GeminiImageModel
 from ...core.model.image.openai import OpenAIImageModel
+from ...core.model.image.xinference import XinferenceImageModel
 
 logger = logging.getLogger(__name__)
 
@@ -490,8 +492,26 @@ def get_image_models(db: Session, user_id: Optional[int] = None) -> Dict[str, An
                     )
                     image_models[str(db_model.model_name)] = image_model
                     logger.info(f"Added image model: {db_model.model_name}")
+                elif model_provider == "gemini":
+                    image_model = GeminiImageModel(
+                        model_name=str(db_model.model_name),
+                        api_key=api_key,
+                        base_url=base_url,
+                        abilities=list(db_model.abilities or ["generate"]),  # pyright: ignore[reportArgumentType]
+                    )
+                    image_models[str(db_model.model_name)] = image_model
+                    logger.info(f"Added image model: {db_model.model_name}")
                 elif model_provider == "openai":
                     image_model = OpenAIImageModel(
+                        model_name=str(db_model.model_name),
+                        api_key=api_key,
+                        base_url=base_url,
+                        abilities=list(db_model.abilities or ["generate", "edit"]),  # pyright: ignore[reportArgumentType]
+                    )
+                    image_models[str(db_model.model_name)] = image_model
+                    logger.info(f"Added image model: {db_model.model_name}")
+                elif model_provider == "xinference":
+                    image_model = XinferenceImageModel(
                         model_name=str(db_model.model_name),
                         api_key=api_key,
                         base_url=base_url,
@@ -536,6 +556,195 @@ def get_models_by_category(category: str, db: Session) -> list:
     except Exception as e:
         logger.error(f"Error getting models by category '{category}': {e}")
         return []
+
+
+def get_default_image_generate_model(
+    user_id: Optional[int] = None,
+) -> Optional[BaseImageModel]:
+    """
+    Get the default image generation model for a specific user.
+
+    Args:
+        user_id: User ID for multi-tenant model resolution. If None, uses admin defaults.
+
+    Returns:
+        The default image generation model or None if not available
+    """
+    try:
+        from ...core.model.image.adapter import get_image_model_instance
+        from ..models.database import get_db
+        from ..models.model import Model as DBModel
+        from ..models.user import User, UserDefaultModel, UserModel
+
+        try:
+            db = next(get_db())
+
+            # If user_id is provided, get user-specific default
+            if user_id:
+                image_default = (
+                    db.query(UserDefaultModel)
+                    .join(UserModel, UserDefaultModel.model_id == UserModel.model_id)
+                    .join(DBModel, UserModel.model_id == DBModel.id)
+                    .filter(
+                        UserDefaultModel.user_id == user_id,
+                        UserDefaultModel.config_type == "image",
+                        UserModel.user_id == user_id,
+                        DBModel.abilities.contains("generate"),
+                    )
+                    .first()
+                )
+
+                if image_default and image_default.model:
+                    try:
+                        return get_image_model_instance(image_default.model)
+                    except Exception as e:
+                        logger.warning(f"Failed to create image model instance: {e}")
+
+            # Fallback to admin defaults first, then other shared defaults
+            admin_image_defaults = (
+                db.query(UserDefaultModel)
+                .join(UserModel, UserDefaultModel.model_id == UserModel.model_id)
+                .join(DBModel, UserModel.model_id == DBModel.id)
+                .filter(
+                    UserDefaultModel.config_type == "image",
+                    UserModel.is_shared,
+                    UserDefaultModel.user_id.in_(
+                        db.query(User.id).filter(User.is_admin)
+                    ),
+                    DBModel.abilities.contains("generate"),
+                )
+                .limit(1)
+                .all()
+            )
+
+            if admin_image_defaults:
+                try:
+                    return get_image_model_instance(admin_image_defaults[0].model)
+                except Exception as e:
+                    logger.warning(f"Failed to create image model instance: {e}")
+
+            # If no admin defaults, fallback to any shared defaults
+            shared_defaults = (
+                db.query(UserDefaultModel)
+                .join(UserModel, UserDefaultModel.model_id == UserModel.model_id)
+                .join(DBModel, UserModel.model_id == DBModel.id)
+                .filter(
+                    UserDefaultModel.config_type == "image",
+                    UserModel.is_shared,
+                    DBModel.abilities.contains("generate"),
+                )
+                .limit(1)
+                .all()
+            )
+
+            if shared_defaults:
+                try:
+                    return get_image_model_instance(shared_defaults[0].model)
+                except Exception as e:
+                    logger.warning(f"Failed to create image model instance: {e}")
+
+        except Exception as e:
+            logger.warning(
+                f"Failed to get default image generation model from database: {e}"
+            )
+            pass
+
+    except ImportError:
+        pass
+
+    return None
+
+
+def get_default_image_edit_model(
+    user_id: Optional[int] = None,
+) -> Optional[BaseImageModel]:
+    """
+    Get the default image editing model for a specific user.
+
+    Args:
+        user_id: User ID for multi-tenant model resolution. If None, uses admin defaults.
+
+    Returns:
+        The default image editing model or None if not available
+    """
+    try:
+        from ...core.model.image.adapter import get_image_model_instance
+        from ..models.database import get_db
+        from ..models.model import Model as DBModel
+        from ..models.user import User, UserDefaultModel, UserModel
+
+        try:
+            db = next(get_db())
+
+            # If user_id is provided, get user-specific default
+            if user_id:
+                image_default = (
+                    db.query(UserDefaultModel)
+                    .join(UserModel, UserDefaultModel.model_id == UserModel.model_id)
+                    .join(DBModel, UserModel.model_id == DBModel.id)
+                    .filter(
+                        UserDefaultModel.user_id == user_id,
+                        UserDefaultModel.config_type == "image_edit",
+                        UserModel.user_id == user_id,
+                    )
+                    .first()
+                )
+
+                if image_default and image_default.model:
+                    try:
+                        return get_image_model_instance(image_default.model)
+                    except Exception as e:
+                        logger.warning(f"Failed to create image model instance: {e}")
+
+            # Fallback to admin defaults first, then other shared defaults
+            admin_image_defaults = (
+                db.query(UserDefaultModel)
+                .join(UserModel, UserDefaultModel.model_id == UserModel.model_id)
+                .filter(
+                    UserDefaultModel.config_type == "image_edit",
+                    UserModel.is_shared,
+                    UserDefaultModel.user_id.in_(
+                        db.query(User.id).filter(User.is_admin)
+                    ),
+                )
+                .limit(1)
+                .all()
+            )
+
+            if admin_image_defaults:
+                try:
+                    return get_image_model_instance(admin_image_defaults[0].model)
+                except Exception as e:
+                    logger.warning(f"Failed to create image model instance: {e}")
+
+            # If no admin defaults, fallback to any shared defaults
+            shared_defaults = (
+                db.query(UserDefaultModel)
+                .join(UserModel, UserDefaultModel.model_id == UserModel.model_id)
+                .filter(
+                    UserDefaultModel.config_type == "image_edit",
+                    UserModel.is_shared,
+                )
+                .limit(1)
+                .all()
+            )
+
+            if shared_defaults:
+                try:
+                    return get_image_model_instance(shared_defaults[0].model)
+                except Exception as e:
+                    logger.warning(f"Failed to create image model instance: {e}")
+
+        except Exception as e:
+            logger.warning(
+                f"Failed to get default image editing model from database: {e}"
+            )
+            pass
+
+    except ImportError:
+        pass
+
+    return None
 
 
 def get_default_embedding_model(user_id: Optional[int] = None) -> Optional[str]:

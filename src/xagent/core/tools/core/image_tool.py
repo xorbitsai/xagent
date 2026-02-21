@@ -45,14 +45,16 @@ When given a user request, rewrite and enrich the prompt into a **professional i
 - For brands/logos: use visual descriptions like "tech company logo" rather than specific names
 - For general concepts: describe the visual representation (e.g., "2M downloads text", "million counter")
 
-Available models and their descriptions (models with edit capabilities are marked with ✎):
+Available models (⭐[DEFAULT] marks the configured default model):
 {}
+
+**IMPORTANT: Prefer the default model marked with ⭐[DEFAULT]. Only specify model_id if the user explicitly requests a different model.**
 
 Parameters:
 - prompt (required): optimized image description with visual details
-- size (optional): image resolution (e.g. "1024x1024")
+- size (optional): image resolution (e.g. "1024x1024", "1280x720", "1920x1080")
 - negative_prompt (optional): undesired elements, auto-generated if empty
-- model_id (optional): model name from the list above, defaults to first available model
+- model_id (optional): model name from the list above. Omit to use the default model marked with ⭐[DEFAULT].
 
 Images are automatically saved to workspace.
     """.strip()
@@ -75,14 +77,16 @@ Text handling in edited images:
 - **New text addition**: Specify exactly what text should appear and where (e.g., "add 'Happy Birthday' text at the top")
 - **Text removal**: Request to remove specific text elements
 
-Available models and their descriptions (only models with edit capabilities are shown):
+Available models (⭐[DEFAULT] marks the configured default model):
 {}
+
+**IMPORTANT: Prefer the default model marked with ⭐[DEFAULT]. Only specify model_id if the user explicitly requests a different model.**
 
 Parameters:
 - image_url (required): single image path/URL or a list of image paths/URLs for multi-image editing
 - prompt (required): description of the desired edits and changes
 - negative_prompt (optional): undesired elements in the result
-- model_id (optional): model name from the list above, defaults to first available model with edit capability
+- model_id (optional): model name from the list above. Omit to use the default model marked with ⭐[DEFAULT].
 
 Images are automatically saved to workspace.
     """.strip()
@@ -92,6 +96,8 @@ Images are automatically saved to workspace.
         image_models: Dict[str, BaseImageModel],
         model_descriptions: Optional[Dict[str, str]] = None,
         workspace: Optional[TaskWorkspace] = None,
+        default_generate_model: Optional[BaseImageModel] = None,
+        default_edit_model: Optional[BaseImageModel] = None,
     ):
         """
         Initialize with pre-configured image models.
@@ -100,10 +106,14 @@ Images are automatically saved to workspace.
             image_models: Dictionary mapping model_id to BaseImageModel instances
             model_descriptions: Dictionary mapping model_id to description strings
             workspace: Optional workspace for saving generated images
+            default_generate_model: Default model for image generation
+            default_edit_model: Default model for image editing
         """
         self._image_models = image_models
         self._model_descriptions = model_descriptions or {}
         self._workspace = workspace
+        self._default_generate_model = default_generate_model
+        self._default_edit_model = default_edit_model
         self._generate_model_info_text()
 
     def _generate_model_info_text(self) -> None:
@@ -115,19 +125,40 @@ Images are automatically saved to workspace.
             )
             return
 
+        # Get default model IDs for marking
+        default_generate_id = (
+            getattr(self._default_generate_model, "model_name", None)
+            if self._default_generate_model
+            else None
+        )
+        default_edit_id = (
+            getattr(self._default_edit_model, "model_name", None)
+            if self._default_edit_model
+            else None
+        )
+
         # Generate info for generate-capable models only (for generate_image)
-        model_lines = []
+        # Put default model first, then others
+        default_model_lines = []
+        other_model_lines = []
         for model_id, model in self._image_models.items():
             if hasattr(model, "has_ability") and model.has_ability("generate"):
                 description = self._model_descriptions.get(model_id, "")
                 edit_marker = " ✎" if model.has_ability("edit") else ""
-                if description:
-                    model_lines.append(f"- {model_id}: {description}{edit_marker}")
-                else:
-                    model_lines.append(
-                        f"- {model_id}: No description available{edit_marker}"
-                    )
+                is_default = model_id == default_generate_id
+                default_marker = " ⭐[DEFAULT]" if is_default else ""
 
+                if description:
+                    line = f"- {model_id}: {description}{edit_marker}{default_marker}"
+                else:
+                    line = f"- {model_id}: No description available{edit_marker}{default_marker}"
+
+                if is_default:
+                    default_model_lines.append(line)
+                else:
+                    other_model_lines.append(line)
+
+        model_lines = default_model_lines + other_model_lines
         if model_lines:
             self._model_info_text = "\n".join(model_lines)
         else:
@@ -136,15 +167,26 @@ Images are automatically saved to workspace.
             )
 
         # Generate info for edit-capable models only (for edit_image)
-        edit_model_lines = []
+        # Put default model first, then others
+        default_edit_lines = []
+        other_edit_lines = []
         for model_id, model in self._image_models.items():
             if hasattr(model, "has_ability") and model.has_ability("edit"):
                 description = self._model_descriptions.get(model_id, "")
-                if description:
-                    edit_model_lines.append(f"- {model_id}: {description}")
-                else:
-                    edit_model_lines.append(f"- {model_id}: No description available")
+                is_default = model_id == default_edit_id
+                default_marker = " ⭐[DEFAULT]" if is_default else ""
 
+                if description:
+                    line = f"- {model_id}: {description}{default_marker}"
+                else:
+                    line = f"- {model_id}: No description available{default_marker}"
+
+                if is_default:
+                    default_edit_lines.append(line)
+                else:
+                    other_edit_lines.append(line)
+
+        edit_model_lines = default_edit_lines + other_edit_lines
         if edit_model_lines:
             self._edit_model_info_text = "\n".join(edit_model_lines)
         else:
@@ -162,7 +204,11 @@ Images are automatically saved to workspace.
                 logger.warning(f"Model {model_id} does not support generation")
                 return None
 
-        # Return first available model with generate capability as default
+        # Use configured default generate model
+        if self._default_generate_model:
+            return self._default_generate_model
+
+        # Fallback: return first available model with generate capability
         for model in self._image_models.values():
             if hasattr(model, "has_ability") and model.has_ability("generate"):
                 return model
@@ -181,7 +227,11 @@ Images are automatically saved to workspace.
                 logger.warning(f"Model {model_id} does not support editing")
                 return None
 
-        # Return first available model with edit capability as default
+        # Use configured default edit model
+        if self._default_edit_model:
+            return self._default_edit_model
+
+        # Fallback: return first available model with edit capability
         for model in self._image_models.values():
             if hasattr(model, "has_ability") and model.has_ability("edit"):
                 return model

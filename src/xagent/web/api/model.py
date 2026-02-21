@@ -224,7 +224,15 @@ async def get_user_default_models(
 
     try:
         # Get all possible config types
-        all_config_types = ["general", "small_fast", "visual", "compact", "embedding"]
+        all_config_types = [
+            "general",
+            "small_fast",
+            "visual",
+            "compact",
+            "embedding",
+            "image",
+            "image_edit",
+        ]
 
         # Get user's own defaults
         user_defaults_by_type: dict[str, UserDefaultModel] = {}

@@ -83,6 +83,16 @@ class BaseToolConfig(ABC):
         """Whether to include published agents as tools."""
         pass
 
+    @abstractmethod
+    def get_image_generate_model(self) -> Optional[Any]:
+        """Get default image generation model."""
+        pass
+
+    @abstractmethod
+    def get_image_edit_model(self) -> Optional[Any]:
+        """Get default image editing model."""
+        pass
+
 
 class ToolConfig(BaseToolConfig):
     """Tool configuration that uses provided config dict for standalone usage."""
@@ -162,3 +172,9 @@ class ToolConfig(BaseToolConfig):
 
     def get_enable_agent_tools(self) -> bool:
         return True
+
+    def get_image_generate_model(self) -> Optional[Any]:
+        return None  # Standalone config doesn't have web context
+
+    def get_image_edit_model(self) -> Optional[Any]:
+        return None  # Standalone config doesn't have web context

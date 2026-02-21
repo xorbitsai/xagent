@@ -1081,6 +1081,8 @@ Build when you need.`
       visual: "Visual Model",
       compact: "Long Context Model",
       embedding: "Embedding Model",
+      image: "Image Generation Model",
+      image_edit: "Image Edit Model",
       shared: "Shared",
     },
     card: {

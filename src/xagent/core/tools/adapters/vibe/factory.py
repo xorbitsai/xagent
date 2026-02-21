@@ -84,7 +84,14 @@ class ToolFactory:
         # Image tools
         image_models = config.get_image_models()
         if image_models:
-            image_tools = create_image_tool(image_models, workspace=workspace)
+            default_generate_model = config.get_image_generate_model()
+            default_edit_model = config.get_image_edit_model()
+            image_tools = create_image_tool(
+                image_models,
+                workspace=workspace,
+                default_generate_model=default_generate_model,
+                default_edit_model=default_edit_model,
+            )
             tools.extend(image_tools)
 
         # Special image tools (workspace-bound)

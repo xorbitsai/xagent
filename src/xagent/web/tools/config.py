@@ -55,6 +55,8 @@ class WebToolConfig(BaseToolConfig):
         # Cache for loaded configurations
         self._cached_vision_config: Optional[Any] = None
         self._cached_image_configs: Optional[Dict[str, Any]] = None
+        self._cached_image_generate_model: Optional[Any] = None
+        self._cached_image_edit_model: Optional[Any] = None
         self._cached_mcp_configs: Optional[List[Dict[str, Any]]] = None
         self._cached_embedding_model: Optional[str] = None
 
@@ -126,6 +128,18 @@ class WebToolConfig(BaseToolConfig):
         if self._cached_image_configs is None:
             self._cached_image_configs = self._load_image_models()
         return self._cached_image_configs
+
+    def get_image_generate_model(self) -> Optional[Any]:
+        """Get default image generation model from database."""
+        if self._cached_image_generate_model is None:
+            self._cached_image_generate_model = self._load_image_generate_model()
+        return self._cached_image_generate_model
+
+    def get_image_edit_model(self) -> Optional[Any]:
+        """Get default image editing model from database."""
+        if self._cached_image_edit_model is None:
+            self._cached_image_edit_model = self._load_image_edit_model()
+        return self._cached_image_edit_model
 
     def get_mcp_server_configs(self) -> List[Dict[str, Any]]:
         """Load MCP server configurations from database."""
@@ -209,6 +223,30 @@ class WebToolConfig(BaseToolConfig):
             logger.warning(f"Failed to load image models: {e}")
 
             return {}
+
+    def _load_image_generate_model(self) -> Optional[Any]:
+        """Load default image generation model from database via model service."""
+        try:
+            from ...web.services.model_service import get_default_image_generate_model
+
+            return get_default_image_generate_model(self._user_id)
+
+        except Exception as e:
+            logger = logging.getLogger(__name__)
+            logger.warning(f"Failed to load default image generation model: {e}")
+            return None
+
+    def _load_image_edit_model(self) -> Optional[Any]:
+        """Load default image editing model from database via model service."""
+        try:
+            from ...web.services.model_service import get_default_image_edit_model
+
+            return get_default_image_edit_model(self._user_id)
+
+        except Exception as e:
+            logger = logging.getLogger(__name__)
+            logger.warning(f"Failed to load default image editing model: {e}")
+            return None
 
     def _load_mcp_server_configs(self) -> List[Dict[str, Any]]:
         """Load MCP server configurations from database with user context."""

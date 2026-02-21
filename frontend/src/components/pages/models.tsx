@@ -110,8 +110,8 @@ const LOCAL_PROVIDER_CONFIGS: Record<string, Partial<ProviderConfig>> = {
   },
   gemini: {
     icon: <img src="/gemini.svg" alt="Gemini" className="w-6 h-6" />,
-    category: ["llm"],
-    defaultBaseUrl: "https://generativelanguage.googleapis.com/v1beta/openai/"
+    category: ["llm", "image"],
+    defaultBaseUrl: "https://generativelanguage.googleapis.com/v1beta"
   },
   claude: {
     icon: <img src="/claude.svg" alt="Claude" className="w-6 h-6" />,
@@ -1148,6 +1148,10 @@ export function ModelsPage() {
                         ] : []),
                         ...(formData.category === 'embedding' ? [
                           { value: "embedding", label: t('models.defaults.embedding') }
+                        ] : []),
+                        ...(formData.category === 'image' ? [
+                          { value: "image", label: t('models.defaults.image') },
+                          ...(formData.abilities?.includes('edit') ? [{ value: "image_edit", label: t('models.defaults.image_edit') }] : [])
                         ] : [])
                       ]}
                       placeholder={t('models.form.defaultPlaceholder')}

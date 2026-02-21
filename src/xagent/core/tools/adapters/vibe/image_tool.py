@@ -26,6 +26,8 @@ class ImageGenerationTool(ImageGenerationToolCore):
         image_models: Dict[str, BaseImageModel],
         model_descriptions: Optional[Dict[str, str]] = None,
         workspace: Optional[TaskWorkspace] = None,
+        default_generate_model: Optional[BaseImageModel] = None,
+        default_edit_model: Optional[BaseImageModel] = None,
     ):
         """
         Initialize with pre-configured image models.
@@ -34,9 +36,17 @@ class ImageGenerationTool(ImageGenerationToolCore):
             image_models: Dictionary mapping model_id to BaseImageModel instances
             model_descriptions: Dictionary mapping model_id to description strings
             workspace: Workspace for saving generated images (required)
+            default_generate_model: Default model for image generation
+            default_edit_model: Default model for image editing
         """
         # Call parent class initialization first
-        super().__init__(image_models, model_descriptions, workspace)
+        super().__init__(
+            image_models,
+            model_descriptions,
+            workspace,
+            default_generate_model,
+            default_edit_model,
+        )
 
         # Vibe-specific initialization: workspace is required
         if workspace is None:
@@ -83,6 +93,8 @@ def create_image_tool(
     image_models: Dict[str, BaseImageModel],
     model_descriptions: Optional[Dict[str, str]] = None,
     workspace: Optional[TaskWorkspace] = None,
+    default_generate_model: Optional[BaseImageModel] = None,
+    default_edit_model: Optional[BaseImageModel] = None,
 ) -> list:
     """
     Create image generation tools with pre-configured models.
@@ -91,6 +103,8 @@ def create_image_tool(
         image_models: Dictionary mapping model_id to BaseImageModel instances
         model_descriptions: Dictionary mapping model_id to description strings
         workspace: Workspace for saving generated images (required)
+        default_generate_model: Default model for image generation
+        default_edit_model: Default model for image editing
 
     Returns:
         List of tool instances
@@ -98,5 +112,11 @@ def create_image_tool(
     if workspace is None:
         raise ValueError("Workspace is required for image generation tools")
 
-    tool_instance = ImageGenerationTool(image_models, model_descriptions, workspace)
+    tool_instance = ImageGenerationTool(
+        image_models,
+        model_descriptions,
+        workspace,
+        default_generate_model,
+        default_edit_model,
+    )
     return tool_instance.get_tools()

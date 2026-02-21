@@ -6,8 +6,46 @@ from ...model import ImageModelConfig
 from ...retry import create_retry_wrapper
 from .base import BaseImageModel
 from .dashscope import DashScopeImageModel
+from .gemini import GeminiImageModel
 from .openai import OpenAIImageModel
 from .xinference import XinferenceImageModel
+
+
+def get_image_model_instance(db_model: Any) -> BaseImageModel:
+    """
+    Create a BaseImageModel instance from a database model record.
+
+    Args:
+        db_model: Database model instance with fields: model_name, model_provider,
+                  api_key, base_url, abilities, timeout, max_retries
+
+    Returns:
+        BaseImageModel instance with retry wrapper
+
+    Raises:
+        ValueError: If provider is not supported or required fields are missing
+    """
+    provider = str(db_model.model_provider).lower()
+    model_name = str(db_model.model_name)
+    api_key = str(db_model.api_key) if db_model.api_key else None
+    base_url = str(db_model.base_url) if db_model.base_url else None
+    abilities = list(db_model.abilities) if db_model.abilities else ["generate"]
+    timeout = getattr(db_model, "timeout", 300.0) or 300.0
+    max_retries = getattr(db_model, "max_retries", 3) or 3
+
+    # Create ImageModelConfig
+    config = ImageModelConfig(
+        id=f"{model_name}-{provider}",
+        model_name=model_name,
+        model_provider=provider,
+        base_url=base_url,
+        api_key=api_key,
+        timeout=timeout,
+        abilities=abilities,
+        max_retries=max_retries,
+    )
+
+    return create_image_model(config)
 
 
 def retry_on(e: Exception) -> bool:
@@ -29,7 +67,15 @@ def create_image_model(model_config: ImageModelConfig) -> BaseImageModel:
 
     llm: BaseImageModel
 
-    if provider == "dashscope":
+    if provider == "gemini":
+        llm = GeminiImageModel(
+            model_name=model_config.model_name,
+            api_key=model_config.api_key,
+            base_url=model_config.base_url,
+            timeout=model_config.timeout,
+            abilities=model_config.abilities,
+        )
+    elif provider == "dashscope":
         llm = DashScopeImageModel(
             model_name=model_config.model_name,
             api_key=model_config.api_key,

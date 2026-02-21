@@ -86,6 +86,63 @@ class TestWorkspaceFileToolConsistency:
         ):
             tools.read_file("nonexistent.txt")
 
+    def test_write_with_output_prefix(self, tmp_path):
+        """Test that writing with 'output/' prefix doesn't create duplicate directories."""
+        workspace = TaskWorkspace("test_task", str(tmp_path))
+        tools = WorkspaceFileTools(workspace)
+
+        test_content = "Test content with output prefix"
+
+        # Write with output/ prefix - should go to workspace/output/banner.html
+        # NOT workspace/output/output/banner.html
+        write_result = tools.write_file("output/banner.html", test_content)
+        assert write_result is True
+
+        # Verify file is in workspace/output/banner.html
+        expected_file = workspace.output_dir / "banner.html"
+        assert expected_file.exists(), f"File should exist at {expected_file}"
+
+        # Verify duplicate directory was NOT created
+        duplicate_file = workspace.output_dir / "output" / "banner.html"
+        assert not duplicate_file.exists(), (
+            "Duplicate output/output directory should not exist"
+        )
+
+        # Verify content is correct
+        assert expected_file.read_text() == test_content
+
+    def test_write_with_input_prefix(self, tmp_path):
+        """Test that writing with 'input/' prefix works correctly."""
+        workspace = TaskWorkspace("test_task", str(tmp_path))
+        tools = WorkspaceFileTools(workspace)
+
+        test_content = "Test content with input prefix"
+
+        # Write with input/ prefix
+        write_result = tools.write_file("input/data.txt", test_content)
+        assert write_result is True
+
+        # Verify file is in workspace/input/data.txt
+        expected_file = workspace.input_dir / "data.txt"
+        assert expected_file.exists()
+        assert expected_file.read_text() == test_content
+
+    def test_write_with_temp_prefix(self, tmp_path):
+        """Test that writing with 'temp/' prefix works correctly."""
+        workspace = TaskWorkspace("test_task", str(tmp_path))
+        tools = WorkspaceFileTools(workspace)
+
+        test_content = "Test content with temp prefix"
+
+        # Write with temp/ prefix
+        write_result = tools.write_file("temp/cache.txt", test_content)
+        assert write_result is True
+
+        # Verify file is in workspace/temp/cache.txt
+        expected_file = workspace.temp_dir / "cache.txt"
+        assert expected_file.exists()
+        assert expected_file.read_text() == test_content
+
 
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])

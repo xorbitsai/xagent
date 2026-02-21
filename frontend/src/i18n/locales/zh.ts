@@ -1081,6 +1081,8 @@ Build when you need.`
       visual: "视觉模型",
       compact: "长上下文模型",
       embedding: "嵌入模型",
+      image: "图像生成模型",
+      image_edit: "图像编辑模型",
       shared: "已分享",
     },
     card: {

@@ -584,7 +584,7 @@ class GeminiLLM(BaseLLM):
 
         # Determine authentication method based on whether using proxy or official API
         # Official Google API uses ?key= in URL
-        # Proxy services (like duckcoding) use Authorization header
+        # Proxy services use Authorization header
         is_official_api = "googleapis.com" in base_url
 
         if is_official_api:
@@ -594,8 +594,6 @@ class GeminiLLM(BaseLLM):
             headers = {}
         else:
             # For proxy services, try different URL patterns
-            # duckcoding uses: {base_url}/v1beta/models/{model_name}:generateContent
-            # or {base_url}/{model_name}:generateContent
             if "/v1beta" in base_url or "/v1" in base_url:
                 # Base URL already includes the version path
                 api_url = f"{base_url}/models/{model_name}:generateContent"

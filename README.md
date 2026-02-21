@@ -1,5 +1,9 @@
 ![Xagent Banner](./assets/github_readme_banner.png)
 
+[![Discord](https://img.shields.io/discord/1474756736358289609?style=for-the-badge&logo=discord)](https://discord.gg/R7TDFMzuXq)
+[![Twitter](https://img.shields.io/twitter/follow/xorbitsio?logo=x&style=for-the-badge)](https://twitter.com/xorbitsio)
+[![Docker Pulls](https://img.shields.io/docker/pulls/xprobe/xagent-backend?style=for-the-badge&logo=docker)](https://hub.docker.com/r/xprobe/xagent-backend)
+
 ---
 
 ## What is Xagent?
@@ -216,6 +220,16 @@ Xagent separates core responsibilities:
 We welcome developers, product builders, and researchers.
 
 Open issues. Submit PRs. Help shape the future of AI agents.
+
+---
+
+## 💬 Community & Contact
+
+**[GitHub Issues](https://github.com/xorbitsai/xagent/issues)** - Report bugs or propose features
+
+**[Discord](https://discord.gg/R7TDFMzuXq)** - Share your tasks or agents and connect with the community
+
+**[X (Twitter)](https://twitter.com/xorbitsio)** - Follow for updates and share your work
 
 ---
 

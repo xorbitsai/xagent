@@ -209,15 +209,20 @@ class ClaudeLLM(BaseLLM):
             name = function.get("name", "")
             description = function.get("description", "")
             parameters = function.get("parameters", {})
+            strict = tool.get("strict", False)
 
             # Convert to Anthropic tool format
-            anthropic_tools.append(
-                {
-                    "name": name,
-                    "description": description,
-                    "input_schema": parameters,
-                }
-            )
+            anthropic_tool = {
+                "name": name,
+                "description": description,
+                "input_schema": parameters,
+            }
+
+            # Add strict mode if specified
+            if strict:
+                anthropic_tool["strict"] = True
+
+            anthropic_tools.append(anthropic_tool)
 
         return anthropic_tools
 
@@ -230,6 +235,7 @@ class ClaudeLLM(BaseLLM):
         tool_choice: Optional[Union[str, Dict[str, Any]]] = None,
         response_format: Optional[Dict[str, Any]] = None,
         thinking: Optional[Dict[str, Any]] = None,
+        output_config: Optional[Dict[str, Any]] = None,
         **kwargs: Any,
     ) -> Any:
         """
@@ -243,6 +249,7 @@ class ClaudeLLM(BaseLLM):
             tool_choice: Tool choice strategy ("auto", "any", "none", or tool name)
             response_format: Response format specification (e.g., {"type": "json_object"})
             thinking: Thinking mode configuration (enables extended thinking for supported models)
+            output_config: Output configuration for structured outputs (e.g., {"format": {"type": "json_schema", "schema": {...}}})
             **kwargs: Additional parameters to pass to the Anthropic API
 
         Returns:
@@ -329,6 +336,24 @@ class ClaudeLLM(BaseLLM):
                 elif thinking.get("type") == "disabled":
                     completion_params["thinking"] = {"type": "disabled"}
 
+            # Handle output_config for structured outputs
+            if output_config is not None:
+                completion_params["output_config"] = output_config
+
+            # Handle response_format for JSON mode
+            # Anthropic doesn't have a response_format parameter, so we add instructions to system message
+            if (
+                response_format is not None
+                and response_format.get("type") == "json_object"
+            ):
+                json_instruction = "You must respond with valid JSON only. Do not include any text outside the JSON structure."
+                if system_message:
+                    completion_params["system"] = (
+                        f"{system_message}\n\n{json_instruction}"
+                    )
+                else:
+                    completion_params["system"] = json_instruction
+
             # Make the API call
             response = await self._client.messages.create(**completion_params)
 
@@ -402,6 +427,15 @@ class ClaudeLLM(BaseLLM):
                         "LLM returned unrepairable JSON when response_format=json_object was requested"
                     )
 
+            # Handle output_config with json_schema - content should already be valid JSON
+            if output_config is not None:
+                format_config = output_config.get("format", {})
+                if format_config.get("type") == "json_schema":
+                    # When using json_schema, the response is already validated JSON
+                    # Return as-is since it's guaranteed to be valid
+                    logger.info("Returning JSON schema validated response")
+                    return content
+
             return content
 
         except Exception as e:
@@ -437,6 +471,7 @@ class ClaudeLLM(BaseLLM):
         tool_choice: Optional[Union[str, Dict[str, Any]]] = None,
         response_format: Optional[Dict[str, Any]] = None,
         thinking: Optional[Dict[str, Any]] = None,
+        output_config: Optional[Dict[str, Any]] = None,
         **kwargs: Any,
     ) -> AsyncIterator[StreamChunk]:
         """
@@ -450,6 +485,7 @@ class ClaudeLLM(BaseLLM):
             tool_choice: Tool choice strategy
             response_format: Response format specification (not used in streaming)
             thinking: Thinking mode configuration
+            output_config: Output configuration for structured outputs
             **kwargs: Additional parameters to pass to the Claude API
 
         Yields:
@@ -538,6 +574,24 @@ class ClaudeLLM(BaseLLM):
                     }
                 elif thinking.get("type") == "disabled":
                     completion_params["thinking"] = {"type": "disabled"}
+
+            # Handle output_config for structured outputs
+            if output_config is not None:
+                completion_params["output_config"] = output_config
+
+            # Handle response_format for JSON mode
+            # Anthropic doesn't have a response_format parameter, so we add instructions to system message
+            if (
+                response_format is not None
+                and response_format.get("type") == "json_object"
+            ):
+                json_instruction = "You must respond with valid JSON only. Do not include any text outside the JSON structure."
+                if system_message:
+                    completion_params["system"] = (
+                        f"{system_message}\n\n{json_instruction}"
+                    )
+                else:
+                    completion_params["system"] = json_instruction
 
             # Make the streaming API call
             stream = await self._client.messages.create(
@@ -736,6 +790,7 @@ class ClaudeLLM(BaseLLM):
         tool_choice: Optional[Union[str, Dict[str, Any]]] = None,
         response_format: Optional[Dict[str, Any]] = None,
         thinking: Optional[Dict[str, Any]] = None,
+        output_config: Optional[Dict[str, Any]] = None,
         **kwargs: Any,
     ) -> Any:
         """
@@ -751,6 +806,7 @@ class ClaudeLLM(BaseLLM):
             tool_choice: Tool choice strategy
             response_format: Response format specification
             thinking: Thinking mode configuration (enables extended thinking)
+            output_config: Output configuration for structured outputs
             **kwargs: Additional parameters to pass to the Claude API
 
         Returns:
@@ -774,6 +830,7 @@ class ClaudeLLM(BaseLLM):
             tool_choice=tool_choice,
             response_format=response_format,
             thinking=thinking,
+            output_config=output_config,
             **kwargs,
         )
 

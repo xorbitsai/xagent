@@ -81,6 +81,7 @@ class OpenAILLM(BaseLLM):
         tool_choice: Optional[Union[str, Dict[str, Any]]] = None,
         response_format: Optional[Dict[str, Any]] = None,
         thinking: Optional[Dict[str, Any]] = None,
+        output_config: Optional[Dict[str, Any]] = None,
         **kwargs: Any,
     ) -> Any:
         """
@@ -94,6 +95,7 @@ class OpenAILLM(BaseLLM):
             tool_choice: Tool choice strategy
             response_format: Response format specification (e.g., {"type": "json_object"})
             thinking: Thinking mode configuration (enables thinking mode for supported models)
+            output_config: Output configuration for structured outputs (e.g., {"format": {"type": "json_schema", "schema": {...}}})
             **kwargs: Additional parameters to pass to the OpenAI API
 
         Returns:
@@ -132,6 +134,18 @@ class OpenAILLM(BaseLLM):
             completion_params["tool_choice"] = tool_choice
         if response_format:
             completion_params["response_format"] = response_format
+
+        # Handle output_config for structured outputs (JSON schema)
+        if output_config is not None:
+            # For OpenAI, we can pass output_config directly or convert to response_format
+            # if it's using json_schema format
+            format_config = output_config.get("format", {})
+            if format_config.get("type") == "json_schema":
+                # OpenAI supports json_schema through response_format
+                completion_params["response_format"] = format_config
+            else:
+                # Pass through other output_config formats
+                completion_params["output_config"] = output_config
 
         # Handle thinking mode using extra_body as specified in the requirements
         # Only add enable_thinking if the client supports this parameter (e.g., standard OpenAI)
@@ -327,6 +341,7 @@ class OpenAILLM(BaseLLM):
         tool_choice: Optional[Union[str, Dict[str, Any]]] = None,
         response_format: Optional[Dict[str, Any]] = None,
         thinking: Optional[Dict[str, Any]] = None,
+        output_config: Optional[Dict[str, Any]] = None,
         **kwargs: Any,
     ) -> Any:
         """
@@ -377,6 +392,18 @@ class OpenAILLM(BaseLLM):
             completion_params["tool_choice"] = tool_choice
         if response_format:
             completion_params["response_format"] = response_format
+
+        # Handle output_config for structured outputs (JSON schema)
+        if output_config is not None:
+            # For OpenAI, we can pass output_config directly or convert to response_format
+            # if it's using json_schema format
+            format_config = output_config.get("format", {})
+            if format_config.get("type") == "json_schema":
+                # OpenAI supports json_schema through response_format
+                completion_params["response_format"] = format_config
+            else:
+                # Pass through other output_config formats
+                completion_params["output_config"] = output_config
 
         # Handle thinking mode using extra_body as specified in the requirements
         # Only add enable_thinking if the client supports this parameter (e.g., standard OpenAI)
@@ -548,6 +575,7 @@ class OpenAILLM(BaseLLM):
         tool_choice: Optional[Union[str, Dict[str, Any]]] = None,
         response_format: Optional[Dict[str, Any]] = None,
         thinking: Optional[Dict[str, Any]] = None,
+        output_config: Optional[Dict[str, Any]] = None,
         **kwargs: Any,
     ) -> AsyncIterator[StreamChunk]:
         """

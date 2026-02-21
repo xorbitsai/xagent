@@ -599,3 +599,78 @@ class TestOpenAILLM:
         # Should raise ValueError for invalid API key
         with pytest.raises(ValueError, match="Invalid API key"):
             await OpenAILLM.list_available_models("invalid-key")
+
+    @pytest.mark.asyncio
+    async def test_output_config_json_schema(self, llm, mocker):
+        """Test output_config with json_schema format for OpenAI."""
+        from openai.types.chat import ChatCompletion
+        from openai.types.chat.chat_completion import Choice
+        from openai.types.chat.chat_completion_message import ChatCompletionMessage
+
+        # Create mock completion with JSON schema response
+        mock_completion = ChatCompletion(
+            id="test-json-schema-id",
+            choices=[
+                Choice(
+                    finish_reason="stop",
+                    index=0,
+                    message=ChatCompletionMessage(
+                        content='{"joke": "Why did the chicken cross the road?", "punchline": "To get to the other side!"}',
+                        role="assistant",
+                        tool_calls=None,
+                    ),
+                )
+            ],
+            created=1234567890,
+            model="gpt-4o",
+            object="chat.completion",
+            usage=None,
+        )
+
+        # Setup mock
+        mock_client = mocker.AsyncMock()
+        mock_client.chat.completions.create.return_value = mock_completion
+        mocker.patch(
+            "xagent.core.model.chat.basic.openai.AsyncOpenAI",
+            return_value=mock_client,
+        )
+
+        messages = [{"role": "user", "content": "Tell me a short joke."}]
+
+        # Test with output_config using json_schema format
+        # For OpenAI, this should be converted to response_format
+        output_config = {
+            "format": {
+                "type": "json_schema",
+                "json_schema": {
+                    "type": "object",
+                    "properties": {
+                        "joke": {
+                            "type": "string",
+                            "description": "The text of the joke.",
+                        },
+                        "punchline": {
+                            "type": "string",
+                            "description": "The punchline of the joke.",
+                        },
+                    },
+                    "required": ["joke", "punchline"],
+                    "additionalProperties": False,
+                },
+            }
+        }
+
+        response = await llm.chat(messages, output_config=output_config)
+
+        assert isinstance(response, dict)
+        assert response.get("type") == "text"
+        # Verify the response contains the expected JSON
+        assert "joke" in response.get("content", "")
+        assert "punchline" in response.get("content", "")
+
+        # Verify the API was called with response_format (OpenAI format)
+        mock_client.chat.completions.create.assert_called_once()
+        call_args = mock_client.chat.completions.create.call_args
+        assert "response_format" in call_args.kwargs
+        assert call_args.kwargs["response_format"]["type"] == "json_schema"
+        assert "json_schema" in call_args.kwargs["response_format"]

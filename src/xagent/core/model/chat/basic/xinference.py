@@ -131,6 +131,7 @@ class XinferenceLLM(BaseLLM):
         tool_choice: Optional[Union[str, Dict[str, Any]]] = None,
         response_format: Optional[Dict[str, Any]] = None,
         thinking: Optional[Dict[str, Any]] = None,
+        output_config: Optional[Dict[str, Any]] = None,
         **kwargs: Any,
     ) -> Any:
         """
@@ -261,6 +262,7 @@ class XinferenceLLM(BaseLLM):
         tool_choice: Optional[Union[str, Dict[str, Any]]] = None,
         response_format: Optional[Dict[str, Any]] = None,
         thinking: Optional[Dict[str, Any]] = None,
+        output_config: Optional[Dict[str, Any]] = None,
         **kwargs: Any,
     ) -> Any:
         """
@@ -311,6 +313,7 @@ class XinferenceLLM(BaseLLM):
         tool_choice: Optional[Union[str, Dict[str, Any]]] = None,
         response_format: Optional[Dict[str, Any]] = None,
         thinking: Optional[Dict[str, Any]] = None,
+        output_config: Optional[Dict[str, Any]] = None,
         **kwargs: Any,
     ) -> AsyncIterator[StreamChunk]:
         """

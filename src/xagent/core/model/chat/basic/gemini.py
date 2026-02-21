@@ -379,6 +379,7 @@ class GeminiLLM(BaseLLM):
         tool_choice: Optional[Union[str, Dict[str, Any]]] = None,
         response_format: Optional[Dict[str, Any]] = None,
         thinking: Optional[Dict[str, Any]] = None,
+        output_config: Optional[Dict[str, Any]] = None,
         **kwargs: Any,
     ) -> Any:
         """
@@ -392,6 +393,7 @@ class GeminiLLM(BaseLLM):
             tool_choice: Tool choice strategy
             response_format: Response format specification (e.g., {"type": "json_object"})
             thinking: Thinking mode configuration (not supported by Gemini)
+            output_config: Output configuration for structured outputs
             **kwargs: Additional parameters to pass to the Gemini API
 
         Returns:
@@ -422,12 +424,26 @@ class GeminiLLM(BaseLLM):
             elif self.default_max_tokens is not None:
                 gen_config["max_output_tokens"] = self.default_max_tokens
 
-            # Handle response_format for JSON mode
+            # Handle output_config for JSON schema (Gemini 3.0+)
+            if output_config is not None:
+                format_config = output_config.get("format", {})
+                if format_config.get("type") == "json_schema":
+                    # Gemini uses response_mime_type and response_json_schema
+                    schema = format_config.get("schema") or format_config.get(
+                        "json_schema", {}
+                    )
+                    if schema:
+                        gen_config["response_mime_type"] = "application/json"
+                        gen_config["response_json_schema"] = schema
+
+            # Handle response_format for JSON mode (legacy)
             # Gemini uses "response_mime_type" instead of "response_format"
             if response_format:
                 response_type: str = response_format.get("type", "")
                 if response_type == "json_object":
-                    gen_config["response_mime_type"] = "application/json"
+                    # Only set if not already set by output_config
+                    if "response_mime_type" not in gen_config:
+                        gen_config["response_mime_type"] = "application/json"
 
             # Handle tools
             gemini_tools = None
@@ -577,7 +593,15 @@ class GeminiLLM(BaseLLM):
             )
             headers = {}
         else:
-            api_url = f"{base_url}/models/{model_name}:generateContent"
+            # For proxy services, try different URL patterns
+            # duckcoding uses: {base_url}/v1beta/models/{model_name}:generateContent
+            # or {base_url}/{model_name}:generateContent
+            if "/v1beta" in base_url or "/v1" in base_url:
+                # Base URL already includes the version path
+                api_url = f"{base_url}/models/{model_name}:generateContent"
+            else:
+                # Add version path for other proxies
+                api_url = f"{base_url}/v1beta/models/{model_name}:generateContent"
             headers = {"Authorization": f"Bearer {self.api_key}"}
 
         # Prepare request body
@@ -662,7 +686,13 @@ class GeminiLLM(BaseLLM):
             api_url = f"{base_url}/models/{model_name}:streamGenerateContent?key={self.api_key}"
             headers = {}
         else:
-            api_url = f"{base_url}/models/{model_name}:streamGenerateContent"
+            # For proxy services, try different URL patterns
+            if "/v1beta" in base_url or "/v1" in base_url:
+                # Base URL already includes the version path
+                api_url = f"{base_url}/models/{model_name}:streamGenerateContent"
+            else:
+                # Add version path for other proxies
+                api_url = f"{base_url}/v1beta/models/{model_name}:streamGenerateContent"
             headers = {"Authorization": f"Bearer {self.api_key}"}
 
         # Prepare request body
@@ -1026,6 +1056,7 @@ class GeminiLLM(BaseLLM):
         tool_choice: Optional[Union[str, Dict[str, Any]]] = None,
         response_format: Optional[Dict[str, Any]] = None,
         thinking: Optional[Dict[str, Any]] = None,
+        output_config: Optional[Dict[str, Any]] = None,
         **kwargs: Any,
     ) -> AsyncIterator[StreamChunk]:
         """Stream chat completion with full streaming support.
@@ -1058,11 +1089,25 @@ class GeminiLLM(BaseLLM):
             elif self.default_max_tokens is not None:
                 gen_config["max_output_tokens"] = self.default_max_tokens
 
-            # Handle response_format for JSON mode
+            # Handle output_config for JSON schema (Gemini 3.0+)
+            if output_config is not None:
+                format_config = output_config.get("format", {})
+                if format_config.get("type") == "json_schema":
+                    # Gemini uses response_mime_type and response_json_schema
+                    schema = format_config.get("schema") or format_config.get(
+                        "json_schema", {}
+                    )
+                    if schema:
+                        gen_config["response_mime_type"] = "application/json"
+                        gen_config["response_json_schema"] = schema
+
+            # Handle response_format for JSON mode (legacy)
             if response_format:
                 response_type: str = response_format.get("type", "")
                 if response_type == "json_object":
-                    gen_config["response_mime_type"] = "application/json"
+                    # Only set if not already set by output_config
+                    if "response_mime_type" not in gen_config:
+                        gen_config["response_mime_type"] = "application/json"
 
             # Handle tools
             gemini_tools = None
@@ -1278,6 +1323,7 @@ class GeminiLLM(BaseLLM):
         tool_choice: Optional[Union[str, Dict[str, Any]]] = None,
         response_format: Optional[Dict[str, Any]] = None,
         thinking: Optional[Dict[str, Any]] = None,
+        output_config: Optional[Dict[str, Any]] = None,
         **kwargs: Any,
     ) -> Any:
         """
@@ -1316,6 +1362,7 @@ class GeminiLLM(BaseLLM):
             tool_choice=tool_choice,
             response_format=response_format,
             thinking=thinking,
+            output_config=output_config,
             **kwargs,
         )
 

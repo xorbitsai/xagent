@@ -503,3 +503,78 @@ class TestGeminiLLM:
         # Should raise ValueError for invalid API key
         with pytest.raises(ValueError, match="Invalid Google API key"):
             await GeminiLLM.list_available_models("invalid-key")
+
+    @pytest.mark.asyncio
+    async def test_output_config_json_schema(
+        self, llm: GeminiLLM, mocker: pytest_mock.MockerFixture
+    ) -> None:
+        """Test output_config with json_schema format for Gemini."""
+        # Create a mock response with JSON schema content
+        mock_response_data = {
+            "candidates": [
+                {
+                    "content": {
+                        "parts": [
+                            {
+                                "text": '{"recipe_name": "Chocolate Chip Cookies", "ingredients": [{"name": "flour", "quantity": "2 and 1/4 cups"}], "instructions": ["Preheat oven to 375°F"]}'
+                            }
+                        ]
+                    },
+                    "finishReason": "STOP",
+                }
+            ],
+            "usageMetadata": {
+                "promptTokenCount": 100,
+                "candidatesTokenCount": 50,
+            },
+        }
+
+        # Mock the internal API call method
+        mock_call = AsyncMock(return_value=mock_response_data)
+        mocker.patch.object(llm, "_call_gemini_rest_api", new=mock_call)
+
+        messages = [{"role": "user", "content": "Extract the recipe from this text."}]
+
+        # Test with output_config using json_schema format (Gemini 3.0+)
+        output_config = {
+            "format": {
+                "type": "json_schema",
+                "schema": {
+                    "type": "object",
+                    "properties": {
+                        "recipe_name": {
+                            "type": "string",
+                            "description": "The name of the recipe.",
+                        },
+                        "ingredients": {
+                            "type": "array",
+                            "items": {
+                                "type": "object",
+                                "properties": {
+                                    "name": {"type": "string"},
+                                    "quantity": {"type": "string"},
+                                },
+                                "required": ["name", "quantity"],
+                            },
+                        },
+                        "instructions": {"type": "array", "items": {"type": "string"}},
+                    },
+                    "required": ["recipe_name", "ingredients", "instructions"],
+                },
+            }
+        }
+
+        response = await llm.chat(messages, output_config=output_config)
+
+        assert isinstance(response, str)
+        # Verify the response contains the expected JSON
+        assert "recipe_name" in response
+        assert "ingredients" in response
+
+        # Verify the API was called with response_mime_type and response_json_schema
+        mock_call.assert_called_once()
+        call_args = mock_call.call_args
+        # Check the generation_config parameter
+        gen_config = call_args.kwargs.get("generation_config", {})
+        assert gen_config.get("response_mime_type") == "application/json"
+        assert "response_json_schema" in gen_config

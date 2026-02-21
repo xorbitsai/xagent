@@ -773,3 +773,132 @@ class TestClaudeLLM:
         # Should raise ValueError for invalid API key
         with pytest.raises(ValueError, match="Invalid Anthropic API key"):
             await ClaudeLLM.list_available_models("invalid-key")
+
+    @pytest.mark.asyncio
+    async def test_output_config_json_schema(self, llm, mocker):
+        """Test output_config with json_schema format."""
+        # Setup mock
+        mock_client = mocker.AsyncMock()
+
+        mock_text_block = mocker.Mock()
+        mock_text_block.type = "text"
+        mock_text_block.text = '{"joke": "Why did the chicken cross the road?", "punchline": "To get to the other side!"}'
+
+        mock_response = mocker.Mock()
+        mock_response.stop_reason = "stop"
+        mock_response.content = [mock_text_block]
+        # Mock usage with integer values
+        mock_usage = mocker.Mock()
+        mock_usage.input_tokens = 20
+        mock_usage.output_tokens = 15
+
+        mock_response.usage = mock_usage
+
+        mock_client.messages.create.return_value = mock_response
+        mocker.patch(
+            "xagent.core.model.chat.basic.claude.AsyncAnthropic",
+            return_value=mock_client,
+        )
+
+        messages = [{"role": "user", "content": "Tell me a short joke."}]
+
+        # Test with output_config using json_schema format
+        output_config = {
+            "format": {
+                "type": "json_schema",
+                "schema": {
+                    "type": "object",
+                    "properties": {
+                        "joke": {
+                            "type": "string",
+                            "description": "The text of the joke.",
+                        },
+                        "punchline": {
+                            "type": "string",
+                            "description": "The punchline of the joke.",
+                        },
+                    },
+                    "required": ["joke", "punchline"],
+                    "additionalProperties": False,
+                },
+            }
+        }
+
+        response = await llm.chat(messages, output_config=output_config)
+
+        assert isinstance(response, str)
+        # Verify the response contains the expected JSON
+        assert "joke" in response
+        assert "punchline" in response
+
+        # Verify the API was called with output_config
+        mock_client.messages.create.assert_called_once()
+        call_args = mock_client.messages.create.call_args
+        assert "output_config" in call_args.kwargs
+        assert call_args.kwargs["output_config"]["format"]["type"] == "json_schema"
+
+    @pytest.mark.asyncio
+    async def test_strict_tool_mode(self, llm, mocker):
+        """Test strict mode for tool calling."""
+        # Setup mock
+        mock_client = mocker.AsyncMock()
+
+        mock_tool_block = mocker.Mock()
+        mock_tool_block.type = "tool_use"
+        mock_tool_block.id = "test_tool_id"
+        mock_tool_block.name = "search_flights"
+        mock_tool_block.input = {"destination": "Paris", "date": "2025-03-15"}
+
+        mock_usage = mocker.Mock()
+        mock_usage.input_tokens = 25
+        mock_usage.output_tokens = 10
+
+        mock_response = mocker.Mock()
+        mock_response.stop_reason = "tool_use"
+        mock_response.content = [mock_tool_block]
+        mock_response.usage = mock_usage
+
+        mock_client.messages.create.return_value = mock_response
+        mocker.patch(
+            "xagent.core.model.chat.basic.claude.AsyncAnthropic",
+            return_value=mock_client,
+        )
+
+        messages = [
+            {"role": "user", "content": "Search for flights to Paris next month"}
+        ]
+
+        # Test with strict tool mode
+        tools = [
+            {
+                "type": "function",
+                "function": {
+                    "name": "search_flights",
+                    "description": "Search for flights",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "destination": {"type": "string"},
+                            "date": {"type": "string", "format": "date"},
+                        },
+                        "required": ["destination", "date"],
+                        "additionalProperties": False,
+                    },
+                },
+                "strict": True,  # Enable strict mode
+            }
+        ]
+
+        response = await llm.chat(messages, tools=tools)
+
+        # Verify tool call response
+        assert isinstance(response, dict)
+        assert response.get("type") == "tool_call"
+
+        # Verify the API was called with strict mode enabled
+        call_args = mock_client.messages.create.call_args
+        assert "tools" in call_args.kwargs
+        anthropic_tools = call_args.kwargs["tools"]
+        assert len(anthropic_tools) == 1
+        assert anthropic_tools[0]["strict"] is True
+        assert anthropic_tools[0]["name"] == "search_flights"

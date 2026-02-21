@@ -110,6 +110,7 @@ class BaseLLM(ABC):
         tool_choice: str | dict[str, Any] | None = None,
         response_format: dict[str, Any] | None = None,
         thinking: dict[str, Any] | None = None,
+        output_config: dict[str, Any] | None = None,
         **kwargs: Any,
     ) -> str | dict[str, Any]:
         """
@@ -128,6 +129,7 @@ class BaseLLM(ABC):
                          - dict: force a structured tool_call selection.
             response_format: Optional response format specification (e.g., {"type": "json_object"}).
             thinking: Optional thinking mode configuration (e.g., {"type": "disabled"}).
+            output_config: Optional output configuration for structured outputs (e.g., {"format": {"type": "json_schema", "schema": {...}}}).
             **kwargs: Additional parameters specific to the underlying model (e.g. top_p, user, stop).
 
         Returns:
@@ -154,6 +156,7 @@ class BaseLLM(ABC):
         tool_choice: str | dict[str, Any] | None = None,
         response_format: dict[str, Any] | None = None,
         thinking: dict[str, Any] | None = None,
+        output_config: dict[str, Any] | None = None,
         **kwargs: Any,
     ) -> str | dict[str, Any]:
         """
@@ -170,6 +173,7 @@ class BaseLLM(ABC):
             tool_choice: Specifies which tool to use.
             response_format: Optional response format specification (e.g., {"type": "json_object"}).
             thinking: Optional thinking mode configuration.
+            output_config: Optional output configuration for structured outputs.
             **kwargs: Additional parameters specific to the underlying model.
 
         Returns:
@@ -200,6 +204,7 @@ class BaseLLM(ABC):
             tool_choice=tool_choice,
             response_format=response_format,
             thinking=thinking,
+            output_config=output_config,
             **kwargs,
         )
 
@@ -212,6 +217,7 @@ class BaseLLM(ABC):
         tool_choice: str | dict[str, Any] | None = None,
         response_format: dict[str, Any] | None = None,
         thinking: dict[str, Any] | None = None,
+        output_config: dict[str, Any] | None = None,
         **kwargs: Any,
     ) -> AsyncIterator[StreamChunk]:
         """
@@ -231,6 +237,7 @@ class BaseLLM(ABC):
             tool_choice: Tool selection strategy
             response_format: Response format
             thinking: Thinking mode configuration
+            output_config: Output configuration for structured outputs
             **kwargs: Other parameters
 
         Yields:
@@ -249,6 +256,7 @@ class BaseLLM(ABC):
             tool_choice=tool_choice,
             response_format=response_format,
             thinking=thinking,
+            output_config=output_config,
             **kwargs,
         )
 

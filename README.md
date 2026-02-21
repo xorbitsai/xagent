@@ -12,6 +12,15 @@
 
 ---
 
+## 🎬 See Xagent Think
+
+Give it a goal.
+Watch it plan, select tools, execute, and deliver.
+
+![Xagent Demo](./assets/task.gif)
+
+---
+
 ## ⚡ The Problem
 
 **Workflow builders are rigid. They break when requirements change.**

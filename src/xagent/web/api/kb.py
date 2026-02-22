@@ -1,5 +1,6 @@
 """Knowledge base API route handlers"""
 
+import asyncio
 import logging
 from pathlib import Path
 from typing import Any, Dict, Optional
@@ -225,9 +226,24 @@ async def list_collections_api(
     _user: User = Depends(get_current_user),
 ) -> ListCollectionsResult:
     """List all collections with their statistics."""
+    kb_collections_timeout_seconds = 15
+
     try:
-        result = list_collections(int(_user.id), bool(_user.is_admin))
+        result = await asyncio.wait_for(
+            asyncio.to_thread(list_collections, int(_user.id), bool(_user.is_admin)),
+            timeout=kb_collections_timeout_seconds,
+        )
         return result
+
+    except asyncio.TimeoutError:
+        logger.error(
+            "Listing KB collections timed out after %s seconds",
+            kb_collections_timeout_seconds,
+        )
+        raise HTTPException(
+            status_code=503,
+            detail="Knowledge base is temporarily unavailable. Please retry.",
+        )
 
     except Exception as e:
         logger.exception(f"Failed to list collections: {e}")

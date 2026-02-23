@@ -699,22 +699,25 @@ async def handle_chat_message(
                     file_info_list = upload_result.get("file_info_list", [])
 
                     if file_info_list:
-                        file_descriptions = [
-                            f"File: {f['name']} (Size: {f['size']} bytes, Type: {f['type']})"
-                            for f in file_info_list
-                        ]
-                        if user_message:
-                            user_message += "\n\nUploaded files:\n" + "\n".join(
-                                file_descriptions
-                            )
-                        else:
-                            user_message = "File processing task:\n" + "\n".join(
-                                file_descriptions
-                            )
-
-                        # Add file paths to context for agent use
                         context["uploaded_files"] = uploaded_file_paths
                         context["file_info"] = file_info_list
+                        file_summary = "\n".join(
+                            [
+                                f"- {f['name']} ({f['size']} bytes, {f['type']})"
+                                for f in file_info_list
+                            ]
+                        )
+                        file_prompt = (
+                            "Uploaded files are available in workspace input directory.\n"
+                            f"{file_summary}"
+                        )
+                        existing_prompt = context.get("system_prompt")
+                        if existing_prompt:
+                            context["system_prompt"] = (
+                                f"{existing_prompt}\n\n{file_prompt}"
+                            )
+                        else:
+                            context["system_prompt"] = file_prompt
 
                 # DAG plan-execute will automatically send user_message trace event
 
@@ -1948,6 +1951,7 @@ async def handle_build_preview_execution(
         # Handle file upload (if any)
         uploaded_files = []
         file_info_list = []
+        file_prompt = ""
         if files_data:
             try:
                 import base64
@@ -2027,20 +2031,17 @@ async def handle_build_preview_execution(
                         if temp_file_path.exists():
                             temp_file_path.unlink()
 
-                # Add file descriptions to message
                 if file_info_list:
-                    file_descriptions = [
-                        f"File: {f['name']} (Size: {f['size']} bytes, Type: {f['type']})"
-                        for f in file_info_list
-                    ]
-                    if user_message:
-                        user_message += "\n\nUploaded files:\n" + "\n".join(
-                            file_descriptions
-                        )
-                    else:
-                        user_message = "File processing task:\n" + "\n".join(
-                            file_descriptions
-                        )
+                    file_summary = "\n".join(
+                        [
+                            f"- {f['name']} ({f['size']} bytes, {f['type']})"
+                            for f in file_info_list
+                        ]
+                    )
+                    file_prompt = (
+                        "Uploaded files are available in workspace input directory.\n"
+                        f"{file_summary}"
+                    )
 
                 logger.info(
                     f"🎉 File upload completed, uploaded {len(uploaded_files)} files"
@@ -2064,6 +2065,14 @@ async def handle_build_preview_execution(
         execution_context = {}
         if instructions:
             execution_context["system_prompt"] = instructions
+        if file_prompt:
+            existing_prompt = execution_context.get("system_prompt")
+            if existing_prompt:
+                execution_context["system_prompt"] = (
+                    f"{existing_prompt}\n\n{file_prompt}"
+                )
+            else:
+                execution_context["system_prompt"] = file_prompt
         if uploaded_files:
             execution_context["uploaded_files"] = uploaded_files
         if file_info_list:

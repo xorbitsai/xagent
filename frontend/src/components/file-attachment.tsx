@@ -74,6 +74,19 @@ export function FileAttachment({ files, className, showPreview = true, variant =
     return parseFloat((bytes / Math.pow(k, i)).toFixed(2)) + ' ' + sizes[i]
   }
 
+  const getFileTypeLabel = (file: FileInfo) => {
+    const ext = file.name.includes('.') ? file.name.split('.').pop()?.toLowerCase() : ''
+    if (ext) {
+      return ext
+    }
+
+    if (file.type.startsWith('image/')) return 'image'
+    if (file.type.startsWith('text/')) return 'txt'
+    if (file.type.includes('pdf')) return 'pdf'
+
+    return t('files.attachment.typeUnknown')
+  }
+
   const handlePreview = async (file: FileInfo) => {
     if (!file.path) return
 
@@ -172,7 +185,7 @@ export function FileAttachment({ files, className, showPreview = true, variant =
                   <Badge
                     variant={variant === 'user-message' ? "secondary" : "outline"}
                     className={cn(
-                      "text-xs shrink-0",
+                      "text-xs shrink-0 px-0",
                       variant === 'user-message'
                         ? "bg-accent/30 text-foreground border-accent/50"
                         : ""
@@ -183,13 +196,13 @@ export function FileAttachment({ files, className, showPreview = true, variant =
                   <Badge
                     variant={variant === 'user-message' ? "secondary" : "outline"}
                     className={cn(
-                      "text-xs shrink-0",
+                      "text-xs shrink-0 pl-0",
                       variant === 'user-message'
                         ? "bg-accent/30 text-foreground border-accent/50"
                         : ""
                     )}
                   >
-                    {file.type.split('/')[0] || t('files.attachment.typeUnknown')}
+                    {getFileTypeLabel(file)}
                   </Badge>
                 </div>
               </div>

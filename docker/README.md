@@ -104,13 +104,21 @@ docker compose up -d
 ### Backend
 
 ```bash
-docker build -f docker/Dockerfile.backend -t xprobe/xagent-backend:latest .
+docker buildx build \
+  --platform linux/amd64,linux/arm64 \
+  -f docker/Dockerfile.backend \
+  -t xprobe/xagent-backend:latest \
+  --push .
 ```
 
 ### Frontend
 
 ```bash
-docker build -f docker/Dockerfile.frontend -t xprobe/xagent-frontend:latest ./frontend
+docker buildx build \
+  --platform linux/amd64,linux/arm64 \
+  -f docker/Dockerfile.frontend \
+  -t xprobe/xagent-frontend:latest \
+  --push ./frontend
 ```
 
 ## Publishing Images
@@ -135,13 +143,16 @@ Or manually:
 
 ```bash
 # Build and tag
-docker build -f docker/Dockerfile.backend -t xprobe/xagent-backend:latest .
-docker build -f docker/Dockerfile.frontend -t xprobe/xagent-frontend:latest ./frontend
-
-# Push to Docker Hub
-docker push xprobe/xagent-backend:latest
-docker push xprobe/xagent-frontend:latest
+docker buildx build --platform linux/amd64,linux/arm64 -f docker/Dockerfile.backend -t xprobe/xagent-backend:latest --push .
+docker buildx build --platform linux/amd64,linux/arm64 -f docker/Dockerfile.frontend -t xprobe/xagent-frontend:latest --push ./frontend
 ```
+
+> If Docker Buildx is not initialized locally, run:
+>
+> ```bash
+> docker buildx create --use
+> docker run --privileged --rm tonistiigi/binfmt --install all
+> ```
 
 ### First Time Setup
 

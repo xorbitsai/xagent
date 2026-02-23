@@ -8,6 +8,7 @@ import { useApp } from "@/contexts/app-context"
 import { getApiUrl } from "@/lib/utils"
 import { apiRequest } from "@/lib/api-wrapper"
 import { useI18n } from "@/contexts/i18n-context"
+import { DocxPreviewRenderer } from "@/components/docx-preview-renderer"
 
 interface FilePreviewDialogProps {
   open: boolean
@@ -30,6 +31,7 @@ export function FilePreviewDialog({ open, onOpenChange }: FilePreviewDialogProps
           // Check if this is a PPTX file that needs preview conversion
           const isPptxFile = filePreview.fileName.toLowerCase().endsWith('.pptx') ||
                            filePreview.fileName.toLowerCase().endsWith('.ppt')
+          const isDocxFile = filePreview.fileName.toLowerCase().endsWith('.docx')
 
           let url: string
           if (isPptxFile) {
@@ -66,7 +68,7 @@ export function FilePreviewDialog({ open, onOpenChange }: FilePreviewDialogProps
             if (isPptxFile) {
               // PPTX preview endpoint returns HTML
               fileContent = await response.text()
-            } else if (filePreview.fileName.match(/\.(jpg|jpeg|png|gif|webp|svg|pdf)$/i)) {
+            } else if (isDocxFile || filePreview.fileName.match(/\.(jpg|jpeg|png|gif|webp|svg|pdf)$/i)) {
               const arrayBuffer = await response.arrayBuffer()
               console.log('Debug: ArrayBuffer size:', arrayBuffer.byteLength)
 
@@ -366,6 +368,8 @@ export function FilePreviewDialog({ open, onOpenChange }: FilePreviewDialogProps
                   sandbox="allow-same-origin allow-scripts"
                   title={filePreview.fileName}
                 />
+              ) : filePreview.fileName.toLowerCase().endsWith('.docx') ? (
+                <DocxPreviewRenderer base64Content={filePreview.content || ''} />
               ) : filePreview.fileName.endsWith('.html') || filePreview.fileName.endsWith('.htm') ? (
                 <iframe
                   srcDoc={processHtmlContent(filePreview.content, filePreview.filePath)}

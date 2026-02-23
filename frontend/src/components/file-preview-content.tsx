@@ -6,6 +6,7 @@ import { getApiUrl } from "@/lib/utils"
 import { apiRequest } from "@/lib/api-wrapper"
 import { useI18n } from "@/contexts/i18n-context"
 import { Loader2, XIcon } from "lucide-react"
+import { DocxPreviewRenderer } from "@/components/docx-preview-renderer"
 
 interface FilePreviewContentProps {
   open: boolean
@@ -23,13 +24,10 @@ export function FilePreviewContent({ open }: FilePreviewContentProps) {
         try {
           const apiUrl = getApiUrl()
 
-          // Extract task_id from filePath (e.g., "web_task_78/output/file.pptx" -> "78")
-          const taskIdMatch = filePreview.filePath.match(/(\d+)_task|web_task_(\d+)|task_(\d+)/)
-          const taskId = taskIdMatch ? (taskIdMatch[1] || taskIdMatch[2] || taskIdMatch[3]) : null
-
           // PPTX files are converted to PDF by backend, treat as PDF
           const isPptx = filePreview.fileName.match(/\.pptx$/i)
           const isPdf = isPptx || filePreview.fileName.match(/\.pdf$/i)
+          const isDocx = filePreview.fileName.match(/\.docx$/i)
 
           const url = `${apiUrl}/api/files/download/${encodeURIComponent(filePreview.filePath)}`
 
@@ -43,7 +41,7 @@ export function FilePreviewContent({ open }: FilePreviewContentProps) {
 
           if (response.ok) {
             let fileContent
-            if (isPdf || filePreview.fileName.match(/\.(jpg|jpeg|png|gif|webp|svg)$/i)) {
+            if (isDocx || isPdf || filePreview.fileName.match(/\.(jpg|jpeg|png|gif|webp|svg)$/i)) {
               const arrayBuffer = await response.arrayBuffer()
 
               const chunkSize = 16384
@@ -136,7 +134,9 @@ export function FilePreviewContent({ open }: FilePreviewContentProps) {
           </div>
         ) : (
           <div className="flex-1 overflow-auto bg-muted/30 rounded border">
-            {filePreview.fileName.endsWith('.html') || filePreview.fileName.endsWith('.htm') ? (
+            {filePreview.fileName.toLowerCase().endsWith('.docx') ? (
+              <DocxPreviewRenderer base64Content={filePreview.content || ''} />
+            ) : filePreview.fileName.endsWith('.html') || filePreview.fileName.endsWith('.htm') ? (
               <iframe
                 srcDoc={processHtmlContent(filePreview.content, filePreview.filePath)}
                 className="w-full h-full border-0"

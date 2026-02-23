@@ -1062,11 +1062,11 @@ Build when you need.`
     tabs: {
       llm: "LLM 模型",
       embedding: "Embedding 模型",
-      image: "图像模型",
+      image: "图像生成模型",
     },
     section: {
       enabledModels: "已启用模型",
-      configuredCount: "已配置 {{count}} 个",
+      configuredCount: "已配置 {count} 个",
       exploreProviders: "模型供应商",
     },
     deleteConfirm: "确定要删除这个模型吗？",

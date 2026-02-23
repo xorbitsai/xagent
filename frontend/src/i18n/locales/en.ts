@@ -1062,11 +1062,11 @@ Build when you need.`
     tabs: {
       llm: "LLM Models",
       embedding: "Embedding Models",
-      image: "Image Models",
+      image: "Image Generation Models",
     },
     section: {
       enabledModels: "Enabled Models",
-      configuredCount: "{{count}} configured",
+      configuredCount: "{count} configured",
       exploreProviders: "Model Providers",
     },
     deleteConfirm: "Are you sure you want to delete this model?",

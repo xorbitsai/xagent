@@ -41,6 +41,12 @@ app = FastAPI(
 )
 
 
+@app.get("/health")
+async def health_check() -> dict[str, str]:
+    """Health check endpoint for container probes."""
+    return {"status": "ok"}
+
+
 # 添加全局异常处理器
 @app.exception_handler(RequestValidationError)
 async def validation_exception_handler(

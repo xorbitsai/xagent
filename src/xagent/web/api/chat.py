@@ -1697,21 +1697,19 @@ async def delete_task(
         # Remove agent from manager if it exists
         get_agent_manager(request).remove_agent(task_id, int(user.id))
 
-        # Close WebSocket connections for this task to prevent residual messages
-        from .websocket import manager
+        from .websocket import background_task_manager, manager
 
-        if task_id in manager.active_connections:
-            # Disconnect all WebSocket connections for this task
-            for connection in manager.active_connections[task_id].copy():
+        connections = manager.active_connections.pop(task_id, [])
+
+        async def _cleanup_runtime_state() -> None:
+            await background_task_manager.cancel_task(task_id, timeout_seconds=0.05)
+            for connection in list(connections):
                 try:
-                    # Properly close the WebSocket connection
                     await connection.close()
                 except Exception as e:
                     logger.warning(f"Failed to close WebSocket connection: {e}")
-                    pass
-            # Remove the task from active connections
-            del manager.active_connections[task_id]
-            logger.info(f"Closed WebSocket connections for deleted task {task_id}")
+
+        asyncio.create_task(_cleanup_runtime_state())
 
         logger.info(f"Task {task_id} deleted successfully")
 

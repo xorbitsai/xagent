@@ -102,6 +102,19 @@ class TaskTracker:
             return
 
         try:
+            task_exists = (
+                self.db_session.query(self.task_model.id)
+                .filter(self.task_model.id == self.task_id)
+                .first()
+                is not None
+            )
+            if not task_exists:
+                self._is_tracking = False
+                logger.info(
+                    f"Stopping token tracking for task {self.task_id}: task no longer exists"
+                )
+                return
+
             # Get current token usage
             usage = get_token_usage()
             logger.debug(
@@ -133,6 +146,28 @@ class TaskTracker:
                 self._last_reported_usage = usage
         except Exception as e:
             logger.error(f"Failed to update token usage for task {self.task_id}: {e}")
+            try:
+                self.db_session.rollback()
+            except Exception as rollback_error:
+                logger.warning(
+                    f"Failed to rollback DB session for task {self.task_id}: {rollback_error}"
+                )
+
+            try:
+                task_exists = (
+                    self.db_session.query(self.task_model.id)
+                    .filter(self.task_model.id == self.task_id)
+                    .first()
+                    is not None
+                )
+                if not task_exists:
+                    self._is_tracking = False
+                    logger.info(
+                        f"Stopped periodic token tracking for deleted task {self.task_id}"
+                    )
+            except Exception:
+                self._is_tracking = False
+
             import traceback
 
             traceback.print_exc()
@@ -200,7 +235,10 @@ class TaskTracker:
             RuntimeError: If tracking was not started
         """
         if not self._is_tracking:
-            raise RuntimeError(f"Task {self.task_id} is not being tracked")
+            logger.info(
+                f"Task {self.task_id} tracking already stopped, returning current usage"
+            )
+            return get_token_usage()
 
         # Stop periodic updates first to prevent race conditions
         await self.stop_periodic_updates()
@@ -216,7 +254,14 @@ class TaskTracker:
         self.task.llm_calls = usage.llm_calls
         self.task.token_usage_details = usage.to_dict()["details"]
 
-        self.db_session.commit()
+        try:
+            self.db_session.commit()
+        except Exception as e:
+            logger.warning(
+                f"Failed to commit final token usage for task {self.task_id}: {e}"
+            )
+            self.db_session.rollback()
+            return usage
 
         # Only log if values have changed from last report
         if (

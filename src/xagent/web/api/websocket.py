@@ -209,6 +209,9 @@ async def execute_task_background(
             )
         except Exception as broadcast_error:
             logger.error(f"Failed to send error notification: {broadcast_error}")
+    except asyncio.CancelledError:
+        logger.info(f"Background task {task_id} cancelled")
+        raise
     finally:
         # Clean up background task record
         background_task_manager.cleanup_task(task_id)
@@ -302,6 +305,9 @@ async def execute_continuation_background(
             )
         except Exception as broadcast_error:
             logger.error(f"Failed to send error notification: {broadcast_error}")
+    except asyncio.CancelledError:
+        logger.info(f"Background continuation for task {task_id} cancelled")
+        raise
     finally:
         # Clean up background task records
         background_task_manager.cleanup_task(task_id)
@@ -343,6 +349,32 @@ class BackgroundTaskManager:
             if task.done():
                 del self.running_tasks[task_id]
                 logger.info(f"Cleaned up background task for task {task_id}")
+
+    async def cancel_task(self, task_id: int, timeout_seconds: float = 0.5) -> None:
+        task = self.running_tasks.get(task_id)
+        if not task:
+            return
+
+        if not task.done():
+            task.cancel()
+            try:
+                await asyncio.wait_for(task, timeout=timeout_seconds)
+            except asyncio.CancelledError:
+                logger.info(f"Cancelled background task for task {task_id}")
+            except asyncio.TimeoutError:
+                logger.info(
+                    f"Cancellation timeout for task {task_id}; continuing cleanup"
+                )
+            except RuntimeError as e:
+                logger.warning(
+                    f"Background task {task_id} cancellation runtime warning: {e}"
+                )
+            except Exception as e:
+                logger.warning(
+                    f"Background task {task_id} raised during cancellation: {e}"
+                )
+
+        self.running_tasks.pop(task_id, None)
 
 
 # Global background task manager

@@ -80,8 +80,16 @@ class DatabaseTraceHandler(BaseTraceHandler):
     def _save_trace_event(self, db: Session, event: CoreTraceEvent) -> None:
         """Save trace event in unified format to database."""
         from ...web.api.ws_trace_handlers import get_event_type_mapping
+        from ...web.models.task import Task
 
         try:
+            task_exists = db.query(Task.id).filter(Task.id == self.task_id).first()
+            if not task_exists:
+                logger.debug(
+                    f"Skip trace event for missing task {self.task_id}: {event.id}"
+                )
+                return
+
             # Map the trace event to the unified event type
             event_type_str = get_event_type_mapping(event)
 

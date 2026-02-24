@@ -1,8 +1,16 @@
+<div align="center">
+
 ![Xagent Banner](./assets/github_readme_banner.png)
 
 [![Discord](https://img.shields.io/discord/1474756736358289609?style=for-the-badge&logo=discord)](https://discord.gg/R7TDFMzuXq)
+[![Telegram](https://img.shields.io/badge/Telegram-2CA5E0?style=for-the-badge&logo=telegram&logoColor=white)](https://t.me/+2_-SAVLtuJNkNWFl)
 [![Twitter](https://img.shields.io/twitter/follow/xorbitsio?logo=x&style=for-the-badge)](https://twitter.com/xorbitsio)
+
+[![Documentation](https://img.shields.io/badge/docs-docs.xagent.run-blue?style=for-the-badge&logo=gitbook)](https://docs.xagent.run/)
+[![GitHub Release](https://img.shields.io/github/v/release/xorbitsai/xagent?logo=github&style=for-the-badge)](https://github.com/xorbitsai/xagent/releases)
 [![Docker Pulls](https://img.shields.io/docker/pulls/xprobe/xagent-backend?style=for-the-badge&logo=docker)](https://hub.docker.com/r/xprobe/xagent-backend)
+
+</div>
 
 ---
 
@@ -13,6 +21,10 @@
 **No more flowcharts.**
 **No more rigid automation.**
 **Just tell Xagent what you want.**
+
+👏 Join [Telegram](https://t.me/+2_-SAVLtuJNkNWFl) | [Discord](https://discord.gg/R7TDFMzuXq)
+
+❤️ Like Xagent? Give it a star 🌟 to support the development!
 
 ---
 
@@ -225,9 +237,13 @@ Open issues. Submit PRs. Help shape the future of AI agents.
 
 ## 💬 Community & Contact
 
+**[Documentation](https://docs.xagent.run/)** - Full documentation and guides
+
 **[GitHub Issues](https://github.com/xorbitsai/xagent/issues)** - Report bugs or propose features
 
 **[Discord](https://discord.gg/R7TDFMzuXq)** - Share your tasks or agents and connect with the community
+
+**[Telegram](https://t.me/+2_-SAVLtuJNkNWFl)** - Join our Telegram group for discussions
 
 **[X (Twitter)](https://twitter.com/xorbitsio)** - Follow for updates and share your work
 

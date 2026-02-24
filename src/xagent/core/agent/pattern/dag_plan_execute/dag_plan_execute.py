@@ -145,6 +145,9 @@ class DAGPlanExecutePattern(AgentPattern):
         self.phase: ExecutionPhase = ExecutionPhase.PLANNING
         self._final_answer: Optional[str] = None
         self._context: Optional[AgentContext] = None
+        self._skill_context: Optional[str] = (
+            None  # Store skill context for execution phase
+        )
 
         # Pause/resume control
         self._pause_event = asyncio.Event()
@@ -503,6 +506,9 @@ class DAGPlanExecutePattern(AgentPattern):
                             skill_context = self.plan_generator._build_skill_context(
                                 skill
                             )
+                            self._skill_context = (
+                                skill_context  # Store for execution phase
+                            )
                             logger.info(f"Using skill: {skill['name']}")
                         else:
                             logger.info("No relevant skill found")
@@ -765,7 +771,7 @@ class DAGPlanExecutePattern(AgentPattern):
                     logger.info("Execution resumed before execution phase")
 
                 execution_results = await self.plan_executor.execute_plan(
-                    plan, tool_map
+                    plan, tool_map, self._skill_context
                 )
 
                 # Send final dag_plan_end event with updated step statuses (including skipped steps)

@@ -65,6 +65,7 @@ class ContextBuilder:
         dependency_results: Dict[str, StepExecutionResult],
         task_id: Optional[str] = None,
         original_goal: Optional[str] = None,
+        skill_context: Optional[str] = None,
     ) -> List[Dict[str, str]]:
         """
         Build context messages for a step based on its dependencies.
@@ -76,6 +77,7 @@ class ContextBuilder:
             dependency_results: Results from dependency steps
             task_id: Optional task ID for tracing
             original_goal: Optional original user goal for context preservation
+            skill_context: Optional skill context with domain knowledge and templates
 
         Returns:
             List of messages forming the context for this step
@@ -85,7 +87,7 @@ class ContextBuilder:
             {
                 "role": "system",
                 "content": self._build_step_system_prompt(
-                    step_name, step_description, original_goal
+                    step_name, step_description, original_goal, skill_context
                 ),
             }
         ]
@@ -490,9 +492,20 @@ class ContextBuilder:
         return result
 
     def _build_step_system_prompt(
-        self, step_name: str, step_description: str, original_goal: Optional[str] = None
+        self,
+        step_name: str,
+        step_description: str,
+        original_goal: Optional[str] = None,
+        skill_context: Optional[str] = None,
     ) -> str:
-        """Build system prompt for a step."""
+        """Build system prompt for a step.
+
+        Args:
+            step_name: Name of the step
+            step_description: Description of the step
+            original_goal: Optional overall goal
+            skill_context: Optional skill context with domain knowledge
+        """
         current_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
         goal_context = ""
@@ -504,9 +517,18 @@ class ContextBuilder:
                 "Your step contributes to achieving the larger objective.\n\n"
             )
 
+        # Add skill context if available
+        skill_section = ""
+        if skill_context:
+            skill_section = f"\n{skill_context}\n\n"
+            skill_section += (
+                "IMPORTANT: The skill above provides domain knowledge and templates. "
+            )
+            skill_section += "Use this knowledge to improve the quality and relevance of your work.\n\n"
+
         return f"""You are executing a specific step in a larger plan: {step_name}
 
-{goal_context}Your task: {step_description}
+{goal_context}{skill_section}Your task: {step_description}
 
 You have access to the results and context from previous dependency steps.
 Use this information to complete your specific task effectively.

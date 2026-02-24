@@ -121,6 +121,15 @@ class ToolFactory:
             )
             tools.extend(agent_tools)
 
+        # PPTX presentation tools (6 tools: read, generate, unpack, pack, add_slide, clean)
+        pptx_tools = ToolFactory._create_pptx_tools(
+            db=config.get_db(),
+            user_id=config.get_user_id(),
+            task_id=config.get_task_id(),
+            config=config,
+        )
+        tools.extend(pptx_tools)
+
         # Filter tools by allowed_tools if specified
         allowed_tools = config.get_allowed_tools()
         if allowed_tools is not None and len(allowed_tools) > 0:
@@ -179,6 +188,13 @@ class ToolFactory:
 
             python_tool = get_python_executor_tool({"workspace": workspace})
             tools.append(python_tool)
+
+        # JavaScript executor tool (if workspace available)
+        if workspace:
+            from .javascript_executor import get_javascript_executor_tool
+
+            js_tool = get_javascript_executor_tool({"workspace": workspace})
+            tools.append(js_tool)
 
         return tools
 
@@ -450,4 +466,39 @@ class ToolFactory:
             return agent_tools
         except Exception as e:
             logger.error(f"Failed to create agent tools: {e}", exc_info=True)
+            return []
+
+    @staticmethod
+    def _create_pptx_tools(
+        db: Any = None,
+        user_id: Optional[int] = None,
+        task_id: Optional[str] = None,
+        config: Any = None,
+    ) -> List[Tool]:
+        """Create PPTX presentation tools.
+
+        Args:
+            db: Database session (unused, kept for compatibility)
+            user_id: User ID (unused, kept for compatibility)
+            task_id: Task ID (unused, kept for compatibility)
+            config: Tool configuration (unused, kept for compatibility)
+
+        Returns:
+            List of PPTX tools (read, generate, unpack, pack, add_slide, clean)
+        """
+        try:
+            from .pptx_tool import create_pptx_tool
+
+            # Get workspace from config
+            workspace = (
+                ToolFactory._create_workspace(config.get_workspace_config())
+                if config
+                else None
+            )
+
+            pptx_tools = create_pptx_tool(workspace=workspace)
+            logger.info(f"Added {len(pptx_tools)} PPTX tools")
+            return pptx_tools
+        except Exception as e:
+            logger.error(f"Failed to create PPTX tools: {e}", exc_info=True)
             return []

@@ -78,9 +78,18 @@ class PlanExecutor:
         self._semaphore = asyncio.Semaphore(max_concurrency)
 
     async def execute_plan(
-        self, plan: ExecutionPlan, tool_map: Dict[str, Tool]
+        self,
+        plan: ExecutionPlan,
+        tool_map: Dict[str, Tool],
+        skill_context: Optional[str] = None,
     ) -> List[Dict[str, Any]]:
-        """Execute the plan using queue-driven concurrent execution"""
+        """Execute the plan using queue-driven concurrent execution
+
+        Args:
+            plan: Execution plan with steps
+            tool_map: Tool name to tool mapping
+            skill_context: Optional skill context to pass to step execution
+        """
         logger.info(
             f"Executing plan {plan.id} with {len(plan.steps)} steps (max concurrency: {self.max_concurrency})"
         )
@@ -154,7 +163,7 @@ class PlanExecutor:
 
                 async with self._semaphore:
                     result = await self._execute_step_with_react_agent(
-                        step, tool_map, execution_results
+                        step, tool_map, execution_results, skill_context
                     )
 
                 # Handle successful completion
@@ -535,8 +544,16 @@ class PlanExecutor:
         step: PlanStep,
         tool_map: Dict[str, Tool],
         execution_results: Optional[List[Dict[str, Any]]] = None,
+        skill_context: Optional[str] = None,
     ) -> Dict[str, Any]:
-        """Execute a single step using ReAct agent"""
+        """Execute a single step using ReAct agent
+
+        Args:
+            step: Plan step to execute
+            tool_map: Tool name to tool mapping
+            execution_results: Optional list of execution results
+            skill_context: Optional skill context to pass to context builder
+        """
         logger.info(f"Executing step {step.id}: {step.name}")
 
         # Trace step start with detailed context
@@ -622,7 +639,7 @@ class PlanExecutor:
                 ):
                     self.parent_pattern.step_patterns[step.id] = react_pattern
 
-            # Build context using ContextBuilder with original goal
+            # Build context using ContextBuilder with original goal and skill context
             original_goal = (
                 getattr(self.parent_pattern, "_original_goal", None)
                 if self.parent_pattern
@@ -635,6 +652,7 @@ class PlanExecutor:
                 dependency_results=self.step_execution_results,
                 task_id=step.id,
                 original_goal=original_goal,
+                skill_context=skill_context,
             )
 
             # Add the current step task, with tool info and original goal context

@@ -235,10 +235,7 @@ class TaskTracker:
             RuntimeError: If tracking was not started
         """
         if not self._is_tracking:
-            logger.info(
-                f"Task {self.task_id} tracking already stopped, returning current usage"
-            )
-            return get_token_usage()
+            raise RuntimeError(f"Task {self.task_id} is not being tracked")
 
         # Stop periodic updates first to prevent race conditions
         await self.stop_periodic_updates()

@@ -142,6 +142,12 @@ PUSH=true ./publish.sh v1.0.0
 PLATFORMS=linux/arm64 ./publish.sh
 ```
 
+`publish.sh` behavior:
+
+- `PUSH=true` (or `CI=true`) -> publish images (`--push`)
+- local default (`PUSH=false`) -> local build only (`--load`, single platform)
+- local multi-platform without push will fail fast with a hint
+
 Or manually:
 
 ```bash

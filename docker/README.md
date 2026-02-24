@@ -133,10 +133,13 @@ From the `docker/` directory:
 
 ```bash
 # Publish with default tag (latest)
-./publish.sh
+PUSH=true ./publish.sh
 
 # Publish with version tag
-./publish.sh v1.0.0
+PUSH=true ./publish.sh v1.0.0
+
+# Local single-platform build without pushing
+PLATFORMS=linux/arm64 ./publish.sh
 ```
 
 Or manually:

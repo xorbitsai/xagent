@@ -239,7 +239,7 @@ logs.forEach(log => console.log(log));
         if packages:
             for pkg in packages:
                 if pkg == "pptxgenjs":
-                    deps[pkg] = "^3.12.0"
+                    deps[pkg] = "^4.0.1"
                 elif pkg == "axios":
                     deps[pkg] = "^1.6.0"
                 elif pkg == "lodash":

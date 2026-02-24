@@ -106,6 +106,16 @@ jobs:
           set -e
           python3 -m uv run python -c "import nltk; nltk.download('punkt_tab')"
 
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Install pptxgenjs globally
+        run: |
+          set -e
+          npm install -g pptxgenjs@4.0.1
+
       - name: Run tests
         shell: bash
         run: |

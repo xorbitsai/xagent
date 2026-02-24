@@ -99,11 +99,10 @@ const PptxGenJS = require('pptxgenjs');
 console.log('PptxGenJS loaded successfully');
 console.log('Version:', typeof PptxGenJS);
 """
-        executor.execute_code(code, packages=["pptxgenjs"])
+        result = executor.execute_code(code, packages=["pptxgenjs"])
 
-        # Note: This test requires Node.js and npm to be installed
-        # It may fail in environments without Node.js
-        # We just check it doesn't crash
+        assert result["success"] is True
+        assert "PptxGenJS loaded successfully" in result["output"]
 
     def test_lodash_package(self):
         """Test that lodash package can be used."""

@@ -87,6 +87,9 @@ COPY --from=backend-build /opt/xagent /opt/xagent
 COPY frontend/package.json frontend/package-lock.json /opt/xagent/frontend/
 RUN cd /opt/xagent/frontend && npm ci
 
+# Install pptxgenjs globally for JavaScript executor tool
+RUN npm install -g pptxgenjs@4.0.1
+
 # Playwright browser + deps
 RUN python -m playwright install --with-deps chromium
 

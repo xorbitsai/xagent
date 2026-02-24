@@ -5,6 +5,7 @@ import logging
 from datetime import datetime, timezone
 from typing import Any, Optional
 
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from ...core.agent.trace import BaseTraceHandler
@@ -80,16 +81,8 @@ class DatabaseTraceHandler(BaseTraceHandler):
     def _save_trace_event(self, db: Session, event: CoreTraceEvent) -> None:
         """Save trace event in unified format to database."""
         from ...web.api.ws_trace_handlers import get_event_type_mapping
-        from ...web.models.task import Task
 
         try:
-            task_exists = db.query(Task.id).filter(Task.id == self.task_id).first()
-            if not task_exists:
-                logger.debug(
-                    f"Skip trace event for missing task {self.task_id}: {event.id}"
-                )
-                return
-
             # Map the trace event to the unified event type
             event_type_str = get_event_type_mapping(event)
 
@@ -151,6 +144,19 @@ class DatabaseTraceHandler(BaseTraceHandler):
                 f"Saved trace event {event.id} of type {event_type_str} to database"
             )
 
+        except IntegrityError as e:
+            db.rollback()
+            error_text = str(e)
+            if (
+                "trace_events_task_id_fkey" in error_text
+                or "ForeignKeyViolation" in error_text
+            ):
+                logger.debug(
+                    f"Skip trace event for missing task {self.task_id}: {event.id}"
+                )
+                return
+            logger.error(f"Failed to save trace event to database: {e}")
+            raise
         except Exception as e:
             logger.error(f"Failed to save trace event to database: {e}")
             db.rollback()

@@ -3,6 +3,7 @@
 import os
 import tempfile
 from pathlib import Path
+from typing import Optional
 
 import pytest
 from fastapi import FastAPI
@@ -11,6 +12,7 @@ from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 
 from xagent.web.api.auth import hash_password
+from xagent.web.auth_config import JWT_ALGORITHM, JWT_SECRET_KEY
 from xagent.web.api.files import file_router
 from xagent.web.models.database import Base, get_db
 from xagent.web.models.user import User
@@ -33,11 +35,13 @@ def test_db():
 
     # Create override function that uses this test's session
     def override_get_db():
+        db = None
         try:
             db = TestingSessionLocal()
             yield db
         finally:
-            db.close()
+            if db is not None:
+                db.close()
 
     # Create test app for this test
     test_app = FastAPI()
@@ -85,9 +89,7 @@ def auth_headers(test_db):
         "iat": datetime.utcnow(),
         "user_id": admin_user.id,  # Use actual user ID from test_db fixture
     }
-    token = jwt.encode(
-        payload, "your-secret-key-change-in-production", algorithm="HS256"
-    )
+    token = jwt.encode(payload, JWT_SECRET_KEY, algorithm=JWT_ALGORITHM)
     return {"Authorization": f"Bearer {token}"}
 
 
@@ -130,7 +132,10 @@ def temp_uploads_dir(monkeypatch):
 
         # Create a wrapper function that uses the temporary directory
         def patched_get_upload_path(
-            filename: str, task_id: str = None, folder: str = None, user_id: int = None
+            filename: str,
+            task_id: Optional[str] = None,
+            folder: Optional[str] = None,
+            user_id: Optional[int] = None,
         ):
             # Use the temporary directory as the base
             if user_id:

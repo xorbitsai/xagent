@@ -3,7 +3,7 @@
 import asyncio
 import hashlib
 from datetime import datetime, timedelta, timezone
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, cast
 
 from fastapi import APIRouter, Depends, HTTPException, status
 from jose import JWTError, jwt
@@ -12,6 +12,7 @@ from sqlalchemy.orm import Session
 
 from ..auth_dependencies import get_current_user
 from ..models.database import get_db
+from ..models.system_setting import SystemSetting
 from ..models.user import User, UserDefaultModel, UserModel
 
 auth_router = APIRouter(prefix="/api/auth", tags=["Authentication"])
@@ -21,9 +22,12 @@ SECRET_KEY = "your-secret-key-change-in-production"  # Should use environment va
 ALGORITHM = "HS256"
 ACCESS_TOKEN_EXPIRE_MINUTES = 120  # Access Token expiration time (minutes)
 REFRESH_TOKEN_EXPIRE_DAYS = 7  # Refresh Token expiration time (days)
+REGISTRATION_ENABLED_SETTING_KEY = "registration_enabled"
 
 
-def create_access_token(data: dict, expires_delta: Optional[timedelta] = None) -> str:
+def create_access_token(
+    data: Dict[str, Any], expires_delta: Optional[timedelta] = None
+) -> str:
     """Create JWT access token"""
     to_encode = data.copy()
     if expires_delta:
@@ -37,7 +41,7 @@ def create_access_token(data: dict, expires_delta: Optional[timedelta] = None) -
     return encoded_jwt
 
 
-def create_refresh_token(data: dict) -> str:
+def create_refresh_token(data: Dict[str, Any]) -> str:
     """Create JWT refresh token with longer expiry"""
     to_encode = data.copy()
     expire = datetime.now(timezone.utc) + timedelta(days=REFRESH_TOKEN_EXPIRE_DAYS)
@@ -101,6 +105,22 @@ class RegisterResponse(BaseModel):
     user: Optional[Dict[str, Any]] = None
 
 
+class SetupStatusResponse(BaseModel):
+    initialized: bool
+    needs_setup: bool
+    registration_enabled: bool
+
+
+class RegisterSwitchRequest(BaseModel):
+    enabled: bool
+
+
+class RegisterSwitchResponse(BaseModel):
+    success: bool
+    registration_enabled: bool
+    message: str
+
+
 class ChangePasswordRequest(BaseModel):
     """Change password request model"""
 
@@ -140,6 +160,120 @@ def hash_password(password: str) -> str:
 def verify_password(password: str, password_hash: str) -> bool:
     """Verify password against hash"""
     return hash_password(password) == password_hash
+
+
+def has_users(db: Session) -> bool:
+    return db.query(User.id).first() is not None
+
+
+def is_registration_enabled(db: Session) -> bool:
+    setting = (
+        db.query(SystemSetting)
+        .filter(SystemSetting.key == REGISTRATION_ENABLED_SETTING_KEY)
+        .first()
+    )
+    if setting is None:
+        return True
+    return str(setting.value).lower() == "true"
+
+
+def set_registration_enabled(db: Session, enabled: bool) -> None:
+    setting = (
+        db.query(SystemSetting)
+        .filter(SystemSetting.key == REGISTRATION_ENABLED_SETTING_KEY)
+        .first()
+    )
+    value = "true" if enabled else "false"
+    if setting is None:
+        setting = SystemSetting(key=REGISTRATION_ENABLED_SETTING_KEY, value=value)
+        db.add(setting)
+    else:
+        setattr(setting, "value", value)
+    db.commit()
+
+
+@auth_router.get("/setup-status", response_model=SetupStatusResponse)
+async def setup_status(db: Session = Depends(get_db)) -> SetupStatusResponse:
+    initialized = has_users(db)
+    registration_enabled = is_registration_enabled(db)
+    return SetupStatusResponse(
+        initialized=initialized,
+        needs_setup=not initialized,
+        registration_enabled=registration_enabled,
+    )
+
+
+@auth_router.post("/setup-admin", response_model=RegisterResponse)
+async def setup_admin(
+    request: RegisterRequest, db: Session = Depends(get_db)
+) -> RegisterResponse:
+    if has_users(db):
+        return RegisterResponse(success=False, message="Setup already completed")
+
+    if len(request.password) < 6:
+        return RegisterResponse(
+            success=False, message="Password must be at least 6 characters"
+        )
+
+    existing_user = get_user_by_username(db, request.username)
+    if existing_user:
+        return RegisterResponse(success=False, message="Username already exists")
+
+    user = User(
+        username=request.username,
+        password_hash=hash_password(request.password),
+        is_admin=True,
+    )
+    db.add(user)
+    db.commit()
+    db.refresh(user)
+
+    return RegisterResponse(
+        success=True,
+        message="Administrator account created successfully",
+        user={
+            "id": user.id,
+            "username": user.username,
+            "is_admin": bool(cast(Any, user.is_admin)),
+            "createdAt": (
+                cast(Any, user.created_at).isoformat()
+                if getattr(user, "created_at", None) is not None
+                else None
+            ),
+        },
+    )
+
+
+@auth_router.get("/register-switch", response_model=RegisterSwitchResponse)
+async def get_register_switch(
+    user: User = Depends(get_current_user), db: Session = Depends(get_db)
+) -> RegisterSwitchResponse:
+    if not bool(cast(Any, user.is_admin)):
+        raise HTTPException(status_code=403, detail="Admin privileges required")
+
+    enabled = is_registration_enabled(db)
+    return RegisterSwitchResponse(
+        success=True,
+        registration_enabled=enabled,
+        message="Registration switch fetched successfully",
+    )
+
+
+@auth_router.patch("/register-switch", response_model=RegisterSwitchResponse)
+async def update_register_switch(
+    request: RegisterSwitchRequest,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> RegisterSwitchResponse:
+    if not bool(cast(Any, user.is_admin)):
+        raise HTTPException(status_code=403, detail="Admin privileges required")
+
+    set_registration_enabled(db, request.enabled)
+    return RegisterSwitchResponse(
+        success=True,
+        registration_enabled=request.enabled,
+        message="Registration switch updated successfully",
+    )
 
 
 def create_user(
@@ -367,6 +501,16 @@ async def register(
         if existing_user:
             return RegisterResponse(success=False, message="Username already exists")
 
+        initialized = has_users(db)
+        if not initialized:
+            return RegisterResponse(
+                success=False,
+                message="System is not initialized. Please create the first admin account.",
+            )
+
+        if not is_registration_enabled(db):
+            return RegisterResponse(success=False, message="Registration is disabled")
+
         # Create new user with inherited defaults
         user = create_user(
             db, request.username, request.password, inherit_defaults=True
@@ -378,7 +522,11 @@ async def register(
             user={
                 "id": user.id,
                 "username": user.username,
-                "createdAt": user.created_at.isoformat() if user.created_at else None,
+                "createdAt": (
+                    cast(Any, user.created_at).isoformat()
+                    if getattr(user, "created_at", None) is not None
+                    else None
+                ),
             },
         )
 
@@ -410,7 +558,7 @@ async def change_password(
             )
 
         # Update password
-        user.password_hash = hash_password(request.new_password)  # type: ignore[assignment]
+        setattr(user, "password_hash", hash_password(request.new_password))
         db.commit()
 
         return ChangePasswordResponse(
@@ -450,9 +598,11 @@ async def refresh_token(
             )
 
         # Check if refresh token matches and is not expired
+        user_refresh_token = getattr(user, "refresh_token", None)
+        refresh_token_expires_at = getattr(user, "refresh_token_expires_at", None)
         if (
-            user.refresh_token != request.refresh_token
-            or not user.refresh_token_expires_at
+            user_refresh_token != request.refresh_token
+            or refresh_token_expires_at is None
         ):
             return RefreshTokenResponse(
                 success=False,
@@ -462,18 +612,18 @@ async def refresh_token(
         # Check expiration - handle timezone-aware and naive datetimes
         now = datetime.now(timezone.utc)
         if (
-            hasattr(user.refresh_token_expires_at, "tzinfo")
-            and user.refresh_token_expires_at.tzinfo is not None
+            hasattr(refresh_token_expires_at, "tzinfo")
+            and getattr(refresh_token_expires_at, "tzinfo", None) is not None
         ):
             # Timezone-aware datetime
-            if user.refresh_token_expires_at < now:
+            if cast(Any, refresh_token_expires_at) < now:
                 return RefreshTokenResponse(
                     success=False,
                     message="Refresh token has expired",
                 )
         else:
             # Naive datetime - assume UTC
-            if user.refresh_token_expires_at < now.replace(tzinfo=None):
+            if cast(Any, refresh_token_expires_at) < now.replace(tzinfo=None):
                 return RefreshTokenResponse(
                     success=False,
                     message="Refresh token has expired",

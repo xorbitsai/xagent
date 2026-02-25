@@ -52,6 +52,7 @@ def init_db(db_url: str | None = None) -> None:
         TemplateStats,
         ToolConfig,
         ToolUsage,
+        SystemSetting,
         User,
         UserDefaultModel,
         UserModel,
@@ -101,52 +102,5 @@ def init_db(db_url: str | None = None) -> None:
     # Create all tables
     Base.metadata.create_all(bind=_engine)
 
-    # Create default users
     logger = logging.getLogger(__name__)
-    logger.info("Creating default users...")
-
-    # Import here to avoid circular imports
-    from ..api.auth import get_user_by_username
-
-    db = _SessionLocal()
-    try:
-        # Create administrator user if not exists
-        admin_user = get_user_by_username(db, "administrator")
-        if not admin_user:
-            # Create administrator user with admin privileges
-            from ..api.auth import hash_password
-            from .user import User
-
-            admin_user = User(
-                username="administrator",
-                password_hash=hash_password("administrator"),
-                is_admin=True,
-            )
-            db.add(admin_user)
-            db.commit()
-            logger.info("Created administrator user with admin privileges")
-        else:
-            # Set admin flag to True for existing administrator user
-            from .user import User
-
-            admin_user = db.query(User).filter(User.username == "administrator").first()
-            if admin_user and not admin_user.is_admin:
-                admin_user.is_admin = True  # type: ignore[assignment]
-                db.commit()
-                logger.info("Updated administrator user with admin privileges")
-
-        logger.info("Default users initialized successfully")
-    except (ValueError, KeyError, TypeError) as e:
-        # 数据验证错误
-        logger.error(f"Data validation error creating default users: {e}")
-        raise
-    except RuntimeError as e:
-        # 运行时错误
-        logger.error(f"Runtime error creating default users: {e}")
-        raise
-    except Exception as e:
-        # 其他错误，重新抛出
-        logger.error(f"Unexpected error creating default users: {e}")
-        raise
-    finally:
-        db.close()
+    logger.info("Database initialized. Waiting for first admin setup.")

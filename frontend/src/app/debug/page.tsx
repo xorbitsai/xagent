@@ -582,7 +582,7 @@ function AgentContent() {
         <div className="flex items-center justify-between h-full px-4">
           <div className="flex items-center gap-4">
             <Link
-              href="/agent/vibe"
+              href="/debug/vibe"
               className="p-2 text-muted-foreground hover:text-foreground hover:bg-accent rounded-md transition-colors"
               title={t('agent.header.backTitle')}
             >

@@ -3112,7 +3112,8 @@ export function AppProvider({ children, token }: { children: React.ReactNode; to
     }
 
     // Update URL to include task ID using new route format /task/[id]
-    if (taskId) {
+    // Skip URL update if we are on the debug page
+    if (taskId && typeof window !== 'undefined' && !window.location.pathname.startsWith('/debug')) {
       window.history.pushState({}, '', `/task/${taskId}`)
       console.log('📍 Updated URL with task ID:', `/task/${taskId}`)
     }

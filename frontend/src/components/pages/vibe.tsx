@@ -181,7 +181,7 @@ export function VibePage() {
         <div className="mb-8">
           <div className="flex items-center justify-between mb-4">
             <h2 className="text-xl font-semibold text-foreground">{t('vibe.actions.you_can')}</h2>
-            <Link href="/agent">
+            <Link href="/debug">
               <Button>
                 <Plus className="h-4 w-4 mr-2" />
                 {t('vibe.actions.new_task')}
@@ -301,7 +301,7 @@ export function VibePage() {
                         {getStatusIcon(task.status)}
                         <div className="flex-1 min-w-0">
                           <Link
-                            href={`/agent?id=${task.task_id}`}
+                            href={`/debug?id=${task.task_id}`}
                             className="text-sm font-medium text-foreground hover:text-primary truncate block transition-colors group-hover:translate-x-1"
                           >
                             {task.title}

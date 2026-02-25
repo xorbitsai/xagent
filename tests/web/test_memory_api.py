@@ -14,8 +14,8 @@ from sqlalchemy.orm import sessionmaker
 from xagent.core.memory.base import MemoryStore
 from xagent.core.memory.core import MemoryNote
 from xagent.web.api.auth import auth_router, hash_password
-from xagent.web.auth_config import JWT_ALGORITHM, JWT_SECRET_KEY
 from xagent.web.api.memory import MemoryManagementRouter
+from xagent.web.auth_config import JWT_ALGORITHM, JWT_SECRET_KEY
 from xagent.web.models.database import Base, get_db
 from xagent.web.models.user import User
 

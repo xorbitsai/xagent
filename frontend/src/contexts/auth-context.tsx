@@ -3,6 +3,7 @@
 import { createContext, useContext, useEffect, useState, ReactNode } from "react"
 import { getApiUrl } from "@/lib/utils"
 import { apiRequest } from "@/lib/api-wrapper"
+import { AUTH_CACHE_KEY, AUTH_TOKEN_UPDATED_EVENT } from "@/lib/auth-cache"
 
 interface User {
   id: string
@@ -25,7 +26,6 @@ interface AuthContextType {
 const AuthContext = createContext<AuthContextType | undefined>(undefined)
 
 // 缓存配置
-const AUTH_CACHE_KEY = "auth_cache"
 const CACHE_DURATION = 120 * 60 * 1000 // 120分钟
 
 interface AuthCache {
@@ -163,7 +163,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   useEffect(() => {
     const handleTokenUpdate = (event: Event) => {
       const storageEvent = event as StorageEvent
-      if (storageEvent.key === 'auth-cache' && storageEvent.newValue) {
+      if (storageEvent.key === AUTH_CACHE_KEY && storageEvent.newValue) {
         try {
           const cache = JSON.parse(storageEvent.newValue)
           if (cache.user && cache.token) {
@@ -177,8 +177,8 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       }
     }
 
-    window.addEventListener('auth-token-updated', handleTokenUpdate)
-    return () => window.removeEventListener('auth-token-updated', handleTokenUpdate)
+    window.addEventListener(AUTH_TOKEN_UPDATED_EVENT, handleTokenUpdate)
+    return () => window.removeEventListener(AUTH_TOKEN_UPDATED_EVENT, handleTokenUpdate)
   }, [])
 
   const login = async (username: string, password: string): Promise<boolean> => {

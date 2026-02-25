@@ -2,6 +2,7 @@
 
 import { useEffect, useState } from "react"
 import { useAuth } from "@/contexts/auth-context"
+import { isAuthPublicPath } from "@/lib/auth-pages"
 import { useRouter, usePathname } from "next/navigation"
 import { useI18n } from "@/contexts/i18n-context"
 
@@ -21,8 +22,7 @@ export function AuthGuard({ children }: AuthGuardProps) {
   }, [])
 
   // Don't protect login and register pages
-  const isAuthPage =
-    pathname === "/login" || pathname === "/register" || pathname === "/setup"
+  const isAuthPage = isAuthPublicPath(pathname)
 
   useEffect(() => {
     if (!mounted || isAuthPage) return

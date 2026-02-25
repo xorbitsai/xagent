@@ -4,6 +4,7 @@ import { usePathname } from "next/navigation";
 import { Sidebar } from "@/components/layout/sidebar";
 import { AppProvider } from "@/contexts/app-context-chat";
 import { useAuth } from "@/contexts/auth-context";
+import { isAuthPublicPath } from "@/lib/auth-pages";
 
 interface LayoutContentProps {
   children: React.ReactNode;
@@ -12,8 +13,7 @@ interface LayoutContentProps {
 export function LayoutContent({ children }: LayoutContentProps) {
   const pathname = usePathname();
   const { token } = useAuth();
-  const isAuthPage =
-    pathname === "/login" || pathname === "/register" || pathname === "/setup";
+  const isAuthPage = isAuthPublicPath(pathname);
 
   if (isAuthPage) {
     // For auth pages, just render children without sidebar

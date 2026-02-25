@@ -1,9 +1,30 @@
 "lib/api-wrapper"
 
 import { getApiUrl } from "@/lib/utils"
+import { AUTH_CACHE_KEY, AUTH_TOKEN_UPDATED_EVENT } from "@/lib/auth-cache"
 
 let isRefreshing = false
 let refreshSubscribers: ((token: string) => void)[] = []
+const REFRESH_EXCLUDED_AUTH_ENDPOINTS = [
+  "/api/auth/login",
+  "/api/auth/register",
+  "/api/auth/setup-admin",
+]
+
+function shouldSkipRefresh(url: string): boolean {
+  if (url.includes("/api/auth/refresh")) {
+    return true
+  }
+
+  try {
+    const parsedUrl = new URL(url, window.location.origin)
+    return REFRESH_EXCLUDED_AUTH_ENDPOINTS.some(endpoint =>
+      parsedUrl.pathname.endsWith(endpoint)
+    )
+  } catch {
+    return REFRESH_EXCLUDED_AUTH_ENDPOINTS.some(endpoint => url.includes(endpoint))
+  }
+}
 
 // 带重试机制的fetch函数
 async function fetchWithRetry(
@@ -55,7 +76,7 @@ function notifyRefreshSubscribers(token: string) {
 // 获取当前tokens
 function getCurrentTokens(): { accessToken: string | null; refreshToken: string | null } {
   // Try new cache format first
-  const cache = localStorage.getItem("auth_cache")
+  const cache = localStorage.getItem(AUTH_CACHE_KEY)
   if (cache) {
     try {
       const authCache = JSON.parse(cache)
@@ -96,7 +117,7 @@ async function refreshToken(): Promise<string | null> {
       const data = await response.json()
       if (data.success && data.access_token) {
         // 更新缓存中的tokens
-        const cache = localStorage.getItem("auth_cache")
+        const cache = localStorage.getItem(AUTH_CACHE_KEY)
         if (cache) {
           try {
             const authCache = JSON.parse(cache)
@@ -111,7 +132,7 @@ async function refreshToken(): Promise<string | null> {
               authCache.refreshExpiresAt = Date.now() + data.refresh_expires_in * 1000
             }
             authCache.timestamp = Date.now()  // 更新时间戳
-            localStorage.setItem("auth_cache", JSON.stringify(authCache))
+            localStorage.setItem(AUTH_CACHE_KEY, JSON.stringify(authCache))
           } catch {
             // 如果解析失败，使用旧格式
             localStorage.setItem("auth_token", data.access_token)
@@ -122,9 +143,9 @@ async function refreshToken(): Promise<string | null> {
         }
 
         // 触发一个存储事件，通知 AuthContext 更新状态
-        window.dispatchEvent(new StorageEvent('auth-token-updated', {
-          key: 'auth_cache',
-          newValue: localStorage.getItem("auth_cache")
+        window.dispatchEvent(new StorageEvent(AUTH_TOKEN_UPDATED_EVENT, {
+          key: AUTH_CACHE_KEY,
+          newValue: localStorage.getItem(AUTH_CACHE_KEY)
         }))
 
         return data.access_token
@@ -159,7 +180,7 @@ export async function apiRequest(
   let response = await fetchWithRetry(url, { ...options, headers })
 
   // 如果401错误且不是refresh请求，尝试刷新token
-  if (response.status === 401 && !url.includes("/api/auth/refresh")) {
+  if (response.status === 401 && !shouldSkipRefresh(url)) {
     // 检查是否是token过期还是无效token
     const errorType = response.headers.get("Error-Type")
     const isExpired = errorType === "TokenExpired" || !errorType // 默认认为是过期，尝试刷新
@@ -168,7 +189,7 @@ export async function apiRequest(
       // 明确的无效token，直接重定向到登录页
       localStorage.removeItem("auth_token")
       localStorage.removeItem("auth_user")
-      localStorage.removeItem("auth_cache")
+      localStorage.removeItem(AUTH_CACHE_KEY)
       window.location.href = "/login"
       return response
     }
@@ -207,7 +228,7 @@ export async function apiRequest(
         console.error("Token refresh failed, redirecting to login")
         localStorage.removeItem("auth_token")
         localStorage.removeItem("auth_user")
-        localStorage.removeItem("auth_cache")
+        localStorage.removeItem(AUTH_CACHE_KEY)
         window.location.href = "/login"
       }
     } finally {
@@ -255,7 +276,7 @@ export function handleAuthError(response: Response) {
     // 清除认证数据并重定向到登录页
     localStorage.removeItem("auth_token")
     localStorage.removeItem("auth_user")
-    localStorage.removeItem("auth_cache")
+    localStorage.removeItem(AUTH_CACHE_KEY)
     window.location.href = "/login"
     return true
   }

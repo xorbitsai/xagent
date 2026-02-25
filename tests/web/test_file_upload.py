@@ -80,6 +80,7 @@ def auth_headers(test_db):
 
     payload = {
         "sub": admin_user.username,  # Use unique username from test_db fixture
+        "type": "access",
         "exp": datetime.utcnow() + timedelta(hours=1),
         "iat": datetime.utcnow(),
         "user_id": admin_user.id,  # Use actual user ID from test_db fixture

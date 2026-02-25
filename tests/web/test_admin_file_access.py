@@ -111,6 +111,7 @@ def create_auth_headers(user):
 
     payload = {
         "sub": user.username,
+        "type": "access",
         "exp": datetime.utcnow() + timedelta(hours=1),
         "iat": datetime.utcnow(),
         "user_id": user.id,

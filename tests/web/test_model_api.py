@@ -16,11 +16,13 @@ from xagent.web.models.database import Base, get_db, get_engine
 
 
 def override_get_db():
+    db = None
     try:
         db = next(get_db())
         yield db
     finally:
-        db.close()
+        if db is not None:
+            db.close()
 
 
 # Create test app without startup events
@@ -31,6 +33,19 @@ test_app.dependency_overrides[get_db] = override_get_db
 
 # Create test client
 client = TestClient(test_app)
+
+
+def ensure_system_initialized() -> None:
+    status_response = client.get("/api/auth/setup-status")
+    assert status_response.status_code == 200
+    status_data = status_response.json()
+
+    if status_data.get("needs_setup", True):
+        setup_response = client.post(
+            "/api/auth/setup-admin", json={"username": "admin", "password": "admin123"}
+        )
+        assert setup_response.status_code == 200
+        assert setup_response.json().get("success") is True
 
 
 @pytest.fixture(scope="function")
@@ -64,18 +79,14 @@ def test_db():
 @pytest.fixture(scope="function")
 def admin_user(test_db):
     """Create admin user for testing"""
-    user_data = {"username": "admin", "password": "admin123"}
-    response = client.post("/api/auth/register", json=user_data)
-    assert response.status_code == 200
-    user_info = response.json()["user"]
-    # Set admin flag (since the auth API doesn't do this automatically in tests)
+    ensure_system_initialized()
+
     db = next(get_db())
     from xagent.web.models.user import User
 
     admin = db.query(User).filter(User.username == "admin").first()
-    if admin:
-        admin.is_admin = True
-        db.commit()
+    assert admin is not None
+    user_info = {"id": admin.id, "username": admin.username}
     db.close()
     return user_info
 
@@ -83,50 +94,39 @@ def admin_user(test_db):
 @pytest.fixture(scope="function")
 def regular_user(test_db):
     """Create regular user for testing"""
+    ensure_system_initialized()
+
     user_data = {"username": "regularuser", "password": "password123"}
     response = client.post("/api/auth/register", json=user_data)
     assert response.status_code == 200
+    assert response.json().get("success") is True
     return response.json()["user"]
 
 
 @pytest.fixture(scope="function")
 def admin_headers(admin_user):
     """Authentication headers for admin user"""
-    # Create a proper JWT token
-    from datetime import datetime, timedelta
-
-    import jwt
-
-    payload = {
-        "sub": admin_user["username"],
-        "exp": datetime.utcnow() + timedelta(hours=1),
-        "iat": datetime.utcnow(),
-        "user_id": admin_user["id"],
-    }
-    token = jwt.encode(
-        payload, "your-secret-key-change-in-production", algorithm="HS256"
+    response = client.post(
+        "/api/auth/login",
+        json={"username": admin_user["username"], "password": "admin123"},
     )
-    return {"Authorization": f"Bearer {token}"}
+    assert response.status_code == 200
+    data = response.json()
+    assert data.get("success") is True
+    return {"Authorization": f"Bearer {data['access_token']}"}
 
 
 @pytest.fixture(scope="function")
 def regular_headers(regular_user):
     """Authentication headers for regular user"""
-    # Create a proper JWT token
-    from datetime import datetime, timedelta
-
-    import jwt
-
-    payload = {
-        "sub": regular_user["username"],
-        "exp": datetime.utcnow() + timedelta(hours=1),
-        "iat": datetime.utcnow(),
-        "user_id": regular_user["id"],
-    }
-    token = jwt.encode(
-        payload, "your-secret-key-change-in-production", algorithm="HS256"
+    response = client.post(
+        "/api/auth/login",
+        json={"username": regular_user["username"], "password": "password123"},
     )
-    return {"Authorization": f"Bearer {token}"}
+    assert response.status_code == 200
+    data = response.json()
+    assert data.get("success") is True
+    return {"Authorization": f"Bearer {data['access_token']}"}
 
 
 @pytest.fixture(scope="function")
@@ -427,6 +427,7 @@ class TestModelAPI:
         user2_data = {"username": "user2", "password": "password2"}
         user2_response = client.post("/api/auth/register", json=user2_data)
         assert user2_response.status_code == 200
+        assert user2_response.json().get("success") is True
 
         # User2 should not see user1's private model
         models_response = client.get("/api/models/", headers=regular_headers)

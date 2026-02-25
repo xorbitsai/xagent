@@ -15,11 +15,13 @@ from xagent.web.models.database import Base, get_db, get_engine
 
 
 def override_get_db():
+    db = None
     try:
         db = next(get_db())
         yield db
     finally:
-        db.close()
+        if db is not None:
+            db.close()
 
 
 # Create test app without startup events
@@ -30,6 +32,19 @@ test_app.dependency_overrides[get_db] = override_get_db
 
 # Create test client
 client = TestClient(test_app)
+
+
+def ensure_system_initialized() -> None:
+    status_response = client.get("/api/auth/setup-status")
+    assert status_response.status_code == 200
+    status_data = status_response.json()
+
+    if status_data.get("needs_setup", True):
+        setup_response = client.post(
+            "/api/auth/setup-admin", json={"username": "admin", "password": "admin123"}
+        )
+        assert setup_response.status_code == 200
+        assert setup_response.json().get("success") is True
 
 
 @pytest.fixture(scope="function")
@@ -138,41 +153,29 @@ def mock_app_state(template_manager):
 @pytest.fixture(scope="function")
 def admin_user(test_db):
     """Create admin user for testing"""
-    user_data = {"username": "admin", "password": "admin123"}
-    response = client.post("/api/auth/register", json=user_data)
-    assert response.status_code == 200
-    user_info = response.json()["user"]
+    ensure_system_initialized()
 
-    # Set admin flag
     db = next(get_db())
     from xagent.web.models.user import User
 
     admin = db.query(User).filter(User.username == "admin").first()
-    if admin:
-        admin.is_admin = True
-        db.commit()
+    assert admin is not None
     db.close()
-    return user_info
+    return {"id": admin.id, "username": admin.username}
 
 
 @pytest.fixture(scope="function")
 def admin_headers(admin_user):
     """Authentication headers for admin user"""
-    from datetime import datetime, timedelta
-
-    import jwt
-
-    payload = {
-        "sub": admin_user["username"],
-        "exp": datetime.utcnow() + timedelta(hours=1),
-        "iat": datetime.utcnow(),
-        "user_id": admin_user["id"],
-    }
-    token = jwt.encode(
-        payload, "your-secret-key-change-in-production", algorithm="HS256"
+    response = client.post(
+        "/api/auth/login",
+        json={"username": admin_user["username"], "password": "admin123"},
     )
+    assert response.status_code == 200
+    data = response.json()
+    assert data.get("success") is True
 
-    return {"Authorization": f"Bearer {token}"}
+    return {"Authorization": f"Bearer {data['access_token']}"}
 
 
 class TestTemplatesAPI:

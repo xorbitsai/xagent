@@ -76,6 +76,7 @@ def auth_headers(test_db):
 
     payload = {
         "sub": "admin",
+        "type": "access",
         "exp": datetime.utcnow() + timedelta(hours=1),
         "iat": datetime.utcnow(),
         "user_id": test_db.id,  # Use actual user ID from test_db fixture

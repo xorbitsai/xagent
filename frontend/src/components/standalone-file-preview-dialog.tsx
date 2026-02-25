@@ -7,6 +7,7 @@ import { XIcon, Loader2, FileText, Download, Eye } from "lucide-react"
 import { getApiUrl } from "@/lib/utils"
 import { apiRequest } from "@/lib/api-wrapper"
 import { useI18n } from "@/contexts/i18n-context"
+import { DocxPreviewRenderer } from "@/components/docx-preview-renderer"
 
 interface StandaloneFilePreviewDialogProps {
   open: boolean
@@ -40,7 +41,7 @@ export function StandaloneFilePreviewDialog({
             // For image files, use arrayBuffer to get binary data
             // For text files (HTML, etc.), use text() for proper encoding
             let fileContent
-            if (fileName.match(/\.(jpg|jpeg|png|gif|webp|svg)$/i)) {
+            if (fileName.match(/\.(docx|jpg|jpeg|png|gif|webp|svg)$/i)) {
               const arrayBuffer = await response.arrayBuffer()
 
               // Convert binary data to base64 using chunks to avoid stack overflow
@@ -214,7 +215,9 @@ export function StandaloneFilePreviewDialog({
             </div>
           ) : (
             <div className="flex-1 overflow-auto bg-muted/30 rounded border">
-              {fileName.endsWith('.html') || fileName.endsWith('.htm') ? (
+              {fileName.toLowerCase().endsWith('.docx') ? (
+                <DocxPreviewRenderer base64Content={content || ''} />
+              ) : fileName.endsWith('.html') || fileName.endsWith('.htm') ? (
                 <iframe
                   srcDoc={processHtmlContent(content, filePath)}
                   className="w-full h-full border-0"

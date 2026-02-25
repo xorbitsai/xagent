@@ -643,6 +643,7 @@ Build when you need.`
       emptyContent: "File content is empty",
       errors: {
         loadFailed: "Failed to load file",
+        docxRenderFailed: "Failed to render DOCX preview",
         cors: "CORS error: Unable to access the file. This might be a browser cache issue, please try refreshing the page.",
         networkErrorWithMsg: "Network error: {msg}",
       },

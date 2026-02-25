@@ -1,6 +1,7 @@
 "use client"
 
 import { useEffect, useRef, useState } from "react"
+import { useI18n } from "@/contexts/i18n-context"
 
 interface DocxPreviewRendererProps {
   base64Content: string
@@ -9,6 +10,7 @@ interface DocxPreviewRendererProps {
 export function DocxPreviewRenderer({ base64Content }: DocxPreviewRendererProps) {
   const containerRef = useRef<HTMLDivElement | null>(null)
   const [error, setError] = useState<string | null>(null)
+  const { t } = useI18n()
 
   useEffect(() => {
     const render = async () => {
@@ -32,12 +34,12 @@ export function DocxPreviewRenderer({ base64Content }: DocxPreviewRendererProps)
         })
         setError(null)
       } catch {
-        setError("Failed to render DOCX preview")
+        setError(t("files.previewDialog.errors.docxRenderFailed"))
       }
     }
 
     render()
-  }, [base64Content])
+  }, [base64Content, t])
 
   if (error) {
     return <div className="p-4 text-sm text-muted-foreground">{error}</div>

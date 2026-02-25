@@ -116,6 +116,24 @@ LANGFUSE_PUBLIC_KEY="your-langfuse-public-key"
 LANGFUSE_SECRET_KEY="your-langfuse-secret-key"
 ```
 
+### Optional Dependencies for Presentation Generation
+
+If you plan to use the presentation generator feature (JavaScript-based PowerPoint creation via `execute_javascript_code` tool), you need to install Node.js and pptxgenjs:
+
+```bash
+# Ensure Node.js 20+ is installed
+node --version
+
+# Install pptxgenjs globally for presentation generation
+npm install -g pptxgenjs@4.0.1
+
+# Verify installation
+npm root -g  # Should show path to global node_modules
+ls $(npm root -g)/pptxgenjs  # Should show the package directory
+```
+
+**Note:** Without this installation, the `javascript_executor` tool will fail with "Cannot find module 'pptxgenjs'" when generating presentations. The pptxgenjs package is automatically installed in Docker/CI environments.
+
 ## Development Commands
 
 ### Installation and Setup

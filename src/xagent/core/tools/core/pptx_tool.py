@@ -750,7 +750,8 @@ class PresentationReader:
                             texts.append(t.text.strip())
 
                     titles.append(texts[0] if texts else "")
-                except Exception:
+                except Exception as e:
+                    logger.debug(f"Failed to parse slide title: {e}")
                     titles.append("")
 
         return {"slide_count": len(slides), "slides": slides, "titles": titles}
@@ -779,8 +780,8 @@ class PresentationReader:
                         for t in root.findall(".//a:t", namespaces={"a": NS_A}):
                             if t.text and t.text.strip():
                                 result.append(f"- {t.text.strip()}\n")
-                    except Exception:
-                        pass
+                    except Exception as e:
+                        logger.debug(f"Failed to extract text from slide: {e}")
 
                 result.append("\n")
 
@@ -967,7 +968,8 @@ class PresentationReader:
                 tree = ET.parse(str(xml_file))
                 ET.indent(tree, space="  ")
                 tree.write(str(xml_file), encoding="UTF-8", xml_declaration=True)
-            except Exception:
+            except Exception as e:
+                logger.debug(f"Failed to format XML file {xml_file}: {e}")
                 pass  # Skip files that can't be parsed
 
 

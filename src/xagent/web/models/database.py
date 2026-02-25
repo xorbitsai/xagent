@@ -48,11 +48,11 @@ def init_db(db_url: str | None = None) -> None:
     from . import (  # noqa: F401
         MCPServer,
         Model,
+        SystemSetting,
         Task,
         TemplateStats,
         ToolConfig,
         ToolUsage,
-        SystemSetting,
         User,
         UserDefaultModel,
         UserModel,

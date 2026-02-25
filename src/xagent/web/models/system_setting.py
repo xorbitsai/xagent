@@ -4,7 +4,7 @@ from sqlalchemy.sql import func
 from .database import Base
 
 
-class SystemSetting(Base):
+class SystemSetting(Base):  # type: ignore[valid-type, misc]
     __tablename__ = "system_settings"
 
     id = Column(Integer, primary_key=True, index=True)

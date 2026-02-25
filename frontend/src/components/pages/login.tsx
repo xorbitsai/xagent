@@ -1,6 +1,6 @@
 "use client"
 
-import { useState } from "react"
+import { useEffect, useState } from "react"
 import { Button } from "@/components/ui/button"
 import { Card } from "@/components/ui/card"
 import { Input } from "@/components/ui/input"
@@ -25,6 +25,8 @@ export function LoginPage() {
   const { t } = useI18n()
   const [showPassword, setShowPassword] = useState(false)
   const [isLoading, setIsLoading] = useState(false)
+  const [isStatusLoading, setIsStatusLoading] = useState(true)
+  const [registrationEnabled, setRegistrationEnabled] = useState(true)
   const [error, setError] = useState("")
   const [formData, setFormData] = useState({
     username: "",
@@ -75,6 +77,30 @@ export function LoginPage() {
       setIsLoading(false)
     }
   }
+
+  useEffect(() => {
+    const checkSetupStatus = async () => {
+      try {
+        const response = await apiRequest(`${getApiUrl()}/api/auth/setup-status`)
+        if (!response.ok) {
+          setRegistrationEnabled(true)
+          return
+        }
+        const data = await response.json()
+        if (data.needs_setup) {
+          window.location.href = "/setup"
+          return
+        }
+        setRegistrationEnabled(Boolean(data.registration_enabled))
+      } catch {
+        setRegistrationEnabled(true)
+      } finally {
+        setIsStatusLoading(false)
+      }
+    }
+
+    checkSetupStatus()
+  }, [])
 
   const handleInputChange = (e: React.ChangeEvent<HTMLInputElement>) => {
     setFormData(prev => ({
@@ -258,10 +284,16 @@ export function LoginPage() {
 
               <div className="mt-8 text-center">
                 <p className="text-muted-foreground">
-                  {t("login.register_prompt")} {" "}
-                  <Link href="/register" className="text-muted-foreground hover:text-foreground font-medium">
-                    {t("login.register_link")}
-                  </Link>
+                  {isStatusLoading ? null : registrationEnabled ? (
+                    <>
+                      {t("login.register_prompt")} {" "}
+                      <Link href="/register" className="text-muted-foreground hover:text-foreground font-medium">
+                        {t("login.register_link")}
+                      </Link>
+                    </>
+                  ) : (
+                    <>{t("login.register_closed")}</>
+                  )}
                 </p>
               </div>
             </Card>

@@ -21,7 +21,8 @@ export function AuthGuard({ children }: AuthGuardProps) {
   }, [])
 
   // Don't protect login and register pages
-  const isAuthPage = pathname === "/login" || pathname === "/register"
+  const isAuthPage =
+    pathname === "/login" || pathname === "/register" || pathname === "/setup"
 
   useEffect(() => {
     if (!mounted || isAuthPage) return

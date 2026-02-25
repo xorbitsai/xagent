@@ -241,6 +241,37 @@ Build when you need.`
       },
     },
   },
+  setup: {
+    title: "初始化 {appName}",
+    description: "请先创建第一个管理员账号以完成系统初始化",
+    features: {
+      bootstrap: {
+        title: "初始化引导",
+        description: "一步完成首次启动所需配置。",
+      },
+      config: {
+        title: "快速进入配置",
+        description: "初始化后可继续配置模型与工具能力。",
+      },
+      security: {
+        title: "管理员优先",
+        description: "先创建管理员账号，再开放系统访问。",
+      },
+    },
+    form: {
+      username: "管理员用户名",
+      password: "管理员密码",
+      confirmPassword: "确认密码",
+      submit: "创建管理员",
+      submitting: "创建中...",
+    },
+    errors: {
+      required: "请填写用户名和密码",
+      passwordTooShort: "密码至少 6 位",
+      passwordMismatch: "两次输入的密码不一致",
+      failed: "初始化失败",
+    },
+  },
   login: {
     mobile_title: "欢迎回来",
     title: "登录 {appName}",
@@ -261,8 +292,9 @@ Build when you need.`
        remember_me: "记住登录状态",
        forgot_password: "忘记密码？",
      },
-     register_prompt: "还没有账户？",
-     register_link: "立即注册",
+    register_prompt: "还没有账户？",
+    register_link: "立即注册",
+    register_closed: "当前已关闭注册",
      features: {
        version_control: {
          title: "自主规划",

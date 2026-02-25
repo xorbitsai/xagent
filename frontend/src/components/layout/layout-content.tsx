@@ -12,7 +12,8 @@ interface LayoutContentProps {
 export function LayoutContent({ children }: LayoutContentProps) {
   const pathname = usePathname();
   const { token } = useAuth();
-  const isAuthPage = pathname === "/login" || pathname === "/register";
+  const isAuthPage =
+    pathname === "/login" || pathname === "/register" || pathname === "/setup";
 
   if (isAuthPage) {
     // For auth pages, just render children without sidebar

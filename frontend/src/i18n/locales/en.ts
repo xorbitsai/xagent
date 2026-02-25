@@ -241,6 +241,37 @@ Build when you need.`
       },
     },
   },
+  setup: {
+    title: "Initialize {appName}",
+    description: "Create the first administrator account to complete setup.",
+    features: {
+      bootstrap: {
+        title: "Guided bootstrap",
+        description: "Finish first-time initialization in one step.",
+      },
+      config: {
+        title: "Ready to configure",
+        description: "After setup, configure models and tools for your team.",
+      },
+      security: {
+        title: "Admin-first security",
+        description: "Create a secure administrator account before opening access.",
+      },
+    },
+    form: {
+      username: "Admin username",
+      password: "Admin password",
+      confirmPassword: "Confirm password",
+      submit: "Create administrator",
+      submitting: "Creating...",
+    },
+    errors: {
+      required: "Please fill in username and password",
+      passwordTooShort: "Password must be at least 6 characters",
+      passwordMismatch: "Passwords do not match",
+      failed: "Setup failed",
+    },
+  },
   login: {
     mobile_title: "Welcome back",
     title: "Login {appName}",
@@ -261,8 +292,9 @@ Build when you need.`
        remember_me: "Remember me",
        forgot_password: "Forgot password?",
      },
-     register_prompt: "Don't have an account?",
-     register_link: "Register now",
+    register_prompt: "Don't have an account?",
+    register_link: "Register now",
+    register_closed: "Registration is currently disabled",
      features: {
        version_control: {
          title: "Autonomous Planning",

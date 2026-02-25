@@ -1,6 +1,6 @@
 "use client"
 
-import { useState } from "react"
+import { useEffect, useState } from "react"
 import { Button } from "@/components/ui/button"
 import { Card } from "@/components/ui/card"
 import { Input } from "@/components/ui/input"
@@ -19,6 +19,7 @@ import {
 } from "lucide-react"
 import Link from "next/link"
 import { useI18n } from "@/contexts/i18n-context"
+import { apiRequest } from "@/lib/api-wrapper"
 
 export function RegisterPage() {
   const branding = getBrandingFromEnv()
@@ -26,6 +27,7 @@ export function RegisterPage() {
   const [showPassword, setShowPassword] = useState(false)
   const [showConfirmPassword, setShowConfirmPassword] = useState(false)
   const [isLoading, setIsLoading] = useState(false)
+  const [isStatusLoading, setIsStatusLoading] = useState(true)
   const [error, setError] = useState("")
   const [success, setSuccess] = useState("")
   const [formData, setFormData] = useState({
@@ -54,7 +56,7 @@ export function RegisterPage() {
     setIsLoading(true)
 
     try {
-      const response = await fetch(`${getApiUrl()}/api/auth/register`, {
+      const response = await apiRequest(`${getApiUrl()}/api/auth/register`, {
         method: "POST",
         headers: {
           "Content-Type": "application/json",
@@ -78,6 +80,33 @@ export function RegisterPage() {
     } finally {
       setIsLoading(false)
     }
+  }
+
+  useEffect(() => {
+    const checkSetupStatus = async () => {
+      try {
+        const response = await apiRequest(`${getApiUrl()}/api/auth/setup-status`)
+        if (!response.ok) {
+          return
+        }
+        const data = await response.json()
+        if (data.needs_setup) {
+          window.location.href = "/setup"
+          return
+        }
+        if (!data.registration_enabled) {
+          window.location.href = "/login"
+        }
+      } finally {
+        setIsStatusLoading(false)
+      }
+    }
+
+    checkSetupStatus()
+  }, [])
+
+  if (isStatusLoading) {
+    return null
   }
 
   const handleInputChange = (e: React.ChangeEvent<HTMLInputElement>) => {

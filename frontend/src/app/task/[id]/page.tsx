@@ -5,7 +5,7 @@ import { GitMerge, Bot, Download, ArrowLeft, Loader2, Sparkles } from "lucide-re
 import { ChatMessage } from "@/components/chat/ChatMessage";
 import { ChatInput } from "@/components/chat/ChatInput";
 import { Button } from "@/components/ui/button";
-import { AppProvider, useApp } from "@/contexts/app-context-chat";
+import { useApp } from "@/contexts/app-context-chat";
 import { useI18n } from "@/contexts/i18n-context";
 import { useParams, useRouter } from "next/navigation"
 import { PreviewSheet } from "@/components/preview-sheet";
@@ -497,10 +497,8 @@ function TaskDetailContent() {
 
 export default function TaskDetailPage() {
   return (
-    <AppProvider>
-      <Suspense fallback={<div className="flex items-center justify-center h-screen"><Loader2 className="w-8 h-8 animate-spin" /></div>}>
-        <TaskDetailContent />
-      </Suspense>
-    </AppProvider>
+    <Suspense fallback={<div className="flex items-center justify-center h-screen"><Loader2 className="w-8 h-8 animate-spin" /></div>}>
+      <TaskDetailContent />
+    </Suspense>
   );
 }

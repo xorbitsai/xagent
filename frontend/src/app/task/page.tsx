@@ -1,19 +1,23 @@
 "use client";
 
-import { useState } from "react";
+import { useState, useEffect } from "react";
 import { Bot, Presentation, BarChart, Image as ImageIcon, Zap, Sparkles } from "lucide-react";
 import { ChatInput } from "@/components/chat/ChatInput";
 import { useI18n } from "@/contexts/i18n-context";
 import { useRouter } from "next/navigation";
-import { useAuth } from "@/contexts/auth-context";
-import { AppProvider, useApp } from "@/contexts/app-context-chat";
+import { useApp } from "@/contexts/app-context-chat";
 
 function TaskHomePageContent() {
   const { t } = useI18n();
   const router = useRouter();
-  const { sendMessage, state } = useApp();
+  const { sendMessage, state, dispatch } = useApp();
   const [files, setFiles] = useState<File[]>([]);
   const [inputValue, setInputValue] = useState("");
+
+  // Clear state on mount to ensure we are in "new task" mode
+  useEffect(() => {
+    dispatch({ type: "RESET_STATE" });
+  }, [dispatch]);
 
   const samplePrompts = [
     {
@@ -125,13 +129,4 @@ function TaskHomePageContent() {
   );
 }
 
-function TaskHomePageWrapper() {
-  const { token } = useAuth();
-  return (
-    <AppProvider token={token || undefined}>
-      <TaskHomePageContent />
-    </AppProvider>
-  );
-}
-
-export default TaskHomePageWrapper;
+export default TaskHomePageContent;

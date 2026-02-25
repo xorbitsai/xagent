@@ -20,30 +20,33 @@ function interpolate(str: string, vars?: Record<string, string | number>) {
   return Object.entries(vars).reduce((s, [k, v]) => s.replace(new RegExp(`\\{${k}\\}`, "g"), String(v)), str)
 }
 
-export function I18nProvider({ children }: { children: React.ReactNode }) {
-  const [locale, setLocaleState] = useState<Locale>("en")
+export function I18nProvider({
+  children,
+  initialLocale = "en",
+}: {
+  children: React.ReactNode
+  initialLocale?: Locale
+}) {
+  const [locale, setLocaleState] = useState<Locale>(initialLocale)
 
-  // 初始化：优先读取本地存储；否则跟随浏览器语言
   useEffect(() => {
     try {
       const stored = typeof window !== "undefined" ? localStorage.getItem("app_locale") : null
       if (stored === "en" || stored === "zh") {
-        setLocaleState(stored as Locale)
-      } else {
-        const navLang = typeof navigator !== "undefined"
-          ? (navigator.languages?.[0] || navigator.language || "en").toLowerCase()
-          : "en"
-        setLocaleState(navLang.includes("zh") ? "zh" : "en")
+        if (stored !== locale) {
+          setLocaleState(stored as Locale)
+        }
       }
     } catch {
       // ignore
     }
-  }, [])
+  }, [locale])
 
   const setLocale = (l: Locale) => {
     setLocaleState(l)
     try {
       localStorage.setItem("app_locale", l)
+      document.cookie = `app_locale=${l}; path=/; max-age=31536000; samesite=lax`
     } catch {
       // ignore
     }

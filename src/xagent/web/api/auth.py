@@ -8,8 +8,16 @@ from typing import Any, Dict, Optional, cast
 from fastapi import APIRouter, Depends, HTTPException, status
 from jose import JWTError, jwt
 from pydantic import BaseModel
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
+from ..auth_config import (
+    ACCESS_TOKEN_EXPIRE_MINUTES,
+    JWT_ALGORITHM,
+    JWT_SECRET_KEY,
+    PASSWORD_MIN_LENGTH,
+    REFRESH_TOKEN_EXPIRE_DAYS,
+)
 from ..auth_dependencies import get_current_user
 from ..models.database import get_db
 from ..models.system_setting import SystemSetting
@@ -17,12 +25,8 @@ from ..models.user import User, UserDefaultModel, UserModel
 
 auth_router = APIRouter(prefix="/api/auth", tags=["Authentication"])
 
-# JWT Configuration
-SECRET_KEY = "your-secret-key-change-in-production"  # Should use environment variable in production
-ALGORITHM = "HS256"
-ACCESS_TOKEN_EXPIRE_MINUTES = 120  # Access Token expiration time (minutes)
-REFRESH_TOKEN_EXPIRE_DAYS = 7  # Refresh Token expiration time (days)
 REGISTRATION_ENABLED_SETTING_KEY = "registration_enabled"
+SETUP_COMPLETED_SETTING_KEY = "setup_completed"
 
 
 def create_access_token(
@@ -37,7 +41,7 @@ def create_access_token(
             minutes=ACCESS_TOKEN_EXPIRE_MINUTES
         )
     to_encode.update({"exp": expire, "type": "access"})
-    encoded_jwt: str = jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
+    encoded_jwt: str = jwt.encode(to_encode, JWT_SECRET_KEY, algorithm=JWT_ALGORITHM)
     return encoded_jwt
 
 
@@ -46,14 +50,16 @@ def create_refresh_token(data: Dict[str, Any]) -> str:
     to_encode = data.copy()
     expire = datetime.now(timezone.utc) + timedelta(days=REFRESH_TOKEN_EXPIRE_DAYS)
     to_encode.update({"exp": expire, "type": "refresh"})
-    encoded_jwt: str = jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
+    encoded_jwt: str = jwt.encode(to_encode, JWT_SECRET_KEY, algorithm=JWT_ALGORITHM)
     return encoded_jwt
 
 
 def verify_refresh_token(token: str) -> Optional[dict[str, Any]]:
     """Verify JWT refresh token and return payload"""
     try:
-        payload: dict[str, Any] = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
+        payload: dict[str, Any] = jwt.decode(
+            token, JWT_SECRET_KEY, algorithms=[JWT_ALGORITHM]
+        )
         if payload.get("type") != "refresh":
             return None
         return payload
@@ -64,7 +70,9 @@ def verify_refresh_token(token: str) -> Optional[dict[str, Any]]:
 def verify_token(token: str) -> Optional[dict[str, Any]]:
     """Verify JWT token and return payload"""
     try:
-        payload: dict[str, Any] = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
+        payload: dict[str, Any] = jwt.decode(
+            token, JWT_SECRET_KEY, algorithms=[JWT_ALGORITHM]
+        )
         return payload
     except JWTError:
         return None
@@ -192,6 +200,15 @@ def set_registration_enabled(db: Session, enabled: bool) -> None:
     db.commit()
 
 
+def is_setup_completed(db: Session) -> bool:
+    setting = (
+        db.query(SystemSetting)
+        .filter(SystemSetting.key == SETUP_COMPLETED_SETTING_KEY)
+        .first()
+    )
+    return setting is not None and str(setting.value).lower() == "true"
+
+
 @auth_router.get("/setup-status", response_model=SetupStatusResponse)
 async def setup_status(db: Session = Depends(get_db)) -> SetupStatusResponse:
     initialized = has_users(db)
@@ -207,26 +224,36 @@ async def setup_status(db: Session = Depends(get_db)) -> SetupStatusResponse:
 async def setup_admin(
     request: RegisterRequest, db: Session = Depends(get_db)
 ) -> RegisterResponse:
-    if has_users(db):
-        return RegisterResponse(success=False, message="Setup already completed")
-
-    if len(request.password) < 6:
+    if len(request.password) < PASSWORD_MIN_LENGTH:
         return RegisterResponse(
-            success=False, message="Password must be at least 6 characters"
+            success=False,
+            message=f"Password must be at least {PASSWORD_MIN_LENGTH} characters",
         )
 
-    existing_user = get_user_by_username(db, request.username)
-    if existing_user:
-        return RegisterResponse(success=False, message="Username already exists")
+    try:
+        if has_users(db) or is_setup_completed(db):
+            return RegisterResponse(success=False, message="Setup already completed")
 
-    user = User(
-        username=request.username,
-        password_hash=hash_password(request.password),
-        is_admin=True,
-    )
-    db.add(user)
-    db.commit()
-    db.refresh(user)
+        existing_user = get_user_by_username(db, request.username)
+        if existing_user:
+            return RegisterResponse(success=False, message="Username already exists")
+
+        user = User(
+            username=request.username,
+            password_hash=hash_password(request.password),
+            is_admin=True,
+        )
+        db.add(user)
+        db.flush()
+
+        setup_setting = SystemSetting(key=SETUP_COMPLETED_SETTING_KEY, value="true")
+        db.add(setup_setting)
+
+        db.commit()
+        db.refresh(user)
+    except IntegrityError:
+        db.rollback()
+        return RegisterResponse(success=False, message="Setup already completed")
 
     return RegisterResponse(
         success=True,
@@ -491,9 +518,10 @@ async def register(
     """User registration endpoint with default configuration inheritance"""
     try:
         # Validate password length
-        if len(request.password) < 6:
+        if len(request.password) < PASSWORD_MIN_LENGTH:
             return RegisterResponse(
-                success=False, message="Password must be at least 6 characters"
+                success=False,
+                message=f"Password must be at least {PASSWORD_MIN_LENGTH} characters",
             )
 
         # Check if user already exists
@@ -552,9 +580,10 @@ async def change_password(
             )
 
         # Validate new password
-        if len(request.new_password) < 6:
+        if len(request.new_password) < PASSWORD_MIN_LENGTH:
             return ChangePasswordResponse(
-                success=False, message="New password must be at least 6 characters"
+                success=False,
+                message=f"New password must be at least {PASSWORD_MIN_LENGTH} characters",
             )
 
         # Update password

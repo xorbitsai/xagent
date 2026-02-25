@@ -8,12 +8,9 @@ from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from jose import JWTError, jwt
 from sqlalchemy.orm import Session
 
+from .auth_config import JWT_ALGORITHM, JWT_SECRET_KEY
 from .models.database import get_db
 from .models.user import User
-
-# JWT Configuration
-SECRET_KEY = "your-secret-key-change-in-production"
-ALGORITHM = "HS256"
 
 logger = logging.getLogger(__name__)
 
@@ -42,7 +39,14 @@ def get_current_user(
         token = credentials.credentials
 
         # Validate JWT token
-        payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
+        payload = jwt.decode(token, JWT_SECRET_KEY, algorithms=[JWT_ALGORITHM])
+        token_type = payload.get("type")
+        if token_type != "access":
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Invalid token type",
+                headers={"WWW-Authenticate": "Bearer"},
+            )
         username = payload.get("sub")
         user_id = payload.get("user_id")
 
@@ -137,7 +141,9 @@ def get_user_from_token(token: str, db: Session) -> Optional[User]:
             token = token[7:]
 
         # Validate JWT token
-        payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
+        payload = jwt.decode(token, JWT_SECRET_KEY, algorithms=[JWT_ALGORITHM])
+        if payload.get("type") != "access":
+            return None
         username = payload.get("sub")
         user_id = payload.get("user_id")
 

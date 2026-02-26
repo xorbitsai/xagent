@@ -123,6 +123,12 @@ On first startup, Xagent redirects to `/setup`.
 
 Create the first administrator account there to complete initialization.
 
+If the admin password is forgotten, reset it via CLI:
+
+```bash
+python -m xagent.web.reset_admin_password --username <admin_username>
+```
+
 That's it. Xagent is now running.
 
 ---

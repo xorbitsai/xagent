@@ -1747,6 +1747,12 @@ Build when you need.`
           visual: "视觉模型",
           compact: "紧凑模型",
         },
+        tips: {
+          general: "适用于大多数任务的通用大语言模型，平衡了性能和成本。",
+          smallFast: "响应速度快，成本较低，适用于简单任务或需要低延迟的场景。",
+          visual: "具备图像识别和处理能力，适用于涉及图片的任务。",
+          compact: "轻量级模型，适用于资源受限或对即时性要求极高的场景。",
+        },
       },
       knowledgeBase: {
         label: "知识库",

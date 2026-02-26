@@ -1747,6 +1747,12 @@ Build when you need.`
           visual: "Visual Model",
           compact: "Compact Model",
         },
+        tips: {
+          general: "General purpose LLM suitable for most tasks, balancing performance and cost.",
+          smallFast: "Fast response and lower cost, suitable for simple tasks or low latency scenarios.",
+          visual: "Capable of image recognition and processing, suitable for image-related tasks.",
+          compact: "Lightweight model suitable for resource-constrained or high-immediacy scenarios.",
+        },
       },
       knowledgeBase: {
         label: "Knowledge Base",

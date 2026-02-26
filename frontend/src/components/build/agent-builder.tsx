@@ -11,12 +11,18 @@ import { ChatInput } from "@/components/chat/ChatInput"
 import { ChatMessage } from "@/components/chat/ChatMessage"
 import { apiRequest } from "@/lib/api-wrapper"
 import { getApiUrl, getWsUrl } from "@/lib/utils"
-import { PlusCircle, MessageSquare, Upload, Download } from "lucide-react"
+import { PlusCircle, MessageSquare, Upload, Download, Info } from "lucide-react"
 import { useI18n } from "@/contexts/i18n-context"
 import { useAuth } from "@/contexts/auth-context"
 import { FileAttachment } from "@/components/file-attachment"
 import { MultiSelect } from "@/components/ui/multi-select"
 import { Select } from "@/components/ui/select"
+import {
+  Tooltip,
+  TooltipContent,
+  TooltipProvider,
+  TooltipTrigger,
+} from "@/components/ui/tooltip"
 import { Sheet, SheetContent, SheetTitle } from "@/components/ui/sheet"
 import {
   Dialog,
@@ -410,15 +416,14 @@ export function AgentBuilder({ agentId }: AgentBuilderProps) {
       try {
         setLoadingAgent(true)
         const response = await apiRequest(
-          `${getApiUrl()}/api/templates/${templateId}?lang=${locale}`
+          `${getApiUrl()}/api/templates/${templateId}`
         )
         if (response.ok) {
           const template = await response.json()
-          // Set instructions from template
+          setName(template.name || "")
+          setDescription(template.description || "")
           setInstructions(template.agent_config?.instructions || "")
-          // Set skills from template
           setSelectedSkills(template.agent_config?.skills || [])
-          // Set tool categories from template
           setSelectedToolCategories(template.agent_config?.tool_categories || [])
         }
       } catch (error) {
@@ -866,7 +871,10 @@ export function AgentBuilder({ agentId }: AgentBuilderProps) {
         <div className="space-y-2">
           <Label>{t("builds.configForm.logo.label")}</Label>
           <div className="flex items-center gap-4">
-            <div className="h-16 w-16 rounded-lg border border-dashed border-muted-foreground/50 flex items-center justify-center bg-background overflow-hidden">
+            <div
+              className="h-16 w-16 rounded-lg border border-dashed border-muted-foreground/50 flex items-center justify-center bg-background overflow-hidden cursor-pointer hover:bg-muted/50 transition-colors"
+              onClick={() => fileInputRef.current?.click()}
+            >
               {logoFile ? (
                 <img src={URL.createObjectURL(logoFile)} alt="Logo" className="h-full w-full object-cover" />
               ) : logoUrl ? (
@@ -875,22 +883,13 @@ export function AgentBuilder({ agentId }: AgentBuilderProps) {
                 <Upload className="h-6 w-6 text-muted-foreground" />
               )}
             </div>
-            <div className="flex flex-col justify-center">
-              <input
-                type="file"
-                accept="image/*"
-                className="hidden"
-                ref={fileInputRef}
-                onChange={handleLogoUpload}
-              />
-              <Button
-                variant="outline"
-                size="sm"
-                onClick={() => fileInputRef.current?.click()}
-              >
-                {t("builds.configForm.logo.upload")}
-              </Button>
-            </div>
+            <input
+              type="file"
+              accept="image/*"
+              className="hidden"
+              ref={fileInputRef}
+              onChange={handleLogoUpload}
+            />
           </div>
         </div>
 
@@ -966,9 +965,23 @@ export function AgentBuilder({ agentId }: AgentBuilderProps) {
             <div className="grid grid-cols-2 gap-3">
               {/* General Model */}
               <div className="space-y-1">
-                <Label className="text-xs text-muted-foreground">
-                  {t("builds.configForm.model.types.general")}
-                </Label>
+                <div className="flex items-center gap-1.5">
+                  <Label className="text-xs text-muted-foreground">
+                    {t("builds.configForm.model.types.general")}
+                  </Label>
+                  <TooltipProvider>
+                    <Tooltip delayDuration={300}>
+                      <TooltipTrigger asChild>
+                        <div className="cursor-default">
+                          <Info className="h-3 w-3 text-muted-foreground/70 hover:text-muted-foreground" />
+                        </div>
+                      </TooltipTrigger>
+                      <TooltipContent>
+                        <p className="max-w-[200px]">{t("builds.configForm.model.tips.general")}</p>
+                      </TooltipContent>
+                    </Tooltip>
+                  </TooltipProvider>
+                </div>
                 <Select
                   value={modelConfig.general?.toString() || ""}
                   onValueChange={(value) => setModelConfig(prev => ({
@@ -982,9 +995,23 @@ export function AgentBuilder({ agentId }: AgentBuilderProps) {
 
               {/* Small & Fast Model */}
               <div className="space-y-1">
-                <Label className="text-xs text-muted-foreground">
-                  {t("builds.configForm.model.types.smallFast")}
-                </Label>
+                <div className="flex items-center gap-1.5">
+                  <Label className="text-xs text-muted-foreground">
+                    {t("builds.configForm.model.types.smallFast")}
+                  </Label>
+                  <TooltipProvider>
+                    <Tooltip delayDuration={300}>
+                      <TooltipTrigger asChild>
+                        <div className="cursor-default">
+                          <Info className="h-3 w-3 text-muted-foreground/70 hover:text-muted-foreground" />
+                        </div>
+                      </TooltipTrigger>
+                      <TooltipContent>
+                        <p className="max-w-[200px]">{t("builds.configForm.model.tips.smallFast")}</p>
+                      </TooltipContent>
+                    </Tooltip>
+                  </TooltipProvider>
+                </div>
                 <Select
                   value={modelConfig.small_fast?.toString() || ""}
                   onValueChange={(value) => setModelConfig(prev => ({
@@ -998,9 +1025,23 @@ export function AgentBuilder({ agentId }: AgentBuilderProps) {
 
               {/* Visual Model */}
               <div className="space-y-1">
-                <Label className="text-xs text-muted-foreground">
-                  {t("builds.configForm.model.types.visual")}
-                </Label>
+                <div className="flex items-center gap-1.5">
+                  <Label className="text-xs text-muted-foreground">
+                    {t("builds.configForm.model.types.visual")}
+                  </Label>
+                  <TooltipProvider>
+                    <Tooltip delayDuration={300}>
+                      <TooltipTrigger asChild>
+                        <div className="cursor-default">
+                          <Info className="h-3 w-3 text-muted-foreground/70 hover:text-muted-foreground" />
+                        </div>
+                      </TooltipTrigger>
+                      <TooltipContent>
+                        <p className="max-w-[200px]">{t("builds.configForm.model.tips.visual")}</p>
+                      </TooltipContent>
+                    </Tooltip>
+                  </TooltipProvider>
+                </div>
                 <Select
                   value={modelConfig.visual?.toString() || ""}
                   onValueChange={(value) => setModelConfig(prev => ({
@@ -1014,9 +1055,23 @@ export function AgentBuilder({ agentId }: AgentBuilderProps) {
 
               {/* Compact Model */}
               <div className="space-y-1">
-                <Label className="text-xs text-muted-foreground">
-                  {t("builds.configForm.model.types.compact")}
-                </Label>
+                <div className="flex items-center gap-1.5">
+                  <Label className="text-xs text-muted-foreground">
+                    {t("builds.configForm.model.types.compact")}
+                  </Label>
+                  <TooltipProvider>
+                    <Tooltip delayDuration={300}>
+                      <TooltipTrigger asChild>
+                        <div className="cursor-default">
+                          <Info className="h-3 w-3 text-muted-foreground/70 hover:text-muted-foreground" />
+                        </div>
+                      </TooltipTrigger>
+                      <TooltipContent>
+                        <p className="max-w-[200px]">{t("builds.configForm.model.tips.compact")}</p>
+                      </TooltipContent>
+                    </Tooltip>
+                  </TooltipProvider>
+                </div>
                 <Select
                   value={modelConfig.compact?.toString() || ""}
                   onValueChange={(value) => setModelConfig(prev => ({
@@ -1046,9 +1101,9 @@ export function AgentBuilder({ agentId }: AgentBuilderProps) {
               placeholder={t("builds.configForm.knowledgeBase.placeholder")}
             />
           ) : (
-            <Button 
-              variant="outline" 
-              className="w-full justify-start text-muted-foreground" 
+            <Button
+              variant="outline"
+              className="w-full justify-start text-muted-foreground"
               onClick={() => router.push('/kb')}
             >
               <PlusCircle className="mr-2 h-4 w-4" />

@@ -2436,6 +2436,7 @@ Build when you need.`
     },
   },
   traceEventRenderer: {
+    skillSelected: "Selected Skill",
     taskExecution: "Task Execution",
     unknownModel: "Unknown Model",
     callLLM: "Call LLM: {model}",

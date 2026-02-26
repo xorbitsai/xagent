@@ -2383,6 +2383,32 @@ export function AppProvider({ children, token }: { children: React.ReactNode; to
             }
             dispatch({ type: "ADD_TRACE_EVENT", payload: traceEvent })
           }
+          // Skill Selection Events
+          else if (eventType === "skill_select_start") {
+             const traceEvent: TraceEvent = {
+                event_id: generateMessageId("skill-select-start"),
+                event_type: eventType,
+                step_id: eventData.step_id,
+                timestamp: message.timestamp,
+                data: {
+                  action: t('agent.logs.event.actions.skillSelectStart'),
+                  ...eventData
+                }
+              }
+              dispatch({ type: "ADD_TRACE_EVENT", payload: traceEvent })
+          } else if (eventType === "skill_select_end") {
+             const traceEvent: TraceEvent = {
+                event_id: generateMessageId("skill-select-end"),
+                event_type: eventType,
+                step_id: eventData.step_id,
+                timestamp: message.timestamp,
+                data: {
+                  action: t('agent.logs.event.actions.skillSelectEnd'),
+                  ...eventData
+                }
+              }
+              dispatch({ type: "ADD_TRACE_EVENT", payload: traceEvent })
+          }
           // Memory Events - 根据是否有step_id决定显示位置
           else if (eventType === "task_start_memory_generate") {
             const stepId = eventData.step_id

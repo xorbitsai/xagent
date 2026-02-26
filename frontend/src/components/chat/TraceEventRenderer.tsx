@@ -45,6 +45,8 @@ interface TraceEvent {
     model_name?: string;
     tool_name?: string;
     tool_args?: ToolArgs;
+    selected?: boolean;
+    skill_name?: string;
     response?: {
       reasoning?: string;
       tool_name?: string;
@@ -118,6 +120,10 @@ function useProcessedSteps(events: TraceEvent[]): ProcessedStep[] {
     };
 
     events.forEach((event, index) => {
+      if (event.event_type?.startsWith('skill_select')) {
+        return;
+      }
+
       let stepId = event.step_id || (event.data?.step_id as string) || 'default';
 
       if (event.event_type === 'react_task_start' || event.event_type === 'task_start_react') {
@@ -631,6 +637,19 @@ export function TraceEventRenderer({ events }: TraceEventRendererProps) {
 
   const { openFilePreview, dispatch } = useApp();
 
+  const skillSelection = useMemo(() => {
+    for (let i = events.length - 1; i >= 0; i--) {
+      const event = events[i];
+      if (event.event_type === 'skill_select_end') {
+        if (event.data?.selected && event.data?.skill_name) {
+          return event.data.skill_name as string;
+        }
+        return null;
+      }
+    }
+    return null;
+  }, [events]);
+
   const getFileNameFromPath = (path?: string) => {
     if (!path) return '';
     const parts = path.split('/');
@@ -684,12 +703,20 @@ export function TraceEventRenderer({ events }: TraceEventRendererProps) {
     dispatch({ type: "SET_FILE_PREVIEW_CONTENT", payload: { content, error: null } });
   }, [openFilePreview, dispatch, t]);
 
-  if (steps.length === 0) {
+  if (steps.length === 0 && !skillSelection) {
     return null;
   }
 
   return (
     <div className="space-y-4">
+      {skillSelection && (
+        <div className="bg-muted/30 border border-border/50 rounded-lg p-3 flex items-center gap-2">
+          <Cpu className="w-4 h-4 text-primary" />
+          <span className="text-sm">
+            {t('traceEventRenderer.skillSelected')}: <span className="font-medium">{skillSelection}</span>
+          </span>
+        </div>
+      )}
       <div className="flex gap-3">
         <div className="flex-1 space-y-4 overflow-hidden">
           {steps.map((step, index) => (

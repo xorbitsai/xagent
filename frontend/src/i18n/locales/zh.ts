@@ -2436,6 +2436,7 @@ Build when you need.`
     },
   },
   traceEventRenderer: {
+    skillSelected: "已选择技能",
     taskExecution: "任务执行",
     unknownModel: "未知模型",
     callLLM: "调用 LLM: {model}",

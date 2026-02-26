@@ -1,20 +1,18 @@
 "use client"
 
-import { useState, useEffect, use, useRef } from "react"
-import Link from "next/link"
+import { useState, useEffect, useRef } from "react"
 import * as TabsPrimitive from "@radix-ui/react-tabs"
-import { ArrowLeft, FileText, HardDrive, Search, Settings, Edit, Upload, Plus, Trash2, FileIcon, CheckCircle, XCircle, Clock, AlertCircle, Globe, Loader2 } from "lucide-react"
+import { ArrowLeft, HardDrive, Search, Upload, Plus, Trash2, FileIcon, CheckCircle, XCircle, AlertCircle, Globe, Loader2 } from "lucide-react"
 import { Button } from "@/components/ui/button"
 import { Input } from "@/components/ui/input"
 import { Label } from "@/components/ui/label"
 import { Card } from "@/components/ui/card"
 import { Alert, AlertDescription } from "@/components/ui/alert"
 import { Dialog, DialogContent, DialogDescription, DialogHeader, DialogTitle } from "@/components/ui/dialog"
-import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs"
+import { Tabs, TabsContent, TabsList } from "@/components/ui/tabs"
 import { ScrollArea } from "@/components/ui/scroll-area"
 import { SelectRadix, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select"
 import { Badge } from "@/components/ui/badge"
-import { Progress } from "@/components/ui/progress"
 import { apiRequest } from "@/lib/api-wrapper"
 import { getApiUrl } from "@/lib/utils"
 import { useI18n } from "@/contexts/i18n-context"
@@ -92,6 +90,51 @@ export function KnowledgeBaseDetailContent({ collectionName }: { collectionName:
   const [isCreateDialogOpen, setIsCreateDialogOpen] = useState(false)
   const [isAddSourceOpen, setIsAddSourceOpen] = useState(false)
   const [activeAddSourceMode, setActiveAddSourceMode] = useState<"web" | "file" | null>(null)
+  const [isDragging, setIsDragging] = useState(false)
+
+  const handleDragOver = (e: React.DragEvent) => {
+    e.preventDefault()
+    e.stopPropagation()
+    setIsDragging(true)
+  }
+
+  const handleDragLeave = (e: React.DragEvent) => {
+    e.preventDefault()
+    e.stopPropagation()
+
+    if (e.relatedTarget && e.currentTarget.contains(e.relatedTarget as Node)) {
+      return
+    }
+
+    setIsDragging(false)
+  }
+
+  const handleDrop = (e: React.DragEvent) => {
+    e.preventDefault()
+    e.stopPropagation()
+    setIsDragging(false)
+
+    if (e.dataTransfer.files && e.dataTransfer.files.length > 0) {
+      const files = Array.from(e.dataTransfer.files)
+      const allowedExtensions = [".pdf", ".txt", ".html", ".htm", ".md", ".doc", ".docx", ".xlsx", ".ppt", ".pptx", ".csv"]
+      const validFiles = files.filter(file => {
+        const fileName = file.name.toLowerCase()
+        return allowedExtensions.some(ext => fileName.endsWith(ext))
+      })
+
+      if (validFiles.length !== files.length) {
+        setError(t("kb.errors.unsupportedFileType") || "Unsupported file type")
+      } else {
+        setError(null)
+      }
+
+      if (validFiles.length > 0) {
+        setSelectedFiles(prev => [...prev, ...validFiles])
+        setActiveAddSourceMode("file")
+      }
+    }
+  }
+
 
   // Web ingestion states
   const [isWebIngesting, setIsWebIngesting] = useState(false)
@@ -588,7 +631,7 @@ export function KnowledgeBaseDetailContent({ collectionName }: { collectionName:
                 type="file"
                 multiple
                 ref={fileInputRef}
-                accept=".pdf,.txt,.html,.htm,.md,.doc,.docx"
+                accept=".pdf,.txt,.html,.htm,.md,.doc,.docx,.xlsx,.ppt,.pptx,.csv"
                 onChange={handleFileSelect}
                 className="hidden"
                 id="file-upload-detail"
@@ -893,10 +936,15 @@ export function KnowledgeBaseDetailContent({ collectionName }: { collectionName:
                 <div className="grid grid-cols-2 gap-4 py-4">
                   <Button
                     variant="outline"
-                    className="h-32 flex flex-col gap-3 hover:bg-muted/50 hover:border-primary transition-all"
+                    className={`h-32 flex flex-col gap-3 hover:bg-muted/50 hover:border-primary transition-all ${
+                      isDragging ? "border-primary bg-primary/10" : ""
+                    }`}
                     onClick={() => {
                       fileInputRef.current?.click()
                     }}
+                    onDragOver={handleDragOver}
+                    onDragLeave={handleDragLeave}
+                    onDrop={handleDrop}
                   >
                     <div className="p-3 bg-blue-100 dark:bg-blue-900/30 rounded-full">
                       <Upload size={24} className="text-blue-600 dark:text-blue-400" />
@@ -926,8 +974,13 @@ export function KnowledgeBaseDetailContent({ collectionName }: { collectionName:
 
                  {selectedFiles.length === 0 ? (
                     <div
-                      className="border-2 border-dashed rounded-lg p-8 text-center cursor-pointer hover:bg-muted/50 transition-colors"
+                      className={`border-2 border-dashed rounded-lg p-8 text-center cursor-pointer hover:bg-muted/50 transition-colors ${
+                        isDragging ? "border-primary bg-primary/10" : ""
+                      }`}
                       onClick={() => fileInputRef.current?.click()}
+                      onDragOver={handleDragOver}
+                      onDragLeave={handleDragLeave}
+                      onDrop={handleDrop}
                     >
                       <Upload className="h-12 w-12 mx-auto mb-4 text-muted-foreground" />
                       <p className="text-sm text-muted-foreground">{t("kb.dialog.fileUpload.dropOrClick")}</p>
@@ -1091,27 +1144,6 @@ export function KnowledgeBaseDetailContent({ collectionName }: { collectionName:
             )}
           </DialogContent>
         </Dialog>
-    </div>
-  )
-}
-
-export default function KnowledgeBaseDetailPage({ params }: { params: Promise<{ name: string }> }) {
-  const collectionName = decodeURIComponent(use(params).name)
-  return (
-    <div className="min-h-screen bg-background text-foreground">
-      <div className="w-full p-6">
-        <div className="flex justify-between items-center mb-8">
-          <div className="flex items-center gap-4">
-            <Link href="/kb" className="p-2 text-muted-foreground hover:text-foreground hover:bg-accent rounded-md transition-colors">
-              <ArrowLeft size={20} />
-            </Link>
-            <div>
-              <h1 className="text-3xl font-bold mb-1">{collectionName}</h1>
-            </div>
-          </div>
-        </div>
-        <KnowledgeBaseDetailContent collectionName={collectionName} />
-      </div>
     </div>
   )
 }

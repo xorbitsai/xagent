@@ -1251,6 +1251,7 @@ Build when you need.`
       webIngestFailed: "Website import failed",
       deleteFailed: "Failed to delete knowledge base: {name}",
       deleteFailedGeneric: "Failed to delete knowledge base",
+      unsupportedFileType: "Unsupported file type",
     },
     actions: {
       deleteConfirm: "Are you sure you want to delete knowledge base {name}? This action cannot be undone.",

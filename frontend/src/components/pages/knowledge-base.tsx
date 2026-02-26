@@ -93,6 +93,7 @@ export function KnowledgeBasePage() {
   const [isUploading, setIsUploading] = useState(false)
   const [uploadProgress, setUploadProgress] = useState(0)
   const [ingestionResults, setIngestionResults] = useState<IngestionResult[]>([])
+  const [isDragging, setIsDragging] = useState(false)
 
   // 网站导入相关状态
   const [isWebIngesting, setIsWebIngesting] = useState(false)
@@ -217,6 +218,48 @@ export function KnowledgeBasePage() {
       setNewCollectionDescription("")
     } catch (err) {
       setError(err instanceof Error ? err.message : t("kb.errors.createFailed"))
+    }
+  }
+
+  const handleDragOver = (e: React.DragEvent) => {
+    e.preventDefault()
+    e.stopPropagation()
+    setIsDragging(true)
+  }
+
+  const handleDragLeave = (e: React.DragEvent) => {
+    e.preventDefault()
+    e.stopPropagation()
+
+    if (e.relatedTarget && e.currentTarget.contains(e.relatedTarget as Node)) {
+      return
+    }
+
+    setIsDragging(false)
+  }
+
+  const handleDrop = (e: React.DragEvent) => {
+    e.preventDefault()
+    e.stopPropagation()
+    setIsDragging(false)
+
+    if (e.dataTransfer.files && e.dataTransfer.files.length > 0) {
+      const files = Array.from(e.dataTransfer.files)
+      const allowedExtensions = [".pdf", ".txt", ".html", ".htm", ".md", ".doc", ".docx", ".xlsx", ".ppt", ".pptx", ".csv"]
+      const validFiles = files.filter(file => {
+        const fileName = file.name.toLowerCase()
+        return allowedExtensions.some(ext => fileName.endsWith(ext))
+      })
+
+      if (validFiles.length !== files.length) {
+        setError(t("kb.errors.unsupportedFileType") || "部分文件格式不支持，已跳过")
+      } else {
+        setError(null)
+      }
+
+      if (validFiles.length > 0) {
+        setSelectedFiles(prev => [...prev, ...validFiles])
+      }
     }
   }
 
@@ -620,8 +663,15 @@ export function KnowledgeBasePage() {
                     <h3 className="text-lg font-medium">{t("kb.dialog.fileUpload.title")}</h3>
 
                     {/* 文件选择区域 */}
-                    <div className="w-full border-2 border-dashed border-border rounded-lg p-8 text-center">
-                      <Upload className="h-12 w-12 mx-auto mb-4 text-muted-foreground" />
+                    <div
+                      className={`w-full border-2 border-dashed rounded-lg p-8 text-center transition-colors ${
+                        isDragging ? "border-primary bg-primary/10" : "border-border"
+                      }`}
+                      onDragOver={handleDragOver}
+                      onDragLeave={handleDragLeave}
+                      onDrop={handleDrop}
+                    >
+                      <Upload className={`h-12 w-12 mx-auto mb-4 ${isDragging ? "text-primary" : "text-muted-foreground"}`} />
                       <p className="text-lg font-medium mb-2">{t("kb.dialog.fileUpload.dropOrClick")}</p>
                       <p className="text-sm text-muted-foreground mb-4">
                         {t("kb.dialog.fileUpload.supportedFormats")}

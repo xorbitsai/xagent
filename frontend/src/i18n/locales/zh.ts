@@ -1251,6 +1251,7 @@ Build when you need.`
       webIngestFailed: "网站导入失败",
       deleteFailed: "删除知识库失败: {name}",
       deleteFailedGeneric: "删除知识库失败",
+      unsupportedFileType: "不支持的文件类型",
     },
     actions: {
       deleteConfirm: "确定要删除知识库 {name} 吗？此操作无法撤销。",

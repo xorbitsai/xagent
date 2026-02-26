@@ -287,14 +287,14 @@ function useProcessedSteps(events: TraceEvent[]): ProcessedStep[] {
 
          // Extract error message with more fallback options
          const errorData = event.data || {};
-         let errorMessage = 
-            errorData.error || 
+         let errorMessage =
+            errorData.error ||
             errorData.message;
-            
+
          if (!errorMessage && errorData.result) {
             errorMessage = (errorData.result as any).error || (errorData.result as any).message;
          }
-         
+
          if (!errorMessage && typeof errorData === 'string') {
              errorMessage = errorData;
          }
@@ -305,7 +305,7 @@ function useProcessedSteps(events: TraceEvent[]): ProcessedStep[] {
 
          // Try to find specific action type based on event type
          let runningAction = step.actions.find(a => a.status === 'running');
-         
+
          // If no running action found, or type mismatch, try to find the last action of corresponding type
          if (event.event_type === 'tool_execution_failed') {
              const lastTool = findLastRunningAction(step, 'tool');
@@ -628,7 +628,7 @@ function StepItem({ step, index, onOpenTerminal, onViewDetail, onFileClick }: St
 export function TraceEventRenderer({ events }: TraceEventRendererProps) {
   const { t } = useI18n();
   const steps = useProcessedSteps(events);
-  
+
   const { openFilePreview, dispatch } = useApp();
 
   const getFileNameFromPath = (path?: string) => {

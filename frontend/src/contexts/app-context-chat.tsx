@@ -795,7 +795,6 @@ export function AppProvider({ children, token }: { children: React.ReactNode; to
                 agentId: taskData.agent_id,
               }
             })
-            dispatch({ type: "TRIGGER_TASK_UPDATE" })
 
             // Check if this is a new task (created within last 5 seconds)
             // If so, we don't expect historical messages, so stop loading
@@ -2037,7 +2036,6 @@ export function AppProvider({ children, token }: { children: React.ReactNode; to
               type: "UPDATE_TASK_STATUS",
               payload: { status: success ? "completed" : "failed" }
             })
-            dispatch({ type: "TRIGGER_TASK_UPDATE" })
           }
 
           // Execution Log Events

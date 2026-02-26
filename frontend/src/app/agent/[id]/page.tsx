@@ -10,6 +10,7 @@ import { ChatMessage } from "@/components/chat/ChatMessage"
 import { ChatInput } from "@/components/chat/ChatInput"
 import { useAuth } from "@/contexts/auth-context"
 import { useI18n } from "@/contexts/i18n-context"
+import { useApp } from "@/contexts/app-context-chat"
 
 interface Agent {
   id: number
@@ -37,6 +38,7 @@ interface Message {
 export default function AgentChatPage() {
   const { token } = useAuth()
   const { t } = useI18n()
+  const { dispatch } = useApp()
   const params = useParams()
   const router = useRouter()
   const agentId = params.id as string
@@ -129,6 +131,7 @@ export default function AgentChatPage() {
         const taskId = taskData.id || taskData.task_id
 
         if (taskId) {
+          dispatch({ type: "TRIGGER_TASK_UPDATE" })
           router.push(`/task/${taskId}`)
           return
         }

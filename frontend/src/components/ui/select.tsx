@@ -20,12 +20,34 @@ interface SelectProps {
   options?: SelectOption[]
   placeholder?: string
   className?: string
+  disabled?: boolean
 }
 
-export function Select({ value, onValueChange, options = [], placeholder, className }: SelectProps) {
+export function Select({ value, onValueChange, options = [], placeholder, className, disabled }: SelectProps) {
   const [open, setOpen] = useState(false)
   const [dropdownDirection, setDropdownDirection] = useState<'down' | 'up'>('down')
   const buttonRef = useRef<HTMLDivElement>(null)
+  const containerRef = useRef<HTMLDivElement>(null)
+
+  // 处理点击外部关闭下拉框
+  useEffect(() => {
+    const handleClickOutside = (event: MouseEvent) => {
+      if (
+        containerRef.current &&
+        !containerRef.current.contains(event.target as Node)
+      ) {
+        setOpen(false)
+      }
+    }
+
+    if (open) {
+      document.addEventListener("mousedown", handleClickOutside)
+    }
+
+    return () => {
+      document.removeEventListener("mousedown", handleClickOutside)
+    }
+  }, [open])
 
   // 检查下拉菜单应该向上还是向下展开
   useEffect(() => {
@@ -51,15 +73,15 @@ export function Select({ value, onValueChange, options = [], placeholder, classN
   }
 
   return (
-    <div className={cn("relative", className)}>
+    <div ref={containerRef} className={cn("relative", className)}>
       <div
         ref={buttonRef}
-        onClick={() => setOpen(!open)}
+        onClick={() => !disabled && setOpen(!open)}
         className={cn(
           "w-full flex items-center justify-between px-3 py-2 text-sm bg-background border border-input rounded-md min-h-[40px] cursor-pointer",
           "hover:bg-accent hover:text-accent-foreground",
           "focus:outline-none focus:ring-2 focus:ring-ring focus:ring-offset-2",
-          "disabled:opacity-50 disabled:cursor-not-allowed"
+          disabled && "opacity-50 cursor-not-allowed pointer-events-none"
         )}
       >
         <div className="flex items-center gap-2 flex-1 min-w-0">

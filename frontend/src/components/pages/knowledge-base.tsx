@@ -12,7 +12,7 @@ import { Textarea } from "@/components/ui/textarea"
 import { Progress } from "@/components/ui/progress"
 import { ScrollArea } from "@/components/ui/scroll-area"
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs"
-import { SelectRadix, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select"
+import { Select, SelectRadix, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select"
 import { getApiUrl } from "@/lib/utils"
 import { useAuth } from "@/contexts/auth-context"
 import { useI18n } from "@/contexts/i18n-context"
@@ -923,33 +923,31 @@ export function KnowledgeBasePage() {
                 <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
                   <div>
                     <Label htmlFor="parse_method">{t("kb.index.parseMethod")}</Label>
-                    <select
-                      id="parse_method"
+                    <Select
                       value={ingestionConfig.parse_method}
-                      onChange={(e) => setIngestionConfig(prev => ({ ...prev, parse_method: e.target.value }))}
-                      className="w-full p-2 border rounded-md bg-background"
-                    >
-                      <option value="default">{t("kb.index.parseOptions.default")}</option>
-                      <option value="pypdf">{t("kb.index.parseOptions.pypdf")}</option>
-                      <option value="pdfplumber">{t("kb.index.parseOptions.pdfplumber")}</option>
-                      <option value="unstructured">{t("kb.index.parseOptions.unstructured")}</option>
-                      <option value="pymupdf">{t("kb.index.parseOptions.pymupdf")}</option>
-                      <option value="deepdoc">{t("kb.index.parseOptions.deepdoc")}</option>
-                    </select>
+                      onValueChange={(value) => setIngestionConfig(prev => ({ ...prev, parse_method: value }))}
+                      options={[
+                        { value: "default", label: t("kb.index.parseOptions.default") },
+                        { value: "pypdf", label: t("kb.index.parseOptions.pypdf") },
+                        { value: "pdfplumber", label: t("kb.index.parseOptions.pdfplumber") },
+                        { value: "unstructured", label: t("kb.index.parseOptions.unstructured") },
+                        { value: "pymupdf", label: t("kb.index.parseOptions.pymupdf") },
+                        { value: "deepdoc", label: t("kb.index.parseOptions.deepdoc") },
+                      ]}
+                    />
                   </div>
 
                   <div>
                     <Label htmlFor="chunk_strategy">{t("kb.index.chunkStrategy")}</Label>
-                    <select
-                      id="chunk_strategy"
+                    <Select
                       value={ingestionConfig.chunk_strategy}
-                      onChange={(e) => setIngestionConfig(prev => ({ ...prev, chunk_strategy: e.target.value }))}
-                      className="w-full p-2 border rounded-md bg-background"
-                    >
-                      <option value="recursive">{t("kb.index.chunkOptions.recursive")}</option>
-                      <option value="fixed_size">{t("kb.index.chunkOptions.fixed_size")}</option>
-                      <option value="markdown">{t("kb.index.chunkOptions.markdown")}</option>
-                    </select>
+                      onValueChange={(value) => setIngestionConfig(prev => ({ ...prev, chunk_strategy: value }))}
+                      options={[
+                        { value: "recursive", label: t("kb.index.chunkOptions.recursive") },
+                        { value: "fixed_size", label: t("kb.index.chunkOptions.fixed_size") },
+                        { value: "markdown", label: t("kb.index.chunkOptions.markdown") },
+                      ]}
+                    />
                   </div>
 
                   <div>

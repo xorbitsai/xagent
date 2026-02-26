@@ -9,6 +9,7 @@ import { Card } from "@/components/ui/card"
 import { Alert, AlertDescription } from "@/components/ui/alert"
 import { Dialog, DialogContent, DialogDescription, DialogHeader, DialogTitle } from "@/components/ui/dialog"
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs"
+import { Select } from "@/components/ui/select"
 import { MultiSelect } from "@/components/ui/multi-select"
 import { Switch } from "@/components/ui/switch"
 import { getApiUrl } from "@/lib/utils"
@@ -988,36 +989,32 @@ export function ModelsPage() {
               <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
                 <div>
                   <Label htmlFor="category">{t('models.form.category')}</Label>
-                  <select
-                    id="category"
-                    className="flex h-10 w-full rounded-md border border-input bg-background px-3 py-2 text-sm ring-offset-background file:border-0 file:bg-transparent file:text-sm file:font-medium placeholder:text-muted-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 disabled:cursor-not-allowed disabled:opacity-50"
+                  <Select
                     value={formData.category}
-                    onChange={(e) => setFormData({ ...formData, category: e.target.value })}
+                    onValueChange={(value) => setFormData({ ...formData, category: value })}
                     disabled={!!editingModel}
-                  >
-                    <option value="llm">{t('models.tabs.llm')}</option>
-                    <option value="embedding">{t('models.tabs.embedding')}</option>
-                    <option value="image">{t('models.tabs.image')}</option>
-                  </select>
+                    options={[
+                      { value: "llm", label: t('models.tabs.llm') },
+                      { value: "embedding", label: t('models.tabs.embedding') },
+                      { value: "image", label: t('models.tabs.image') }
+                    ]}
+                  />
                 </div>
 
                 <div>
                   <Label htmlFor="model_provider">{t('models.form.provider')}</Label>
-                  <select
-                    id="model_provider"
-                    className="flex h-10 w-full rounded-md border border-input bg-background px-3 py-2 text-sm ring-offset-background file:border-0 file:bg-transparent file:text-sm file:font-medium placeholder:text-muted-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 disabled:cursor-not-allowed disabled:opacity-50"
+                  <Select
                     value={formData.model_provider}
-                    onChange={(e) => setFormData({ ...formData, model_provider: e.target.value })}
+                    onValueChange={(value) => setFormData({ ...formData, model_provider: value })}
                     disabled={!!editingModel}
-                  >
-                    {providers
+                    options={providers
                       .filter(p => p.category.includes(formData.category as any))
-                      .map((provider) => (
-                      <option key={provider.id} value={provider.id}>
-                        {provider.name}
-                      </option>
-                    ))}
-                  </select>
+                      .map((provider) => ({
+                        value: provider.id,
+                        label: provider.name
+                      }))
+                    }
+                  />
                 </div>
               </div>
 

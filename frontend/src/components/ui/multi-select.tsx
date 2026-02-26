@@ -3,6 +3,7 @@
 import { useState, useRef, useEffect } from "react"
 import { cn } from "@/lib/utils"
 import { ChevronDown, X } from "lucide-react"
+import { marked } from "marked"
 
 interface MultiSelectOption {
   value: string
@@ -20,12 +21,58 @@ interface MultiSelectProps {
   searchable?: boolean
 }
 
+const MarkdownDescription = ({ content }: { content: string }) => {
+  const [html, setHtml] = useState<string>("")
+
+  useEffect(() => {
+    const parse = async () => {
+      try {
+        const result = await marked.parse(content)
+        setHtml(result)
+      } catch (e) {
+        setHtml(content)
+      }
+    }
+    parse()
+  }, [content])
+
+  if (!html) return null
+
+  return (
+    <div
+      className="text-xs text-muted-foreground mt-1 ml-2 [&_p]:m-0 [&_p]:leading-normal [&_strong]:text-foreground [&_code]:bg-muted [&_code]:px-1 [&_code]:rounded [&_code]:font-mono [&_ul]:pl-4 [&_ul]:m-0 [&_ol]:pl-4 [&_ol]:m-0"
+      dangerouslySetInnerHTML={{ __html: html }}
+    />
+  )
+}
+
 export function MultiSelect({ values, onValuesChange, options, placeholder, className, creatable, searchable }: MultiSelectProps) {
   const [open, setOpen] = useState(false)
   const [dropdownDirection, setDropdownDirection] = useState<'down' | 'up'>('down')
   const [inputValue, setInputValue] = useState("")
   const [searchQuery, setSearchQuery] = useState("")
   const buttonRef = useRef<HTMLDivElement>(null)
+  const containerRef = useRef<HTMLDivElement>(null)
+
+  // Handle click outside to close dropdown
+  useEffect(() => {
+    const handleClickOutside = (event: MouseEvent) => {
+      if (
+        containerRef.current &&
+        !containerRef.current.contains(event.target as Node)
+      ) {
+        setOpen(false)
+      }
+    }
+
+    if (open) {
+      document.addEventListener("mousedown", handleClickOutside)
+    }
+
+    return () => {
+      document.removeEventListener("mousedown", handleClickOutside)
+    }
+  }, [open])
 
   // Check dropdown direction
   useEffect(() => {
@@ -77,12 +124,12 @@ export function MultiSelect({ values, onValuesChange, options, placeholder, clas
   }
 
   return (
-    <div className={cn("relative", className)}>
+    <div ref={containerRef} className={cn("relative", className)}>
       <div
         ref={buttonRef}
         onClick={() => setOpen(!open)}
         className={cn(
-          "w-full flex items-center justify-between px-3 py-2 text-sm bg-background border border-border rounded-md min-h-[40px] cursor-pointer",
+          "w-full flex items-center justify-between px-3 py-2 text-sm bg-background border border-input rounded-md min-h-[40px] cursor-pointer",
           "hover:bg-accent hover:text-accent-foreground",
           "focus:outline-none focus:ring-2 focus:ring-ring focus:ring-offset-2",
           "disabled:opacity-50 disabled:cursor-not-allowed"
@@ -111,7 +158,7 @@ export function MultiSelect({ values, onValuesChange, options, placeholder, clas
 
       {open && (
         <div className={cn(
-          "absolute left-0 right-0 z-[9999] bg-background border border-border rounded-md shadow-lg",
+          "absolute left-0 right-0 z-[9999] bg-popover text-popover-foreground border border-border rounded-md shadow-lg",
           dropdownDirection === 'down' ? "top-full mt-1" : "bottom-full mb-1"
         )}>
           {searchable && (
@@ -150,7 +197,7 @@ export function MultiSelect({ values, onValuesChange, options, placeholder, clas
                     </div>
                   </div>
                   {option.description && (
-                    <div className="text-xs text-muted-foreground mt-1">{option.description}</div>
+                    <MarkdownDescription content={option.description} />
                   )}
                 </button>
               ))

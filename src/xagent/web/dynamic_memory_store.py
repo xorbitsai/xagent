@@ -121,10 +121,21 @@ class DynamicMemoryStoreManager:
 
             from xagent.core.model.embedding import DashScopeEmbedding
 
-            current_dir = os.path.dirname(
-                os.path.dirname(os.path.dirname(os.path.dirname(__file__)))
+            # Check legacy location (project root) first for backward compatibility
+            legacy_dir = os.path.join(
+                os.path.dirname(
+                    os.path.dirname(os.path.dirname(os.path.dirname(__file__)))
+                ),
+                "memory_store",
             )
-            db_dir = os.path.join(current_dir, "memory_store")
+            if os.path.exists(legacy_dir) and os.listdir(legacy_dir):
+                logger.info(f"Using legacy memory store location: {legacy_dir}")
+                db_dir = legacy_dir
+            else:
+                # Use new default location
+                new_dir = os.path.expanduser("~/.xagent/memory_store")
+                os.makedirs(new_dir, exist_ok=True)
+                db_dir = new_dir
 
             if embedding_model.model_provider == "dashscope":
                 lancedb_store = LanceDBMemoryStore(

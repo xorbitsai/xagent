@@ -43,8 +43,6 @@ services:
     volumes:
       - xagent_data:/root/.xagent
       - xagent_uploads:/opt/xagent/src/xagent/web/uploads
-      - xagent_lancedb:/opt/xagent/data
-      - xagent_memory:/opt/xagent/memory_store
     depends_on:
       postgres:
         condition: service_healthy
@@ -83,10 +81,6 @@ volumes:
   xagent_data:
     driver: local
   xagent_uploads:
-    driver: local
-  xagent_lancedb:
-    driver: local
-  xagent_memory:
     driver: local
 
 networks:

@@ -8,6 +8,7 @@ lancedb_client.py and a separate vector store implementation.
 
 from __future__ import annotations
 
+import functools
 import logging
 import os
 import time
@@ -61,14 +62,29 @@ class LanceDBConnectionManager:
         return time.time() - last_accessed > CONNECTION_TTL
 
     @staticmethod
+    @functools.lru_cache(maxsize=None)
     def get_default_lancedb_dir() -> str:
         """Get the default LanceDB directory path.
 
         Returns:
-            Default LanceDB directory path relative to project root
+            Default LanceDB directory path
+
+        Note:
+            Priority: legacy_location (if has data) > ~/.xagent/data/lancedb
+            Result is cached after first call.
         """
-        project_root = Path(__file__).parent.parent.parent.parent.parent
-        return str(project_root / "data" / "lancedb")
+        # Check legacy location (project root) first for backward compatibility
+        legacy_dir = (
+            Path(__file__).parent.parent.parent.parent.parent / "data" / "lancedb"
+        )
+        if legacy_dir.exists() and list(legacy_dir.iterdir()):
+            logger.info(f"Using legacy LanceDB location: {legacy_dir}")
+            return str(legacy_dir)
+
+        # Use new default location
+        new_dir = Path.home() / ".xagent" / "data" / "lancedb"
+        new_dir.mkdir(parents=True, exist_ok=True)
+        return str(new_dir)
 
     @staticmethod
     def _cleanup_expired_connections() -> None:

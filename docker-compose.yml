@@ -41,7 +41,7 @@ services:
     env_file:
       - .env
     volumes:
-      - xagent_data:/home/xagent/.xagent
+      - xagent_data:/root/.xagent
       - xagent_uploads:/opt/xagent/src/xagent/web/uploads
       - xagent_lancedb:/opt/xagent/data
       - xagent_memory:/opt/xagent/memory_store

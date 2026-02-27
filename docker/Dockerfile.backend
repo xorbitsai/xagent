@@ -117,7 +117,7 @@ RUN cd /opt/xagent/frontend && npm ci \
     && python -c "import nltk; nltk.download('punkt'); nltk.download('punkt_tab'); nltk.download('wordnet'); nltk.download('averaged_perceptron_tagger')" \
     && python -c "import tiktoken; tiktoken.encoding_for_model('gpt-4')" \
     && chmod +x /opt/xagent/deploy/entrypoint.sh \
-    && mkdir -p /opt/xagent/uploads /home/xagent/.xagent
+    && mkdir -p /opt/xagent/src/xagent/web/uploads /root/.xagent
 
 EXPOSE 8000
 ENTRYPOINT ["/opt/xagent/deploy/entrypoint.sh"]

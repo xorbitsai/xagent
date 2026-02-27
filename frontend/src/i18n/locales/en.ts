@@ -1310,6 +1310,7 @@ Build when you need.`
         uploading: "Uploading...",
         uploadSuccess: "Upload Successful",
         uploadFailed: "Upload Failed",
+        progressTitle: "Upload Progress",
         processing: "Processing...",
         processSuccess: "Processing Success",
         processResult: {
@@ -1322,6 +1323,7 @@ Build when you need.`
         title: "Website Import",
         description: "Respect robots.txt and crawl target website content, then index",
         basic: {
+          title: "Basic Configuration",
           startUrl: "Start URL",
           maxPages: "Max Pages",
           crawlDepth: "Crawl Depth",

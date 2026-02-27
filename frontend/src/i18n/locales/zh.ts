@@ -1310,6 +1310,7 @@ Build when you need.`
         uploading: "正在上传...",
         uploadSuccess: "上传成功",
         uploadFailed: "上传失败",
+        progressTitle: "上传进度",
         processing: "处理中...",
         processSuccess: "处理成功",
         processResult: {
@@ -1322,6 +1323,7 @@ Build when you need.`
         title: "网站导入",
         description: "遵守 robots.txt，爬取目标网站内容并建立索引",
         basic: {
+          title: "基础配置",
           startUrl: "起始 URL",
           maxPages: "最大页面数",
           crawlDepth: "爬取深度",

@@ -1,6 +1,6 @@
 "use client"
 
-import { useState, useEffect } from "react"
+import { useState, useEffect, useRef } from "react"
 import { Button } from "@/components/ui/button"
 import { Input } from "@/components/ui/input"
 import { Label } from "@/components/ui/label"
@@ -86,6 +86,7 @@ export function KnowledgeBasePage() {
   const [filteredCollections, setFilteredCollections] = useState<Collection[]>([])
   const [selectedCollection, setSelectedCollection] = useState<string | null>(null)
   const [isDrawerOpen, setIsDrawerOpen] = useState(false)
+  const fileInputRef = useRef<HTMLInputElement>(null)
 
   // 文件上传相关状态
   const [selectedFiles, setSelectedFiles] = useState<File[]>([])
@@ -653,19 +654,21 @@ export function KnowledgeBasePage() {
 
                     {/* 文件选择区域 */}
                     <div
-                      className={`w-full border-2 border-dashed rounded-lg p-8 text-center transition-colors ${
+                      className={`w-full border-2 border-dashed rounded-lg p-8 text-center cursor-pointer hover:bg-muted/50 transition-colors ${
                         isDragging ? "border-primary bg-primary/10" : "border-border"
                       }`}
+                      onClick={() => fileInputRef.current?.click()}
                       onDragOver={handleDragOver}
                       onDragLeave={handleDragLeave}
                       onDrop={handleDrop}
                     >
                       <Upload className={`h-12 w-12 mx-auto mb-4 ${isDragging ? "text-primary" : "text-muted-foreground"}`} />
-                      <p className="text-lg font-medium mb-2">{t("kb.dialog.fileUpload.dropOrClick")}</p>
+                      <p className="text-sm font-medium mb-2">{t("kb.dialog.fileUpload.dropOrClick")}</p>
                       <p className="text-sm text-muted-foreground mb-4">
                         {t("kb.dialog.fileUpload.supportedFormats")}
                       </p>
                       <input
+                        ref={fileInputRef}
                         type="file"
                         multiple
                         accept=".pdf,.txt,.html,.htm,.md,.doc,.docx,.xlsx,.ppt,.pptx,.csv"
@@ -673,13 +676,6 @@ export function KnowledgeBasePage() {
                         className="hidden"
                         id="file-upload"
                       />
-                      <label
-                        htmlFor="file-upload"
-                        className="inline-flex items-center justify-center rounded-md text-sm font-medium ring-offset-background transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 disabled:pointer-events-none disabled:opacity-50 border border-input bg-background hover:bg-accent hover:text-accent-foreground h-10 px-4 py-2 cursor-pointer"
-                      >
-                        <FileText size={16} className="mr-2" />
-                        {t("kb.dialog.fileUpload.selectFiles")}
-                      </label>
                     </div>
 
                     {/* 已选择文件列表 */}

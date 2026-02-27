@@ -89,7 +89,7 @@ async def ingest(
         description="Delay between retries in seconds (default: 1.0)",
     ),
     _user: User = Depends(get_current_user),
-) -> IngestionResult:
+) -> IngestionResult | JSONResponse:
     """Upload and ingest a document into the knowledge base.
 
     Args:
@@ -482,8 +482,8 @@ async def ingest_web(
         description="Delay between retries in seconds (default: 1.0)",
     ),
     _user: User = Depends(get_current_user),
-) -> WebIngestionResult:
-    """Crawl a website and ingest all pages into the knowledge base.
+) -> WebIngestionResult | JSONResponse:
+    """Ingest website content into the knowledge base.
 
     Args:
         collection: Target collection name

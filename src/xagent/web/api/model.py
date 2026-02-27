@@ -4,7 +4,7 @@ import logging
 import time
 from typing import Any, List, Optional
 
-from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi import APIRouter, Body, Depends, HTTPException, Query
 from sqlalchemy.orm import Session
 
 from xagent.core.model.model import (
@@ -1397,8 +1397,8 @@ async def list_supported_providers() -> dict:
 @model_router.post("/providers/{provider}/models")
 async def fetch_provider_models(
     provider: str,
-    api_key: str,
-    base_url: Optional[str] = None,
+    api_key: str = Body(...),
+    base_url: Optional[str] = Body(None),
     db: Session = Depends(get_db),
     user: User = Depends(get_current_user),
 ) -> dict:

@@ -186,17 +186,15 @@ export async function getProviderModels(
 ): Promise<ProviderModel[]> {
   const apiUrl = getApiUrl()
 
-  // Construct query parameters
-  const params = new URLSearchParams();
-  if (config?.api_key) params.append('api_key', config.api_key);
-  if (config?.base_url) params.append('base_url', config.base_url);
-
-  const response = await apiRequest(`${apiUrl}/api/models/providers/${provider}/models?${params.toString()}`, {
+  const response = await apiRequest(`${apiUrl}/api/models/providers/${provider}/models`, {
     method: 'POST',
     headers: {
       'Content-Type': 'application/json',
     },
-    body: JSON.stringify({}),
+    body: JSON.stringify({
+      api_key: config?.api_key ?? '',
+      base_url: config?.base_url,
+    }),
   });
 
   if (!response.ok) {

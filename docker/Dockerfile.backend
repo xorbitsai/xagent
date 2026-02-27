@@ -1,13 +1,24 @@
 # syntax=docker/dockerfile:1.6
 ARG PYTHON_VERSION=3.11
 ARG NODE_VERSION=22
+ARG PYPI_INDEX_URL=""
+ARG APT_MIRROR=""
 
 ############################
 # Backend build
 ############################
 FROM python:${PYTHON_VERSION}-bookworm AS backend-build
 
+ARG PYPI_INDEX_URL=""
+ARG APT_MIRROR=""
+
 WORKDIR /opt/xagent
+
+# Use APT mirror if provided (for faster downloads in China)
+RUN if [ -n "$APT_MIRROR" ]; then \
+        sed -i "s|http://deb.debian.org/debian|$APT_MIRROR|g" /etc/apt/sources.list.d/debian.sources \
+        || sed -i "s|http://deb.debian.org/debian|$APT_MIRROR|g" /etc/apt/sources.list; \
+    fi
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
     build-essential \
@@ -21,29 +32,34 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libsm6 \
     libxrender1 \
     libxext6 \
+    && git config --global http.version HTTP/1.1 \
+    && git config --global http.postBuffer 524288000 \
     && rm -rf /var/lib/apt/lists/*
 
-# Improve git reliability for large repos / HTTP2 issues
-RUN git config --global http.version HTTP/1.1 \
-    && git config --global http.postBuffer 524288000
+# Copy dependency files first for better layer caching
+COPY pyproject.toml .
+COPY README.md .
 
+# Copy .git directory for version detection (hatch-vcs)
 COPY .git .git
-COPY pyproject.toml README.md .
-COPY src ./src
-COPY alembic.ini .
 
 # Create venv and install build tools
 RUN python -m venv /opt/venv \
-    && /opt/venv/bin/pip install --no-cache-dir --upgrade pip
+    && /opt/venv/bin/pip install --no-cache-dir ${PYPI_INDEX_URL:+--index-url $PYPI_INDEX_URL} --upgrade pip
 
-# Install app + deepdoc + chromadb into venv
-# Patch deepdoc to use CPU onnxruntime on x86_64
-RUN /opt/venv/bin/pip install --no-cache-dir . \
+# Install torch CPU version first (to avoid CUDA version from docling dependency)
+RUN /opt/venv/bin/pip install --no-cache-dir --extra-index-url https://download.pytorch.org/whl/cpu torch
+
+# Copy source code (changes frequently)
+COPY src ./src
+COPY alembic.ini .
+
+# Install app + deepdoc into venv
+RUN /opt/venv/bin/pip install --no-cache-dir ${PYPI_INDEX_URL:+--index-url $PYPI_INDEX_URL} . \
     && git clone https://github.com/xorbitsai/deepdoc-lib /opt/xagent/deepdoc-lib \
     && cd /opt/xagent/deepdoc-lib && git checkout fe75bbb676b141a1ea4257b198f6a04a89e5ac5c \
-    && /opt/venv/bin/pip install --no-cache-dir /opt/xagent/deepdoc-lib \
-    && /opt/venv/bin/pip install --no-cache-dir chromadb \
-    && rm -rf /opt/xagent/deepdoc-lib
+    && /opt/venv/bin/pip install --no-cache-dir ${PYPI_INDEX_URL:+--index-url $PYPI_INDEX_URL} /opt/xagent/deepdoc-lib \
+    && rm -rf /opt/xagent/deepdoc-lib .git
 
 ############################
 # Runtime
@@ -51,11 +67,18 @@ RUN /opt/venv/bin/pip install --no-cache-dir . \
 FROM python:${PYTHON_VERSION}-bookworm AS runtime
 
 ARG NODE_VERSION=22
+ARG APT_MIRROR=""
 ENV PLAYWRIGHT_BROWSERS_PATH=/ms-playwright
 ENV VIRTUAL_ENV=/opt/venv
 ENV PATH="/opt/venv/bin:$PATH"
 
 WORKDIR /opt/xagent
+
+# Use APT mirror if provided (for faster downloads in China)
+RUN if [ -n "$APT_MIRROR" ]; then \
+        sed -i "s|http://deb.debian.org/debian|$APT_MIRROR|g" /etc/apt/sources.list.d/debian.sources \
+        || sed -i "s|http://deb.debian.org/debian|$APT_MIRROR|g" /etc/apt/sources.list; \
+    fi
 
 # System deps + Node.js + LibreOffice
 RUN apt-get update && apt-get install -y --no-install-recommends \
@@ -77,31 +100,24 @@ RUN curl -fsSL https://deb.nodesource.com/gpgkey/nodesource-repo.gpg.key | gpg -
     && apt-get install -y --no-install-recommends nodejs \
     && rm -rf /var/lib/apt/lists/*
 
-# Copy venv + app
+# Copy entrypoint script early (changes rarely)
+COPY docker/entrypoint.sh /opt/xagent/deploy/entrypoint.sh
+
+# Copy venv + app (exclude .git directory)
 COPY --from=backend-build /opt/venv /opt/venv
-COPY --from=backend-build /opt/xagent /opt/xagent
+COPY --from=backend-build /opt/xagent/src /opt/xagent/src
+COPY --from=backend-build /opt/xagent/pyproject.toml /opt/xagent/
+COPY --from=backend-build /opt/xagent/alembic.ini /opt/xagent/
 
 # Copy frontend package files for npm tasks (e.g., PPTX generation)
 COPY frontend/package.json frontend/package-lock.json /opt/xagent/frontend/
-RUN cd /opt/xagent/frontend && npm ci
-
-# Install pptxgenjs globally for JavaScript executor tool
-RUN npm install -g pptxgenjs@4.0.1
-
-# Playwright browser + deps
-RUN python -m playwright install --with-deps chromium
-
-# Download NLTK data and tiktoken models
-RUN python -c "import nltk; nltk.download('punkt_tab')" \
-    && python -c "import tiktoken; tiktoken.encoding_for_model('gpt-4')"
-
-# Copy entrypoint script
-COPY docker/entrypoint.sh /opt/xagent/deploy/entrypoint.sh
-RUN chmod +x /opt/xagent/deploy/entrypoint.sh
-
-# Create directory for uploads and data
-RUN mkdir -p /opt/xagent/uploads \
-    && mkdir -p /home/xagent/.xagent
+RUN cd /opt/xagent/frontend && npm ci \
+    && npm install -g pptxgenjs@4.0.1 \
+    && python -m playwright install chromium \
+    && python -c "import nltk; nltk.download('punkt'); nltk.download('punkt_tab'); nltk.download('wordnet'); nltk.download('averaged_perceptron_tagger')" \
+    && python -c "import tiktoken; tiktoken.encoding_for_model('gpt-4')" \
+    && chmod +x /opt/xagent/deploy/entrypoint.sh \
+    && mkdir -p /opt/xagent/uploads /home/xagent/.xagent
 
 EXPOSE 8000
 ENTRYPOINT ["/opt/xagent/deploy/entrypoint.sh"]

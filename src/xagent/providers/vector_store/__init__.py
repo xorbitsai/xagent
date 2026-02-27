@@ -5,16 +5,29 @@ This module provides various vector storage backends that implement
 the standard VectorStore interface.
 """
 
-from xagent.providers.vector_store.base import VectorStore
-from xagent.providers.vector_store.chroma import ChromaVectorStore
-from xagent.providers.vector_store.lancedb import (
+import importlib.util
+
+from .base import VectorStore
+from .lancedb import (
     LanceDBConnectionManager,
     LanceDBVectorStore,
 )
 
-__all__ = [
-    "VectorStore",
-    "ChromaVectorStore",
-    "LanceDBVectorStore",
-    "LanceDBConnectionManager",
-]
+# ChromaVectorStore is optional (requires chromadb)
+_chroma_available = importlib.util.find_spec("chromadb") is not None
+
+if _chroma_available:
+    from .chroma import ChromaVectorStore
+
+    __all__ = [
+        "VectorStore",
+        "LanceDBVectorStore",
+        "LanceDBConnectionManager",
+        "ChromaVectorStore",
+    ]
+else:
+    __all__ = [
+        "VectorStore",
+        "LanceDBVectorStore",
+        "LanceDBConnectionManager",
+    ]

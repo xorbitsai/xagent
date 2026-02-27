@@ -3,9 +3,14 @@ from __future__ import annotations
 from typing import Any, ClassVar, Optional
 from uuid import uuid4
 
-from chromadb import Client
-from chromadb.config import Settings
-from chromadb.utils.embedding_functions import DefaultEmbeddingFunction
+try:
+    from chromadb import Client
+    from chromadb.config import Settings
+    from chromadb.utils.embedding_functions import DefaultEmbeddingFunction
+except ImportError as e:
+    raise ImportError(
+        "ChromaDB is not installed. Please install it with: pip install chromadb"
+    ) from e
 
 from .base import VectorStore
 

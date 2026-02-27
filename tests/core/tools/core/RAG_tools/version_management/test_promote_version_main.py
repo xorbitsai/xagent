@@ -90,8 +90,8 @@ class TestPromoteVersionMain:
         """Test that default LanceDB directory is used when LANCEDB_DIR environment variable is not set.
 
         Verifies that:
-        1. Function uses default data/lancedb path when LANCEDB_DIR is missing
-        2. Default path is correctly resolved relative to project root
+        1. Function uses ~/.xagent/data/lancedb as default when LANCEDB_DIR is missing
+        2. Function checks legacy path (project_root/data/lancedb) for backward compatibility
         3. Function continues execution instead of failing fast
         """
         from pathlib import Path
@@ -102,9 +102,8 @@ class TestPromoteVersionMain:
         if "LANCEDB_DIR" in os.environ:
             del os.environ["LANCEDB_DIR"]
 
-        # Calculate expected default path
-        project_root = Path(__file__).parent.parent.parent.parent.parent.parent.parent
-        expected_default_path = str(project_root / "data" / "lancedb")
+        # Expected default path is now ~/.xagent/data/lancedb
+        expected_default_path = str(Path.home() / ".xagent" / "data" / "lancedb")
 
         # Verify the default path matches what LanceDBConnectionManager returns
         assert (

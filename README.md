@@ -93,20 +93,6 @@ cd xagent
 cp example.env .env
 ```
 
-Set JWT config in `.env` before running in production:
-
-```bash
-# Generate a secure secret:
-python -c "import secrets; print(secrets.token_urlsafe(48))"
-
-# Then set in .env
-XAGENT_JWT_SECRET="<your-generated-secret>"
-XAGENT_JWT_ALGORITHM="HS256"
-XAGENT_ACCESS_TOKEN_EXPIRE_MINUTES="120"
-XAGENT_REFRESH_TOKEN_EXPIRE_DAYS="7"
-XAGENT_PASSWORD_MIN_LENGTH="6"
-```
-
 ### 2️⃣ Start with Docker
 
 ```bash

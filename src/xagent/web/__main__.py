@@ -9,13 +9,71 @@ Usage:
 
 import argparse
 import logging
+import os
 import sys
+from pathlib import Path
 
 import uvicorn
 from dotenv import load_dotenv
 
 # Load environment variables from .env file
 load_dotenv()
+
+
+JWT_ENV_KEYS = (
+    "XAGENT_JWT_SECRET",
+    "XAGENT_JWT_ALGORITHM",
+    "XAGENT_ACCESS_TOKEN_EXPIRE_MINUTES",
+    "XAGENT_REFRESH_TOKEN_EXPIRE_DAYS",
+    "XAGENT_PASSWORD_MIN_LENGTH",
+)
+
+
+def _strip_wrapping_quotes(value: str) -> str:
+    if len(value) >= 2 and value[0] == value[-1] and value[0] in {'"', "'"}:
+        return value[1:-1]
+    return value
+
+
+def _load_example_env_values() -> dict[str, str]:
+    example_env_path = Path(__file__).resolve().parents[3] / "example.env"
+    if not example_env_path.exists():
+        return {}
+
+    values: dict[str, str] = {}
+    for line in example_env_path.read_text(encoding="utf-8").splitlines():
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#") or "=" not in stripped:
+            continue
+
+        key, raw_value = stripped.split("=", 1)
+        key = key.strip()
+        if key not in JWT_ENV_KEYS:
+            continue
+
+        values[key] = _strip_wrapping_quotes(raw_value.strip())
+
+    return values
+
+
+def warn_if_example_jwt_config(logger: logging.Logger) -> None:
+    example_values = _load_example_env_values()
+    if not example_values:
+        return
+
+    matched_keys = [
+        key
+        for key, example_value in example_values.items()
+        if os.getenv(key) == example_value
+    ]
+
+    if not matched_keys:
+        return
+
+    logger.warning(
+        "⚠️ JWT-related environment variables are still using example defaults: %s. Please update your .env for production.",
+        ", ".join(matched_keys),
+    )
 
 
 def setup_logging(debug: bool = False) -> None:
@@ -99,6 +157,7 @@ def main() -> None:
     # Configure logging
     setup_logging(args.debug)
     logger = logging.getLogger(__name__)
+    warn_if_example_jwt_config(logger)
 
     logger.info("🚀 Starting xagent Web service...")
     logger.info(f"📍 Service URL: http://{args.host}:{args.port}")

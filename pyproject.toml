@@ -65,7 +65,7 @@ dependencies = [
 
 [project.optional-dependencies]
 deepdoc = [
-  "deepdoc-lib @ git+https://github.com/xorbitsai/deepdoc-lib.git@cd4d0e13a89a3d9ea0716c696357396e84e81cf7",
+  "deepdoc-lib @ git+https://github.com/xorbitsai/deepdoc-lib.git@fe75bbb676b141a1ea4257b198f6a04a89e5ac5c",
 ]
 dev = [
   "pre-commit>=4.2.0",

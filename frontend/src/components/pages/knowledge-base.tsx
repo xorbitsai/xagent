@@ -6,7 +6,6 @@ import { Input } from "@/components/ui/input"
 import { Label } from "@/components/ui/label"
 import { Badge } from "@/components/ui/badge"
 import { Card } from "@/components/ui/card"
-import { Alert, AlertDescription } from "@/components/ui/alert"
 import { Dialog, DialogContent, DialogDescription, DialogHeader, DialogTitle } from "@/components/ui/dialog"
 import { Textarea } from "@/components/ui/textarea"
 import { Progress } from "@/components/ui/progress"
@@ -74,13 +73,13 @@ interface WebIngestionResult {
 
 import { Sheet, SheetContent, SheetHeader, SheetTitle, SheetDescription } from "@/components/ui/sheet"
 import { KnowledgeBaseDetailContent } from "./knowledge-base-detail"
+import { toast } from "sonner"
 
 export function KnowledgeBasePage() {
   const { token } = useAuth()
   const { t, locale } = useI18n()
   const [collections, setCollections] = useState<Collection[]>([])
   const [loading, setLoading] = useState(true)
-  const [error, setError] = useState<string | null>(null)
   const [deletingCollection, setDeletingCollection] = useState<string | null>(null)
   const [isCreateDialogOpen, setIsCreateDialogOpen] = useState(false)
   const [searchQuery, setSearchQuery] = useState("")
@@ -163,7 +162,7 @@ export function KnowledgeBasePage() {
       const data = await response.json()
       setCollections(data.collections || [])
     } catch (err) {
-      setError(err instanceof Error ? err.message : "Unknown error")
+      toast.error(err instanceof Error ? err.message : "Unknown error")
     } finally {
       setLoading(false)
     }
@@ -202,13 +201,12 @@ export function KnowledgeBasePage() {
 
   const handleCreateCollection = async () => {
     if (!newCollectionName.trim()) {
-      setError(t("kb.errors.nameRequired"))
+      toast.error(t("kb.errors.nameRequired"))
       return
     }
 
     try {
       setIsCreateDialogOpen(false)
-      setError(null)
 
       // 这里可以扩展为真正的创建collection API
       // 目前通过上传文件来创建collection
@@ -217,7 +215,7 @@ export function KnowledgeBasePage() {
       setNewCollectionName("")
       setNewCollectionDescription("")
     } catch (err) {
-      setError(err instanceof Error ? err.message : t("kb.errors.createFailed"))
+      toast.error(err instanceof Error ? err.message : t("kb.errors.createFailed"))
     }
   }
 
@@ -252,9 +250,7 @@ export function KnowledgeBasePage() {
       })
 
       if (validFiles.length !== files.length) {
-        setError(t("kb.errors.unsupportedFileType") || "部分文件格式不支持，已跳过")
-      } else {
-        setError(null)
+        toast.error(t("kb.errors.unsupportedFileType") || "部分文件格式不支持，已跳过")
       }
 
       if (validFiles.length > 0) {
@@ -274,7 +270,7 @@ export function KnowledgeBasePage() {
 
   const handleUpload = async () => {
     if (selectedFiles.length === 0) {
-      setError(t("kb.errors.uploadFileRequired"))
+      toast.error(t("kb.errors.uploadFileRequired"))
       return
     }
 
@@ -308,6 +304,10 @@ export function KnowledgeBasePage() {
 
         if (!response.ok) {
           const errorData = await response.json()
+          if (errorData.status === 'error') {
+            setIngestionResults(prev => [...prev, errorData])
+            throw new Error(errorData.message || t("kb.errors.uploadFailedFile", { name: file.name }))
+          }
           throw new Error(errorData.detail || t("kb.errors.uploadFailedFile", { name: file.name }))
         }
 
@@ -334,7 +334,7 @@ export function KnowledgeBasePage() {
       setActiveImportTab("file")
 
     } catch (err) {
-      setError(err instanceof Error ? err.message : t("kb.errors.uploadFailed"))
+      toast.error(err instanceof Error ? err.message : t("kb.errors.uploadFailed"))
     } finally {
       setIsUploading(false)
     }
@@ -342,7 +342,7 @@ export function KnowledgeBasePage() {
 
   const handleWebIngest = async () => {
     if (!webIngestionConfig.start_url.trim()) {
-      setError(t("kb.errors.startUrlRequired"))
+      toast.error(t("kb.errors.startUrlRequired"))
       return
     }
 
@@ -398,6 +398,10 @@ export function KnowledgeBasePage() {
 
       if (!response.ok) {
         const errorData = await response.json()
+        if (errorData.status === 'error') {
+          setWebIngestionResult(errorData)
+          throw new Error(errorData.message || t("kb.errors.webIngestFailed"))
+        }
         throw new Error(errorData.detail || t("kb.errors.webIngestFailed"))
       }
 
@@ -429,7 +433,7 @@ export function KnowledgeBasePage() {
       })
 
     } catch (err) {
-      setError(err instanceof Error ? err.message : t("kb.errors.webIngestFailed"))
+      toast.error(err instanceof Error ? err.message : t("kb.errors.webIngestFailed"))
     } finally {
       setIsWebIngesting(false)
       setWebIngestionProgress(0)
@@ -464,7 +468,7 @@ export function KnowledgeBasePage() {
       await fetchCollections()
 
     } catch (err) {
-      setError(err instanceof Error ? err.message : t("kb.errors.deleteFailedGeneric"))
+      toast.error(err instanceof Error ? err.message : t("kb.errors.deleteFailedGeneric"))
     } finally {
       setDeletingCollection(null)
     }
@@ -526,20 +530,12 @@ export function KnowledgeBasePage() {
                 className="pl-10"
               />
             </div>
-            <Button onClick={() => { setError(null); setIsCreateDialogOpen(true) }} className="flex items-center gap-2">
+            <Button onClick={() => { setIsCreateDialogOpen(true) }} className="flex items-center gap-2">
               <Plus size={16} className="mr-2" />
               {t("kb.header.new")}
             </Button>
           </div>
         </div>
-
-        {/* Error */}
-        {error && (
-          <Alert variant="destructive" className="flex justify-start items-center mb-6">
-            <AlertCircle className="h-4 w-4" />
-            <AlertDescription>{error}</AlertDescription>
-          </Alert>
-        )}
 
         {/* Collections Grid */}
         {filteredCollections.length > 0 ? (
@@ -594,7 +590,7 @@ export function KnowledgeBasePage() {
               {searchQuery ? t("kb.empty.hintSearch") : t("kb.empty.hintCreate")}
             </p>
             {!searchQuery && (
-              <Button onClick={() => { setError(null); setIsCreateDialogOpen(true) }} className="flex items-center gap-2">
+              <Button onClick={() => { setIsCreateDialogOpen(true) }} className="flex items-center gap-2">
                 <Plus size={16} className="mr-2" />
                 {t("kb.header.new")}
               </Button>
@@ -611,13 +607,6 @@ export function KnowledgeBasePage() {
                 {t("kb.dialog.createDescription")}
               </DialogDescription>
             </DialogHeader>
-
-            {error && (
-              <Alert variant="destructive">
-                <AlertCircle className="h-4 w-4" />
-                <AlertDescription>{error}</AlertDescription>
-              </Alert>
-            )}
 
             <div className="flex flex-col gap-6">
               {/* 基本信息 */}
@@ -740,15 +729,24 @@ export function KnowledgeBasePage() {
                         <ScrollArea className="h-32 border rounded-md p-2">
                           <div className="space-y-2">
                             {ingestionResults.map((result, index) => (
-                              <div key={index} className="flex items-center gap-2 p-2 bg-muted rounded">
-                                {getStatusIcon(result.status)}
-                                <span className="text-sm">{result.collection}</span>
-                                <Badge variant="outline" className="text-xs">
-                                  {result.document_count} {t("kb.dialog.fileUpload.processResult.createDocuments")}
-                                </Badge>
-                                <Badge variant="outline" className="text-xs">
-                                  {result.chunks_count} {t("kb.dialog.fileUpload.processResult.textChunks")}
-                                </Badge>
+                              <div key={index} className="flex flex-col gap-1 p-2 bg-muted rounded">
+                                <div className="flex items-center gap-2">
+                                  {getStatusIcon(result.status)}
+                                  <span className="text-sm">{result.collection}</span>
+                                  {result.status === 'success' && (
+                                    <>
+                                      <Badge variant="outline" className="text-xs">
+                                        {result.document_count} {t("kb.dialog.fileUpload.processResult.createDocuments")}
+                                      </Badge>
+                                      <Badge variant="outline" className="text-xs">
+                                        {result.chunks_count} {t("kb.dialog.fileUpload.processResult.textChunks")}
+                                      </Badge>
+                                    </>
+                                  )}
+                                </div>
+                                {result.status === 'error' && result.message && (
+                                  <p className="text-xs text-red-500 ml-6 break-all">{result.message}</p>
+                                )}
                               </div>
                             ))}
                           </div>

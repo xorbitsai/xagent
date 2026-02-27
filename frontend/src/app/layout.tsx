@@ -9,6 +9,7 @@ import { LayoutContent } from "@/components/layout/layout-content";
 import { getBrandingFromEnv } from "@/lib/branding";
 import { I18nProvider } from "@/contexts/i18n-context";
 import { getThemeFromEnv, themes } from "@/lib/theme";
+import { Toaster } from "@/components/ui/sonner";
 
 const branding = getBrandingFromEnv();
 
@@ -122,6 +123,7 @@ export default async function RootLayout({
             <AuthProvider>
               <AuthGuard>
                 <LayoutContent>{children}</LayoutContent>
+                <Toaster />
               </AuthGuard>
             </AuthProvider>
           </ThemeProvider>

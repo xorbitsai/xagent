@@ -7,7 +7,6 @@ import { Button } from "@/components/ui/button"
 import { Input } from "@/components/ui/input"
 import { Label } from "@/components/ui/label"
 import { Card } from "@/components/ui/card"
-import { Alert, AlertDescription } from "@/components/ui/alert"
 import { Dialog, DialogContent, DialogDescription, DialogHeader, DialogTitle } from "@/components/ui/dialog"
 import { Tabs, TabsContent, TabsList } from "@/components/ui/tabs"
 import { ScrollArea } from "@/components/ui/scroll-area"
@@ -16,6 +15,7 @@ import { Badge } from "@/components/ui/badge"
 import { apiRequest } from "@/lib/api-wrapper"
 import { getApiUrl } from "@/lib/utils"
 import { useI18n } from "@/contexts/i18n-context"
+import { toast } from "sonner"
 
 interface CollectionInfo {
   name: string
@@ -72,7 +72,6 @@ export function KnowledgeBaseDetailContent({ collectionName }: { collectionName:
   const fileInputRef = useRef<HTMLInputElement>(null)
   const [collectionInfo, setCollectionInfo] = useState<CollectionInfo | null>(null)
   const [loading, setLoading] = useState(true)
-  const [error, setError] = useState<string | null>(null)
   const [activeTab, setActiveTab] = useState("files")
 
   // Edit dialog states
@@ -123,9 +122,7 @@ export function KnowledgeBaseDetailContent({ collectionName }: { collectionName:
       })
 
       if (validFiles.length !== files.length) {
-        setError(t("kb.errors.unsupportedFileType") || "Unsupported file type")
-      } else {
-        setError(null)
+        toast.error(t("kb.errors.unsupportedFileType") || "Unsupported file type")
       }
 
       if (validFiles.length > 0) {
@@ -246,7 +243,7 @@ export function KnowledgeBaseDetailContent({ collectionName }: { collectionName:
 
       setCollectionInfo(collection)
     } catch (err) {
-      setError(err instanceof Error ? err.message : "Unknown error")
+      toast.error(err instanceof Error ? err.message : "Unknown error")
     } finally {
       setLoading(false)
     }
@@ -284,9 +281,9 @@ export function KnowledgeBaseDetailContent({ collectionName }: { collectionName:
 
       // Handle partial success or failure
       if (result.status === "partial_success") {
-        setError(t("kb.detail.errors.partialSuccess", { message: result.message }))
+        toast.error(t("kb.detail.errors.partialSuccess", { message: result.message }))
       } else if (result.status === "failed") {
-        setError(t("kb.detail.errors.deleteFailedWithMessage", { message: result.message }))
+        toast.error(t("kb.detail.errors.deleteFailedWithMessage", { message: result.message }))
         return
       }
 
@@ -298,13 +295,13 @@ export function KnowledgeBaseDetailContent({ collectionName }: { collectionName:
       console.log("Collection info refreshed")
     } catch (error) {
       console.error("Delete error:", error)
-      setError(error instanceof Error ? error.message : t("kb.detail.errors.deleteFailed"))
+      toast.error(error instanceof Error ? error.message : t("kb.detail.errors.deleteFailed"))
     }
   }
 
   const handleUpload = async () => {
     if (selectedFiles.length === 0) {
-      setError(t("kb.detail.errors.pleaseSelectFiles"))
+      toast.error(t("kb.detail.errors.pleaseSelectFiles"))
       return
     }
 
@@ -335,6 +332,10 @@ export function KnowledgeBaseDetailContent({ collectionName }: { collectionName:
 
         if (!response.ok) {
           const errorData = await response.json()
+          if (errorData.status === 'error') {
+            setIngestionResults(prev => [...prev, errorData])
+            throw new Error(errorData.message || t("kb.errors.uploadFailedFile", { name: file.name }))
+          }
           throw new Error(errorData.detail || t("kb.detail.errors.uploadFailedWithName", { name: file.name }))
         }
 
@@ -347,9 +348,8 @@ export function KnowledgeBaseDetailContent({ collectionName }: { collectionName:
       setSelectedFiles([])
       setUploadProgress(0)
       setIsAddSourceOpen(false)
-
     } catch (err) {
-      setError(err instanceof Error ? err.message : t("kb.detail.errors.uploadFailedGeneric"))
+      toast.error(err instanceof Error ? err.message : t("kb.detail.errors.uploadFailedGeneric"))
     } finally {
       setIsUploading(false)
     }
@@ -357,7 +357,7 @@ export function KnowledgeBaseDetailContent({ collectionName }: { collectionName:
 
   const handleWebIngest = async () => {
     if (!webIngestionConfig.start_url.trim()) {
-      setError(t("kb.detail.errors.enterStartUrl"))
+      toast.error(t("kb.detail.errors.enterStartUrl"))
       return
     }
 
@@ -411,6 +411,10 @@ export function KnowledgeBaseDetailContent({ collectionName }: { collectionName:
 
       if (!response.ok) {
         const errorData = await response.json()
+        if (errorData.status === 'error') {
+          setWebIngestionResult(errorData)
+          throw new Error(errorData.message || t("kb.errors.webIngestFailed"))
+        }
         throw new Error(errorData.detail || t("kb.detail.errors.webImportFailed"))
       }
 
@@ -441,7 +445,7 @@ export function KnowledgeBaseDetailContent({ collectionName }: { collectionName:
       })
 
     } catch (err) {
-      setError(err instanceof Error ? err.message : t("kb.detail.errors.webImportFailed"))
+      toast.error(err instanceof Error ? err.message : t("kb.detail.errors.webImportFailed"))
     } finally {
       setIsWebIngesting(false)
       setWebIngestionProgress(0)
@@ -477,7 +481,7 @@ export function KnowledgeBaseDetailContent({ collectionName }: { collectionName:
       const result = await response.json()
       setSearchResults(result.results || [])
     } catch (err) {
-      setError(err instanceof Error ? err.message : t("kb.detail.errors.searchFailed"))
+      toast.error(err instanceof Error ? err.message : t("kb.detail.errors.searchFailed"))
     } finally {
       setSearching(false)
     }
@@ -495,7 +499,6 @@ export function KnowledgeBaseDetailContent({ collectionName }: { collectionName:
     }
 
     setIsUpdating(true)
-    setError(null)
     try {
       const formData = new FormData()
       formData.append("new_name", editCollectionName)
@@ -515,7 +518,7 @@ export function KnowledgeBaseDetailContent({ collectionName }: { collectionName:
       // 重命名成功后跳转到新的 URL
       window.location.href = `/kb/${encodeURIComponent(editCollectionName)}`
     } catch (err) {
-      setError(err instanceof Error ? err.message : t("kb.detail.edit.errors.updateFailed"))
+      toast.error(err instanceof Error ? err.message : t("kb.detail.edit.errors.updateFailed"))
     } finally {
       setIsUpdating(false)
     }
@@ -545,14 +548,6 @@ export function KnowledgeBaseDetailContent({ collectionName }: { collectionName:
 
   return (
     <div className="h-full flex flex-col space-y-6">
-        {/* Error */}
-        {error && (
-          <Alert className="mb-6">
-            <AlertCircle className="h-4 w-4" />
-            <AlertDescription>{error}</AlertDescription>
-          </Alert>
-        )}
-
         {/* Main Content */}
         <Tabs value={activeTab} onValueChange={setActiveTab} className="lex-1 w-full">
           <TabsList className="flex w-full justify-start rounded-none border-b bg-transparent px-6 mb-6">

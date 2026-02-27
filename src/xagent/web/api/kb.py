@@ -6,6 +6,7 @@ from pathlib import Path
 from typing import Any, Dict, Optional
 
 from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile
+from fastapi.responses import JSONResponse
 
 from ...core.tools.core.RAG_tools.core.schemas import (
     ChunkStrategy,
@@ -195,6 +196,9 @@ async def ingest(
         with concurrent.futures.ThreadPoolExecutor() as executor:
             future = executor.submit(_run_ingestion)
             result: IngestionResult = future.result()
+
+        if result.status == "error":
+            return JSONResponse(status_code=500, content=result.model_dump())
 
         return result
 
@@ -595,6 +599,9 @@ async def ingest_web(
                 )
             ),
         )
+
+        if result.status == "error":
+            return JSONResponse(status_code=500, content=result.model_dump())
 
         return result
 

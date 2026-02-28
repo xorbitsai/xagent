@@ -49,6 +49,19 @@ def get_default_tool_configs() -> list[Dict[str, Any]]:
             "dependencies": ["google_api_key", "google_cse_id"],
         },
         {
+            "tool_name": "tavily_web_search",
+            "tool_type": "builtin",
+            "category": "search",
+            "display_name": "Tavily 网络搜索",
+            "description": "使用 Tavily Search API 进行网络搜索，无需 Google 账号",
+            "enabled": True,
+            "config": {
+                "provider": "tavily",
+                "api_key_env": "TAVILY_API_KEY",
+            },
+            "dependencies": ["tavily_api_key"],
+        },
+        {
             "tool_name": "zhipu_web_search",
             "tool_type": "builtin",
             "category": "search",

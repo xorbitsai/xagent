@@ -21,6 +21,7 @@ from .image_tool import create_image_tool
 
 # Import MCP function for test compatibility
 from .mcp_adapter import load_mcp_tools_as_agent_tools
+from .tavily_web_search import TavilyWebSearchTool
 from .vision_tool import get_vision_tool
 from .web_search import WebSearchTool
 from .zhipu_web_search import ZhipuWebSearchTool
@@ -172,13 +173,16 @@ class ToolFactory:
         """Create basic tools that are always available."""
         tools: List[Tool] = []
 
-        # Web search tool preference: Zhipu -> Google -> none
+        # Web search tool preference: Zhipu -> Tavily -> Google -> none
         zhipu_api_key = os.getenv("ZHIPU_API_KEY") or os.getenv("BIGMODEL_API_KEY")
+        tavily_api_key = os.getenv("TAVILY_API_KEY")
         google_api_key = os.getenv("GOOGLE_API_KEY")
         google_cse_id = os.getenv("GOOGLE_CSE_ID")
 
         if zhipu_api_key:
             tools.append(ZhipuWebSearchTool())
+        elif tavily_api_key:
+            tools.append(TavilyWebSearchTool())
         elif google_api_key and google_cse_id:
             tools.append(WebSearchTool())
 

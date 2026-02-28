@@ -77,7 +77,7 @@ class LanceDBConnectionManager:
         legacy_dir = (
             Path(__file__).parent.parent.parent.parent.parent / "data" / "lancedb"
         )
-        if legacy_dir.exists() and list(legacy_dir.iterdir()):
+        if legacy_dir.is_dir() and list(legacy_dir.iterdir()):
             logger.info(f"Using legacy LanceDB location: {legacy_dir}")
             return str(legacy_dir)
 

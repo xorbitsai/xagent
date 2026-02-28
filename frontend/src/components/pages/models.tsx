@@ -6,7 +6,6 @@ import { Input } from "@/components/ui/input"
 import { Label } from "@/components/ui/label"
 import { Badge } from "@/components/ui/badge"
 import { Card } from "@/components/ui/card"
-import { Alert, AlertDescription } from "@/components/ui/alert"
 import { Dialog, DialogContent, DialogDescription, DialogHeader, DialogTitle } from "@/components/ui/dialog"
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs"
 import { Select } from "@/components/ui/select"
@@ -36,10 +35,12 @@ import {
   Settings,
   CheckCircle2,
   Loader2,
-  Search
+  Search,
+  RefreshCw
 } from "lucide-react"
 import { useI18n } from "@/contexts/i18n-context"
 import { ScrollArea } from "@/components/ui/scroll-area"
+import { toast } from "sonner"
 
 function doubleEncodeModelId(modelId: string): string {
   return encodeURIComponent(encodeURIComponent(modelId))
@@ -135,7 +136,6 @@ export function ModelsPage() {
   const { t, locale } = useI18n()
   const [models, setModels] = useState<Model[]>([])
   const [loading, setLoading] = useState(true)
-  const [error, setError] = useState<string | null>(null)
   const [isDialogOpen, setIsDialogOpen] = useState(false)
   const [editingModel, setEditingModel] = useState<Model | null>(null)
   const [activeTab, setActiveTab] = useState("llm")
@@ -150,7 +150,6 @@ export function ModelsPage() {
   const [fetchedModels, setFetchedModels] = useState<ProviderModel[]>([])
   const [selectedFetchedModels, setSelectedFetchedModels] = useState<string[]>([])
   const [isFetchingModels, setIsFetchingModels] = useState(false)
-  const [fetchModelsError, setFetchModelsError] = useState<string | null>(null)
 
   // Default models state
   const [defaultModels, setDefaultModels] = useState<{
@@ -258,11 +257,11 @@ export function ModelsPage() {
         headers: {}
       })
 
-      if (!response.ok) throw new Error("Failed to fetch models")
+      if (!response.ok) throw new Error(t('models.errors.fetchFailed'))
       const data = await response.json()
       setModels(data)
     } catch (err) {
-      setError(err instanceof Error ? err.message : "Unknown error")
+      toast.error(err instanceof Error ? err.message : t('models.errors.fetchFailed'))
     } finally {
       setLoading(false)
     }
@@ -337,7 +336,7 @@ export function ModelsPage() {
 
         if (!response.ok) {
           const errorData = await response.json()
-          throw new Error(errorData.detail || `Failed to save model ${payload.model_name}`)
+          throw new Error(errorData.detail || t('models.errors.saveFailed'))
         }
 
         // Handle default configurations
@@ -382,7 +381,7 @@ export function ModelsPage() {
         closeDialog()
       }
     } catch (err) {
-      setError(err instanceof Error ? err.message : "Unknown error")
+      toast.error(err instanceof Error ? err.message : t('models.errors.saveFailed'))
     } finally {
       setLoading(false)
     }
@@ -427,7 +426,7 @@ export function ModelsPage() {
         method: "DELETE",
         headers: {}
       })
-      if (!response.ok) throw new Error("Failed to delete model")
+      if (!response.ok) throw new Error(t('models.errors.deleteFailed'))
 
       await fetchModels()
 
@@ -436,7 +435,7 @@ export function ModelsPage() {
         setManagingProviderModels(prev => prev.filter(m => m.model_id !== modelId))
       }
     } catch (err) {
-      setError(err instanceof Error ? err.message : "Unknown error")
+      toast.error(err instanceof Error ? err.message : t('models.errors.deleteFailed'))
     }
   }
 
@@ -498,7 +497,6 @@ export function ModelsPage() {
         // Reset if missing required fields
         setFetchedModels([])
         setSelectedFetchedModels([])
-        setFetchModelsError(null)
       }
     }, 500) // 500ms debounce
 
@@ -520,14 +518,14 @@ export function ModelsPage() {
 
     try {
       setIsFetchingModels(true)
-      setFetchModelsError(null)
       const models = await getProviderModels(formData.model_provider, {
         api_key: formData.api_key,
         base_url: formData.base_url
       })
       setFetchedModels(models)
     } catch (err) {
-      setFetchModelsError(err instanceof Error ? err.message : "Failed to fetch models")
+      const errorMessage = err instanceof Error ? err.message : t('models.errors.fetchFailed')
+      toast.error(errorMessage)
       setFetchedModels([])
     } finally {
       setIsFetchingModels(false)
@@ -559,7 +557,7 @@ export function ModelsPage() {
       await fetchModels()
       closeDialog()
     } catch (err) {
-      setError(err instanceof Error ? err.message : "Failed to save models")
+      toast.error(err instanceof Error ? err.message : t('models.errors.saveFailed'))
     } finally {
       setLoading(false)
     }
@@ -582,7 +580,6 @@ export function ModelsPage() {
     // Reset fetch state
     setFetchedModels([])
     setSelectedFetchedModels([])
-    setFetchModelsError(null)
     setIsFetchingModels(false)
 
     // Open in connect mode
@@ -637,13 +634,6 @@ export function ModelsPage() {
             {t('models.header.add')}
           </Button>
         </div>
-
-        {/* Error */}
-        {error && (
-          <div className="bg-destructive text-destructive-foreground p-4 rounded-lg mb-6">
-            {error}
-          </div>
-        )}
 
         {/* Tabs */}
         <Tabs value={activeTab} onValueChange={setActiveTab} className="w-full">
@@ -749,12 +739,7 @@ export function ModelsPage() {
                           </div>
                         </div>
 
-                        <div className="flex items-center justify-between mt-4">
-                          <div className="flex items-center gap-2 text-sm text-green-600">
-                            <div className="w-2 h-2 rounded-full bg-green-500" />
-                            {t('models.card.status.connected')}
-                          </div>
-
+                        <div className="flex items-center justify-end mt-4">
                           <Button variant="ghost" size="sm" onClick={() => handleManageProvider(providerModels, providerId)}>
                             <Settings className="w-4 h-4 mr-2" />
                             {t('models.card.actions.edit')}
@@ -858,7 +843,7 @@ export function ModelsPage() {
 
             <div className="flex justify-end gap-2 mt-6">
               <Button variant="outline" onClick={closeDialog}>
-                {t('models.defaultDialog.close')}
+                {t('models.dialog.cancel')}
               </Button>
             </div>
           </DialogContent>
@@ -898,14 +883,20 @@ export function ModelsPage() {
                  </div>
                </div>
 
-               {fetchModelsError && (
-                 <Alert variant="destructive">
-                   <AlertDescription>{fetchModelsError}</AlertDescription>
-                 </Alert>
-               )}
-
                <div className="mt-4">
-                 <Label className="mb-2 block">{t('models.dialog.availableModels')}</Label>
+                 <div className="flex items-center justify-between mb-2">
+                   <Label>{t('models.dialog.availableModels')}</Label>
+                   <Button
+                     variant="ghost"
+                     size="icon"
+                     className="h-6 w-6"
+                     onClick={handleFetchModels}
+                     disabled={isFetchingModels || (!formData.api_key && !formData.base_url)}
+                     title={t('models.dialog.refreshModels')}
+                   >
+                     <RefreshCw className={`h-3 w-3 ${isFetchingModels ? 'animate-spin' : ''}`} />
+                   </Button>
+                 </div>
                  {isFetchingModels ? (
                    <div className="flex items-center justify-center p-8 border rounded-md text-muted-foreground">
                      <Loader2 className="w-6 h-6 animate-spin mr-2" />
@@ -983,12 +974,6 @@ export function ModelsPage() {
             </DialogHeader>
 
             <div className="flex flex-col gap-4 mt-4">
-              {error && (
-                <Alert>
-                  <AlertDescription>{error}</AlertDescription>
-                </Alert>
-              )}
-
               {/* Category and Provider - Always visible */}
               <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
                 <div>
@@ -1061,9 +1046,20 @@ export function ModelsPage() {
               <div>
                 <div className="flex justify-between items-center mb-2">
                   <Label htmlFor="model_name">{t('models.form.name')}</Label>
-                  {isFetchingModels && <span className="text-xs text-muted-foreground animate-pulse">Fetching models...</span>}
-                  {!isFetchingModels && fetchModelsError && !editingModel && (
-                     <span className="text-xs text-destructive">{t('models.error.fetchFailed') || "Fetch failed"}</span>
+                  {!editingModel && (
+                    <div className="flex items-center gap-2">
+                      <Button
+                        variant="ghost"
+                        size="icon"
+                        className="h-6 w-6"
+                        onClick={handleFetchModels}
+                        disabled={isFetchingModels || (!formData.api_key && !formData.base_url)}
+                        title={t('models.dialog.refreshModels')}
+                        type="button"
+                      >
+                        <RefreshCw className={`h-3 w-3 ${isFetchingModels ? 'animate-spin' : ''}`} />
+                      </Button>
+                    </div>
                   )}
                 </div>
 
@@ -1072,7 +1068,7 @@ export function ModelsPage() {
                     id="model_name"
                     value={formData.model_name}
                     onChange={(e) => setFormData({ ...formData, model_name: e.target.value })}
-                    placeholder="Enter model name"
+                    placeholder={t('models.form.enterModelName')}
                   />
                 ) : (
                   <MultiSelect
@@ -1080,7 +1076,7 @@ export function ModelsPage() {
                     values={formData.model_names || (formData.model_name ? [formData.model_name] : [])}
                     onValuesChange={(values) => setFormData({ ...formData, model_names: values })}
                     options={fetchedModels.map(m => ({ value: m.id, label: m.id }))}
-                    placeholder={fetchedModels.length > 0 ? (t('models.form.selectModel') || "Select models...") : "Enter model names..."}
+                    placeholder={t('models.form.selectModel')}
                   />
                 )}
               </div>
@@ -1176,7 +1172,7 @@ export function ModelsPage() {
 
             <div className="flex justify-end gap-2 mt-6">
               <Button variant="outline" onClick={closeDialog}>
-                {t('models.defaultDialog.close')}
+                {t('models.dialog.cancel')}
               </Button>
               <Button onClick={handleSubmit}>
                 {editingModel ? t('models.form.update') : t('models.form.create')}

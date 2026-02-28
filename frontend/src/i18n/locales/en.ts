@@ -1107,6 +1107,9 @@ Build when you need.`
     errors: {
       setDefaultFailed: "Failed to set default model",
       removeDefaultFailed: "Failed to remove default model",
+      fetchFailed: "Failed to fetch models",
+      saveFailed: "Failed to save model",
+      deleteFailed: "Failed to delete model",
     },
     defaults: {
       general: "Default Model",
@@ -1166,6 +1169,7 @@ Build when you need.`
       manageDescription: "Manage your configured models for this provider.",
       noModelsConfigured: "No models configured.",
       availableModels: "Available Models",
+      refreshModels: "Refresh Models",
     },
     form: {
       modelId: "Model ID",
@@ -1181,12 +1185,14 @@ Build when you need.`
       baseUrlPlaceholder: "https://api.openai.com/v1",
       abilities: "Abilities",
       description: "Description",
+      selectModel: "Select Model Name",
       setDefault: "Set as default model",
       defaultPlaceholder: "Select default type...",
       shareWithUsers: "Share this model with all users",
       abilitiesPlaceholder: "Select abilities...",
       update: "Update Model",
       create: "Create Model",
+      enterModelName: "Enter model name",
     },
     abilities: {
       chat: "Chat",
@@ -1196,21 +1202,6 @@ Build when you need.`
       embedding: "Embedding",
       generate: "Generate",
       edit: "Edit",
-    },
-    defaultDialog: {
-      title: "Set Default Model",
-      description: "Set the default model type for {modelId}",
-      selectType: "Select model type",
-      current: "Current",
-      removeTitle: "Remove default",
-      cancel: {
-        general: "Cancel Default",
-        fast: "Cancel Fast",
-        visual: "Cancel Visual",
-        compact: "Cancel Long Context",
-        embedding: "Cancel Embedding",
-      },
-      close: "Close",
     },
     providers: {
       openai: {

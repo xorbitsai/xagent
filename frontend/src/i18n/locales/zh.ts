@@ -1107,6 +1107,9 @@ Build when you need.`
     errors: {
       setDefaultFailed: "设置默认模型失败",
       removeDefaultFailed: "移除默认模型失败",
+      fetchFailed: "获取模型失败",
+      saveFailed: "保存模型失败",
+      deleteFailed: "删除模型失败",
     },
     defaults: {
       general: "默认模型",
@@ -1166,6 +1169,7 @@ Build when you need.`
       manageDescription: "管理此提供商的已配置模型。",
       noModelsConfigured: "暂无配置的模型。",
       availableModels: "可用模型",
+      refreshModels: "刷新模型",
     },
     form: {
       modelId: "模型 ID",
@@ -1181,12 +1185,14 @@ Build when you need.`
       baseUrlPlaceholder: "https://api.openai.com/v1",
       abilities: "能力选择",
       description: "描述",
+      selectModel: "选择模型名称",
       setDefault: "设为默认模型",
       defaultPlaceholder: "选择默认类型...",
       shareWithUsers: "与所有用户共享此模型",
       abilitiesPlaceholder: "选择能力...",
       update: "更新模型",
       create: "创建模型",
+      enterModelName: "请输入模型名称",
     },
     abilities: {
       chat: "对话",
@@ -1196,21 +1202,6 @@ Build when you need.`
       embedding: "嵌入",
       generate: "生成",
       edit: "编辑",
-    },
-    defaultDialog: {
-      title: "设置默认模型",
-      description: "为 {modelId} 设置默认模型类型",
-      selectType: "选择模型类型",
-      current: "当前",
-      removeTitle: "移除默认",
-      cancel: {
-        general: "取消默认",
-        fast: "取消快速",
-        visual: "取消视觉",
-        compact: "取消长上下文",
-        embedding: "取消嵌入",
-      },
-      close: "关闭",
     },
     providers: {
       openai: {

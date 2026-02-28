@@ -1170,6 +1170,12 @@ Build when you need.`
       noModelsConfigured: "No models configured.",
       availableModels: "Available Models",
       refreshModels: "Refresh Models",
+      setDefaultConfirm: {
+        title: "Set as Default Model",
+        description: "No default {type} model detected. Would you like to set {model} as default?",
+        confirm: "Yes, set as default",
+        cancel: "No, create only",
+      },
     },
     form: {
       modelId: "Model ID",

@@ -7,6 +7,16 @@ import { Label } from "@/components/ui/label"
 import { Badge } from "@/components/ui/badge"
 import { Card } from "@/components/ui/card"
 import { Dialog, DialogContent, DialogDescription, DialogHeader, DialogTitle } from "@/components/ui/dialog"
+import {
+  AlertDialog,
+  AlertDialogAction,
+  AlertDialogCancel,
+  AlertDialogContent,
+  AlertDialogDescription,
+  AlertDialogFooter,
+  AlertDialogHeader,
+  AlertDialogTitle,
+} from "@/components/ui/alert-dialog"
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs"
 import { Select } from "@/components/ui/select"
 import { MultiSelect } from "@/components/ui/multi-select"
@@ -36,7 +46,8 @@ import {
   CheckCircle2,
   Loader2,
   Search,
-  RefreshCw
+  RefreshCw,
+  X
 } from "lucide-react"
 import { useI18n } from "@/contexts/i18n-context"
 import { ScrollArea } from "@/components/ui/scroll-area"
@@ -150,6 +161,10 @@ export function ModelsPage() {
   const [fetchedModels, setFetchedModels] = useState<ProviderModel[]>([])
   const [selectedFetchedModels, setSelectedFetchedModels] = useState<string[]>([])
   const [isFetchingModels, setIsFetchingModels] = useState(false)
+  const [showDefaultConfirm, setShowDefaultConfirm] = useState(false)
+  const [pendingDefaultType, setPendingDefaultType] = useState<string | null>(null)
+  const [pendingModels, setPendingModels] = useState<string[]>([])
+  const [selectedDefaultModel, setSelectedDefaultModel] = useState<string>("")
 
   // Default models state
   const [defaultModels, setDefaultModels] = useState<{
@@ -294,30 +309,42 @@ export function ModelsPage() {
   }, [filteredModels])
 
   // Handlers from models-1.tsx
-  const handleSubmit = async () => {
+  const submitModelData = async (data: ModelCreate, defaultTypeToSet?: string, defaultModelId?: string) => {
     try {
       const payloads: ModelCreate[] = []
 
-      if (!editingModel && formData.model_names && formData.model_names.length > 0) {
+      if (!editingModel && data.model_names && data.model_names.length > 0) {
         // Batch create mode
-        formData.model_names.forEach(name => {
-           const payload = { ...formData, model_name: name }
+        data.model_names.forEach(name => {
+           const payload = { ...data, model_name: name }
            // Remove array field from payload to match backend expectation
            const { model_names, ...rest } = payload as any
            if (!rest.model_id) {
              rest.model_id = `${name}-${rest.model_provider}`
            }
+
+           // Handle default type for specific model in batch
+           if (defaultTypeToSet && defaultModelId && name === defaultModelId) {
+             rest.default_config_types = [...(rest.default_config_types || []), defaultTypeToSet]
+           }
+
            payloads.push(rest)
         })
       } else {
         // Single create/edit mode
-        const payload = { ...formData }
+        const payload = { ...data }
         // Remove array field
         const { model_names, ...rest } = payload as any
 
         if (!editingModel && !rest.model_id && rest.model_name && rest.model_provider) {
            rest.model_id = `${rest.model_name}-${rest.model_provider}`
         }
+
+        // Handle default type for single model
+        if (defaultTypeToSet) {
+           rest.default_config_types = [...(rest.default_config_types || []), defaultTypeToSet]
+        }
+
         payloads.push(rest)
       }
 
@@ -344,7 +371,7 @@ export function ModelsPage() {
         const modelId = modelResponse.id
 
         const currentDefaults = editingModel ? getModelDefaultTypes(editingModel.id) : []
-        const newDefaults = formData.default_config_types || []
+        const newDefaults = payload.default_config_types || []
 
         for (const configType of currentDefaults) {
           if (!newDefaults.includes(configType)) {
@@ -385,6 +412,78 @@ export function ModelsPage() {
     } finally {
       setLoading(false)
     }
+  }
+
+  const handleSubmit = async () => {
+    // Check for default model
+    if (!editingModel) {
+      // Only check for general (LLM) default model
+      const targetType = formData.category === 'llm' ? 'general' : null
+
+      // Check if default exists
+      const hasDefault = targetType && (defaultModels as any)[targetType]
+
+      // Check if user already selected this type in the form
+      const userAlreadySelected = targetType && formData.default_config_types?.includes(targetType)
+
+      if (targetType && !hasDefault && !userAlreadySelected) {
+        setPendingDefaultType(targetType)
+        setPendingModels(formData.model_names && formData.model_names.length > 0 ? formData.model_names : [formData.model_name])
+        setSelectedDefaultModel(formData.model_names && formData.model_names.length > 0 ? formData.model_names[0] : formData.model_name)
+        setShowDefaultConfirm(true)
+        return
+      }
+    }
+
+    await submitModelData(formData)
+  }
+
+  const handleConfirmDefault = async () => {
+    setShowDefaultConfirm(false)
+    if (viewMode === 'connect') {
+      const selected = fetchedModels.filter(m => selectedFetchedModels.includes(m.id))
+      // If user selected a specific model to be default
+      await submitSelectedModels(selected, pendingDefaultType || undefined, selectedDefaultModel)
+    } else {
+      if (pendingDefaultType) {
+        // Handle batch create with selected default
+        if (formData.model_names && formData.model_names.length > 0) {
+           await submitModelData(formData, pendingDefaultType || undefined, selectedDefaultModel)
+        } else {
+           // Single create
+           const newData = {
+             ...formData,
+             default_config_types: [...(formData.default_config_types || []), pendingDefaultType]
+           }
+           await submitModelData(newData)
+        }
+      } else {
+        await submitModelData(formData)
+      }
+    }
+    setPendingDefaultType(null)
+    setPendingModels([])
+    setSelectedDefaultModel("")
+  }
+
+  const handleCancelDefault = async () => {
+    setShowDefaultConfirm(false)
+    if (viewMode === 'connect') {
+      const selected = fetchedModels.filter(m => selectedFetchedModels.includes(m.id))
+      await submitSelectedModels(selected)
+    } else {
+      await submitModelData(formData)
+    }
+    setPendingDefaultType(null)
+    setPendingModels([])
+    setSelectedDefaultModel("")
+  }
+
+  const handleCloseDefaultConfirm = () => {
+    setShowDefaultConfirm(false)
+    setPendingDefaultType(null)
+    setPendingModels([])
+    setSelectedDefaultModel("")
   }
 
   const handleManageProvider = (models: Model[], providerId: string) => {
@@ -429,6 +528,7 @@ export function ModelsPage() {
       if (!response.ok) throw new Error(t('models.errors.deleteFailed'))
 
       await fetchModels()
+      await loadDefaultModels()
 
       // If in list view, update the local list
       if (viewMode === 'list') {
@@ -534,27 +634,68 @@ export function ModelsPage() {
 
   const handleSaveSelectedModels = async () => {
     try {
-      setLoading(true)
       const selected = fetchedModels.filter(m => selectedFetchedModels.includes(m.id))
 
-      for (const model of selected) {
+      // Check for default model for the first selected model
+      // Only check if we are creating LLM models
+      if (formData.category === 'llm') {
+        const targetType = 'general'
+        const hasDefault = (defaultModels as any)[targetType]
+
+        if (!hasDefault && selected.length > 0) {
+          setPendingDefaultType(targetType)
+          setPendingModels(selected.map(m => m.id))
+          setSelectedDefaultModel(selected[0].id)
+          setShowDefaultConfirm(true)
+          return
+        }
+      }
+
+      await submitSelectedModels(selected)
+    } catch (err) {
+      toast.error(err instanceof Error ? err.message : t('models.errors.saveFailed'))
+    }
+  }
+
+  const submitSelectedModels = async (selectedModels: ProviderModel[], defaultTypeToSet?: string, defaultModelId?: string) => {
+    try {
+      setLoading(true)
+
+      for (let i = 0; i < selectedModels.length; i++) {
+         const model = selectedModels[i]
+
          const payload: ModelCreate = {
             ...formData,
             model_id: `${model.id}-${formData.model_provider}`,
             model_name: model.id,
-            // Ensure capabilities are set?
-            // For now use defaults from formData which are set in handleConnectProvider
+            default_config_types: (defaultTypeToSet && defaultModelId && model.id === defaultModelId) ? [defaultTypeToSet] : []
          }
 
          const url = `${getApiUrl()}/api/models/`
-         await apiRequest(url, {
+         const response = await apiRequest(url, {
             method: "POST",
             headers: { "Content-Type": "application/json" },
             body: JSON.stringify(payload)
          })
+
+         if (response.ok && defaultTypeToSet && defaultModelId && model.id === defaultModelId) {
+             const modelResponse = await response.json()
+             // Set default
+             await apiRequest(`${getApiUrl()}/api/models/user-default`, {
+              method: 'POST',
+              headers: {
+                'Content-Type': 'application/json'
+              },
+              body: JSON.stringify({
+                config_type: defaultTypeToSet,
+                model_id: modelResponse.id
+              })
+            })
+         }
       }
 
       await fetchModels()
+      await loadDefaultModels()
       closeDialog()
     } catch (err) {
       toast.error(err instanceof Error ? err.message : t('models.errors.saveFailed'))
@@ -904,7 +1045,7 @@ export function ModelsPage() {
                    </div>
                  ) : fetchedModels.length > 0 ? (
                    <>
-                     <ScrollArea className="h-max-[300px] border p-4">
+                     <ScrollArea className="max-h-[200px] overflow-y-scroll border p-4">
                        <div className="space-y-2">
                          {fetchedModels.map(model => (
                            <div key={model.id} className="flex items-center space-x-2">
@@ -1181,6 +1322,45 @@ export function ModelsPage() {
           </DialogContent>
         )}
       </Dialog>
+
+      <AlertDialog open={showDefaultConfirm} onOpenChange={setShowDefaultConfirm}>
+        <AlertDialogContent>
+          <Button
+            variant="ghost"
+            className="absolute right-4 top-4 h-6 w-6 p-0 rounded-sm opacity-70 ring-offset-background transition-opacity hover:opacity-100 focus:outline-none focus:ring-2 focus:ring-ring focus:ring-offset-2 disabled:pointer-events-none data-[state=open]:bg-accent data-[state=open]:text-muted-foreground"
+            onClick={handleCloseDefaultConfirm}
+          >
+            <X className="h-4 w-4" />
+          </Button>
+          <AlertDialogHeader>
+            <AlertDialogTitle>{t('models.dialog.setDefaultConfirm.title')}</AlertDialogTitle>
+            <AlertDialogDescription>
+              {pendingModels.length > 1 && (
+                <div className="pb-2">
+                  <Select
+                    value={selectedDefaultModel}
+                    onValueChange={setSelectedDefaultModel}
+                    options={pendingModels.map(m => ({ value: m, label: m }))}
+                  />
+                </div>
+              )}
+              {t('models.dialog.setDefaultConfirm.description', {
+                type: pendingDefaultType ? t(`models.defaults.${pendingDefaultType}`) : '',
+                model: selectedDefaultModel || formData.model_name
+              })}
+            </AlertDialogDescription>
+          </AlertDialogHeader>
+
+          <AlertDialogFooter>
+            <AlertDialogCancel onClick={handleCancelDefault}>
+              {t('models.dialog.setDefaultConfirm.cancel')}
+            </AlertDialogCancel>
+            <AlertDialogAction onClick={handleConfirmDefault}>
+              {t('models.dialog.setDefaultConfirm.confirm')}
+            </AlertDialogAction>
+          </AlertDialogFooter>
+        </AlertDialogContent>
+      </AlertDialog>
       </div>
     </div>
   )

@@ -1170,6 +1170,12 @@ Build when you need.`
       noModelsConfigured: "暂无配置的模型。",
       availableModels: "可用模型",
       refreshModels: "刷新模型",
+      setDefaultConfirm: {
+        title: "设为默认模型",
+        description: "检测到当前未设置{type}，是否将 {model} 设为默认模型？",
+        confirm: "是的，设为默认",
+        cancel: "不，仅创建",
+      },
     },
     form: {
       modelId: "模型 ID",

@@ -1110,6 +1110,7 @@ Build when you need.`
       fetchFailed: "Failed to fetch models",
       saveFailed: "Failed to save model",
       deleteFailed: "Failed to delete model",
+      createFailed: "Failed to create model",
     },
     defaults: {
       general: "Default Model",

@@ -1110,6 +1110,7 @@ Build when you need.`
       fetchFailed: "获取模型失败",
       saveFailed: "保存模型失败",
       deleteFailed: "删除模型失败",
+      createFailed: "创建模型失败",
     },
     defaults: {
       general: "默认模型",

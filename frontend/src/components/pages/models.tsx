@@ -272,7 +272,10 @@ export function ModelsPage() {
         headers: {}
       })
 
-      if (!response.ok) throw new Error(t('models.errors.fetchFailed'))
+      if (!response.ok) {
+        const errorData = await response.json()
+        throw new Error(errorData.detail || t('models.errors.fetchFailed'))
+      }
       const data = await response.json()
       setModels(data)
     } catch (err) {
@@ -316,19 +319,19 @@ export function ModelsPage() {
       if (!editingModel && data.model_names && data.model_names.length > 0) {
         // Batch create mode
         data.model_names.forEach(name => {
-           const payload = { ...data, model_name: name }
-           // Remove array field from payload to match backend expectation
-           const { model_names, ...rest } = payload as any
-           if (!rest.model_id) {
-             rest.model_id = `${name}-${rest.model_provider}`
-           }
+          const payload = { ...data, model_name: name }
+          // Remove array field from payload to match backend expectation
+          const { model_names, ...rest } = payload as any
+          if (!rest.model_id) {
+            rest.model_id = `${name}-${rest.model_provider}-${user?.id}`
+          }
 
-           // Handle default type for specific model in batch
-           if (defaultTypeToSet && defaultModelId && name === defaultModelId) {
-             rest.default_config_types = [...(rest.default_config_types || []), defaultTypeToSet]
-           }
+          // Handle default type for specific model in batch
+          if (defaultTypeToSet && defaultModelId && name === defaultModelId) {
+            rest.default_config_types = [...(rest.default_config_types || []), defaultTypeToSet]
+          }
 
-           payloads.push(rest)
+          payloads.push(rest)
         })
       } else {
         // Single create/edit mode
@@ -337,12 +340,12 @@ export function ModelsPage() {
         const { model_names, ...rest } = payload as any
 
         if (!editingModel && !rest.model_id && rest.model_name && rest.model_provider) {
-           rest.model_id = `${rest.model_name}-${rest.model_provider}`
+          rest.model_id = `${rest.model_name}-${rest.model_provider}-${user?.id}`
         }
 
         // Handle default type for single model
         if (defaultTypeToSet) {
-           rest.default_config_types = [...(rest.default_config_types || []), defaultTypeToSet]
+          rest.default_config_types = [...(rest.default_config_types || []), defaultTypeToSet]
         }
 
         payloads.push(rest)
@@ -525,7 +528,10 @@ export function ModelsPage() {
         method: "DELETE",
         headers: {}
       })
-      if (!response.ok) throw new Error(t('models.errors.deleteFailed'))
+      if (!response.ok) {
+        const errorData = await response.json()
+        throw new Error(errorData.detail || t('models.errors.deleteFailed'))
+      }
 
       await fetchModels()
       await loadDefaultModels()
@@ -666,7 +672,7 @@ export function ModelsPage() {
 
          const payload: ModelCreate = {
             ...formData,
-            model_id: `${model.id}-${formData.model_provider}`,
+            model_id: `${model.id}-${formData.model_provider}-${user?.id}`,
             model_name: model.id,
             default_config_types: (defaultTypeToSet && defaultModelId && model.id === defaultModelId) ? [defaultTypeToSet] : []
          }
@@ -678,7 +684,10 @@ export function ModelsPage() {
             body: JSON.stringify(payload)
          })
 
-         if (response.ok && defaultTypeToSet && defaultModelId && model.id === defaultModelId) {
+         if (!response.ok) {
+          const errorData = await response.json()
+          throw new Error(errorData.detail || t('models.errors.createFailed'))
+        } else if (defaultTypeToSet && defaultModelId && model.id === defaultModelId) {
              const modelResponse = await response.json()
              // Set default
              await apiRequest(`${getApiUrl()}/api/models/user-default`, {
@@ -935,7 +944,7 @@ export function ModelsPage() {
         else setIsDialogOpen(true)
       }}>
         {viewMode === 'list' ? (
-          <DialogContent className="max-w-2xl max-h-[80vh] overflow-y-auto">
+          <DialogContent showCloseButton={false} className="max-w-2xl max-h-[80vh] overflow-y-auto">
             <DialogHeader>
               <div className="flex justify-between items-center pr-8">
                 <DialogTitle>
@@ -958,14 +967,33 @@ export function ModelsPage() {
                 </div>
               ) : (
                 <div className="border rounded-md divide-y">
-                  {managingProviderModels.map(model => (
+                  {managingProviderModels.map(model => {
+                    const defaultTypes = getModelDefaultTypes(model.id)
+                    return (
                     <div key={model.model_id} className="flex items-center justify-between p-4">
                       <div>
-                        <div className="font-medium flex items-center gap-2">
+                        <div className="font-medium flex items-center gap-2 flex-wrap">
                           {model.model_name}
-                          <Badge variant="outline" className="text-xs font-normal">
-                            {model.model_id}
-                          </Badge>
+                          {!model.is_owner && (
+                            <Badge variant="secondary" className="text-xs px-2 py-0.5 h-auto whitespace-normal text-orange-500">
+                              {t('models.defaults.shared_from_others')}
+                            </Badge>
+                          )}
+                          {defaultTypes.map(type => {
+                            let labelKey = `models.defaults.${type}`
+                            if (type === 'small_fast') labelKey = 'models.defaults.fast'
+
+                            return (
+                              <Badge key={type} variant="secondary" className="text-xs px-2 py-0.5 h-auto whitespace-normal text-primary">
+                                {t(labelKey)}
+                              </Badge>
+                            )
+                          })}
+                          {model.is_shared && model.is_owner && (
+                            <Badge variant="secondary" className="text-xs px-2 py-0.5 h-auto whitespace-normal text-orange-500">
+                              {t('models.defaults.shared')}
+                            </Badge>
+                          )}
                         </div>
                       </div>
                       <div className="flex items-center gap-1">
@@ -986,7 +1014,7 @@ export function ModelsPage() {
                         )}
                       </div>
                     </div>
-                  ))}
+                  )})}
                 </div>
               )}
             </div>
@@ -998,7 +1026,7 @@ export function ModelsPage() {
             </div>
           </DialogContent>
         ) : viewMode === 'connect' ? (
-          <DialogContent className="max-w-2xl max-h-[90vh] overflow-y-auto">
+          <DialogContent showCloseButton={false} className="max-w-2xl max-h-[90vh] overflow-y-auto">
             <DialogHeader>
                <div className="flex justify-between items-center pr-8">
                  <DialogTitle>
@@ -1101,7 +1129,7 @@ export function ModelsPage() {
             </div>
           </DialogContent>
         ) : (
-          <DialogContent className="max-w-2xl max-h-[90vh] overflow-y-auto">
+          <DialogContent showCloseButton={false} className="max-w-2xl max-h-[90vh] overflow-y-auto">
             <DialogHeader>
               <div className="flex items-center gap-2">
                 {managingProviderId && (

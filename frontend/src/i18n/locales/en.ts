@@ -1118,8 +1118,9 @@ Build when you need.`
       compact: "Long Context Model",
       embedding: "Embedding Model",
       image: "Image Generation Model",
-      image_edit: "Image Edit Model",
+      image_edit: "Image Edit",
       shared: "Shared",
+      shared_from_others: "Public Model",
     },
     card: {
       owner: "Owner",

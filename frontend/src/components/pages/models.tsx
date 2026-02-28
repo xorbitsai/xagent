@@ -852,11 +852,16 @@ export function ModelsPage() {
                                 return (
                                   <div
                                     key={m.id}
-                                    className="flex items-center gap-2 cursor-pointer hover:bg-muted/50 p-1 rounded transition-colors"
-                                    onClick={() => handleEdit(m)}
+                                    className={`flex items-center gap-2 p-1 rounded transition-colors ${m.can_edit ? 'cursor-pointer hover:bg-muted/50' : 'cursor-default'}`}
+                                    onClick={() => m.can_edit && handleEdit(m)}
                                   >
-                                    <Badge variant="secondary" className="text-xs px-2 py-0.5 h-auto whitespace-normal text-left">
-                                      <span className="mr-1">{m.model_name}</span>
+                                    <Badge variant="secondary" className={`text-xs px-2 py-0.5 h-auto whitespace-normal text-left flex items-center gap-2 ${!m.is_owner ? 'text-orange-500' : ''}`}>
+                                      <span>{m.model_name}</span>
+                                      {!m.is_owner && (
+                                        <span>
+                                          ({t('models.defaults.shared_from_others')})
+                                        </span>
+                                      )}
                                       {defaultTypes.map(type => {
                                         let labelKey = `models.defaults.${type}`
                                         if (type === 'small_fast') labelKey = 'models.defaults.fast'
@@ -963,18 +968,22 @@ export function ModelsPage() {
                           </Badge>
                         </div>
                       </div>
-                      <div className="flex items-center gap-2">
-                        <Button variant="ghost" size="icon" onClick={() => handleEdit(model)}>
-                          <Edit className="w-4 h-4" />
-                        </Button>
-                        <Button
-                          variant="ghost"
-                          size="icon"
-                          className="text-destructive hover:text-destructive"
-                          onClick={() => handleDelete(model.model_id)}
-                        >
-                          <Trash2 className="w-4 h-4" />
-                        </Button>
+                      <div className="flex items-center gap-1">
+                        {model.can_edit && (
+                          <Button variant="ghost" size="icon" onClick={() => handleEdit(model)}>
+                            <Edit className="w-4 h-4" />
+                          </Button>
+                        )}
+                        {model.can_delete && (
+                          <Button
+                            variant="ghost"
+                            size="icon"
+                            className="text-destructive hover:text-destructive"
+                            onClick={() => handleDelete(model.model_id)}
+                          >
+                            <Trash2 className="w-4 h-4" />
+                          </Button>
+                        )}
                       </div>
                     </div>
                   ))}

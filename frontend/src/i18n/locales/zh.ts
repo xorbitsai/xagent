@@ -1120,6 +1120,7 @@ Build when you need.`
       image: "图像生成模型",
       image_edit: "图像编辑模型",
       shared: "已分享",
+      shared_from_others: "公共模型",
     },
     card: {
       owner: "我的模型",

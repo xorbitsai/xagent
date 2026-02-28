@@ -470,13 +470,14 @@ async def update_model(
                 status_code=403, detail="Only administrators can enable global sharing"
             )
 
-        # Update sharing status for all user models
-        db.query(UserModel).filter(UserModel.model_id == db_model.id).update(
-            {"is_shared": model_update.share_with_users}
-        )
-
-        # If sharing is enabled, create relationships for users who don't have access
+        # Update sharing status
         if model_update.share_with_users:
+            # Enable sharing: update all existing records to shared=True
+            db.query(UserModel).filter(UserModel.model_id == db_model.id).update(
+                {"is_shared": True}
+            )
+
+            # Create relationships for users who don't have access
             existing_user_ids = [
                 um.user_id
                 for um in db.query(UserModel)
@@ -495,6 +496,17 @@ async def update_model(
                     is_shared=True,
                 )
                 db.add(shared_user_model)
+        else:
+            # Disable sharing:
+            # 1. Update owner's record to shared=False
+            db.query(UserModel).filter(
+                UserModel.model_id == db_model.id, UserModel.is_owner.is_(True)
+            ).update({"is_shared": False})
+
+            # 2. Delete all non-owner records (revoke access)
+            db.query(UserModel).filter(
+                UserModel.model_id == db_model.id, UserModel.is_owner.is_(False)
+            ).delete()
 
     # Update model configuration in-place
     update_data = model_update.model_dump(exclude_unset=True)

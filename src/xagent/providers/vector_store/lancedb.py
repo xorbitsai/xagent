@@ -152,8 +152,9 @@ class LanceDBConnectionManager:
         """
         Get LanceDB connection from environment variable with fallback to default path.
 
-        If the environment variable is not set, uses the default path: data/lancedb
-        relative to the project root directory.
+        If the environment variable is not set, uses get_default_lancedb_dir() which:
+        1. Checks legacy location (project root data/lancedb) if it contains data
+        2. Otherwise uses ~/.xagent/data/lancedb
 
         Args:
             env_var: Environment variable name containing database directory
@@ -163,6 +164,7 @@ class LanceDBConnectionManager:
 
         Raises:
             ValueError: If environment variable is empty
+            KeyError: If environment variable (other than LANCEDB_DIR) is not set
         """
         db_dir = os.getenv(env_var)
 
@@ -385,7 +387,10 @@ def get_connection(db_dir: str) -> DBConnection:
 
 def get_connection_from_env(env_var: str = "LANCEDB_DIR") -> DBConnection:
     """
-    Get LanceDB connection from environment variable.
+    Get LanceDB connection from environment variable with fallback to default path.
+
+    If LANCEDB_DIR is not set, uses get_default_lancedb_dir() which checks legacy
+    location first, then falls back to ~/.xagent/data/lancedb.
 
     Args:
         env_var: Environment variable name

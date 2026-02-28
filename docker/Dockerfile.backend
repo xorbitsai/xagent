@@ -39,10 +39,8 @@ RUN python -m venv /opt/venv \
 # Install app + deepdoc + chromadb into venv
 # Patch deepdoc to use CPU onnxruntime on x86_64
 RUN /opt/venv/bin/pip install --no-cache-dir . \
-    && /opt/venv/bin/pip install --no-cache-dir --index-url https://download.pytorch.org/whl/cpu torch==2.9.1+cpu \
     && git clone https://github.com/xorbitsai/deepdoc-lib /opt/xagent/deepdoc-lib \
-    && cd /opt/xagent/deepdoc-lib && git checkout cd4d0e13a89a3d9ea0716c696357396e84e81cf7 \
-    && sed -i "s/onnxruntime-gpu==1.19.2; sys_platform != 'darwin' and platform_machine == 'x86_64'/onnxruntime==1.19.2; sys_platform != 'darwin' and platform_machine == 'x86_64'/" /opt/xagent/deepdoc-lib/pyproject.toml \
+    && cd /opt/xagent/deepdoc-lib && git checkout fe75bbb676b141a1ea4257b198f6a04a89e5ac5c \
     && /opt/venv/bin/pip install --no-cache-dir /opt/xagent/deepdoc-lib \
     && /opt/venv/bin/pip install --no-cache-dir chromadb \
     && rm -rf /opt/xagent/deepdoc-lib

@@ -6,6 +6,7 @@ from pathlib import Path
 from typing import Any, Dict, Optional
 
 from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile
+from fastapi.responses import JSONResponse
 
 from ...core.tools.core.RAG_tools.core.schemas import (
     ChunkStrategy,
@@ -88,7 +89,7 @@ async def ingest(
         description="Delay between retries in seconds (default: 1.0)",
     ),
     _user: User = Depends(get_current_user),
-) -> IngestionResult:
+) -> IngestionResult | JSONResponse:
     """Upload and ingest a document into the knowledge base.
 
     Args:
@@ -195,6 +196,9 @@ async def ingest(
         with concurrent.futures.ThreadPoolExecutor() as executor:
             future = executor.submit(_run_ingestion)
             result: IngestionResult = future.result()
+
+        if result.status == "error":
+            return JSONResponse(status_code=500, content=result.model_dump())
 
         return result
 
@@ -478,8 +482,8 @@ async def ingest_web(
         description="Delay between retries in seconds (default: 1.0)",
     ),
     _user: User = Depends(get_current_user),
-) -> WebIngestionResult:
-    """Crawl a website and ingest all pages into the knowledge base.
+) -> WebIngestionResult | JSONResponse:
+    """Ingest website content into the knowledge base.
 
     Args:
         collection: Target collection name
@@ -595,6 +599,9 @@ async def ingest_web(
                 )
             ),
         )
+
+        if result.status == "error":
+            return JSONResponse(status_code=500, content=result.model_dump())
 
         return result
 

@@ -107,9 +107,11 @@ def test_document_search_end_to_end(
 
     monkeypatch.setattr(
         "xagent.core.tools.core.RAG_tools.management.collection_manager.get_collection_sync",
-        lambda collection_name: mock_collection
-        if collection_name == "test_collection"
-        else CollectionInfo(name=collection_name),
+        lambda collection_name: (
+            mock_collection
+            if collection_name == "test_collection"
+            else CollectionInfo(name=collection_name)
+        ),
     )
     # Ensure index manager creates FTS indices
     idx_policy = idx_module.IndexPolicy(fts_enabled=True)
@@ -237,9 +239,11 @@ def test_chinese_sparse_search(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) 
 
     monkeypatch.setattr(
         "xagent.core.tools.core.RAG_tools.management.collection_manager.get_collection_sync",
-        lambda collection_name: mock_collection
-        if collection_name == "test_collection_chinese"
-        else CollectionInfo(name=collection_name),
+        lambda collection_name: (
+            mock_collection
+            if collection_name == "test_collection_chinese"
+            else CollectionInfo(name=collection_name)
+        ),
     )
 
     # Ensure index manager creates FTS indices

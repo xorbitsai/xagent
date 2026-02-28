@@ -318,8 +318,8 @@ class TestAgentServiceManagerReconstruction:
         mock_dag_query.first.return_value = None
 
         query_results = [mock_trace_query, mock_dag_query]
-        mock_db.query.side_effect = (
-            lambda model: query_results.pop(0) if query_results else MagicMock()
+        mock_db.query.side_effect = lambda model: (
+            query_results.pop(0) if query_results else MagicMock()
         )
 
         # 调用方法应该抛出异常

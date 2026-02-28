@@ -31,7 +31,25 @@ class OpenAIEmbedding(BaseEmbedding):
         """
         self.model = model
         self.api_key = api_key
-        self.base_url = base_url or "https://api.openai.com/v1/embeddings"
+
+        # Ensure base_url ends with /embeddings for OpenAI-compatible APIs
+        if base_url:
+            # First, strip trailing slashes for consistent checking
+            clean_base_url = base_url.rstrip("/")
+
+            # If base_url doesn't end with /embeddings, append it
+            if not clean_base_url.endswith("/embeddings"):
+                # Check if it ends with /v1 or similar
+                if clean_base_url.endswith("/v1"):
+                    self.base_url = clean_base_url + "/embeddings"
+                else:
+                    # For other cases, just use as-is (might be custom endpoint)
+                    self.base_url = base_url
+            else:
+                # Already has /embeddings, use the cleaned version
+                self.base_url = clean_base_url
+        else:
+            self.base_url = "https://api.openai.com/v1/embeddings"
 
         self.dimension = dimension
         self._session: Optional[requests.Session] = None

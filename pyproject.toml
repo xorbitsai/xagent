@@ -56,7 +56,7 @@ dependencies = [
   "alembic>=1.13.0",
   "python-jose[cryptography]>=3.3.0",
   "psycopg2-binary>=2.9.0",
-  "json-repair>=0.35.0",
+  "json-repair==0.35.0",
   "pre-commit>=4.3.0",
   "jsonschema>=4.25.1",
   "playwright>=1.40.0",
@@ -65,7 +65,7 @@ dependencies = [
 
 [project.optional-dependencies]
 deepdoc = [
-  "deepdoc-lib @ git+https://github.com/xorbitsai/deepdoc-lib.git@cd4d0e13a89a3d9ea0716c696357396e84e81cf7",
+  "deepdoc-lib @ git+https://github.com/xorbitsai/deepdoc-lib.git@fe75bbb676b141a1ea4257b198f6a04a89e5ac5c",
 ]
 dev = [
   "pre-commit>=4.2.0",

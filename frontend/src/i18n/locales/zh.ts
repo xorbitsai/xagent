@@ -1251,6 +1251,7 @@ Build when you need.`
       webIngestFailed: "网站导入失败",
       deleteFailed: "删除知识库失败: {name}",
       deleteFailedGeneric: "删除知识库失败",
+      unsupportedFileType: "不支持的文件类型",
     },
     actions: {
       deleteConfirm: "确定要删除知识库 {name} 吗？此操作无法撤销。",
@@ -1309,6 +1310,7 @@ Build when you need.`
         uploading: "正在上传...",
         uploadSuccess: "上传成功",
         uploadFailed: "上传失败",
+        progressTitle: "上传进度",
         processing: "处理中...",
         processSuccess: "处理成功",
         processResult: {
@@ -1321,6 +1323,7 @@ Build when you need.`
         title: "网站导入",
         description: "遵守 robots.txt，爬取目标网站内容并建立索引",
         basic: {
+          title: "基础配置",
           startUrl: "起始 URL",
           maxPages: "最大页面数",
           crawlDepth: "爬取深度",

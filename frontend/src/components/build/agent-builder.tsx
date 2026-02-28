@@ -33,7 +33,7 @@ import {
   DialogTitle,
 } from "@/components/ui/dialog"
 import { useRouter, useSearchParams } from "next/navigation"
-import { KnowledgeBaseCreationDialog } from "@/components/pages/knowledge-base-creation-dialog"
+import { KnowledgeBaseCreationDialog } from "@/components/kb/knowledge-base-creation-dialog"
 
 interface KnowledgeBase {
   name: string

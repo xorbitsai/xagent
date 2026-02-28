@@ -17,8 +17,8 @@ import {
   HardDrive
 } from "lucide-react"
 import { Sheet, SheetContent, SheetHeader, SheetTitle, SheetDescription } from "@/components/ui/sheet"
-import { KnowledgeBaseDetailContent } from "./knowledge-base-detail"
-import { KnowledgeBaseCreationDialog } from "./knowledge-base-creation-dialog"
+import { KnowledgeBaseDetailContent } from "@/components/kb/knowledge-base-detail"
+import { KnowledgeBaseCreationDialog } from "@/components/kb/knowledge-base-creation-dialog"
 import { toast } from "sonner"
 
 interface Collection {

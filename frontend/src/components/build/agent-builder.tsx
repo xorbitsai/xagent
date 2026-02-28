@@ -11,7 +11,7 @@ import { ChatInput } from "@/components/chat/ChatInput"
 import { ChatMessage } from "@/components/chat/ChatMessage"
 import { apiRequest } from "@/lib/api-wrapper"
 import { getApiUrl, getWsUrl } from "@/lib/utils"
-import { PlusCircle, MessageSquare, Upload, Download, Info } from "lucide-react"
+import { PlusCircle, MessageSquare, Upload, Download, Info, Settings2 } from "lucide-react"
 import { useI18n } from "@/contexts/i18n-context"
 import { useAuth } from "@/contexts/auth-context"
 import { FileAttachment } from "@/components/file-attachment"
@@ -33,6 +33,7 @@ import {
   DialogTitle,
 } from "@/components/ui/dialog"
 import { useRouter, useSearchParams } from "next/navigation"
+import { KnowledgeBaseCreationDialog } from "@/components/pages/knowledge-base-creation-dialog"
 
 interface KnowledgeBase {
   name: string
@@ -122,6 +123,8 @@ export function AgentBuilder({ agentId }: AgentBuilderProps) {
   const [errorMessage, setErrorMessage] = useState<string | null>(null)
   const [loadingAgent, setLoadingAgent] = useState(false)
   const [originalData, setOriginalData] = useState<any>(null)
+  const [isKbModalOpen, setIsKbModalOpen] = useState(false)
+  const [isModelConfigOpen, setIsModelConfigOpen] = useState(false)
 
   // Create Success Dialog State
   const [showSuccessDialog, setShowSuccessDialog] = useState(false)
@@ -366,6 +369,18 @@ export function AgentBuilder({ agentId }: AgentBuilderProps) {
 
     fetchData()
   }, [])
+
+  const refreshKbs = async () => {
+    try {
+      const kbRes = await apiRequest(`${getApiUrl()}/api/kb/collections`)
+      if (kbRes.ok) {
+        const kbData = await kbRes.json()
+        setKbs(kbData.collections || [])
+      }
+    } catch (error) {
+      console.error("Failed to refresh KBs:", error)
+    }
+  }
 
   // Load agent data in edit mode
   useEffect(() => {
@@ -958,158 +973,185 @@ export function AgentBuilder({ agentId }: AgentBuilderProps) {
           </div>
         </div>
 
-        {/* Model Selection - 4 types */}
+        {/* Model Selection */}
         <div className="space-y-4">
-          <Label>{t("builds.configForm.model.label")}</Label>
+          <div className="flex items-center justify-between">
+            <Label>{t("builds.configForm.model.label")}</Label>
+            <Button
+              variant="ghost"
+              size="sm"
+              className="h-6 text-xs text-muted-foreground hover:text-foreground"
+              onClick={() => setIsModelConfigOpen(true)}
+            >
+              <Settings2 className="mr-1.5 h-3.5 w-3.5" />
+              {t("builds.configForm.model.configure")}
+            </Button>
+          </div>
+
           {models.length > 0 ? (
-            <div className="grid grid-cols-2 gap-3">
-              {/* General Model */}
-              <div className="space-y-1">
-                <div className="flex items-center gap-1.5">
-                  <Label className="text-xs text-muted-foreground">
-                    {t("builds.configForm.model.types.general")}
-                  </Label>
-                  <TooltipProvider>
-                    <Tooltip delayDuration={300}>
-                      <TooltipTrigger asChild>
-                        <div className="cursor-default">
-                          <Info className="h-3 w-3 text-muted-foreground/70 hover:text-muted-foreground" />
-                        </div>
-                      </TooltipTrigger>
-                      <TooltipContent>
-                        <p className="max-w-[200px]">{t("builds.configForm.model.tips.general")}</p>
-                      </TooltipContent>
-                    </Tooltip>
-                  </TooltipProvider>
-                </div>
-                <Select
-                  value={modelConfig.general?.toString() || ""}
-                  onValueChange={(value) => setModelConfig(prev => ({
-                    ...prev,
-                    general: value ? Number(value) : null
-                  }))}
-                  options={modelOptions}
-                  placeholder="--"
-                />
+            <div className="space-y-1">
+              <div className="flex items-center gap-1.5">
+                <Label className="text-xs text-muted-foreground">
+                  {t("builds.configForm.model.types.general")}
+                </Label>
+                <TooltipProvider>
+                  <Tooltip delayDuration={300}>
+                    <TooltipTrigger asChild>
+                      <div className="cursor-default">
+                        <Info className="h-3 w-3 text-muted-foreground/70 hover:text-muted-foreground" />
+                      </div>
+                    </TooltipTrigger>
+                    <TooltipContent>
+                      <p className="max-w-[200px]">{t("builds.configForm.model.tips.general")}</p>
+                    </TooltipContent>
+                  </Tooltip>
+                </TooltipProvider>
               </div>
-
-              {/* Small & Fast Model */}
-              <div className="space-y-1">
-                <div className="flex items-center gap-1.5">
-                  <Label className="text-xs text-muted-foreground">
-                    {t("builds.configForm.model.types.smallFast")}
-                  </Label>
-                  <TooltipProvider>
-                    <Tooltip delayDuration={300}>
-                      <TooltipTrigger asChild>
-                        <div className="cursor-default">
-                          <Info className="h-3 w-3 text-muted-foreground/70 hover:text-muted-foreground" />
-                        </div>
-                      </TooltipTrigger>
-                      <TooltipContent>
-                        <p className="max-w-[200px]">{t("builds.configForm.model.tips.smallFast")}</p>
-                      </TooltipContent>
-                    </Tooltip>
-                  </TooltipProvider>
-                </div>
-                <Select
-                  value={modelConfig.small_fast?.toString() || ""}
-                  onValueChange={(value) => setModelConfig(prev => ({
-                    ...prev,
-                    small_fast: value ? Number(value) : null
-                  }))}
-                  options={modelOptions}
-                  placeholder="--"
-                />
-              </div>
-
-              {/* Visual Model */}
-              <div className="space-y-1">
-                <div className="flex items-center gap-1.5">
-                  <Label className="text-xs text-muted-foreground">
-                    {t("builds.configForm.model.types.visual")}
-                  </Label>
-                  <TooltipProvider>
-                    <Tooltip delayDuration={300}>
-                      <TooltipTrigger asChild>
-                        <div className="cursor-default">
-                          <Info className="h-3 w-3 text-muted-foreground/70 hover:text-muted-foreground" />
-                        </div>
-                      </TooltipTrigger>
-                      <TooltipContent>
-                        <p className="max-w-[200px]">{t("builds.configForm.model.tips.visual")}</p>
-                      </TooltipContent>
-                    </Tooltip>
-                  </TooltipProvider>
-                </div>
-                <Select
-                  value={modelConfig.visual?.toString() || ""}
-                  onValueChange={(value) => setModelConfig(prev => ({
-                    ...prev,
-                    visual: value ? Number(value) : null
-                  }))}
-                  options={modelOptions}
-                  placeholder="--"
-                />
-              </div>
-
-              {/* Compact Model */}
-              <div className="space-y-1">
-                <div className="flex items-center gap-1.5">
-                  <Label className="text-xs text-muted-foreground">
-                    {t("builds.configForm.model.types.compact")}
-                  </Label>
-                  <TooltipProvider>
-                    <Tooltip delayDuration={300}>
-                      <TooltipTrigger asChild>
-                        <div className="cursor-default">
-                          <Info className="h-3 w-3 text-muted-foreground/70 hover:text-muted-foreground" />
-                        </div>
-                      </TooltipTrigger>
-                      <TooltipContent>
-                        <p className="max-w-[200px]">{t("builds.configForm.model.tips.compact")}</p>
-                      </TooltipContent>
-                    </Tooltip>
-                  </TooltipProvider>
-                </div>
-                <Select
-                  value={modelConfig.compact?.toString() || ""}
-                  onValueChange={(value) => setModelConfig(prev => ({
-                    ...prev,
-                    compact: value ? Number(value) : null
-                  }))}
-                  options={modelOptions}
-                  placeholder="--"
-                />
-              </div>
+              <Select
+                value={modelConfig.general?.toString() || ""}
+                onValueChange={(value) => setModelConfig(prev => ({
+                  ...prev,
+                  general: value ? Number(value) : null
+                }))}
+                options={modelOptions}
+                placeholder="--"
+              />
             </div>
           ) : (
             <div className="text-sm text-muted-foreground">
               {t("builds.configForm.model.noData")}
             </div>
           )}
+
+          <Dialog open={isModelConfigOpen} onOpenChange={setIsModelConfigOpen}>
+            <DialogContent>
+              <DialogHeader>
+                <DialogTitle>{t("builds.configForm.model.configure")}</DialogTitle>
+                <DialogDescription>
+                  {t("builds.configForm.model.configureDescription")}
+                </DialogDescription>
+              </DialogHeader>
+              <div className="space-y-4 py-4">
+                {/* Small & Fast Model */}
+                <div className="space-y-1">
+                  <div className="flex items-center gap-1.5">
+                    <Label className="text-xs text-muted-foreground">
+                      {t("builds.configForm.model.types.smallFast")}
+                    </Label>
+                    <TooltipProvider>
+                      <Tooltip delayDuration={300}>
+                        <TooltipTrigger asChild>
+                          <div className="cursor-default">
+                            <Info className="h-3 w-3 text-muted-foreground/70 hover:text-muted-foreground" />
+                          </div>
+                        </TooltipTrigger>
+                        <TooltipContent>
+                          <p className="max-w-[200px]">{t("builds.configForm.model.tips.smallFast")}</p>
+                        </TooltipContent>
+                      </Tooltip>
+                    </TooltipProvider>
+                  </div>
+                  <Select
+                    value={modelConfig.small_fast?.toString() || ""}
+                    onValueChange={(value) => setModelConfig(prev => ({
+                      ...prev,
+                      small_fast: value ? Number(value) : null
+                    }))}
+                    options={modelOptions}
+                    placeholder="--"
+                  />
+                </div>
+
+                {/* Visual Model */}
+                <div className="space-y-1">
+                  <div className="flex items-center gap-1.5">
+                    <Label className="text-xs text-muted-foreground">
+                      {t("builds.configForm.model.types.visual")}
+                    </Label>
+                    <TooltipProvider>
+                      <Tooltip delayDuration={300}>
+                        <TooltipTrigger asChild>
+                          <div className="cursor-default">
+                            <Info className="h-3 w-3 text-muted-foreground/70 hover:text-muted-foreground" />
+                          </div>
+                        </TooltipTrigger>
+                        <TooltipContent>
+                          <p className="max-w-[200px]">{t("builds.configForm.model.tips.visual")}</p>
+                        </TooltipContent>
+                      </Tooltip>
+                    </TooltipProvider>
+                  </div>
+                  <Select
+                    value={modelConfig.visual?.toString() || ""}
+                    onValueChange={(value) => setModelConfig(prev => ({
+                      ...prev,
+                      visual: value ? Number(value) : null
+                    }))}
+                    options={modelOptions}
+                    placeholder="--"
+                  />
+                </div>
+
+                {/* Compact Model */}
+                <div className="space-y-1">
+                  <div className="flex items-center gap-1.5">
+                    <Label className="text-xs text-muted-foreground">
+                      {t("builds.configForm.model.types.compact")}
+                    </Label>
+                    <TooltipProvider>
+                      <Tooltip delayDuration={300}>
+                        <TooltipTrigger asChild>
+                          <div className="cursor-default">
+                            <Info className="h-3 w-3 text-muted-foreground/70 hover:text-muted-foreground" />
+                          </div>
+                        </TooltipTrigger>
+                        <TooltipContent>
+                          <p className="max-w-[200px]">{t("builds.configForm.model.tips.compact")}</p>
+                        </TooltipContent>
+                      </Tooltip>
+                    </TooltipProvider>
+                  </div>
+                  <Select
+                    value={modelConfig.compact?.toString() || ""}
+                    onValueChange={(value) => setModelConfig(prev => ({
+                      ...prev,
+                      compact: value ? Number(value) : null
+                    }))}
+                    options={modelOptions}
+                    placeholder="--"
+                  />
+                </div>
+              </div>
+              <DialogFooter>
+                <Button onClick={() => setIsModelConfigOpen(false)}>
+                  {t("common.confirm")}
+                </Button>
+              </DialogFooter>
+            </DialogContent>
+          </Dialog>
         </div>
 
         {/* Knowledge Base - Multi Select */}
         <div className="space-y-2">
-          <Label>{t("builds.configForm.knowledgeBase.label")}</Label>
-          {kbs.length > 0 ? (
-            <MultiSelect
-              values={selectedKbs}
-              onValuesChange={setSelectedKbs}
-              options={kbOptions}
-              placeholder={t("builds.configForm.knowledgeBase.placeholder")}
-            />
-          ) : (
+          <div className="flex items-center justify-between">
+            <Label>{t("builds.configForm.knowledgeBase.label")}</Label>
             <Button
-              variant="outline"
-              className="w-full justify-start text-muted-foreground"
-              onClick={() => router.push('/kb')}
+              variant="secondary"
+              size="sm"
+              className="text-muted-foreground"
+              onClick={() => setIsKbModalOpen(true)}
             >
               <PlusCircle className="mr-2 h-4 w-4" />
               {t("builds.configForm.knowledgeBase.create")}
             </Button>
-          )}
+          </div>
+
+          <MultiSelect
+            values={selectedKbs}
+            onValuesChange={setSelectedKbs}
+            options={kbOptions}
+            placeholder={t("builds.configForm.knowledgeBase.placeholder")}
+          />
         </div>
 
         {/* Skills - Multi Select */}
@@ -1352,6 +1394,14 @@ export function AgentBuilder({ agentId }: AgentBuilderProps) {
           </DialogFooter>
         </DialogContent>
       </Dialog>
+
+      <KnowledgeBaseCreationDialog
+        open={isKbModalOpen}
+        onOpenChange={setIsKbModalOpen}
+        onSuccess={() => {
+          refreshKbs()
+        }}
+      />
     </div>
   )
 }

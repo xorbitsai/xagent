@@ -8,6 +8,7 @@ from typing import Any, AsyncIterator, Dict, List, Optional, Union, cast
 
 import httpx
 
+from ....utils.security import redact_sensitive_text, redact_url_credentials_for_logging
 from ..exceptions import (
     LLMEmptyContentError,
     LLMInvalidResponseError,
@@ -542,7 +543,7 @@ class GeminiLLM(BaseLLM):
             return content
 
         except Exception as e:
-            logger.error(f"Gemini API error: {str(e)}")
+            logger.error("Gemini API error: %s", redact_sensitive_text(str(e)))
             # Re-raise LLMRetryableError as-is (will be caught by retry wrapper)
             # Wrap other errors in RuntimeError
             if isinstance(e, LLMRetryableError):
@@ -634,7 +635,10 @@ class GeminiLLM(BaseLLM):
             request_body["tools"] = tools
 
         # Debug: log the request
-        logger.info(f"Gemini REST API request URL: {api_url}")
+        logger.info(
+            "Gemini REST API request URL: %s",
+            redact_url_credentials_for_logging(api_url),
+        )
         logger.debug(
             f"Gemini REST API request body: {json.dumps(request_body, indent=2)[:500]}"
         )
@@ -649,7 +653,10 @@ class GeminiLLM(BaseLLM):
 
             if response.status_code != 200:
                 # Log full error response
-                logger.error(f"Gemini REST API error response (full):\n{response.text}")
+                logger.error(
+                    "Gemini REST API error response (full):\n%s",
+                    redact_sensitive_text(response.text),
+                )
 
             # Raise HTTPError for bad status codes (4xx, 5xx)
             # This will be caught by retry wrapper
@@ -737,7 +744,10 @@ class GeminiLLM(BaseLLM):
         # Make streaming request
         timeout = httpx.Timeout(self.timeout, connect=10.0)
         async with httpx.AsyncClient(timeout=timeout) as client:
-            logger.info(f"Gemini streaming API URL: {api_url}")
+            logger.info(
+                "Gemini streaming API URL: %s",
+                redact_url_credentials_for_logging(api_url),
+            )
             logger.debug(
                 f"Gemini streaming request body: {json.dumps(request_body, indent=2)[:1000]}"
             )
@@ -752,7 +762,10 @@ class GeminiLLM(BaseLLM):
                     error_content = await response.aread()
                     logger.error(f"Gemini streaming API error: {response.status_code}")
                     logger.error(
-                        f"Response: {error_content.decode('utf-8', errors='replace')[:1000]}"
+                        "Response: %s",
+                        redact_sensitive_text(
+                            error_content.decode("utf-8", errors="replace")[:1000]
+                        ),
                     )
                     response.raise_for_status()
 
@@ -884,7 +897,9 @@ class GeminiLLM(BaseLLM):
                             logger.warning(
                                 f"Failed to parse SSE data: {data_str[:150]}"
                             )
-                            logger.warning(f"Parse error: {str(e)}")
+                            logger.warning(
+                                "Parse error: %s", redact_sensitive_text(str(e))
+                            )
                             yield {
                                 "type": "error",
                                 "error": f"Parse error: {str(e)}",
@@ -956,7 +971,9 @@ class GeminiLLM(BaseLLM):
                             logger.error(
                                 f"Failed to parse buffer as JSON: {buffer[:200]}"
                             )
-                            logger.error(f"Parse error: {e}")
+                            logger.error(
+                                "Parse error: %s", redact_sensitive_text(str(e))
+                            )
                             yield {
                                 "type": "error",
                                 "error": f"Parse error: {str(e)}",
@@ -1290,9 +1307,10 @@ class GeminiLLM(BaseLLM):
             ):
                 raise LLMRetryableError(f"Gemini streaming HTTP error: {str(e)}") from e
             # Other HTTP errors - return error chunk
+            safe_error = redact_sensitive_text(str(e))
             yield StreamChunk(
                 type=ChunkType.ERROR,
-                content=f"Gemini streaming error: {str(e)}",
+                content=f"Gemini streaming error: {safe_error}",
                 raw=e,
             )
         except (
@@ -1305,10 +1323,11 @@ class GeminiLLM(BaseLLM):
             raise LLMRetryableError(f"Gemini streaming network error: {str(e)}") from e
         except Exception as e:
             # Log and convert to error chunk for non-retryable errors
-            logger.error(f"Gemini streaming error: {str(e)}")
+            safe_error = redact_sensitive_text(str(e))
+            logger.error("Gemini streaming error: %s", safe_error)
             yield StreamChunk(
                 type=ChunkType.ERROR,
-                content=f"Gemini streaming error: {str(e)}",
+                content=f"Gemini streaming error: {safe_error}",
                 raw=e,
             )
 
@@ -1441,5 +1460,7 @@ class GeminiLLM(BaseLLM):
                 ) from e
             raise
         except Exception as e:
-            logger.error(f"Failed to fetch Gemini models: {e}")
+            logger.error(
+                "Failed to fetch Gemini models: %s", redact_sensitive_text(str(e))
+            )
             return []

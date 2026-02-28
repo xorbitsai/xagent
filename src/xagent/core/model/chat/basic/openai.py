@@ -6,6 +6,7 @@ from typing import Any, AsyncIterator, Dict, List, Optional, Union
 import openai
 from openai import AsyncOpenAI
 
+from ....utils.security import redact_sensitive_text
 from ..exceptions import LLMRetryableError, LLMTimeoutError
 from ..timeout_config import TimeoutConfig
 from ..token_context import add_token_usage
@@ -734,19 +735,23 @@ class OpenAILLM(BaseLLM):
             raise LLMRetryableError(f"OpenAI API timeout: {str(e)}") from e
 
         except openai.RateLimitError as e:
-            logger.error(f"OpenAI rate limit exceeded: {e}")
+            logger.error(
+                "OpenAI rate limit exceeded: %s", redact_sensitive_text(str(e))
+            )
             raise LLMRetryableError(f"OpenAI rate limit exceeded: {e.message}") from e
 
         except openai.AuthenticationError as e:
-            logger.error(f"OpenAI authentication failed: {e}")
+            logger.error(
+                "OpenAI authentication failed: %s", redact_sensitive_text(str(e))
+            )
             raise RuntimeError(f"OpenAI authentication failed: {e.message}") from e
 
         except openai.BadRequestError as e:
-            logger.error(f"OpenAI bad request: {e}")
+            logger.error("OpenAI bad request: %s", redact_sensitive_text(str(e)))
             raise RuntimeError(f"OpenAI bad request: {e.message}") from e
 
         except openai.APIError as e:
-            logger.error(f"OpenAI API error: {e}")
+            logger.error("OpenAI API error: %s", redact_sensitive_text(str(e)))
             error_msg = f"OpenAI API error: {e.message}"
             if (status_code := getattr(e, "status_code", None)) is not None:
                 error_msg = f"OpenAI API error ({status_code}): {e.message}"
@@ -756,7 +761,7 @@ class OpenAILLM(BaseLLM):
             raise
 
         except Exception as e:
-            logger.error(f"OpenAI stream chat failed: {e}")
+            logger.error("OpenAI stream chat failed: %s", redact_sensitive_text(str(e)))
             raise RuntimeError(f"LLM stream chat failed: {str(e)}") from e
 
     def _parse_stream_chunk(
@@ -950,5 +955,5 @@ class OpenAILLM(BaseLLM):
                 raise ValueError("Invalid API key") from e
             raise
         except Exception as e:
-            logger.error(f"Failed to fetch models: {e}")
+            logger.error("Failed to fetch models: %s", redact_sensitive_text(str(e)))
             return []

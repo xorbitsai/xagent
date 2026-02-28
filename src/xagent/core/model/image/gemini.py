@@ -12,6 +12,7 @@ from typing import Any, Dict, List, Optional
 
 import httpx
 
+from ...utils.security import redact_sensitive_text, redact_url_credentials_for_logging
 from .base import BaseImageModel
 
 logger = logging.getLogger(__name__)
@@ -250,7 +251,10 @@ class GeminiImageModel(BaseImageModel):
         request_body["generationConfig"] = gen_config
 
         # Log the request
-        logger.info(f"Gemini image generation API URL: {api_url}")
+        logger.info(
+            "Gemini image generation API URL: %s",
+            redact_url_credentials_for_logging(api_url),
+        )
         logger.debug(f"Image config: {image_config}")
         logger.debug(f"Request prompt: {prompt[:100]}...")
 
@@ -270,7 +274,10 @@ class GeminiImageModel(BaseImageModel):
 
                 if response.status_code != 200:
                     error_text = response.text
-                    logger.error(f"Gemini image generation error: {error_text}")
+                    logger.error(
+                        "Gemini image generation error: %s",
+                        redact_sensitive_text(error_text),
+                    )
                     response.raise_for_status()
 
                 response_data = response.json()
@@ -360,7 +367,8 @@ class GeminiImageModel(BaseImageModel):
 
         except httpx.HTTPStatusError as e:
             raise RuntimeError(
-                f"Gemini image generation API error ({e.response.status_code}): {e.response.text}"
+                "Gemini image generation API error "
+                f"({e.response.status_code}): {redact_sensitive_text(e.response.text)}"
             ) from e
         except httpx.TimeoutException as e:
             raise RuntimeError(f"Image generation timeout: {str(e)}") from e

@@ -3,6 +3,8 @@
 import logging
 from typing import Any, Dict, List, Optional
 
+from ...core.utils.security import redact_sensitive_text
+
 logger = logging.getLogger(__name__)
 
 
@@ -131,7 +133,11 @@ async def fetch_models_from_provider(
         result: List[Dict[str, Any]] = await fetcher(api_key, base_url)
         return result
     except Exception as e:
-        logger.error(f"Error fetching models from {provider}: {e}")
+        logger.error(
+            "Error fetching models from %s: %s",
+            provider,
+            redact_sensitive_text(str(e)),
+        )
         raise
 
 

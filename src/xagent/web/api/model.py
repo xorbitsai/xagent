@@ -13,6 +13,7 @@ from xagent.core.model.model import (
     ImageModelConfig,
     ModelConfig,
 )
+from xagent.core.utils.security import redact_sensitive_text
 
 from ..auth_dependencies import get_current_user
 from ..models.database import get_db
@@ -653,14 +654,19 @@ async def test_models(
 
         except Exception as e:
             response_time = time.time() - start_time
-            logger.error(f"Error testing model {model.model_id}: {e}")
+            safe_error = redact_sensitive_text(str(e))
+            logger.error(
+                "Error testing model %s: %s",
+                model.model_id,
+                safe_error,
+            )
             test_results.append(
                 ModelTestResponse(
                     model_id=model.model_id,
                     status="failed",
                     response_time=response_time,
                     message="Model test failed",
-                    error=str(e),
+                    error=safe_error,
                 )
             )
 
@@ -1436,10 +1442,15 @@ async def fetch_provider_models(
             "count": len(models),
         }
     except Exception as e:
-        logger.error(f"Error fetching models from {provider}: {e}")
+        safe_error = redact_sensitive_text(str(e))
+        logger.error(
+            "Error fetching models from %s: %s",
+            provider,
+            safe_error,
+        )
         raise HTTPException(
             status_code=500,
-            detail=f"Failed to fetch models from {provider}: {str(e)}",
+            detail=f"Failed to fetch models from {provider}: {safe_error}",
         )
 
 
@@ -1507,9 +1518,14 @@ async def fetch_multiple_providers_models(
                 "count": len(models),
             }
         except Exception as e:
-            logger.error(f"Error fetching from {provider}: {e}")
+            safe_error = redact_sensitive_text(str(e))
+            logger.error(
+                "Error fetching from %s: %s",
+                provider,
+                safe_error,
+            )
             results[provider] = {
-                "error": str(e),
+                "error": safe_error,
                 "models": [],
             }
 

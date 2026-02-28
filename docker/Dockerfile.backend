@@ -136,6 +136,7 @@ RUN cd /opt/xagent/frontend && npm ci \
     && npm install -g pptxgenjs@4.0.1 \
     && python -m playwright install chromium \
     && python -c "import nltk; nltk.download('punkt'); nltk.download('punkt_tab'); nltk.download('wordnet'); nltk.download('averaged_perceptron_tagger')" \
+    && unzip /root/nltk_data/corpora/wordnet.zip -d /root/nltk_data/corpora \
     && python -c "import tiktoken; tiktoken.encoding_for_model('gpt-4')" \
     && chmod +x /opt/xagent/deploy/entrypoint.sh
 

@@ -1,7 +1,8 @@
 """Test cases for Gemini image generation model."""
 
 import os
-from unittest.mock import patch
+import tempfile
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
@@ -47,7 +48,7 @@ class TestGeminiImageModel:
 
     def test_abilities_configuration(self):
         """Test model abilities configuration."""
-        # Test with default abilities
+        # Test with default abilities (no editing for older models)
         model1 = GeminiImageModel()
         assert model1.abilities == ["generate"]
 
@@ -55,9 +56,9 @@ class TestGeminiImageModel:
         model2 = GeminiImageModel(abilities=["generate"])
         assert model2.abilities == ["generate"]
 
-        # Test edit ability is removed (not supported)
+        # Test edit ability is preserved when explicitly provided
         model3 = GeminiImageModel(abilities=["generate", "edit"])
-        assert model3.abilities == ["generate"]  # edit should be removed
+        assert model3.abilities == ["generate", "edit"]  # edit is preserved
 
         # Test with empty abilities (should use default)
         model4 = GeminiImageModel(abilities=[])
@@ -66,6 +67,10 @@ class TestGeminiImageModel:
         # Test with None abilities (should use default)
         model5 = GeminiImageModel(abilities=None)
         assert model5.abilities == ["generate"]
+
+        # Test auto-detection of edit capability for newer models
+        model6 = GeminiImageModel(model_name="gemini-3-pro-image-preview-2k")
+        assert model6.abilities == ["generate", "edit"]
 
     def test_has_ability_method(self):
         """Test the has_ability method."""
@@ -132,7 +137,7 @@ class TestGeminiImageModel:
     async def test_edit_image_not_supported(self, model):
         """Test that edit_image raises RuntimeError (not supported)."""
         with pytest.raises(
-            RuntimeError, match="Image editing is not supported by Gemini image models"
+            RuntimeError, match="This model doesn't support image editing"
         ):
             await model.edit_image("https://example.com/image.jpg", "Edit the image")
 
@@ -143,3 +148,79 @@ class TestGeminiImageModel:
         assert model.model_name == "gemini-2.5-flash-image"
         assert model.abilities == ["generate"]
         assert model.timeout == 300.0
+
+    @pytest.mark.asyncio
+    async def test_edit_image_with_local_file_path(self):
+        """Test edit_image with local file path."""
+        # Create a temporary image file
+        with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as f:
+            # Write minimal PNG data (1x1 red pixel)
+            temp_file = f.name
+            f.write(
+                b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR\x00\x00\x00\x01\x00\x00\x00\x01"
+                b"\x08\x02\x00\x00\x00\x90wS\xde\x00\x00\x00\x0cIDATx\x9cc\xf8\xcf\xc0"
+                b"\x00\x00\x00\x03\x00\x01\x00\x00\x00\x00IEND\xaeB`\x82"
+            )
+
+        try:
+            # Create model with edit ability
+            model = GeminiImageModel(
+                model_name="gemini-3-pro-image-preview-2k",
+                api_key="test_key",
+                abilities=["generate", "edit"],
+            )
+
+            # Mock the HTTP client to avoid actual API call
+            with patch("httpx.AsyncClient") as mock_client_class:
+                mock_client = MagicMock()
+                mock_client_class.return_value.__aenter__.return_value = mock_client
+
+                # Mock the POST response
+                mock_response = MagicMock()
+                mock_response.status_code = 200
+                mock_response.json.return_value = {
+                    "candidates": [
+                        {
+                            "content": {
+                                "parts": [
+                                    {"text": "![Image](https://example.com/edited.png)"}
+                                ]
+                            },
+                            "finishReason": "STOP",
+                        }
+                    ],
+                    "usageMetadata": {
+                        "promptTokenCount": 100,
+                        "candidatesTokenCount": 50,
+                        "totalTokenCount": 150,
+                    },
+                }
+                mock_client.post = AsyncMock(return_value=mock_response)
+
+                # Test editing with local file path
+                result = await model.edit_image(
+                    image_url=temp_file, prompt="Edit the image"
+                )
+
+                # Verify the result
+                assert "image_url" in result
+                assert result["image_url"] == "https://example.com/edited.png"
+                assert result["finish_reason"] == "STOP"
+
+                # Verify the POST request was made
+                assert mock_client.post.called
+                call_args = mock_client.post.call_args
+                request_body = call_args[1]["json"]
+
+                # Verify the local file was converted to inlineData
+                parts = request_body["contents"][0]["parts"]
+                assert len(parts) == 2  # image + text prompt
+                assert "inlineData" in parts[0]
+                assert parts[0]["inlineData"]["mimeType"] == "image/png"
+                assert "data" in parts[0]["inlineData"]
+                assert parts[1]["text"] == "Edit the image"
+
+        finally:
+            # Clean up temp file
+            if os.path.exists(temp_file):
+                os.remove(temp_file)

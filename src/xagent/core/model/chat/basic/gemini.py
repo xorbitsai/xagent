@@ -1345,7 +1345,8 @@ class GeminiLLM(BaseLLM):
     ) -> Any:
         """
         Perform a vision-aware chat completion for Gemini models that support vision.
-        This method handles multimodal messages with image content.
+        This method handles multimodal messages with image content using streaming API
+        to leverage timeout mechanisms.
 
         Args:
             messages: List of message dictionaries with 'role' and 'content'
@@ -1370,18 +1371,81 @@ class GeminiLLM(BaseLLM):
                 f"Model {self._model_name} does not support vision capabilities"
             )
 
-        # Gemini's chat method handles vision automatically
-        return await self.chat(
-            messages=messages,
-            temperature=temperature,
-            max_tokens=max_tokens,
-            tools=tools,
-            tool_choice=tool_choice,
-            response_format=response_format,
-            thinking=thinking,
-            output_config=output_config,
-            **kwargs,
+        # Use streaming API internally to leverage timeout mechanisms,
+        # but collect and return the complete result to maintain API compatibility
+        logger.info(
+            f"Gemini vision_chat using streaming for timeout control: {self._model_name}"
         )
+
+        # Accumulate streaming response
+        accumulated_content = ""
+        accumulated_tool_calls = []
+
+        try:
+            # Stream the vision chat response
+            async for chunk in self.stream_chat(
+                messages=messages,
+                temperature=temperature,
+                max_tokens=max_tokens,
+                tools=tools,
+                tool_choice=tool_choice,
+                response_format=response_format,
+                thinking=thinking,
+                output_config=output_config,
+                **kwargs,
+            ):
+                chunk_type = chunk.type
+
+                if chunk_type == ChunkType.TOKEN:
+                    # Text token
+                    accumulated_content = chunk.content or ""
+
+                elif chunk_type == ChunkType.TOOL_CALL:
+                    # Tool call
+                    accumulated_tool_calls = chunk.tool_calls or []
+
+                elif chunk_type == ChunkType.USAGE:
+                    # Token usage - logged but not used in return value
+                    logger.debug(f"Gemini vision_chat usage: {chunk.usage}")
+
+                elif chunk_type == ChunkType.END:
+                    # End of stream
+                    logger.debug(
+                        f"Gemini vision_chat stream ended: {chunk.finish_reason}"
+                    )
+
+                elif chunk_type == ChunkType.ERROR:
+                    # Error
+                    error_msg = chunk.content or "Unknown error"
+                    raise RuntimeError(
+                        f"Gemini vision chat streaming error: {error_msg}"
+                    )
+
+            # Return result in the same format as non-streaming chat
+            if accumulated_tool_calls:
+                return {
+                    "type": "tool_call",
+                    "tool_calls": accumulated_tool_calls,
+                    "raw": {"content": accumulated_content},
+                }
+
+            # Return text content
+            if not accumulated_content:
+                raise LLMEmptyContentError(
+                    "LLM returned empty content and no tool calls"
+                )
+
+            return accumulated_content
+
+        except (TimeoutError, LLMTimeoutError):
+            # Re-raise timeout errors for retry
+            raise
+        except LLMRetryableError:
+            # Re-raise retryable errors for retry
+            raise
+        except Exception as e:
+            logger.error(f"Gemini vision_chat error: {e}")
+            raise RuntimeError(f"Gemini vision chat failed: {str(e)}") from e
 
     async def close(self) -> None:
         """Close the Gemini client and cleanup resources."""

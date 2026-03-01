@@ -231,14 +231,36 @@ class TestGeminiLLM:
         mocker: pytest_mock.MockerFixture,
     ) -> None:
         """Test vision chat functionality."""
+        from xagent.core.model.chat.types import ChunkType, StreamChunk
+
         # Test with vision-capable model
         vision_llm = GeminiLLM(model_name="gemini-pro-vision", api_key="test-key")
 
-        # Mock the internal API call method
+        # Mock stream_chat to return streaming chunks
+        async def mock_stream_chat(*args, **kwargs):
+            """Mock streaming response for vision chat."""
+            yield StreamChunk(
+                type=ChunkType.TOKEN,
+                content="Hello",
+                delta="Hello",
+                raw=None,
+            )
+            yield StreamChunk(
+                type=ChunkType.TOKEN,
+                content="Hello World",
+                delta=" World",
+                raw=None,
+            )
+            yield StreamChunk(
+                type=ChunkType.END,
+                finish_reason="stop",
+                raw=None,
+            )
+
         mocker.patch.object(
             vision_llm,
-            "_call_gemini_rest_api",
-            new=AsyncMock(return_value=mock_response_text),
+            "stream_chat",
+            new=mock_stream_chat,
         )
 
         messages = [

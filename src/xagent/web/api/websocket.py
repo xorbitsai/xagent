@@ -1906,8 +1906,6 @@ async def handle_build_preview_execution(
             )
 
             # Collect tools by category (async)
-            import asyncio
-
             async def _get_tools_by_category() -> list[str]:
                 all_tools = await ToolFactory.create_all_tools(temp_config)
                 allowed_tools = []
@@ -1923,7 +1921,7 @@ async def handle_build_preview_execution(
 
                 return allowed_tools
 
-            allowed_tools = asyncio.run(_get_tools_by_category())
+            allowed_tools = await _get_tools_by_category()
 
         # Create tool configuration
         tool_config = WebToolConfig(

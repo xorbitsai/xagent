@@ -1129,6 +1129,8 @@ class DAGPlanExecutePattern(AgentPattern):
             result_str: str = json.dumps(final_result)
 
             # Trace overall completion
+            from ...trace import trace_task_completion
+
             await trace_task_completion(
                 self.tracer,
                 self.task_id or "dag_plan_execute",

@@ -9,13 +9,21 @@ from typing import Any, Dict, List, Optional
 from uuid import uuid4
 
 from ....model.chat.basic.base import BaseLLM
+from ....model.chat.token_context import add_token_usage
 from ....tools.adapters.vibe import Tool
 from ...context import AgentContext
 from ...exceptions import DAGPlanGenerationError, LLMResponseError
 from ...trace import trace_dag_plan_end, trace_dag_plan_start
 from ...utils.compact import CompactConfig, CompactUtils
 from ...utils.llm_utils import clean_messages, extract_json_from_markdown
-from .models import ExecutionPlan, PlanStep
+from .models import (
+    ChatResponse,
+    ExecutionPlan,
+    Interaction,
+    InteractionType,
+    PlanGeneratorResult,
+    PlanStep,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -465,6 +473,229 @@ class PlanGenerator:
             context={"goal": goal[:100], "tools_count": len(tools)},
         )
 
+    async def should_chat_directly(
+        self,
+        goal: str,
+        tools: List[Tool],
+        iteration: int,
+        history: List[Dict[str, Any]],
+        tracer: Any,
+        context: Optional[AgentContext] = None,
+    ) -> PlanGeneratorResult:
+        """
+        Quick check if the goal can be answered directly without planning.
+
+        Returns:
+            PlanGeneratorResult with type="chat" and chat_response if should chat
+            PlanGeneratorResult with type="plan" (no plan object) if should generate plan
+
+        This is called BEFORE skill selection to quickly determine the execution path.
+        """
+        logger.info(f"[should_chat_directly] Checking goal: {goal[:100]}")
+        logger.info(
+            f"[should_chat_directly] Context: history_count={len(history)}, tools_count={len(tools)}, iteration={iteration}"
+        )
+        if context:
+            logger.info(
+                f"[should_chat_directly] Agent context: {type(context).__name__}"
+            )
+
+        # Build classification prompt (no skill context needed for quick check)
+        messages = self._build_classification_prompt(
+            goal, history, tools, context, skill_context=None
+        )
+        logger.info(
+            f"[should_chat_directly] Built prompt with {len(messages)} messages"
+        )
+
+        # Call LLM to analyze
+        try:
+            response = await self._call_llm_with_retry(messages=messages)
+
+            content = response["content"] if isinstance(response, dict) else response
+            usage = response.get("usage") if isinstance(response, dict) else None
+
+            # Record token usage
+            if usage:
+                logger.info(
+                    f"[should_chat_directly] LLM usage - "
+                    f"prompt_tokens: {usage.get('prompt_tokens', 0)}, "
+                    f"completion_tokens: {usage.get('completion_tokens', 0)}, "
+                    f"total_tokens: {usage.get('total_tokens', 0)}"
+                )
+
+            logger.info(f"LLM analysis response received, length: {len(str(content))}")
+
+            # Try to parse as JSON
+            try:
+                json_str = extract_json_from_markdown(content)
+                parsed = json.loads(json_str)
+
+                if not isinstance(parsed, dict):
+                    raise ValueError("Response is not a dictionary")
+
+                response_type = parsed.get("type", "")
+
+                if response_type == "chat":
+                    # Parse chat response
+                    chat_data = parsed.get("chat", {})
+                    message = chat_data.get("message", "")
+
+                    interactions = []
+                    for interaction_data in chat_data.get("interactions", []):
+                        interaction_type = InteractionType(
+                            interaction_data.get("type", "text_input")
+                        )
+                        interaction = Interaction(
+                            type=interaction_type,
+                            field=interaction_data.get("field"),
+                            label=interaction_data.get("label"),
+                            options=interaction_data.get("options"),
+                            placeholder=interaction_data.get("placeholder"),
+                            multiline=interaction_data.get("multiline"),
+                            min=interaction_data.get("min"),
+                            max=interaction_data.get("max"),
+                            default=interaction_data.get("default"),
+                            accept=interaction_data.get("accept"),
+                            multiple=interaction_data.get("multiple"),
+                        )
+                        interactions.append(interaction)
+
+                    chat_response = ChatResponse(
+                        message=message,
+                        interactions=interactions if interactions else None,
+                    )
+
+                    return PlanGeneratorResult(type="chat", chat_response=chat_response)
+
+                elif response_type == "plan":
+                    # Need to generate plan
+                    return PlanGeneratorResult(type="plan", plan=None)
+
+                else:
+                    # Unknown type, assume plan generation is needed
+                    logger.info(
+                        f"Unknown response type '{response_type}', treating as plan"
+                    )
+                    return PlanGeneratorResult(type="plan", plan=None)
+
+            except (json.JSONDecodeError, ValueError, KeyError) as e:
+                logger.warning(f"Failed to parse LLM response as structured JSON: {e}")
+                # On parse error, assume plan is needed
+                return PlanGeneratorResult(type="plan", plan=None)
+
+        except Exception as e:
+            logger.error(f"Error during analysis: {e}")
+            # On error, assume plan is needed
+            return PlanGeneratorResult(type="plan", plan=None)
+
+    def _build_classification_prompt(
+        self,
+        goal: str,
+        history: List[Dict[str, Any]],
+        tools: List[Tool],
+        context: Optional[AgentContext] = None,
+        skill_context: Optional[str] = None,
+    ) -> List[Dict[str, str]]:
+        """Build prompt for classifying user input (chat vs plan)"""
+        logger.debug(
+            f"[_build_classification_prompt] Building prompt with {len(history)} history items, {len(tools)} tools"
+        )
+
+        # Build tools context
+        tools_context = ""
+        if tools:
+            tools_context = "\n\nAVAILABLE TOOLS:\n"
+            for tool in tools:
+                if tool.metadata:
+                    tool_name = tool.metadata.name
+                    tool_description = (
+                        tool.metadata.description or f"Execute {tool_name}"
+                    )
+                else:
+                    tool_name = getattr(tool, "name", "unknown_tool")
+                    tool_description = getattr(
+                        tool, "description", f"Execute {tool_name}"
+                    )
+                tools_context += f"- {tool_name}: {tool_description}\n"
+
+        # Build system prompt
+        system_prompt = """You are an intelligent task assistant. Analyze the user's input and decide:
+
+1. **Direct Answer (type: "chat")** - If the user asks a simple question that you can answer directly without executing any tasks
+2. **Need Clarification (type: "chat")** - If you need more information to help the user effectively
+3. **Need Execution (type: "plan")** - If the user's request requires multi-step execution with tools
+
+## Response Format
+
+### For Chat (direct answer or clarification):
+```json
+{
+  "type": "chat",
+  "chat": {
+    "message": "Your response to the user",
+    "interactions": [
+      {
+        "type": "select_one|select_multiple|text_input|file_upload|confirm|number_input",
+        "field": "field_name",
+        "label": "Display label",
+        "options": [{"value": "A", "label": "Option A"}],
+        "placeholder": "...",
+        "multiline": false,
+        "min": 1,
+        "max": 100,
+        "default": true,
+        "accept": [".csv", ".xlsx"],
+        "multiple": false
+      }
+    ]
+  }
+}
+```
+
+### For Plan (execution required - just indicate this, don't generate the plan):
+```json
+{
+  "type": "plan"
+}
+```
+
+## Interaction Types
+- **select_one**: Single choice from options
+- **select_multiple**: Multiple choices from options
+- **text_input**: Single-line text input
+- **file_upload**: File upload with type restrictions
+- **confirm**: Yes/No confirmation
+- **number_input**: Numeric input with min/max
+
+## Important Guidelines
+- Use the SAME LANGUAGE as the user's goal for all text
+- Only use "plan" type when multi-step tool execution is clearly needed
+- For simple questions, clarifications, or information gathering, use "chat" type
+- When returning type="plan", do NOT include plan details - just the type indicator
+- interactions is optional - omit if no user input is needed
+"""
+
+        if tools_context:
+            system_prompt += f"\n{tools_context}\n"
+
+        # Build messages list with history
+        messages = [{"role": "system", "content": system_prompt}]
+
+        # Add conversation history as separate messages
+        if history:
+            messages.extend(history)
+
+        # Add current goal as the final user message
+        messages.append(
+            {
+                "role": "user",
+                "content": f"User input: {goal}\n\nAnalyze and respond with appropriate JSON.",
+            }
+        )
+
+        return messages
+
     async def generate_plan(
         self,
         goal: str,
@@ -724,10 +955,6 @@ class PlanGenerator:
     ) -> List[Dict[str, str]]:
         """Build prompt for plan generation"""
 
-        history_context = ""
-        if history and iteration > 1:
-            history_context = f"\nPrevious execution history:\n{json.dumps(history, indent=2, default=str)}\n"
-
         # Check if custom system prompt is provided in context
         custom_prompt = ""
         use_custom_role = False
@@ -822,23 +1049,41 @@ class PlanGenerator:
 
         logger.debug(f"PLAN GENERATION SYSTEM PROMPT:\n{system_prompt}")
 
-        user_prompt = (
-            f"Goal: {goal}\n"
-            f"Iteration: {iteration}\n"
-            f"Current Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
-            f"{history_context}"
+        logger.info(
+            f"[generate_plan] Goal: {goal[:100]}, history_count={len(history)}, iteration={iteration}"
+        )
+
+        # Build messages list with history
+        messages = [{"role": "system", "content": system_prompt}]
+
+        # Add conversation history as separate messages
+        if history:
+            messages.extend(history)
+            # Log history preview
+            first_msg = history[0]
+            last_msg = history[-1]
+            logger.info(
+                f"[generate_plan] History: {len(history)} messages, first={first_msg.get('role')}, last={last_msg.get('role')}"
+            )
+
+        # Add current goal as the final user message
+        messages.append(
+            {
+                "role": "user",
+                "content": f"Goal: {goal}\nIteration: {iteration}\nCurrent Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\nCreate a step-by-step execution plan as a JSON object.",
+            }
         )
 
         # Add skill reminder if available
         if skill_context:
-            user_prompt += (
+            messages[-1]["content"] += (
                 "\n"
                 "A skill is available that can help with this task. "
                 "Consider its knowledge and templates when creating the plan.\n\n"
             )
 
-        user_prompt += (
-            f"Create a step-by-step execution plan as a JSON object with a 'plan' field.\n\n"
+        # Add plan generation instructions
+        messages[-1]["content"] += (
             f"**IMPORTANT**: The plan MUST include a 'task_name' field with a concise, descriptive title (3-10 words).\n\n"
             f"Required fields:\n"
             f"- task_name: A concise title for this task (REQUIRED, 3-10 words, meaningful for display in task lists, **MUST USE THE SAME LANGUAGE AS THE GOAL**)\n"
@@ -889,10 +1134,7 @@ class PlanGenerator:
             f"- etc.\n"
         )
 
-        return [
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": user_prompt},
-        ]
+        return messages
 
     def _build_tools_schema(self, tools: List[Tool]) -> List[Dict[str, Any]]:
         """Build tools schema for LLM function calling"""
@@ -1117,6 +1359,14 @@ class PlanGenerator:
                     f"total_tokens: {usage.get('total_tokens', 0)}"
                 )
 
+                # Add token usage to tracker
+                add_token_usage(
+                    input_tokens=usage.get("prompt_tokens", 0),
+                    output_tokens=usage.get("completion_tokens", 0),
+                    model=self.llm.model_name,
+                    call_type="plan_generation",
+                )
+
             # Return format (compatible with original chat())
             if tool_calls:
                 return {
@@ -1144,6 +1394,15 @@ class PlanGenerator:
                         usage = chunk.usage
                     elif chunk.is_error():
                         raise RuntimeError(f"LLM stream error: {chunk.content}")
+
+                # Record token usage for fallback
+                if usage:
+                    add_token_usage(
+                        input_tokens=usage.get("prompt_tokens", 0),
+                        output_tokens=usage.get("completion_tokens", 0),
+                        model=self.llm.model_name,
+                        call_type="plan_generation_fallback",
+                    )
 
                 return {"content": full_content, "usage": usage}
             except Exception as e2:

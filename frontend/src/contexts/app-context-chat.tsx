@@ -2142,6 +2142,7 @@ export function AppProvider({ children, token }: { children: React.ReactNode; to
                 content: eventData.content || "",
                 timestamp: message.timestamp,
                 status: "completed",
+                isResult: true,  // Mark as result message so it shows in task page
               }
             })
           }
@@ -2984,6 +2985,7 @@ export function AppProvider({ children, token }: { children: React.ReactNode; to
           payload: { status: taskData.success ? "completed" : "failed" }
         })
         dispatch({ type: "TRIGGER_TASK_UPDATE" })
+        dispatch({ type: "SET_PROCESSING", payload: false })  // Stop processing on task completion
 
         // Update DAG execution status to completed
         if (state.dagExecution) {

@@ -91,6 +91,9 @@ TASK_END_GENERAL = TraceEventType(
 )
 TASK_ERROR = TraceEventType(TraceScope.TASK, TraceAction.ERROR, TraceCategory.GENERAL)
 
+# AI message event (for chat responses)
+AI_MESSAGE = TraceEventType(TraceScope.TASK, TraceAction.END, TraceCategory.MESSAGE)
+
 # Step-level events
 STEP_START_DAG = TraceEventType(TraceScope.STEP, TraceAction.START, TraceCategory.DAG)
 STEP_END_DAG = TraceEventType(TraceScope.STEP, TraceAction.END, TraceCategory.DAG)
@@ -709,10 +712,11 @@ async def trace_ai_message(
     tracer: Tracer, task_id: str, message: str, data: Optional[Dict[str, Any]] = None
 ) -> str:
     """Trace AI message event."""
-    event_data = {"message": message}
+    event_data = {"content": message}  # Use 'content' to match frontend expectations
     if data:
         event_data.update(data)
-    return await trace_task_end(tracer, task_id, TraceCategory.MESSAGE, event_data)
+    # Use AI_MESSAGE event type to generate "ai_message" event_type for frontend
+    return await tracer.trace_event(AI_MESSAGE, task_id=task_id, data=event_data)
 
 
 async def trace_skill_select_start(

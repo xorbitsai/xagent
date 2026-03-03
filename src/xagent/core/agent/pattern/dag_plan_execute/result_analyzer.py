@@ -11,6 +11,7 @@ from typing import Any, Dict, List, Optional
 from json_repair import loads as repair_loads
 
 from ....model.chat.basic.base import BaseLLM
+from ....model.chat.token_context import add_token_usage
 from ...exceptions import LLMResponseError
 from ...trace import (
     Tracer,
@@ -98,7 +99,19 @@ class ResultAnalyzer:
                 messages=cleaned_prompt,
             )
 
-            content = response["content"] if isinstance(response, dict) else response
+            # Debug: log response type and structure
+            logger.debug(f"LLM response type: {type(response)}, value: {response!r}")
+
+            # Extract content from response
+            if isinstance(response, dict):
+                content = response.get("content", response)
+            elif isinstance(response, tuple):
+                # If response is a tuple, extract first element (content)
+                logger.warning(f"Unexpected tuple response from LLM: {response}")
+                content = response[0] if len(response) > 0 else str(response)
+            else:
+                # Direct string or other type
+                content = response
 
             logger.info(f"Comprehensive goal check response received: {content}")
 
@@ -107,10 +120,11 @@ class ResultAnalyzer:
 
             # Parse response
             try:
-                result = repair_loads(content, logging=True)
+                # Note: logging must be False to avoid tuple return (json, repair_log)
+                result = repair_loads(content, logging=False)
                 if not isinstance(result, dict):
                     raise LLMResponseError(
-                        "Comprehensive goal check response is not a JSON object",
+                        f"Comprehensive goal check response is not a JSON object. Got: {type(result).__name__}",
                         response=content,
                         expected_format="JSON object with goal achievement and memory insights",
                     )
@@ -212,8 +226,9 @@ class ResultAnalyzer:
                 return result
 
             except json.JSONDecodeError as e:
+                # Check if response looks like a model rejection/safety filter message
                 raise LLMResponseError(
-                    "Failed to parse comprehensive goal check response as JSON",
+                    f"Failed to parse response as JSON. This might be due to model content filtering. Response: {content}",
                     response=content,
                     expected_format="JSON object with goal achievement and memory insights",
                     cause=e,
@@ -677,7 +692,21 @@ STORAGE THRESHOLD: Be extremely conservative. Default to should_store = false un
                     f"total_tokens: {usage.get('total_tokens', 0)}"
                 )
 
+                # Add token usage to tracker
+                add_token_usage(
+                    input_tokens=usage.get("prompt_tokens", 0),
+                    output_tokens=usage.get("completion_tokens", 0),
+                    model=self.llm.model_name,
+                    call_type="goal_check",
+                )
+
             # Return format (compatible with original chat())
+            # Ensure we always return a dict with content key
+            if not isinstance(full_content, str):
+                logger.error(
+                    f"Unexpected full_content type: {type(full_content)}, value: {full_content!r}"
+                )
+                full_content = str(full_content)
             return {"content": full_content, "usage": usage}
 
         except Exception as e:
@@ -703,6 +732,21 @@ STORAGE THRESHOLD: Be extremely conservative. Default to should_store = false un
                     f"Normal mode call succeeded (fallback), response length: {len(full_content)}"
                 )
 
+                # Record token usage for fallback
+                if usage:
+                    add_token_usage(
+                        input_tokens=usage.get("prompt_tokens", 0),
+                        output_tokens=usage.get("completion_tokens", 0),
+                        model=self.llm.model_name,
+                        call_type="goal_check_fallback",
+                    )
+
+                # Ensure we always return a dict with content key
+                if not isinstance(full_content, str):
+                    logger.error(
+                        f"Unexpected full_content type in fallback: {type(full_content)}, value: {full_content!r}"
+                    )
+                    full_content = str(full_content)
                 return {"content": full_content, "usage": usage}
 
             except Exception as e2:

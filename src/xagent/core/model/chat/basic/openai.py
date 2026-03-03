@@ -1,3 +1,4 @@
+import json
 import logging
 import os
 import time
@@ -181,13 +182,6 @@ class OpenAILLM(BaseLLM):
             ):
                 # For hybrid models, allow disabling thinking mode
                 extra_body["enable_thinking"] = False
-        elif self.supports_thinking_mode and "thinking_mode" in self.abilities:
-            # For hybrid models with thinking_mode ability, auto-enable thinking mode only for streaming
-            if is_streaming:
-                extra_body["enable_thinking"] = True
-            else:
-                # For non-streaming calls, enable_thinking must be false
-                extra_body["enable_thinking"] = False
 
         # Helper function to process response
         async def _make_api_call() -> Any:
@@ -265,7 +259,36 @@ class OpenAILLM(BaseLLM):
         try:
             # Make the API call
             response = await _make_api_call()
-            return _process_response(response)
+            result = _process_response(response)
+
+            # Handle thinking mode models with response_format returning invalid JSON
+            # Some models (like DashScope qwen3) return garbage in content when thinking is enabled
+            # Detect this and retry with thinking disabled
+            if (
+                response_format
+                and "thinking_mode" in self.abilities
+                and result.get("type") == "text"
+                and hasattr(response, "choices")
+                and response.choices
+            ):
+                message = response.choices[0].message
+                # Check if response has reasoning_content (indicates thinking was active)
+                if hasattr(message, "reasoning_content") and message.reasoning_content:
+                    content = result.get("content", "")
+                    # Try to parse as JSON
+                    try:
+                        json.loads(content)
+                    except (json.JSONDecodeError, ValueError):
+                        # Content is not valid JSON, retry with thinking disabled
+                        logger.warning(
+                            "Model returned non-JSON content with response_format while thinking was enabled. "
+                            "Retrying with thinking disabled."
+                        )
+                        extra_body = {"enable_thinking": False}
+                        response = await _make_api_call()
+                        result = _process_response(response)
+
+            return result
 
         except openai.BadRequestError as e:
             # Handle bad request errors
@@ -651,7 +674,15 @@ class OpenAILLM(BaseLLM):
             ):
                 extra_body["enable_thinking"] = False
         elif self.supports_thinking_mode and "thinking_mode" in self.abilities:
-            extra_body["enable_thinking"] = True
+            # For hybrid models with thinking_mode ability
+            # If response_format is requested, disable thinking to avoid JSON corruption
+            if response_format:
+                logger.debug(
+                    "Disabling thinking mode for response_format to ensure valid JSON output"
+                )
+                extra_body["enable_thinking"] = False
+            else:
+                extra_body["enable_thinking"] = True
 
         try:
             # Create streaming response

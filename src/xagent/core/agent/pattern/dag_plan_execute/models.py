@@ -318,3 +318,52 @@ def extract_branch_key_from_final_answer(
             return branch
 
     return None
+
+
+# Chat response models for interactive conversations
+
+
+class InteractionType(str, Enum):
+    """Types of user interactions in chat mode"""
+
+    SELECT_ONE = "select_one"
+    SELECT_MULTIPLE = "select_multiple"
+    TEXT_INPUT = "text_input"
+    FILE_UPLOAD = "file_upload"
+    CONFIRM = "confirm"
+    NUMBER_INPUT = "number_input"
+
+
+@dataclass
+class Interaction:
+    """A single interaction field in chat mode"""
+
+    type: InteractionType
+    field: Optional[str] = None  # Field identifier for response processing
+    label: Optional[str] = None  # Display label
+    # Type-specific properties
+    options: Optional[List[Dict[str, str]]] = None  # For select_*
+    placeholder: Optional[str] = None  # For text/number input
+    multiline: Optional[bool] = None  # For text input
+    min: Optional[int] = None  # For number input
+    max: Optional[int] = None  # For number input
+    default: Optional[Any] = None  # Default value
+    accept: Optional[List[str]] = None  # For file upload (MIME types)
+    multiple: Optional[bool] = None  # For file upload or select_multiple
+
+
+@dataclass
+class ChatResponse:
+    """Chat response with optional interactions"""
+
+    message: str  # Main message to display
+    interactions: Optional[List[Interaction]] = None  # Optional interaction fields
+
+
+@dataclass
+class PlanGeneratorResult:
+    """Result from plan generator - either chat or plan"""
+
+    type: str  # "chat" or "plan"
+    chat_response: Optional[ChatResponse] = None
+    plan: Optional[ExecutionPlan] = None

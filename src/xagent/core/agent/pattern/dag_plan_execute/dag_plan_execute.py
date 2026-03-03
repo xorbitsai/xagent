@@ -36,7 +36,6 @@ from ...trace import (
     trace_memory_retrieve_start,
     trace_memory_store_end,
     trace_memory_store_start,
-    trace_task_completion,
     trace_task_start,
     trace_user_message,
 )
@@ -46,7 +45,10 @@ if TYPE_CHECKING:
     from ...agent import Agent
     # from ..react import ReActPattern  # Already in TYPE_CHECKING
 
-from ...exceptions import LLMNotAvailableError, PatternExecutionError
+from ...exceptions import (
+    LLMNotAvailableError,
+    PatternExecutionError,
+)
 from ...utils import ContextBuilder, StepExecutionResult
 from ..base import AgentPattern
 
@@ -176,6 +178,9 @@ class DAGPlanExecutePattern(AgentPattern):
         self.user_input_mapper = UserInputMapper()
         self._new_user_input: Optional[str] = None
 
+        # Conversation history for chat-to-plan flow
+        self._conversation_history: List[Dict[str, Any]] = []
+
         # Initialize StepAgentFactory first
         assert workspace is not None, "workspace must be provided"
         self.step_agent_factory = StepAgentFactory(
@@ -206,6 +211,106 @@ class DAGPlanExecutePattern(AgentPattern):
             step_agent_factory=self.step_agent_factory,
         )
         self.result_analyzer = ResultAnalyzer(llm, tracer or Tracer())
+
+    def _add_user_message(self, content: str) -> None:
+        """Add user message to conversation history."""
+        self._conversation_history.append(
+            {
+                "role": "user",
+                "content": content,
+            }
+        )
+
+    def _add_assistant_message(
+        self,
+        content: str,
+        interactions: Optional[List] = None,
+    ) -> None:
+        """Add assistant message to conversation history with optional interactions.
+
+        Interactions are converted to natural language and merged into content.
+        The original interactions are stored separately for frontend use.
+        """
+        content_parts = [content]
+
+        # Convert interactions to natural language description
+        if interactions:
+            content_parts.append("\n\n请用户回答以下问题：")
+            for interaction in interactions:
+                from .models import InteractionType
+
+                interaction_type = (
+                    interaction.type
+                    if isinstance(interaction.type, InteractionType)
+                    else InteractionType(interaction.type)
+                )
+
+                if interaction_type == InteractionType.SELECT_ONE:
+                    options_desc = ", ".join(
+                        [
+                            f"{opt.get('value')}: {opt.get('label')}"
+                            for opt in (interaction.options or [])
+                        ]
+                    )
+                    label = interaction.label or "请选择"
+                    content_parts.append(f"- {label}: {options_desc}")
+
+                elif interaction_type == InteractionType.SELECT_MULTIPLE:
+                    options_desc = ", ".join(
+                        [
+                            f"{opt.get('value')}: {opt.get('label')}"
+                            for opt in (interaction.options or [])
+                        ]
+                    )
+                    label = interaction.label or "请选择（可多选）"
+                    content_parts.append(f"- {label}: {options_desc}")
+
+                elif interaction_type == InteractionType.TEXT_INPUT:
+                    label = interaction.label or "请输入"
+                    placeholder = interaction.placeholder or "文本输入"
+                    content_parts.append(f"- {label}: {placeholder}")
+
+                elif interaction_type == InteractionType.FILE_UPLOAD:
+                    label = interaction.label or "请上传文件"
+                    accept_desc = (
+                        ", ".join(interaction.accept)
+                        if interaction.accept
+                        else "任意文件"
+                    )
+                    multiple_desc = "可多选" if interaction.multiple else "单个文件"
+                    content_parts.append(f"- {label}: {accept_desc}（{multiple_desc}）")
+
+                elif interaction_type == InteractionType.CONFIRM:
+                    label = interaction.label or "请确认"
+                    default_desc = "默认：是" if interaction.default else "默认：否"
+                    content_parts.append(f"- {label} ({default_desc})")
+
+                elif interaction_type == InteractionType.NUMBER_INPUT:
+                    label = interaction.label or "请输入数字"
+                    range_desc = ""
+                    if interaction.min is not None and interaction.max is not None:
+                        range_desc = f"（范围：{interaction.min}-{interaction.max}）"
+                    content_parts.append(f"- {label}{range_desc}")
+
+        # Store with natural language content + original interactions
+        self._conversation_history.append(
+            {
+                "role": "assistant",
+                "content": "\n".join(content_parts),
+                "_interactions": interactions,  # Internal use, not sent to LLM
+            }
+        )
+
+    def _get_messages_for_llm(self) -> List[Dict[str, str]]:
+        """Get conversation history in standard format for LLM.
+
+        Filters out internal fields like '_interactions' and returns
+        only the standard 'role' and 'content' fields.
+        """
+        return [
+            {"role": msg["role"], "content": msg["content"]}
+            for msg in self._conversation_history
+        ]
 
     async def run(
         self,
@@ -406,7 +511,75 @@ class DAGPlanExecutePattern(AgentPattern):
                             )
                         logger.info("Execution resumed during planning phase")
 
-                    # Prepare parallel queries for memory and skill
+                    # Add user message to conversation history (before analyze_goal)
+                    self._add_user_message(task)
+
+                    # FIRST: Call should_chat_directly to determine if we should chat or plan
+                    # This happens BEFORE memory/skill selection to avoid unnecessary work
+                    result = await self.plan_generator.should_chat_directly(
+                        goal=task,
+                        tools=tools,
+                        iteration=iteration,
+                        history=self._get_messages_for_llm(),
+                        tracer=self.tracer,
+                        context=self._context,
+                    )
+
+                    # Check if LLM decided to return a chat response instead of generating a plan
+                    if result.type == "chat" and result.chat_response:
+                        logger.info(
+                            "LLM decided to return chat response instead of generating plan"
+                        )
+
+                        # Build interactions data for frontend and history
+                        interactions_data = None
+                        if result.chat_response.interactions:
+                            interactions_data = [
+                                {
+                                    "type": interaction.type.value,
+                                    "field": interaction.field,
+                                    "label": interaction.label,
+                                    "options": interaction.options,
+                                    "placeholder": interaction.placeholder,
+                                    "multiline": interaction.multiline,
+                                    "min": interaction.min,
+                                    "max": interaction.max,
+                                    "default": interaction.default,
+                                    "accept": interaction.accept,
+                                    "multiple": interaction.multiple,
+                                }
+                                for interaction in result.chat_response.interactions
+                            ]
+
+                        # Record assistant response to conversation history (with interactions)
+                        self._add_assistant_message(
+                            content=result.chat_response.message,
+                            interactions=interactions_data,
+                        )
+
+                        # Send task completion event with chat response as result
+                        # This will display the message AND stop processing
+                        if hasattr(self, "tracer") and self.tracer and self.task_id:
+                            from ...trace import trace_task_completion
+
+                            await trace_task_completion(
+                                self.tracer,
+                                self.task_id,
+                                result=result.chat_response.message,
+                                success=True,
+                            )
+
+                        # Return success with chat response - no plan execution needed
+                        return {
+                            "success": True,
+                            "chat_response": {
+                                "message": result.chat_response.message,
+                                "interactions": interactions_data or [],
+                            },
+                        }
+
+                    # If we reach here, LLM decided to generate a plan
+                    # Now proceed with memory and skill selection for plan generation
                     enhanced_task = task
                     skill_context = None
 
@@ -515,15 +688,24 @@ class DAGPlanExecutePattern(AgentPattern):
                     elif skill_result and isinstance(skill_result, Exception):
                         logger.warning(f"Skill selection failed: {skill_result}")
 
+                    # Generate plan with memory and skill context
                     plan = await self.plan_generator.generate_plan(
-                        goal=enhanced_task,  # May include memory enhancement, examples already in task
+                        goal=enhanced_task,
                         tools=tools,
                         iteration=iteration,
-                        history=execution_history,
+                        history=self._get_messages_for_llm(),
                         tracer=self.tracer,
                         context=self._context,
-                        skill_context=skill_context,  # Pass pre-fetched skill context
+                        skill_context=skill_context,
                     )
+                    if not plan:
+                        from ...exceptions import DAGPlanGenerationError
+
+                        raise DAGPlanGenerationError(
+                            "Plan generation returned None",
+                            goal=enhanced_task,
+                            iteration=iteration,
+                        )
 
                     # Send trace event with generated plan to frontend
                     if hasattr(self, "tracer") and self.tracer and self.task_id:
@@ -813,14 +995,14 @@ class DAGPlanExecutePattern(AgentPattern):
                 execution_history[-1]["results"] = execution_results
 
                 # Store execution results for context building
-                for result in execution_results:
-                    if result.get("status") == "completed":
-                        step_id = result["step_id"]
+                for step_result in execution_results:
+                    if step_result.get("status") == "completed":
+                        step_id = step_result["step_id"]
                         self.step_execution_results[step_id] = StepExecutionResult(
                             step_id=step_id,
                             messages=[],  # This would be populated from actual execution
-                            final_result=result["result"],
-                            agent_name=f"step_agent_{result['step_name']}",
+                            final_result=step_result.get("result", {}),
+                            agent_name=f"step_agent_{step_result.get('step_name', '')}",
                         )
 
                 # Execution insights will be generated together with other insights at the end
@@ -1548,6 +1730,10 @@ class DAGPlanExecutePattern(AgentPattern):
         # Clear pause event if it exists
         if hasattr(self, "_pause_event") and self._pause_event:
             self._pause_event.clear()
+
+        # Clear conversation history for fresh task
+        if hasattr(self, "_conversation_history"):
+            self._conversation_history.clear()
 
         # Reset plan executor state if it has a reset method
         if hasattr(self.plan_executor, "reset"):

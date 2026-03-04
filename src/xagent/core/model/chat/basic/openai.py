@@ -144,7 +144,18 @@ class OpenAILLM(BaseLLM):
             format_config = output_config.get("format", {})
             if format_config.get("type") == "json_schema":
                 # OpenAI supports json_schema through response_format
-                completion_params["response_format"] = format_config
+                # Convert to OpenAI's official format: {"type": "json_schema", "json_schema": {"name": ..., "strict": True, "schema": ...}}
+                schema = format_config.get("schema", {})
+                completion_params["response_format"] = {
+                    "type": "json_schema",
+                    "json_schema": {
+                        "name": schema.get("title", "response")
+                        .lower()
+                        .replace(" ", "_"),
+                        "strict": True,
+                        "schema": schema,
+                    },
+                }
             else:
                 # Pass through other output_config formats
                 completion_params["output_config"] = output_config
@@ -424,7 +435,18 @@ class OpenAILLM(BaseLLM):
             format_config = output_config.get("format", {})
             if format_config.get("type") == "json_schema":
                 # OpenAI supports json_schema through response_format
-                completion_params["response_format"] = format_config
+                # Convert to OpenAI's official format: {"type": "json_schema", "json_schema": {"name": ..., "strict": True, "schema": ...}}
+                schema = format_config.get("schema", {})
+                completion_params["response_format"] = {
+                    "type": "json_schema",
+                    "json_schema": {
+                        "name": schema.get("title", "response")
+                        .lower()
+                        .replace(" ", "_"),
+                        "strict": True,
+                        "schema": schema,
+                    },
+                }
             else:
                 # Pass through other output_config formats
                 completion_params["output_config"] = output_config
@@ -974,7 +996,7 @@ class OpenAILLM(BaseLLM):
     async def list_available_models(
         api_key: str, base_url: Optional[str] = None
     ) -> List[Dict[str, Any]]:
-        """Fetch available models from OpenAI-compatible API.
+        """Fetch available models from OpenAI-compatible API using SDK.
 
         Args:
             api_key: API key for the OpenAI-compatible service
@@ -995,37 +1017,43 @@ class OpenAILLM(BaseLLM):
             ...     base_url="https://my-proxy.com/v1"
             ... )
         """
-        import httpx
-
-        # Use official OpenAI API if base_url not provided
-        url = (base_url or "https://api.openai.com/v1").rstrip("/") + "/models"
-        headers = {"Authorization": f"Bearer {api_key}"}
+        # Create a client using SDK
+        client = AsyncOpenAI(
+            base_url=base_url if base_url != "https://api.openai.com/v1" else None,
+            api_key=api_key,
+            timeout=30.0,
+        )
 
         try:
-            async with httpx.AsyncClient(timeout=30.0) as client:
-                response = await client.get(url, headers=headers)
-                response.raise_for_status()
-                data = response.json()
+            # Use SDK's models.list() method
+            models_pager = await client.models.list()
 
-                models = []
-                for model in data.get("data", []):
-                    models.append(
-                        {
-                            "id": model.get("id"),
-                            "created": model.get("created"),
-                            "owned_by": model.get("owned_by"),
-                        }
-                    )
+            models = []
+            for model in models_pager.data:
+                models.append(
+                    {
+                        "id": model.id,
+                        "created": getattr(model, "created", None),
+                        "owned_by": getattr(model, "owned_by", None),
+                    }
+                )
 
-                # Sort by created date (newest first)
-                models.sort(key=lambda x: x.get("created", 0), reverse=True)
-                return models
+            # Sort by created date (newest first)
+            models.sort(
+                key=lambda x: (x.get("created") or 0)
+                if x.get("created") is not None
+                else 0,
+                reverse=True,
+            )
+            return models
 
-        except httpx.HTTPStatusError as e:
-            logger.error(f"HTTP error fetching models: {e.response.status_code}")
-            if e.response.status_code == 401:
-                raise ValueError("Invalid API key") from e
-            raise
+        except openai.AuthenticationError as e:
+            logger.error(
+                "OpenAI authentication failed: %s", redact_sensitive_text(str(e))
+            )
+            raise ValueError("Invalid API key") from e
         except Exception as e:
             logger.error("Failed to fetch models: %s", redact_sensitive_text(str(e)))
             return []
+        finally:
+            await client.close()

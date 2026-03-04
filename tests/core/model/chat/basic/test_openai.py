@@ -493,32 +493,29 @@ class TestOpenAILLM:
 
     @pytest.mark.asyncio
     async def test_list_available_models_with_default_base_url(self, mocker):
-        """Test listing available models using default base URL (official API)."""
-        # Mock httpx response
-        mock_response = mocker.MagicMock()
-        mock_response.status_code = 200
-        mock_response.json.return_value = {
-            "object": "list",
-            "data": [
-                {
-                    "id": "gpt-4o",
-                    "created": 1234567890,
-                    "owned_by": "openai",
-                },
-                {
-                    "id": "gpt-4o-mini",
-                    "created": 1234567891,
-                    "owned_by": "openai",
-                },
-            ],
-        }
+        """Test listing available models using SDK with default base URL."""
+        from openai.types import Model
 
-        mock_async_client = mocker.AsyncMock()
-        mock_async_client.get.return_value = mock_response
-        mock_async_client.__aenter__.return_value = mock_async_client
-        mock_async_client.__aexit__.return_value = None
+        # Mock the models list response from SDK
+        mock_model1 = Model(
+            id="gpt-4o", created=1234567890, owned_by="openai", object="model"
+        )
+        mock_model2 = Model(
+            id="gpt-4o-mini", created=1234567891, owned_by="openai", object="model"
+        )
 
-        mocker.patch("httpx.AsyncClient", return_value=mock_async_client)
+        mock_models_page = mocker.MagicMock()
+        mock_models_page.data = [mock_model1, mock_model2]
+
+        # Mock the AsyncOpenAI client
+        mock_client = mocker.AsyncMock()
+        mock_client.models.list.return_value = mock_models_page
+        mock_client.close = mocker.AsyncMock()
+
+        # Patch AsyncOpenAI to return our mock
+        mocker.patch(
+            "xagent.core.model.chat.basic.openai.AsyncOpenAI", return_value=mock_client
+        )
 
         # Call without base_url - should use official API
         models = await OpenAILLM.list_available_models("test-api-key")
@@ -530,35 +527,34 @@ class TestOpenAILLM:
         assert models[0]["id"] == "gpt-4o-mini"
         assert models[1]["id"] == "gpt-4o"
 
-        # Verify the API was called with official base URL
-        mock_async_client.get.assert_called_once()
-        call_args = mock_async_client.get.call_args
-        assert "api.openai.com/v1/models" in call_args[0][0]
-        assert call_args[1]["headers"]["Authorization"] == "Bearer test-api-key"
+        # Verify the SDK's models.list() was called
+        mock_client.models.list.assert_called_once()
+
+        # Verify client was closed
+        mock_client.close.assert_called_once()
 
     @pytest.mark.asyncio
     async def test_list_available_models_with_custom_base_url(self, mocker):
-        """Test listing available models using custom base URL."""
-        # Mock httpx response
-        mock_response = mocker.MagicMock()
-        mock_response.status_code = 200
-        mock_response.json.return_value = {
-            "object": "list",
-            "data": [
-                {
-                    "id": "custom-model-1",
-                    "created": 1234567890,
-                    "owned_by": "custom",
-                },
-            ],
-        }
+        """Test listing available models using SDK with custom base URL."""
+        from openai.types import Model
 
-        mock_async_client = mocker.AsyncMock()
-        mock_async_client.get.return_value = mock_response
-        mock_async_client.__aenter__.return_value = mock_async_client
-        mock_async_client.__aexit__.return_value = None
+        # Mock the models list response from SDK
+        mock_model = Model(
+            id="custom-model-1", created=1234567890, owned_by="custom", object="model"
+        )
 
-        mocker.patch("httpx.AsyncClient", return_value=mock_async_client)
+        mock_models_page = mocker.MagicMock()
+        mock_models_page.data = [mock_model]
+
+        # Mock the AsyncOpenAI client
+        mock_client = mocker.AsyncMock()
+        mock_client.models.list.return_value = mock_models_page
+        mock_client.close = mocker.AsyncMock()
+
+        # Patch AsyncOpenAI to return our mock and capture constructor args
+        async_openai_mock = mocker.patch(
+            "xagent.core.model.chat.basic.openai.AsyncOpenAI", return_value=mock_client
+        )
 
         # Call with custom base_url
         custom_base_url = "https://custom-proxy.com/v1"
@@ -570,35 +566,49 @@ class TestOpenAILLM:
         assert len(models) == 1
         assert models[0]["id"] == "custom-model-1"
 
-        # Verify the API was called with custom base URL
-        mock_async_client.get.assert_called_once()
-        call_args = mock_async_client.get.call_args
-        assert "custom-proxy.com/v1/models" in call_args[0][0]
+        # Verify AsyncOpenAI was called with custom base_url
+        async_openai_mock.assert_called_once()
+        call_kwargs = async_openai_mock.call_args.kwargs
+        assert call_kwargs["base_url"] == custom_base_url
+        assert call_kwargs["api_key"] == "test-api-key"
+
+        # Verify the SDK's models.list() was called
+        mock_client.models.list.assert_called_once()
+
+        # Verify client was closed
+        mock_client.close.assert_called_once()
 
     @pytest.mark.asyncio
     async def test_list_available_models_unauthorized(self, mocker):
-        """Test listing models with invalid API key."""
-        import httpx
+        """Test listing models with invalid API key using SDK."""
+        import openai
 
-        # Mock httpx to raise 401 error
+        # Mock the AsyncOpenAI client
+        mock_client = mocker.AsyncMock()
+
+        # Create a mock 401 response
         mock_response = mocker.MagicMock()
         mock_response.status_code = 401
         mock_response.text = "Unauthorized"
 
-        error = httpx.HTTPStatusError(
-            "Unauthorized", request=mocker.MagicMock(), response=mock_response
+        mock_client.models.list.side_effect = openai.AuthenticationError(
+            "Invalid API key",
+            response=mock_response,
+            body={"error": {"message": "Invalid API key"}},
         )
+        mock_client.close = mocker.AsyncMock()
 
-        mock_async_client = mocker.AsyncMock()
-        mock_async_client.get.side_effect = error
-        mock_async_client.__aenter__.return_value = mock_async_client
-        mock_async_client.__aexit__.return_value = None
-
-        mocker.patch("httpx.AsyncClient", return_value=mock_async_client)
+        # Patch AsyncOpenAI to return our mock
+        mocker.patch(
+            "xagent.core.model.chat.basic.openai.AsyncOpenAI", return_value=mock_client
+        )
 
         # Should raise ValueError for invalid API key
         with pytest.raises(ValueError, match="Invalid API key"):
             await OpenAILLM.list_available_models("invalid-key")
+
+        # Verify client was closed even after error
+        mock_client.close.assert_called_once()
 
     @pytest.mark.asyncio
     async def test_output_config_json_schema(self, llm, mocker):

@@ -8,6 +8,7 @@ import { FileAttachment } from "../components/file-attachment"
 import { ReplayScheduler } from '@/lib/replay-scheduler'
 import { CollapsibleSection } from "../components/collapsible-section"
 import { Badge } from "@/components/ui/badge"
+import { ClarificationForm } from "@/components/chat/clarification-form"
 
 interface WebSocketMessage {
   type: string
@@ -17,6 +18,19 @@ interface WebSocketMessage {
   step_id?: string
   event_type?: string
   event_id?: string
+}
+export interface Interaction {
+  type: "select_one" | "select_multiple" | "text_input" | "file_upload" | "confirm" | "number_input";
+  field: string;
+  label: string;
+  options?: Array<{ label: string; value: string }>;
+  placeholder?: string;
+  multiline?: boolean;
+  min?: number;
+  max?: number;
+  default?: any;
+  accept?: string[] | string;
+  multiple?: boolean;
 }
 import { useWebSocket } from "@/hooks/use-websocket"
 import { useAuth } from "@/contexts/auth-context"
@@ -98,6 +112,109 @@ const isDuplicateResult = (content: string) => {
 }
 
 
+const normalizeInteractions = (value: unknown): Interaction[] => {
+  if (!Array.isArray(value)) {
+    return []
+  }
+
+  return value
+    .map((item: any) => {
+      if (!item || typeof item !== "object") {
+        return null
+      }
+
+      const type = item.type
+      const field = item.field
+      if (
+        !["select_one", "select_multiple", "text_input", "file_upload", "confirm", "number_input"].includes(type) ||
+        typeof field !== "string" ||
+        !field.trim()
+      ) {
+        return null
+      }
+
+      const normalized: Interaction = {
+        type,
+        field,
+        label: typeof item.label === "string" && item.label.trim() ? item.label : field,
+      }
+
+      if (Array.isArray(item.options)) {
+        normalized.options = item.options
+          .filter((opt: any) => opt && typeof opt.value === "string")
+          .map((opt: any) => ({
+            value: opt.value,
+            label: typeof opt.label === "string" ? opt.label : opt.value,
+          }))
+      }
+
+      if (typeof item.placeholder === "string") normalized.placeholder = item.placeholder
+      if (typeof item.multiline === "boolean") normalized.multiline = item.multiline
+      if (typeof item.min === "number") normalized.min = item.min
+      if (typeof item.max === "number") normalized.max = item.max
+      if (typeof item.default !== "undefined") normalized.default = item.default
+      if (Array.isArray(item.accept) || typeof item.accept === "string") normalized.accept = item.accept
+      if (typeof item.multiple === "boolean") normalized.multiple = item.multiple
+
+      return normalized
+    })
+    .filter(Boolean) as Interaction[]
+}
+
+const extractClarificationMessage = (raw: unknown): { message: string; interactions: Interaction[] } | null => {
+  let asObject = raw && typeof raw === "object" ? (raw as any) : null
+
+  if (typeof raw === 'string') {
+    try {
+      asObject = JSON.parse(raw)
+    } catch (e) {
+      // ignore
+    }
+  }
+
+  const directMessage = typeof asObject?.content === "string" ? asObject.content : ""
+  const directInteractions = normalizeInteractions(asObject?.interactions)
+  if (directInteractions.length > 0) {
+    return { message: directMessage, interactions: directInteractions }
+  }
+
+  const chatResponse = asObject?.chat_response
+  if (chatResponse && typeof chatResponse === "object") {
+    const chatInteractions = normalizeInteractions((chatResponse as any).interactions)
+    if (chatInteractions.length > 0) {
+      return {
+        message: typeof (chatResponse as any).message === "string" ? (chatResponse as any).message : directMessage,
+        interactions: chatInteractions,
+      }
+    }
+  }
+
+  const resultValue = asObject?.result
+  // Try to parse result if it's a string
+  let parsedResult = resultValue
+  if (typeof resultValue === 'string') {
+    try {
+      parsedResult = JSON.parse(resultValue)
+    } catch (e) {
+      // ignore
+    }
+  }
+
+  if (parsedResult && typeof parsedResult === "object") {
+    const nested = extractClarificationMessage(parsedResult)
+    if (nested) return nested
+  }
+
+  const metadataValue = asObject?.metadata
+  if (metadataValue && typeof metadataValue === "object") {
+    const nested = extractClarificationMessage(metadataValue)
+    if (nested) return nested
+  }
+
+  return null
+}
+
+
 interface Message {
   id: string
   role: "user" | "assistant"
@@ -107,6 +224,7 @@ interface Message {
   isResult?: boolean
   isFileOutput?: boolean
   traceEvents?: TraceEvent[]
+  interactions?: Interaction[]
 }
 
 interface Task {
@@ -1781,22 +1899,43 @@ export function AppProvider({ children, token }: { children: React.ReactNode; to
 
           // Task Completion Events
           else if (eventType === "task_completion") {
-            const { result, success, metadata } = eventData
-            console.log('🔍 task_completion event:', { result, success, metadata, hasResult: !!(result && result.trim() !== '') })
+            const { result, success } = eventData
+            // Check for clarification request in task completion
+            const clarification = extractClarificationMessage(eventData)
+            if (clarification) {
+              dispatch({
+                type: "ADD_MESSAGE",
+                payload: {
+                  id: generateMessageId("msg-clarification"),
+                  role: "assistant",
+                  content: <div className="space-y-2">
+                    <div>
+                      {result.content}
+                    </div>
+                    <ClarificationForm interactions={clarification.interactions} />
+                  </div>,
+                  timestamp: message.timestamp,
+                  status: "completed",
+                  isResult: true,
+                  interactions: clarification.interactions,
+                }
+              })
+              return
+            }
 
             // Parse result string into object
             let resultData = {}
-            if (typeof result === 'string') {
+            if (typeof result.content === 'string') {
               try {
-                resultData = JSON.parse(result)
+                resultData = JSON.parse(result.content)
               } catch (e) {
-                console.log('Result is not JSON, treating as plain text output:', result)
-                resultData = { output: result }
+                console.log('Result is not JSON, treating as plain text output:', result.content)
+                resultData = { output: result.content }
               }
-            } else if (typeof result === 'object' && result !== null) {
-              resultData = result
+            } else if (typeof result.content === 'object' && result.content !== null) {
+              resultData = result.content
             } else {
-              resultData = { output: result }
+              resultData = { output: result.content }
             }
 
             // 1. Output meta info (excluding output, file_outputs, and history)
@@ -2134,15 +2273,24 @@ export function AppProvider({ children, token }: { children: React.ReactNode; to
 
           // AI Message Events
           else if (eventType === "ai_message") {
+            const clarification = extractClarificationMessage(eventData)
+            const content = clarification
+              ? <>
+                {eventData.content}
+                <ClarificationForm interactions={clarification.interactions} />
+              </>
+              : (eventData.content || "")
+
             dispatch({
               type: "ADD_MESSAGE",
               payload: {
                 id: generateMessageId("msg-ai"),
                 role: "assistant",
-                content: eventData.content || "",
+                content,
                 timestamp: message.timestamp,
                 status: "completed",
                 isResult: true,  // Mark as result message so it shows in task page
+                interactions: clarification?.interactions,
               }
             })
           }
@@ -2979,7 +3127,7 @@ export function AppProvider({ children, token }: { children: React.ReactNode; to
         break
 
       case "task_completed":
-        const taskData = message.data as { success?: boolean; result?: string; file_outputs?: string[] }
+        const taskData = message.data as { success?: boolean; result?: string | Record<string, unknown>; file_outputs?: string[] }
         dispatch({
           type: "UPDATE_TASK_STATUS",
           payload: { status: taskData.success ? "completed" : "failed" }
@@ -3009,8 +3157,6 @@ export function AppProvider({ children, token }: { children: React.ReactNode; to
         if (state.taskId) {
           historicalDataRequestMap.set(state.taskId, true)
         }
-
-        // Note: Result is now handled by trace events, not included in task_completed event
 
         // Handle file outputs
         if (taskData.file_outputs && taskData.file_outputs.length > 0) {

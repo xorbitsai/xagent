@@ -239,57 +239,68 @@ class DAGPlanExecutePattern(AgentPattern):
             for interaction in interactions:
                 from .models import InteractionType
 
+                def get_attr(obj: Any, key: str, default: Any = None) -> Any:
+                    if isinstance(obj, dict):
+                        return obj.get(key, default)
+                    return getattr(obj, key, default)
+
+                i_type = get_attr(interaction, "type")
+                i_options = get_attr(interaction, "options")
+                i_label = get_attr(interaction, "label")
+                i_placeholder = get_attr(interaction, "placeholder")
+                i_accept = get_attr(interaction, "accept")
+                i_multiple = get_attr(interaction, "multiple")
+                i_default = get_attr(interaction, "default")
+                i_min = get_attr(interaction, "min")
+                i_max = get_attr(interaction, "max")
+
                 interaction_type = (
-                    interaction.type
-                    if isinstance(interaction.type, InteractionType)
-                    else InteractionType(interaction.type)
+                    i_type
+                    if isinstance(i_type, InteractionType)
+                    else InteractionType(i_type)
                 )
 
                 if interaction_type == InteractionType.SELECT_ONE:
                     options_desc = ", ".join(
                         [
                             f"{opt.get('value')}: {opt.get('label')}"
-                            for opt in (interaction.options or [])
+                            for opt in (i_options or [])
                         ]
                     )
-                    label = interaction.label or "请选择"
+                    label = i_label or "请选择"
                     content_parts.append(f"- {label}: {options_desc}")
 
                 elif interaction_type == InteractionType.SELECT_MULTIPLE:
                     options_desc = ", ".join(
                         [
                             f"{opt.get('value')}: {opt.get('label')}"
-                            for opt in (interaction.options or [])
+                            for opt in (i_options or [])
                         ]
                     )
-                    label = interaction.label or "请选择（可多选）"
+                    label = i_label or "请选择（可多选）"
                     content_parts.append(f"- {label}: {options_desc}")
 
                 elif interaction_type == InteractionType.TEXT_INPUT:
-                    label = interaction.label or "请输入"
-                    placeholder = interaction.placeholder or "文本输入"
+                    label = i_label or "请输入"
+                    placeholder = i_placeholder or "文本输入"
                     content_parts.append(f"- {label}: {placeholder}")
 
                 elif interaction_type == InteractionType.FILE_UPLOAD:
-                    label = interaction.label or "请上传文件"
-                    accept_desc = (
-                        ", ".join(interaction.accept)
-                        if interaction.accept
-                        else "任意文件"
-                    )
-                    multiple_desc = "可多选" if interaction.multiple else "单个文件"
+                    label = i_label or "请上传文件"
+                    accept_desc = ", ".join(i_accept) if i_accept else "任意文件"
+                    multiple_desc = "可多选" if i_multiple else "单个文件"
                     content_parts.append(f"- {label}: {accept_desc}（{multiple_desc}）")
 
                 elif interaction_type == InteractionType.CONFIRM:
-                    label = interaction.label or "请确认"
-                    default_desc = "默认：是" if interaction.default else "默认：否"
+                    label = i_label or "请确认"
+                    default_desc = "默认：是" if i_default else "默认：否"
                     content_parts.append(f"- {label} ({default_desc})")
 
                 elif interaction_type == InteractionType.NUMBER_INPUT:
-                    label = interaction.label or "请输入数字"
+                    label = i_label or "请输入数字"
                     range_desc = ""
-                    if interaction.min is not None and interaction.max is not None:
-                        range_desc = f"（范围：{interaction.min}-{interaction.max}）"
+                    if i_min is not None and i_max is not None:
+                        range_desc = f"（范围：{i_min}-{i_max}）"
                     content_parts.append(f"- {label}{range_desc}")
 
         # Store with natural language content + original interactions
@@ -565,7 +576,13 @@ class DAGPlanExecutePattern(AgentPattern):
                             await trace_task_completion(
                                 self.tracer,
                                 self.task_id,
-                                result=result.chat_response.message,
+                                result={
+                                    "content": result.chat_response.message,
+                                    "chat_response": {
+                                        "message": result.chat_response.message,
+                                        "interactions": interactions_data or [],
+                                    },
+                                },
                                 success=True,
                             )
 

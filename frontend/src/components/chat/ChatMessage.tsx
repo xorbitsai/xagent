@@ -179,7 +179,7 @@ export function ChatMessage({
             "flex gap-4 transition-all duration-300",
             isUser
               ? "bg-slate-100 text-slate-700 p-3 rounded-2xl flex-row-reverse items-center"
-              : "bg-transparent p-0"
+              : "bg-transparent p-0 w-full"
           )}
         >
           {/* Avatar */}

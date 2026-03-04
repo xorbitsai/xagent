@@ -389,7 +389,7 @@ async def trace_task_end(
 async def trace_task_completion(
     tracer: Tracer,
     task_id: str,
-    result: str,
+    result: Any,
     success: bool = True,
 ) -> str:
     """Trace task completion event with result data."""

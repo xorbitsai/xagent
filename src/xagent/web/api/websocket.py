@@ -144,7 +144,13 @@ async def execute_task_background(
             )
 
         # Get AI response
-        ai_response = result.get("output", "Task completed")
+        chat_response = result.get("chat_response")
+        if isinstance(chat_response, dict):
+            ai_response = chat_response.get("message") or result.get(
+                "output", "Task completed"
+            )
+        else:
+            ai_response = result.get("output", "Task completed")
 
         # Task execution result is logged by ConsoleTraceHandler, no need for duplicate logs
 
@@ -188,6 +194,9 @@ async def execute_task_background(
                 "result": ai_response,
                 "output": ai_response,
                 "success": result.get("success", False),
+                "chat_response": chat_response
+                if isinstance(chat_response, dict)
+                else None,
                 "timestamp": datetime.now(timezone.utc).timestamp(),
             },
             task_id,
@@ -249,7 +258,13 @@ async def execute_continuation_background(
             result = await dag_pattern.handle_continuation(user_message, context)
 
         # Get AI response
-        ai_response = result.get("output", "Task continuation completed")
+        chat_response = result.get("chat_response")
+        if isinstance(chat_response, dict):
+            ai_response = chat_response.get("message") or result.get(
+                "output", "Task continuation completed"
+            )
+        else:
+            ai_response = result.get("output", "Task continuation completed")
 
         # Update task status (get new session to avoid expiration)
         from ..models.database import get_db
@@ -282,6 +297,9 @@ async def execute_continuation_background(
                 "result": ai_response,
                 "output": ai_response,
                 "success": result.get("success", False),
+                "chat_response": chat_response
+                if isinstance(chat_response, dict)
+                else None,
                 "timestamp": datetime.now(timezone.utc).timestamp(),
             },
             task_id,
@@ -1118,6 +1136,9 @@ async def handle_execute_task(
                         "description": task.description,
                     },
                     "success": result.get("success", False),
+                    "result": result.get("output", ""),
+                    "output": result.get("output", ""),
+                    "chat_response": result.get("chat_response"),
                     "metadata": result.get("metadata", {}),
                     "file_outputs": file_outputs,  # Add file output info
                     "timestamp": datetime.now(timezone.utc).timestamp(),
@@ -2137,6 +2158,7 @@ async def handle_build_preview_execution(
                     "type": "task_completed",
                     "result": result.get("output", ""),
                     "success": result.get("success", False),
+                    "chat_response": result.get("chat_response"),
                     "timestamp": datetime.now(timezone.utc).timestamp(),
                 }
             )

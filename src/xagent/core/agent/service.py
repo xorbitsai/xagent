@@ -344,14 +344,21 @@ class AgentService:
                 pattern = self.patterns[0]
                 if isinstance(pattern, DAGPlanExecutePattern):
                     execution_status = pattern.get_execution_status()
+                    chat_response = result.get("chat_response")
+                    normalized_output = result.get("output")
+                    if not normalized_output and isinstance(chat_response, dict):
+                        normalized_output = chat_response.get(
+                            "message", result.get("error", "No output provided")
+                        )
+                    if not normalized_output:
+                        normalized_output = result.get("error", "No output provided")
 
                     # Normalize result format
                     return {
                         "status": "completed" if result.get("success") else "failed",
-                        "output": result.get(
-                            "output", result.get("error", "No output provided")
-                        ),
+                        "output": normalized_output,
                         "success": result.get("success", False),
+                        "chat_response": chat_response,
                         "dag_status": execution_status,
                         "metadata": {
                             "agent_name": self.name,

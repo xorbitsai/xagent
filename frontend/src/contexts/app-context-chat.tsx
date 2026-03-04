@@ -73,7 +73,7 @@ if (typeof window !== 'undefined') {
 let isHistoricalDataLoading = false
 // Store pending task info for auto-execution after historical data loads
 let pendingTaskToExecute: { description: string } | null = null
-const isDuplicateMessage = (content: string | React.ReactNode, type: string = 'general', force: boolean = false) => {
+const isDuplicateMessage = (content: string | React.ReactNode, type: string = 'general', force: boolean = false, shouldCache: boolean = true) => {
   // Convert React element to string representation for comparison
   let contentStr: string
   if (typeof content === 'string') {
@@ -95,14 +95,18 @@ const isDuplicateMessage = (content: string | React.ReactNode, type: string = 'g
   }
 
   const key = `${type}:${contentStr}`
-  if (recentMessages.has(key)) {
+  if (!force && recentMessages.has(key)) {
     return true
   }
-  recentMessages.add(key)
-  // Clean up old messages after 30 seconds
-  setTimeout(() => {
-    recentMessages.delete(key)
-  }, 30000)
+
+  if (shouldCache) {
+    recentMessages.add(key)
+    // Clean up old messages after 30 seconds
+    setTimeout(() => {
+      recentMessages.delete(key)
+    }, 30000)
+  }
+
   return false
 }
 
@@ -161,7 +165,7 @@ const normalizeInteractions = (value: unknown): Interaction[] => {
     .filter(Boolean) as Interaction[]
 }
 
-const extractClarificationMessage = (raw: unknown): { message: string; interactions: Interaction[] } | null => {
+const extractClarificationMessage = (raw: unknown): { interactions: Interaction[]; timeout?: number; expiresAt?: string } | null => {
   let asObject = raw && typeof raw === "object" ? (raw as any) : null
 
   if (typeof raw === 'string') {
@@ -172,10 +176,13 @@ const extractClarificationMessage = (raw: unknown): { message: string; interacti
     }
   }
 
-  const directMessage = typeof asObject?.content === "string" ? asObject.content : ""
   const directInteractions = normalizeInteractions(asObject?.interactions)
   if (directInteractions.length > 0) {
-    return { message: directMessage, interactions: directInteractions }
+    return {
+      interactions: directInteractions,
+      timeout: typeof asObject?.timeout === 'number' ? asObject.timeout : undefined,
+      expiresAt: typeof asObject?.expires_at === 'string' ? asObject.expires_at : undefined,
+    }
   }
 
   const chatResponse = asObject?.chat_response
@@ -183,8 +190,9 @@ const extractClarificationMessage = (raw: unknown): { message: string; interacti
     const chatInteractions = normalizeInteractions((chatResponse as any).interactions)
     if (chatInteractions.length > 0) {
       return {
-        message: typeof (chatResponse as any).message === "string" ? (chatResponse as any).message : directMessage,
         interactions: chatInteractions,
+        timeout: typeof (chatResponse as any).timeout === 'number' ? (chatResponse as any).timeout : undefined,
+        expiresAt: typeof (chatResponse as any).expires_at === 'string' ? (chatResponse as any).expires_at : undefined,
       }
     }
   }
@@ -966,7 +974,9 @@ export function AppProvider({ children, token }: { children: React.ReactNode; to
             })
 
             // Check if this is a duplicate message
-            const isDuplicate = isDuplicateMessage(messageContent, 'user-message')
+            // Note: We don't cache messages from WebSocket to prevent blocking subsequent identical messages
+            // This is especially important for historical data loading where we might receive multiple identical messages
+            const isDuplicate = isDuplicateMessage(messageContent, 'user-message', false, false)
             console.log('🔍 Duplicate check:', {
               messageContent,
               isDuplicate,
@@ -1902,17 +1912,26 @@ export function AppProvider({ children, token }: { children: React.ReactNode; to
             const { result, success } = eventData
             // Check for clarification request in task completion
             const clarification = extractClarificationMessage(eventData)
+
+            console.log('-----------------------clarification', clarification);
+
             if (clarification) {
+              const msgId = generateMessageId("msg-clarification")
               dispatch({
                 type: "ADD_MESSAGE",
                 payload: {
-                  id: generateMessageId("msg-clarification"),
+                  id: msgId,
                   role: "assistant",
                   content: <div className="space-y-2">
                     <div>
                       {result.content}
                     </div>
-                    <ClarificationForm interactions={clarification.interactions} />
+                    <ClarificationForm
+                      interactions={clarification.interactions}
+                      timeout={clarification.timeout}
+                      expiresAt={(clarification as any).expiresAt}
+                      messageId={msgId}
+                    />
                   </div>,
                   timestamp: message.timestamp,
                   status: "completed",
@@ -1925,17 +1944,18 @@ export function AppProvider({ children, token }: { children: React.ReactNode; to
 
             // Parse result string into object
             let resultData = {}
-            if (typeof result.content === 'string') {
+            const resultContent = result?.content || result
+            if (typeof resultContent === 'string') {
               try {
-                resultData = JSON.parse(result.content)
+                resultData = JSON.parse(resultContent)
               } catch (e) {
                 console.log('Result is not JSON, treating as plain text output:', result.content)
-                resultData = { output: result.content }
+                resultData = { output: resultContent }
               }
-            } else if (typeof result.content === 'object' && result.content !== null) {
-              resultData = result.content
+            } else if (typeof resultContent === 'object' && resultContent !== null) {
+              resultData = resultContent
             } else {
-              resultData = { output: result.content }
+              resultData = { output: resultContent }
             }
 
             // 1. Output meta info (excluding output, file_outputs, and history)
@@ -2274,17 +2294,23 @@ export function AppProvider({ children, token }: { children: React.ReactNode; to
           // AI Message Events
           else if (eventType === "ai_message") {
             const clarification = extractClarificationMessage(eventData)
+            const msgId = generateMessageId("msg-ai")
             const content = clarification
               ? <>
                 {eventData.content}
-                <ClarificationForm interactions={clarification.interactions} />
+                <ClarificationForm
+                  interactions={clarification.interactions}
+                  timeout={clarification.timeout}
+                  expiresAt={clarification.expiresAt}
+                  messageId={msgId}
+                />
               </>
               : (eventData.content || "")
 
             dispatch({
               type: "ADD_MESSAGE",
               payload: {
-                id: generateMessageId("msg-ai"),
+                id: msgId,
                 role: "assistant",
                 content,
                 timestamp: message.timestamp,
@@ -3527,7 +3553,7 @@ export function AppProvider({ children, token }: { children: React.ReactNode; to
       })
 
       // Optimistically add the user message to the UI
-      if (!isDuplicateMessage(message, 'user-message')) {
+      if (!isDuplicateMessage(message, 'user-message', config?.force)) {
         let content: React.ReactNode = message
         if (files && files.length > 0) {
           content = (
@@ -3553,7 +3579,7 @@ export function AppProvider({ children, token }: { children: React.ReactNode; to
 
         // Send chat message - backend will handle user message via trace event
         // Only send if not a duplicate
-        sendChatMessage(message, files)
+        sendChatMessage(message, files, config?.force)
       } else {
         console.log('⚠️ Duplicate message blocked from sending:', message)
       }

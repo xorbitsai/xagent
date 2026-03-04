@@ -383,7 +383,7 @@ export function useWebSocket(options: UseWebSocketOptions = {}) {
     }
   }, [])
 
-  const sendChatMessage = useCallback((message: string, files?: File[]) => {
+  const sendChatMessage = useCallback((message: string, files?: File[], force: boolean = false) => {
     const timestamp = Date.now()
     console.log(`🚀 sendChatMessage called [${timestamp}]:`, { message, files: files?.map(f => f.name) })
 
@@ -393,7 +393,7 @@ export function useWebSocket(options: UseWebSocketOptions = {}) {
       msg => msg.taskId === currentTaskId && msg.message === message && (timestamp - msg.timestamp) < MESSAGE_DUPLICATE_THRESHOLD
     )
 
-    if (duplicateMessage) {
+    if (!force && duplicateMessage) {
       console.warn(
         `🚨 DUPLICATE MESSAGE DETECTED (Silently ignored)!\n` +
         `Message: "${message}"\n` +

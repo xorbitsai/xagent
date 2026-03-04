@@ -19,6 +19,7 @@ interface MultiSelectProps {
   className?: string
   creatable?: boolean
   searchable?: boolean
+  disabled?: boolean
 }
 
 const MarkdownDescription = ({ content }: { content: string }) => {
@@ -46,7 +47,7 @@ const MarkdownDescription = ({ content }: { content: string }) => {
   )
 }
 
-export function MultiSelect({ values, onValuesChange, options, placeholder, className, creatable, searchable }: MultiSelectProps) {
+export function MultiSelect({ values, onValuesChange, options, placeholder, className, creatable, searchable, disabled }: MultiSelectProps) {
   const [open, setOpen] = useState(false)
   const [dropdownDirection, setDropdownDirection] = useState<'down' | 'up'>('down')
   const [inputValue, setInputValue] = useState("")
@@ -100,12 +101,17 @@ export function MultiSelect({ values, onValuesChange, options, placeholder, clas
     opt.value.toLowerCase().includes(searchQuery.toLowerCase())
   )
 
-  const handleOptionClick = (optionValue: string) => {
-    if (values.includes(optionValue)) {
-      onValuesChange(values.filter(v => v !== optionValue))
-    } else {
-      onValuesChange([...values, optionValue])
-    }
+  const toggleOpen = () => {
+    if (disabled) return
+    setOpen(!open)
+  }
+
+  const handleSelect = (value: string) => {
+    if (disabled) return
+    const newValues = values.includes(value)
+      ? values.filter(v => v !== value)
+      : [...values, value]
+    onValuesChange(newValues)
   }
 
   const handleCreate = () => {
@@ -118,22 +124,23 @@ export function MultiSelect({ values, onValuesChange, options, placeholder, clas
     }
   }
 
-  const removeValue = (valueToRemove: string, e: React.MouseEvent) => {
+  const handleRemove = (value: string, e: React.MouseEvent) => {
+    if (disabled) return
     e.stopPropagation()
-    onValuesChange(values.filter(v => v !== valueToRemove))
+    const newValues = values.filter(v => v !== value)
+    onValuesChange(newValues)
   }
 
   return (
     <div ref={containerRef} className={cn("relative", className)}>
       <div
         ref={buttonRef}
-        onClick={() => setOpen(!open)}
         className={cn(
-          "w-full flex items-center justify-between px-3 py-2 text-sm bg-background border border-input rounded-md min-h-[40px] cursor-pointer",
-          "hover:bg-accent hover:text-accent-foreground",
-          "focus:outline-none focus:ring-2 focus:ring-ring focus:ring-offset-2",
-          "disabled:opacity-50 disabled:cursor-not-allowed"
+          "flex min-h-10 w-full items-center justify-between rounded-md border border-input bg-background px-3 py-2 text-sm ring-offset-background placeholder:text-muted-foreground focus:outline-none focus:ring-2 focus:ring-ring focus:ring-offset-2 disabled:cursor-not-allowed disabled:opacity-50",
+          open && "ring-2 ring-ring ring-offset-2",
+          disabled && "cursor-not-allowed opacity-50"
         )}
+        onClick={toggleOpen}
       >
         <div className="flex items-center gap-2 flex-wrap">
           {selectedOptions.length > 0 ? (
@@ -142,7 +149,7 @@ export function MultiSelect({ values, onValuesChange, options, placeholder, clas
                 {option.label}
                 <button
                   type="button"
-                  onClick={(e) => removeValue(option.value, e)}
+                  onClick={(e) => handleRemove(option.value, e)}
                   className="hover:text-destructive"
                 >
                   <X className="h-3 w-3" />
@@ -181,7 +188,7 @@ export function MultiSelect({ values, onValuesChange, options, placeholder, clas
                 <button
                   key={option.value}
                   type="button"
-                  onClick={() => handleOptionClick(option.value)}
+                  onClick={() => handleSelect(option.value)}
                   className={cn(
                     "w-full px-3 py-2 text-sm text-left hover:bg-accent hover:text-accent-foreground",
                     "border-b border-border last:border-b-0",

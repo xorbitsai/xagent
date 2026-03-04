@@ -130,6 +130,7 @@ const en = {
       submitting: "Submitting...",
       submit: "Submit Response",
       unsupportedType: "Unsupported field type: {type}",
+      continue: "Continue",
     },
   },
   branding: {

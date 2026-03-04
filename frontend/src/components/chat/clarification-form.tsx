@@ -1,4 +1,4 @@
-import React, { useState } from "react"
+import React, { useState, useEffect, useRef } from "react"
 import { Interaction } from "@/contexts/app-context-chat"
 import { Input } from "@/components/ui/input"
 import { Button } from "@/components/ui/button"
@@ -16,9 +16,12 @@ import { ChevronDown, ChevronRight, MessageSquare, Upload, File as FileIcon, X }
 interface ClarificationFormProps {
   message?: string
   interactions: Interaction[]
+  timeout?: number
+  messageId?: string
+  expiresAt?: string
 }
 
-export function ClarificationForm({ interactions }: ClarificationFormProps) {
+export function ClarificationForm({ interactions, timeout, messageId, expiresAt }: ClarificationFormProps) {
   const { state, sendMessage } = useApp()
   const { t } = useI18n()
   const [formState, setFormState] = useState<Record<string, any>>({})
@@ -26,6 +29,100 @@ export function ClarificationForm({ interactions }: ClarificationFormProps) {
   const [isOpen, setIsOpen] = useState(true)
 
   const isTaskRunning = state.currentTask?.status === "running"
+
+  // Check if this is the last message
+  const isLastMessage = React.useMemo(() => {
+    if (!messageId || !state.messages.length) return true
+    const lastMsg = state.messages[state.messages.length - 1]
+    return lastMsg.id === messageId
+  }, [state.messages, messageId])
+
+  const [timeLeft, setTimeLeft] = useState<number | null>(() => {
+    if (expiresAt) {
+      const now = new Date().getTime()
+      const end = new Date(expiresAt).getTime()
+      return Math.max(0, Math.floor((end - now) / 1000))
+    }
+    return timeout || null
+  })
+  const hasAutoSubmitted = useRef(false)
+
+  useEffect(() => {
+    if (!isLastMessage) {
+      setTimeLeft(null)
+      return
+    }
+
+    // Determine initial time left and start timer
+    let initialTimeLeft: number | null = null
+    if (expiresAt) {
+      const now = new Date().getTime()
+      const end = new Date(expiresAt).getTime()
+      initialTimeLeft = Math.max(0, Math.floor((end - now) / 1000))
+    } else if (timeout !== undefined && timeout !== null && timeout > 0) {
+      initialTimeLeft = timeout
+    }
+
+    if (initialTimeLeft === null) {
+      setTimeLeft(null)
+      return
+    }
+
+    // If already expired (and using expiresAt), trigger auto-continue immediately
+    if (expiresAt && initialTimeLeft <= 0) {
+      setTimeLeft(0)
+      handleAutoContinue()
+      return
+    }
+
+    setTimeLeft(initialTimeLeft)
+
+    const timer = setInterval(() => {
+      if (expiresAt) {
+        // Recalculate based on current time
+        const now = new Date().getTime()
+        const end = new Date(expiresAt).getTime()
+        const diff = Math.max(0, Math.floor((end - now) / 1000))
+
+        setTimeLeft(diff)
+
+        if (diff <= 0) {
+          clearInterval(timer)
+          handleAutoContinue()
+        }
+      } else {
+        // Legacy decrement
+        setTimeLeft((prev) => {
+          if (prev === null) return null
+          if (prev <= 1) {
+            clearInterval(timer)
+            handleAutoContinue()
+            return 0
+          }
+          return prev - 1
+        })
+      }
+    }, 1000)
+
+    return () => clearInterval(timer)
+  }, [timeout, expiresAt, isLastMessage])
+
+  const handleAutoContinue = async () => {
+    if (hasAutoSubmitted.current || isSubmitting || isTaskRunning) return
+    hasAutoSubmitted.current = true
+
+    try {
+      setIsSubmitting(true)
+      await sendMessage(t("chatPage.clarification.continue"), { force: true })
+      setIsOpen(false)
+      // Hide the continue button by clearing the timeout
+      setTimeLeft(null)
+    } catch (error) {
+      console.error("Failed to auto-continue", error)
+    } finally {
+      setIsSubmitting(false)
+    }
+  }
 
   const handleInputChange = (field: string, value: any) => {
     setFormState((prev) => ({ ...prev, [field]: value }))
@@ -93,7 +190,7 @@ export function ClarificationForm({ interactions }: ClarificationFormProps) {
         // If textMessage is empty but we have files, send a generic message?
         const finalMessage = textMessage || (files.length > 0 ? t("chatPage.clarification.uploadedFiles") : t("chatPage.clarification.confirmed"))
 
-        await sendMessage(finalMessage, undefined, files)
+        await sendMessage(finalMessage, { force: true }, files)
         setIsOpen(false) // Collapse after submission
     } catch (error) {
         console.error("Failed to send clarification response", error)
@@ -243,7 +340,7 @@ export function ClarificationForm({ interactions }: ClarificationFormProps) {
     <Collapsible
       open={isOpen}
       onOpenChange={setIsOpen}
-      className="w-full space-y-2 rounded-lg border bg-card text-card-foreground shadow-sm my-2 overflow-hidden"
+      className="w-full space-y-2 rounded-lg border bg-card text-card-foreground shadow-sm my-2"
     >
       <CollapsibleTrigger asChild>
         <div className="flex items-center justify-between p-4 bg-muted/80 cursor-pointer hover:bg-muted/60 transition-colors">
@@ -271,8 +368,18 @@ export function ClarificationForm({ interactions }: ClarificationFormProps) {
           ))}
         </div>
 
-        <div className="pt-2">
-          <Button className="w-full" size="sm" onClick={handleSubmit} disabled={isSubmitting || isTaskRunning}>
+        <div className="pt-2 flex gap-2">
+          {timeLeft !== null && timeLeft > 0 && (
+            <Button
+              variant="outline"
+              size="sm"
+              onClick={handleAutoContinue}
+              disabled={isSubmitting || isTaskRunning}
+            >
+              {t("chatPage.clarification.continue")} ({timeLeft}s)
+            </Button>
+          )}
+          <Button className="flex-1" size="sm" onClick={handleSubmit} disabled={isSubmitting || isTaskRunning}>
             {isSubmitting ? t("chatPage.clarification.submitting") : t("chatPage.clarification.submit")}
           </Button>
         </div>

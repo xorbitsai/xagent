@@ -70,6 +70,16 @@ class PlanGenerator:
         self.skill_manager = skill_manager
         self.allowed_skills = allowed_skills
 
+    def _validate_timeout(self, timeout: Any) -> Optional[int]:
+        """Validate timeout value from LLM response"""
+        if timeout is None:
+            return None
+        try:
+            return int(timeout)
+        except (ValueError, TypeError):
+            logger.warning(f"Invalid timeout value from LLM: {timeout}")
+            return None
+
     async def _generate_plan_with_flow(
         self,
         tracer: Any,
@@ -564,6 +574,7 @@ class PlanGenerator:
                     chat_response = ChatResponse(
                         message=message,
                         interactions=interactions if interactions else None,
+                        timeout=self._validate_timeout(chat_data.get("timeout")),
                     )
 
                     return PlanGeneratorResult(type="chat", chat_response=chat_response)
@@ -634,6 +645,7 @@ class PlanGenerator:
   "type": "chat",
   "chat": {
     "message": "Your response to the user",
+    "timeout": 60,
     "interactions": [
       {
         "type": "select_one|select_multiple|text_input|file_upload|confirm|number_input",
@@ -674,6 +686,8 @@ class PlanGenerator:
 - For simple questions, clarifications, or information gathering, use "chat" type
 - When returning type="plan", do NOT include plan details - just the type indicator
 - interactions is optional - omit if no user input is needed
+- timeout is optional (in seconds). Use 60 seconds for auto-continuation. If the user auto-continues but you ABSOLUTELY CANNOT proceed without input, ask again WITHOUT timeout.
+- IMPORTANT: If user replies "Continue" (or "继续") to a previous question with timeout, it means they want to proceed with defaults. If you can proceed, return type="plan". If you cannot proceed without input, return type="chat" again WITHOUT timeout.
 """
 
         if tools_context:

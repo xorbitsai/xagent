@@ -21,6 +21,7 @@ from ...trace import (
     trace_task_llm_call_start,
 )
 from ...utils.llm_utils import clean_messages, extract_json_from_markdown
+from .schemas import GoalCheckResponse
 
 logger = logging.getLogger(__name__)
 
@@ -93,10 +94,21 @@ class ResultAnalyzer:
 
             # Clean messages before sending to LLM
             cleaned_prompt = clean_messages(prompt)
+
+            # Prepare output_config with JSON schema from Pydantic model
+            # This ensures the required fields are present and provides type safety
+            output_config = {
+                "format": {
+                    "type": "json_schema",
+                    "schema": GoalCheckResponse.model_json_schema(),
+                }
+            }
+
             # Call LLM for comprehensive goal checking and insight generation
             # Using _call_llm_with_retry for automatic fallback from JSON mode to normal mode
             response = await self._call_llm_with_retry(
                 messages=cleaned_prompt,
+                output_config=output_config,
             )
 
             # Debug: log response type and structure
@@ -113,15 +125,86 @@ class ResultAnalyzer:
                 # Direct string or other type
                 content = response
 
-            logger.info(f"Comprehensive goal check response received: {content}")
+            logger.info(
+                f"Comprehensive goal check response received (first 500 chars): {str(content)[:500]}"
+            )
+            logger.debug(
+                f"Full response: {content!r}"
+            )  # Log full response for debugging
 
             # Extract JSON from markdown if response_format was specified
+            content_before_extraction = content
             content = extract_json_from_markdown(content)
+
+            # Debug: Log if extraction occurred
+            if content != content_before_extraction:
+                logger.info(
+                    "⚠️ JSON extraction changed content (markdown code block found)"
+                )
+                logger.info(
+                    f"   Before (first 150 chars): {str(content_before_extraction)[:150]}"
+                )
+                logger.info(f"   After (first 150 chars):  {str(content)[:150]}")
+            else:
+                logger.debug(
+                    "✅ No markdown extraction needed (content is already JSON)"
+                )
 
             # Parse response
             try:
-                # Note: logging must be False to avoid tuple return (json, repair_log)
-                result = repair_loads(content, logging=False)
+                result = None
+
+                # Check if content is a JSON array (starts with '[')
+                content_stripped = content.strip()
+                if content_stripped.startswith("["):
+                    # LLM returned a JSON array instead of object
+                    # This might happen if the model wrapped the response in an array
+                    logger.warning(
+                        "LLM returned JSON array instead of object, attempting to extract first element"
+                    )
+                    try:
+                        parsed_array = repair_loads(content, logging=False)
+                        if isinstance(parsed_array, list) and len(parsed_array) > 0:
+                            # Use first element of array directly as result
+                            result = parsed_array[0]
+                            logger.info(
+                                f"✅ Extracted first element from JSON array: {type(result).__name__}"
+                            )
+                        else:
+                            raise LLMResponseError(
+                                "LLM returned empty or invalid JSON array",
+                                response=content,
+                                expected_format="JSON object with goal achievement and memory insights",
+                            )
+                    except LLMResponseError:
+                        raise
+                    except Exception as e:
+                        raise LLMResponseError(
+                            f"Failed to parse JSON array response: {str(e)}",
+                            response=content,
+                            expected_format="JSON object with goal achievement and memory insights",
+                            cause=e,
+                        )
+                else:
+                    # Normal parsing: content should be a JSON object
+                    # Note: logging must be False to avoid tuple return (json, repair_log)
+                    result = repair_loads(content, logging=False)
+
+                    # Debug: Log the parsed result type
+                    logger.debug(f"repair_loads returned type: {type(result).__name__}")
+                    if isinstance(result, list):
+                        logger.debug(
+                            f"repair_loads returned list with {len(result)} elements"
+                        )
+                        if len(result) > 0:
+                            logger.debug(
+                                f"First element type: {type(result[0]).__name__}"
+                            )
+                            logger.debug(
+                                f"First element (first 200 chars): {str(result[0])[:200]}"
+                            )
+
+                # Validate result is a dict
                 if not isinstance(result, dict):
                     raise LLMResponseError(
                         f"Comprehensive goal check response is not a JSON object. Got: {type(result).__name__}",
@@ -672,17 +755,35 @@ STORAGE THRESHOLD: Be extremely conservative. Default to should_store = false un
             full_content = ""
             usage = {}
 
-            async for chunk in self.llm.stream_chat(
-                messages=cleaned_messages,
-                response_format={"type": "json_object"},
-                **kwargs,
-            ):
-                if chunk.is_token():
-                    full_content += chunk.delta
-                elif chunk.is_usage():
-                    usage = chunk.usage
-                elif chunk.is_error():
-                    raise RuntimeError(f"LLM stream error: {chunk.content}")
+            # Prefer output_config over response_format for structured output
+            if "output_config" in kwargs:
+                # Use output_config (better for Gemini with complex schemas)
+                output_config = kwargs.pop("output_config")
+                async for chunk in self.llm.stream_chat(
+                    messages=cleaned_messages,
+                    output_config=output_config,
+                    **kwargs,
+                ):
+                    if chunk.is_token():
+                        full_content += chunk.delta
+                    elif chunk.is_usage():
+                        usage = chunk.usage
+                    elif chunk.is_error():
+                        raise RuntimeError(f"LLM stream error: {chunk.content}")
+            else:
+                # Fallback to response_format
+                response_format = kwargs.pop("response_format", {"type": "json_object"})
+                async for chunk in self.llm.stream_chat(
+                    messages=cleaned_messages,
+                    response_format=response_format,
+                    **kwargs,
+                ):
+                    if chunk.is_token():
+                        full_content += chunk.delta
+                    elif chunk.is_usage():
+                        usage = chunk.usage
+                    elif chunk.is_error():
+                        raise RuntimeError(f"LLM stream error: {chunk.content}")
 
             # Record token usage
             if usage:
@@ -717,16 +818,33 @@ STORAGE THRESHOLD: Be extremely conservative. Default to should_store = false un
                 full_content = ""
                 usage = {}
 
-                async for chunk in self.llm.stream_chat(
-                    messages=cleaned_messages,
-                    **kwargs,
-                ):
-                    if chunk.is_token():
-                        full_content += chunk.delta
-                    elif chunk.is_usage():
-                        usage = chunk.usage
-                    elif chunk.is_error():
-                        raise RuntimeError(f"LLM stream error: {chunk.content}")
+                # Preserve output_config if provided (for retry)
+                output_config = kwargs.get("output_config")
+                if output_config:
+                    # Try with output_config first
+                    async for chunk in self.llm.stream_chat(
+                        messages=cleaned_messages,
+                        output_config=output_config,
+                        **kwargs,
+                    ):
+                        if chunk.is_token():
+                            full_content += chunk.delta
+                        elif chunk.is_usage():
+                            usage = chunk.usage
+                        elif chunk.is_error():
+                            raise RuntimeError(f"LLM stream error: {chunk.content}")
+                else:
+                    # Fallback to no format constraints
+                    async for chunk in self.llm.stream_chat(
+                        messages=cleaned_messages,
+                        **kwargs,
+                    ):
+                        if chunk.is_token():
+                            full_content += chunk.delta
+                        elif chunk.is_usage():
+                            usage = chunk.usage
+                        elif chunk.is_error():
+                            raise RuntimeError(f"LLM stream error: {chunk.content}")
 
                 logger.info(
                     f"Normal mode call succeeded (fallback), response length: {len(full_content)}"

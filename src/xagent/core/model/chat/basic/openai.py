@@ -726,6 +726,8 @@ class OpenAILLM(BaseLLM):
 
             # Accumulate tool calls (across multiple chunks)
             accumulated_tool_calls: Dict[str, Dict] = {}
+            last_raw_chunk = None  # Track last raw chunk for usage extraction
+            usage_received = False
 
             async for raw_chunk in stream:
                 current_time = time.time()
@@ -752,10 +754,49 @@ class OpenAILLM(BaseLLM):
 
                 last_token_time = current_time
 
+                # Store last raw chunk for potential usage extraction
+                last_raw_chunk = raw_chunk
+
                 # Parse chunk
                 chunk = self._parse_stream_chunk(raw_chunk, accumulated_tool_calls)
                 if chunk:
+                    if chunk.is_usage():
+                        usage_received = True
                     yield chunk
+
+            # Fallback: Ensure usage chunk is always sent
+            # If no usage chunk was received, try to extract from the last raw chunk
+            if not usage_received and last_raw_chunk is not None:
+                logger.warning(
+                    "OpenAI stream ended without usage chunk, attempting to extract from last chunk"
+                )
+                if hasattr(last_raw_chunk, "usage") and last_raw_chunk.usage:
+                    usage = last_raw_chunk.usage
+                    input_tokens = getattr(usage, "prompt_tokens", 0)
+                    output_tokens = getattr(usage, "completion_tokens", 0)
+
+                    if input_tokens > 0 or output_tokens > 0:
+                        # Record token usage
+                        add_token_usage(
+                            input_tokens=input_tokens,
+                            output_tokens=output_tokens,
+                            model=self._model_name,
+                            call_type="stream_chat",
+                        )
+
+                        # Yield usage chunk
+                        yield StreamChunk(
+                            type=ChunkType.USAGE,
+                            usage={
+                                "prompt_tokens": input_tokens,
+                                "completion_tokens": output_tokens,
+                                "total_tokens": input_tokens + output_tokens,
+                            },
+                            raw=last_raw_chunk,
+                        )
+                        logger.info(
+                            f"Extracted usage from last chunk: {input_tokens} + {output_tokens} tokens"
+                        )
 
         except LLMTimeoutError:
             # Re-raise timeout errors for retry

@@ -2,10 +2,13 @@
 Unit tests for LLM content cleaning utilities
 """
 
+from json_repair import loads as repair_loads
+
 from xagent.core.agent.utils.llm_utils import (
     clean_dict_content,
     clean_llm_content,
     clean_messages,
+    extract_json_from_markdown,
 )
 
 
@@ -212,3 +215,195 @@ class TestLLMContentCleaning:
         assert "Hello World&Test" in cleaned
         assert "\n\n" in cleaned  # Should preserve 2 newlines
         assert "End" in cleaned
+
+
+class TestExtractJsonFromMarkdown:
+    """Test cases for extract_json_from_markdown functionality"""
+
+    def test_json_object_with_inner_code_block(self):
+        """Test that JSON objects with inner code blocks are NOT extracted"""
+        # This is the problematic case: JSON string contains code blocks within string values
+        json_with_inner_code = """{
+  "achieved": true,
+  "reason": "Test",
+  "final_answer": "Here's the code:\\n```python\\nimport random\\nprint(random.randint(1, 10))\\n```",
+  "memory_insights": {
+    "should_store": false,
+    "reason": "Test"
+  }
+}"""
+
+        result = extract_json_from_markdown(json_with_inner_code)
+
+        # Should NOT extract (content is already JSON)
+        assert result == json_with_inner_code
+
+        # Should be parseable as JSON
+        parsed = repair_loads(result, logging=False)
+        assert isinstance(parsed, dict)
+        assert parsed["achieved"] is True
+        assert "final_answer" in parsed
+        assert "```python" in parsed["final_answer"]
+
+    def test_json_wrapped_in_markdown_code_block(self):
+        """Test that JSON wrapped in markdown code blocks IS extracted"""
+        json_in_markdown = """```json
+{
+  "achieved": true,
+  "reason": "Test successful",
+  "confidence": 0.95
+}
+```"""
+
+        result = extract_json_from_markdown(json_in_markdown)
+
+        # Should extract the JSON from markdown
+        assert result != json_in_markdown
+        assert not result.startswith("```")
+        assert result.startswith("{")
+
+        # Should be parseable
+        parsed = repair_loads(result, logging=False)
+        assert isinstance(parsed, dict)
+        assert parsed["achieved"] is True
+        assert parsed["confidence"] == 0.95
+
+    def test_json_in_generic_code_block(self):
+        """Test extraction from generic (no language specified) code blocks"""
+        json_in_generic_block = """```
+{
+  "achieved": true,
+  "reason": "Test"
+}
+```"""
+
+        result = extract_json_from_markdown(json_in_generic_block)
+
+        # Should extract
+        assert result != json_in_generic_block
+        assert not result.startswith("```")
+        assert result.startswith("{")
+
+        parsed = repair_loads(result, logging=False)
+        assert isinstance(parsed, dict)
+
+    def test_plain_text_no_code_blocks(self):
+        """Test that plain text without code blocks is returned unchanged"""
+        plain_text = "This is just plain text without any JSON or code blocks."
+
+        result = extract_json_from_markdown(plain_text)
+
+        # Should return unchanged
+        assert result == plain_text
+
+    def test_json_array_with_inner_code_block(self):
+        """Test that JSON arrays with inner code blocks are NOT extracted"""
+        json_array_with_code = """[
+  {
+    "achieved": true,
+    "code_example": "```python\\nprint('hello')\\n```"
+  }
+]"""
+
+        result = extract_json_from_markdown(json_array_with_code)
+
+        # Should NOT extract (already JSON array)
+        assert result == json_array_with_code
+
+        parsed = repair_loads(result, logging=False)
+        assert isinstance(parsed, list)
+        assert len(parsed) == 1
+
+    def test_json_array_wrapped_in_markdown(self):
+        """Test extraction of JSON arrays from markdown"""
+        json_array_in_markdown = """```json
+[
+  {"achieved": true},
+  {"achieved": false}
+]
+```"""
+
+        result = extract_json_from_markdown(json_array_in_markdown)
+
+        # Should extract
+        assert result != json_array_in_markdown
+        assert result.startswith("[")
+
+        parsed = repair_loads(result, logging=False)
+        assert isinstance(parsed, list)
+        assert len(parsed) == 2
+
+    def test_empty_string(self):
+        """Test handling of empty string"""
+        result = extract_json_from_markdown("")
+        assert result == ""
+
+    def test_non_string_input(self):
+        """Test handling of non-string inputs"""
+        assert extract_json_from_markdown(None) is None
+        assert extract_json_from_markdown(123) == 123
+        assert extract_json_from_markdown([]) == []
+
+    def test_multiple_code_blocks_extracts_first(self):
+        """Test that only the first code block is extracted"""
+        multiple_blocks = """```json
+{"first": "value"}
+```
+
+Some text in between
+
+```json
+{"second": "value"}
+```"""
+
+        result = extract_json_from_markdown(multiple_blocks)
+
+        # Should extract first block
+        assert '{"first": "value"}' in result
+        assert '{"second": "value"}' not in result
+
+        parsed = repair_loads(result, logging=False)
+        assert isinstance(parsed, dict)
+        assert parsed["first"] == "value"
+
+    def test_markdown_with_language_variants(self):
+        """Test extraction from code blocks with different language specifiers"""
+        # Should work with json specifier
+        with_json = extract_json_from_markdown('```json\n{"key": "value"}\n```')
+        assert '{"key": "value"}' in with_json
+
+        # Should work with no specifier
+        with_no_spec = extract_json_from_markdown('```\n{"key": "value"}\n```')
+        assert '{"key": "value"}' in with_no_spec
+
+    def test_real_world_goal_check_response(self):
+        """Test with a realistic goal check response that has inner code blocks"""
+        realistic_response = """{
+  "achieved": true,
+  "reason": "已成功编写并执行Python脚本",
+  "confidence": 1.0,
+  "final_answer": "Python 随机数生成任务已圆满完成。\\n\\n### 执行结果摘要\\n1. **随机整数:** `[82, 15, 4]`\\n\\n### 核心代码实现\\n```python\\nimport random\\nrandom_integers = [random.randint(1, 100) for _ in range(5)]\\n```",
+  "memory_insights": {
+    "should_store": false,
+    "reason": "标准的基础编程任务",
+    "classification": {
+      "primary_domain": "Software Development",
+      "task_type": "Code Generation",
+      "complexity_level": "Simple"
+    }
+  }
+}"""
+
+        result = extract_json_from_markdown(realistic_response)
+
+        # Should NOT extract inner code block
+        assert result == realistic_response
+
+        # Should be parseable and have correct structure
+        parsed = repair_loads(result, logging=False)
+        assert isinstance(parsed, dict)
+        assert parsed["achieved"] is True
+        assert "final_answer" in parsed
+        # Verify the Python code is still in the final_answer
+        assert "```python" in parsed["final_answer"]
+        assert "import random" in parsed["final_answer"]

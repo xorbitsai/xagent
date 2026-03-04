@@ -76,6 +76,14 @@ def extract_json_from_markdown(content: str) -> str:
     if not content or not isinstance(content, str):
         return content
 
+    # Check if content is already a JSON object (starts with { or [)
+    # This prevents extracting inner code blocks from within JSON strings
+    content_stripped = content.strip()
+    if content_stripped.startswith("{") or content_stripped.startswith("["):
+        # Content looks like raw JSON, don't try to extract from markdown
+        logger.debug("Content appears to be raw JSON, skipping markdown extraction")
+        return content
+
     # Try to match various markdown code block formats
     patterns = [
         r"```json\s*([\s\S]*?)\s*```",  # ```json ... ```
@@ -87,6 +95,9 @@ def extract_json_from_markdown(content: str) -> str:
         if match:
             extracted = match.group(1).strip()
             logger.info("Extracted JSON from markdown code block")
+            logger.debug(f"Extracted content (first 100 chars): {extracted[:100]}")
+            logger.debug(f"Extracted starts with '[': {extracted.startswith('[')}")
+            logger.debug(f"Extracted starts with '{{': {extracted.startswith('{')}")
             return extracted
 
     # No code block found, return original content

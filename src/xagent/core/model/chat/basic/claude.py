@@ -337,7 +337,10 @@ class ClaudeLLM(BaseLLM):
                     completion_params["thinking"] = {"type": "disabled"}
 
             # Handle output_config for structured outputs
+            # In newer anthropic versions (>= 0.84.0), output_config is a direct parameter
+            # In older versions, it needs to be passed via extra_body
             if output_config is not None:
+                # Try to pass output_config directly first (for newer SDK versions)
                 completion_params["output_config"] = output_config
 
             # Handle response_format for JSON mode
@@ -576,7 +579,11 @@ class ClaudeLLM(BaseLLM):
                     completion_params["thinking"] = {"type": "disabled"}
 
             # Handle output_config for structured outputs
+            # Handle output_config for structured outputs
+            # In newer anthropic versions (>= 0.84.0), output_config is a direct parameter
+            # In older versions, it needs to be passed via extra_body
             if output_config is not None:
+                # Try to pass output_config directly (for newer SDK versions)
                 completion_params["output_config"] = output_config
 
             # Handle response_format for JSON mode
@@ -906,7 +913,12 @@ class ClaudeLLM(BaseLLM):
                     )
 
                 # Sort by created date (newest first)
-                models.sort(key=lambda x: x.get("created", 0), reverse=True)
+                models.sort(
+                    key=lambda x: (x.get("created") or 0)
+                    if x.get("created") is not None
+                    else 0,
+                    reverse=True,
+                )
                 return models
 
         except httpx.HTTPStatusError as e:

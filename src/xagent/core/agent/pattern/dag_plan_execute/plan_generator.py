@@ -24,6 +24,7 @@ from .models import (
     PlanGeneratorResult,
     PlanStep,
 )
+from .schemas import ClassificationResponse
 
 logger = logging.getLogger(__name__)
 
@@ -520,7 +521,18 @@ class PlanGenerator:
 
         # Call LLM to analyze
         try:
-            response = await self._call_llm_with_retry(messages=messages)
+            # Prepare output_config with JSON schema from Pydantic model
+            # This ensures the required fields are present and provides type safety
+            output_config = {
+                "format": {
+                    "type": "json_schema",
+                    "schema": ClassificationResponse.model_json_schema(),
+                }
+            }
+
+            response = await self._call_llm_with_retry(
+                messages=messages, output_config=output_config
+            )
 
             content = response["content"] if isinstance(response, dict) else response
             usage = response.get("usage") if isinstance(response, dict) else None
@@ -1351,9 +1363,19 @@ class PlanGenerator:
             usage = {}
             tool_calls = []
 
+            # Check if output_config is provided (for structured outputs with JSON schema)
+            # If not, fall back to response_format for simple JSON mode
+            llm_params = {}
+            if "output_config" in kwargs:
+                # Use output_config for structured outputs with JSON schema
+                llm_params["output_config"] = kwargs.pop("output_config")
+            else:
+                # Fall back to simple JSON object mode
+                llm_params["response_format"] = {"type": "json_object"}
+
             async for chunk in self.llm.stream_chat(
                 messages=cleaned_messages,
-                response_format={"type": "json_object"},
+                **llm_params,
                 **kwargs,
             ):
                 if chunk.is_token():

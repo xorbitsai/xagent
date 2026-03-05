@@ -678,6 +678,29 @@ class OpenAILLM(BaseLLM):
         if response_format:
             completion_params["response_format"] = response_format
 
+        # Handle output_config for structured outputs (JSON schema)
+        if output_config is not None:
+            # For OpenAI, we can pass output_config directly or convert to response_format
+            # if it's using json_schema format
+            format_config = output_config.get("format", {})
+            if format_config.get("type") == "json_schema":
+                # OpenAI supports json_schema through response_format
+                # Convert to OpenAI's official format: {"type": "json_schema", "json_schema": {"name": ..., "strict": True, "schema": ...}}
+                schema = format_config.get("schema", {})
+                completion_params["response_format"] = {
+                    "type": "json_schema",
+                    "json_schema": {
+                        "name": schema.get("title", "response")
+                        .lower()
+                        .replace(" ", "_"),
+                        "strict": True,
+                        "schema": schema,
+                    },
+                }
+            else:
+                # Pass through other output_config formats
+                completion_params["output_config"] = output_config
+
         # Handle thinking mode
         extra_body = {}
         is_thinking_only = (

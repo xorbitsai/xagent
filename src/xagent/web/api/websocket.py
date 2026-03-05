@@ -1919,6 +1919,21 @@ async def handle_build_preview_execution(
                             if tool_name:
                                 allowed_tools.append(tool_name)
 
+                # Auto-include knowledge tools when knowledge_bases are selected
+                if knowledge_bases:
+                    knowledge_tool_names = {"knowledge_search", "list_knowledge_bases"}
+                    for tool in all_tools:
+                        tool_name = getattr(tool, "name", None)
+                        if (
+                            tool_name
+                            and tool_name in knowledge_tool_names
+                            and tool_name not in allowed_tools
+                        ):
+                            allowed_tools.append(tool_name)
+                    logger.info(
+                        f"📚 Auto-included knowledge tools for knowledge_bases: {knowledge_bases}"
+                    )
+
                 return allowed_tools
 
             allowed_tools = await _get_tools_by_category()

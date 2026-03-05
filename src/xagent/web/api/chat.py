@@ -580,6 +580,24 @@ class AgentServiceManager:
                                 if tool_name:
                                     allowed_tools.append(tool_name)
 
+                    # Auto-include knowledge tools when knowledge_bases are selected
+                    if agent_config.get("knowledge_bases"):
+                        knowledge_tool_names = {
+                            "knowledge_search",
+                            "list_knowledge_bases",
+                        }
+                        for tool in all_tools:
+                            tool_name = getattr(tool, "name", None)
+                            if (
+                                tool_name
+                                and tool_name in knowledge_tool_names
+                                and tool_name not in allowed_tools
+                            ):
+                                allowed_tools.append(tool_name)
+                        logger.info(
+                            f"📚 Auto-included knowledge tools for knowledge_bases: {agent_config['knowledge_bases']}"
+                        )
+
                     logger.info(
                         f"🔧 Tool categories {tool_categories} mapped to {len(allowed_tools)} tools for task {task_id}"
                     )

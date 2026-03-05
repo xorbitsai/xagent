@@ -1378,8 +1378,13 @@ class GeminiLLM(BaseLLM):
         )
 
         # Accumulate streaming response
-        accumulated_content = ""
-        accumulated_tool_calls = []
+        # Note: chunk.content already contains accumulated content from stream_chat,
+        # not delta, so we use direct assignment rather than +=
+        current_content = ""
+        current_tool_calls = []
+        raw_response = (
+            None  # Store the last chunk's raw response for interface compliance
+        )
 
         try:
             # Stream the vision chat response
@@ -1396,13 +1401,17 @@ class GeminiLLM(BaseLLM):
             ):
                 chunk_type = chunk.type
 
+                # Store raw response from the last chunk for interface compliance
+                if chunk.raw is not None:
+                    raw_response = chunk.raw
+
                 if chunk_type == ChunkType.TOKEN:
-                    # Text token
-                    accumulated_content = chunk.content or ""
+                    # Text token - chunk.content is the accumulated complete content
+                    current_content = chunk.content or ""
 
                 elif chunk_type == ChunkType.TOOL_CALL:
                     # Tool call
-                    accumulated_tool_calls = chunk.tool_calls or []
+                    current_tool_calls = chunk.tool_calls or []
 
                 elif chunk_type == ChunkType.USAGE:
                     # Token usage - logged but not used in return value
@@ -1421,21 +1430,25 @@ class GeminiLLM(BaseLLM):
                         f"Gemini vision chat streaming error: {error_msg}"
                     )
 
+                else:
+                    # Defensive: unexpected chunk type
+                    logger.warning(f"Unknown chunk type in vision_chat: {chunk_type}")
+
             # Return result in the same format as non-streaming chat
-            if accumulated_tool_calls:
+            if current_tool_calls:
                 return {
                     "type": "tool_call",
-                    "tool_calls": accumulated_tool_calls,
-                    "raw": {"content": accumulated_content},
+                    "tool_calls": current_tool_calls,
+                    "raw": raw_response,
                 }
 
             # Return text content
-            if not accumulated_content:
+            if not current_content:
                 raise LLMEmptyContentError(
                     "LLM returned empty content and no tool calls"
                 )
 
-            return accumulated_content
+            return current_content
 
         except (TimeoutError, LLMTimeoutError):
             # Re-raise timeout errors for retry

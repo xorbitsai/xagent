@@ -1,5 +1,6 @@
 """File storage configuration for xagent web application"""
 
+import logging
 import os
 from pathlib import Path
 from typing import List, Optional
@@ -21,18 +22,15 @@ _EXTERNAL_UPLOAD_DIRS = os.getenv("XAGENT_EXTERNAL_UPLOAD_DIRS", "")
 ALLOWED_EXTERNAL_UPLOAD_DIRS: List[Path] = []
 
 if _EXTERNAL_UPLOAD_DIRS:
+    logger = logging.getLogger(__name__)
     for dir_path in _EXTERNAL_UPLOAD_DIRS.split(","):
         dir_path = dir_path.strip()
         if dir_path:
             path = Path(dir_path)
             if path.exists():
                 ALLOWED_EXTERNAL_UPLOAD_DIRS.append(path)
-                import logging
-
-                logger = logging.getLogger(__name__)
                 logger.info(f"Added external upload directory: {path}")
             else:
-                logger = logging.getLogger(__name__)
                 logger.warning(f"External upload directory does not exist: {path}")
 
 # File storage paths for AI tools

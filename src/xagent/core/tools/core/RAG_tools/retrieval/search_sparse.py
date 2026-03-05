@@ -72,8 +72,16 @@ def search_sparse(
 
         search_query = table.search(query_text, query_type="fts").limit(top_k)
 
-        # Build filter expression combining user permissions and custom filters
+        # Build filter expression combining collection scope, user permissions and custom filters
         filter_clauses = []
+
+        # Scope results to the requested collection (required for KB isolation)
+        if collection:
+            collection_filter = build_lancedb_filter_expression(
+                {"collection": collection}
+            )
+            if collection_filter:
+                filter_clauses.append(collection_filter)
 
         # Add user permission filter for multi-tenancy
         user_filter = UserPermissions.get_user_filter(user_id, is_admin)

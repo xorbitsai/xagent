@@ -1,9 +1,10 @@
 """Knowledge base API route handlers"""
 
 import asyncio
+import json
 import logging
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
 from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, UploadFile
 from fastapi.responses import JSONResponse
@@ -48,6 +49,25 @@ logger = logging.getLogger(__name__)
 kb_router = APIRouter(prefix="/api/kb", tags=["kb"])
 
 
+def _parse_separators(separators: Optional[str]) -> Optional[List[str]]:
+    """Parse optional custom separators (JSON array of strings) from form input.
+
+    Returns None if input is missing/empty or invalid; returns a list of
+    non-empty strings when valid (possibly empty list for input '[]').
+    """
+    if not separators or not separators.strip():
+        return None
+    try:
+        raw = json.loads(separators)
+        if isinstance(raw, list) and all(isinstance(x, str) for x in raw):
+            return [s for s in raw if s]
+        logger.warning("separators must be a list of strings; ignoring")
+        return None
+    except (json.JSONDecodeError, TypeError) as e:
+        logger.warning("invalid separators JSON, using default: %s", e)
+        return None
+
+
 @kb_router.post(
     "/ingest",
     response_model=IngestionResult,
@@ -74,6 +94,14 @@ async def ingest(
         None,
         ge=0,
         description="Chunk overlap in characters (default: 200)",
+    ),
+    separators: Optional[str] = Form(
+        None,
+        description=(
+            "Custom chunk separators as JSON array of strings, e.g. "
+            '["\\n\\n", "\\n", "。"]. Only used when chunk_strategy is recursive. '
+            "Omit or empty to use default separators."
+        ),
     ),
     embedding_model_id: str = Form(
         "text-embedding-v4",
@@ -105,6 +133,7 @@ async def ingest(
         chunk_strategy: Strategy for chunking the document.
         chunk_size: Target chunk size in characters.
         chunk_overlap: Overlap between consecutive chunks.
+        separators: Optional JSON array of custom chunk separators (recursive only).
         embedding_model_id: Embedding model ID from model hub.
         embedding_batch_size: Batch size for embedding operations.
         max_retries: Maximum retry attempts for failures.
@@ -167,15 +196,29 @@ async def ingest(
                 f"to ensure it's less than chunk_size ({final_chunk_size})"
             )
 
+        parsed_separators = _parse_separators(separators)
+        final_strategy = (
+            chunk_strategy if chunk_strategy is not None else ChunkStrategy.RECURSIVE
+        )
+        if (
+            separators
+            and separators.strip()
+            and final_strategy != ChunkStrategy.RECURSIVE
+        ):
+            logger.warning(
+                "separators are only used when chunk_strategy is recursive; "
+                "current strategy is %s, ignoring separators",
+                final_strategy.value,
+            )
+
         config = IngestionConfig(
             parse_method=parse_method
             if parse_method is not None
             else ParseMethod.DEFAULT,
-            chunk_strategy=chunk_strategy
-            if chunk_strategy is not None
-            else ChunkStrategy.RECURSIVE,
+            chunk_strategy=final_strategy,
             chunk_size=final_chunk_size,
             chunk_overlap=final_chunk_overlap,
+            separators=parsed_separators,
             embedding_model_id=embedding_model_id,
             embedding_batch_size=embedding_batch_size
             if embedding_batch_size is not None and embedding_batch_size > 0
@@ -474,6 +517,13 @@ async def ingest_web(
         ge=0,
         description="Chunk overlap (default: 200)",
     ),
+    separators: Optional[str] = Form(
+        None,
+        description=(
+            "Custom chunk separators as JSON array of strings; "
+            "only used when chunk_strategy is recursive."
+        ),
+    ),
     embedding_model_id: str = Form(
         "text-embedding-v4",
         description="Embedding model ID",
@@ -571,17 +621,29 @@ async def ingest_web(
                 f"to ensure it's less than chunk_size ({final_chunk_size})"
             )
 
+        web_parsed_separators = _parse_separators(separators)
+        web_final_strategy = (
+            chunk_strategy if chunk_strategy is not None else ChunkStrategy.RECURSIVE
+        )
+        if (
+            separators
+            and separators.strip()
+            and web_final_strategy != ChunkStrategy.RECURSIVE
+        ):
+            logger.warning(
+                "separators are only used when chunk_strategy is recursive; "
+                "current strategy is %s, ignoring separators",
+                web_final_strategy.value,
+            )
+
         ingestion_config = IngestionConfig(
             parse_method=(
                 parse_method if parse_method is not None else ParseMethod.DEFAULT
             ),
-            chunk_strategy=(
-                chunk_strategy
-                if chunk_strategy is not None
-                else ChunkStrategy.RECURSIVE
-            ),
+            chunk_strategy=web_final_strategy,
             chunk_size=final_chunk_size,
             chunk_overlap=final_chunk_overlap,
+            separators=web_parsed_separators,
             embedding_model_id=embedding_model_id,
             embedding_batch_size=(
                 embedding_batch_size

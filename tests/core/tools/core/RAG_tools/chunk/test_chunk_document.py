@@ -802,6 +802,116 @@ class TestChunkDocument:
             version_rows = df[df["config_hash"] == config_hash]
             assert len(version_rows) > 0
 
+    def test_chunk_recursive_custom_separators_integration(
+        self, temp_lancedb_dir, test_collection, test_doc_id
+    ):
+        """Integration: register -> parse -> chunk with custom separators; verify chunk boundaries and count."""
+        txt_path = "tests/resources/test_files/test.txt"
+        register_document(
+            collection=test_collection,
+            source_path=txt_path,
+            doc_id=test_doc_id,
+            user_id=1,
+        )
+        parse_result = parse_document(
+            collection=test_collection,
+            doc_id=test_doc_id,
+            parse_method="default",
+            user_id=1,
+            is_admin=True,
+        )
+        parse_hash = parse_result["parse_hash"]
+
+        # Chunk with only newline as separator (narrower splitting) and small chunk_size
+        chunk_result = chunk_document(
+            collection=test_collection,
+            doc_id=test_doc_id,
+            parse_hash=parse_hash,
+            chunk_strategy=ChunkStrategy.RECURSIVE,
+            chunk_size=30,
+            chunk_overlap=5,
+            separators=["\n"],
+            user_id=1,
+        )
+        assert chunk_result["created"] is True
+        assert chunk_result["chunk_count"] >= 1
+
+        from xagent.providers.vector_store.lancedb import get_connection_from_env
+
+        conn = get_connection_from_env()
+        table = conn.open_table("chunks")
+        df = (
+            table.search()
+            .where(
+                f"collection == '{test_collection}' AND doc_id == '{test_doc_id}' AND parse_hash == '{parse_hash}'"
+            )
+            .to_pandas()
+        )
+        # Chunk count and content reflect custom separator
+        assert len(df) == chunk_result["chunk_count"]
+        self._verify_chunk_text_fidelity_and_metadata(
+            test_collection, test_doc_id, parse_hash
+        )
+
+    def test_chunk_recursive_custom_separators_vs_default_different_result(
+        self, temp_lancedb_dir, test_collection, test_doc_id
+    ):
+        """Integration: custom separators produce different chunk count or config than default."""
+        txt_path = "tests/resources/test_files/test.txt"
+        register_document(
+            collection=test_collection,
+            source_path=txt_path,
+            doc_id=test_doc_id,
+            user_id=1,
+        )
+        parse_result = parse_document(
+            collection=test_collection,
+            doc_id=test_doc_id,
+            parse_method="default",
+            user_id=1,
+            is_admin=True,
+        )
+        parse_hash = parse_result["parse_hash"]
+
+        chunk_default = chunk_document(
+            collection=test_collection,
+            doc_id=test_doc_id,
+            parse_hash=parse_hash,
+            chunk_strategy=ChunkStrategy.RECURSIVE,
+            chunk_size=50,
+            chunk_overlap=10,
+            separators=None,
+            user_id=1,
+        )
+        chunk_custom = chunk_document(
+            collection=test_collection,
+            doc_id=test_doc_id,
+            parse_hash=parse_hash,
+            chunk_strategy=ChunkStrategy.RECURSIVE,
+            chunk_size=50,
+            chunk_overlap=10,
+            separators=["。", "\n"],
+            user_id=1,
+        )
+        assert chunk_default["created"] is True
+        assert chunk_custom["created"] is True
+        # Different separators must yield different config_hash (hence different version)
+        from xagent.providers.vector_store.lancedb import get_connection_from_env
+
+        conn = get_connection_from_env()
+        table = conn.open_table("chunks")
+        df = (
+            table.search()
+            .where(
+                f"collection == '{test_collection}' AND doc_id == '{test_doc_id}' AND parse_hash == '{parse_hash}'"
+            )
+            .to_pandas()
+        )
+        config_hashes = df["config_hash"].unique()
+        assert len(config_hashes) == 2, (
+            "Default and custom separators should produce two distinct chunk versions"
+        )
+
     def test_chunk_row_level_hash_uniqueness(
         self, temp_lancedb_dir, test_collection, test_doc_id
     ):

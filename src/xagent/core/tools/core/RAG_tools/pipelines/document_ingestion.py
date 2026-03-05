@@ -7,7 +7,7 @@ import logging
 import os
 import time
 from contextlib import contextmanager
-from typing import Any, Dict, Iterator, List, Mapping, Optional, Tuple, Union, cast
+from typing import Any, Dict, Iterator, List, Mapping, Optional, Tuple, Union
 
 from xagent.core.model.embedding.base import BaseEmbedding
 from xagent.core.model.model import EmbeddingModelConfig
@@ -45,6 +45,10 @@ from ..management.collection_manager import (
 from ..management.status import write_ingestion_status
 from ..parse.parse_document import parse_document
 from ..progress import ProgressManager, ProgressTracker
+from ..utils.embedding_utils import (
+    normalize_raw_embedding_to_vectors,
+    normalize_single_embedding,
+)
 from ..utils.model_resolver import resolve_embedding_adapter
 from ..vector_storage.vector_manager import (
     read_chunks_for_embedding,
@@ -209,22 +213,8 @@ async def _compute_embeddings_async(
                         embedding_adapter.encode, chunk.text
                     )
 
-                    # Process return result (may be single vector or list)
-                    vector: List[float]
-                    if isinstance(raw_vector, list):
-                        if raw_vector and isinstance(raw_vector[0], float):
-                            # Single vector: List[float]
-                            vector = cast(List[float], raw_vector)
-                        else:
-                            # List of vectors: List[List[float]], take the first one
-                            if raw_vector and isinstance(raw_vector[0], list):
-                                vector = cast(List[float], raw_vector[0])
-                            else:
-                                vector = []
-                    else:
-                        raise VectorValidationError(
-                            f"Unexpected embedding response type: {type(raw_vector)}"
-                        )
+                    # Unify provider response (list of float, list of lists, or list of dict with "embedding")
+                    vector = normalize_single_embedding(raw_vector)
 
                     return ChunkEmbeddingData(
                         doc_id=chunk.doc_id,
@@ -836,29 +826,8 @@ def process_document(
                 ]
                 batch_texts = [chunk.text for chunk in batch_chunks]
                 raw_vectors = embedding_adapter.encode(batch_texts)
-                vectors: List[List[float]]
-                if not isinstance(raw_vectors, list):
-                    raise VectorValidationError(
-                        "Embedding adapter returned non-list response",
-                        details={
-                            "batch_index": processed_batches,
-                            "response_type": type(raw_vectors).__name__,
-                        },
-                    )
-                if not raw_vectors:
-                    vectors = []
-                elif isinstance(raw_vectors[0], float):
-                    if len(batch_texts) != 1:
-                        raise VectorValidationError(
-                            "Embedding adapter returned single vector for multi-text batch",
-                            details={
-                                "batch_index": processed_batches,
-                                "batch_size": len(batch_texts),
-                            },
-                        )
-                    vectors = [raw_vectors]  # type: ignore[list-item]
-                else:
-                    vectors = cast(List[List[float]], raw_vectors)
+                # Unify provider response (list of float, list of lists, or list of dict with "embedding")
+                vectors = normalize_raw_embedding_to_vectors(raw_vectors)
 
                 if len(vectors) != len(batch_chunks):
                     raise VectorValidationError(

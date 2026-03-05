@@ -116,7 +116,8 @@ class TestSearchDenseEngine:
             mock_table, mock_results_df
         )
 
-        mock_build_filter.return_value = None
+        # Collection filter is always applied for KB isolation
+        mock_build_filter.return_value = "collection == 'test_collection'"
 
         # Mock index manager
         with patch(
@@ -160,7 +161,8 @@ class TestSearchDenseEngine:
                 [0.1, 0.2, 0.3],
                 vector_column_name="vector",
             )
-            mock_build_filter.assert_not_called()
+            # Collection filter must be applied for KB isolation (Issue #72)
+            mock_build_filter.assert_any_call({"collection": "test_collection"})
 
     @patch(
         "xagent.core.tools.core.RAG_tools.retrieval.search_engine.get_connection_from_env"
@@ -195,10 +197,13 @@ class TestSearchDenseEngine:
             )
             mock_get_index_manager.return_value = mock_index_manager
 
-            # Execute search with filters
+            # Execute search with filters (collection filter + custom filters)
             filters = {"doc_id": "test_doc", "file_type": "pdf"}
             expected_filter_clause = "doc_id = 'test_doc' AND file_type = 'pdf'"
-            mock_build_filter.return_value = expected_filter_clause
+            mock_build_filter.side_effect = [
+                "collection == 'test_collection'",
+                expected_filter_clause,
+            ]
 
             search_dense_engine(
                 collection="test_collection",
@@ -210,18 +215,66 @@ class TestSearchDenseEngine:
                 is_admin=True,
             )
 
-            # Verify filter application
+            # Verify filter application (collection filter + custom filters)
             mock_get_conn.assert_called_once()
             mock_conn.open_table.assert_called_once_with("embeddings_test_model")
             mock_get_index_manager.assert_called_once()
             mock_index_manager.check_and_create_index.assert_called_once_with(
                 mock_table, "embeddings_test_model", False
             )
-            mock_build_filter.assert_called_once_with(filters)
+            mock_build_filter.assert_any_call({"collection": "test_collection"})
+            mock_build_filter.assert_any_call(filters)
             search_query = mock_table.search.return_value
             # Note: The filter is wrapped in parentheses by the filter application logic
-            search_query.where.assert_called_once_with(f"({expected_filter_clause})")
+            search_query.where.assert_called_once()
+            where_arg = search_query.where.call_args[0][0]
+            assert expected_filter_clause in where_arg
             search_query.where.return_value.limit.assert_called_once_with(5)
+
+    @patch(
+        "xagent.core.tools.core.RAG_tools.retrieval.search_engine.get_connection_from_env"
+    )
+    @patch(
+        "xagent.core.tools.core.RAG_tools.retrieval.search_engine.build_lancedb_filter_expression"
+    )
+    def test_search_dense_engine_applies_collection_filter(
+        self, mock_build_filter: Mock, mock_get_conn: Mock, mock_search_chain
+    ) -> None:
+        """Test that search_dense_engine always applies collection filter for KB isolation (Issue #72)."""
+        mock_conn = Mock()
+        mock_table = Mock()
+        mock_get_conn.return_value = mock_conn
+        mock_conn.open_table.return_value = mock_table
+
+        import pandas as pd
+
+        mock_search_chain(mock_table, pd.DataFrame([]))
+        mock_build_filter.return_value = "collection == 'my_kb'"
+
+        with patch(
+            "xagent.core.tools.core.RAG_tools.retrieval.search_engine.get_index_manager"
+        ) as mock_get_index_manager:
+            mock_index_manager = Mock()
+            mock_index_manager.check_and_create_index.return_value = (
+                "index_ready",
+                None,
+            )
+            mock_get_index_manager.return_value = mock_index_manager
+
+            search_dense_engine(
+                collection="my_kb",
+                model_tag="test_model",
+                query_vector=[0.1, 0.2, 0.3],
+                top_k=5,
+                user_id=None,
+                is_admin=True,
+            )
+
+            mock_build_filter.assert_any_call({"collection": "my_kb"})
+            search_query = mock_table.search.return_value
+            search_query.where.assert_called_once()
+            where_arg = search_query.where.call_args[0][0]
+            assert "collection" in where_arg.lower() or "my_kb" in where_arg
 
     @patch(
         "xagent.core.tools.core.RAG_tools.retrieval.search_engine.get_connection_from_env"
@@ -246,7 +299,8 @@ class TestSearchDenseEngine:
         # Use fixture to create mock search chain
         mock_search_chain(mock_table, mock_results_df)
 
-        mock_build_filter.return_value = None
+        # Collection filter is always applied for KB isolation
+        mock_build_filter.return_value = "collection == 'test_collection'"
 
         with patch(
             "xagent.core.tools.core.RAG_tools.retrieval.search_engine.get_index_manager"
@@ -283,7 +337,8 @@ class TestSearchDenseEngine:
                 [0.1, 0.2, 0.3],
                 vector_column_name="vector",
             )
-            mock_build_filter.assert_not_called()
+            # Collection filter is always applied for KB isolation
+            mock_build_filter.assert_any_call({"collection": "test_collection"})
 
     @patch(
         "xagent.core.tools.core.RAG_tools.retrieval.search_engine.get_connection_from_env"

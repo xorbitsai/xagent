@@ -16,7 +16,10 @@ from unittest.mock import patch
 import pytest
 
 from xagent.core.tools.core.RAG_tools.core.schemas import ParseMethod
-from xagent.core.tools.core.RAG_tools.file.register_document import register_document
+from xagent.core.tools.core.RAG_tools.file.register_document import (
+    list_documents,
+    register_document,
+)
 from xagent.core.tools.core.RAG_tools.parse.parse_document import parse_document
 from xagent.providers.vector_store.lancedb import (
     LanceDBVectorStore,
@@ -230,6 +233,115 @@ class TestLanceDBProviderIntegration:
             # Verify table exists
             table_names = conn.table_names()
             assert "test_table" in table_names
+
+
+class TestKnowledgeBaseIsolationIntegration:
+    """Integration tests for KB isolation (Issue #72): list_documents and search by collection."""
+
+    def test_list_documents_returns_only_requested_collection(
+        self, tmp_path, temp_lancedb_dir
+    ):
+        """list_documents must return only documents from the requested collection."""
+        file_a = tmp_path / "kb_a_doc.txt"
+        file_a.write_text("Content in KB A", encoding="utf-8")
+        file_b = tmp_path / "kb_b_doc.txt"
+        file_b.write_text("Content in KB B", encoding="utf-8")
+
+        register_document(
+            collection="kb_chinese_new_year",
+            source_path=str(file_a),
+            doc_id="doc-a",
+            user_id=1,
+        )
+        register_document(
+            collection="kb_other",
+            source_path=str(file_b),
+            doc_id="doc-b",
+            user_id=1,
+        )
+
+        results = list_documents(
+            temp_lancedb_dir, collection="kb_chinese_new_year", limit=100
+        )
+        assert len(results) == 1
+        assert results[0]["collection"] == "kb_chinese_new_year"
+        assert results[0]["doc_id"] == "doc-a"
+
+        results_other = list_documents(
+            temp_lancedb_dir, collection="kb_other", limit=100
+        )
+        assert len(results_other) == 1
+        assert results_other[0]["collection"] == "kb_other"
+        assert results_other[0]["doc_id"] == "doc-b"
+
+    def test_search_returns_only_specified_collection(self, tmp_path, temp_lancedb_dir):
+        """Search with a specified collection must not return results from other collections (Issue #72)."""
+        from xagent.core.tools.core.RAG_tools.core.schemas import ChunkEmbeddingData
+        from xagent.core.tools.core.RAG_tools.LanceDB.schema_manager import (
+            ensure_embeddings_table,
+        )
+        from xagent.core.tools.core.RAG_tools.retrieval.search_dense import (
+            search_dense,
+        )
+        from xagent.core.tools.core.RAG_tools.vector_storage.vector_manager import (
+            write_vectors_to_db,
+        )
+
+        conn = get_connection_from_env()
+        model_tag = "kb_isolate_test_model"
+        table_name = f"embeddings_{model_tag}"
+        try:
+            conn.drop_table(table_name)
+        except Exception:
+            pass
+
+        ensure_embeddings_table(conn, model_tag, vector_dim=3)
+
+        # Same vector in both collections: without collection filter, both would match
+        vec = [1.0, 0.0, 0.0]
+        emb = ChunkEmbeddingData(
+            doc_id="doc_alpha",
+            chunk_id="chunk_alpha",
+            parse_hash="parse1",
+            model=model_tag,
+            vector=vec,
+            text="content in kb_alpha",
+            chunk_hash="hash_alpha",
+        )
+        r1 = write_vectors_to_db("kb_alpha", [emb], create_index=False)
+        assert r1.upsert_count == 1
+
+        emb_beta = ChunkEmbeddingData(
+            doc_id="doc_beta",
+            chunk_id="chunk_beta",
+            parse_hash="parse1",
+            model=model_tag,
+            vector=vec,
+            text="content in kb_beta",
+            chunk_hash="hash_beta",
+        )
+        r2 = write_vectors_to_db("kb_beta", [emb_beta], create_index=False)
+        assert r2.upsert_count == 1
+
+        # Search only in kb_alpha
+        response = search_dense(
+            collection="kb_alpha",
+            model_tag=model_tag,
+            query_vector=vec,
+            top_k=10,
+            user_id=None,
+            is_admin=True,
+        )
+
+        assert response.status == "success"
+        assert len(response.results) >= 1
+        doc_ids = [r.doc_id for r in response.results]
+        assert all(did == "doc_alpha" for did in doc_ids), (
+            f"Expected all results from kb_alpha (doc_alpha), got doc_ids: {doc_ids}"
+        )
+        assert "doc_beta" not in doc_ids, (
+            "Search in kb_alpha must not return results from kb_beta"
+        )
 
 
 class TestRAGWorkflowIntegration:

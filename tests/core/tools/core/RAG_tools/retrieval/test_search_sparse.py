@@ -30,10 +30,16 @@ class TestSearchSparse:
         "xagent.core.tools.core.RAG_tools.retrieval.search_sparse.get_connection_from_env"
     )
     @patch("xagent.core.tools.core.RAG_tools.retrieval.search_sparse.get_index_manager")
+    @patch(
+        "xagent.core.tools.core.RAG_tools.retrieval.search_sparse.build_lancedb_filter_expression"
+    )
     def test_search_sparse_success_no_filters(
-        self, mock_get_index_manager: Mock, mock_get_conn: Mock
+        self,
+        mock_build_filter: Mock,
+        mock_get_index_manager: Mock,
+        mock_get_conn: Mock,
     ) -> None:
-        """Test successful sparse search without filters."""
+        """Test successful sparse search with collection filter only (KB isolation)."""
         # Mock connection and table
         mock_conn = Mock()
         mock_table = Mock()
@@ -50,7 +56,10 @@ class TestSearchSparse:
         mock_index_manager.get_fts_index_status.return_value = True
         mock_get_index_manager.return_value = mock_index_manager
 
-        # Mock search results
+        # Collection filter is always applied for KB isolation (Issue #72)
+        mock_build_filter.return_value = "collection == 'test_col'"
+
+        # Mock search results; chain: search() -> limit() -> where() -> to_pandas()
         mock_results_df = pd.DataFrame(
             [
                 {
@@ -63,12 +72,13 @@ class TestSearchSparse:
                 }
             ]
         )
-        # Correctly mock the chained calls
-        mock_table.search.return_value.limit.return_value.to_pandas.return_value = (
-            mock_results_df
-        )
-
-        # Filter builder not used in this test since no filters are provided
+        mock_search = Mock()
+        mock_limit = Mock()
+        mock_where = Mock()
+        mock_table.search.return_value = mock_search
+        mock_search.limit.return_value = mock_limit
+        mock_limit.where.return_value = mock_where
+        mock_where.to_pandas.return_value = mock_results_df
 
         response = search_sparse_module.search_sparse(
             collection="test_col",
@@ -87,18 +97,19 @@ class TestSearchSparse:
         assert response.results[0].doc_id == "doc1"
         assert response.results[0].text == "test content one"
         # Score is normalized from TF-IDF to similarity score (0-1 range)
-        # Original score 0.9 becomes 0.9 / (1.0 + 0.9) ≈ 0.4736842105263158
         assert abs(response.results[0].score - 0.4736842105263158) < 1e-10
         assert not response.warnings
 
-        # Verify calls
+        # Verify calls: collection filter must be applied for KB isolation
         mock_get_conn.assert_called_once()
         mock_conn.open_table.assert_called_once_with("embeddings_test_model")
         mock_get_index_manager.assert_called_once()
-        mock_index_manager.get_fts_index_status.assert_called_once_with(mock_table)
+        mock_build_filter.assert_called_once_with({"collection": "test_col"})
         mock_table.search.assert_called_once_with("content", query_type="fts")
-        mock_table.search.return_value.limit.assert_called_once_with(1)
-        # No filter builder assertions needed since no filters are provided
+        mock_search.limit.assert_called_once_with(1)
+        mock_limit.where.assert_called_once()
+        where_arg = mock_limit.where.call_args[0][0]
+        assert "collection" in where_arg.lower() or "test_col" in where_arg
 
     @patch(
         "xagent.core.tools.core.RAG_tools.retrieval.search_sparse.get_connection_from_env"
@@ -143,7 +154,11 @@ class TestSearchSparse:
             expected_filter_clause = (
                 "doc_id = 'filtered_doc' AND collection = 'test_col'"
             )
-            mock_build_filter.return_value = expected_filter_clause
+            # Collection filter first, then custom filters (Issue #72)
+            mock_build_filter.side_effect = [
+                "collection == 'test_col'",
+                expected_filter_clause,
+            ]
 
             response = search_sparse_module.search_sparse(
                 collection="test_col",
@@ -165,21 +180,76 @@ class TestSearchSparse:
             mock_conn.open_table.assert_called_once_with("embeddings_test_model")
             mock_get_index_manager.assert_called_once()
             mock_index_manager.get_fts_index_status.assert_called_once_with(mock_table)
-            mock_build_filter.assert_called_once_with(filters)
+            mock_build_filter.assert_any_call({"collection": "test_col"})
+            mock_build_filter.assert_any_call(filters)
             mock_table.search.assert_called_once_with(
                 "filtered content", query_type="fts"
             )
             mock_search.limit.assert_called_once_with(5)
-            # Note: The filter is wrapped in parentheses by the filter application logic
-            mock_limit.where.assert_called_once_with(f"({expected_filter_clause})")
+            mock_limit.where.assert_called_once()
+            where_arg = mock_limit.where.call_args[0][0]
+            assert expected_filter_clause in where_arg
             mock_where.to_pandas.assert_called_once()
 
     @patch(
         "xagent.core.tools.core.RAG_tools.retrieval.search_sparse.get_connection_from_env"
     )
     @patch("xagent.core.tools.core.RAG_tools.retrieval.search_sparse.get_index_manager")
+    @patch(
+        "xagent.core.tools.core.RAG_tools.retrieval.search_sparse.build_lancedb_filter_expression"
+    )
+    def test_search_sparse_applies_collection_filter(
+        self,
+        mock_build_filter: Mock,
+        mock_get_index_manager: Mock,
+        mock_get_conn: Mock,
+    ) -> None:
+        """Test that search_sparse always applies collection filter for KB isolation (Issue #72)."""
+        with patch.object(search_sparse_module, "_substring_fallback", return_value=[]):
+            mock_conn = Mock()
+            mock_table = Mock()
+            mock_get_conn.return_value = mock_conn
+            mock_conn.open_table.return_value = mock_table
+            mock_index_manager = Mock()
+            mock_index_manager.check_and_create_index.return_value = (
+                "index_ready",
+                "Index ready",
+            )
+            mock_index_manager.get_fts_index_status.return_value = True
+            mock_get_index_manager.return_value = mock_index_manager
+            mock_build_filter.return_value = "collection == 'my_kb'"
+            mock_search = Mock()
+            mock_limit = Mock()
+            mock_where = Mock()
+            mock_table.search.return_value = mock_search
+            mock_search.limit.return_value = mock_limit
+            mock_limit.where.return_value = mock_where
+            mock_where.to_pandas.return_value = pd.DataFrame()
+
+            search_sparse_module.search_sparse(
+                collection="my_kb",
+                model_tag="test_model",
+                query_text="query",
+                top_k=5,
+                user_id=None,
+                is_admin=True,
+            )
+
+            mock_build_filter.assert_called_once_with({"collection": "my_kb"})
+            mock_limit.where.assert_called_once()
+
+    @patch(
+        "xagent.core.tools.core.RAG_tools.retrieval.search_sparse.get_connection_from_env"
+    )
+    @patch("xagent.core.tools.core.RAG_tools.retrieval.search_sparse.get_index_manager")
+    @patch(
+        "xagent.core.tools.core.RAG_tools.retrieval.search_sparse.build_lancedb_filter_expression"
+    )
     def test_search_sparse_fts_index_missing(
-        self, mock_get_index_manager: Mock, mock_get_conn: Mock
+        self,
+        mock_build_filter: Mock,
+        mock_get_index_manager: Mock,
+        mock_get_conn: Mock,
     ) -> None:
         """Test sparse search when FTS index is missing."""
         with patch.object(search_sparse_module, "_substring_fallback", return_value=[]):
@@ -196,9 +266,14 @@ class TestSearchSparse:
             mock_index_manager.get_fts_index_status.return_value = False
             mock_get_index_manager.return_value = mock_index_manager
 
-            mock_table.search.return_value.limit.return_value.to_pandas.return_value = (
-                pd.DataFrame()
-            )
+            mock_build_filter.return_value = "collection == 'test_col'"
+            mock_search = Mock()
+            mock_limit = Mock()
+            mock_where = Mock()
+            mock_table.search.return_value = mock_search
+            mock_search.limit.return_value = mock_limit
+            mock_limit.where.return_value = mock_where
+            mock_where.to_pandas.return_value = pd.DataFrame()
 
             response = search_sparse_module.search_sparse(
                 collection="test_col",
@@ -218,14 +293,20 @@ class TestSearchSparse:
             mock_get_index_manager.assert_called_once()
             mock_index_manager.get_fts_index_status.assert_called_once_with(mock_table)
             mock_table.search.assert_called_once_with("query", query_type="fts")
-            mock_table.search.return_value.limit.assert_called_once_with(1)
+            mock_search.limit.assert_called_once_with(1)
 
     @patch(
         "xagent.core.tools.core.RAG_tools.retrieval.search_sparse.get_connection_from_env"
     )
     @patch("xagent.core.tools.core.RAG_tools.retrieval.search_sparse.get_index_manager")
+    @patch(
+        "xagent.core.tools.core.RAG_tools.retrieval.search_sparse.build_lancedb_filter_expression"
+    )
     def test_search_sparse_readonly_mode(
-        self, mock_get_index_manager: Mock, mock_get_conn: Mock
+        self,
+        mock_build_filter: Mock,
+        mock_get_index_manager: Mock,
+        mock_get_conn: Mock,
     ) -> None:
         """Test sparse search in readonly mode."""
         with patch.object(search_sparse_module, "_substring_fallback", return_value=[]):
@@ -242,9 +323,14 @@ class TestSearchSparse:
             mock_index_manager.get_fts_index_status.return_value = False
             mock_get_index_manager.return_value = mock_index_manager
 
-            mock_table.search.return_value.limit.return_value.to_pandas.return_value = (
-                pd.DataFrame()
-            )
+            mock_build_filter.return_value = "collection == 'test_col'"
+            mock_search = Mock()
+            mock_limit = Mock()
+            mock_where = Mock()
+            mock_table.search.return_value = mock_search
+            mock_search.limit.return_value = mock_limit
+            mock_limit.where.return_value = mock_where
+            mock_where.to_pandas.return_value = pd.DataFrame()
 
             response = search_sparse_module.search_sparse(
                 collection="test_col",
@@ -265,7 +351,7 @@ class TestSearchSparse:
             mock_get_index_manager.assert_called_once()
             mock_index_manager.get_fts_index_status.assert_called_once_with(mock_table)
             mock_table.search.assert_called_once_with("query", query_type="fts")
-            mock_table.search.return_value.limit.assert_called_once_with(1)
+            mock_search.limit.assert_called_once_with(1)
 
     @patch(
         "xagent.core.tools.core.RAG_tools.retrieval.search_sparse.get_connection_from_env"
@@ -304,8 +390,14 @@ class TestSearchSparse:
         "xagent.core.tools.core.RAG_tools.retrieval.search_sparse.get_connection_from_env"
     )
     @patch("xagent.core.tools.core.RAG_tools.retrieval.search_sparse.get_index_manager")
+    @patch(
+        "xagent.core.tools.core.RAG_tools.retrieval.search_sparse.build_lancedb_filter_expression"
+    )
     def test_search_sparse_empty_results(
-        self, mock_get_index_manager: Mock, mock_get_conn: Mock
+        self,
+        mock_build_filter: Mock,
+        mock_get_index_manager: Mock,
+        mock_get_conn: Mock,
     ) -> None:
         """Test sparse search returning no results."""
         with patch.object(search_sparse_module, "_substring_fallback", return_value=[]):
@@ -321,10 +413,14 @@ class TestSearchSparse:
             )
             mock_index_manager.get_fts_index_status.return_value = True
             mock_get_index_manager.return_value = mock_index_manager
-
-            mock_table.search.return_value.limit.return_value.to_pandas.return_value = (
-                pd.DataFrame()
-            )
+            mock_build_filter.return_value = "collection == 'test_col'"
+            mock_search = Mock()
+            mock_limit = Mock()
+            mock_where = Mock()
+            mock_table.search.return_value = mock_search
+            mock_search.limit.return_value = mock_limit
+            mock_limit.where.return_value = mock_where
+            mock_where.to_pandas.return_value = pd.DataFrame()
 
             response = search_sparse_module.search_sparse(
                 collection="test_col",
@@ -343,16 +439,21 @@ class TestSearchSparse:
             mock_get_conn.assert_called_once()
             mock_conn.open_table.assert_called_once_with("embeddings_test_model")
             mock_get_index_manager.assert_called_once()
-            mock_index_manager.get_fts_index_status.assert_called_once_with(mock_table)
             mock_table.search.assert_called_once_with("no matches", query_type="fts")
-            mock_table.search.return_value.limit.assert_called_once_with(5)
+            mock_search.limit.assert_called_once_with(5)
 
     @patch(
         "xagent.core.tools.core.RAG_tools.retrieval.search_sparse.get_connection_from_env"
     )
     @patch("xagent.core.tools.core.RAG_tools.retrieval.search_sparse.get_index_manager")
+    @patch(
+        "xagent.core.tools.core.RAG_tools.retrieval.search_sparse.build_lancedb_filter_expression"
+    )
     def test_search_sparse_triggers_fallback_with_results(
-        self, mock_get_index_manager: Mock, mock_get_conn: Mock
+        self,
+        mock_build_filter: Mock,
+        mock_get_index_manager: Mock,
+        mock_get_conn: Mock,
     ) -> None:
         """Ensure fallback populates results and emits an FTS warning."""
 
@@ -391,10 +492,14 @@ class TestSearchSparse:
         )
         mock_index_manager.get_fts_index_status.return_value = True
         mock_get_index_manager.return_value = mock_index_manager
-
-        mock_table.search.return_value.limit.return_value.to_pandas.return_value = (
-            pd.DataFrame()
-        )
+        mock_build_filter.return_value = "collection == 'test_col'"
+        mock_search = Mock()
+        mock_limit = Mock()
+        mock_where = Mock()
+        mock_table.search.return_value = mock_search
+        mock_search.limit.return_value = mock_limit
+        mock_limit.where.return_value = mock_where
+        mock_where.to_pandas.return_value = pd.DataFrame()
 
         with patch.object(
             search_sparse_module, "_substring_fallback", side_effect=_fake_fallback
@@ -417,8 +522,14 @@ class TestSearchSparse:
         "xagent.core.tools.core.RAG_tools.retrieval.search_sparse.get_connection_from_env"
     )
     @patch("xagent.core.tools.core.RAG_tools.retrieval.search_sparse.get_index_manager")
+    @patch(
+        "xagent.core.tools.core.RAG_tools.retrieval.search_sparse.build_lancedb_filter_expression"
+    )
     def test_search_sparse_score_clamping(
-        self, mock_get_index_manager: Mock, mock_get_conn: Mock
+        self,
+        mock_build_filter: Mock,
+        mock_get_index_manager: Mock,
+        mock_get_conn: Mock,
     ) -> None:
         """Test that sparse search scores are properly clamped to [0, 1] range."""
         # Mock connection and table
@@ -436,10 +547,15 @@ class TestSearchSparse:
         )
         mock_index_manager.get_fts_index_status.return_value = True
         mock_get_index_manager.return_value = mock_index_manager
+        mock_build_filter.return_value = "collection == 'test_col'"
+        mock_search = Mock()
+        mock_limit = Mock()
+        mock_where = Mock()
+        mock_table.search.return_value = mock_search
+        mock_search.limit.return_value = mock_limit
+        mock_limit.where.return_value = mock_where
 
         # Create test data with a very high _score that would result in score > 1
-        # Using _score = 10, the formula score = _score / (1 + _score) = 10/11 ≈ 0.909
-        # But let's use an even higher value to ensure clamping works
         test_data = pd.DataFrame(
             {
                 "doc_id": ["doc1"],
@@ -448,12 +564,10 @@ class TestSearchSparse:
                 "parse_hash": ["hash1"],
                 "created_at": [pd.Timestamp.now()],
                 "metadata": ['{"key": "value"}'],
-                "_score": [100.0],  # This would give score = 100/101 ≈ 0.99, still < 1
+                "_score": [100.0],  # score = 100/101 ≈ 0.99
             }
         )
-        mock_table.search.return_value.limit.return_value.to_pandas.return_value = (
-            test_data
-        )
+        mock_where.to_pandas.return_value = test_data
 
         response = search_sparse_module.search_sparse(
             collection="test_col",

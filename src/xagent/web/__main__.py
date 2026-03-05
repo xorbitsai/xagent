@@ -12,9 +12,12 @@ import logging
 import os
 import sys
 from pathlib import Path
+from typing import cast
 
 import uvicorn
 from dotenv import load_dotenv
+
+from .logging_config import LogLevel, setup_logging
 
 # Load environment variables from .env file
 load_dotenv()
@@ -76,41 +79,6 @@ def warn_if_example_jwt_config(logger: logging.Logger) -> None:
     )
 
 
-def setup_logging(debug: bool = False) -> None:
-    """Configure logging"""
-    level = logging.DEBUG if debug else logging.INFO
-
-    # Basic logging configuration
-    logging.basicConfig(
-        level=level,
-        format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-        datefmt="%Y-%m-%d %H:%M:%S",
-    )
-
-    if debug:
-        # Debug mode: configure detailed logging for specific modules
-        # XAgent modules - set to DEBUG for all submodules
-        logging.getLogger("xagent.core").setLevel(logging.DEBUG)
-        logging.getLogger("xagent.web").setLevel(logging.DEBUG)
-        logging.getLogger("xagent.entrypoint").setLevel(logging.DEBUG)
-        logging.getLogger("xagent.skills").setLevel(logging.DEBUG)
-
-        # LangChain/LangGraph detailed logging
-        logging.getLogger("langchain").setLevel(logging.DEBUG)
-        logging.getLogger("langgraph").setLevel(logging.DEBUG)
-        logging.getLogger("langchain_core").setLevel(logging.DEBUG)
-
-        # Suppress verbose logs from third-party libraries
-        logging.getLogger("aiohttp").setLevel(logging.WARNING)
-        logging.getLogger("sqlalchemy").setLevel(logging.WARNING)
-        logging.getLogger("urllib3").setLevel(logging.WARNING)
-        logging.getLogger("uvicorn.access").setLevel(logging.WARNING)
-
-        print("🐛 Debug mode enabled")
-        print("🔍 LLM responses and tool call details will be logged")
-        print("-" * 50)
-
-
 def parse_args() -> argparse.Namespace:
     """Parse command line arguments"""
     parser = argparse.ArgumentParser(
@@ -154,10 +122,18 @@ def main() -> None:
     """Main function"""
     args = parse_args()
 
-    # Configure logging
-    setup_logging(args.debug)
+    # Configure logging BEFORE importing app
+    log_level = "debug" if args.debug else args.log_level
+    setup_logging(level=cast(LogLevel, log_level.upper()))
+
     logger = logging.getLogger(__name__)
     warn_if_example_jwt_config(logger)
+
+    # Show debug banner if --debug was used
+    if args.debug:
+        print("🐛 Debug mode enabled")
+        print("🔍 LLM responses and tool call details will be logged")
+        print("-" * 50)
 
     logger.info("🚀 Starting xagent Web service...")
     logger.info(f"📍 Service URL: http://{args.host}:{args.port}")
@@ -174,7 +150,7 @@ def main() -> None:
             host=args.host,
             port=args.port,
             reload=args.reload,
-            log_level=args.log_level,
+            log_level=log_level,
         )
     except KeyboardInterrupt:
         logger.info("⏹️  Service stopped")

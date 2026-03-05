@@ -7,7 +7,9 @@
     "build": "next build",
     "start": "next start",
     "lint": "eslint",
-    "type-check": "tsc --noEmit"
+    "type-check": "tsc --noEmit",
+    "test": "vitest",
+    "test:run": "vitest run"
   },
   "dependencies": {
     "@radix-ui/react-alert-dialog": "^1.1.15",
@@ -56,6 +58,7 @@
   "devDependencies": {
     "@types/dagre": "^0.7.53",
     "@types/highlight.js": "^10.0.0",
-    "@types/marked": "^5.0.0"
+    "@types/marked": "^5.0.0",
+    "vitest": "^2.1.9"
   }
 }

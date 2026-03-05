@@ -1,8 +1,9 @@
-"""Unit tests for chunk strategies (P0 token merge, P1 protected content & headers)."""
+"""Unit tests for chunk strategies (P0 token merge, P1 protected content & headers, custom separators)."""
 
 from xagent.core.tools.core.RAG_tools.chunk.chunk_strategies import (
     _find_protected_ranges,
     _split_by_headers,
+    _split_by_separators_core,
     apply_markdown_strategy,
     apply_recursive_strategy,
     attach_media_context,
@@ -96,6 +97,118 @@ class TestApplyRecursiveStrategyTokenMode:
         # Both should produce valid chunks with text
         assert all(c.get("text", "").strip() for c in token_chunks)
         assert all(c.get("text", "").strip() for c in char_chunks)
+
+
+class TestSplitBySeparatorsCore:
+    """Tests for _split_by_separators_core (default and custom separators)."""
+
+    def test_default_separators_splits_by_double_newline(self) -> None:
+        text = "aaa\n\nbbb\n\nccc"
+        result = _split_by_separators_core(text, None)
+        assert len(result) == 3
+        assert result[0].strip() == "aaa"
+        assert result[1].strip() == "bbb"
+        assert result[2].strip() == "ccc"
+
+    def test_custom_separator_single_sentence_end(self) -> None:
+        text = "第一句。第二句。第三句。"
+        result = _split_by_separators_core(text, ["。"])
+        # Split by 。 gives: "第一句", "第二句", "第三句", ""
+        assert len(result) >= 3
+        assert "第一句" in result[0]
+        assert "第二句" in result[1]
+        assert "第三句" in result[2]
+
+    def test_custom_separators_double_newline_and_newline(self) -> None:
+        text = "block1\n\nblock2\nblock3"
+        result = _split_by_separators_core(text, ["\n\n", "\n"])
+        assert len(result) >= 2
+        assert "block1" in result[0]
+        assert "block2" in result[1] or "block3" in result[1]
+
+    def test_empty_separators_list_uses_default(self) -> None:
+        text = "a\n\nb"
+        result = _split_by_separators_core(text, [])
+        assert len(result) == 2
+        assert "a" in result[0]
+        assert "b" in result[1]
+
+
+class TestApplyRecursiveStrategyCustomSeparators:
+    """Tests for apply_recursive_strategy with custom separators."""
+
+    def _paragraph(self, text: str) -> dict:
+        return {"text": text, "metadata": {}}
+
+    def test_custom_separator_sentence_only(self) -> None:
+        """Split only by 。; use small chunk_size so sliding window yields multiple chunks."""
+        paragraphs = [
+            self._paragraph("第一句。第二句。第三句。"),
+        ]
+        params = {
+            "separators": ["。"],
+            "chunk_size": 4,
+            "chunk_overlap": 0,
+        }
+        chunks = apply_recursive_strategy(paragraphs, params)
+        assert len(chunks) >= 2
+        texts = [c["text"].strip() for c in chunks if c["text"].strip()]
+        assert any("第一句" in t for t in texts)
+        assert any("第二句" in t for t in texts)
+        assert any("第三句" in t for t in texts)
+
+    def test_custom_separators_double_newline_and_newline(self) -> None:
+        """Custom separators [\\n\\n, \\n] split by paragraph then line; small chunk_size."""
+        paragraphs = [
+            self._paragraph("A\n\nB\nC"),
+        ]
+        params = {
+            "separators": ["\n\n", "\n"],
+            "chunk_size": 2,
+            "chunk_overlap": 0,
+        }
+        chunks = apply_recursive_strategy(paragraphs, params)
+        assert len(chunks) >= 2
+        texts = [c["text"].strip() for c in chunks if c["text"].strip()]
+        assert any("A" in t for t in texts)
+        assert any("B" in t or "C" in t for t in texts)
+
+    def test_none_separators_uses_default(self) -> None:
+        """When separators is None, DEFAULT_SEPARATORS is used; small chunk_size."""
+        paragraphs = [
+            self._paragraph("x\n\ny"),
+        ]
+        params = {
+            "separators": None,
+            "chunk_size": 2,
+            "chunk_overlap": 0,
+        }
+        chunks = apply_recursive_strategy(paragraphs, params)
+        assert len(chunks) >= 2
+        texts = [c["text"].strip() for c in chunks if c["text"].strip()]
+        assert any("x" in t for t in texts)
+        assert any("y" in t for t in texts)
+
+    def test_empty_paragraphs_returns_empty_list(self) -> None:
+        chunks = apply_recursive_strategy(
+            [], {"separators": ["\n"], "chunk_size": 10, "chunk_overlap": 0}
+        )
+        assert chunks == []
+
+    def test_metadata_preserved_in_chunks(self) -> None:
+        meta = {"page_number": 1, "section": "intro"}
+        paragraphs = [self._paragraph("a\n\nb"), self._paragraph("c")]
+        for p in paragraphs:
+            p["metadata"] = meta
+        params = {
+            "separators": ["\n\n", "\n"],
+            "chunk_size": 100,
+            "chunk_overlap": 0,
+        }
+        chunks = apply_recursive_strategy(paragraphs, params)
+        assert len(chunks) >= 1
+        for c in chunks:
+            assert c.get("metadata") == meta
 
 
 class TestProtectedContent:

@@ -3,6 +3,10 @@
 This package contains common utility functions used across RAG tool modules.
 """
 
+from .embedding_utils import (
+    normalize_raw_embedding_to_vectors,
+    normalize_single_embedding,
+)
 from .file_utils import check_file_type, validate_file_path
 from .hash_utils import compute_content_hash, compute_file_hash, validate_hash_format
 from .lancedb_query_utils import query_to_list
@@ -16,6 +20,9 @@ from .string_utils import (
 from .validation_utils import validate_and_convert_user_id
 
 __all__ = [
+    # Embedding utilities
+    "normalize_raw_embedding_to_vectors",
+    "normalize_single_embedding",
     # File utilities
     "check_file_type",
     "validate_file_path",

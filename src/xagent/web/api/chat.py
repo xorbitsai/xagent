@@ -123,6 +123,7 @@ async def create_default_tools(
     allowed_skills: Optional[List[str]] = None,
     allowed_tools: Optional[List[str]] = None,
     excluded_agent_id: Optional[int] = None,
+    vision_model: Optional[Any] = None,
 ) -> tuple[list[Any], Any]:
     """Create default tools and tool_config for AgentService using ToolFactory"""
     if not user:
@@ -148,6 +149,7 @@ async def create_default_tools(
         allowed_collections=allowed_collections,  # Agent Builder knowledge bases
         allowed_skills=allowed_skills,  # Agent Builder skills
         allowed_tools=allowed_tools,  # Agent Builder tool categories
+        vision_model=vision_model,  # Pass task-specific vision model
     )
 
     # Store excluded_agent_id in tool_config for agent tool filtering
@@ -596,6 +598,7 @@ class AgentServiceManager:
                     allowed_skills=agent_config["skills"] if agent_config else None,
                     allowed_tools=allowed_tools,
                     excluded_agent_id=excluded_agent_id,
+                    vision_model=task_vision_llm,  # Pass task-specific vision model
                 )
 
                 with UserContext(int(user.id)):

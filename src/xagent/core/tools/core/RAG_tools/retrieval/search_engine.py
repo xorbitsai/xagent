@@ -72,8 +72,16 @@ def search_dense_engine(
             vector_column_name="vector",
         )
 
-        # Build filter expression combining user permissions and custom filters
+        # Build filter expression combining collection scope, user permissions and custom filters
         filter_clauses = []
+
+        # Scope results to the requested collection (required for KB isolation)
+        if collection:
+            collection_filter = build_lancedb_filter_expression(
+                {"collection": collection}
+            )
+            if collection_filter:
+                filter_clauses.append(collection_filter)
 
         # Add user permission filter for multi-tenancy
         from ..utils.user_permissions import UserPermissions

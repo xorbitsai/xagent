@@ -12,7 +12,10 @@ from xagent.core.tools.core.RAG_tools.core.exceptions import (
     DocumentValidationError,
     HashComputationError,
 )
-from xagent.core.tools.core.RAG_tools.file.register_document import register_document
+from xagent.core.tools.core.RAG_tools.file.register_document import (
+    list_documents,
+    register_document,
+)
 
 
 class TestRegisterDocument:
@@ -257,3 +260,56 @@ class TestRegisterDocument:
         # Should propagate DatabaseOperationError
         with pytest.raises(DatabaseOperationError, match="Table access failed"):
             register_document(collection="test_collection", source_path=str(test_file))
+
+
+class TestListDocuments:
+    """Test list_documents function (collection filter for KB isolation)."""
+
+    def test_list_documents_filters_by_collection(
+        self, tmp_path: Path, monkeypatch
+    ) -> None:
+        """List_documents must return only documents from the requested collection (Issue #72)."""
+        db_dir = tmp_path / "lancedb"
+        db_dir.mkdir(parents=True, exist_ok=True)
+        monkeypatch.setenv("LANCEDB_DIR", str(db_dir))
+
+        # Register one doc in collection A
+        file_a = tmp_path / "a.txt"
+        file_a.write_text("Doc A")
+        register_document(
+            collection="coll_a",
+            source_path=str(file_a),
+            doc_id="doc-a",
+        )
+
+        # Register one doc in collection B
+        file_b = tmp_path / "b.txt"
+        file_b.write_text("Doc B")
+        register_document(
+            collection="coll_b",
+            source_path=str(file_b),
+            doc_id="doc-b",
+        )
+
+        # List only coll_a: must not include coll_b docs
+        results_a = list_documents(str(db_dir), collection="coll_a", limit=100)
+        assert len(results_a) == 1
+        assert results_a[0]["collection"] == "coll_a"
+        assert results_a[0]["doc_id"] == "doc-a"
+
+        # List only coll_b: must not include coll_a docs
+        results_b = list_documents(str(db_dir), collection="coll_b", limit=100)
+        assert len(results_b) == 1
+        assert results_b[0]["collection"] == "coll_b"
+        assert results_b[0]["doc_id"] == "doc-b"
+
+    def test_list_documents_empty_collection_returns_empty(
+        self, tmp_path: Path, monkeypatch
+    ) -> None:
+        """List_documents for a collection with no docs returns empty list."""
+        db_dir = tmp_path / "lancedb"
+        db_dir.mkdir(parents=True, exist_ok=True)
+        monkeypatch.setenv("LANCEDB_DIR", str(db_dir))
+
+        results = list_documents(str(db_dir), collection="no_such_coll", limit=10)
+        assert results == []

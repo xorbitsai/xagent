@@ -231,14 +231,36 @@ class TestGeminiLLM:
         mocker: pytest_mock.MockerFixture,
     ) -> None:
         """Test vision chat functionality."""
+        from xagent.core.model.chat.types import ChunkType, StreamChunk
+
         # Test with vision-capable model
         vision_llm = GeminiLLM(model_name="gemini-pro-vision", api_key="test-key")
 
-        # Mock the internal API call method
+        # Mock stream_chat to return streaming chunks
+        async def mock_stream_chat(*args, **kwargs):
+            """Mock streaming response for vision chat."""
+            yield StreamChunk(
+                type=ChunkType.TOKEN,
+                content="Hello",
+                delta="Hello",
+                raw=None,
+            )
+            yield StreamChunk(
+                type=ChunkType.TOKEN,
+                content="Hello World",
+                delta=" World",
+                raw=None,
+            )
+            yield StreamChunk(
+                type=ChunkType.END,
+                finish_reason="stop",
+                raw=None,
+            )
+
         mocker.patch.object(
             vision_llm,
-            "_call_gemini_rest_api",
-            new=AsyncMock(return_value=mock_response_text),
+            "stream_chat",
+            new=mock_stream_chat,
         )
 
         messages = [
@@ -259,9 +281,130 @@ class TestGeminiLLM:
         response = await vision_llm.vision_chat(messages)
 
         assert isinstance(response, str)
-        assert response == "Hello World"
+
         print(f"Vision chat response: {response}")
 
+    @pytest.mark.asyncio
+    async def test_vision_chat_with_tool_call(
+        self,
+        mocker: pytest_mock.MockerFixture,
+    ) -> None:
+        """Test vision chat with tool call."""
+        from xagent.core.model.chat.types import ChunkType, StreamChunk
+
+        vision_llm = GeminiLLM(model_name="gemini-pro-vision", api_key="test-key")
+
+        async def mock_stream_chat(*args, **kwargs):
+            """Mock streaming response with tool call."""
+            yield StreamChunk(
+                type=ChunkType.TOOL_CALL,
+                content="",
+                delta="",
+                tool_calls=[
+                    {
+                        "id": "test_id",
+                        "type": "function",
+                        "function": {
+                            "name": "test_function",
+                            "arguments": '{"arg": "value"}',
+                        },
+                    }
+                ],
+                raw={"response": "data"},
+            )
+            yield StreamChunk(
+                type=ChunkType.END,
+                finish_reason="stop",
+                raw=None,
+            )
+
+        mocker.patch.object(vision_llm, "stream_chat", new=mock_stream_chat)
+
+        response = await vision_llm.vision_chat([{"role": "user", "content": "test"}])
+
+        assert response["type"] == "tool_call"
+        assert len(response["tool_calls"]) == 1
+        assert response["tool_calls"][0]["function"]["name"] == "test_function"
+        assert response["raw"] == {"response": "data"}
+
+    @pytest.mark.asyncio
+    async def test_vision_chat_with_error_chunk(
+        self,
+        mocker: pytest_mock.MockerFixture,
+    ) -> None:
+        """Test vision chat with ERROR chunk."""
+        from xagent.core.model.chat.types import ChunkType, StreamChunk
+
+        vision_llm = GeminiLLM(model_name="gemini-pro-vision", api_key="test-key")
+
+        async def mock_stream_chat(*args, **kwargs):
+            """Mock streaming response with error."""
+            yield StreamChunk(
+                type=ChunkType.ERROR,
+                content="API rate limit exceeded",
+                delta="",
+                raw=None,
+            )
+
+        mocker.patch.object(vision_llm, "stream_chat", new=mock_stream_chat)
+
+        with pytest.raises(RuntimeError, match="Gemini vision chat streaming error"):
+            await vision_llm.vision_chat([{"role": "user", "content": "test"}])
+
+    @pytest.mark.asyncio
+    async def test_vision_chat_empty_content(
+        self,
+        mocker: pytest_mock.MockerFixture,
+    ) -> None:
+        """Test vision chat with empty content raises LLMEmptyContentError."""
+        from xagent.core.model.chat.exceptions import LLMEmptyContentError
+        from xagent.core.model.chat.types import ChunkType, StreamChunk
+
+        vision_llm = GeminiLLM(model_name="gemini-pro-vision", api_key="test-key")
+
+        async def mock_stream_chat(*args, **kwargs):
+            """Mock streaming response with empty content."""
+            yield StreamChunk(
+                type=ChunkType.TOKEN,
+                content="",  # Empty content
+                delta="",
+                raw=None,
+            )
+            yield StreamChunk(
+                type=ChunkType.END,
+                finish_reason="stop",
+                raw=None,
+            )
+
+        mocker.patch.object(vision_llm, "stream_chat", new=mock_stream_chat)
+
+        with pytest.raises(
+            LLMEmptyContentError, match="empty content and no tool calls"
+        ):
+            await vision_llm.vision_chat([{"role": "user", "content": "test"}])
+
+    @pytest.mark.asyncio
+    async def test_vision_chat_timeout(
+        self,
+        mocker: pytest_mock.MockerFixture,
+    ) -> None:
+        """Test vision chat timeout is properly propagated."""
+        from xagent.core.model.chat.exceptions import LLMTimeoutError
+
+        vision_llm = GeminiLLM(model_name="gemini-pro-vision", api_key="test-key")
+
+        async def mock_stream_chat_timeout(*args, **kwargs):
+            """Mock streaming response that times out."""
+            raise LLMTimeoutError("Request timed out")
+            yield  # Make this an async generator
+
+        mocker.patch.object(vision_llm, "stream_chat", new=mock_stream_chat_timeout)
+
+        # Timeout errors should be re-raised for retry handling
+        with pytest.raises(LLMTimeoutError, match="Request timed out"):
+            await vision_llm.vision_chat([{"role": "user", "content": "test"}])
+
+    @pytest.mark.asyncio
     @pytest.mark.asyncio
     async def test_http_error_handling(
         self, llm: GeminiLLM, mocker: pytest_mock.MockerFixture

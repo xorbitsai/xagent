@@ -211,7 +211,7 @@ def get_document(db_dir: str, collection: str, doc_id: str) -> Optional[Any]:
 
     Args:
         db_dir: LanceDB directory path
-        collection: Collection name (currently unused, for future multi-collection support)
+        collection: Collection name to filter by (only returns documents from this collection)
         doc_id: Document ID to retrieve
 
     Returns:
@@ -246,11 +246,11 @@ def list_documents(
 
     Args:
         db_dir: LanceDB directory path
-        collection: Collection name (currently unused, for future multi-collection support)
+        collection: Collection name to filter by (only documents in this KB are returned)
         limit: Maximum number of documents to return
 
     Returns:
-        List of document records
+        List of document records for the given collection
 
     Raises:
         DatabaseOperationError: If database operation fails
@@ -260,7 +260,8 @@ def list_documents(
         ensure_documents_table(db)
         table = db.open_table("documents")
 
-        results = table.search().limit(limit).to_pandas()
+        filter_expr = build_lancedb_filter_expression({"collection": collection})
+        results = table.search().where(filter_expr).limit(limit).to_pandas()
         return list(results.to_dict("records"))
 
     except Exception as e:

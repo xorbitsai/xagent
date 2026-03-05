@@ -12,6 +12,7 @@ import { ScrollArea } from "@/components/ui/scroll-area"
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs"
 import { SelectRadix, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select"
 import { getApiUrl } from "@/lib/utils"
+import { appendIngestionConfigToFormData } from "@/lib/ingestion-form"
 import { useAuth } from "@/contexts/auth-context"
 import { useI18n } from "@/contexts/i18n-context"
 import { apiRequest } from "@/lib/api-wrapper"
@@ -99,6 +100,7 @@ export function KnowledgeBaseCreationDialog({ open, onOpenChange, onSuccess }: K
     chunk_strategy: "recursive",
     chunk_size: 1000,
     chunk_overlap: 200,
+    separators: "" as string,
     embedding_model_id: "",
     embedding_batch_size: 10,
     max_retries: 3,
@@ -256,14 +258,7 @@ export function KnowledgeBaseCreationDialog({ open, onOpenChange, onSuccess }: K
 
         formData.append("file", file)
         formData.append("collection", collectionName)
-        formData.append("parse_method", ingestionConfig.parse_method)
-        formData.append("chunk_strategy", ingestionConfig.chunk_strategy)
-        formData.append("chunk_size", ingestionConfig.chunk_size.toString())
-        formData.append("chunk_overlap", ingestionConfig.chunk_overlap.toString())
-        formData.append("embedding_model_id", ingestionConfig.embedding_model_id)
-        formData.append("embedding_batch_size", ingestionConfig.embedding_batch_size.toString())
-        formData.append("max_retries", ingestionConfig.max_retries.toString())
-        formData.append("retry_delay", ingestionConfig.retry_delay.toString())
+        appendIngestionConfigToFormData(formData, ingestionConfig)
 
         const response = await apiRequest(`${getApiUrl()}/api/kb/ingest`, {
           method: "POST",
@@ -337,14 +332,7 @@ export function KnowledgeBaseCreationDialog({ open, onOpenChange, onSuccess }: K
       formData.append("timeout", webIngestionConfig.timeout.toString())
       formData.append("respect_robots_txt", webIngestionConfig.respect_robots_txt.toString())
 
-      formData.append("parse_method", ingestionConfig.parse_method)
-      formData.append("chunk_strategy", ingestionConfig.chunk_strategy)
-      formData.append("chunk_size", ingestionConfig.chunk_size.toString())
-      formData.append("chunk_overlap", ingestionConfig.chunk_overlap.toString())
-      formData.append("embedding_model_id", ingestionConfig.embedding_model_id)
-      formData.append("embedding_batch_size", ingestionConfig.embedding_batch_size.toString())
-      formData.append("max_retries", ingestionConfig.max_retries.toString())
-      formData.append("retry_delay", ingestionConfig.retry_delay.toString())
+      appendIngestionConfigToFormData(formData, ingestionConfig)
 
       setWebIngestionProgress(10)
 
@@ -802,6 +790,21 @@ export function KnowledgeBaseCreationDialog({ open, onOpenChange, onSuccess }: K
                   onChange={(e) => setIngestionConfig(prev => ({ ...prev, chunk_overlap: parseInt(e.target.value) || 200 }))}
                 />
               </div>
+
+              {ingestionConfig.chunk_strategy === "recursive" && (
+                <div>
+                  <Label htmlFor="separators" title={t("kb.index.separatorsTip")}>
+                    {t("kb.index.separators")}
+                  </Label>
+                  <Input
+                    id="separators"
+                    type="text"
+                    value={ingestionConfig.separators ?? ""}
+                    onChange={(e) => setIngestionConfig(prev => ({ ...prev, separators: e.target.value }))}
+                    placeholder={t("kb.index.separatorsPlaceholder")}
+                  />
+                </div>
+              )}
 
               <div>
                 <Label htmlFor="embedding_model_id">{t("kb.index.embeddingModelId")}</Label>

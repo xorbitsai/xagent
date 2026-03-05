@@ -358,6 +358,7 @@ type AppAction =
   | { type: "ADD_TO_REPLAY_CACHE"; payload: WebSocketMessage }
   | { type: "CLEAR_REPLAY_CACHE" }
   | { type: "SET_HISTORY_LOADING"; payload: boolean }
+  | { type: "SYNC_PROCESSING_STATUS" }
 
 const initialState: AppState = {
   messages: [],
@@ -396,6 +397,12 @@ function appReducer(state: AppState, action: AppAction): AppState {
   switch (action.type) {
     case "SET_HISTORY_LOADING":
       return { ...state, isHistoryLoading: action.payload }
+
+    case "SYNC_PROCESSING_STATUS":
+      if (state.currentTask?.status === 'completed' || state.currentTask?.status === 'failed') {
+        return { ...state, isProcessing: false }
+      }
+      return state
 
     case "TRIGGER_TASK_UPDATE":
       return { ...state, lastTaskUpdate: Date.now() }
@@ -1912,9 +1919,6 @@ export function AppProvider({ children, token }: { children: React.ReactNode; to
             const { result, success } = eventData
             // Check for clarification request in task completion
             const clarification = extractClarificationMessage(eventData)
-
-            console.log('-----------------------clarification', clarification);
-
             if (clarification) {
               const msgId = generateMessageId("msg-clarification")
               dispatch({
@@ -2993,6 +2997,7 @@ export function AppProvider({ children, token }: { children: React.ReactNode; to
           else if (eventType === "historical_data_complete") {
             isHistoricalDataLoading = false
             dispatch({ type: "SET_HISTORY_LOADING", payload: false })
+            dispatch({ type: "SYNC_PROCESSING_STATUS" })
 
             // If we're in replay mode, initialize the replay scheduler
             if (state.isReplaying && state.replayTaskId && state.replayEventCache.length > 0) {
@@ -3011,7 +3016,7 @@ export function AppProvider({ children, token }: { children: React.ReactNode; to
           // Default: add as trace event
           else {
             console.trace('Original message:', JSON.stringify(message), 'Handler: handleMessage (unhandled event_type:', eventType, ')')
-                        dispatch({ type: "ADD_TRACE_EVENT", payload: traceEventData })
+            dispatch({ type: "ADD_TRACE_EVENT", payload: traceEventData })
           }
         } else {
           console.trace('Original message:', JSON.stringify(message), 'Handler: handleMessage (no event_type, direct trace event)')
@@ -3041,7 +3046,7 @@ export function AppProvider({ children, token }: { children: React.ReactNode; to
                 step_data: traceEventData.step_data,
                 file_outputs: traceEventData.file_outputs || [],
               }
-                            dispatch({ type: "ADD_STEP", payload: step })
+              dispatch({ type: "ADD_STEP", payload: step })
             } else {
               // Add as trace event instead
               dispatch({ type: "ADD_TRACE_EVENT", payload: traceEventData })
@@ -3375,6 +3380,7 @@ export function AppProvider({ children, token }: { children: React.ReactNode; to
         // Historical data loading complete
         isHistoricalDataLoading = false
         dispatch({ type: "SET_HISTORY_LOADING", payload: false })
+        dispatch({ type: "SYNC_PROCESSING_STATUS" })
 
         // If we're in replay mode, initialize the replay scheduler
         if (state.isReplaying && state.replayTaskId && state.replayEventCache.length > 0) {

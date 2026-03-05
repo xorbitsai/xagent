@@ -124,7 +124,43 @@ class OptimizeInstructionsRequest(BaseModel):
     )
 
 
+KNOWLEDGE_TOOL_CATEGORY = "knowledge"
+
+KB_PRIORITY_PROMPT = (
+    "\n\n[Knowledge Base Instructions]\n"
+    "You have access to the following knowledge base(s). "
+    "When answering user questions, you MUST first search the knowledge base(s) "
+    "using the available knowledge tools before relying on your own knowledge. "
+    "Always prioritize information retrieved from the knowledge base(s) over "
+    "your built-in knowledge. If the knowledge base does not contain relevant "
+    "information, you may then use your own knowledge to answer, but clearly "
+    "indicate that the answer is not from the knowledge base."
+)
+
+
+def enhance_system_prompt_with_kb(
+    system_prompt: Optional[str], knowledge_bases: Optional[List[str]]
+) -> Optional[str]:
+    """Append knowledge-base priority instructions when KBs are configured."""
+    if not knowledge_bases:
+        return system_prompt
+    if system_prompt:
+        return system_prompt + KB_PRIORITY_PROMPT
+    return KB_PRIORITY_PROMPT.lstrip("\n")
+
+
 # ===== Helper Functions =====
+
+
+def _validate_knowledge_base_tools(
+    knowledge_bases: List[str], tool_categories: List[str]
+) -> None:
+    """Raise HTTPException if knowledge bases are selected without the knowledge tool category."""
+    if knowledge_bases and KNOWLEDGE_TOOL_CATEGORY not in tool_categories:
+        raise HTTPException(
+            status_code=400,
+            detail="Knowledge bases are selected but the Knowledge tool category is not enabled. Please enable the Knowledge tools before saving.",
+        )
 
 
 def _save_logo(base64_data: Optional[str], agent_id: int) -> Optional[str]:
@@ -286,6 +322,10 @@ async def create_agent(
                 status_code=400, detail="Agent with this name already exists"
             )
 
+        _validate_knowledge_base_tools(
+            agent_data.knowledge_bases, agent_data.tool_categories
+        )
+
         # Create agent
         agent = Agent(
             user_id=current_user.id,
@@ -398,6 +438,19 @@ async def update_agent(
 
         if not agent:
             raise HTTPException(status_code=404, detail="Agent not found")
+
+        # Validate knowledge base + tool category consistency
+        effective_kb = (
+            agent_data.knowledge_bases
+            if agent_data.knowledge_bases is not None
+            else (agent.knowledge_bases or [])
+        )
+        effective_tools = (
+            agent_data.tool_categories
+            if agent_data.tool_categories is not None
+            else (agent.tool_categories or [])
+        )
+        _validate_knowledge_base_tools(effective_kb, effective_tools)  # type: ignore[arg-type]
 
         # Update fields
         if agent_data.name is not None:
@@ -770,9 +823,11 @@ async def preview_agent(
         # Execute task with system prompt in context
         execution_context = {}
         if request.instructions:
-            # User's instructions are added as a prefix (role definition)
-            # Planning capabilities are preserved
             execution_context["system_prompt"] = request.instructions
+        execution_context["system_prompt"] = enhance_system_prompt_with_kb(  # type: ignore[assignment]
+            execution_context.get("system_prompt"),
+            request.knowledge_bases if request.knowledge_bases else None,
+        )
 
         with UserContext(int(current_user.id)):
             result = await agent_service.execute_task(

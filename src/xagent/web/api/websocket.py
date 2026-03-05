@@ -2107,6 +2107,8 @@ async def handle_build_preview_execution(
                 return
 
         # Execute task
+        from .agents import enhance_system_prompt_with_kb
+
         execution_context = {}
         if instructions:
             execution_context["system_prompt"] = instructions
@@ -2118,6 +2120,10 @@ async def handle_build_preview_execution(
                 )
             else:
                 execution_context["system_prompt"] = file_prompt
+        # Emphasize KB priority when knowledge bases are configured
+        execution_context["system_prompt"] = enhance_system_prompt_with_kb(
+            execution_context.get("system_prompt"), knowledge_bases
+        )
         if uploaded_files:
             execution_context["uploaded_files"] = uploaded_files
         if file_info_list:

@@ -635,8 +635,16 @@ class AgentServiceManager:
                     tools_list, tool_config = tools
 
                     # Get system prompt from agent config (if available)
+                    from .agents import enhance_system_prompt_with_kb
+
                     system_prompt = (
                         agent_config.get("instructions") if agent_config else None
+                    )
+                    kb_list = (
+                        agent_config.get("knowledge_bases") if agent_config else None
+                    )
+                    system_prompt = enhance_system_prompt_with_kb(
+                        system_prompt, kb_list
                     )
 
                     # Create AgentService first (this creates the workspace)

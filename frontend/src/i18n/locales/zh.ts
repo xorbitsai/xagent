@@ -1575,8 +1575,17 @@ Build when you need.`
         failed: "创建 Agent 失败",
         publishFailed: "发布 Agent 失败",
         unpublishFailed: "取消发布 Agent 失败",
+        kbToolsNotEnabled: "选择了知识库但未启用知识库工具，请在工具类别中勾选「知识库」工具后再保存。",
         unknown: "发生未知错误",
-      }
+      },
+      kbToolWarning: {
+        title: "需要启用知识库工具",
+        description: "您已选择了知识库，但尚未启用「知识库」工具类别。Agent 需要知识库工具才能检索和使用知识库中的内容。",
+        hint: "点击下方按钮可一键启用知识库工具，启用后请重新保存。",
+        cancel: "稍后处理",
+        enableAndContinue: "启用知识库工具",
+        enabled: "已启用知识库工具，请重新保存",
+      },
     },
     configForm: {
       logo: {

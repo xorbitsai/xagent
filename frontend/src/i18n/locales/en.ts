@@ -1575,8 +1575,17 @@ Build when you need.`
         failed: "Failed to create agent",
         publishFailed: "Failed to publish agent",
         unpublishFailed: "Failed to unpublish agent",
+        kbToolsNotEnabled: "Knowledge bases are selected but the Knowledge tool category is not enabled. Please enable the Knowledge tools before saving.",
         unknown: "An unknown error occurred",
-      }
+      },
+      kbToolWarning: {
+        title: "Knowledge Tools Required",
+        description: "You have selected knowledge bases but haven't enabled the Knowledge tool category. The agent needs Knowledge tools to search and retrieve content from the knowledge bases.",
+        hint: "Click the button below to enable Knowledge tools, then save again.",
+        cancel: "Later",
+        enableAndContinue: "Enable Knowledge Tools",
+        enabled: "Knowledge tools enabled. Please save again.",
+      },
     },
     configForm: {
       logo: {

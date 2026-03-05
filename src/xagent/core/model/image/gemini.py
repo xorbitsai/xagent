@@ -447,12 +447,20 @@ class GeminiImageModel(BaseImageModel):
 
         # Handle single or multiple images
         images = [image_url] if isinstance(image_url, str) else image_url
+        if not images:
+            raise ValueError("At least one image must be provided for editing")
 
         for img in images:
             # Determine mime type and get base64 data
             if img.startswith("data:"):
                 # Data URL: data:image/png;base64,xxxxx
-                mime_type = "image/png"
+                # Parse MIME type from data URL format
+                try:
+                    mime_type = img[5:].split(";base64,")[0]
+                    if not mime_type or "/" not in mime_type:
+                        mime_type = "image/png"
+                except IndexError:
+                    mime_type = "image/png"
                 base64_data = img.split(",", 1)[1]
                 parts.append(
                     {"inlineData": {"mimeType": mime_type, "data": base64_data}}
@@ -485,34 +493,35 @@ class GeminiImageModel(BaseImageModel):
                     raise RuntimeError(f"Failed to process image URL {img}: {e}") from e
             else:
                 # Local file path - read and encode
-                try:
-                    # Check if it's a valid file path
-                    path = pathlib.Path(img)
-                    if path.is_file():
-                        # Read file and determine mime type
-                        with open(path, "rb") as f:
-                            image_bytes = f.read()
+                # Check if it's a valid file path
+                path = pathlib.Path(img)
+                if not path.is_file():
+                    raise ValueError(f"File not found: {img}")
 
-                        # Determine mime type from extension
-                        ext = path.suffix.lower()
-                        mime_map = {
-                            ".jpg": "image/jpeg",
-                            ".jpeg": "image/jpeg",
-                            ".png": "image/png",
-                            ".gif": "image/gif",
-                            ".webp": "image/webp",
-                        }
-                        mime_type = mime_map.get(ext, "image/jpeg")
-                        base64_data = base64.b64encode(image_bytes).decode("utf-8")
-                        parts.append(
-                            {"inlineData": {"mimeType": mime_type, "data": base64_data}}
-                        )
-                    else:
-                        raise ValueError(f"File not found: {img}")
-                except Exception as e:
-                    raise ValueError(
-                        f"Unsupported image URL format or file not found: {img}"
-                    ) from e
+                try:
+                    # Read file and determine mime type
+                    with open(path, "rb") as f:
+                        image_bytes = f.read()
+                except (OSError, IOError) as e:
+                    raise ValueError(f"Failed to read file {img}: {e}") from e
+
+                # Determine mime type from extension
+                ext = path.suffix.lower()
+                mime_map = {
+                    ".jpg": "image/jpeg",
+                    ".jpeg": "image/jpeg",
+                    ".png": "image/png",
+                    ".gif": "image/gif",
+                    ".webp": "image/webp",
+                    ".bmp": "image/bmp",
+                    ".tiff": "image/tiff",
+                    ".tif": "image/tiff",
+                }
+                mime_type = mime_map.get(ext, "image/jpeg")
+                base64_data = base64.b64encode(image_bytes).decode("utf-8")
+                parts.append(
+                    {"inlineData": {"mimeType": mime_type, "data": base64_data}}
+                )
 
         # Add the text prompt
         parts.append({"text": prompt})
@@ -569,14 +578,14 @@ class GeminiImageModel(BaseImageModel):
             first_candidate = candidates[0]
             finish_reason = first_candidate.get("finishReason")
             content = first_candidate.get("content", {})
-            parts = content.get("parts", [])
+            response_parts = content.get("parts", [])
 
-            if not parts:
+            if not response_parts:
                 raise RuntimeError("No parts in response content")
 
             # Look for image URL in Markdown text response (most common format)
             edited_image_url = None
-            for part in parts:
+            for part in response_parts:
                 text = part.get("text", "")
                 if text:
                     # Extract image URL from Markdown format: ![Image](url)
@@ -587,7 +596,7 @@ class GeminiImageModel(BaseImageModel):
 
             # Also check for inlineData as fallback
             if not edited_image_url:
-                for part in parts:
+                for part in response_parts:
                     inline_data = part.get("inlineData")
                     if inline_data:
                         mime_type = inline_data.get("mimeType", "image/png")

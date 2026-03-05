@@ -698,8 +698,9 @@ class PlanGenerator:
 - For simple questions, clarifications, or information gathering, use "chat" type
 - When returning type="plan", do NOT include plan details - just the type indicator
 - interactions is optional - omit if no user input is needed
-- timeout is optional (in seconds). Use 60 seconds for auto-continuation. If the user auto-continues but you ABSOLUTELY CANNOT proceed without input, ask again WITHOUT timeout.
-- IMPORTANT: If user replies "Continue" (or "继续") to a previous question with timeout, it means they want to proceed with defaults. If you can proceed, return type="plan". If you cannot proceed without input, return type="chat" again WITHOUT timeout.
+- timeout: Use 60 seconds ONLY if the task can proceed with default assumptions when the user does nothing (auto-continuation).
+- **STRICT RULE**: If the task CANNOT proceed without specific user input or file upload (e.g., mandatory missing information), you MUST NOT include a "timeout".
+- If you previously asked for input with a timeout, and the user replied "Continue" (auto-continued) but you still lack the mandatory info, ask again WITHOUT a timeout.
 """
 
         if tools_context:

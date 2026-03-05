@@ -565,20 +565,20 @@ class DAGPlanExecutePattern(AgentPattern):
                         # Calculate absolute expiration time if timeout is present
                         expires_at = None
 
-                        # Force timeout for the first iteration if not present
-                        # This ensures the first clarification request always has a timeout for auto-continuation
-                        if iteration == 1 and not result.chat_response.timeout:
-                            result.chat_response.timeout = 60
+                        # Only apply timeout logic if there are interactions
+                        if interactions_data:
+                            if result.chat_response.timeout:
+                                from datetime import timedelta, timezone
 
-                        if result.chat_response.timeout:
-                            from datetime import timedelta, timezone
-
-                            # Use UTC time to avoid timezone issues between server and client
-                            expires_at = (
-                                datetime.now(timezone.utc)
-                                + timedelta(seconds=result.chat_response.timeout)
-                            ).isoformat()
-                            result.chat_response.expires_at = expires_at
+                                # Use UTC time to avoid timezone issues between server and client
+                                expires_at = (
+                                    datetime.now(timezone.utc)
+                                    + timedelta(seconds=result.chat_response.timeout)
+                                ).isoformat()
+                                result.chat_response.expires_at = expires_at
+                        else:
+                            # Ensure no timeout if no interactions
+                            result.chat_response.timeout = None
 
                         # Record assistant response to conversation history (with interactions)
                         self._add_assistant_message(

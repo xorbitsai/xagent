@@ -71,7 +71,6 @@ export function ClarificationForm({ interactions, timeout, messageId, expiresAt 
     // If already expired (and using expiresAt), trigger auto-continue immediately
     if (expiresAt && initialTimeLeft <= 0) {
       setTimeLeft(0)
-      handleAutoContinue()
       return
     }
 
@@ -88,7 +87,6 @@ export function ClarificationForm({ interactions, timeout, messageId, expiresAt 
 
         if (diff <= 0) {
           clearInterval(timer)
-          handleAutoContinue()
         }
       } else {
         // Legacy decrement
@@ -96,7 +94,6 @@ export function ClarificationForm({ interactions, timeout, messageId, expiresAt 
           if (prev === null) return null
           if (prev <= 1) {
             clearInterval(timer)
-            handleAutoContinue()
             return 0
           }
           return prev - 1

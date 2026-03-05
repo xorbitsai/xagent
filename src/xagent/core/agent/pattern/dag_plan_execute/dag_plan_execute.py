@@ -567,11 +567,6 @@ class DAGPlanExecutePattern(AgentPattern):
 
                         # Only apply timeout logic if there are interactions
                         if interactions_data:
-                            # Force timeout for the first iteration if not present
-                            # This ensures the first clarification request always has a timeout for auto-continuation
-                            if iteration == 1 and not result.chat_response.timeout:
-                                result.chat_response.timeout = 60
-
                             if result.chat_response.timeout:
                                 from datetime import timedelta, timezone
 

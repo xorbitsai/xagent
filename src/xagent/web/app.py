@@ -139,6 +139,11 @@ async def startup_event() -> None:
     init_db()
     logger.info("Database initialized successfully")
 
+    # Start timeout manager
+    from .timeout_manager import timeout_manager
+
+    await timeout_manager.start()
+
     # Initialize skill manager
     from ..skills.utils import create_skill_manager
 
@@ -174,6 +179,14 @@ async def startup_event() -> None:
     logger.info(
         f"Memory store similarity threshold: {store_info['similarity_threshold']}"
     )
+
+
+@app.on_event("shutdown")
+async def shutdown_event() -> None:
+    # Stop timeout manager
+    from .timeout_manager import timeout_manager
+
+    await timeout_manager.stop()
 
 
 # Frontend is now served by Next.js at http://localhost:3000

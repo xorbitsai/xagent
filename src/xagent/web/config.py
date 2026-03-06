@@ -9,11 +9,17 @@ from typing import List, Optional
 WEB_DIR = Path(__file__).parent
 
 # File storage configuration
-UPLOADS_DIR = WEB_DIR / "uploads"
+# Support XAGENT_UPLOADS_DIR environment variable, default to WEB_DIR/uploads for backward compatibility
+_UPLOADS_DIR = os.getenv("XAGENT_UPLOADS_DIR")
+if _UPLOADS_DIR:
+    UPLOADS_DIR = Path(_UPLOADS_DIR)
+else:
+    UPLOADS_DIR = WEB_DIR / "uploads"
+
 STATIC_DIR = WEB_DIR / "static"
 
 # Ensure uploads directory exists
-UPLOADS_DIR.mkdir(exist_ok=True)
+UPLOADS_DIR.mkdir(parents=True, exist_ok=True)
 
 # External upload directories (for accessing knowledge base files from other projects)
 # Format: comma-separated list of directory paths

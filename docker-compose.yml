@@ -38,11 +38,11 @@ services:
       - DATABASE_URL=postgresql://xagent:${POSTGRES_PASSWORD:-xagent_password}@postgres:5432/xagent
       - POSTGRES_PASSWORD=${POSTGRES_PASSWORD:-xagent_password}
       - BACKEND_PORT=8000
+      - XAGENT_UPLOADS_DIR=/root/.xagent/uploads
     env_file:
       - .env
     volumes:
       - xagent_data:/root/.xagent
-      - xagent_uploads:/opt/xagent/src/xagent/web/uploads
     depends_on:
       postgres:
         condition: service_healthy
@@ -79,8 +79,6 @@ volumes:
   postgres_data:
     driver: local
   xagent_data:
-    driver: local
-  xagent_uploads:
     driver: local
 
 networks:

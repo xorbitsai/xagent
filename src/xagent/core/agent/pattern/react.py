@@ -1314,17 +1314,13 @@ Failed final answer:
             "messages": final_messages,
         }
 
-        # Only add tools if available (tools exist)
+        # Get tool schemas for tracing (but don't pass to LLM)
+        # In JSON instruction mode, LLM returns JSON text describing the action,
+        # not actual tool calls. The code then parses the JSON and executes tools.
         tool_schemas = self.tool_registry.get_tool_schemas()
 
-        if tool_schemas:
-            chat_kwargs["tools"] = tool_schemas
-            chat_kwargs["tool_choice"] = "auto"
-            # Enforce JSON format for all LLMs including Gemini
-            chat_kwargs["response_format"] = {"type": "json_object"}
-        else:
-            # No tools - enforce JSON format for all LLMs
-            chat_kwargs["response_format"] = {"type": "json_object"}
+        # Enforce JSON format for all LLMs
+        chat_kwargs["response_format"] = {"type": "json_object"}
 
         # Disable thinking mode if supported
         if (

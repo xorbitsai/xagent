@@ -28,8 +28,11 @@ def _fix_pydantic_schema_for_claude(schema: Dict[str, Any]) -> Dict[str, Any]:
     """
     Fix Pydantic-generated schema for Claude API compatibility.
 
-    Claude requires that all object types explicitly set additionalProperties to false.
-    Pydantic's model_json_schema() may set it to true or omit it, so we always set it to false.
+    Claude requires:
+    1. All object types must have additionalProperties: false (not true or omitted)
+    2. Number/integer types cannot have: minimum, maximum, exclusiveMinimum, exclusiveMaximum
+
+    Pydantic's model_json_schema() may add these unsupported properties, so we remove them.
 
     Args:
         schema: The schema dictionary to fix
@@ -44,6 +47,18 @@ def _fix_pydantic_schema_for_claude(schema: Dict[str, Any]) -> Dict[str, Any]:
     if schema.get("type") == "object":
         # Always set to false (Claude doesn't support additionalProperties: true)
         schema["additionalProperties"] = False
+
+    # For number type, remove unsupported properties
+    # Claude doesn't support: minimum, maximum, exclusiveMinimum, exclusiveMaximum
+    if schema.get("type") in ("number", "integer"):
+        unsupported_props = [
+            "minimum",
+            "maximum",
+            "exclusiveMinimum",
+            "exclusiveMaximum",
+        ]
+        for prop in unsupported_props:
+            schema.pop(prop, None)
 
     # Recursively process nested structures
     for key, value in list(schema.items()):

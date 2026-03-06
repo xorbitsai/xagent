@@ -59,7 +59,7 @@ COPY alembic.ini .
 # Install app + deepdoc into venv
 RUN /opt/venv/bin/pip install --no-cache-dir ${PYPI_INDEX_URL:+--index-url $PYPI_INDEX_URL} . \
     && git clone https://github.com/xorbitsai/deepdoc-lib /opt/xagent/deepdoc-lib \
-    && cd /opt/xagent/deepdoc-lib && git checkout 4d5aef10f0c7bc0dd75609f0306ee5fcb0c58b87 \
+    && cd /opt/xagent/deepdoc-lib && git checkout 88f420a1c032a07688115b5182ac6eb210efd961 \
     && /opt/venv/bin/pip install --no-cache-dir ${PYPI_INDEX_URL:+--index-url $PYPI_INDEX_URL} /opt/xagent/deepdoc-lib \
     && rm -rf /opt/xagent/deepdoc-lib .git
 

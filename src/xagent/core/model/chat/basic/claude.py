@@ -94,7 +94,12 @@ class ClaudeLLM(BaseLLM):
             }
 
             if self.base_url:
-                client_kwargs["base_url"] = self.base_url
+                # Remove trailing /v1 if present to avoid duplication
+                # The Anthropic SDK automatically appends /v1/ to the base_url
+                clean_base_url = self.base_url.rstrip("/")
+                if clean_base_url.endswith("/v1"):
+                    clean_base_url = clean_base_url[:-3]
+                client_kwargs["base_url"] = clean_base_url
 
             self._client = AsyncAnthropic(**client_kwargs)
 

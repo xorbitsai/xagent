@@ -403,9 +403,11 @@ class ClaudeLLM(BaseLLM):
 
             # Handle response_format for JSON mode
             # Anthropic doesn't have a response_format parameter, so we add instructions to system message
+            # Note: When tools are present, response_format is ignored as tools already require structured output
             if (
                 response_format is not None
                 and response_format.get("type") == "json_object"
+                and not tools
             ):
                 json_instruction = "You must respond with valid JSON only. Do not include any text outside the JSON structure."
                 if system_message:
@@ -661,9 +663,11 @@ class ClaudeLLM(BaseLLM):
 
             # Handle response_format for JSON mode
             # Anthropic doesn't have a response_format parameter, so we add instructions to system message
+            # Note: When tools are present, response_format is ignored as tools already require structured output
             if (
                 response_format is not None
                 and response_format.get("type") == "json_object"
+                and not tools
             ):
                 json_instruction = "You must respond with valid JSON only. Do not include any text outside the JSON structure."
                 if system_message:

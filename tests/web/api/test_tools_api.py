@@ -201,5 +201,5 @@ class TestToolsAvailableAPI:
         """Test that /api/tools/available requires authentication."""
         response = client.get("/api/tools/available")
 
-        # Should return 403 without auth (FastAPI returns 403 when no auth header)
-        assert response.status_code == 403
+        # Should return 401 (older FastAPI) or 403 (newer FastAPI) without auth
+        assert response.status_code in [401, 403]

@@ -354,7 +354,20 @@ class GeminiLLM(BaseLLM):
                 raise LLMInvalidResponseError("No candidates in Gemini SDK response")
 
             candidate = response.candidates[0]
+
+            # Check if candidate.content exists
+            if not hasattr(candidate, "content") or candidate.content is None:
+                raise LLMInvalidResponseError(
+                    "Candidate content is None in Gemini SDK response"
+                )
+
             content_parts = candidate.content.parts
+
+            # Check if content_parts is None
+            if content_parts is None:
+                raise LLMInvalidResponseError(
+                    "Content parts is None in Gemini SDK response"
+                )
 
             tool_calls = []
             text_parts = []
@@ -490,6 +503,10 @@ class GeminiLLM(BaseLLM):
                 config=config if config else None,
             )
 
+            # Check if response_stream is None
+            if response_stream is None:
+                raise RuntimeError("Gemini SDK returned None response stream")
+
             # Process streaming response
             for chunk in response_stream:
                 current_time = time.time()
@@ -551,7 +568,16 @@ class GeminiLLM(BaseLLM):
                     continue
 
                 candidate = chunk.candidates[0]
+
+                # Check if candidate.content exists
+                if not hasattr(candidate, "content") or candidate.content is None:
+                    continue
+
                 content_parts = candidate.content.parts
+
+                # Check if content_parts is None
+                if content_parts is None:
+                    continue
 
                 for part in content_parts:
                     if hasattr(part, "function_call") and part.function_call:

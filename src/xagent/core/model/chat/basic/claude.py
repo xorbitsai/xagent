@@ -799,13 +799,18 @@ class ClaudeLLM(BaseLLM):
                             if accumulated_tool_calls:
                                 tool_calls_list = []
                                 for tool_call in accumulated_tool_calls.values():
+                                    # Ensure arguments is valid JSON
+                                    arguments = tool_call["arguments"]
+                                    if not arguments or arguments == "":
+                                        arguments = "{}"
+
                                     tool_calls_list.append(
                                         {
                                             "id": tool_call["id"],
                                             "type": "function",
                                             "function": {
                                                 "name": tool_call["name"],
-                                                "arguments": tool_call["arguments"],
+                                                "arguments": arguments,
                                             },
                                         }
                                     )

@@ -24,6 +24,43 @@ from .base import BaseLLM
 logger = logging.getLogger(__name__)
 
 
+def _fix_pydantic_schema_for_claude(schema: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Fix Pydantic-generated schema for Claude API compatibility.
+
+    Claude requires that all object types explicitly set additionalProperties to false.
+    Pydantic's model_json_schema() doesn't add this field, so we need to add it recursively.
+
+    Args:
+        schema: The schema dictionary to fix
+
+    Returns:
+        The fixed schema dictionary
+    """
+    if not isinstance(schema, dict):
+        return schema
+
+    # If this is an object type, add additionalProperties: false
+    if schema.get("type") == "object":
+        # Only add if not already present
+        if "additionalProperties" not in schema:
+            schema["additionalProperties"] = False
+
+    # Recursively process nested structures
+    for key, value in list(schema.items()):
+        if isinstance(value, dict):
+            schema[key] = _fix_pydantic_schema_for_claude(value)
+        elif isinstance(value, list):
+            schema[key] = [
+                _fix_pydantic_schema_for_claude(item)
+                if isinstance(item, dict)
+                else item
+                for item in value
+            ]
+
+    return schema
+
+
 class ClaudeLLM(BaseLLM):
     """
     Anthropic Claude LLM client using the official Anthropic SDK.
@@ -345,6 +382,22 @@ class ClaudeLLM(BaseLLM):
             # In newer anthropic versions (>= 0.84.0), output_config is a direct parameter
             # In older versions, it needs to be passed via extra_body
             if output_config is not None:
+                # Fix Pydantic-generated schemas for Claude API compatibility
+                format_config = output_config.get("format", {})
+                if (
+                    format_config.get("type") == "json_schema"
+                    and "schema" in format_config
+                ):
+                    # Apply schema fixes recursively
+                    fixed_schema = _fix_pydantic_schema_for_claude(
+                        format_config["schema"]
+                    )
+                    output_config = {
+                        "format": {
+                            "type": "json_schema",
+                            "schema": fixed_schema,
+                        }
+                    }
                 # Try to pass output_config directly first (for newer SDK versions)
                 completion_params["output_config"] = output_config
 

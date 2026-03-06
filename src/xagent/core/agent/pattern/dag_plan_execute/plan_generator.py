@@ -523,6 +523,7 @@ class PlanGenerator:
         try:
             # Prepare output_config with JSON schema from Pydantic model
             # This ensures the required fields are present and provides type safety
+            # Note: ClaudeLLM will automatically fix the schema for API compatibility
             output_config = {
                 "format": {
                     "type": "json_schema",

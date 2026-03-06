@@ -31,6 +31,7 @@ def _fix_pydantic_schema_for_claude(schema: Dict[str, Any]) -> Dict[str, Any]:
     Claude requires:
     1. All object types must have additionalProperties: false (not true or omitted)
     2. Number/integer types cannot have: minimum, maximum, exclusiveMinimum, exclusiveMaximum
+    3. Empty schemas {} are not supported - must specify a concrete type
 
     Pydantic's model_json_schema() may add these unsupported properties, so we remove them.
 
@@ -42,6 +43,11 @@ def _fix_pydantic_schema_for_claude(schema: Dict[str, Any]) -> Dict[str, Any]:
     """
     if not isinstance(schema, dict):
         return schema
+
+    # Handle empty schema - convert to a concrete type
+    if not schema or len(schema) == 0:
+        # Default to object type with no properties
+        return {"type": "object", "properties": {}, "additionalProperties": False}
 
     # If this is an object type, add additionalProperties: false
     if schema.get("type") == "object":

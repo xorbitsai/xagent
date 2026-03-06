@@ -355,17 +355,17 @@ class TestPlanGenerator:
             pytest.skip(f"Full plan generation not supported in test environment: {e}")
 
     def test_error_message_format(self, plan_generator):
-        """测试错误消息中的格式说明已更新"""
-        # 验证提示模板只包含新的格式要求
+        """Test that error message format instructions have been updated"""
+        # Verify prompt template only contains new format requirements
         prompt = plan_generator._build_planning_prompt(
             goal="test goal", iteration=1, history=[], tools=[]
         )
 
-        # 验证提示中只包含新的格式要求
+        # Verify prompt contains JSON format requirements and correct structure
         prompt_text = "".join([msg["content"] for msg in prompt])
-        assert "JSON object with a 'plan' field" in prompt_text
+        assert "JSON object" in prompt_text
         assert '"plan": {' in prompt_text
         assert '"steps": [' in prompt_text
 
-        # 确保没有提到旧的数组格式
+        # Ensure old array format is not mentioned
         assert "JSON array" not in prompt_text

@@ -29,7 +29,7 @@ def _fix_pydantic_schema_for_claude(schema: Dict[str, Any]) -> Dict[str, Any]:
     Fix Pydantic-generated schema for Claude API compatibility.
 
     Claude requires that all object types explicitly set additionalProperties to false.
-    Pydantic's model_json_schema() doesn't add this field, so we need to add it recursively.
+    Pydantic's model_json_schema() may set it to true or omit it, so we always set it to false.
 
     Args:
         schema: The schema dictionary to fix
@@ -42,9 +42,8 @@ def _fix_pydantic_schema_for_claude(schema: Dict[str, Any]) -> Dict[str, Any]:
 
     # If this is an object type, add additionalProperties: false
     if schema.get("type") == "object":
-        # Only add if not already present
-        if "additionalProperties" not in schema:
-            schema["additionalProperties"] = False
+        # Always set to false (Claude doesn't support additionalProperties: true)
+        schema["additionalProperties"] = False
 
     # Recursively process nested structures
     for key, value in list(schema.items()):

@@ -637,10 +637,25 @@ class ClaudeLLM(BaseLLM):
                     completion_params["thinking"] = {"type": "disabled"}
 
             # Handle output_config for structured outputs
-            # Handle output_config for structured outputs
             # In newer anthropic versions (>= 0.84.0), output_config is a direct parameter
             # In older versions, it needs to be passed via extra_body
             if output_config is not None:
+                # Fix Pydantic-generated schemas for API compatibility
+                format_config = output_config.get("format", {})
+                if (
+                    format_config.get("type") == "json_schema"
+                    and "schema" in format_config
+                ):
+                    # Apply schema fixes recursively
+                    fixed_schema = _fix_pydantic_schema_for_claude(
+                        format_config["schema"]
+                    )
+                    output_config = {
+                        "format": {
+                            "type": "json_schema",
+                            "schema": fixed_schema,
+                        }
+                    }
                 # Try to pass output_config directly (for newer SDK versions)
                 completion_params["output_config"] = output_config
 

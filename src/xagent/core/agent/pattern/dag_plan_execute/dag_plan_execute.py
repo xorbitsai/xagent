@@ -235,7 +235,7 @@ class DAGPlanExecutePattern(AgentPattern):
 
         # Convert interactions to natural language description
         if interactions:
-            content_parts.append("\n\n请用户回答以下问题：")
+            content_parts.append("\n\nPlease answer the following questions:")
             for interaction in interactions:
                 from .models import InteractionType
 
@@ -267,7 +267,7 @@ class DAGPlanExecutePattern(AgentPattern):
                             for opt in (i_options or [])
                         ]
                     )
-                    label = i_label or "请选择"
+                    label = i_label or "Select"
                     content_parts.append(f"- {label}: {options_desc}")
 
                 elif interaction_type == InteractionType.SELECT_MULTIPLE:
@@ -277,30 +277,32 @@ class DAGPlanExecutePattern(AgentPattern):
                             for opt in (i_options or [])
                         ]
                     )
-                    label = i_label or "请选择（可多选）"
+                    label = i_label or "Select multiple options"
                     content_parts.append(f"- {label}: {options_desc}")
 
                 elif interaction_type == InteractionType.TEXT_INPUT:
-                    label = i_label or "请输入"
-                    placeholder = i_placeholder or "文本输入"
+                    label = i_label or "Enter text"
+                    placeholder = i_placeholder or "text input"
                     content_parts.append(f"- {label}: {placeholder}")
 
                 elif interaction_type == InteractionType.FILE_UPLOAD:
-                    label = i_label or "请上传文件"
-                    accept_desc = ", ".join(i_accept) if i_accept else "任意文件"
-                    multiple_desc = "可多选" if i_multiple else "单个文件"
-                    content_parts.append(f"- {label}: {accept_desc}（{multiple_desc}）")
+                    label = i_label or "Upload file"
+                    accept_desc = ", ".join(i_accept) if i_accept else "any file"
+                    multiple_desc = (
+                        "multiple files allowed" if i_multiple else "single file"
+                    )
+                    content_parts.append(f"- {label}: {accept_desc} ({multiple_desc})")
 
                 elif interaction_type == InteractionType.CONFIRM:
-                    label = i_label or "请确认"
-                    default_desc = "默认：是" if i_default else "默认：否"
+                    label = i_label or "Confirm"
+                    default_desc = "Default: yes" if i_default else "Default: no"
                     content_parts.append(f"- {label} ({default_desc})")
 
                 elif interaction_type == InteractionType.NUMBER_INPUT:
-                    label = i_label or "请输入数字"
+                    label = i_label or "Enter number"
                     range_desc = ""
                     if i_min is not None and i_max is not None:
-                        range_desc = f"（范围：{i_min}-{i_max}）"
+                        range_desc = f" (range: {i_min}-{i_max})"
                     content_parts.append(f"- {label}{range_desc}")
 
         # Store with natural language content + original interactions

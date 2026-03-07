@@ -50,7 +50,12 @@ class TestGeminiLLMSDK:
 
         # Mock the Client constructor
         mocker.patch("google.genai.Client", return_value=mock_sdk_client)
-        mock_sdk_client.models.generate_content.return_value = mock_response
+
+        # Create async mock for generate_content
+        async def mock_generate_content(*args, **kwargs):
+            return mock_response
+
+        mock_sdk_client.aio.models.generate_content = mock_generate_content
 
         messages = [
             {
@@ -95,12 +100,15 @@ class TestGeminiLLMSDK:
         mock_chunk3 = MagicMock()
         mock_chunk3.candidates = None  # End chunk
 
-        # Setup streaming response
-        mock_client.models.generate_content_stream.return_value = [
-            mock_chunk1,
-            mock_chunk2,
-            mock_chunk3,
-        ]
+        # Setup streaming response (async iterator)
+        async def mock_stream():
+            for chunk in [mock_chunk1, mock_chunk2, mock_chunk3]:
+                yield chunk
+
+        async def mock_generate_content_stream(*args, **kwargs):
+            return mock_stream()
+
+        mock_client.aio.models.generate_content_stream = mock_generate_content_stream
 
         # Patch the _ensure_client to return our mock
         mocker.patch.object(llm, "_ensure_client")
@@ -145,7 +153,11 @@ class TestGeminiLLMSDK:
         mock_response.usage_metadata.prompt_token_count = 15
         mock_response.usage_metadata.candidates_token_count = 10
 
-        mock_client.models.generate_content.return_value = mock_response
+        # Create async mock for generate_content
+        async def mock_generate_content(*args, **kwargs):
+            return mock_response
+
+        mock_client.aio.models.generate_content = mock_generate_content
 
         # Patch the _ensure_client to return our mock
         mocker.patch.object(llm, "_ensure_client")
@@ -207,7 +219,11 @@ class TestGeminiLLMSDK:
         mock_response.usage_metadata.prompt_token_count = 14
         mock_response.usage_metadata.candidates_token_count = 20
 
-        mock_client.models.generate_content.return_value = mock_response
+        # Create async mock for generate_content
+        async def mock_generate_content(*args, **kwargs):
+            return mock_response
+
+        mock_client.aio.models.generate_content = mock_generate_content
 
         # Patch the _ensure_client to return our mock
         mocker.patch.object(llm, "_ensure_client")
@@ -341,11 +357,15 @@ class TestGeminiLLMSDK:
 
         # Mock the SDK to raise 429 error
         mock_client = mocker.MagicMock()
-        mock_client.models.generate_content.side_effect = genai_errors.ClientError(
-            code=429,
-            response_json={"error": {"code": 429, "message": "RESOURCE_EXHAUSTED"}},
-            response=mock_response,
-        )
+
+        async def mock_generate_content_error(*args, **kwargs):
+            raise genai_errors.ClientError(
+                code=429,
+                response_json={"error": {"code": 429, "message": "RESOURCE_EXHAUSTED"}},
+                response=mock_response,
+            )
+
+        mock_client.aio.models.generate_content = mock_generate_content_error
 
         # Patch the Client constructor
         mocker.patch("google.genai.Client", return_value=mock_client)
@@ -379,11 +399,17 @@ class TestGeminiLLMSDK:
 
         # Mock the SDK to raise 500 error
         mock_client = mocker.MagicMock()
-        mock_client.models.generate_content.side_effect = genai_errors.ClientError(
-            code=500,
-            response_json={"error": {"code": 500, "message": "Internal Server Error"}},
-            response=mock_response,
-        )
+
+        async def mock_generate_content_error(*args, **kwargs):
+            raise genai_errors.ClientError(
+                code=500,
+                response_json={
+                    "error": {"code": 500, "message": "Internal Server Error"}
+                },
+                response=mock_response,
+            )
+
+        mock_client.aio.models.generate_content = mock_generate_content_error
 
         # Patch the Client constructor
         mocker.patch("google.genai.Client", return_value=mock_client)

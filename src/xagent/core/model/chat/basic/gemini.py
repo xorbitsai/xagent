@@ -326,8 +326,8 @@ class GeminiLLM(BaseLLM):
                 else:
                     contents.append(parts)
 
-            # Make API call using SDK
-            response = self._client.models.generate_content(
+            # Make API call using SDK (async)
+            response = await self._client.aio.models.generate_content(
                 model=self._model_name,
                 contents=contents,
                 config=config if config else None,
@@ -496,8 +496,8 @@ class GeminiLLM(BaseLLM):
                 else:
                     contents.append(parts)
 
-            # Make streaming API call using SDK
-            response_stream = self._client.models.generate_content_stream(
+            # Make streaming API call using SDK (async)
+            response_stream = await self._client.aio.models.generate_content_stream(
                 model=self._model_name,
                 contents=contents,
                 config=config if config else None,
@@ -507,8 +507,8 @@ class GeminiLLM(BaseLLM):
             if response_stream is None:
                 raise RuntimeError("Gemini SDK returned None response stream")
 
-            # Process streaming response
-            for chunk in response_stream:
+            # Process streaming response (async iteration)
+            async for chunk in response_stream:
                 current_time = time.time()
 
                 if first_token:
@@ -717,11 +717,11 @@ class GeminiLLM(BaseLLM):
                 http_options=http_options,
             )
 
-            # Use SDK to list models
-            models_pager = client.models.list()
+            # Use SDK to list models (async)
+            models_pager = await client.aio.models.list()
             models = []
 
-            for model in models_pager:
+            async for model in models_pager:
                 models.append(
                     {
                         "id": model.name,

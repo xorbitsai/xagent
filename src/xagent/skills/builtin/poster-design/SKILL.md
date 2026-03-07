@@ -108,14 +108,7 @@ When **any** of these conditions are met:
 
 ### Critical Screenshot Requirement
 
-**When using browser screenshot tools, the viewport width MUST be explicitly set to match the layout width (default: 1080px).**
-
-Failure to set the correct viewport width will result in:
-* Incorrect rendering and scaled content
-* Broken layout proportions
-* Blurry or distorted text
-
-**Always ensure the browser is configured with the exact width before taking the screenshot.**
+**When using browser screenshot tools, the viewport width MUST be explicitly set to match the layout width (default: 1080px), and the output filename MUST clearly indicate the poster's purpose.**
 
 ### Intent
 

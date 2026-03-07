@@ -71,6 +71,12 @@ export function ClarificationForm({ interactions, timeout, messageId, expiresAt 
     // If already expired (and using expiresAt), trigger auto-continue immediately
     if (expiresAt && initialTimeLeft <= 0) {
       setTimeLeft(0)
+      // Use setTimeout to ensure state updates complete before triggering
+      setTimeout(() => {
+        if (!hasAutoSubmitted.current && !isSubmitting && !isTaskRunning) {
+          handleAutoContinue()
+        }
+      }, 0)
       return
     }
 
@@ -103,6 +109,13 @@ export function ClarificationForm({ interactions, timeout, messageId, expiresAt 
 
     return () => clearInterval(timer)
   }, [timeout, expiresAt, isLastMessage])
+
+  // Auto-trigger continue when timeLeft reaches 0
+  useEffect(() => {
+    if (timeLeft === 0 && isLastMessage && !hasAutoSubmitted.current && !isSubmitting && !isTaskRunning) {
+      handleAutoContinue()
+    }
+  }, [timeLeft, isLastMessage, isSubmitting, isTaskRunning])
 
   const handleAutoContinue = async () => {
     if (hasAutoSubmitted.current || isSubmitting || isTaskRunning) return
@@ -306,7 +319,7 @@ export function ClarificationForm({ interactions, timeout, messageId, expiresAt 
                 type="file"
                 className="absolute inset-0 h-full w-full cursor-pointer opacity-0"
                 accept={Array.isArray(interaction.accept) ? interaction.accept.join(",") : interaction.accept}
-                multiple={true} // Always allow multiple selection
+                multiple={interaction.multiple ?? true}
                 onChange={handleFileChange}
               />
             </div>

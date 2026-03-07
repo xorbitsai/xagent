@@ -549,6 +549,9 @@ class PlanGenerator:
 
             logger.info(f"LLM analysis response received, length: {len(str(content))}")
 
+            # Log raw response for debugging parsing issues
+            logger.debug(f"Raw LLM response: {str(content)[:500]}")
+
             # Try to parse as JSON
             try:
                 json_str = extract_json_from_markdown(content)

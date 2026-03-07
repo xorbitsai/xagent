@@ -380,12 +380,12 @@ Some text in between
         """Test with a realistic goal check response that has inner code blocks"""
         realistic_response = """{
   "achieved": true,
-  "reason": "已成功编写并执行Python脚本",
+  "reason": "Successfully wrote and executed Python script",
   "confidence": 1.0,
-  "final_answer": "Python 随机数生成任务已圆满完成。\\n\\n### 执行结果摘要\\n1. **随机整数:** `[82, 15, 4]`\\n\\n### 核心代码实现\\n```python\\nimport random\\nrandom_integers = [random.randint(1, 100) for _ in range(5)]\\n```",
+  "final_answer": "Python random number generation task completed successfully.\\n\\n### Execution Results Summary\\n1. **Random Integers:** `[82, 15, 4]`\\n\\n### Core Code Implementation\\n```python\\nimport random\\nrandom_integers = [random.randint(1, 100) for _ in range(5)]\\n```",
   "memory_insights": {
     "should_store": false,
-    "reason": "标准的基础编程任务",
+    "reason": "Standard basic programming task",
     "classification": {
       "primary_domain": "Software Development",
       "task_type": "Code Generation",

@@ -175,11 +175,11 @@ class ToolConfig(BaseToolConfig):
     def get_enable_agent_tools(self) -> bool:
         return True
 
+    def get_allowed_tools(self) -> Optional[List[str]]:
+        return self.allowed_tools
+
     def get_image_generate_model(self) -> Optional[Any]:
         return None  # Standalone config doesn't have web context
 
     def get_image_edit_model(self) -> Optional[Any]:
         return None  # Standalone config doesn't have web context
-
-    def get_allowed_tools(self) -> Optional[List[str]]:
-        return self.allowed_tools

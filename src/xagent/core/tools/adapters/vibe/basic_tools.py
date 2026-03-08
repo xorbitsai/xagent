@@ -52,4 +52,9 @@ async def create_basic_tools(config: "BaseToolConfig") -> List[Any]:
 
         tools.append(get_javascript_executor_tool({"workspace": workspace}))
 
+    # API tool
+    from .api_tool import APITool
+
+    tools.append(APITool())
+
     return tools

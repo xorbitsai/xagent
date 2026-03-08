@@ -110,6 +110,7 @@ class ToolConfig(BaseToolConfig):
         task_id = config_dict.get("task_id")
         allowed_collections = config_dict.get("allowed_collections")
         allowed_skills = config_dict.get("allowed_skills")
+        allowed_tools = config_dict.get("allowed_tools")
         user_id = config_dict.get("user_id")
         is_admin = config_dict.get("is_admin", False)
 
@@ -128,6 +129,7 @@ class ToolConfig(BaseToolConfig):
         self.task_id: Optional[str] = task_id
         self.allowed_collections: Optional[List[str]] = allowed_collections
         self.allowed_skills: Optional[List[str]] = allowed_skills
+        self.allowed_tools: Optional[List[str]] = allowed_tools
         self.user_id: Optional[int] = user_id
         self.is_admin_value: bool = bool(is_admin)
 
@@ -178,3 +180,6 @@ class ToolConfig(BaseToolConfig):
 
     def get_image_edit_model(self) -> Optional[Any]:
         return None  # Standalone config doesn't have web context
+
+    def get_allowed_tools(self) -> Optional[List[str]]:
+        return self.allowed_tools

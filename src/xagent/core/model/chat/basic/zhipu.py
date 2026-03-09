@@ -429,16 +429,84 @@ class ZhipuLLM(BaseLLM):
             completion_params["response_format"] = response_format
 
         try:
-            # Make the streaming API call in executor
-            def create_stream() -> Any:
+            # Make the entire streaming process non-blocking
+            # by running everything in executor
+            def process_stream() -> List[Dict[str, Any]]:
+                """Process the entire stream in a thread to avoid blocking event loop."""
                 if self._client is None:
                     raise RuntimeError("Zhipu client is not initialized")
-                return self._client.chat.completions.create(**completion_params)
 
-            stream = await asyncio.get_event_loop().run_in_executor(None, create_stream)
+                chunks_data: List[Dict[str, Any]] = []
+                stream = self._client.chat.completions.create(**completion_params)
 
-            # Process streaming response
-            for chunk in stream:
+                for chunk in stream:
+                    # Convert chunk to dict to avoid threading issues
+                    chunk_dict: Dict[str, Any] = {}
+
+                    if hasattr(chunk, "choices") and chunk.choices:
+                        choice = chunk.choices[0]
+                        choice_dict: Dict[str, Any] = {}
+
+                        if hasattr(choice, "delta"):
+                            delta = choice.delta
+                            delta_dict: Dict[str, Any] = {}
+
+                            if hasattr(delta, "content") and delta.content:
+                                delta_dict["content"] = delta.content
+
+                            if hasattr(delta, "tool_calls") and delta.tool_calls:
+                                tool_calls_list: List[Dict[str, Any]] = []
+                                for tool_call in delta.tool_calls:
+                                    tool_call_dict: Dict[str, Any] = {
+                                        "id": getattr(tool_call, "id", None),
+                                    }
+
+                                    if hasattr(tool_call, "function"):
+                                        func = tool_call.function
+                                        func_dict: Dict[str, Any] = {}
+
+                                        if hasattr(func, "name") and func.name:
+                                            func_dict["name"] = func.name
+                                        if (
+                                            hasattr(func, "arguments")
+                                            and func.arguments
+                                        ):
+                                            func_dict["arguments"] = func.arguments
+
+                                        tool_call_dict["function"] = func_dict
+
+                                    tool_calls_list.append(tool_call_dict)
+
+                                delta_dict["tool_calls"] = tool_calls_list
+
+                            choice_dict["delta"] = delta_dict
+
+                        if hasattr(choice, "finish_reason") and choice.finish_reason:
+                            choice_dict["finish_reason"] = choice.finish_reason
+
+                        chunk_dict["choices"] = [choice_dict]
+
+                    if hasattr(chunk, "usage") and chunk.usage:
+                        usage = chunk.usage
+                        usage_dict: Dict[str, Any] = {
+                            "prompt_tokens": getattr(usage, "prompt_tokens", 0)
+                            or getattr(usage, "input_tokens", 0),
+                            "completion_tokens": getattr(usage, "completion_tokens", 0)
+                            or getattr(usage, "output_tokens", 0),
+                        }
+                        chunk_dict["usage"] = usage_dict
+
+                    chunks_data.append(chunk_dict)
+
+                return chunks_data
+
+            # Run the entire stream processing in executor
+            chunks_data = await asyncio.get_event_loop().run_in_executor(
+                None, process_stream
+            )
+
+            # Now yield chunks from the processed data (non-blocking)
+            for chunk_dict in chunks_data:
                 current_time = time.time()
 
                 # Check first token timeout
@@ -462,27 +530,27 @@ class ZhipuLLM(BaseLLM):
 
                 last_token_time = current_time
 
-                # Parse the chunk (similar to OpenAI format)
-                if hasattr(chunk, "choices") and chunk.choices:
-                    choice = chunk.choices[0]
-                    delta = choice.delta if hasattr(choice, "delta") else None
+                # Process the chunk data
+                if chunk_dict.get("choices"):
+                    choice = chunk_dict["choices"][0]
+                    delta = choice.get("delta")
 
                     if delta:
                         # Check for content
-                        if hasattr(delta, "content") and delta.content:
-                            text = delta.content
+                        if delta.get("content"):
+                            text = delta["content"]
                             current_content += text
                             yield StreamChunk(
                                 type=ChunkType.TOKEN,
                                 content=current_content,
                                 delta=text,
-                                raw=chunk,
+                                raw=chunk_dict,
                             )
 
                         # Check for tool calls
-                        if hasattr(delta, "tool_calls") and delta.tool_calls:
-                            for tool_call in delta.tool_calls:
-                                tool_id = getattr(tool_call, "id", None)
+                        if delta.get("tool_calls"):
+                            for tool_call in delta["tool_calls"]:
+                                tool_id = tool_call.get("id")
 
                                 # Initialize tool call if not exists
                                 if tool_id and tool_id not in accumulated_tool_calls:
@@ -494,24 +562,20 @@ class ZhipuLLM(BaseLLM):
 
                                 # Update tool call info
                                 if tool_id:
-                                    if hasattr(tool_call, "function"):
-                                        func = tool_call.function
-                                        if hasattr(func, "name") and func.name:
+                                    func = tool_call.get("function")
+                                    if func:
+                                        if func.get("name"):
                                             accumulated_tool_calls[tool_id]["name"] = (
-                                                func.name
+                                                func["name"]
                                             )
-                                        if (
-                                            hasattr(func, "arguments")
-                                            and func.arguments
-                                        ):
+                                        if func.get("arguments"):
                                             accumulated_tool_calls[tool_id][
                                                 "arguments"
-                                            ] += func.arguments
+                                            ] += func["arguments"]
 
                     # Check for finish reason
-                    if hasattr(choice, "finish_reason") and choice.finish_reason:
-                        finish_reason = choice.finish_reason
-
+                    finish_reason = choice.get("finish_reason")
+                    if finish_reason:
                         # Yield tool calls if accumulated
                         if accumulated_tool_calls:
                             tool_calls_list = []
@@ -531,24 +595,20 @@ class ZhipuLLM(BaseLLM):
                                 type=ChunkType.TOOL_CALL,
                                 tool_calls=tool_calls_list,
                                 finish_reason=finish_reason,
-                                raw=chunk,
+                                raw=chunk_dict,
                             )
                         else:
                             yield StreamChunk(
                                 type=ChunkType.END,
                                 finish_reason=finish_reason,
-                                raw=chunk,
+                                raw=chunk_dict,
                             )
 
                 # Check for usage information
-                if hasattr(chunk, "usage") and chunk.usage:
-                    usage = chunk.usage
-                    input_tokens = getattr(usage, "prompt_tokens", 0) or getattr(
-                        usage, "input_tokens", 0
-                    )
-                    output_tokens = getattr(usage, "completion_tokens", 0) or getattr(
-                        usage, "output_tokens", 0
-                    )
+                if chunk_dict.get("usage"):
+                    usage = chunk_dict["usage"]
+                    input_tokens = usage.get("prompt_tokens", 0)
+                    output_tokens = usage.get("completion_tokens", 0)
 
                     # Record token usage
                     add_token_usage(
@@ -567,7 +627,7 @@ class ZhipuLLM(BaseLLM):
                     yield StreamChunk(
                         type=ChunkType.USAGE,
                         usage=usage_dict,
-                        raw=chunk,
+                        raw=chunk_dict,
                     )
 
         except LLMTimeoutError:

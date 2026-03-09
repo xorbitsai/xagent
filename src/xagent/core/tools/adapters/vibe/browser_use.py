@@ -18,6 +18,7 @@ from ....tools.core.browser_use import (
     browser_fill,
     browser_list_sessions,
     browser_navigate,
+    browser_pdf,
     browser_screenshot,
     browser_select_option,
     browser_wait_for_selector,
@@ -33,9 +34,15 @@ logger = logging.getLogger(__name__)
 
 
 class BrowserNavigateArgs(BaseModel):
-    session_id: str = Field(description="Session ID for the browser")
+    session_id: Optional[str] = Field(
+        default=None,
+        description="Session ID for the browser (auto-managed, usually not needed)",
+    )
     url: str = Field(description="URL to navigate to")
-    headless: bool = Field(default=True, description="Whether to run in headless mode")
+    headless: bool = Field(
+        default=False,
+        description="Run mode (default: False). Use True only for simple content extraction",
+    )
     wait_until: str = Field(default="networkidle", description="Wait condition")
 
 
@@ -49,9 +56,10 @@ class BrowserNavigateResult(BaseModel):
 
 
 class BrowserClickArgs(BaseModel):
-    session_id: str = Field(description="Session ID")
+    session_id: Optional[str] = Field(
+        default=None, description="Session ID (auto-managed, usually not needed)"
+    )
     selector: str = Field(description="CSS selector or XPath")
-    headless: bool = Field(default=True, description="Whether to run in headless mode")
     timeout: int = Field(default=30000, description="Timeout in milliseconds")
 
 
@@ -64,10 +72,11 @@ class BrowserClickResult(BaseModel):
 
 
 class BrowserFillArgs(BaseModel):
-    session_id: str = Field(description="Session ID")
+    session_id: Optional[str] = Field(
+        default=None, description="Session ID (auto-managed, usually not needed)"
+    )
     selector: str = Field(description="CSS selector or XPath")
     value: str = Field(description="Text value to fill")
-    headless: bool = Field(default=True, description="Whether to run in headless mode")
 
 
 class BrowserFillResult(BaseModel):
@@ -80,12 +89,10 @@ class BrowserFillResult(BaseModel):
 
 
 class BrowserScreenshotArgs(BaseModel):
-    session_id: str = Field(description="Session ID")
-    full_page: bool = Field(default=False, description="Whether to capture full page")
-    headless: bool = Field(
-        default=True,
-        description="Whether to run in headless mode (default: True, recommended). Only set to False for debugging security pages or visual troubleshooting.",
+    session_id: Optional[str] = Field(
+        default=None, description="Session ID (auto-managed, usually not needed)"
     )
+    full_page: bool = Field(default=False, description="Whether to capture full page")
     width: Optional[int] = Field(
         default=None,
         description="Desired output width in pixels (e.g., 2025, 1080, 1920). Set viewport size before screenshot.",
@@ -100,7 +107,7 @@ class BrowserScreenshotArgs(BaseModel):
     )
     output_filename: Optional[str] = Field(
         default=None,
-        description="Output filename for saving to output directory. If provided, saves to output/ instead of temp/. Example: 'result.png'",
+        description="Custom filename for the screenshot (e.g., 'result.png'). If not provided, auto-generates with timestamp (e.g., 'screenshot_20250113_123456.png'). Always saves to output/ directory.",
     )
 
 
@@ -116,9 +123,10 @@ class BrowserScreenshotResult(BaseModel):
 
 
 class BrowserExtractTextArgs(BaseModel):
-    session_id: str = Field(description="Session ID")
+    session_id: Optional[str] = Field(
+        default=None, description="Session ID (auto-managed, usually not needed)"
+    )
     selector: str = Field(default="body", description="CSS selector or XPath")
-    headless: bool = Field(default=True, description="Whether to run in headless mode")
 
 
 class BrowserExtractTextResult(BaseModel):
@@ -132,9 +140,10 @@ class BrowserExtractTextResult(BaseModel):
 
 
 class BrowserEvaluateArgs(BaseModel):
-    session_id: str = Field(description="Session ID")
+    session_id: Optional[str] = Field(
+        default=None, description="Session ID (auto-managed, usually not needed)"
+    )
     javascript: str = Field(description="JavaScript code to execute")
-    headless: bool = Field(default=True, description="Whether to run in headless mode")
 
 
 class BrowserEvaluateResult(BaseModel):
@@ -146,11 +155,12 @@ class BrowserEvaluateResult(BaseModel):
 
 
 class BrowserSelectOptionArgs(BaseModel):
-    session_id: str = Field(description="Session ID")
+    session_id: Optional[str] = Field(
+        default=None, description="Session ID (auto-managed, usually not needed)"
+    )
     selector: str = Field(description="CSS selector for the select element")
     value: Optional[str] = Field(default=None, description="Option value to select")
     index: Optional[int] = Field(default=None, description="Option index to select")
-    headless: bool = Field(default=True, description="Whether to run in headless mode")
 
 
 class BrowserSelectOptionResult(BaseModel):
@@ -166,10 +176,11 @@ class BrowserSelectOptionResult(BaseModel):
 
 
 class BrowserWaitForSelectorArgs(BaseModel):
-    session_id: str = Field(description="Session ID")
+    session_id: Optional[str] = Field(
+        default=None, description="Session ID (auto-managed, usually not needed)"
+    )
     selector: str = Field(description="CSS selector or XPath to wait for")
     timeout: int = Field(default=30000, description="Timeout in milliseconds")
-    headless: bool = Field(default=True, description="Whether to run in headless mode")
 
 
 class BrowserWaitForSelectorResult(BaseModel):
@@ -181,12 +192,44 @@ class BrowserWaitForSelectorResult(BaseModel):
 
 
 class BrowserCloseArgs(BaseModel):
-    session_id: str = Field(description="Session ID to close")
+    session_id: Optional[str] = Field(
+        default=None,
+        description="Session ID to close (auto-managed, usually not needed)",
+    )
 
 
 class BrowserCloseResult(BaseModel):
     success: bool = Field(description="Whether close succeeded")
     session_id: str = Field(description="Closed session ID")
+    message: str = Field(description="Result message")
+    error: str = Field(default="", description="Error message if failed")
+
+
+class BrowserPdfArgs(BaseModel):
+    session_id: Optional[str] = Field(
+        default=None, description="Session ID (auto-managed, usually not needed)"
+    )
+    output_filename: Optional[str] = Field(
+        default=None,
+        description="Output PDF filename (e.g., 'page.pdf'). Auto-generated with timestamp if not provided.",
+    )
+    landscape: bool = Field(
+        default=False, description="PDF orientation (False=portrait, True=landscape)"
+    )
+    format: str = Field(default="A4", description="Paper format (A4, Letter, etc.)")
+    print_background: bool = Field(
+        default=True, description="Include background graphics in PDF"
+    )
+
+
+class BrowserPdfResult(BaseModel):
+    success: bool = Field(description="Whether PDF generation succeeded")
+    session_id: str = Field(description="Session ID")
+    output_path: str = Field(
+        description="Relative path to generated PDF file in workspace"
+    )
+    format: str = Field(description="File format (base64 or file)")
+    size: int = Field(default=0, description="PDF file size in bytes")
     message: str = Field(description="Result message")
     error: str = Field(default="", description="Error message if failed")
 
@@ -211,58 +254,17 @@ class BrowserNavigateTool(AbstractBaseTool):
 
     @property
     def description(self) -> str:
-        return """Navigate to a URL in a browser session.
+        return """Navigate to URL. Browser session auto-created.
 
-        The browser session is created automatically on first use (lazy initialization).
-        Use this tool to visit web pages, open URLs, and navigate between pages.
+        Workspace files: Use filename (e.g., "poster.html") - auto-searches input/output/temp dirs.
 
-        WORKSPACE FILE SUPPORT (AUTOMATIC PATH RESOLUTION):
-        - You can use relative filenames without specifying the directory
-        - The browser will automatically search for files in this order:
-          1. input/ directory (e.g., "poster.html" → input/poster.html)
-          2. output/ directory (e.g., "poster.html" → output/poster.html)
-          3. temp/ directory (e.g., "poster.html" → temp/poster.html)
-          4. workspace root (e.g., "poster.html" → workspace/poster.html)
-
-        Examples:
-        - url="poster.html" → Automatically finds poster.html in input/output/temp/
-        - url="report.html" → Opens report.html from the first matching directory
-        - url="temp/screenshot.png" → Opens specific file from temp/ directory
-
-        Supported formats: HTML, SVG, images, PDF (browser may show download prompt for PDF)
-
-        IMPORTANT USAGE NOTES:
-        - The browser runs in HEADLESS mode (no GUI) by default
-        - If you encounter security verification pages (like "Baidu security verification"), try headless=False
-        - Many websites detect headless browsers more easily than visible browsers
-        - Setting headless=False will open a visible browser window
-
-        ANTI-DETECTION MEASURES:
-        The browser automatically applies anti-detection techniques:
-        - Hides navigator.webdriver property
-        - Adds realistic browser features (plugins, languages, chrome object)
-        - Sets Chinese locale and timezone
-        - Disables automation control flags
+        Default: headless=False (shows browser window for debugging/interaction).
+        Set headless=True only for simple content extraction without user interaction.
 
         Args:
-            session_id: Session ID for the browser (typically use task_id)
-            url: Target URL to navigate to
-                 - http:// or https:// for websites
-                 - Relative filename (e.g., "poster.html") for workspace files
-                 - Absolute path or file:// URL also supported
-            headless: Whether to run in headless mode (default: True)
-                    Set to False if you encounter security verification pages
-            wait_until: When to consider navigation succeeded (default: "networkidle"):
-                - "load": Page is fully loaded (safer for most pages)
-                - "domcontentloaded": DOM is ready (RECOMMENDED for modern SPA apps, faster)
-                - "networkidle": No network activity for 500ms (may hang on pages with continuous requests)
-                - "commit": Received response headers (fastest, but page may still be loading)
-
-        Recommendations:
-        - Use wait_until="domcontentloaded" for faster navigation on modern web apps
-        - For workspace files, just use the filename (e.g., "index.html") - no need to specify directory
-        - If you see security verification, try headless=False and wait again
-        - For major platforms (Baidu, Alibaba, etc.), consider using their official APIs instead
+            url: URL to navigate (http/https for websites, filename for workspace files)
+            headless: Run mode (default: False). Use True only for automated tasks
+            wait_until: "domcontentloaded" (fast) or "networkidle" (wait)
         """
 
     @property
@@ -286,6 +288,11 @@ class BrowserNavigateTool(AbstractBaseTool):
         )
 
     async def run_json_async(self, args: Mapping[str, Any]) -> Any:
+        # Use task_id as default session_id if not provided
+        if not args.get("session_id") and self._task_id:
+            args = dict(args)  # Make a mutable copy
+            args["session_id"] = self._task_id
+
         # Convert workspace-relative paths to file:// URLs
         url = args.get("url", "")
 
@@ -423,24 +430,9 @@ class BrowserClickTool(AbstractBaseTool):
     def description(self) -> str:
         return """Click an element on the current page.
 
-        Use this tool to interact with buttons, links, and other clickable elements.
-        The browser session is created automatically if it doesn't exist.
-
-        IMPORTANT: The browser runs in HEADLESS mode (no GUI) by default.
-        If you encounter security verification or element detection issues, try headless=False.
-
         Args:
-            session_id: Session ID for the browser
-            selector: CSS selector or XPath for the element to click
-            headless: Whether to run in headless mode (default: True)
-            timeout: Maximum time to wait for element to be clickable (default: 30000ms = 30 seconds)
-
-        Tips:
-        - If element is not found, try waiting for it first with browser_wait_for_selector
-        - If click times out, the element may be hidden, disabled, or not yet loaded
-        - For pages with security verification, use headless=False in browser_navigate first
-
-        Example: Click a button with selector 'button.submit'
+            selector: CSS selector or XPath for element to click
+            timeout: Max wait time in ms (default 30000)
         """
 
     @property
@@ -464,6 +456,11 @@ class BrowserClickTool(AbstractBaseTool):
         )
 
     async def run_json_async(self, args: Mapping[str, Any]) -> Any:
+        # Use task_id as default session_id if not provided
+        if not args.get("session_id") and self._task_id:
+            args = dict(args)  # Make a mutable copy
+            args["session_id"] = self._task_id
+
         result = await browser_click(**args)
         return BrowserClickResult(**result).model_dump()
 
@@ -484,13 +481,9 @@ class BrowserFillTool(AbstractBaseTool):
     def description(self) -> str:
         return """Fill an input field with text.
 
-        Use this tool to enter text into input fields, text areas, and form fields.
-        The browser session is created automatically if it doesn't exist.
-
-        IMPORTANT: The browser runs in HEADLESS mode (no GUI) by default.
-        Do NOT set headless=False unless explicitly required by the user.
-
-        Example: Fill an email input with selector 'input[name=\"email\"]'
+        Args:
+            selector: CSS selector or XPath for input element
+            value: Text to fill
         """
 
     @property
@@ -514,6 +507,11 @@ class BrowserFillTool(AbstractBaseTool):
         )
 
     async def run_json_async(self, args: Mapping[str, Any]) -> Any:
+        # Use task_id as default session_id if not provided
+        if not args.get("session_id") and self._task_id:
+            args = dict(args)  # Make a mutable copy
+            args["session_id"] = self._task_id
+
         result = await browser_fill(**args)
         return BrowserFillResult(**result).model_dump()
 
@@ -535,42 +533,14 @@ class BrowserScreenshotTool(AbstractBaseTool):
 
     @property
     def description(self) -> str:
-        return """Take a screenshot of the current page.
+        return """Take a screenshot of the current page. Returns relative path to saved screenshot (output/ directory).
 
-        Returns a relative path to the saved screenshot.
-        By default, saves to workspace/temp/ with auto-generated filename (e.g., temp/screenshot_20250113_123456.png).
-        If output_filename is provided, saves to workspace/output/ with the specified filename (e.g., output/result.png).
+        Auto-saves to output/ with timestamp filename. Use output_filename for custom name.
 
-        You can optionally specify the desired output width using the width parameter.
-        This does NOT change the browser viewport size. Instead, you should set the width in your HTML/CSS:
-        - HTML: <meta name='viewport' content='width=1080'>
-        - CSS: body { width: 1080px; max-width: 1080px; }
-        The width parameter is just informational to tell you what width to use in your HTML.
-
-        IMPORTANT USAGE NOTES:
-        - The browser runs in HEADLESS mode (no GUI) by default - RECOMMENDED for stability and speed
-        - Only use headless=False for debugging security verification pages or visual troubleshooting
-        - headless=False may be slower and less reliable for full_page screenshots
-        - AFTER taking a screenshot, you MUST use image understanding tools to analyze the screenshot content
-        - The screenshot is saved as a PNG file
-        - The returned path is relative to workspace (e.g., temp/screenshot_xxx.png or output/result.png)
-        - Use output_filename when the screenshot is a final deliverable that should be preserved
-        - Use width/height to control the viewport size before taking the screenshot
-        - Planning: When planning to use browser_screenshot, also plan to use image understanding tools afterwards
-
-        PARAMETERS:
-        - full_page: Set to True to capture the entire scrolling page (not just visible area)
-        - wait_for_lazy_load: Set to True (with full_page=True) for pages with infinite scroll or lazy-loaded content.
-          This will scroll the page to trigger lazy loading before capturing.
-
-        Example workflow (intermediate screenshot):
-        1. browser_navigate to the target URL
-        2. browser_screenshot(full_page=True, wait_for_lazy_load=True) to capture the full page
-        3. understand_images(images="temp/screenshot_20250113_123456.png", question="What do you see?")
-
-        Example workflow (final output with custom size):
-        1. browser_navigate to the result page
-        2. browser_screenshot(width=1920, height=1080, output_filename="result.png") (returns "output/result.png")
+        Args:
+            full_page: Capture entire scrolling page (not just visible area)
+            wait_for_lazy_load: Scroll to trigger lazy loading (use with full_page=True)
+            output_filename: Custom filename (e.g., "result.png"). Auto-generated if not provided.
         """
 
     @property
@@ -594,6 +564,11 @@ class BrowserScreenshotTool(AbstractBaseTool):
         )
 
     async def run_json_async(self, args: Mapping[str, Any]) -> Any:
+        # Use task_id as default session_id if not provided
+        if not args.get("session_id") and self._task_id:
+            args = dict(args)  # Make a mutable copy
+            args["session_id"] = self._task_id
+
         # Call async version directly
         import traceback
 
@@ -621,15 +596,15 @@ class BrowserScreenshotTool(AbstractBaseTool):
                 # Decode base64 to bytes
                 image_bytes = base64.b64decode(base64_data)
 
-                # Determine filename and save directory
+                # Determine filename - always save to output directory
                 output_filename = args.get("output_filename")
                 if output_filename:
                     filename = output_filename
-                    file_path = self._workspace.output_dir / filename
                 else:
                     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
                     filename = f"screenshot_{timestamp}.png"
-                    file_path = self._workspace.temp_dir / filename
+                # Always save to output directory
+                file_path = self._workspace.output_dir / filename
 
                 # Save to file
                 with open(file_path, "wb") as f:
@@ -666,29 +641,10 @@ class BrowserExtractTextTool(AbstractBaseTool):
 
     @property
     def description(self) -> str:
-        return """Extract text content from the page or a specific element.
-
-        Use this tool to read page content, scrape text, or analyze web pages.
-        The browser session is created automatically if it doesn't exist.
-
-        IMPORTANT: The browser runs in HEADLESS mode (no GUI) by default.
-        If you encounter security verification or text extraction fails, try headless=False in browser_navigate.
+        return """Extract text content from page or element.
 
         Args:
-            session_id: Session ID for the browser
-            selector: CSS selector or XPath (default: "body" extracts entire page)
-            headless: Whether to run in headless mode (default: True)
-
-        Timeout: This operation has a 15-second timeout with JavaScript fallback.
-        If inner_text() fails, it automatically uses textContent which is more reliable.
-
-        Tips:
-        - Use selector="body" to extract all text from the page
-        - Use specific selectors to extract text from specific elements
-        - If extraction returns empty text, the page might have security verification
-        - For security verification pages, navigate again with headless=False
-
-        Example: Extract all text from the page body
+            selector: CSS selector or XPath (default "body" for entire page)
         """
 
     @property
@@ -712,6 +668,11 @@ class BrowserExtractTextTool(AbstractBaseTool):
         )
 
     async def run_json_async(self, args: Mapping[str, Any]) -> Any:
+        # Use task_id as default session_id if not provided
+        if not args.get("session_id") and self._task_id:
+            args = dict(args)  # Make a mutable copy
+            args["session_id"] = self._task_id
+
         result = await browser_extract_text(**args)
         return BrowserExtractTextResult(**result).model_dump()
 
@@ -730,15 +691,20 @@ class BrowserEvaluateTool(AbstractBaseTool):
 
     @property
     def description(self) -> str:
-        return """Execute JavaScript code in the browser context.
+        return """Execute JavaScript in browser context.
 
-        Use this tool for advanced interactions, data extraction, or custom logic.
-        The browser session is created automatically if it doesn't exist.
+        For visual inspection before modifying pages (when vision tools are available):
+        1. Use browser_screenshot to capture the current page
+        2. Use vision tools to analyze the screenshot content and layout
+        3. Use browser_evaluate with JavaScript to make targeted modifications
 
-        IMPORTANT: The browser runs in HEADLESS mode (no GUI) by default.
-        If you encounter security verification or JS execution fails, try headless=False in browser_navigate.
+        Examples:
+        - Change element style: document.querySelector('.header').style.backgroundColor = 'red'
+        - Get element text: document.querySelector('h1').textContent
+        - Scroll to element: document.querySelector('.footer').scrollIntoView()
 
-        Example: Execute 'document.title' to get the page title
+        Args:
+            javascript: JS code to execute (can access page DOM and make changes)
         """
 
     @property
@@ -762,6 +728,11 @@ class BrowserEvaluateTool(AbstractBaseTool):
         )
 
     async def run_json_async(self, args: Mapping[str, Any]) -> Any:
+        # Use task_id as default session_id if not provided
+        if not args.get("session_id") and self._task_id:
+            args = dict(args)  # Make a mutable copy
+            args["session_id"] = self._task_id
+
         result = await browser_evaluate(**args)
         return BrowserEvaluateResult(**result).model_dump()
 
@@ -830,27 +801,12 @@ class BrowserSelectOptionTool(AbstractBaseTool):
 
     @property
     def description(self) -> str:
-        return """Select an option from a select dropdown element.
-
-        Use this tool to interact with dropdown menus and select lists.
-        The browser session is created automatically if it doesn't exist.
-
-        IMPORTANT: The browser runs in HEADLESS mode (no GUI) by default.
-        If you encounter security verification or interaction issues, try headless=False in browser_navigate.
+        return """Select option from dropdown element.
 
         Args:
-            session_id: Session ID for the browser
-            selector: CSS selector for the select element
+            selector: CSS selector for select element
             value: Option value to select (exclusive with index)
             index: Option index to select (exclusive with value)
-            headless: Whether to run in headless mode (default: True)
-
-        Tips:
-        - Provide either value OR index, not both
-        - Use browser_navigate with headless=False if you encounter security verification
-        - Use browser_wait_for_selector to ensure the dropdown is ready before selecting
-
-        Example: Select option with value='option1' from selector 'select#country'
         """
 
     @property
@@ -874,6 +830,11 @@ class BrowserSelectOptionTool(AbstractBaseTool):
         )
 
     async def run_json_async(self, args: Mapping[str, Any]) -> Any:
+        # Use task_id as default session_id if not provided
+        if not args.get("session_id") and self._task_id:
+            args = dict(args)  # Make a mutable copy
+            args["session_id"] = self._task_id
+
         result = await browser_select_option(**args)
         return BrowserSelectOptionResult(**result).model_dump()
 
@@ -892,26 +853,11 @@ class BrowserWaitForSelectorTool(AbstractBaseTool):
 
     @property
     def description(self) -> str:
-        return """Wait for an element to appear on the page.
-
-        Use this tool to ensure an element is ready before interacting with it.
-        Useful for dynamic content that loads asynchronously.
-
-        IMPORTANT: The browser runs in HEADLESS mode (no GUI) by default.
-        If you encounter issues, try headless=False in browser_navigate.
+        return """Wait for element to appear on page.
 
         Args:
-            session_id: Session ID for the browser
             selector: CSS selector or XPath to wait for
-            timeout: Maximum time to wait in milliseconds (default: 30000 = 30 seconds)
-            headless: Whether to run in headless mode (default: True)
-
-        Use cases:
-        - Wait for dynamic content to load
-        - Ensure element exists before clicking
-        - Wait for page transitions to complete
-
-        Example: Wait for selector '.result-container' to appear
+            timeout: Max wait time in ms (default 30000)
         """
 
     @property
@@ -935,6 +881,11 @@ class BrowserWaitForSelectorTool(AbstractBaseTool):
         )
 
     async def run_json_async(self, args: Mapping[str, Any]) -> Any:
+        # Use task_id as default session_id if not provided
+        if not args.get("session_id") and self._task_id:
+            args = dict(args)  # Make a mutable copy
+            args["session_id"] = self._task_id
+
         result = await browser_wait_for_selector(**args)
         return BrowserWaitForSelectorResult(**result).model_dump()
 
@@ -953,13 +904,7 @@ class BrowserCloseTool(AbstractBaseTool):
 
     @property
     def description(self) -> str:
-        return """Close a browser session and free resources.
-
-        Use this tool to explicitly close a browser session when done.
-        Sessions are also automatically cleaned up after 30 minutes of inactivity.
-
-        Example: Close session 'task-123'
-        """
+        return """Close a browser session and free resources. Sessions auto-close after 30min inactivity."""
 
     @property
     def tags(self) -> list[str]:
@@ -982,8 +927,119 @@ class BrowserCloseTool(AbstractBaseTool):
         )
 
     async def run_json_async(self, args: Mapping[str, Any]) -> Any:
+        # Use task_id as default session_id if not provided
+        if not args.get("session_id") and self._task_id:
+            args = dict(args)  # Make a mutable copy
+            args["session_id"] = self._task_id
+
         result = await browser_close(**args)
         return BrowserCloseResult(**result).model_dump()
+
+
+class BrowserPdfTool(AbstractBaseTool):
+    category = ToolCategory.BROWSER
+    """Save current page as PDF."""
+
+    def __init__(
+        self, task_id: Optional[str] = None, workspace: Optional["TaskWorkspace"] = None
+    ):
+        self._visibility = ToolVisibility.PUBLIC
+        self._task_id = task_id
+        self._workspace = workspace
+
+    @property
+    def name(self) -> str:
+        return "browser_pdf"
+
+    @property
+    def description(self) -> str:
+        return """Save current browser page as PDF.
+
+        Generates a PDF of the current page content. Useful for:
+        - Saving web pages as PDF documents
+        - Archiving dynamic content
+        - Converting HTML reports to PDF format
+
+        Args:
+            output_filename: Output PDF filename (e.g., 'page.pdf'). Auto-generated with timestamp if not provided.
+            landscape: Orientation (default: False for portrait)
+            format: Paper size (default: "A4", options: A4, Letter, etc.)
+            print_background: Include background graphics (default: True)
+        """
+
+    @property
+    def tags(self) -> list[str]:
+        return ["browser", "automation", "pdf", "export"]
+
+    def args_type(self) -> Type[BaseModel]:
+        return BrowserPdfArgs
+
+    def return_type(self) -> Type[BaseModel]:
+        return BrowserPdfResult
+
+    def run_json_sync(self, args: Mapping[str, Any]) -> Any:
+        """
+        Synchronous wrapper (not supported - use run_json_async instead).
+
+        Browser tools are async-only. Please call them from async context.
+        """
+        raise NotImplementedError(
+            f"{self.name} is async-only. Use await {self.name}() or call from async context."
+        )
+
+    async def run_json_async(self, args: Mapping[str, Any]) -> Any:
+        # Use task_id as default session_id if not provided
+        if not args.get("session_id") and self._task_id:
+            args = dict(args)  # Make a mutable copy
+            args["session_id"] = self._task_id
+
+        # Call core function to get PDF data (base64 encoded)
+        result = await browser_pdf(**args)
+
+        # If workspace is available, save PDF to file and return relative path
+        if self._workspace and result.get("success"):
+            try:
+                import base64
+                from datetime import datetime
+
+                # Extract base64 data
+                pdf_data = result.get("pdf", "")
+                if pdf_data.startswith("data:application/pdf;base64,"):
+                    base64_data = pdf_data.split(",", 1)[1]
+                else:
+                    base64_data = pdf_data
+
+                # Decode base64 to bytes
+                pdf_bytes = base64.b64decode(base64_data)
+
+                # Determine filename - always save to output directory
+                output_filename = args.get("output_filename")
+                if output_filename:
+                    filename = output_filename
+                else:
+                    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+                    filename = f"page_{timestamp}.pdf"
+
+                # Always save to output directory
+                file_path = self._workspace.output_dir / filename
+
+                # Save to file
+                with open(file_path, "wb") as f:
+                    f.write(pdf_bytes)
+
+                relative_path = str(
+                    file_path.relative_to(self._workspace.workspace_dir)
+                )
+                result["output_path"] = relative_path
+                result["format"] = "file"
+                result["message"] = f"PDF saved to {relative_path}"
+            except Exception as e:
+                logger.error(f"Failed to save PDF to workspace: {e}", exc_info=True)
+                result["message"] = (
+                    f"PDF generated (base64 format, file save failed: {e})"
+                )
+
+        return BrowserPdfResult(**result).model_dump()
 
 
 # ============== Factory Functions ==============
@@ -1008,6 +1064,7 @@ def create_browser_tools(
         BrowserFillTool(task_id=task_id),
         BrowserScreenshotTool(task_id=task_id, workspace=workspace),
         BrowserExtractTextTool(task_id=task_id),
+        BrowserPdfTool(task_id=task_id, workspace=workspace),
         BrowserEvaluateTool(task_id=task_id),
         BrowserSelectOptionTool(task_id=task_id),
         BrowserWaitForSelectorTool(task_id=task_id),

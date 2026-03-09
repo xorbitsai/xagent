@@ -633,6 +633,64 @@ class PlanGenerator:
             # On error, assume plan is needed
             return PlanGeneratorResult(type="plan", plan=None)
 
+    def _build_tools_context(self, tools: List[Tool]) -> str:
+        """
+        Build tools context with new format: tool list + detailed descriptions + collaboration examples.
+
+        Args:
+            tools: List of available tools
+
+        Returns:
+            Formatted tools context string
+        """
+        if not tools:
+            return ""
+
+        # Collect tool information
+        tool_info_list = []
+        tool_names = []
+
+        for tool in tools:
+            if tool.metadata:
+                tool_name = tool.metadata.name
+                tool_description = tool.metadata.description or f"Execute {tool_name}"
+            else:
+                tool_name = getattr(tool, "name", "unknown_tool")
+                tool_description = getattr(tool, "description", f"Execute {tool_name}")
+
+            tool_names.append(tool_name)
+            tool_info_list.append((tool_name, tool_description))
+
+        # Build the new format
+        context_parts = []
+
+        # Part 1: Tool name list
+        context_parts.append("AVAILABLE TOOLS:\n")
+        context_parts.append(", ".join(tool_names) + "\n")
+
+        # Part 2: Detailed descriptions (by tool)
+        context_parts.append("TOOL DESCRIPTIONS:\n\n")
+        for tool_name, tool_description in tool_info_list:
+            context_parts.append(f"{tool_name}:\n  {tool_description}\n\n")
+
+        # Part 3: Collaboration examples
+        has_browser = any("browser" in name.lower() for name in tool_names)
+        has_vision = any(
+            "vision" in name.lower() or "understand_images" in name.lower()
+            for name in tool_names
+        )
+
+        if has_browser and has_vision:
+            context_parts.append("COLLABORATION EXAMPLES:\n\n")
+            context_parts.append(
+                "Web Page Visual Modification:\n"
+                "1. browser_screenshot - capture current page\n"
+                "2. vision tools - analyze screenshot content\n"
+                "3. browser_evaluate - make targeted modifications\n"
+            )
+
+        return "".join(context_parts)
+
     def _build_classification_prompt(
         self,
         goal: str,
@@ -659,22 +717,10 @@ class PlanGenerator:
                 f"[_build_classification_prompt] Using custom system prompt from context: {custom_prompt[:100]}..."
             )
 
-        # Build tools context
+        # Build tools context with new format
         tools_context = ""
         if tools:
-            tools_context = "\n\nAVAILABLE TOOLS:\n"
-            for tool in tools:
-                if tool.metadata:
-                    tool_name = tool.metadata.name
-                    tool_description = (
-                        tool.metadata.description or f"Execute {tool_name}"
-                    )
-                else:
-                    tool_name = getattr(tool, "name", "unknown_tool")
-                    tool_description = getattr(
-                        tool, "description", f"Execute {tool_name}"
-                    )
-                tools_context += f"- {tool_name}: {tool_description}\n"
+            tools_context = self._build_tools_context(tools)
 
         # Build system prompt
         system_prompt = (
@@ -737,6 +783,15 @@ class PlanGenerator:
 - timeout: Use 60 seconds ONLY if the task can proceed with default assumptions when the user does nothing (auto-continuation).
 - **STRICT RULE**: If the task CANNOT proceed without specific user input or file upload (e.g., mandatory missing information), you MUST NOT include a "timeout".
 - If you previously asked for input with a timeout, and the user replied "Continue" (auto-continued) but you still lack the mandatory info, ask again WITHOUT a timeout.
+
+## CRITICAL: Direct Chat Mode Guidelines
+When you return type="chat" (direct answer mode), you are providing a TEXT RESPONSE ONLY. NO tools will be executed.
+- **DO NOT** describe what you "will do", "are going to do", or "start to do"
+- **DO NOT** use phrases like "Now starting to...", "Next I will...", "Let me begin..."
+- **DO NOT** promise future actions or describe execution steps
+- **DO** provide a direct, immediate answer to the user's question
+- **DO** give helpful information, explanations, or ask clarifying questions directly
+- Remember: type="chat" means CONVERSATION, not EXECUTION. Users see your message as your final response, not a plan of action.
 """
         )
 
@@ -893,22 +948,10 @@ class PlanGenerator:
         ):
             custom_prompt = f"\n\n{context.state['system_prompt']}\n\n"
 
-        # Build tools context
+        # Build tools context with new format
         tools_context = ""
         if tools:
-            tools_context = "\n\nAVAILABLE TOOLS:\n"
-            for tool in tools:
-                if tool.metadata:
-                    tool_name = tool.metadata.name
-                    tool_description = (
-                        tool.metadata.description or f"Execute {tool_name}"
-                    )
-                else:
-                    tool_name = getattr(tool, "name", "unknown_tool")
-                    tool_description = getattr(
-                        tool, "description", f"Execute {tool_name}"
-                    )
-                tools_context += f"- {tool_name}: {tool_description}\n"
+            tools_context = self._build_tools_context(tools)
         else:
             tools_context = "\n\nNote: No tools are currently available. Please generate additional conceptual steps that would help achieve the goal. Use hypothetical tool names that would be appropriate for each step."
 
@@ -1033,22 +1076,10 @@ class PlanGenerator:
             custom_prompt = context.state["system_prompt"]
             use_custom_role = True
 
-        # Build tools context
+        # Build tools context with new format
         tools_context = ""
         if tools:
-            tools_context = "\n\nAVAILABLE TOOLS:\n"
-            for tool in tools:
-                if tool.metadata:
-                    tool_name = tool.metadata.name
-                    tool_description = (
-                        tool.metadata.description or f"Execute {tool_name}"
-                    )
-                else:
-                    tool_name = getattr(tool, "name", "unknown_tool")
-                    tool_description = getattr(
-                        tool, "description", f"Execute {tool_name}"
-                    )
-                tools_context += f"- {tool_name}: {tool_description}\n"
+            tools_context = self._build_tools_context(tools)
         else:
             tools_context = "\n\nNote: No tools are currently available. Please generate a conceptual execution plan that breaks down the task into logical steps. Use hypothetical tool names that would be appropriate for each step (e.g., 'data_analyzer', 'report_generator', etc.). Each step should be executable conceptually even without actual tools.\n"
 
@@ -1063,7 +1094,7 @@ class PlanGenerator:
                     "Create plans as DAGs (Directed Acyclic Graphs) where steps can have dependencies.\n"
                     "Each step should specify which previous steps it depends on.\n"
                     "Steps with no dependencies can run in parallel.\n"
-                    f"You have access to the following tools that you can use in your plan steps:{tools_context}\n"
+                    f"You have access to the following tools that you can use in your plan steps:\n{tools_context}\n"
                 )
             )
         else:
@@ -1073,7 +1104,7 @@ class PlanGenerator:
                 "Create plans as DAGs (Directed Acyclic Graphs) where steps can have dependencies.\n"
                 "Each step should specify which previous steps it depends on.\n"
                 "Steps with no dependencies can run in parallel.\n"
-                f"You have access to the following tools that you can use in your plan steps:{tools_context}\n"
+                f"You have access to the following tools that you can use in your plan steps:\n{tools_context}\n"
             )
 
         # Add skill context if available

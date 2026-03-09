@@ -222,37 +222,24 @@ class BrowserSessionManager:
 
         Args:
             session_id: Unique session identifier
-            headless: Whether to use headless mode
+            headless: Whether to use headless mode (only used when creating new session)
 
         Returns:
             BrowserSession instance
         """
         async with self._lock:
-            # Check if session exists and if headless mode matches
+            # Check if session already exists
             if session_id in self._sessions:
-                existing_session = self._sessions[session_id]
-                # If headless mode doesn't match, close the old session and create a new one
-                if (
-                    existing_session.headless != headless
-                    and existing_session._initialized
-                ):
-                    # Close old session async-safe within the lock
-                    old_session = existing_session
-                    del self._sessions[session_id]
-                    try:
-                        await old_session.close()
-                    except Exception:
-                        pass  # Ignore errors during close
-                else:
-                    # Update last used time
-                    self._sessions[session_id]._last_used = datetime.now()
-                    return self._sessions[session_id]
+                # Update last used time and return existing session
+                # Ignore headless parameter for existing sessions (can't change mode after creation)
+                self._sessions[session_id]._last_used = datetime.now()
+                return self._sessions[session_id]
 
             # Start cleanup task on first session creation
             if self._cleanup_task is None:
                 self._cleanup_task = asyncio.create_task(self._cleanup_loop())
 
-            # Create new session
+            # Create new session with specified headless mode
             self._sessions[session_id] = BrowserSession(session_id, headless)
             self._sessions[session_id]._last_used = datetime.now()
             return self._sessions[session_id]
@@ -360,7 +347,7 @@ async def browser_navigate(**kwargs: Any) -> Dict[str, Any]:
             "message": "",
             "error": "Missing required parameters: session_id and url are required",
         }
-    headless = kwargs.get("headless", True)
+    headless = kwargs.get("headless", False)
     wait_until = kwargs.get("wait_until", "networkidle")
 
     if not PLAYWRIGHT_AVAILABLE:
@@ -412,7 +399,7 @@ async def browser_navigate(**kwargs: Any) -> Dict[str, Any]:
             "session_id": session_id,
             "url": url,
             "title": title,
-            "message": f"Navigated to {url}",
+            "message": f"Navigated to {url}. IMPORTANT: Session ID is '{session_id}'. You MUST use this exact session_id='{session_id}' in all subsequent browser calls (browser_click, browser_extract_text, etc.) to continue using this browser.",
         }
     except Exception as e:
         import logging
@@ -458,7 +445,6 @@ async def browser_click(**kwargs: Any) -> Dict[str, Any]:
             "message": "",
             "error": "Missing required parameters: session_id and selector are required",
         }
-    headless = kwargs.get("headless", True)
     timeout = kwargs.get("timeout", 30000)
 
     if not PLAYWRIGHT_AVAILABLE:
@@ -471,7 +457,7 @@ async def browser_click(**kwargs: Any) -> Dict[str, Any]:
         }
 
     manager = get_browser_manager()
-    session = await manager.get_or_create(session_id, headless)
+    session = await manager.get_or_create(session_id, headless=True)
     page = await session.get_page()
 
     try:
@@ -480,7 +466,7 @@ async def browser_click(**kwargs: Any) -> Dict[str, Any]:
             "success": True,
             "session_id": session_id,
             "selector": selector,
-            "message": f"Successfully clicked element: {selector}",
+            "message": f"Successfully clicked element: {selector}. Session ID: {session_id}",
         }
     except Exception as e:
         return {
@@ -520,7 +506,6 @@ async def browser_fill(**kwargs: Any) -> Dict[str, Any]:
             "message": "",
             "error": "Missing required parameters: session_id, selector, and value are required",
         }
-    headless = kwargs.get("headless", True)
 
     if not PLAYWRIGHT_AVAILABLE:
         return {
@@ -533,7 +518,7 @@ async def browser_fill(**kwargs: Any) -> Dict[str, Any]:
         }
 
     manager = get_browser_manager()
-    session = await manager.get_or_create(session_id, headless)
+    session = await manager.get_or_create(session_id, headless=True)
     page = await session.get_page()
 
     try:
@@ -545,7 +530,7 @@ async def browser_fill(**kwargs: Any) -> Dict[str, Any]:
             "session_id": session_id,
             "selector": selector,
             "value": preview,
-            "message": f"Filled {selector} with: {preview}",
+            "message": f"Filled {selector} with: {preview}. Session ID: {session_id}",
         }
     except Exception as e:
         return {
@@ -603,7 +588,6 @@ async def browser_screenshot(**kwargs: Any) -> Dict[str, Any]:
             "error": "Missing required parameter: session_id is required",
         }
     full_page = kwargs.get("full_page", False)
-    headless = kwargs.get("headless", True)
     width = kwargs.get("width", 1920)
     height = kwargs.get("height", 1080)
     wait_for_lazy_load = kwargs.get("wait_for_lazy_load", False)
@@ -624,13 +608,13 @@ async def browser_screenshot(**kwargs: Any) -> Dict[str, Any]:
 
     logger = logging.getLogger(__name__)
     logger.info(
-        f"[browser_screenshot] Starting screenshot function (session={session_id}, headless={headless}, width={width}, height={height})"
+        f"[browser_screenshot] Starting screenshot function (session={session_id}, width={width}, height={height})"
     )
 
     manager = get_browser_manager()
     logger.info(f"[browser_screenshot] Got browser manager (session={session_id})")
 
-    session = await manager.get_or_create(session_id, headless)
+    session = await manager.get_or_create(session_id, headless=True)
     logger.info(f"[browser_screenshot] Got/created session (session={session_id})")
 
     page = await session.get_page()
@@ -753,7 +737,7 @@ async def browser_screenshot(**kwargs: Any) -> Dict[str, Any]:
             "format": "base64",
             "full_page": actual_full_page,  # Will be False if we fell back
             "wait_for_lazy_load": wait_for_lazy_load,
-            "message": f"Screenshot captured successfully (full_page={actual_full_page})",
+            "message": f"Screenshot captured successfully (full_page={actual_full_page}). Session ID: {session_id}",
         }
     except Exception as e:
         return {
@@ -795,7 +779,6 @@ async def browser_extract_text(**kwargs: Any) -> Dict[str, Any]:
             "error": "Missing required parameter: session_id is required",
         }
     selector = kwargs.get("selector", "body")
-    headless = kwargs.get("headless", True)
 
     if not PLAYWRIGHT_AVAILABLE:
         return {
@@ -809,7 +792,7 @@ async def browser_extract_text(**kwargs: Any) -> Dict[str, Any]:
         }
 
     manager = get_browser_manager()
-    session = await manager.get_or_create(session_id, headless)
+    session = await manager.get_or_create(session_id, headless=True)
     page = await session.get_page()
 
     try:
@@ -839,7 +822,7 @@ async def browser_extract_text(**kwargs: Any) -> Dict[str, Any]:
             "selector": selector,
             "text": text,
             "length": len(text),
-            "message": f"Extracted {len(text)} characters from {selector}",
+            "message": f"Extracted {len(text)} characters from {selector}. Session ID: {session_id}",
         }
     except Exception as e:
         return {
@@ -878,7 +861,6 @@ async def browser_evaluate(**kwargs: Any) -> Dict[str, Any]:
             "message": "",
             "error": "Missing required parameters: session_id and javascript are required",
         }
-    headless = kwargs.get("headless", True)
 
     if not PLAYWRIGHT_AVAILABLE:
         return {
@@ -890,7 +872,7 @@ async def browser_evaluate(**kwargs: Any) -> Dict[str, Any]:
         }
 
     manager = get_browser_manager()
-    session = await manager.get_or_create(session_id, headless)
+    session = await manager.get_or_create(session_id, headless=True)
     page = await session.get_page()
 
     try:
@@ -900,7 +882,7 @@ async def browser_evaluate(**kwargs: Any) -> Dict[str, Any]:
             "success": True,
             "session_id": session_id,
             "result": result,
-            "message": "JavaScript executed successfully",
+            "message": f"JavaScript executed successfully. Session ID: {session_id}",
         }
     except Exception as e:
         return {
@@ -951,7 +933,6 @@ async def browser_select_option(**kwargs: Any) -> Dict[str, Any]:
             "message": "",
             "error": "Either value or index must be provided",
         }
-    headless = kwargs.get("headless", True)
 
     if not PLAYWRIGHT_AVAILABLE:
         return {
@@ -965,7 +946,7 @@ async def browser_select_option(**kwargs: Any) -> Dict[str, Any]:
         }
 
     manager = get_browser_manager()
-    session = await manager.get_or_create(session_id, headless)
+    session = await manager.get_or_create(session_id, headless=True)
     page = await session.get_page()
 
     try:
@@ -977,7 +958,7 @@ async def browser_select_option(**kwargs: Any) -> Dict[str, Any]:
                 "session_id": session_id,
                 "selector": selector,
                 "selected_value": value,
-                "message": f"Selected option with value: {value}",
+                "message": f"Selected option with value: {value}. Session ID: {session_id}",
             }
         elif index is not None:
             # Add timeout to prevent hanging (default 30 seconds)
@@ -987,7 +968,7 @@ async def browser_select_option(**kwargs: Any) -> Dict[str, Any]:
                 "session_id": session_id,
                 "selector": selector,
                 "selected_index": index,
-                "message": f"Selected option at index: {index}",
+                "message": f"Selected option at index: {index}. Session ID: {session_id}",
             }
         else:
             return {
@@ -1038,7 +1019,6 @@ async def browser_wait_for_selector(**kwargs: Any) -> Dict[str, Any]:
             "error": "Missing required parameters: session_id and selector are required",
         }
     timeout = kwargs.get("timeout", 30000)
-    headless = kwargs.get("headless", True)
 
     if not PLAYWRIGHT_AVAILABLE:
         return {
@@ -1050,7 +1030,7 @@ async def browser_wait_for_selector(**kwargs: Any) -> Dict[str, Any]:
         }
 
     manager = get_browser_manager()
-    session = await manager.get_or_create(session_id, headless)
+    session = await manager.get_or_create(session_id, headless=True)
     page = await session.get_page()
 
     try:
@@ -1059,7 +1039,7 @@ async def browser_wait_for_selector(**kwargs: Any) -> Dict[str, Any]:
             "success": True,
             "session_id": session_id,
             "selector": selector,
-            "message": f"Element found: {selector}",
+            "message": f"Element found: {selector}. Session ID: {session_id}",
         }
     except Exception as e:
         return {
@@ -1089,7 +1069,7 @@ async def browser_close(session_id: str) -> Dict[str, Any]:
     return {
         "success": True,
         "session_id": session_id,
-        "message": f"Browser session {session_id} closed",
+        "message": f"Browser session {session_id} closed. Session ID: {session_id}",
     }
 
 
@@ -1119,3 +1099,88 @@ async def browser_list_sessions() -> Dict[str, Any]:
         "sessions": sessions,
         "message": f"Found {len(sessions)} active session(s)",
     }
+
+
+async def browser_pdf(**kwargs: Any) -> Dict[str, Any]:
+    """
+    Save current page as PDF. Browser session is created automatically if needed.
+
+    Args:
+        session_id: Session ID
+        headless: Whether to run browser in headless mode (default: True)
+        landscape: PDF orientation (default: False for portrait)
+        format: Paper format (default: "A4"). Options: A4, Letter, etc.
+        print_background: Include background graphics (default: True)
+
+    Returns:
+        Dictionary with PDF generation result (base64 encoded PDF data)
+    """
+    # Extract parameters with validation
+    session_id = kwargs.get("session_id")
+    if not session_id:
+        return {
+            "success": False,
+            "session_id": "",
+            "pdf": "",
+            "message": "",
+            "error": "Missing required parameter: session_id is required",
+        }
+    landscape = kwargs.get("landscape", False)
+    format = kwargs.get("format", "A4")
+    print_background = kwargs.get("print_background", True)
+
+    if not PLAYWRIGHT_AVAILABLE:
+        return {
+            "success": False,
+            "session_id": session_id,
+            "pdf": "",
+            "message": "",
+            "error": "Playwright is not installed or browsers not downloaded. Install with: pip install playwright. Then download browsers: playwright install chromium",
+        }
+
+    manager = get_browser_manager()
+    session = await manager.get_or_create(session_id, headless=True)
+    page = await session.get_page()
+
+    try:
+        import logging
+
+        logger = logging.getLogger(__name__)
+        logger.info(
+            f"[browser_pdf] Generating PDF (session={session_id}, format={format}, landscape={landscape})"
+        )
+
+        # Generate PDF from current page
+        pdf_bytes = await page.pdf(
+            landscape=landscape,
+            format=format,
+            print_background=print_background,
+        )
+
+        # Encode to base64
+        import base64
+
+        pdf_base64 = base64.b64encode(pdf_bytes).decode("utf-8")
+        file_size = len(pdf_bytes)
+
+        logger.info(f"[browser_pdf] PDF generated successfully ({file_size} bytes)")
+
+        return {
+            "success": True,
+            "session_id": session_id,
+            "pdf": pdf_base64,
+            "format": "base64",
+            "size": file_size,
+            "message": f"PDF generated successfully ({file_size} bytes). Session ID: {session_id}",
+        }
+    except Exception as e:
+        return {
+            "success": False,
+            "session_id": session_id,
+            "pdf": "",
+            "size": 0,
+            "message": "",
+            "error": _format_error_with_traceback(
+                e, f"PDF generation failed for session '{session_id}'"
+            ),
+        }

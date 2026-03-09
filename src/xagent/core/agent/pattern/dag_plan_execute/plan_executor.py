@@ -645,6 +645,14 @@ class PlanExecutor:
                 if self.parent_pattern
                 else None
             )
+
+            # Get conversation history from parent pattern for context
+            conversation_history = None
+            if self.parent_pattern and hasattr(
+                self.parent_pattern, "_get_messages_for_llm"
+            ):
+                conversation_history = self.parent_pattern._get_messages_for_llm()
+
             context_messages = await self.context_builder.build_context_for_step(
                 step_name=step.name,
                 step_description=step.description,
@@ -653,6 +661,7 @@ class PlanExecutor:
                 task_id=step.id,
                 original_goal=original_goal,
                 skill_context=skill_context,
+                conversation_history=conversation_history,
             )
 
             # Add the current step task, with tool info and original goal context

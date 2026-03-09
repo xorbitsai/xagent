@@ -376,3 +376,68 @@ class TestContextBuilder:
         # Individual threshold should be compact_threshold // num_dependencies
         expected_individual_threshold = 1000 // len(dependencies)
         assert expected_individual_threshold > 0
+
+    @pytest.mark.asyncio
+    async def test_conversation_history_included(self, context_builder):
+        """Test that conversation history is included in the context."""
+        conversation_history = [
+            {"role": "user", "content": "First message"},
+            {"role": "assistant", "content": "First response"},
+            {"role": "user", "content": "Second message"},
+        ]
+
+        result = await context_builder.build_context_for_step(
+            step_name="test_step",
+            step_description="Test step description",
+            dependencies=[],
+            dependency_results={},
+            conversation_history=conversation_history,
+        )
+
+        # Should have system prompt + separator + history messages + end separator
+        assert len(result) == 6  # system + start_sep + 3 history msgs + end_sep
+        assert result[0]["role"] == "system"
+        assert "=== Previous Conversation ===" in result[1]["content"]
+        assert result[2]["content"] == "First message"
+        assert result[3]["content"] == "First response"
+        assert result[4]["content"] == "Second message"
+        assert "=== End of Previous Conversation ===" in result[5]["content"]
+
+    @pytest.mark.asyncio
+    async def test_conversation_history_with_dependencies(
+        self, context_builder, sample_dependency_results
+    ):
+        """Test that conversation history appears before dependency results."""
+        conversation_history = [
+            {"role": "user", "content": "User question"},
+            {"role": "assistant", "content": "Assistant answer"},
+        ]
+
+        result = await context_builder.build_context_for_step(
+            step_name="test_step",
+            step_description="Test step description",
+            dependencies=["dep1"],
+            dependency_results=sample_dependency_results,
+            conversation_history=conversation_history,
+        )
+
+        # Find the positions of different sections
+        history_section_start = None
+        history_section_end = None
+        dependency_section = None
+
+        for i, msg in enumerate(result):
+            if "=== Previous Conversation ===" in msg.get("content", ""):
+                history_section_start = i
+            if "=== End of Previous Conversation ===" in msg.get("content", ""):
+                history_section_end = i
+            if "=== Results from dependency step:" in msg.get("content", ""):
+                dependency_section = i
+
+        # Verify order: conversation history comes before dependencies
+        assert history_section_start is not None, "Conversation history start not found"
+        assert history_section_end is not None, "Conversation history end not found"
+        assert dependency_section is not None, "Dependency section not found"
+        assert history_section_start < history_section_end < dependency_section, (
+            "Conversation history should appear before dependency results"
+        )

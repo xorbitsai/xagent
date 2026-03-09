@@ -66,6 +66,7 @@ class ContextBuilder:
         task_id: Optional[str] = None,
         original_goal: Optional[str] = None,
         skill_context: Optional[str] = None,
+        conversation_history: Optional[List[Dict[str, str]]] = None,
     ) -> List[Dict[str, str]]:
         """
         Build context messages for a step based on its dependencies.
@@ -78,6 +79,7 @@ class ContextBuilder:
             task_id: Optional task ID for tracing
             original_goal: Optional original user goal for context preservation
             skill_context: Optional skill context with domain knowledge and templates
+            conversation_history: Optional conversation history from user interactions
 
         Returns:
             List of messages forming the context for this step
@@ -91,6 +93,24 @@ class ContextBuilder:
                 ),
             }
         ]
+
+        # Add conversation history before dependency results if available
+        if conversation_history:
+            # Add a separator to distinguish conversation history from dependency results
+            messages.append(
+                {
+                    "role": "user",
+                    "content": "=== Previous Conversation ===\nBelow is the conversation history that led to this task:",
+                }
+            )
+            messages.extend(conversation_history)
+            # Add a separator after conversation history
+            messages.append(
+                {
+                    "role": "user",
+                    "content": "=== End of Previous Conversation ===\n\nNow proceeding with the current task execution:",
+                }
+            )
 
         if not dependencies:
             return messages

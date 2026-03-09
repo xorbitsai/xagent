@@ -510,6 +510,23 @@ class PlanGenerator:
             logger.info(
                 f"[should_chat_directly] Agent context: {type(context).__name__}"
             )
+            # Log context state for debugging
+            if hasattr(context, "state"):
+                logger.info(
+                    f"[should_chat_directly] Context state keys: {list(context.state.keys())}"
+                )
+                if "system_prompt" in context.state:
+                    logger.info(
+                        f"[should_chat_directly] System prompt in context: {context.state['system_prompt'][:200]}..."
+                    )
+                if "file_info" in context.state:
+                    logger.info(
+                        f"[should_chat_directly] File info in context: {context.state['file_info']}"
+                    )
+                if "uploaded_files" in context.state:
+                    logger.info(
+                        f"[should_chat_directly] Uploaded files in context: {context.state['uploaded_files']}"
+                    )
 
         # Build classification prompt (no skill context needed for quick check)
         messages = self._build_classification_prompt(
@@ -629,6 +646,19 @@ class PlanGenerator:
             f"[_build_classification_prompt] Building prompt with {len(history)} history items, {len(tools)} tools"
         )
 
+        # Check if custom system prompt is provided in context (e.g., file information)
+        custom_prompt = ""
+        if (
+            context
+            and hasattr(context, "state")
+            and "system_prompt" in context.state
+            and context.state["system_prompt"]
+        ):
+            custom_prompt = context.state["system_prompt"]
+            logger.info(
+                f"[_build_classification_prompt] Using custom system prompt from context: {custom_prompt[:100]}..."
+            )
+
         # Build tools context
         tools_context = ""
         if tools:
@@ -647,7 +677,9 @@ class PlanGenerator:
                 tools_context += f"- {tool_name}: {tool_description}\n"
 
         # Build system prompt
-        system_prompt = """You are an intelligent task assistant. Analyze the user's input and decide:
+        system_prompt = (
+            custom_prompt
+            + """You are an intelligent task assistant. Analyze the user's input and decide:
 
 1. **Direct Answer (type: "chat")** - If the user asks a simple question that you can answer directly without executing any tasks
 2. **Need Clarification (type: "chat")** - If you need more information to help the user effectively
@@ -706,6 +738,7 @@ class PlanGenerator:
 - **STRICT RULE**: If the task CANNOT proceed without specific user input or file upload (e.g., mandatory missing information), you MUST NOT include a "timeout".
 - If you previously asked for input with a timeout, and the user replied "Continue" (auto-continued) but you still lack the mandatory info, ask again WITHOUT a timeout.
 """
+        )
 
         if tools_context:
             system_prompt += f"\n{tools_context}\n"

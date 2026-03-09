@@ -1197,6 +1197,7 @@ Build when you need.`
       abilities: "能力选择",
       description: "描述",
       selectModel: "选择模型名称",
+      searchModels: "搜索模型...",
       setDefault: "设为默认模型",
       defaultPlaceholder: "选择默认类型...",
       shareWithUsers: "与所有用户共享此模型",

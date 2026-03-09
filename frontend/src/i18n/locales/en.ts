@@ -1197,6 +1197,7 @@ Build when you need.`
       abilities: "Abilities",
       description: "Description",
       selectModel: "Select Model Name",
+      searchModels: "Search models...",
       setDefault: "Set as default model",
       defaultPlaceholder: "Select default type...",
       shareWithUsers: "Share this model with all users",

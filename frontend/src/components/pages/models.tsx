@@ -165,6 +165,7 @@ export function ModelsPage() {
   const [pendingDefaultType, setPendingDefaultType] = useState<string | null>(null)
   const [pendingModels, setPendingModels] = useState<string[]>([])
   const [selectedDefaultModel, setSelectedDefaultModel] = useState<string>("")
+  const [modelSearchQuery, setModelSearchQuery] = useState<string>("")
 
   // Default models state
   const [defaultModels, setDefaultModels] = useState<{
@@ -297,6 +298,30 @@ export function ModelsPage() {
   const filteredModels = useMemo(() => {
     return models.filter(m => m.category === activeTab)
   }, [models, activeTab])
+
+  // Filtered models for connect mode dialog with search (non-mutating, stable sort)
+  const filteredFetchedModels = useMemo(() => {
+    const withIndex = fetchedModels.map((model, index) => ({ model, index }))
+    let result = withIndex
+    if (modelSearchQuery.trim()) {
+      const query = modelSearchQuery.toLowerCase()
+      result = result.filter(({ model }) => {
+        const id = model.id.toLowerCase()
+        const ownedBy = model.owned_by ? String(model.owned_by).toLowerCase() : ""
+        const object = model.object ? String(model.object).toLowerCase() : ""
+        return id.includes(query) || ownedBy.includes(query) || object.includes(query)
+      })
+    }
+    // Sort: selected first, then by original index (stable)
+    const sorted = [...result].sort((a, b) => {
+      const aSelected = selectedFetchedModels.includes(a.model.id)
+      const bSelected = selectedFetchedModels.includes(b.model.id)
+      if (aSelected && !bSelected) return -1
+      if (!aSelected && bSelected) return 1
+      return a.index - b.index
+    })
+    return sorted.map(({ model }) => model)
+  }, [fetchedModels, modelSearchQuery, selectedFetchedModels])
 
   // Group filtered models by provider
   const enabledProviders = useMemo(() => {
@@ -1082,9 +1107,20 @@ export function ModelsPage() {
                    </div>
                  ) : fetchedModels.length > 0 ? (
                    <>
-                     <ScrollArea className="max-h-[200px] overflow-y-scroll border p-4">
-                       <div className="space-y-2">
-                         {fetchedModels.map(model => (
+                     <div className="flex gap-2 mb-3">
+                       <Input
+                         placeholder={t('models.form.searchModels')}
+                         value={modelSearchQuery}
+                         onChange={(e) => setModelSearchQuery(e.target.value)}
+                         className="h-9 flex-1"
+                       />
+                       <span className="text-sm text-muted-foreground whitespace-nowrap flex items-center">
+                         {selectedFetchedModels.length} selected{filteredFetchedModels.length !== fetchedModels.length ? ` (${filteredFetchedModels.length}/${fetchedModels.length})` : ''}
+                       </span>
+                     </div>
+                     <ScrollArea className="max-h-[200px] overflow-y-scroll border rounded-md p-4">
+                       <div className="space-y-2 py-1 px-0.5">
+                         {filteredFetchedModels.map(model => (
                            <div key={model.id} className="flex items-center space-x-2">
                              <input
                                type="checkbox"
@@ -1106,9 +1142,6 @@ export function ModelsPage() {
                          ))}
                        </div>
                      </ScrollArea>
-                     <div className="text-sm text-muted-foreground mt-2">
-                       {selectedFetchedModels.length} models selected
-                     </div>
                    </>
                  ) : (
                    <div className="flex items-center justify-center p-8 border rounded-md text-muted-foreground italic bg-muted/30">

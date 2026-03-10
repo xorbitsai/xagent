@@ -432,6 +432,9 @@ class ZhipuLLM(BaseLLM):
             # Create a queue to bridge the synchronous stream to async generator
             queue: asyncio.Queue[Optional[Dict[str, Any]]] = asyncio.Queue()
 
+            # Get the event loop in the main thread before spawning the worker thread
+            loop = asyncio.get_event_loop()
+
             def stream_producer() -> None:
                 """
                 Consume the synchronous Zhipu stream and put chunks into the queue.
@@ -505,25 +508,26 @@ class ZhipuLLM(BaseLLM):
                             }
                             chunk_dict["usage"] = usage_dict
 
-                        # Put chunk in queue (this blocks if queue is full, which is fine)
-                        asyncio.get_event_loop().call_soon_threadsafe(
-                            queue.put_nowait, chunk_dict
-                        )
+                        # Put chunk in queue using the event loop from main thread
+                        loop.call_soon_threadsafe(queue.put_nowait, chunk_dict)
 
                     # Signal end of stream with sentinel value
-                    asyncio.get_event_loop().call_soon_threadsafe(
-                        queue.put_nowait, None
-                    )
+                    loop.call_soon_threadsafe(queue.put_nowait, None)
 
-                except Exception as e:
+                except Exception:
                     # Put exception in queue so it can be raised in the async context
-                    exc = e
-                    asyncio.get_event_loop().call_soon_threadsafe(
-                        lambda: queue.put_nowait(exc)  # type: ignore[arg-type]
-                    )
+                    import sys
+
+                    exc_type, exc_value, _ = sys.exc_info()
+                    if exc_value is not None:
+
+                        def put_exception() -> None:
+                            queue.put_nowait(exc_value)  # type: ignore[arg-type]
+
+                        loop.call_soon_threadsafe(put_exception)
 
             # Start the producer thread
-            await asyncio.get_event_loop().run_in_executor(None, stream_producer)
+            await loop.run_in_executor(None, stream_producer)
 
             # Consume chunks from the queue as they arrive (true streaming)
             while True:

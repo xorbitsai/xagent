@@ -1,7 +1,6 @@
 """Knowledge base API route handlers"""
 
 import asyncio
-import concurrent.futures
 import functools
 import json
 import logging

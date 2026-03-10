@@ -1016,9 +1016,9 @@ class ClaudeLLM(BaseLLM):
 
                 # Sort by created date (newest first)
                 models.sort(
-                    key=lambda x: (x.get("created") or 0)
-                    if x.get("created") is not None
-                    else 0,
+                    key=lambda x: (
+                        (x.get("created") or 0) if x.get("created") is not None else 0
+                    ),
                     reverse=True,
                 )
                 return models

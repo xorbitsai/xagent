@@ -15,25 +15,26 @@ from xagent.core.tools.core.RAG_tools.version_management.cascade_cleaner import 
 
 
 def _create_mock_table_with_schema() -> MagicMock:
-    """Create a mock table with a schema that includes the metadata field.
+    """Create a mock table with a schema that passes ensure_*_table validation.
 
-    This helper function ensures that schema validation passes in tests
-    by providing a mock schema that includes all required fields, especially
-    the 'metadata' field that is validated in ensure_chunks_table.
-
-    Returns:
-        A MagicMock table object with a properly configured schema.
+    Schema includes all fields required by ensure_documents_table, ensure_parses_table,
+    ensure_chunks_table, and ensure_main_pointers_table (e.g. metadata, user_id),
+    so cleanup_cascade()'s upfront ensure_* calls do not raise.
     """
     table = MagicMock()
-    # Create mock schema fields - at minimum include 'metadata' which is validated
-    metadata_field = MagicMock()
-    metadata_field.name = "metadata"
-    collection_field = MagicMock()
-    collection_field.name = "collection"
-    doc_id_field = MagicMock()
-    doc_id_field.name = "doc_id"
-    # Set schema as a list of field objects (mimicking PyArrow schema structure)
-    table.schema = [collection_field, doc_id_field, metadata_field]
+
+    def _field(name: str) -> MagicMock:
+        f = MagicMock()
+        f.name = name
+        return f
+
+    # Required by: documents/parses/main_pointers -> user_id; chunks -> metadata, user_id
+    table.schema = [
+        _field("collection"),
+        _field("doc_id"),
+        _field("metadata"),
+        _field("user_id"),
+    ]
     return table
 
 

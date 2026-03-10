@@ -270,17 +270,31 @@ class TestRegisterDocument:
         test_file = tmp_path / "db_error_test.txt"
         test_file.write_text("Test content")
 
-        # Mock database connection to succeed, but table operations to fail
+        # ensure_documents_table: open_table in _table_exists, then in _ensure_table_fields,
+        # then in "if _table_exists(...): return". register_document then calls open_table once.
+        # First three must return a valid table (schema with user_id); fourth raises.
+        def _mock_field(name: str) -> MagicMock:
+            f = MagicMock()
+            f.name = name
+            return f
+
+        mock_table = MagicMock()
+        mock_table.schema = [
+            _mock_field("collection"),
+            _mock_field("doc_id"),
+            _mock_field("user_id"),
+        ]
+
         mock_db = MagicMock()
         mock_get_db.return_value = mock_db
+        mock_db.open_table.side_effect = [
+            mock_table,
+            mock_table,
+            mock_table,
+            Exception("Table access failed"),
+        ]
 
-        # Mock ensure_documents_table to succeed
-        mock_db.ensure_documents_table = MagicMock()
-
-        # Mock open_table to raise an error
-        mock_db.open_table.side_effect = Exception("Table access failed")
-
-        # Should propagate DatabaseOperationError
+        # Should propagate DatabaseOperationError with the underlying message
         with pytest.raises(DatabaseOperationError, match="Table access failed"):
             register_document(collection="test_collection", source_path=str(test_file))
 

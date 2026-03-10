@@ -725,6 +725,30 @@ class DAGPlanExecutePattern(AgentPattern):
                                 skill_context  # Store for execution phase
                             )
                             logger.info(f"Using skill: {skill['name']}")
+
+                            # After skill selection, re-check if clarification is needed
+                            # based on skill instructions (e.g., require date range)
+                            logger.info(
+                                "Re-checking if clarification is needed with skill context..."
+                            )
+                            clarify_result = await self.plan_generator.should_chat_directly(
+                                goal=task,
+                                tools=tools,
+                                iteration=iteration,
+                                history=self._get_messages_for_llm(),
+                                tracer=self.tracer,
+                                context=self._context,
+                                skill_context=skill_context,
+                            )
+                            if (
+                                clarify_result.type == "chat"
+                                and clarify_result.chat_response
+                            ):
+                                # Skill instructions require clarification
+                                logger.info(
+                                    "Skill requires clarification, returning chat response"
+                                )
+                                return clarify_result
                         else:
                             logger.info("No relevant skill found")
                     elif skill_result and isinstance(skill_result, Exception):

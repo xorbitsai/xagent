@@ -668,6 +668,7 @@ class DAGPlanExecutePattern(AgentPattern):
                             tracer=self.tracer,
                             task_id=skill_task_id,
                             allowed_skills=self.allowed_skills,
+                            context=self._context,
                         )
 
                     # Execute memory and skill queries in parallel

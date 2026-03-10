@@ -61,13 +61,19 @@ If no skill is directly relevant, return selected: false."""
         """
         self.llm = llm
 
-    async def select(self, task: str, candidates: List[Dict]) -> Optional[Dict]:
+    async def select(
+        self,
+        task: str,
+        candidates: List[Dict],
+        agent_instructions: Optional[str] = None,
+    ) -> Optional[Dict]:
         """
         Select the most appropriate skill, or return None
 
         Args:
             task: User task
             candidates: List of candidate skills
+            agent_instructions: Optional agent instructions to guide selection
 
         Returns:
             Selected skill, or None
@@ -78,6 +84,19 @@ If no skill is directly relevant, return selected: false."""
 
         logger.info(f"Selecting skill for task: {task[:100]}...")
         logger.info(f"Available candidates: {len(candidates)} skills")
+        if agent_instructions:
+            logger.info(f"Agent instructions provided: {len(agent_instructions)} chars")
+
+        # Build system message with agent instructions if provided
+        system_message = self.SELECTOR_SYSTEM
+        if agent_instructions:
+            system_message += f"""
+
+## AGENT INSTRUCTIONS (CRITICAL - MUST FOLLOW)
+{agent_instructions}
+
+Follow these AGENT INSTRUCTIONS above all else when selecting a skill.
+"""
 
         prompt = self._build_prompt(task, candidates)
 
@@ -87,7 +106,7 @@ If no skill is directly relevant, return selected: false."""
         try:
             response = await self.llm.chat(
                 messages=[
-                    {"role": "system", "content": self.SELECTOR_SYSTEM},
+                    {"role": "system", "content": system_message},
                     {"role": "user", "content": prompt},
                 ],
                 response_format={"type": "json_object"},
@@ -96,7 +115,7 @@ If no skill is directly relevant, return selected: false."""
             logger.warning(f"JSON mode not supported, falling back to normal mode: {e}")
             response = await self.llm.chat(
                 messages=[
-                    {"role": "system", "content": self.SELECTOR_SYSTEM},
+                    {"role": "system", "content": system_message},
                     {"role": "user", "content": prompt},
                 ]
             )

@@ -5,10 +5,15 @@ Skill Manager - Manage skill scanning and retrieval
 import asyncio
 import logging
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+
+# TYPE_CHECKING import to avoid circular dependency
+from typing import TYPE_CHECKING, Any, Dict, List, Optional
 
 from .parser import SkillParser
 from .selector import SkillSelector
+
+if TYPE_CHECKING:
+    from xagent.core.agent.context import AgentContext
 
 logger = logging.getLogger(__name__)
 
@@ -106,6 +111,7 @@ class SkillManager:
         tracer: Optional[Any] = None,
         task_id: Optional[str] = None,
         allowed_skills: Optional[List[str]] = None,
+        context: Optional["AgentContext"] = None,
     ) -> Optional[Dict]:
         """
         Select appropriate skill based on task
@@ -116,6 +122,7 @@ class SkillManager:
             tracer: Tracer instance for sending trace events (optional)
             task_id: Task ID for trace events (optional)
             allowed_skills: Optional list of allowed skills for filtering
+            context: Optional AgentContext containing agent instructions (system_prompt)
 
         Returns:
             Selected skill, or None
@@ -142,6 +149,14 @@ class SkillManager:
         logger.debug(f"Selecting skill for task: {task[:100]}...")
         logger.debug(f"Available skills: {len(candidates)}")
 
+        # Extract agent instructions from context if available
+        agent_instructions = None
+        if context and context.state.get("system_prompt"):
+            agent_instructions = context.state["system_prompt"]
+            logger.debug(
+                f"Agent instructions extracted from context ({len(agent_instructions)} chars)"
+            )
+
         # Send skill selection start event if tracer is provided
         if tracer and task_id:
             from xagent.core.agent.trace import (
@@ -162,7 +177,9 @@ class SkillManager:
         selector = SkillSelector(llm)
 
         try:
-            selected_skill = await selector.select(task=task, candidates=candidates)
+            selected_skill = await selector.select(
+                task=task, candidates=candidates, agent_instructions=agent_instructions
+            )
 
             # Send skill selection end event if tracer is provided
             if tracer and task_id:

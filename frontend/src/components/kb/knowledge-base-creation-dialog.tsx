@@ -33,8 +33,12 @@ interface IngestionResult {
   collection: string
   document_count: number
   chunks_count: number
+  embedding_count?: number
+  vector_count?: number
   status: string
   message: string
+  warnings?: string[]
+  failed_step?: string
 }
 
 interface WebIngestionResult {
@@ -274,13 +278,24 @@ export function KnowledgeBaseCreationDialog({ open, onOpenChange, onSuccess }: K
           throw new Error(errorData.detail || t("kb.errors.uploadFailedFile", { name: file.name }))
         }
 
-        const result = await response.json()
-        setIngestionResults(prev => [...prev, result])
+        const result: IngestionResult = await response.json()
 
-        if (result.status === "partial" && result.failed_step) {
-          throw new Error(result.message || t("kb.errors.failedAtStep", { step: result.failed_step }))
+        if (result.status === "error") {
+          throw new Error(result.message || t("kb.errors.uploadFailedFile", { name: file.name }))
+        }
+        if (result.status === "partial") {
+          toast.warning(
+            result.message + (result.warnings?.length ? ` Warnings: ${result.warnings.join(", ")}` : "")
+          )
+        }
+        if (result.status === "success" && (result.embedding_count ?? 0) === 0 && (result.chunks_count ?? 0) > 0) {
+          toast.error(
+            "文档上传成功，但 embedding 生成失败（" + result.chunks_count + " 个 chunks 未生成 embedding）。文档无法被搜索。请检查 embedding 模型配置和 API 状态。" +
+            (result.warnings?.length ? ` 警告: ${result.warnings.join(", ")}` : "")
+          )
         }
 
+        setIngestionResults(prev => [...prev, result])
         setUploadProgress(((i + 1) / selectedFiles.length) * 100)
       }
 
@@ -353,6 +368,16 @@ export function KnowledgeBaseCreationDialog({ open, onOpenChange, onSuccess }: K
       }
 
       const result: WebIngestionResult = await response.json()
+
+      if (result.status === "error") {
+        throw new Error(result.message || t("kb.errors.webIngestFailed"))
+      }
+      if (result.status === "partial") {
+        toast.warning(
+          result.message + (result.warnings?.length ? ` Warnings: ${result.warnings.join(", ")}` : "")
+        )
+      }
+
       setWebIngestionResult(result)
       setWebIngestionProgress(100)
 

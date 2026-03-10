@@ -203,10 +203,8 @@ async def ingest(
             detail=f"File size exceeds maximum limit of {MAX_FILE_SIZE // (1024 * 1024)}MB",
         )
 
-    # Get upload path with user isolation using unified path management
     file_path = get_upload_path(safe_filename, user_id=int(_user.id))
 
-    # Save uploaded file with filename-specific error logging
     try:
         with open(file_path, "wb") as buffer:
             buffer.write(content)
@@ -214,19 +212,13 @@ async def ingest(
             "File uploaded: %s -> %s (user: %s)", safe_filename, file_path, _user.id
         )
     except (PermissionError, OSError) as e:
-        # Log with filename for better debugging before re-raising
         logger.error("File system error saving file %s: %s", safe_filename, e)
-        raise
+        raise HTTPException(status_code=403, detail=f"文件系统错误: {str(e)}")
 
-    # Build configuration from individual parameters
-    # Use defaults that match IngestionConfig defaults exactly
-    # Validate user-provided values to prevent errors
     final_chunk_size = chunk_size if chunk_size is not None and chunk_size > 0 else 1000
     final_chunk_overlap = (
         chunk_overlap if chunk_overlap is not None and chunk_overlap >= 0 else 200
     )
-
-    # Ensure overlap is always less than size
     if final_chunk_overlap >= final_chunk_size:
         final_chunk_overlap = min(int(final_chunk_size * 0.2), final_chunk_size - 1)
         logger.warning(
@@ -264,20 +256,15 @@ async def ingest(
     )
 
     progress_manager = get_progress_manager()
-
-    def _run_ingestion() -> IngestionResult:
-        return run_document_ingestion(
-            collection=collection,
-            source_path=str(file_path),
-            ingestion_config=config,
-            progress_manager=progress_manager,
-            user_id=int(_user.id),
-            is_admin=bool(_user.is_admin),
-        )
-
-    with concurrent.futures.ThreadPoolExecutor() as executor:
-        future = executor.submit(_run_ingestion)
-        result: IngestionResult = future.result()
+    result: IngestionResult = await asyncio.to_thread(
+        run_document_ingestion,
+        collection=collection,
+        source_path=str(file_path),
+        ingestion_config=config,
+        progress_manager=progress_manager,
+        user_id=int(_user.id),
+        is_admin=bool(_user.is_admin),
+    )
 
     if result.status == "error":
         logger.error(

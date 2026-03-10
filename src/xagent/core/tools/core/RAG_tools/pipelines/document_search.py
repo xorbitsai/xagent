@@ -5,6 +5,7 @@ from __future__ import annotations
 import logging
 import numbers
 import os
+import time
 from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple, Union, cast
 
 import requests
@@ -561,6 +562,20 @@ def search_documents(
     requested_type = cfg.search_type
     fetch_top_k = max(cfg.top_k, cfg.rerank_top_k or 0)
     warnings: List[str] = []
+    search_start = time.time()
+
+    logger.info(
+        "Document search STARTED: Collection=%s, Query='%s', SearchType=%s, TopK=%d, "
+        "RerankTopK=%s, EmbeddingModel=%s, UserID=%s, IsAdmin=%s",
+        collection,
+        query_text[:100] + ("..." if len(query_text) > 100 else ""),
+        requested_type.value,
+        cfg.top_k,
+        cfg.rerank_top_k,
+        cfg.embedding_model_id,
+        user_id,
+        is_admin,
+    )
 
     # Get collection's bound embedding model
     from ..management.collection_manager import (
@@ -623,6 +638,11 @@ def search_documents(
             timeout_sec=None,
         )
         model_tag = embedding_config.model_name
+        logger.info(
+            "Embedding adapter resolved: Model=%s, ModelTag=%s",
+            cfg.embedding_model_id,
+            model_tag,
+        )
         current_step = "post_resolve_embedding"
         actual_type = requested_type
         results: List[SearchResult] = []
@@ -630,20 +650,46 @@ def search_documents(
         message = "Search completed successfully"
 
         if requested_type == SearchType.SPARSE:
+            logger.info(
+                "Executing SPARSE search: Collection=%s, TopK=%d, ModelTag=%s",
+                collection,
+                fetch_top_k,
+                model_tag,
+            )
+            sparse_start = time.time()
             with progress_tracker.track_step("sparse_search"):
                 pass
             current_step = "search_sparse"
             results, status, sparse_warnings, message = _execute_sparse_search(
                 collection, query_text, cfg, model_tag, user_id, is_admin
             )
+            sparse_elapsed = int((time.time() - sparse_start) * 1000)
+            logger.info(
+                "SPARSE search completed: Found %d results, Status=%s, Elapsed=%dms",
+                len(results),
+                status,
+                sparse_elapsed,
+            )
             warnings.extend(sparse_warnings)
         else:
             # Use embedding adapter for dense/hybrid paths
             try:
+                logger.info(
+                    "Encoding query vector: Model=%s, QueryLength=%d",
+                    model_tag,
+                    len(query_text),
+                )
+                encode_start = time.time()
                 with progress_tracker.track_step("encode_query"):
                     pass
                 current_step = "encode_query_vector"
                 query_vector = _encode_query_vector(embedding_adapter, query_text)
+                encode_elapsed = int((time.time() - encode_start) * 1000)
+                logger.info(
+                    "Query vector encoded: Dimension=%d, Elapsed=%dms",
+                    len(query_vector),
+                    encode_elapsed,
+                )
             except VectorValidationError:
                 if requested_type == SearchType.HYBRID and cfg.fallback_to_sparse:
                     current_step = "search_sparse_fallback"
@@ -662,6 +708,16 @@ def search_documents(
                     raise
             else:
                 if requested_type == SearchType.DENSE:
+                    logger.info(
+                        "Executing DENSE search: Collection=%s, TopK=%d, ModelTag=%s, "
+                        "NProbes=%s, RefineFactor=%s",
+                        collection,
+                        fetch_top_k,
+                        model_tag,
+                        cfg.nprobes,
+                        cfg.refine_factor,
+                    )
+                    dense_start = time.time()
                     with progress_tracker.track_step("dense_search"):
                         pass
                     dense_response: DenseSearchResponse = search_dense(
@@ -683,7 +739,26 @@ def search_documents(
                     message = (
                         advice if advice else "Dense search completed successfully"
                     )
+                    dense_elapsed = int((time.time() - dense_start) * 1000)
+                    logger.info(
+                        "DENSE search completed: Found %d results, Status=%s, Elapsed=%dms, "
+                        "IndexAdvice=%s",
+                        len(results),
+                        status,
+                        dense_elapsed,
+                        advice or "None",
+                    )
                 else:  # HYBRID
+                    logger.info(
+                        "Executing HYBRID search: Collection=%s, TopK=%d, ModelTag=%s, "
+                        "FusionConfig=%s, FallbackToSparse=%s",
+                        collection,
+                        fetch_top_k,
+                        model_tag,
+                        cfg.fusion_config,
+                        cfg.fallback_to_sparse,
+                    )
+                    hybrid_start = time.time()
                     try:
                         with progress_tracker.track_step("hybrid_search"):
                             pass
@@ -721,17 +796,67 @@ def search_documents(
                             current_step = "search_hybrid"
                             raise
                     else:
+                        hybrid_elapsed = int((time.time() - hybrid_start) * 1000)
                         warnings.extend(_serialize_warnings(hybrid_response.warnings))
                         results = list(hybrid_response.results)
                         status = hybrid_response.status or "success"
                         message = "Hybrid search completed successfully"
+                        logger.info(
+                            "HYBRID search completed: Found %d results, Status=%s, Elapsed=%dms",
+                            len(results),
+                            status,
+                            hybrid_elapsed,
+                        )
 
         # Apply optional rerank
         current_step = "apply_rerank"
+        rerank_start = time.time()
         results, used_rerank, rerank_warnings = _apply_rerank_if_needed(
             results, query_text, cfg
         )
+        rerank_elapsed = int((time.time() - rerank_start) * 1000)
         warnings.extend(rerank_warnings)
+
+        if used_rerank:
+            logger.info(
+                "Rerank applied: Input results=%d, Output results=%d, Elapsed=%dms",
+                len(results) + len(rerank_warnings),
+                len(results),
+                rerank_elapsed,
+            )
+        else:
+            logger.debug("Rerank skipped: Not configured or no results to rerank")
+
+        total_elapsed = int((time.time() - search_start) * 1000)
+        logger.info(
+            "Document search COMPLETED: Collection=%s, Status=%s, SearchType=%s, "
+            "Results=%d, TopK=%d, TotalElapsed=%dms, UsedRerank=%s, Warnings=%d, "
+            "Model=%s",
+            collection,
+            status.upper(),
+            actual_type.value,
+            len(results),
+            cfg.top_k,
+            total_elapsed,
+            used_rerank,
+            len(warnings),
+            model_tag,
+        )
+        if status == "success":
+            logger.info(
+                "Search SUCCESS: Found %d results in %dms using %s search with model %s",
+                len(results),
+                total_elapsed,
+                actual_type.value,
+                model_tag,
+            )
+        elif status != "success":
+            logger.warning(
+                "Search completed with status '%s': Found %d results, Warnings: %d",
+                status,
+                len(results),
+                len(warnings),
+            )
 
         return _build_pipeline_result(
             status=status,

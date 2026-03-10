@@ -388,6 +388,17 @@ def read_chunks_for_embedding(
             # OPTIMIZATION: Use count_rows() for memory-efficient counting
             total_count = chunks_table.count_rows(filter_expr)
             if total_count == 0:
+                try:
+                    count_without_user_filter = chunks_table.count_rows(
+                        base_filter_expr
+                    )
+                    if count_without_user_filter > 0:
+                        logger.error(
+                            "Chunks exist but user filter excluded them! "
+                            "This may indicate a user_id mismatch or permission issue."
+                        )
+                except Exception as e:
+                    logger.debug("Failed to query without user filter: %s", e)
                 logger.info("No chunks found for the given criteria")
                 return EmbeddingReadResponse(chunks=[], total_count=0, pending_count=0)
 
@@ -419,7 +430,10 @@ def read_chunks_for_embedding(
                 embedding_config, _ = resolve_embedding_adapter(model)
                 vector_dim = embedding_config.dimension
 
+            # Ensure embeddings table exists - this should raise an exception if it fails
             ensure_embeddings_table(conn, model_tag, vector_dim=vector_dim)
+
+            # Verify table was actually created by trying to open it
             embeddings_table = conn.open_table(embeddings_table_name)
 
             # Get existing embeddings for these chunks
@@ -460,8 +474,16 @@ def read_chunks_for_embedding(
                 if item.get("chunk_id") is not None
             }
 
+        except (DatabaseOperationError, VectorValidationError, ValueError) as e:
+            logger.error(
+                "Failed to ensure/access embeddings table for model %s: %s",
+                model,
+                e,
+            )
+            raise DatabaseOperationError(
+                f"Failed to access embeddings table for model '{model}': {str(e)}"
+            ) from e
         except Exception as e:  # noqa: BLE001
-            # If embeddings table doesn't exist or query fails, assume no embeddings exist
             logger.warning(
                 "Failed to query existing embeddings for model %s (assuming none exist): %s",
                 model,
@@ -512,11 +534,24 @@ def read_chunks_for_embedding(
         pending_count = len(pending_chunks)
 
         logger.info(
-            "Found %d total chunks, %d need embedding for model %s",
+            "Found %d total chunks, %d need embedding for model %s. "
+            "Already embedded: %d chunks",
             total_count,
             pending_count,
             model,
+            len(embedded_chunk_ids),
         )
+
+        if total_count > 0 and pending_count == 0:
+            logger.warning(
+                "All %d chunks are marked as already having embeddings for model %s. "
+                "If embeddings are missing, this may indicate: "
+                "1) Embeddings table query returned incorrect results, "
+                "2) Model name mismatch between chunks and embeddings table, "
+                "3) Previous ingestion marked chunks as embedded but failed to write vectors",
+                total_count,
+                model,
+            )
 
         return EmbeddingReadResponse(
             chunks=pending_chunks, total_count=total_count, pending_count=pending_count

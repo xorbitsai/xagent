@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import time
 
 import pyarrow as pa  # type: ignore
 from lancedb.db import DBConnection
@@ -73,12 +74,135 @@ def _validate_schema_fields(
 
 
 def _create_table(conn: DBConnection, name: str, schema: object | None = None) -> None:
+    """Create a table if it doesn't exist.
+
+    Args:
+        conn: LanceDB connection
+        name: Table name
+        schema: Table schema (PyArrow schema)
+
+    Raises:
+        Exception: If table creation fails
+    """
     if _table_exists(conn, name):
         return
-    conn.create_table(name, schema=schema)
+
+    try:
+        conn.create_table(name, schema=schema)
+        if not _table_exists(conn, name):
+            raise RuntimeError(
+                f"Table '{name}' creation reported success but table does not exist"
+            )
+        logger.info("Successfully created table '%s'", name)
+    except Exception as e:
+        logger.error("Failed to create table '%s': %s", name, e)
+        raise
+
+
+def _ensure_table_fields(
+    conn: DBConnection,
+    table_name: str,
+    required_fields: list[str],
+    auto_addable_sql: dict[str, str],
+    validate_if_not_exists: bool = False,
+) -> None:
+    """Ensure table has required fields; add missing ones via SQL expression when possible.
+
+    Shared logic for schema migration: if table exists, check for missing required fields,
+    add them using auto_addable_sql (field name -> SQL expression, e.g. {"user_id": "cast(null as bigint)"}),
+    then re-check. If still missing or add fails, validate and may raise.
+
+    Args:
+        conn: LanceDB connection
+        table_name: Table to check/update
+        required_fields: Required field names (e.g. ["user_id"] or ["metadata", "user_id"])
+        auto_addable_sql: Map field name -> SQL expression for adding column (only these are auto-added)
+        validate_if_not_exists: If True, run validation even when table does not exist (e.g. chunks)
+
+    Raises:
+        ValueError: If table exists but is missing required fields that could not be added.
+    """
+    table_exists = _table_exists(conn, table_name)
+    if table_exists:
+        try:
+            table = conn.open_table(table_name)
+            existing_names = getattr(
+                table.schema, "names", [f.name for f in table.schema]
+            )
+            missing = [f for f in required_fields if f not in existing_names]
+            if missing:
+                logger.info(
+                    "Table '%s' missing fields %s; attempting to add automatically",
+                    table_name,
+                    missing,
+                )
+                to_add = {k: v for k, v in auto_addable_sql.items() if k in missing}
+                if to_add:
+                    try:
+                        table.add_columns(to_add)
+                        logger.info(
+                            "Added fields %s to table '%s'",
+                            list(to_add.keys()),
+                            table_name,
+                        )
+                        time.sleep(0.1)
+                        table = conn.open_table(table_name)
+                        existing_names = getattr(
+                            table.schema, "names", [f.name for f in table.schema]
+                        )
+                        missing = [
+                            f for f in required_fields if f not in existing_names
+                        ]
+                        if not missing:
+                            logger.info(
+                                "All required fields present in table '%s'",
+                                table_name,
+                            )
+                        else:
+                            logger.warning(
+                                "After add, table '%s' still missing: %s",
+                                table_name,
+                                missing,
+                            )
+                    except Exception as e:
+                        logger.error(
+                            "Failed to add fields to table '%s': %s",
+                            table_name,
+                            e,
+                            exc_info=True,
+                        )
+                if missing:
+                    logger.error(
+                        "Table '%s' still missing fields after auto-add: %s",
+                        table_name,
+                        missing,
+                    )
+                    _validate_schema_fields(conn, table_name, required_fields)
+        except ValueError:
+            raise
+        except Exception as e:
+            logger.warning(
+                "Error checking/updating table '%s' schema: %s",
+                table_name,
+                e,
+            )
+            _validate_schema_fields(conn, table_name, required_fields)
+    else:
+        if validate_if_not_exists:
+            _validate_schema_fields(conn, table_name, required_fields)
 
 
 def ensure_documents_table(conn: DBConnection) -> None:
+    """Ensure the documents table exists with proper schema and user_id."""
+    _ensure_table_fields(
+        conn,
+        "documents",
+        required_fields=["user_id"],
+        auto_addable_sql={"user_id": "cast(null as bigint)"},
+    )
+    if _table_exists(conn, "documents"):
+        logger.debug("Table 'documents' already exists with correct schema")
+        return
     schema = pa.schema(
         [
             pa.field("collection", pa.string()),
@@ -92,24 +216,20 @@ def ensure_documents_table(conn: DBConnection) -> None:
             pa.field("user_id", pa.int64()),
         ]
     )
-
-    # Automatic migration for existing tables missing 'user_id'
-    if _table_exists(conn, "documents"):
-        try:
-            table = conn.open_table("documents")
-            if "user_id" not in table.schema.names:
-                logger.info(
-                    "Migrating 'documents' table: adding missing 'user_id' column"
-                )
-                # Add user_id column with null default, cast to bigint (int64)
-                table.add_columns({"user_id": "cast(null as bigint)"})
-        except Exception as e:
-            logger.warning(f"Failed to check/migrate 'documents' table schema: {e}")
-
     _create_table(conn, "documents", schema=schema)
 
 
 def ensure_parses_table(conn: DBConnection) -> None:
+    """Ensure the parses table exists with proper schema and user_id."""
+    _ensure_table_fields(
+        conn,
+        "parses",
+        required_fields=["user_id"],
+        auto_addable_sql={"user_id": "cast(null as bigint)"},
+    )
+    if _table_exists(conn, "parses"):
+        logger.debug("Table 'parses' already exists with correct schema")
+        return
     schema = pa.schema(
         [
             pa.field("collection", pa.string()),
@@ -122,17 +242,6 @@ def ensure_parses_table(conn: DBConnection) -> None:
             pa.field("user_id", pa.int64()),
         ]
     )
-
-    # Automatic migration for existing tables missing 'user_id'
-    if _table_exists(conn, "parses"):
-        try:
-            table = conn.open_table("parses")
-            if "user_id" not in table.schema.names:
-                logger.info("Migrating 'parses' table: adding missing 'user_id' column")
-                table.add_columns({"user_id": "cast(null as bigint)"})
-        except Exception as e:
-            logger.warning(f"Failed to check/migrate 'parses' table schema: {e}")
-
     _create_table(conn, "parses", schema=schema)
 
 
@@ -159,12 +268,16 @@ def ensure_chunks_table(conn: DBConnection) -> None:
         you need to either delete the existing table or manually add the missing
         'metadata' field.
     """
-    # Required fields that must exist in the table (especially for schema validation)
-    required_fields = ["metadata"]
-
-    # Validate existing table schema before creating/using it
-    _validate_schema_fields(conn, "chunks", required_fields)
-
+    _ensure_table_fields(
+        conn,
+        "chunks",
+        required_fields=["metadata", "user_id"],
+        auto_addable_sql={"user_id": "cast(null as bigint)"},
+        validate_if_not_exists=True,
+    )
+    if _table_exists(conn, "chunks"):
+        logger.debug("Table 'chunks' already exists with correct schema")
+        return
     schema = pa.schema(
         [
             pa.field("collection", pa.string()),
@@ -215,13 +328,15 @@ def ensure_embeddings_table(
         'metadata' field.
     """
     table_name = f"embeddings_{model_tag}"
-
-    # Required fields that must exist in the table (especially for schema validation)
-    required_fields = ["metadata"]
-
-    # Validate existing table schema before creating/using it
-    _validate_schema_fields(conn, table_name, required_fields)
-
+    _ensure_table_fields(
+        conn,
+        table_name,
+        required_fields=["metadata", "user_id"],
+        auto_addable_sql={"user_id": "cast(null as bigint)"},
+    )
+    if _table_exists(conn, table_name):
+        logger.debug("Table '%s' already exists with correct schema", table_name)
+        return
     # Support dynamic vector dimension: if provided, create a FixedSizeList; otherwise allow variable-length
     vector_field_type = (
         pa.list_(pa.float32(), list_size=vector_dim)
@@ -244,19 +359,44 @@ def ensure_embeddings_table(
             pa.field("user_id", pa.int64()),
         ]
     )
-    _create_table(
-        conn,
-        table_name,
-        schema=schema,
-    )
+    try:
+        _create_table(
+            conn,
+            table_name,
+            schema=schema,
+        )
+        if not _table_exists(conn, table_name):
+            raise RuntimeError(
+                f"Table '{table_name}' creation failed: table does not exist after creation"
+            )
+        logger.info("Successfully created embeddings table '%s'", table_name)
+    except Exception as e:
+        logger.error(
+            "Failed to create embeddings table '%s' for model '%s': %s",
+            table_name,
+            model_tag,
+            e,
+        )
+        raise ValueError(
+            f"Failed to create embeddings table '{table_name}': {str(e)}"
+        ) from e
 
 
 def ensure_main_pointers_table(conn: DBConnection) -> None:
-    """Ensure the main_pointers table exists with proper schema.
+    """Ensure the main_pointers table exists with proper schema and user_id.
 
     Args:
         conn: LanceDB connection
     """
+    _ensure_table_fields(
+        conn,
+        "main_pointers",
+        required_fields=["user_id"],
+        auto_addable_sql={"user_id": "cast(null as bigint)"},
+    )
+    if _table_exists(conn, "main_pointers"):
+        logger.debug("Table 'main_pointers' already exists with correct schema")
+        return
     schema = pa.schema(
         [
             pa.field("collection", pa.string()),
@@ -268,18 +408,28 @@ def ensure_main_pointers_table(conn: DBConnection) -> None:
             pa.field("created_at", pa.timestamp("ms")),
             pa.field("updated_at", pa.timestamp("ms")),
             pa.field("operator", pa.string()),
+            pa.field("user_id", pa.int64()),
         ]
     )
     _create_table(conn, "main_pointers", schema=schema)
 
 
 def ensure_prompt_templates_table(conn: DBConnection) -> None:
-    """Ensure the prompt_templates table exists with proper schema.
+    """Ensure the prompt_templates table exists with proper schema and user_id.
 
     Args:
         conn: LanceDB connection
     """
     table_name = "prompt_templates"
+    _ensure_table_fields(
+        conn,
+        table_name,
+        required_fields=["user_id"],
+        auto_addable_sql={"user_id": "cast(null as bigint)"},
+    )
+    if _table_exists(conn, table_name):
+        logger.debug("Table '%s' already exists with correct schema", table_name)
+        return
     schema = pa.schema(
         [
             pa.field("collection", pa.string()),
@@ -294,30 +444,26 @@ def ensure_prompt_templates_table(conn: DBConnection) -> None:
             pa.field("updated_at", pa.timestamp("us")),
         ]
     )
-
-    # Automatic migration for existing tables missing 'user_id'
-    if _table_exists(conn, table_name):
-        try:
-            table = conn.open_table(table_name)
-            if "user_id" not in table.schema.names:
-                logger.info(
-                    f"Migrating '{table_name}' table: adding missing 'user_id' column"
-                )
-                table.add_columns({"user_id": "cast(null as bigint)"})
-        except Exception as e:
-            logger.warning(f"Failed to check/migrate '{table_name}' table schema: {e}")
-
     _create_table(conn, table_name, schema=schema)
 
 
 def ensure_ingestion_runs_table(conn: DBConnection) -> None:
-    """Ensure the ingestion_runs table exists with proper schema.
+    """Ensure the ingestion_runs table exists with proper schema and user_id.
 
     This table tracks the status of document ingestion processes.
 
     Args:
         conn: LanceDB connection
     """
+    _ensure_table_fields(
+        conn,
+        "ingestion_runs",
+        required_fields=["user_id"],
+        auto_addable_sql={"user_id": "cast(null as bigint)"},
+    )
+    if _table_exists(conn, "ingestion_runs"):
+        logger.debug("Table 'ingestion_runs' already exists with correct schema")
+        return
     schema = pa.schema(
         [
             pa.field("collection", pa.string()),
@@ -330,19 +476,4 @@ def ensure_ingestion_runs_table(conn: DBConnection) -> None:
             pa.field("user_id", pa.int64()),
         ]
     )
-
-    # Automatic migration for existing tables missing 'user_id'
-    if _table_exists(conn, "ingestion_runs"):
-        try:
-            table = conn.open_table("ingestion_runs")
-            if "user_id" not in table.schema.names:
-                logger.info(
-                    "Migrating 'ingestion_runs' table: adding missing 'user_id' column"
-                )
-                table.add_columns({"user_id": "cast(null as bigint)"})
-        except Exception as e:
-            logger.warning(
-                f"Failed to check/migrate 'ingestion_runs' table schema: {e}"
-            )
-
     _create_table(conn, "ingestion_runs", schema=schema)

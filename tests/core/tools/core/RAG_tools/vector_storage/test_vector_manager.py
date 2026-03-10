@@ -30,26 +30,28 @@ from xagent.core.tools.core.RAG_tools.vector_storage.vector_manager import (
 
 
 def _create_mock_table_with_schema() -> MagicMock:
-    """Create a mock table with a schema that includes the metadata field.
+    """Create a mock table with a schema that includes the metadata and user_id fields.
 
     This helper function ensures that schema validation passes in tests
     by providing a mock schema that includes all required fields, especially
-    the 'metadata' field that is validated in ensure_chunks_table and
-    ensure_embeddings_table.
+    the 'metadata' and 'user_id' fields that are validated in ensure_chunks_table
+    and ensure_embeddings_table.
 
     Returns:
         A MagicMock table object with a properly configured schema.
     """
     table = MagicMock()
-    # Create mock schema fields - at minimum include 'metadata' which is validated
+    # Create mock schema fields - include 'metadata' and 'user_id' which are validated
     metadata_field = MagicMock()
     metadata_field.name = "metadata"
+    user_id_field = MagicMock()
+    user_id_field.name = "user_id"
     collection_field = MagicMock()
     collection_field.name = "collection"
     doc_id_field = MagicMock()
     doc_id_field.name = "doc_id"
     # Set schema as a list of field objects (mimicking PyArrow schema structure)
-    table.schema = [collection_field, doc_id_field, metadata_field]
+    table.schema = [collection_field, doc_id_field, metadata_field, user_id_field]
     return table
 
 
@@ -149,9 +151,8 @@ class TestReadChunksForEmbedding:
                 f"doc_id == 'malicious'' OR 1=1 --' AND "
                 f"parse_hash == '{safe_parse_hash}'"
             )
-            mock_chunks_table.count_rows.assert_called_once_with(
-                expected_chunks_where_clause
-            )
+            # When total_count==0 we may call count_rows again (base_filter_expr); allow at least one call with expected clause
+            mock_chunks_table.count_rows.assert_any_call(expected_chunks_where_clause)
 
             # Since count_rows returns 0, search() should not be called
             mock_chunks_table.search.assert_not_called()
@@ -1060,6 +1061,8 @@ class TestWriteVectorsToDb:
 
         mock_metadata_field = MagicMock()
         mock_metadata_field.name = "metadata"
+        mock_user_id_field = MagicMock()
+        mock_user_id_field.name = "user_id"
 
         # Create a custom schema class that is both iterable and has field() method
         class MockSchema:
@@ -1073,7 +1076,9 @@ class TestWriteVectorsToDb:
             def field(self, name):
                 return self._field_dict.get(name)
 
-        mock_schema = MockSchema([mock_vector_field, mock_metadata_field])
+        mock_schema = MockSchema(
+            [mock_vector_field, mock_metadata_field, mock_user_id_field]
+        )
         mock_embeddings_table.schema = mock_schema
 
         # Mock drop_table to remove table from list

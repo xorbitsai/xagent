@@ -9,6 +9,7 @@ import logging
 from typing import Any, Dict, List, Optional, Tuple
 
 from ......providers.vector_store.lancedb import get_connection_from_env
+from ..core.exceptions import VectorValidationError
 from ..core.schemas import SearchResult
 from ..LanceDB.model_tag_utils import to_model_tag
 from ..utils.lancedb_query_utils import query_to_list
@@ -55,10 +56,24 @@ def search_dense_engine(
         conn = get_connection_from_env()
 
         # Build table name
-        table_name = f"embeddings_{to_model_tag(model_tag)}"
+        normalized_model_tag = to_model_tag(model_tag)
+        table_name = f"embeddings_{normalized_model_tag}"
 
-        # Open table
-        table = conn.open_table(table_name)
+        # Open table - this will raise an exception if table doesn't exist
+        try:
+            table = conn.open_table(table_name)
+        except Exception as e:
+            error_msg = str(e).lower()
+            if (
+                "not found" in error_msg
+                or "does not exist" in error_msg
+                or "no such table" in error_msg
+            ):
+                raise VectorValidationError(
+                    f"Embeddings table '{table_name}' for model '{model_tag}' does not exist. "
+                    "Please ensure data has been ingested for this model before searching."
+                ) from e
+            raise
 
         # Check and create index if needed
         index_manager = get_index_manager()

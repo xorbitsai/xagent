@@ -9,6 +9,7 @@ from __future__ import annotations
 import os
 import tempfile
 from datetime import datetime
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import pandas as pd
@@ -19,6 +20,28 @@ from xagent.core.tools.core.RAG_tools.version_management.main_pointer_manager im
     list_main_pointers,
     set_main_pointer,
 )
+
+# Schema field names expected by ensure_main_pointers_table (must include user_id)
+MAIN_POINTERS_SCHEMA_NAMES = [
+    "collection",
+    "doc_id",
+    "step_type",
+    "model_tag",
+    "semantic_id",
+    "technical_id",
+    "created_at",
+    "updated_at",
+    "operator",
+    "user_id",
+]
+
+
+def _mock_main_pointers_schema() -> MagicMock:
+    """Return a mock schema for main_pointers table (includes user_id for ensure_main_pointers_table)."""
+    schema = MagicMock()
+    schema.names = list(MAIN_POINTERS_SCHEMA_NAMES)
+    schema.__iter__ = lambda self: iter([SimpleNamespace(name=n) for n in self.names])
+    return schema
 
 
 class TestMainPointerManager:
@@ -53,6 +76,7 @@ class TestMainPointerManager:
         conn = MagicMock()
         table = MagicMock()
         docs_table = MagicMock()
+        table.schema = _mock_main_pointers_schema()
         table.search.return_value.where.return_value.to_pandas.return_value = (
             pd.DataFrame()
         )
@@ -74,6 +98,7 @@ class TestMainPointerManager:
         conn = MagicMock()
         table = MagicMock()
         docs_table = MagicMock()
+        table.schema = _mock_main_pointers_schema()
 
         # Mock merge_insert chain
         mock_merge = MagicMock()
@@ -97,7 +122,13 @@ class TestMainPointerManager:
             ]
         )
 
-        table.search.return_value.where.return_value.to_pandas.return_value = row_df
+        empty_df = pd.DataFrame()
+        # set_main_pointer: may probe existence first (empty), then get_main_pointer reads row
+        table.search.return_value.where.return_value.to_pandas.side_effect = [
+            empty_df,
+            row_df,
+            row_df,
+        ]
         conn.open_table.side_effect = (
             lambda name: docs_table if name == "documents" else table
         )
@@ -157,6 +188,7 @@ class TestMainPointerManager:
         conn.open_table.side_effect = (
             lambda name: docs_table if name == "documents" else table
         )
+        table.schema = _mock_main_pointers_schema()
         conn.table_names.return_value = ["main_pointers"]
         mock_get_conn.return_value = conn
 
@@ -246,6 +278,7 @@ class TestMainPointerManager:
             mock_result.to_pandas.return_value = pd.DataFrame()
             return mock_result
 
+        table.schema = _mock_main_pointers_schema()
         table.search.return_value.where.side_effect = capture_where
         conn.open_table.side_effect = (
             lambda name: docs_table if name == "documents" else table
@@ -344,6 +377,7 @@ class TestMainPointerManager:
         table.search.return_value.where.return_value.to_pandas.return_value = (
             pd.DataFrame()
         )
+        table.schema = _mock_main_pointers_schema()
         conn.open_table.return_value = table
         conn.table_names.return_value = ["main_pointers"]
         mock_get_conn.return_value = conn

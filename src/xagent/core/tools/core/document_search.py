@@ -137,10 +137,25 @@ async def search_knowledge_base(
         RuntimeError: If search fails
     """
     try:
+        logger.info(
+            "Listing collections for search: UserID=%s, IsAdmin=%s, Query='%s'",
+            user_id,
+            is_admin,
+            tool_args.query[:100] + ("..." if len(tool_args.query) > 100 else ""),
+        )
         # List all collections
         collections_result = list_collections(user_id=user_id, is_admin=is_admin)
 
+        logger.info(
+            "Found %d collections: %s",
+            len(collections_result.collections),
+            [
+                (c.name, c.documents, c.chunks, c.embeddings)
+                for c in collections_result.collections
+            ],
+        )
         if not collections_result.collections:
+            logger.warning("No collections available for search")
             return KnowledgeSearchResult(
                 results=[],
                 summary="No knowledge bases available. Please create a knowledge base and upload documents first.",
@@ -218,6 +233,7 @@ async def search_knowledge_base(
             "top_k": tool_args.top_k,
             "min_score": tool_args.min_score,
             "merge_results": True,
+            "fallback_to_sparse": True,
         }
 
         if tool_args.embedding_model_id:
@@ -227,13 +243,25 @@ async def search_knowledge_base(
         all_results = []
         total_searched = 0
 
+        logger.info(
+            "Starting search across %d collections: %s",
+            len(collections_to_iterate),
+            [c.name for c in collections_to_iterate],
+        )
         for collection_info in collections_to_iterate:
             collection_name = collection_info.name
 
             # Skip collections with no embeddings
             if collection_info.embeddings == 0:
-                logger.debug(
-                    f"Skipping collection with no embeddings: {collection_name}"
+                logger.warning(
+                    "Skipping collection '%s' with no embeddings (documents=%d, chunks=%d, embeddings=%d). "
+                    "UserID=%s, IsAdmin=%s",
+                    collection_name,
+                    collection_info.documents,
+                    collection_info.chunks,
+                    collection_info.embeddings,
+                    user_id,
+                    is_admin,
                 )
                 continue
 
@@ -263,6 +291,11 @@ async def search_knowledge_base(
                 continue
 
         if not all_results:
+            logger.warning(
+                "Knowledge search returned no results. Searched %d documents across %d collections.",
+                total_searched,
+                len(collections_to_iterate),
+            )
             return KnowledgeSearchResult(
                 results=[],
                 summary=f"No relevant documents found in any knowledge base. "

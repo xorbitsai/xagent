@@ -4,11 +4,12 @@ API Tool - HTTP Client for making arbitrary API calls
 Supports various HTTP methods, authentication, headers, and error handling.
 """
 
+import base64
 import json
 import logging
 import os
 from typing import Any, Dict, Optional, Union
-from urllib.parse import urlparse
+from urllib.parse import urlencode, urlparse
 
 import httpx
 
@@ -45,6 +46,7 @@ class APIClientCore:
         body: Optional[Union[Dict[str, Any], str]] = None,
         auth_type: Optional[str] = None,
         auth_token: Optional[str] = None,
+        api_key_param: str = "api_key",
         timeout: Optional[int] = None,
         retry_count: Optional[int] = None,
         allow_redirects: bool = True,
@@ -59,7 +61,8 @@ class APIClientCore:
             params: Query parameters
             body: Request body (dict for JSON, str for raw)
             auth_type: Authentication type ('bearer', 'basic', 'api_key', 'api_key_query')
-            auth_token: Authentication token/credentials
+            auth_token: Authentication token/credentials (for 'basic' auth, use "username:password" format)
+            api_key_param: Parameter name for API key when using 'api_key_query' auth
             timeout: Request timeout in seconds
             retry_count: Number of retries on failure
             allow_redirects: Whether to follow redirects
@@ -88,6 +91,13 @@ class APIClientCore:
         retry_count = (
             retry_count if retry_count is not None else self.default_retry_count
         )
+        # Ensure retry_count is non-negative to avoid empty range
+        retry_count = max(0, retry_count)
+
+        # Handle API key in query parameters
+        request_params = dict(params) if params else {}
+        if auth_type == "api_key_query" and auth_token:
+            request_params[api_key_param] = auth_token
 
         # Prepare headers
         request_headers = self._prepare_headers(headers, auth_type, auth_token, body)
@@ -106,7 +116,7 @@ class APIClientCore:
                     url=url,
                     method=method,
                     headers=request_headers,
-                    params=params,
+                    params=request_params,
                     data=request_body,
                     timeout=timeout,
                     proxy_url=proxy_url,
@@ -148,48 +158,56 @@ class APIClientCore:
         proxy_url: Optional[str],
         allow_redirects: bool,
     ) -> Dict[str, Any]:
-        """Make the actual HTTP request"""
+        """Make the actual HTTP request with streaming to limit download size"""
         client_kwargs: Dict[str, Any] = {"timeout": timeout}
         if proxy_url:
             client_kwargs["proxy"] = proxy_url
             logger.debug(f"   Using proxy: {proxy_url}")
 
         async with httpx.AsyncClient(**client_kwargs) as client:
-            response = await client.request(
+            # Use streaming to limit download size
+            async with client.stream(
                 method=method,
                 url=url,
                 headers=headers,
                 params=params,
                 content=data,
                 follow_redirects=allow_redirects,
-            )
+            ) as response:
+                # Check response size by reading only up to max_response_size
+                response_size = 0
+                content_chunks = []
+                async for chunk in response.aiter_bytes():
+                    response_size += len(chunk)
+                    if response_size > self.max_response_size:
+                        logger.warning(
+                            f"⚠️ Response size exceeds limit ({self.max_response_size} bytes), aborting download"
+                        )
+                        return {
+                            "success": False,
+                            "status_code": response.status_code,
+                            "headers": dict(response.headers),
+                            "body": None,
+                            "error": f"Response too large (exceeds {self.max_response_size} bytes), download aborted",
+                        }
+                    content_chunks.append(chunk)
 
-            # Check response size
-            response_size = len(response.content)
-            if response_size > self.max_response_size:
-                logger.warning(
-                    f"⚠️ Response size ({response_size} bytes) exceeds limit ({self.max_response_size} bytes)"
+                response_content = b"".join(content_chunks)
+
+                # Parse response body
+                body = self._parse_response_body_from_content(
+                    response_content, dict(response.headers)
                 )
+
                 return {
-                    "success": False,
+                    "success": 200 <= response.status_code < 300,
                     "status_code": response.status_code,
                     "headers": dict(response.headers),
-                    "body": None,
-                    "error": f"Response too large: {response_size} bytes (max: {self.max_response_size})",
+                    "body": body,
+                    "error": None
+                    if 200 <= response.status_code < 300
+                    else f"HTTP {response.status_code}",
                 }
-
-            # Parse response body
-            body = self._parse_response_body(response)
-
-            return {
-                "success": 200 <= response.status_code < 300,
-                "status_code": response.status_code,
-                "headers": dict(response.headers),
-                "body": body,
-                "error": None
-                if 200 <= response.status_code < 300
-                else f"HTTP {response.status_code}",
-            }
 
     def _is_valid_url(self, url: str) -> bool:
         """Validate URL format and scheme"""
@@ -230,8 +248,6 @@ class APIClientCore:
             if auth_type_lower == "bearer":
                 request_headers["Authorization"] = f"Bearer {auth_token}"
             elif auth_type_lower == "basic":
-                import base64
-
                 credentials = base64.b64encode(auth_token.encode()).decode()
                 request_headers["Authorization"] = f"Basic {credentials}"
             elif auth_type_lower == "api_key":
@@ -265,27 +281,41 @@ class APIClientCore:
                 return json.dumps(body)
             else:
                 # For dict with non-JSON content type, convert to form data
-                return "&".join(f"{k}={v}" for k, v in body.items())
+                # Use urlencode to properly escape special characters
+                return urlencode(body)
         elif isinstance(body, str):
             return body
         else:
             return str(body)
 
-    def _parse_response_body(self, response: httpx.Response) -> Any:
-        """Parse response body based on content type"""
-        content_type = response.headers.get("content-type", "").lower()
+    def _parse_response_body_from_content(
+        self, content: bytes, headers: Dict[str, str]
+    ) -> Any:
+        """Parse response body from raw content based on content type"""
+        if not content:
+            return None
+
+        content_type = headers.get("content-type", "").lower()
+
+        # Try to determine encoding from content-type header
+        encoding = "utf-8"
+        if "charset=" in content_type:
+            try:
+                encoding = content_type.split("charset=")[-1].split(";")[0].strip()
+            except Exception:
+                pass
 
         try:
             if "application/json" in content_type:
-                return response.json()
+                return json.loads(content.decode(encoding))
             else:
                 # Return text for non-JSON responses
-                return response.text
+                return content.decode(encoding)
         except Exception as e:
-            logger.warning(f"⚠️ Failed to parse response body as JSON: {str(e)}")
-            # Try to return text as fallback
+            logger.warning(f"⚠️ Failed to parse response body: {str(e)}")
+            # Try to return text as fallback with ignored errors
             try:
-                return response.text[:1000]  # Return first 1000 chars as fallback
+                return content.decode(encoding, errors="ignore")
             except Exception:
                 return None
 
@@ -305,6 +335,7 @@ async def call_api(
     body: Optional[Union[Dict[str, Any], str]] = None,
     auth_type: Optional[str] = None,
     auth_token: Optional[str] = None,
+    api_key_param: str = "api_key",
     timeout: Optional[int] = None,
     retry_count: Optional[int] = None,
 ) -> Dict[str, Any]:
@@ -318,7 +349,8 @@ async def call_api(
         params: Query parameters
         body: Request body (dict for JSON, str for raw)
         auth_type: Authentication type ('bearer', 'basic', 'api_key', 'api_key_query')
-        auth_token: Authentication token/credentials
+        auth_token: Authentication token/credentials (for 'basic' auth, use "username:password" format)
+        api_key_param: Parameter name for API key when using 'api_key_query' auth
         timeout: Request timeout in seconds
         retry_count: Number of retries on failure
 
@@ -353,6 +385,7 @@ async def call_api(
         body=body,
         auth_type=auth_type,
         auth_token=auth_token,
+        api_key_param=api_key_param,
         timeout=timeout,
         retry_count=retry_count,
     )

@@ -58,6 +58,37 @@ class TestAPIClientCore:
         assert result["body"]["token"] == "test-token-123"
 
     @pytest.mark.asyncio
+    async def test_api_key_query_auth(self):
+        """Test API key in query parameters using convenience function"""
+        result = await call_api(
+            url="https://httpbin.org/get",
+            method="GET",
+            auth_type="api_key_query",
+            auth_token="test-key-123",
+        )
+
+        assert result["success"] is True
+        assert result["status_code"] == 200
+        # Verify the api_key was added to query params
+        assert result["body"]["args"]["api_key"] == "test-key-123"
+
+    @pytest.mark.asyncio
+    async def test_api_key_query_custom_param(self):
+        """Test API key in custom query parameter"""
+        result = await call_api(
+            url="https://httpbin.org/get",
+            method="GET",
+            auth_type="api_key_query",
+            auth_token="test-key-123",
+            api_key_param="token",
+        )
+
+        assert result["success"] is True
+        assert result["status_code"] == 200
+        # Verify the custom param was added to query params
+        assert result["body"]["args"]["token"] == "test-key-123"
+
+    @pytest.mark.asyncio
     async def test_custom_headers(self):
         """Test custom headers"""
         client = APIClientCore()
@@ -172,6 +203,26 @@ class TestAPITool:
 
         assert result["success"] is True
         assert result["status_code"] == 200
+
+    @pytest.mark.asyncio
+    async def test_api_call_with_api_key_query(self):
+        """Test API key in query parameters via tool"""
+        tool = APITool()
+
+        result = await tool.run_json_async(
+            {
+                "url": "https://httpbin.org/get",
+                "method": "GET",
+                "auth_type": "api_key_query",
+                "auth_token": "my-secret-key-123",
+                "api_key_param": "key",
+            }
+        )
+
+        assert result["success"] is True
+        assert result["status_code"] == 200
+        # Verify the custom param 'key' was added to query params
+        assert result["body"]["args"]["key"] == "my-secret-key-123"
 
     def test_return_value_formatting(self):
         """Test return value formatting"""

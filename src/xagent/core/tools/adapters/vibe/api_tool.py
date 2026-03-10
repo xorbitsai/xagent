@@ -36,7 +36,12 @@ class APICallArgs(BaseModel):
         description="Authentication type: 'bearer', 'basic', 'api_key', 'api_key_query'",
     )
     auth_token: Optional[str] = Field(
-        default=None, description="Authentication token or credentials"
+        default=None,
+        description="Authentication token. For basic auth, use username:password format",
+    )
+    api_key_param: Optional[str] = Field(
+        default="api_key",
+        description="Parameter name for API key in query string (for api_key_query auth)",
     )
     timeout: Optional[int] = Field(
         default=None, description="Request timeout in seconds (default: 30)"
@@ -94,25 +99,16 @@ class APITool(AbstractBaseTool):
     async def run_json_async(self, args: Mapping[str, Any]) -> Any:
         api_args = APICallArgs.model_validate(args)
 
-        # Add API key as query param if specified
-        if api_args.auth_type == "api_key_query" and api_args.auth_token:
-            if not api_args.params:
-                params: Dict[str, Any] = {}
-            else:
-                params = dict(api_args.params)
-            params["api_key"] = api_args.auth_token
-        else:
-            params = api_args.params or {}
-
-        # Make API call
+        # Make API call - api_key_query logic is now handled in core client
         result = await self._client.call_api(
             url=api_args.url,
             method=api_args.method,
             headers=api_args.headers,
-            params=params,
+            params=api_args.params,
             body=api_args.body,
             auth_type=api_args.auth_type,
             auth_token=api_args.auth_token,
+            api_key_param=api_args.api_key_param or "api_key",
             timeout=api_args.timeout,
             retry_count=api_args.retry_count,
             allow_redirects=api_args.allow_redirects,

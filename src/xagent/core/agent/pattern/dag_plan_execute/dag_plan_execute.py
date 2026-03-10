@@ -707,13 +707,12 @@ class DAGPlanExecutePattern(AgentPattern):
                             )
 
                     # Process skill result
-                    skill_result = (
-                        results[1]
-                        if memory_task and skill_task and len(results) > 1
-                        else results[0]
-                        if skill_task and len(results) > 0
-                        else None
-                    )
+                    # results order matches the order in asyncio.gather: [memory_task, skill_task]
+                    skill_result = None
+                    if skill_task and memory_task and len(results) > 1:
+                        skill_result = results[1]  # Second element is skill result
+                    elif skill_task and not memory_task and len(results) > 0:
+                        skill_result = results[0]  # Only skill task, first element
                     if skill_result and not isinstance(skill_result, Exception):
                         # Type narrowing: we know skill_result is the actual result, not Exception
                         skill: Dict[str, Any] = skill_result  # type: ignore[assignment]
@@ -731,14 +730,16 @@ class DAGPlanExecutePattern(AgentPattern):
                             logger.info(
                                 "Re-checking if clarification is needed with skill context..."
                             )
-                            clarify_result = await self.plan_generator.should_chat_directly(
-                                goal=task,
-                                tools=tools,
-                                iteration=iteration,
-                                history=self._get_messages_for_llm(),
-                                tracer=self.tracer,
-                                context=self._context,
-                                skill_context=skill_context,
+                            clarify_result = (
+                                await self.plan_generator.should_chat_directly(
+                                    goal=task,
+                                    tools=tools,
+                                    iteration=iteration,
+                                    history=self._get_messages_for_llm(),
+                                    tracer=self.tracer,
+                                    context=self._context,
+                                    skill_context=skill_context,
+                                )
                             )
                             if (
                                 clarify_result.type == "chat"
@@ -748,7 +749,84 @@ class DAGPlanExecutePattern(AgentPattern):
                                 logger.info(
                                     "Skill requires clarification, returning chat response"
                                 )
-                                return clarify_result
+
+                                # Build interactions data for frontend and history
+                                interactions_data = None
+                                if clarify_result.chat_response.interactions:
+                                    interactions_data = [
+                                        {
+                                            "type": interaction.type.value,
+                                            "field": interaction.field,
+                                            "label": interaction.label,
+                                            "options": interaction.options,
+                                            "placeholder": interaction.placeholder,
+                                            "multiline": interaction.multiline,
+                                            "min": interaction.min,
+                                            "max": interaction.max,
+                                            "default": interaction.default,
+                                            "accept": interaction.accept,
+                                            "multiple": interaction.multiple,
+                                        }
+                                        for interaction in clarify_result.chat_response.interactions
+                                    ]
+
+                                # Calculate absolute expiration time if timeout is present
+                                expires_at = None
+                                if (
+                                    interactions_data
+                                    and clarify_result.chat_response.timeout
+                                ):
+                                    from datetime import timedelta, timezone
+
+                                    expires_at = (
+                                        datetime.now(timezone.utc)
+                                        + timedelta(
+                                            seconds=clarify_result.chat_response.timeout
+                                        )
+                                    ).isoformat()
+                                    clarify_result.chat_response.expires_at = expires_at
+                                else:
+                                    clarify_result.chat_response.timeout = None
+
+                                # Record assistant response to conversation history
+                                self._add_assistant_message(
+                                    content=clarify_result.chat_response.message,
+                                    interactions=interactions_data,
+                                )
+
+                                # Send task completion event with chat response as result
+                                if (
+                                    hasattr(self, "tracer")
+                                    and self.tracer
+                                    and self.task_id
+                                ):
+                                    from ...trace import trace_task_completion
+
+                                    await trace_task_completion(
+                                        self.tracer,
+                                        self.task_id,
+                                        result={
+                                            "content": clarify_result.chat_response.message,
+                                            "chat_response": {
+                                                "message": clarify_result.chat_response.message,
+                                                "interactions": interactions_data or [],
+                                                "timeout": clarify_result.chat_response.timeout,
+                                                "expires_at": expires_at,
+                                            },
+                                        },
+                                        success=True,
+                                    )
+
+                                # Return success with chat response - no plan execution needed
+                                return {
+                                    "success": True,
+                                    "chat_response": {
+                                        "message": clarify_result.chat_response.message,
+                                        "interactions": interactions_data or [],
+                                        "timeout": clarify_result.chat_response.timeout,
+                                        "expires_at": expires_at,
+                                    },
+                                }
                         else:
                             logger.info("No relevant skill found")
                     elif skill_result and isinstance(skill_result, Exception):

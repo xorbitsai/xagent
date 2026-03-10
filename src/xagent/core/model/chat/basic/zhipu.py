@@ -429,84 +429,113 @@ class ZhipuLLM(BaseLLM):
             completion_params["response_format"] = response_format
 
         try:
-            # Make the entire streaming process non-blocking
-            # by running everything in executor
-            def process_stream() -> List[Dict[str, Any]]:
-                """Process the entire stream in a thread to avoid blocking event loop."""
+            # Create a queue to bridge the synchronous stream to async generator
+            queue: asyncio.Queue[Optional[Dict[str, Any]]] = asyncio.Queue()
+
+            def stream_producer() -> None:
+                """
+                Consume the synchronous Zhipu stream and put chunks into the queue.
+                This runs in a separate thread to avoid blocking the event loop.
+                """
                 if self._client is None:
                     raise RuntimeError("Zhipu client is not initialized")
 
-                chunks_data: List[Dict[str, Any]] = []
-                stream = self._client.chat.completions.create(**completion_params)
+                try:
+                    stream = self._client.chat.completions.create(**completion_params)
 
-                for chunk in stream:
-                    # Convert chunk to dict to avoid threading issues
-                    chunk_dict: Dict[str, Any] = {}
+                    for chunk in stream:
+                        # Convert chunk to dict to avoid threading issues
+                        chunk_dict: Dict[str, Any] = {}
 
-                    if hasattr(chunk, "choices") and chunk.choices:
-                        choice = chunk.choices[0]
-                        choice_dict: Dict[str, Any] = {}
+                        if hasattr(chunk, "choices") and chunk.choices:
+                            choice = chunk.choices[0]
+                            choice_dict: Dict[str, Any] = {}
 
-                        if hasattr(choice, "delta"):
-                            delta = choice.delta
-                            delta_dict: Dict[str, Any] = {}
+                            if hasattr(choice, "delta"):
+                                delta = choice.delta
+                                delta_dict: Dict[str, Any] = {}
 
-                            if hasattr(delta, "content") and delta.content:
-                                delta_dict["content"] = delta.content
+                                if hasattr(delta, "content") and delta.content:
+                                    delta_dict["content"] = delta.content
 
-                            if hasattr(delta, "tool_calls") and delta.tool_calls:
-                                tool_calls_list: List[Dict[str, Any]] = []
-                                for tool_call in delta.tool_calls:
-                                    tool_call_dict: Dict[str, Any] = {
-                                        "id": getattr(tool_call, "id", None),
-                                    }
+                                if hasattr(delta, "tool_calls") and delta.tool_calls:
+                                    tool_calls_list: List[Dict[str, Any]] = []
+                                    for tool_call in delta.tool_calls:
+                                        tool_call_dict: Dict[str, Any] = {
+                                            "id": getattr(tool_call, "id", None),
+                                        }
 
-                                    if hasattr(tool_call, "function"):
-                                        func = tool_call.function
-                                        func_dict: Dict[str, Any] = {}
+                                        if hasattr(tool_call, "function"):
+                                            func = tool_call.function
+                                            func_dict: Dict[str, Any] = {}
 
-                                        if hasattr(func, "name") and func.name:
-                                            func_dict["name"] = func.name
-                                        if (
-                                            hasattr(func, "arguments")
-                                            and func.arguments
-                                        ):
-                                            func_dict["arguments"] = func.arguments
+                                            if hasattr(func, "name") and func.name:
+                                                func_dict["name"] = func.name
+                                            if (
+                                                hasattr(func, "arguments")
+                                                and func.arguments
+                                            ):
+                                                func_dict["arguments"] = func.arguments
 
-                                        tool_call_dict["function"] = func_dict
+                                            tool_call_dict["function"] = func_dict
 
-                                    tool_calls_list.append(tool_call_dict)
+                                        tool_calls_list.append(tool_call_dict)
 
-                                delta_dict["tool_calls"] = tool_calls_list
+                                    delta_dict["tool_calls"] = tool_calls_list
 
-                            choice_dict["delta"] = delta_dict
+                                choice_dict["delta"] = delta_dict
 
-                        if hasattr(choice, "finish_reason") and choice.finish_reason:
-                            choice_dict["finish_reason"] = choice.finish_reason
+                            if (
+                                hasattr(choice, "finish_reason")
+                                and choice.finish_reason
+                            ):
+                                choice_dict["finish_reason"] = choice.finish_reason
 
-                        chunk_dict["choices"] = [choice_dict]
+                            chunk_dict["choices"] = [choice_dict]
 
-                    if hasattr(chunk, "usage") and chunk.usage:
-                        usage = chunk.usage
-                        usage_dict: Dict[str, Any] = {
-                            "prompt_tokens": getattr(usage, "prompt_tokens", 0)
-                            or getattr(usage, "input_tokens", 0),
-                            "completion_tokens": getattr(usage, "completion_tokens", 0)
-                            or getattr(usage, "output_tokens", 0),
-                        }
-                        chunk_dict["usage"] = usage_dict
+                        if hasattr(chunk, "usage") and chunk.usage:
+                            usage = chunk.usage
+                            usage_dict: Dict[str, Any] = {
+                                "prompt_tokens": getattr(usage, "prompt_tokens", 0)
+                                or getattr(usage, "input_tokens", 0),
+                                "completion_tokens": getattr(
+                                    usage, "completion_tokens", 0
+                                )
+                                or getattr(usage, "output_tokens", 0),
+                            }
+                            chunk_dict["usage"] = usage_dict
 
-                    chunks_data.append(chunk_dict)
+                        # Put chunk in queue (this blocks if queue is full, which is fine)
+                        asyncio.get_event_loop().call_soon_threadsafe(
+                            queue.put_nowait, chunk_dict
+                        )
 
-                return chunks_data
+                    # Signal end of stream with sentinel value
+                    asyncio.get_event_loop().call_soon_threadsafe(
+                        queue.put_nowait, None
+                    )
 
-            # Run the entire stream processing in executor
-            chunks_data = await asyncio.get_event_loop().run_in_executor(
-                None, process_stream
-            )
+                except Exception as e:
+                    # Put exception in queue so it can be raised in the async context
+                    exc = e
+                    asyncio.get_event_loop().call_soon_threadsafe(
+                        lambda: queue.put_nowait(exc)  # type: ignore[arg-type]
+                    )
 
-            # Now yield chunks from the processed data (non-blocking)
-            for chunk_dict in chunks_data:
+            # Start the producer thread
+            await asyncio.get_event_loop().run_in_executor(None, stream_producer)
+
+            # Consume chunks from the queue as they arrive (true streaming)
+            while True:
+                chunk_dict = await queue.get()
+
+                # Check for end of stream sentinel
+                if chunk_dict is None:
+                    break
+
+                # Check if an exception was put in the queue
+                if isinstance(chunk_dict, Exception):
+                    raise chunk_dict
                 current_time = time.time()
 
                 # Check first token timeout

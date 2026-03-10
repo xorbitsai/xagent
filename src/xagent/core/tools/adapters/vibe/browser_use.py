@@ -6,6 +6,7 @@ Browser sessions are automatically cleaned up when tasks complete.
 """
 
 import logging
+import os
 from typing import Any, Mapping, Optional, Type
 
 from pydantic import BaseModel, Field
@@ -599,7 +600,8 @@ class BrowserScreenshotTool(AbstractBaseTool):
                 # Determine filename - always save to output directory
                 output_filename = args.get("output_filename")
                 if output_filename:
-                    filename = output_filename
+                    # Sanitize filename to prevent path traversal attacks
+                    filename = os.path.basename(output_filename)
                 else:
                     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
                     filename = f"screenshot_{timestamp}.png"
@@ -1015,7 +1017,8 @@ class BrowserPdfTool(AbstractBaseTool):
                 # Determine filename - always save to output directory
                 output_filename = args.get("output_filename")
                 if output_filename:
-                    filename = output_filename
+                    # Sanitize filename to prevent path traversal attacks
+                    filename = os.path.basename(output_filename)
                 else:
                     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
                     filename = f"page_{timestamp}.pdf"

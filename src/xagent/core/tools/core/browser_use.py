@@ -215,7 +215,7 @@ class BrowserSessionManager:
         self._cleanup_task: Optional[asyncio.Task[None]] = None  # Track cleanup task
 
     async def get_or_create(
-        self, session_id: str, headless: bool = True
+        self, session_id: str, headless: bool = False
     ) -> BrowserSession:
         """
         Get or create a browser session (async-safe).
@@ -457,7 +457,7 @@ async def browser_click(**kwargs: Any) -> Dict[str, Any]:
         }
 
     manager = get_browser_manager()
-    session = await manager.get_or_create(session_id, headless=True)
+    session = await manager.get_or_create(session_id)
     page = await session.get_page()
 
     try:
@@ -518,7 +518,7 @@ async def browser_fill(**kwargs: Any) -> Dict[str, Any]:
         }
 
     manager = get_browser_manager()
-    session = await manager.get_or_create(session_id, headless=True)
+    session = await manager.get_or_create(session_id)
     page = await session.get_page()
 
     try:
@@ -614,7 +614,7 @@ async def browser_screenshot(**kwargs: Any) -> Dict[str, Any]:
     manager = get_browser_manager()
     logger.info(f"[browser_screenshot] Got browser manager (session={session_id})")
 
-    session = await manager.get_or_create(session_id, headless=True)
+    session = await manager.get_or_create(session_id)
     logger.info(f"[browser_screenshot] Got/created session (session={session_id})")
 
     page = await session.get_page()
@@ -792,7 +792,7 @@ async def browser_extract_text(**kwargs: Any) -> Dict[str, Any]:
         }
 
     manager = get_browser_manager()
-    session = await manager.get_or_create(session_id, headless=True)
+    session = await manager.get_or_create(session_id)
     page = await session.get_page()
 
     try:
@@ -872,7 +872,7 @@ async def browser_evaluate(**kwargs: Any) -> Dict[str, Any]:
         }
 
     manager = get_browser_manager()
-    session = await manager.get_or_create(session_id, headless=True)
+    session = await manager.get_or_create(session_id)
     page = await session.get_page()
 
     try:
@@ -946,7 +946,7 @@ async def browser_select_option(**kwargs: Any) -> Dict[str, Any]:
         }
 
     manager = get_browser_manager()
-    session = await manager.get_or_create(session_id, headless=True)
+    session = await manager.get_or_create(session_id)
     page = await session.get_page()
 
     try:
@@ -1030,7 +1030,7 @@ async def browser_wait_for_selector(**kwargs: Any) -> Dict[str, Any]:
         }
 
     manager = get_browser_manager()
-    session = await manager.get_or_create(session_id, headless=True)
+    session = await manager.get_or_create(session_id)
     page = await session.get_page()
 
     try:
@@ -1139,7 +1139,7 @@ async def browser_pdf(**kwargs: Any) -> Dict[str, Any]:
         }
 
     manager = get_browser_manager()
-    session = await manager.get_or_create(session_id, headless=True)
+    session = await manager.get_or_create(session_id)
     page = await session.get_page()
 
     try:

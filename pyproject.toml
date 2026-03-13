@@ -177,6 +177,7 @@ module = [
   "xagent.core.model.chat.basic.xinference",
   "xagent.core.model.embedding.xinference",
   "xagent.core.model.image.xinference",
+  "xagent.core.model.asr.xinference",
 ]
 disallow_any_unimported = false
 warn_unused_ignores = false

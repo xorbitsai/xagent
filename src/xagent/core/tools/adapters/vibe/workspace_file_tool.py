@@ -157,7 +157,7 @@ class WorkspaceFileTools(WorkspaceFileOperations):
             FileTool(
                 self.read_file,
                 name="read_file",
-                description="Read file content in workspace. Use relative paths (e.g., 'filename.txt'), not absolute paths.",
+                description="Read file content in workspace. Accepts either file paths (e.g., 'filename.txt') or file_ids (e.g., 'abc-123-def'). Automatically detects input type.",
             ),
             FileTool(
                 self.write_file,
@@ -197,7 +197,7 @@ class WorkspaceFileTools(WorkspaceFileOperations):
             FileTool(
                 self.read_json_file,
                 name="read_json_file",
-                description="Read JSON file in workspace",
+                description="Read JSON file in workspace. Accepts either file paths (e.g., 'filename.txt') or file_ids (e.g., 'abc-123-def'). Automatically detects input type.",
             ),
             FileTool(
                 self.write_json_file,
@@ -207,7 +207,7 @@ class WorkspaceFileTools(WorkspaceFileOperations):
             FileTool(
                 self.read_csv_file,
                 name="read_csv_file",
-                description="Read CSV file in workspace",
+                description="Read CSV file in workspace. Accepts either file paths (e.g., 'filename.txt') or file_ids (e.g., 'abc-123-def'). Automatically detects input type.",
             ),
             FileTool(
                 self.write_csv_file,

@@ -434,11 +434,11 @@ class WorkspaceFileOperations:
             encoding=None,  # Add encoding field
         )
 
-    def read_json_file(self, file_path: str, encoding: str = "utf-8") -> Any:
-        """Read JSON file in workspace"""
+    def read_json_file(self, file_path_or_id: str, encoding: str = "utf-8") -> Any:
+        """Read JSON file in workspace. Accepts either file paths or file_ids."""
         from .file_tool import read_json_file as basic_read_json_file
 
-        resolved_path = self.workspace.resolve_path_with_search(file_path)
+        resolved_path = self.workspace.resolve_path_with_search(file_path_or_id)
         return basic_read_json_file(str(resolved_path), encoding)
 
     def write_json_file(
@@ -456,17 +456,17 @@ class WorkspaceFileOperations:
 
     def read_csv_file(
         self,
-        file_path: str,
+        file_path_or_id: str,
         encoding: str = "utf-8",
         delimiter: str = ",",
     ) -> List[Dict[str, str]]:
-        """Read CSV file in workspace"""
+        """Read CSV file in workspace. Accepts either file paths or file_ids."""
         # Read the file directly without using document parser
         # CSV files should be read as plain text for proper parsing
-        resolved_path = self.workspace.resolve_path_with_search(file_path)
+        resolved_path = self.workspace.resolve_path_with_search(file_path_or_id)
 
         if not resolved_path.exists():
-            raise FileNotFoundError(f"File not found: {file_path}")
+            raise FileNotFoundError(f"File not found: {file_path_or_id}")
 
         with open(resolved_path, "r", encoding=encoding) as f:
             content = f.read()

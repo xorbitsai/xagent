@@ -9,7 +9,7 @@ import logging
 import os
 import sys
 import traceback
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, Optional
 
 logger = logging.getLogger(__name__)
 
@@ -236,36 +236,16 @@ class PythonExecutorCore:
             try:
                 import asyncio
 
-                loop = asyncio.get_event_loop()
-                if loop.is_running():
-                    # If we're in an async context, we need to run in a new thread
-                    import threading
-
-                    result_container: List[Any] = [None]
-                    exception_container: List[Optional[Exception]] = [None]
-
-                    def run_async() -> None:
-                        try:
-                            new_loop = asyncio.new_event_loop()
-                            asyncio.set_event_loop(new_loop)
-                            result_container[0] = new_loop.run_until_complete(
-                                async_llm(prompt, system_prompt)
-                            )
-                        except Exception as e:
-                            exception_container[0] = e
-                        finally:
-                            new_loop.close()
-
-                    thread = threading.Thread(target=run_async)
-                    thread.start()
-                    thread.join()
-
-                    if exception_container[0]:
-                        raise exception_container[0]
-                    return str(result_container[0])
-                else:
-                    result = loop.run_until_complete(async_llm(prompt, system_prompt))
+                # Always create new event loop in thread pool context
+                new_loop = asyncio.new_event_loop()
+                asyncio.set_event_loop(new_loop)
+                try:
+                    result = new_loop.run_until_complete(
+                        async_llm(prompt, system_prompt)
+                    )
                     return str(result)
+                finally:
+                    new_loop.close()
             except Exception as e:
                 logger = logging.getLogger(__name__)
                 logger.error(f"LLM call failed: {e}")

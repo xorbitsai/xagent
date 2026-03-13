@@ -26,6 +26,7 @@ CATEGORY_DISPLAY_NAMES = {
     "ppt": "PPT",
     "agent": "Agent",
     "mcp": "MCP",
+    "skill": "Skill",
     "other": "Other",
 }
 
@@ -94,6 +95,8 @@ def _create_tool_info(
         tool_type = "browser"
     elif category == "agent":
         tool_type = "agent"
+    elif category == "skill":
+        tool_type = "skill"
 
     return {
         "name": tool_name,

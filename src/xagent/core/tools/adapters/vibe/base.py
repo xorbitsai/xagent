@@ -28,6 +28,7 @@ class ToolCategory(str, Enum):
     AGENT = "agent"
     MCP = "mcp"
     DATABASE = "database"
+    SKILL = "skill"
     OTHER = "other"
 
 

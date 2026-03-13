@@ -605,6 +605,7 @@ Build when you need.`
       analysis: "Analysis Tools",
       mcp: "MCP Tools",
       database: "Database",
+      skill: "Skill Tools",
     },
     badges: {
       types: {
@@ -1713,6 +1714,7 @@ Build when you need.`
           specialImage: "Image Tools",
           agent: "Agent Invocation",
           database: "Database",
+          skill: "Skill Tools",
         },
         categoryDescriptions: {
           basic: "System basic capabilities, including core functions like mathematical calculations and date/time retrieval.",
@@ -1727,6 +1729,7 @@ Build when you need.`
           specialImage: "Advanced image processing, providing professional image analysis and conversion tools.",
           agent: "Multi-agent collaboration, supporting invocation of other Agents to complete complex tasks.",
           database: "Database operations, supporting SQL query, data export, and database management.",
+          skill: "Skill file access, supporting reading and listing files from skill directories.",
         },
       },
       suggestedPrompts: {

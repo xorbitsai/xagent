@@ -141,6 +141,40 @@ class TestToolsAvailableAPI:
         assert "read_file" in tool_names, "Should have read_file tool"
         assert "write_file" in tool_names, "Should have write_file tool"
 
+        # Skill file access tools should be present
+        assert "read_skill_file" in tool_names, "Should have read_skill_file tool"
+        assert "list_skill_files" in tool_names, "Should have list_skill_files tool"
+
+    def test_skill_category_in_available_tools(self):
+        """Test that skill tools appear with correct category."""
+        # Login to get token
+        login_response = client.post(
+            "/api/auth/login", json={"username": "admin", "password": "admin123"}
+        )
+        assert login_response.status_code == 200
+        token = login_response.json()["access_token"]
+
+        response = client.get(
+            "/api/tools/available", headers={"Authorization": f"Bearer {token}"}
+        )
+        assert response.status_code == 200
+        data = response.json()
+
+        # Check for skill tools
+        skill_tools = [
+            tool for tool in data["tools"] if tool.get("category") == "skill"
+        ]
+
+        # Should have read_skill_file and list_skill_files
+        skill_tool_names = {tool["name"] for tool in skill_tools}
+        assert "read_skill_file" in skill_tool_names
+        assert "list_skill_files" in skill_tool_names
+
+        # Verify tool type and display category
+        for tool in skill_tools:
+            assert tool["type"] == "skill"
+            assert tool["display_category"] == "Skill"
+
     def test_get_available_tools_includes_usage_count(self):
         """Test that /api/tools/available includes usage statistics."""
         # Login to get token

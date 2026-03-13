@@ -635,6 +635,135 @@ class TaskWorkspace:
             logger.warning(f"get_file_id_from_path: Exception: {e}")
             return None
 
+    def list_all_user_files(
+        self,
+        include_workspace_files: bool = True,
+        limit: int = 1000,
+        offset: int = 0,
+    ) -> Dict[str, Any]:
+        """List all user files across all workspaces and uploaded files.
+
+        Args:
+            include_workspace_files: Whether to include current workspace files
+            limit: Maximum number of files to return (default: 1000)
+            offset: Number of files to skip for pagination (default: 0)
+
+        Returns:
+            Dictionary with list of all user files with metadata including file_id,
+            filename, storage_path, size, mime_type, etc.
+        """
+        import os
+        from pathlib import Path
+
+        from ..web.models.task import Task
+        from ..web.models.uploaded_file import UploadedFile
+        from .storage.manager import create_db_session
+
+        # Use existing session or create temporary one
+        db = self.db_session if self.db_session else create_db_session()
+        should_close = self.db_session is None
+
+        try:
+            # Extract user_id from workspace id (e.g., 'web_task_265' -> 265)
+            task_id = None
+            user_id = None
+            try:
+                task_id = int(self.id.split("_")[-1])
+            except (ValueError, IndexError):
+                task_id = None
+
+            # Try to get user_id from task if we have a valid task_id
+            if task_id:
+                task = db.query(Task).filter(Task.id == task_id).first()
+                if task:
+                    user_id = task.user_id
+
+            # Build file list - start with uploaded files if we have user_id
+            result_files = []
+            total_count = 0
+
+            if user_id:
+                # Query uploaded files for this user
+                query = db.query(UploadedFile).filter(UploadedFile.user_id == user_id)
+                total_count = query.count()
+                files = query.offset(offset).limit(limit).all()
+
+                # Build file list from database
+                for file_record in files:
+                    file_path = Path(file_record.storage_path)
+                    if file_path.exists():
+                        result_files.append(
+                            {
+                                "file_id": file_record.file_id,
+                                "filename": file_record.filename,
+                                "storage_path": file_record.storage_path,
+                                "relative_path": str(file_path),
+                                "size": file_record.file_size,
+                                "mime_type": file_record.mime_type,
+                                "task_id": file_record.task_id,
+                                "uploaded_at": file_record.uploaded_at.isoformat()
+                                if file_record.uploaded_at
+                                else None,
+                                "in_current_workspace": file_path.is_relative_to(
+                                    self.workspace_dir
+                                )
+                                if file_path.exists()
+                                else False,
+                            }
+                        )
+
+            # Optionally include current workspace files (not yet uploaded)
+            if include_workspace_files:
+                try:
+                    workspace_files_dict = self.get_all_files()
+                    # Flatten the dict values to get all files
+                    for category in ["input", "output", "temp", "workspace"]:
+                        for file_info in workspace_files_dict.get(category, []):
+                            file_path = file_info.get("file_path", "")
+                            relative_path = file_info.get("relative_path", "")
+                            if not file_path:
+                                continue
+                            is_already_listed = any(
+                                f.get("storage_path") == file_path for f in result_files
+                            )
+                            if not is_already_listed:
+                                stat = (
+                                    os.stat(file_path)
+                                    if os.path.exists(file_path)
+                                    else None
+                                )
+                                if stat:
+                                    result_files.append(
+                                        {
+                                            "file_id": None,
+                                            "filename": Path(file_path).name,
+                                            "storage_path": file_path,
+                                            "relative_path": relative_path,
+                                            "size": stat.st_size,
+                                            "mime_type": "unknown",
+                                            "task_id": task_id,
+                                            "uploaded_at": None,
+                                            "in_current_workspace": True,
+                                            "is_unregistered": True,
+                                        }
+                                    )
+                except Exception as e:
+                    logger.warning(f"Failed to get workspace files: {e}")
+
+            return {
+                "success": True,
+                "files": result_files,
+                "total_count": total_count,
+                "workspace_id": self.id,
+                "user_id": user_id,
+                "limit": limit,
+                "offset": offset,
+            }
+
+        finally:
+            if should_close:
+                db.close()
+
     def __enter__(self) -> "TaskWorkspace":
         """Context manager entry"""
         return self

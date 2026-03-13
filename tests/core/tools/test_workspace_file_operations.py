@@ -277,6 +277,81 @@ class TestWorkspaceFileOperations:
                 # We'll just verify the structure is preserved
                 assert key in read_data[i]
 
+    def test_list_all_user_files_test_workspace(self, tmp_path):
+        """Test list_all_user_files with test workspace (no database)."""
+        workspace = TaskWorkspace("test_workspace", str(tmp_path))
+        ops = WorkspaceFileOperations(workspace)
+
+        # Test workspace should return success but no user_id
+        result = ops.list_all_user_files()
+
+        assert result["success"] is True
+        assert result["user_id"] is None  # No user_id for test workspace
+        # Files will only include workspace files if include_workspace_files=True
+        assert len(result["files"]) == 0  # Default is include_workspace_files=False
+
+    def test_list_all_user_files_with_workspace_files(self, tmp_path):
+        """Test list_all_user_files includes workspace files when requested."""
+        # Use a workspace ID that matches the web_task_{id} pattern to avoid test workspace detection
+        workspace = TaskWorkspace("web_task_12345", str(tmp_path))
+        ops = WorkspaceFileOperations(workspace)
+
+        # Create some test files in workspace
+        ops.write_file("test1.txt", "content1")
+        ops.write_file("test2.txt", "content2")
+
+        # Get files including workspace files
+        result = ops.list_all_user_files(include_workspace_files=True)
+
+        # Should have workspace files included
+        assert result["success"] is True
+        workspace_files = [f for f in result["files"] if f.get("is_unregistered")]
+        assert len(workspace_files) >= 2
+
+        # Check file metadata
+        file_names = [f["filename"] for f in workspace_files]
+        assert "test1.txt" in file_names
+        assert "test2.txt" in file_names
+
+        # Verify all unregistered files are in current workspace
+        for f in workspace_files:
+            assert f["in_current_workspace"] is True
+            assert f["file_id"] is None
+
+    def test_list_all_user_files_pagination(self, tmp_path):
+        """Test list_all_user_files pagination parameters."""
+        workspace = TaskWorkspace("test_pagination", str(tmp_path))
+        ops = WorkspaceFileOperations(workspace)
+
+        # Create multiple files
+        for i in range(5):
+            ops.write_file(f"file{i}.txt", f"content{i}")
+
+        # Test pagination
+        result = ops.list_all_user_files(limit=2, offset=0)
+        assert result["limit"] == 2
+        assert result["offset"] == 0
+
+        result_offset = ops.list_all_user_files(limit=2, offset=2)
+        assert result_offset["limit"] == 2
+        assert result_offset["offset"] == 2
+
+    def test_list_all_user_files_exclude_workspace(self, tmp_path):
+        """Test list_all_user_files can exclude workspace files."""
+        workspace = TaskWorkspace("test_exclude", str(tmp_path))
+        ops = WorkspaceFileOperations(workspace)
+
+        # Create test file
+        ops.write_file("test.txt", "content")
+
+        # Get files excluding workspace files
+        result = ops.list_all_user_files(include_workspace_files=False)
+
+        assert result["success"] is True
+        # Should not have unregistered workspace files
+        unregistered = [f for f in result["files"] if f.get("is_unregistered")]
+        assert len(unregistered) == 0
+
 
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])

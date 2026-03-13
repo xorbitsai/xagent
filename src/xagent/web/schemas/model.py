@@ -18,6 +18,11 @@ class ModelCreate(BaseModel):
     abilities: Optional[List[str]] = None
     description: Optional[str] = None
     share_with_users: bool = False  # Admin only: share this model with all users
+    # Speech-specific parameters (for ASR and TTS)
+    language: Optional[str] = None  # Default language code (e.g., 'zh', 'en')
+    voice: Optional[str] = None  # TTS voice/speaker (e.g., 'female', 'male')
+    format: Optional[str] = None  # TTS audio format (e.g., 'mp3', 'wav', 'pcm')
+    sample_rate: Optional[int] = None  # TTS sample rate in Hz (e.g., 24000, 48000)
 
     @field_validator("model_id", "model_name", "base_url", "api_key", mode="before")
     @classmethod
@@ -94,6 +99,11 @@ class ModelUpdate(BaseModel):
     description: Optional[str] = None
     abilities: Optional[List[str]] = None
     share_with_users: Optional[bool] = None  # Admin only: update sharing status
+    # Speech-specific parameters (for ASR and TTS)
+    language: Optional[str] = None  # Default language code (e.g., 'zh', 'en')
+    voice: Optional[str] = None  # TTS voice/speaker (e.g., 'female', 'male')
+    format: Optional[str] = None  # TTS audio format (e.g., 'mp3', 'wav', 'pcm')
+    sample_rate: Optional[int] = None  # TTS sample rate in Hz (e.g., 24000, 48000)
 
     @field_validator("model_name", "base_url", "api_key", mode="before")
     @classmethod

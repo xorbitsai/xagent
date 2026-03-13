@@ -110,6 +110,10 @@ async def create_model(
             timeout=180.0,
             abilities=model.abilities,
             description=model.description,
+            language=model.language,
+            voice=model.voice,
+            format=model.format,
+            sample_rate=model.sample_rate,
         )
     else:
         raise HTTPException(status_code=400, detail="Invalid model category")
@@ -249,6 +253,8 @@ async def get_user_default_models(
             "embedding",
             "image",
             "image_edit",
+            "asr",
+            "tts",
         ]
 
         # Get user's own defaults
@@ -1222,15 +1228,34 @@ async def set_user_default_model(
     if not user_model:
         raise HTTPException(status_code=404, detail="Model not found or access denied")
 
+    # Get the model to check its abilities
+    model = db.query(DBModel).filter(DBModel.id == config.model_id).first()
+    if not model:
+        raise HTTPException(status_code=404, detail="Model not found")
+
+    # For speech models, automatically determine config_type based on actual abilities
+    # This prevents ASR and TTS models from conflicting with each other
+    if model.category == "speech" and model.abilities:
+        if "asr" in model.abilities and "tts" not in model.abilities:
+            config_type = "asr"  # Only ASR ability
+        elif "tts" in model.abilities and "asr" not in model.abilities:
+            config_type = "tts"  # Only TTS ability
+        elif "asr" in model.abilities and "tts" in model.abilities:
+            config_type = "speech"  # Both abilities
+        else:
+            config_type = config.config_type  # Fallback to user-specified
+    else:
+        config_type = config.config_type
+
     # Remove existing configuration for this config_type
     db.query(UserDefaultModel).filter(
         UserDefaultModel.user_id == user.id,
-        UserDefaultModel.config_type == config.config_type,
+        UserDefaultModel.config_type == config_type,
     ).delete()
 
     # Create new default configuration
     user_default = UserDefaultModel(
-        user_id=user.id, model_id=config.model_id, config_type=config.config_type
+        user_id=user.id, model_id=config.model_id, config_type=config_type
     )
 
     db.add(user_default)

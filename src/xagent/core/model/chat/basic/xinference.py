@@ -566,30 +566,145 @@ class XinferenceLLM(BaseLLM):
             ...     base_url="http://localhost:9997"
             ... )
         """
-        client = XinferenceClient(base_url=base_url, api_key=api_key)
+        import time
 
-        try:
-            # Get list of running models
-            # list_models returns Dict[str, Dict[str, Any]] where key is model_uid
-            models_dict = client.list_models()
+        import requests
 
-            result = []
-            for model_uid, model_info in models_dict.items():
-                result.append(
-                    {
-                        "id": model_info.get("model_name", model_uid),
-                        "model_uid": model_uid,
-                        "model_type": model_info.get("model_type", ""),
-                        "model_ability": model_info.get("model_ability", []),
-                        "description": model_info.get("model_description", ""),
-                    }
+        # Ensure base_url doesn't have trailing slash
+        base_url = base_url.rstrip("/")
+
+        # Map Xinference abilities to Xagent abilities
+        ability_mapping = {
+            "audio2text": "asr",
+            "text2audio": "tts",
+            "text2audio_zero_shot": "tts",
+            "text2audio_voice_cloning": "tts",
+            "chat": "chat",
+            "vision": "vision",
+            "tool_calling": "tool_calling",
+        }
+
+        # Retry logic for transient network issues
+        max_retries = 3
+        retry_delay = 1.0  # seconds
+
+        for attempt in range(max_retries):
+            try:
+                # Direct HTTP request instead of using xinference-client
+                # This gives us better control over error handling
+                url = f"{base_url}/v1/models"
+                headers = {}
+
+                if api_key:
+                    headers["Authorization"] = f"Bearer {api_key}"
+
+                logger.debug(
+                    f"Fetching models from Xinference: {url} (attempt {attempt + 1}/{max_retries})"
                 )
 
-            return result
+                response = requests.get(url, headers=headers, timeout=10)
 
-        except Exception as e:
-            logger.error(f"Failed to fetch models from Xinference: {e}")
-            return []
+                # Log response details for debugging
+                logger.debug(f"Response status: {response.status_code}")
+                logger.debug(f"Response headers: {dict(response.headers)}")
+                logger.debug(f"Response content length: {len(response.content)}")
 
-        finally:
-            client.close()
+                if response.status_code != 200:
+                    raise RuntimeError(
+                        f"HTTP {response.status_code}: {response.text[:500]}"
+                    )
+
+                # Check if response is empty
+                if not response.text or len(response.text.strip()) == 0:
+                    if attempt < max_retries - 1:
+                        logger.warning(
+                            f"Empty response from Xinference, retrying in {retry_delay}s..."
+                        )
+                        time.sleep(retry_delay)
+                        continue
+                    else:
+                        raise RuntimeError("Empty response from Xinference server")
+
+                # Parse JSON
+                try:
+                    response_data = response.json()
+                except ValueError as e:
+                    # Invalid JSON response
+                    if attempt < max_retries - 1:
+                        logger.warning(
+                            f"Invalid JSON response, retrying in {retry_delay}s... Response: {response.text[:200]}"
+                        )
+                        time.sleep(retry_delay)
+                        continue
+                    else:
+                        raise RuntimeError(
+                            f"Invalid JSON response from server: {e}. Response: {response.text[:200]}"
+                        )
+
+                # Extract model data
+                model_list = response_data.get("data", [])
+
+                result = []
+                for model_info in model_list:
+                    model_uid = model_info.get("id", "")
+                    if not model_uid:
+                        continue
+
+                    # Map abilities
+                    xinference_abilities = model_info.get("model_ability", [])
+                    mapped_abilities = []
+                    for ability in xinference_abilities:
+                        mapped_ability = ability_mapping.get(ability, ability)
+                        if mapped_ability not in mapped_abilities:
+                            mapped_abilities.append(mapped_ability)
+
+                    result.append(
+                        {
+                            "id": model_info.get("model_name", model_uid),
+                            "model_uid": model_uid,
+                            "model_type": model_info.get("model_type", ""),
+                            "model_ability": mapped_abilities,
+                            "description": model_info.get("model_description", ""),
+                        }
+                    )
+
+                logger.info(
+                    f"Successfully fetched {len(result)} models from Xinference"
+                )
+                return result
+
+            except requests.exceptions.RequestException as e:
+                # Network error
+                if attempt < max_retries - 1:
+                    logger.warning(
+                        f"Network error connecting to Xinference, retrying in {retry_delay}s: {e}"
+                    )
+                    time.sleep(retry_delay)
+                    continue
+                else:
+                    logger.error(
+                        f"Failed to connect to Xinference after {max_retries} attempts: {e}"
+                    )
+                    raise RuntimeError(
+                        f"Cannot connect to Xinference server at {base_url}: {e}"
+                    )
+
+            except Exception as e:
+                # Other errors should not be retried
+                error_msg = str(e)
+                if "Expecting value" in error_msg or "JSON decode" in error_msg:
+                    logger.error(
+                        f"JSON parsing error: {error_msg}. This usually means the server returned invalid data."
+                    )
+                elif "Connection" in error_msg or "resolve" in error_msg:
+                    logger.error(
+                        f"Connection error: Cannot connect to {base_url}. Please check if the server is running."
+                    )
+                else:
+                    logger.error(
+                        f"Unexpected error fetching models from Xinference: {error_msg}"
+                    )
+                raise
+
+        # This should never be reached, but mypy needs it
+        return []

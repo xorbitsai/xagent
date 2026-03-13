@@ -5,7 +5,9 @@ from .model import (
     ImageModelConfig,
     ModelConfig,
     RerankModelConfig,
+    SpeechModelConfig,
 )
+from .tts import BaseTTS, TTSResult, XinferenceTTS, get_tts_model
 
 __all__ = [
     "ModelConfig",
@@ -13,5 +15,10 @@ __all__ = [
     "ImageModelConfig",
     "RerankModelConfig",
     "EmbeddingModelConfig",
+    "SpeechModelConfig",
     "DashScopeEmbedding",
+    "BaseTTS",
+    "TTSResult",
+    "XinferenceTTS",
+    "get_tts_model",
 ]

@@ -63,6 +63,12 @@ class SpeechModelConfig(ModelConfig):
 
     model_provider: str = "xinference"  # xinference, etc.
     language: Optional[str] = None  # Default language code (e.g., 'zh', 'en')
+    # TTS-specific configuration
+    voice: Optional[str] = (
+        None  # Default voice/speaker for TTS (e.g., 'female', 'male')
+    )
+    format: Optional[str] = None  # Audio format for TTS (e.g., 'mp3', 'wav', 'pcm')
+    sample_rate: Optional[int] = None  # Sample rate for TTS in Hz (e.g., 24000, 48000)
 
 
 class VectorDBConfig(ModelConfig):

@@ -61,13 +61,16 @@ Advanced features (if supported by model):
 - Smart segment merging: consecutive segments from same speaker are automatically merged (gap < 1s) to improve readability
 
 Output:
-- text: Complete transcribed text
 - file_id: File ID for accessing the full transcription JSON file in workspace
 - transcription_path: Path to saved transcription JSON file in workspace
 - saved_to_workspace: Whether the transcription was saved to workspace
 - segments: Detailed segment information (if verbose=True)
 - language: Detected language code
 - model_used: The actual model used for transcription
+- text_length: Length of transcribed text
+- segment_count: Number of segments
+
+Note: Use read_file(file_id) to get the full transcription text.
 
 JSON Output Format (saved to file specified by file_id):
 ```json
@@ -111,7 +114,7 @@ JSON Field Descriptions:
   - verbose_mode: Whether detailed output was requested
   - total_segments: Number of segments in the transcription
 
-Note: The complete transcription is returned directly in the 'text' field. A JSON file with detailed information (including segments) is also saved and can be accessed using the returned 'file_id' for reference or further processing.
+Note: Use read_file(file_id) to get the full transcription text.
     """.strip()
 
     # Description for synthesize_speech tool
@@ -519,13 +522,14 @@ The generated audio file will be automatically saved to workspace.
 
             return {
                 "success": True,
-                "text": text,  # Return complete transcription text
                 "file_id": file_id,
                 "transcription_path": transcription_path,
                 "segments": segments,
                 "language": language_detected,
                 "model_used": actual_model_id,
                 "saved_to_workspace": transcription_path is not None,
+                "text_length": len(text) if text else 0,
+                "segment_count": len(segments) if segments else 0,
             }
 
         except Exception as e:
@@ -536,7 +540,6 @@ The generated audio file will be automatically saved to workspace.
             return {
                 "success": False,
                 "error": str(e),
-                "text": None,
                 "file_id": None,
                 "transcription_path": None,
                 "model_used": actual_model_id,

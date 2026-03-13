@@ -29,7 +29,6 @@ class WebToolConfig(BaseToolConfig):
         allowed_collections: Optional[List[str]] = None,
         allowed_skills: Optional[List[str]] = None,
         allowed_tools: Optional[List[str]] = None,
-        llm: Optional[Any] = None,
     ):
         self.db = db
         self.request = request
@@ -52,7 +51,6 @@ class WebToolConfig(BaseToolConfig):
         self._allowed_skills = allowed_skills
         self._allowed_tools = allowed_tools
         self._excluded_agent_id: Optional[int] = None
-        self._explicit_llm = llm
 
         # Sandbox instance - only store reference, lifecycle managed by upper layer
         self._sandbox: Optional[Any] = None
@@ -68,7 +66,6 @@ class WebToolConfig(BaseToolConfig):
         self._cached_tts_model: Optional[Any] = None
         self._cached_mcp_configs: Optional[List[Dict[str, Any]]] = None
         self._cached_embedding_model: Optional[str] = None
-        self._cached_llm: Optional[Any] = None
 
     def _get_user_id_from_request(self, request: Any) -> int:
         """Extract user ID from request using JWT authentication."""
@@ -337,12 +334,6 @@ class WebToolConfig(BaseToolConfig):
             logger = logging.getLogger(__name__)
             logger.warning(f"Failed to load default TTS model: {e}")
             return None
-
-    def get_llm(self) -> Optional[Any]:
-        """Get current LLM model, prioritizing explicitly provided model."""
-        if hasattr(self, "_explicit_llm") and self._explicit_llm:
-            return self._explicit_llm
-        return None
 
     def _load_mcp_server_configs(self) -> List[Dict[str, Any]]:
         """Load MCP server configurations from database with user context."""

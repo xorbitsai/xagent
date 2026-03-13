@@ -39,12 +39,9 @@ class PythonExecutorResult(BaseModel):
 class PythonExecutorTool(AbstractBaseTool):
     """Framework wrapper for the pure Python executor tool"""
 
-    def __init__(
-        self, workspace: Optional[TaskWorkspace] = None, llm: Optional[Any] = None
-    ) -> None:
+    def __init__(self, workspace: Optional[TaskWorkspace] = None) -> None:
         self._visibility = ToolVisibility.PUBLIC
         self._workspace = workspace
-        self._llm = llm
 
     @property
     def name(self) -> str:
@@ -54,13 +51,7 @@ class PythonExecutorTool(AbstractBaseTool):
     def description(self) -> str:
         return """Execute Python code safely and return the output.
         Supports most Python operations including calculations, data processing, and visualization.
-        Captures stdout and stderr from the execution.
-
-        If LLM is available, you can use the llm() function in your code:
-        - llm("What is the capital of France?") - Simple call
-        - llm("summarize this text", system_prompt="You are a helpful assistant") - With system prompt
-
-        The llm() function returns the LLM response as a string."""
+        Captures stdout and stderr from the execution."""
 
     @property
     def tags(self) -> list[str]:
@@ -81,10 +72,8 @@ class PythonExecutorTool(AbstractBaseTool):
         # Add workspace environment variables if workspace is available
         workspace_env = self._get_workspace_env()
 
-        # Create core executor instance with llm
-        executor = PythonExecutorCore(
-            working_directory=working_directory, llm=self._llm
-        )
+        # Create core executor instance
+        executor = PythonExecutorCore(working_directory=working_directory)
 
         # Add workspace variables to the executor's globals if available
         if workspace_env:
@@ -131,7 +120,7 @@ def get_python_executor_tool(info: Optional[dict[str, Any]] = None) -> FunctionT
     Create a workspace-bound Python executor tool.
 
     Args:
-        info: Dictionary containing workspace information and llm
+        info: Dictionary containing workspace information
 
     Returns:
         A Python executor tool bound to the specified workspace
@@ -143,13 +132,8 @@ def get_python_executor_tool(info: Optional[dict[str, Any]] = None) -> FunctionT
             info["workspace"] if isinstance(info["workspace"], TaskWorkspace) else None
         )
 
-    # Extract llm from info if provided
-    llm = None
-    if info and "llm" in info:
-        llm = info["llm"]
-
     # Create workspace-bound Python executor
-    executor = PythonExecutorTool(workspace=workspace, llm=llm)
+    executor = PythonExecutorTool(workspace=workspace)
 
     # Wrap as LangChain tool
     def execute_python_code(code: str, capture_output: bool = True) -> Dict[str, Any]:

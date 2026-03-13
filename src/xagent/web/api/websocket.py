@@ -2522,7 +2522,6 @@ async def handle_build_preview_execution(
             task_id=preview_task_id,
             workspace_base_dir="uploads/build_preview",
             vision_model=vision_llm,  # Pass vision model for tool creation
-            llm=default_llm,  # Pass LLM for tool creation
         )
 
         # Create sandbox for preview task

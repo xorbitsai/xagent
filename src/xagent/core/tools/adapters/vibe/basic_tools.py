@@ -44,8 +44,7 @@ async def create_basic_tools(config: "BaseToolConfig") -> List[Any]:
     if workspace:
         from .python_executor import get_python_executor_tool
 
-        llm = config.get_llm()
-        tools.append(get_python_executor_tool({"workspace": workspace, "llm": llm}))
+        tools.append(get_python_executor_tool({"workspace": workspace}))
 
     # JavaScript executor tool (if workspace available)
     if workspace:

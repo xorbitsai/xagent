@@ -113,6 +113,13 @@ class CoreStorage:
             )
         elif db_model.category == "rerank":
             return RerankModelConfig(**common)
+        elif db_model.category == "speech":
+            from ...core.model.model import SpeechModelConfig
+
+            return SpeechModelConfig(
+                **common,
+                model_provider=db_model.model_provider,
+            )
         else:
             raise ValueError(f"Unknown model category: {db_model.category}")
 
@@ -167,8 +174,8 @@ class CoreStorage:
                 }
             )
         else:
-            # Try ImageModelConfig
-            from ...core.model.model import ImageModelConfig
+            # Try ImageModelConfig or SpeechModelConfig
+            from ...core.model.model import ImageModelConfig, SpeechModelConfig
 
             if isinstance(model, ImageModelConfig):
                 db_data.update(
@@ -176,6 +183,13 @@ class CoreStorage:
                         "model_provider": model.model_provider,
                         "max_tokens": model.default_max_tokens,
                         "category": "image",
+                    }
+                )
+            elif isinstance(model, SpeechModelConfig):
+                db_data.update(
+                    {
+                        "model_provider": model.model_provider,
+                        "category": "speech",
                     }
                 )
             else:

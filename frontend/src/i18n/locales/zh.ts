@@ -1141,6 +1141,7 @@ Build when you need.`
       llm: "LLM 模型",
       embedding: "Embedding 模型",
       image: "图像生成模型",
+      speech: "语音模型",
     },
     section: {
       enabledModels: "已启用模型",
@@ -1165,6 +1166,8 @@ Build when you need.`
       embedding: "嵌入模型",
       image: "图像生成模型",
       image_edit: "图像编辑模型",
+      asr: "语音识别模型",
+      tts: "文本转语音模型",
       shared: "已分享",
       shared_from_others: "公共模型",
     },
@@ -1256,6 +1259,8 @@ Build when you need.`
       embedding: "嵌入",
       generate: "生成",
       edit: "编辑",
+      asr: "语音识别 (ASR)",
+      tts: "文本转语音 (TTS)",
     },
     providers: {
       openai: {

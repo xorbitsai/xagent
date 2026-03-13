@@ -58,6 +58,13 @@ class RerankModelConfig(ModelConfig):
     instruct: Optional[str] = None
 
 
+class SpeechModelConfig(ModelConfig):
+    """Configuration for speech models (ASR and TTS)."""
+
+    model_provider: str = "xinference"  # xinference, etc.
+    language: Optional[str] = None  # Default language code (e.g., 'zh', 'en')
+
+
 class VectorDBConfig(ModelConfig):
     """Configuration for vector database backend (e.g. LanceDB, Weaviate).
 

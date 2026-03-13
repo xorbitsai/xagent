@@ -98,6 +98,19 @@ async def create_model(
             abilities=model.abilities,
             description=model.description,
         )
+    elif model.category == "speech":
+        from xagent.core.model.model import SpeechModelConfig
+
+        config = SpeechModelConfig(
+            id=model.model_id,
+            model_name=model.model_name,
+            model_provider=model.model_provider,
+            base_url=base_url,
+            api_key=model.api_key,
+            timeout=180.0,
+            abilities=model.abilities,
+            description=model.description,
+        )
     else:
         raise HTTPException(status_code=400, detail="Invalid model category")
 

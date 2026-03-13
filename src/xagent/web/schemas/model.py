@@ -64,6 +64,19 @@ class ModelCreate(BaseModel):
 
             if not v:
                 raise ValueError("Embedding model must have at least one ability")
+        elif category == "speech":
+            # Speech models can have "asr", "tts" abilities
+            valid_speech_abilities = {"asr", "tts"}
+            invalid_abilities = set(v) - valid_speech_abilities
+
+            if invalid_abilities:
+                raise ValueError(
+                    f"Invalid abilities for speech model: {invalid_abilities}. "
+                    f"Valid abilities are: {valid_speech_abilities}"
+                )
+
+            if not v:
+                raise ValueError("Speech model must have at least one ability")
 
         return v
 
@@ -128,6 +141,19 @@ class ModelUpdate(BaseModel):
 
             if not v:
                 raise ValueError("Embedding model must have at least one ability")
+        elif category == "speech":
+            # Speech models can have "asr", "tts" abilities
+            valid_speech_abilities = {"asr", "tts"}
+            invalid_abilities = set(v) - valid_speech_abilities
+
+            if invalid_abilities:
+                raise ValueError(
+                    f"Invalid abilities for speech model: {invalid_abilities}. "
+                    f"Valid abilities are: {valid_speech_abilities}"
+                )
+
+            if not v:
+                raise ValueError("Speech model must have at least one ability")
 
         return v
 
@@ -186,7 +212,7 @@ class UserDefaultModelCreate(BaseModel):
     """User default model configuration creation schema"""
 
     model_id: int
-    config_type: str  # 'general', 'small_fast', 'visual', 'compact', 'embedding', 'image', 'image_edit'
+    config_type: str  # 'general', 'small_fast', 'visual', 'compact', 'embedding', 'image', 'image_edit', 'asr', 'tts', 'speech'
 
     @field_validator("config_type")
     @classmethod
@@ -199,6 +225,9 @@ class UserDefaultModelCreate(BaseModel):
             "embedding",
             "image",
             "image_edit",
+            "asr",
+            "tts",
+            "speech",
         }
         if v not in valid_types:
             raise ValueError(

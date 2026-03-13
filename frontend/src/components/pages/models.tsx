@@ -172,7 +172,7 @@ const LOCAL_PROVIDER_CONFIGS: Record<string, Partial<ProviderConfig>> = {
   },
   xinference: {
     icon: <img src="/xagent_logo.svg" alt="Xinference" className="w-6 h-6" />,
-    category: ["llm", "embedding", "image"],
+    category: ["llm", "embedding", "image", "speech"],
     defaultBaseUrl: "http://localhost:9997"
   }
 }
@@ -241,6 +241,11 @@ export function ModelsPage() {
     { value: "edit", label: t('models.abilities.edit') }
   ], [t])
 
+  const speechAbilityOptions = useMemo(() => [
+    { value: "asr", label: t('models.abilities.asr') },
+    { value: "tts", label: t('models.abilities.tts') }
+  ], [t])
+
   useEffect(() => {
     fetchModels()
     loadDefaultModels()
@@ -258,7 +263,7 @@ export function ModelsPage() {
           description: p.description,
           icon: localConfig.icon || <Brain className="w-6 h-6" />,
           defaultBaseUrl: p.default_base_url || localConfig.defaultBaseUrl, // Use API default or local fallback
-          category: localConfig.category || ["llm", "embedding", "image"], // Default to all if unknown
+          category: localConfig.category || ["llm", "embedding", "image", "speech"], // Default to all if unknown
           requires_base_url: p.requires_base_url
         }
       })
@@ -326,7 +331,8 @@ export function ModelsPage() {
     return {
       llm: models.filter(m => m.category === 'llm').length,
       embedding: models.filter(m => m.category === 'embedding').length,
-      image: models.filter(m => m.category === 'image').length
+      image: models.filter(m => m.category === 'image').length,
+      speech: models.filter(m => m.category === 'speech').length
     }
   }, [models])
 
@@ -645,7 +651,7 @@ export function ModelsPage() {
       base_url: "",
       temperature: activeTab === 'llm' ? undefined : undefined,
       dimension: activeTab === 'embedding' ? undefined : undefined,
-      abilities: activeTab === 'llm' ? ["chat"] : activeTab === 'embedding' ? ["embedding"] : ["generate"],
+      abilities: activeTab === 'llm' ? ["chat"] : activeTab === 'embedding' ? ["embedding"] : activeTab === 'image' ? ["generate"] : ["asr"],
       default_config_types: []
     })
     setViewMode('form')
@@ -783,7 +789,7 @@ export function ModelsPage() {
       base_url: provider.defaultBaseUrl || "",
       temperature: activeTab === 'llm' ? undefined : undefined,
       dimension: activeTab === 'embedding' ? undefined : undefined,
-      abilities: activeTab === 'llm' ? ["chat"] : activeTab === 'embedding' ? ["embedding"] : ["generate"],
+      abilities: activeTab === 'llm' ? ["chat"] : activeTab === 'embedding' ? ["embedding"] : activeTab === 'image' ? ["generate"] : ["asr"],
       default_config_types: []
     })
 
@@ -810,7 +816,7 @@ export function ModelsPage() {
       base_url: providerConfig?.defaultBaseUrl || "",
       temperature: activeTab === 'llm' ? undefined : undefined,
       dimension: activeTab === 'embedding' ? undefined : undefined,
-      abilities: activeTab === 'llm' ? ["chat"] : activeTab === 'embedding' ? ["embedding"] : ["generate"],
+      abilities: activeTab === 'llm' ? ["chat"] : activeTab === 'embedding' ? ["embedding"] : activeTab === 'image' ? ["generate"] : ["asr"],
       default_config_types: []
     })
     setViewMode('form')
@@ -878,6 +884,17 @@ export function ModelsPage() {
                 <span className="font-medium">{t('models.tabs.image')}</span>
                 <Badge variant="secondary" className="rounded-full px-2 py-0.5 text-xs">
                   {modelCounts.image}
+                </Badge>
+              </div>
+            </TabsTrigger>
+            <TabsTrigger
+              value="speech"
+              className="flex-none rounded-none border-b-2 border-transparent data-[state=active]:border-primary data-[state=active]:bg-transparent px-0 py-2"
+            >
+              <div className="flex items-center gap-2">
+                <span className="font-medium">{t('models.tabs.speech')}</span>
+                <Badge variant="secondary" className="rounded-full px-2 py-0.5 text-xs">
+                  {modelCounts.speech}
                 </Badge>
               </div>
             </TabsTrigger>
@@ -1231,7 +1248,8 @@ export function ModelsPage() {
                     options={[
                       { value: "llm", label: t('models.tabs.llm') },
                       { value: "embedding", label: t('models.tabs.embedding') },
-                      { value: "image", label: t('models.tabs.image') }
+                      { value: "image", label: t('models.tabs.image') },
+                      { value: "speech", label: t('models.tabs.speech') }
                     ]}
                   />
                 </div>
@@ -1336,7 +1354,8 @@ export function ModelsPage() {
                   options={
                     formData.category === 'llm' ? abilityOptions :
                     formData.category === 'embedding' ? embeddingAbilityOptions :
-                    imageAbilityOptions
+                    formData.category === 'image' ? imageAbilityOptions :
+                    speechAbilityOptions
                   }
                   placeholder={t('models.form.abilitiesPlaceholder')}
                 />
@@ -1395,6 +1414,10 @@ export function ModelsPage() {
                         ...(formData.category === 'image' ? [
                           { value: "image", label: t('models.defaults.image') },
                           ...(formData.abilities?.includes('edit') ? [{ value: "image_edit", label: t('models.defaults.image_edit') }] : [])
+                        ] : []),
+                        ...(formData.category === 'speech' ? [
+                          ...(formData.abilities?.includes('asr') ? [{ value: "asr", label: t('models.defaults.asr') }] : []),
+                          ...(formData.abilities?.includes('tts') ? [{ value: "tts", label: t('models.defaults.tts') }] : [])
                         ] : [])
                       ]}
                       placeholder={t('models.form.defaultPlaceholder')}

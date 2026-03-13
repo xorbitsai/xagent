@@ -1141,6 +1141,7 @@ Build when you need.`
       llm: "LLM Models",
       embedding: "Embedding Models",
       image: "Image Generation Models",
+      speech: "Speech Models",
     },
     section: {
       enabledModels: "Enabled Models",
@@ -1165,6 +1166,8 @@ Build when you need.`
       embedding: "Embedding Model",
       image: "Image Generation Model",
       image_edit: "Image Edit",
+      asr: "Speech Recognition Model",
+      tts: "Text-to-Speech Model",
       shared: "Shared",
       shared_from_others: "Public Model",
     },
@@ -1256,6 +1259,8 @@ Build when you need.`
       embedding: "Embedding",
       generate: "Generate",
       edit: "Edit",
+      asr: "Speech Recognition (ASR)",
+      tts: "Text-to-Speech (TTS)",
     },
     providers: {
       openai: {

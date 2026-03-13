@@ -1164,6 +1164,16 @@ Example:
 }"""
             )
         else:
+            # Build tool descriptions
+            tool_descriptions = []
+            for tool_name in tool_names:
+                try:
+                    tool = self.tool_registry.get(tool_name)
+                    desc = tool.metadata.description or ""
+                    tool_descriptions.append(f"- {tool_name}: {desc}")
+                except Exception:
+                    tool_descriptions.append(f"- {tool_name}")
+
             prompt = (
                 custom_prompt
                 + f"""You are an AI assistant that uses tools to accomplish tasks.
@@ -1179,7 +1189,7 @@ You must respond with a structured action in the following JSON format:
    }}
 
 Available tools:
-{chr(10).join(f"- {name}" for name in tool_names)}
+{chr(10).join(tool_descriptions)}
 
 Rules:
 1. You must respond with valid JSON only
@@ -1263,6 +1273,16 @@ Failure case:
 }
 === END ACTION FORMAT REQUIREMENTS ==="""
         else:
+            # Build tool descriptions
+            tool_descriptions = []
+            for tool_name in tool_names:
+                try:
+                    tool = self.tool_registry.get(tool_name)
+                    desc = tool.metadata.description or ""
+                    tool_descriptions.append(f"- {tool_name}: {desc}")
+                except Exception:
+                    tool_descriptions.append(f"- {tool_name}")
+
             action_requirements = f"""
 
 === ACTION FORMAT REQUIREMENTS ===
@@ -1279,7 +1299,7 @@ You must respond with a structured action in the following JSON format:
 }}
 
 Available tools:
-{chr(10).join(f"- {name}" for name in tool_names)}
+{chr(10).join(tool_descriptions)}
 
 Rules:
 1. You must respond with valid JSON only

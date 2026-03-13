@@ -59,8 +59,9 @@ COPY alembic.ini .
 # Install app + deepdoc into venv
 RUN /opt/venv/bin/pip install --no-cache-dir ${PYPI_INDEX_URL:+--index-url $PYPI_INDEX_URL} . \
     && git clone https://github.com/xorbitsai/deepdoc-lib /opt/xagent/deepdoc-lib \
-    && cd /opt/xagent/deepdoc-lib && git checkout 88f420a1c032a07688115b5182ac6eb210efd961 \
+    && cd /opt/xagent/deepdoc-lib && git checkout 356098f9aaa063c74cb5c55b05fd1add75ceb8d4 \
     && /opt/venv/bin/pip install --no-cache-dir ${PYPI_INDEX_URL:+--index-url $PYPI_INDEX_URL} /opt/xagent/deepdoc-lib \
+    && /opt/venv/bin/python -c "from deepdoc.common.tiktoken_cache import download_cl100k_base; download_cl100k_base()" \
     && rm -rf /opt/xagent/deepdoc-lib .git
 
 ############################
@@ -129,6 +130,7 @@ COPY --from=backend-build /opt/venv /opt/venv
 COPY --from=backend-build /opt/xagent/src /opt/xagent/src
 COPY --from=backend-build /opt/xagent/pyproject.toml /opt/xagent/
 COPY --from=backend-build /opt/xagent/alembic.ini /opt/xagent/
+COPY --from=backend-build /root/.cache/deepdoc /root/.cache/deepdoc
 
 # Copy frontend package files for npm tasks (e.g., PPTX generation)
 COPY frontend/package.json frontend/package-lock.json /opt/xagent/frontend/
@@ -137,7 +139,6 @@ RUN cd /opt/xagent/frontend && npm ci \
     && python -m playwright install chromium \
     && python -c "import nltk; nltk.download('punkt'); nltk.download('punkt_tab'); nltk.download('wordnet'); nltk.download('averaged_perceptron_tagger')" \
     && unzip /root/nltk_data/corpora/wordnet.zip -d /root/nltk_data/corpora \
-    && python -c "import tiktoken; tiktoken.encoding_for_model('gpt-4')" \
     && chmod +x /opt/xagent/deploy/entrypoint.sh
 
 EXPOSE 8000

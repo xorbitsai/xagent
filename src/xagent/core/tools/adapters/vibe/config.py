@@ -118,6 +118,11 @@ class BaseToolConfig(ABC):
         """Get default TTS (text-to-speech) model."""
         pass
 
+    @abstractmethod
+    def get_llm(self) -> Optional[Any]:
+        """Get current LLM model for general text processing."""
+        pass
+
 
 class ToolConfig(BaseToolConfig):
     """Tool configuration that uses provided config dict for standalone usage."""
@@ -224,6 +229,9 @@ class ToolConfig(BaseToolConfig):
         return None  # Standalone config doesn't have web context
 
     def get_tts_model(self) -> Optional[Any]:
+        return None  # Standalone config doesn't have web context
+
+    def get_llm(self) -> Optional[Any]:
         return None  # Standalone config doesn't have web context
 
     def get_allowed_tools(self) -> Optional[List[str]]:

@@ -9,7 +9,7 @@ import logging
 import os
 import sys
 import traceback
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
 logger = logging.getLogger(__name__)
 
@@ -28,14 +28,18 @@ except ImportError:
 class PythonExecutorCore:
     """Pure Python executor without framework dependencies"""
 
-    def __init__(self, working_directory: Optional[str] = None):
+    def __init__(
+        self, working_directory: Optional[str] = None, llm: Optional[Any] = None
+    ):
         """
         Initialize the Python executor.
 
         Args:
             working_directory: Directory to use as working directory during execution
+            llm: Optional LLM instance to inject into execution environment
         """
         self.working_directory = working_directory
+        self._llm = llm
 
     def execute_code(self, code: str, capture_output: bool = True) -> Dict[str, Any]:
         """
@@ -152,6 +156,10 @@ class PythonExecutorCore:
             "all": all,
         }
 
+        # Add llm function if available
+        if self._llm:
+            safe_globals["llm"] = self._create_llm_function()
+
         # Add common modules
         try:
             import datetime
@@ -196,10 +204,82 @@ class PythonExecutorCore:
 
         return safe_globals
 
+    def _create_llm_function(self) -> Any:
+        """Create an llm function that uses the configured LLM instance."""
+
+        async def async_llm(prompt: str, system_prompt: Optional[str] = None) -> str:
+            """Call LLM with the given prompt."""
+            try:
+                if not self._llm:
+                    return "LLM Error: No LLM instance available"
+
+                messages = []
+                if system_prompt:
+                    messages.append({"role": "system", "content": system_prompt})
+                messages.append({"role": "user", "content": prompt})
+
+                response = await self._llm.chat(messages=messages)
+                if isinstance(response, str):
+                    return response
+                elif isinstance(response, dict):
+                    content = response.get("content")
+                    return str(content) if content is not None else str(response)
+                else:
+                    return str(response)
+            except Exception as e:
+                logger = logging.getLogger(__name__)
+                logger.error(f"LLM call failed: {e}")
+                return f"LLM Error: {str(e)}"
+
+        def sync_llm(prompt: str, system_prompt: Optional[str] = None) -> str:
+            """Synchronous wrapper for LLM call."""
+            try:
+                import asyncio
+
+                loop = asyncio.get_event_loop()
+                if loop.is_running():
+                    # If we're in an async context, we need to run in a new thread
+                    import threading
+
+                    result_container: List[Any] = [None]
+                    exception_container: List[Optional[Exception]] = [None]
+
+                    def run_async() -> None:
+                        try:
+                            new_loop = asyncio.new_event_loop()
+                            asyncio.set_event_loop(new_loop)
+                            result_container[0] = new_loop.run_until_complete(
+                                async_llm(prompt, system_prompt)
+                            )
+                        except Exception as e:
+                            exception_container[0] = e
+                        finally:
+                            new_loop.close()
+
+                    thread = threading.Thread(target=run_async)
+                    thread.start()
+                    thread.join()
+
+                    if exception_container[0]:
+                        raise exception_container[0]
+                    return str(result_container[0])
+                else:
+                    result = loop.run_until_complete(async_llm(prompt, system_prompt))
+                    return str(result)
+            except Exception as e:
+                logger = logging.getLogger(__name__)
+                logger.error(f"LLM call failed: {e}")
+                return f"LLM Error: {str(e)}"
+
+        return sync_llm
+
 
 # Convenience function for direct usage
 def execute_python_code(
-    code: str, capture_output: bool = True, working_directory: Optional[str] = None
+    code: str,
+    capture_output: bool = True,
+    working_directory: Optional[str] = None,
+    llm: Optional[Any] = None,
 ) -> Dict[str, Any]:
     """
     Execute Python code and return result.
@@ -208,9 +288,10 @@ def execute_python_code(
         code: Python code to execute
         capture_output: Whether to capture stdout/stderr
         working_directory: Directory to use as working directory
+        llm: Optional LLM instance to inject into execution environment
 
     Returns:
         Dictionary with execution results
     """
-    executor = PythonExecutorCore(working_directory)
+    executor = PythonExecutorCore(working_directory, llm)
     return executor.execute_code(code, capture_output)

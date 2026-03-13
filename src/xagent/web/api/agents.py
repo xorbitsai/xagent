@@ -790,6 +790,7 @@ async def preview_agent(
             allowed_skills=request.skills if request.skills else None,
             task_id=preview_task_id,
             workspace_base_dir="uploads/preview",
+            llm=default_llm,
         )
 
         # Determine execution mode (default to "graph")

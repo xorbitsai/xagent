@@ -8,10 +8,11 @@ This module provides audio processing capabilities including:
 Uses pre-configured ASR and TTS models passed from the web layer.
 """
 
+import json
 import logging
 import uuid
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
 from ...model.asr.base import ASRResult, BaseASR
 from ...model.tts.base import BaseTTS, TTSResult
@@ -38,7 +39,7 @@ Available models (⭐[DEFAULT] marks the configured default model):
 **IMPORTANT: Prefer the default model marked with ⭐[DEFAULT]. Only specify model_id if the user explicitly requests a different model.**
 
 Parameters:
-- audio (required): audio file path, file_id, or URL to transcribe
+- audio_file_path (required): audio file path, file_id, or URL to transcribe
 - language (optional): language code (e.g., 'zh', 'en', 'yue', 'ja', 'ko')
 - model_id (optional): specific ASR model to use. Omit to use the default model marked with ⭐[DEFAULT].
 - verbose (optional): if True, return detailed result with segments and timing. Default: False (returns text only)
@@ -57,8 +58,60 @@ Advanced features (if supported by model):
 - Speaker diarization: identify different speakers
 - Timestamps: get word-level or segment-level timing
 - Confidence scores: get transcription confidence
+- Smart segment merging: consecutive segments from same speaker are automatically merged (gap < 1s) to improve readability
 
-The transcribed text will be returned automatically.
+Output:
+- text: Complete transcribed text
+- file_id: File ID for accessing the full transcription JSON file in workspace
+- transcription_path: Path to saved transcription JSON file in workspace
+- saved_to_workspace: Whether the transcription was saved to workspace
+- segments: Detailed segment information (if verbose=True)
+- language: Detected language code
+- model_used: The actual model used for transcription
+
+JSON Output Format (saved to file specified by file_id):
+```json
+{{
+  "model": "model_name",
+  "language": "zh",
+  "text": "Full transcribed text here...",
+  "segments": [
+    {{
+      "text": "Segment text",
+      "start": 0.0,
+      "end": 2.5,
+      "speaker": "spk1",
+      "confidence": 0.95
+    }}
+  ],
+  "metadata": {{
+    "audio_source": "input_audio.mp3",
+    "verbose_mode": true,
+    "total_segments": 10
+  }}
+}}
+```
+
+JSON Field Descriptions:
+- model: Name of the ASR model used
+- language: Detected/specified language code
+- text: Complete transcribed text (full content, not truncated)
+- segments: Array of detailed segments (auto-merged for readability)
+  - text: Segment text content
+  - start: Segment start time in seconds
+  - end: Segment end time in seconds
+  - speaker: Speaker identifier (if diarization enabled)
+  - confidence: Confidence score (0-1, if supported by model)
+
+  Note: Segments are automatically merged when consecutive segments from
+  the same speaker are close together (< 1 second gap) to improve readability
+  and reduce fragmentation.
+- metadata: Additional information about the transcription
+  - audio_source: Original audio input
+  - verbose_mode: Whether detailed output was requested
+  - total_segments: Number of segments in the transcription
+
+Note: The complete transcription is returned directly in the 'text' field. A JSON file with detailed information (including segments) is also saved and can be accessed using the returned 'file_id' for reference or further processing.
     """.strip()
 
     # Description for synthesize_speech tool
@@ -207,6 +260,52 @@ The generated audio file will be automatically saved to workspace.
 
         return None
 
+    def _merge_segments(
+        self, segments: List[Dict[str, Any]], max_gap: float = 1.0
+    ) -> List[Dict[str, Any]]:
+        """
+        Merge consecutive segments from the same speaker.
+
+        Args:
+            segments: List of segment dictionaries
+            max_gap: Maximum time gap (seconds) to merge segments
+
+        Returns:
+            List of merged segments with combined text and updated time ranges
+        """
+        if not segments:
+            return []
+
+        merged = []
+        current = segments[0].copy()
+
+        for next_seg in segments[1:]:
+            # Check if segments should be merged
+            gap = next_seg["start"] - current["end"]
+            same_speaker = next_seg.get("speaker") == current.get("speaker")
+
+            if same_speaker and gap <= max_gap:
+                # Merge segments
+                current["text"] += " " + next_seg["text"]
+                current["end"] = next_seg["end"]
+                # Update confidence to average if both exist
+                if (
+                    current.get("confidence") is not None
+                    and next_seg.get("confidence") is not None
+                ):
+                    current["confidence"] = (
+                        current["confidence"] + next_seg["confidence"]
+                    ) / 2
+                elif next_seg.get("confidence") is not None:
+                    current["confidence"] = next_seg["confidence"]
+            else:
+                # Don't merge, save current segment
+                merged.append(current)
+                current = next_seg.copy()
+
+        merged.append(current)
+        return merged
+
     def _get_tts_model(self, model_id: Optional[str] = None) -> Optional[BaseTTS]:
         """Get TTS model by ID or default model."""
         if model_id and model_id in self._tts_models:
@@ -278,7 +377,7 @@ The generated audio file will be automatically saved to workspace.
 
     async def transcribe_audio(
         self,
-        audio: str,
+        audio_file_path: str,
         language: Optional[str] = None,
         model_id: Optional[str] = None,
         verbose: bool = False,
@@ -288,14 +387,26 @@ The generated audio file will be automatically saved to workspace.
         Transcribe audio to text using ASR.
 
         Args:
-            audio: Audio file path, file_id, or URL to transcribe
+            audio_file_path: Audio file path, file_id, or URL to transcribe
             language: Language code (e.g., 'zh', 'en', 'yue')
             model_id: Specific ASR model to use (optional, uses default if not provided)
             verbose: If True, return detailed result with segments and timing
             **kwargs: Additional model-specific parameters
 
         Returns:
-            Dictionary with transcription result
+            Dictionary with transcription result containing:
+            - success (bool): Whether transcription succeeded
+            - text (str): Complete transcribed text
+            - file_id (str): File ID for accessing the transcription JSON file in workspace
+            - transcription_path (str): Path to saved transcription JSON file in workspace
+            - saved_to_workspace (bool): Whether the transcription was saved to workspace
+            - segments (list): Detailed segment information (if verbose=True)
+            - language (str): Detected language code
+            - model_used (str): The actual model used for transcription
+            - error (str): Error message if success=False
+
+            The complete transcription is returned in the 'text' field. Additional details
+            and segments are also saved to a JSON file specified by 'file_id' for reference.
         """
         try:
             # Get the ASR model to use
@@ -309,7 +420,7 @@ The generated audio file will be automatically saved to workspace.
                 }
 
             # Resolve audio path
-            audio_path = self._resolve_audio_path(audio)
+            audio_path = self._resolve_audio_path(audio_file_path)
 
             # Transcribe the audio
             result = asr_model.transcribe(
@@ -349,12 +460,72 @@ The generated audio file will be automatically saved to workspace.
                 )
                 language_detected = result.language
 
+            # Merge segments to reduce fragmentation
+            if segments:
+                merged_segments = self._merge_segments(segments, max_gap=1.0)
+                logger.info(
+                    f"Merged {len(segments)} segments into {len(merged_segments)} segments"
+                )
+                segments = merged_segments
+
+            # Save transcription to JSON file if workspace is available
+            file_id: Optional[str] = None
+            transcription_path = None
+
+            if text and self._workspace:
+                try:
+                    # Generate filename for transcription
+                    filename = f"transcription_{uuid.uuid4().hex[:8]}.json"
+
+                    # Build structured JSON data
+                    transcription_data = {
+                        "model": actual_model_id,
+                        "language": language_detected,
+                        "text": text,
+                        "segments": segments,
+                        "metadata": {
+                            "audio_source": audio_file_path,
+                            "verbose_mode": verbose,
+                            "total_segments": len(segments) if segments else 0,
+                            "segments_merged": True,
+                        },
+                    }
+
+                    # Register and save file in workspace
+                    with self._workspace.auto_register_files():
+                        save_path = self._workspace.output_dir / filename
+
+                        # Write transcription to JSON file
+                        with open(save_path, "w", encoding="utf-8") as f:
+                            json.dump(
+                                transcription_data, f, ensure_ascii=False, indent=2
+                            )
+
+                        transcription_path = str(save_path)
+                        logger.info(f"Saved transcription to: {transcription_path}")
+
+                    # Get file ID from workspace after registration
+                    if transcription_path:
+                        file_id = self._workspace.get_file_id_from_path(
+                            transcription_path
+                        )
+
+                except Exception as e:
+                    logger.warning(f"Failed to save transcription to workspace: {e}")
+            elif text and not self._workspace:
+                logger.warning(
+                    "No workspace available, transcription not saved locally"
+                )
+
             return {
                 "success": True,
-                "text": text,
+                "text": text,  # Return complete transcription text
+                "file_id": file_id,
+                "transcription_path": transcription_path,
                 "segments": segments,
                 "language": language_detected,
                 "model_used": actual_model_id,
+                "saved_to_workspace": transcription_path is not None,
             }
 
         except Exception as e:
@@ -366,6 +537,8 @@ The generated audio file will be automatically saved to workspace.
                 "success": False,
                 "error": str(e),
                 "text": None,
+                "file_id": None,
+                "transcription_path": None,
                 "model_used": actual_model_id,
             }
 
@@ -390,7 +563,16 @@ The generated audio file will be automatically saved to workspace.
             **kwargs: Additional model-specific parameters
 
         Returns:
-            Dictionary with synthesis result
+            Dictionary with synthesis result containing:
+            - success (bool): Whether synthesis succeeded
+            - audio_path (str): Path to generated audio file
+            - file_id (str): File ID for accessing the audio file
+            - format (str): Audio format (e.g., 'mp3', 'wav')
+            - sample_rate (int): Audio sample rate
+            - language (str): Detected/specified language
+            - model_used (str): The actual model used for synthesis
+            - saved_to_workspace (bool): Whether the audio was saved to workspace
+            - error (str): Error message if success=False
         """
         try:
             # Get the TTS model to use
@@ -440,17 +622,20 @@ The generated audio file will be automatically saved to workspace.
                 try:
                     # Generate filename
                     filename = f"synthesized_speech_{uuid.uuid4().hex[:8]}.{audio_format or 'mp3'}"
-                    save_path = self._workspace.output_dir / filename
 
-                    # Write audio data
-                    with open(save_path, "wb") as f:
-                        f.write(audio_data)
-
-                    audio_path = str(save_path)
-                    logger.info(f"Saved synthesized audio to: {audio_path}")
-
-                    # Register file in workspace
+                    # Register and save audio file in workspace
                     with self._workspace.auto_register_files():
+                        save_path = self._workspace.output_dir / filename
+
+                        # Write audio data
+                        with open(save_path, "wb") as f:
+                            f.write(audio_data)
+
+                        audio_path = str(save_path)
+                        logger.info(f"Saved synthesized audio to: {audio_path}")
+
+                    # Get file ID from workspace after registration
+                    if audio_path:
                         audio_file_id = self._workspace.get_file_id_from_path(
                             audio_path
                         )
@@ -489,7 +674,14 @@ The generated audio file will be automatically saved to workspace.
         List all available audio models (ASR and TTS).
 
         Returns:
-            Dictionary with available models information including descriptions
+            Dictionary containing:
+            - success (bool): Whether operation succeeded
+            - asr_models (list): List of ASR model information
+            - tts_models (list): List of TTS model information
+            - default_asr_model (str): Default ASR model ID (if set)
+            - default_tts_model (str): Default TTS model ID (if set)
+
+            Each model info contains: type, model_id, available, description
         """
         try:
             asr_models_info = []

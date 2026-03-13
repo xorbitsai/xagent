@@ -1027,9 +1027,10 @@ class BrowserPdfTool(AbstractBaseTool):
                 # Always save to output directory
                 file_path = self._workspace.output_dir / filename
 
-                # Save to file
-                with open(file_path, "wb") as f:
-                    f.write(pdf_bytes)
+                # Save to file within auto_register context
+                with self._workspace.auto_register_files():
+                    with open(file_path, "wb") as f:
+                        f.write(pdf_bytes)
 
                 relative_path = str(
                     file_path.relative_to(self._workspace.workspace_dir)

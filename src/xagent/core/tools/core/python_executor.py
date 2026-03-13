@@ -230,14 +230,8 @@ class PythonExecutorCore:
             """Synchronous wrapper for LLM call."""
             import asyncio
 
-            # Always create new event loop in thread pool context
-            new_loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(new_loop)
-            try:
-                result = new_loop.run_until_complete(async_llm(prompt, system_prompt))
-                return str(result)
-            finally:
-                new_loop.close()
+            # Use asyncio.run() to properly handle loop and Future cleanup
+            return asyncio.run(async_llm(prompt, system_prompt))
 
         return sync_llm
 

@@ -42,7 +42,7 @@ Parameters:
 - audio_file_path (required): audio file path, file_id, or URL to transcribe
 - language (optional): language code (e.g., 'zh', 'en', 'yue', 'ja', 'ko')
 - model_id (optional): specific ASR model to use. Omit to use the default model marked with ⭐[DEFAULT].
-- verbose (optional): if True, return detailed result with segments and timing. Default: False (returns text only)
+- verbose (optional): Set to True if you need segment details in the return value. Default: False
 
 Language support:
 - 'zh': Chinese (Mandarin)
@@ -64,7 +64,7 @@ Output:
 - file_id: File ID for accessing the full transcription JSON file in workspace
 - transcription_path: Path to saved transcription JSON file in workspace
 - saved_to_workspace: Whether the transcription was saved to workspace
-- segments: Detailed segment information (if verbose=True)
+- segments: Detailed segment information (only present if verbose=True)
 - language: Detected language code
 - model_used: The actual model used for transcription
 - text_length: Length of transcribed text
@@ -399,17 +399,18 @@ The generated audio file will be automatically saved to workspace.
         Returns:
             Dictionary with transcription result containing:
             - success (bool): Whether transcription succeeded
-            - text (str): Complete transcribed text
-            - file_id (str): File ID for accessing the transcription JSON file in workspace
-            - transcription_path (str): Path to saved transcription JSON file in workspace
-            - saved_to_workspace (bool): Whether the transcription was saved to workspace
-            - segments (list): Detailed segment information (if verbose=True)
+            - file_id (str): File ID for accessing the transcription JSON file
+            - transcription_path (str): Path to saved transcription JSON file
+            - saved_to_workspace (bool): Whether the transcription was saved
+            - segments (list): Detailed segment information (only if verbose=True)
             - language (str): Detected language code
-            - model_used (str): The actual model used for transcription
+            - model_used (str): The actual model used
+            - text_length (int): Length of transcribed text
+            - segment_count (int): Number of segments
             - error (str): Error message if success=False
 
-            The complete transcription is returned in the 'text' field. Additional details
-            and segments are also saved to a JSON file specified by 'file_id' for reference.
+            Note: Complete transcription text is saved in JSON file (use file_id).
+            Segments are only in response when verbose=True.
         """
         try:
             # Get the ASR model to use

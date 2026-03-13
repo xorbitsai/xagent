@@ -209,47 +209,35 @@ class PythonExecutorCore:
 
         async def async_llm(prompt: str, system_prompt: Optional[str] = None) -> str:
             """Call LLM with the given prompt."""
-            try:
-                if not self._llm:
-                    return "LLM Error: No LLM instance available"
+            if not self._llm:
+                raise ValueError("No LLM instance available")
 
-                messages = []
-                if system_prompt:
-                    messages.append({"role": "system", "content": system_prompt})
-                messages.append({"role": "user", "content": prompt})
+            messages = []
+            if system_prompt:
+                messages.append({"role": "system", "content": system_prompt})
+            messages.append({"role": "user", "content": prompt})
 
-                response = await self._llm.chat(messages=messages)
-                if isinstance(response, str):
-                    return response
-                elif isinstance(response, dict):
-                    content = response.get("content")
-                    return str(content) if content is not None else str(response)
-                else:
-                    return str(response)
-            except Exception as e:
-                logger = logging.getLogger(__name__)
-                logger.error(f"LLM call failed: {e}")
-                return f"LLM Error: {str(e)}"
+            response = await self._llm.chat(messages=messages)
+            if isinstance(response, str):
+                return response
+            elif isinstance(response, dict):
+                content = response.get("content")
+                return str(content) if content is not None else str(response)
+            else:
+                return str(response)
 
         def sync_llm(prompt: str, system_prompt: Optional[str] = None) -> str:
             """Synchronous wrapper for LLM call."""
-            try:
-                import asyncio
+            import asyncio
 
-                # Always create new event loop in thread pool context
-                new_loop = asyncio.new_event_loop()
-                asyncio.set_event_loop(new_loop)
-                try:
-                    result = new_loop.run_until_complete(
-                        async_llm(prompt, system_prompt)
-                    )
-                    return str(result)
-                finally:
-                    new_loop.close()
-            except Exception as e:
-                logger = logging.getLogger(__name__)
-                logger.error(f"LLM call failed: {e}")
-                return f"LLM Error: {str(e)}"
+            # Always create new event loop in thread pool context
+            new_loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(new_loop)
+            try:
+                result = new_loop.run_until_complete(async_llm(prompt, system_prompt))
+                return str(result)
+            finally:
+                new_loop.close()
 
         return sync_llm
 

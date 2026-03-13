@@ -807,3 +807,279 @@ def get_default_embedding_model(user_id: Optional[int] = None) -> Optional[str]:
         return str(embedding_models[0].model.model_id)
 
     return None
+
+
+def get_asr_models(db: Session, user_id: Optional[int] = None) -> Dict[str, Any]:
+    """
+    Get ASR (speech-to-text) models from database.
+
+    Args:
+        db: Database session
+        user_id: User ID (currently ignored as models are shared)
+
+    Returns:
+        Dictionary of ASR model instances
+    """
+    asr_models: dict[str, Any] = {}
+    try:
+        from ..models.model import Model as DBModel
+
+        db_models = (
+            db.query(DBModel)
+            .filter(
+                DBModel.category == "speech",
+                DBModel.is_active,
+                DBModel.abilities.contains("asr"),
+            )
+            .all()
+        )
+
+        for db_model in db_models:
+            # Validate API key
+            if not db_model.api_key:
+                raise ValueError("ASR model API key cannot be empty")
+            # Validate base URL
+            if not db_model.base_url:
+                raise ValueError("ASR model base URL cannot be empty")
+
+            model_provider = str(db_model.model_provider).strip().lower()
+            try:
+                if model_provider == "xinference":
+                    from ...core.model.asr.adapter import get_asr_model_instance
+
+                    asr_model = get_asr_model_instance(db_model)
+                    asr_models[str(db_model.model_name)] = asr_model
+                    logger.info(f"Added ASR model: {db_model.model_name}")
+                else:
+                    logger.warning(f"Unsupported ASR model provider: {model_provider}")
+            except Exception as e:
+                logger.warning(f"Failed to create ASR model {db_model.model_name}: {e}")
+
+    except Exception as e:
+        logger.error(f"Failed to load ASR models: {e}")
+
+    return asr_models
+
+
+def get_tts_models(db: Session, user_id: Optional[int] = None) -> Dict[str, Any]:
+    """
+    Get TTS (text-to-speech) models from database.
+
+    Args:
+        db: Database session
+        user_id: User ID (currently ignored as models are shared)
+
+    Returns:
+        Dictionary of TTS model instances
+    """
+    tts_models: dict[str, Any] = {}
+    try:
+        from ..models.model import Model as DBModel
+
+        db_models = (
+            db.query(DBModel)
+            .filter(
+                DBModel.category == "speech",
+                DBModel.is_active,
+                DBModel.abilities.contains("tts"),
+            )
+            .all()
+        )
+
+        for db_model in db_models:
+            # Validate API key
+            if not db_model.api_key:
+                raise ValueError("TTS model API key cannot be empty")
+            # Validate base URL
+            if not db_model.base_url:
+                raise ValueError("TTS model base URL cannot be empty")
+
+            model_provider = str(db_model.model_provider).strip().lower()
+            try:
+                if model_provider == "xinference":
+                    from ...core.model.tts.adapter import get_tts_model_instance
+
+                    tts_model = get_tts_model_instance(db_model)
+                    tts_models[str(db_model.model_name)] = tts_model
+                    logger.info(f"Added TTS model: {db_model.model_name}")
+                else:
+                    logger.warning(f"Unsupported TTS model provider: {model_provider}")
+            except Exception as e:
+                logger.warning(f"Failed to create TTS model {db_model.model_name}: {e}")
+
+    except Exception as e:
+        logger.error(f"Failed to load TTS models: {e}")
+
+    return tts_models
+
+
+def get_default_asr_model(user_id: Optional[int] = None) -> Optional[Any]:
+    """
+    Get the default ASR model for a specific user.
+
+    Args:
+        user_id: User ID for multi-tenant model resolution. If None, uses admin defaults.
+
+    Returns:
+        The default ASR model or None if not available
+    """
+    try:
+        from ...core.model.asr.adapter import get_asr_model_instance
+        from ..models.database import get_db
+        from ..models.model import Model as DBModel
+        from ..models.user import User, UserDefaultModel, UserModel
+
+        try:
+            db = next(get_db())
+
+            # If user_id is provided, get user-specific default
+            if user_id:
+                asr_default = (
+                    db.query(UserDefaultModel)
+                    .join(UserModel, UserDefaultModel.model_id == UserModel.model_id)
+                    .join(DBModel, UserModel.model_id == DBModel.id)
+                    .filter(
+                        UserDefaultModel.user_id == user_id,
+                        UserDefaultModel.config_type == "asr",
+                        UserModel.user_id == user_id,
+                    )
+                    .first()
+                )
+
+                if asr_default and asr_default.model:
+                    try:
+                        return get_asr_model_instance(asr_default.model)
+                    except Exception as e:
+                        logger.warning(f"Failed to create ASR model instance: {e}")
+
+            # Admin defaults
+            admin_asr_defaults = (
+                db.query(UserDefaultModel)
+                .join(UserModel, UserDefaultModel.model_id == UserModel.model_id)
+                .join(DBModel, UserModel.model_id == DBModel.id)
+                .filter(
+                    UserDefaultModel.config_type == "asr",
+                    UserModel.is_shared,
+                    UserDefaultModel.user_id.in_(
+                        db.query(User.id).filter(User.is_admin)
+                    ),
+                )
+                .limit(1)
+                .all()
+            )
+
+            if admin_asr_defaults:
+                try:
+                    return get_asr_model_instance(admin_asr_defaults[0].model)
+                except Exception as e:
+                    logger.warning(f"Failed to create ASR model instance: {e}")
+
+            # Any shared defaults
+            asr_models = (
+                db.query(UserDefaultModel)
+                .join(UserModel, UserDefaultModel.model_id == UserModel.model_id)
+                .join(DBModel, UserModel.model_id == DBModel.id)
+                .filter(UserDefaultModel.config_type == "asr", UserModel.is_shared)
+                .limit(1)
+                .all()
+            )
+
+            if asr_models:
+                try:
+                    return get_asr_model_instance(asr_models[0].model)
+                except Exception as e:
+                    logger.warning(f"Failed to create ASR model instance: {e}")
+
+        except Exception as e:
+            logger.warning(f"Database query failed for ASR model: {e}")
+
+    except Exception as e:
+        logger.error(f"Failed to get default ASR model: {e}")
+
+    return None
+
+
+def get_default_tts_model(user_id: Optional[int] = None) -> Optional[Any]:
+    """
+    Get the default TTS model for a specific user.
+
+    Args:
+        user_id: User ID for multi-tenant model resolution. If None, uses admin defaults.
+
+    Returns:
+        The default TTS model or None if not available
+    """
+    try:
+        from ...core.model.tts.adapter import get_tts_model_instance
+        from ..models.database import get_db
+        from ..models.model import Model as DBModel
+        from ..models.user import User, UserDefaultModel, UserModel
+
+        try:
+            db = next(get_db())
+
+            # If user_id is provided, get user-specific default
+            if user_id:
+                tts_default = (
+                    db.query(UserDefaultModel)
+                    .join(UserModel, UserDefaultModel.model_id == UserModel.model_id)
+                    .join(DBModel, UserModel.model_id == DBModel.id)
+                    .filter(
+                        UserDefaultModel.user_id == user_id,
+                        UserDefaultModel.config_type == "tts",
+                        UserModel.user_id == user_id,
+                    )
+                    .first()
+                )
+
+                if tts_default and tts_default.model:
+                    try:
+                        return get_tts_model_instance(tts_default.model)
+                    except Exception as e:
+                        logger.warning(f"Failed to create TTS model instance: {e}")
+
+            # Admin defaults
+            admin_tts_defaults = (
+                db.query(UserDefaultModel)
+                .join(UserModel, UserDefaultModel.model_id == UserModel.model_id)
+                .join(DBModel, UserModel.model_id == DBModel.id)
+                .filter(
+                    UserDefaultModel.config_type == "tts",
+                    UserModel.is_shared,
+                    UserDefaultModel.user_id.in_(
+                        db.query(User.id).filter(User.is_admin)
+                    ),
+                )
+                .limit(1)
+                .all()
+            )
+
+            if admin_tts_defaults:
+                try:
+                    return get_tts_model_instance(admin_tts_defaults[0].model)
+                except Exception as e:
+                    logger.warning(f"Failed to create TTS model instance: {e}")
+
+            # Any shared defaults
+            tts_models = (
+                db.query(UserDefaultModel)
+                .join(UserModel, UserDefaultModel.model_id == UserModel.model_id)
+                .join(DBModel, UserModel.model_id == DBModel.id)
+                .filter(UserDefaultModel.config_type == "tts", UserModel.is_shared)
+                .limit(1)
+                .all()
+            )
+
+            if tts_models:
+                try:
+                    return get_tts_model_instance(tts_models[0].model)
+                except Exception as e:
+                    logger.warning(f"Failed to create TTS model instance: {e}")
+
+        except Exception as e:
+            logger.warning(f"Database query failed for TTS model: {e}")
+
+    except Exception as e:
+        logger.error(f"Failed to get default TTS model: {e}")
+
+    return None

@@ -30,7 +30,8 @@ import {
   Code,
   FileText,
   Book,
-  Loader2
+  Loader2,
+  Mic
 } from "lucide-react"
 import { getApiUrl } from "@/lib/utils"
 import { apiRequest } from "@/lib/api-wrapper"
@@ -39,7 +40,7 @@ import { useI18n } from "@/contexts/i18n-context"
 interface Tool {
   name: string
   description: string
-  type: 'builtin' | 'mcp' | 'image' | 'vision'
+  type: 'builtin' | 'mcp' | 'image' | 'vision' | 'audio'
   category: string
   display_category?: string  // Add display_category field
   enabled: boolean
@@ -289,6 +290,7 @@ export default function ToolsPage() {
     if (lowerCategory === 'browser') return <Globe className="h-6 w-6 text-blue-500" />
     if (lowerCategory === 'file') return <FileText className="h-6 w-6 text-amber-500" />
     if (lowerCategory === 'knowledge') return <Book className="h-6 w-6 text-indigo-500" />
+    if (lowerCategory === 'audio') return <Mic className="h-6 w-6 text-green-500" />
 
     if (type === 'mcp') return <Server className="h-6 w-6 text-green-600" />
     if (type === 'builtin' || lowerCategory === 'basic') return <Wrench className="h-6 w-6 text-slate-500" />

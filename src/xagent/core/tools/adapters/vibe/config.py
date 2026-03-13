@@ -29,6 +29,16 @@ class BaseToolConfig(ABC):
         pass
 
     @abstractmethod
+    def get_asr_models(self) -> Dict[str, Any]:
+        """Get ASR (speech-to-text) models."""
+        pass
+
+    @abstractmethod
+    def get_tts_models(self) -> Dict[str, Any]:
+        """Get TTS (text-to-speech) models."""
+        pass
+
+    @abstractmethod
     def get_mcp_server_configs(self) -> List[Dict[str, Any]]:
         """Get MCP server configurations."""
         pass
@@ -98,6 +108,16 @@ class BaseToolConfig(ABC):
         """Get sandbox instance for sandboxed executors. Returns None if not available."""
         pass
 
+    @abstractmethod
+    def get_asr_model(self) -> Optional[Any]:
+        """Get default ASR (speech-to-text) model."""
+        pass
+
+    @abstractmethod
+    def get_tts_model(self) -> Optional[Any]:
+        """Get default TTS (text-to-speech) model."""
+        pass
+
 
 class ToolConfig(BaseToolConfig):
     """Tool configuration that uses provided config dict for standalone usage."""
@@ -107,6 +127,8 @@ class ToolConfig(BaseToolConfig):
         workspace_config = config_dict.get("workspace")
         config_dict.get("vision_model")  # Unused in base config
         config_dict.get("image_models", [])  # Unused in base config
+        config_dict.get("asr_models", [])  # Unused in base config
+        config_dict.get("tts_models", [])  # Unused in base config
         mcp_server_configs = config_dict.get("mcp_servers", [])
         file_tools_enabled = config_dict.get("file_tools_enabled", True)
         basic_tools_enabled = config_dict.get("basic_tools_enabled", True)
@@ -124,6 +146,12 @@ class ToolConfig(BaseToolConfig):
             None  # Standalone usage typically doesn't have web context
         )
         self.image_models: Dict[
+            str, Any
+        ] = {}  # Standalone usage typically doesn't have web context
+        self.asr_models: Dict[
+            str, Any
+        ] = {}  # Standalone usage typically doesn't have web context
+        self.tts_models: Dict[
             str, Any
         ] = {}  # Standalone usage typically doesn't have web context
         self.mcp_server_configs: List[Dict[str, Any]] = mcp_server_configs
@@ -146,6 +174,12 @@ class ToolConfig(BaseToolConfig):
 
     def get_image_models(self) -> Dict[str, Any]:
         return self.image_models
+
+    def get_asr_models(self) -> Dict[str, Any]:
+        return self.asr_models
+
+    def get_tts_models(self) -> Dict[str, Any]:
+        return self.tts_models
 
     def get_mcp_server_configs(self) -> List[Dict[str, Any]]:
         return self.mcp_server_configs
@@ -184,6 +218,12 @@ class ToolConfig(BaseToolConfig):
         return None  # Standalone config doesn't have web context
 
     def get_image_edit_model(self) -> Optional[Any]:
+        return None  # Standalone config doesn't have web context
+
+    def get_asr_model(self) -> Optional[Any]:
+        return None  # Standalone config doesn't have web context
+
+    def get_tts_model(self) -> Optional[Any]:
         return None  # Standalone config doesn't have web context
 
     def get_allowed_tools(self) -> Optional[List[str]]:

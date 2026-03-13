@@ -92,9 +92,9 @@ class WorkspaceFileTools(WorkspaceFileOperations):
         """Create directory in workspace"""
         return self.inner.create_directory(directory_path, parents)
 
-    def get_file_info(self, file_path: str) -> FileInfo:
-        """Get detailed file information in workspace"""
-        return self.inner.get_file_info(file_path)
+    def get_file_info(self, file_path_or_id: str) -> FileInfo:
+        """Get detailed file information in workspace. Accepts either file paths or file_ids."""
+        return self.inner.get_file_info(file_path_or_id)
 
     def read_json_file(self, file_path: str, encoding: str = "utf-8") -> Any:
         """Read JSON file in workspace"""

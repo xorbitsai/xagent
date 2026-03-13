@@ -19,6 +19,7 @@ logger = logging.getLogger(__name__)
 CATEGORY_DISPLAY_NAMES = {
     "vision": "Vision",
     "image": "Image",
+    "audio": "Audio",
     "knowledge": "Knowledge",
     "file": "File",
     "basic": "Basic",
@@ -35,7 +36,12 @@ tools_router = APIRouter(prefix="/api/tools", tags=["tools"])
 
 
 def _create_tool_info(
-    tool: Any, category: str, vision_model: Any = None, image_models: Any = None
+    tool: Any,
+    category: str,
+    vision_model: Any = None,
+    image_models: Any = None,
+    asr_models: Any = None,
+    tts_models: Any = None,
 ) -> Dict[str, Any]:
     """Create tool information based on category instead of hardcoded names"""
     tool_name = getattr(tool, "name", tool.__class__.__name__)
@@ -51,7 +57,10 @@ def _create_tool_info(
         # vision tool depends on vision model
         if not vision_model:
             status = "missing_model"
-            status_reason = "Vision model not configured, please add a vision model in model management page"
+            status_reason = (
+                "Vision model not configured, "
+                "please add a vision model in model management page"
+            )
             enabled = False
 
     elif category == "image":
@@ -59,7 +68,10 @@ def _create_tool_info(
         # image tool depends on image models
         if not image_models:
             status = "missing_model"
-            status_reason = "Image model not configured, please add an image generation model in model management page"
+            status_reason = (
+                "Image model not configured, please add an "
+                "image generation model in model management page"
+            )
             enabled = False
         elif tool_name == "edit_image":
             # Special check for image editing capability
@@ -68,8 +80,36 @@ def _create_tool_info(
             )
             if not has_edit_capability:
                 status = "missing_capability"
-                status_reason = "Current image model does not support editing, please add an image model with editing support"
+                status_reason = (
+                    "Current image model does not support editing, "
+                    "please add an image model with editing support"
+                )
                 enabled = False
+
+    elif category == "audio":
+        tool_type = "audio"
+        # audio tool depends on ASR/TTS models
+        if not asr_models and not tts_models:
+            status = "missing_model"
+            status_reason = (
+                "Audio model not configured, please add an "
+                "ASR or TTS model in model management page"
+            )
+            enabled = False
+        elif tool_name == "transcribe_audio" and not asr_models:
+            status = "missing_model"
+            status_reason = (
+                "ASR model not configured, please add a "
+                "speech recognition model in model management page"
+            )
+            enabled = False
+        elif tool_name == "synthesize_speech" and not tts_models:
+            status = "missing_model"
+            status_reason = (
+                "TTS model not configured, please add a "
+                "text-to-speech model in model management page"
+            )
+            enabled = False
 
     elif category == "file":
         tool_type = "file"
@@ -157,11 +197,26 @@ async def get_available_tools(
         """
         return str(tool.metadata.category.value)
 
+    # Get models for tool status checking
+    vision_model = tool_config.get_vision_model()
+    image_models = tool_config.get_image_models()
+    asr_models = tool_config.get_asr_models()
+    tts_models = tool_config.get_tts_models()
+
     # Convert tools to API format with category information
     tools: List[Dict[str, Any]] = []
     for tool in all_tools:
         category = get_tool_category(tool)
-        tools.append(_create_tool_info(tool, category))
+        tools.append(
+            _create_tool_info(
+                tool,
+                category,
+                vision_model,
+                image_models,
+                asr_models,
+                tts_models,
+            )
+        )
 
     # Calculate tool usage count from ToolUsage table (execution stats)
     from collections import defaultdict

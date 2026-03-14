@@ -2,9 +2,23 @@
 
 from __future__ import annotations
 
+import importlib.util
 from unittest.mock import AsyncMock, MagicMock, Mock, patch
 
 import pytest
+
+# Handle optional xinference dependency
+if importlib.util.find_spec("xinference.client.restful.async_restful_client"):
+    _ASYNC_CLIENT_PATH = "xinference.client.restful.async_restful_client.AsyncClient"
+elif importlib.util.find_spec("xinference_client.client.restful.async_restful_client"):
+    _ASYNC_CLIENT_PATH = (
+        "xinference_client.client.restful.async_restful_client.AsyncClient"
+    )
+else:
+    pytest.skip(
+        "Neither xinference nor xinference_client is installed",
+        allow_module_level=True,
+    )
 
 from xagent.core.model.tts import TTSResult, XinferenceTTS
 
@@ -115,7 +129,7 @@ class TestXinferenceTTS:
         tts_with_voice = XinferenceTTS(voice="female")
         assert tts_with_voice.supports_multiple_voices is True
 
-    @patch("xinference.client.restful.async_restful_client.AsyncClient")
+    @patch(_ASYNC_CLIENT_PATH)
     async def test_synthesize_simple_audio_only(self, mock_client_class: Mock) -> None:
         """Test simple synthesis returning audio bytes only (verbose=False)."""
         # Setup mock
@@ -133,7 +147,7 @@ class TestXinferenceTTS:
         assert result == b"fake audio data"
         mock_model_handle.speech.assert_called_once()
 
-    @patch("xinference.client.restful.async_restful_client.AsyncClient")
+    @patch(_ASYNC_CLIENT_PATH)
     async def test_synthesize_verbose_with_metadata(
         self, mock_client_class: Mock
     ) -> None:
@@ -154,7 +168,7 @@ class TestXinferenceTTS:
         assert result.format == "mp3"
         assert result.sample_rate == 24000
 
-    @patch("xinference.client.restful.async_restful_client.AsyncClient")
+    @patch(_ASYNC_CLIENT_PATH)
     async def test_synthesize_with_custom_voice(self, mock_client_class: Mock) -> None:
         """Test synthesis with custom voice."""
         # Setup mock
@@ -173,7 +187,7 @@ class TestXinferenceTTS:
         assert call_kwargs.get("voice") == "female"
         assert result == b"fake audio data"
 
-    @patch("xinference.client.restful.async_restful_client.AsyncClient")
+    @patch(_ASYNC_CLIENT_PATH)
     async def test_synthesize_with_language(self, mock_client_class: Mock) -> None:
         """Test synthesis with language parameter."""
         # Setup mock
@@ -192,7 +206,7 @@ class TestXinferenceTTS:
         assert call_kwargs.get("language") == "en"
         assert result == b"fake audio data"
 
-    @patch("xinference.client.restful.async_restful_client.AsyncClient")
+    @patch(_ASYNC_CLIENT_PATH)
     async def test_synthesize_with_custom_format(self, mock_client_class: Mock) -> None:
         """Test synthesis with custom format."""
         # Setup mock
@@ -211,7 +225,7 @@ class TestXinferenceTTS:
         assert call_kwargs.get("output_audio_format") == "wav"
         assert result == b"fake audio data"
 
-    @patch("xinference.client.restful.async_restful_client.AsyncClient")
+    @patch(_ASYNC_CLIENT_PATH)
     async def test_synthesize_with_custom_sample_rate(
         self, mock_client_class: Mock
     ) -> None:
@@ -232,7 +246,7 @@ class TestXinferenceTTS:
         assert call_kwargs.get("sample_rate") == 48000
         assert result == b"fake audio data"
 
-    @patch("xinference.client.restful.async_restful_client.AsyncClient")
+    @patch(_ASYNC_CLIENT_PATH)
     async def test_synthesize_with_speed_parameter(
         self, mock_client_class: Mock
     ) -> None:
@@ -253,7 +267,7 @@ class TestXinferenceTTS:
         assert call_kwargs.get("speed") == 1.2
         assert result == b"fake audio data"
 
-    @patch("xinference.client.restful.async_restful_client.AsyncClient")
+    @patch(_ASYNC_CLIENT_PATH)
     async def test_synthesize_with_volume_parameter(
         self, mock_client_class: Mock
     ) -> None:
@@ -274,7 +288,7 @@ class TestXinferenceTTS:
         assert call_kwargs.get("volume") == 1.5
         assert result == b"fake audio data"
 
-    @patch("xinference.client.restful.async_restful_client.AsyncClient")
+    @patch(_ASYNC_CLIENT_PATH)
     @patch("builtins.open", new_callable=MagicMock)
     async def test_synthesize_with_reference_audio(
         self, mock_open: Mock, mock_client_class: Mock
@@ -307,7 +321,7 @@ class TestXinferenceTTS:
         assert "reference_audio" not in call_kwargs  # Should be removed from kwargs
         assert result == b"fake audio data"
 
-    @patch("xinference.client.restful.async_restful_client.AsyncClient")
+    @patch(_ASYNC_CLIENT_PATH)
     async def test_synthesize_with_multiple_parameters(
         self, mock_client_class: Mock
     ) -> None:
@@ -342,7 +356,7 @@ class TestXinferenceTTS:
         assert call_kwargs.get("volume") == 1.2
         assert result == b"fake audio data"
 
-    @patch("xinference.client.restful.async_restful_client.AsyncClient")
+    @patch(_ASYNC_CLIENT_PATH)
     async def test_synthesize_uses_init_defaults(self, mock_client_class: Mock) -> None:
         """Test that synthesis uses initialization defaults when not overridden."""
         # Setup mock
@@ -366,7 +380,7 @@ class TestXinferenceTTS:
         assert call_kwargs.get("sample_rate") == 48000
         assert result == b"fake audio data"
 
-    @patch("xinference.client.restful.async_restful_client.AsyncClient")
+    @patch(_ASYNC_CLIENT_PATH)
     async def test_synthesize_override_init_defaults(
         self, mock_client_class: Mock
     ) -> None:
@@ -395,7 +409,7 @@ class TestXinferenceTTS:
         assert call_kwargs.get("sample_rate") == 48000
         assert result == b"fake audio data"
 
-    @patch("xinference.client.restful.async_restful_client.AsyncClient")
+    @patch(_ASYNC_CLIENT_PATH)
     async def test_synthesize_empty_text(self, mock_client_class: Mock) -> None:
         """Test synthesis with empty text."""
         # Setup mock
@@ -416,7 +430,7 @@ class TestXinferenceTTS:
         assert call_kwargs.get("sample_rate") == 24000
         assert result == b"fake audio data"
 
-    @patch("xinference.client.restful.async_restful_client.AsyncClient")
+    @patch(_ASYNC_CLIENT_PATH)
     async def test_synthesize_unicode_text(self, mock_client_class: Mock) -> None:
         """Test synthesis with unicode text."""
         # Setup mock
@@ -435,7 +449,7 @@ class TestXinferenceTTS:
         assert call_kwargs.get("input") == "你好，世界！🎉"
         assert result == b"fake audio data"
 
-    @patch("xinference.client.restful.async_restful_client.AsyncClient")
+    @patch(_ASYNC_CLIENT_PATH)
     async def test_synthesize_long_text(self, mock_client_class: Mock) -> None:
         """Test synthesis with long text."""
         # Setup mock
@@ -455,7 +469,7 @@ class TestXinferenceTTS:
         assert len(call_kwargs.get("input", "")) == len(long_text)
         assert result == b"fake audio data"
 
-    @patch("xinference.client.restful.async_restful_client.AsyncClient")
+    @patch(_ASYNC_CLIENT_PATH)
     async def test_synthesize_special_characters(self, mock_client_class: Mock) -> None:
         """Test synthesis with special characters."""
         # Setup mock
@@ -476,7 +490,7 @@ class TestXinferenceTTS:
         assert "@#$%^&*()" in call_kwargs.get("input", "")
         assert result == b"fake audio data"
 
-    @patch("xinference.client.restful.async_restful_client.AsyncClient")
+    @patch(_ASYNC_CLIENT_PATH)
     async def test_synthesize_verbose_includes_all_metadata(
         self, mock_client_class: Mock
     ) -> None:
@@ -501,7 +515,7 @@ class TestXinferenceTTS:
         assert result.raw_response["model"] == "chat-tts"
         assert result.raw_response["voice"] == "female"
 
-    @patch("xinference.client.restful.async_restful_client.AsyncClient")
+    @patch(_ASYNC_CLIENT_PATH)
     async def test_synthesize_error_handling(self, mock_client_class: Mock) -> None:
         """Test error handling when synthesis fails."""
         # Setup mock to return None
@@ -516,7 +530,7 @@ class TestXinferenceTTS:
         with pytest.raises(RuntimeError, match="Unexpected audio data type"):
             await tts.synthesize("Hello")
 
-    @patch("xinference.client.restful.async_restful_client.AsyncClient")
+    @patch(_ASYNC_CLIENT_PATH)
     async def test_synthesize_exception_handling(self, mock_client_class: Mock) -> None:
         """Test exception handling when API call raises exception."""
         # Setup mock to raise exception
@@ -531,7 +545,7 @@ class TestXinferenceTTS:
         with pytest.raises(RuntimeError, match="Xinference TTS failed"):
             await tts.synthesize("Hello")
 
-    @patch("xinference.client.restful.async_restful_client.AsyncClient")
+    @patch(_ASYNC_CLIENT_PATH)
     async def test_synthesize_invalid_response_type(
         self, mock_client_class: Mock
     ) -> None:
@@ -548,7 +562,7 @@ class TestXinferenceTTS:
         with pytest.raises(RuntimeError, match="Unexpected audio data type"):
             await tts.synthesize("Hello")
 
-    @patch("xinference.client.restful.async_restful_client.AsyncClient")
+    @patch(_ASYNC_CLIENT_PATH)
     async def test_synthesize_get_model_failure(self, mock_client_class: Mock) -> None:
         """Test error handling when get_model raises exception."""
         # Setup mock to raise exception on get_model
@@ -682,7 +696,7 @@ class TestXinferenceTTS:
         assert len(models) == 1
         assert models[0]["id"] == "speech-model"
 
-    @patch("xinference.client.restful.async_restful_client.AsyncClient")
+    @patch(_ASYNC_CLIENT_PATH)
     def test_context_manager(self, mock_client_class: Mock) -> None:
         """Test that context manager properly closes resources."""
         # Setup mock
@@ -698,7 +712,7 @@ class TestXinferenceTTS:
         # After exiting context, close should have been called if model was used
         # (In this case model was never used, so _model_handle is still None)
 
-    @patch("xinference.client.restful.async_restful_client.AsyncClient")
+    @patch(_ASYNC_CLIENT_PATH)
     async def test_context_manager_with_model_used(
         self, mock_client_class: Mock
     ) -> None:
@@ -742,7 +756,7 @@ class TestXinferenceTTS:
         assert tts._model_handle is None
         assert tts._client is None
 
-    @patch("xinference.client.restful.async_restful_client.AsyncClient")
+    @patch(_ASYNC_CLIENT_PATH)
     def test_close_without_model_handle(self, mock_client_class: Mock) -> None:
         """Test close when model handle was never initialized."""
         # Setup mock
@@ -757,7 +771,7 @@ class TestXinferenceTTS:
         assert tts._model_handle is None
         assert tts._client is None
 
-    @patch("xinference.client.restful.async_restful_client.AsyncClient")
+    @patch(_ASYNC_CLIENT_PATH)
     def test_close_exception_handling(self, mock_client_class: Mock) -> None:
         """Test that close handles exceptions gracefully."""
         # Setup mock that raises exception
@@ -776,7 +790,7 @@ class TestXinferenceTTS:
         assert tts._model_handle is None
         assert tts._client is None
 
-    @patch("xinference.client.restful.async_restful_client.AsyncClient")
+    @patch(_ASYNC_CLIENT_PATH)
     async def test_get_session_lazy_initialization(
         self, mock_client_class: Mock
     ) -> None:
@@ -800,7 +814,7 @@ class TestXinferenceTTS:
         assert client1 is client2
         assert mock_client_class.call_count == 1
 
-    @patch("xinference.client.restful.async_restful_client.AsyncClient")
+    @patch(_ASYNC_CLIENT_PATH)
     async def test_ensure_model_handle_lazy_initialization(
         self, mock_client_class: Mock
     ) -> None:
@@ -824,7 +838,7 @@ class TestXinferenceTTS:
         assert handle1 is handle2
         assert mock_client.get_model.call_count == 1
 
-    @patch("xinference.client.restful.async_restful_client.AsyncClient")
+    @patch(_ASYNC_CLIENT_PATH)
     async def test_ensure_model_handle_with_custom_model_uid(
         self, mock_client_class: Mock
     ) -> None:

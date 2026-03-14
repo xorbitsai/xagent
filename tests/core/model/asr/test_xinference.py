@@ -2,9 +2,23 @@
 
 from __future__ import annotations
 
+import importlib.util
 from unittest.mock import AsyncMock, MagicMock, Mock, patch
 
 import pytest
+
+# Handle optional xinference dependency
+if importlib.util.find_spec("xinference.client.restful.async_restful_client"):
+    _ASYNC_CLIENT_PATH = "xinference.client.restful.async_restful_client.AsyncClient"
+elif importlib.util.find_spec("xinference_client.client.restful.async_restful_client"):
+    _ASYNC_CLIENT_PATH = (
+        "xinference_client.client.restful.async_restful_client.AsyncClient"
+    )
+else:
+    pytest.skip(
+        "Neither xinference nor xinference_client is installed",
+        allow_module_level=True,
+    )
 
 from xagent.core.model.asr import ASRResult, ASRSegment, XinferenceASR
 
@@ -72,7 +86,7 @@ class TestXinferenceASR:
         asr = XinferenceASR()
         assert asr.supports_timestamps is True
 
-    @patch("xinference.client.restful.async_restful_client.AsyncClient")
+    @patch(_ASYNC_CLIENT_PATH)
     async def test_transcribe_simple_text_only(self, mock_client_class: Mock) -> None:
         """Test simple transcription returning text only (verbose=False)."""
         # Setup mock
@@ -92,7 +106,7 @@ class TestXinferenceASR:
         assert result == "test text"
         mock_model.transcriptions.assert_called_once()
 
-    @patch("xinference.client.restful.async_restful_client.AsyncClient")
+    @patch(_ASYNC_CLIENT_PATH)
     async def test_transcribe_verbose_with_segments(
         self, mock_client_class: Mock
     ) -> None:
@@ -122,7 +136,7 @@ class TestXinferenceASR:
         assert result.segments[0].end == 2.5
         assert result.segments[0].speaker == "0"
 
-    @patch("xinference.client.restful.async_restful_client.AsyncClient")
+    @patch(_ASYNC_CLIENT_PATH)
     async def test_transcribe_with_speaker_zero(self, mock_client_class: Mock) -> None:
         """Test that speaker ID 0 is correctly parsed (not treated as falsy)."""
         # Setup mock
@@ -143,7 +157,7 @@ class TestXinferenceASR:
         # Verify speaker ID is preserved
         assert result.segments[0].speaker == "0"
 
-    @patch("xinference.client.restful.async_restful_client.AsyncClient")
+    @patch(_ASYNC_CLIENT_PATH)
     async def test_transcribe_with_multiple_speakers(
         self, mock_client_class: Mock
     ) -> None:
@@ -171,7 +185,7 @@ class TestXinferenceASR:
         assert result.segments[0].text == "hello"
         assert result.segments[1].text == "world"
 
-    @patch("xinference.client.restful.async_restful_client.AsyncClient")
+    @patch(_ASYNC_CLIENT_PATH)
     async def test_transcribe_with_hotword(self, mock_client_class: Mock) -> None:
         """Test transcription with hotword parameter."""
         # Setup mock
@@ -194,7 +208,7 @@ class TestXinferenceASR:
         assert call_kwargs["hotword"] == "test word"
         assert result == "test"
 
-    @patch("xinference.client.restful.async_restful_client.AsyncClient")
+    @patch(_ASYNC_CLIENT_PATH)
     async def test_transcribe_with_bytes(self, mock_client_class: Mock) -> None:
         """Test transcription with audio bytes."""
         # Setup mock
@@ -212,7 +226,7 @@ class TestXinferenceASR:
         assert result == "test"
         mock_model.transcriptions.assert_called_once()
 
-    @patch("xinference.client.restful.async_restful_client.AsyncClient")
+    @patch(_ASYNC_CLIENT_PATH)
     async def test_transcribe_with_language_parameter(
         self, mock_client_class: Mock
     ) -> None:
@@ -233,7 +247,7 @@ class TestXinferenceASR:
         assert "language" in call_kwargs
         assert call_kwargs["language"] == "zh"
 
-    @patch("xinference.client.restful.async_restful_client.AsyncClient")
+    @patch(_ASYNC_CLIENT_PATH)
     async def test_transcribe_response_format_verbose_json(
         self, mock_client_class: Mock
     ) -> None:
@@ -333,7 +347,7 @@ class TestXinferenceASR:
         segments = asr._parse_segments(segments_data)
         assert len(segments) == 0
 
-    @patch("xinference.client.restful.async_restful_client.AsyncClient")
+    @patch(_ASYNC_CLIENT_PATH)
     def test_context_manager(self, mock_client_class: Mock) -> None:
         """Test context manager functionality."""
         mock_client = MagicMock()
@@ -347,7 +361,7 @@ class TestXinferenceASR:
         assert asr._client is None
         assert asr._model_handle is None
 
-    @patch("xinference.client.restful.async_restful_client.AsyncClient")
+    @patch(_ASYNC_CLIENT_PATH)
     async def test_close(self, mock_client_class: Mock) -> None:
         """Test close method cleans up resources."""
         mock_client = MagicMock()
@@ -363,7 +377,7 @@ class TestXinferenceASR:
         assert asr._client is None
         assert asr._model_handle is None
 
-    @patch("xinference.client.restful.async_restful_client.AsyncClient")
+    @patch(_ASYNC_CLIENT_PATH)
     async def test_transcribe_error_handling(self, mock_client_class: Mock) -> None:
         """Test error handling when transcription fails."""
         # Setup mock to raise exception
@@ -379,7 +393,7 @@ class TestXinferenceASR:
         with pytest.raises(RuntimeError, match="Xinference ASR failed"):
             await asr.transcribe(audio_bytes, format="wav")
 
-    @patch("xinference.client.restful.async_restful_client.AsyncClient")
+    @patch(_ASYNC_CLIENT_PATH)
     async def test_get_session_lazy_initialization(
         self, mock_client_class: Mock
     ) -> None:
@@ -395,7 +409,7 @@ class TestXinferenceASR:
         assert asr._client is not None
         assert client is not None
 
-    @patch("xinference.client.restful.async_restful_client.AsyncClient")
+    @patch(_ASYNC_CLIENT_PATH)
     async def test_ensure_model_handle(self, mock_client_class: Mock) -> None:
         """Test that model handle is created and cached."""
         mock_client = MagicMock()

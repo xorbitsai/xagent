@@ -2,23 +2,27 @@
 
 from __future__ import annotations
 
-import importlib.util
 from unittest.mock import AsyncMock, MagicMock, Mock, patch
 
 import pytest
 
 # Handle optional xinference dependency
-if importlib.util.find_spec("xinference.client.restful.async_restful_client"):
+try:
+    import xinference.client.restful.async_restful_client  # noqa: F401
+
     _ASYNC_CLIENT_PATH = "xinference.client.restful.async_restful_client.AsyncClient"
-elif importlib.util.find_spec("xinference_client.client.restful.async_restful_client"):
-    _ASYNC_CLIENT_PATH = (
-        "xinference_client.client.restful.async_restful_client.AsyncClient"
-    )
-else:
-    pytest.skip(
-        "Neither xinference nor xinference_client is installed",
-        allow_module_level=True,
-    )
+except ImportError:
+    try:
+        import xinference_client.client.restful.async_restful_client  # noqa: F401
+
+        _ASYNC_CLIENT_PATH = (
+            "xinference_client.client.restful.async_restful_client.AsyncClient"
+        )
+    except ImportError:
+        pytest.skip(
+            "Neither xinference nor xinference_client is installed",
+            allow_module_level=True,
+        )
 
 from xagent.core.model.tts import TTSResult, XinferenceTTS
 

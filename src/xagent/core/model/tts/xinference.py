@@ -15,7 +15,7 @@ logger = logging.getLogger(__name__)
 class ModelProtocol(Protocol):
     """Protocol for xinference model handle."""
 
-    def speech(self, text: str, **kwargs: Any) -> bytes: ...
+    async def speech(self, text: str, **kwargs: Any) -> bytes: ...
     def close(self) -> None: ...
 
 
@@ -64,23 +64,32 @@ class XinferenceTTS(BaseTTS):
         self._client: Optional[XinferenceClient] = None
         self._model_handle: Optional[ModelProtocol] = None
 
-    def _get_session(self) -> XinferenceClient:  # type: ignore[no-any-unimported]
-        """Get or create Xinference client."""
+    async def _get_session(self) -> Any:  # AsyncClient
+        """Get or create async Xinference client."""
         if self._client is None:
-            self._client = XinferenceClient(
-                base_url=self.base_url, api_key=self.api_key
-            )
+            try:
+                # Try to import from local xinference package first
+                from xinference.client.restful.async_restful_client import (  # type: ignore
+                    AsyncClient,
+                )
+            except ImportError:
+                # Fallback to xinference_client package
+                from xinference_client.client.restful.async_restful_client import (  # type: ignore
+                    AsyncClient,
+                )
+
+            self._client = AsyncClient(base_url=self.base_url, api_key=self.api_key)
         return self._client
 
-    def _ensure_model_handle(self) -> ModelProtocol:
+    async def _ensure_model_handle(self) -> Any:  # AsyncModelProtocol
         """Ensure the TTS model handle is initialized."""
         if self._model_handle is None:
-            client = self._get_session()
+            client = await self._get_session()
             # Get the model handle (assumes model is already launched on the server)
-            self._model_handle = client.get_model(self._model_uid)
+            self._model_handle = await client.get_model(self._model_uid)
         return self._model_handle
 
-    def synthesize(
+    async def synthesize(
         self,
         text: str,
         voice: Optional[str] = None,
@@ -126,7 +135,7 @@ class XinferenceTTS(BaseTTS):
             >>> # With speed control
             >>> audio = tts.synthesize("Test", speed=1.2)
         """
-        model_handle = self._ensure_model_handle()
+        model_handle = await self._ensure_model_handle()
 
         # Prepare parameters
         final_voice = voice or self.voice
@@ -152,7 +161,7 @@ class XinferenceTTS(BaseTTS):
         try:
             # Call speech synthesis API
             # Xinference TTS models use speech() method
-            audio_data = model_handle.speech(text, **params)
+            audio_data = await model_handle.speech(text, **params)
 
             # Validate response
             if audio_data is None:

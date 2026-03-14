@@ -31,7 +31,7 @@ class BaseTTS(ABC):
     """Abstract base class for Text-to-Speech (TTS) models."""
 
     @abstractmethod
-    def synthesize(
+    async def synthesize(
         self,
         text: str,
         voice: Optional[str] = None,

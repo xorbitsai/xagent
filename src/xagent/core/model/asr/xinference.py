@@ -15,7 +15,7 @@ logger = logging.getLogger(__name__)
 class ModelProtocol(Protocol):
     """Protocol for xinference model handle."""
 
-    def transcriptions(self, audio: bytes, **kwargs: Any) -> dict[str, Any]: ...
+    async def transcriptions(self, audio: bytes, **kwargs: Any) -> dict[str, Any]: ...
     def close(self) -> None: ...
 
 
@@ -53,23 +53,32 @@ class XinferenceASR(BaseASR):
         self._client: Optional[XinferenceClient] = None
         self._model_handle: Optional[ModelProtocol] = None
 
-    def _get_session(self) -> XinferenceClient:  # type: ignore[no-any-unimported]
-        """Get or create Xinference client."""
+    async def _get_session(self) -> Any:  # AsyncClient
+        """Get or create async Xinference client."""
         if self._client is None:
-            self._client = XinferenceClient(
-                base_url=self.base_url, api_key=self.api_key
-            )
+            try:
+                # Try to import from local xinference package first
+                from xinference.client.restful.async_restful_client import (  # type: ignore
+                    AsyncClient,
+                )
+            except ImportError:
+                # Fallback to xinference_client package
+                from xinference_client.client.restful.async_restful_client import (  # type: ignore
+                    AsyncClient,
+                )
+
+            self._client = AsyncClient(base_url=self.base_url, api_key=self.api_key)
         return self._client
 
-    def _ensure_model_handle(self) -> ModelProtocol:
+    async def _ensure_model_handle(self) -> Any:  # AsyncModelProtocol
         """Ensure the ASR model handle is initialized."""
         if self._model_handle is None:
-            client = self._get_session()
+            client = await self._get_session()
             # Get the model handle (assumes model is already launched on the server)
-            self._model_handle = client.get_model(self._model_uid)
+            self._model_handle = await client.get_model(self._model_uid)
         return self._model_handle
 
-    def transcribe(
+    async def transcribe(
         self,
         audio: Union[str, bytes],
         language: Optional[str] = None,
@@ -102,7 +111,7 @@ class XinferenceASR(BaseASR):
             >>> # Use hotwords to improve specific term recognition
             >>> result = asr.transcribe("audio.mp3", hotword="香港 航空", verbose=True)
         """
-        model_handle = self._ensure_model_handle()
+        model_handle = await self._ensure_model_handle()
 
         # Prepare audio input
         if isinstance(audio, bytes):
@@ -139,8 +148,8 @@ class XinferenceASR(BaseASR):
             with open(audio_path, "rb") as audio_file:
                 audio_data = audio_file.read()
 
-            # Call transcriptions API (not speech - speech is for TTS!)
-            result = model_handle.transcriptions(audio=audio_data, **params)
+            # Call async transcriptions API (not speech - speech is for TTS!)
+            result = await model_handle.transcriptions(audio=audio_data, **params)
 
             # Extract transcription result
             if isinstance(result, dict):
@@ -193,7 +202,7 @@ class XinferenceASR(BaseASR):
                     return transcription_text
 
             elif hasattr(result, "text"):
-                alt_transcription_text = result.text
+                alt_transcription_text: str = str(result.text)
 
                 if verbose and hasattr(result, "segments"):
                     segments = self._parse_segments(result.segments)
@@ -208,8 +217,7 @@ class XinferenceASR(BaseASR):
                 else:
                     return alt_transcription_text
             else:
-                alt_transcription_text = str(result)
-                return alt_transcription_text
+                return str(result)
 
         except Exception as e:
             logger.error(f"Xinference ASR failed: {e}")
@@ -365,6 +373,3 @@ class XinferenceASR(BaseASR):
         except Exception as e:
             logger.error(f"Failed to fetch ASR models from Xinference: {e}")
             return []
-
-        finally:
-            client.close()

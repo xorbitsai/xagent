@@ -56,7 +56,7 @@ class BaseASR(ABC):
     """Abstract base class for Automatic Speech Recognition (ASR) models."""
 
     @abstractmethod
-    def transcribe(
+    async def transcribe(
         self,
         audio: Union[str, bytes],
         language: Optional[str] = None,

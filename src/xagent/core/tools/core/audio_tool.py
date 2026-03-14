@@ -426,8 +426,8 @@ The generated audio file will be automatically saved to workspace.
             # Resolve audio path
             audio_path = self._resolve_audio_path(audio_file_path)
 
-            # Transcribe the audio
-            result = asr_model.transcribe(
+            # Transcribe the audio (async)
+            result = await asr_model.transcribe(
                 audio=audio_path,
                 language=language,
                 verbose=verbose,
@@ -589,8 +589,8 @@ The generated audio file will be automatically saved to workspace.
                     "audio_path": None,
                 }
 
-            # Synthesize the speech
-            result = tts_model.synthesize(
+            # Synthesize the speech (async)
+            result = await tts_model.synthesize(
                 text=text,
                 voice=voice,
                 language=language,

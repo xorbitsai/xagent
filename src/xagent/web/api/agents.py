@@ -782,6 +782,7 @@ async def preview_agent(
         tool_config = WebToolConfig(
             db=db,
             request=MinimalRequest(int(current_user.id)),
+            llm=default_llm,
             user_id=int(current_user.id),
             is_admin=bool(current_user.is_admin),
             allowed_collections=request.knowledge_bases

@@ -22,6 +22,7 @@ class WebToolConfig(BaseToolConfig):
         is_admin: bool = False,
         workspace_config: Optional[Dict[str, Any]] = None,
         vision_model: Optional[Any] = None,
+        llm: Optional[Any] = None,
         include_mcp_tools: bool = True,
         task_id: Optional[str] = None,
         workspace_base_dir: str = "uploads",
@@ -44,6 +45,7 @@ class WebToolConfig(BaseToolConfig):
             workspace_config["base_dir"] = workspace_base_dir
         self._workspace_config = workspace_config
         self._explicit_vision_model = vision_model
+        self._explicit_llm = llm
         self._include_mcp_tools = include_mcp_tools
         self._task_id = task_id
         self._browser_tools_enabled = browser_tools_enabled
@@ -322,6 +324,10 @@ class WebToolConfig(BaseToolConfig):
         if self._cached_tts_model is None:
             self._cached_tts_model = self._load_tts_model()
         return self._cached_tts_model
+
+    def get_llm(self) -> Optional[Any]:
+        """Get LLM from constructor parameter."""
+        return self._explicit_llm
 
     def _load_tts_model(self) -> Optional[Any]:
         """Load default TTS model from database via model service."""

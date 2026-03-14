@@ -169,11 +169,13 @@ async def get_available_tools(
             self.credentials: Optional[Any] = None
 
     # Create WebToolConfig, now includes MCP tools
+    # Note: llm=None for tool listing (display only, no execution)
     tool_config = WebToolConfig(
         db=db,
         request=MockRequest(),
         user_id=int(current_user.id),
         is_admin=bool(current_user.is_admin),
+        llm=None,  # Not needed for tool listing
         workspace_config={
             "base_dir": "./uploads",
             "task_id": "tools_list",  # Use a generic task ID for workspace creation

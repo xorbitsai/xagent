@@ -71,6 +71,7 @@ class ToolRegistry:
                 skill_tools,
                 special_image_tools,
                 sql_tool,
+                translate_json,
                 vision_tool,
                 workspace_file_tool,
             )

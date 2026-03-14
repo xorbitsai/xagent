@@ -2484,6 +2484,7 @@ async def handle_build_preview_execution(
             temp_config = WebToolConfig(
                 db=db,
                 request=MinimalRequest(int(user.id)),
+                llm=default_llm,
                 user_id=int(user.id),
                 is_admin=bool(user.is_admin),
                 workspace_config=None,
@@ -2514,6 +2515,7 @@ async def handle_build_preview_execution(
         tool_config = WebToolConfig(
             db=db,
             request=MinimalRequest(int(user.id)),
+            llm=default_llm,
             user_id=int(user.id),
             is_admin=bool(user.is_admin),
             allowed_collections=knowledge_bases if knowledge_bases else None,

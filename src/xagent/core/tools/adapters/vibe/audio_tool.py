@@ -72,6 +72,11 @@ class AudioTool(AudioToolCore):
             self._tts_model_info_text
         )
 
+        # Add batch JSON tool
+        json_description = self.SYNTHESIZE_SPEECH_JSON_DESCRIPTION.format(
+            self._tts_model_info_text
+        )
+
         tools = [
             AudioFunctionTool(
                 self.transcribe_audio,
@@ -82,6 +87,11 @@ class AudioTool(AudioToolCore):
                 self.synthesize_speech,
                 name="synthesize_speech",
                 description=synthesize_description,
+            ),
+            AudioFunctionTool(
+                self.synthesize_speech_json,
+                name="synthesize_speech_json",
+                description=json_description,
             ),
             AudioFunctionTool(
                 self.list_available_models,

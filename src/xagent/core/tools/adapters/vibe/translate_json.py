@@ -49,6 +49,8 @@ Parameters:
 - output_field (optional): Field name for translated text. Default: "translated_text"
 - target_lang (optional): Target language code. Default: "en"
 - source_lang (optional): Source language code. Auto-detect if not specified
+- batch_size (optional): Number of texts to translate per batch (1-50, default: 10). Larger batches maintain better context but may be slower for long texts
+- instructions (optional): Additional translation instructions for style, terminology, or context (e.g., "Use formal tone", "Keep technical terms in English", "Preserve formatting")
 
 Returns:
 Dictionary with translation result containing:
@@ -129,6 +131,16 @@ Translation results are automatically saved to workspace when available.
             source_lang: Optional[str] = Field(
                 default=None, description="Source language code (auto-detect if None)"
             )
+            batch_size: int = Field(
+                default=10,
+                ge=1,
+                le=50,
+                description="Number of texts to translate per batch (1-50, default: 10). Larger batches may be slower but can maintain better context.",
+            )
+            instructions: Optional[str] = Field(
+                default=None,
+                description="Additional translation instructions (e.g., 'Use formal tone', 'Keep technical terms in English', 'Preserve formatting')",
+            )
 
         return TranslateJsonArgs
 
@@ -162,6 +174,8 @@ Translation results are automatically saved to workspace when available.
             output_field = args.get("output_field", "translated_text")
             target_lang = args.get("target_lang", "en")
             source_lang = args.get("source_lang")
+            batch_size = args.get("batch_size", 10)
+            instructions = args.get("instructions")
 
             # Validate required arguments - either json_data or file_id must be provided
             if json_data is None and file_id is None:
@@ -206,6 +220,8 @@ Translation results are automatically saved to workspace when available.
                     output_field=output_field,
                     target_lang=target_lang,
                     source_lang=source_lang,
+                    batch_size=batch_size,
+                    instructions=instructions,
                 )
             )
 
@@ -239,6 +255,8 @@ Translation results are automatically saved to workspace when available.
             output_field = args.get("output_field", "translated_text")
             target_lang = args.get("target_lang", "en")
             source_lang = args.get("source_lang")
+            batch_size = args.get("batch_size", 10)
+            instructions = args.get("instructions")
 
             # Validate required arguments - either json_data or file_id must be provided
             if json_data is None and file_id is None:
@@ -282,6 +300,8 @@ Translation results are automatically saved to workspace when available.
                 output_field=output_field,
                 target_lang=target_lang,
                 source_lang=source_lang,
+                batch_size=batch_size,
+                instructions=instructions,
             )
 
             return result
@@ -366,13 +386,21 @@ if TYPE_CHECKING:
 
 @register_tool
 async def create_translate_json_tool(config: "BaseToolConfig") -> List[Any]:
-    """Create translate_json tool with LLM from configuration."""
+    """Create translate_json tool with LLM and workspace from configuration."""
     llm = config.get_llm()
 
+    # Get workspace from config for file_id support
+    workspace = None
+    workspace_config = config.get_workspace_config()
+    if workspace_config:
+        from .factory import ToolFactory
+
+        workspace = ToolFactory._create_workspace(workspace_config)
+
     try:
-        # Create tool with or without LLM
+        # Create tool with LLM and workspace
         # Tool will still appear in tool list even without LLM
-        tool_instance = TranslateJsonTool(llm=llm)
+        tool_instance = TranslateJsonTool(llm=llm, workspace=workspace)
         return [tool_instance]
 
     except Exception as e:

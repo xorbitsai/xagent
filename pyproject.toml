@@ -26,6 +26,7 @@ dependencies = [
   "zai-sdk>=0.0.3.2",
   "numexpr >= 2.11.0",
   "aiohttp >= 3.12.14",
+  "tqdm >= 4.66.0",
   "beautifulsoup4 >= 4.12.3",
   "html2text >= 2025.4.15",
   "PyYAML >= 6.0.2",
@@ -160,6 +161,8 @@ module = [
   "jose",
   "alembic",
   "alembic.*",
+  "xinference",
+  "xinference.*",
   "xinference_client",
 ]
 ignore_missing_imports = true

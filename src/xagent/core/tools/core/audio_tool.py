@@ -150,6 +150,89 @@ Audio format options:
 The generated audio file will be automatically saved to workspace.
     """.strip()
 
+    # Description for synthesize_speech_json tool
+    SYNTHESIZE_SPEECH_JSON_DESCRIPTION = """
+Batch synthesize speech from JSON structure using Text-to-Speech (TTS).
+
+This tool converts multiple text segments into speech audio files in a single call.
+Supports flexible JSON format with configurable field mapping, voice cloning, and batch processing.
+
+Available models (⭐[DEFAULT] marks the configured default model):
+{}
+
+**IMPORTANT: Prefer the default model marked with ⭐[DEFAULT]. Only specify model_id if the user explicitly requests a different model.**
+
+Parameters:
+- json_data (optional): JSON string or dict containing synthesis configuration. Either json_data or file_id must be provided.
+- file_id (optional): File ID, file path, or URL to read JSON data from. Either json_data or file_id must be provided.
+- segments_field (optional): Field name containing segments array (default: "segments")
+- text_field (optional): Field name containing text within each segment (default: "text")
+- voice_field (optional): Field name containing voice within each segment (default: "voice")
+- reference_field (optional): Field name containing reference audio file path/ID for voice cloning (default: "reference_audio")
+- default_voice (optional): Default voice for segments without voice specified
+- default_language (optional): Default language code (auto-detect if None)
+- format (optional): Output audio format (default: 'mp3')
+- sample_rate (optional): Sample rate in Hz (default: model-specific)
+- model_id (optional): Specific TTS model to use. Omit to use the default model marked with ⭐[DEFAULT].
+- batch_size (optional): Number of syntheses to process in parallel (1-20, default: 5)
+
+JSON Format (nested segment structure):
+```json
+{{
+    "segments": [
+        {{
+            "text": "你好世界",
+            "voice": "zh-female",
+            "reference_audio": "ref_voice_1"
+        }},
+        {{
+            "text": "这是一个测试",
+            "voice": "zh-male",
+            "reference_audio": "ref_voice_2"
+        }}
+    ],
+    "default_voice": "zh-female",
+    "output_format": "mp3",
+    "sample_rate": 24000
+}}
+```
+
+Field Mapping (configurable):
+- segments_field: Top-level field containing the segments array (default: "segments")
+- text_field: Field within each segment containing the text to synthesize (default: "text")
+- voice_field: Field within each segment containing the voice ID (default: "voice")
+- reference_field: Field within each segment containing reference audio ID for voice cloning (default: "reference_audio_id")
+
+Voice Cloning:
+- Use reference_audio in each segment to clone voices from reference audio files
+- Supports both workspace file IDs and direct file paths (absolute or relative)
+- Voice cloning quality depends on the reference audio quality
+- Not all models support voice cloning
+
+Batch Processing:
+- All segments are processed in parallel for efficiency
+- Use batch_size to control parallelism (1-20)
+- Progress is shown during synthesis
+- Failed segments don't stop the batch
+
+Output:
+- success (bool): Whether all syntheses succeeded
+- results (list): List of synthesis results, one per segment
+- total (int): Total number of segments processed
+- successful (int): Number of successful syntheses
+- failed (int): Number of failed syntheses
+- errors (list): List of error messages for failed segments
+- saved_to_workspace (bool): Whether audio files were saved to workspace
+
+Using file_id parameter is recommended for workflows with file chaining.
+This tool automatically handles file reading when file_id is provided.
+
+file_id parameter supports:
+- File ID: Registered workspace file ID (e.g., "abc123-def456")
+- File path: Local file path (e.g., "/path/to/config.json" or "config.json")
+- URL: HTTP/HTTPS URL (e.g., "https://example.com/config.json")
+    """.strip()
+
     def __init__(
         self,
         asr_models: Optional[Dict[str, BaseASR]] = None,
@@ -727,4 +810,509 @@ The generated audio file will be automatically saved to workspace.
                 "asr_count": 0,
                 "tts_count": 0,
                 "total_count": 0,
+            }
+
+    async def synthesize_speech_json(
+        self,
+        json_data: Optional[str | Dict[str, Any]] = None,
+        file_id: Optional[str] = None,  # Can be file_id, file path, or URL
+        segments_field: str = "segments",
+        text_field: str = "text",
+        voice_field: str = "voice",
+        reference_field: str = "reference_audio",
+        default_voice: Optional[str] = None,
+        default_language: Optional[str] = None,
+        format: str = "mp3",
+        sample_rate: Optional[int] = None,
+        model_id: Optional[str] = None,
+        batch_size: int = 5,
+    ) -> Dict[str, Any]:
+        """
+        Batch synthesize speech from JSON structure using TTS.
+
+        Supports flexible JSON format with configurable field mapping and voice cloning.
+
+        Args:
+            json_data: JSON string or dict containing synthesis configuration
+            file_id: File ID, file path, or URL to read JSON data from (alternative to json_data)
+            segments_field: Field name containing segments array (default: "segments")
+            text_field: Field name containing text within each segment (default: "text")
+            voice_field: Field name containing voice within each segment (default: "voice")
+            reference_field: Field name containing reference audio ID (default: "reference_audio_id")
+            default_voice: Default voice for segments without voice specified
+            default_language: Default language code (auto-detect if None)
+            format: Output audio format (default: 'mp3')
+            sample_rate: Sample rate in Hz (default: model-specific)
+            model_id: Specific TTS model to use
+            batch_size: Number of syntheses to process in parallel (1-20, default: 5)
+
+        Returns:
+            Dictionary with batch synthesis result containing:
+            - success (bool): Whether all syntheses succeeded
+            - results (list): List of synthesis results, one per segment
+            - total (int): Total number of segments processed
+            - successful (int): Number of successful syntheses
+            - failed (int): Number of failed syntheses
+            - errors (list): List of error messages for failed segments
+            - saved_to_workspace (bool): Whether audio files were saved to workspace
+
+        JSON Format Example:
+            {
+                "segments": [
+                    {
+                        "text": "你好世界",
+                        "voice": "zh-female",
+                        "reference_audio_id": "ref_voice_1"
+                    },
+                    {
+                        "text": "这是一个测试",
+                        "voice": "zh-male",
+                        "reference_audio_id": "ref_voice_2"
+                    }
+                ],
+                "default_voice": "zh-female",
+                "output_format": "mp3",
+                "sample_rate": 24000
+            }
+
+        Example:
+            >>> # Batch synthesis with voice cloning
+            >>> data = {
+            ...     "segments": [
+            ...         {"text": "你好", "voice": "zh-female", "reference_audio_id": "ref1"},
+            ...         {"text": "世界", "voice": "zh-male"}
+            ...     ]
+            ... }
+            >>> result = await synthesize_speech_json(json_data=data)
+            >>> print(f"Synthesized {result['successful']}/{result['total']} segments")
+        """
+        # Validate that either json_data or file_id is provided
+        if json_data is None and file_id is None:
+            return {
+                "success": False,
+                "error": "Either json_data or file_id must be provided",
+                "results": [],
+                "total": 0,
+                "successful": 0,
+                "failed": 0,
+                "errors": ["Either json_data or file_id must be provided"],
+            }
+
+        # Parse JSON input
+        if json_data is not None and isinstance(json_data, str):
+            try:
+                data = json.loads(json_data)
+            except json.JSONDecodeError as e:
+                return {
+                    "success": False,
+                    "error": f"Invalid JSON: {e}",
+                    "results": [],
+                    "total": 0,
+                    "successful": 0,
+                    "failed": 0,
+                    "errors": [str(e)],
+                }
+        elif json_data is not None:
+            # json_data is already a dict
+            data = json_data
+
+        # Read from file_id if provided (takes precedence over json_data)
+        # file_id can be: file_id, file path, or URL
+        if file_id is not None:
+            try:
+                # Check if it's a URL
+                if file_id.startswith(("http://", "https://")):
+                    # Download JSON from URL
+                    import httpx
+
+                    async with httpx.AsyncClient(timeout=30.0) as client:
+                        response = await client.get(file_id)
+                        response.raise_for_status()
+                        json_content = response.text
+                        data = json.loads(json_content)
+                    logger.info(f"Downloaded JSON data from URL: {file_id}")
+
+                elif self._workspace:
+                    # Try to resolve as file_id first
+                    file_path = self._workspace.resolve_file_id(file_id)
+                    if file_path and file_path.exists():
+                        with open(file_path, "r", encoding="utf-8") as f:
+                            data = json.load(f)
+                        logger.info(f"Read JSON data from file_id: {file_id}")
+                    else:
+                        # Try as file path
+                        try:
+                            # Use workspace path resolution with search
+                            resolved_path = self._workspace.resolve_path_with_search(
+                                file_id
+                            )
+                            if resolved_path.exists():
+                                with open(resolved_path, "r", encoding="utf-8") as f:
+                                    data = json.load(f)
+                                logger.info(
+                                    f"Read JSON data from file path: {resolved_path}"
+                                )
+                            else:
+                                return {
+                                    "success": False,
+                                    "error": f"File not found: {file_id}",
+                                    "results": [],
+                                    "total": 0,
+                                    "successful": 0,
+                                    "failed": 0,
+                                    "errors": [f"File not found: {file_id}"],
+                                }
+                        except ValueError:
+                            # resolve_path_with_search failed, try direct path
+                            file_path = Path(file_id)
+                            if not file_path.is_absolute():
+                                file_path = Path.cwd() / file_path
+                            if file_path.exists():
+                                with open(file_path, "r", encoding="utf-8") as f:
+                                    data = json.load(f)
+                                logger.info(
+                                    f"Read JSON data from direct path: {file_path}"
+                                )
+                            else:
+                                return {
+                                    "success": False,
+                                    "error": f"File not found: {file_id}",
+                                    "results": [],
+                                    "total": 0,
+                                    "successful": 0,
+                                    "failed": 0,
+                                    "errors": [f"File not found: {file_id}"],
+                                }
+                else:
+                    # No workspace, try direct file path
+                    file_path = Path(file_id)
+                    if not file_path.is_absolute():
+                        file_path = Path.cwd() / file_path
+                    if file_path.exists():
+                        with open(file_path, "r", encoding="utf-8") as f:
+                            data = json.load(f)
+                        logger.info(f"Read JSON data from file path: {file_path}")
+                    else:
+                        return {
+                            "success": False,
+                            "error": f"File not found: {file_id}",
+                            "results": [],
+                            "total": 0,
+                            "successful": 0,
+                            "failed": 0,
+                            "errors": [f"File not found: {file_id}"],
+                        }
+
+            except Exception as e:
+                return {
+                    "success": False,
+                    "error": f"Failed to read file {file_id}: {e}",
+                    "results": [],
+                    "total": 0,
+                    "successful": 0,
+                    "failed": 0,
+                    "errors": [str(e)],
+                }
+
+        # Extract segments from JSON
+        segments = data.get(segments_field, [])
+        if not segments:
+            return {
+                "success": False,
+                "error": f"No segments found in field '{segments_field}'",
+                "results": [],
+                "total": 0,
+                "successful": 0,
+                "failed": 0,
+                "errors": [f"No segments found in field '{segments_field}'"],
+            }
+
+        total = len(segments)
+        results = []
+        errors = []
+        successful_count = 0
+        failed_count = 0
+
+        # Get TTS model
+        tts_model = self._get_tts_model(model_id)
+        if not tts_model:
+            return {
+                "success": False,
+                "error": "No available TTS models configured",
+                "results": [],
+                "total": total,
+                "successful": 0,
+                "failed": total,
+                "errors": ["No TTS models configured"] * total,
+            }
+
+        # Process segments in batches with progress tracking
+        import asyncio
+
+        from tqdm.asyncio import tqdm as tqdm_async  # type: ignore[import-untyped]
+
+        batches = [segments[i : i + batch_size] for i in range(0, total, batch_size)]
+
+        if len(batches) == 1:
+            # Single batch: direct processing
+            logger.info(f"Synthesizing single batch of {total} segments")
+
+            for idx, segment in enumerate(segments):
+                result = await self._synthesize_single_segment(
+                    segment,
+                    text_field,
+                    voice_field,
+                    reference_field,
+                    default_voice,
+                    default_language,
+                    format,
+                    sample_rate,
+                    tts_model,
+                    idx,
+                )
+                results.append(result)
+                if result["success"]:
+                    successful_count += 1
+                else:
+                    failed_count += 1
+                    if result.get("error"):
+                        errors.append(result["error"])
+
+        else:
+            # Multiple batches: parallel processing with progress
+            logger.info(
+                f"Synthesizing {total} segments in {len(batches)} parallel batches (batch_size={batch_size})"
+            )
+
+            async def process_batch(
+                batch_texts: List[Dict[str, Any]], batch_index: int
+            ) -> List[Dict[str, Any]]:
+                """Process a batch of segments"""
+                batch_results = []
+                for segment in batch_texts:
+                    idx = segments.index(segment)  # Get original index
+                    result = await self._synthesize_single_segment(
+                        segment,
+                        text_field,
+                        voice_field,
+                        reference_field,
+                        default_voice,
+                        default_language,
+                        format,
+                        sample_rate,
+                        tts_model,
+                        idx,
+                    )
+                    batch_results.append(result)
+                return batch_results
+
+            with tqdm_async(
+                total=len(batches),
+                desc="TTS batches",
+                unit="batch",
+                colour="green",
+            ) as pbar:
+
+                async def process_batch_with_progress(
+                    batch: List[Dict[str, Any]], idx: int
+                ) -> List[Dict[str, Any]]:
+                    result = await process_batch(batch, idx)
+                    pbar.update(1)
+                    pbar.set_postfix(
+                        {"batch": f"{idx + 1}/{len(batches)}", "segments": len(batch)}
+                    )
+                    return result
+
+                tasks = [
+                    process_batch_with_progress(batch, i)
+                    for i, batch in enumerate(batches)
+                ]
+
+                batch_results = await asyncio.gather(*tasks)
+
+            # Flatten batch results
+            for batch_result in batch_results:
+                for result in batch_result:
+                    results.append(result)
+                    if result["success"]:
+                        successful_count += 1
+                    else:
+                        failed_count += 1
+                        if result.get("error"):
+                            errors.append(result["error"])
+
+        return {
+            "success": failed_count == 0,
+            "results": results,
+            "total": total,
+            "successful": successful_count,
+            "failed": failed_count,
+            "errors": errors if errors else None,
+            "saved_to_workspace": self._workspace is not None,
+        }
+
+    async def _synthesize_single_segment(
+        self,
+        segment: Dict[str, Any],
+        text_field: str,
+        voice_field: str,
+        reference_field: str,
+        default_voice: Optional[str],
+        default_language: Optional[str],
+        format: str,
+        sample_rate: Optional[int],
+        tts_model: Any,
+        index: int,
+    ) -> Dict[str, Any]:
+        """
+        Synthesize speech for a single segment.
+
+        Args:
+            segment: Segment dictionary containing synthesis parameters
+            text_field: Field name for text content
+            voice_field: Field name for voice
+            reference_field: Field name for reference audio ID
+            default_voice: Default voice if not specified in segment
+            default_language: Default language if not specified
+            format: Audio format
+            sample_rate: Sample rate
+            tts_model: TTS model instance
+            index: Segment index for error reporting
+
+        Returns:
+            Dictionary with synthesis result
+        """
+        try:
+            # Extract parameters from segment
+            text = segment.get(text_field)
+            if not text:
+                return {
+                    "success": False,
+                    "error": f"Segment {index}: No text found in field '{text_field}'",
+                    "index": index,
+                }
+
+            voice = segment.get(voice_field, default_voice)
+            language = segment.get("language", default_language)
+
+            # Validate reference audio field names
+            # Check if user provided common alternative field names
+            if (
+                "reference_audio_id" in segment
+                and reference_field != "reference_audio_id"
+            ):
+                return {
+                    "success": False,
+                    "error": f"Segment {index}: Found 'reference_audio_id' field but tool expects '{reference_field}'. Please use '{reference_field}' or set reference_field='reference_audio_id' parameter.",
+                    "index": index,
+                }
+
+            ref_audio_id = segment.get(reference_field)
+
+            # Build synthesis parameters
+            kwargs: Dict[str, Any] = {"format": format}
+            if sample_rate:
+                kwargs["sample_rate"] = sample_rate
+
+            # Handle reference audio for voice cloning
+            if ref_audio_id:
+                ref_audio_path = None
+
+                # Try to resolve as file_id first (if workspace available)
+                if self._workspace:
+                    try:
+                        resolved_path = self._workspace.resolve_file_id(ref_audio_id)
+                        if resolved_path and resolved_path.exists():
+                            ref_audio_path = resolved_path
+                    except Exception:
+                        pass  # Not a file_id, try as direct path
+
+                # If not found as file_id, try as direct file path
+                if not ref_audio_path:
+                    from pathlib import Path as PathLib
+
+                    direct_path = PathLib(ref_audio_id)
+                    if direct_path.exists():
+                        ref_audio_path = direct_path
+                    elif direct_path.is_absolute():
+                        # Absolute path but doesn't exist
+                        logger.warning(
+                            f"Reference audio file not found: {ref_audio_id}"
+                        )
+                    else:
+                        # Relative path, try current directory
+                        resolved_cwd = PathLib.cwd() / direct_path
+                        if resolved_cwd.exists():
+                            ref_audio_path = resolved_cwd
+                        else:
+                            logger.warning(
+                                f"Reference audio file not found: {ref_audio_id}"
+                            )
+
+                # Pass reference audio path to TTS model
+                if ref_audio_path:
+                    kwargs["reference_audio"] = str(ref_audio_path)
+
+            # Synthesize speech
+            audio_data = await tts_model.synthesize(
+                text=text,
+                voice=voice,
+                language=language,
+                **kwargs,
+            )
+
+            # Handle result
+            if isinstance(audio_data, bytes):
+                audio_binary = audio_data
+                audio_format = format
+            else:
+                # Assume it's TTSResult
+                audio_binary = audio_data.audio
+                audio_format = audio_data.format
+
+            # Save to workspace if available
+            audio_path = None
+            audio_file_id = None
+
+            if self._workspace:
+                try:
+                    filename = f"synthesized_speech_{index}_{uuid.uuid4().hex[:8]}.{audio_format or 'mp3'}"
+
+                    with self._workspace.auto_register_files():
+                        save_path = self._workspace.output_dir / filename
+
+                        with open(save_path, "wb") as f:
+                            f.write(audio_binary)
+
+                        audio_path = str(save_path)
+                        logger.info(f"Saved synthesized audio to: {audio_path}")
+
+                    # Get file ID
+                    if audio_path:
+                        audio_file_id = self._workspace.get_file_id_from_path(
+                            audio_path
+                        )
+
+                except Exception as e:
+                    logger.warning(f"Failed to save audio to workspace: {e}")
+
+            return {
+                "success": True,
+                "index": index,
+                "text": text,
+                "voice": voice,
+                "audio_path": audio_path,
+                "file_id": audio_file_id,
+                "format": audio_format,
+                "saved_to_workspace": audio_path is not None,
+            }
+
+        except Exception as e:
+            logger.error(f"Segment {index} synthesis failed: {e}")
+            return {
+                "success": False,
+                "error": f"Segment {index}: {str(e)}",
+                "index": index,
+                "text": text,
+                "saved_to_workspace": False,
             }

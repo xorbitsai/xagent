@@ -5,7 +5,12 @@ from __future__ import annotations
 import logging
 from typing import Any, Optional, Protocol, Union
 
-from xinference_client import RESTfulClient as XinferenceClient
+try:
+    from xinference.client.restful.restful_client import (
+        RESTfulClient as XinferenceClient,  # type: ignore
+    )
+except ImportError:
+    from xinference_client import RESTfulClient as XinferenceClient  # type: ignore
 
 from .base import BaseTTS, TTSResult
 
@@ -155,20 +160,59 @@ class XinferenceTTS(BaseTTS):
         if final_language:
             params["language"] = final_language
 
-        # Add any additional parameters
+        # Handle reference_audio for voice cloning (extract from kwargs before updating params)
+        # Xinference expects 'prompt_speech' parameter with audio bytes
+        prompt_speech = None
+        reference_audio_path = kwargs.pop("reference_audio", None)
+        if reference_audio_path:
+            print(f"  📁 Reading reference audio from: {reference_audio_path}")
+            try:
+                with open(reference_audio_path, "rb") as f:
+                    prompt_speech = f.read()
+                print(f"  ✅ Reference audio loaded: {len(prompt_speech)} bytes")
+            except Exception as e:
+                print(f"  ❌ Failed to read reference audio: {e}")
+
+        # Add any additional parameters (excluding reference_audio which we already handled)
         params.update(kwargs)
+
+        # Print all parameters for debugging
+        print("\n🎙️ TTS Call Parameters:")
+        print(f"  Text (first 100 chars): {text[:100]}...")
+        print(f"  Voice: {final_voice}")
+        print(f"  Language: {final_language}")
+        print(f"  Format: {final_format}")
+        print(f"  Sample Rate: {final_sample_rate}")
+        if prompt_speech:
+            print(f"  🎯 Prompt Speech (voice cloning): {len(prompt_speech)} bytes")
+        # Log any other parameters
+        other_params = {
+            k: v
+            for k, v in params.items()
+            if k not in ["output_audio_format", "sample_rate", "voice", "language"]
+        }
+        if other_params:
+            print(f"  Other params: {other_params}")
+        print(f"  All params: {params}")
 
         try:
             # Call speech synthesis API
             # Xinference TTS models use speech() method
-            audio_data = await model_handle.speech(text, **params)
+            # Note: xinference expects 'input' parameter, not 'text'
+            # For voice cloning, pass prompt_speech with audio bytes
+            response = await model_handle.speech(
+                input=text, prompt_speech=prompt_speech, **params
+            )
+
+            # The response should be bytes directly from xinference client
+            if not isinstance(response, bytes):
+                raise RuntimeError(f"Unexpected audio data type: {type(response)}")
+
+            audio_data = response
 
             # Validate response
             if audio_data is None:
                 raise RuntimeError("Synthesis returned no audio data")
-
-            if not isinstance(audio_data, bytes):
-                raise RuntimeError(f"Unexpected audio data type: {type(audio_data)}")
 
             if verbose:
                 return TTSResult(
@@ -267,10 +311,15 @@ class XinferenceTTS(BaseTTS):
                     model_ability = [model_ability]
 
                 # Check if model has audio-generation or TTS ability
-                if any(
-                    ability in model_ability
-                    for ability in ["audio-generation", "tts", "speech"]
-                ):
+                # Note: Xinference uses different ability names for different model types:
+                # - Older models: "audio-generation", "tts", "speech"
+                # - Newer models like IndexTTS2: "text2audio", "text2audio_zero_shot", etc.
+                has_audio_ability = any(
+                    any(ability.startswith(prefix) for ability in model_ability)
+                    for prefix in ["audio-generation", "tts", "speech", "text2audio"]
+                )
+
+                if has_audio_ability:
                     result.append(
                         {
                             "id": model_info.get("model_name", model_uid),

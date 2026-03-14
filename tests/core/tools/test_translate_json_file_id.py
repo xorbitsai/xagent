@@ -13,11 +13,9 @@ from xagent.core.workspace import TaskWorkspace
 def temp_workspace(tmp_path):
     """Create a temporary workspace for testing"""
     workspace = TaskWorkspace(
-        workspace_id="test_workspace",
+        id="test_workspace",
         base_dir=str(tmp_path / "workspaces"),
-        task_id="test_task",
     )
-    workspace.create_workspace_dirs()
     yield workspace
     # Cleanup
     if workspace.workspace_dir.exists():
@@ -43,8 +41,23 @@ def mock_llm():
         translations = [f"Translation{i + 1}" for i in range(count)]
         return "\n".join(f"{i + 1}. {t}" for i, t in enumerate(translations))
 
+    async def mock_stream_chat(messages):
+        """Mock stream_chat that yields chunks"""
+        from xagent.core.model.chat.types import ChunkType, StreamChunk
+
+        # Get the response from regular chat
+        response = await mock_chat(messages)
+
+        # Yield as a single chunk
+        yield StreamChunk(
+            type=ChunkType.TOKEN,
+            content=response,
+            delta=response,
+        )
+
     llm = AsyncMock()
     llm.chat = AsyncMock(side_effect=mock_chat)
+    llm.stream_chat = mock_stream_chat
     return llm
 
 
@@ -120,10 +133,13 @@ async def test_adapter_requires_json_or_file_id(mock_llm, temp_workspace):
 
 def test_adapter_file_id_without_workspace():
     """Test that file_id requires workspace"""
+    from unittest.mock import AsyncMock
+
     from xagent.core.tools.adapters.vibe.translate_json import TranslateJsonTool
 
-    # Create adapter without workspace
-    adapter = TranslateJsonTool(llm=None, workspace=None)
+    # Create adapter without workspace but with mock LLM
+    mock_llm = AsyncMock()
+    adapter = TranslateJsonTool(llm=mock_llm, workspace=None)
 
     args = {
         "file_id": "some-file-id",
@@ -131,6 +147,7 @@ def test_adapter_file_id_without_workspace():
         "target_lang": "en",
     }
 
-    # Should raise ValueError about workspace requirement
-    with pytest.raises(ValueError, match="Workspace is required"):
-        adapter.run_json_sync(args)
+    # Should return error dict with workspace requirement message
+    result = adapter.run_json_sync(args)
+    assert result["success"] is False
+    assert "Workspace is required" in result["error"]

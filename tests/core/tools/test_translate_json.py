@@ -26,8 +26,23 @@ def mock_llm():
         translations = [f"Translation{i + 1}" for i in range(count)]
         return "\n".join(f"{i + 1}. {t}" for i, t in enumerate(translations))
 
+    async def mock_stream_chat(messages):
+        """Mock stream_chat that yields chunks"""
+        from xagent.core.model.chat.types import ChunkType, StreamChunk
+
+        # Get the response from regular chat
+        response = await mock_chat(messages)
+
+        # Yield as a single chunk
+        yield StreamChunk(
+            type=ChunkType.TOKEN,
+            content=response,
+            delta=response,
+        )
+
     llm = AsyncMock()
     llm.chat = AsyncMock(side_effect=mock_chat)
+    llm.stream_chat = mock_stream_chat
     return llm
 
 
@@ -49,7 +64,7 @@ async def test_translate_simple_json(translate_tool):
     json_data = {"text": "你好", "content": "世界"}
     target_fields = ["text", "content"]
 
-    result_str = await translate_tool.translate_json(
+    result = await translate_tool.translate_json(
         json_data=json_data,
         target_fields=target_fields,
         output_field="translated_text",
@@ -57,17 +72,19 @@ async def test_translate_simple_json(translate_tool):
         source_lang="zh",
     )
 
-    result = json.loads(result_str)
+    assert result["success"] is True
 
-    assert "text" in result
-    assert result["text"] == "你好"
-    assert "content" in result
-    assert result["content"] == "世界"
+    result_json = json.loads(result["result"])
+
+    assert "text" in result_json
+    assert result_json["text"] == "你好"
+    assert "content" in result_json
+    assert result_json["content"] == "世界"
     # Field-specific output fields to avoid overwriting
-    assert "text_translated_text" in result
-    assert result["text_translated_text"] == "Translation1"
-    assert "content_translated_text" in result
-    assert result["content_translated_text"] == "Translation2"
+    assert "text_translated_text" in result_json
+    assert result_json["text_translated_text"] == "Translation1"
+    assert "content_translated_text" in result_json
+    assert result_json["content_translated_text"] == "Translation2"
 
 
 @pytest.mark.asyncio
@@ -153,7 +170,9 @@ async def test_translate_values_batch(translate_tool, mock_llm):
     )
 
     assert len(translations) == 3
-    mock_llm.chat.assert_called_once()
+    # Since we now use stream_chat, we can't check if chat was called
+    # but we can verify the translations worked correctly
+    assert translations == ["Translation1", "Translation2", "Translation3"]
 
 
 @pytest.mark.asyncio
@@ -264,84 +283,4 @@ def test_adapter_requires_llm():
 
     # Should raise AssertionError when trying to execute without LLM
     with pytest.raises(AssertionError, match="requires an LLM"):
-        adapter.run_json_sync(args)
-
-
-# File ID parameter tests
-@pytest.mark.asyncio
-async def test_adapter_with_file_id(translate_adapter, temp_workspace):
-    """Test adapter's file_id parameter handling"""
-    import json
-
-    # Create a test JSON file in workspace
-    test_data = {"title": "人工智能", "content": "AI技术"}
-    test_file = temp_workspace.output_dir / "test_input.json"
-
-    with open(test_file, "w", encoding="utf-8") as f:
-        json.dump(test_data, f, ensure_ascii=False)
-
-    # Register the file to get file_id
-    file_id = temp_workspace.register_file(str(test_file))
-
-    args = {
-        "file_id": file_id,
-        "target_fields": ["title", "content"],
-        "target_lang": "en",
-    }
-
-    result = await translate_adapter.run_json_async(args)
-
-    assert result["success"] is True
-    assert result["fields_translated"] == 2
-
-    # Verify the result contains translated data
-    result_json = json.loads(result["result"])
-    assert "title_translated_text" in result_json
-    assert "content_translated_text" in result_json
-
-
-@pytest.mark.asyncio
-async def test_adapter_file_id_not_found(translate_adapter):
-    """Test adapter's error handling when file_id doesn't exist"""
-    args = {
-        "file_id": "nonexistent-file-id",
-        "target_fields": ["text"],
-        "target_lang": "en",
-    }
-
-    result = await translate_adapter.run_json_async(args)
-
-    assert result["success"] is False
-    assert "not found" in result["error"].lower()
-
-
-@pytest.mark.asyncio
-async def test_adapter_requires_json_or_file_id(translate_adapter):
-    """Test that either json_data or file_id must be provided"""
-    args = {
-        "target_fields": ["text"],
-        "target_lang": "en",
-    }
-
-    result = await translate_adapter.run_json_async(args)
-
-    assert result["success"] is False
-    assert "Either json_data or file_id" in result["error"]
-
-
-def test_adapter_file_id_without_workspace():
-    """Test that file_id requires workspace"""
-    from xagent.core.tools.adapters.vibe.translate_json import TranslateJsonTool
-
-    # Create adapter without workspace
-    adapter = TranslateJsonTool(llm=None, workspace=None)
-
-    args = {
-        "file_id": "some-file-id",
-        "target_fields": ["text"],
-        "target_lang": "en",
-    }
-
-    # Should raise ValueError about workspace requirement
-    with pytest.raises(ValueError, match="Workspace is required"):
         adapter.run_json_sync(args)

@@ -58,19 +58,34 @@ async def validation_exception_handler(
     logger.error(f"Validation error in {request.url}: {str(exc)}")
     logger.error(f"Traceback: {traceback.format_exc()}")
 
-    # Sanitize error details to remove binary data that can't be encoded as JSON
+    # Sanitize error details to remove binary data and non-serializable objects
     sanitized_errors = []
     for error in exc.errors():
-        sanitized_error = error.copy()
-        if "input" in sanitized_error:
-            # Replace binary input with a placeholder
+        sanitized_error = {}
+        for key, value in error.items():
+            # Try to serialize each value to check if it's JSON-serializable
             try:
-                # Try to serialize the input to check if it's binary
                 import json
 
-                json.dumps(sanitized_error["input"])
-            except (TypeError, UnicodeDecodeError):
-                sanitized_error["input"] = "<binary or non-serializable data>"
+                json.dumps(value)
+                sanitized_error[key] = value
+            except (TypeError, ValueError):
+                # If not serializable, convert to string representation
+                if key == "ctx" and isinstance(value, dict):
+                    # Special handling for ctx dict - sanitize each sub-value
+                    sanitized_ctx = {}
+                    for ctx_key, ctx_value in value.items():
+                        if isinstance(ctx_value, Exception):
+                            sanitized_ctx[ctx_key] = str(ctx_value)
+                        else:
+                            try:
+                                json.dumps(ctx_value)
+                                sanitized_ctx[ctx_key] = ctx_value
+                            except (TypeError, ValueError):
+                                sanitized_ctx[ctx_key] = str(ctx_value)
+                    sanitized_error[key] = sanitized_ctx
+                else:
+                    sanitized_error[key] = str(value)
         sanitized_errors.append(sanitized_error)
 
     return JSONResponse(

@@ -154,6 +154,12 @@ export interface ProviderModel {
   object: string;
   created: number;
   owned_by: string;
+  model_type?: string;
+  model_ability?: string[];
+  abilities?: string[];  // Added for xagent compatibility
+  category?: string;
+  model_provider?: string;
+  description?: string;
 }
 
 /**

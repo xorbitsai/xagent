@@ -47,6 +47,13 @@ async def create_model(
 ) -> ModelWithAccessInfo:
     """Create a new model configuration"""
 
+    # Debug logging
+    logger.info(f"🔍 Creating model: {model.model_id}")
+    logger.info(f"  Category: {model.category}")
+    logger.info(f"  Provider: {model.model_provider}")
+    logger.info(f"  Abilities: {model.abilities}")
+    logger.info(f"  Model name: {model.model_name}")
+
     # Check if model_id already exists
     model_storage = CoreStorage(db, DBModel)
 
@@ -1585,3 +1592,61 @@ async def fetch_multiple_providers_models(
     return {
         "results": results,
     }
+
+
+@model_router.get("/xinference/tts-models")
+async def list_xinference_tts_models(
+    base_url: str = Query(..., description="Xinference server base URL"),
+    api_key: Optional[str] = Query(None, description="Optional API key"),
+) -> dict:
+    """Get available TTS models from Xinference server.
+
+    Returns a list of TTS/audio models running on the Xinference server,
+    along with their model abilities that can be used for the 'abilities' field
+    when registering a model.
+
+    For TTS models, use abilities: ["tts"]
+    For ASR models, use abilities: ["asr"]
+    For models with both capabilities, use: ["tts", "asr"]
+    """
+    try:
+        from xagent.core.model.tts.xinference import XinferenceTTS
+
+        models = XinferenceTTS.list_available_models(base_url=base_url, api_key=api_key)
+
+        # Map model abilities to xagent abilities format
+        result_models = []
+        for model in models:
+            model_ability = model.get("model_ability", [])
+
+            # Determine xagent abilities based on model capabilities
+            abilities = []
+            if any(ability.startswith("text2audio") for ability in model_ability):
+                abilities.append("tts")
+            if any(ability.startswith("audio2text") for ability in model_ability):
+                abilities.append("asr")
+
+            result_models.append(
+                {
+                    "id": model["id"],
+                    "model_uid": model["model_uid"],
+                    "model_type": model["model_type"],
+                    "model_ability": model_ability,
+                    "description": model["description"],
+                    "abilities": abilities,  # Suggested abilities for xagent
+                    "category": "speech",
+                    "model_provider": "xinference",
+                }
+            )
+
+        return {
+            "models": result_models,
+            "count": len(result_models),
+        }
+
+    except Exception as e:
+        logger.error(f"Error fetching Xinference TTS models: {e}")
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to fetch TTS models from Xinference: {str(e)}",
+        )

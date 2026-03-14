@@ -655,8 +655,17 @@ class XinferenceLLM(BaseLLM):
                     mapped_abilities = []
                     for ability in xinference_abilities:
                         mapped_ability = ability_mapping.get(ability, ability)
-                        if mapped_ability not in mapped_abilities:
-                            mapped_abilities.append(mapped_ability)
+                        # Only add core abilities (asr, tts, chat, vision, tool_calling)
+                        # Filter out detailed capabilities like text2audio_emotion_control
+                        if mapped_ability in [
+                            "asr",
+                            "tts",
+                            "chat",
+                            "vision",
+                            "tool_calling",
+                        ]:
+                            if mapped_ability not in mapped_abilities:
+                                mapped_abilities.append(mapped_ability)
 
                     result.append(
                         {
@@ -664,6 +673,7 @@ class XinferenceLLM(BaseLLM):
                             "model_uid": model_uid,
                             "model_type": model_info.get("model_type", ""),
                             "model_ability": mapped_abilities,
+                            "abilities": mapped_abilities,  # Add abilities field for xagent
                             "description": model_info.get("model_description", ""),
                         }
                     )

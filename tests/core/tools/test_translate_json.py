@@ -81,7 +81,7 @@ async def test_translate_nested_json(translate_tool):
     }
     target_fields = ["segments.text"]
 
-    result_str = await translate_tool.translate_json(
+    result = await translate_tool.translate_json(
         json_data=json_data,
         target_fields=target_fields,
         output_field="translated_text",
@@ -89,14 +89,17 @@ async def test_translate_nested_json(translate_tool):
         source_lang="zh",
     )
 
-    result = json.loads(result_str)
+    assert result["success"] is True
+    assert result["fields_translated"] == 2
 
-    assert "segments" in result
-    assert len(result["segments"]) == 2
-    assert result["segments"][0]["text"] == "你好"
-    assert "translated_text" in result["segments"][0]
-    assert result["segments"][0]["translated_text"] == "Translation1"
-    assert result["segments"][1]["translated_text"] == "Translation2"
+    result_json = json.loads(result["result"])
+
+    assert "segments" in result_json
+    assert len(result_json["segments"]) == 2
+    assert result_json["segments"][0]["text"] == "你好"
+    assert "translated_text" in result_json["segments"][0]
+    assert result_json["segments"][0]["translated_text"] == "Translation1"
+    assert result_json["segments"][1]["translated_text"] == "Translation2"
 
 
 @pytest.mark.asyncio
@@ -105,19 +108,21 @@ async def test_translate_with_different_output_field(translate_tool):
     json_data = {"title": "标题"}
     target_fields = ["title"]
 
-    result_str = await translate_tool.translate_json(
+    result = await translate_tool.translate_json(
         json_data=json_data,
         target_fields=target_fields,
         output_field="en_title",
         target_lang="en",
     )
 
-    result = json.loads(result_str)
+    assert result["success"] is True
 
-    assert "title" in result
-    assert result["title"] == "标题"
-    assert "title_en_title" in result
-    assert result["title_en_title"] == "Translation1"
+    result_json = json.loads(result["result"])
+
+    assert "title" in result_json
+    assert result_json["title"] == "标题"
+    assert "title_en_title" in result_json
+    assert result_json["title_en_title"] == "Translation1"
 
 
 @pytest.mark.asyncio
@@ -157,17 +162,20 @@ async def test_translate_json_string_input(translate_tool):
     json_str = '{"text": "你好"}'
     target_fields = ["text"]
 
-    result_str = await translate_tool.translate_json(
+    result = await translate_tool.translate_json(
         json_data=json_str,
         target_fields=target_fields,
         target_lang="en",
     )
 
-    result = json.loads(result_str)
-    assert "text" in result
-    assert result["text"] == "你好"
-    assert "text_translated_text" in result
-    assert result["text_translated_text"] == "Translation1"
+    assert result["success"] is True
+
+    result_json = json.loads(result["result"])
+
+    assert "text" in result_json
+    assert result_json["text"] == "你好"
+    assert "text_translated_text" in result_json
+    assert result_json["text_translated_text"] == "Translation1"
 
 
 @pytest.mark.asyncio
@@ -177,14 +185,14 @@ async def test_no_matching_fields():
     json_data = {"foo": "bar"}
     target_fields = ["text"]
 
-    result_str = await tool.translate_json(
+    result = await tool.translate_json(
         json_data=json_data,
         target_fields=target_fields,
         target_lang="en",
     )
 
-    result = json.loads(result_str)
-    assert result == {"foo": "bar"}
+    assert result["success"] is False
+    assert "No fields found" in result["error"]
 
 
 def test_translate_json_sync_wrapper():
@@ -198,7 +206,10 @@ def test_translate_json_sync_wrapper():
     # Note: This test may fail if no LLM is configured
     try:
         result = translate_json(json_data, target_fields, target_lang="en")
-        assert result  # Should return a JSON string
+        # Now returns a dictionary instead of a string
+        assert isinstance(result, dict)
+        assert "success" in result
+        assert "result" in result
     except ValueError as e:
         # Expected if no LLM is configured
         assert "No LLM instance available" in str(e)

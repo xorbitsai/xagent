@@ -7,6 +7,7 @@ Supports nested structures and batch translation.
 
 import json
 import logging
+import uuid
 from typing import Any, Dict, List, Optional
 
 logger = logging.getLogger(__name__)
@@ -15,14 +16,18 @@ logger = logging.getLogger(__name__)
 class TranslateJSONToolCore:
     """Core JSON translation functionality"""
 
-    def __init__(self, llm: Optional[Any] = None) -> None:
+    def __init__(
+        self, llm: Optional[Any] = None, workspace: Optional[Any] = None
+    ) -> None:
         """
         Initialize JSON translation tool.
 
         Args:
             llm: LLM instance for translation
+            workspace: Optional workspace for saving translated files
         """
         self._llm = llm
+        self._workspace = workspace
 
     def _get_field_value(self, data: Dict[str, Any], field_path: str) -> List[Any]:
         """
@@ -185,7 +190,7 @@ Translations:"""
         output_field: str = "translated_text",
         target_lang: str = "en",
         source_lang: Optional[str] = None,
-    ) -> str:
+    ) -> Dict[str, Any]:
         """
         Translate specific fields in JSON structure.
 
@@ -209,7 +214,13 @@ Translations:"""
             try:
                 data = json.loads(json_data)
             except json.JSONDecodeError as e:
-                raise ValueError(f"Invalid JSON: {e}")
+                return {
+                    "success": False,
+                    "result": "",
+                    "error": f"Invalid JSON: {e}",
+                    "fields_translated": 0,
+                    "target_lang": target_lang,
+                }
         else:
             data = json_data
 
@@ -223,17 +234,41 @@ Translations:"""
 
         if not all_results:
             logger.warning(f"No fields found matching: {target_fields}")
-            return json.dumps(data, ensure_ascii=False, indent=2)
+            return {
+                "success": False,
+                "result": json.dumps(data, ensure_ascii=False, indent=2),
+                "error": "No fields found matching the specified paths",
+                "fields_translated": 0,
+                "target_lang": target_lang,
+            }
 
         # Extract texts
         texts = [r["value"] for r in all_results if isinstance(r["value"], str)]
 
         if not texts:
             logger.warning("No text values found to translate")
-            return json.dumps(data, ensure_ascii=False, indent=2)
+            return {
+                "success": False,
+                "result": json.dumps(data, ensure_ascii=False, indent=2),
+                "error": "No text values found to translate",
+                "fields_translated": 0,
+                "target_lang": target_lang,
+            }
 
         # Translate
-        translated_texts = await self.translate_values(texts, target_lang, source_lang)
+        try:
+            translated_texts = await self.translate_values(
+                texts, target_lang, source_lang
+            )
+        except Exception as e:
+            logger.error(f"Translation failed: {e}")
+            return {
+                "success": False,
+                "result": "",
+                "error": str(e),
+                "fields_translated": 0,
+                "target_lang": target_lang,
+            }
 
         # Update JSON with translated values
         trans_idx = 0
@@ -270,7 +305,63 @@ Translations:"""
                 if isinstance(parent[key], dict):
                     parent[key][output_field] = translated_text
 
-        return json.dumps(data, ensure_ascii=False, indent=2)
+        result_json = json.dumps(data, ensure_ascii=False, indent=2)
+
+        # Save translation to JSON file if workspace is available
+        file_id: Optional[str] = None
+        translation_path = None
+        saved_to_workspace = False
+
+        if self._workspace:
+            try:
+                # Generate filename for translation
+                filename = f"translation_{uuid.uuid4().hex[:8]}.json"
+
+                # Build structured JSON data
+                translation_data = {
+                    "target_fields": target_fields,
+                    "output_field": output_field,
+                    "target_lang": target_lang,
+                    "source_lang": source_lang,
+                    "fields_translated": len(translated_texts),
+                    "result": data,
+                    "metadata": {
+                        "input_type": "json_string"
+                        if isinstance(json_data, str)
+                        else "json_dict",
+                        "total_input_fields": len(target_fields),
+                    },
+                }
+
+                # Register and save file in workspace
+                with self._workspace.auto_register_files():
+                    save_path = self._workspace.output_dir / filename
+
+                    # Write translation to JSON file
+                    with open(save_path, "w", encoding="utf-8") as f:
+                        json.dump(translation_data, f, ensure_ascii=False, indent=2)
+
+                    translation_path = str(save_path)
+                    logger.info(f"Saved translation to: {translation_path}")
+
+                # Get file ID from workspace after registration
+                if translation_path:
+                    file_id = self._workspace.get_file_id_from_path(translation_path)
+                    saved_to_workspace = True
+
+            except Exception as e:
+                logger.warning(f"Failed to save translation to workspace: {e}")
+
+        return {
+            "success": True,
+            "result": result_json,
+            "error": None,
+            "fields_translated": len(translated_texts),
+            "target_lang": target_lang,
+            "file_id": file_id,
+            "translation_path": translation_path,
+            "saved_to_workspace": saved_to_workspace,
+        }
 
 
 def translate_json(
@@ -279,7 +370,7 @@ def translate_json(
     output_field: str = "translated_text",
     target_lang: str = "en",
     source_lang: Optional[str] = None,
-) -> str:
+) -> Dict[str, Any]:
     """
     Translate specific fields in JSON structure.
 

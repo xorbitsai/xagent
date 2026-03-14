@@ -27,7 +27,7 @@ class TranslateJsonTool(AbstractBaseTool):
     ):
         self._workspace = workspace
         self._llm = llm
-        self._core = TranslateJSONToolCore(llm=llm)
+        self._core = TranslateJSONToolCore(llm=llm, workspace=workspace)
 
     @property
     def name(self) -> str:
@@ -50,7 +50,15 @@ Parameters:
 - source_lang (optional): Source language code. Auto-detect if not specified
 
 Returns:
-Translated JSON string with translations added to specified fields.
+Dictionary with translation result containing:
+- success (bool): Whether translation succeeded
+- result (str): Translated JSON string with translations added to specified fields
+- error (str): Error message if failed
+- fields_translated (int): Number of fields translated
+- target_lang (str): Target language used
+- file_id (str): File ID for accessing the translation JSON file
+- translation_path (str): Path to saved translation JSON file
+- saved_to_workspace (bool): Whether the translation was saved to workspace
 
 Examples:
 1. Simple translation:
@@ -66,6 +74,7 @@ Examples:
    Returns: {"title": "标题", "translated_title": "Title", "content": "内容", "translated_content": "Content"}
 
 Note: Translation is done in batches for efficiency. All texts are sent to LLM together.
+Translation results are automatically saved to workspace when available.
 """
 
     @property
@@ -145,13 +154,7 @@ Note: Translation is done in batches for efficiency. All texts are sent to LLM t
                 )
             )
 
-            return {
-                "success": True,
-                "result": result,
-                "error": None,
-                "fields_translated": len(target_fields_typed),
-                "target_lang": target_lang,
-            }
+            return result
 
         except Exception as e:
             logger.error(f"JSON translation failed: {e}")
@@ -161,6 +164,9 @@ Note: Translation is done in batches for efficiency. All texts are sent to LLM t
                 "error": str(e),
                 "fields_translated": 0,
                 "target_lang": target_lang if "target_lang" in args else "en",
+                "file_id": None,
+                "translation_path": None,
+                "saved_to_workspace": False,
             }
 
     async def run_json_async(self, args: Mapping[str, Any]) -> Any:
@@ -199,13 +205,7 @@ Note: Translation is done in batches for efficiency. All texts are sent to LLM t
                 source_lang=source_lang,
             )
 
-            return {
-                "success": True,
-                "result": result,
-                "error": None,
-                "fields_translated": len(target_fields_typed),
-                "target_lang": target_lang,
-            }
+            return result
 
         except Exception as e:
             logger.error(f"JSON translation failed: {e}")
@@ -215,6 +215,9 @@ Note: Translation is done in batches for efficiency. All texts are sent to LLM t
                 "error": str(e),
                 "fields_translated": 0,
                 "target_lang": target_lang if "target_lang" in args else "en",
+                "file_id": None,
+                "translation_path": None,
+                "saved_to_workspace": False,
             }
 
 

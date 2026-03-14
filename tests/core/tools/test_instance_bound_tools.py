@@ -146,7 +146,12 @@ async def test_tool_creation_function():
         file_tools = create_workspace_file_tools(workspace)
         assert len(file_tools) == 15  # Should have 15 file tools
 
-        # Test file tool functionality
+        # Test that tools are created and bound correctly
+        assert (
+            len(file_tools) == 16
+        )  # Should have 16 file tools (13 original + 2 new editing tools + 1 translate_json tool)
+
+        # Test tool functionality
         write_tool = next(tool for tool in file_tools if tool.name == "write_file")
         read_tool = next(tool for tool in file_tools if tool.name == "read_file")
 

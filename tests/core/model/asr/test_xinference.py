@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from unittest.mock import MagicMock, Mock, patch
+from unittest.mock import AsyncMock, MagicMock, Mock, patch
 
 import pytest
 
@@ -72,44 +72,45 @@ class TestXinferenceASR:
         asr = XinferenceASR()
         assert asr.supports_timestamps is True
 
-    @patch("xagent.core.model.asr.xinference.XinferenceClient")
-    def test_transcribe_simple_text_only(self, mock_client_class: Mock) -> None:
+    @patch("xinference.client.restful.async_restful_client.AsyncClient")
+    async def test_transcribe_simple_text_only(self, mock_client_class: Mock) -> None:
         """Test simple transcription returning text only (verbose=False)."""
         # Setup mock
         mock_client = MagicMock()
         mock_model = MagicMock()
-        mock_model.transcriptions.return_value = {"text": "test text"}
-        mock_client.get_model.return_value = mock_model
+        mock_model.transcriptions = AsyncMock(return_value={"text": "test text"})
+        mock_client.get_model = AsyncMock(return_value=mock_model)
         mock_client_class.return_value = mock_client
 
         asr = XinferenceASR()
         # Use audio bytes to avoid file system operations
         audio_bytes = b"fake audio data"
-        result = asr.transcribe(audio_bytes, format="wav", verbose=False)
+        result = await asr.transcribe(audio_bytes, format="wav", verbose=False)
 
         # Verify
         assert isinstance(result, str)
         assert result == "test text"
         mock_model.transcriptions.assert_called_once()
 
-    @patch("xagent.core.model.asr.xinference.XinferenceClient")
-    def test_transcribe_verbose_with_segments(self, mock_client_class: Mock) -> None:
+    @patch("xinference.client.restful.async_restful_client.AsyncClient")
+    async def test_transcribe_verbose_with_segments(
+        self, mock_client_class: Mock
+    ) -> None:
         """Test verbose transcription returning ASRResult with segments."""
         # Setup mock
         mock_client = MagicMock()
         mock_model = MagicMock()
-        mock_model.transcriptions.return_value = {
-            "text": "test text",
-            "segments": [
-                {"id": 0, "start": 0.0, "end": 2.5, "text": "test text", "speaker": 0}
-            ],
-        }
-        mock_client.get_model.return_value = mock_model
+        segments_data = [
+            {"id": 0, "start": 0.0, "end": 2.5, "text": "test text", "speaker": 0}
+        ]
+        mock_result = {"text": "test text", "segments": segments_data}
+        mock_model.transcriptions = AsyncMock(return_value=mock_result)
+        mock_client.get_model = AsyncMock(return_value=mock_model)
         mock_client_class.return_value = mock_client
 
         asr = XinferenceASR()
         audio_bytes = b"fake audio data"
-        result = asr.transcribe(audio_bytes, format="wav", verbose=True)
+        result = await asr.transcribe(audio_bytes, format="wav", verbose=True)
 
         # Verify
         assert isinstance(result, ASRResult)
@@ -121,53 +122,47 @@ class TestXinferenceASR:
         assert result.segments[0].end == 2.5
         assert result.segments[0].speaker == "0"
 
-    @patch("xagent.core.model.asr.xinference.XinferenceClient")
-    def test_transcribe_with_speaker_zero(self, mock_client_class: Mock) -> None:
+    @patch("xinference.client.restful.async_restful_client.AsyncClient")
+    async def test_transcribe_with_speaker_zero(self, mock_client_class: Mock) -> None:
         """Test that speaker ID 0 is correctly parsed (not treated as falsy)."""
         # Setup mock
         mock_client = MagicMock()
         mock_model = MagicMock()
-        mock_model.transcriptions.return_value = {
-            "text": "speech",
-            "segments": [
-                {
-                    "id": 0,
-                    "start": 0.0,
-                    "end": 1.0,
-                    "text": "speech",
-                    "speaker": 0,  # Speaker 0 should be preserved
-                }
-            ],
-        }
-        mock_client.get_model.return_value = mock_model
+        segments_data = [
+            {"id": 0, "start": 0.0, "end": 1.0, "text": "speech", "speaker": 0}
+        ]
+        mock_result = {"text": "speech", "segments": segments_data}
+        mock_model.transcriptions = AsyncMock(return_value=mock_result)
+        mock_client.get_model = AsyncMock(return_value=mock_model)
         mock_client_class.return_value = mock_client
 
         asr = XinferenceASR()
         audio_bytes = b"fake audio data"
-        result = asr.transcribe(audio_bytes, format="wav", verbose=True)
+        result = await asr.transcribe(audio_bytes, format="wav", verbose=True)
 
         # Verify speaker ID is preserved
         assert result.segments[0].speaker == "0"
 
-    @patch("xagent.core.model.asr.xinference.XinferenceClient")
-    def test_transcribe_with_multiple_speakers(self, mock_client_class: Mock) -> None:
+    @patch("xinference.client.restful.async_restful_client.AsyncClient")
+    async def test_transcribe_with_multiple_speakers(
+        self, mock_client_class: Mock
+    ) -> None:
         """Test transcription with multiple speakers."""
         # Setup mock
         mock_client = MagicMock()
         mock_model = MagicMock()
-        mock_model.transcriptions.return_value = {
-            "text": "hello world",
-            "segments": [
-                {"id": 0, "start": 0.0, "end": 1.0, "text": "hello", "speaker": 0},
-                {"id": 1, "start": 1.0, "end": 2.0, "text": "world", "speaker": 1},
-            ],
-        }
-        mock_client.get_model.return_value = mock_model
+        segments_data = [
+            {"id": 0, "start": 0.0, "end": 1.0, "text": "hello", "speaker": 0},
+            {"id": 1, "start": 1.0, "end": 2.0, "text": "world", "speaker": 1},
+        ]
+        mock_result = {"text": "hello world", "segments": segments_data}
+        mock_model.transcriptions = AsyncMock(return_value=mock_result)
+        mock_client.get_model = AsyncMock(return_value=mock_model)
         mock_client_class.return_value = mock_client
 
         asr = XinferenceASR()
         audio_bytes = b"fake audio data"
-        result = asr.transcribe(audio_bytes, format="wav", verbose=True)
+        result = await asr.transcribe(audio_bytes, format="wav", verbose=True)
 
         # Verify
         assert len(result.segments) == 2
@@ -176,19 +171,19 @@ class TestXinferenceASR:
         assert result.segments[0].text == "hello"
         assert result.segments[1].text == "world"
 
-    @patch("xagent.core.model.asr.xinference.XinferenceClient")
-    def test_transcribe_with_hotword(self, mock_client_class: Mock) -> None:
+    @patch("xinference.client.restful.async_restful_client.AsyncClient")
+    async def test_transcribe_with_hotword(self, mock_client_class: Mock) -> None:
         """Test transcription with hotword parameter."""
         # Setup mock
         mock_client = MagicMock()
         mock_model = MagicMock()
-        mock_model.transcriptions.return_value = {"text": "test"}
-        mock_client.get_model.return_value = mock_model
+        mock_model.transcriptions = AsyncMock(return_value={"text": "test"})
+        mock_client.get_model = AsyncMock(return_value=mock_model)
         mock_client_class.return_value = mock_client
 
         asr = XinferenceASR()
         audio_bytes = b"fake audio data"
-        result = asr.transcribe(
+        result = await asr.transcribe(
             audio_bytes, format="wav", hotword="test word", verbose=False
         )
 
@@ -199,58 +194,60 @@ class TestXinferenceASR:
         assert call_kwargs["hotword"] == "test word"
         assert result == "test"
 
-    @patch("xagent.core.model.asr.xinference.XinferenceClient")
-    def test_transcribe_with_bytes(self, mock_client_class: Mock) -> None:
+    @patch("xinference.client.restful.async_restful_client.AsyncClient")
+    async def test_transcribe_with_bytes(self, mock_client_class: Mock) -> None:
         """Test transcription with audio bytes."""
         # Setup mock
         mock_client = MagicMock()
         mock_model = MagicMock()
-        mock_model.transcriptions.return_value = {"text": "test"}
-        mock_client.get_model.return_value = mock_model
+        mock_model.transcriptions = AsyncMock(return_value={"text": "test"})
+        mock_client.get_model = AsyncMock(return_value=mock_model)
         mock_client_class.return_value = mock_client
 
         asr = XinferenceASR()
         audio_bytes = b"fake audio data"
-        result = asr.transcribe(audio_bytes, format="wav", verbose=False)
+        result = await asr.transcribe(audio_bytes, format="wav", verbose=False)
 
         # Verify
         assert result == "test"
         mock_model.transcriptions.assert_called_once()
 
-    @patch("xagent.core.model.asr.xinference.XinferenceClient")
-    def test_transcribe_with_language_parameter(self, mock_client_class: Mock) -> None:
+    @patch("xinference.client.restful.async_restful_client.AsyncClient")
+    async def test_transcribe_with_language_parameter(
+        self, mock_client_class: Mock
+    ) -> None:
         """Test transcription with language parameter."""
         # Setup mock
         mock_client = MagicMock()
         mock_model = MagicMock()
-        mock_model.transcriptions.return_value = {"text": "test"}
-        mock_client.get_model.return_value = mock_model
+        mock_model.transcriptions = AsyncMock(return_value={"text": "test"})
+        mock_client.get_model = AsyncMock(return_value=mock_model)
         mock_client_class.return_value = mock_client
 
         asr = XinferenceASR()
         audio_bytes = b"fake audio data"
-        asr.transcribe(audio_bytes, format="wav", language="zh", verbose=False)
+        await asr.transcribe(audio_bytes, format="wav", language="zh", verbose=False)
 
         # Verify language was passed
         call_kwargs = mock_model.transcriptions.call_args.kwargs
         assert "language" in call_kwargs
         assert call_kwargs["language"] == "zh"
 
-    @patch("xagent.core.model.asr.xinference.XinferenceClient")
-    def test_transcribe_response_format_verbose_json(
+    @patch("xinference.client.restful.async_restful_client.AsyncClient")
+    async def test_transcribe_response_format_verbose_json(
         self, mock_client_class: Mock
     ) -> None:
         """Test that verbose=True sets response_format to verbose_json."""
         # Setup mock
         mock_client = MagicMock()
         mock_model = MagicMock()
-        mock_model.transcriptions.return_value = {"text": "test"}
-        mock_client.get_model.return_value = mock_model
+        mock_model.transcriptions = AsyncMock(return_value={"text": "test"})
+        mock_client.get_model = AsyncMock(return_value=mock_model)
         mock_client_class.return_value = mock_client
 
         asr = XinferenceASR()
         audio_bytes = b"fake audio data"
-        asr.transcribe(audio_bytes, format="wav", verbose=True)
+        await asr.transcribe(audio_bytes, format="wav", verbose=True)
 
         # Verify response_format was set
         call_kwargs = mock_model.transcriptions.call_args.kwargs
@@ -336,7 +333,7 @@ class TestXinferenceASR:
         segments = asr._parse_segments(segments_data)
         assert len(segments) == 0
 
-    @patch("xagent.core.model.asr.xinference.XinferenceClient")
+    @patch("xinference.client.restful.async_restful_client.AsyncClient")
     def test_context_manager(self, mock_client_class: Mock) -> None:
         """Test context manager functionality."""
         mock_client = MagicMock()
@@ -350,15 +347,15 @@ class TestXinferenceASR:
         assert asr._client is None
         assert asr._model_handle is None
 
-    @patch("xagent.core.model.asr.xinference.XinferenceClient")
-    def test_close(self, mock_client_class: Mock) -> None:
+    @patch("xinference.client.restful.async_restful_client.AsyncClient")
+    async def test_close(self, mock_client_class: Mock) -> None:
         """Test close method cleans up resources."""
         mock_client = MagicMock()
         mock_client_class.return_value = mock_client
 
         asr = XinferenceASR()
         # Create a client by accessing _get_session
-        asr._get_session()
+        await asr._get_session()
         assert asr._client is not None
 
         # Close should clean up resources
@@ -366,24 +363,26 @@ class TestXinferenceASR:
         assert asr._client is None
         assert asr._model_handle is None
 
-    @patch("xagent.core.model.asr.xinference.XinferenceClient")
-    def test_transcribe_error_handling(self, mock_client_class: Mock) -> None:
+    @patch("xinference.client.restful.async_restful_client.AsyncClient")
+    async def test_transcribe_error_handling(self, mock_client_class: Mock) -> None:
         """Test error handling when transcription fails."""
         # Setup mock to raise exception
         mock_client = MagicMock()
         mock_model = MagicMock()
-        mock_model.transcriptions.side_effect = Exception("API Error")
-        mock_client.get_model.return_value = mock_model
+        mock_model.transcriptions = AsyncMock(side_effect=Exception("API Error"))
+        mock_client.get_model = AsyncMock(return_value=mock_model)
         mock_client_class.return_value = mock_client
 
         asr = XinferenceASR()
         audio_bytes = b"fake audio data"
 
         with pytest.raises(RuntimeError, match="Xinference ASR failed"):
-            asr.transcribe(audio_bytes, format="wav")
+            await asr.transcribe(audio_bytes, format="wav")
 
-    @patch("xagent.core.model.asr.xinference.XinferenceClient")
-    def test_get_session_lazy_initialization(self, mock_client_class: Mock) -> None:
+    @patch("xinference.client.restful.async_restful_client.AsyncClient")
+    async def test_get_session_lazy_initialization(
+        self, mock_client_class: Mock
+    ) -> None:
         """Test that client is lazily initialized."""
         mock_client = MagicMock()
         mock_client_class.return_value = mock_client
@@ -392,28 +391,28 @@ class TestXinferenceASR:
         assert asr._client is None
 
         # Access _get_session should create client
-        client = asr._get_session()
+        client = await asr._get_session()
         assert asr._client is not None
         assert client is not None
 
-    @patch("xagent.core.model.asr.xinference.XinferenceClient")
-    def test_ensure_model_handle(self, mock_client_class: Mock) -> None:
+    @patch("xinference.client.restful.async_restful_client.AsyncClient")
+    async def test_ensure_model_handle(self, mock_client_class: Mock) -> None:
         """Test that model handle is created and cached."""
         mock_client = MagicMock()
         mock_model = MagicMock()
-        mock_client.get_model.return_value = mock_model
+        mock_client.get_model = AsyncMock(return_value=mock_model)
         mock_client_class.return_value = mock_client
 
         asr = XinferenceASR()
         assert asr._model_handle is None
 
         # First call should create model handle
-        handle1 = asr._ensure_model_handle()
+        handle1 = await asr._ensure_model_handle()
         assert handle1 is not None
         assert asr._model_handle is not None
 
         # Second call should return cached handle
-        handle2 = asr._ensure_model_handle()
+        handle2 = await asr._ensure_model_handle()
         assert handle1 is handle2
 
         # Should only call get_model once

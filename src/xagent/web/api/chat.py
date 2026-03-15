@@ -611,8 +611,10 @@ class AgentServiceManager:
                             )
                             self._sandboxes[user_id] = sandbox
                         except Exception as e:
-                            logger.error(
-                                f"Failed to create sandbox for user {user_id}: {e}"
+                            # Graceful degradation: tools will run locally without sandbox
+                            logger.warning(
+                                f"Sandbox creation failed for user {user_id}, "
+                                f"falling back to local execution: {e}"
                             )
 
                 # Create tools using ToolFactory

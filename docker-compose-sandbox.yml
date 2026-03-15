@@ -40,7 +40,7 @@ services:
       - BACKEND_PORT=8000
       - XAGENT_UPLOADS_DIR=/root/.xagent/uploads
       - SANDBOX_ENABLED=true
-      - SANDBOX_IMAGE=crpi-6bqou17itrylepr1.cn-guangzhou.personal.cr.aliyuncs.com/yyquiet/sandbox:v2 # Will replace with XAgent image later.
+      - SANDBOX_IMAGE=python:slim # Will replace with XAgent image later.
       - SANDBOX_CPUS=1
       - SANDBOX_MEMORY=512
       - BOXLITE_HOME_DIR=/root/.xagent/boxlite

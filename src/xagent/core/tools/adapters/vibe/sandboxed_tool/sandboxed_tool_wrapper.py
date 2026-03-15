@@ -29,6 +29,11 @@ class SandboxedToolWrapper(AbstractBaseTool):
     Execute tool logic in isolated environment by mounting the entire xagent library to the sandbox.
     """
 
+    # Per-sandbox dependency tracking: sandbox.name -> installed flag
+    _sandbox_deps_installed: dict[str, bool] = {}
+    _sandbox_deps_locks: dict[str, asyncio.Lock] = {}
+    _locks_lock = asyncio.Lock()  # Protects _sandbox_deps_locks creation
+
     def __init__(
         self,
         target_tool: AbstractBaseTool,
@@ -43,7 +48,7 @@ class SandboxedToolWrapper(AbstractBaseTool):
         """
         self._target = target_tool
         self._sandbox = sandbox
-        self._dependencies_installed = False
+        self._sandbox_key = sandbox.name
 
         # Load dependencies and environment variables from config module
         base_requirements = [
@@ -101,9 +106,8 @@ class SandboxedToolWrapper(AbstractBaseTool):
             # Read environment variable from host
             value = os.getenv(env_var)
             if value is not None:
-                # Escape special characters
-                escaped_value = value.replace("\\", "\\\\").replace("'", "\\'")
-                env_lines.append(f"os.environ['{env_var}'] = '{escaped_value}'")
+                # Use json.dumps for safe string encoding (handles \n, quotes, etc.)
+                env_lines.append(f"os.environ['{env_var}'] = {json.dumps(value)}")
             else:
                 # Environment variable not found, log warning but don't interrupt execution
                 logger.warning(f"Environment variable {env_var} not found in host")
@@ -111,40 +115,68 @@ class SandboxedToolWrapper(AbstractBaseTool):
         return "\n".join(env_lines)
 
     async def _ensure_dependencies(self) -> None:
-        """Ensure dependencies are installed in the sandbox"""
-        if self._dependencies_installed:
+        """Ensure dependencies are installed in the sandbox.
+
+        Uses per-sandbox asyncio.Lock to avoid blocking unrelated sandboxes.
+        """
+        if SandboxedToolWrapper._sandbox_deps_installed.get(self._sandbox_key, False):
             return
 
-        if not self._requirements:
-            self._dependencies_installed = True
-            return
+        # Get or create per-sandbox lock
+        if self._sandbox_key not in SandboxedToolWrapper._sandbox_deps_locks:
+            async with SandboxedToolWrapper._locks_lock:
+                if self._sandbox_key not in SandboxedToolWrapper._sandbox_deps_locks:
+                    SandboxedToolWrapper._sandbox_deps_locks[self._sandbox_key] = (
+                        asyncio.Lock()
+                    )
+        lock = SandboxedToolWrapper._sandbox_deps_locks[self._sandbox_key]
 
-        try:
-            # Generate requirements.txt
-            requirements_txt = "\n".join(self._requirements)
-            await self._sandbox.write_file(
-                content=requirements_txt,
-                remote_path="/tmp/requirements.txt",
-                overwrite=True,
-            )
+        async with lock:
+            # Double-check after acquiring lock
+            if SandboxedToolWrapper._sandbox_deps_installed.get(
+                self._sandbox_key, False
+            ):
+                return
 
-            # Install dependencies
-            result = await self._sandbox.exec(
-                "pip",
-                "install",
-                "-r",
-                "/tmp/requirements.txt",
-            )
+            if not self._requirements:
+                SandboxedToolWrapper._sandbox_deps_installed[self._sandbox_key] = True
+                return
 
-            if result.exit_code != 0:
-                logger.error(f"Failed to install dependencies: {result.stderr}")
-                raise RuntimeError(f"Dependency installation failed: {result.stderr}")
+            try:
+                requirements_txt = "\n".join(self._requirements)
+                await self._sandbox.write_file(
+                    content=requirements_txt,
+                    remote_path="/tmp/requirements.txt",
+                    overwrite=True,
+                )
 
-            self._dependencies_installed = True
+                try:
+                    result = await asyncio.wait_for(
+                        self._sandbox.exec(
+                            "pip",
+                            "install",
+                            "-r",
+                            "/tmp/requirements.txt",
+                        ),
+                        timeout=300,
+                    )
+                except asyncio.TimeoutError:
+                    logger.error("pip install timed out after 300s")
+                    raise RuntimeError(
+                        "Dependency installation timed out after 300 seconds"
+                    )
 
-        except Exception as e:
-            logger.error(f"Error installing dependencies: {e}")
-            raise
+                if result.exit_code != 0:
+                    logger.error(f"Failed to install dependencies: {result.stderr}")
+                    raise RuntimeError(
+                        f"Dependency installation failed: {result.stderr}"
+                    )
+
+                SandboxedToolWrapper._sandbox_deps_installed[self._sandbox_key] = True
+
+            except Exception as e:
+                logger.error(f"Error installing dependencies: {e}")
+                raise
 
     def _resolve_execution_strategy(self) -> str:
         """

@@ -28,18 +28,18 @@ class SandboxManager:
         Args:
             service: SandboxService instance for creating sandboxes
         """
-        self._service = service
+        self._service: SandboxService = service
 
     async def get_or_create_sandbox(
         self,
-        lifecycle_tpye: str,
+        lifecycle_type: str,
         lifecycle_id: str,
     ) -> Sandbox:
         """
         Get or create a sandbox.
 
         Args:
-            lifecycle_tpye: e.g. task|user
+            lifecycle_type: e.g. task|user
             lifecycle_id: e.g. task_id|user_id
 
         Returns:
@@ -47,13 +47,22 @@ class SandboxManager:
         """
         # TODO: Determine template and config based on user configuration
         sandbox_image = os.getenv("SANDBOX_IMAGE", "python:slim")
-        sandbox_cpus = int(os.getenv("SANDBOX_CPUS", "1"))
-        sandbox_memory = int(os.getenv("SANDBOX_MEMORY", "512"))
+        try:
+            sandbox_cpus = int(os.getenv("SANDBOX_CPUS", "1"))
+        except ValueError:
+            logger.warning("Invalid SANDBOX_CPUS value, using default")
+            sandbox_cpus = 1
+        try:
+            sandbox_memory = int(os.getenv("SANDBOX_MEMORY", "512"))
+        except ValueError:
+            logger.warning("Invalid SANDBOX_MEMORY value, using default")
+            sandbox_memory = 512
+
         template = SandboxTemplate(type="image", image=sandbox_image)
         config = SandboxConfig(cpus=sandbox_cpus, memory=sandbox_memory)
 
         # Create sandbox with task-specific name
-        sandbox_name = f"{lifecycle_tpye}::{lifecycle_id}"
+        sandbox_name = f"{lifecycle_type}::{lifecycle_id}"
 
         logger.debug(f"Getting or creating sandbox for: {sandbox_name}")
         sandbox = await self._service.get_or_create(
@@ -66,15 +75,15 @@ class SandboxManager:
         await upload_code_to_sandbox(sandbox)
         return sandbox
 
-    async def delete_sandbox(self, lifecycle_tpye: str, lifecycle_id: str) -> None:
+    async def delete_sandbox(self, lifecycle_type: str, lifecycle_id: str) -> None:
         """
         Delete sandbox.
 
         Args:
-            lifecycle_tpye: e.g. task|user
+            lifecycle_type: e.g. task|user
             lifecycle_id: e.g. task_id|user_id
         """
-        sandbox_name = f"{lifecycle_tpye}::{lifecycle_id}"
+        sandbox_name = f"{lifecycle_type}::{lifecycle_id}"
         try:
             await self._service.delete(sandbox_name)
             logger.debug(f"Sandbox deleted: {sandbox_name}")

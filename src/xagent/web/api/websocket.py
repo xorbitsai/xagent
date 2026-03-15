@@ -2337,8 +2337,6 @@ async def handle_build_preview_execution(
     db_gen = get_db()
     db: Session = next(db_gen)
 
-    sandbox_manager = None
-
     try:
         # Parse model configuration
         default_llm = None
@@ -2466,14 +2464,13 @@ async def handle_build_preview_execution(
         sandbox_manager = get_sandbox_manager()
         sandbox = None
         if sandbox_manager:
+            user_id = int(user.id)
             try:
                 sandbox = await sandbox_manager.get_or_create_sandbox(
-                    "task", preview_task_id
+                    "user", str(user_id)
                 )
             except Exception as e:
-                logger.error(
-                    f"Failed to create sandbox for preview {preview_task_id}: {e}"
-                )
+                logger.error(f"Failed to create sandbox for user {user_id}: {e}")
 
             if sandbox:
                 tool_config.set_sandbox(sandbox)
@@ -2729,15 +2726,6 @@ async def handle_build_preview_execution(
         except Exception:
             pass
     finally:
-        # Cleanup sandbox for preview task
-        if sandbox_manager:
-            try:
-                await sandbox_manager.delete_sandbox("task", preview_task_id)
-            except Exception as e:
-                logger.error(
-                    f"Failed to cleanup sandbox for preview {preview_task_id}: {e}"
-                )
-
         db.close()
 
 

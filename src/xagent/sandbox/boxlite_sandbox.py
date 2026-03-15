@@ -309,7 +309,7 @@ async def _create_or_reuse_box(  # type: ignore[no-any-unimported]
         "image": template.image,
         "cpus": config.cpus,
         "memory_mib": config.memory,
-        "disk_size_gb": 10,  # Default size is too small
+        "disk_size_gb": 10,  # Increased to accommodate packages + workspace files
         "auto_remove": False,  # Don't auto-remove, preserve state
         "runtime": runtime,
         "name": name,

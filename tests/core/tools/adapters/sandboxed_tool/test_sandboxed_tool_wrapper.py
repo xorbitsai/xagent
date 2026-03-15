@@ -59,9 +59,7 @@ async def _create_sandbox(service: BoxliteSandboxService, name: str):
     """Helper function: create sandbox instance"""
     template = SandboxTemplate()
     template.type = "image"
-    template.image = (
-        "crpi-6bqou17itrylepr1.cn-guangzhou.personal.cr.aliyuncs.com/yyquiet/sandbox:v2"
-    )
+    template.image = "python:slim"
     config = SandboxConfig(
         cpus=1,
         memory=1024,

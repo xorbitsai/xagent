@@ -179,8 +179,47 @@ class ToolFactory:
                 "⚠️ allowed_tools is empty list - this will filter out all tools! If you want to allow all tools, set allowed_tools to None"
             )
 
+        # Wrap sandbox-enabled tools if sandbox is available
+        sandbox = config.get_sandbox()
+        if sandbox is not None:
+            tools = await ToolFactory._wrap_sandbox_tools(tools, sandbox)
+
         logger.info(f"Created {len(tools)} tools from configuration")
         return tools
+
+    @staticmethod
+    async def _wrap_sandbox_tools(tools: List[Tool], sandbox: Any) -> List[Tool]:
+        """Wrap sandbox-enabled tools with SandboxedToolWrapper.
+
+        Args:
+            tools: Original tool list
+            sandbox: Sandbox instance
+
+        Returns:
+            Tool list with sandbox-enabled tools wrapped
+        """
+        from .sandboxed_tool_config import is_sandbox_enabled
+        from .sandboxed_tool_wrapper import create_sandboxed_tool
+
+        wrapped_tools: List[Tool] = []
+        for tool in tools:
+            if is_sandbox_enabled(tool.name):
+                try:
+                    wrapped = await create_sandboxed_tool(
+                        tool=tool,
+                        sandbox=sandbox,
+                    )
+                    wrapped_tools.append(wrapped)
+                    logger.info(f"Wrapped tool '{tool.name}' with sandbox")
+                except Exception as e:
+                    logger.warning(
+                        f"Failed to wrap tool '{tool.name}' with sandbox: {e}, "
+                        f"using original tool"
+                    )
+                    wrapped_tools.append(tool)
+            else:
+                wrapped_tools.append(tool)
+        return wrapped_tools
 
     # New unified tool creation methods
     @staticmethod

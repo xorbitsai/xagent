@@ -52,6 +52,9 @@ class WebToolConfig(BaseToolConfig):
         self._allowed_tools = allowed_tools
         self._excluded_agent_id: Optional[int] = None
 
+        # Sandbox instance - only store reference, lifecycle managed by upper layer
+        self._sandbox: Optional[Any] = None
+
         # Cache for loaded configurations
         self._cached_vision_config: Optional[Any] = None
         self._cached_image_configs: Optional[Dict[str, Any]] = None
@@ -192,6 +195,14 @@ class WebToolConfig(BaseToolConfig):
     def get_enable_agent_tools(self) -> bool:
         """Whether to include published agents as tools."""
         return True
+
+    def get_sandbox(self) -> Optional[Any]:
+        """Get sandbox instance. Returns None if not available."""
+        return self._sandbox
+
+    def set_sandbox(self, sandbox: Any) -> None:
+        """Set sandbox instance for this config."""
+        self._sandbox = sandbox
 
     def _load_embedding_model(self) -> Optional[str]:
         """Load embedding model ID from database via model service."""

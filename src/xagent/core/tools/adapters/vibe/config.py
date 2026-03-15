@@ -93,6 +93,11 @@ class BaseToolConfig(ABC):
         """Get default image editing model."""
         pass
 
+    @abstractmethod
+    def get_sandbox(self) -> Optional[Any]:
+        """Get sandbox instance for sandboxed executors. Returns None if not available."""
+        pass
+
 
 class ToolConfig(BaseToolConfig):
     """Tool configuration that uses provided config dict for standalone usage."""
@@ -183,3 +188,6 @@ class ToolConfig(BaseToolConfig):
 
     def get_allowed_tools(self) -> Optional[List[str]]:
         return self.allowed_tools
+
+    def get_sandbox(self) -> Optional[Any]:
+        return None  # Standalone config doesn't have sandbox

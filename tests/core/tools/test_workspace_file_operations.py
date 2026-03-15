@@ -292,8 +292,8 @@ class TestWorkspaceFileOperations:
 
     def test_list_all_user_files_with_workspace_files(self, tmp_path):
         """Test list_all_user_files includes workspace files when requested."""
-        # Use a workspace ID that matches the web_task_{id} pattern to avoid test workspace detection
-        workspace = TaskWorkspace("web_task_12345", str(tmp_path))
+        # Use a workspace ID that doesn't match web_task_{id} pattern to avoid database queries
+        workspace = TaskWorkspace("test_workspace_files", str(tmp_path))
         ops = WorkspaceFileOperations(workspace)
 
         # Create some test files in workspace

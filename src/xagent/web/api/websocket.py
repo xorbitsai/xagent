@@ -2337,6 +2337,8 @@ async def handle_build_preview_execution(
     db_gen = get_db()
     db: Session = next(db_gen)
 
+    sandbox_manager = None
+
     try:
         # Parse model configuration
         default_llm = None
@@ -2457,6 +2459,24 @@ async def handle_build_preview_execution(
             workspace_base_dir="uploads/build_preview",
             vision_model=vision_llm,  # Pass vision model for tool creation
         )
+
+        # Create sandbox for preview task
+        from ..sandbox_manager import get_sandbox_manager
+
+        sandbox_manager = get_sandbox_manager()
+        sandbox = None
+        if sandbox_manager:
+            try:
+                sandbox = await sandbox_manager.get_or_create_sandbox(
+                    "task", preview_task_id
+                )
+            except Exception as e:
+                logger.error(
+                    f"Failed to create sandbox for preview {preview_task_id}: {e}"
+                )
+
+            if sandbox:
+                tool_config.set_sandbox(sandbox)
 
         # Check if previewing a published agent, exclude it from agent tools
         preview_agent_id = message_data.get("agent_id")
@@ -2709,6 +2729,15 @@ async def handle_build_preview_execution(
         except Exception:
             pass
     finally:
+        # Cleanup sandbox for preview task
+        if sandbox_manager:
+            try:
+                await sandbox_manager.delete_sandbox("task", preview_task_id)
+            except Exception as e:
+                logger.error(
+                    f"Failed to cleanup sandbox for preview {preview_task_id}: {e}"
+                )
+
         db.close()
 
 

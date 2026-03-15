@@ -2,6 +2,7 @@ from .agent import Agent
 from .database import Base, get_db, get_engine, get_session_local
 from .mcp import MCPServer, UserMCPServer
 from .model import Model
+from .sandbox import SandboxInfo
 from .system_setting import SystemSetting
 from .task import DAGExecution, Task
 from .template_stats import TemplateStats
@@ -30,4 +31,5 @@ __all__ = [
     "SystemSetting",
     "Agent",
     "UploadedFile",
+    "SandboxInfo",
 ]

@@ -126,6 +126,7 @@ async def create_default_tools(
     allowed_tools: Optional[List[str]] = None,
     excluded_agent_id: Optional[int] = None,
     vision_model: Optional[Any] = None,
+    sandbox: Optional[Any] = None,
 ) -> tuple[list[Any], Any]:
     """Create default tools and tool_config for AgentService using ToolFactory"""
     if not user:
@@ -157,6 +158,10 @@ async def create_default_tools(
     # Store excluded_agent_id in tool_config for agent tool filtering
     if excluded_agent_id:
         tool_config._excluded_agent_id = excluded_agent_id
+
+    # Use sandbox if available
+    if sandbox:
+        tool_config.set_sandbox(sandbox)
 
     from ...core.tools.adapters.vibe.factory import ToolFactory
 
@@ -230,6 +235,7 @@ class AgentServiceManager:
 
     def __init__(self, request: Optional[Any] = None) -> None:
         self._agents: Dict[int, AgentService] = {}
+        self._sandboxes: Dict[int, Any] = {}  # user_id -> Sandbox instance
         self._default_llm = create_default_llm()
         self.request = request
 
@@ -348,7 +354,10 @@ class AgentServiceManager:
         }
 
     async def get_agent_for_task(
-        self, task_id: int, db: Optional[Session] = None, user: Optional[User] = None
+        self,
+        task_id: int,
+        db: Optional[Session] = None,
+        user: Optional[User] = None,
     ) -> AgentService:
         """Get or create AgentService instance for specific task"""
         if task_id not in self._agents:
@@ -588,6 +597,24 @@ class AgentServiceManager:
                         f"🔧 Tool categories {tool_categories} mapped to {len(allowed_tools)} tools for task {task_id}"
                     )
 
+                # Get or create sandbox for this user
+                user_id = int(user.id)
+                sandbox = self._sandboxes.get(user_id)
+                if sandbox is None:
+                    from ..sandbox_manager import get_sandbox_manager
+
+                    sandbox_mgr = get_sandbox_manager()
+                    if sandbox_mgr:
+                        try:
+                            sandbox = await sandbox_mgr.get_or_create_sandbox(
+                                "user", str(user_id)
+                            )
+                            self._sandboxes[user_id] = sandbox
+                        except Exception as e:
+                            logger.error(
+                                f"Failed to create sandbox for user {user_id}: {e}"
+                            )
+
                 # Create tools using ToolFactory
                 tools = await create_default_tools(
                     db,
@@ -601,6 +628,7 @@ class AgentServiceManager:
                     allowed_tools=allowed_tools,
                     excluded_agent_id=excluded_agent_id,
                     vision_model=task_vision_llm,  # Pass task-specific vision model
+                    sandbox=sandbox,
                 )
 
                 with UserContext(int(user.id)):

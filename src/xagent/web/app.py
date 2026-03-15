@@ -177,6 +177,16 @@ async def startup_event() -> None:
         f"Memory store similarity threshold: {store_info['similarity_threshold']}"
     )
 
+    # Warmup sandbox manager
+    from .sandbox_manager import get_sandbox_manager
+
+    sandbox_mgr = get_sandbox_manager()
+    if sandbox_mgr:
+        await sandbox_mgr.warmup()
+        logger.info("Sandbox manager initialized and warmed up")
+    else:
+        logger.info("Sandbox manager not available (disabled or init failed)")
+
 
 @app.on_event("shutdown")
 async def shutdown_event() -> None:
@@ -184,6 +194,13 @@ async def shutdown_event() -> None:
     from .timeout_manager import timeout_manager
 
     await timeout_manager.stop()
+
+    # Shutdown all sandboxes
+    from .sandbox_manager import get_sandbox_manager
+
+    sandbox_mgr = get_sandbox_manager()
+    if sandbox_mgr:
+        await sandbox_mgr.shutdown_all()
 
 
 # Frontend is now served by Next.js at http://localhost:3000

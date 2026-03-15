@@ -14,8 +14,8 @@ from typing import Any, Mapping, Optional, Type
 
 from pydantic import BaseModel
 
-from .....sandbox.base import Sandbox
-from .base import AbstractBaseTool, ToolMetadata
+from ......sandbox.base import Sandbox
+from ..base import AbstractBaseTool, ToolMetadata
 from .sandboxed_tool_config import get_sandbox_tool_config
 
 logger = logging.getLogger(__name__)

@@ -4,7 +4,7 @@ Unit tests for sandboxed tool configuration module
 
 from unittest.mock import mock_open, patch
 
-from src.xagent.core.tools.adapters.vibe.sandboxed_tool_config import (
+from src.xagent.core.tools.adapters.vibe.sandboxed_tool.sandboxed_tool_config import (
     SandboxedToolConfig,
     SandboxedToolConfigManager,
     get_sandbox_tool_config,
@@ -65,7 +65,7 @@ class TestConfigLoading:
         SandboxedToolConfigManager._instance = None
         if hasattr(SandboxedToolConfigManager, "_config"):
             SandboxedToolConfigManager._config = None
-        import src.xagent.core.tools.adapters.vibe.sandboxed_tool_config as config_module
+        import src.xagent.core.tools.adapters.vibe.sandboxed_tool.sandboxed_tool_config as config_module
 
         if hasattr(config_module, "_config_manager"):
             config_module._config_manager._config = None

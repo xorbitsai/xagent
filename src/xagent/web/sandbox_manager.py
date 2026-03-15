@@ -7,7 +7,7 @@ import os
 import threading
 from typing import Optional
 
-from ..core.tools.adapters.vibe.sandboxed_tool_wrapper import (
+from ..core.tools.adapters.vibe.sandboxed_tool.sandboxed_tool_wrapper import (
     upload_code_to_sandbox,
 )
 from ..sandbox import SandboxService

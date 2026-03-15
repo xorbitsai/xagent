@@ -12,7 +12,7 @@ from src.xagent.core.tools.adapters.vibe.javascript_executor import (
     get_javascript_executor_tool,
 )
 from src.xagent.core.tools.adapters.vibe.python_executor import get_python_executor_tool
-from src.xagent.core.tools.adapters.vibe.sandboxed_tool_wrapper import (
+from src.xagent.core.tools.adapters.vibe.sandboxed_tool.sandboxed_tool_wrapper import (
     create_sandboxed_tool,
     upload_code_to_sandbox,
 )

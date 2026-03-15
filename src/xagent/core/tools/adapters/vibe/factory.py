@@ -198,8 +198,8 @@ class ToolFactory:
         Returns:
             Tool list with sandbox-enabled tools wrapped
         """
-        from .sandboxed_tool_config import is_sandbox_enabled
-        from .sandboxed_tool_wrapper import create_sandboxed_tool
+        from .sandboxed_tool.sandboxed_tool_config import is_sandbox_enabled
+        from .sandboxed_tool.sandboxed_tool_wrapper import create_sandboxed_tool
 
         wrapped_tools: List[Tool] = []
         for tool in tools:

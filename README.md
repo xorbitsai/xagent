@@ -99,6 +99,12 @@ cp example.env .env
 docker compose up -d
 ```
 
+To enable sandbox (requires Linux or WSL2 with KVM support):
+
+```bash
+docker compose -f docker-compose-sandbox.yml up -d
+```
+
 ### 3️⃣ Open in browser
 
 ```

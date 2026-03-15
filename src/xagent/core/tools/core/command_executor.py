@@ -6,11 +6,207 @@ Execute shell commands and scripts with proper controls.
 
 import logging
 import os
+import re
 import subprocess
 import tempfile
-from typing import Any, Dict, Optional
+from pathlib import Path
+from typing import Any, Dict, Optional, Set
 
 logger = logging.getLogger(__name__)
+
+# Constants
+# Maximum output size to prevent memory exhaustion (10 MB)
+MAX_OUTPUT_SIZE = 10 * 1024 * 1024
+
+# Timeout return code constant
+TIMEOUT_EXIT_CODE = -999
+
+# Allowed interpreters for script execution (prevents command injection)
+ALLOWED_INTERPRETERS: Set[str] = {
+    "bash",
+    "sh",
+    "python",
+    "python3",
+    "node",
+    "npm",
+    "ruby",
+    "perl",
+    "php",
+}
+
+# Blocked command patterns (basic safety checks)
+# These patterns are checked before command execution as a defense-in-depth measure
+BLOCKED_PATTERNS = [
+    r"rm\s+-rf\s+/",
+    r"dd\s+if=/dev/zero",
+    r"dd\s+if=/dev/random",
+    r":\(\)\s*{\s*:\s*\|\s*:\s*&\s*}\s*;",  # Fork bomb
+    r"mkfs\.",
+]
+
+# Allowed environment variables (whitelist for security)
+# Only these environment variables will be passed to subprocess
+ALLOWED_ENV_VARS: Set[str] = {
+    "PATH",
+    "HOME",
+    "USER",
+    "USERNAME",
+    "LANG",
+    "LC_ALL",
+    "LC_CTYPE",
+    "SHELL",
+    "TERM",
+    "PWD",
+    "TMPDIR",
+    "TEMP",
+    "TMP",
+}
+
+
+def _validate_timeout(timeout: Optional[int], default_timeout: int) -> int:
+    """
+    Validate and normalize timeout value.
+
+    Args:
+        timeout: Timeout in seconds
+        default_timeout: Default timeout to use if timeout is None
+
+    Returns:
+        Validated timeout value
+
+    Raises:
+        ValueError: If timeout is invalid
+    """
+    if timeout is not None:
+        if timeout <= 0:
+            raise ValueError(f"timeout must be positive, got: {timeout}")
+        return timeout
+    return default_timeout
+
+
+def _sanitize_command_for_logging(command: Any, max_length: int = 200) -> str:
+    """
+    Sanitize command for logging to avoid exposing sensitive data.
+
+    Args:
+        command: The command to sanitize (str or list)
+        max_length: Maximum length of command to log
+
+    Returns:
+        Sanitized command string
+    """
+    # Convert list command to string for logging
+    if isinstance(command, list):
+        command_str = " ".join(str(x) for x in command)
+    else:
+        command_str = str(command)
+
+    # Truncate long commands
+    if len(command_str) > max_length:
+        return command_str[:max_length] + "... [TRUNCATED]"
+
+    # Redact potential sensitive patterns
+    sensitive_patterns = [
+        (
+            r"(Bearer|Authorization|Token|API[_-]?KEY|PASSWORD|PASSWD|SECRET)[=\s][^\s]+",
+            "REDACTED",
+        ),
+        (r"--password[=\s][^\s]+", "--password=REDACTED"),
+        (r"-p\s+[^\s]+", "-p REDACTED"),
+    ]
+
+    for pattern, replacement in sensitive_patterns:
+        command_str = re.sub(pattern, replacement, command_str, flags=re.IGNORECASE)
+
+    return command_str
+
+
+def _validate_command(command: Any) -> None:
+    """
+    Validate command against blocked patterns.
+
+    This is a defense-in-depth measure. The sandbox provides primary protection,
+    but this adds an additional layer of validation.
+
+    Args:
+        command: The command to validate (str or list)
+
+    Raises:
+        CommandValidationError: If command contains blocked patterns
+    """
+    # Convert list command to string for validation
+    if isinstance(command, list):
+        command_str = " ".join(str(x) for x in command)
+    else:
+        command_str = str(command)
+
+    command_lower = command_str.lower()
+
+    for pattern in BLOCKED_PATTERNS:
+        if re.search(pattern, command_lower):
+            raise ValueError(
+                f"Command contains blocked pattern: {pattern}. "
+                "This command is not allowed for safety reasons."
+            )
+
+
+def _get_safe_environment() -> Dict[str, str]:
+    """
+    Get a sanitized environment dictionary with only safe variables.
+
+    This is a defense-in-depth measure. The sandbox provides primary protection,
+    but this limits what environment variables are accessible to commands.
+
+    Returns:
+        Dictionary with allowed environment variables
+    """
+    return {k: v for k, v in os.environ.items() if k in ALLOWED_ENV_VARS}
+
+
+def _validate_working_directory(working_directory: Optional[str]) -> None:
+    """
+    Validate working directory before use.
+
+    Args:
+        working_directory: Directory path to validate
+
+    Raises:
+        FileNotFoundError: If directory doesn't exist
+        NotADirectoryError: If path is not a directory
+        PermissionError: If directory is not accessible
+    """
+    if not working_directory:
+        return
+
+    work_dir = Path(working_directory)
+
+    if not work_dir.exists():
+        raise FileNotFoundError(
+            f"Working directory does not exist: {working_directory}"
+        )
+
+    if not work_dir.is_dir():
+        raise NotADirectoryError(f"Path is not a directory: {working_directory}")
+
+    if not os.access(working_directory, os.X_OK):
+        raise PermissionError(
+            f"No execute permission for directory: {working_directory}"
+        )
+
+
+def _sanitize_interpreter_suffix(interpreter: str) -> str:
+    """
+    Sanitize interpreter name for use as temp file suffix.
+
+    Args:
+        interpreter: Interpreter name (e.g., 'bash', 'python3.11')
+
+    Returns:
+        Sanitized interpreter name suitable for file suffix
+    """
+    # Take first part (before any space) and remove dots
+    safe_name = interpreter.split()[0].replace(".", "").replace("-", "_")
+    return safe_name if safe_name else "tmp"
 
 
 class CommandExecutorCore:
@@ -44,8 +240,16 @@ class CommandExecutorCore:
 
         Returns:
             Dictionary with success status, output, and error information
+
+        Raises:
+            ValueError: If timeout is invalid
+            FileNotFoundError: If working directory doesn't exist
+            NotADirectoryError: If working directory path is not a directory
+            PermissionError: If working directory is not accessible
         """
-        timeout = timeout or self.timeout
+        timeout = _validate_timeout(timeout, self.timeout)
+        _validate_working_directory(self.working_directory)
+        _validate_command(command)
 
         old_cwd = None
         if self.working_directory:
@@ -55,21 +259,34 @@ class CommandExecutorCore:
             )
             os.chdir(self.working_directory)
 
-        try:
-            logger.info(f"CommandExecutor: Executing command: {command}")
+        # Sanitize command for logging
+        safe_command = _sanitize_command_for_logging(command)
+        logger.info(f"CommandExecutor: Executing: {safe_command}")
 
+        try:
             result = subprocess.run(
                 command,
                 shell=shell,
                 capture_output=capture_output,
                 text=True,
                 timeout=timeout,
+                env=_get_safe_environment(),
             )
+
+            output = result.stdout if capture_output else ""
+            error = result.stderr if capture_output else ""
+
+            # Truncate output if it exceeds maximum size
+            if capture_output:
+                if len(output) > MAX_OUTPUT_SIZE:
+                    output = output[:MAX_OUTPUT_SIZE] + "\n[OUTPUT TRUNCATED]"
+                if len(error) > MAX_OUTPUT_SIZE:
+                    error = error[:MAX_OUTPUT_SIZE] + "\n[ERROR TRUNCATED]"
 
             return {
                 "success": result.returncode == 0,
-                "output": result.stdout if capture_output else "",
-                "error": result.stderr if capture_output else "",
+                "output": output,
+                "error": error,
                 "return_code": result.returncode,
             }
 
@@ -81,7 +298,7 @@ class CommandExecutorCore:
                 "success": False,
                 "output": "",
                 "error": f"Command timed out after {timeout} seconds",
-                "return_code": -1,
+                "return_code": TIMEOUT_EXIT_CODE,
             }
         except Exception as e:
             logger.error(f"CommandExecutor: Execution error: {str(e)}")
@@ -89,14 +306,17 @@ class CommandExecutorCore:
                 "success": False,
                 "output": "",
                 "error": f"Execution error: {str(e)}",
-                "return_code": -1,
+                "return_code": TIMEOUT_EXIT_CODE,
             }
         finally:
             if old_cwd is not None:
-                logger.info(
-                    f"CommandExecutor: Restoring working directory to {old_cwd}"
-                )
-                os.chdir(old_cwd)
+                try:
+                    os.chdir(old_cwd)
+                except Exception as e:
+                    logger.error(
+                        f"CommandExecutor: Failed to restore working directory to {old_cwd}: {e}"
+                    )
+                    # Don't raise - let original exception propagate
 
     def execute_script(
         self,
@@ -114,16 +334,30 @@ class CommandExecutorCore:
 
         Returns:
             Dictionary with execution result
+
+        Raises:
+            ValueError: If interpreter is not allowed or timeout is invalid
         """
-        timeout = timeout or self.timeout
+        timeout = _validate_timeout(timeout, self.timeout)
+
+        # Validate interpreter against whitelist
+        interpreter_base = interpreter.split()[0]  # Take first part only
+        if interpreter_base not in ALLOWED_INTERPRETERS:
+            raise ValueError(
+                f"Interpreter '{interpreter}' is not allowed. "
+                f"Allowed interpreters: {', '.join(sorted(ALLOWED_INTERPRETERS))}"
+            )
 
         try:
             logger.info(
                 f"CommandExecutor: Executing script with interpreter: {interpreter}"
             )
 
+            # Sanitize interpreter for temp file suffix
+            safe_suffix = _sanitize_interpreter_suffix(interpreter)
+
             with tempfile.NamedTemporaryFile(
-                mode="w", suffix=f".{interpreter}", delete=False
+                mode="w", suffix=f".{safe_suffix}", delete=False
             ) as f:
                 f.write(script_content)
                 script_path = f.name
@@ -133,7 +367,10 @@ class CommandExecutorCore:
                 command = f"{interpreter} {script_path}"
                 return self.execute_command(command, timeout=timeout)
             finally:
-                os.unlink(script_path)
+                try:
+                    os.unlink(script_path)
+                except OSError:
+                    pass  # Temp file cleanup failed, but command already ran
 
         except Exception as e:
             logger.error(f"CommandExecutor: Script execution error: {str(e)}")
@@ -141,7 +378,7 @@ class CommandExecutorCore:
                 "success": False,
                 "output": "",
                 "error": f"Script execution error: {str(e)}",
-                "return_code": -1,
+                "return_code": TIMEOUT_EXIT_CODE,
             }
 
 
@@ -188,7 +425,7 @@ def execute_script(
     return executor.execute_script(script_content, interpreter, timeout)
 
 
-def get_command_executor_tool(_info: Optional[dict[str, str]] = None) -> Any:
+def get_command_executor_tool(_info: Optional[dict[str, Any]] = None) -> Any:
     """
     Get command executor tool for LangChain integration.
 
@@ -245,7 +482,10 @@ def get_command_executor_tool(_info: Optional[dict[str, str]] = None) -> Any:
         working_dir = None
         if _info and "workspace" in _info:
             workspace = _info["workspace"]
-            if hasattr(workspace, "path"):
+            # Use resolve_path method for consistency with adapter
+            if hasattr(workspace, "resolve_path"):
+                working_dir = str(workspace.resolve_path(""))
+            elif hasattr(workspace, "path"):
                 working_dir = workspace.path
 
         executor = CommandExecutorCore(working_dir)

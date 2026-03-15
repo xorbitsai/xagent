@@ -83,7 +83,7 @@ class TestCommandExecutorTool:
 
         assert result["success"] is False
         assert "timed out" in result["error"].lower()
-        assert result["return_code"] == -1
+        assert result["return_code"] == -999  # TIMEOUT_EXIT_CODE
 
     def test_invalid_command(self, command_executor):
         """Test handling of invalid command"""
@@ -371,19 +371,15 @@ class TestEdgeCases:
 
     def test_zero_timeout(self, command_executor):
         """Test command with zero timeout"""
-        # Zero timeout should use default or fail immediately
-        result = command_executor.run_json_sync({"command": "echo test", "timeout": 0})
-
-        # Should either succeed quickly or timeout
-        assert isinstance(result["success"], bool)
+        # Zero timeout should now raise ValueError
+        with pytest.raises(ValueError, match="timeout must be positive"):
+            command_executor.run_json_sync({"command": "echo test", "timeout": 0})
 
     def test_negative_timeout(self, command_executor):
         """Test command with negative timeout"""
-        # Negative timeout should be handled gracefully
-        result = command_executor.run_json_sync({"command": "echo test", "timeout": -1})
-
-        # Should handle negative timeout
-        assert isinstance(result["success"], bool)
+        # Negative timeout should now raise ValueError
+        with pytest.raises(ValueError, match="timeout must be positive"):
+            command_executor.run_json_sync({"command": "echo test", "timeout": -1})
 
 
 class TestPlatformSpecific:
@@ -411,3 +407,154 @@ class TestPlatformSpecific:
 
         assert result["success"] is True
         assert len(result["output"].strip()) > 0
+
+
+class TestExecuteScriptFunction:
+    """Test cases for the execute_script convenience function"""
+
+    def test_execute_script_function(self):
+        """Test execute_script convenience function"""
+        script = "#!/bin/bash\necho 'script output'"
+        result = execute_script(script, interpreter="bash")
+
+        assert result["success"] is True
+        assert "script output" in result["output"]
+
+    def test_execute_script_with_python(self):
+        """Test execute_script with Python interpreter"""
+        script = "print('python script output')"
+        result = execute_script(script, interpreter="python")
+
+        assert result["success"] is True
+        assert "python script output" in result["output"]
+
+    def test_execute_script_invalid_interpreter(self):
+        """Test execute_script with invalid interpreter"""
+        script = "echo test"
+        with pytest.raises(ValueError, match="not allowed"):
+            execute_script(script, interpreter="invalid_interpreter_xyz")
+
+    def test_execute_script_with_timeout(self):
+        """Test execute_script with timeout"""
+        script = "#!/bin/bash\nsleep 0.1"
+        result = execute_script(script, interpreter="bash", timeout=5)
+
+        assert result["success"] is True
+
+
+class TestConcurrentExecution:
+    """Test cases for concurrent command execution"""
+
+    def test_concurrent_execution(self):
+        """Test that concurrent executions don't interfere"""
+        import threading
+
+        results = []
+
+        def run_cmd(work_dir, thread_id):
+            try:
+                executor = CommandExecutorCore(working_directory=work_dir)
+                result = executor.execute_command("pwd")
+                results.append((thread_id, result["output"].strip(), result["success"]))
+            except Exception as e:
+                results.append((thread_id, str(e), False))
+
+        threads = [
+            threading.Thread(target=run_cmd, args=("/tmp", 1)),
+            threading.Thread(target=run_cmd, args=("/home", 2)),
+        ]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+
+        # Both threads should complete successfully
+        assert len(results) == 2
+        for tid, output, success in results:
+            assert success is True
+            assert len(output) > 0
+
+
+class TestTimeoutValidation:
+    """Test cases for timeout validation"""
+
+    def test_negative_timeout_raises_error(self):
+        """Test that negative timeout raises ValueError"""
+        executor = CommandExecutorCore()
+
+        with pytest.raises(ValueError, match="timeout must be positive"):
+            executor.execute_command("echo test", timeout=-1)
+
+    def test_zero_timeout_raises_error(self):
+        """Test that zero timeout raises ValueError"""
+        executor = CommandExecutorCore()
+
+        with pytest.raises(ValueError, match="timeout must be positive"):
+            executor.execute_command("echo test", timeout=0)
+
+
+class TestWorkingDirectoryValidation:
+    """Test cases for working directory validation"""
+
+    def test_nonexistent_working_directory(self):
+        """Test that nonexistent working directory raises FileNotFoundError"""
+        executor = CommandExecutorCore(working_directory="/nonexistent/path/xyz")
+
+        with pytest.raises(FileNotFoundError, match="does not exist"):
+            executor.execute_command("echo test")
+
+    def test_file_as_working_directory(self, tmp_path):
+        """Test that using a file (not directory) as working directory raises error"""
+        test_file = tmp_path / "test.txt"
+        test_file.write_text("test")
+
+        executor = CommandExecutorCore(working_directory=str(test_file))
+
+        with pytest.raises(NotADirectoryError, match="not a directory"):
+            executor.execute_command("echo test")
+
+
+class TestInterpreterWhitelist:
+    """Test cases for interpreter whitelist validation"""
+
+    def test_allowed_interpreters(self):
+        """Test that allowed interpreters work"""
+        executor = CommandExecutorCore()
+        allowed = ["bash", "sh", "python", "python3", "node"]
+
+        for interp in allowed:
+            # Just test that validation doesn't raise
+            try:
+                executor.execute_script("echo test", interpreter=interp)
+            except ValueError as e:
+                if "not allowed" in str(e):
+                    pytest.fail(f"Allowed interpreter '{interp}' was rejected")
+                else:
+                    # Other errors (e.g., interpreter not installed) are OK
+                    pass
+
+    def test_blocked_interpreter(self):
+        """Test that blocked interpreters raise ValueError"""
+        executor = CommandExecutorCore()
+
+        # Use an interpreter not in the allowed list
+        with pytest.raises(ValueError, match="not allowed"):
+            executor.execute_script("echo test", interpreter="xyz_invalid_interpreter")
+
+
+class TestOutputSizeLimit:
+    """Test cases for output size limiting"""
+
+    def test_large_output_truncation(self, command_executor):
+        """Test that very large output is truncated"""
+        # Generate a command that produces lots of output (more than 10MB)
+        # Use Python to generate large output
+        result = command_executor.run_json_sync(
+            {"command": "python -c \"print('x' * 11_000_000)\""}
+        )
+
+        assert result["success"] is True
+        # Output should be truncated
+        assert "[OUTPUT TRUNCATED]" in result["output"]
+        # Output should be truncated to MAX_OUTPUT_SIZE + suffix
+        assert len(result["output"]) <= 10 * 1024 * 1024 + 100

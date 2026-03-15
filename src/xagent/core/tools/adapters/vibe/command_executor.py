@@ -102,9 +102,7 @@ def get_command_executor_tool(info: Optional[dict[str, Any]] = None) -> Function
     # Extract workspace from info if provided
     workspace = None
     if info and "workspace" in info:
-        workspace = (
-            info["workspace"] if isinstance(info["workspace"], TaskWorkspace) else None
-        )
+        workspace = info["workspace"]
 
     # Create workspace-bound command executor
     executor = CommandExecutorTool(workspace=workspace)

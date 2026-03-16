@@ -65,7 +65,8 @@ dependencies = [
   "playwright>=1.40.0",
   "beartype>=0.18.5",
   "matplotlib>=3.5.0",
-  "boxlite>=0.6.0; sys_platform != 'linux' or platform_machine != 'aarch64'",
+  "boxlite>=0.6.0; sys_platform == 'linux' and platform_machine == 'x86_64'",
+  "boxlite>=0.6.0; sys_platform == 'darwin' and platform_machine == 'arm64'",
 ]
 
 [project.optional-dependencies]

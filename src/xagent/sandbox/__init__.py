@@ -13,12 +13,6 @@ from .base import (
     SandboxTemplate,
     TemplateType,
 )
-from .boxlite_sandbox import (
-    BoxliteSandbox,
-    BoxliteSandboxService,
-    BoxliteStore,
-    MemBoxliteStore,
-)
 
 __all__ = [
     "TemplateType",
@@ -30,8 +24,21 @@ __all__ = [
     "ExecResult",
     "Sandbox",
     "SandboxService",
-    "BoxliteSandbox",
-    "BoxliteStore",
-    "MemBoxliteStore",
-    "BoxliteSandboxService",
 ]
+
+try:
+    from .boxlite_sandbox import (
+        BoxliteSandbox,
+        BoxliteSandboxService,
+        BoxliteStore,
+        MemBoxliteStore,
+    )
+
+    __all__ += [
+        "BoxliteSandbox",
+        "BoxliteStore",
+        "MemBoxliteStore",
+        "BoxliteSandboxService",
+    ]
+except ImportError:
+    pass

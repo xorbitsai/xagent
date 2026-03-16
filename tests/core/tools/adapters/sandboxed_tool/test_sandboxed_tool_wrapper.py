@@ -8,6 +8,14 @@ import asyncio
 
 import pytest
 
+try:
+    import boxlite  # noqa: F401
+except ImportError:
+    pytest.skip(
+        "boxlite not installed, skipping sandbox integration tests",
+        allow_module_level=True,
+    )
+
 from src.xagent.core.tools.adapters.vibe.javascript_executor import (
     get_javascript_executor_tool,
 )
@@ -34,8 +42,6 @@ def event_loop():
 def _check_boxlite_available() -> bool:
     """Check if boxlite is available"""
     try:
-        import boxlite
-
         try:
             boxlite.Boxlite.default()
             print("\n✓ Boxlite initialized successfully")

@@ -127,6 +127,15 @@ class TestGetSandboxManager:
         assert all(r is results[0] for r in results)
 
 
+try:
+    from xagent.sandbox import BoxliteSandboxService  # noqa: F401
+
+    _has_boxlite = True
+except ImportError:
+    _has_boxlite = False
+
+
+@pytest.mark.skipif(not _has_boxlite, reason="boxlite not installed")
 class TestCreateBoxliteService:
     """Test _create_boxlite_service function."""
 

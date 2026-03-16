@@ -10,6 +10,13 @@ import tempfile
 
 import pytest
 
+try:
+    import boxlite  # noqa: F401
+except ImportError:
+    pytest.skip(
+        "boxlite not installed, skipping sandbox tests", allow_module_level=True
+    )
+
 from src.xagent.sandbox.base import SandboxConfig, SandboxTemplate
 from src.xagent.sandbox.boxlite_sandbox import BoxliteSandboxService, MemBoxliteStore
 
@@ -22,23 +29,17 @@ def event_loop():
 
 
 def _check_boxlite_available() -> bool:
-    """Check if boxlite is available and can be initialized."""
+    """Check if boxlite is available"""
     try:
-        import boxlite
-
-        # Try to initialize boxlite runtime
-        # This may fail on Linux without KVM access or on unsupported platforms
         try:
             boxlite.Boxlite.default()
-            print("\n✓ Boxlite initialization success")
+            print("\n✓ Boxlite initialized successfully")
             return True
         except BaseException as e:
-            # Catch all exceptions including Rust panics (PanicException)
             error_msg = f"✗ Boxlite initialization failed: {type(e).__name__}: {e}"
             print(f"\n{error_msg}")
             return False
     except ImportError as e:
-        # boxlite not installed
         error_msg = f"✗ Boxlite import failed: {type(e).__name__}: {e}"
         print(f"\n{error_msg}")
         return False

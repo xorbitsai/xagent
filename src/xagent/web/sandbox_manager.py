@@ -7,9 +7,6 @@ import os
 import threading
 from typing import Optional
 
-from ..core.tools.adapters.vibe.sandboxed_tool.sandboxed_tool_wrapper import (
-    upload_code_to_sandbox,
-)
 from ..sandbox import SandboxService
 from ..sandbox.base import Sandbox, SandboxConfig, SandboxTemplate
 
@@ -72,6 +69,10 @@ class SandboxManager:
         )
 
         # Package and upload xagent code
+        from ..core.tools.adapters.vibe.sandboxed_tool.sandboxed_tool_wrapper import (
+            upload_code_to_sandbox,
+        )
+
         await upload_code_to_sandbox(sandbox)
         return sandbox
 
@@ -178,7 +179,12 @@ def _create_sandbox_service() -> Optional[SandboxService]:
 
 def _create_boxlite_service() -> Optional[SandboxService]:
     """Create Boxlite sandbox service."""
-    from ..sandbox import BoxliteSandboxService
+    try:
+        from ..sandbox import BoxliteSandboxService
+    except ImportError:
+        logger.error("boxlite is not installed.")
+        return None
+
     from .sandbox_store import DBBoxliteStore
 
     store = DBBoxliteStore()

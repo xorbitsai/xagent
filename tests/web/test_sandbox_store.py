@@ -4,6 +4,14 @@ import json
 from datetime import datetime
 
 import pytest
+
+try:
+    import boxlite  # noqa: F401
+except ImportError:
+    pytest.skip(
+        "boxlite not installed, skipping sandbox store tests", allow_module_level=True
+    )
+
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 

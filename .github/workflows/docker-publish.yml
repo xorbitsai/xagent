@@ -14,7 +14,6 @@ env:
   REGISTRY: docker.io
   BACKEND_IMAGE: xprobe/xagent-backend
   FRONTEND_IMAGE: xprobe/xagent-frontend
-  SANDBOX_IMAGE: xprobe/xagent-sandbox
   PLATFORMS: linux/amd64,linux/arm64
 
 jobs:
@@ -60,15 +59,6 @@ jobs:
             type=semver,pattern={{version}}
             type=raw,value=latest,enable={{is_default_branch}}
 
-      - name: Extract metadata for sandbox
-        id: meta-sandbox
-        uses: docker/metadata-action@v5
-        with:
-          images: ${{ env.SANDBOX_IMAGE }}
-          tags: |
-            type=semver,pattern={{version}}
-            type=raw,value=latest,enable={{is_default_branch}}
-
       - name: Build and push backend image
         uses: docker/build-push-action@v6
         with:
@@ -95,15 +85,3 @@ jobs:
             NEXT_PUBLIC_WS_URL=
           cache-from: type=registry,ref=${{ env.FRONTEND_IMAGE }}:buildcache
           cache-to: type=registry,ref=${{ env.FRONTEND_IMAGE }}:buildcache,mode=max
-
-      - name: Build and push sandbox image
-        uses: docker/build-push-action@v6
-        with:
-          context: .
-          file: docker/Dockerfile.sandbox
-          platforms: ${{ env.PLATFORMS }}
-          push: true
-          tags: ${{ steps.meta-sandbox.outputs.tags }}
-          labels: ${{ steps.meta-sandbox.outputs.labels }}
-          cache-from: type=registry,ref=${{ env.SANDBOX_IMAGE }}:buildcache
-          cache-to: type=registry,ref=${{ env.SANDBOX_IMAGE }}:buildcache,mode=max

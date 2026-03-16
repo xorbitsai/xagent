@@ -1,6 +1,9 @@
 name: Publish Sandbox Image
 
 on:
+  push:
+    tags:
+      - '*'
   workflow_dispatch:
     inputs:
       tag:
@@ -42,6 +45,15 @@ jobs:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_PASSWORD }}
 
+      - name: Extract metadata for sandbox
+        id: meta-sandbox
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.SANDBOX_IMAGE }}
+          tags: |
+            type=semver,pattern={{version}},enable=${{ github.event_name == 'push' }}
+            type=raw,value=${{ github.event.inputs.tag || 'latest' }},enable=${{ github.event_name == 'workflow_dispatch' }}
+
       - name: Build and push sandbox image
         uses: docker/build-push-action@v6
         with:
@@ -49,6 +61,7 @@ jobs:
           file: docker/Dockerfile.sandbox
           platforms: ${{ env.PLATFORMS }}
           push: true
-          tags: ${{ env.SANDBOX_IMAGE }}:${{ github.event.inputs.tag }}
+          tags: ${{ steps.meta-sandbox.outputs.tags }}
+          labels: ${{ steps.meta-sandbox.outputs.labels }}
           cache-from: type=registry,ref=${{ env.SANDBOX_IMAGE }}:buildcache
           cache-to: type=registry,ref=${{ env.SANDBOX_IMAGE }}:buildcache,mode=max

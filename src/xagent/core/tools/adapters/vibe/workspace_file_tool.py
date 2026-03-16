@@ -6,13 +6,12 @@ Each tool instance operates within its designated workspace only.
 """
 
 import logging
-import os
 import re
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Dict, List, Optional
 
-from xagent.core.workspace import TaskWorkspace
-
+from .....core.workspace import TaskWorkspace
+from .....skills.utils import create_skill_manager
 from ...core.workspace_file_tool import FileInfo, WorkspaceFileOperations
 from .base import ToolCategory
 from .function import FunctionTool
@@ -20,47 +19,10 @@ from .function import FunctionTool
 logger = logging.getLogger(__name__)
 
 
-def _get_default_skill_dirs() -> List[Path]:
-    """Get default skill directories (matches skills/utils.py)."""
-    builtin_skills_dir = (
-        Path(__file__).parent.parent.parent.parent / "skills" / "builtin"
-    )
-    user_skills_dir = Path(".xagent/skills")
-    user_skills_dir.mkdir(parents=True, exist_ok=True)
-    return [builtin_skills_dir, user_skills_dir]
-
-
-def _get_external_skill_dirs() -> List[Path]:
-    """Parse XAGENT_EXTERNAL_SKILLS_LIBRARY_DIRS environment variable."""
-    env_dirs = os.getenv("XAGENT_EXTERNAL_SKILLS_LIBRARY_DIRS", "")
-    if not env_dirs:
-        return []
-
-    skills_roots = []
-    for dir_path in env_dirs.split(","):
-        dir_path = dir_path.strip()
-        if not dir_path:
-            continue
-
-        if "://" in dir_path:
-            logger.warning(f"Skipping non-local path: {dir_path}")
-            continue
-
-        expanded_path = os.path.expandvars(dir_path)
-        path = Path(expanded_path).expanduser()
-
-        if path.exists() and path.is_dir():
-            skills_roots.append(path)
-            logger.info(f"Added external skills directory: {path}")
-
-    return skills_roots
-
-
 def _get_all_skill_roots() -> List[Path]:
-    """Get all skill directories (builtin, user, external)."""
-    skills_roots = _get_default_skill_dirs()
-    external_dirs = _get_external_skill_dirs()
-    return skills_roots + external_dirs
+    """Get all skill directories (reusing skills/utils.py logic)."""
+    skill_manager = create_skill_manager()
+    return skill_manager.skills_roots
 
 
 def _validate_skill_name(skill_name: str) -> None:

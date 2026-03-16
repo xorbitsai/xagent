@@ -209,11 +209,10 @@ class TestSkillFileAccess:
 
     def test_multiple_skill_roots_search_order(self, mock_workspace):
         """Test that skills are searched in root order (first match wins)."""
-        # Create both temporary directories first
-        tmpdir1 = tempfile.mkdtemp()
-        tmpdir2 = tempfile.mkdtemp()
-
-        try:
+        with (
+            tempfile.TemporaryDirectory() as tmpdir1,
+            tempfile.TemporaryDirectory() as tmpdir2,
+        ):
             root1 = Path(tmpdir1) / "root1"
             root1.mkdir()
             skill1 = root1 / "my_skill"
@@ -232,12 +231,6 @@ class TestSkillFileAccess:
             )
             content = tools.read_skill_file("my_skill", "file.txt")
             assert content == "from root1"  # First match wins
-        finally:
-            # Clean up
-            import shutil
-
-            shutil.rmtree(tmpdir1, ignore_errors=True)
-            shutil.rmtree(tmpdir2, ignore_errors=True)
 
     def test_external_skill_dirs_from_env(self, mock_workspace):
         """Test that XAGENT_EXTERNAL_SKILLS_LIBRARY_DIRS is respected."""

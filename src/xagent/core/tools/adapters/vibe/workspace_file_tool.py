@@ -407,7 +407,7 @@ class WorkspaceFileTools(WorkspaceFileOperations):
             SkillTool(
                 self.read_skill_file,
                 name="read_skill_file",
-                description="Read a file from a skill directory by skill name and file path.",
+                description="Read a text format file from a skill directory by skill name and file path.",
             ),
             SkillTool(
                 self.list_skill_files,

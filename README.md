@@ -1,6 +1,6 @@
 <div align="center">
 
-![Xagent Banner](./assets/github_readme_banner.png)
+![Xagent Banner](./assets/github_readme_banner.jpg)
 
 [![Discord](https://img.shields.io/discord/1474756736358289609?style=for-the-badge&logo=discord)](https://discord.gg/R7TDFMzuXq)
 [![Telegram](https://img.shields.io/badge/Telegram-2CA5E0?style=for-the-badge&logo=telegram&logoColor=white)](https://t.me/+2_-SAVLtuJNkNWFl)
@@ -28,12 +28,26 @@
 
 ---
 
+## Xagent vs OpenClaw
+
+| Capability         | Xagent                                                                                                                                                                                                      | OpenClaw                                                                                  |
+| ------------------ | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------- |
+| Core design        | **Enterprise agent platform**                                                                                                                                                                               | Autonomous personal agent                                                                 |
+| Security           | **VM‑level sandbox** for safe agent execution                                                                                                                                                               | Only a Docker container sandbox — and real usage often requires elevated host permissions |
+| Agent architecture | **Planning + efficient multi‑agent orchestration**                                                                                                                                                          | Mostly linear task execution                                                              |
+| Model capability   | **API-compatible, with deeper model intelligence powered by Xinference** — beyond calling APIs, Xagent understands how models should be selected, combined, and optimized across API and open‑source models | Models mostly treated as interchangeable endpoints                                        |
+| Knowledge systems  | **Enterprise RAG / knowledge platforms**                                                                                                                                                                    | Local memory / lightweight RAG                                                            |
+| Deployment         | **Flexible deployment** — local, private (on‑prem), or cloud                                                                                                                                                | Mostly local runtime                                                                      |
+| Multi-tenancy      | **Tenant‑aware architecture**                                                                                                                                                                               | Primarily single‑user                                                                     |
+
+---
+
 ## 🎬 See Xagent Think
 
 Give it a goal.
 Watch it plan, select tools, execute, and deliver.
 
-![Xagent Demo](./assets/task.gif)
+![Xagent Demo](./assets/task_demo.jpg)
 
 ---
 
@@ -176,6 +190,14 @@ Built for real production use:
 - Multi-user support
 
 **Operate agents like real systems — not demos.**
+
+---
+
+## 🎬 Xagent in Action
+
+Watch Xagent plan, execute, and deliver results in real-time.
+
+![Xagent in Action](./assets/task.gif)
 
 ---
 

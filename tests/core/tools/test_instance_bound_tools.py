@@ -140,8 +140,8 @@ async def test_tool_creation_function():
 
         # Test that tools are created and bound correctly
         assert (
-            len(tools) == 15
-        )  # Should have 15 file tools (skill tools are now separate)
+            len(tools) == 16
+        )  # Should have 16 file tools (skill tools are now separate)
 
         # Test tool functionality
         write_tool = next(tool for tool in tools if tool.name == "write_file")

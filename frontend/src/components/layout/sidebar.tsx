@@ -7,7 +7,6 @@ import { useState, useEffect, useCallback, useRef } from "react"
 import { getApiUrl } from "@/lib/utils"
 import { apiRequest } from "@/lib/api-wrapper"
 import { useAuth } from "@/contexts/auth-context"
-import { useTheme } from "@/contexts/theme-context"
 import { useApp } from "@/contexts/app-context-chat"
 import { getBrandingFromEnv } from "@/lib/branding"
 import {
@@ -34,7 +33,16 @@ import {
   CheckCircle2,
   XCircle,
   PauseCircle,
+  Info,
+  Tag,
+  Github,
+  Star,
 } from "lucide-react"
+import {
+  Dialog,
+  DialogContent,
+  DialogTitle,
+} from "@/components/ui/dialog"
 
 import { useI18n } from "@/contexts/i18n-context"
 
@@ -46,6 +54,20 @@ interface Task {
   description?: string
   agent_id?: number
   agent_logo_url?: string
+}
+
+interface VersionInfo {
+  version: string
+  commit?: string
+  build_time?: string
+  latest_version?: string | null
+  is_latest?: boolean | null
+}
+
+function formatStars(stars: number): string {
+  if (stars >= 1000000) return `${(stars / 1000000).toFixed(1)}M`
+  if (stars >= 1000) return `${(stars / 1000).toFixed(1)}k`
+  return String(stars)
 }
 
 interface NavigationItem {
@@ -173,13 +195,18 @@ interface SidebarProps {
   className?: string
 }
 
-export function Sidebar({ isCollapsible = false, className }: SidebarProps) {
+export function Sidebar({ className }: SidebarProps) {
   const pathname = usePathname()
   const router = useRouter()
-  const { user, logout, token } = useAuth()
+  const { user, logout } = useAuth()
   const branding = getBrandingFromEnv()
   const { t } = useI18n()
   const { state } = useApp()
+  const githubUrl = process.env.NEXT_PUBLIC_GITHUB_URL || "https://github.com/xorbitsai/xagent"
+  const normalizedGithubUrl = githubUrl.replace(/\.git$/, "").replace(/\/$/, "")
+  const githubRepoDisplay = normalizedGithubUrl.replace(/^https?:\/\/github\.com\//i, "")
+  const licenseUrl = `${normalizedGithubUrl}/blob/main/LICENSE`
+  const [githubStars, setGithubStars] = useState<number | null>(null)
 
   const deleteTask = async (taskId: string, e: React.MouseEvent) => {
     e.preventDefault()
@@ -208,6 +235,7 @@ export function Sidebar({ isCollapsible = false, className }: SidebarProps) {
   const [isExpanded, setIsExpanded] = useState(false)
   const [expandedMenus, setExpandedMenus] = useState<string[]>(["/agent"]) // Use href as a stable key
   const [showUserMenu, setShowUserMenu] = useState(false)
+  const [isAboutOpen, setIsAboutOpen] = useState(false)
   const sidebarRef = useRef<HTMLDivElement | null>(null)
   const userMenuRef = useRef<HTMLDivElement | null>(null)
 
@@ -241,12 +269,96 @@ export function Sidebar({ isCollapsible = false, className }: SidebarProps) {
   }, [pathname])
 
   const [tasks, setTasks] = useState<Task[]>([])
+  const [versionInfo, setVersionInfo] = useState<VersionInfo | null>(null)
   const [isLoadingTasks, setIsLoadingTasks] = useState(false)
   const [isHistoryExpanded, setIsHistoryExpanded] = useState(true)
   const [page, setPage] = useState(1)
   const [hasMore, setHasMore] = useState(true)
   const [isLoadingMore, setIsLoadingMore] = useState(false)
   const navRef = useRef<HTMLElement | null>(null)
+
+  useEffect(() => {
+    let isCancelled = false
+
+    const loadVersion = async () => {
+      try {
+        const response = await fetch(`${getApiUrl()}/api/system/version`, {
+          method: "GET",
+          cache: "no-store",
+        })
+
+        if (!response.ok) {
+          throw new Error(`Failed to load version: ${response.status}`)
+        }
+
+        const data = (await response.json()) as VersionInfo
+        if (!isCancelled) {
+          setVersionInfo({
+            version: data.version || "unknown",
+            commit: data.commit || "",
+            build_time: data.build_time || "",
+            latest_version: data.latest_version ?? null,
+            is_latest: data.is_latest ?? null,
+          })
+        }
+      } catch {
+        if (!isCancelled) {
+          setVersionInfo({
+            version: "unknown",
+            commit: "",
+            build_time: "",
+            latest_version: null,
+            is_latest: null,
+          })
+        }
+      }
+    }
+
+    void loadVersion()
+
+    return () => {
+      isCancelled = true
+    }
+  }, [])
+
+  useEffect(() => {
+    if (!isAboutOpen) return
+
+    const match = githubRepoDisplay.match(/^([^/]+)\/([^/]+)$/)
+    if (!match) {
+      setGithubStars(null)
+      return
+    }
+
+    const controller = new AbortController()
+    const [, owner, repo] = match
+
+    const loadStars = async () => {
+      try {
+        const response = await fetch(`https://api.github.com/repos/${owner}/${repo}`, {
+          method: "GET",
+          headers: { Accept: "application/vnd.github+json" },
+          signal: controller.signal,
+        })
+        if (!response.ok) {
+          setGithubStars(null)
+          return
+        }
+        const data = (await response.json()) as { stargazers_count?: number }
+        setGithubStars(typeof data.stargazers_count === "number" ? data.stargazers_count : null)
+      } catch {
+        if (!controller.signal.aborted) {
+          setGithubStars(null)
+        }
+      }
+    }
+
+    void loadStars()
+
+    return () => {
+      controller.abort()
+    }
+  }, [githubRepoDisplay, isAboutOpen])
 
   // Load task list
   const loadTasks = useCallback(async (pageNum = 1, isAppending = false) => {
@@ -588,6 +700,16 @@ export function Sidebar({ isCollapsible = false, className }: SidebarProps) {
                     {item.nameKey ? t(item.nameKey) : item.name}
                   </Link>
                 ))}
+                <button
+                  onClick={() => {
+                    setShowUserMenu(false)
+                    setIsAboutOpen(true)
+                  }}
+                  className="flex w-full items-center px-4 py-2 text-sm text-foreground hover:bg-accent transition-colors text-left"
+                >
+                  <Info className="h-4 w-4 mr-3 text-muted-foreground" />
+                  {t("sidebar.about.menu")}
+                </button>
                 <div className="h-px bg-border my-1 mx-2" />
                 <button
                   onClick={() => {
@@ -612,9 +734,109 @@ export function Sidebar({ isCollapsible = false, className }: SidebarProps) {
           <div className="ml-3 flex-1">
             <p className="text-base font-medium text-foreground">{user?.username || t('sidebar.user.defaultName')}</p>
           </div>
+          <span
+            className="mr-2 inline-flex items-center gap-1.5 rounded-md border border-border px-2 py-0.5 text-[11px] text-muted-foreground"
+            title={
+              versionInfo?.is_latest === true
+                ? t("sidebar.about.versionLatest")
+                : versionInfo?.is_latest === false
+                  ? t("sidebar.about.versionUpdateAvailable")
+                  : t("sidebar.about.versionStatusUnknown")
+            }
+          >
+            <span
+              className={cn(
+                "h-1.5 w-1.5 rounded-full",
+                versionInfo?.is_latest === true
+                  ? "bg-green-500"
+                  : versionInfo?.is_latest === false
+                    ? "bg-yellow-400"
+                    : "bg-gray-400"
+              )}
+            />
+            v{versionInfo?.version || "unknown"}
+          </span>
           <ChevronDown className={cn("h-4 w-4 text-muted-foreground transition-transform", showUserMenu && "rotate-180")} />
         </button>
       </div>
+
+      <Dialog open={isAboutOpen} onOpenChange={setIsAboutOpen}>
+        <DialogContent className="w-[min(760px,calc(100%-2rem))] max-w-none p-0 overflow-hidden">
+          <DialogTitle className="sr-only">{t("sidebar.about.title")}</DialogTitle>
+          <div className="grid grid-cols-10 min-h-[240px]">
+            <div className="col-span-3 border-r border-border flex flex-col items-center justify-center px-6 py-8 text-center">
+              <img
+                src={branding.logoPath}
+                alt={branding.logoAlt}
+                className="h-14 w-14"
+              />
+              <div className="mt-3 text-base font-medium text-foreground">{branding.appName}</div>
+            </div>
+            <div className="col-span-7 px-8 py-8 flex flex-col justify-center gap-4">
+              <div className="flex min-h-7 items-center gap-3 text-sm text-foreground">
+                <span className="inline-flex h-7 w-7 items-center justify-center rounded-md bg-accent text-accent-foreground">
+                  <Tag className="h-4 w-4" />
+                </span>
+                <span className="inline-flex items-center gap-1.5 leading-7">
+                  <span>{t("sidebar.about.version")}: v{versionInfo?.version || "unknown"}</span>
+                  <span
+                    className={cn(
+                      "inline-block h-2 w-2 rounded-full",
+                      versionInfo?.is_latest === true
+                        ? "bg-green-500"
+                        : versionInfo?.is_latest === false
+                          ? "bg-yellow-400"
+                          : "bg-gray-400"
+                    )}
+                    title={
+                      versionInfo?.is_latest === true
+                        ? t("sidebar.about.versionLatest")
+                        : versionInfo?.is_latest === false
+                          ? t("sidebar.about.versionUpdateAvailable")
+                          : t("sidebar.about.versionStatusUnknown")
+                    }
+                  />
+                </span>
+              </div>
+              <div className="flex min-h-7 items-center gap-3 text-sm text-foreground">
+                <span className="inline-flex h-7 w-7 shrink-0 items-center justify-center rounded-md bg-accent text-accent-foreground">
+                  <Github className="h-4 w-4" />
+                </span>
+                <span className="leading-7">
+                  {t("sidebar.about.github")}:{" "}
+                  <a
+                    href={githubUrl}
+                    target="_blank"
+                    rel="noopener noreferrer"
+                    className="text-blue-500 hover:underline break-all"
+                  >
+                    {githubRepoDisplay}
+                  </a>
+                </span>
+              </div>
+              <div className="flex min-h-7 items-center gap-3 text-sm text-foreground">
+                <span className="inline-flex h-7 w-7 items-center justify-center rounded-md bg-accent text-accent-foreground">
+                  <Star className="h-4 w-4" />
+                </span>
+                <span className="leading-7">{t("sidebar.about.stars")}: {githubStars === null ? "--" : formatStars(githubStars)}</span>
+              </div>
+              <div className="flex min-h-7 items-center gap-3 text-sm text-foreground">
+                <span className="inline-flex h-7 w-7 items-center justify-center rounded-md bg-accent text-accent-foreground">
+                  <FileText className="h-4 w-4" />
+                </span>
+                <a
+                  href={licenseUrl}
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  className="leading-7 text-blue-500 hover:underline"
+                >
+                  {t("sidebar.about.license")}
+                </a>
+              </div>
+            </div>
+          </div>
+        </DialogContent>
+      </Dialog>
     </div>
   )
 }

@@ -875,6 +875,17 @@ Build when you need.`
       empty: "暂无任务",
       viewAll: "查看全部",
     },
+    about: {
+      menu: "关于项目",
+      title: "关于项目",
+      version: "版本",
+      versionLatest: "当前已是最新版本",
+      versionUpdateAvailable: "有可用更新",
+      versionStatusUnknown: "版本状态未知",
+      github: "GitHub 仓库",
+      stars: "星标",
+      license: "开源许可证",
+    },
     user: {
       loggedIn: "已登录",
       notLoggedIn: "未登录",

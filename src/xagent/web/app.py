@@ -19,6 +19,7 @@ from .api.model import model_router
 from .api.monitor import monitor_router
 from .api.progress_ws import progress_ws_router
 from .api.skills import router as skills_router
+from .api.system import system_router
 from .api.templates import router as templates_router
 from .api.text2sql import text2sql_router
 from .api.tools import tools_router
@@ -125,6 +126,7 @@ app.include_router(text2sql_router)
 app.include_router(tools_router)
 app.include_router(admin_users_router)
 app.include_router(skills_router)
+app.include_router(system_router)
 app.include_router(templates_router)
 app.include_router(agents_router)
 

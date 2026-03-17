@@ -875,6 +875,17 @@ Build when you need.`
       empty: "No tasks",
       viewAll: "View All",
     },
+    about: {
+      menu: "About",
+      title: "About Project",
+      version: "Version",
+      versionLatest: "Latest version",
+      versionUpdateAvailable: "Update available",
+      versionStatusUnknown: "Version status unknown",
+      github: "GitHub Repository",
+      stars: "Stars",
+      license: "Open Source License",
+    },
     user: {
       loggedIn: "Logged in",
       notLoggedIn: "Not logged in",

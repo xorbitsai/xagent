@@ -59,6 +59,18 @@ jobs:
             type=semver,pattern={{version}}
             type=raw,value=latest,enable={{is_default_branch}}
 
+      - name: Prepare backend version metadata
+        id: version-meta
+        shell: bash
+        run: |
+          RELEASE_VERSION="${GITHUB_REF_NAME}"
+          if [ -z "$RELEASE_VERSION" ]; then
+            RELEASE_VERSION="unknown"
+          fi
+          BUILD_TIME="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          echo "release_version=$RELEASE_VERSION" >> "$GITHUB_OUTPUT"
+          echo "build_time=$BUILD_TIME" >> "$GITHUB_OUTPUT"
+
       - name: Build and push backend image
         uses: docker/build-push-action@v6
         with:
@@ -68,6 +80,10 @@ jobs:
           push: true
           tags: ${{ steps.meta-backend.outputs.tags }}
           labels: ${{ steps.meta-backend.outputs.labels }}
+          build-args: |
+            XAGENT_VERSION=${{ steps.version-meta.outputs.release_version }}
+            XAGENT_GIT_COMMIT=${{ github.sha }}
+            XAGENT_BUILD_TIME=${{ steps.version-meta.outputs.build_time }}
           cache-from: type=registry,ref=${{ env.BACKEND_IMAGE }}:buildcache
           cache-to: type=registry,ref=${{ env.BACKEND_IMAGE }}:buildcache,mode=max
 

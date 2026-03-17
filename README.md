@@ -30,15 +30,17 @@
 
 ## Xagent vs OpenClaw
 
-| Capability         | Xagent                                                                                                                                                                                                      | OpenClaw                                                                                  |
-| ------------------ | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------- |
-| Core design        | **Enterprise agent platform**                                                                                                                                                                               | Autonomous personal agent                                                                 |
-| Security           | **VM‑level sandbox** for safe agent execution                                                                                                                                                               | Only a Docker container sandbox — and real usage often requires elevated host permissions |
-| Agent architecture | **Planning + efficient multi‑agent orchestration**                                                                                                                                                          | Mostly linear task execution                                                              |
-| Model capability   | **API-compatible, with deeper model intelligence powered by Xinference** — beyond calling APIs, Xagent understands how models should be selected, combined, and optimized across API and open‑source models | Models mostly treated as interchangeable endpoints                                        |
-| Knowledge systems  | **Enterprise RAG / knowledge platforms**                                                                                                                                                                    | Local memory / lightweight RAG                                                            |
-| Deployment         | **Flexible deployment** — local, private (on‑prem), or cloud                                                                                                                                                | Mostly local runtime                                                                      |
-| Multi-tenancy      | **Tenant‑aware architecture**                                                                                                                                                                               | Primarily single‑user                                                                     |
+| Capability         | Xagent                                                        | OpenClaw                                                                                  |
+| ------------------ | ------------------------------------------------------------- | ----------------------------------------------------------------------------------------- |
+| Core design        | **Enterprise agent platform**                                 | Autonomous personal agent                                                                 |
+| Security           | **VM‑level sandbox** for safe agent execution                 | Only a Docker container sandbox — and real usage often requires elevated host permissions |
+| Agent architecture | **LLM‑driven planning + efficient multi‑agent orchestration** | Mostly linear task execution                                                              |
+| Model capability   | **API-compatible* + model-native intelligence**               | Models mostly treated as interchangeable endpoints                                        |
+| Knowledge systems  | **Enterprise RAG / knowledge platforms**                      | Local memory / lightweight RAG                                                            |
+| Deployment         | **Flexible deployment** — local, private (on‑prem), or cloud  | Mostly local runtime                                                                      |
+| Multi-tenancy      | **Tenant‑aware architecture**                                 | Primarily single‑user                                                                     |
+
+\* Xagent supports both API-based models and open-source models, powered by deep integration with Xinference for model-level optimization.
 
 ---
 

@@ -10,7 +10,7 @@ import re
 import subprocess
 import tempfile
 from pathlib import Path
-from typing import Any, Dict, Optional, Set
+from typing import Any, Dict, Optional
 
 logger = logging.getLogger(__name__)
 
@@ -20,47 +20,6 @@ MAX_OUTPUT_SIZE = 10 * 1024 * 1024
 
 # Timeout return code constant
 TIMEOUT_EXIT_CODE = -999
-
-# Allowed interpreters for script execution (prevents command injection)
-ALLOWED_INTERPRETERS: Set[str] = {
-    "bash",
-    "sh",
-    "python",
-    "python3",
-    "node",
-    "npm",
-    "ruby",
-    "perl",
-    "php",
-}
-
-# Blocked command patterns (basic safety checks)
-# These patterns are checked before command execution as a defense-in-depth measure
-BLOCKED_PATTERNS = [
-    r"rm\s+-rf\s+/",
-    r"dd\s+if=/dev/zero",
-    r"dd\s+if=/dev/random",
-    r":\(\)\s*{\s*:\s*\|\s*:\s*&\s*}\s*;",  # Fork bomb
-    r"mkfs\.",
-]
-
-# Allowed environment variables (whitelist for security)
-# Only these environment variables will be passed to subprocess
-ALLOWED_ENV_VARS: Set[str] = {
-    "PATH",
-    "HOME",
-    "USER",
-    "USERNAME",
-    "LANG",
-    "LC_ALL",
-    "LC_CTYPE",
-    "SHELL",
-    "TERM",
-    "PWD",
-    "TMPDIR",
-    "TEMP",
-    "TMP",
-}
 
 
 def _validate_timeout(timeout: Optional[int], default_timeout: int) -> int:
@@ -119,48 +78,6 @@ def _sanitize_command_for_logging(command: Any, max_length: int = 200) -> str:
         command_str = re.sub(pattern, replacement, command_str, flags=re.IGNORECASE)
 
     return command_str
-
-
-def _validate_command(command: Any) -> None:
-    """
-    Validate command against blocked patterns.
-
-    This is a defense-in-depth measure. The sandbox provides primary protection,
-    but this adds an additional layer of validation.
-
-    Args:
-        command: The command to validate (str or list)
-
-    Raises:
-        CommandValidationError: If command contains blocked patterns
-    """
-    # Convert list command to string for validation
-    if isinstance(command, list):
-        command_str = " ".join(str(x) for x in command)
-    else:
-        command_str = str(command)
-
-    command_lower = command_str.lower()
-
-    for pattern in BLOCKED_PATTERNS:
-        if re.search(pattern, command_lower):
-            raise ValueError(
-                f"Command contains blocked pattern: {pattern}. "
-                "This command is not allowed for safety reasons."
-            )
-
-
-def _get_safe_environment() -> Dict[str, str]:
-    """
-    Get a sanitized environment dictionary with only safe variables.
-
-    This is a defense-in-depth measure. The sandbox provides primary protection,
-    but this limits what environment variables are accessible to commands.
-
-    Returns:
-        Dictionary with allowed environment variables
-    """
-    return {k: v for k, v in os.environ.items() if k in ALLOWED_ENV_VARS}
 
 
 def _validate_working_directory(working_directory: Optional[str]) -> None:
@@ -249,7 +166,6 @@ class CommandExecutorCore:
         """
         timeout = _validate_timeout(timeout, self.timeout)
         _validate_working_directory(self.working_directory)
-        _validate_command(command)
 
         old_cwd = None
         if self.working_directory:
@@ -270,7 +186,6 @@ class CommandExecutorCore:
                 capture_output=capture_output,
                 text=True,
                 timeout=timeout,
-                env=_get_safe_environment(),
             )
 
             output = result.stdout if capture_output else ""
@@ -336,17 +251,9 @@ class CommandExecutorCore:
             Dictionary with execution result
 
         Raises:
-            ValueError: If interpreter is not allowed or timeout is invalid
+            ValueError: If timeout is invalid
         """
         timeout = _validate_timeout(timeout, self.timeout)
-
-        # Validate interpreter against whitelist
-        interpreter_base = interpreter.split()[0]  # Take first part only
-        if interpreter_base not in ALLOWED_INTERPRETERS:
-            raise ValueError(
-                f"Interpreter '{interpreter}' is not allowed. "
-                f"Allowed interpreters: {', '.join(sorted(ALLOWED_INTERPRETERS))}"
-            )
 
         try:
             logger.info(

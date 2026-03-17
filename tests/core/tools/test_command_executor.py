@@ -428,12 +428,6 @@ class TestExecuteScriptFunction:
         assert result["success"] is True
         assert "python script output" in result["output"]
 
-    def test_execute_script_invalid_interpreter(self):
-        """Test execute_script with invalid interpreter"""
-        script = "echo test"
-        with pytest.raises(ValueError, match="not allowed"):
-            execute_script(script, interpreter="invalid_interpreter_xyz")
-
     def test_execute_script_with_timeout(self):
         """Test execute_script with timeout"""
         script = "#!/bin/bash\nsleep 0.1"
@@ -512,34 +506,6 @@ class TestWorkingDirectoryValidation:
 
         with pytest.raises(NotADirectoryError, match="not a directory"):
             executor.execute_command("echo test")
-
-
-class TestInterpreterWhitelist:
-    """Test cases for interpreter whitelist validation"""
-
-    def test_allowed_interpreters(self):
-        """Test that allowed interpreters work"""
-        executor = CommandExecutorCore()
-        allowed = ["bash", "sh", "python", "python3", "node"]
-
-        for interp in allowed:
-            # Just test that validation doesn't raise
-            try:
-                executor.execute_script("echo test", interpreter=interp)
-            except ValueError as e:
-                if "not allowed" in str(e):
-                    pytest.fail(f"Allowed interpreter '{interp}' was rejected")
-                else:
-                    # Other errors (e.g., interpreter not installed) are OK
-                    pass
-
-    def test_blocked_interpreter(self):
-        """Test that blocked interpreters raise ValueError"""
-        executor = CommandExecutorCore()
-
-        # Use an interpreter not in the allowed list
-        with pytest.raises(ValueError, match="not allowed"):
-            executor.execute_script("echo test", interpreter="xyz_invalid_interpreter")
 
 
 class TestOutputSizeLimit:

@@ -67,6 +67,7 @@ class ToolRegistry:
                 knowledge_tools,
                 mcp_tools,
                 pptx_tool,
+                skill_tools,
                 special_image_tools,
                 sql_tool,
                 vision_tool,
@@ -110,8 +111,9 @@ class ToolRegistry:
         7. PPT - PPT tools
         8. DATABASE - Database tools (SQL query)
         9. MCP - MCP tools
-        10. AGENT - Agent tools (delegation)
-        11. OTHER - Other tools
+        10. SKILL - Skill documentation access tools
+        11. AGENT - Agent tools (delegation)
+        12. OTHER - Other tools
         """
         from .base import ToolCategory
 
@@ -126,8 +128,9 @@ class ToolRegistry:
             ToolCategory.PPT: 6,
             ToolCategory.DATABASE: 7,
             ToolCategory.MCP: 8,
-            ToolCategory.AGENT: 9,
-            ToolCategory.OTHER: 10,
+            ToolCategory.SKILL: 9,
+            ToolCategory.AGENT: 10,
+            ToolCategory.OTHER: 11,
         }
 
         def get_tool_priority(tool: Tool) -> int:

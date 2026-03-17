@@ -35,7 +35,7 @@
 | Core design        | **Enterprise agent platform**                                 | Autonomous personal agent                                                                 |
 | Security           | **VM‑level sandbox** for safe agent execution                 | Only a Docker container sandbox — and real usage often requires elevated host permissions |
 | Agent architecture | **LLM‑driven planning + efficient multi‑agent orchestration** | Mostly linear task execution                                                              |
-| Model capability   | **API-compatible* + model-native intelligence**               | Models mostly treated as interchangeable endpoints                                        |
+| Model capability   | **API-compatible* + model-native intelligence**               | API or local models used as simple plug-ins (no deep integration)                        |
 | Knowledge systems  | **Enterprise RAG / knowledge platforms**                      | Local memory / lightweight RAG                                                            |
 | Deployment         | **Flexible deployment** — local, private (on‑prem), or cloud  | Mostly local runtime                                                                      |
 | Multi-tenancy      | **Tenant‑aware architecture**                                 | Primarily single‑user                                                                     |

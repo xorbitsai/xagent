@@ -3,8 +3,11 @@ Test instance-bound workspace tools.
 """
 
 import asyncio
+import sys
 import tempfile
 from pathlib import Path
+
+import pytest
 
 from xagent.core.tools.adapters.vibe.workspace_file_tool import WorkspaceFileTools
 from xagent.core.workspace import create_workspace
@@ -118,6 +121,9 @@ async def test_concurrent_tool_instances():
         print("✅ Concurrent tool instances test passed!")
 
 
+@pytest.mark.skipif(
+    sys.platform == "win32", reason="Windows short filename path case-sensitivity issue"
+)
 async def test_tool_creation_function():
     """
     Test the create_workspace_file_tools function.

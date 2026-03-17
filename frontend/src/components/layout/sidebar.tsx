@@ -58,6 +58,7 @@ interface Task {
 
 interface VersionInfo {
   version: string
+  display_version?: string
   commit?: string
   build_time?: string
   latest_version?: string | null
@@ -276,6 +277,7 @@ export function Sidebar({ className }: SidebarProps) {
   const [hasMore, setHasMore] = useState(true)
   const [isLoadingMore, setIsLoadingMore] = useState(false)
   const navRef = useRef<HTMLElement | null>(null)
+  const displayVersion = versionInfo?.display_version || "unknown"
 
   useEffect(() => {
     let isCancelled = false
@@ -295,6 +297,7 @@ export function Sidebar({ className }: SidebarProps) {
         if (!isCancelled) {
           setVersionInfo({
             version: data.version || "unknown",
+            display_version: data.display_version || "unknown",
             commit: data.commit || "",
             build_time: data.build_time || "",
             latest_version: data.latest_version ?? null,
@@ -305,6 +308,7 @@ export function Sidebar({ className }: SidebarProps) {
         if (!isCancelled) {
           setVersionInfo({
             version: "unknown",
+            display_version: "unknown",
             commit: "",
             build_time: "",
             latest_version: null,
@@ -726,36 +730,38 @@ export function Sidebar({ className }: SidebarProps) {
         )}
         <button
           onClick={() => setShowUserMenu(!showUserMenu)}
-          className="flex items-center w-full hover:bg-accent/50 p-2 -ml-2 rounded-lg transition-colors text-left"
+          className="flex w-full items-center gap-2 hover:bg-accent/50 p-2 -ml-2 rounded-lg transition-colors text-left"
         >
-          <div className="h-8 w-8 rounded-full bg-accent flex items-center justify-center">
+          <div className="h-8 w-8 shrink-0 rounded-full bg-accent flex items-center justify-center">
             <User className="h-4 w-4 text-accent-foreground" />
           </div>
-          <div className="ml-3 flex-1">
-            <p className="text-base font-medium text-foreground">{user?.username || t('sidebar.user.defaultName')}</p>
+          <div className="ml-1 min-w-0 flex-1">
+            <p className="truncate whitespace-nowrap text-base font-medium text-foreground">{user?.username || t('sidebar.user.defaultName')}</p>
+            <div className="mt-0">
+              <span
+                className="inline-flex shrink-0 max-w-[8.5rem] items-center gap-1.5 overflow-hidden whitespace-nowrap rounded-md border border-border px-2 py-0.5 text-[11px] text-muted-foreground text-ellipsis"
+                title={
+                  versionInfo?.is_latest === true
+                    ? t("sidebar.about.versionLatest")
+                    : versionInfo?.is_latest === false
+                      ? t("sidebar.about.versionUpdateAvailable")
+                      : t("sidebar.about.versionStatusUnknown")
+                }
+              >
+                <span
+                  className={cn(
+                    "h-1.5 w-1.5 rounded-full",
+                    versionInfo?.is_latest === true
+                      ? "bg-green-500"
+                      : versionInfo?.is_latest === false
+                        ? "bg-yellow-400"
+                        : "bg-gray-400"
+                  )}
+                />
+                {displayVersion}
+              </span>
+            </div>
           </div>
-          <span
-            className="mr-2 inline-flex items-center gap-1.5 rounded-md border border-border px-2 py-0.5 text-[11px] text-muted-foreground"
-            title={
-              versionInfo?.is_latest === true
-                ? t("sidebar.about.versionLatest")
-                : versionInfo?.is_latest === false
-                  ? t("sidebar.about.versionUpdateAvailable")
-                  : t("sidebar.about.versionStatusUnknown")
-            }
-          >
-            <span
-              className={cn(
-                "h-1.5 w-1.5 rounded-full",
-                versionInfo?.is_latest === true
-                  ? "bg-green-500"
-                  : versionInfo?.is_latest === false
-                    ? "bg-yellow-400"
-                    : "bg-gray-400"
-              )}
-            />
-            v{versionInfo?.version || "unknown"}
-          </span>
           <ChevronDown className={cn("h-4 w-4 text-muted-foreground transition-transform", showUserMenu && "rotate-180")} />
         </button>
       </div>
@@ -777,8 +783,8 @@ export function Sidebar({ className }: SidebarProps) {
                 <span className="inline-flex h-7 w-7 items-center justify-center rounded-md bg-accent text-accent-foreground">
                   <Tag className="h-4 w-4" />
                 </span>
-                <span className="inline-flex items-center gap-1.5 leading-7">
-                  <span>{t("sidebar.about.version")}: v{versionInfo?.version || "unknown"}</span>
+                <span className="inline-flex max-w-full items-center gap-1.5 whitespace-nowrap leading-7">
+                  <span>{t("sidebar.about.version")}: {displayVersion}</span>
                   <span
                     className={cn(
                       "inline-block h-2 w-2 rounded-full",

@@ -30,10 +30,7 @@ class WorkspaceFileTools(WorkspaceFileOperations):
     file operations restricted to that workspace.
     """
 
-    def __init__(
-        self,
-        workspace: TaskWorkspace,
-    ):
+    def __init__(self, workspace: TaskWorkspace):
         """
         Initialize with workspace binding.
 
@@ -214,9 +211,7 @@ class WorkspaceFileTools(WorkspaceFileOperations):
         ]
 
 
-def create_workspace_file_tools(
-    workspace: TaskWorkspace,
-) -> List[FunctionTool]:
+def create_workspace_file_tools(workspace: TaskWorkspace) -> List[FunctionTool]:
     """
     Create list of file tools bound to specified workspace
 

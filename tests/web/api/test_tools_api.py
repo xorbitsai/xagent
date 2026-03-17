@@ -142,8 +142,9 @@ class TestToolsAvailableAPI:
         assert "write_file" in tool_names, "Should have write_file tool"
 
         # Skill file access tools should be present
-        assert "read_skill_file" in tool_names, "Should have read_skill_file tool"
-        assert "list_skill_files" in tool_names, "Should have list_skill_files tool"
+        assert "read_skill_doc" in tool_names, "Should have read_skill_doc tool"
+        assert "list_skill_docs" in tool_names, "Should have list_skill_docs tool"
+        assert "fetch_skill_file" in tool_names, "Should have fetch_skill_file tool"
 
     def test_skill_category_in_available_tools(self):
         """Test that skill tools appear with correct category."""
@@ -165,10 +166,11 @@ class TestToolsAvailableAPI:
             tool for tool in data["tools"] if tool.get("category") == "skill"
         ]
 
-        # Should have read_skill_file and list_skill_files
+        # Should have read_skill_doc and list_skill_docs
         skill_tool_names = {tool["name"] for tool in skill_tools}
-        assert "read_skill_file" in skill_tool_names
-        assert "list_skill_files" in skill_tool_names
+        assert "read_skill_doc" in skill_tool_names
+        assert "list_skill_docs" in skill_tool_names
+        assert "fetch_skill_file" in skill_tool_names
 
         # Verify tool type and display category
         for tool in skill_tools:

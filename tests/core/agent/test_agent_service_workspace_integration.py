@@ -112,8 +112,13 @@ class TestAgentServiceWorkspaceIntegration:
         # The issue might be in step agent creation or tool passing
 
         # Check if all tools share the same workspace instance
+        # Note: Skill tools are global resource access and have their own workspace binding
+        # They should be excluded from this check
         workspace_refs = []
         for tool in service.tools:
+            # Skip skill tools (they have their own workspace for global resource access)
+            if tool.metadata.category.value == "skill":
+                continue
             # Handle both function tools and other tool types
             if hasattr(tool, "func") and hasattr(tool.func, "__self__"):
                 tool_instance = tool.func.__self__

@@ -8,6 +8,7 @@ backends.
 
 import logging
 import re
+import shutil
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Dict, List, Optional
 
@@ -34,12 +35,18 @@ def _validate_skill_name(skill_name: str) -> None:
         )
 
 
-def _validate_doc_path(doc_path: str) -> None:
-    """Validate doc path to prevent path traversal attacks."""
-    if ".." in doc_path or doc_path.startswith("/") or doc_path.startswith("\\"):
+def _validate_skill_path(path: str) -> None:
+    """Validate skill path to prevent path traversal attacks.
+
+    Args:
+        path: Path within the skill to validate
+
+    Raises:
+        ValueError: If path contains path traversal attempts
+    """
+    if ".." in path or path.startswith("/") or path.startswith("\\"):
         raise ValueError(
-            f"Invalid doc path: '{doc_path}'. "
-            "Relative paths within the skill are allowed."
+            f"Invalid path: '{path}'. Relative paths within the skill are allowed."
         )
 
 
@@ -59,9 +66,7 @@ class SkillTools:
     """
 
     def __init__(
-        self,
-        workspace: TaskWorkspace,
-        skills_roots: Optional[List[str]] = None,
+        self, workspace: TaskWorkspace, skills_roots: Optional[List[str]] = None
     ):
         """Initialize with workspace binding.
 
@@ -84,17 +89,12 @@ class SkillTools:
                 return candidate
         return None
 
-    def read_skill_doc(
-        self,
-        skill_name: str,
-        doc_path: str,
-        encoding: str = "utf-8",
-    ) -> str:
+    def read_skill_doc(self, skill: str, path: str, encoding: str = "utf-8") -> str:
         """Read documentation from a skill.
 
         Args:
-            skill_name: Name of the skill
-            doc_path: Location identifier for the documentation within the skill
+            skill: Name of the skill
+            path: Location identifier for the documentation within the skill
             encoding: Text encoding (default: utf-8)
 
         Returns:
@@ -102,96 +102,135 @@ class SkillTools:
 
         Raises:
             FileNotFoundError: If the skill or doc doesn't exist
-            ValueError: If skill_name or doc_path contains invalid characters
+            ValueError: If skill or path contains invalid characters
         """
-        _validate_skill_name(skill_name)
-        _validate_doc_path(doc_path)
+        _validate_skill_name(skill)
+        _validate_skill_path(path)
 
-        skill_dir = self._find_skill_dir(skill_name)
+        skill_dir = self._find_skill_dir(skill)
         if skill_dir is None:
-            raise FileNotFoundError(f"Skill not found: '{skill_name}'")
+            raise FileNotFoundError(f"Skill not found: '{skill}'")
 
-        full_path = skill_dir / doc_path
+        full_path = skill_dir / path
         if not full_path.exists():
             raise FileNotFoundError(
-                f"Documentation not found: '{doc_path}' in skill '{skill_name}'"
+                f"Documentation not found: '{path}' in skill '{skill}'"
             )
 
         return full_path.read_text(encoding=encoding)
 
     def list_skill_docs(
-        self,
-        skill_name: str,
-        directory_path: str = ".",
-        show_hidden: bool = False,
-        recursive: bool = True,
+        self, skill: str, path: str = ".", recursive: bool = True
     ) -> Dict[str, Any]:
         """List documentation within a skill.
 
         Args:
-            skill_name: Name of the skill
-            directory_path: Optional sub-location to scope the listing (default: '.' for all)
-            show_hidden: Whether to include hidden items (default: False)
+            skill: Name of the skill
+            path: Optional sub-location to scope the listing (default: '.' for all)
             recursive: Whether to list nested items (default: True)
 
         Returns:
             Simplified dict with documents list and count:
             {
                 "documents": [
-                    {"name": "SKILL.md", "size": 1234},
-                    {"name": "examples/example.py", "size": 5678}
+                    {"path": "SKILL.md", "size": 1234},
+                    {"path": "examples/example.py", "size": 5678}
                 ],
                 "count": 2
             }
 
         Raises:
             FileNotFoundError: If the skill directory doesn't exist
-            ValueError: If skill_name or directory_path contains invalid characters
+            ValueError: If skill or path contains invalid characters
         """
-        _validate_skill_name(skill_name)
-        if directory_path != ".":
-            _validate_doc_path(directory_path)
+        _validate_skill_name(skill)
+        if path != ".":
+            _validate_skill_path(path)
 
-        skill_dir = self._find_skill_dir(skill_name)
+        skill_dir = self._find_skill_dir(skill)
         if skill_dir is None:
-            raise FileNotFoundError(f"Skill not found: '{skill_name}'")
+            raise FileNotFoundError(f"Skill not found: '{skill}'")
 
-        search_path = skill_dir / directory_path if directory_path != "." else skill_dir
+        search_path = skill_dir / path if path != "." else skill_dir
 
         if not search_path.exists():
-            raise FileNotFoundError(
-                f"Directory not found: '{directory_path}' in skill '{skill_name}'"
-            )
+            raise FileNotFoundError(f"Directory not found: '{path}' in skill '{skill}'")
 
         documents = []
 
         def scan_directory(current_path: Path) -> None:
-            try:
-                for item in current_path.iterdir():
-                    if not show_hidden and item.name.startswith("."):
-                        continue
+            for item in current_path.iterdir():
+                # Skip hidden files (starting with dot)
+                if item.name.startswith("."):
+                    continue
 
-                    # Only include files, not directories
-                    if item.is_file():
-                        stat = item.stat()
-                        rel_path = item.relative_to(skill_dir)
-                        # Normalize path separators to forward slashes for consistency
-                        documents.append(
-                            {
-                                "name": str(rel_path).replace("\\", "/"),
-                                "size": stat.st_size,
-                            }
-                        )
+                # Only include files, not directories
+                if item.is_file():
+                    stat = item.stat()
+                    rel_path = item.relative_to(skill_dir)
+                    # Normalize path separators to forward slashes for consistency
+                    documents.append(
+                        {"path": str(rel_path).replace("\\", "/"), "size": stat.st_size}
+                    )
 
-                    if recursive and item.is_dir():
-                        scan_directory(item)
-
-            except PermissionError:
-                pass
+                if recursive and item.is_dir():
+                    scan_directory(item)
 
         scan_directory(search_path)
 
         return {"documents": documents, "count": len(documents)}
+
+    def fetch_skill_file(
+        self, skill: str, path: str, dest: Optional[str] = None
+    ) -> Dict[str, Any]:
+        """Fetch a file from skill directory to workspace.
+
+        Copies a file from the skill directory to the workspace where it can be
+        used by tools, scripts, or other operations.
+
+        Args:
+            skill: Name of the skill
+            path: Path to the file within the skill directory
+            dest: Optional destination path in workspace (default: same filename)
+
+        Returns:
+            Dict with operation results:
+            {
+                "source": "original/path/in/skill",
+                "destination": "workspace/path",
+                "size": 1234,
+                "extracted": false
+            }
+        """
+        _validate_skill_name(skill)
+        _validate_skill_path(path)
+
+        skill_dir = self._find_skill_dir(skill)
+        if skill_dir is None:
+            raise FileNotFoundError(f"Skill not found: '{skill}'")
+
+        source = skill_dir / path
+        if not source.exists():
+            raise FileNotFoundError(f"File not found: '{path}' in skill '{skill}'")
+
+        # Determine destination path
+        if dest is None:
+            dest = source.name
+
+        destination = self.workspace.output_dir / dest
+
+        # Create parent directories if needed
+        destination.parent.mkdir(parents=True, exist_ok=True)
+
+        # Copy file to workspace
+        shutil.copy2(source, destination)
+
+        return {
+            "source": str(source),
+            "destination": str(destination.relative_to(self.workspace.workspace_dir)),
+            "size": source.stat().st_size,
+            "extracted": False,
+        }
 
     def get_tools(self) -> List[FunctionTool]:
         """Get all tool instances."""
@@ -199,12 +238,25 @@ class SkillTools:
             SkillTool(
                 self.read_skill_doc,
                 name="read_skill_doc",
-                description="Read documentation from a skill by providing the skill name and the document location.",
+                description="Read documentation from a skill. "
+                "Parameters: skill (str, required), path (str, required), encoding (str, optional, default='utf-8'). "
+                "Returns the text content of the documentation file.",
             ),
             SkillTool(
                 self.list_skill_docs,
                 name="list_skill_docs",
-                description="List available documentation within a skill. Returns document names and sizes.",
+                description="List available documentation within a skill. "
+                "Parameters: skill (str, required), path (str, optional, default='.'), "
+                "recursive (bool, optional, default=True). "
+                "Returns document names and sizes.",
+            ),
+            SkillTool(
+                self.fetch_skill_file,
+                name="fetch_skill_file",
+                description="Fetch a file from a skill directory to the workspace for use by tools or scripts. "
+                "Parameters: skill (str, required), path (str, required), "
+                "dest (str, optional, default=source filename). "
+                "Returns source and destination paths with file size.",
             ),
         ]
 

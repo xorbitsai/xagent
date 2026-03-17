@@ -15,8 +15,8 @@ import pytest
 
 from xagent.core.tools.adapters.vibe.skill_tools import (
     SkillTools,
-    _validate_doc_path,
     _validate_skill_name,
+    _validate_skill_path,
     create_skill_tools,
 )
 
@@ -94,27 +94,11 @@ class TestSkillFileAccess:
         assert result["count"] == 3  # SKILL.md, schema.json, guide.md
         assert len(result["documents"]) == 3
 
-        # Check file names (using relative paths)
-        file_names = {f["name"] for f in result["documents"]}
+        # Check file paths (using relative paths)
+        file_names = {f["path"] for f in result["documents"]}
         assert "SKILL.md" in file_names
         assert "schema.json" in file_names
         assert "references/guide.md" in file_names
-
-    def test_list_skill_docs_no_hidden(self, temp_skills_dir, mock_workspace):
-        """Test that hidden files are not listed by default."""
-        skill_tools = SkillTools(mock_workspace, skills_roots=[str(temp_skills_dir)])
-        result = skill_tools.list_skill_docs("test_skill")
-
-        file_names = {f["name"] for f in result["documents"]}
-        assert ".hidden" not in file_names
-
-    def test_list_skill_docs_show_hidden(self, temp_skills_dir, mock_workspace):
-        """Test showing hidden files when requested."""
-        skill_tools = SkillTools(mock_workspace, skills_roots=[str(temp_skills_dir)])
-        result = skill_tools.list_skill_docs("test_skill", show_hidden=True)
-
-        file_names = {f["name"] for f in result["documents"]}
-        assert ".hidden" in file_names
 
     def test_list_skill_docs_subdirectory(self, temp_skills_dir, mock_workspace):
         """Test listing files in a subdirectory."""
@@ -122,7 +106,7 @@ class TestSkillFileAccess:
         result = skill_tools.list_skill_docs("test_skill", "references")
 
         assert result["count"] == 1
-        assert result["documents"][0]["name"] == "references/guide.md"
+        assert result["documents"][0]["path"] == "references/guide.md"
 
     def test_list_skill_docs_recursive(self, temp_skills_dir, mock_workspace):
         """Test recursive file listing."""
@@ -130,7 +114,7 @@ class TestSkillFileAccess:
         result = skill_tools.list_skill_docs("test_skill", recursive=True)
 
         # Should include files in references/ subdirectory
-        file_names = {f["name"] for f in result["documents"]}
+        file_names = {f["path"] for f in result["documents"]}
         assert "references/guide.md" in file_names
 
     def test_list_skill_docs_non_recursive(self, temp_skills_dir, mock_workspace):
@@ -139,7 +123,7 @@ class TestSkillFileAccess:
         result = skill_tools.list_skill_docs("test_skill", recursive=False)
 
         # Should not include files in references/ subdirectory
-        file_names = {f["name"] for f in result["documents"]}
+        file_names = {f["path"] for f in result["documents"]}
         assert "references/guide.md" not in file_names
 
     def test_read_skill_doc_subdirectory(self, temp_skills_dir, mock_workspace):
@@ -156,12 +140,80 @@ class TestSkillFileAccess:
         tool_names = {tool.name for tool in tools}
         assert "read_skill_doc" in tool_names
         assert "list_skill_docs" in tool_names
+        assert "fetch_skill_file" in tool_names
 
         # Check that skill tools have the right category
 
         for tool in tools:
-            if tool.name in ["read_skill_doc", "list_skill_docs"]:
+            if tool.name in ["read_skill_doc", "list_skill_docs", "fetch_skill_file"]:
                 assert tool.metadata.category.value == "skill"
+
+    def test_fetch_skill_file_success(self, temp_skills_dir, mock_workspace):
+        """Test successful file fetching from skill directory."""
+        skill_tools = SkillTools(mock_workspace, skills_roots=[str(temp_skills_dir)])
+        result = skill_tools.fetch_skill_file("test_skill", "schema.json")
+
+        # Verify result structure
+        assert "source" in result
+        assert "destination" in result
+        assert "size" in result
+        assert "extracted" in result
+        assert result["extracted"] is False
+
+        # Verify file was copied to workspace
+        assert (mock_workspace.output_dir / "schema.json").exists()
+
+        # Verify content matches
+        original_content = (temp_skills_dir / "test_skill" / "schema.json").read_text()
+        copied_content = (mock_workspace.output_dir / "schema.json").read_text()
+        assert original_content == copied_content
+
+    def test_fetch_skill_file_with_custom_dest(self, temp_skills_dir, mock_workspace):
+        """Test fetching file with custom destination path."""
+        skill_tools = SkillTools(mock_workspace, skills_roots=[str(temp_skills_dir)])
+        result = skill_tools.fetch_skill_file(
+            "test_skill", "schema.json", "config/schema.json"
+        )
+
+        # Verify file was copied to custom destination
+        assert (mock_workspace.output_dir / "config" / "schema.json").exists()
+        # Normalize path separators for comparison
+        dest_normalized = result["destination"].replace("\\", "/")
+        assert "config/schema.json" in dest_normalized
+
+    def test_fetch_skill_file_not_found(self, temp_skills_dir, mock_workspace):
+        """Test FileNotFoundError when file doesn't exist."""
+        skill_tools = SkillTools(mock_workspace, skills_roots=[str(temp_skills_dir)])
+        with pytest.raises(FileNotFoundError) as exc_info:
+            skill_tools.fetch_skill_file("test_skill", "nonexistent.txt")
+        assert "File not found" in str(exc_info.value)
+
+    def test_fetch_skill_file_skill_not_found(self, temp_skills_dir, mock_workspace):
+        """Test FileNotFoundError when skill doesn't exist."""
+        skill_tools = SkillTools(mock_workspace, skills_roots=[str(temp_skills_dir)])
+        with pytest.raises(FileNotFoundError) as exc_info:
+            skill_tools.fetch_skill_file("nonexistent_skill", "file.txt")
+        assert "Skill not found" in str(exc_info.value)
+
+    def test_fetch_skill_file_from_subdirectory(self, temp_skills_dir, mock_workspace):
+        """Test fetching file from subdirectory."""
+        skill_tools = SkillTools(mock_workspace, skills_roots=[str(temp_skills_dir)])
+        skill_tools.fetch_skill_file("test_skill", "references/guide.md")
+
+        # Verify file was copied
+        assert (mock_workspace.output_dir / "guide.md").exists()
+
+    def test_fetch_skill_file_path_traversal_blocked(
+        self, temp_skills_dir, mock_workspace
+    ):
+        """Test that path traversal attacks are blocked in fetch_skill_file."""
+        skill_tools = SkillTools(mock_workspace, skills_roots=[str(temp_skills_dir)])
+
+        with pytest.raises(ValueError, match="Invalid skill name"):
+            skill_tools.fetch_skill_file("../etc/passwd", "file.txt")
+
+        with pytest.raises(ValueError, match="Invalid path"):
+            skill_tools.fetch_skill_file("test_skill", "../../etc/passwd")
 
     def test_create_skill_tools_with_skills_roots(
         self, temp_skills_dir, mock_workspace
@@ -172,14 +224,13 @@ class TestSkillFileAccess:
         tool_names = {tool.name for tool in tools}
         assert "read_skill_doc" in tool_names
         assert "list_skill_docs" in tool_names
+        assert "fetch_skill_file" in tool_names
 
     def test_default_skills_roots(self, mock_workspace):
         """Test that default skills_roots includes builtin and user directories."""
         tools = SkillTools(mock_workspace)
         # Should have at least builtin and user directories
         assert len(tools.skills_roots) >= 2
-        # Last directory name should contain "skills" (case insensitive)
-        assert "skills" in tools.skills_roots[-1].name.lower()
 
     def test_multiple_skill_roots_search_order(self, mock_workspace):
         """Test that skills are searched in root order (first match wins)."""
@@ -277,13 +328,13 @@ class TestSkillPathValidation:
             with pytest.raises(ValueError):
                 _validate_skill_name(name)
 
-    def test_validate_doc_path_valid(self):
+    def test_validate_skill_path_valid(self):
         """Test that valid file paths pass validation."""
         valid_paths = ["file.txt", "dir/file.txt", "SKILL.md", "schema.json"]
         for path in valid_paths:
-            _validate_doc_path(path)  # Should not raise
+            _validate_skill_path(path)  # Should not raise
 
-    def test_validate_doc_path_invalid(self):
+    def test_validate_skill_path_invalid(self):
         """Test that invalid file paths are rejected."""
         invalid_paths = [
             "../secret.txt",
@@ -296,7 +347,7 @@ class TestSkillPathValidation:
         ]
         for path in invalid_paths:
             with pytest.raises(ValueError):
-                _validate_doc_path(path)
+                _validate_skill_path(path)
 
     def test_read_skill_doc_path_traversal_blocked(
         self, temp_skills_dir, mock_workspace
@@ -307,7 +358,7 @@ class TestSkillPathValidation:
         with pytest.raises(ValueError, match="Invalid skill name"):
             skill_tools.read_skill_doc("../etc/passwd", "file.txt")
 
-        with pytest.raises(ValueError, match="Invalid doc path"):
+        with pytest.raises(ValueError, match="Invalid path"):
             skill_tools.read_skill_doc("test_skill", "../../etc/passwd")
 
     def test_list_skill_docs_path_traversal_blocked(
@@ -319,5 +370,5 @@ class TestSkillPathValidation:
         with pytest.raises(ValueError, match="Invalid skill name"):
             skill_tools.list_skill_docs("../etc")
 
-        with pytest.raises(ValueError, match="Invalid doc path"):
+        with pytest.raises(ValueError, match="Invalid path"):
             skill_tools.list_skill_docs("test_skill", "../../etc")

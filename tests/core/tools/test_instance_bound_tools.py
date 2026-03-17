@@ -136,25 +136,40 @@ async def test_tool_creation_function():
         # Create workspace
         workspace = create_workspace("test_agent_task", str(temp_path))
 
-        # Import the creation function
+        # Import the creation functions
+        from xagent.core.tools.adapters.vibe.skill_tools import create_skill_tools
         from xagent.core.tools.adapters.vibe.workspace_file_tool import (
             create_workspace_file_tools,
         )
 
-        # Create tools using the function
-        tools = create_workspace_file_tools(workspace)
+        # Create file tools using the function
+        file_tools = create_workspace_file_tools(workspace)
+        assert len(file_tools) == 15  # Should have 15 file tools
 
-        # Test that tools are created and bound correctly
-        assert len(tools) == 15  # Should have 15 file tools
-
-        # Test tool functionality
-        write_tool = next(tool for tool in tools if tool.name == "write_file")
-        read_tool = next(tool for tool in tools if tool.name == "read_file")
+        # Test file tool functionality
+        write_tool = next(tool for tool in file_tools if tool.name == "write_file")
+        read_tool = next(tool for tool in file_tools if tool.name == "read_file")
 
         # Use the tools
         write_tool.func("function_test.txt", "Test content")
         content = read_tool.func("function_test.txt")
         assert content == "Test content"
+        print("✅ File tools creation and functionality test passed!")
+
+        # Create skill tools using the function
+        skill_tools = create_skill_tools(workspace)
+        assert len(skill_tools) == 3  # Should have 3 skill tools
+
+        # Verify skill tool names
+        skill_tool_names = {tool.name for tool in skill_tools}
+        assert "read_skill_doc" in skill_tool_names
+        assert "list_skill_docs" in skill_tool_names
+        assert "fetch_skill_file" in skill_tool_names
+        print("✅ Skill tools creation test passed!")
+
+        # Total tools: 15 file + 3 skill = 18
+        all_tools = file_tools + skill_tools
+        assert len(all_tools) == 18
 
         print("✅ Tool creation function test passed!")
 

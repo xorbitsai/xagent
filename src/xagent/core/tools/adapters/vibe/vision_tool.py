@@ -86,54 +86,59 @@ class VisionTool:
             return [self._resolve_image_path(img) for img in images]
         return images
 
-    def _coalesce_images(
+    def _normalize_images(
         self,
-        images: Union[str, List[str]] | None = None,
-        image: Union[str, List[str]] | None = None,
+        images: Union[str, List[str]],
     ) -> Union[str, List[str]]:
-        """Accept both images/image inputs for compatibility."""
+        """
+        Normalize and validate image input.
 
-        def process_param(param_value: Union[str, List[str], None]) -> List[str]:
-            """Process and validate a single image parameter."""
-            if isinstance(param_value, str):
-                return [param_value]
-            elif isinstance(param_value, list):
-                if all(isinstance(x, str) for x in param_value):
-                    return param_value
-                else:
-                    raise ValueError("all items in image/images must be strings")
-            elif param_value is None:
-                return []
-            else:
-                raise TypeError("image/images must be a string or a list of strings")
+        Args:
+            images: Single image path/URL or list of image paths/URLs
 
-        # Process both parameters using the same logic
-        processed_images = process_param(images)
-        processed_image = process_param(image)
+        Returns:
+            Normalized image input (single string or list)
 
-        # can not be both empty
-        if not processed_images and not processed_image:
+        Raises:
+            ValueError: If images is None or invalid
+        """
+        if images is None:
             raise ValueError("At least one image must be provided")
 
-        # merge and distinguish them
-        effected_images = list(set(processed_images + processed_image))
-
-        # return a list
-        return effected_images if len(effected_images) > 1 else effected_images[0]
+        if isinstance(images, str):
+            return images
+        elif isinstance(images, list):
+            if not images:
+                raise ValueError("At least one image must be provided")
+            if all(isinstance(x, str) for x in images):
+                return images
+            else:
+                raise ValueError("all items in images must be strings")
+        else:
+            raise TypeError("images must be a string or a list of strings")
 
     async def understand_images(
         self,
-        images: Union[str, List[str]] | None = None,
-        question: str = "",
+        images: Union[str, List[str]],
+        question: str,
         temperature: Optional[float] = None,
         max_tokens: Optional[int] = None,
-        image: Union[str, List[str]] | None = None,
     ) -> UnderstandImagesResult:
-        """Analyze images and answer questions about their content."""
-        if not question:
-            raise ValueError("question is required")
+        """
+        Analyze images and answer questions about their content.
+
+        Args:
+            images: Single image path/URL or list of image paths/URLs
+            question: Question to ask about the images
+            temperature: Sampling temperature for generation
+            max_tokens: Maximum tokens to generate
+
+        Returns:
+            UnderstandImagesResult with analysis result and metadata
+        """
         try:
-            resolved_images = self._resolve_images(self._coalesce_images(images, image))
+            normalized_images = self._normalize_images(images)
+            resolved_images = self._resolve_images(normalized_images)
         except Exception as e:
             logger.error(f"understand_images: Error in resolving images: {e}")
             return UnderstandImagesResult(success=False, error=str(e))
@@ -143,33 +148,64 @@ class VisionTool:
 
     async def describe_images(
         self,
-        images: Union[str, List[str]] | None = None,
+        images: Union[str, List[str]],
         detail_level: str = "normal",
         temperature: Optional[float] = None,
         max_tokens: Optional[int] = None,
-        image: Union[str, List[str]] | None = None,
     ) -> UnderstandImagesResult:
-        """Generate descriptions for images."""
-        resolved_images = self._resolve_images(self._coalesce_images(images, image))
+        """
+        Generate descriptions for images.
+
+        Args:
+            images: Single image path/URL or list of image paths/URLs
+            detail_level: Level of detail ("simple", "normal", "detailed")
+            temperature: Sampling temperature for generation
+            max_tokens: Maximum tokens to generate
+
+        Returns:
+            UnderstandImagesResult with descriptions and metadata
+        """
+        try:
+            normalized_images = self._normalize_images(images)
+            resolved_images = self._resolve_images(normalized_images)
+        except Exception as e:
+            logger.error(f"describe_images: Error in resolving images: {e}")
+            return UnderstandImagesResult(success=False, error=str(e))
         return await self.core.describe_images(
             resolved_images, detail_level, temperature, max_tokens
         )
 
     async def detect_objects(
         self,
-        images: Union[str, List[str]] | None = None,
-        task: str = "",
+        images: Union[str, List[str]],
+        task: str,
         mark_objects: bool = False,
         box_color: str = "red",
         confidence_threshold: float = 0.5,
         temperature: Optional[float] = None,
         max_tokens: Optional[int] = None,
-        image: Union[str, List[str]] | None = None,
     ) -> DetectObjectsResult:
-        """Detect objects in images with optional marking capability."""
-        if not task:
-            raise ValueError("task is required")
-        resolved_images = self._resolve_images(self._coalesce_images(images, image))
+        """
+        Detect objects in images with optional marking capability.
+
+        Args:
+            images: Single image path/URL or list of image paths/URLs
+            task: Natural language description of what to detect
+            mark_objects: Whether to create a marked image with bounding boxes
+            box_color: Color for bounding boxes if marking
+            confidence_threshold: Minimum confidence score for detected objects
+            temperature: Sampling temperature for generation
+            max_tokens: Maximum tokens to generate
+
+        Returns:
+            DetectObjectsResult with detected objects and optionally marked image path
+        """
+        try:
+            normalized_images = self._normalize_images(images)
+            resolved_images = self._resolve_images(normalized_images)
+        except Exception as e:
+            logger.error(f"detect_objects: Error in resolving images: {e}")
+            return DetectObjectsResult(success=False, error=str(e))
 
         # Execute within auto_register context when marking
         if mark_objects and self.workspace:
@@ -251,7 +287,7 @@ This tool provides automated image description capabilities, perfect for:
 - Automated image analysis workflows
 
 Parameters:
-- images (required): Single image path/URL or list of image paths/URLs
+- images (required): The image parameter name is "images". Provide a single image file path, URL, or a list of multiple image paths/URLs
 - detail_level (optional): Level of detail ("simple", "normal", "detailed") - default: "normal"
   * "simple": Brief, concise description
   * "normal": Standard description with main elements
@@ -271,7 +307,7 @@ Detect objects in images with optional bounding box annotation.
 This unified tool can both detect objects and optionally create marked images with visual annotations. Simply describe what you want to find in natural language.
 
 Parameters:
-- images (required): Single image path/URL or list of image paths/URLs. For best results, use single images.
+- images (required): The image parameter name is "images". Provide a single image file path, URL, or a list of multiple image paths/URLs. For best results, use single images.
 - task (required): Describe what you want to detect in plain language. Examples:
   * "Find all people in the image"
   * "Detect workers not wearing safety helmets"

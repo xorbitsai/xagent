@@ -3,6 +3,7 @@ Plan execution logic for DAG plan-execute pattern.
 """
 
 import asyncio
+import json
 import logging
 import traceback
 from collections import deque
@@ -654,6 +655,26 @@ class PlanExecutor:
             ):
                 conversation_history = self.parent_pattern._get_messages_for_llm()
 
+            # Get file information from parent pattern context
+            file_info = None
+            uploaded_files = None
+            if self.parent_pattern and hasattr(self.parent_pattern, "_context"):
+                parent_context = self.parent_pattern._context
+                if parent_context:
+                    # Handle both dict and AgentContext (Pydantic model) cases
+                    if isinstance(parent_context, dict):
+                        file_info = parent_context.get("file_info")
+                        uploaded_files = parent_context.get("uploaded_files")
+                    elif hasattr(parent_context, "state") and parent_context.state:
+                        # AgentContext has a state dict
+                        file_info = parent_context.state.get("file_info")
+                        uploaded_files = parent_context.state.get("uploaded_files")
+                    elif hasattr(parent_context, "model_dump"):
+                        # Pydantic model - try to get as dict
+                        context_dict = parent_context.model_dump()
+                        file_info = context_dict.get("file_info")
+                        uploaded_files = context_dict.get("uploaded_files")
+
             context_messages = await self.context_builder.build_context_for_step(
                 step_name=step.name,
                 step_description=step.description,
@@ -663,6 +684,8 @@ class PlanExecutor:
                 original_goal=original_goal,
                 skill_context=skill_context,
                 conversation_history=conversation_history,
+                file_info=file_info,
+                uploaded_files=uploaded_files,
             )
 
             # Add the current step task, with tool info and original goal context
@@ -693,15 +716,45 @@ class PlanExecutor:
                     f'{{\n  "type": "final_answer",\n  "reasoning": "Based on the analysis, the answer was found",\n  "answer": "{valid_branches[0]}",\n  "success": true,\n  "error": null\n}}\n'
                 )
             elif tool_names:
-                task_message = (
-                    f"{goal_reminder}"
-                    f"Execute: {step.name}\n"
-                    f"Description: {step.description}\n"
-                    f"Available tools: {', '.join(tool_names)}\n"
-                    f"You may use any of these tools as needed to complete the task."
-                )
+                task_message_parts = [
+                    f"{goal_reminder}",
+                    f"Execute: {step.name}",
+                    f"Description: {step.description}",
+                    "",
+                    "Available tools:",
+                ]
+
+                # Add detailed tool information with parameter schemas
+                for tool in tools:
+                    tool_name = tool.name if hasattr(tool, "name") else str(tool)
+                    tool_description = (
+                        tool.description
+                        if hasattr(tool, "description")
+                        else "No description"
+                    )
+
+                    task_message_parts.append(f"\n{tool_name}:")
+                    task_message_parts.append(f"  Description: {tool_description}")
+
+                    # Get parameter schema if available
+                    args_schema = None
+                    if hasattr(tool, "args_type") and callable(tool.args_type):
+                        try:
+                            args_schema = tool.args_type().model_json_schema()
+                        except Exception:
+                            pass
+
+                    # Add structured parameter information
+                    if args_schema and "properties" in args_schema:
+                        task_message_parts.append("  Parameters (JSON schema):")
+                        schema_str = json.dumps(args_schema, indent=2)
+                        for line in schema_str.split("\n"):
+                            task_message_parts.append(f"    {line}")
+
+                task_message = "\n".join(task_message_parts)
+
                 if original_goal:
-                    task_message += "\nRemember: This step contributes to achieving the overall goal above."
+                    task_message += "\n\nRemember: This step contributes to achieving the overall goal above."
             else:
                 task_message = f"{goal_reminder}Execute: {step.name}\nDescription: {step.description}"
                 if original_goal:

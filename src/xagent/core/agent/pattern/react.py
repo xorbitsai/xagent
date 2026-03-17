@@ -1454,13 +1454,16 @@ Failed final answer:
             "messages": final_messages,
         }
 
-        # Get tool schemas for tracing (but don't pass to LLM)
-        # In JSON instruction mode, LLM returns JSON text describing the action,
-        # not actual tool calls. The code then parses the JSON and executes tools.
+        # Get tool schemas
         tool_schemas = self.tool_registry.get_tool_schemas()
 
-        # Enforce JSON format for all LLMs
-        chat_kwargs["response_format"] = {"type": "json_object"}
+        # Only enforce JSON format when NO tools available
+        # When tools are available, let LLM use native tool call without JSON format restriction
+        if not tool_schemas:
+            chat_kwargs["response_format"] = {"type": "json_object"}
+        else:
+            # Pass tools to LLM for native tool calling
+            chat_kwargs["tools"] = tool_schemas
 
         # Disable thinking mode if supported
         if (

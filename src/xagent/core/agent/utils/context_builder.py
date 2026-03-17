@@ -67,6 +67,8 @@ class ContextBuilder:
         original_goal: Optional[str] = None,
         skill_context: Optional[str] = None,
         conversation_history: Optional[List[Dict[str, str]]] = None,
+        file_info: Optional[List[Dict[str, Any]]] = None,
+        uploaded_files: Optional[List[str]] = None,
     ) -> List[Dict[str, str]]:
         """
         Build context messages for a step based on its dependencies.
@@ -80,6 +82,8 @@ class ContextBuilder:
             original_goal: Optional original user goal for context preservation
             skill_context: Optional skill context with domain knowledge and templates
             conversation_history: Optional conversation history from user interactions
+            file_info: Optional list of uploaded file information dictionaries
+            uploaded_files: Optional list of uploaded file identifiers
 
         Returns:
             List of messages forming the context for this step
@@ -93,6 +97,22 @@ class ContextBuilder:
                 ),
             }
         ]
+
+        # Add file information if available
+        if uploaded_files and file_info:
+            messages.append(
+                {
+                    "role": "user",
+                    "content": f"UPLOADED FILES: {len(uploaded_files)} files available for processing:\n"
+                    + "\n".join(
+                        [
+                            f"- {f.get('name', 'unknown')} ({f.get('size', 0)} bytes, {f.get('type', 'unknown')}) - File ID: {file_id}"
+                            for f, file_id in zip(file_info, uploaded_files)
+                        ]
+                    )
+                    + "\nThese files have been uploaded and are available in the workspace.",
+                }
+            )
 
         # Add conversation history before dependency results if available
         if conversation_history:

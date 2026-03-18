@@ -1,5 +1,5 @@
 import React from 'react'
-import ReactMarkdown from 'react-markdown'
+import ReactMarkdown, { defaultUrlTransform } from 'react-markdown'
 import remarkGfm from 'remark-gfm'
 import remarkMath from 'remark-math'
 import rehypeKatex from 'rehype-katex'
@@ -33,8 +33,7 @@ interface MarkdownRendererProps {
 const safeUrlTransform = (url: string): string => {
   if (!url) return ''
   if (url.startsWith('file:')) return url
-  if (/^(https?:|mailto:|tel:|\/|#)/i.test(url)) return url
-  return ''
+  return defaultUrlTransform(url)
 }
 
 const UUID_PATTERN =

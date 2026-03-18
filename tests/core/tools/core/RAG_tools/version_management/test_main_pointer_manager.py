@@ -13,7 +13,9 @@ from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import pandas as pd
+import pytest
 
+from xagent.core.tools.core.RAG_tools.core.exceptions import MainPointerError
 from xagent.core.tools.core.RAG_tools.version_management.main_pointer_manager import (
     delete_main_pointer,
     get_main_pointer,
@@ -40,6 +42,15 @@ def _mock_main_pointers_schema() -> MagicMock:
     """Return a mock schema for main_pointers table (includes user_id for ensure_main_pointers_table)."""
     schema = MagicMock()
     schema.names = list(MAIN_POINTERS_SCHEMA_NAMES)
+    schema.__iter__ = lambda self: iter([SimpleNamespace(name=n) for n in self.names])
+    return schema
+
+
+def _mock_old_main_pointers_schema() -> MagicMock:
+    """Return a mock schema for legacy main_pointers table (no user_id). Used for forward-compat tests."""
+    old_names = [n for n in MAIN_POINTERS_SCHEMA_NAMES if n != "user_id"]
+    schema = MagicMock()
+    schema.names = old_names
     schema.__iter__ = lambda self: iter([SimpleNamespace(name=n) for n in self.names])
     return schema
 
@@ -244,6 +255,7 @@ class TestMainPointerManager:
             mock_res.to_pandas.return_value = df
             return mock_res
 
+        table.schema = _mock_main_pointers_schema()
         table.search.return_value.where.side_effect = capture_where
         conn.open_table.side_effect = lambda name: (
             docs_table if name == "documents" else table
@@ -301,6 +313,29 @@ class TestMainPointerManager:
     @patch(
         "xagent.core.tools.core.RAG_tools.version_management.main_pointer_manager.get_connection_from_env"
     )
+    def test_get_main_pointer_raises_when_table_missing_user_id(
+        self, mock_get_conn: MagicMock
+    ) -> None:
+        """Forward-compat: table exists with old schema (no user_id) must raise clear error."""
+        conn = MagicMock()
+        table = MagicMock()
+        table.schema = _mock_old_main_pointers_schema()
+        conn.open_table.return_value = table
+        conn.table_names.return_value = ["main_pointers"]
+        mock_get_conn.return_value = conn
+
+        with pytest.raises(MainPointerError) as exc_info:
+            get_main_pointer("c", "d", "parse")
+
+        assert "user_id" in str(exc_info.value)
+        assert (
+            "missing" in str(exc_info.value).lower()
+            or "required" in str(exc_info.value).lower()
+        )
+
+    @patch(
+        "xagent.core.tools.core.RAG_tools.version_management.main_pointer_manager.get_connection_from_env"
+    )
     def test_set_main_pointer_preserves_created_at(
         self, mock_get_conn: MagicMock
     ) -> None:
@@ -331,6 +366,7 @@ class TestMainPointerManager:
         )
 
         # Configure search to return the existing record
+        table.schema = _mock_main_pointers_schema()
         table.search.return_value.where.return_value.to_pandas.return_value = (
             existing_df
         )
@@ -435,6 +471,7 @@ class TestMainPointerManager:
         )
 
         # Configure search to return the existing NULL-tag record
+        table.schema = _mock_main_pointers_schema()
         table.search.return_value.where.return_value.to_pandas.return_value = (
             existing_df
         )
@@ -494,6 +531,7 @@ class TestMainPointerManager:
             ]
         )
 
+        table.schema = _mock_main_pointers_schema()
         table.search.return_value.where.return_value.to_pandas.return_value = (
             existing_df
         )

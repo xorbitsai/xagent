@@ -137,6 +137,7 @@ export default function ToolsPage() {
     }
   }
 
+
   const loadMCPServers = async () => {
     try {
       const response = await apiRequest(`${getApiUrl()}/api/mcp/servers`)
@@ -243,6 +244,26 @@ export default function ToolsPage() {
       setIsLoading(false)
     }
   }
+
+  const handleToggleToolEnabled = async (tool: Tool) => {
+    try {
+      const response = await apiRequest(`${getApiUrl()}/api/tools/${tool.name}/enabled`, {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ enabled: !tool.enabled }),
+      })
+      if (!response.ok) {
+        const err = await response.json()
+        alert(err.detail || t('tools.policy.toggleFailed'))
+        return
+      }
+      await loadTools()
+    } catch (error) {
+      console.error("Failed to toggle tool enabled:", error)
+      alert(t('tools.policy.toggleFailed'))
+    }
+  }
+
 
   const getCategoryLabel = (category: string) => {
     if (!category) return ""
@@ -359,9 +380,21 @@ export default function ToolsPage() {
             {tool.description}
           </p>
 
-          <div className="flex items-center justify-end text-xs text-muted-foreground">
+          <div className="mb-3 flex items-center justify-between text-xs text-muted-foreground">
+            <Badge variant={tool.enabled ? 'secondary' : 'outline'}>
+              {tool.enabled ? t('tools.policy.enabled') : t('tools.policy.disabled')}
+            </Badge>
             <span>{t('tools.list.usedByAgents', { count: tool.usage_count || 0 })}</span>
           </div>
+
+          <Button
+            variant="outline"
+            size="sm"
+            className="w-full"
+            onClick={() => handleToggleToolEnabled(tool)}
+          >
+            {tool.enabled ? t('tools.policy.disableAction') : t('tools.policy.enableAction')}
+          </Button>
         </CardContent>
       </Card>
     )
@@ -553,19 +586,23 @@ export default function ToolsPage() {
               {(activeTab === 'all' || activeTab === 'mcp') && filteredMcpServers.map(server => (
                 <MCPServerCard key={`mcp-${server.id}`} server={server} />
               ))}
+
+              {/* Empty State */}
+              {(activeTab !== 'mcp' && filteredTools.length === 0 &&
+                ((activeTab !== 'all' && activeTab !== 'mcp') || (activeTab === 'all' && filteredMcpServers.length === 0)) &&
+                (activeTab !== 'mcp' || filteredMcpServers.length === 0)) && (
+                <div className="col-span-full flex justify-center">
+                  <EmptyState />
+                </div>
+              )}
+
+              {/* Special case: Tab is MCP and no servers */}
+              {activeTab === 'mcp' && filteredMcpServers.length === 0 && (
+                <div className="col-span-full flex justify-center">
+                  <EmptyState />
+                </div>
+              )}
             </div>
-
-            {/* Empty State */}
-            {((activeTab !== 'mcp' && filteredTools.length === 0) &&
-              ((activeTab !== 'all' && activeTab !== 'mcp') || (activeTab === 'all' && filteredMcpServers.length === 0)) &&
-              (activeTab !== 'mcp' || filteredMcpServers.length === 0)) && (
-              <EmptyState />
-            )}
-
-            {/* Special case: Tab is MCP and no servers */}
-            {activeTab === 'mcp' && filteredMcpServers.length === 0 && (
-              <EmptyState />
-            )}
           </TabsContent>
         </div>
       </Tabs>
@@ -576,7 +613,7 @@ export default function ToolsPage() {
 function EmptyState() {
   const { t } = useI18n()
   return (
-    <div className="text-center py-16 text-muted-foreground border border-dashed rounded-lg">
+    <div className="mx-auto w-full max-w-2xl min-h-[220px] flex flex-col items-center justify-center text-center py-16 text-muted-foreground border border-dashed rounded-lg">
       <Wrench className="h-10 w-10 mx-auto mb-4 opacity-50" />
       <div className="font-medium mb-1">{t('tools.list.empty.title')}</div>
       <div className="text-sm">{t('tools.list.empty.description')}</div>

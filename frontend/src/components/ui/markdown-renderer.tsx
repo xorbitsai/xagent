@@ -5,6 +5,7 @@ import remarkMath from 'remark-math'
 import rehypeKatex from 'rehype-katex'
 import type { Components } from 'react-markdown'
 import { getApiUrl } from '@/lib/utils'
+import { apiRequest } from '@/lib/api-wrapper'
 
 // Enhanced Markdown detection function: covers broader Markdown features not limited to starting with #
 const isLikelyMarkdown = (s: string): boolean => {
@@ -29,10 +30,99 @@ interface MarkdownRendererProps {
   onFileClick?: (filePath: string, fileName: string) => void
 }
 
+const safeUrlTransform = (url: string): string => {
+  if (!url) return ''
+  if (url.startsWith('file:')) return url
+  if (/^(https?:|mailto:|tel:|\/|#)/i.test(url)) return url
+  return ''
+}
+
+const UUID_PATTERN =
+  /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i
+
+function MarkdownFileImage({
+  filePath,
+  alt,
+  title,
+  onFileClick,
+  className,
+  ...props
+}: {
+  filePath: string
+  alt?: string
+  title?: string
+  onFileClick?: (filePath: string, fileName: string) => void
+  className?: string
+  [key: string]: any
+}) {
+  const apiUrl = getApiUrl()
+  const publicUrl = `${apiUrl}/api/files/public/preview/${encodeURIComponent(filePath)}`
+  const [resolvedUrl, setResolvedUrl] = React.useState(publicUrl)
+
+  React.useEffect(() => {
+    let objectUrl: string | null = null
+    let isCancelled = false
+
+    setResolvedUrl(publicUrl)
+
+    const runFallback = async () => {
+      if (UUID_PATTERN.test(filePath)) return
+      try {
+        const response = await apiRequest(
+          `${apiUrl}/api/files/preview/${encodeURIComponent(filePath)}`,
+          {
+            cache: 'no-cache',
+            headers: {
+              'Cache-Control': 'no-cache',
+              Pragma: 'no-cache',
+            },
+          }
+        )
+        if (!response.ok) return
+        const blob = await response.blob()
+        objectUrl = URL.createObjectURL(blob)
+        if (!isCancelled) {
+          setResolvedUrl(objectUrl)
+        }
+      } catch {
+        return
+      }
+    }
+
+    void runFallback()
+
+    return () => {
+      isCancelled = true
+      if (objectUrl) {
+        URL.revokeObjectURL(objectUrl)
+      }
+    }
+  }, [apiUrl, filePath, publicUrl])
+
+  const fileName = filePath.split('/').pop() || filePath
+  const handleClick = (e: React.MouseEvent<HTMLImageElement>) => {
+    if (!onFileClick) return
+    e.preventDefault()
+    onFileClick(filePath, fileName)
+  }
+
+  return (
+    <img
+      src={resolvedUrl}
+      alt={alt || ''}
+      title={title || alt || ''}
+      data-file-path={filePath}
+      className={className || 'file-image cursor-pointer'}
+      onClick={handleClick}
+      {...props}
+    />
+  )
+}
+
 export function MarkdownRenderer({ content, className = '', onFileClick }: MarkdownRendererProps) {
   const components = React.useMemo<Components>(
     () => ({
-      a({ href, title, children, ...props }) {
+      a({ node: _node, href, title, children, ...props }) {
         if (href && href.startsWith('file:')) {
           const filePath = href.replace(/^file:/, '')
           const fileNameFromPath = filePath.split('/').pop() || filePath
@@ -69,27 +159,16 @@ export function MarkdownRenderer({ content, className = '', onFileClick }: Markd
           </a>
         )
       },
-      img({ src, alt, title, ...props }) {
+      img({ node: _node, src, alt, title, ...props }) {
         if (src && src.startsWith('file:')) {
           const filePath = src.replace(/^file:/, '')
-          const apiUrl = getApiUrl()
-          const imageUrl = `${apiUrl}/api/files/public/preview/${encodeURIComponent(filePath)}`
-          const fileName = filePath.split('/').pop() || filePath
-
-          const handleClick = (e: React.MouseEvent<HTMLImageElement>) => {
-            if (!onFileClick) return
-            e.preventDefault()
-            onFileClick(filePath, fileName)
-          }
-
           return (
-            <img
-              src={imageUrl}
+            <MarkdownFileImage
+              filePath={filePath}
               alt={alt || ''}
               title={title || alt || ''}
-              data-file-path={filePath}
+              onFileClick={onFileClick}
               className="file-image cursor-pointer"
-              onClick={handleClick}
               {...props}
             />
           )
@@ -107,6 +186,7 @@ export function MarkdownRenderer({ content, className = '', onFileClick }: Markd
         remarkPlugins={[remarkGfm, remarkMath]}
         rehypePlugins={[rehypeKatex]}
         components={components}
+        urlTransform={safeUrlTransform}
       >
         {content}
       </ReactMarkdown>

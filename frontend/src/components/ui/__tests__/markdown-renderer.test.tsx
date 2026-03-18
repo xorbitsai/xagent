@@ -1,10 +1,29 @@
 /// <reference types="@testing-library/jest-dom/vitest" />
 import React from 'react'
-import { describe, it, expect, vi } from 'vitest'
-import { render, screen, fireEvent } from '@testing-library/react'
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
+import { render, screen, fireEvent, waitFor, cleanup } from '@testing-library/react'
+
+const apiRequestMock = vi.hoisted(() => vi.fn())
+
+vi.mock('@/lib/utils', () => ({
+  getApiUrl: () => 'http://api.local',
+}))
+
+vi.mock('@/lib/api-wrapper', () => ({
+  apiRequest: apiRequestMock,
+}))
+
 import { MarkdownRenderer } from '../markdown-renderer'
 
 describe('MarkdownRenderer', () => {
+  beforeEach(() => {
+    apiRequestMock.mockReset()
+  })
+
+  afterEach(() => {
+    cleanup()
+  })
+
   it('renders inline math with KaTeX without leaving dollar delimiters', () => {
     const content = 'The equation is $x^2 + y^2 = 1$.'
     render(<MarkdownRenderer content={content} />)
@@ -45,5 +64,49 @@ describe('MarkdownRenderer', () => {
 
     expect(handleFileClick).toHaveBeenCalledTimes(1)
     expect(handleFileClick).toHaveBeenCalledWith('/tmp/test.txt', 'open file')
+  })
+
+  it('preserves standard relative markdown links and images', () => {
+    const content = '[relative doc](../doc.md)\n\n![relative image](./a.png)'
+    render(<MarkdownRenderer content={content} />)
+
+    const link = screen.getByText('relative doc')
+    expect(link).toBeInTheDocument()
+    expect(link).toHaveAttribute('href', '../doc.md')
+
+    const image = screen.getByAltText('relative image')
+    expect(image).toBeInTheDocument()
+    expect(image).toHaveAttribute('src', './a.png')
+  })
+
+  it('uses authenticated preview fallback for non-uuid file: images', async () => {
+    apiRequestMock.mockResolvedValue({ ok: false })
+    const content = '![final image](file:output/screenshot.png)'
+    render(<MarkdownRenderer content={content} />)
+
+    await waitFor(() => {
+      expect(apiRequestMock).toHaveBeenCalledWith(
+        'http://api.local/api/files/preview/output%2Fscreenshot.png',
+        expect.objectContaining({
+          cache: 'no-cache',
+          headers: expect.objectContaining({
+            'Cache-Control': 'no-cache',
+            Pragma: 'no-cache',
+          }),
+        })
+      )
+    })
+  })
+
+  it('does not run authenticated fallback for uuid file: images', async () => {
+    const content = '![uuid image](file:550e8400-e29b-41d4-a716-446655440000)'
+    render(<MarkdownRenderer content={content} />)
+
+    await waitFor(() => {
+      const image = screen.getByAltText('uuid image')
+      expect(image).toBeInTheDocument()
+    })
+
+    expect(apiRequestMock).not.toHaveBeenCalled()
   })
 })

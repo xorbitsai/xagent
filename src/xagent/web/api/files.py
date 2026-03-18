@@ -12,7 +12,13 @@ from sqlalchemy.orm import Session
 
 from ...core.tools.adapters.vibe.file_tool import read_file
 from ..auth_dependencies import get_current_user
-from ..config import MAX_FILE_SIZE, UPLOADS_DIR, get_upload_path, is_allowed_file
+from ..config import (
+    BINARY_EXTENSIONS,
+    MAX_FILE_SIZE,
+    UPLOADS_DIR,
+    get_upload_path,
+    is_allowed_file,
+)
 from ..models.database import get_db
 from ..models.uploaded_file import UploadedFile
 from ..models.user import User
@@ -450,15 +456,18 @@ async def upload_file(
         db.flush()
 
         content_preview = ""
-        try:
-            preview_content = read_file(str(target_path))
-            content_preview = (
-                preview_content[:500] + "..."
-                if isinstance(preview_content, str) and len(preview_content) > 500
-                else preview_content
-            )
-        except Exception:
-            content_preview = ""
+        # Skip preview generation for binary files (images, videos, etc.)
+        file_extension = Path(uploaded.filename).suffix.lower()
+        if file_extension not in BINARY_EXTENSIONS:
+            try:
+                preview_content = read_file(str(target_path))
+                content_preview = (
+                    preview_content[:500] + "..."
+                    if isinstance(preview_content, str) and len(preview_content) > 500
+                    else preview_content
+                )
+            except Exception:
+                content_preview = ""
 
         uploaded_files.append(
             {

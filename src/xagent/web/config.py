@@ -43,6 +43,38 @@ if _EXTERNAL_UPLOAD_DIRS:
 FILE_STORAGE_BASE_DIR = UPLOADS_DIR
 FILE_STORAGE_URL_BASE = "/uploads"
 
+# Binary file extensions that should not be previewed as text
+BINARY_EXTENSIONS = {
+    # Image files
+    ".png",
+    ".jpg",
+    ".jpeg",
+    ".gif",
+    ".bmp",
+    ".webp",
+    ".svg",
+    ".ico",
+    # Video files
+    ".mp4",
+    ".avi",
+    ".mov",
+    ".wmv",
+    ".flv",
+    ".webm",
+    # Audio files
+    ".mp3",
+    ".wav",
+    ".ogg",
+    ".flac",
+    ".aac",
+    # Archive files
+    ".zip",
+    ".rar",
+    ".7z",
+    ".tar",
+    ".gz",
+}
+
 # Supported file types
 ALLOWED_EXTENSIONS = {
     "general": [
@@ -60,7 +92,8 @@ ALLOWED_EXTENSIONS = {
         ".xlsx",
         ".xls",
         ".pptx",
-    ],
+    ]
+    + list(BINARY_EXTENSIONS),
     "text": [".txt", ".md", ".html", ".htm"],
     "code": [".py", ".js", ".json", ".html", ".htm"],
     "data": [".csv", ".json", ".xlsx", ".xls"],
@@ -76,6 +109,7 @@ ALLOWED_EXTENSIONS = {
         ".xls",
         ".pptx",
     ],
+    "image": [".png", ".jpg", ".jpeg", ".gif", ".bmp", ".webp", ".svg", ".ico"],
 }
 
 # Maximum file size (100MB)

@@ -247,6 +247,65 @@ class TestFileUpload:
 
         assert response.status_code in [200, 201]
 
+    def test_upload_png_file_success(
+        self, client, test_db, temp_uploads_dir, auth_headers
+    ):
+        """Test successful upload of PNG image file"""
+        # Create a minimal valid PNG file (1x1 pixel PNG)
+        # PNG signature + IHDR + IDAT + IEND
+        png_data = (
+            b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR\x00\x00\x00\x01\x00\x00\x00\x01"
+            b"\x08\x02\x00\x00\x00\x90wS\xde\x00\x00\x00\x0cIDATx\x9cc\xf8\xcf\xc0"
+            b"\x00\x00\x00\x03\x00\x01\x00\x00\x00\x00IEND\xaeB`\x82"
+        )
+
+        with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as tmp:
+            tmp.write(png_data)
+            tmp.flush()
+
+            with open(tmp.name, "rb") as f:
+                response = client.post(
+                    "/api/files/upload",
+                    files={"file": ("test.png", f, "image/png")},
+                    data={"task_type": "general"},
+                    headers=auth_headers,
+                )
+
+        os.unlink(tmp.name)
+        assert response.status_code in [200, 201]
+
+    def test_upload_jpg_file_success(
+        self, client, test_db, temp_uploads_dir, auth_headers
+    ):
+        """Test successful upload of JPG image file"""
+        # Create a minimal valid JPEG file
+        jpeg_data = (
+            b"\xff\xd8\xff\xe0\x00\x10JFIF\x00\x01\x01\x00\x00\x01\x00\x01\x00\x00"
+            b"\xff\xdb\x00C\x00\x03\x02\x02\x03\x02\x02\x03\x03\x03\x03\x04\x03\x03"
+            b"\x04\x05\x08\x05\x05\x04\x04\x05\n\x07\x07\x06\x08\x0c\n\x0c\x0c\x0b"
+            b"\n\x0b\x0b\r\x0e\x12\x10\r\x0e\x11\x0e\x0b\x0b\x10\x16\x10\x11\x13\x14"
+            b"\x15\x15\x15\x0c\x0f\x17\x18\x16\x14\x18\x12\x14\x15\x14\xff\xc0\x00"
+            b"\x0b\x08\x00\x01\x00\x01\x01\x01\x11\x00\xff\xc4\x00\x14\x00\x01\x00"
+            b"\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\n\xff\xc4\x00"
+            b"\x14\x10\x01\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00"
+            b"\x00\x00\xff\xda\x00\x08\x01\x01\x00\x00?\x00T\x9f\xff\xd9"
+        )
+
+        with tempfile.NamedTemporaryFile(suffix=".jpg", delete=False) as tmp:
+            tmp.write(jpeg_data)
+            tmp.flush()
+
+            with open(tmp.name, "rb") as f:
+                response = client.post(
+                    "/api/files/upload",
+                    files={"file": ("test.jpg", f, "image/jpeg")},
+                    data={"task_type": "general"},
+                    headers=auth_headers,
+                )
+
+        os.unlink(tmp.name)
+        assert response.status_code in [200, 201]
+
     def test_upload_no_filename_error(self, client, test_db, auth_headers):
         """Test upload with no filename"""
         with tempfile.NamedTemporaryFile(delete=False) as tmp:

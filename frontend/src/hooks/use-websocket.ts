@@ -2,7 +2,7 @@
 
 import { useEffect, useRef, useState, useCallback } from "react"
 import { useAuth } from "@/contexts/auth-context"
-import { getWsUrl } from "@/lib/utils"
+import { getWsUrl, getApiUrl } from "@/lib/utils"
 
 // Duplicate message detection: record recently sent messages
 const recentMessages: Array<{ message: string; timestamp: number; taskId: number }> = []
@@ -424,32 +424,73 @@ export function useWebSocket(options: UseWebSocketOptions = {}) {
         task_id: taskIdRef.current,
       }
 
-      // If there are files, add file info
+      // If there are files, upload them first via API, then send file_ids
       if (files && files.length > 0) {
-        console.log(`📁 Processing files [${timestamp}]:`, files.length)
+        console.log(`📁 Uploading files before sending chat [${timestamp}]:`, files.length)
 
-        const filePromises = files.map(file => {
-          return new Promise((resolve) => {
-            const reader = new FileReader()
-            reader.onload = (e) => {
-              const fileData = {
-                name: file.name,
-                size: file.size,
-                type: file.type,
-                content: typeof e.target?.result === 'string' ? e.target.result.split(',')[1] : '' // Get base64 content
-              }
-              console.log(`📄 File processed [${timestamp}]:`, fileData.name, 'size:', fileData.size)
-              resolve(fileData)
-            }
-            reader.readAsDataURL(file)
+        const filesToUpload = files.filter(f => !(f as any).file_id)
+        const preUploadedFiles = files.filter(f => (f as any).file_id).map(f => ({
+          file_id: (f as any).file_id,
+          name: f.name,
+          size: f.size,
+          type: f.type || ''
+        }))
+
+        if (filesToUpload.length > 0) {
+          const formData = new FormData()
+          filesToUpload.forEach(f => formData.append('files', f))
+          formData.append('task_type', 'task')
+          if (taskIdRef.current) {
+            formData.append('task_id', taskIdRef.current.toString())
+          }
+
+          fetch(`${getApiUrl()}/api/files/upload`, {
+            method: 'POST',
+            headers: {
+              'Authorization': `Bearer ${token || localStorage.getItem('token') || ''}`
+            },
+            body: formData
           })
-        })
+            .then(res => res.json())
+            .then(data => {
+              messageData.files = [...preUploadedFiles];
+              if (data.success && data.files) {
+                // Send file_ids in the websocket message
+                const newUploadedFiles = data.files.map((f: any) => ({
+                  file_id: f.file_id,
+                  name: f.filename,
+                  size: f.file_size,
+                  type: f.mime_type || ''
+                }));
+                messageData.files = messageData.files.concat(newUploadedFiles);
+              }
 
-        // Wait for all files to be read
-        Promise.all(filePromises).then(fileDataList => {
-          console.log(`✅ All files processed [${timestamp}], sending:`, fileDataList.length)
-          messageData.files = fileDataList
-          console.log(`📤 Sending message with files [${timestamp}]:`, messageData)
+              console.log(`📤 Sending message with uploaded files [${timestamp}]:`, messageData)
+              socketRef.current?.send(JSON.stringify(messageData))
+              console.log(`✅ Message sent [${timestamp}]`)
+
+              // Record sent message
+              recentMessages.push({ message, timestamp, taskId: currentTaskId! })
+              // Clear records older than 5 seconds
+              const cutoffTime = timestamp - 5000
+              const firstKeepIndex = recentMessages.findIndex(msg => msg.timestamp >= cutoffTime)
+              if (firstKeepIndex === -1) {
+                recentMessages.splice(0, recentMessages.length)
+              } else if (firstKeepIndex > 0) {
+                recentMessages.splice(0, firstKeepIndex)
+              }
+            })
+            .catch(err => {
+              console.error('Failed to upload files:', err)
+              if (preUploadedFiles.length > 0) {
+                messageData.files = preUploadedFiles;
+              }
+              // Send without newly uploaded files if upload fails
+              socketRef.current?.send(JSON.stringify(messageData))
+            })
+        } else {
+          messageData.files = preUploadedFiles;
+          console.log(`📤 Sending message with pre-uploaded files [${timestamp}]:`, messageData)
           socketRef.current?.send(JSON.stringify(messageData))
           console.log(`✅ Message sent [${timestamp}]`)
 
@@ -463,7 +504,7 @@ export function useWebSocket(options: UseWebSocketOptions = {}) {
           } else if (firstKeepIndex > 0) {
             recentMessages.splice(0, firstKeepIndex)
           }
-        })
+        }
       } else {
         console.log(`📤 Sending message without files [${timestamp}]`)
         socketRef.current?.send(JSON.stringify(messageData))

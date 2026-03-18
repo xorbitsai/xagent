@@ -739,12 +739,28 @@ export function AgentBuilder({ agentId }: AgentBuilderProps) {
       // Process files if any
       let processedFiles: any[] = []
       if (files.length > 0) {
-        processedFiles = await Promise.all(files.map(async (file) => ({
-          name: file.name,
-          type: file.type,
-          content: await fileToBase64(file),
-          size: file.size
-        })))
+        const formData = new FormData()
+        files.forEach(f => formData.append('files', f))
+        formData.append('task_type', 'task')
+
+        const uploadResponse = await apiRequest(`${getApiUrl()}/api/files/upload`, {
+          method: 'POST',
+          body: formData
+        })
+
+        if (uploadResponse.ok) {
+          const uploadData = await uploadResponse.json()
+          if (uploadData.success && uploadData.files) {
+            processedFiles = uploadData.files.map((f: any) => ({
+              file_id: f.file_id,
+              name: f.filename,
+              size: f.file_size,
+              type: f.mime_type || ''
+            }))
+          }
+        } else {
+          console.error('Failed to upload preview files:', uploadResponse.statusText)
+        }
       }
 
       // Ensure message is not empty for backend

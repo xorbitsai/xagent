@@ -4,11 +4,9 @@ import { useState, useEffect } from "react"
 import { apiRequest } from "@/lib/api-wrapper"
 import { getApiUrl } from "@/lib/utils"
 import { Button } from "@/components/ui/button"
-import { Eye, File as FileIcon, Loader2, RefreshCw, Upload, HardDrive, FolderOutput } from "lucide-react"
+import { Eye, File as FileIcon, Loader2, RefreshCw } from "lucide-react"
 import { useI18n } from "@/contexts/i18n-context"
-import { ScrollArea } from "@/components/ui/scroll-area"
 import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover"
-import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs"
 
 interface FileItem {
   file_id: string
@@ -66,18 +64,8 @@ export function TaskFileManager({ taskId, children, onPreview }: TaskFileManager
     return parseFloat((bytes / Math.pow(k, i)).toFixed(2)) + ' ' + sizes[i]
   }
 
-  const getInputFiles = () => {
-    // Input files: files categorized as 'input'
-    return files
-      .filter(f => f.category === 'input')
-      .sort((a, b) => b.modified_time - a.modified_time)
-  }
-
-  const getOutputFiles = () => {
-    // Output files: files categorized as 'output'
-    return files
-      .filter(f => f.category === 'output')
-      .sort((a, b) => b.modified_time - a.modified_time)
+  const getAllFiles = () => {
+    return files.sort((a, b) => b.modified_time - a.modified_time)
   }
 
   const renderFileList = (fileList: FileItem[], emptyMsg: string) => {
@@ -92,7 +80,7 @@ export function TaskFileManager({ taskId, children, onPreview }: TaskFileManager
 
     if (fileList.length === 0) {
       return (
-        <div className="w-full text-center text-sm text-muted-foreground py-8 border-2 border-dashed rounded-lg m-2">
+        <div className="w-full text-center text-sm text-muted-foreground py-8">
           {emptyMsg}
         </div>
       )
@@ -145,6 +133,7 @@ export function TaskFileManager({ taskId, children, onPreview }: TaskFileManager
         <div className="flex items-center justify-between p-3 border-b bg-muted/20">
           <h3 className="font-medium text-sm flex items-center gap-2">
             {t('files.header.title')}
+            <span className="text-xs bg-muted px-1.5 py-0.5 rounded-full">{files.length}</span>
           </h3>
           <Button
             variant="ghost"
@@ -158,39 +147,9 @@ export function TaskFileManager({ taskId, children, onPreview }: TaskFileManager
           </Button>
         </div>
 
-        <Tabs defaultValue="output" className="w-full">
-          <TabsList className="w-full justify-start rounded-none border-b bg-transparent p-0">
-            <TabsTrigger
-              value="input"
-              className="relative h-9 rounded-none border-b-2 border-transparent bg-transparent px-4 pb-3 pt-2 font-semibold text-muted-foreground shadow-none transition-none data-[state=active]:border-primary data-[state=active]:text-foreground data-[state=active]:shadow-none"
-            >
-              <div className="flex items-center gap-2">
-                <Upload className="h-3.5 w-3.5" />
-                <span>{t('files.tabs.input')}</span>
-                <span className="text-xs bg-muted px-1.5 py-0.5 rounded-full">{getInputFiles().length}</span>
-              </div>
-            </TabsTrigger>
-            <TabsTrigger
-              value="output"
-              className="relative h-9 rounded-none border-b-2 border-transparent bg-transparent px-4 pb-3 pt-2 font-semibold text-muted-foreground shadow-none transition-none data-[state=active]:border-primary data-[state=active]:text-foreground data-[state=active]:shadow-none"
-            >
-              <div className="flex items-center gap-2">
-                <FolderOutput className="h-3.5 w-3.5" />
-                <span>{t('files.tabs.output')}</span>
-                <span className="text-xs bg-muted px-1.5 py-0.5 rounded-full">{getOutputFiles().length}</span>
-              </div>
-            </TabsTrigger>
-          </TabsList>
-
-          <ScrollArea className="h-[300px]">
-            <TabsContent value="input" className="m-0 border-0">
-              {renderFileList(getInputFiles(), t('files.table.empty.noFiles'))}
-            </TabsContent>
-            <TabsContent value="output" className="m-0 border-0">
-              {renderFileList(getOutputFiles(), t('files.table.empty.noFiles'))}
-            </TabsContent>
-          </ScrollArea>
-        </Tabs>
+        <div className="h-[300px] w-full overflow-auto">
+          {renderFileList(getAllFiles(), t('files.table.empty.noFiles'))}
+        </div>
       </PopoverContent>
     </Popover>
   )

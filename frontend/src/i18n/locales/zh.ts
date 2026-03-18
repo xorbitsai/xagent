@@ -692,10 +692,6 @@ Build when you need.`
       title: "文件管理",
       description: "管理项目文件：上传、预览、下载与删除",
     },
-    tabs: {
-      input: "输入",
-      output: "输出",
-    },
     search: {
       placeholder: "搜索文件...",
     },

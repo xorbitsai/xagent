@@ -79,7 +79,7 @@ let startDelayedPlayback = () => {
 
 // Expose to window for global access
 if (typeof window !== 'undefined') {
-  ;(window as any).clearDuplicateMessageCache = clearDuplicateMessageCache
+  ; (window as any).clearDuplicateMessageCache = clearDuplicateMessageCache
 }
 // Flag to track if we're loading historical data
 let isHistoricalDataLoading = false
@@ -319,13 +319,13 @@ function appReducer(state: AppState, action: AppAction): AppState {
     case "UPDATE_TASK_STATUS":
       return state.currentTask
         ? {
-            ...state,
-            currentTask: {
-              ...state.currentTask,
-              status: action.payload.status,
-              updatedAt: new Date().toISOString(),
-            },
-          }
+          ...state,
+          currentTask: {
+            ...state.currentTask,
+            status: action.payload.status,
+            updatedAt: new Date().toISOString(),
+          },
+        }
         : state
 
     case "SET_DAG_EXECUTION":
@@ -338,9 +338,9 @@ function appReducer(state: AppState, action: AppAction): AppState {
         // Update existing step - merge data intelligently to preserve existing information
         const existingStep = state.steps[existingStepIndex]
         const shouldUpdate = newStep.name !== existingStep.name ||
-                           newStep.description !== existingStep.description ||
-                           !arraysEqual(newStep.tool_names || [], existingStep.tool_names || []) ||
-                           newStep.status !== existingStep.status
+          newStep.description !== existingStep.description ||
+          !arraysEqual(newStep.tool_names || [], existingStep.tool_names || []) ||
+          newStep.status !== existingStep.status
 
         if (shouldUpdate) {
           const mergedStep = {
@@ -681,7 +681,7 @@ export function AppProvider({ children, token }: { children: React.ReactNode; to
 
       // If this is historical_data_complete, start the delayed playback
       const isHistoricalComplete = message.type === "historical_data_complete" ||
-          (message.type === "trace_event" && (message as any).event_type === "historical_data_complete")
+        (message.type === "trace_event" && (message as any).event_type === "historical_data_complete")
 
       if (isHistoricalComplete) {
         // Add a small delay to ensure all events are collected before starting playback
@@ -1313,7 +1313,7 @@ export function AppProvider({ children, token }: { children: React.ReactNode; to
                 }
               })
             }
-          // Task-level LLM Call End Events
+            // Task-level LLM Call End Events
           } else if (eventType === "task_end_llm") {
             const modelName = eventData.model_name || "LLM"
             const taskType = eventData.task_type || "LLM Call"
@@ -1529,11 +1529,11 @@ export function AppProvider({ children, token }: { children: React.ReactNode; to
                   id: generateMessageId("msg-tool-start"),
                   role: "assistant",
                   content: (
-                  <>
-                    <Wrench className="h-4 w-4 inline mr-2 text-orange-500" />
-                    {t('agent.logs.event.actions.tool_execution_start')}: {toolName}
-                  </>
-                ),
+                    <>
+                      <Wrench className="h-4 w-4 inline mr-2 text-orange-500" />
+                      {t('agent.logs.event.actions.tool_execution_start')}: {toolName}
+                    </>
+                  ),
                   timestamp: message.timestamp,
                   status: "completed",
                 }
@@ -1562,11 +1562,11 @@ export function AppProvider({ children, token }: { children: React.ReactNode; to
                   id: generateMessageId("msg-tool-end"),
                   role: "assistant",
                   content: (
-                  <>
-                    <CheckCircle className="h-4 w-4 inline mr-2 text-green-500" />
-                    {t('agent.logs.event.actions.tool_execution_end')}: {toolName}
-                  </>
-                ),
+                    <>
+                      <CheckCircle className="h-4 w-4 inline mr-2 text-green-500" />
+                      {t('agent.logs.event.actions.tool_execution_end')}: {toolName}
+                    </>
+                  ),
                   timestamp: message.timestamp,
                   status: "completed",
                 }
@@ -1595,11 +1595,11 @@ export function AppProvider({ children, token }: { children: React.ReactNode; to
                   id: generateMessageId("msg-tool-failed"),
                   role: "assistant",
                   content: (
-                  <>
-                    <XCircle className="h-4 w-4 inline mr-2 text-red-500" />
-                    {t('agent.logs.event.actions.tool_execution_failed')}: {toolName}
-                  </>
-                ),
+                    <>
+                      <XCircle className="h-4 w-4 inline mr-2 text-red-500" />
+                      {t('agent.logs.event.actions.tool_execution_failed')}: {toolName}
+                    </>
+                  ),
                   timestamp: message.timestamp,
                   status: "failed",
                 }
@@ -2585,7 +2585,7 @@ export function AppProvider({ children, token }: { children: React.ReactNode; to
                 step_data: traceEventData.step_data,
                 file_outputs: traceEventData.file_outputs || [],
               }
-                            dispatch({ type: "ADD_STEP", payload: step })
+              dispatch({ type: "ADD_STEP", payload: step })
             } else {
               // Add as trace event instead
               dispatch({ type: "ADD_TRACE_EVENT", payload: traceEventData })
@@ -2620,17 +2620,17 @@ export function AppProvider({ children, token }: { children: React.ReactNode; to
                   id: generateMessageId("msg-plan-start"),
                   role: "assistant",
                   content: (
-                  <>
-                    <FileText className="h-4 w-4 inline mr-2" />
-                    {t('agent.logs.event.messages.planStart', { phase })}
-                    <br />
-                    <Target className="h-4 w-4 inline mr-2 mt-1 text-red-500" />
-                    {t('agent.logs.event.messages.goalTitle')}: {goal}
-                    <br />
-                    <Activity className="h-4 w-4 inline mr-2 mt-1 text-blue-500" />
-                    {t('agent.logs.event.messages.stepsCount', { count: stepsCount })}
-                  </>
-                ),
+                    <>
+                      <FileText className="h-4 w-4 inline mr-2" />
+                      {t('agent.logs.event.messages.planStart', { phase })}
+                      <br />
+                      <Target className="h-4 w-4 inline mr-2 mt-1 text-red-500" />
+                      {t('agent.logs.event.messages.goalTitle')}: {goal}
+                      <br />
+                      <Activity className="h-4 w-4 inline mr-2 mt-1 text-blue-500" />
+                      {t('agent.logs.event.messages.stepsCount', { count: stepsCount })}
+                    </>
+                  ),
                   timestamp: message.timestamp,
                   status: "completed",
                 }
@@ -2644,13 +2644,13 @@ export function AppProvider({ children, token }: { children: React.ReactNode; to
                     id: generateMessageId(`msg-plan-step-${index}`),
                     role: "assistant",
                     content: (
-                  <>
-                    <Target className="h-4 w-4 inline mr-2 text-red-500" />
-                    {t('agent.logs.event.messages.execStepPrefix')}{index + 1}: {step.name || step.id}
-                    <br />
-                    <span className="ml-6">{step.description || ''}</span>
-                  </>
-                ),
+                      <>
+                        <Target className="h-4 w-4 inline mr-2 text-red-500" />
+                        {t('agent.logs.event.messages.execStepPrefix')}{index + 1}: {step.name || step.id}
+                        <br />
+                        <span className="ml-6">{step.description || ''}</span>
+                      </>
+                    ),
                     timestamp: message.timestamp,
                     status: "completed",
                   }
@@ -2664,11 +2664,11 @@ export function AppProvider({ children, token }: { children: React.ReactNode; to
                   id: generateMessageId("msg-plan-start"),
                   role: "assistant",
                   content: (
-                  <>
-                    <FileText className="h-4 w-4 inline mr-2" />
-                    {t('agent.logs.event.messages.planStart', { phase })}
-                  </>
-                ),
+                    <>
+                      <FileText className="h-4 w-4 inline mr-2" />
+                      {t('agent.logs.event.messages.planStart', { phase })}
+                    </>
+                  ),
                   timestamp: message.timestamp,
                   status: "completed",
                 }
@@ -2734,8 +2734,8 @@ export function AppProvider({ children, token }: { children: React.ReactNode; to
           const fileContent = (
             <>
               <FileText className="h-4 w-4 inline mr-2 text-green-500" />
-                    {t('agent.logs.event.messages.fileOutputsGenerated', { count: fileCount })}:
-                    <div className="mt-2 space-y-1">
+              {t('agent.logs.event.messages.fileOutputsGenerated', { count: fileCount })}:
+              <div className="mt-2 space-y-1">
                 {taskData.file_outputs.map((file: string | any, index: number) => {
                   let fileName, filePath
                   if (typeof file === 'object' && file !== null) {
@@ -2963,20 +2963,56 @@ export function AppProvider({ children, token }: { children: React.ReactNode; to
         const taskDescription = message
         const taskTitle = message.length > 50 ? `${message.substring(0, 50)}...` : message
 
+        const requestBody: any = {
+          title: taskTitle,
+          description: taskDescription,
+          llm_ids: llmIds,
+          memory_similarity_threshold: config?.memorySimilarityThreshold ?? 1.5,
+          vibe_mode: config?.vibeMode?.mode || "task",
+          process_description: config?.vibeMode?.processDescription,
+          examples: config?.vibeMode?.examples,
+        }
+
+        // Upload files first if present
+        if (files && files.length > 0) {
+          const filesToUpload = files.filter(f => !(f as any).file_id)
+          const uploadedFileIds = files.filter(f => (f as any).file_id).map(f => (f as any).file_id)
+
+          if (filesToUpload.length > 0) {
+            const formData = new FormData()
+            filesToUpload.forEach(f => formData.append('files', f))
+            formData.append('task_type', config?.vibeMode?.mode || 'task')
+
+            try {
+              const uploadResponse = await apiRequest(`${apiUrl}/api/files/upload`, {
+                method: 'POST',
+                body: formData
+              })
+
+              if (uploadResponse.ok) {
+                const uploadData = await uploadResponse.json()
+                if (uploadData.success && uploadData.files) {
+                  uploadData.files.forEach((f: any) => uploadedFileIds.push(f.file_id))
+                }
+              } else {
+                console.error('Failed to upload files:', uploadResponse.statusText)
+              }
+            } catch (e) {
+              console.error('Error uploading files before task creation:', e)
+            }
+          }
+
+          if (uploadedFileIds.length > 0) {
+            requestBody.files = uploadedFileIds
+          }
+        }
+
         const response = await apiRequest(`${apiUrl}/api/chat/task/create`, {
           method: 'POST',
           headers: {
             'Content-Type': 'application/json',
           },
-          body: JSON.stringify({
-            title: taskTitle,
-            description: taskDescription,
-            llm_ids: llmIds,
-            memory_similarity_threshold: config?.memorySimilarityThreshold ?? 1.5,
-            vibe_mode: config?.vibeMode?.mode || "task",
-            process_description: config?.vibeMode?.processDescription,
-            examples: config?.vibeMode?.examples,
-          }),
+          body: JSON.stringify(requestBody),
         })
 
         if (response.ok) {

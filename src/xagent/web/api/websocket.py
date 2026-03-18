@@ -965,8 +965,7 @@ async def handle_file_upload_for_task(
 ) -> dict:
     """Handle file upload for task"""
     try:
-        import base64
-        import tempfile
+        import shutil
         from pathlib import Path
 
         from ..models.uploaded_file import UploadedFile
@@ -984,30 +983,26 @@ async def handle_file_upload_for_task(
         logger.info(f"🤖 Got agent service for task {task_id}")
 
         for file_info in files:
-            file_name = file_info.get("name", "unknown")
-            file_size = file_info.get("size", 0)
-            file_type = file_info.get("type", "unknown")
-            has_content = "content" in file_info
+            file_id = file_info.get("file_id")
+            if not file_id:
+                logger.warning(f"No file_id provided in file info: {file_info}")
+                continue
 
-            logger.info(
-                f"📄 Processing file: {file_name}, size: {file_size}, has_content: {has_content}"
+            file_record = (
+                db.query(UploadedFile).filter(UploadedFile.file_id == file_id).first()
             )
+            if not file_record:
+                logger.warning(f"File record not found for file_id: {file_id}")
+                continue
 
-            # Create temporary file
-            with tempfile.NamedTemporaryFile(
-                delete=False, suffix=f"_{file_name}"
-            ) as temp_file:
-                # Write content if base64 content exists, otherwise create empty file
-                if has_content:
-                    # Assume frontend sends base64 encoded file content
-                    content = base64.b64decode(file_info["content"])
-                    temp_file.write(content)
-                    logger.info(f"Wrote {len(content)} bytes to temp file")
-                else:
-                    logger.warning(f"No content found for file {file_name}")
+            file_name = file_record.filename
+            file_size = file_record.file_size
+            file_type = file_record.mime_type
+            source_path = Path(str(file_record.storage_path))
 
-                temp_file_path = Path(temp_file.name)
-                logger.info(f"📁 Created temp file: {temp_file_path}")
+            if not source_path.exists():
+                logger.warning(f"Physical file not found: {source_path}")
+                continue
 
             try:
                 # Add file to workspace, use original filename
@@ -1021,6 +1016,7 @@ async def handle_file_upload_for_task(
                     target_dir = agent_service.workspace.input_dir
                 elif agent_service.workspace:
                     target_dir = agent_service.workspace.workspace_dir / "input"
+                    target_dir.mkdir(parents=True, exist_ok=True)
                 else:
                     raise ValueError("Agent service workspace is not available")
 
@@ -1030,21 +1026,12 @@ async def handle_file_upload_for_task(
                 target_path = build_unique_target_path(target_dir, normalized_file_name)
 
                 # Copy file to workspace
-                shutil.copy2(temp_file_path, target_path)
+                shutil.copy2(source_path, target_path)
                 uploaded_files.append(str(target_path))
 
-                if user is None:
-                    raise ValueError("Authenticated user is required for file upload")
+                if file_record.task_id is None:
+                    file_record.task_id = task_id
 
-                file_record = UploadedFile(
-                    user_id=int(cast(Any, user.id)),
-                    task_id=task_id,
-                    filename=normalized_file_name,
-                    storage_path=str(target_path),
-                    mime_type=file_type,
-                    file_size=int(file_size),
-                )
-                db.add(file_record)
                 db.flush()
 
                 if agent_service.workspace:
@@ -1070,11 +1057,9 @@ async def handle_file_upload_for_task(
                     f"File added to workspace: {target_path} (original: {original_file_name} -> normalized: {normalized_file_name})"
                 )
 
-            finally:
-                # Clean up temporary file
-                if temp_file_path.exists():
-                    temp_file_path.unlink()
-                    logger.info(f"🗑️ Cleaned up temp file: {temp_file_path}")
+            except Exception as e:
+                logger.error(f"Error handling file {file_info.get('name')}: {e}")
+                raise
 
         logger.info(f"🎉 File upload completed, uploaded {len(uploaded_files)} files")
         db.commit()
@@ -2701,43 +2686,36 @@ async def handle_build_preview_execution(
         file_prompt = ""
         if files_data:
             try:
-                import base64
                 import shutil
-                import tempfile
                 from pathlib import Path
 
                 from ..models.uploaded_file import UploadedFile
 
                 for file_info in files_data:
-                    file_name = file_info.get("name", "unknown")
-                    file_size = file_info.get("size", 0)
-                    file_type = file_info.get("type", "unknown")
-                    file_content = file_info.get("content", "")
+                    file_id = file_info.get("file_id")
+                    if not file_id:
+                        logger.warning(
+                            f"No file_id provided in preview file info: {file_info}"
+                        )
+                        continue
 
-                    # Handle data URL format (format returned by frontend's readAsDataURL)
-                    # Format: data:image/jpeg;base64,/9j/4AAQSkZJRg...
-                    if file_content.startswith("data:"):
-                        # Extract base64 part (remove data:...;base64, prefix)
-                        try:
-                            base64_prefix = ";base64,"
-                            if base64_prefix in file_content:
-                                file_content = file_content.split(base64_prefix, 1)[1]
-                        except Exception as e:
-                            logger.error(f"Failed to strip data URL prefix: {e}")
-                            continue
+                    file_record = (
+                        db.query(UploadedFile)
+                        .filter(UploadedFile.file_id == file_id)
+                        .first()
+                    )
+                    if not file_record:
+                        logger.warning(f"File record not found for file_id: {file_id}")
+                        continue
 
-                    # Decode base64 content (handle possible padding issues)
-                    missing_padding = len(file_content) % 4
-                    if missing_padding:
-                        file_content += "=" * (4 - missing_padding)
-                    content = base64.b64decode(file_content)
+                    file_name = file_record.filename
+                    file_size = file_record.file_size
+                    file_type = file_record.mime_type
+                    source_path = Path(str(file_record.storage_path))
 
-                    # Create temporary file
-                    with tempfile.NamedTemporaryFile(
-                        delete=False, suffix=f"_{file_name}"
-                    ) as temp_file:
-                        temp_file.write(content)
-                        temp_file_path = Path(temp_file.name)
+                    if not source_path.exists():
+                        logger.warning(f"Physical file not found: {source_path}")
+                        continue
 
                     try:
                         # Get workspace's input directory
@@ -2762,19 +2740,8 @@ async def handle_build_preview_execution(
                         )
 
                         # Copy file to workspace
-                        shutil.copy2(temp_file_path, target_path)
+                        shutil.copy2(source_path, target_path)
                         uploaded_files.append(str(target_path))
-
-                        file_record = UploadedFile(
-                            user_id=int(cast(Any, user.id)),
-                            task_id=None,
-                            filename=normalized_file_name,
-                            storage_path=str(target_path),
-                            mime_type=file_type,
-                            file_size=int(file_size),
-                        )
-                        db.add(file_record)
-                        db.flush()
 
                         if agent_service.workspace:
                             agent_service.workspace.register_file(
@@ -2792,12 +2759,15 @@ async def handle_build_preview_execution(
                             }
                         )
 
-                        logger.info(f"File added to workspace: {target_path}")
+                        logger.info(
+                            f"File added to workspace: {target_path} (original: {original_file_name} -> normalized: {normalized_file_name})"
+                        )
 
-                    finally:
-                        # Clean up temporary file
-                        if temp_file_path.exists():
-                            temp_file_path.unlink()
+                    except Exception as e:
+                        logger.error(
+                            f"Error handling file {file_info.get('name')}: {e}"
+                        )
+                        continue
 
                 if file_info_list:
                     file_summary = "\n".join(

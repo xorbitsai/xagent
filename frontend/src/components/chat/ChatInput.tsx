@@ -49,6 +49,9 @@ export function ChatInput({
   isLoading,
   files = [],
   onFilesChange,
+  showModeToggle,
+  mode,
+  onModeChange,
   inputValue,
   onInputChange,
   taskStatus,
@@ -105,6 +108,8 @@ export function ChatInput({
 
   // Track files for async operations
   const filesRef = useRef(files);
+  const uploadAbortControllersRef = useRef<Map<string, AbortController>>(new Map());
+
   useEffect(() => {
     filesRef.current = files;
   }, [files]);
@@ -167,6 +172,78 @@ export function ChatInput({
   }>({ model: "", memorySimilarityThreshold: 1.5 });
   const [models, setModels] = useState<any[]>([]);
 
+  // State to track files currently being uploaded
+  const [uploadingFiles, setUploadingFiles] = useState<Set<string>>(new Set());
+
+  // Helper to upload files immediately
+  const uploadFiles = async (newFiles: File[]) => {
+    if (newFiles.length === 0) return;
+
+    // Mark as uploading (use name + lastModified as rough unique ID)
+    const fileIds = newFiles.map(f => `${f.name}-${f.lastModified}`);
+    setUploadingFiles(prev => {
+      const next = new Set(prev);
+      fileIds.forEach(id => next.add(id));
+      return next;
+    });
+
+    const failedFiles = new Set<File>();
+
+    // Upload files individually to ensure better reliability and progress tracking
+    await Promise.all(newFiles.map(async (file) => {
+      const fileId = `${file.name}-${file.lastModified}`;
+      const controller = new AbortController();
+      uploadAbortControllersRef.current.set(fileId, controller);
+
+      try {
+        const formData = new FormData();
+        formData.append('file', file);
+        // Default to task mode if not specified
+        formData.append('task_type', mode || 'task');
+
+        const response = await apiRequest(`${getApiUrl()}/api/files/upload`, {
+          method: 'POST',
+          body: formData,
+          signal: controller.signal
+        });
+
+        if (response.ok) {
+          const data = await response.json();
+          if (data.success && data.file_id) {
+            // Attach file_id to the File object
+            (file as any).file_id = data.file_id;
+          } else {
+            failedFiles.add(file);
+          }
+        } else {
+          failedFiles.add(file);
+        }
+      } catch (error: any) {
+        if (error.name === 'AbortError') {
+          // Upload cancelled, do nothing
+        } else {
+          console.error("Error uploading file:", error);
+          failedFiles.add(file);
+        }
+      } finally {
+        uploadAbortControllersRef.current.delete(fileId);
+        setUploadingFiles(prev => {
+          const next = new Set(prev);
+          next.delete(fileId);
+          return next;
+        });
+      }
+    }));
+
+    // Handle failed files
+    if (failedFiles.size > 0) {
+      toast.error(t("files.uploadFailed") || "Failed to upload some files");
+      if (onFilesChange) {
+        onFilesChange(filesRef.current.filter(f => !failedFiles.has(f)));
+      }
+    }
+  };
+
   // Fetch default models on mount
   useEffect(() => {
     const fetchDefaultModels = async () => {
@@ -175,15 +252,15 @@ export function ChatInput({
 
         // Fetch all models first to have the list for display names
         const modelsResponse = await apiRequest(`${apiUrl}/api/models/?category=llm`, {
-            headers: {}
+          headers: {}
         });
 
         let allModels: any[] = [];
         if (modelsResponse.ok) {
-            allModels = await modelsResponse.json();
-            if (Array.isArray(allModels)) {
-                setModels(allModels);
-            }
+          allModels = await modelsResponse.json();
+          if (Array.isArray(allModels)) {
+            setModels(allModels);
+          }
         }
 
         // Fetch user default models
@@ -205,10 +282,10 @@ export function ChatInput({
 
         // Find default if no user preference
         if (!defaultModels.general && allModels.length > 0) {
-            const defaultModel = allModels.find((m: any) => m.is_default) || allModels[0];
-            if (defaultModel) {
+          const defaultModel = allModels.find((m: any) => m.is_default) || allModels[0];
+          if (defaultModel) {
             defaultModels.general = { model_id: defaultModel.model_id };
-            }
+          }
         }
 
         setAgentConfig(prev => ({
@@ -252,7 +329,8 @@ export function ChatInput({
   const canSubmit = () => {
     const hasText = message.trim().length > 0;
     const hasFiles = files.length > 0;
-    return (hasText || hasFiles) && !isLoading;
+    const isUploadingFiles = uploadingFiles.size > 0;
+    return (hasText || hasFiles) && !isLoading && !isUploadingFiles;
   };
 
   const handleSubmit = async (e: React.FormEvent) => {
@@ -338,6 +416,7 @@ export function ChatInput({
 
       if (pastedFiles.length > 0) {
         onFilesChange?.([...files, ...pastedFiles]);
+        uploadFiles(pastedFiles);
       }
     } else {
       // Strip formatting from text paste
@@ -352,12 +431,22 @@ export function ChatInput({
   const handleFileSelect = (e: React.ChangeEvent<HTMLInputElement>) => {
     const selectedFiles = Array.from(e.target.files || []);
     onFilesChange?.([...files, ...selectedFiles]);
+    uploadFiles(selectedFiles);
     if (fileInputRef.current) {
       fileInputRef.current.value = "";
     }
   };
 
   const removeFile = (index: number) => {
+    const fileToRemove = files[index];
+    if (fileToRemove) {
+      const fileId = `${fileToRemove.name}-${fileToRemove.lastModified}`;
+      const controller = uploadAbortControllersRef.current.get(fileId);
+      if (controller) {
+        controller.abort();
+        uploadAbortControllersRef.current.delete(fileId);
+      }
+    }
     onFilesChange?.(files.filter((_, i) => i !== index));
   };
 
@@ -394,27 +483,43 @@ export function ChatInput({
       {/* File list */}
       {files.length > 0 && (
         <div className="flex flex-wrap gap-2">
-          {files.map((file, index) => (
-            <div
-              key={index}
-              className="flex items-center gap-2 px-3 py-2 bg-secondary/80 rounded-xl text-sm animate-fade-in-scale border border-border/50 hover:border-primary/30 transition-colors"
-            >
-              <div className="w-6 h-6 rounded-lg bg-primary/10 flex items-center justify-center">
-                <FileIcon className="w-3.5 h-3.5 text-primary" />
-              </div>
-              <span className="truncate max-w-[120px] font-medium text-foreground/90">{file.name}</span>
-              <span className="text-xs text-muted-foreground">
-                {formatFileSize(file.size)}
-              </span>
-              <button
-                type="button"
-                onClick={() => removeFile(index)}
-                className="ml-1 text-muted-foreground hover:text-destructive transition-colors p-0.5 rounded-md hover:bg-destructive/10"
+          {files.map((file, index) => {
+            const isUploading = uploadingFiles.has(`${file.name}-${file.lastModified}`);
+            return (
+              <div
+                key={index}
+                className={cn(
+                  "flex items-center gap-2 px-3 py-2 bg-secondary/80 rounded-xl text-sm animate-fade-in-scale border border-border/50 hover:border-primary/30 transition-colors",
+                  isUploading && "opacity-70"
+                )}
               >
-                <X className="w-3.5 h-3.5" />
-              </button>
-            </div>
-          ))}
+                <div className="w-6 h-6 rounded-lg bg-primary/10 flex items-center justify-center">
+                  {isUploading ? (
+                    <Loader2 className="w-3.5 h-3.5 text-primary animate-spin" />
+                  ) : (
+                    <FileIcon className="w-3.5 h-3.5 text-primary" />
+                  )}
+                </div>
+                <span className="truncate max-w-[120px] font-medium text-foreground/90">{file.name}</span>
+                <span className="text-xs text-muted-foreground">
+                  {formatFileSize(file.size)}
+                </span>
+                <button
+                  type="button"
+                  onClick={() => removeFile(index)}
+                  className={cn(
+                    "ml-1 p-0.5 rounded-md transition-colors",
+                    isUploading
+                      ? "text-muted-foreground/50 hover:text-foreground hover:bg-secondary"
+                      : "text-muted-foreground hover:text-destructive hover:bg-destructive/10"
+                  )}
+                  title={isUploading ? t("common.cancel") : t("common.remove")}
+                >
+                  <X className="w-3.5 h-3.5" />
+                </button>
+              </div>
+            )
+          })}
         </div>
       )}
 
@@ -431,138 +536,138 @@ export function ChatInput({
         />
         <form
           onSubmit={handleSubmit}
-        className={cn(
-          "relative rounded-2xl bg-card overflow-hidden transition-all duration-300 border",
-          isFocused
-            ? "border-primary/50 shadow-md"
-            : "border-border shadow-sm hover:border-border/80"
-        )}
-      >
-        <div
-          ref={editorRef}
-          contentEditable
           className={cn(
-            "min-h-[130px] max-h-[300px] w-full rounded-md border-0 bg-transparent px-3 py-2 text-[15px] outline-none placeholder:text-muted-foreground/60 overflow-y-auto resize-none focus-visible:ring-0 focus-visible:ring-offset-0 pb-14 whitespace-pre-wrap break-words text-left",
-            isLoading ? "opacity-50 pointer-events-none" : ""
+            "relative rounded-2xl bg-card overflow-hidden transition-all duration-300 border",
+            isFocused
+              ? "border-primary/50 shadow-md"
+              : "border-border shadow-sm hover:border-border/80"
           )}
-          onInput={handleInput}
-          onKeyDown={handleKeyDown}
-          onPaste={handlePaste as any}
-          onFocus={() => setIsFocused(true)}
-          onBlur={() => setIsFocused(false)}
-          role="textbox"
-          aria-multiline="true"
-        />
-        {!message && (
-          <div className="absolute top-2 left-3 text-muted-foreground/60 pointer-events-none text-[14px]">
-            {t("chatPage.input.placeholder")}
-          </div>
-        )}
-
-        {/* Bottom toolbar */}
-        <div className="absolute bottom-0 left-0 right-0 flex items-center justify-between px-4 py-3 bg-card">
-          <div className="flex items-center gap-2">
-            {/* Settings button - left of upload */}
-            {!hideConfig && (
-              <>
-                {readOnlyConfig ? (
-                  <Button
-                    type="button"
-                    variant="ghost"
-                    size="sm"
-                    className="h-9 px-3 text-muted-foreground rounded-xl gap-2 cursor-default hover:bg-transparent"
-                    disabled={true}
-                    title={models.find(m => m.model_id === agentConfig.model)?.model_name || agentConfig.model || t("chatPage.input.noModel")}
-                  >
-                    <Globe className="h-4 w-4" />
-                    <span className="text-xs font-normal max-w-[150px] truncate hidden sm:inline-block">
-                      {models.find(m => m.model_id === agentConfig.model)?.model_name || agentConfig.model || t("chatPage.input.noModel")}
-                    </span>
-                  </Button>
-                ) : (
-                  <ConfigDialog
-                    onConfigChange={handleConfigChange}
-                    currentConfig={agentConfig}
-                    trigger={
-                      <Button
-                        type="button"
-                        variant="ghost"
-                        size="sm"
-                        className="h-9 px-3 text-muted-foreground hover:text-foreground hover:bg-secondary/80 rounded-xl gap-2"
-                        disabled={isLoading}
-                        title={t('agent.input.actions.config')}
-                      >
-                        <Globe className="h-4 w-4" />
-                        <span className="text-xs font-normal max-w-[150px] truncate hidden sm:inline-block">
-                          {models.find(m => m.model_id === agentConfig.model)?.model_name || agentConfig.model || t("chatPage.input.noModel")}
-                        </span>
-                      </Button>
-                    }
-                  />
-                )}
-              </>
+        >
+          <div
+            ref={editorRef}
+            contentEditable
+            className={cn(
+              "min-h-[130px] max-h-[300px] w-full rounded-md border-0 bg-transparent px-3 py-2 text-[15px] outline-none placeholder:text-muted-foreground/60 overflow-y-auto resize-none focus-visible:ring-0 focus-visible:ring-offset-0 pb-14 whitespace-pre-wrap break-words text-left",
+              isLoading ? "opacity-50 pointer-events-none" : ""
             )}
-            {/* Upload button - adjacent to bottom toolbar */}
-            <input
-              ref={fileInputRef}
-              type="file"
-              multiple
-              onChange={handleFileSelect}
-              className="hidden"
-              accept=".pdf,.doc,.docx,.txt,.md,.csv,.json,.xlsx,.xls,.png,.jpg,.jpeg,.gif,.webp"
-            />
-            <Button
-              type="button"
-              variant="ghost"
-              size="sm"
-              className="h-9 w-9 p-0 text-muted-foreground hover:text-foreground hover:bg-secondary/80 rounded-full"
-              onClick={() => fileInputRef.current?.click()}
-              disabled={isLoading}
-              title={t("chatPage.input.actions.upload")}
-            >
-              <Paperclip className="h-4 w-4" />
-            </Button>
-          </div>
+            onInput={handleInput}
+            onKeyDown={handleKeyDown}
+            onPaste={handlePaste as any}
+            onFocus={() => setIsFocused(true)}
+            onBlur={() => setIsFocused(false)}
+            role="textbox"
+            aria-multiline="true"
+          />
+          {!message && (
+            <div className="absolute top-2 left-3 text-muted-foreground/60 pointer-events-none text-[14px]">
+              {t("chatPage.input.placeholder")}
+            </div>
+          )}
 
-          <div className="flex items-center gap-3">
-            {taskStatus === 'running' ? (
+          {/* Bottom toolbar */}
+          <div className="absolute bottom-0 left-0 right-0 flex items-center justify-between px-4 py-3 bg-card">
+            <div className="flex items-center gap-2">
+              {/* Settings button - left of upload */}
+              {!hideConfig && (
+                <>
+                  {readOnlyConfig ? (
+                    <Button
+                      type="button"
+                      variant="ghost"
+                      size="sm"
+                      className="h-9 px-3 text-muted-foreground rounded-xl gap-2 cursor-default hover:bg-transparent"
+                      disabled={true}
+                      title={models.find(m => m.model_id === agentConfig.model)?.model_name || agentConfig.model || t("chatPage.input.noModel")}
+                    >
+                      <Globe className="h-4 w-4" />
+                      <span className="text-xs font-normal max-w-[150px] truncate hidden sm:inline-block">
+                        {models.find(m => m.model_id === agentConfig.model)?.model_name || agentConfig.model || t("chatPage.input.noModel")}
+                      </span>
+                    </Button>
+                  ) : (
+                    <ConfigDialog
+                      onConfigChange={handleConfigChange}
+                      currentConfig={agentConfig}
+                      trigger={
+                        <Button
+                          type="button"
+                          variant="ghost"
+                          size="sm"
+                          className="h-9 px-3 text-muted-foreground hover:text-foreground hover:bg-secondary/80 rounded-xl gap-2"
+                          disabled={isLoading}
+                          title={t('agent.input.actions.config')}
+                        >
+                          <Globe className="h-4 w-4" />
+                          <span className="text-xs font-normal max-w-[150px] truncate hidden sm:inline-block">
+                            {models.find(m => m.model_id === agentConfig.model)?.model_name || agentConfig.model || t("chatPage.input.noModel")}
+                          </span>
+                        </Button>
+                      }
+                    />
+                  )}
+                </>
+              )}
+              {/* Upload button - adjacent to bottom toolbar */}
+              <input
+                ref={fileInputRef}
+                type="file"
+                multiple
+                onChange={handleFileSelect}
+                className="hidden"
+                accept=".pdf,.doc,.docx,.txt,.md,.csv,.json,.xlsx,.xls,.png,.jpg,.jpeg,.gif,.webp"
+              />
               <Button
                 type="button"
-                size="icon"
-                onClick={onPause}
-                className="h-8 w-8 rounded-full transition-all duration-300 bg-yellow-500 hover:bg-yellow-600 text-white"
+                variant="ghost"
+                size="sm"
+                className="h-9 w-9 p-0 text-muted-foreground hover:text-foreground hover:bg-secondary/80 rounded-full"
+                onClick={() => fileInputRef.current?.click()}
+                disabled={isLoading}
+                title={t("chatPage.input.actions.upload")}
               >
-                <Pause className="h-4 w-4" />
+                <Paperclip className="h-4 w-4" />
               </Button>
-            ) : taskStatus === 'paused' ? (
-              <Button
-                type="button"
-                size="icon"
-                onClick={onResume}
-                className="h-8 w-8 rounded-full transition-all duration-300 bg-green-500 hover:bg-green-600 text-white"
-              >
-                <Play className="h-4 w-4" />
-              </Button>
-            ) : (
-              <Button
-                type="submit"
-                size="icon"
-                disabled={!canSubmit()}
-                className={cn(
-                  "h-8 w-8 rounded-lg transition-all duration-300",
-                  !canSubmit() && "bg-muted text-muted-foreground/50"
-                )}
-              >
-                {isLoading ? (
-                  <Sparkles className="h-4 w-4 animate-pulse" />
-                ) : (
-                  <ArrowUp className="h-4 w-4" />
-                )}
-              </Button>
-            )}
+            </div>
+
+            <div className="flex items-center gap-3">
+              {taskStatus === 'running' ? (
+                <Button
+                  type="button"
+                  size="icon"
+                  onClick={onPause}
+                  className="h-8 w-8 rounded-full transition-all duration-300 bg-yellow-500 hover:bg-yellow-600 text-white"
+                >
+                  <Pause className="h-4 w-4" />
+                </Button>
+              ) : taskStatus === 'paused' ? (
+                <Button
+                  type="button"
+                  size="icon"
+                  onClick={onResume}
+                  className="h-8 w-8 rounded-full transition-all duration-300 bg-green-500 hover:bg-green-600 text-white"
+                >
+                  <Play className="h-4 w-4" />
+                </Button>
+              ) : (
+                <Button
+                  type="submit"
+                  size="icon"
+                  disabled={!canSubmit()}
+                  className={cn(
+                    "h-8 w-8 rounded-lg transition-all duration-300",
+                    !canSubmit() && "bg-muted text-muted-foreground/50"
+                  )}
+                >
+                  {isLoading ? (
+                    <Sparkles className="h-4 w-4 animate-pulse" />
+                  ) : (
+                    <ArrowUp className="h-4 w-4" />
+                  )}
+                </Button>
+              )}
+            </div>
           </div>
-        </div>
-      </form>
+        </form>
       </div>
 
       <AlertDialog open={showNoModelAlert} onOpenChange={setShowNoModelAlert}>

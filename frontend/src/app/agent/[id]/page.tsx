@@ -86,6 +86,43 @@ export default function AgentChatPage() {
     setInputValue("")
 
     try {
+      let uploadedFileIds: string[] = []
+
+      // Upload files first if present
+      if (filesToSend && filesToSend.length > 0) {
+        const formData = new FormData()
+        filesToSend.forEach(f => formData.append('files', f))
+        formData.append('task_type', 'task')
+
+        try {
+          const uploadResponse = await apiRequest(`${getApiUrl()}/api/files/upload`, {
+            method: 'POST',
+            body: formData
+          })
+
+          if (uploadResponse.ok) {
+            const uploadData = await uploadResponse.json()
+            if (uploadData.success && uploadData.files) {
+              uploadedFileIds = uploadData.files.map((f: any) => f.file_id)
+            }
+          } else {
+            console.error('Failed to upload files:', uploadResponse.statusText)
+          }
+        } catch (e) {
+          console.error('Error uploading files before task creation:', e)
+        }
+      }
+
+      const requestBody: any = {
+        title: content,
+        description: content,
+        agent_id: parseInt(agentId),
+      }
+
+      if (uploadedFileIds.length > 0) {
+        requestBody.files = uploadedFileIds
+      }
+
       // Create task with agent_id
       // Backend will automatically fetch agent's model configuration from database
       const taskResponse = await apiRequest(`${getApiUrl()}/api/chat/task/create`, {
@@ -93,11 +130,7 @@ export default function AgentChatPage() {
         headers: {
           "Content-Type": "application/json",
         },
-        body: JSON.stringify({
-          title: content,
-          description: content,
-          agent_id: parseInt(agentId),
-        }),
+        body: JSON.stringify(requestBody),
       })
 
       if (taskResponse.ok) {
@@ -106,10 +139,10 @@ export default function AgentChatPage() {
 
         if (taskId) {
           dispatch({ type: "TRIGGER_TASK_UPDATE" })
-          // Set pending message and files for WebSocket to send upon connection
+          // Set pending message and empty files since they are already uploaded
           setPendingMessage({
             message: content,
-            files: filesToSend,
+            files: [],
             targetTaskId: typeof taskId === 'string' ? parseInt(taskId) : taskId
           })
 

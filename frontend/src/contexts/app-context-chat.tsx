@@ -3472,6 +3472,40 @@ export function AppProvider({ children, token }: { children: React.ReactNode; to
           memory_similarity_threshold: config?.memorySimilarityThreshold ?? 1.5,
         }
 
+        // Upload files first if present
+        if (files && files.length > 0) {
+          const filesToUpload = files.filter(f => !(f as any).file_id)
+          const uploadedFileIds = files.filter(f => (f as any).file_id).map(f => (f as any).file_id)
+
+          if (filesToUpload.length > 0) {
+            const formData = new FormData()
+            filesToUpload.forEach(f => formData.append('files', f))
+            formData.append('task_type', config?.vibeMode?.mode || 'task')
+
+            try {
+              const uploadResponse = await apiRequest(`${apiUrl}/api/files/upload`, {
+                method: 'POST',
+                body: formData
+              })
+
+              if (uploadResponse.ok) {
+                const uploadData = await uploadResponse.json()
+                if (uploadData.success && uploadData.files) {
+                  uploadData.files.forEach((f: any) => uploadedFileIds.push(f.file_id))
+                }
+              } else {
+                console.error('Failed to upload files:', uploadResponse.statusText)
+              }
+            } catch (e) {
+              console.error('Error uploading files before task creation:', e)
+            }
+          }
+
+          if (uploadedFileIds.length > 0) {
+            requestBody.files = uploadedFileIds
+          }
+        }
+
         // Add LLM configuration
         if (llmIds) {
           requestBody.llm_ids = llmIds

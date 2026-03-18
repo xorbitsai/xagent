@@ -1,22 +1,28 @@
 ---
 name: presentation
-description: "Generate and edit PowerPoint presentations (.pptx). Use for: creating slide decks, pitch decks, or presentations from scratch; reading, parsing, or extracting content from .pptx files; editing, modifying, or updating existing presentations; combining or splitting slide files; working with templates, layouts, speaker notes, or comments. Trigger when user mentions 'deck,' 'slides,' 'presentation,' or references a .pptx filename."
+description: "Generate and edit PowerPoint presentations (.pptx) with integrated image tools. Use for: creating slide decks, pitch decks, or presentations from scratch; generating custom images, searching for visuals, adding logos; reading, parsing, or extracting content from .pptx files; editing, modifying, or updating existing presentations; combining or splitting slide files; working with templates, layouts, speaker notes, or comments. Trigger when user mentions 'deck,' 'slides,' 'presentation,' or references a .pptx filename."
 ---
 
 # Presentation Generator
 
-Generate PowerPoint presentations using JavaScript code with the pptxgenjs library.
+Generate PowerPoint presentations using JavaScript code with the pptxgenjs library and integrated image tools.
 
 ## ⚠️ CRITICAL REQUIREMENTS - READ FIRST
 
 **YOU MUST FOLLOW THESE RULES - NO EXCEPTIONS:**
 
-1. **ONLY use the 4 predefined themes below** (NOVA, ORBIT, PULSE, MINIMA)
+1. **ONLY use the 4 predefined themes** (NOVA, ORBIT, PULSE, MINIMA)
 2. **NEVER create custom color variables** like `const colorAccent = "0078D7"`
 3. **NEVER use hardcoded hex values** in your code - always reference `theme.xxx`
 4. **ALWAYS include the `#` prefix** in hex colors (e.g., `#EF4444` not `EF4444`)
 5. **Slide 0 MUST use `theme.cover`** - first slide is the cover with dark/high-contrast background
 6. **Slides 1+ MUST use `theme.content`** - all other slides use light/readable background
+7. **MUST generate all images with `generate_image`** - NO external URLs or pre-existing images allowed
+8. **DEFAULT to Image-Text Mixed Mode** - Use Full Image Mode ONLY when user explicitly requests "全图", "full image", etc.
+9. **RANDOMIZE layouts in Mixed Mode** - Mix left-image-right-text and left-text-right-image layouts
+10. **DATA VISUALIZATION MUST use specific chart types** - Use appropriate chart types (line, bar, pie, etc.) with clear data labels, not abstract images
+11. **CLEAR TITLE HIERARCHY** - Use distinct font sizes, colors, and styles for Level 1, Level 2, Level 3 titles and body text
+12. **PROPER CHART LABELING** - All charts must include axis labels, data labels, legends, and grid lines where appropriate
 
 **WRONG:**
 ```javascript
@@ -24,6 +30,7 @@ const colorAccent = "0078D7";  // ❌ WRONG - custom color
 slide1.addText("Title", { color: "363636" });  // ❌ WRONG - hardcoded hex
 pres.addSlide();
 pres.background = { color: theme.cover.background };  // ❌ WRONG - cover on non-first slide
+slide1.addImage({ path: 'https://external.com/image.jpg', x: 1, y: 1, w: 8, h: 4.5 });  // ❌ WRONG - external URL
 ```
 
 **CORRECT:**
@@ -55,221 +62,160 @@ pres.addText("Content", { color: theme.content.primary });
 
 ---
 
-## Execution Rules
+## Quick Start
 
-**CRITICAL: MANDATORY constraints for stable presentation generation:**
+**IMPORTANT**: You MUST use one of the predefined themes (NOVA, ORBIT, PULSE, MINIMA). Never define custom colors or use hardcoded hex values.
 
-1. **USE PREDEFINED THEMES ONLY**: You MUST use one of the 4 predefined themes (NOVA, ORBIT, PULSE, MINIMA) from the "Predefined Themes" section below. NEVER define custom colors or use hardcoded hex values like `"003366"` or `color: "FF0000"`.
+**CRITICAL**: Slide 0 (cover) uses `theme.cover`, all other slides use `theme.content`.
 
-2. **Theme Object Format**: Always define theme as:
-   ```javascript
-   const theme = {
-     background: '#XXXXXX',
-     primary: '#XXXXXX',
-     secondary: '#XXXXXX',
-     accent: '#XXXXXX',
-     text: '#XXXXXX'
-   };
-   ```
-   Then reference colors as `theme.background`, `theme.primary`, etc.
+### Key Improvements:
+1. **Enhanced Data Visualization**: Use specific chart types (line, bar, pie) with clear and accurate data labels instead of abstract images
+2. **Five-Level Title Hierarchy**: Distinct styling for 大标题 (Level 1), 小标题 (Level 2), 二级标题 (Level 3), 内容标题 (Level 4), 内容 (Level 5)
+3. **Key Text Emphasis**: Highlight important text with accent colors and bold styling
+4. **Professional Chart Labeling**: All charts must include proper axis labels, data labels, legends, and accurate data representation
 
-3. **Slide Creation**: Always call `pres.addSlide()` before adding content to a new slide (except the first slide)
-
-4. **Font Consistency**: Keep font sizes consistent: titles 40-56pt, subtitles 24-32pt, body text 16-20pt
-
-5. **Slide Bounds**: Never position elements outside 10 x 7.5 inch slide area (x: 0-10, y: 0-7.5)
-
-6. **Layout Simplicity**: Prefer clean, simple layouts over dense or decorative designs
-
-7. **Theme Selection**: Choose theme based on presentation context (see Theme Selection Guide below)
-
-8. **Visual Hierarchy**: Slides must follow clear visual hierarchy: Title → Section Heading → Body → Accent Highlight. Avoid mixing too many font sizes on a single slide.
-
-9. **Image Sizing**: ALWAYS specify both width AND height, or use sizing to ensure images stay within bounds:
-   - Use `w` and `h` together to control exact dimensions
-   - Or use `sizing: { type: 'contain', w: 8, h: 5 }` to fit within bounds while maintaining aspect ratio
-   - NEVER use only `w` or only `h` without the other - image may overflow
-   - Keep images within content area: x: 0-10, y: 0-7.5 inches
-
-## Layout Zones
-
-For consistent slide layouts:
-
-| Zone | X/Y Range | Purpose |
-|------|-----------|---------|
-| Safe content area | x: 0.5-9.5, y: 0.5-7 | Main content, images, data |
-| Title area | y: 0.5 - 1.5 | Slide titles and headings |
-| Content area | y: 1.5 - 5.5 | Main content, bullets, data |
-| Footer area | y: 6.0 - 7.0 | Footer text, page numbers, notes |
-
-**Note**: Title slides may use vertically centered positioning (y ≈ 3). All other slides must follow layout zones.
-
-## Theme Selection Guide
-
-| Context | Recommended Theme | Why |
-|---------|------------------|-----|
-| Strategy / AI narrative / Investor deck | **NOVA** | Large titles, generous whitespace, authoritative feel |
-| Technical deep dive / Architecture / Dev | **ORBIT** | Dark background, strong contrast, clean technical aesthetic |
-| Metrics-heavy / Growth / Business performance | **PULSE** | Bold KPI emphasis, high-contrast numbers, data-focused |
-| Founder story / Brand / Minimalist | **MINIMA** | Extremely clean, typography-driven, minimal decoration |
-
-**Default**: Use NOVA if context is unclear or not specified.
-
-## Predefined Themes
-
-All presentations MUST use one of these themes.
-
-**Each theme has TWO variants:**
-- **Cover (slide 0)**: Dark background, high visual impact, emotional
-- **Content (slides 1+)**: Light background, clean, readable
-
-| Theme | Positioning | Cover Colors | Content Colors | Style |
-|-------|------------|-------------|----------------|-------|
-| **NOVA** (Default) | Strategy / AI / Investor | `bg: #0A0F1C`, `title: #FFFFFF`, `accent: #7C3AED` | `bg: #F6F7FB`, `primary: #0A0F1C`, `accent: #7C3AED` | Dark cover, light content |
-| **ORBIT** | Technical / Architecture / Dev | `bg: #0B1220`, `title: #F1F5F9`, `accent: #22D3EE` | `bg: #0F172A`, `primary: #F1F5F9`, `accent: #22D3EE` | Dark cover, lighter dark content |
-| **PULSE** | Metrics / Growth / Performance | `bg: #111827`, `title: #FFFFFF`, `accent: #EF4444` | `bg: #FFFFFF`, `primary: #111827`, `accent: #EF4444` | Dark cover, white content |
-| **MINIMA** | Founder / Brand / Minimalist | `bg: #111111`, `title: #FFFFFF` | `bg: #FAFAFA`, `primary: #111111`, `accent: #000000` | Black cover, off-white content |
-
-### Color Reference Table
-
-| Purpose | NOVA Cover | NOVA Content | ORBIT Cover | ORBIT Content |
-|---------|-----------|--------------|-------------|----------------|
-| Background | `#0A0F1C` | `#F6F7FB` | `#0B1220` | `#0F172A` |
-| Title/Primary | `#FFFFFF` | `#0A0F1C` | `#F1F5F9` | `#F1F5F9` |
-| Subtitle/Secondary | `#94A3B8` | `#5B6475` | `#94A3B8` | `#94A3B8` |
-| Accent | `#7C3AED` | `#7C3AED` | `#22D3EE` | `#22D3EE` |
-| Text | - | `#0A0F1C` | - | `#F1F5F9` |
-
-| Purpose | PULSE Cover | PULSE Content | MINIMA Cover | MINIMA Content |
-|---------|-------------|---------------|--------------|-----------------|
-| Background | `#111827` | `#FFFFFF` | `#111111` | `#FAFAFA` |
-| Title/Primary | `#FFFFFF` | `#111827` | `#FFFFFF` | `#111111` |
-| Subtitle/Secondary | `#9CA3AF` | `#6B7280` | `#999999` | `#777777` |
-| Accent | `#EF4444` | `#EF4444` | `#FFFFFF` | `#000000` |
-| Success | - | `#10B981` | - | - |
-| Warning | - | `#F59E0B` | - | - |
-| Secondary | `#5B6475` | `#94A3B8` | `#6B7280` | `#777777` |
-| Accent | `#7C3AED` | `#22D3EE` | `#EF4444` | `#000000` |
-| Success | - | `#34D399` | `#10B981` | - |
-| Warning | - | - | `#F59E0B` | - |
-| Highlight | `#22D3EE` | - | - | - |
-
-### Theme Code Templates (Copy & Use)
-
-**IMPORTANT**: Each theme has TWO variants - Cover (slide 0) and Content (slides 1+).
-
-**NOVA Theme** (Strategy / AI / Investor):
 ```javascript
+execute_javascript_code("""
+const PptxGenJS = require('pptxgenjs');
+
 const theme = {
-  // Cover slide (slide 0) - dark, high impact
   cover: {
     background: '#0A0F1C',
     title: '#FFFFFF',
     subtitle: '#94A3B8',
     accent: '#7C3AED'
   },
-  // Content slides (slides 1+) - light, readable
   content: {
     background: '#F6F7FB',
     primary: '#0A0F1C',
     secondary: '#5B6475',
     accent: '#7C3AED',
+    success: '#10B981',
+    warning: '#F59E0B',
     text: '#0A0F1C'
   }
 };
-```
 
-**ORBIT Theme** (Technical / Architecture / Dev):
-```javascript
-const theme = {
-  // Cover slide (slide 0) - dark, tech aesthetic
-  cover: {
-    background: '#0B1220',
-    title: '#F1F5F9',
-    subtitle: '#94A3B8',
-    accent: '#22D3EE'
-  },
-  // Content slides (slides 1+) - slightly lighter dark
-  content: {
-    background: '#0F172A',
-    primary: '#F1F5F9',
-    secondary: '#94A3B8',
-    accent: '#22D3EE',
-    success: '#34D399',
-    text: '#F1F5F9'
-  }
-};
-```
-
-**PULSE Theme** (Metrics / Growth / Performance):
-```javascript
-const theme = {
-  // Cover slide (slide 0) - dark, bold
-  cover: {
-    background: '#111827',
-    title: '#FFFFFF',
-    subtitle: '#9CA3AF',
-    accent: '#EF4444'
-  },
-  // Content slides (slides 1+) - light, clean
-  content: {
-    background: '#FFFFFF',
-    primary: '#111827',
-    secondary: '#6B7280',
-    accent: '#EF4444',
-    success: '#10B981',
-    warning: '#F59E0B',
-    text: '#111827'
-  }
-};
-```
-
-**MINIMA Theme** (Founder / Brand / Minimalist):
-```javascript
-const theme = {
-  // Cover slide (slide 0) - pure black & white
-  cover: {
-    background: '#111111',
-    title: '#FFFFFF',
-    subtitle: '#999999',
-    accent: '#FFFFFF'
-  },
-  // Content slides (slides 1+) - off-white, clean
-  content: {
-    background: '#FAFAFA',
-    primary: '#111111',
-    secondary: '#777777',
-    accent: '#000000',
-    text: '#111111'
-  }
-};
-```
-
-**Usage Example**:
-```javascript
 const pres = new PptxGenJS();
+pres.layout = 'LAYOUT_WIDE';
 
-// Slide 0: Cover (use theme.cover)
-pres.background = { color: theme.cover.background };
-pres.addText('My Presentation', { x: 1, y: 3, fontSize: 60, bold: true, color: theme.cover.title });
-pres.addText('Company Name', { x: 1, y: 4.2, fontSize: 28, color: theme.cover.subtitle });
-
-// Slide 1+: Content (use theme.content)
-pres.addSlide();
-pres.background = { color: theme.content.background };
-pres.addText('Key Points', { x: 1, y: 0.8, fontSize: 44, bold: true, color: theme.content.primary });
-['Point 1', 'Point 2', 'Point 3'].forEach((text, i) => {
-  pres.addText(text, { x: 1, y: 2 + i * 0.7, fontSize: 18, color: theme.content.text, bullet: true });
+// Slide 0: Cover slide - pure image with embedded title (non-editable)
+pres.addImage({
+    path: 'generated_cover_image.png',
+    x: 0, y: 0,
+    w: '100%', h: '100%'
 });
+// Optional: Add semi-transparent overlay for better readability
+pres.addShape(pres.ShapeType.rect, {
+    x: 0, y: 0, w: '100%', h: '100%',
+    fill: { color: '000000', transparency: 40 }
+});
+
+// Slide 1: Content slide with five-level title hierarchy and key text emphasis
+const slide1 = pres.addSlide();
+slide1.background = { color: theme.content.background };
+
+// Level 1: 大标题 (Main Title)
+slide1.addText('2024年度业务绩效报告', {
+    x: 0.5, y: 0.8, w: 9, fontSize: 52, bold: true,
+    color: theme.content.primary, fontFace: 'Arial'
+});
+// Accent line under main title
+slide1.addShape(pres.ShapeType.line, {
+    x: 0.5, y: 1.4, w: 9, h: 0,
+    line: { color: theme.content.accent, width: 3 }
+});
+
+// Level 2: 小标题 (Sub Title)
+slide1.addText('财务绩效分析', {
+    x: 0.5, y: 1.8, fontSize: 40, bold: true,
+    color: theme.content.accent, fontFace: 'Arial'
+});
+// Light divider line
+slide1.addShape(pres.ShapeType.line, {
+    x: 0.5, y: 2.3, w: 4, h: 0,
+    line: { color: theme.content.secondary, width: 1, dashType: 'dash' }
+});
+
+// Level 3: 二级标题 (Secondary Title)
+slide1.addText('关键收入指标:', {
+    x: 0.5, y: 2.6, fontSize: 30, bold: true,
+    color: theme.content.secondary, fontFace: 'Arial'
+});
+
+// Level 4: 内容标题 (Content Title)
+slide1.addText('季度表现:', {
+    x: 0.8, y: 3.2, fontSize: 24, bold: true,
+    color: theme.content.text, fontFace: 'Arial'
+});
+
+// Level 5: 内容 (Content) with key text emphasis
+const metrics = [
+    '总收入: $15.2M',
+    '同比增长: 25%',
+    '毛利率: 68%',
+    '营业利润: $4.8M'
+];
+
+metrics.forEach((text, i) => {
+    slide1.addText(text, {
+        x: 0.8, y: 3.6 + i * 0.6,
+        fontSize: 20, color: theme.content.text,
+        bullet: true, lineSpacing: 24, fontFace: 'Arial'
+    });
+});
+
+// Key text emphasis - highlight important data
+slide1.addText('$15.2M', {
+    x: 2.5, y: 3.6, fontSize: 20, bold: true,
+    color: theme.content.accent, fontFace: 'Arial'
+});
+
+slide1.addText('+25%', {
+    x: 2.5, y: 4.2, fontSize: 20, bold: true,
+    color: theme.content.success, fontFace: 'Arial'
+});
+
+slide1.addText('68%', {
+    x: 2.5, y: 4.8, fontSize: 20, bold: true,
+    color: theme.content.accent, fontFace: 'Arial'
+});
+
+slide1.addText('$4.8M', {
+    x: 2.5, y: 5.4, fontSize: 20, bold: true,
+    color: theme.content.accent, fontFace: 'Arial'
+});
+
+// Caption with data source
+slide1.addText('数据来源: 内部财务报告 Q4 2024 | 注: 所有数据未经审计', {
+    x: 0.5, y: 6.8, fontSize: 14,
+    color: theme.content.secondary, italic: true, fontFace: 'Arial'
+});
+
+pres.writeFile({ fileName: 'my_presentation_with_hierarchy.pptx' });
+""", packages='pptxgenjs')
 ```
 
-## Quick Start
+**Note**: Generated files are automatically saved to the workspace output directory.
 
-**IMPORTANT**: You MUST use one of the predefined themes (NOVA, ORBIT, PULSE, MINIMA) below. Never define custom colors or use hardcoded hex values.
+### Quick Start with Images
 
-**CRITICAL**: Slide 0 (cover) uses `theme.cover`, all other slides use `theme.content`.
+Create a presentation with custom-generated images:
 
-```javascript
+```python
+# Step 1: Generate a custom cover image
+generate_image(
+    prompt="Abstract futuristic background with blue and purple gradients, tech pattern, clean design, presentation cover",
+    size="1920x1080"
+)
+
+# Step 2: Generate a 3D chart image (REQUIRED for data)
+generate_image(
+    prompt="3D精美 bar chart showing growth metrics: 2022 75%, 2023 85%, 2024 95%. Professional 3D design, gradient bars, data labels, realistic lighting, high quality",
+    size="1024x768"
+)
+
+# Step 3: Create presentation with images
 execute_javascript_code("""
 const PptxGenJS = require('pptxgenjs');
 
@@ -291,31 +237,42 @@ const theme = {
 
 const pres = new PptxGenJS();
 
-// Slide 0: Cover slide (use theme.cover)
-pres.background = { color: theme.cover.background };
-pres.addText('My Presentation', { x: 1, y: 3, fontSize: 60, bold: true, color: theme.cover.title });
-pres.addText('Company Name', { x: 1, y: 4.2, fontSize: 28, color: theme.cover.subtitle });
+// Slide 0: Cover with generated image (first slide, no addSlide)
+pres.addImage({ path: 'generated_cover_image.png', x: 0, y: 0, w: '100%', h: '100%' });
+pres.addShape(pres.ShapeType.rect, { x: 0, y: 0, w: '100%', h: '100%', fill: { color: '000000', transparency: 40 } });
+pres.addText('Annual Strategy Review', { x: 1, y: 3, fontSize: 64, bold: true, color: theme.cover.title });
+pres.addText('2024 Performance & 2025 Outlook', { x: 1, y: 4, fontSize: 28, color: theme.cover.subtitle });
 
-// Slide 1: Content slide (use theme.content)
+// Slide 1: Content with chart
 pres.addSlide();
 pres.background = { color: theme.content.background };
-pres.addText('Key Points', { x: 1, y: 0.8, fontSize: 44, bold: true, color: theme.content.primary });
-['Point 1', 'Point 2', 'Point 3'].forEach((text, i) => {
-  pres.addText(text, { x: 1, y: 2 + i * 0.7, fontSize: 18, color: theme.content.text, bullet: true });
-});
+pres.addText('Growth Metrics', { x: 1, y: 0.8, fontSize: 44, bold: true, color: theme.content.primary });
+pres.addImage({ path: 'generated_chart_image.png', x: 1, y: 1.5, w: 8, h: 4.5 });
 
-pres.writeFile({ fileName: 'my_presentation.pptx' });
+pres.writeFile({ fileName: 'strategy_with_images.pptx' });
 """, packages='pptxgenjs')
 ```
 
-**Note**: Generated files are automatically saved to the workspace output directory.
+### Improved Example with Enhanced Data Visualization, Five-Level Title Hierarchy & Key Text Emphasis
 
-## Core Slide Patterns
+This example demonstrates the improved approach with specific chart types, clear five-level title hierarchy, and key text emphasis:
 
-### Cover + Content Slides (NOVA - Strategy Deck)
+```python
+# Step 1: Generate detailed line chart with proper labeling
+generate_image(
+    prompt="Professional line chart showing quarterly revenue growth. X-axis: Q1 2023 to Q4 2024. Y-axis: Revenue in $M. Data: Q1 2023: 1.2, Q2 2023: 1.5, Q3 2023: 1.8, Q4 2023: 2.1, Q1 2024: 2.4, Q2 2024: 2.7, Q3 2024: 3.0, Q4 2024: 3.3. Include grid lines, axis labels, data point markers, trend line, legend. Professional design with blue gradient line (#7C3AED), gray grid, white background.",
+    size="1024x768"
+)
 
-```javascript
-const pres = new PptxGenJS();
+# Step 2: Generate detailed bar chart for comparison
+generate_image(
+    prompt="3D bar chart comparing regional performance. Regions: North America, Europe, Asia, South America. Sales: NA: $5.2M, Europe: $3.8M, Asia: $4.5M, SA: $2.1M. Each bar labeled with region and value. Include Y-axis scale, grid lines, color-coded bars (gradient blue to purple). Professional 3D design.",
+    size="1024x768"
+)
+
+# Step 3: Create presentation with enhanced title hierarchy
+execute_javascript_code("""
+const PptxGenJS = require('pptxgenjs');
 
 const theme = {
   cover: {
@@ -333,276 +290,150 @@ const theme = {
   }
 };
 
-// Slide 0: Cover (dark background, white title)
-pres.background = { color: theme.cover.background };
-pres.addText('Annual Report 2024', { x: 1, y: 3, fontSize: 64, bold: true, color: theme.cover.title });
-pres.addText('Company Name', { x: 1, y: 4.2, fontSize: 28, color: theme.cover.subtitle });
+const pres = new PptxGenJS();
+pres.layout = 'LAYOUT_WIDE';
 
-// Slide 1: Content (light background, readable)
-pres.addSlide();
-pres.background = { color: theme.content.background };
-pres.addText('Key Points', { x: 1, y: 0.8, fontSize: 44, bold: true, color: theme.content.primary });
-['Point 1', 'Point 2', 'Point 3'].forEach((text, i) => {
-  pres.addText(text, { x: 1, y: 2 + i * 0.7, fontSize: 18, color: theme.content.text, bullet: true });
+// Slide 1: Cover
+pres.addImage({ path: 'generated_cover_image.png', x: 0, y: 0, w: '100%', h: '100%' });
+pres.addShape(pres.ShapeType.rect, { x: 0, y: 0, w: '100%', h: '100%', fill: { color: '000000', transparency: 40 } });
+pres.addText('2024 Annual Performance Review', { x: 1, y: 3, fontSize: 64, bold: true, color: theme.cover.title });
+pres.addText('Data-Driven Insights & Strategic Outlook', { x: 1, y: 4, fontSize: 28, color: theme.cover.subtitle });
+
+// Slide 2: Revenue Analysis with clear title hierarchy
+const slide2 = pres.addSlide();
+slide2.background = { color: theme.content.background };
+
+// Level 1 Title
+slide2.addText('Financial Performance Analysis', {
+  x: 0.5, y: 0.8, w: 9, fontSize: 52, bold: true,
+  color: theme.content.primary, fontFace: 'Arial'
 });
 
-pres.writeFile({ fileName: 'strategy.pptx' });
-```
+// Accent line under title
+slide2.addShape(pres.ShapeType.line, {
+  x: 0.5, y: 1.4, w: 9, h: 0,
+  line: { color: theme.content.accent, width: 3 }
+});
 
-### Content Slide with Bullets (ORBIT - Technical)
+// Level 2 Title
+slide2.addText('Quarterly Revenue Trends', {
+  x: 0.5, y: 1.8, fontSize: 40, bold: true,
+  color: theme.content.accent, fontFace: 'Arial'
+});
 
-```javascript
-const pres = new PptxGenJS();
+// Detailed line chart
+slide2.addImage({ path: 'generated_line_chart.png', x: 0.5, y: 2.2, w: 9, h: 4 });
 
-const theme = {
-  cover: {
-    background: '#0B1220',
-    title: '#F1F5F9',
-    subtitle: '#94A3B8',
-    accent: '#22D3EE'
-  },
-  content: {
-    background: '#0F172A',
-    primary: '#F1F5F9',
-    secondary: '#94A3B8',
-    accent: '#22D3EE',
-    success: '#34D399',
-    text: '#F1F5F9'
-  }
-};
+// Level 3 Title for insights
+slide2.addText('Key Insights:', {
+  x: 0.5, y: 6.3, fontSize: 30, bold: true,
+  color: theme.content.secondary, fontFace: 'Arial'
+});
 
-// Content slide
-pres.addSlide();
-pres.background = { color: theme.content.background };
-pres.addText('System Architecture', { x: 1, y: 0.8, fontSize: 48, bold: true, color: theme.content.primary });
-
-const bullets = [
-  'Microservices architecture',
-  'Event-driven communication',
-  'Scalable infrastructure'
+// Body text with bullet points
+const insights = [
+  'Steady quarterly growth averaging 12.5%',
+  'Q4 2024 shows strongest performance at $3.3M',
+  'Year-over-year growth of 57% from 2023',
+  'Consistent upward trend across all quarters'
 ];
 
-bullets.forEach((text, i) => {
-  pres.addText(text, { x: 1, y: 2 + i * 0.7, fontSize: 18, color: theme.content.text, bullet: true });
+insights.forEach((text, i) => {
+  slide2.addText(text, {
+    x: 0.8, y: 6.8 + i * 0.6,
+    fontSize: 20, color: theme.content.text,
+    bullet: true, lineSpacing: 24
+  });
 });
 
-pres.writeFile({ fileName: 'technical.pptx' });
-```
+// Slide 3: Regional Comparison
+const slide3 = pres.addSlide();
+slide3.background = { color: theme.content.background };
 
-### Metrics Slide (PULSE - Business Performance)
+// Level 1 Title
+slide3.addText('Regional Performance Comparison', {
+  x: 0.5, y: 0.8, w: 9, fontSize: 48, bold: true,
+  color: theme.content.primary, fontFace: 'Arial'
+});
 
-```javascript
-const pres = new PptxGenJS();
+// Level 2 Title
+slide3.addText('Sales by Region (2024)', {
+  x: 0.5, y: 1.6, fontSize: 36, bold: true,
+  color: theme.content.accent, fontFace: 'Arial'
+});
 
-const theme = {
-  cover: {
-    background: '#111827',
-    title: '#FFFFFF',
-    subtitle: '#9CA3AF',
-    accent: '#EF4444'
-  },
-  content: {
-    background: '#FFFFFF',
-    primary: '#111827',
-    secondary: '#6B7280',
-    accent: '#EF4444',
-    success: '#10B981',
-    warning: '#F59E0B',
-    text: '#111827'
-  }
-};
+// Detailed bar chart
+slide3.addImage({ path: 'generated_bar_chart.png', x: 0.5, y: 2.2, w: 9, h: 4 });
 
-// Content slide with metrics
-pres.addSlide();
-pres.background = { color: theme.content.background };
-pres.addText('Q4 Key Metrics', { x: 1, y: 0.8, fontSize: 52, bold: true, color: theme.content.primary });
+// Level 3 Title for analysis
+slide3.addText('Regional Analysis:', {
+  x: 0.5, y: 6.3, fontSize: 28, bold: true,
+  color: theme.content.secondary, fontFace: 'Arial'
+});
 
-const metrics = [
-  { label: 'Revenue', value: '$1.5M', color: theme.content.success },
-  { label: 'Growth', value: '+25%', color: theme.content.accent },
-  { label: 'Customers', value: '86', color: theme.content.warning }
+// Body text in two columns
+const leftColumn = [
+  'North America leads with $5.2M',
+  'Europe shows strong growth potential',
+  'Asia demonstrates rapid expansion'
 ];
 
-metrics.forEach((metric, i) => {
-  const x = 1 + (i % 3) * 3;
-  const y = 2.5 + Math.floor(i / 3) * 2;
-  pres.addText(metric.label, { x, y: y, fontSize: 16, color: theme.content.secondary });
-  pres.addText(metric.value, { x, y: y + 0.4, fontSize: 36, bold: true, color: metric.color });
-});
-
-pres.writeFile({ fileName: 'metrics.pptx' });
-```
-};
-
-pres.background = { color: theme.background };
-
-pres.addText('Q4 Key Metrics', { x: 1, y: 0.8, fontSize: 52, bold: true, color: theme.primary });
-
-const metrics = [
-  { label: 'Revenue', value: '$1.5M', color: theme.success },
-  { label: 'Growth', value: '+25%', color: theme.accent },
-  { label: 'Customers', value: '86', color: theme.warning }
+const rightColumn = [
+  'South America emerging market',
+  'NA accounts for 42% of total revenue',
+  'International markets growing 35% YoY'
 ];
 
-metrics.forEach((metric, i) => {
-  const x = 1 + (i % 3) * 3;
-  const y = 2.5 + Math.floor(i / 3) * 2;
-  pres.addText(metric.label, { x, y: y, fontSize: 16, color: theme.secondary });
-  pres.addText(metric.value, { x, y: y + 0.4, fontSize: 36, bold: true, color: metric.color });
+leftColumn.forEach((text, i) => {
+  slide3.addText(text, {
+    x: 0.8, y: 6.8 + i * 0.6,
+    fontSize: 18, color: theme.content.text,
+    bullet: true, lineSpacing: 22
+  });
 });
 
-pres.writeFile({ fileName: 'metrics.pptx' });
-```
-
-### Minimalist Content (MINIMA - Founder Story)
-
-```javascript
-const pres = new PptxGenJS();
-
-const theme = {
-  background: '#FAFAFA',
-  primary: '#111111',
-  secondary: '#777777',
-  accent: '#000000',
-  text: '#111111'
-};
-
-pres.background = { color: theme.background };
-
-pres.addText('Our Journey', { x: 1, y: 0.8, fontSize: 56, bold: true, color: theme.primary });
-
-['Founded in 2020', 'Team of 10', 'Bootstrapped'].forEach((text, i) => {
-  pres.addText(text, { x: 1, y: 2.5 + i * 0.8, fontSize: 20, color: theme.text });
+rightColumn.forEach((text, i) => {
+  slide3.addText(text, {
+    x: 5.0, y: 6.8 + i * 0.6,
+    fontSize: 18, color: theme.content.text,
+    bullet: true, lineSpacing: 22
+  });
 });
 
-pres.writeFile({ fileName: 'minimal.pptx' });
-```
-
-### Multi-Slide Presentation (NOVA - Strategy Context)
-
-```javascript
-const pres = new PptxGenJS();
-
-const theme = {
-  background: '#F6F7FB',
-  primary: '#0A0F1C',
-  secondary: '#5B6475',
-  accent: '#7C3AED',
-  highlight: '#22D3EE',
-  text: '#0A0F1C'
-};
-
-// Slide 1: Title
-pres.background = { color: theme.background };
-pres.addText('Strategic Vision 2025', { x: 1, y: 3, fontSize: 64, bold: true, color: theme.primary });
-pres.addText('Company Name', { x: 1, y: 4.2, fontSize: 28, color: theme.secondary });
-
-// Slide 2: Content
-pres.addSlide();
-pres.background = { color: theme.background };
-pres.addText('Key Initiatives', { x: 1, y: 0.8, fontSize: 44, bold: true, color: theme.primary });
-['AI Platform Launch', 'Market Expansion', 'Team Growth'].forEach((text, i) => {
-  pres.addText(text, { x: 1, y: 2 + i * 0.7, fontSize: 18, color: theme.text, bullet: true });
+// Caption at bottom
+slide3.addText('Data Source: Internal Sales Reports Q1-Q4 2024 | Note: All figures in USD millions', {
+  x: 0.5, y: 7.2, fontSize: 14,
+  color: theme.content.secondary, italic: true
 });
 
-// Slide 3: Metrics
-pres.addSlide();
-pres.background = { color: theme.background };
-pres.addText('Performance Targets', { x: 1, y: 0.8, fontSize: 44, bold: true, color: theme.primary });
-pres.addText('Revenue: $5M', { x: 1, y: 2.5, fontSize: 28, color: theme.accent });
-pres.addText('Growth: 150%', { x: 5, y: 2.5, fontSize: 28, color: theme.highlight });
-
-pres.writeFile({ fileName: 'strategy.pptx' });
+pres.writeFile({ fileName: 'enhanced_presentation.pptx' });
+""", packages='pptxgenjs')
 ```
 
-## Working with Images
+---
 
-When adding images to presentations, use relative paths (code runs in workspace/output directory):
+## Documentation Navigation
 
-```javascript
-const pres = new PptxGenJS();
-const fs = require('fs');
+### 📚 Core Documentation
+- **[Core Rules & Themes](docs/core-rules-and-themes.md)** - Combined execution rules, complete theme system, **five-level title hierarchy guidelines**, and **key text emphasis guidelines**
+- **[Slide Patterns](docs/slide-patterns.md)** - Ready-to-use slide templates and patterns
+- **[Five-Level Hierarchy Example](docs/five-level-hierarchy-example.md)** - Complete example of five-level title hierarchy with key text emphasis
 
-// Slide with image
-pres.addSlide();
-pres.addText('Revenue Chart', { x: 0.5, y: 0.8, fontSize: 40, bold: true, color: theme.content.primary });
+### 🖼️ Image Generation Workflow
+- **[Image Generation Workflow](docs/image-generation-workflow.md)** - Combined image tools, mandatory workflow, **detailed chart generation guidelines**, and **data accuracy requirements**
 
-// Check if image exists
-if (fs.existsSync('revenue_chart.png')) {
-  // GOOD: Specify both w and h to control exact dimensions
-  pres.addImage({ path: 'revenue_chart.png', x: 1, y: 1.5, w: 8, h: 4.5 });
+### 🎨 Presentation Modes
+- **[Mixed Mode Guide](docs/mixed-mode-guide.md)** - Default mode with 30% full-image + 70% mixed slides, includes layouts
+- **[Full Image Mode](docs/full-image-mode.md)** - 100% full-image slides with embedded text
 
-  // BETTER: Use sizing: 'contain' to fit within bounds while maintaining aspect ratio
-  // pres.addImage({ path: 'revenue_chart.png', x: 1, y: 1.5, sizing: { type: 'contain', w: 8, h: 4.5 } });
-} else {
-  pres.addText('Image not available: revenue_chart.png', { x: 1, y: 3, fontSize: 18, color: theme.content.secondary || theme.content.warning });
-}
+### 🔧 Advanced Features
+- **[Existing Presentations](docs/existing-presentations.md)** - Reading and editing existing PPTX files
 
-pres.writeFile({ fileName: 'with_image.pptx' });
-```
-
-**Image Sizing Best Practices:**
-
-| Method | When to Use | Example |
-|--------|-------------|---------|
-| `w: 8, h: 4.5` | Exact dimensions needed | `{ x: 1, y: 2, w: 8, h: 4 }` |
-| `sizing: { type: 'contain', w: 8, h: 5 }` | Maintain aspect ratio, fit in bounds | `{ x: 1, y: 1.5, sizing: { type: 'contain', w: 8, h: 5 } }` |
-| `sizing: { type: 'cover', w: 8, h: 5 }` | Fill bounds, crop if needed | `{ x: 1, y: 1.5, sizing: { type: 'cover', w: 8, h: 5 } }` |
-
-**WRONG - May overflow slide:**
-```javascript
-// ❌ Only width - height depends on aspect ratio, may exceed slide bounds
-pres.addImage({ path: 'chart.png', x: 1, y: 2, w: 9 });
-
-// ❌ Only height - width may exceed slide width
-pres.addImage({ path: 'photo.png', x: 1, y: 1, h: 6 });
-```
-
-**CORRECT - Stay within bounds:**
-```javascript
-// ✅ Both w and h specified
-pres.addImage({ path: 'chart.png', x: 1, y: 1.5, w: 8, h: 4.5 });
-
-// ✅ Using contain with max bounds
-pres.addImage({ path: 'photo.png', x: 0.5, y: 1, sizing: { type: 'contain', w: 9, h: 6 } });
-```
-
-**Important Notes:**
-- Use relative paths like `'revenue_chart.png'` - code runs in workspace/output directory
-- Supported formats: PNG, JPG, JPEG, GIF, PDF
-- Keep images within safe area: x: 0.5-9.5, y: 0.5-7 inches
-- Use `sizing: { type: 'contain' }` when you want to preserve aspect ratio
-- Use `sizing: { type: 'cover' }` when you want to fill the entire area
-
-## Working with Existing Presentations
-
-### Read Presentation Structure
-
-```
-read_pptx("presentation.pptx", extract_text=False)
-```
-
-Returns:
-```json
-{
-  "slide_count": 5,
-  "slides": [
-    {"index": 0, "filename": "slide1.xml", "hidden": false}
-  ],
-  "titles": ["Title", "Content", "Summary", "Q&A", "Thank You"]
-}
-```
-
-### Extract Text Content
-
-```
-read_pptx("presentation.pptx", extract_text=True)
-```
-
-Returns all text content from the presentation.
+---
 
 ## Available Tools
 
+### Presentation Tools
 | Tool | Purpose |
 |-------|---------|
 | `execute_javascript_code` | Generate presentations using JavaScript (use packages='pptxgenjs') |
@@ -610,3 +441,33 @@ Returns all text content from the presentation.
 | `unpack_pptx` | Extract PPTX files to directory for inspection/learning from templates |
 | `pack_pptx` | Package directory back into PPTX file after manual editing |
 | `clean_pptx` | Clean orphaned files from unpacked PPTX directory |
+
+### Image Tools for Presentations
+| Tool | Purpose | Use Case in Presentations |
+|------|---------|---------------------------|
+| `generate_image` | Generate high-quality images from text prompts | Create custom visuals, charts, diagrams, illustrations for slides |
+| `image_web_search` | Search and download images from the web | Find relevant photos, icons, backgrounds for presentation content |
+| `logo_overlay` | Overlay logos on images with customizable position/size | Add company logos to slide images, create branded visuals |
+| `edit_image` | Edit existing images using text prompts | Modify images to fit presentation theme, adjust colors, add text |
+
+### File Tools for Presentations
+| Tool | Purpose | Use Case in Presentations |
+|------|---------|---------------------------|
+| `read_file` | Read file content from workspace | Read configuration files, data files, templates |
+| `write_file` | Write content to file in workspace | Save generated content, create configuration files |
+| `list_files` | List files in workspace directory | Check available images, templates, data files |
+| `file_exists` | Check if file exists in workspace | Verify image files exist before adding to presentation |
+| `get_file_info` | Get detailed file information | Check file sizes, modification times for images |
+
+**重要提示**: 所有文件工具都在工作空间内操作，使用相对路径（如`'generated_image.png'`），而不是绝对路径。
+
+**Note**: All generated/downloaded images are automatically saved to the workspace output directory, ready to be used in presentations.
+
+---
+
+## Getting Help
+
+- Start with **Quick Start** above for basic usage
+- Check **Available Tools** for tool references
+- Use the **Documentation Navigation** to explore specific topics
+- Follow **CRITICAL REQUIREMENTS** to avoid common mistakes

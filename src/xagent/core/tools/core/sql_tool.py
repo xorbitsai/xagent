@@ -52,7 +52,9 @@ class SQLQueryResult(BaseModel):
     message: str = Field(default="", description="Summary of what happened")
 
 
-def _get_connection_url(connection_name: str) -> URL:
+def _get_connection_url(
+    connection_name: str, connection_url: Optional[str] = None
+) -> URL:
     """Get database connection URL from environment variable.
 
     Environment variable format: XAGENT_EXTERNAL_DB_<NAME>=<connection_url>
@@ -63,8 +65,10 @@ def _get_connection_url(connection_name: str) -> URL:
     Returns:
         Connection URL if found
     """
-    env_key = f"XAGENT_EXTERNAL_DB_{connection_name.upper()}"
-    url = os.getenv(env_key)
+    url = connection_url
+    if not url:
+        env_key = f"XAGENT_EXTERNAL_DB_{connection_name.upper()}"
+        url = os.getenv(env_key)
 
     if not url:
         raise ValueError(f"Database connection '{connection_name}' not found.")
@@ -73,7 +77,9 @@ def _get_connection_url(connection_name: str) -> URL:
     return make_url(url)
 
 
-def get_database_type(connection_name: str) -> str:
+def get_database_type(
+    connection_name: str, connection_url: Optional[str] = None
+) -> str:
     """Get database type for a connection name.
 
     Returns the database driver/type which helps LLM write appropriate SQL dialect.
@@ -85,7 +91,7 @@ def get_database_type(connection_name: str) -> str:
     Returns:
         Database type (driver name)
     """
-    url = _get_connection_url(connection_name)
+    url = _get_connection_url(connection_name, connection_url)
     # Extract driver name from URL (e.g., "postgresql+asyncpg" -> "postgresql")
     return url.drivername.split("+")[0]
 
@@ -100,6 +106,7 @@ def execute_sql_query(
     query: str,
     output_file: Optional[str] = None,
     workspace: Optional["TaskWorkspace"] = None,
+    connection_url: Optional[str] = None,
 ) -> dict[str, Any]:
     """Execute SQL queries on databases and return structured results.
 
@@ -121,7 +128,7 @@ def execute_sql_query(
             - message: what happened
     """
     # Get connection URL from environment
-    url = _get_connection_url(connection_name)
+    url = _get_connection_url(connection_name, connection_url)
     stmt = text(query)
     engine = create_engine(url)
 

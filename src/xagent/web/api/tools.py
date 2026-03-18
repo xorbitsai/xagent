@@ -2,15 +2,27 @@
 
 import asyncio
 import logging
-from typing import Any, DefaultDict, Dict, List, Optional
+from typing import Any, DefaultDict, Dict, List, Optional, cast
 
 from fastapi import APIRouter, Depends, HTTPException
+from pydantic import BaseModel
 from sqlalchemy.orm import Session
 
 from ..auth_dependencies import get_current_user
+from ..init_tool_configs import get_default_tool_configs
 from ..models.database import get_db
-from ..models.tool_config import ToolUsage
+from ..models.tool_config import ToolConfig, ToolUsage
 from ..models.user import User
+from ..services.tool_credentials import (
+    TOOL_CREDENTIAL_SPECS,
+    clear_tool_credential,
+    delete_sql_connection,
+    get_tool_credential_view,
+    list_configurable_tool_names,
+    list_sql_connections,
+    set_sql_connection,
+    set_tool_credentials,
+)
 from ..tools.config import WebToolConfig
 
 logger = logging.getLogger(__name__)
@@ -33,6 +45,22 @@ CATEGORY_DISPLAY_NAMES = {
 
 # 创建路由器
 tools_router = APIRouter(prefix="/api/tools", tags=["tools"])
+
+
+class CredentialFieldUpdate(BaseModel):
+    value: str
+
+
+class ToolCredentialUpdateRequest(BaseModel):
+    credentials: Dict[str, CredentialFieldUpdate]
+
+
+class ToolEnableUpdateRequest(BaseModel):
+    enabled: bool
+
+
+class SqlConnectionUpsertRequest(BaseModel):
+    connection_url: str
 
 
 def _create_tool_info(
@@ -197,7 +225,19 @@ async def get_available_tools(
 
         Tools declare their category via the category class attribute.
         """
-        return str(tool.metadata.category.value)
+        try:
+            metadata = getattr(tool, "metadata", None)
+            category = getattr(metadata, "category", None)
+            value = getattr(category, "value", None)
+            if isinstance(value, str) and value:
+                return value
+        except Exception:
+            logger.warning(
+                "Failed to read tool category from metadata for %s",
+                getattr(tool, "name", tool.__class__.__name__),
+                exc_info=True,
+            )
+        return "other"
 
     # Get models for tool status checking
     vision_model = tool_config.get_vision_model()
@@ -236,10 +276,208 @@ async def get_available_tools(
         tool_name = tool_item.get("name", "")
         tool_item["usage_count"] = usage_map[tool_name]
 
+    config_rows = db.query(ToolConfig).all()
+    enabled_map: dict[str, bool] = {}
+    for row in config_rows:
+        row_tool_name = cast(Any, row.tool_name)
+        if isinstance(row_tool_name, str):
+            enabled_map[row_tool_name] = bool(cast(Any, row.enabled))
+    for tool_item in tools:
+        tool_name = str(tool_item.get("name") or "")
+        if tool_name in enabled_map:
+            tool_item["enabled"] = enabled_map[tool_name]
+            if not enabled_map[tool_name]:
+                tool_item["status"] = "disabled"
+                tool_item["status_reason"] = "Disabled by tool policy"
+
     return {
         "tools": tools,
         "count": len(tools),
     }
+
+
+@tools_router.get("/configurable")
+async def get_configurable_tools(
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> Dict[str, Any]:
+    if not bool(current_user.is_admin):
+        raise HTTPException(status_code=403, detail="Admin privileges required")
+
+    items: List[Dict[str, Any]] = []
+    for tool_name in list_configurable_tool_names():
+        view = get_tool_credential_view(db, tool_name)
+        items.append(
+            {
+                "tool_name": tool_name,
+                "display_name": view.get("display_name", tool_name),
+                "configured": view["configured"],
+                "fields": view["fields"],
+            }
+        )
+
+    return {
+        "tools": items,
+        "count": len(items),
+    }
+
+
+@tools_router.get("/sql-connections")
+async def get_sql_connections(
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> Dict[str, Any]:
+    if not bool(current_user.is_admin):
+        raise HTTPException(status_code=403, detail="Admin privileges required")
+
+    items = list_sql_connections(db)
+    return {
+        "connections": items,
+        "count": len(items),
+    }
+
+
+@tools_router.put("/sql-connections/{name}")
+async def upsert_sql_connection(
+    name: str,
+    payload: SqlConnectionUpsertRequest,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> Dict[str, Any]:
+    if not bool(current_user.is_admin):
+        raise HTTPException(status_code=403, detail="Admin privileges required")
+
+    try:
+        set_sql_connection(db, name, payload.connection_url)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    return {
+        "connections": list_sql_connections(db),
+    }
+
+
+@tools_router.delete("/sql-connections/{name}")
+async def remove_sql_connection(
+    name: str,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> Dict[str, Any]:
+    if not bool(current_user.is_admin):
+        raise HTTPException(status_code=403, detail="Admin privileges required")
+
+    delete_sql_connection(db, name)
+    return {
+        "connections": list_sql_connections(db),
+    }
+
+
+@tools_router.put("/{tool_name}/enabled")
+async def update_tool_enabled(
+    tool_name: str,
+    payload: ToolEnableUpdateRequest,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> Dict[str, Any]:
+    if not bool(current_user.is_admin):
+        raise HTTPException(status_code=403, detail="Admin privileges required")
+
+    config_row = db.query(ToolConfig).filter(ToolConfig.tool_name == tool_name).first()
+    if not config_row:
+        defaults = {item["tool_name"]: item for item in get_default_tool_configs()}
+        default_data = defaults.get(tool_name)
+        if default_data:
+            config_row = ToolConfig(**default_data)
+        else:
+            config_row = ToolConfig(
+                tool_name=tool_name,
+                tool_type="builtin",
+                category="other",
+                display_name=tool_name,
+                description="",
+                enabled=payload.enabled,
+                config={},
+                dependencies=[],
+                status="available",
+            )
+        db.add(config_row)
+
+    cast(Any, config_row).enabled = payload.enabled
+    db.add(config_row)
+    db.commit()
+    return {
+        "tool_name": tool_name,
+        "enabled": bool(cast(Any, config_row).enabled),
+    }
+
+
+@tools_router.get("/{tool_name}/credentials")
+async def get_tool_credentials(
+    tool_name: str,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> Dict[str, Any]:
+    if not bool(current_user.is_admin):
+        raise HTTPException(status_code=403, detail="Admin privileges required")
+
+    if tool_name not in TOOL_CREDENTIAL_SPECS:
+        raise HTTPException(
+            status_code=404, detail=f"Tool '{tool_name}' is not configurable"
+        )
+
+    return get_tool_credential_view(db, tool_name)
+
+
+@tools_router.put("/{tool_name}/credentials")
+async def update_tool_credentials(
+    tool_name: str,
+    payload: ToolCredentialUpdateRequest,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> Dict[str, Any]:
+    if not bool(current_user.is_admin):
+        raise HTTPException(status_code=403, detail="Admin privileges required")
+
+    if tool_name not in TOOL_CREDENTIAL_SPECS:
+        raise HTTPException(
+            status_code=404, detail=f"Tool '{tool_name}' is not configurable"
+        )
+
+    updates = {
+        field_name: field_update.value
+        for field_name, field_update in payload.credentials.items()
+    }
+
+    try:
+        set_tool_credentials(db, tool_name, updates)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    return get_tool_credential_view(db, tool_name)
+
+
+@tools_router.delete("/{tool_name}/credentials/{field_name}")
+async def delete_tool_credential(
+    tool_name: str,
+    field_name: str,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> Dict[str, Any]:
+    if not bool(current_user.is_admin):
+        raise HTTPException(status_code=403, detail="Admin privileges required")
+
+    if tool_name not in TOOL_CREDENTIAL_SPECS:
+        raise HTTPException(
+            status_code=404, detail=f"Tool '{tool_name}' is not configurable"
+        )
+
+    if field_name not in TOOL_CREDENTIAL_SPECS[tool_name]:
+        raise HTTPException(
+            status_code=404, detail=f"Field '{field_name}' is not configurable"
+        )
+
+    clear_tool_credential(db, tool_name, field_name)
+    return get_tool_credential_view(db, tool_name)
 
 
 @tools_router.get("/usage")

@@ -30,8 +30,9 @@ class TavilyWebSearchResult(BaseModel):
 class TavilyWebSearchTool(AbstractBaseTool):
     """Framework wrapper for the Tavily web search tool."""
 
-    def __init__(self) -> None:
+    def __init__(self, api_key: str | None = None) -> None:
         self._visibility = ToolVisibility.PUBLIC
+        self._api_key = api_key
 
     @property
     def name(self) -> str:
@@ -60,7 +61,7 @@ class TavilyWebSearchTool(AbstractBaseTool):
 
     async def run_json_async(self, args: Mapping[str, Any]) -> Any:
         search_args = TavilyWebSearchArgs.model_validate(args)
-        searcher = TavilyWebSearchCore()
+        searcher = TavilyWebSearchCore(api_key=self._api_key)
 
         results = await searcher.search(
             query=search_args.query,

@@ -1,7 +1,6 @@
 """Basic tools registration using @register_tool decorator."""
 
 import logging
-import os
 from typing import TYPE_CHECKING, Any, List
 
 from .factory import ToolFactory, register_tool
@@ -22,23 +21,24 @@ async def create_basic_tools(config: "BaseToolConfig") -> List[Any]:
     workspace = ToolFactory._create_workspace(config.get_workspace_config())
 
     # Web search tool preference: Zhipu -> Tavily -> Google -> none
-    zhipu_api_key = os.getenv("ZHIPU_API_KEY") or os.getenv("BIGMODEL_API_KEY")
-    tavily_api_key = os.getenv("TAVILY_API_KEY")
-    google_api_key = os.getenv("GOOGLE_API_KEY")
-    google_cse_id = os.getenv("GOOGLE_CSE_ID")
+    zhipu_api_key = config.get_tool_credential("zhipu_web_search", "api_key")
+    zhipu_base_url = config.get_tool_credential("zhipu_web_search", "base_url")
+    tavily_api_key = config.get_tool_credential("tavily_web_search", "api_key")
+    google_api_key = config.get_tool_credential("web_search", "api_key")
+    google_cse_id = config.get_tool_credential("web_search", "cse_id")
 
     if zhipu_api_key:
         from .zhipu_web_search import ZhipuWebSearchTool
 
-        tools.append(ZhipuWebSearchTool())
+        tools.append(ZhipuWebSearchTool(api_key=zhipu_api_key, base_url=zhipu_base_url))
     elif tavily_api_key:
         from .tavily_web_search import TavilyWebSearchTool
 
-        tools.append(TavilyWebSearchTool())
+        tools.append(TavilyWebSearchTool(api_key=tavily_api_key))
     elif google_api_key and google_cse_id:
         from .web_search import WebSearchTool
 
-        tools.append(WebSearchTool())
+        tools.append(WebSearchTool(api_key=google_api_key, cse_id=google_cse_id))
 
     # Python executor tool (if workspace available)
     if workspace:

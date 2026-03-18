@@ -239,3 +239,164 @@ class TestToolsAvailableAPI:
 
         # Should return 401 (older FastAPI) or 403 (newer FastAPI) without auth
         assert response.status_code in [401, 403]
+
+    def test_get_available_tools_falls_back_to_other_when_metadata_missing(self):
+        login_response = client.post(
+            "/api/auth/login", json={"username": "admin", "password": "admin123"}
+        )
+        assert login_response.status_code == 200
+        token = login_response.json()["access_token"]
+
+        class _Category:
+            value = "basic"
+
+        class _Metadata:
+            category = _Category()
+
+        class _ToolWithoutMetadata:
+            name = "tool_without_metadata"
+            description = ""
+
+        class _ToolWithMetadata:
+            name = "tool_with_metadata"
+            description = ""
+            metadata = _Metadata()
+
+        with patch(
+            "xagent.core.tools.adapters.vibe.factory.ToolFactory.create_all_tools",
+            return_value=[_ToolWithoutMetadata(), _ToolWithMetadata()],
+        ):
+            response = client.get(
+                "/api/tools/available", headers={"Authorization": f"Bearer {token}"}
+            )
+
+        assert response.status_code == 200
+        payload = response.json()
+        categories = {item["name"]: item["category"] for item in payload["tools"]}
+        assert categories["tool_without_metadata"] == "other"
+        assert categories["tool_with_metadata"] == "basic"
+
+
+class TestToolsGovernanceAPI:
+    @pytest.fixture(autouse=True)
+    def setup(self, test_db):
+        ensure_system_initialized()
+        yield
+
+    def _admin_headers(self) -> dict[str, str]:
+        login_response = client.post(
+            "/api/auth/login", json={"username": "admin", "password": "admin123"}
+        )
+        assert login_response.status_code == 200
+        token = login_response.json()["access_token"]
+        return {"Authorization": f"Bearer {token}"}
+
+    def test_enable_unknown_tool_creates_policy_record(self):
+        headers = self._admin_headers()
+
+        response = client.put(
+            "/api/tools/custom_runtime_tool/enabled",
+            headers=headers,
+            json={"enabled": False},
+        )
+
+        assert response.status_code == 200
+        data = response.json()
+        assert data["tool_name"] == "custom_runtime_tool"
+        assert data["enabled"] is False
+
+    def test_configurable_credentials_put_and_get_masked(self):
+        headers = self._admin_headers()
+
+        put_resp = client.put(
+            "/api/tools/zhipu_web_search/credentials",
+            headers=headers,
+            json={
+                "credentials": {
+                    "api_key": {"value": "test-secret-zhipu-key-1234"},
+                    "base_url": {"value": "https://open.bigmodel.cn"},
+                }
+            },
+        )
+        assert put_resp.status_code == 200
+
+        get_resp = client.get(
+            "/api/tools/zhipu_web_search/credentials",
+            headers=headers,
+        )
+        assert get_resp.status_code == 200
+        payload = get_resp.json()
+
+        assert payload["tool_name"] == "zhipu_web_search"
+        assert payload["configured"] is True
+        assert payload["fields"]["api_key"]["source"] == "db"
+        assert payload["fields"]["api_key"]["is_configured"] is True
+        assert "1234" in payload["fields"]["api_key"]["masked"]
+        assert (
+            "test-secret-zhipu-key-1234" not in payload["fields"]["api_key"]["masked"]
+        )
+
+    def test_configurable_credentials_env_source_when_not_stored(self, monkeypatch):
+        headers = self._admin_headers()
+        monkeypatch.setenv("TAVILY_API_KEY", "env-only-tavily-key-5678")
+
+        resp = client.get("/api/tools/tavily_web_search/credentials", headers=headers)
+        assert resp.status_code == 200
+        payload = resp.json()
+
+        assert payload["fields"]["api_key"]["source"] == "env"
+        assert payload["fields"]["api_key"]["is_configured"] is True
+        assert "5678" in payload["fields"]["api_key"]["masked"]
+
+    def test_sql_connections_crud_and_db_priority_over_env(self, monkeypatch):
+        headers = self._admin_headers()
+        monkeypatch.setenv(
+            "XAGENT_EXTERNAL_DB_ANALYTICS",
+            "postgresql://env_user:env_pass@localhost:5432/env_db",
+        )
+
+        initial = client.get("/api/tools/sql-connections", headers=headers)
+        assert initial.status_code == 200
+        initial_items = {item["name"]: item for item in initial.json()["connections"]}
+        assert initial_items["ANALYTICS"]["source"] == "env"
+
+        upsert = client.put(
+            "/api/tools/sql-connections/analytics",
+            headers=headers,
+            json={
+                "connection_url": "postgresql://db_user:db_pass@localhost:5432/db_db"
+            },
+        )
+        assert upsert.status_code == 200
+
+        after_upsert = client.get("/api/tools/sql-connections", headers=headers)
+        assert after_upsert.status_code == 200
+        upsert_items = {
+            item["name"]: item for item in after_upsert.json()["connections"]
+        }
+        assert upsert_items["ANALYTICS"]["source"] == "db"
+        assert "db_pass" not in upsert_items["ANALYTICS"]["masked"]
+
+        delete_resp = client.delete(
+            "/api/tools/sql-connections/analytics", headers=headers
+        )
+        assert delete_resp.status_code == 200
+
+        after_delete = client.get("/api/tools/sql-connections", headers=headers)
+        assert after_delete.status_code == 200
+        delete_items = {
+            item["name"]: item for item in after_delete.json()["connections"]
+        }
+        assert delete_items["ANALYTICS"]["source"] == "env"
+
+    def test_sql_connection_rejects_unsupported_scheme(self):
+        headers = self._admin_headers()
+
+        upsert = client.put(
+            "/api/tools/sql-connections/analytics",
+            headers=headers,
+            json={"connection_url": "redis://localhost:6379/0"},
+        )
+
+        assert upsert.status_code == 400
+        assert "Unsupported SQLAlchemy URL scheme" in upsert.json()["detail"]

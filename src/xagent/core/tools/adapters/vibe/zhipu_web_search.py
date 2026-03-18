@@ -48,8 +48,10 @@ class ZhipuWebSearchTool(AbstractBaseTool):
     category = ToolCategory.BASIC
     """Framework wrapper for the Zhipu web search tool."""
 
-    def __init__(self) -> None:
+    def __init__(self, api_key: str | None = None, base_url: str | None = None) -> None:
         self._visibility = ToolVisibility.PUBLIC
+        self._api_key = api_key
+        self._base_url = base_url
 
     @property
     def name(self) -> str:
@@ -77,7 +79,7 @@ class ZhipuWebSearchTool(AbstractBaseTool):
 
     async def run_json_async(self, args: Mapping[str, Any]) -> Any:
         search_args = ZhipuWebSearchArgs.model_validate(args)
-        searcher = ZhipuWebSearchCore()
+        searcher = ZhipuWebSearchCore(api_key=self._api_key, base_url=self._base_url)
 
         response = await searcher.search(
             query=search_args.query,

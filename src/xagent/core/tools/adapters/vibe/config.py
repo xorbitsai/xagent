@@ -108,6 +108,12 @@ class BaseToolConfig(ABC):
         """Get sandbox instance for sandboxed executors. Returns None if not available."""
         pass
 
+    def get_tool_credential(self, tool_name: str, field_name: str) -> Optional[str]:
+        return None
+
+    def get_sql_connections(self) -> Dict[str, str]:
+        return {}
+
     @abstractmethod
     def get_asr_model(self) -> Optional[Any]:
         """Get default ASR (speech-to-text) model."""
@@ -145,6 +151,7 @@ class ToolConfig(BaseToolConfig):
         allowed_tools = config_dict.get("allowed_tools")
         user_id = config_dict.get("user_id")
         is_admin = config_dict.get("is_admin", False)
+        tool_credentials = config_dict.get("tool_credentials", {})
 
         self.workspace_config: Optional[Dict[str, Any]] = workspace_config
         self.vision_model: Optional[Any] = (
@@ -170,6 +177,7 @@ class ToolConfig(BaseToolConfig):
         self.allowed_tools: Optional[List[str]] = allowed_tools
         self.user_id: Optional[int] = user_id
         self.is_admin_value: bool = bool(is_admin)
+        self.tool_credentials: Dict[str, Dict[str, str]] = tool_credentials
 
     def get_workspace_config(self) -> Optional[Dict[str, Any]]:
         return self.workspace_config
@@ -239,3 +247,13 @@ class ToolConfig(BaseToolConfig):
 
     def get_sandbox(self) -> Optional[Any]:
         return None  # Standalone config doesn't have sandbox
+
+    def get_tool_credential(self, tool_name: str, field_name: str) -> Optional[str]:
+        tool_data = self.tool_credentials.get(tool_name)
+        if not isinstance(tool_data, dict):
+            return None
+        value = tool_data.get(field_name)
+        return value if isinstance(value, str) and value else None
+
+    def get_sql_connections(self) -> Dict[str, str]:
+        return {}

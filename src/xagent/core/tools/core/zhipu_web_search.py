@@ -15,6 +15,10 @@ logger = logging.getLogger(__name__)
 class ZhipuWebSearchCore:
     """Pure Zhipu web search tool without framework dependencies."""
 
+    def __init__(self, api_key: str | None = None, base_url: str | None = None) -> None:
+        self._api_key = api_key
+        self._base_url = base_url
+
     async def search(
         self,
         query: str,
@@ -52,7 +56,9 @@ class ZhipuWebSearchCore:
             search_intent,
         )
 
-        api_key = os.getenv("ZHIPU_API_KEY") or os.getenv("BIGMODEL_API_KEY")
+        api_key = (
+            self._api_key or os.getenv("ZHIPU_API_KEY") or os.getenv("BIGMODEL_API_KEY")
+        )
         if not api_key:
             raise ValueError(
                 "Missing required environment variable. Please set ZHIPU_API_KEY."
@@ -60,7 +66,9 @@ class ZhipuWebSearchCore:
 
         count = min(max(1, count), 50)
 
-        base_url = os.getenv("ZHIPU_BASE_URL", "https://open.bigmodel.cn").rstrip("/")
+        base_url = (
+            self._base_url or os.getenv("ZHIPU_BASE_URL") or "https://open.bigmodel.cn"
+        ).rstrip("/")
         url = f"{base_url}/api/paas/v4/web_search"
 
         payload: Dict[str, Any] = {

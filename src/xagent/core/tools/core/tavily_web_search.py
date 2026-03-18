@@ -15,6 +15,9 @@ logger = logging.getLogger(__name__)
 class TavilyWebSearchCore:
     """Pure Tavily web search tool without framework dependencies."""
 
+    def __init__(self, api_key: str | None = None) -> None:
+        self._api_key = api_key
+
     async def search(
         self,
         query: str,
@@ -41,7 +44,7 @@ class TavilyWebSearchCore:
             search_depth,
         )
 
-        api_key = os.getenv("TAVILY_API_KEY")
+        api_key = self._api_key or os.getenv("TAVILY_API_KEY")
         if not api_key:
             raise ValueError(
                 "Missing required environment variable TAVILY_API_KEY. "

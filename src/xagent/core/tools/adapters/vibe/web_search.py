@@ -34,8 +34,10 @@ class WebSearchTool(AbstractBaseTool):
     category = ToolCategory.BASIC
     """Framework wrapper for the pure web search tool"""
 
-    def __init__(self) -> None:
+    def __init__(self, api_key: str | None = None, cse_id: str | None = None) -> None:
         self._visibility = ToolVisibility.PUBLIC
+        self._api_key = api_key
+        self._cse_id = cse_id
 
     @property
     def name(self) -> str:
@@ -64,7 +66,7 @@ class WebSearchTool(AbstractBaseTool):
         search_args = WebSearchArgs.model_validate(args)
 
         # Create core searcher instance
-        searcher = WebSearchCore()
+        searcher = WebSearchCore(api_key=self._api_key, cse_id=self._cse_id)
 
         # Perform search
         results = await searcher.search(

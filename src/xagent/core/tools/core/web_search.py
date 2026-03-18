@@ -18,6 +18,10 @@ logger = logging.getLogger(__name__)
 class WebSearchCore:
     """Pure web search tool without framework dependencies"""
 
+    def __init__(self, api_key: str | None = None, cse_id: str | None = None) -> None:
+        self._api_key = api_key
+        self._cse_id = cse_id
+
     async def search(
         self,
         query: str,
@@ -40,8 +44,8 @@ class WebSearchCore:
             f"(num_results={num_results}, include_content={include_content})"
         )
 
-        api_key = os.getenv("GOOGLE_API_KEY")
-        cse_id = os.getenv("GOOGLE_CSE_ID")
+        api_key = self._api_key or os.getenv("GOOGLE_API_KEY")
+        cse_id = self._cse_id or os.getenv("GOOGLE_CSE_ID")
 
         if not api_key or not cse_id:
             raise ValueError(

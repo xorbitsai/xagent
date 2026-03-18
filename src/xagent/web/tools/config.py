@@ -9,6 +9,7 @@ import logging
 from typing import Any, Dict, List, Optional
 
 from ...core.tools.adapters.vibe.config import BaseToolConfig
+from ..services.tool_credentials import get_sql_connection_map, resolve_tool_credential
 
 
 class WebToolConfig(BaseToolConfig):
@@ -205,6 +206,12 @@ class WebToolConfig(BaseToolConfig):
     def get_sandbox(self) -> Optional[Any]:
         """Get sandbox instance. Returns None if not available."""
         return self._sandbox
+
+    def get_tool_credential(self, tool_name: str, field_name: str) -> Optional[str]:
+        return resolve_tool_credential(self.db, tool_name, field_name)
+
+    def get_sql_connections(self) -> Dict[str, str]:
+        return get_sql_connection_map(self.db)
 
     def set_sandbox(self, sandbox: Any) -> None:
         """Set sandbox instance for this config."""

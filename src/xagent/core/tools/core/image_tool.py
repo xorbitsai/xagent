@@ -52,26 +52,9 @@ Available models (⭐[DEFAULT] marks the configured default model):
 
 Parameters:
 - prompt (required): optimized image description with visual details
-- size (optional): image resolution in "width*height" format (e.g. "1024*1024", "1280*720", "1920*1080")
-- width (optional): image width in pixels (use with height for desired dimensions)
-- height (optional): image height in pixels (use with width for desired dimensions)
-- resolution (optional): image resolution in "WIDTHxHEIGHT" format (e.g. "1920x1080")
-- aspect_ratio (optional): aspect ratio (e.g. "1:1", "3:2", "16:9", "21:9") - overrides calculated aspect ratio from size
+- size (optional): image resolution (e.g. "1024x1024", "1280x720", "1920x1080")
 - negative_prompt (optional): undesired elements, auto-generated if empty
 - model_id (optional): model name from the list above. Omit to use the default model marked with ⭐[DEFAULT].
-
-**IMPORTANT NOTES ON IMAGE SIZES:**
-- Different models have different size capabilities and constraints
-- **Gemini models**: Use aspect ratio + size bucket system (1K/2K/4K). Exact pixel dimensions are converted to the closest supported ratio and bucket. Output dimensions may vary from requested dimensions.
-- **OpenAI models**: Support only specific preset sizes (256x256, 512x512, 1024x1024, etc.)
-- **DashScope models**: Support limited size options
-- **Xinference models**: Based on Stable Diffusion, may support more flexible dimensions
-
-Size parameter priority (highest to lowest):
-1. aspect_ratio + size (aspect_ratio determines ratio, size determines resolution bucket)
-2. width + height (desired dimensions, will be approximated to closest supported values)
-3. resolution (alternative dimension format)
-4. size (simple format)
 
 Images are automatically saved to workspace.
     """.strip()
@@ -100,7 +83,7 @@ Available models (⭐[DEFAULT] marks the configured default model):
 **IMPORTANT: Prefer the default model marked with ⭐[DEFAULT]. Only specify model_id if the user explicitly requests a different model.**
 
 Parameters:
-- image_url (required): single image path/URL/file_id (supports both `file_id` and `file:file_id`) or a list of image paths/URLs/file_ids for multi-image editing
+- image_url (required): single image path/URL or a list of image paths/URLs for multi-image editing
 - prompt (required): description of the desired edits and changes
 - negative_prompt (optional): undesired elements in the result
 - model_id (optional): model name from the list above. Omit to use the default model marked with ⭐[DEFAULT].
@@ -265,9 +248,6 @@ Images are automatically saved to workspace.
         Returns:
             str: Resolved image path/URL suitable for the image model
         """
-        if image_input.startswith("file:") and not image_input.startswith("file://"):
-            image_input = image_input[5:].strip()
-
         # Check if it's a URL (http/https)
         if image_input.startswith(("http://", "https://")):
             return image_input
@@ -378,8 +358,10 @@ Images are automatically saved to workspace.
                     content = base64.b64decode(data)
                 else:
                     content = parse.unquote_to_bytes(data)
-                with open(save_path, "wb") as f:
+                tmp_path = save_path.with_name(save_path.name + ".tmp")
+                with open(tmp_path, "wb") as f:
                     f.write(content)
+                os.replace(tmp_path, save_path)
                 logger.info(f"Saved data URL image to: {save_path}")
                 return str(save_path)
 
@@ -394,7 +376,9 @@ Images are automatically saved to workspace.
             if local_path is not None:
                 if not local_path.is_file():
                     raise RuntimeError(f"Local image path is not a file: {local_path}")
-                shutil.copyfile(local_path, save_path)
+                tmp_path = save_path.with_name(save_path.name + ".tmp")
+                shutil.copyfile(local_path, tmp_path)
+                os.replace(tmp_path, save_path)
                 logger.info(f"Copied local image to: {save_path}")
                 return str(save_path)
 
@@ -408,16 +392,41 @@ Images are automatically saved to workspace.
                         )
 
                     # Save the image
-                    with open(save_path, "wb") as f:
+                    tmp_path = save_path.with_name(save_path.name + ".tmp")
+                    with open(tmp_path, "wb") as f:
                         async for chunk in response.content.iter_chunked(8192):
                             f.write(chunk)
+                    os.replace(tmp_path, save_path)
 
             logger.info(f"Downloaded image to: {save_path}")
             return str(save_path)
 
         except Exception as e:
+            try:
+                tmp_path = save_path.with_name(save_path.name + ".tmp")
+                if tmp_path.exists():
+                    tmp_path.unlink(missing_ok=True)
+            except Exception:
+                pass
             logger.warning(f"Failed to download image from {image_url}: {e}")
             raise
+
+    def _to_workspace_file_ref(self, abs_path: str) -> Optional[str]:
+        """
+        Convert an absolute path under current task workspace into `file:` reference
+        that the xagent UI can preview, e.g. `file:web_task_123/output/a.png`.
+        """
+        if not self._workspace:
+            return None
+        try:
+            p = Path(abs_path).resolve()
+            root = self._workspace.workspace_dir.resolve()
+            if p == root or p.is_relative_to(root):
+                rel = p.relative_to(root).as_posix()
+                return f"file:{self._workspace.id}/{rel}"
+        except Exception:
+            return None
+        return None
 
     async def generate_image(
         self,
@@ -425,11 +434,6 @@ Images are automatically saved to workspace.
         size: str = "1024*1024",
         negative_prompt: str = "",
         model_id: Optional[str] = None,
-        width: Optional[int] = None,
-        height: Optional[int] = None,
-        resolution: Optional[str] = None,
-        aspect_ratio: Optional[str] = None,
-        **kwargs: Any,
     ) -> Dict[str, Any]:
         """
         Generate an image using the configured image model.
@@ -439,11 +443,8 @@ Images are automatically saved to workspace.
             size: Image size in format "width*height" (e.g., "1024*1024")
             negative_prompt: Negative prompt for image generation
             model_id: Specific model ID to use (optional, uses default if not provided)
-            width: Image width in pixels (alternative to size)
-            height: Image height in pixels (alternative to size)
-            resolution: Image resolution (e.g., "1920x1080")
-            aspect_ratio: Aspect ratio (e.g., "3:2", "16:9")
-            **kwargs: Additional model-specific parameters
+            save_to_workspace: Whether to download and save the image to workspace
+            **kwargs: Additional parameters specific to the model
 
         Returns:
             Dictionary with image generation result
@@ -460,28 +461,12 @@ Images are automatically saved to workspace.
                     "image_path": None,
                 }
 
-            # Build parameters for image generation
-            generate_params: dict[str, Any] = {
-                "prompt": prompt,
-                "size": size,
-                "negative_prompt": negative_prompt,
-            }
-
-            # Add optional parameters if provided
-            if width is not None:
-                generate_params["width"] = width
-            if height is not None:
-                generate_params["height"] = height
-            if resolution is not None:
-                generate_params["resolution"] = resolution
-            if aspect_ratio is not None:
-                generate_params["aspect_ratio"] = aspect_ratio
-
-            # Add any additional kwargs
-            generate_params.update(kwargs)
-
             # Generate the image
-            result = await image_model.generate_image(**generate_params)
+            result = await image_model.generate_image(
+                prompt=prompt,
+                size=size,
+                negative_prompt=negative_prompt,
+            )
 
             # Determine the actual model used
             actual_model_id = (
@@ -490,17 +475,14 @@ Images are automatically saved to workspace.
 
             image_url = result.get("image_url")
             image_path = None
-            image_file_id: Optional[str] = None
+            image_file = None
 
             # Download image to workspace if workspace is available
             if image_url and self._workspace:
                 try:
-                    with self._workspace.auto_register_files():
-                        image_path = await self._download_image(image_url)
-                        if image_path:
-                            image_file_id = self._workspace.get_file_id_from_path(
-                                image_path
-                            )
+                    image_path = await self._download_image(image_url)
+                    if image_path:
+                        image_file = self._to_workspace_file_ref(image_path)
                 except Exception as e:
                     logger.warning(f"Failed to download image to workspace: {e}")
                     # Continue execution even if download fails
@@ -511,7 +493,8 @@ Images are automatically saved to workspace.
                 "success": True,
                 "image_url": image_url,
                 "image_path": image_path,
-                "file_id": image_file_id,
+                "image_file": image_file,
+                "image_markdown": f"![generated image]({image_file})" if image_file else None,
                 "usage": result.get("usage", {}),
                 "task_metric": result.get("task_metric", {}),
                 "request_id": result.get("request_id"),
@@ -530,6 +513,8 @@ Images are automatically saved to workspace.
                 "error": str(e),
                 "image_url": None,
                 "image_path": None,
+                "image_file": None,
+                "image_markdown": None,
                 "model_used": actual_model_id,
             }
 
@@ -586,21 +571,16 @@ Images are automatically saved to workspace.
 
             edited_image_url = result.get("image_url")
             image_path = None
-            image_file_id: Optional[str] = None
+            image_file = None
 
             # Download image to workspace if workspace is available
             if edited_image_url and self._workspace:
                 try:
                     # Use a different filename pattern for edited images
                     filename = f"edited_image_{uuid.uuid4().hex[:8]}.png"
-                    with self._workspace.auto_register_files():
-                        image_path = await self._download_image(
-                            edited_image_url, filename
-                        )
-                        if image_path:
-                            image_file_id = self._workspace.get_file_id_from_path(
-                                image_path
-                            )
+                    image_path = await self._download_image(edited_image_url, filename)
+                    if image_path:
+                        image_file = self._to_workspace_file_ref(image_path)
                 except Exception as e:
                     logger.warning(f"Failed to download edited image to workspace: {e}")
                     # Continue execution even if download fails
@@ -611,7 +591,8 @@ Images are automatically saved to workspace.
                 "success": True,
                 "image_url": edited_image_url,
                 "image_path": image_path,
-                "file_id": image_file_id,
+                "image_file": image_file,
+                "image_markdown": f"![edited image]({image_file})" if image_file else None,
                 "usage": result.get("usage", {}),
                 "task_metric": result.get("task_metric", {}),
                 "request_id": result.get("request_id"),
@@ -628,6 +609,8 @@ Images are automatically saved to workspace.
                 "error": str(e),
                 "image_url": None,
                 "image_path": None,
+                "image_file": None,
+                "image_markdown": None,
                 "model_used": actual_model_id,
             }
 

@@ -17,9 +17,32 @@ export function FilePreviewContent({ open }: FilePreviewContentProps) {
   const { filePreview } = state
   const { t } = useI18n()
 
+  // When on a task page, paths like "output/foo.png" need to be under web_task_<id> for the API
+  const effectiveFilePath = (() => {
+    if (!filePreview.filePath || !state.taskId) return filePreview.filePath
+
+    // If path doesn't include web_task_, prepend it
+    if (!filePreview.filePath.includes('web_task_')) {
+      return `web_task_${state.taskId}/${filePreview.filePath}`
+    }
+
+    // Path already has web_task_ prefix - ensure it has output/ subdirectory
+    // Handle cases like "web_task_77/generated_image_xxx.jpg" -> "web_task_77/output/generated_image_xxx.jpg"
+    const webTaskMatch = filePreview.filePath.match(/^(web_task_\d+\/)(.+)$/)
+    if (webTaskMatch) {
+      const [, webTaskPrefix, subPath] = webTaskMatch
+      // If the subpath doesn't start with "output/" or other known directories, insert "output/"
+      if (!subPath.startsWith('output/') && !subPath.startsWith('input/') && !subPath.startsWith('temp/')) {
+        return `${webTaskPrefix}output/${subPath}`
+      }
+    }
+
+    return filePreview.filePath
+  })()
+
   // Load file content when the preview is open within container
   useEffect(() => {
-    if (open && filePreview.fileId && !filePreview.content && !filePreview.error) {
+    if (open && effectiveFilePath && !filePreview.content && !filePreview.error) {
       const loadFileContent = async () => {
         try {
           const apiUrl = getApiUrl()
@@ -29,7 +52,19 @@ export function FilePreviewContent({ open }: FilePreviewContentProps) {
           const isPdf = isPptx || filePreview.fileName.match(/\.pdf$/i)
           const isDocx = filePreview.fileName.match(/\.docx$/i)
 
-          const url = `${apiUrl}/api/files/preview/${filePreview.fileId}`
+          const absolutePath = effectiveFilePath.startsWith('/')
+            ? effectiveFilePath.substring(1)
+            : effectiveFilePath
+
+          // Prefer no-auth endpoints for task output previews to avoid 401 when tokens are missing/expired.
+          // - PPTX needs conversion -> /api/files/preview/{taskId}/{path}
+          // - Other files -> /api/files/public/preview/{taskId}/{path}
+          const url =
+            state.taskId
+              ? isPptx
+                ? `${apiUrl}/api/files/preview/${state.taskId}/${encodeURIComponent(absolutePath)}`
+                : `${apiUrl}/api/files/public/preview/${state.taskId}/${encodeURIComponent(absolutePath)}`
+              : `${apiUrl}/api/files/download/${encodeURIComponent(absolutePath)}`
 
           const response = await apiRequest(url, {
             cache: 'no-cache',
@@ -41,45 +76,26 @@ export function FilePreviewContent({ open }: FilePreviewContentProps) {
 
           if (response.ok) {
             let fileContent
+            if (isDocx || isPdf || filePreview.fileName.match(/\.(jpg|jpeg|png|gif|webp|svg)$/i)) {
+              const arrayBuffer = await response.arrayBuffer()
 
-            // Get MIME type from response headers (more reliable than file extension)
-            const contentType = response.headers.get('content-type') || ''
-            const mimeType = contentType.split(';')[0].trim()
+              const chunkSize = 16384
+              const bytes = new Uint8Array(arrayBuffer)
+              let binary = ''
 
-          // Determine file type based on MIME type instead of file extension
-          const isImage = mimeType.startsWith('image/')
-          const isPdf = mimeType.startsWith('application/pdf') || mimeType === 'application/pdf'
-          const isDocx = mimeType === 'application/vnd.openxmlformats-officedocument.wordprocessingml.document'
+              for (let i = 0; i < bytes.length; i += chunkSize) {
+                const chunk = bytes.slice(i, i + chunkSize)
+                binary += String.fromCharCode.apply(null, Array.from(chunk))
+              }
 
-          console.log('File preview debug:', {
-            fileName: filePreview.fileName,
-            mimeType,
-            isImage,
-            isDocx,
-            isPdf,
-            contentType: response.headers.get('content-type')
-          })
-
-          if (isImage || isPdf || isDocx || filePreview.fileName.match(/\.(docx|pdf|jpg|jpeg|png|gif|webp|svg|pptx)$/i)) {
-            const arrayBuffer = await response.arrayBuffer()
-
-            // Use modern, efficient base64 conversion
-            const bytes = new Uint8Array(arrayBuffer)
-            const binaryString = Array.from(bytes, (byte) => String.fromCharCode(byte)).join('')
-            fileContent = btoa(binaryString)
-
-            console.log('Base64 conversion completed:', {
-              mimeType,
-              originalSize: arrayBuffer.byteLength,
-              base64Size: fileContent.length
-            })
+              fileContent = btoa(binary)
             } else {
               fileContent = await response.text()
             }
 
             dispatch({
               type: "SET_FILE_PREVIEW_CONTENT",
-              payload: { content: fileContent, mimeType, error: null }
+              payload: { content: fileContent, error: null }
             })
           } else {
             dispatch({
@@ -105,19 +121,38 @@ export function FilePreviewContent({ open }: FilePreviewContentProps) {
 
       loadFileContent()
     }
-  }, [open, filePreview.fileId, filePreview.content, filePreview.error, dispatch, t, filePreview.fileName])
+  }, [open, effectiveFilePath, filePreview.content, filePreview.error, dispatch, t, filePreview.fileName])
 
-  const processHtmlContent = (htmlContent: string, fileId: string) => {
-    if (!htmlContent || !fileId) return htmlContent
+  const processHtmlContent = (htmlContent: string, pathForRewrite: string) => {
+    if (!htmlContent || !pathForRewrite) return htmlContent
 
+    const dirPath = pathForRewrite.substring(0, pathForRewrite.lastIndexOf('/'))
     const apiUrl = getApiUrl()
+
+    // Extract task_id from path (e.g., "web_task_78/output/file.html" -> "78"); when on task page use state.taskId
+    const taskIdMatch = pathForRewrite.match(/web_task_(\d+)/)
+    const taskId = taskIdMatch ? taskIdMatch[1] : (state.taskId ? String(state.taskId) : null)
 
     return htmlContent.replace(
       /(src|href)=["']([^"']+)["']/g,
       (match, attr, path) => {
         if (path.match(/^(https?:\/|data:|\/\/|#)/)) return match
 
-        return `${attr}="${apiUrl}/api/files/public/preview/${encodeURIComponent(fileId)}?relative_path=${encodeURIComponent(path)}"`
+        // If HTML hardcodes the backend preview endpoints, append task_id so compat routes can resolve.
+        // Example: /api/files/preview/screenshot.png  -> /api/files/preview/screenshot.png?task_id=78
+        if (taskId && (path.startsWith('/api/files/preview/') || path.startsWith('/api/files/public/preview/'))) {
+          const sep = path.includes('?') ? '&' : '?'
+          return `${attr}="${apiUrl}${path}${sep}task_id=${encodeURIComponent(taskId)}"`
+        }
+
+        const absolutePath = path.startsWith('/') ? path.substring(1) : `${dirPath}/${path}`
+
+        // Use public preview API if taskId is available, otherwise use download API
+        if (taskId) {
+          return `${attr}="${apiUrl}/api/files/public/preview/${taskId}/${encodeURIComponent(absolutePath)}"`
+        } else {
+          return `${attr}="${apiUrl}/api/files/download/${encodeURIComponent(absolutePath)}"`
+        }
       }
     )
   }
@@ -141,14 +176,30 @@ export function FilePreviewContent({ open }: FilePreviewContentProps) {
           </div>
         ) : (
           <div className="flex-1 overflow-auto bg-muted/30 rounded border">
-            {filePreview.mimeType?.startsWith('image/') ? (
+            {filePreview.fileName.toLowerCase().endsWith('.docx') ? (
+              <DocxPreviewRenderer base64Content={filePreview.content || ''} />
+            ) : filePreview.fileName.endsWith('.html') || filePreview.fileName.endsWith('.htm') ? (
+              <iframe
+                srcDoc={processHtmlContent(filePreview.content, effectiveFilePath || filePreview.filePath)}
+                className="w-full h-full border-0"
+                sandbox="allow-scripts"
+                title={filePreview.fileName}
+              />
+            ) : filePreview.fileName.toLowerCase().endsWith('.pdf') || filePreview.fileName.toLowerCase().endsWith('.pptx') ? (
+              <div className="flex items-center justify-center h-full p-4">
+                <iframe
+                  src={`data:application/pdf;base64,${filePreview.content || ''}`}
+                  className="w-full h-full border-0"
+                  title={filePreview.fileName}
+                />
+              </div>
+            ) : filePreview.fileName.match(/\.(jpg|jpeg|png|gif|webp|svg)$/i) ? (
               <div className="flex items-center justify-center h-full p-4">
                 <img
-                  src={`data:${filePreview.mimeType};base64,${filePreview.content || ''}`}
+                  src={`data:image/${filePreview.fileName.split('.').pop()};base64,${filePreview.content || ''}`}
                   alt={filePreview.fileName}
                   className="max-w-full max-h-full object-contain"
                   onError={(e) => {
-                    console.error('Image load error:', e)
                     e.currentTarget.style.display = 'none'
                     const fallback = e.currentTarget.nextElementSibling as HTMLElement
                     if (fallback) fallback.style.display = 'flex'
@@ -159,23 +210,6 @@ export function FilePreviewContent({ open }: FilePreviewContentProps) {
                   <span className="text-sm">{t('files.previewDialog.imageError.hint')}</span>
                 </div>
               </div>
-            ) : filePreview.mimeType === 'application/pdf' || filePreview.fileName.toLowerCase().endsWith('.pdf') || filePreview.fileName.toLowerCase().endsWith('.pptx') ? (
-              <div className="flex items-center justify-center h-full p-4">
-                <iframe
-                  src={`data:application/pdf;base64,${filePreview.content || ''}`}
-                  className="w-full h-full border-0"
-                  title={filePreview.fileName}
-                />
-              </div>
-            ) : filePreview.mimeType?.includes('wordprocessingml') || filePreview.fileName.toLowerCase().endsWith('.docx') ? (
-              <DocxPreviewRenderer base64Content={filePreview.content || ''} />
-            ) : filePreview.fileName.endsWith('.html') || filePreview.fileName.endsWith('.htm') ? (
-              <iframe
-                srcDoc={processHtmlContent(filePreview.content, filePreview.fileId)}
-                className="w-full h-full border-0"
-                sandbox="allow-same-origin allow-scripts"
-                title={filePreview.fileName}
-              />
             ) : (
               <pre className="p-4 text-sm font-mono whitespace-pre-wrap break-words">
                 {filePreview.content || t('files.previewDialog.emptyContent')}

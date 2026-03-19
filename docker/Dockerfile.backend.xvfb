@@ -1,0 +1,25 @@
+# 在官方后端镜像基础上安装 Xvfb，并用 xvfb-run 启动，使浏览器/网页截图在无显示器环境下可用
+# 使用方式：docker compose build backend && docker compose up -d
+ARG BACKEND_IMAGE=xprobe/xagent-backend:latest
+FROM ${BACKEND_IMAGE}
+
+USER root
+
+# 确保能找到 venv 中的可执行文件（如 xagent-web、playwright 等）
+ENV VIRTUAL_ENV=/opt/venv
+ENV PATH="/opt/venv/bin:${PATH}"
+
+# 安装 Xvfb（虚拟 X server）及 xauth（xvfb-run 依赖）
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends xvfb xauth \
+    && rm -rf /var/lib/apt/lists/*
+
+# 把运行期需要的 Python 依赖烘焙进镜像，避免每次启动 pip install 导致后端起不来/登录异常
+RUN /opt/venv/bin/python -m pip install -q --no-cache-dir \
+    tencentcloud-sdk-python-common \
+    tencentcloud-sdk-python-wimgs
+
+# 固定 entrypoint：设置 PATH 后用 xvfb-run 启动后端（无需 compose command 拼接）
+COPY docker/entrypoint-xvfb-wrapper.sh /opt/xagent/deploy/entrypoint-xvfb-wrapper.sh
+RUN chmod +x /opt/xagent/deploy/entrypoint-xvfb-wrapper.sh
+ENTRYPOINT ["/opt/xagent/deploy/entrypoint-xvfb-wrapper.sh"]

@@ -60,10 +60,18 @@ class ImageWebSearchTool(AbstractBaseTool):
 
     @property
     def description(self) -> str:
-        return """Search the web for images using Google Search.
-        Returns image results with URLs, metadata, and local file paths when saved to workspace.
-        Images are automatically downloaded and saved to the workspace temp directory.
-        Useful for finding reference images, stock photos, and visual content."""
+        return """Search the web for images.
+        Provider is selected by env `IMAGE_SEARCH_PROVIDER`:
+        - `tencent` (recommended in China): Tencent Cloud Web Image Search (联网图像搜索)
+        - `google`: Google Custom Search (may require proxy in China)
+
+        Results include:
+        - `image_link` / `context_link` (original URLs)
+        - `local_path` (downloaded into workspace temp when save_to_workspace=true)
+        - `file_ref` (UI-previewable path, e.g. `file:web_task_123/temp/xxx.jpg`)
+
+        To display an image in the final answer, use Markdown:
+        - `![desc](file:web_task_123/temp/xxx.jpg)`"""
 
     @property
     def tags(self) -> list[str]:
@@ -112,6 +120,26 @@ class ImageWebSearchTool(AbstractBaseTool):
                 image_type=search_args.image_type,
                 save_images=search_args.save_to_workspace,
             )
+
+        # Add UI-previewable file reference if workspace is available
+        if self._workspace:
+            try:
+                root = Path(self._workspace.workspace_dir).resolve()
+                for item in results:
+                    lp = item.get("local_path")
+                    if not lp:
+                        continue
+                    try:
+                        p = Path(str(lp)).resolve()
+                        if p == root or p.is_relative_to(root):
+                            rel = p.relative_to(root).as_posix()
+                            item["file_ref"] = f"file:{self._workspace.id}/{rel}"
+                            title = item.get("title") or "image"
+                            item["image_markdown"] = f"![{title}]({item['file_ref']})"
+                    except Exception:
+                        continue
+            except Exception:
+                pass
 
         return ImageWebSearchResult(results=results).model_dump()
 

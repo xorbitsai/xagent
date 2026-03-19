@@ -1,7 +1,7 @@
 "use client";
 
 import { useState, useRef, useEffect, Suspense, useCallback, useMemo } from "react";
-import { GitMerge, Bot, Download, ArrowLeft, Loader2, Sparkles, FolderOpen } from "lucide-react";
+import { GitMerge, Bot, Download, ArrowLeft, Loader2, Sparkles } from "lucide-react";
 import { ChatMessage } from "@/components/chat/ChatMessage";
 import { ChatInput } from "@/components/chat/ChatInput";
 import { Button } from "@/components/ui/button";
@@ -11,7 +11,6 @@ import { useParams, useRouter } from "next/navigation"
 import { PreviewSheet } from "@/components/preview-sheet";
 import { FilePreviewContent } from "@/components/file-preview-content";
 import { TokenUsageDisplay } from "@/components/chat/TokenUsageDisplay";
-import { TaskFileManager } from "@/components/task-file-manager";
 import { getApiUrl } from "@/lib/utils";
 import { apiRequest } from "@/lib/api-wrapper";
 import type React from "react";
@@ -22,6 +21,7 @@ function TaskDetailContent() {
   const { state, sendMessage, setTaskId, openFilePreview, closeFilePreview, requestStatus, dispatch, pauseTask, resumeTask } = useApp();
   const { t } = useI18n();
   const [files, setFiles] = useState<File[]>([]);
+  const [inputValue, setInputValue] = useState("");
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const params = useParams();
   const router = useRouter();
@@ -118,9 +118,14 @@ function TaskDetailContent() {
 
   const handleDownload = async () => {
     try {
-      if (!state.filePreview.fileId) return;
+      if (!state.filePreview.filePath) return;
+      const filePath = state.filePreview.filePath;
+      const effectivePath =
+        state.taskId && !filePath.includes('web_task_')
+          ? `web_task_${state.taskId}/${filePath}`
+          : filePath;
 
-      const response = await apiRequest(`${getApiUrl()}/api/files/download/${state.filePreview.fileId}`);
+      const response = await apiRequest(`${getApiUrl()}/api/files/download/${encodeURIComponent(effectivePath)}`);
 
       if (!response.ok) {
         throw new Error(`Download failed: ${response.statusText}`);
@@ -373,6 +378,7 @@ function TaskDetailContent() {
                       showProcessView={true}
                       isVirtual
                       taskStatus={state.currentTask?.status}
+                      isPlanning={isPlanning}
                     />
                   )}
                 </>
@@ -399,19 +405,6 @@ function TaskDetailContent() {
                   {t("chatPage.executionPlan.title")}
                 </div>
               )}
-
-              <TaskFileManager
-                taskId={state.taskId}
-                onPreview={(fileId, fileName) => openFilePreview(fileId, fileName)}
-              >
-                <div
-                  className="ml-2 inline-flex items-center gap-1 rounded-xl border bg-card/80 backdrop-blur p-2 cursor-pointer hover:bg-muted/30 transition-colors text-sm"
-                  title={t("files.header.title")}
-                >
-                  <FolderOpen className="w-3.5 h-3.5" />
-                  {t("files.header.title")}
-                </div>
-              </TaskFileManager>
 
               <div className="ml-auto">
                 <TokenUsageDisplay
@@ -466,10 +459,7 @@ function TaskDetailContent() {
                 setDagPreviewOpen(false);
               }
             }}
-            title={
-              state.filePreview.isOpen ? <>{state.filePreview.fileName}</> :
-              t("chatPage.executionPlan.title")
-            }
+            title={state.filePreview.isOpen ? <>{state.filePreview.fileName}</> : t("chatPage.executionPlan.title")}
             actions={state.filePreview.isOpen ? (
               <Button
                 variant="outline"

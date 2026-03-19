@@ -20,15 +20,29 @@ export function FilePreviewDialog({ open, onOpenChange }: FilePreviewDialogProps
   const { filePreview } = state
   const { t } = useI18n()
 
-  // Extract the base filename from filePath if fileName contains path separators
-  // This ensures we use just "image.jpeg" not "web_task_235/output/image.jpeg"
-  const baseFileName = filePreview.fileName.includes('/')
-    ? filePreview.fileName.split('/').pop() || filePreview.fileName
-    : filePreview.fileName
+
+  // Normalize file path to ensure output/ directory is included
+  const normalizedFilePath = (() => {
+    const filePath = filePreview.filePath
+    if (!filePath) return filePath
+
+    // Path already has web_task_ prefix - ensure it has output/ subdirectory
+    // Handle cases like "web_task_77/generated_image_xxx.jpg" -> "web_task_77/output/generated_image_xxx.jpg"
+    const webTaskMatch = filePath.match(/^(web_task_\d+\/)(.+)$/)
+    if (webTaskMatch) {
+      const [, webTaskPrefix, subPath] = webTaskMatch
+      // If the subpath doesn't start with "output/" or other known directories, insert "output/"
+      if (!subPath.startsWith('output/') && !subPath.startsWith('input/') && !subPath.startsWith('temp/')) {
+        return `${webTaskPrefix}output/${subPath}`
+      }
+    }
+
+    return filePath
+  })()
 
   // Load file content when dialog opens
   useEffect(() => {
-    if (open && filePreview.fileId && !filePreview.content && !filePreview.error) {
+    if (open && normalizedFilePath && !filePreview.content && !filePreview.error) {
       const loadFileContent = async () => {
         try {
           const apiUrl = getApiUrl()
@@ -40,9 +54,31 @@ export function FilePreviewDialog({ open, onOpenChange }: FilePreviewDialogProps
 
           let url: string
           if (isPptxFile) {
-            url = `${apiUrl}/api/files/preview/${encodeURIComponent(filePreview.fileId)}`
+            // Extract task ID from file path for preview endpoint
+            // Format: web_task_103/output/file.pptx
+            const pathMatch = normalizedFilePath.match(/web_task_(\d+)/)
+            if (pathMatch && pathMatch[1]) {
+              const taskId = pathMatch[1]
+              const absolutePath = normalizedFilePath.startsWith('/')
+                ? normalizedFilePath.substring(1)
+                : normalizedFilePath
+              url = `${apiUrl}/api/files/preview/${taskId}/${encodeURIComponent(absolutePath)}`
+            } else {
+              // Fallback to download endpoint for files without task ID
+              url = `${apiUrl}/api/files/download/${encodeURIComponent(normalizedFilePath)}`
+            }
           } else {
-            url = `${apiUrl}/api/files/download/${encodeURIComponent(filePreview.fileId)}`
+            // Prefer public preview for task output files (no auth required)
+            const pathMatch = normalizedFilePath.match(/web_task_(\d+)/)
+            if (pathMatch && pathMatch[1]) {
+              const taskId = pathMatch[1]
+              const absolutePath = normalizedFilePath.startsWith('/')
+                ? normalizedFilePath.substring(1)
+                : normalizedFilePath
+              url = `${apiUrl}/api/files/public/preview/${taskId}/${encodeURIComponent(absolutePath)}`
+            } else {
+              url = `${apiUrl}/api/files/download/${encodeURIComponent(normalizedFilePath)}`
+            }
           }
 
           const response = await apiRequest(url, {
@@ -61,8 +97,9 @@ export function FilePreviewDialog({ open, onOpenChange }: FilePreviewDialogProps
             if (isPptxFile) {
               // PPTX preview endpoint returns HTML
               fileContent = await response.text()
-            } else if (isDocxFile || baseFileName.match(/\.(jpg|jpeg|png|gif|webp|svg|pdf)$/i)) {
+            } else if (isDocxFile || filePreview.fileName.match(/\.(jpg|jpeg|png|gif|webp|svg|pdf)$/i)) {
               const arrayBuffer = await response.arrayBuffer()
+              console.log('Debug: ArrayBuffer size:', arrayBuffer.byteLength)
 
               // Convert binary data to base64 using chunks to avoid stack overflow
               const chunkSize = 16384; // 16KB chunks
@@ -110,13 +147,27 @@ export function FilePreviewDialog({ open, onOpenChange }: FilePreviewDialogProps
 
       loadFileContent()
     }
-  }, [open, filePreview.fileId, filePreview.content, filePreview.error, filePreview.fileName, dispatch])
+  }, [open, filePreview.filePath, filePreview.content, filePreview.error, filePreview.fileName, dispatch])
 
   // Convert relative paths in HTML to absolute paths
-  const processHtmlContent = (htmlContent: string, fileId: string) => {
-    if (!htmlContent || !fileId) return htmlContent
+  const processHtmlContent = (htmlContent: string, filePath: string) => {
+    if (!htmlContent || !filePath) return htmlContent
 
+    // Get the directory path of the HTML file
+    const dirPath = filePath.substring(0, filePath.lastIndexOf('/'))
     const apiUrl = getApiUrl()
+
+    // Extract task ID from file path for public preview endpoint
+    // Format: web_task_103/output/file.html
+    let taskId: string | null = null
+    const pathMatch = filePath.match(/web_task_(\d+)/)
+    if (pathMatch && pathMatch[1]) {
+      taskId = pathMatch[1]
+    }
+
+    // Debug log
+    console.log('[FilePreviewDialog processHtmlContent] filePath:', filePath)
+    console.log('[FilePreviewDialog processHtmlContent] taskId:', taskId)
 
     // Replace relative paths for images, scripts, links, etc.
     return htmlContent.replace(
@@ -127,7 +178,23 @@ export function FilePreviewDialog({ open, onOpenChange }: FilePreviewDialogProps
           return match
         }
 
-        const newUrl = `${apiUrl}/api/files/public/preview/${encodeURIComponent(fileId)}?relative_path=${encodeURIComponent(path)}`
+        // If HTML hardcodes the backend preview endpoints, append task_id so compat routes can resolve.
+        if (taskId && (path.startsWith('/api/files/preview/') || path.startsWith('/api/files/public/preview/'))) {
+          const sep = path.includes('?') ? '&' : '?'
+          return `${attr}="${apiUrl}${path}${sep}task_id=${encodeURIComponent(taskId)}"`
+        }
+
+        // Convert relative path to absolute path
+        const absolutePath = path.startsWith('/')
+          ? path.substring(1) // Remove leading slash
+          : `${dirPath}/${path}`
+
+        // Use public preview endpoint if task ID is available
+        const newUrl = taskId
+          ? `${apiUrl}/api/files/public/preview/${taskId}/${encodeURIComponent(absolutePath)}`
+          : `${apiUrl}/api/files/download/${encodeURIComponent(absolutePath)}`
+
+        console.log(`[FilePreviewDialog] Replacing ${path} -> ${newUrl}`)
 
         return `${attr}="${newUrl}"`
       }
@@ -135,9 +202,9 @@ export function FilePreviewDialog({ open, onOpenChange }: FilePreviewDialogProps
   }
 
   const handleDownload = async () => {
-    if (filePreview.fileId) {
+    if (filePreview.filePath) {
       try {
-        const response = await apiRequest(`${getApiUrl()}/api/files/download/${encodeURIComponent(filePreview.fileId)}`)
+        const response = await apiRequest(`${getApiUrl()}/api/files/download/${encodeURIComponent(filePreview.filePath)}`)
 
         if (!response.ok) {
           throw new Error(`Download failed: ${response.statusText}`)
@@ -165,17 +232,37 @@ export function FilePreviewDialog({ open, onOpenChange }: FilePreviewDialogProps
   }
 
   const handleOpenInNewWindow = () => {
-    if (filePreview.fileId) {
+    if (filePreview.filePath) {
+      // Extract task ID from file path for public preview
+      let taskId: string | null = null
+      const pathMatch = filePreview.filePath.match(/web_task_(\d+)/)
+      if (pathMatch && pathMatch[1]) {
+        taskId = pathMatch[1]
+      }
+
       // Check if this is a PPTX file
       const isPptxFile = filePreview.fileName.toLowerCase().endsWith('.pptx') ||
                         filePreview.fileName.toLowerCase().endsWith('.ppt')
 
+      // Construct URL based on file type and task ID availability
       let fileUrl: string
-      const apiUrl = getApiUrl()
-      if (isPptxFile) {
-        fileUrl = `${apiUrl}/api/files/preview/${encodeURIComponent(filePreview.fileId)}`
+      if (taskId) {
+        const apiUrl = getApiUrl()
+        const absolutePath = filePreview.filePath.startsWith('/')
+          ? filePreview.filePath.substring(1)
+          : filePreview.filePath
+
+        if (isPptxFile) {
+          // Use preview endpoint for PPTX files (returns HTML)
+          fileUrl = `${apiUrl}/api/files/preview/${taskId}/${encodeURIComponent(absolutePath)}`
+        } else {
+          // Use public preview endpoint for other files
+          fileUrl = `${apiUrl}/api/files/public/preview/${taskId}/${encodeURIComponent(absolutePath)}`
+        }
       } else {
-        fileUrl = `${apiUrl}/api/files/public/preview/${encodeURIComponent(filePreview.fileId)}`
+        // Fallback to download endpoint (requires authentication)
+        const apiUrl = getApiUrl()
+        fileUrl = `${apiUrl}/api/files/download/${encodeURIComponent(filePreview.filePath)}`
       }
 
       // Open in new window/tab
@@ -313,16 +400,16 @@ export function FilePreviewDialog({ open, onOpenChange }: FilePreviewDialogProps
                 <iframe
                   srcDoc={filePreview.content || ''}
                   className="w-full h-full border-0"
-                  sandbox="allow-same-origin allow-scripts"
+                  sandbox="allow-scripts"
                   title={filePreview.fileName}
                 />
               ) : filePreview.fileName.toLowerCase().endsWith('.docx') ? (
                 <DocxPreviewRenderer base64Content={filePreview.content || ''} />
               ) : filePreview.fileName.endsWith('.html') || filePreview.fileName.endsWith('.htm') ? (
                 <iframe
-                  srcDoc={processHtmlContent(filePreview.content, filePreview.fileId)}
+                  srcDoc={processHtmlContent(filePreview.content, normalizedFilePath)}
                   className="w-full h-full border-0"
-                  sandbox="allow-same-origin allow-scripts"
+                  sandbox="allow-scripts"
                   title={filePreview.fileName}
                 />
               ) : filePreview.fileName.toLowerCase().endsWith('.pdf') ? (
@@ -333,11 +420,11 @@ export function FilePreviewDialog({ open, onOpenChange }: FilePreviewDialogProps
                     title={filePreview.fileName}
                   />
                 </div>
-              ) : baseFileName.match(/\.(jpg|jpeg|png|gif|webp|svg)$/i) ? (
+              ) : filePreview.fileName.match(/\.(jpg|jpeg|png|gif|webp|svg)$/i) ? (
                 <div className="flex items-center justify-center h-full p-4">
                   <img
-                    src={`data:image/${baseFileName.split('.').pop()};base64,${filePreview.content || ''}`}
-                    alt={baseFileName}
+                    src={`data:image/${filePreview.fileName.split('.').pop()};base64,${filePreview.content || ''}`}
+                    alt={filePreview.fileName}
                     className="max-w-full max-h-full object-contain"
                     onError={(e) => {
                       e.currentTarget.style.display = 'none'

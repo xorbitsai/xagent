@@ -1,0 +1,14 @@
+# 由 start.sh 将 __SCRIPT_DIR__ 替换为实际路径后生成 nginx.conf，避免写 /var/log/nginx 权限错误
+worker_processes 1;
+error_log __SCRIPT_DIR__/logs/nginx-proxy-error.log;
+pid        __SCRIPT_DIR__/nginx-proxy.pid;
+
+events {
+    worker_connections 1024;
+}
+
+http {
+    default_type  application/octet-stream;
+    access_log __SCRIPT_DIR__/logs/nginx-proxy-access.log;
+    include       __SCRIPT_DIR__/xagent-proxy.generated.conf;
+}

@@ -16,7 +16,10 @@ services:
 
   # Xagent Frontend (Next.js)
   frontend:
-    image: xprobe/xagent-frontend:0.2.0
+    build:
+      context: ./frontend
+      dockerfile: ../docker/Dockerfile.frontend
+    image: xagent-frontend:local
     container_name: xagent_frontend
     restart: unless-stopped
     networks:
@@ -28,21 +31,40 @@ services:
       retries: 3
       start_period: 10s
 
-  # Xagent Backend (FastAPI)
+  # Xagent Backend (FastAPI)，使用带 Xvfb 的镜像以便浏览器/网页截图在无显示器环境运行
   backend:
-    image: xprobe/xagent-backend:0.2.0
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.backend.xvfb
+      args:
+        BACKEND_IMAGE: xprobe/xagent-backend:latest
+    image: xagent-backend:xvfb
     container_name: xagent_backend
     restart: unless-stopped
+    # 使容器能访问宿主机上的服务（如宿主机上的 xinference）
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     # Don't expose ports, only accessible through nginx
     environment:
       - DATABASE_URL=postgresql://xagent:${POSTGRES_PASSWORD:-xagent_password}@postgres:5432/xagent
       - POSTGRES_PASSWORD=${POSTGRES_PASSWORD:-xagent_password}
       - BACKEND_PORT=8000
-      - XAGENT_UPLOADS_DIR=/root/.xagent/uploads
     env_file:
       - .env
     volumes:
-      - xagent_data:/root/.xagent
+      - xagent_data:/home/xagent/.xagent
+      - xagent_uploads:/opt/xagent/src/xagent/web/uploads
+      - xagent_lancedb:/opt/xagent/data
+      - xagent_memory:/opt/xagent/memory_store
+      - ./src/xagent/core/tools/core/image_web_search.py:/opt/venv/lib/python3.11/site-packages/xagent/core/tools/core/image_web_search.py:ro
+      - ./src/xagent/core/tools/core/image_tool.py:/opt/venv/lib/python3.11/site-packages/xagent/core/tools/core/image_tool.py:ro
+      - ./src/xagent/core/tools/adapters/vibe/image_web_search.py:/opt/venv/lib/python3.11/site-packages/xagent/core/tools/adapters/vibe/image_web_search.py:ro
+      - ./src/xagent/web/api/files.py:/opt/venv/lib/python3.11/site-packages/xagent/web/api/files.py:ro
+      # 确保容器内从源码路径加载时也使用修复后的 files.py（图片内存返回、兼容路由）
+      - ./src/xagent/web/api/files.py:/opt/xagent/src/xagent/web/api/files.py:ro
+      # 登录用户名大小写不敏感
+      - ./src/xagent/web/api/auth.py:/opt/venv/lib/python3.11/site-packages/xagent/web/api/auth.py:ro
+      - ./src/xagent/web/api/auth.py:/opt/xagent/src/xagent/web/api/auth.py:ro
     depends_on:
       postgres:
         condition: service_healthy
@@ -79,6 +101,12 @@ volumes:
   postgres_data:
     driver: local
   xagent_data:
+    driver: local
+  xagent_uploads:
+    driver: local
+  xagent_lancedb:
+    driver: local
+  xagent_memory:
     driver: local
 
 networks:

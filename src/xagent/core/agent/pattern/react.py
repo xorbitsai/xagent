@@ -1644,9 +1644,28 @@ Failed final answer:
         }
 
     def _ensure_action_type(self, action_data: Dict[str, Any]) -> Dict[str, Any]:
-        """Infer missing action 'type' from common fields."""
+        """
+        Infer missing action 'type' from common fields.
+        Also normalize common tool-name field variants to 'tool_name' to be resilient across model formats.
+        """
         if action_data.get("type"):
             return action_data
+
+        # Normalize tool name fields (LLMs often use different keys)
+        if not action_data.get("tool_name"):
+            candidate = (
+                action_data.get("tool")
+                or action_data.get("toolName")
+                or action_data.get("tool_name")
+                or action_data.get("name")
+                or action_data.get("function_name")
+            )
+            if isinstance(candidate, dict):
+                # e.g. {"tool": {"name": "...", "arguments": {...}}}
+                candidate = candidate.get("name") or candidate.get("tool_name")
+            if isinstance(candidate, str) and candidate.strip():
+                action_data = dict(action_data)
+                action_data["tool_name"] = candidate.strip()
 
         inferred: Optional[str] = None
         if action_data.get("tool_name") or action_data.get("tool_args"):

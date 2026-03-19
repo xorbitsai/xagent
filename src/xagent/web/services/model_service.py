@@ -6,8 +6,10 @@ across the xagent system with multi-tenant support.
 """
 
 import logging
+import os
 from typing import Any, Dict, Optional
 
+from sqlalchemy import Text, cast
 from sqlalchemy.orm import Session
 
 from xagent.core.model.image.base import BaseImageModel
@@ -19,6 +21,34 @@ from ...core.model.image.openai import OpenAIImageModel
 from ...core.model.image.xinference import XinferenceImageModel
 
 logger = logging.getLogger(__name__)
+
+# 环境变量：未配置数据库图片模型时，使用以下变量创建 OpenAI 兼容的图片生成模型（如 whatai.cc）
+IMAGE_GENERATION_BASE_URL_ENV = "IMAGE_GENERATION_BASE_URL"
+IMAGE_GENERATION_API_KEY_ENV = "IMAGE_GENERATION_API_KEY"
+IMAGE_GENERATION_MODEL_NAME_ENV = "IMAGE_GENERATION_MODEL_NAME"
+
+
+def _image_model_from_env() -> Optional[BaseImageModel]:
+    """当设置了 IMAGE_GENERATION_BASE_URL 与 IMAGE_GENERATION_API_KEY 时，返回一个 OpenAI 兼容的图片生成模型。"""
+    base_url = (os.getenv(IMAGE_GENERATION_BASE_URL_ENV) or "").strip().rstrip("/")
+    api_key = (os.getenv(IMAGE_GENERATION_API_KEY_ENV) or "").strip()
+    if not base_url or not api_key:
+        return None
+    if not base_url.endswith("/v1"):
+        base_url = f"{base_url}/v1"
+    model_name = (
+        os.getenv(IMAGE_GENERATION_MODEL_NAME_ENV) or "dall-e-3"
+    ).strip() or "dall-e-3"
+    try:
+        return OpenAIImageModel(
+            model_name=model_name,
+            api_key=api_key,
+            base_url=base_url,
+            abilities=["generate", "edit"],
+        )
+    except Exception as e:
+        logger.warning(f"Failed to create image model from env: {e}")
+        return None
 
 
 def get_default_vision_model(user_id: Optional[int] = None) -> Optional[BaseLLM]:
@@ -524,6 +554,14 @@ def get_image_models(db: Session, user_id: Optional[int] = None) -> Dict[str, An
                     f"Failed to create image model for {db_model.model_name}: {e}"
                 )
 
+        # 无数据库图片模型时，若配置了环境变量（如 IMAGE_GENERATION_BASE_URL / IMAGE_GENERATION_API_KEY），使用环境变量创建
+        if not image_models:
+            env_model = _image_model_from_env()
+            if env_model is not None:
+                model_name = getattr(env_model, "model_name", "env_image")
+                image_models[model_name] = env_model
+                logger.info(f"Using image generation model from env: {model_name}")
+
     except Exception as e:
         logger.error(f"Failed to get image models from database: {e}")
 
@@ -589,7 +627,7 @@ def get_default_image_generate_model(
                         UserDefaultModel.user_id == user_id,
                         UserDefaultModel.config_type == "image",
                         UserModel.user_id == user_id,
-                        DBModel.abilities.contains("generate"),
+                        cast(DBModel.abilities, Text).like("%generate%"),
                     )
                     .first()
                 )
@@ -611,7 +649,7 @@ def get_default_image_generate_model(
                     UserDefaultModel.user_id.in_(
                         db.query(User.id).filter(User.is_admin)
                     ),
-                    DBModel.abilities.contains("generate"),
+                    cast(DBModel.abilities, Text).like("%generate%"),
                 )
                 .limit(1)
                 .all()
@@ -631,7 +669,7 @@ def get_default_image_generate_model(
                 .filter(
                     UserDefaultModel.config_type == "image",
                     UserModel.is_shared,
-                    DBModel.abilities.contains("generate"),
+                    cast(DBModel.abilities, Text).like("%generate%"),
                 )
                 .limit(1)
                 .all()
@@ -651,6 +689,12 @@ def get_default_image_generate_model(
 
     except ImportError:
         pass
+
+    # 数据库无可用模型时，尝试从环境变量创建（如 whatai.cc）
+    env_model = _image_model_from_env()
+    if env_model is not None:
+        logger.info("Using default image generation model from env (IMAGE_GENERATION_*)")
+        return env_model
 
     return None
 

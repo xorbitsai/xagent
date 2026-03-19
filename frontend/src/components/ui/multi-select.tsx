@@ -29,7 +29,10 @@ const MarkdownDescription = ({ content }: { content: string }) => {
   useEffect(() => {
     const parse = async () => {
       try {
-        const result = await marked.parse(content)
+        const result = await marked.parse(content, {
+          headerIds: false,
+          mangle: false,
+        })
         setHtml(result)
       } catch (e) {
         setHtml(content)

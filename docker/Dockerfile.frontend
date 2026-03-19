@@ -1,54 +1,27 @@
-# syntax=docker/dockerfile:1.6
-ARG NODE_VERSION=22
-
-############################
-# Dependencies
-############################
-FROM node:${NODE_VERSION}-bookworm-slim AS dependencies
+FROM node:20-alpine AS deps
 WORKDIR /app
-
+ENV NEXT_TELEMETRY_DISABLED=1
 COPY package.json package-lock.json ./
 RUN npm ci
 
-############################
-# Builder
-############################
-FROM node:${NODE_VERSION}-bookworm-slim AS builder
+FROM node:20-alpine AS builder
 WORKDIR /app
-
-# Build arguments for API URL configuration
-# Default to empty string for relative paths (works behind reverse proxy)
-ARG NEXT_PUBLIC_API_URL=
-ARG NEXT_PUBLIC_WS_URL=
-
-COPY --from=dependencies /app/node_modules ./node_modules
-COPY . .
-
 ENV NEXT_TELEMETRY_DISABLED=1
-ENV NEXT_PUBLIC_API_URL=${NEXT_PUBLIC_API_URL}
-ENV NEXT_PUBLIC_WS_URL=${NEXT_PUBLIC_WS_URL}
+COPY --from=deps /app/node_modules ./node_modules
+COPY . .
 RUN npm run build
 
-############################
-# Runner - Node.js
-############################
-FROM node:${NODE_VERSION}-bookworm-slim AS runner
+FROM node:20-alpine AS runner
 WORKDIR /app
-
 ENV NODE_ENV=production
 ENV NEXT_TELEMETRY_DISABLED=1
-ENV PORT=3000
-ENV HOSTNAME="0.0.0.0"
 
-# Copy built files from standalone output
-COPY --from=builder /app/.next/standalone ./
-COPY --from=builder /app/.next/static ./.next/static
+# Next.js runtime
+COPY --from=builder /app/package.json ./package.json
+COPY --from=builder /app/next.config.mjs ./next.config.mjs
 COPY --from=builder /app/public ./public
-
-# Health check
-HEALTHCHECK --interval=30s --timeout=10s --start-period=10s --retries=3 \
-    CMD node -e "require('http').get('http://localhost:3000/', (r) => {process.exit(r.statusCode === 200 ? 0 : 1)})" || exit 1
+COPY --from=builder /app/.next ./.next
+COPY --from=builder /app/node_modules ./node_modules
 
 EXPOSE 3000
-
-CMD ["node", "server.js"]
+CMD ["npm", "run", "start"]

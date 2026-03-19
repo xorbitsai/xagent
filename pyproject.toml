@@ -70,6 +70,11 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+# 腾讯云联网图像搜索（国内可用），IMAGE_SEARCH_PROVIDER=tencent 时需安装
+image-search-tencent = [
+  "tencentcloud-sdk-python-common>=3.1.33",
+  "tencentcloud-sdk-python-wimgs>=3.1.0",
+]
 deepdoc = [
   "deepdoc-lib @ git+https://github.com/xorbitsai/deepdoc-lib.git@356098f9aaa063c74cb5c55b05fd1add75ceb8d4",
 ]

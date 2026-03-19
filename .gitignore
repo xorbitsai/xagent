@@ -224,15 +224,11 @@ examples/*.html
 # UV.lock
 uv.lock
 
-# filelock artifacts from tests (mock paths like <MagicMock ...>.lock)
-.*MagicMock.*\.lock
-
 # Root directory markdown files (except README.md and AGENTS.md)
 *.md
 !README.md
 !AGENTS.md
 !CLAUDE.md
-!CHANGELOG.md
 # But keep skills markdown files and test markdown files
 !src/xagent/skills/**/*.md
 !tests/resources/test_files/*.md
@@ -254,4 +250,13 @@ default.yaml
 .xagent/skills/
 fenixaos_web.db
 
-.claude/
+# Docker 离线镜像包（体积较大）
+docker/offline-images/*.tar
+docker/offline-images/*.tar.gz
+
+# nginx 外网代理生成文件
+nginx-proxy/ssl/
+nginx-proxy/logs/
+nginx-proxy/*.generated.conf
+nginx-proxy/nginx.conf.generated
+nginx-proxy/nginx-proxy.pid

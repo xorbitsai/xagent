@@ -8,6 +8,7 @@ from typing import Any, Dict, Optional, cast
 from fastapi import APIRouter, Depends, HTTPException, status
 from jose import JWTError, jwt
 from pydantic import BaseModel
+from sqlalchemy import func
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
@@ -430,7 +431,12 @@ def _inherit_admin_defaults(db: Session, new_user: User) -> None:
 
 def get_user_by_username(db: Session, username: str) -> Optional[User]:
     """Get user by username"""
-    return db.query(User).filter(User.username == username).first()
+    # Username matching should be case-insensitive for better UX
+    return (
+        db.query(User)
+        .filter(func.lower(User.username) == func.lower(username))
+        .first()
+    )
 
 
 @auth_router.post("/login")

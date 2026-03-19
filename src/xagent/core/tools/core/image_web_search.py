@@ -1,8 +1,11 @@
 """
 Pure Image Web Search Tool
-Standalone image search functionality without framework dependencies
+Standalone image search functionality without framework dependencies.
+Supports Google Custom Search (default) and Tencent Cloud 联网图像搜索 (国内可用).
 """
 
+import asyncio
+import json
 import logging
 import os
 import uuid
@@ -13,6 +16,9 @@ from urllib.parse import urlparse
 import httpx
 
 logger = logging.getLogger(__name__)
+
+# 图像搜索提供商：google（默认，需翻墙）| tencent（腾讯云联网图像搜索，国内可用）
+IMAGE_SEARCH_PROVIDER_ENV = "IMAGE_SEARCH_PROVIDER"
 
 
 class ImageWebSearchCore:
@@ -30,6 +36,11 @@ class ImageWebSearchCore:
         )
         self.save_directory.mkdir(parents=True, exist_ok=True)
 
+    def _get_provider(self) -> str:
+        """Return image search provider: 'google' or 'tencent' (lowercase)."""
+        p = (os.getenv(IMAGE_SEARCH_PROVIDER_ENV) or "google").strip().lower()
+        return p if p in ("google", "tencent") else "google"
+
     async def search_images(
         self,
         query: str,
@@ -39,34 +50,127 @@ class ImageWebSearchCore:
         save_images: bool = True,
     ) -> List[Dict[str, Any]]:
         """
-        Search for images using Google Custom Search API.
+        Search for images. Provider is chosen by env IMAGE_SEARCH_PROVIDER:
+        - google: Google Custom Search API (default)
+        - tencent: 腾讯云联网图像搜索 (国内可用，需 TENCENT_SECRET_ID / TENCENT_SECRET_KEY)
 
         Args:
             query: The image search query string
-            num_results: Number of images to return (max 10)
-            image_size: Image size: small, medium, large, xlarge, xxlarge, huge
-            image_type: Image type: photo, clipart, lineart, animated, transparent
+            num_results: Number of images to return (max 10 for Google, max 20 for Tencent)
+            image_size: Image size (Google only): small, medium, large, ...
+            image_type: Image type (Google only): photo, clipart, ...
             save_images: Whether to download and save images locally
 
         Returns:
             List of image results with metadata and local paths
         """
+        provider = self._get_provider()
         logger.info(
             f"🔍 Starting image search for: '{query}' "
-            f"(results={num_results}, size={image_size}, type={image_type})"
+            f"(provider={provider}, results={num_results})"
         )
 
+        if provider == "tencent":
+            return await self._search_images_tencent(query, num_results, save_images)
+        return await self._search_images_google(
+            query, num_results, image_size, image_type, save_images
+        )
+
+    async def _search_images_tencent(
+        self, query: str, num_results: int, save_images: bool
+    ) -> List[Dict[str, Any]]:
+        """腾讯云联网图像搜索（文搜图），国内可访问。需安装: pip install tencentcloud-sdk-python-wimgs"""
+        secret_id = os.getenv("TENCENT_SECRET_ID") or os.getenv("TENCENTCLOUD_SECRET_ID")
+        secret_key = os.getenv("TENCENT_SECRET_KEY") or os.getenv(
+            "TENCENTCLOUD_SECRET_KEY"
+        )
+        if not secret_id or not secret_key:
+            raise ValueError(
+                "Missing Tencent Cloud credentials for image search. "
+                "Set TENCENT_SECRET_ID and TENCENT_SECRET_KEY (or TENCENTCLOUD_*). "
+                "Optional: pip install tencentcloud-sdk-python-wimgs"
+            )
+
+        num_results = min(max(1, num_results), 20)
+
+        def _call_tencent() -> List[Dict[str, Any]]:
+            try:
+                from tencentcloud.common import credential
+                from tencentcloud.common.profile.client_profile import ClientProfile
+                from tencentcloud.wimgs.v20251106 import wimgs_client, models
+            except ImportError as e:
+                raise ValueError(
+                    "Tencent image search requires tencentcloud-sdk-python-wimgs. "
+                    "Install with: pip install tencentcloud-sdk-python-wimgs"
+                ) from e
+
+            cred = credential.Credential(secret_id, secret_key)
+            profile = ClientProfile()
+            profile.httpProfile.endpoint = "wimgs.tencentcloudapi.com"
+            client = wimgs_client.WimgsClient(cred, "", profile)
+            req = models.SearchByTextRequest()
+            req.Query = query
+            resp = client.SearchByText(req)
+            if not resp.Images:
+                return []
+            out: List[Dict[str, Any]] = []
+            for i, img_str in enumerate(resp.Images[:num_results], 1):
+                try:
+                    img = json.loads(img_str) if isinstance(img_str, str) else img_str
+                except Exception:
+                    continue
+                out.append({
+                    "title": img.get("title", ""),
+                    "link": img.get("siteUrl", ""),
+                    "snippet": img.get("title", ""),
+                    "image_link": img.get("origPicUrl") or img.get("thumbnailUrl", ""),
+                    "context_link": img.get("siteUrl", ""),
+                    "height": img.get("origPicHeight") or img.get("thumbnailHeight", 0),
+                    "width": img.get("origPicWidth") or img.get("thumbnailWidth", 0),
+                    "file_format": "unknown",
+                    "local_path": None,
+                })
+            return out
+
+        loop = asyncio.get_event_loop()
+        raw_results = await loop.run_in_executor(None, _call_tencent)
+        if not raw_results:
+            logger.warning("⚠️ No image search results found (Tencent)")
+            return []
+
+        logger.info(f"📋 Found {len(raw_results)} image results (Tencent)")
+        results: List[Dict[str, Any]] = []
+        for i, result in enumerate(raw_results, 1):
+            if save_images and result.get("image_link"):
+                try:
+                    result["local_path"] = await self._download_image(
+                        result["image_link"], result["title"], i
+                    )
+                except Exception as e:
+                    logger.warning(f"   Failed to download: {e}")
+                    result["local_path"] = None
+            results.append(result)
+        logger.info(f"🎯 Search completed with {len(results)} results")
+        return results
+
+    async def _search_images_google(
+        self,
+        query: str,
+        num_results: int,
+        image_size: str,
+        image_type: str,
+        save_images: bool,
+    ) -> List[Dict[str, Any]]:
+        """Google Custom Search API（国内需代理）。"""
         api_key = os.getenv("GOOGLE_API_KEY")
         cse_id = os.getenv("GOOGLE_CSE_ID")
-
         if not api_key or not cse_id:
             raise ValueError(
-                "Missing required environment variables. Please set GOOGLE_API_KEY and GOOGLE_CSE_ID."
+                "Missing required environment variables. Please set GOOGLE_API_KEY and GOOGLE_CSE_ID. "
+                "For China, you can use Tencent: set IMAGE_SEARCH_PROVIDER=tencent and TENCENT_SECRET_ID/TENCENT_SECRET_KEY."
             )
 
         num_results = min(max(1, num_results), 10)
-
-        # Setup proxy configuration
         proxy_url = self._get_proxy_url()
         if proxy_url:
             logger.info(f"🌐 Using proxy: {proxy_url}")
@@ -86,7 +190,6 @@ class ImageWebSearchCore:
             client_kwargs: Dict[str, Any] = {}
             if proxy_url:
                 client_kwargs["proxy"] = proxy_url
-
             logger.info("📡 Making request to Google Custom Search API...")
             async with httpx.AsyncClient(**client_kwargs) as client:
                 response = await client.get(
@@ -94,16 +197,12 @@ class ImageWebSearchCore:
                     params=params,
                     timeout=10,
                 )
-
                 if response.status_code == 403:
                     self._handle_403_error(response)
-
                 response.raise_for_status()
                 data = response.json()
-
-                logger.info("✅ Google API request successful")
-                return await self._process_search_results(data, save_images)
-
+            logger.info("✅ Google API request successful")
+            return await self._process_search_results(data, save_images)
         except httpx.RequestError as e:
             logger.error(f"❌ Network error: {str(e)}")
             raise ValueError(f"Network error during image search: {str(e)}") from e
@@ -158,9 +257,11 @@ class ImageWebSearchCore:
         return results
 
     async def _download_image(self, image_url: str, title: str, index: int) -> str:
-        """Download image from URL and save to local directory"""
+        """Download image from URL and save to local directory using atomic write."""
         filename = self._generate_filename(title, index, image_url)
         save_path = self.save_directory / filename
+        # Write to temp file first, then atomically rename to avoid partial reads
+        temp_path = save_path.with_suffix(save_path.suffix + ".tmp")
 
         proxy_url = self._get_proxy_url()
         client_kwargs: Dict[str, Any] = {"timeout": 30}
@@ -171,8 +272,12 @@ class ImageWebSearchCore:
             response = await client.get(image_url)
             response.raise_for_status()
 
-            with open(save_path, "wb") as f:
+            # Write to temp file first
+            with open(temp_path, "wb") as f:
                 f.write(response.content)
+            # Atomic rename to prevent partial reads during write
+            import os
+            os.replace(temp_path, save_path)
 
         logger.info(f"Downloaded image to: {save_path}")
         return str(save_path)

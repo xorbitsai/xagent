@@ -77,6 +77,72 @@ docker compose down
 
 ## Advanced Usage
 
+### 网络时间受限时：分步拉取镜像
+
+若 `docker compose up -d` 因可用网络时间很短（例如每次只有十几秒）导致镜像拉取不全，可先**只拉取镜像**，再在本地启动：
+
+```bash
+# 在项目根目录执行，按服务逐个拉取（postgres → nginx → backend → frontend）
+./docker/pull-all.sh
+```
+
+脚本会依次拉取：`postgres`、`nginx`、`backend`、`frontend`。每次只拉一个服务，拉完再拉下一个；若某次失败，可重新执行脚本（已存在的镜像不会重复拉）。全部拉取完成后执行：
+
+```bash
+docker compose up -d
+```
+
+也可手动按需拉取单个服务：
+
+```bash
+docker compose pull postgres   # 或 nginx / backend / frontend
+```
+
+### 配置镜像源并升级到最新版
+
+若需使用国内镜像源（如 `https://docker.1ms.run`）并一次性拉取最新镜像、升级 xagent：
+
+```bash
+# 在 xagent 项目根目录执行（会提示输入 sudo 密码）
+./docker/set-mirror-and-upgrade.sh
+```
+
+脚本会：1）将 Docker 镜像源设为 `https://docker.1ms.run`；2）重启 Docker；3）`docker compose pull` 拉取最新镜像；4）`docker compose up -d` 启动。仅修改镜像源可手动编辑 `/etc/docker/daemon.json` 后执行 `sudo systemctl restart docker`。
+
+### 离线导入：从其他机器拷镜像包到本机
+
+在**有外网**的机器上拉取并导出为一个 tar 包。**若本机是 x86_64/AMD64，而导出机是 ARM（如 Mac M1），必须指定目标平台**，否则拷过来的镜像是 ARM 架构，在本机无法运行（会报 platform 不匹配、postgres unhealthy 等）：
+
+```bash
+# 本机是 x86_64 时，在有网络的机器上执行（指定 linux/amd64）
+PLATFORM=linux/amd64 ./docker/save-images.sh
+# 或
+./docker/save-images.sh xagent-images.tar linux/amd64
+```
+
+不指定平台时，导出的是「当前机器架构」的镜像（ARM 机导出 ARM，x86 机导出 x86）：
+
+```bash
+# 在有网络的机器上执行（可指定输出路径，默认为当前目录下的 xagent-images.tar）
+./docker/save-images.sh
+# 或指定路径，例如：
+./docker/save-images.sh /path/to/xagent-images.tar
+```
+
+将生成的 **`xagent-images.tar`** 拷贝到**本机**项目下的 **`docker/offline-images/`** 目录（若目录不存在可创建），然后在本机项目根目录执行：
+
+```bash
+./docker/load-images.sh
+```
+
+脚本默认会加载 `docker/offline-images/xagent-images.tar`；若你把 tar 放在别处或改了文件名，可传入路径：
+
+```bash
+./docker/load-images.sh /path/to/你的镜像包.tar
+```
+
+导入完成后执行 `docker compose up -d` 即可启动（无需再拉取）。
+
 ### Custom Port
 
 By default, the frontend runs on port 80. To use a different port (e.g., 8080):

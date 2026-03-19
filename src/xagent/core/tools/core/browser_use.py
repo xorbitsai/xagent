@@ -7,8 +7,18 @@ automatically cleaned up after a timeout period.
 """
 
 import asyncio
+import os
 from datetime import datetime, timedelta
 from typing import TYPE_CHECKING, Any, Dict, Optional
+
+
+def _has_display() -> bool:
+    """True if we have an X/Wayland display (e.g. desktop or xvfb)."""
+    if os.environ.get("DISPLAY"):
+        return True
+    if os.environ.get("WAYLAND_DISPLAY"):
+        return True
+    return False
 
 if TYPE_CHECKING:
     from playwright.async_api import Browser, BrowserContext, Page, async_playwright
@@ -64,7 +74,8 @@ class BrowserSession:
             headless: Whether to run browser in headless mode
         """
         self.session_id = session_id
-        self.headless = headless
+        # On server/SSH/Docker there is no display; force headless to avoid "missing X server"
+        self.headless = headless if _has_display() else True
         self._browser: Optional[Browser] = None
         self._context: Optional[BrowserContext] = None
         self._page: Optional[Page] = None
@@ -86,22 +97,28 @@ class BrowserSession:
             self._playwright = await async_playwright().start()
 
             # Launch browser with anti-detection settings
+            # Server/headless-friendly args (no X server required)
+            args = [
+                # Disable WebDriver detection
+                "--disable-blink-features=AutomationControlled",
+                "--disable-infobars",
+                "--window-size=1920,1080",
+                "--allow-file-access-from-files",
+                "--allow-file-access",
+                "--no-sandbox",
+                "--disable-web-security",
+                # Required when no display (SSH/Docker/server)
+                "--disable-gpu",
+                "--disable-dev-shm-usage",
+                "--disable-software-rasterizer",
+                "--no-first-run",
+                "--no-zygote",
+            ]
+            if self.headless:
+                args.append("--headless=new")  # Chromium new headless mode
             self._browser = await self._playwright.chromium.launch(
                 headless=self.headless,
-                args=[
-                    # Disable WebDriver detection
-                    "--disable-blink-features=AutomationControlled",
-                    # Other anti-detection flags
-                    "--disable-infobars",
-                    "--window-size=1920,1080",
-                    # Allow local file access
-                    "--allow-file-access-from-files",
-                    "--allow-file-access",
-                    # No sandbox for local file access in some environments
-                    "--no-sandbox",
-                    # Disable web security for file:// URLs (required for local files)
-                    "--disable-web-security",
-                ],
+                args=args,
             )
 
             # Create context with realistic settings

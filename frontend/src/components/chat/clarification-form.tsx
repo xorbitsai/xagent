@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useRef } from "react"
+import React, { useState } from "react"
 import { Interaction } from "@/contexts/app-context-chat"
 import { Input } from "@/components/ui/input"
 import { Button } from "@/components/ui/button"
@@ -16,12 +16,10 @@ import { ChevronDown, ChevronRight, MessageSquare, Upload, File as FileIcon, X }
 interface ClarificationFormProps {
   message?: string
   interactions: Interaction[]
-  timeout?: number
   messageId?: string
-  expiresAt?: string
 }
 
-export function ClarificationForm({ interactions, timeout, messageId, expiresAt }: ClarificationFormProps) {
+export function ClarificationForm({ interactions, messageId }: ClarificationFormProps) {
   const { state, sendMessage } = useApp()
   const { t } = useI18n()
   const [formState, setFormState] = useState<Record<string, any>>({})
@@ -29,110 +27,6 @@ export function ClarificationForm({ interactions, timeout, messageId, expiresAt 
   const [isOpen, setIsOpen] = useState(true)
 
   const isTaskRunning = state.currentTask?.status === "running"
-
-  // Check if this is the last message
-  const isLastMessage = React.useMemo(() => {
-    if (!messageId || !state.messages.length) return true
-    const lastMsg = state.messages[state.messages.length - 1]
-    return lastMsg.id === messageId
-  }, [state.messages, messageId])
-
-  const [timeLeft, setTimeLeft] = useState<number | null>(() => {
-    if (expiresAt) {
-      const now = new Date().getTime()
-      const end = new Date(expiresAt).getTime()
-      return Math.max(0, Math.floor((end - now) / 1000))
-    }
-    return timeout || null
-  })
-  const hasAutoSubmitted = useRef(false)
-
-  useEffect(() => {
-    if (!isLastMessage) {
-      setTimeLeft(null)
-      return
-    }
-
-    // Determine initial time left and start timer
-    let initialTimeLeft: number | null = null
-    if (expiresAt) {
-      const now = new Date().getTime()
-      const end = new Date(expiresAt).getTime()
-      initialTimeLeft = Math.max(0, Math.floor((end - now) / 1000))
-    } else if (timeout !== undefined && timeout !== null && timeout > 0) {
-      initialTimeLeft = timeout
-    }
-
-    if (initialTimeLeft === null) {
-      setTimeLeft(null)
-      return
-    }
-
-    // If already expired (and using expiresAt), trigger auto-continue immediately
-    if (expiresAt && initialTimeLeft <= 0) {
-      setTimeLeft(0)
-      // Use setTimeout to ensure state updates complete before triggering
-      setTimeout(() => {
-        if (!hasAutoSubmitted.current && !isSubmitting && !isTaskRunning) {
-          handleAutoContinue()
-        }
-      }, 0)
-      return
-    }
-
-    setTimeLeft(initialTimeLeft)
-
-    const timer = setInterval(() => {
-      if (expiresAt) {
-        // Recalculate based on current time
-        const now = new Date().getTime()
-        const end = new Date(expiresAt).getTime()
-        const diff = Math.max(0, Math.floor((end - now) / 1000))
-
-        setTimeLeft(diff)
-
-        if (diff <= 0) {
-          clearInterval(timer)
-        }
-      } else {
-        // Legacy decrement
-        setTimeLeft((prev) => {
-          if (prev === null) return null
-          if (prev <= 1) {
-            clearInterval(timer)
-            return 0
-          }
-          return prev - 1
-        })
-      }
-    }, 1000)
-
-    return () => clearInterval(timer)
-  }, [timeout, expiresAt, isLastMessage])
-
-  // Auto-trigger continue when timeLeft reaches 0
-  useEffect(() => {
-    if (timeLeft === 0 && isLastMessage && !hasAutoSubmitted.current && !isSubmitting && !isTaskRunning) {
-      handleAutoContinue()
-    }
-  }, [timeLeft, isLastMessage, isSubmitting, isTaskRunning])
-
-  const handleAutoContinue = async () => {
-    if (hasAutoSubmitted.current || isSubmitting || isTaskRunning) return
-    hasAutoSubmitted.current = true
-
-    try {
-      setIsSubmitting(true)
-      await sendMessage(t("chatPage.clarification.continue"), { force: true })
-      setIsOpen(false)
-      // Hide the continue button by clearing the timeout
-      setTimeLeft(null)
-    } catch (error) {
-      console.error("Failed to auto-continue", error)
-    } finally {
-      setIsSubmitting(false)
-    }
-  }
 
   const handleInputChange = (field: string, value: any) => {
     setFormState((prev) => ({ ...prev, [field]: value }))
@@ -379,16 +273,6 @@ export function ClarificationForm({ interactions, timeout, messageId, expiresAt 
         </div>
 
         <div className="pt-2 flex gap-2">
-          {timeLeft !== null && timeLeft > 0 && (
-            <Button
-              variant="outline"
-              size="sm"
-              onClick={handleAutoContinue}
-              disabled={isSubmitting || isTaskRunning}
-            >
-              {t("chatPage.clarification.continue")} ({timeLeft}s)
-            </Button>
-          )}
           <Button className="flex-1" size="sm" onClick={handleSubmit} disabled={isSubmitting || isTaskRunning}>
             {isSubmitting ? t("chatPage.clarification.submitting") : t("chatPage.clarification.submit")}
           </Button>

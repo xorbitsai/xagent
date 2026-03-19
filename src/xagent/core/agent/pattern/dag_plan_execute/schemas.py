@@ -123,9 +123,6 @@ class ChatResponseData(BaseModel):
     """Chat response data schema."""
 
     message: str = Field(description="Response message to the user")
-    timeout: Optional[int] = Field(
-        default=60, description="Timeout in seconds for auto-continuation"
-    )
     interactions: Optional[List[ChatInteraction]] = Field(
         default=None, description="List of interactions to present to user"
     )
@@ -146,7 +143,6 @@ class ClassificationResponse(BaseModel):
                     "type": "chat",
                     "chat": {
                         "message": "I can help you with that!",
-                        "timeout": 60,
                     },
                 },
                 {"type": "plan"},

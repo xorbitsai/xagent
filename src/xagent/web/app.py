@@ -138,11 +138,6 @@ async def startup_event() -> None:
     init_db()
     logger.info("Database initialized successfully")
 
-    # Start timeout manager
-    from .timeout_manager import timeout_manager
-
-    await timeout_manager.start()
-
     # Initialize skill manager
     from ..skills.utils import create_skill_manager
 
@@ -193,11 +188,6 @@ async def startup_event() -> None:
 
 @app.on_event("shutdown")
 async def shutdown_event() -> None:
-    # Stop timeout manager
-    from .timeout_manager import timeout_manager
-
-    await timeout_manager.stop()
-
     # Shutdown all sandboxes
     from .sandbox_manager import get_sandbox_manager
 

@@ -71,16 +71,6 @@ class PlanGenerator:
         self.skill_manager = skill_manager
         self.allowed_skills = allowed_skills
 
-    def _validate_timeout(self, timeout: Any) -> Optional[int]:
-        """Validate timeout value from LLM response"""
-        if timeout is None:
-            return None
-        try:
-            return int(timeout)
-        except (ValueError, TypeError):
-            logger.warning(f"Invalid timeout value from LLM: {timeout}")
-            return None
-
     async def _generate_plan_with_flow(
         self,
         tracer: Any,
@@ -607,7 +597,6 @@ class PlanGenerator:
                     chat_response = ChatResponse(
                         message=message,
                         interactions=interactions if interactions else None,
-                        timeout=self._validate_timeout(chat_data.get("timeout")),
                     )
 
                     return PlanGeneratorResult(type="chat", chat_response=chat_response)
@@ -739,7 +728,6 @@ class PlanGenerator:
   "type": "chat",
   "chat": {
     "message": "Your response to the user",
-    "timeout": 60,
     "interactions": [
       {
         "type": "select_one|select_multiple|text_input|file_upload|confirm|number_input",
@@ -780,9 +768,6 @@ class PlanGenerator:
 - For simple questions, clarifications, or information gathering, use "chat" type
 - When returning type="plan", do NOT include plan details - just the type indicator
 - interactions is optional - omit if no user input is needed
-- timeout: Use 60 seconds ONLY if the task can proceed with default assumptions when the user does nothing (auto-continuation).
-- **STRICT RULE**: If the task CANNOT proceed without specific user input or file upload (e.g., mandatory missing information), you MUST NOT include a "timeout".
-- If you previously asked for input with a timeout, and the user replied "Continue" (auto-continued) but you still lack the mandatory info, ask again WITHOUT a timeout.
 
 ## CRITICAL: Direct Chat Mode Guidelines
 When you return type="chat" (direct answer mode), you are providing a TEXT RESPONSE ONLY. NO tools will be executed.

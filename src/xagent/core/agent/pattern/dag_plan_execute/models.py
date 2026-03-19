@@ -358,8 +358,6 @@ class ChatResponse:
 
     message: str  # Main message to display
     interactions: Optional[List[Interaction]] = None  # Optional interaction fields
-    timeout: Optional[int] = None  # Optional timeout in seconds for auto-continue
-    expires_at: Optional[str] = None  # Absolute expiration timestamp (ISO format)
 
 
 @dataclass

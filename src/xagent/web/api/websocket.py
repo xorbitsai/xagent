@@ -28,7 +28,6 @@ from ..models.database import get_db
 from ..models.task import Task
 from ..models.uploaded_file import UploadedFile
 from ..models.user import User
-from ..timeout_manager import timeout_manager
 from ..tools.config import WebToolConfig
 from ..user_isolated_memory import UserContext
 from ..utils.db_timezone import safe_timestamp_to_unix
@@ -472,9 +471,6 @@ async def execute_task_background(
     # Wait for previous background task to complete
     await background_task_manager.wait_for_previous(task_id)
 
-    # Clear any pending timeout for this task as we are starting execution
-    timeout_manager.remove_task(task_id)
-
     try:
         logger.info(f"Background task execution started for task {task_id}")
 
@@ -512,14 +508,6 @@ async def execute_task_background(
             ai_response = chat_response.get("message") or result.get(
                 "output", "Task completed"
             )
-
-            # Register timeout for auto-continuation if specified
-            timeout_seconds = chat_response.get("timeout")
-            if timeout_seconds and isinstance(timeout_seconds, (int, float)):
-                # Use interactions check to ensure we only timeout when waiting for input
-                interactions = chat_response.get("interactions")
-                if interactions:
-                    timeout_manager.add_task(task_id, int(timeout_seconds))
         else:
             ai_response = result.get("output", "Task completed")
 
@@ -1253,9 +1241,6 @@ async def handle_chat_message(
                     # Use continuation: old task will handle at appropriate time
                     logger.info(f"Using continuation for running task {task_id}")
                     assert dag_pattern is not None  # for mypy type checking
-
-                    # Clear any pending timeout for this task as we are continuing execution
-                    timeout_manager.remove_task(task_id)
 
                     # Immediately send trace_user_message to display user message on interface
                     if hasattr(dag_pattern, "tracer") and hasattr(
@@ -2727,60 +2712,3 @@ async def handle_build_preview_execution(
             pass
     finally:
         db.close()
-
-
-# Timeout handler
-async def _run_timeout_execution(task_id: int) -> None:
-    """Execute timeout continuation with proper DB session management"""
-    from ..models.database import get_db
-    from ..models.task import Task
-    from .chat import get_agent_manager
-
-    logger.info(f"Starting timeout execution for task {task_id}")
-
-    db_gen = get_db()
-    db = next(db_gen)
-    try:
-        task = db.query(Task).filter(Task.id == task_id).first()
-        if not task:
-            logger.warning(f"Task {task_id} not found for timeout continuation")
-            return
-
-        # Get user (needed for UserContext)
-        user = db.query(User).filter(User.id == task.user_id).first()
-
-        # If user not found, we can't create UserContext.
-        # But maybe we can proceed with minimal context?
-        # execute_task_background requires user.
-        if not user:
-            logger.warning(
-                f"User for task {task_id} not found for timeout continuation"
-            )
-            return
-
-        await execute_task_background(
-            task_id=task_id,
-            user_message="Continue",
-            context={"source": "timeout_auto_continue"},
-            agent_manager=get_agent_manager(),
-            user=user,
-            task=task,
-            db=db,
-        )
-    except Exception as e:
-        logger.error(
-            f"Error executing timeout continuation for task {task_id}: {e}",
-            exc_info=True,
-        )
-    finally:
-        db.close()
-
-
-async def handle_timeout_continuation(task_id: int) -> None:
-    """Callback for timeout manager"""
-    # Run in background to avoid blocking timeout loop
-    asyncio.create_task(_run_timeout_execution(task_id))
-
-
-# Register callback
-timeout_manager.set_callback(handle_timeout_continuation)

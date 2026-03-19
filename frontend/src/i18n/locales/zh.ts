@@ -131,7 +131,6 @@ const zh = {
       submitting: "提交中...",
       submit: "提交回复",
       unsupportedType: "不支持的字段类型: {type}",
-      continue: "继续",
     },
   },
   branding: {

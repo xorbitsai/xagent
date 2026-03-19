@@ -564,24 +564,6 @@ class DAGPlanExecutePattern(AgentPattern):
                                 for interaction in result.chat_response.interactions
                             ]
 
-                        # Calculate absolute expiration time if timeout is present
-                        expires_at = None
-
-                        # Only apply timeout logic if there are interactions
-                        if interactions_data:
-                            if result.chat_response.timeout:
-                                from datetime import timedelta, timezone
-
-                                # Use UTC time to avoid timezone issues between server and client
-                                expires_at = (
-                                    datetime.now(timezone.utc)
-                                    + timedelta(seconds=result.chat_response.timeout)
-                                ).isoformat()
-                                result.chat_response.expires_at = expires_at
-                        else:
-                            # Ensure no timeout if no interactions
-                            result.chat_response.timeout = None
-
                         # Record assistant response to conversation history (with interactions)
                         self._add_assistant_message(
                             content=result.chat_response.message,
@@ -601,8 +583,6 @@ class DAGPlanExecutePattern(AgentPattern):
                                     "chat_response": {
                                         "message": result.chat_response.message,
                                         "interactions": interactions_data or [],
-                                        "timeout": result.chat_response.timeout,
-                                        "expires_at": expires_at,
                                     },
                                 },
                                 success=True,
@@ -614,8 +594,6 @@ class DAGPlanExecutePattern(AgentPattern):
                             "chat_response": {
                                 "message": result.chat_response.message,
                                 "interactions": interactions_data or [],
-                                "timeout": result.chat_response.timeout,
-                                "expires_at": expires_at,
                             },
                         }
 

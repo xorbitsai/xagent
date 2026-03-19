@@ -165,7 +165,7 @@ const normalizeInteractions = (value: unknown): Interaction[] => {
     .filter(Boolean) as Interaction[]
 }
 
-const extractClarificationMessage = (raw: unknown): { interactions: Interaction[]; timeout?: number; expiresAt?: string } | null => {
+const extractClarificationMessage = (raw: unknown): { interactions: Interaction[] } | null => {
   let asObject = raw && typeof raw === "object" ? (raw as any) : null
 
   if (typeof raw === 'string') {
@@ -180,8 +180,6 @@ const extractClarificationMessage = (raw: unknown): { interactions: Interaction[
   if (directInteractions.length > 0) {
     return {
       interactions: directInteractions,
-      timeout: typeof asObject?.timeout === 'number' ? asObject.timeout : undefined,
-      expiresAt: typeof asObject?.expires_at === 'string' ? asObject.expires_at : undefined,
     }
   }
 
@@ -191,8 +189,6 @@ const extractClarificationMessage = (raw: unknown): { interactions: Interaction[
     if (chatInteractions.length > 0) {
       return {
         interactions: chatInteractions,
-        timeout: typeof (chatResponse as any).timeout === 'number' ? (chatResponse as any).timeout : undefined,
-        expiresAt: typeof (chatResponse as any).expires_at === 'string' ? (chatResponse as any).expires_at : undefined,
       }
     }
   }
@@ -1997,8 +1993,6 @@ export function AppProvider({ children, token }: { children: React.ReactNode; to
                     <MarkdownRenderer content={result.content || ""} />
                     <ClarificationForm
                       interactions={clarification.interactions}
-                      timeout={clarification.timeout}
-                      expiresAt={(clarification as any).expiresAt}
                       messageId={msgId}
                     />
                   </div>,

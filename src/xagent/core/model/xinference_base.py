@@ -83,8 +83,8 @@ class BaseXinferenceModel:
             self._model_handle = await client.get_model(self._model_uid)
         return self._model_handle
 
-    async def close(self) -> None:
-        """Close the Xinference client and cleanup resources."""
+    def close(self) -> None:
+        """Close the Xinference client and cleanup resources (sync version)."""
         if self._model_handle is not None:
             try:
                 self._model_handle.close()
@@ -99,12 +99,14 @@ class BaseXinferenceModel:
                 pass
             self._client = None
 
+    async def aclose(self) -> None:
+        """Close the Xinference client and cleanup resources (async version)."""
+        self.close()
+
     def __enter__(self) -> "BaseXinferenceModel":
         """Context manager entry."""
         return self
 
     def __exit__(self, exc_type: Any, exc_val: Any, exc_tb: Any) -> None:
-        """Context manager exit."""
-        # Note: This is a sync context manager, so we can't call async close()
-        # Subclasses should override this if they need async cleanup
-        pass
+        """Context manager exit - cleanup resources."""
+        self.close()

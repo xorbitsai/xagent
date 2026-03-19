@@ -247,6 +247,9 @@ This tool automatically handles file reading when file_id is provided.
 
             return result
 
+        except AssertionError:
+            # Re-raise assertion errors (e.g., LLM not available)
+            raise
         except Exception as e:
             logger.error(f"JSON translation failed: {e}")
             return {
@@ -287,6 +290,9 @@ This tool automatically handles file reading when file_id is provided.
 
             return result
 
+        except AssertionError:
+            # Re-raise assertion errors (e.g., LLM not available)
+            raise
         except Exception as e:
             logger.error(f"JSON translation failed: {e}")
             return {

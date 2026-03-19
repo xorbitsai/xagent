@@ -600,7 +600,7 @@ class TestXinferenceTTS:
         assert "pcm" in formats
         assert "opus" in formats
 
-    @patch("xinference.client.restful.restful_client.RESTfulClient")
+    @patch("xinference_client.RESTfulClient")
     def test_list_available_models_success(self, mock_client_class: Mock) -> None:
         """Test listing available models successfully."""
         # Setup mock
@@ -642,7 +642,7 @@ class TestXinferenceTTS:
         assert models[1]["model_ability"] == ["tts"]
         mock_client.close.assert_called_once()
 
-    @patch("xinference.client.restful.restful_client.RESTfulClient")
+    @patch("xinference_client.RESTfulClient")
     def test_list_available_models_empty(self, mock_client_class: Mock) -> None:
         """Test listing models when no TTS models available."""
         # Setup mock
@@ -662,7 +662,7 @@ class TestXinferenceTTS:
         assert len(models) == 0
         mock_client.close.assert_called_once()
 
-    @patch("xinference.client.restful.restful_client.RESTfulClient")
+    @patch("xinference_client.RESTfulClient")
     def test_list_available_models_error_handling(
         self, mock_client_class: Mock
     ) -> None:
@@ -678,7 +678,7 @@ class TestXinferenceTTS:
         assert models == []
         mock_client.close.assert_called_once()
 
-    @patch("xinference.client.restful.restful_client.RESTfulClient")
+    @patch("xinference_client.RESTfulClient")
     def test_list_available_models_with_speech_ability(
         self, mock_client_class: Mock
     ) -> None:

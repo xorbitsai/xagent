@@ -651,7 +651,7 @@ export function ModelsPage() {
       base_url: "",
       temperature: activeTab === 'llm' ? undefined : undefined,
       dimension: activeTab === 'embedding' ? undefined : undefined,
-      abilities: activeTab === 'llm' ? ["chat"] : activeTab === 'embedding' ? ["embedding"] : activeTab === 'image' ? ["generate"] : activeTab === 'speech' ? [] : ["asr"],
+      abilities: activeTab === 'llm' ? ["chat"] : activeTab === 'embedding' ? ["embedding"] : activeTab === 'image' ? ["generate"] : activeTab === 'speech' ? ["asr"] : [],
       default_config_types: []
     })
     setViewMode('form')
@@ -791,7 +791,7 @@ export function ModelsPage() {
       base_url: provider.defaultBaseUrl || "",
       temperature: activeTab === 'llm' ? undefined : undefined,
       dimension: activeTab === 'embedding' ? undefined : undefined,
-      abilities: activeTab === 'llm' ? ["chat"] : activeTab === 'embedding' ? ["embedding"] : activeTab === 'image' ? ["generate"] : activeTab === 'speech' ? [] : ["asr"],
+      abilities: activeTab === 'llm' ? ["chat"] : activeTab === 'embedding' ? ["embedding"] : activeTab === 'image' ? ["generate"] : activeTab === 'speech' ? ["asr"] : [],
       default_config_types: []
     })
 
@@ -818,7 +818,7 @@ export function ModelsPage() {
       base_url: providerConfig?.defaultBaseUrl || "",
       temperature: activeTab === 'llm' ? undefined : undefined,
       dimension: activeTab === 'embedding' ? undefined : undefined,
-      abilities: activeTab === 'llm' ? ["chat"] : activeTab === 'embedding' ? ["embedding"] : activeTab === 'image' ? ["generate"] : activeTab === 'speech' ? [] : ["asr"],
+      abilities: activeTab === 'llm' ? ["chat"] : activeTab === 'embedding' ? ["embedding"] : activeTab === 'image' ? ["generate"] : activeTab === 'speech' ? ["asr"] : [],
       default_config_types: []
     })
     setViewMode('form')

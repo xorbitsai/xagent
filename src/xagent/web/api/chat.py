@@ -159,7 +159,6 @@ async def create_default_tools(
         allowed_skills=allowed_skills,  # Agent Builder skills
         allowed_tools=allowed_tools,  # Agent Builder tool categories
         vision_model=vision_model,  # Pass task-specific vision model
-        llm=llm,  # Pass LLM for tool creation
     )
 
     # Store excluded_agent_id in tool_config for agent tool filtering

@@ -17,6 +17,11 @@ from typing import Any, Dict, List, Optional
 from ...model.asr.base import ASRResult, BaseASR
 from ...model.tts.base import BaseTTS, TTSResult
 from ...workspace import TaskWorkspace
+from .audio_tool_descriptions import (
+    SYNTHESIZE_SPEECH_DESCRIPTION,
+    SYNTHESIZE_SPEECH_JSON_DESCRIPTION,
+    TRANSCRIBE_AUDIO_DESCRIPTION,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -24,214 +29,14 @@ logger = logging.getLogger(__name__)
 class AudioToolCore:
     """
     Audio processing tool that uses pre-configured ASR and TTS models.
+
+    Tool descriptions are imported from audio_tool_descriptions.py for better maintainability.
     """
 
-    # Description for transcribe_audio tool
-    TRANSCRIBE_AUDIO_DESCRIPTION = """
-Transcribe audio to text using Speech-to-Text (ASR).
-
-This tool converts spoken language in audio files into written text.
-Supports multiple languages and can provide detailed timing information.
-
-Available models (⭐[DEFAULT] marks the configured default model):
-{}
-
-**IMPORTANT: Prefer the default model marked with ⭐[DEFAULT]. Only specify model_id if the user explicitly requests a different model.**
-
-Parameters:
-- audio_file_path (required): audio file path, file_id, or URL to transcribe
-- language (optional): language code (e.g., 'zh', 'en', 'yue', 'ja', 'ko')
-- model_id (optional): specific ASR model to use. Omit to use the default model marked with ⭐[DEFAULT].
-- verbose (optional): Set to True if you need segment details in the return value. Default: False
-
-Language support:
-- 'zh': Chinese (Mandarin)
-- 'en': English
-- 'yue': Cantonese
-- 'ja': Japanese
-- 'ko': Korean
-- And more depending on model capabilities
-
-Audio formats: wav, mp3, m4a, flac, ogg, and other common formats
-
-Advanced features (if supported by model):
-- Speaker diarization: identify different speakers
-- Timestamps: get word-level or segment-level timing
-- Confidence scores: get transcription confidence
-- Smart segment merging: consecutive segments from same speaker are automatically merged (gap < 1s) to improve readability
-
-Output:
-- file_id: File ID for accessing the full transcription JSON file in workspace
-- transcription_path: Path to saved transcription JSON file in workspace
-- saved_to_workspace: Whether the transcription was saved to workspace
-- segments: Detailed segment information (only present if verbose=True)
-- language: Detected language code
-- model_used: The actual model used for transcription
-- text_length: Length of transcribed text
-- segment_count: Number of segments
-
-Note: Use read_file(file_id) to get the full transcription text.
-
-JSON Output Format (saved to file specified by file_id):
-```json
-{{
-  "model": "model_name",
-  "language": "zh",
-  "text": "Full transcribed text here...",
-  "segments": [
-    {{
-      "text": "Segment text",
-      "start": 0.0,
-      "end": 2.5,
-      "speaker": "spk1",
-      "confidence": 0.95
-    }}
-  ],
-  "metadata": {{
-    "audio_source": "input_audio.mp3",
-    "verbose_mode": true,
-    "total_segments": 10
-  }}
-}}
-```
-
-JSON Field Descriptions:
-- model: Name of the ASR model used
-- language: Detected/specified language code
-- text: Complete transcribed text (full content, not truncated)
-- segments: Array of detailed segments (auto-merged for readability)
-  - text: Segment text content
-  - start: Segment start time in seconds
-  - end: Segment end time in seconds
-  - speaker: Speaker identifier (if diarization enabled)
-  - confidence: Confidence score (0-1, if supported by model)
-
-  Note: Segments are automatically merged when consecutive segments from
-  the same speaker are close together (< 1 second gap) to improve readability
-  and reduce fragmentation.
-- metadata: Additional information about the transcription
-  - audio_source: Original audio input
-  - verbose_mode: Whether detailed output was requested
-  - total_segments: Number of segments in the transcription
-
-Note: Use read_file(file_id) to get the full transcription text.
-    """.strip()
-
-    # Description for synthesize_speech tool
-    SYNTHESIZE_SPEECH_DESCRIPTION = """
-Synthesize speech from text using Text-to-Speech (TTS).
-
-This tool converts written text into natural-sounding speech audio.
-Supports multiple voices, languages, and audio formats.
-
-Available models (⭐[DEFAULT] marks the configured default model):
-{}
-
-**IMPORTANT: Prefer the default model marked with ⭐[DEFAULT]. Only specify model_id if the user explicitly requests a different model.**
-
-Parameters:
-- text (required): text content to synthesize into speech
-- voice (optional): voice ID or name (e.g., 'zh-android', 'zh-female', 'en-male'). Omit for default voice.
-- language (optional): language code (e.g., 'zh', 'en', 'yue'). Auto-detected from text if not specified.
-- format (optional): audio output format (e.g., 'mp3', 'wav', 'pcm'). Default: 'mp3'
-- model_id (optional): specific TTS model to use. Omit to use the default model marked with ⭐[DEFAULT].
-- reference_audio (optional): reference audio file path for voice cloning (if supported by model)
-
-Voice options depend on the model:
-- Most models support standard voices: male, female, neutral
-- Some models support voice cloning using reference_audio
-- Multilingual models can auto-detect language from text
-
-Audio format options:
-- mp3: Compressed audio, good for speech (default)
-- wav: Uncompressed audio, higher quality
-- pcm: Raw audio data
-
-The generated audio file will be automatically saved to workspace.
-    """.strip()
-
-    # Description for synthesize_speech_json tool
-    SYNTHESIZE_SPEECH_JSON_DESCRIPTION = """
-Batch synthesize speech from JSON structure using Text-to-Speech (TTS).
-
-This tool converts multiple text segments into speech audio files in a single call.
-Supports flexible JSON format with configurable field mapping, voice cloning, and batch processing.
-
-Available models (⭐[DEFAULT] marks the configured default model):
-{}
-
-**IMPORTANT: Prefer the default model marked with ⭐[DEFAULT]. Only specify model_id if the user explicitly requests a different model.**
-
-Parameters:
-- json_data (optional): JSON string or dict containing synthesis configuration. Either json_data or file_id must be provided.
-- file_id (optional): File ID, file path, or URL to read JSON data from. Either json_data or file_id must be provided.
-- segments_field (optional): Field name containing segments array (default: "segments")
-- text_field (optional): Field name containing text within each segment (default: "text")
-- voice_field (optional): Field name containing voice within each segment (default: "voice")
-- reference_field (optional): Field name containing reference audio file path/ID for voice cloning (default: "reference_audio")
-- default_voice (optional): Default voice for segments without voice specified
-- default_language (optional): Default language code (auto-detect if None)
-- format (optional): Output audio format (default: 'mp3')
-- sample_rate (optional): Sample rate in Hz (default: model-specific)
-- model_id (optional): Specific TTS model to use. Omit to use the default model marked with ⭐[DEFAULT].
-- batch_size (optional): Number of syntheses to process in parallel (1-20, default: 5)
-
-JSON Format (nested segment structure):
-```json
-{{
-    "segments": [
-        {{
-            "text": "你好世界",
-            "voice": "zh-female",
-            "reference_audio": "ref_voice_1"
-        }},
-        {{
-            "text": "这是一个测试",
-            "voice": "zh-male",
-            "reference_audio": "ref_voice_2"
-        }}
-    ],
-    "default_voice": "zh-female",
-    "output_format": "mp3",
-    "sample_rate": 24000
-}}
-```
-
-Field Mapping (configurable):
-- segments_field: Top-level field containing the segments array (default: "segments")
-- text_field: Field within each segment containing the text to synthesize (default: "text")
-- voice_field: Field within each segment containing the voice ID (default: "voice")
-- reference_field: Field within each segment containing reference audio ID for voice cloning (default: "reference_audio_id")
-
-Voice Cloning:
-- Use reference_audio in each segment to clone voices from reference audio files
-- Supports both workspace file IDs and direct file paths (absolute or relative)
-- Voice cloning quality depends on the reference audio quality
-- Not all models support voice cloning
-
-Batch Processing:
-- All segments are processed in parallel for efficiency
-- Use batch_size to control parallelism (1-20)
-- Progress is shown during synthesis
-- Failed segments don't stop the batch
-
-Output:
-- success (bool): Whether all syntheses succeeded
-- results (list): List of synthesis results, one per segment
-- total (int): Total number of segments processed
-- successful (int): Number of successful syntheses
-- failed (int): Number of failed syntheses
-- errors (list): List of error messages for failed segments
-- saved_to_workspace (bool): Whether audio files were saved to workspace
-
-Using file_id parameter is recommended for workflows with file chaining.
-This tool automatically handles file reading when file_id is provided.
-
-file_id parameter supports:
-- File ID: Registered workspace file ID (e.g., "abc123-def456")
-- File path: Local file path (e.g., "/path/to/config.json" or "config.json")
-- URL: HTTP/HTTPS URL (e.g., "https://example.com/config.json")
-    """.strip()
+    # Import description templates from separate file
+    TRANSCRIBE_AUDIO_DESCRIPTION = TRANSCRIBE_AUDIO_DESCRIPTION
+    SYNTHESIZE_SPEECH_DESCRIPTION = SYNTHESIZE_SPEECH_DESCRIPTION
+    SYNTHESIZE_SPEECH_JSON_DESCRIPTION = SYNTHESIZE_SPEECH_JSON_DESCRIPTION
 
     def __init__(
         self,
@@ -331,20 +136,39 @@ file_id parameter supports:
                 else "No TTS models available"
             )
 
-    def _get_asr_model(self, model_id: Optional[str] = None) -> Optional[BaseASR]:
-        """Get ASR model by ID or default model."""
-        if model_id and model_id in self._asr_models:
-            return self._asr_models[model_id]
+    def _get_model(
+        self,
+        models: Dict[str, Any],
+        default_model: Optional[Any],
+        model_id: Optional[str] = None,
+    ) -> Optional[Any]:
+        """
+        Generic method to get model by ID or default model.
 
-        # Use configured default ASR model
-        if self._default_asr_model:
-            return self._default_asr_model
+        Args:
+            models: Dictionary mapping model_id to model instances
+            default_model: Configured default model instance
+            model_id: Specific model ID to retrieve
+
+        Returns:
+            Model instance or None if not found
+        """
+        if model_id and model_id in models:
+            return models[model_id]
+
+        # Use configured default model
+        if default_model:
+            return default_model
 
         # Fallback: return first available model
-        if self._asr_models:
-            return next(iter(self._asr_models.values()))
+        if models:
+            return next(iter(models.values()))
 
         return None
+
+    def _get_asr_model(self, model_id: Optional[str] = None) -> Optional[BaseASR]:
+        """Get ASR model by ID or default model."""
+        return self._get_model(self._asr_models, self._default_asr_model, model_id)
 
     def _merge_segments(
         self, segments: List[Dict[str, Any]], max_gap: float = 1.0
@@ -394,18 +218,7 @@ file_id parameter supports:
 
     def _get_tts_model(self, model_id: Optional[str] = None) -> Optional[BaseTTS]:
         """Get TTS model by ID or default model."""
-        if model_id and model_id in self._tts_models:
-            return self._tts_models[model_id]
-
-        # Use configured default TTS model
-        if self._default_tts_model:
-            return self._default_tts_model
-
-        # Fallback: return first available model
-        if self._tts_models:
-            return next(iter(self._tts_models.values()))
-
-        return None
+        return self._get_model(self._tts_models, self._default_tts_model, model_id)
 
     def _resolve_audio_path(self, audio_input: str) -> str:
         """
@@ -634,7 +447,7 @@ file_id parameter supports:
         text: str,
         voice: Optional[str] = None,
         language: Optional[str] = None,
-        format: str = "mp3",
+        audio_format: str = "mp3",
         model_id: Optional[str] = None,
         **kwargs: Any,
     ) -> Dict[str, Any]:
@@ -645,7 +458,7 @@ file_id parameter supports:
             text: Input text to synthesize
             voice: Voice ID or name (optional)
             language: Language code (optional)
-            format: Output audio format (default: 'mp3')
+            audio_format: Output audio format (default: 'mp3')
             model_id: Specific TTS model to use (optional, uses default if not provided)
             **kwargs: Additional model-specific parameters
 
@@ -677,7 +490,7 @@ file_id parameter supports:
                 text=text,
                 voice=voice,
                 language=language,
-                format=format,
+                format=audio_format,
                 **kwargs,
             )
 
@@ -686,18 +499,18 @@ file_id parameter supports:
                 model_id if model_id and model_id in self._tts_models else "default"
             )
 
-            audio_data = None
-            audio_format = None
-            sample_rate = None
-            language_detected = None
+            audio_data: Optional[bytes] = None
+            result_audio_format: Optional[str] = None
+            sample_rate: Optional[int] = None
+            language_detected: Optional[str] = None
 
             # Handle different result types
             if isinstance(result, bytes):
                 audio_data = result
-                audio_format = format
+                result_audio_format = audio_format
             elif isinstance(result, TTSResult):
                 audio_data = result.audio
-                audio_format = result.format
+                result_audio_format = result.format
                 sample_rate = result.sample_rate
                 language_detected = result.language
 
@@ -708,7 +521,7 @@ file_id parameter supports:
             if audio_data and self._workspace:
                 try:
                     # Generate filename
-                    filename = f"synthesized_speech_{uuid.uuid4().hex[:8]}.{audio_format or 'mp3'}"
+                    filename = f"synthesized_speech_{uuid.uuid4().hex[:8]}.{result_audio_format or 'mp3'}"
 
                     # Register and save audio file in workspace
                     with self._workspace.auto_register_files():
@@ -737,7 +550,7 @@ file_id parameter supports:
                 "success": True,
                 "audio_path": audio_path,
                 "file_id": audio_file_id,
-                "format": audio_format,
+                "format": result_audio_format,
                 "sample_rate": sample_rate,
                 "language": language_detected,
                 "model_used": actual_model_id,
@@ -822,7 +635,7 @@ file_id parameter supports:
         reference_field: str = "reference_audio",
         default_voice: Optional[str] = None,
         default_language: Optional[str] = None,
-        format: str = "mp3",
+        audio_format: str = "mp3",
         sample_rate: Optional[int] = None,
         model_id: Optional[str] = None,
         batch_size: int = 5,
@@ -841,7 +654,7 @@ file_id parameter supports:
             reference_field: Field name containing reference audio ID (default: "reference_audio_id")
             default_voice: Default voice for segments without voice specified
             default_language: Default language code (auto-detect if None)
-            format: Output audio format (default: 'mp3')
+            audio_format: Output audio format (default: 'mp3')
             sample_rate: Sample rate in Hz (default: model-specific)
             model_id: Specific TTS model to use
             batch_size: Number of syntheses to process in parallel (1-20, default: 5)
@@ -1065,7 +878,7 @@ file_id parameter supports:
                     reference_field,
                     default_voice,
                     default_language,
-                    format,
+                    audio_format,
                     sample_rate,
                     tts_model,
                     idx,
@@ -1098,7 +911,7 @@ file_id parameter supports:
                         reference_field,
                         default_voice,
                         default_language,
-                        format,
+                        audio_format,
                         sample_rate,
                         tts_model,
                         idx,
@@ -1159,7 +972,7 @@ file_id parameter supports:
         reference_field: str,
         default_voice: Optional[str],
         default_language: Optional[str],
-        format: str,
+        audio_format: str,
         sample_rate: Optional[int],
         tts_model: Any,
         index: int,
@@ -1174,7 +987,7 @@ file_id parameter supports:
             reference_field: Field name for reference audio ID
             default_voice: Default voice if not specified in segment
             default_language: Default language if not specified
-            format: Audio format
+            audio_format: Audio format
             sample_rate: Sample rate
             tts_model: TTS model instance
             index: Segment index for error reporting
@@ -1210,7 +1023,7 @@ file_id parameter supports:
             ref_audio_id = segment.get(reference_field)
 
             # Build synthesis parameters
-            kwargs: Dict[str, Any] = {"format": format}
+            kwargs: Dict[str, Any] = {"format": audio_format}
             if sample_rate:
                 kwargs["sample_rate"] = sample_rate
 
@@ -1229,9 +1042,7 @@ file_id parameter supports:
 
                 # If not found as file_id, try as direct file path
                 if not ref_audio_path:
-                    from pathlib import Path as PathLib
-
-                    direct_path = PathLib(ref_audio_id)
+                    direct_path = Path(ref_audio_id)
                     if direct_path.exists():
                         ref_audio_path = direct_path
                     elif direct_path.is_absolute():
@@ -1241,7 +1052,7 @@ file_id parameter supports:
                         )
                     else:
                         # Relative path, try current directory
-                        resolved_cwd = PathLib.cwd() / direct_path
+                        resolved_cwd = Path.cwd() / direct_path
                         if resolved_cwd.exists():
                             ref_audio_path = resolved_cwd
                         else:
@@ -1264,7 +1075,7 @@ file_id parameter supports:
             # Handle result
             if isinstance(audio_data, bytes):
                 audio_binary = audio_data
-                audio_format = format
+                # audio_format remains as the function parameter
             else:
                 # Assume it's TTSResult
                 audio_binary = audio_data.audio

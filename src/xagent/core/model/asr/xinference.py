@@ -5,21 +5,20 @@ from __future__ import annotations
 import logging
 from typing import Any, Optional, Protocol, Union
 
-from xinference_client import RESTfulClient as XinferenceClient
-
+from ..xinference_base import BaseXinferenceModel
 from .base import ASRResult, ASRSegment, BaseASR
 
 logger = logging.getLogger(__name__)
 
 
 class ModelProtocol(Protocol):
-    """Protocol for xinference model handle."""
+    """Protocol for xinference ASR model handle."""
 
     async def transcriptions(self, audio: bytes, **kwargs: Any) -> dict[str, Any]: ...
     def close(self) -> None: ...
 
 
-class XinferenceASR(BaseASR):
+class XinferenceASR(BaseASR, BaseXinferenceModel):
     """
     Xinference Automatic Speech Recognition (ASR) model client using the xinference-client SDK.
     Supports speech recognition using Xinference's audio models.
@@ -43,40 +42,8 @@ class XinferenceASR(BaseASR):
             api_key: Optional API key for authentication
             language: Default language code (e.g., 'zh', 'en')
         """
-        self.model = model
-        self._model_uid = model_uid or model
-        self.base_url = (base_url or "http://localhost:9997").rstrip("/")
-        self.api_key = api_key
+        BaseXinferenceModel.__init__(self, model, model_uid, base_url, api_key)
         self.language = language
-
-        # Initialize the Xinference client (lazy initialization)
-        self._client: Optional[XinferenceClient] = None
-        self._model_handle: Optional[ModelProtocol] = None
-
-    async def _get_session(self) -> Any:  # AsyncClient
-        """Get or create async Xinference client."""
-        if self._client is None:
-            try:
-                # Try to import from local xinference package first
-                from xinference.client.restful.async_restful_client import (  # type: ignore
-                    AsyncClient,
-                )
-            except ImportError:
-                # Fallback to xinference_client package
-                from xinference_client.client.restful.async_restful_client import (  # type: ignore
-                    AsyncClient,
-                )
-
-            self._client = AsyncClient(base_url=self.base_url, api_key=self.api_key)
-        return self._client
-
-    async def _ensure_model_handle(self) -> Any:  # AsyncModelProtocol
-        """Ensure the ASR model handle is initialized."""
-        if self._model_handle is None:
-            client = await self._get_session()
-            # Get the model handle (assumes model is already launched on the server)
-            self._model_handle = await client.get_model(self._model_uid)
-        return self._model_handle
 
     async def transcribe(
         self,
@@ -299,29 +266,9 @@ class XinferenceASR(BaseASR):
             "hotword",  # Some models support hotword for improved accuracy
         ]
 
-    def close(self) -> None:
-        """Close the Xinference client and cleanup resources."""
-        if self._model_handle is not None:
-            try:
-                self._model_handle.close()
-            except Exception:
-                pass
-            self._model_handle = None
-
-        if self._client is not None:
-            try:
-                self._client.close()
-            except Exception:
-                pass
-            self._client = None
-
     def __enter__(self) -> "XinferenceASR":
         """Context manager entry."""
         return self
-
-    def __exit__(self, exc_type: Any, exc_val: Any, exc_tb: Any) -> None:
-        """Context manager exit."""
-        self.close()
 
     @staticmethod
     def list_available_models(
@@ -341,6 +288,13 @@ class XinferenceASR(BaseASR):
             ...     base_url="http://localhost:9997"
             ... )
         """
+        try:
+            from xinference_client import RESTfulClient as XinferenceClient
+        except ImportError:
+            from xinference.client.restful.restful_client import (
+                RESTfulClient as XinferenceClient,  # type: ignore
+            )
+
         client = XinferenceClient(base_url=base_url, api_key=api_key)
 
         try:

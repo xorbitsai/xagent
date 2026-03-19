@@ -84,24 +84,6 @@ Note: Translation is done in batches for efficiency. All texts are sent to LLM t
 Translation results are automatically saved to workspace when available.
 Using file_id parameter is recommended for workflows with file chaining.
 This tool automatically handles file reading when file_id is provided.
-- translation_path (str): Path to saved translation JSON file
-- saved_to_workspace (bool): Whether the translation was saved to workspace
-
-Examples:
-1. Simple translation:
-   translate_json('{"text": "你好"}', ["text"], target_lang="en")
-   Returns: {"text": "你好", "translated_text": "Hello"}
-
-2. Nested structure:
-   translate_json('{"segments": [{"text": "测试"}]}', ["segments.text"], target_lang="en")
-   Returns: {"segments": [{"text": "测试", "translated_text": "Test"}]}
-
-3. Multiple fields:
-   translate_json('{"title": "标题", "content": "内容"}', ["title", "content"], target_lang="en")
-   Returns: {"title": "标题", "translated_title": "Title", "content": "内容", "translated_content": "Content"}
-
-Note: Translation is done in batches for efficiency. All texts are sent to LLM together.
-Translation results are automatically saved to workspace when available.
 """
 
     @property
@@ -158,59 +140,97 @@ Translation results are automatically saved to workspace when available.
 
         return TranslateJsonResult
 
-    def run_json_sync(self, args: Mapping[str, Any]) -> Any:
-        """Execute translation synchronously"""
-        import asyncio
-        from pathlib import Path  # noqa: F401
+    def _parse_and_execute(
+        self, args: Mapping[str, Any]
+    ) -> tuple[
+        str | Dict[str, Any], List[str], str, str, Optional[str], int, Optional[str]
+    ]:
+        """
+        Parse and validate arguments for JSON translation.
 
+        Common logic extracted from sync and async methods.
+
+        Args:
+            args: Input arguments mapping
+
+        Returns:
+            Tuple of (json_data, target_fields, output_field, target_lang, source_lang, batch_size, instructions)
+
+        Raises:
+            ValueError: If validation fails
+            AssertionError: If LLM is not available
+        """
         # Assert LLM is available for execution
         assert self._llm is not None, "translate_json tool requires an LLM to function"
 
+        # Parse arguments
+        json_data = args.get("json_data")
+        file_id = args.get("file_id")
+        target_fields = args.get("target_fields")
+        output_field = args.get("output_field", "translated_text")
+        target_lang = args.get("target_lang", "en")
+        source_lang = args.get("source_lang")
+        batch_size = args.get("batch_size", 10)
+        instructions = args.get("instructions")
+
+        # Validate required arguments - either json_data or file_id must be provided
+        if json_data is None and file_id is None:
+            raise ValueError("Either json_data or file_id must be provided")
+        if target_fields is None:
+            raise ValueError("target_fields is required")
+
+        # If file_id is provided, read JSON data from workspace
+        if file_id is not None:
+            if not self._workspace:
+                raise ValueError("Workspace is required when using file_id parameter")
+            try:
+                # Get file path from file_id
+                file_path = self._workspace.resolve_file_id(file_id)
+                if not file_path or not file_path.exists():
+                    raise ValueError(f"File not found: {file_path}")
+
+                # Read JSON content from file
+                with open(file_path, "r", encoding="utf-8") as f:
+                    json_data = f.read()
+
+                logger.info(f"Read JSON data from file: {file_path}")
+
+            except Exception as e:
+                raise ValueError(f"Failed to read file {file_id}: {e}")
+
+        # Type narrowing for mypy
+        json_data_typed: str | Dict[str, Any] = (
+            json_data if isinstance(json_data, (str, dict)) else str(json_data)
+        )
+        target_fields_typed: List[str] = (
+            target_fields if isinstance(target_fields, list) else [target_fields]
+        )
+
+        return (
+            json_data_typed,
+            target_fields_typed,
+            output_field,
+            target_lang,
+            source_lang,
+            batch_size,
+            instructions,
+        )
+
+    def run_json_sync(self, args: Mapping[str, Any]) -> Any:
+        """Execute translation synchronously"""
+        import asyncio
+
         try:
-            # Parse arguments
-            json_data = args.get("json_data")
-            file_id = args.get("file_id")
-            target_fields = args.get("target_fields")
-            output_field = args.get("output_field", "translated_text")
-            target_lang = args.get("target_lang", "en")
-            source_lang = args.get("source_lang")
-            batch_size = args.get("batch_size", 10)
-            instructions = args.get("instructions")
-
-            # Validate required arguments - either json_data or file_id must be provided
-            if json_data is None and file_id is None:
-                raise ValueError("Either json_data or file_id must be provided")
-            if target_fields is None:
-                raise ValueError("target_fields is required")
-
-            # If file_id is provided, read JSON data from workspace
-            if file_id is not None:
-                if not self._workspace:
-                    raise ValueError(
-                        "Workspace is required when using file_id parameter"
-                    )
-                try:
-                    # Get file path from file_id
-                    file_path = self._workspace.resolve_file_id(file_id)
-                    if not file_path or not file_path.exists():
-                        raise ValueError(f"File not found: {file_id}")
-
-                    # Read JSON content from file
-                    with open(file_path, "r", encoding="utf-8") as f:
-                        json_data = f.read()
-
-                    logger.info(f"Read JSON data from file: {file_path}")
-
-                except Exception as e:
-                    raise ValueError(f"Failed to read file {file_id}: {e}")
-
-            # Type narrowing for mypy
-            json_data_typed: str | Dict[str, Any] = (
-                json_data if isinstance(json_data, (str, dict)) else str(json_data)
-            )
-            target_fields_typed: List[str] = (
-                target_fields if isinstance(target_fields, list) else [target_fields]
-            )
+            # Parse and validate arguments
+            (
+                json_data_typed,
+                target_fields_typed,
+                output_field,
+                target_lang,
+                source_lang,
+                batch_size,
+                instructions,
+            ) = self._parse_and_execute(args)
 
             # Run async translation
             result = asyncio.run(
@@ -234,7 +254,7 @@ Translation results are automatically saved to workspace when available.
                 "result": "",
                 "error": str(e),
                 "fields_translated": 0,
-                "target_lang": target_lang if "target_lang" in args else "en",
+                "target_lang": args.get("target_lang", "en"),
                 "file_id": None,
                 "translation_path": None,
                 "saved_to_workspace": False,
@@ -242,56 +262,17 @@ Translation results are automatically saved to workspace when available.
 
     async def run_json_async(self, args: Mapping[str, Any]) -> Any:
         """Execute translation asynchronously"""
-        from pathlib import Path  # noqa: F401
-
-        # Assert LLM is available for execution
-        assert self._llm is not None, "translate_json tool requires an LLM to function"
-
         try:
-            # Parse arguments
-            json_data = args.get("json_data")
-            file_id = args.get("file_id")
-            target_fields = args.get("target_fields")
-            output_field = args.get("output_field", "translated_text")
-            target_lang = args.get("target_lang", "en")
-            source_lang = args.get("source_lang")
-            batch_size = args.get("batch_size", 10)
-            instructions = args.get("instructions")
-
-            # Validate required arguments - either json_data or file_id must be provided
-            if json_data is None and file_id is None:
-                raise ValueError("Either json_data or file_id must be provided")
-            if target_fields is None:
-                raise ValueError("target_fields is required")
-
-            # If file_id is provided, read JSON data from workspace
-            if file_id is not None:
-                if not self._workspace:
-                    raise ValueError(
-                        "Workspace is required when using file_id parameter"
-                    )
-                try:
-                    # Get file path from file_id
-                    file_path = self._workspace.resolve_file_id(file_id)
-                    if not file_path or not file_path.exists():
-                        raise ValueError(f"File not found: {file_id}")
-
-                    # Read JSON content from file
-                    with open(file_path, "r", encoding="utf-8") as f:
-                        json_data = f.read()
-
-                    logger.info(f"Read JSON data from file: {file_path}")
-
-                except Exception as e:
-                    raise ValueError(f"Failed to read file {file_id}: {e}")
-
-            # Type narrowing for mypy
-            json_data_typed: str | Dict[str, Any] = (
-                json_data if isinstance(json_data, (str, dict)) else str(json_data)
-            )
-            target_fields_typed: List[str] = (
-                target_fields if isinstance(target_fields, list) else [target_fields]
-            )
+            # Parse and validate arguments
+            (
+                json_data_typed,
+                target_fields_typed,
+                output_field,
+                target_lang,
+                source_lang,
+                batch_size,
+                instructions,
+            ) = self._parse_and_execute(args)
 
             # Direct async call
             result = await self._core.translate_json(
@@ -313,7 +294,7 @@ Translation results are automatically saved to workspace when available.
                 "result": "",
                 "error": str(e),
                 "fields_translated": 0,
-                "target_lang": target_lang if "target_lang" in args else "en",
+                "target_lang": args.get("target_lang", "en"),
                 "file_id": None,
                 "translation_path": None,
                 "saved_to_workspace": False,

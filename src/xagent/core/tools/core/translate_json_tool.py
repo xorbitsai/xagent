@@ -115,6 +115,81 @@ class TranslateJSONToolCore:
 
         return False
 
+    async def _translate_batch(
+        self,
+        batch_texts: List[str],
+        batch_index: int,
+        target_lang: str,
+        source_lang: Optional[str],
+        instructions_section: str,
+    ) -> List[str]:
+        """
+        Translate a batch of texts.
+
+        Args:
+            batch_texts: List of texts to translate in this batch
+            batch_index: Batch index for error reporting
+            target_lang: Target language
+            source_lang: Source language (auto-detect if None)
+            instructions_section: Additional instructions section for prompt
+
+        Returns:
+            List of translated texts
+
+        Raises:
+            RuntimeError: If translation fails
+            ValueError: If translation count mismatches
+        """
+        # Assert LLM is available (caller should have checked)
+        assert self._llm is not None, "LLM must be available for translation"
+
+        # Build translation prompt for this batch
+        source_info = f" from {source_lang}" if source_lang else ""
+        prompt = f"""Translate the following texts to {target_lang}{source_info}. Return only the translations, one per line, in the same order.{instructions_section}
+
+Texts to translate:
+{chr(10).join(f"{i + 1}. {text}" for i, text in enumerate(batch_texts))}
+
+Translations:"""
+
+        messages = [
+            {"role": "user", "content": prompt},
+        ]
+
+        try:
+            # Use stream_chat to avoid timeout
+            content = ""
+            async for chunk in self._llm.stream_chat(messages=messages):
+                if chunk.is_token():
+                    content += chunk.delta
+                elif chunk.is_error():
+                    raise RuntimeError(f"Translation error: {chunk.delta}")
+
+            # Parse translations
+            lines = content.strip().split("\n")
+            translations = []
+
+            for line in lines:
+                line = line.strip()
+                # Remove numbering if present
+                if line and line[0].isdigit() and line[1] == ".":
+                    translations.append(line.split(".", 1)[1].strip())
+                elif line:
+                    translations.append(line)
+
+            # Ensure we have the right number of translations
+            if len(translations) != len(batch_texts):
+                raise ValueError(
+                    f"Batch {batch_index}: Translation count mismatch: expected {len(batch_texts)}, got {len(translations)}. "
+                    f"LLM response:\n{content}"
+                )
+
+            return translations
+
+        except Exception:
+            # Re-raise the exception to notify the user of translation failure
+            raise
+
     async def translate_values(
         self,
         texts: List[str],
@@ -142,86 +217,10 @@ class TranslateJSONToolCore:
         if not self._llm:
             raise ValueError("No LLM instance available")
 
-        # Get LLM instance for use in nested function
-        llm = self._llm
-
         # Build instructions section for prompt
         instructions_section = ""
         if instructions:
             instructions_section = f"\n\nAdditional Instructions:\n{instructions}\n"
-
-        async def translate_batch(
-            batch_texts: List[str], batch_index: int
-        ) -> List[str]:
-            """Translate a batch of texts"""
-            # Build translation prompt for this batch
-            source_info = f" from {source_lang}" if source_lang else ""
-            prompt = f"""Translate the following texts to {target_lang}{source_info}. Return only the translations, one per line, in the same order.{instructions_section}
-
-Texts to translate:
-{chr(10).join(f"{i + 1}. {text}" for i, text in enumerate(batch_texts))}
-
-Translations:"""
-
-            messages = [
-                {"role": "user", "content": prompt},
-            ]
-
-            try:
-                # Use stream_chat to avoid timeout with progress tracking
-                content = ""
-
-                # Add progress bar for streaming tokens
-                with tqdm_std(
-                    total=100,
-                    desc=f"Batch {batch_index + 1}",
-                    unit="%",
-                    colour="cyan",
-                    leave=False,
-                    bar_format="{l_bar}{bar}| {n:.1f}/{total_fmt} [{elapsed}]",
-                ) as pbar:
-                    last_percent = 0
-                    async for chunk in llm.stream_chat(messages=messages):
-                        if chunk.is_token():
-                            content += chunk.delta
-                            # Estimate progress based on content length
-                            # Assume average translation is about the same length as input
-                            estimated_length = sum(len(text) for text in batch_texts)
-                            current_percent = min(
-                                100, int(len(content) / max(1, estimated_length) * 100)
-                            )
-                            if current_percent > last_percent:
-                                pbar.update(current_percent - last_percent)
-                                last_percent = current_percent
-                        elif chunk.is_error():
-                            raise RuntimeError(f"Translation error: {chunk.delta}")
-
-                # Parse translations
-                lines = content.strip().split("\n")
-                translations = []
-
-                for line in lines:
-                    line = line.strip()
-                    # Remove numbering if present
-                    if line and line[0].isdigit() and line[1] == ".":
-                        translations.append(line.split(".", 1)[1].strip())
-                    elif line:
-                        translations.append(line)
-
-                # Ensure we have the right number of translations
-                if len(translations) != len(batch_texts):
-                    logger.warning(
-                        f"Batch {batch_index}: Translation count mismatch: expected {len(batch_texts)}, got {len(translations)}"
-                    )
-                    # Fallback: return original texts for this batch
-                    return batch_texts
-
-                return translations
-
-            except Exception as e:
-                logger.error(f"Batch {batch_index} translation failed: {e}")
-                # Fallback: return original texts for this batch
-                return batch_texts
 
         try:
             # Split texts into batches
@@ -232,7 +231,9 @@ Translations:"""
             if len(batches) == 1:
                 # Single batch: translate directly
                 logger.info(f"Translating single batch of {len(texts)} texts")
-                return await translate_batch(batches[0], 0)
+                return await self._translate_batch(
+                    batches[0], 0, target_lang, source_lang, instructions_section
+                )
             else:
                 # Multiple batches: translate in parallel with progress tracking
                 logger.info(
@@ -253,7 +254,13 @@ Translations:"""
                     async def translate_batch_with_progress(
                         batch_texts: List[str], batch_index: int
                     ) -> List[str]:
-                        result = await translate_batch(batch_texts, batch_index)
+                        result = await self._translate_batch(
+                            batch_texts,
+                            batch_index,
+                            target_lang,
+                            source_lang,
+                            instructions_section,
+                        )
                         pbar.update(1)
                         pbar.set_postfix(
                             {

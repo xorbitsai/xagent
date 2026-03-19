@@ -5,26 +5,20 @@ from __future__ import annotations
 import logging
 from typing import Any, Optional, Protocol, Union
 
-try:
-    from xinference.client.restful.restful_client import (
-        RESTfulClient as XinferenceClient,  # type: ignore
-    )
-except ImportError:
-    from xinference_client import RESTfulClient as XinferenceClient  # type: ignore
-
+from ..xinference_base import BaseXinferenceModel
 from .base import BaseTTS, TTSResult
 
 logger = logging.getLogger(__name__)
 
 
 class ModelProtocol(Protocol):
-    """Protocol for xinference model handle."""
+    """Protocol for xinference TTS model handle."""
 
     async def speech(self, text: str, **kwargs: Any) -> bytes: ...
     def close(self) -> None: ...
 
 
-class XinferenceTTS(BaseTTS):
+class XinferenceTTS(BaseTTS, BaseXinferenceModel):
     """
     Xinference Text-to-Speech (TTS) model client using the xinference-client SDK.
 
@@ -56,43 +50,11 @@ class XinferenceTTS(BaseTTS):
             format: Output audio format (e.g., "mp3", "wav", "pcm")
             sample_rate: Sample rate in Hz (22050, 24000, 48000)
         """
-        self.model = model
-        self._model_uid = model_uid or model
-        self.base_url = (base_url or "http://localhost:9997").rstrip("/")
-        self.api_key = api_key
+        BaseXinferenceModel.__init__(self, model, model_uid, base_url, api_key)
         self.voice = voice
         self.language = language
         self.format = format
         self.sample_rate = sample_rate
-
-        # Initialize the Xinference client (lazy initialization)
-        self._client: Optional[XinferenceClient] = None
-        self._model_handle: Optional[ModelProtocol] = None
-
-    async def _get_session(self) -> Any:  # AsyncClient
-        """Get or create async Xinference client."""
-        if self._client is None:
-            try:
-                # Try to import from local xinference package first
-                from xinference.client.restful.async_restful_client import (  # type: ignore
-                    AsyncClient,
-                )
-            except ImportError:
-                # Fallback to xinference_client package
-                from xinference_client.client.restful.async_restful_client import (  # type: ignore
-                    AsyncClient,
-                )
-
-            self._client = AsyncClient(base_url=self.base_url, api_key=self.api_key)
-        return self._client
-
-    async def _ensure_model_handle(self) -> Any:  # AsyncModelProtocol
-        """Ensure the TTS model handle is initialized."""
-        if self._model_handle is None:
-            client = await self._get_session()
-            # Get the model handle (assumes model is already launched on the server)
-            self._model_handle = await client.get_model(self._model_uid)
-        return self._model_handle
 
     async def synthesize(
         self,
@@ -165,26 +127,24 @@ class XinferenceTTS(BaseTTS):
         prompt_speech = None
         reference_audio_path = kwargs.pop("reference_audio", None)
         if reference_audio_path:
-            print(f"  📁 Reading reference audio from: {reference_audio_path}")
+            logger.debug(f"Reading reference audio from: {reference_audio_path}")
             try:
                 with open(reference_audio_path, "rb") as f:
                     prompt_speech = f.read()
-                print(f"  ✅ Reference audio loaded: {len(prompt_speech)} bytes")
+                logger.debug(f"Reference audio loaded: {len(prompt_speech)} bytes")
             except Exception as e:
-                print(f"  ❌ Failed to read reference audio: {e}")
+                logger.error(f"Failed to read reference audio: {e}")
 
         # Add any additional parameters (excluding reference_audio which we already handled)
         params.update(kwargs)
 
-        # Print all parameters for debugging
-        print("\n🎙️ TTS Call Parameters:")
-        print(f"  Text (first 100 chars): {text[:100]}...")
-        print(f"  Voice: {final_voice}")
-        print(f"  Language: {final_language}")
-        print(f"  Format: {final_format}")
-        print(f"  Sample Rate: {final_sample_rate}")
+        # Log all parameters for debugging
+        logger.debug(
+            f"TTS Call Parameters: text={text[:100]}..., voice={final_voice}, "
+            f"language={final_language}, format={final_format}, sample_rate={final_sample_rate}"
+        )
         if prompt_speech:
-            print(f"  🎯 Prompt Speech (voice cloning): {len(prompt_speech)} bytes")
+            logger.debug(f"Prompt Speech (voice cloning): {len(prompt_speech)} bytes")
         # Log any other parameters
         other_params = {
             k: v
@@ -192,8 +152,8 @@ class XinferenceTTS(BaseTTS):
             if k not in ["output_audio_format", "sample_rate", "voice", "language"]
         }
         if other_params:
-            print(f"  Other params: {other_params}")
-        print(f"  All params: {params}")
+            logger.debug(f"Other TTS params: {other_params}")
+        logger.debug(f"All TTS params: {params}")
 
         try:
             # Call speech synthesis API
@@ -253,29 +213,9 @@ class XinferenceTTS(BaseTTS):
 
         return abilities
 
-    def close(self) -> None:
-        """Close the Xinference client and cleanup resources."""
-        if self._model_handle is not None:
-            try:
-                self._model_handle.close()
-            except Exception:
-                pass
-            self._model_handle = None
-
-        if self._client is not None:
-            try:
-                self._client.close()
-            except Exception:
-                pass
-            self._client = None
-
     def __enter__(self) -> "XinferenceTTS":
         """Context manager entry."""
         return self
-
-    def __exit__(self, exc_type: Any, exc_val: Any, exc_tb: Any) -> None:
-        """Context manager exit."""
-        self.close()
 
     @staticmethod
     def list_available_models(
@@ -297,6 +237,13 @@ class XinferenceTTS(BaseTTS):
             >>> for model in models:
             ...     print(f"{model['id']}: {model['description']}")
         """
+        try:
+            from xinference_client import RESTfulClient as XinferenceClient
+        except ImportError:
+            from xinference.client.restful.restful_client import (
+                RESTfulClient as XinferenceClient,  # type: ignore
+            )
+
         client = XinferenceClient(base_url=base_url, api_key=api_key)
 
         try:

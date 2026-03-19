@@ -809,6 +809,77 @@ def get_default_embedding_model(user_id: Optional[int] = None) -> Optional[str]:
     return None
 
 
+def _get_models_by_category(
+    db: Session, ability: str, model_type: str
+) -> Dict[str, Any]:
+    """
+    Get models by category and ability from database.
+
+    Generic helper function to load models (ASR, TTS, etc.) from database.
+
+    Args:
+        db: Database session
+        ability: Model ability to filter by (e.g., "asr", "tts")
+        model_type: Model type for error messages (e.g., "ASR", "TTS")
+
+    Returns:
+        Dictionary of model instances
+    """
+    models: dict[str, Any] = {}
+    try:
+        from ..models.model import Model as DBModel
+
+        db_models = (
+            db.query(DBModel)
+            .filter(
+                DBModel.category == "speech",
+                DBModel.is_active,
+                DBModel.abilities.contains(ability),
+            )
+            .all()
+        )
+
+        for db_model in db_models:
+            # Validate API key
+            if not db_model.api_key:
+                raise ValueError(f"{model_type} model API key cannot be empty")
+            # Validate base URL
+            if not db_model.base_url:
+                raise ValueError(f"{model_type} model base URL cannot be empty")
+
+            model_provider = str(db_model.model_provider).strip().lower()
+            try:
+                model: Any = None
+                if model_provider == "xinference":
+                    # Import appropriate adapter based on model type
+                    if ability == "asr":
+                        from ...core.model.asr.adapter import get_asr_model_instance
+
+                        model = get_asr_model_instance(db_model)
+                    elif ability == "tts":
+                        from ...core.model.tts.adapter import get_tts_model_instance
+
+                        model = get_tts_model_instance(db_model)
+                    else:
+                        raise ValueError(f"Unsupported model ability: {ability}")
+
+                    models[str(db_model.model_name)] = model
+                    logger.info(f"Added {model_type} model: {db_model.model_name}")
+                else:
+                    logger.warning(
+                        f"Unsupported {model_type} model provider: {model_provider}"
+                    )
+            except Exception as e:
+                logger.warning(
+                    f"Failed to create {model_type} model {db_model.model_name}: {e}"
+                )
+
+    except Exception as e:
+        logger.error(f"Failed to load {model_type} models: {e}")
+
+    return models
+
+
 def get_asr_models(db: Session, user_id: Optional[int] = None) -> Dict[str, Any]:
     """
     Get ASR (speech-to-text) models from database.
@@ -820,45 +891,7 @@ def get_asr_models(db: Session, user_id: Optional[int] = None) -> Dict[str, Any]
     Returns:
         Dictionary of ASR model instances
     """
-    asr_models: dict[str, Any] = {}
-    try:
-        from ..models.model import Model as DBModel
-
-        db_models = (
-            db.query(DBModel)
-            .filter(
-                DBModel.category == "speech",
-                DBModel.is_active,
-                DBModel.abilities.contains("asr"),
-            )
-            .all()
-        )
-
-        for db_model in db_models:
-            # Validate API key
-            if not db_model.api_key:
-                raise ValueError("ASR model API key cannot be empty")
-            # Validate base URL
-            if not db_model.base_url:
-                raise ValueError("ASR model base URL cannot be empty")
-
-            model_provider = str(db_model.model_provider).strip().lower()
-            try:
-                if model_provider == "xinference":
-                    from ...core.model.asr.adapter import get_asr_model_instance
-
-                    asr_model = get_asr_model_instance(db_model)
-                    asr_models[str(db_model.model_name)] = asr_model
-                    logger.info(f"Added ASR model: {db_model.model_name}")
-                else:
-                    logger.warning(f"Unsupported ASR model provider: {model_provider}")
-            except Exception as e:
-                logger.warning(f"Failed to create ASR model {db_model.model_name}: {e}")
-
-    except Exception as e:
-        logger.error(f"Failed to load ASR models: {e}")
-
-    return asr_models
+    return _get_models_by_category(db, "asr", "ASR")
 
 
 def get_tts_models(db: Session, user_id: Optional[int] = None) -> Dict[str, Any]:
@@ -872,45 +905,7 @@ def get_tts_models(db: Session, user_id: Optional[int] = None) -> Dict[str, Any]
     Returns:
         Dictionary of TTS model instances
     """
-    tts_models: dict[str, Any] = {}
-    try:
-        from ..models.model import Model as DBModel
-
-        db_models = (
-            db.query(DBModel)
-            .filter(
-                DBModel.category == "speech",
-                DBModel.is_active,
-                DBModel.abilities.contains("tts"),
-            )
-            .all()
-        )
-
-        for db_model in db_models:
-            # Validate API key
-            if not db_model.api_key:
-                raise ValueError("TTS model API key cannot be empty")
-            # Validate base URL
-            if not db_model.base_url:
-                raise ValueError("TTS model base URL cannot be empty")
-
-            model_provider = str(db_model.model_provider).strip().lower()
-            try:
-                if model_provider == "xinference":
-                    from ...core.model.tts.adapter import get_tts_model_instance
-
-                    tts_model = get_tts_model_instance(db_model)
-                    tts_models[str(db_model.model_name)] = tts_model
-                    logger.info(f"Added TTS model: {db_model.model_name}")
-                else:
-                    logger.warning(f"Unsupported TTS model provider: {model_provider}")
-            except Exception as e:
-                logger.warning(f"Failed to create TTS model {db_model.model_name}: {e}")
-
-    except Exception as e:
-        logger.error(f"Failed to load TTS models: {e}")
-
-    return tts_models
+    return _get_models_by_category(db, "tts", "TTS")
 
 
 def get_default_asr_model(user_id: Optional[int] = None) -> Optional[Any]:

@@ -456,7 +456,6 @@ Images are automatically saved to workspace.
                 return {
                     "success": False,
                     "error": "No available image models configured",
-                    "image_url": None,
                     "image_path": None,
                 }
 
@@ -509,7 +508,6 @@ Images are automatically saved to workspace.
 
             return {
                 "success": True,
-                "image_url": image_url,
                 "image_path": image_path,
                 "file_id": image_file_id,
                 "usage": result.get("usage", {}),
@@ -528,7 +526,6 @@ Images are automatically saved to workspace.
             return {
                 "success": False,
                 "error": str(e),
-                "image_url": None,
                 "image_path": None,
                 "model_used": actual_model_id,
             }
@@ -560,7 +557,6 @@ Images are automatically saved to workspace.
                 return {
                     "success": False,
                     "error": "No available image models with edit capabilities",
-                    "image_url": None,
                     "image_path": None,
                 }
 
@@ -609,7 +605,6 @@ Images are automatically saved to workspace.
 
             return {
                 "success": True,
-                "image_url": edited_image_url,
                 "image_path": image_path,
                 "file_id": image_file_id,
                 "usage": result.get("usage", {}),
@@ -626,7 +621,6 @@ Images are automatically saved to workspace.
             return {
                 "success": False,
                 "error": str(e),
-                "image_url": None,
                 "image_path": None,
                 "model_used": actual_model_id,
             }

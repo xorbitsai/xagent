@@ -89,7 +89,7 @@ RUN if [ -n "$APT_MIRROR" ]; then \
         || sed -i "s|http://deb.debian.org/debian|$APT_MIRROR|g" /etc/apt/sources.list; \
     fi
 
-# System deps + Node.js + LibreOffice + Playwright dependencies
+# System deps + Node.js + LibreOffice + Xvfb (for headless browser/screenshots)
 RUN apt-get update && apt-get install -y --no-install-recommends \
     curl \
     gnupg \
@@ -118,6 +118,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libxrandr2 \
     libasound2 \
     libpangocairo-1.0-0 \
+    xvfb \
+    xauth \
     && rm -rf /var/lib/apt/lists/*
 
 # Install Node.js

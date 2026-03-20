@@ -327,11 +327,28 @@ class GeminiLLM(BaseLLM):
                     contents.append(parts)
 
             # Make API call using SDK (async)
-            response = await self._client.aio.models.generate_content(
-                model=self._model_name,
-                contents=contents,
-                config=config if config else None,
-            )
+            api_params = {
+                "model": self._model_name,
+                "contents": contents,
+            }
+
+            # Prepare config
+            merged_config = config.copy() if config else {}
+
+            # Import types for config wrapping
+            from google.genai import types
+
+            # Add tools if available - wrap in types.Tool
+            if tools:
+                gemini_tools_dict = self._convert_tools_to_gemini_format(tools)
+                gemini_tools = types.Tool(**gemini_tools_dict)
+                merged_config["tools"] = [gemini_tools]
+
+            # Add config if present
+            if merged_config:
+                api_params["config"] = types.GenerateContentConfig(**merged_config)
+
+            response = await self._client.aio.models.generate_content(**api_params)
 
             # Extract token usage
             if hasattr(response, "usage_metadata") and response.usage_metadata:
@@ -497,10 +514,31 @@ class GeminiLLM(BaseLLM):
                     contents.append(parts)
 
             # Make streaming API call using SDK (async)
+            # Note: Gemini streaming doesn't support tools directly
+            # Tools need to be passed through config
+            api_params = {
+                "model": self._model_name,
+                "contents": contents,
+            }
+
+            # Prepare config
+            merged_config = config.copy() if config else {}
+
+            # Import types for config wrapping
+            from google.genai import types
+
+            # Add tools if available - wrap in types.Tool
+            if tools:
+                gemini_tools_dict = self._convert_tools_to_gemini_format(tools)
+                gemini_tools = types.Tool(**gemini_tools_dict)
+                merged_config["tools"] = [gemini_tools]
+
+            # Add config if present
+            if merged_config:
+                api_params["config"] = types.GenerateContentConfig(**merged_config)
+
             response_stream = await self._client.aio.models.generate_content_stream(
-                model=self._model_name,
-                contents=contents,
-                config=config if config else None,
+                **api_params
             )
 
             # Check if response_stream is None

@@ -804,6 +804,14 @@ When you return type="chat" (direct answer mode), you are providing a TEXT RESPO
 - **DO** provide a direct, immediate answer to the user's question
 - **DO** give helpful information, explanations, or ask clarifying questions directly
 - Remember: type="chat" means CONVERSATION, not EXECUTION. Users see your message as your final response, not a plan of action.
+
+## CRITICAL: File and Media Handling Rules
+- **If the user uploaded IMAGES, videos, audio, or other media files**: You MUST use type="plan" to execute tools. You CANNOT analyze media in chat mode.
+- **If the user uploaded PDFs, documents, or other files**: You MUST use type="plan" to read and process them with tools.
+- **DO NOT** guess, hallucinate, or make assumptions about file contents in chat mode
+- **DO NOT** describe what you "think" might be in an image or file without actually using tools to examine it
+- **If you see file names mentioned but cannot access their content**: Always use type="plan"
+- **Remember**: You can only read files and analyze images by using tools in plan mode
 """
         )
 

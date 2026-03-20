@@ -817,6 +817,10 @@ class ReActPattern(AgentPattern):
                 # Check if this is the final answer
                 if result["type"] == "final_answer":
                     logger.info(f"Action ReAct completed in {iteration + 1} iterations")
+                    logger.debug(
+                        f"Final answer content: {result.get('content', 'NO_CONTENT')[:200]}"
+                    )
+                    logger.debug(f"Is sub-agent: {self.is_sub_agent}")
 
                     # Get the success status from the result
                     # This may be False if LLM indicated task failure
@@ -833,6 +837,9 @@ class ReActPattern(AgentPattern):
                     # Only send task completion events if NOT a sub-agent
                     # Sub-agents (DAG steps) should not trigger task-level completion
                     if not self.is_sub_agent:
+                        logger.debug(
+                            f"Tracing AI message with content length: {len(result.get('content', ''))}"
+                        )
                         # Trace AI message with the final result
                         await trace_ai_message(
                             self.tracer,
@@ -841,6 +848,7 @@ class ReActPattern(AgentPattern):
                             data={"content": result["content"]},
                         )
 
+                        logger.debug("Tracing task completion")
                         # Trace task completion
                         await trace_task_completion(
                             self.tracer,
@@ -849,6 +857,7 @@ class ReActPattern(AgentPattern):
                             success=success_status,
                         )
 
+                        logger.debug("Tracing task end")
                         # Trace task end (REACT specific)
                         await trace_task_end(
                             self.tracer,
@@ -1285,7 +1294,6 @@ Failure case:
 }
 === END ACTION FORMAT REQUIREMENTS ==="""
         else:
-            # Build tool descriptions
             tool_descriptions = self._build_tool_descriptions(tool_names)
 
             action_requirements = f"""
@@ -1313,43 +1321,10 @@ You must respond with a structured action in the following JSON format:
 Available tools:
 {chr(10).join(tool_descriptions)}
 
-Rules:
-1. You must respond with valid JSON only
-2. Use "tool_call" when you need to use a tool
-3. Use "final_answer" when you have completed the task
-4. Always provide clear reasoning for your actions
-5. Tool arguments must match the tool's schema
-6. For final_answer, set "success" to true if the task was completed successfully, false if it failed
-7. For final_answer, if success is false, provide a detailed error message in the "error" field
-8. LANGUAGE: You MUST respond in the SAME LANGUAGE as the user's task. If the task is in Chinese, respond in Chinese. If the task is in English, respond in English.
-
-Examples:
-Tool call:
-{{
-    "type": "tool_call",
-    "reasoning": "I need to calculate the sum of 5 and 3",
-    "tool_name": "calculator",
-    "tool_args": {{"expression": "5 + 3"}}
-}}
-
-Successful final answer:
-{{
-    "type": "final_answer",
-    "reasoning": "I have completed the calculation successfully",
-    "answer": "The sum of 5 and 3 is 8",
-    "success": true,
-    "error": null
-}}
-
-Failed final answer:
-{{
-    "type": "final_answer",
-    "reasoning": "The calculation could not be completed due to invalid expression",
-    "answer": "Unable to calculate the sum because the expression is invalid",
-    "success": false,
-    "error": "Invalid mathematical expression"
-}}
-=== END ACTION FORMAT REQUIREMENTS ==="""
+You have access to the above tools. Use them when needed to complete the task.
+The tools will be called automatically through the native function calling API.
+After using tools, provide a clear summary of the results in the SAME LANGUAGE as the user's task.
+"""
 
         return existing_prompt + action_requirements
 
@@ -1626,7 +1601,45 @@ Failed final answer:
         if isinstance(response, dict) and response.get("type") == "tool_call":
             return self._convert_native_tool_call_to_action(response)
 
-        # Parse JSON response
+        # Handle direct text response (when using native tool calling)
+        # This happens when LLM returns text directly instead of JSON-formatted action
+        # Treat text responses as final_answer
+        if isinstance(response, str):
+            logger.debug(
+                f"LLM returned direct text response (length: {len(response)}), treating as final_answer"
+            )
+            logger.debug(f"Text response preview: {response[:200]}")
+            action = Action(
+                type="final_answer",
+                reasoning="LLM provided direct response",
+                answer=response.strip(),
+                success=True,
+                error=None,
+            )
+
+            # Since we're bypassing _execute_action, we need to trace here
+            # Check if we have context for tracing
+            # Note: We don't have access to task_id/step_id here, so we'll trace at the return point
+            # The actual trace happens in the caller (run method)
+            return action
+
+        # Handle dict response with type="final_answer" (from native tool calling)
+        if isinstance(response, dict) and response.get("type") == "final_answer":
+            # Convert dict to Action
+            try:
+                return Action.model_validate(response)
+            except Exception as e:
+                logger.warning(f"Failed to validate final_answer dict: {e}")
+                # Fallback: extract answer field
+                return Action(
+                    type="final_answer",
+                    reasoning="LLM provided final answer",
+                    answer=response.get("answer", str(response)),
+                    success=response.get("success", True),
+                    error=response.get("error"),
+                )
+
+        # Parse JSON response (for when response_format="json_object" is enforced)
         try:
             content = self._extract_content(response)
             repaired = repair_loads(content, logging=True)
@@ -1866,6 +1879,9 @@ Failed final answer:
                 }
 
         elif action.type == "final_answer":
+            logger.debug(
+                f"_execute_action: Processing final_answer with answer: {str(action.answer)[:100] if action.answer else 'NO_ANSWER'}"
+            )
             if not action.answer:
                 raise PatternExecutionError(
                     pattern_name="ReAct", message="Final answer missing answer"
@@ -1905,13 +1921,17 @@ Failed final answer:
                 }
             )
 
-            return {
+            result = {
                 "type": "final_answer",
                 "content": action.answer,
                 "reasoning": action.reasoning,
                 "success": action.success if action.success is not None else True,
                 "error": action.error,
             }
+            logger.debug(
+                f"_execute_action: Returning final_answer result with content length: {len(result.get('content', ''))}"
+            )
+            return result
 
         else:
             raise PatternExecutionError(

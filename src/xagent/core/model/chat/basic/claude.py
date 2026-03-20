@@ -32,6 +32,7 @@ def _fix_pydantic_schema_for_claude(schema: Dict[str, Any]) -> Dict[str, Any]:
     1. All object types must have additionalProperties: false (not true or omitted)
     2. Number/integer types cannot have: minimum, maximum, exclusiveMinimum, exclusiveMaximum
     3. Empty schemas {} are not supported - must specify a concrete type
+    4. anyOf/oneOf are not supported - must choose a concrete type
 
     Pydantic's model_json_schema() may add these unsupported properties, so we remove them.
 
@@ -48,6 +49,94 @@ def _fix_pydantic_schema_for_claude(schema: Dict[str, Any]) -> Dict[str, Any]:
     if not schema or len(schema) == 0:
         # Default to object type with no properties
         return {"type": "object", "properties": {}, "additionalProperties": False}
+
+    # Handle anyOf/oneOf - Claude doesn't support these
+    # We need to simplify to a single type
+    if "anyOf" in schema:
+        options = schema["anyOf"]
+        if isinstance(options, list) and len(options) > 0:
+            # Check if this is Optional[T] (anyOf with null)
+            has_null = any(
+                opt.get("type") == "null" or opt is None
+                for opt in options
+                if isinstance(opt, dict)
+            )
+            if has_null and len(options) == 2:
+                # Optional[T] - use the non-null type
+                for opt in options:
+                    if isinstance(opt, dict) and opt.get("type") != "null":
+                        result = _fix_pydantic_schema_for_claude(opt)
+                        # Continue processing the rest
+                        schema = (
+                            result.copy()
+                            if isinstance(result, dict)
+                            else {"type": "string"}
+                        )
+                        break
+            else:
+                # Check if this is Union[str, List[str]] - convert to array
+                if len(options) == 2:
+                    types = [
+                        opt.get("type") for opt in options if isinstance(opt, dict)
+                    ]
+                    if set(types) == {"string", "array"}:
+                        # Union[str, List[str]] - use array to support both
+                        schema = {"type": "array", "items": {"type": "string"}}
+                    else:
+                        # Default: use first option
+                        first_option = (
+                            options[0] if isinstance(options[0], dict) else {}
+                        )
+                        schema = _fix_pydantic_schema_for_claude(first_option)
+                else:
+                    # More than 2 options or other cases - use first
+                    first_option = options[0] if isinstance(options[0], dict) else {}
+                    schema = _fix_pydantic_schema_for_claude(first_option)
+        else:
+            # Invalid anyOf - default to string
+            schema = {"type": "string"}
+        # Remove anyOf key and continue processing
+        schema.pop("anyOf", None)
+
+    if "oneOf" in schema:
+        options = schema["oneOf"]
+        if isinstance(options, list) and len(options) > 0:
+            # Check if this is Optional[T] (oneOf with null)
+            has_null = any(
+                opt.get("type") == "null" or opt is None
+                for opt in options
+                if isinstance(opt, dict)
+            )
+            if has_null and len(options) == 2:
+                for opt in options:
+                    if isinstance(opt, dict) and opt.get("type") != "null":
+                        result = _fix_pydantic_schema_for_claude(opt)
+                        schema = (
+                            result.copy()
+                            if isinstance(result, dict)
+                            else {"type": "string"}
+                        )
+                        break
+            else:
+                # Check if this is Union[str, List[str]]
+                if len(options) == 2:
+                    types = [
+                        opt.get("type") for opt in options if isinstance(opt, dict)
+                    ]
+                    if set(types) == {"string", "array"}:
+                        schema = {"type": "array", "items": {"type": "string"}}
+                    else:
+                        first_option = (
+                            options[0] if isinstance(options[0], dict) else {}
+                        )
+                        schema = _fix_pydantic_schema_for_claude(first_option)
+                else:
+                    first_option = options[0] if isinstance(options[0], dict) else {}
+                    schema = _fix_pydantic_schema_for_claude(first_option)
+        else:
+            schema = {"type": "string"}
+        # Remove oneOf key
+        schema.pop("oneOf", None)
 
     # If this is an object type, add additionalProperties: false
     if schema.get("type") == "object":
@@ -273,11 +362,25 @@ class ClaudeLLM(BaseLLM):
             parameters = function.get("parameters", {})
             strict = tool.get("strict", False)
 
+            # Debug: log before fixing
+            logger.debug(
+                f"[Claude] Converting tool: {name}, original parameters: {str(parameters)[:200]}"
+            )
+
+            # Fix Pydantic-generated schema for Claude API compatibility
+            # This handles anyOf, oneOf, etc. which Claude doesn't support
+            fixed_parameters = _fix_pydantic_schema_for_claude(parameters.copy())
+
+            # Debug: log after fixing
+            logger.debug(
+                f"[Claude] Fixed tool: {name}, fixed parameters: {str(fixed_parameters)[:200]}"
+            )
+
             # Convert to Anthropic tool format
             anthropic_tool = {
                 "name": name,
                 "description": description,
-                "input_schema": parameters,
+                "input_schema": fixed_parameters,
             }
 
             # Add strict mode if specified
@@ -285,6 +388,11 @@ class ClaudeLLM(BaseLLM):
                 anthropic_tool["strict"] = True
 
             anthropic_tools.append(anthropic_tool)
+
+        # Debug: log final anthropic tools
+        logger.debug(
+            f"[Claude] Final Anthropic tools being sent to API: {json.dumps(anthropic_tools, ensure_ascii=False)[:1000]}"
+        )
 
         return anthropic_tools
 

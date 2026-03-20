@@ -167,17 +167,14 @@ class CommandExecutorCore:
         timeout = _validate_timeout(timeout, self.timeout)
         _validate_working_directory(self.working_directory)
 
-        old_cwd = None
-        if self.working_directory:
-            old_cwd = os.getcwd()
-            logger.info(
-                f"CommandExecutor: Changing working directory from {old_cwd} to {self.working_directory}"
-            )
-            os.chdir(self.working_directory)
-
         # Sanitize command for logging
         safe_command = _sanitize_command_for_logging(command)
         logger.info(f"CommandExecutor: Executing: {safe_command}")
+
+        if self.working_directory:
+            logger.info(
+                f"CommandExecutor: Using working directory: {self.working_directory}"
+            )
 
         try:
             result = subprocess.run(
@@ -186,6 +183,7 @@ class CommandExecutorCore:
                 capture_output=capture_output,
                 text=True,
                 timeout=timeout,
+                cwd=self.working_directory,  # Use cwd parameter instead of os.chdir()
             )
 
             output = result.stdout if capture_output else ""
@@ -223,15 +221,6 @@ class CommandExecutorCore:
                 "error": f"Execution error: {str(e)}",
                 "return_code": TIMEOUT_EXIT_CODE,
             }
-        finally:
-            if old_cwd is not None:
-                try:
-                    os.chdir(old_cwd)
-                except Exception as e:
-                    logger.error(
-                        f"CommandExecutor: Failed to restore working directory to {old_cwd}: {e}"
-                    )
-                    # Don't raise - let original exception propagate
 
     def execute_script(
         self,

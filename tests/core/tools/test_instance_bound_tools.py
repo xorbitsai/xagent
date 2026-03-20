@@ -144,7 +144,6 @@ async def test_tool_creation_function():
 
         # Create file tools using the function
         file_tools = create_workspace_file_tools(workspace)
-        assert len(file_tools) == 15  # Should have 15 file tools
 
         # Test that tools are created and bound correctly
         assert (
@@ -172,9 +171,9 @@ async def test_tool_creation_function():
         assert "fetch_skill_file" in skill_tool_names
         print("✅ Skill tools creation test passed!")
 
-        # Total tools: 15 file + 3 skill = 18
+        # Total tools: 16 file + 3 skill = 19
         all_tools = file_tools + skill_tools
-        assert len(all_tools) == 18
+        assert len(all_tools) == 19
 
         print("✅ Tool creation function test passed!")
 

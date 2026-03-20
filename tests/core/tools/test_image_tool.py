@@ -127,10 +127,11 @@ class TestImageGenerationTool:
         result = await image_tool.generate_image("A test prompt")
 
         assert result["success"] is True
-        assert result["image_url"] == "https://example.com/image1.jpg"
+        assert result["image_path"] is not None
         assert result["model_used"] == "default"
         assert result["usage"] == {"input_tokens": 10, "output_tokens": 20}
         assert result["request_id"] == "req1"
+        assert result["saved_to_workspace"] is True
 
         # Verify the first model was used (default behavior)
         mock_image_models["model1"].generate_image.assert_called_once_with(
@@ -158,8 +159,9 @@ class TestImageGenerationTool:
         result = await image_tool.generate_image("A test prompt", model_id="model2")
 
         assert result["success"] is True
-        assert result["image_url"] == "https://example.com/image2.jpg"
+        assert result["image_path"] is not None
         assert result["model_used"] == "model2"
+        assert result["saved_to_workspace"] is True
 
         # Verify the specified model was used
         mock_image_models["model2"].generate_image.assert_called_once_with(
@@ -237,7 +239,6 @@ class TestImageGenerationTool:
 
         assert result["success"] is False
         assert result["error"] == "No available image models configured"
-        assert result["image_url"] is None
         assert result["image_path"] is None
 
     @pytest.mark.asyncio
@@ -275,7 +276,6 @@ class TestImageGenerationTool:
         result = await tool.generate_image("A test prompt")
 
         assert result["success"] is True
-        assert result["image_url"] == "https://example.com/image1.jpg"
         assert result["image_path"] is not None
         assert result["saved_to_workspace"] is True
         assert "generated_image_" in result["image_path"]
@@ -352,7 +352,6 @@ class TestImageGenerationTool:
 
         assert result["success"] is False
         assert result["error"] == "Model error"
-        assert result["image_url"] is None
         assert result["image_path"] is None
         assert result["model_used"] == "default"
 
@@ -559,10 +558,11 @@ class TestImageGenerationTool:
         )
 
         assert result["success"] is True
-        assert result["image_url"] == "https://example.com/edited_image.jpg"
+        assert result["image_path"] is not None
         assert result["model_used"] == "default_edit_model"
         assert result["usage"] == {"input_tokens": 15, "output_tokens": 25}
         assert result["request_id"] == "edit_req1"
+        assert result["saved_to_workspace"] is True
 
         # Verify the model's edit_image was called
         mock_image_models["model1"].edit_image.assert_called_once_with(
@@ -632,7 +632,8 @@ class TestImageGenerationTool:
         )
 
         assert result["success"] is True
-        assert result["image_url"] == "https://example.com/edited_image.jpg"
+        assert result["image_path"] is not None
+        assert result["saved_to_workspace"] is True
 
         # Verify the model's edit_image was called with list
         mock_image_models["model1"].edit_image.assert_called_once_with(
@@ -774,7 +775,8 @@ class TestCreateImageTool:
         )
 
         assert result["success"] is True
-        assert result["image_url"] == "https://example.com/image1.jpg"
+        assert result["image_path"] is not None
+        assert result["saved_to_workspace"] is True
 
     def test_list_models_tool_functionality(self, mock_image_models, mock_workspace):
         """Test that list_models tool works"""

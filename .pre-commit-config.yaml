@@ -71,6 +71,13 @@ repos:
 
   - repo: local
     hooks:
+      - id: alembic-check
+        name: alembic-check
+        entry: scripts/check_alembic_heads.sh
+        language: script
+        pass_filenames: false
+        files: ^src/xagent/migrations/versions/
+
       - id: npm-lint
         name: npm lint
         entry: npm run --prefix frontend lint

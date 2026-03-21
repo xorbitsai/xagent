@@ -11,7 +11,7 @@ from typing import Any, Dict, Optional
 from ...core.model.chat.token_context import (
     TokenUsage,
     get_token_usage,
-    reset_token_usage,
+    set_token_usage,
 )
 
 logger = logging.getLogger(__name__)
@@ -76,8 +76,32 @@ class TaskTracker:
             logger.warning(f"Task {self.task_id} is already being tracked")
             return
 
-        # Initialize token context
-        reset_token_usage()
+        details: list[dict[str, Any]] = []
+        raw_details = getattr(self.task, "token_usage_details", None)
+        if isinstance(raw_details, list):
+            details = [item for item in raw_details if isinstance(item, dict)]
+
+        def _safe_int(value: Any) -> int:
+            if isinstance(value, bool):
+                return int(value)
+            if isinstance(value, int):
+                return value
+            if isinstance(value, float):
+                return int(value)
+            if isinstance(value, str):
+                try:
+                    return int(value)
+                except ValueError:
+                    return 0
+            return 0
+
+        initial_usage = TokenUsage(
+            input_tokens=_safe_int(getattr(self.task, "input_tokens", 0)),
+            output_tokens=_safe_int(getattr(self.task, "output_tokens", 0)),
+            llm_calls=_safe_int(getattr(self.task, "llm_calls", 0)),
+            details=details,
+        )
+        set_token_usage(initial_usage)
 
         logger.info(f"Started token tracking for task {self.task_id}")
 

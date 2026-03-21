@@ -491,6 +491,7 @@ async def execute_task_background(
                 task=user_message,
                 context=context,
                 task_id=actual_task_id,
+                tracking_task_id=str(task_id),
                 db_session=db,
             )
 

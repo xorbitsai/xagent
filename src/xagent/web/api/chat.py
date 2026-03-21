@@ -855,6 +855,7 @@ class AgentServiceManager:
         task: str,
         context: Optional[Dict[str, Any]] = None,
         task_id: Optional[str] = None,
+        tracking_task_id: Optional[str] = None,
         db_session: Optional[Any] = None,
     ) -> Dict[str, Any]:
         """
@@ -866,7 +867,8 @@ class AgentServiceManager:
             agent_service: The AgentService instance to use
             task: Task description
             context: Optional context data
-            task_id: Optional task identifier for tracking
+            task_id: Optional task identifier passed to agent execution
+            tracking_task_id: Optional task identifier used only for token tracking
             db_session: Optional database session for token tracking
 
         Returns:
@@ -874,16 +876,20 @@ class AgentServiceManager:
         """
         # Initialize tracker if db_session and task_id are provided
         tracker = None
-        if db_session and task_id:
+        tracker_task_id = tracking_task_id or task_id
+        if db_session and tracker_task_id:
             try:
                 from ..tracking.task_tracker import TaskTracker
 
-                tracker = TaskTracker(task_id=int(task_id), db_session=db_session)
+                tracker = TaskTracker(
+                    task_id=int(tracker_task_id),
+                    db_session=db_session,
+                )
                 await tracker.start_tracking()
-                logger.info(f"Started token tracking for task {task_id}")
+                logger.info(f"Started token tracking for task {tracker_task_id}")
             except Exception as e:
                 logger.warning(
-                    f"Failed to start token tracking for task {task_id}: {e}"
+                    f"Failed to start token tracking for task {tracker_task_id}: {e}"
                 )
                 tracker = None
 
@@ -911,10 +917,10 @@ class AgentServiceManager:
             if tracker:
                 try:
                     await tracker.complete_tracking()
-                    logger.info(f"Completed token tracking for task {task_id}")
+                    logger.info(f"Completed token tracking for task {tracker_task_id}")
                 except Exception as e:
                     logger.error(
-                        f"Failed to complete token tracking for task {task_id}: {e}"
+                        f"Failed to complete token tracking for task {tracker_task_id}: {e}"
                     )
 
     def _cleanup_workspace_directory(

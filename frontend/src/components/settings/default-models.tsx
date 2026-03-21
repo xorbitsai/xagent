@@ -51,6 +51,19 @@ const modelTypeConfig = {
   },
 }
 
+const getModelCategory = (model: Model): string => {
+  const record = model as unknown as Record<string, unknown>
+  const category = record.category
+  return typeof category === 'string' ? category : ''
+}
+
+const getCompatibleModels = (models: Model[], configType: keyof typeof modelTypeConfig): Model[] => {
+  if (configType === 'embedding') {
+    return models.filter((model) => getModelCategory(model) === 'embedding')
+  }
+  return models.filter((model) => getModelCategory(model) === 'llm')
+}
+
 export function DefaultModelsSettings() {
   const { token } = useAuth()
   const [models, setModels] = useState<Model[]>([])
@@ -171,6 +184,10 @@ export function DefaultModelsSettings() {
             const currentDefault = defaultModels[configType as keyof typeof modelTypeConfig]
             const Icon = config.icon
             const isSaving = saving === configType
+            const compatibleModels = getCompatibleModels(
+              models,
+              configType as keyof typeof modelTypeConfig,
+            )
 
             return (
               <Card key={configType} className="relative">
@@ -229,13 +246,13 @@ export function DefaultModelsSettings() {
                         onValueChange={(value) =>
                           handleSetDefault(configType as keyof typeof modelTypeConfig, parseInt(value))
                         }
-                        options={models.map((model) => ({
+                        options={compatibleModels.map((model) => ({
                           value: model.id.toString(),
                           label: `${model.name} (${model.provider})`,
                         }))}
                         placeholder={t('settings.defaultModels.labels.selectModel')}
                       />
-                      {models.length === 0 && (
+                      {compatibleModels.length === 0 && (
                         <p className="text-xs text-muted-foreground">
                           {t('settings.defaultModels.empty.noModels')}
                         </p>

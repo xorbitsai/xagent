@@ -93,6 +93,27 @@ def _serialize_model_with_access(
     }
 
 
+def _is_default_config_type_compatible(model: Any, config_type: str) -> bool:
+    category_by_config_type = {
+        "general": "llm",
+        "small_fast": "llm",
+        "visual": "llm",
+        "compact": "llm",
+        "embedding": "embedding",
+        "image": "image",
+        "image_edit": "image",
+        "asr": "speech",
+        "tts": "speech",
+        "speech": "speech",
+    }
+
+    expected_category = category_by_config_type.get(config_type)
+    if expected_category is None:
+        return False
+    current_category = str(getattr(model, "category", ""))
+    return current_category == expected_category
+
+
 @model_router.post("/", response_model=ModelWithAccessInfo)
 @model_router.post("/register", response_model=ModelWithAccessInfo)
 async def create_model(
@@ -1238,6 +1259,15 @@ async def set_user_default_model(
             config_type = config.config_type  # Fallback to user-specified
     else:
         config_type = config.config_type
+
+    if not _is_default_config_type_compatible(model, config_type):
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"Config type '{config_type}' is incompatible with model category "
+                f"'{model.category}'"
+            ),
+        )
 
     # Remove existing configuration for this config_type
     db.query(UserDefaultModel).filter(

@@ -147,6 +147,22 @@ def sample_model_data():
     }
 
 
+@pytest.fixture(scope="function")
+def sample_embedding_model_data():
+    return {
+        "model_id": "test-embedding-model",
+        "category": "embedding",
+        "model_provider": "openai",
+        "model_name": "text-embedding-3-small",
+        "api_key": "test-api-key",
+        "base_url": "https://api.openai.com/v1",
+        "dimension": 1536,
+        "abilities": ["embedding"],
+        "description": "Test embedding model",
+        "share_with_users": False,
+    }
+
+
 class TestModelAPI:
     """Test model management API endpoints"""
 
@@ -505,3 +521,51 @@ class TestModelAPI:
         assert response.status_code == 200
         data = response.json()
         assert data["abilities"] == ["chat", "tool_calling", "vision"]
+
+    def test_reject_embedding_model_as_general_default(
+        self,
+        test_db,
+        regular_user,
+        regular_headers,
+        sample_embedding_model_data,
+    ):
+        create_response = client.post(
+            "/api/models/",
+            json=sample_embedding_model_data,
+            headers=regular_headers,
+        )
+        assert create_response.status_code == 200
+        embedding_model_id = create_response.json()["id"]
+
+        default_response = client.post(
+            "/api/models/user-default",
+            json={"model_id": embedding_model_id, "config_type": "general"},
+            headers=regular_headers,
+        )
+
+        assert default_response.status_code == 400
+        assert "incompatible" in default_response.json()["detail"]
+
+    def test_allow_embedding_model_as_embedding_default(
+        self,
+        test_db,
+        regular_user,
+        regular_headers,
+        sample_embedding_model_data,
+    ):
+        create_response = client.post(
+            "/api/models/",
+            json=sample_embedding_model_data,
+            headers=regular_headers,
+        )
+        assert create_response.status_code == 200
+        embedding_model_id = create_response.json()["id"]
+
+        default_response = client.post(
+            "/api/models/user-default",
+            json={"model_id": embedding_model_id, "config_type": "embedding"},
+            headers=regular_headers,
+        )
+
+        assert default_response.status_code == 200
+        assert default_response.json()["config_type"] == "embedding"

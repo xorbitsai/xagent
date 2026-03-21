@@ -5,8 +5,9 @@ This service provides centralized functionality for model resolution and managem
 across the xagent system with multi-tenant support.
 """
 
+import json
 import logging
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, cast
 
 from sqlalchemy.orm import Session
 
@@ -869,17 +870,28 @@ def _get_models_by_category(
             .filter(
                 DBModel.category == "speech",
                 DBModel.is_active,
-                cast(DBModel.abilities, String).contains(f'"{ability}"'),
             )
             .all()
         )
 
         for db_model in db_models:
-            # Validate API key
-            if not db_model.api_key:
+            abilities: Any = getattr(db_model, "abilities", None)
+            if isinstance(abilities, str):
+                try:
+                    abilities = json.loads(abilities)
+                except (TypeError, json.JSONDecodeError):
+                    abilities = []
+            if (
+                not isinstance(abilities, (list, tuple, set))
+                or ability not in abilities
+            ):
+                continue
+
+            api_key = cast(Optional[str], getattr(db_model, "api_key", None))
+            if not api_key:
                 raise ValueError(f"{model_type} model API key cannot be empty")
-            # Validate base URL
-            if not db_model.base_url:
+            base_url = cast(Optional[str], getattr(db_model, "base_url", None))
+            if not base_url:
                 raise ValueError(f"{model_type} model base URL cannot be empty")
 
             model_provider = str(db_model.model_provider).strip().lower()
@@ -911,6 +923,7 @@ def _get_models_by_category(
 
     except Exception as e:
         logger.error(f"Failed to load {model_type} models: {e}")
+        db.rollback()
 
     return models
 

@@ -155,9 +155,23 @@ class TestAPITool:
         assert args.body == {"test": "value"}
 
     @pytest.mark.asyncio
-    async def test_api_call_execution(self):
-        """Test actual API call execution"""
+    async def test_api_call_execution(self, monkeypatch):
+        """Test API tool wrapper delegates to client core"""
         tool = APITool()
+
+        async def mock_call_api(**kwargs):
+            assert kwargs["url"] == "https://httpbin.org/get"
+            assert kwargs["method"] == "GET"
+            assert kwargs["params"] == {"test": "value"}
+            return {
+                "success": True,
+                "status_code": 200,
+                "headers": {"content-type": "application/json"},
+                "body": {"ok": True},
+                "error": None,
+            }
+
+        monkeypatch.setattr(tool._client, "call_api", mock_call_api)
 
         result = await tool.run_json_async(
             {
@@ -171,9 +185,22 @@ class TestAPITool:
         assert result["status_code"] == 200
 
     @pytest.mark.asyncio
-    async def test_api_call_with_auth(self):
-        """Test API call with authentication"""
+    async def test_api_call_with_auth(self, monkeypatch):
+        """Test API call forwards authentication args"""
         tool = APITool()
+
+        async def mock_call_api(**kwargs):
+            assert kwargs["auth_type"] == "bearer"
+            assert kwargs["auth_token"] == "test-token"
+            return {
+                "success": True,
+                "status_code": 200,
+                "headers": {},
+                "body": {"authenticated": True},
+                "error": None,
+            }
+
+        monkeypatch.setattr(tool._client, "call_api", mock_call_api)
 
         result = await tool.run_json_async(
             {
@@ -188,9 +215,23 @@ class TestAPITool:
         assert result["status_code"] == 200
 
     @pytest.mark.asyncio
-    async def test_api_call_with_post_body(self):
-        """Test API call with POST body"""
+    async def test_api_call_with_post_body(self, monkeypatch):
+        """Test API call forwards POST body and headers"""
         tool = APITool()
+
+        async def mock_call_api(**kwargs):
+            assert kwargs["method"] == "POST"
+            assert kwargs["body"] == {"name": "test", "value": 123}
+            assert kwargs["headers"] == {"Content-Type": "application/json"}
+            return {
+                "success": True,
+                "status_code": 200,
+                "headers": {},
+                "body": {"name": "test", "value": 123},
+                "error": None,
+            }
+
+        monkeypatch.setattr(tool._client, "call_api", mock_call_api)
 
         result = await tool.run_json_async(
             {
@@ -205,9 +246,23 @@ class TestAPITool:
         assert result["status_code"] == 200
 
     @pytest.mark.asyncio
-    async def test_api_call_with_api_key_query(self):
-        """Test API key in query parameters via tool"""
+    async def test_api_call_with_api_key_query(self, monkeypatch):
+        """Test API key query options are forwarded via tool"""
         tool = APITool()
+
+        async def mock_call_api(**kwargs):
+            assert kwargs["auth_type"] == "api_key_query"
+            assert kwargs["auth_token"] == "my-secret-key-123"
+            assert kwargs["api_key_param"] == "key"
+            return {
+                "success": True,
+                "status_code": 200,
+                "headers": {},
+                "body": {"args": {"key": "my-secret-key-123"}},
+                "error": None,
+            }
+
+        monkeypatch.setattr(tool._client, "call_api", mock_call_api)
 
         result = await tool.run_json_async(
             {
@@ -221,7 +276,6 @@ class TestAPITool:
 
         assert result["success"] is True
         assert result["status_code"] == 200
-        # Verify the custom param 'key' was added to query params
         assert result["body"]["args"]["key"] == "my-secret-key-123"
 
     def test_return_value_formatting(self):

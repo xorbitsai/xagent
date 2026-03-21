@@ -12,7 +12,7 @@ import sqlalchemy as sa
 from alembic import op
 
 # revision identifiers, used by Alembic.
-revision: str = "20250209_add_execution_mode"
+revision: str = "20250209_add_execution_mode_to_agents"
 down_revision: Union[str, None] = "fix_agent_status_case"
 branch_labels: Union[str, Sequence[str], None] = None
 depends_on: Union[str, Sequence[str], None] = None

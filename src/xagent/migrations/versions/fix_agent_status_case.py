@@ -12,7 +12,7 @@ from alembic import op
 
 # revision identifiers, used by Alembic.
 revision = "fix_agent_status_case"
-down_revision = "20250201_add_template_stats"
+down_revision = "9800a4c3abe5"
 branch_labels = None
 depends_on = None
 

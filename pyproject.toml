@@ -123,6 +123,7 @@ asyncio_mode = "auto"
 markers = [
   "integration: marks tests as integration tests",
   "slow: marks tests as slow running tests",
+  "postgresql: marks tests that require PostgreSQL database",
 ]
 
 [tool.mypy]

@@ -92,9 +92,12 @@ class MigrationTester:
                     ),
                     {"table_name": table_name},
                 )
+                return [row[0] for row in result]
             else:
+                # SQLite: PRAGMA table_info returns (cid, name, type, notnull, dflt_value, pk)
+                # We want index 1 (name)
                 result = conn.execute(text(f"PRAGMA table_info({table_name})"))
-            return [row[0] for row in result]
+                return [row[1] for row in result]
 
 
 class TestMigrations:

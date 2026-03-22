@@ -380,43 +380,6 @@ class TestMigrations:
             "441d4f5d399c should have encrypted api_key"
         )
 
-    @pytest.mark.skip(reason="Downgrade tests require complex migration chain handling")
-    def test_sqlite_downgrade(self, sqlite_tester):
-        """Test downgrade on SQLite."""
-        # First, create base tables using SQLAlchemy (simulates production database)
-        from xagent.web.models.database import Base
-
-        Base.metadata.create_all(bind=sqlite_tester.engine)
-
-        # Upgrade to head
-        command.upgrade(sqlite_tester.alembic_cfg, "head")
-
-        # Downgrade to base
-        command.downgrade(sqlite_tester.alembic_cfg, "base")
-
-        # Verify tables are removed (only alembic_version should remain)
-        tables = sqlite_tester.get_table_names()
-        assert "alembic_version" in tables, "alembic_version should still exist"
-
-    @pytest.mark.postgresql
-    @pytest.mark.skip(reason="Downgrade tests require complex migration chain handling")
-    def test_postgresql_downgrade(self, postgresql_tester):
-        """Test downgrade on PostgreSQL."""
-        # First, create base tables using SQLAlchemy (simulates production database)
-        from xagent.web.models.database import Base
-
-        Base.metadata.create_all(bind=postgresql_tester.engine)
-
-        # Upgrade to head
-        command.upgrade(postgresql_tester.alembic_cfg, "head")
-
-        # Downgrade to base
-        command.downgrade(postgresql_tester.alembic_cfg, "base")
-
-        # Verify schema is cleaned
-        tables = postgresql_tester.get_table_names()
-        assert "alembic_version" in tables, "alembic_version should still exist"
-
 
 if __name__ == "__main__":
     """CLI interface for running migration tests manually."""

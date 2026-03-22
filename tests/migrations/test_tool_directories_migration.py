@@ -16,7 +16,7 @@ from sqlalchemy import create_engine, inspect, text
 
 # The previous migration version that tool_directories depends on
 # This is configurable to avoid hardcoding in multiple places
-PREVIOUS_MIGRATION_VERSION = "222f2073c886"
+PREVIOUS_MIGRATION_VERSION = "be6f77416f06"
 
 
 @pytest.fixture
@@ -57,6 +57,10 @@ def engine_with_migration(alembic_config: tuple[Config, str]) -> Any:
 
     # Run the migration using alembic command
     command.upgrade(config, "a1b2c3d4e5f6")
+
+    # Dispose and recreate engine so inspector can see the new indexes
+    engine.dispose()
+    engine = create_engine(db_url)
 
     yield engine
 
@@ -302,19 +306,18 @@ class TestMigrationRollback:
     @pytest.fixture
     def engine_with_rollback(self, tmp_path: Path) -> Any:
         """Create engine with migration applied and then rolled back."""
-        from alembic.migration import MigrationContext
-        from alembic.operations import Operations
+        from alembic import command
 
         db_path = tmp_path / "test_rollback.db"
         db_url = f"sqlite:///{db_path}"
         engine = create_engine(db_url)
 
-        # Apply migration
-        from xagent.migrations.versions.a1b2c3d4e5f6_create_tool_directories_table import (
-            downgrade,
-            upgrade,
-        )
+        # Create alembic config
+        config = Config()
+        config.set_main_option("sqlalchemy.url", db_url)
+        config.set_main_option("script_location", "src/xagent/migrations")
 
+        # Stamp to previous version
         with engine.begin() as conn:
             conn.execute(
                 text(
@@ -327,19 +330,15 @@ class TestMigrationRollback:
                 )
             )
 
-            migration_context = MigrationContext.configure(conn)
-            with Operations.context(migration_context):
-                upgrade()
+        # Apply migration using alembic command
+        command.upgrade(config, "a1b2c3d4e5f6")
 
         # Verify table exists
         inspector = inspect(engine)
         assert "tool_directories" in inspector.get_table_names()
 
-        # Rollback migration
-        with engine.begin() as conn:
-            migration_context = MigrationContext.configure(conn)
-            with Operations.context(migration_context):
-                downgrade()
+        # Rollback migration using alembic command
+        command.downgrade(config, PREVIOUS_MIGRATION_VERSION)
 
         yield engine
 

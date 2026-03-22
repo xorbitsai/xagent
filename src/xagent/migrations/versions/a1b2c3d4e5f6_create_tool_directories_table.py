@@ -77,27 +77,19 @@ def upgrade() -> None:
         sa.PrimaryKeyConstraint("id"),
     )
 
-    # Check and create indexes
-    existing_indexes = (
-        [idx["name"] for idx in inspector.get_indexes("tool_directories")]
-        if "tool_directories" in existing_tables
-        else []
+    # Create indexes (we just created the table, so no need to check if they exist)
+    op.create_index(
+        op.f("ix_tool_directories_id"), "tool_directories", ["id"], unique=False
     )
-    if "ix_tool_directories_id" not in existing_indexes:
-        op.create_index(
-            op.f("ix_tool_directories_id"), "tool_directories", ["id"], unique=False
-        )
-    if "ix_tool_directories_name" not in existing_indexes:
-        op.create_index(
-            op.f("ix_tool_directories_name"), "tool_directories", ["name"], unique=True
-        )
-    if "ix_tool_directories_enabled" not in existing_indexes:
-        op.create_index(
-            op.f("ix_tool_directories_enabled"),
-            "tool_directories",
-            ["enabled"],
-            unique=False,
-        )
+    op.create_index(
+        op.f("ix_tool_directories_name"), "tool_directories", ["name"], unique=True
+    )
+    op.create_index(
+        op.f("ix_tool_directories_enabled"),
+        "tool_directories",
+        ["enabled"],
+        unique=False,
+    )
 
 
 def downgrade() -> None:

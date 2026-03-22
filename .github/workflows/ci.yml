@@ -127,13 +127,13 @@ jobs:
         shell: bash
         run: |
           set -e
-          python3 -m uv run python -m pytest -m "not slow" -n 4 --dist=loadscope -v
+          python3 -m uv run python -m pytest -m "not slow and not postgresql" -n 4 --dist=loadscope -v
 
       - name: Run slow tests
         shell: bash
         run: |
           set -e
-          python3 -m uv run python -m pytest -m "slow" -v
+          python3 -m uv run python -m pytest -m "slow and not postgresql" -v
 
   frontend-build:
     runs-on: ubuntu-latest

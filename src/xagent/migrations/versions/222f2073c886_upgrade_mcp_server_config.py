@@ -25,12 +25,11 @@ depends_on: Union[str, Sequence[str], None] = None
 logger = logging.getLogger(__name__)
 
 
-def get_json_type() -> Any:
+def get_json_type(bind) -> Any:
     """
     Get the appropriate JSON type based on the database dialect.
     Returns postgresql.JSON for PostgreSQL, sa.JSON for other databases (SQLite).
     """
-    bind = op.get_bind()
     dialect_name = bind.dialect.name
 
     if dialect_name == "postgresql":
@@ -426,7 +425,7 @@ def create_new_tables() -> None:
     dialect_name = bind.dialect.name
 
     # Get the appropriate JSON type for the current database
-    json_type = get_json_type()
+    json_type = get_json_type(bind)
 
     # Get the appropriate timestamp default for the current database
     # PostgreSQL uses now(), SQLite uses CURRENT_TIMESTAMP

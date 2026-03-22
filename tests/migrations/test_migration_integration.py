@@ -382,6 +382,11 @@ class TestMigrations:
 
     def test_sqlite_downgrade(self, sqlite_tester):
         """Test downgrade on SQLite."""
+        # First, create base tables using SQLAlchemy (simulates production database)
+        from xagent.web.models.database import Base
+
+        Base.metadata.create_all(bind=sqlite_tester.engine)
+
         # Upgrade to head
         command.upgrade(sqlite_tester.alembic_cfg, "head")
 
@@ -395,6 +400,11 @@ class TestMigrations:
     @pytest.mark.postgresql
     def test_postgresql_downgrade(self, postgresql_tester):
         """Test downgrade on PostgreSQL."""
+        # First, create base tables using SQLAlchemy (simulates production database)
+        from xagent.web.models.database import Base
+
+        Base.metadata.create_all(bind=postgresql_tester.engine)
+
         # Upgrade to head
         command.upgrade(postgresql_tester.alembic_cfg, "head")
 

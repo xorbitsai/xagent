@@ -25,6 +25,12 @@ def upgrade() -> None:
     bind = context.get_bind()
     inspector = Inspector.from_engine(bind)
 
+    # Check if agents table exists
+    tables = inspector.get_table_names()
+    if "agents" not in tables:
+        # Table doesn't exist yet, will be created by SQLAlchemy or a later migration
+        return
+
     # Check if column already exists
     existing_columns = [col["name"] for col in inspector.get_columns("agents")]
     if "suggested_prompts" not in existing_columns:
@@ -39,6 +45,12 @@ def downgrade() -> None:
 
     bind = context.get_bind()
     inspector = Inspector.from_engine(bind)
+
+    # Check if agents table exists
+    tables = inspector.get_table_names()
+    if "agents" not in tables:
+        # Table doesn't exist yet, will be created by SQLAlchemy or a later migration
+        return
 
     # Check if column exists before dropping
     existing_columns = [col["name"] for col in inspector.get_columns("agents")]

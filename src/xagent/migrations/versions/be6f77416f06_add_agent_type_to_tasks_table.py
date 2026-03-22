@@ -37,14 +37,15 @@ def upgrade() -> None:
             )
 
     # Check if columns already exist before adding them
-    existing_columns = [col["name"] for col in inspector.get_columns("tasks")]
-    if "agent_type" not in existing_columns:
-        op.add_column(
-            "tasks", sa.Column("agent_type", sa.String(length=20), nullable=True)
-        )
+    if inspector.has_table("tasks"):
+        existing_columns = [col["name"] for col in inspector.get_columns("tasks")]
+        if "agent_type" not in existing_columns:
+            op.add_column(
+                "tasks", sa.Column("agent_type", sa.String(length=20), nullable=True)
+            )
 
-    if "agent_config" not in existing_columns:
-        op.add_column("tasks", sa.Column("agent_config", sa.JSON(), nullable=True))
+        if "agent_config" not in existing_columns:
+            op.add_column("tasks", sa.Column("agent_config", sa.JSON(), nullable=True))
     # ### end Alembic commands ###
 
 

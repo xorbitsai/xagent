@@ -79,24 +79,31 @@ def upgrade() -> None:
 
         if dialect_name == "sqlite":
             # SQLite workaround for altering columns and constraints
-            with op.batch_alter_table("uploaded_files", schema=None) as batch_op:
-                batch_op.alter_column(
-                    "id", existing_type=sa.INTEGER(), nullable=False, autoincrement=True
-                )
-                if "ix_uploaded_files_file_id" in existing_indexes:
-                    batch_op.drop_index("ix_uploaded_files_file_id")
-                if (
-                    "ix_uploaded_files_file_id" not in existing_indexes or True
-                ):  # Always recreate to ensure unique=True
-                    batch_op.create_index(
-                        batch_op.f("ix_uploaded_files_file_id"),
-                        ["file_id"],
-                        unique=True,
+            # Check if users table exists before attempting to alter uploaded_files
+            # (uploaded_files may have FK to users, and batch_alter_table tries to reflect FKs)
+            if "users" in existing_tables:
+                with op.batch_alter_table("uploaded_files", schema=None) as batch_op:
+                    batch_op.alter_column(
+                        "id",
+                        existing_type=sa.INTEGER(),
+                        nullable=False,
+                        autoincrement=True,
                     )
-                if "uq_uploaded_files_storage_path" not in existing_constraints:
-                    batch_op.create_unique_constraint(
-                        batch_op.f("uq_uploaded_files_storage_path"), ["storage_path"]
-                    )
+                    if "ix_uploaded_files_file_id" in existing_indexes:
+                        batch_op.drop_index("ix_uploaded_files_file_id")
+                    if (
+                        "ix_uploaded_files_file_id" not in existing_indexes or True
+                    ):  # Always recreate to ensure unique=True
+                        batch_op.create_index(
+                            batch_op.f("ix_uploaded_files_file_id"),
+                            ["file_id"],
+                            unique=True,
+                        )
+                    if "uq_uploaded_files_storage_path" not in existing_constraints:
+                        batch_op.create_unique_constraint(
+                            batch_op.f("uq_uploaded_files_storage_path"),
+                            ["storage_path"],
+                        )
         else:
             # For PostgreSQL and other databases, use native operations
             if "uq_uploaded_files_storage_path" not in existing_constraints:

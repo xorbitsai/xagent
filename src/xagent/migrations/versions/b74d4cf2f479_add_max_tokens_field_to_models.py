@@ -25,6 +25,12 @@ def upgrade() -> None:
     bind = context.get_bind()
     inspector = Inspector.from_engine(bind)
 
+    # Check if models table exists
+    tables = inspector.get_table_names()
+    if "models" not in tables:
+        # Table doesn't exist yet, will be created by SQLAlchemy or a later migration
+        return
+
     # Check if column already exists
     existing_columns = [col["name"] for col in inspector.get_columns("models")]
     if "max_tokens" not in existing_columns:

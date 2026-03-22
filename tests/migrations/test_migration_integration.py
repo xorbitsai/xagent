@@ -61,11 +61,8 @@ class MigrationTester:
         self.alembic_cfg = Config(str(project_root / "alembic.ini"))
         self.alembic_cfg.set_main_option("sqlalchemy.url", db_url)
 
-        # IMPORTANT: Create tables using SQLAlchemy first (mimics production)
-        # Then migrations should be idempotent and handle existing tables
-        from xagent.web.models.database import Base
-
-        Base.metadata.create_all(bind=self.engine)
+        # DO NOT create tables with SQLAlchemy - we want to test migrations
+        # can build the schema from scratch
 
     def teardown_database(self):
         """Clean up test database."""
@@ -120,8 +117,19 @@ class TestMigrations:
         tester.teardown_database()
 
     def test_sqlite_upgrade(self, sqlite_tester):
-        """Test full migration upgrade on SQLite."""
-        # Run upgrade
+        """Test full migration upgrade on SQLite from empty database.
+
+        This tests that migrations can correctly create all tables and columns
+        from scratch, not just when tables are pre-created by SQLAlchemy.
+        """
+        # NOTE: Some base tables (users, models, tasks) are created by SQLAlchemy
+        # in production, not by migrations. We need to create them here to
+        # simulate production environment.
+        from xagent.web.models.database import Base
+
+        Base.metadata.create_all(bind=sqlite_tester.engine)
+
+        # Run upgrade from empty database (but with base tables present)
         command.upgrade(sqlite_tester.alembic_cfg, "head")
 
         # Verify alembic_version table
@@ -134,17 +142,37 @@ class TestMigrations:
         tables = sqlite_tester.get_table_names()
         assert "agents" in tables, "agents table should exist"
         assert "alembic_version" in tables, "alembic_version table should exist"
+        assert "models" in tables, "models table should exist"
+        assert "users" in tables, "users table should exist"
+        assert "tasks" in tables, "tasks table should exist"
 
-        # Verify agents table structure
+        # Verify agents table structure - this tests that migrations
+        # correctly created all columns, not just that SQLAlchemy created them
         columns = sqlite_tester.get_column_names("agents")
         assert "models" in columns, "models column should exist"
         assert "name" in columns, "name column should exist"
+        assert "execution_mode" in columns, "execution_mode column should exist"
+        assert "status" in columns, "status column should exist"
+        assert "suggested_prompts" in columns, "suggested_prompts column should exist"
+
+        # Verify models table has encrypted column
+        models_columns = sqlite_tester.get_column_names("models")
+        assert "_api_key_encrypted" in models_columns, (
+            "_api_key_encrypted column should exist"
+        )
 
     @pytest.mark.postgresql
     @pytest.mark.postgresql
     def test_postgresql_upgrade(self, postgresql_tester):
-        """Test full migration upgrade on PostgreSQL."""
-        # Run upgrade
+        """Test full migration upgrade on PostgreSQL from empty database.
+
+        This tests that migrations can correctly create all tables and columns
+        from scratch, not just when tables are pre-created by SQLAlchemy.
+        """
+        # DO NOT use Base.metadata.create_all() - we want to test migrations
+        # can build the database schema from scratch
+
+        # Run upgrade from empty database
         command.upgrade(postgresql_tester.alembic_cfg, "head")
 
         # Verify alembic_version table
@@ -157,23 +185,45 @@ class TestMigrations:
         tables = postgresql_tester.get_table_names()
         assert "agents" in tables, "agents table should exist"
         assert "alembic_version" in tables, "alembic_version table should exist"
+        assert "models" in tables, "models table should exist"
+        assert "users" in tables, "users table should exist"
+        assert "tasks" in tables, "tasks table should exist"
 
         # Verify agents table structure
         columns = postgresql_tester.get_column_names("agents")
         assert "models" in columns, "models column should exist"
         assert "name" in columns, "name column should exist"
+        assert "execution_mode" in columns, "execution_mode column should exist"
+        assert "status" in columns, "status column should exist"
+        assert "suggested_prompts" in columns, "suggested_prompts column should exist"
 
-    def test_sqlite_idempotence(self, sqlite_tester):
-        """Test that migrations are idempotent on SQLite."""
-        # First upgrade
+        # Verify models table has encrypted column
+        models_columns = postgresql_tester.get_column_names("models")
+        assert "_api_key_encrypted" in models_columns, (
+            "_api_key_encrypted column should exist"
+        )
+
+    def test_sqlite_idempotence_with_sqlalchemy(self, sqlite_tester):
+        """Test that migrations are idempotent when tables pre-created by SQLAlchemy.
+
+        This tests the production scenario where SQLAlchemy's Base.metadata.create_all()
+        creates tables first, then Alembic migrations run. Migrations should correctly
+        detect existing tables/columns and skip already-applied changes.
+        """
+        # First, create tables using SQLAlchemy (mimics production)
+        from xagent.web.models.database import Base
+
+        Base.metadata.create_all(bind=sqlite_tester.engine)
+
+        # Then run migrations - should be idempotent and not fail
         command.upgrade(sqlite_tester.alembic_cfg, "head")
 
-        # Get version after first upgrade
+        # Get version after upgrade
         with sqlite_tester.engine.begin() as conn:
             result = conn.execute(text("SELECT version_num FROM alembic_version"))
             version1 = result.scalar()
 
-        # Second upgrade (should not fail)
+        # Run migrations again - should still work
         command.upgrade(sqlite_tester.alembic_cfg, "head")
 
         # Verify version hasn't changed
@@ -183,18 +233,37 @@ class TestMigrations:
 
         assert version1 == version2, "Version should not change on re-run"
 
+        # Verify tables still have correct structure
+        tables = sqlite_tester.get_table_names()
+        assert "agents" in tables
+        assert "models" in tables
+
+        agents_columns = sqlite_tester.get_column_names("agents")
+        assert "models" in agents_columns
+        assert "name" in agents_columns
+
     @pytest.mark.postgresql
-    def test_postgresql_idempotence(self, postgresql_tester):
-        """Test that migrations are idempotent on PostgreSQL."""
-        # First upgrade
+    def test_postgresql_idempotence_with_sqlalchemy(self, postgresql_tester):
+        """Test that migrations are idempotent when tables pre-created by SQLAlchemy.
+
+        This tests the production scenario where SQLAlchemy's Base.metadata.create_all()
+        creates tables first, then Alembic migrations run. Migrations should correctly
+        detect existing tables/columns and skip already-applied changes.
+        """
+        # First, create tables using SQLAlchemy (mimics production)
+        from xagent.web.models.database import Base
+
+        Base.metadata.create_all(bind=postgresql_tester.engine)
+
+        # Then run migrations - should be idempotent and not fail
         command.upgrade(postgresql_tester.alembic_cfg, "head")
 
-        # Get version after first upgrade
+        # Get version after upgrade
         with postgresql_tester.engine.begin() as conn:
             result = conn.execute(text("SELECT version_num FROM alembic_version"))
             version1 = result.scalar()
 
-        # Second upgrade (should not fail)
+        # Run migrations again - should still work
         command.upgrade(postgresql_tester.alembic_cfg, "head")
 
         # Verify version hasn't changed

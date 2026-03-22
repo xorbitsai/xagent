@@ -36,6 +36,12 @@ def upgrade() -> None:
     bind = context.get_bind()
     inspector = Inspector.from_engine(bind)
 
+    # Check if tasks table exists
+    tables = inspector.get_table_names()
+    if "tasks" not in tables:
+        # Table doesn't exist yet, will be created by SQLAlchemy or a later migration
+        return
+
     # Check which columns already exist
     existing_columns = [col["name"] for col in inspector.get_columns("tasks")]
 
@@ -84,6 +90,12 @@ def downgrade() -> None:
 
     bind = context.get_bind()
     inspector = Inspector.from_engine(bind)
+
+    # Check if tasks table exists
+    tables = inspector.get_table_names()
+    if "tasks" not in tables:
+        # Table doesn't exist yet, will be created by SQLAlchemy or a later migration
+        return
 
     # Check which columns exist before dropping
     existing_columns = [col["name"] for col in inspector.get_columns("tasks")]

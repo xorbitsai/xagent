@@ -24,6 +24,13 @@ def upgrade() -> None:
 
     bind = context.get_bind()
     inspector = Inspector.from_engine(bind)
+
+    # Check if agents table exists
+    tables = inspector.get_table_names()
+    if "agents" not in tables:
+        # Table doesn't exist yet, will be created by SQLAlchemy or a later migration
+        return
+
     columns = [col["name"] for col in inspector.get_columns("agents")]
     dialect_name = bind.dialect.name
 
@@ -57,6 +64,13 @@ def downgrade() -> None:
 
     bind = context.get_bind()
     inspector = Inspector.from_engine(bind)
+
+    # Check if agents table exists
+    tables = inspector.get_table_names()
+    if "agents" not in tables:
+        # Table doesn't exist yet, will be created by SQLAlchemy or a later migration
+        return
+
     columns = [col["name"] for col in inspector.get_columns("agents")]
     dialect_name = bind.dialect.name
 

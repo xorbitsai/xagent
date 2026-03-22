@@ -423,9 +423,18 @@ def create_new_tables() -> None:
 
     bind = context.get_bind()
     inspector = Inspector.from_engine(bind)
+    dialect_name = bind.dialect.name
 
     # Get the appropriate JSON type for the current database
     json_type = get_json_type()
+
+    # Get the appropriate timestamp default for the current database
+    # PostgreSQL uses now(), SQLite uses CURRENT_TIMESTAMP
+    timestamp_default = (
+        sa.text("now()")
+        if dialect_name == "postgresql"
+        else sa.text("CURRENT_TIMESTAMP")
+    )
 
     # Check and create new mcp_servers table
     existing_tables = inspector.get_table_names()
@@ -462,13 +471,13 @@ def create_new_tables() -> None:
             sa.Column(
                 "created_at",
                 sa.DateTime(timezone=True),
-                server_default=sa.text("now()"),
+                server_default=timestamp_default,
                 nullable=True,
             ),
             sa.Column(
                 "updated_at",
                 sa.DateTime(timezone=True),
-                server_default=sa.text("now()"),
+                server_default=timestamp_default,
                 nullable=True,
             ),
             sa.PrimaryKeyConstraint("id"),
@@ -497,7 +506,7 @@ def create_new_tables() -> None:
             sa.Column(
                 "created_at",
                 sa.DateTime(timezone=True),
-                server_default=sa.text("now()"),
+                server_default=timestamp_default,
                 nullable=True,
             ),
             sa.Column("updated_at", sa.DateTime(timezone=True), nullable=True),

@@ -37,19 +37,13 @@ def alembic_config(tmp_path: Path) -> tuple[Config, str]:
 @pytest.fixture
 def engine_with_migration(alembic_config: tuple[Config, str]) -> Any:
     """Create engine with migration applied."""
-    from alembic.migration import MigrationContext
-    from alembic.operations import Operations
+    from alembic import command
 
     config, db_url = alembic_config
     engine = create_engine(db_url)
 
-    # Run the migration
-    from xagent.migrations.versions.a1b2c3d4e5f6_create_tool_directories_table import (
-        upgrade,
-    )
-
+    # Stamp to previous version, then upgrade to current
     with engine.begin() as conn:
-        # Create a basic schema context for the migration
         conn.execute(
             text(
                 "CREATE TABLE IF NOT EXISTS alembic_version (version_num VARCHAR(32) NOT NULL)"
@@ -61,10 +55,8 @@ def engine_with_migration(alembic_config: tuple[Config, str]) -> Any:
             )
         )
 
-        # Apply the migration with proper Alembic context
-        migration_context = MigrationContext.configure(conn)
-        with Operations.context(migration_context):
-            upgrade()
+    # Run the migration using alembic command
+    command.upgrade(config, "a1b2c3d4e5f6")
 
     yield engine
 
@@ -370,16 +362,15 @@ class TestMigrationIdempotency:
 
     def test_upgrade_idempotent(self, tmp_path: Path) -> None:
         """Test that running upgrade twice doesn't fail."""
-        from alembic.migration import MigrationContext
-        from alembic.operations import Operations
+        from alembic import command
 
         db_path = tmp_path / "test_idempotent.db"
         db_url = f"sqlite:///{db_path}"
         engine = create_engine(db_url)
 
-        from xagent.migrations.versions.a1b2c3d4e5f6_create_tool_directories_table import (
-            upgrade,
-        )
+        config = Config()
+        config.set_main_option("sqlalchemy.url", db_url)
+        config.set_main_option("script_location", "src/xagent/migrations")
 
         with engine.begin() as conn:
             conn.execute(
@@ -393,17 +384,12 @@ class TestMigrationIdempotency:
                 )
             )
 
-            migration_context = MigrationContext.configure(conn)
-            with Operations.context(migration_context):
-                upgrade()
+        # Run upgrade first time
+        command.upgrade(config, "a1b2c3d4e5f6")
 
         # Run upgrade again - should handle gracefully
-        # (In practice, Alembic tracks versions, but we test the migration itself)
         try:
-            with engine.begin() as conn:
-                migration_context = MigrationContext.configure(conn)
-                with Operations.context(migration_context):
-                    upgrade()
+            command.upgrade(config, "a1b2c3d4e5f6")
         except Exception as e:
             # Table already exists error is expected
             assert "already exists" in str(e).lower()

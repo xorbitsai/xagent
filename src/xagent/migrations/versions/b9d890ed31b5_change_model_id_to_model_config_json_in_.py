@@ -86,5 +86,5 @@ def downgrade() -> None:
     if "model_id" not in columns:
         op.add_column("agents", sa.Column("model_id", sa.Integer(), nullable=True))
         op.create_foreign_key(
-            "fk_agents_model_id_models", "agents", ["model_id"], ["id"]
+            "fk_agents_model_id_models", "agents", ["model_id"], "models", ["id"]
         )

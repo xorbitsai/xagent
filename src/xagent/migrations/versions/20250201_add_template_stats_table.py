@@ -40,19 +40,13 @@ def upgrade() -> None:
             sa.Column("updated_at", sa.DateTime(timezone=True), nullable=False),
             sa.PrimaryKeyConstraint("id"),
         )
-        # Check if index exists before creating
-        existing_indexes = (
-            [idx["name"] for idx in inspector.get_indexes("template_stats")]
-            if "template_stats" in existing_tables
-            else []
+        # Create the index - since we just created the table, the index won't exist
+        op.create_index(
+            "ix_template_stats_template_id",
+            "template_stats",
+            ["template_id"],
+            unique=True,
         )
-        if "ix_template_stats_template_id" not in existing_indexes:
-            op.create_index(
-                "ix_template_stats_template_id",
-                "template_stats",
-                ["template_id"],
-                unique=True,
-            )
 
 
 def downgrade() -> None:

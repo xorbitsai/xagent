@@ -84,7 +84,15 @@ def downgrade() -> None:
 
     # Add back model_id column if it doesn't exist
     if "model_id" not in columns:
-        op.add_column("agents", sa.Column("model_id", sa.Integer(), nullable=True))
-        op.create_foreign_key(
-            "fk_agents_model_id_models", "agents", ["model_id"], "models", ["id"]
-        )
+        if dialect_name == "sqlite":
+            # SQLite: use batch_alter_table
+            with op.batch_alter_table("agents", recreate="auto") as batch_op:
+                batch_op.add_column(sa.Column("model_id", sa.Integer(), nullable=True))
+                # Don't create FK in SQLite batch mode as it can cause issues
+                # The FK will be recreated by the next migration's upgrade
+        else:
+            # PostgreSQL
+            op.add_column("agents", sa.Column("model_id", sa.Integer(), nullable=True))
+            op.create_foreign_key(
+                "fk_agents_model_id_models", "agents", ["model_id"], "models", ["id"]
+            )

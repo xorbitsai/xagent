@@ -43,6 +43,7 @@ def downgrade() -> None:
 
     bind = context.get_bind()
     inspector = Inspector.from_engine(bind)
+    dialect_name = bind.dialect.name
 
     # Check if tasks table exists
     tables = inspector.get_table_names()
@@ -54,4 +55,10 @@ def downgrade() -> None:
     existing_columns = [col["name"] for col in inspector.get_columns("tasks")]
     if "agent_id" in existing_columns:
         # Remove agent_id column
-        op.drop_column("tasks", "agent_id")
+        if dialect_name == "sqlite":
+            # SQLite: use batch_alter_table
+            with op.batch_alter_table("tasks", recreate="auto") as batch_op:
+                batch_op.drop_column("agent_id")
+        else:
+            # PostgreSQL: drop column directly
+            op.drop_column("tasks", "agent_id")

@@ -72,10 +72,15 @@ def downgrade() -> None:
     dialect_name = bind.dialect.name
     if dialect_name == "sqlite":
         # Use batch mode for SQLite to drop foreign key and column
+        # Note: batch_alter_table will handle the constraint automatically
         with op.batch_alter_table("agents", recreate="auto") as batch_op:
-            batch_op.drop_constraint("fk_agents_model_id_models", type_="foreignkey")
             batch_op.drop_column("model_id")
     else:
         # For PostgreSQL and other databases, use native operations
-        op.drop_constraint("fk_agents_model_id_models", "agents", type_="foreignkey")
+        try:
+            op.drop_constraint(
+                "fk_agents_model_id_models", "agents", type_="foreignkey"
+            )
+        except Exception:
+            pass  # Constraint doesn't exist, skip
         op.drop_column("agents", "model_id")

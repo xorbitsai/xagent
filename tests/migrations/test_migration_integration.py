@@ -276,20 +276,29 @@ class TestMigrations:
     def test_sqlite_incremental_upgrade(self, sqlite_tester):
         """Test incremental upgrades from b9d890ed31b5 to head on SQLite.
 
+        This tests each migration in the chain to ensure they work correctly
+        when run sequentially from an earlier version.
+
         Note: We start from b9d890ed31b5 instead of base because earlier
         migrations may have issues with table/column assumptions.
         """
         from alembic.script import ScriptDirectory
 
-        # Start from b9d890ed31b5 (the first fixed migration)
+        # First, create base tables using SQLAlchemy (simulates production database)
+        from xagent.web.models.database import Base
+
+        Base.metadata.create_all(bind=sqlite_tester.engine)
+
+        # Start from b9d890ed31b5 (an earlier revision)
         START_REVISION = "b9d890ed31b5"
 
+        # Stamp to starting revision to simulate upgrading from that version
+        command.stamp(sqlite_tester.alembic_cfg, START_REVISION)
+
+        # Get all migrations from START_REVISION to head
         script_dir = ScriptDirectory.from_config(sqlite_tester.alembic_cfg)
         revisions = list(script_dir.walk_revisions(START_REVISION, "heads"))
         revisions.reverse()  # START_REVISION to head
-
-        # Stamp to starting revision
-        command.stamp(sqlite_tester.alembic_cfg, START_REVISION)
 
         # Upgrade one revision at a time
         for revision in revisions:
@@ -301,24 +310,51 @@ class TestMigrations:
                 version = result.scalar()
                 assert version == revision.revision
 
+        # After all upgrades, verify that migrations actually added their columns
+        # This tests that migrations work, not just that they're idempotent
+        agents_columns = sqlite_tester.get_column_names("agents")
+        assert "models" in agents_columns, (
+            "f79da474c69d should have renamed model_config to models"
+        )
+        assert "suggested_prompts" in agents_columns, (
+            "20250209_add_suggested_prompts should have added column"
+        )
+
+        models_columns = sqlite_tester.get_column_names("models")
+        assert "_api_key_encrypted" in models_columns, (
+            "441d4f5d399c should have encrypted api_key"
+        )
+        assert "max_tokens" in models_columns, (
+            "b74d4cf2f479 should have added max_tokens column"
+        )
+
     @pytest.mark.postgresql
     def test_postgresql_incremental_upgrade(self, postgresql_tester):
         """Test incremental upgrades from b9d890ed31b5 to head on PostgreSQL.
+
+        This tests each migration in the chain to ensure they work correctly
+        when run sequentially from an earlier version.
 
         Note: We start from b9d890ed31b5 instead of base because earlier
         migrations may have issues with table/column assumptions.
         """
         from alembic.script import ScriptDirectory
 
-        # Start from b9d890ed31b5 (the first fixed migration)
+        # First, create base tables using SQLAlchemy (simulates production database)
+        from xagent.web.models.database import Base
+
+        Base.metadata.create_all(bind=postgresql_tester.engine)
+
+        # Start from b9d890ed31b5 (an earlier revision)
         START_REVISION = "b9d890ed31b5"
 
+        # Stamp to starting revision to simulate upgrading from that version
+        command.stamp(postgresql_tester.alembic_cfg, START_REVISION)
+
+        # Get all migrations from START_REVISION to head
         script_dir = ScriptDirectory.from_config(postgresql_tester.alembic_cfg)
         revisions = list(script_dir.walk_revisions(START_REVISION, "heads"))
         revisions.reverse()  # START_REVISION to head
-
-        # Stamp to starting revision
-        command.stamp(postgresql_tester.alembic_cfg, START_REVISION)
 
         # Upgrade one revision at a time
         for revision in revisions:
@@ -329,6 +365,20 @@ class TestMigrations:
                 result = conn.execute(text("SELECT version_num FROM alembic_version"))
                 version = result.scalar()
                 assert version == revision.revision
+
+        # After all upgrades, verify that migrations actually added their columns
+        agents_columns = postgresql_tester.get_column_names("agents")
+        assert "models" in agents_columns, (
+            "f79da474c69d should have renamed model_config to models"
+        )
+        assert "suggested_prompts" in agents_columns, (
+            "20250209_add_suggested_prompts should have added column"
+        )
+
+        models_columns = postgresql_tester.get_column_names("models")
+        assert "_api_key_encrypted" in models_columns, (
+            "441d4f5d399c should have encrypted api_key"
+        )
 
     def test_sqlite_downgrade(self, sqlite_tester):
         """Test downgrade on SQLite."""

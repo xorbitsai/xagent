@@ -11,6 +11,7 @@ from typing import Any, Sequence, Union
 import sqlalchemy as sa
 from alembic import op
 from sqlalchemy.dialects import postgresql
+from sqlalchemy.engine.reflection import Inspector
 
 revision: str = "a1b2c3d4e5f6"
 down_revision: Union[str, None] = "be6f77416f06"
@@ -19,9 +20,18 @@ depends_on: Union[str, Sequence[str], None] = None
 
 
 def upgrade() -> None:
+    from alembic import context
+
+    bind = context.get_bind()
+    inspector = Inspector.from_engine(bind)
+
+    # Check if table already exists
+    existing_tables = inspector.get_table_names()
+    if "tool_directories" in existing_tables:
+        return  # Table already exists, skip migration
+
     # Get database dialect
-    bind = op.get_bind()
-    dialect = bind.dialect.name
+    dialect_name = bind.dialect.name
 
     # Create tool_directories table with dialect-specific types
     exclude_patterns_type: Any
@@ -30,7 +40,7 @@ def upgrade() -> None:
     bool_false: Any
     timestamp_default: Any
 
-    if dialect == "postgresql":
+    if dialect_name == "postgresql":
         exclude_patterns_type = postgresql.JSON(astext_type=sa.Text())
         datetime_type = sa.DateTime(timezone=True)
         bool_true = sa.text("true")
@@ -66,22 +76,42 @@ def upgrade() -> None:
         ),
         sa.PrimaryKeyConstraint("id"),
     )
-    op.create_index(
-        op.f("ix_tool_directories_id"), "tool_directories", ["id"], unique=False
+
+    # Check and create indexes
+    existing_indexes = (
+        [idx["name"] for idx in inspector.get_indexes("tool_directories")]
+        if "tool_directories" in existing_tables
+        else []
     )
-    op.create_index(
-        op.f("ix_tool_directories_name"), "tool_directories", ["name"], unique=True
-    )
-    op.create_index(
-        op.f("ix_tool_directories_enabled"),
-        "tool_directories",
-        ["enabled"],
-        unique=False,
-    )
+    if "ix_tool_directories_id" not in existing_indexes:
+        op.create_index(
+            op.f("ix_tool_directories_id"), "tool_directories", ["id"], unique=False
+        )
+    if "ix_tool_directories_name" not in existing_indexes:
+        op.create_index(
+            op.f("ix_tool_directories_name"), "tool_directories", ["name"], unique=True
+        )
+    if "ix_tool_directories_enabled" not in existing_indexes:
+        op.create_index(
+            op.f("ix_tool_directories_enabled"),
+            "tool_directories",
+            ["enabled"],
+            unique=False,
+        )
 
 
 def downgrade() -> None:
-    op.drop_index(op.f("ix_tool_directories_enabled"), table_name="tool_directories")
-    op.drop_index(op.f("ix_tool_directories_name"), table_name="tool_directories")
-    op.drop_index(op.f("ix_tool_directories_id"), table_name="tool_directories")
-    op.drop_table("tool_directories")
+    from alembic import context
+
+    bind = context.get_bind()
+    inspector = Inspector.from_engine(bind)
+
+    # Check if table exists before dropping
+    existing_tables = inspector.get_table_names()
+    if "tool_directories" in existing_tables:
+        op.drop_index(
+            op.f("ix_tool_directories_enabled"), table_name="tool_directories"
+        )
+        op.drop_index(op.f("ix_tool_directories_name"), table_name="tool_directories")
+        op.drop_index(op.f("ix_tool_directories_id"), table_name="tool_directories")
+        op.drop_table("tool_directories")

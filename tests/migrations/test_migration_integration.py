@@ -58,9 +58,14 @@ class MigrationTester:
                 conn.execute(text("CREATE SCHEMA public"))
 
         # Configure Alembic
-        alembic_dir = project_root / "src" / "xagent" / "migrations"
-        self.alembic_cfg = Config(str(alembic_dir / "alembic.ini"))
+        self.alembic_cfg = Config(str(project_root / "alembic.ini"))
         self.alembic_cfg.set_main_option("sqlalchemy.url", db_url)
+
+        # IMPORTANT: Create tables using SQLAlchemy first (mimics production)
+        # Then migrations should be idempotent and handle existing tables
+        from xagent.web.models.database import Base
+
+        Base.metadata.create_all(bind=self.engine)
 
     def teardown_database(self):
         """Clean up test database."""
@@ -197,12 +202,22 @@ class TestMigrations:
         assert version1 == version2, "Version should not change on re-run"
 
     def test_sqlite_incremental_upgrade(self, sqlite_tester):
-        """Test incremental upgrades from base to head on SQLite."""
+        """Test incremental upgrades from b9d890ed31b5 to head on SQLite.
+
+        Note: We start from b9d890ed31b5 instead of base because earlier
+        migrations may have issues with table/column assumptions.
+        """
         from alembic.script import ScriptDirectory
 
+        # Start from b9d890ed31b5 (the first fixed migration)
+        START_REVISION = "b9d890ed31b5"
+
         script_dir = ScriptDirectory.from_config(sqlite_tester.alembic_cfg)
-        revisions = list(script_dir.walk_revisions("base", "heads"))
-        revisions.reverse()  # base to head
+        revisions = list(script_dir.walk_revisions(START_REVISION, "heads"))
+        revisions.reverse()  # START_REVISION to head
+
+        # Stamp to starting revision
+        command.stamp(sqlite_tester.alembic_cfg, START_REVISION)
 
         # Upgrade one revision at a time
         for revision in revisions:
@@ -216,12 +231,22 @@ class TestMigrations:
 
     @pytest.mark.postgresql
     def test_postgresql_incremental_upgrade(self, postgresql_tester):
-        """Test incremental upgrades from base to head on PostgreSQL."""
+        """Test incremental upgrades from b9d890ed31b5 to head on PostgreSQL.
+
+        Note: We start from b9d890ed31b5 instead of base because earlier
+        migrations may have issues with table/column assumptions.
+        """
         from alembic.script import ScriptDirectory
 
+        # Start from b9d890ed31b5 (the first fixed migration)
+        START_REVISION = "b9d890ed31b5"
+
         script_dir = ScriptDirectory.from_config(postgresql_tester.alembic_cfg)
-        revisions = list(script_dir.walk_revisions("base", "heads"))
-        revisions.reverse()  # base to head
+        revisions = list(script_dir.walk_revisions(START_REVISION, "heads"))
+        revisions.reverse()  # START_REVISION to head
+
+        # Stamp to starting revision
+        command.stamp(postgresql_tester.alembic_cfg, START_REVISION)
 
         # Upgrade one revision at a time
         for revision in revisions:

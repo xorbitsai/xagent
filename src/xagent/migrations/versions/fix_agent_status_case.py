@@ -18,12 +18,26 @@ depends_on = None
 
 
 def upgrade() -> None:
-    # Update uppercase status values to lowercase
-    op.execute("""
-        UPDATE agents
-        SET status = LOWER(status::text)::agentstatus
-        WHERE status::text IN ('PUBLISHED', 'DRAFT', 'ARCHIVED')
-    """)
+    from alembic import context
+
+    bind = context.get_bind()
+    dialect_name = bind.dialect.name
+
+    # This migration uses PostgreSQL-specific syntax
+    if dialect_name == "postgresql":
+        # Update uppercase status values to lowercase
+        op.execute("""
+            UPDATE agents
+            SET status = LOWER(status::text)::agentstatus
+            WHERE status::text IN ('PUBLISHED', 'DRAFT', 'ARCHIVED')
+        """)
+    else:
+        # SQLite: use LOWER() function instead
+        op.execute("""
+            UPDATE agents
+            SET status = LOWER(status)
+            WHERE status IN ('PUBLISHED', 'DRAFT', 'ARCHIVED')
+        """)
 
 
 def downgrade() -> None:

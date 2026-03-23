@@ -187,6 +187,13 @@ class ToolFactory:
         # Wrap sandbox-enabled tools if sandbox is available
         sandbox = config.get_sandbox()
         if sandbox is not None:
+            workspace = ToolFactory._create_workspace(config.get_workspace_config())
+            if workspace is not None:
+                from .sandboxed_tool.sandboxed_tool_wrapper import (
+                    create_workspace_in_sandbox,
+                )
+
+                await create_workspace_in_sandbox(sandbox, workspace)
             tools = await ToolFactory._wrap_sandbox_tools(tools, sandbox)
 
         logger.info(f"Created {len(tools)} tools from configuration")

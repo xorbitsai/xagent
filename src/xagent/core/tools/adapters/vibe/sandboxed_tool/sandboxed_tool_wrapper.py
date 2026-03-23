@@ -5,6 +5,8 @@ Execute tool's run_json_sync/async methods in sandbox environment by uploading t
 """
 
 import asyncio
+import base64
+import inspect
 import json
 import logging
 import os
@@ -12,13 +14,84 @@ import uuid
 from pathlib import Path
 from typing import Any, Mapping, Optional, Type
 
+import cloudpickle  # type: ignore[import-untyped]
 from pydantic import BaseModel
 
 from ......sandbox.base import Sandbox
+from .....workspace import TaskWorkspace
 from ..base import AbstractBaseTool, ToolMetadata
 from .sandboxed_tool_config import get_sandbox_tool_config
 
 logger = logging.getLogger(__name__)
+
+
+def _extract_init_params(tool: AbstractBaseTool) -> dict[str, Any]:
+    """Extract __init__ parameter values from a tool instance.
+
+    Uses inspect.signature to get parameter names, then looks up
+    corresponding attribute values on the tool instance using the
+    naming convention: _name or name.
+
+    Args:
+        tool: Tool instance to extract init params from
+
+    Returns:
+        Dict mapping parameter name to its value.
+        Empty dict if tool has no init params (beyond self).
+    """
+    sig = inspect.signature(tool.__class__.__init__)
+
+    params: dict[str, Any] = {}
+    instance_dict = getattr(tool, "__dict__", {})
+    for name in sig.parameters:
+        if name == "self":
+            continue
+        # Look up attribute: _name or name
+        found = False
+        for attr_name in (f"_{name}", name):
+            if attr_name in instance_dict:
+                params[name] = instance_dict[attr_name]
+                found = True
+                break
+        if not found:
+            logger.warning(
+                f"Init param '{name}' not found on {tool.__class__.__name__} "
+                f"(tried '_{name}' and '{name}'), skipping"
+            )
+
+    return params
+
+
+def _serialize_init_params(params: dict[str, Any]) -> str | None:
+    """Serialize init params dict to base64-encoded pickle string.
+
+    Args:
+        params: Dict of parameter name -> value
+
+    Returns:
+        base64-encoded pickle string, or None if params is empty.
+
+    Raises:
+        RuntimeError: If any parameter value is not serializable.
+    """
+    if not params:
+        return None
+
+    try:
+        data = cloudpickle.dumps(params)
+    except Exception:
+        for param_name, value in params.items():
+            try:
+                cloudpickle.dumps(value)
+            except Exception as e:
+                raise RuntimeError(
+                    f"Init parameter '{param_name}' (type: {type(value).__name__}) "
+                    f"is not serializable: {e}. "
+                    f"This tool cannot run in sandbox with non-serializable init params."
+                ) from e
+        raise
+
+    return base64.b64encode(data).decode("ascii")
 
 
 class SandboxedToolWrapper(AbstractBaseTool):
@@ -54,6 +127,7 @@ class SandboxedToolWrapper(AbstractBaseTool):
         base_requirements = [
             "pydantic>=2.0.0",
             "pydantic-settings",
+            "cloudpickle>=3.0.0",
         ]
         tool_config = get_sandbox_tool_config(target_tool.name)
         self._requirements = base_requirements + tool_config.packages
@@ -62,6 +136,10 @@ class SandboxedToolWrapper(AbstractBaseTool):
         # Proxy target tool attributes
         self._visibility = getattr(target_tool, "_visibility", None)
         self._allow_users = getattr(target_tool, "_allow_users", None)
+
+        # Extract and serialize init params for sandbox reconstruction
+        init_params = _extract_init_params(target_tool)
+        self._init_params_b64 = _serialize_init_params(init_params)
 
     @property
     def name(self) -> str:
@@ -205,6 +283,7 @@ class SandboxedToolWrapper(AbstractBaseTool):
         Generate Python script to execute tool in sandbox.
 
         Uses tool_class strategy: Class().run_json_sync(args) or run_json_async(args)
+        When init params exists, use Class(**params).
 
         Args:
             args: Tool arguments
@@ -213,8 +292,6 @@ class SandboxedToolWrapper(AbstractBaseTool):
         Returns:
             Python execution script
         """
-        import base64
-
         import_path = self._resolve_execution_strategy()
         module_path, name = import_path.rsplit(":", 1)
 
@@ -225,7 +302,28 @@ class SandboxedToolWrapper(AbstractBaseTool):
         # Generate environment variable setup code
         env_setup = self._generate_env_setup()
 
-        execution_code = f"""
+        if self._init_params_b64 is not None:
+            execution_code = f"""
+import cloudpickle
+
+# Deserialize init params
+init_params_b64 = '{self._init_params_b64}'
+init_params = cloudpickle.loads(base64.b64decode(init_params_b64))
+
+# Import and reconstruct tool class with params
+from {module_path} import {name}
+tool = {name}(**init_params)
+
+# Execute via tool's run method
+import inspect
+if inspect.iscoroutinefunction(tool.run_json_async):
+    import asyncio
+    result = asyncio.run(tool.run_json_async(args))
+else:
+    result = tool.run_json_sync(args)
+"""
+        else:
+            execution_code = f"""
 # Import and reconstruct tool class
 from {module_path} import {name}
 tool = {name}()
@@ -364,6 +462,23 @@ async def create_sandboxed_tool(
     )
 
     return wrapper
+
+
+async def create_workspace_in_sandbox(
+    sandbox: Sandbox,
+    workspace: TaskWorkspace,
+) -> None:
+    """Create workspace directories inside the sandbox.
+
+    Args:
+        sandbox: Sandbox instance
+        workspace: TaskWorkspace instance
+    """
+    dirs = workspace.get_allowed_dirs()
+    if not dirs:
+        return
+
+    await sandbox.exec("mkdir", "-p", *dirs)
 
 
 def _calculate_tar_hash(tar_path: str) -> str:

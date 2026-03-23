@@ -2,6 +2,7 @@
 Sandbox management in application layer.
 """
 
+import asyncio
 import logging
 import os
 import threading
@@ -26,6 +27,9 @@ class SandboxManager:
             service: SandboxService instance for creating sandboxes
         """
         self._service: SandboxService = service
+        self._cache: dict[str, Sandbox] = {}
+        self._locks: dict[str, asyncio.Lock] = {}
+        self._locks_guard = asyncio.Lock()
 
     def _get_sandbox_config(self) -> tuple[str, int, int]:
         sandbox_image = os.getenv("SANDBOX_IMAGE", DEFAULT_SANDBOX_IMAGE)
@@ -56,29 +60,42 @@ class SandboxManager:
         Returns:
             Sandbox instance
         """
-        # TODO: Determine template and config based on user configuration
-        sandbox_image, sandbox_cpus, sandbox_memory = self._get_sandbox_config()
-
-        template = SandboxTemplate(type="image", image=sandbox_image)
-        config = SandboxConfig(cpus=sandbox_cpus, memory=sandbox_memory)
-
-        # Create sandbox with task-specific name
         sandbox_name = f"{lifecycle_type}::{lifecycle_id}"
+        if sandbox_name in self._cache:
+            return self._cache[sandbox_name]
 
-        logger.debug(f"Getting or creating sandbox for: {sandbox_name}")
-        sandbox = await self._service.get_or_create(
-            sandbox_name,
-            template=template,
-            config=config,
-        )
+        # Acquire per-name lock to prevent concurrent creation
+        async with self._locks_guard:
+            if sandbox_name not in self._locks:
+                self._locks[sandbox_name] = asyncio.Lock()
+            lock = self._locks[sandbox_name]
 
-        # Package and upload xagent code
-        from ..core.tools.adapters.vibe.sandboxed_tool.sandboxed_tool_wrapper import (
-            upload_code_to_sandbox,
-        )
+        async with lock:
+            # Double-check after acquiring lock
+            if sandbox_name in self._cache:
+                return self._cache[sandbox_name]
 
-        await upload_code_to_sandbox(sandbox)
-        return sandbox
+            # TODO: Determine template and config based on user configuration
+            sandbox_image, sandbox_cpus, sandbox_memory = self._get_sandbox_config()
+
+            template = SandboxTemplate(type="image", image=sandbox_image)
+            config = SandboxConfig(cpus=sandbox_cpus, memory=sandbox_memory)
+
+            logger.debug(f"Getting or creating sandbox for: {sandbox_name}")
+            sandbox = await self._service.get_or_create(
+                sandbox_name,
+                template=template,
+                config=config,
+            )
+
+            # Package and upload xagent code
+            from ..core.tools.adapters.vibe.sandboxed_tool.sandboxed_tool_wrapper import (
+                upload_code_to_sandbox,
+            )
+
+            await upload_code_to_sandbox(sandbox)
+            self._cache[sandbox_name] = sandbox
+            return sandbox
 
     async def delete_sandbox(self, lifecycle_type: str, lifecycle_id: str) -> None:
         """
@@ -94,6 +111,11 @@ class SandboxManager:
             logger.debug(f"Sandbox deleted: {sandbox_name}")
         except Exception as e:
             logger.error(f"Failed to delete sandbox {sandbox_name}: {e}")
+        finally:
+            # Always evict from cache — even on failure the instance
+            # may be in an unknown state and should be recreated.
+            self._cache.pop(sandbox_name, None)
+            self._locks.pop(sandbox_name, None)
 
     async def warmup(self) -> None:
         """
@@ -162,6 +184,8 @@ class SandboxManager:
                 except Exception as e:
                     logger.error(f"Failed to handle sandbox {sb.name}: {e}")
 
+            self._cache.clear()
+            self._locks.clear()
             logger.info("Sandbox cleanup completed")
         except Exception as e:
             logger.error(f"Failed to cleanup sandboxes: {e}")

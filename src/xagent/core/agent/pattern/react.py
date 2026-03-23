@@ -1685,8 +1685,10 @@ Failed final answer:
         }
 
     def _ensure_action_type(self, action_data: Dict[str, Any]) -> Dict[str, Any]:
-        """Infer missing action 'type' from common fields."""
-        if action_data.get("type"):
+        """Infer missing or incorrect action 'type' from common fields."""
+        action_type = action_data.get("type")
+        # LLM may return incorrect action type
+        if action_type in ("tool_call", "final_answer"):
             return action_data
 
         inferred: Optional[str] = None

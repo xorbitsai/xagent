@@ -71,6 +71,7 @@ dependencies = [
   "boxlite>=0.6.0; sys_platform == 'linux' and platform_machine == 'x86_64'",
   "boxlite>=0.6.0; sys_platform == 'darwin' and platform_machine == 'arm64'",
   "filelock>=3.0.0",
+  "cloudpickle>=3.0.0",
 ]
 
 [project.optional-dependencies]

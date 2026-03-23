@@ -17,9 +17,9 @@ except ImportError:
     )
 
 from xagent.core.tools.adapters.vibe.javascript_executor import (
-    get_javascript_executor_tool,
+    JavaScriptExecutorToolForBasic,
 )
-from xagent.core.tools.adapters.vibe.python_executor import get_python_executor_tool
+from xagent.core.tools.adapters.vibe.python_executor import PythonExecutorToolForBasic
 from xagent.core.tools.adapters.vibe.sandboxed_tool.sandboxed_tool_wrapper import (
     create_sandboxed_tool,
     upload_code_to_sandbox,
@@ -99,7 +99,7 @@ class TestSandboxedToolWrapper:
             sandbox = await _create_sandbox(service, sandbox_name)
 
             # Create sandboxed tool
-            python_executor = get_python_executor_tool(None)
+            python_executor = PythonExecutorToolForBasic(None)
             sandboxed_executor = await create_sandboxed_tool(
                 tool=python_executor,
                 sandbox=sandbox,
@@ -154,7 +154,7 @@ class TestSandboxedToolWrapper:
             sandbox = await _create_sandbox(service, sandbox_name)
 
             # Create first sandboxed tool
-            python_executor = get_python_executor_tool(None)
+            python_executor = PythonExecutorToolForBasic(None)
             sandboxed_py1 = await create_sandboxed_tool(
                 tool=python_executor,
                 sandbox=sandbox,
@@ -215,7 +215,7 @@ class TestSandboxedToolWrapper:
             sandbox = await _create_sandbox(service, sandbox_name)
 
             # Create sandboxed tool
-            python_executor = get_python_executor_tool(None)
+            python_executor = PythonExecutorToolForBasic(None)
             sandboxed_executor = await create_sandboxed_tool(
                 tool=python_executor,
                 sandbox=sandbox,
@@ -260,7 +260,7 @@ class TestSandboxedToolWrapper:
             sandbox = await _create_sandbox(service, sandbox_name)
 
             # Create sandboxed tool
-            python_executor = get_python_executor_tool(None)
+            python_executor = PythonExecutorToolForBasic(None)
             sandboxed_executor = await create_sandboxed_tool(
                 tool=python_executor,
                 sandbox=sandbox,
@@ -377,7 +377,7 @@ class TestTools:
 
             # Create sandboxed tool with contain_tests=True to upload tests
             sandboxed_tool = await create_sandboxed_tool(
-                tool=get_python_executor_tool(None),
+                tool=PythonExecutorToolForBasic(None),
                 sandbox=sandbox,
             )
 
@@ -453,7 +453,7 @@ class TestTools:
 
             # Create sandboxed tool with contain_tests=True to upload tests
             sandboxed_tool = await create_sandboxed_tool(
-                tool=get_javascript_executor_tool(None),
+                tool=JavaScriptExecutorToolForBasic(None),
                 sandbox=sandbox,
             )
 
@@ -562,7 +562,7 @@ class TestSandboxVsLocal:
             sandbox = await _create_sandbox(service, sandbox_name)
 
             # Create tools
-            python_tool = get_python_executor_tool(None)
+            python_tool = PythonExecutorToolForBasic(None)
             sandboxed_tool = await create_sandboxed_tool(
                 tool=python_tool,
                 sandbox=sandbox,

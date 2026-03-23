@@ -42,15 +42,15 @@ async def create_basic_tools(config: "BaseToolConfig") -> List[Any]:
 
     # Python executor tool (if workspace available)
     if workspace:
-        from .python_executor import get_python_executor_tool
+        from .python_executor import PythonExecutorToolForBasic
 
-        tools.append(get_python_executor_tool({"workspace": workspace}))
+        tools.append(PythonExecutorToolForBasic(workspace=workspace))
 
     # JavaScript executor tool (if workspace available)
     if workspace:
-        from .javascript_executor import get_javascript_executor_tool
+        from .javascript_executor import JavaScriptExecutorToolForBasic
 
-        tools.append(get_javascript_executor_tool({"workspace": workspace}))
+        tools.append(JavaScriptExecutorToolForBasic(workspace=workspace))
 
     # API tool
     from .api_tool import APITool

@@ -99,6 +99,16 @@ class JavaScriptExecutorTool(AbstractBaseTool):
         return None
 
 
+class JavaScriptExecutorToolForBasic(JavaScriptExecutorTool):
+    """JavaScript executor tool with BASIC category."""
+
+    category = ToolCategory.BASIC
+
+    @property
+    def name(self) -> str:
+        return "execute_javascript_code"
+
+
 def get_javascript_executor_tool(info: Optional[dict[str, Any]] = None) -> FunctionTool:
     """
     Create a workspace-bound JavaScript executor tool.

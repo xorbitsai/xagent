@@ -49,6 +49,7 @@ repos:
           - nest-asyncio
           - anthropic
           - python-pptx
+          - cloudpickle
 
   - repo: https://github.com/pre-commit/pre-commit-hooks
     rev: v5.0.0

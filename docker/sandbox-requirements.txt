@@ -6,6 +6,7 @@
 # ============================================
 pydantic>=2.11.7
 pydantic-settings
+cloudpickle>=3.0.0
 
 # ============================================
 # Tools dependencies

@@ -115,6 +115,16 @@ class PythonExecutorTool(AbstractBaseTool):
         }
 
 
+class PythonExecutorToolForBasic(PythonExecutorTool):
+    """Python executor tool with BASIC category."""
+
+    category = ToolCategory.BASIC
+
+    @property
+    def name(self) -> str:
+        return "execute_python_code"
+
+
 def get_python_executor_tool(info: Optional[dict[str, Any]] = None) -> FunctionTool:
     """
     Create a workspace-bound Python executor tool.

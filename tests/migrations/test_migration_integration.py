@@ -162,7 +162,6 @@ class TestMigrations:
         )
 
     @pytest.mark.postgresql
-    @pytest.mark.postgresql
     def test_postgresql_upgrade(self, postgresql_tester):
         """Test full migration upgrade on PostgreSQL from empty database.
 

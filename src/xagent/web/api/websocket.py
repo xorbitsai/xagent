@@ -2603,7 +2603,7 @@ async def handle_build_preview_execution(
             allowed_skills=skills if skills is not None else None,
             allowed_tools=allowed_tools,
             task_id=preview_task_id,
-            workspace_base_dir="uploads/build_preview",
+            workspace_base_dir=str(UPLOADS_DIR / "build_preview"),
             vision_model=vision_llm,  # Pass vision model for tool creation
         )
 
@@ -2664,7 +2664,7 @@ async def handle_build_preview_execution(
             use_dag_pattern=use_dag_pattern,
             id=preview_task_id,
             enable_workspace=True,
-            workspace_base_dir="uploads/build_preview",
+            workspace_base_dir=str(UPLOADS_DIR / "build_preview"),
             task_id=preview_task_id,
             tracer=preview_tracer,
         )
@@ -2807,13 +2807,11 @@ async def handle_build_preview_execution(
         if instructions:
             execution_context["system_prompt"] = instructions
         if file_prompt:
-            existing_prompt = execution_context.get("system_prompt")
-            if existing_prompt:
-                execution_context["system_prompt"] = (
-                    f"{existing_prompt}\n\n{file_prompt}"
-                )
+            if user_message:
+                user_message = f"{user_message}\n\n{file_prompt}"
             else:
-                execution_context["system_prompt"] = file_prompt
+                user_message = file_prompt
+
         # Emphasize KB priority when knowledge bases are configured
         execution_context["system_prompt"] = enhance_system_prompt_with_kb(
             execution_context.get("system_prompt"), knowledge_bases

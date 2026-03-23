@@ -739,28 +739,13 @@ export function AgentBuilder({ agentId }: AgentBuilderProps) {
       // Process files if any
       let processedFiles: any[] = []
       if (files.length > 0) {
-        const formData = new FormData()
-        files.forEach(f => formData.append('files', f))
-        formData.append('task_type', 'task')
-
-        const uploadResponse = await apiRequest(`${getApiUrl()}/api/files/upload`, {
-          method: 'POST',
-          body: formData
-        })
-
-        if (uploadResponse.ok) {
-          const uploadData = await uploadResponse.json()
-          if (uploadData.success && uploadData.files) {
-            processedFiles = uploadData.files.map((f: any) => ({
-              file_id: f.file_id,
-              name: f.filename,
-              size: f.file_size,
-              type: f.mime_type || ''
-            }))
-          }
-        } else {
-          console.error('Failed to upload preview files:', uploadResponse.statusText)
-        }
+        // Files are already uploaded by ChatInput component
+        processedFiles = files.map(f => ({
+          file_id: (f as any).file_id,
+          name: f.name,
+          size: f.size,
+          type: f.type || ''
+        }))
       }
 
       // Ensure message is not empty for backend

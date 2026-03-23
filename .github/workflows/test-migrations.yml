@@ -17,19 +17,47 @@ on:
       - 'src/xagent/db/**'
 
 jobs:
-  test-migrations:
-    name: Test Migrations on ${{ matrix.db }}
+  test-sqlite-migrations:
+    name: Test SQLite Migrations
     runs-on: ubuntu-latest
 
-    strategy:
-      fail-fast: false
-      matrix:
-        db: [sqlite, postgresql]
-        python-version: ["3.11"]
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[dev]"
+
+      - name: Test migration upgrade
+        run: |
+          python tests/migrations/test_migration_integration.py --db sqlite upgrade
+
+      - name: Test migration idempotence
+        run: |
+          python tests/migrations/test_migration_integration.py --db sqlite idempotence
+
+      - name: Test incremental upgrades
+        run: |
+          python tests/migrations/test_migration_integration.py --db sqlite incremental
+
+      - name: Test migration downgrade
+        run: |
+          python tests/migrations/test_migration_integration.py --db sqlite downgrade
+
+  test-postgresql-migrations:
+    name: Test PostgreSQL Migrations
+    runs-on: ubuntu-latest
 
     services:
       postgres:
-        # PostgreSQL service for postgresql tests
         image: postgres:16-bookworm
         env:
           POSTGRES_USER: xagent
@@ -52,10 +80,10 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
 
-      - name: Set up Python ${{ matrix.python-version }}
+      - name: Set up Python
         uses: actions/setup-python@v4
         with:
-          python-version: ${{ matrix.python-version }}
+          python-version: "3.11"
           cache: "pip"
 
       - name: Install dependencies
@@ -65,24 +93,24 @@ jobs:
 
       - name: Test migration upgrade
         run: |
-          python tests/migrations/test_migration_integration.py --db ${{ matrix.db }} upgrade
+          python tests/migrations/test_migration_integration.py --db postgresql upgrade
         env:
-          DATABASE_URL: ${{ matrix.db == 'postgresql' && 'postgresql://xagent:xagent@localhost:5432/xagent_test' || '' }}
+          DATABASE_URL: postgresql://xagent:xagent@localhost:5432/xagent_test
 
       - name: Test migration idempotence
         run: |
-          python tests/migrations/test_migration_integration.py --db ${{ matrix.db }} idempotence
+          python tests/migrations/test_migration_integration.py --db postgresql idempotence
         env:
-          DATABASE_URL: ${{ matrix.db == 'postgresql' && 'postgresql://xagent:xagent@localhost:5432/xagent_test' || '' }}
+          DATABASE_URL: postgresql://xagent:xagent@localhost:5432/xagent_test
 
       - name: Test incremental upgrades
         run: |
-          python tests/migrations/test_migration_integration.py --db ${{ matrix.db }} incremental
+          python tests/migrations/test_migration_integration.py --db postgresql incremental
         env:
-          DATABASE_URL: ${{ matrix.db == 'postgresql' && 'postgresql://xagent:xagent@localhost:5432/xagent_test' || '' }}
+          DATABASE_URL: postgresql://xagent:xagent@localhost:5432/xagent_test
 
       - name: Test migration downgrade
         run: |
-          python tests/migrations/test_migration_integration.py --db ${{ matrix.db }} downgrade
+          python tests/migrations/test_migration_integration.py --db postgresql downgrade
         env:
-          DATABASE_URL: ${{ matrix.db == 'postgresql' && 'postgresql://xagent:xagent@localhost:5432/xagent_test' || '' }}
+          DATABASE_URL: postgresql://xagent:xagent@localhost:5432/xagent_test

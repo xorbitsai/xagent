@@ -861,8 +861,6 @@ def _get_models_by_category(
     """
     models: dict[str, Any] = {}
     try:
-        from sqlalchemy import String, cast
-
         from ..models.model import Model as DBModel
 
         db_models = (

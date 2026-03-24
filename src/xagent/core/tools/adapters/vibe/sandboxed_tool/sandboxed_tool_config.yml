@@ -28,3 +28,9 @@ execute_javascript_code:
   tool_class: "xagent.core.tools.adapters.vibe.javascript_executor:JavaScriptExecutorTool"
   packages: []
   env_vars: []
+
+execute_command:
+  sandbox_enabled: true
+  tool_class: "xagent.core.tools.adapters.vibe.command_executor:CommandExecutorTool"
+  packages: []
+  env_vars: []

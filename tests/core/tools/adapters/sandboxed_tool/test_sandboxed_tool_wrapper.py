@@ -16,6 +16,7 @@ except ImportError:
         allow_module_level=True,
     )
 
+from xagent.core.tools.adapters.vibe.command_executor import CommandExecutorToolForBasic
 from xagent.core.tools.adapters.vibe.javascript_executor import (
     JavaScriptExecutorToolForBasic,
 )
@@ -502,6 +503,82 @@ class TestTools:
             )
 
             print("✅ JavaScript executor test suite passed in sandbox")
+
+        finally:
+            try:
+                await service.delete(sandbox_name)
+            except Exception:
+                pass
+
+    @pytest.mark.asyncio(loop_scope="module")
+    async def test_command_executor_in_sandbox(self):
+        """
+        Launch a sandbox, upload code + tests via create_sandboxed_tool,
+        then run tests/core/tools/test_command_executor.py inside the sandbox.
+        """
+        print("\n=== Test command_executor test suite in sandbox ===")
+
+        service = BoxliteSandboxService(MemBoxliteStore())
+        sandbox_name = "test_cmd_executor_suite"
+
+        try:
+            # Cleanup
+            try:
+                await service.delete(sandbox_name)
+            except Exception:
+                pass
+
+            # Create sandbox
+            sandbox = await _create_sandbox(service, sandbox_name)
+
+            # Create sandboxed tool with contain_tests=True to upload tests
+            sandboxed_tool = await create_sandboxed_tool(
+                tool=CommandExecutorToolForBasic(None),
+                sandbox=sandbox,
+            )
+
+            # Get sandbox instance for direct exec
+            sb = await sandboxed_tool.get_sandbox_for_test()
+
+            # Verify tests were uploaded
+            check = await sb.exec(
+                "test", "-f", "/app/tests/core/tools/test_command_executor.py"
+            )
+            assert check.exit_code == 0, (
+                "test_command_executor.py should exist in sandbox"
+            )
+
+            # Install pytest in sandbox
+            install_result = await sb.exec(
+                "pip", "install", "--break-system-packages", "pytest", "pytest-asyncio"
+            )
+            assert install_result.exit_code == 0, (
+                f"Failed to install pytest: {install_result.stderr}"
+            )
+
+            # Run test_command_executor.py in sandbox
+            test_result = await sb.exec(
+                "python",
+                "-m",
+                "pytest",
+                "/app/tests/core/tools/test_command_executor.py",
+                "-v",
+                "--tb=short",
+                env={"PYTHONPATH": "/app/src"},
+            )
+
+            print(f"\n--- pytest stdout ---\n{test_result.stdout}")
+            if test_result.stderr:
+                print(f"\n--- pytest stderr ---\n{test_result.stderr}")
+            print(f"\nExit code: {test_result.exit_code}")
+
+            assert test_result.exit_code == 0, (
+                f"pytest failed with exit code {test_result.exit_code}\n"
+                f"stdout:\n{test_result.stdout}\n"
+                f"stderr:\n{test_result.stderr}"
+            )
+
+            print("✅ Command executor test suite passed in sandbox")
 
         finally:
             try:

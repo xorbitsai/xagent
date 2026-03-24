@@ -59,8 +59,8 @@ async def create_basic_tools(config: "BaseToolConfig") -> List[Any]:
 
     # Command executor tool (if workspace available)
     if workspace:
-        from .command_executor import get_command_executor_tool
+        from .command_executor import CommandExecutorToolForBasic
 
-        tools.append(get_command_executor_tool({"workspace": workspace}))
+        tools.append(CommandExecutorToolForBasic(workspace=workspace))
 
     return tools

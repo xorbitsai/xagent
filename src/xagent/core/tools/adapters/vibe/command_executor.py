@@ -89,6 +89,16 @@ class CommandExecutorTool(AbstractBaseTool):
         return None
 
 
+class CommandExecutorToolForBasic(CommandExecutorTool):
+    """Command executor tool with BASIC category."""
+
+    category = ToolCategory.BASIC
+
+    @property
+    def name(self) -> str:
+        return "execute_command"
+
+
 def get_command_executor_tool(info: Optional[dict[str, Any]] = None) -> FunctionTool:
     """
     Create a workspace-bound command executor tool.

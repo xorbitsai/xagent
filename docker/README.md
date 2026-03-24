@@ -194,8 +194,9 @@ Images are automatically published to Docker Hub when you create a GitHub releas
 1. Configure GitHub secrets:
    - Go to repository Settings → Secrets and variables → Actions
    - Add `DOCKERHUB_USERNAME`: Your Docker Hub username
-   - Add `DOCKERHUB_TOKEN`: Your Docker Hub access token
+   - Add `DOCKERHUB_PASSWORD`: Your Docker Hub access token (not your password)
      - Create at: https://hub.docker.com/settings/security
+     - Use "Read & Write" permissions for pushing images
 
 2. Ensure Docker Hub repositories exist:
    - `xprobe/xagent-backend`

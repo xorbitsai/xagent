@@ -5,7 +5,7 @@ import logging
 import os
 import shutil
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, cast
 
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.orm import Session
@@ -245,19 +245,43 @@ class AgentServiceManager:
         self._default_llm = create_default_llm()
         self.request = request
 
+    def _get_task_llm_ids(self, task: Task, db: Session) -> List[Optional[str]]:
+        """Return internal model_id identifiers for a task (never provider model_name)."""
+        from ..services.llm_utils import CoreStorage, make_normalize_model_id
+
+        core_storage = CoreStorage(db, DBModel)
+
+        _normalize = make_normalize_model_id(core_storage)
+
+        return [
+            _normalize(
+                getattr(task, "model_id", None), getattr(task, "model_name", None)
+            ),
+            _normalize(
+                getattr(task, "small_fast_model_id", None),
+                getattr(task, "small_fast_model_name", None),
+            ),
+            _normalize(
+                getattr(task, "visual_model_id", None),
+                getattr(task, "visual_model_name", None),
+            ),
+            _normalize(
+                getattr(task, "compact_model_id", None),
+                getattr(task, "compact_model_name", None),
+            ),
+        ]
+
     def set_task_llms(
-        self, task_id: int, llm_names: Optional[List[Optional[str]]], db: Session
+        self, task_id: int, llm_ids: Optional[List[Optional[str]]], db: Session
     ) -> None:
         """Set LLM configuration for a specific task (configuration now stored in Task table)"""
-        logger.info(
-            f"set_task_llms called for task {task_id} with llm_names: {llm_names}"
-        )
+        logger.info(f"set_task_llms called for task {task_id} with llm_ids: {llm_ids}")
         # Configuration is now stored in Task table, this method is kept for backward compatibility
         # If AgentService already exists, update its LLM configuration
         if task_id in self._agents:
             # This method doesn't have user context, use None for user_id
             default_llm, fast_llm, vision_llm, compact_llm = resolve_llms_from_names(
-                llm_names, db, None
+                llm_ids, db, None
             )
             agent = self._agents[task_id]
             agent.llm = default_llm
@@ -507,26 +531,16 @@ class AgentServiceManager:
                             f"❌ Task {task.id} is not Text2SQL, using standard agent creation"
                         )
 
-                    # Load configuration from task record - check for any configured models
-                    llm_names: List[Optional[str]] = [
-                        str(task.model_name) if task.model_name else None,
-                        str(task.small_fast_model_name)
-                        if task.small_fast_model_name
-                        else None,
-                        str(task.visual_model_name) if task.visual_model_name else None,
-                        str(task.compact_model_name)
-                        if task.compact_model_name
-                        else None,
-                    ]
+                    llm_ids = self._get_task_llm_ids(task, db)
                     logger.info(
-                        f"Loading LLM configuration from task {task_id}: {llm_names}"
+                        f"Loading LLM configuration from task {task_id}: {llm_ids}"
                     )
                     # Use user_id for model resolution if available
                     user_id_for_resolution: Optional[int] = (
                         int(user.id) if user and user.id is not None else None
                     )
                     task_llm, task_fast_llm, task_vision_llm, task_compact_llm = (
-                        resolve_llms_from_names(llm_names, db, user_id_for_resolution)
+                        resolve_llms_from_names(llm_ids, db, user_id_for_resolution)
                     )
 
                     # Override with Agent Builder configuration if task.agent_id exists
@@ -855,6 +869,7 @@ class AgentServiceManager:
         task: str,
         context: Optional[Dict[str, Any]] = None,
         task_id: Optional[str] = None,
+        tracking_task_id: Optional[str] = None,
         db_session: Optional[Any] = None,
     ) -> Dict[str, Any]:
         """
@@ -866,7 +881,8 @@ class AgentServiceManager:
             agent_service: The AgentService instance to use
             task: Task description
             context: Optional context data
-            task_id: Optional task identifier for tracking
+            task_id: Optional task identifier passed to agent execution
+            tracking_task_id: Optional task identifier used only for token tracking
             db_session: Optional database session for token tracking
 
         Returns:
@@ -874,16 +890,20 @@ class AgentServiceManager:
         """
         # Initialize tracker if db_session and task_id are provided
         tracker = None
-        if db_session and task_id:
+        tracker_task_id = tracking_task_id or task_id
+        if db_session and tracker_task_id:
             try:
                 from ..tracking.task_tracker import TaskTracker
 
-                tracker = TaskTracker(task_id=int(task_id), db_session=db_session)
+                tracker = TaskTracker(
+                    task_id=int(tracker_task_id),
+                    db_session=db_session,
+                )
                 await tracker.start_tracking()
-                logger.info(f"Started token tracking for task {task_id}")
+                logger.info(f"Started token tracking for task {tracker_task_id}")
             except Exception as e:
                 logger.warning(
-                    f"Failed to start token tracking for task {task_id}: {e}"
+                    f"Failed to start token tracking for task {tracker_task_id}: {e}"
                 )
                 tracker = None
 
@@ -911,10 +931,10 @@ class AgentServiceManager:
             if tracker:
                 try:
                     await tracker.complete_tracking()
-                    logger.info(f"Completed token tracking for task {task_id}")
+                    logger.info(f"Completed token tracking for task {tracker_task_id}")
                 except Exception as e:
                     logger.error(
-                        f"Failed to complete token tracking for task {task_id}: {e}"
+                        f"Failed to complete token tracking for task {tracker_task_id}: {e}"
                     )
 
     def _cleanup_workspace_directory(
@@ -998,18 +1018,12 @@ class AgentServiceManager:
                 f"Creating Text2SQL agent for task {task.id} with config: {config}"
             )
 
-            # Get LLM configuration
-            llm_names: List[Optional[str]] = [
-                str(task.model_name) if task.model_name else None,
-                str(task.small_fast_model_name) if task.small_fast_model_name else None,
-                str(task.visual_model_name) if task.visual_model_name else None,
-                str(task.compact_model_name) if task.compact_model_name else None,
-            ]
+            llm_ids = self._get_task_llm_ids(task, db)
 
             # Use user_id for model resolution if available
             user_id_for_resolution = int(user.id) if user else None
             task_llm, task_fast_llm, task_vision_llm, task_compact_llm = (
-                resolve_llms_from_names(llm_names, db, user_id_for_resolution)
+                resolve_llms_from_names(llm_ids, db, user_id_for_resolution)
             )
 
             # Use default LLM if no specific LLM configured
@@ -1208,27 +1222,13 @@ class AgentServiceManager:
                 try:
                     task = db.query(Task).filter(Task.id == task_id).first()
                     if task:
-                        # Load configuration from task record - check for any configured models
-                        llm_names: List[Optional[str]] = [
-                            str(task.model_name) if task.model_name else None,
-                            str(task.small_fast_model_name)
-                            if task.small_fast_model_name
-                            else None,
-                            str(task.visual_model_name)
-                            if task.visual_model_name
-                            else None,
-                            str(task.compact_model_name)
-                            if task.compact_model_name
-                            else None,
-                        ]
+                        llm_ids = self._get_task_llm_ids(task, db)
                         # Use user_id for model resolution if available
                         user_id_for_resolution = (
                             int(task.user_id) if task.user_id else None
                         )
                         task_llm, task_fast_llm, task_vision_llm, task_compact_llm = (
-                            resolve_llms_from_names(
-                                llm_names, db, user_id_for_resolution
-                            )
+                            resolve_llms_from_names(llm_ids, db, user_id_for_resolution)
                         )
 
                         # If no models were resolved, use defaults
@@ -1403,45 +1403,152 @@ async def create_task(
                         file_info_list
                     )
 
-        # Set LLM configuration for this task first to get model info
-        # If llm_names is not provided but agent_id is, fetch from agent config
-        llm_names_to_use = request.llm_names
-        if not llm_names_to_use and request.agent_id:
+        # Set LLM configuration for this task first to get model info.
+        # Prefer internal model identifiers (llm_ids).
+        # If neither is provided but agent_id is, fetch from agent config.
+        from ..models.user import UserDefaultModel, UserModel
+        from ..services.llm_utils import CoreStorage
+
+        core_storage = CoreStorage(db, DBModel)
+
+        def _to_internal_model_id_if_accessible(
+            model_ref: Optional[Any],
+        ) -> Optional[str]:
+            if model_ref is None:
+                return None
+            if isinstance(model_ref, str):
+                model_ref = model_ref.strip()
+                if not model_ref:
+                    return None
+
+            db_model = core_storage.get_db_model(model_ref)
+            if not db_model:
+                return None
+
+            has_access = (
+                db.query(UserModel)
+                .filter(
+                    UserModel.user_id == int(user.id), UserModel.model_id == db_model.id
+                )
+                .first()
+                is not None
+            )
+            if not has_access:
+                return None
+
+            return str(db_model.model_id)
+
+        def _normalize_llm_refs(llm_refs: List[Optional[Any]]) -> List[Optional[str]]:
+            return [
+                _to_internal_model_id_if_accessible(model_ref) for model_ref in llm_refs
+            ]
+
+        def _get_default_internal_model_ids() -> Dict[str, Optional[str]]:
+            config_types = ["general", "small_fast", "visual", "compact"]
+            defaults: Dict[str, Optional[str]] = {ct: None for ct in config_types}
+
+            # User-specific defaults (only if user has access via UserModel).
+            user_defaults = (
+                db.query(UserDefaultModel)
+                .join(UserModel, UserDefaultModel.model_id == UserModel.model_id)
+                .filter(
+                    UserDefaultModel.user_id == int(user.id),
+                    UserModel.user_id == int(user.id),
+                    UserDefaultModel.config_type.in_(config_types),
+                )
+                .all()
+            )
+            for row in user_defaults:
+                if row.model:
+                    config_type = cast(str, row.config_type)
+                    defaults[config_type] = str(row.model.model_id)
+
+            # Fill missing defaults from shared admin defaults.
+            if any(defaults[ct] is None for ct in config_types):
+                shared_defaults = (
+                    db.query(UserDefaultModel)
+                    .join(UserModel, UserDefaultModel.model_id == UserModel.model_id)
+                    .filter(
+                        UserDefaultModel.config_type.in_(config_types),
+                        UserModel.is_shared,
+                    )
+                    .all()
+                )
+                for row in shared_defaults:
+                    config_type = row.config_type  # type: ignore
+                    if row.model and defaults.get(config_type) is None:
+                        defaults[config_type] = str(row.model.model_id)
+
+            return defaults
+
+        llm_ids_to_use = request.llm_ids
+        if not llm_ids_to_use and request.agent_id:
             # Fetch model configuration from agent
             from ..models.agent import Agent as AgentModel
 
             agent_db = (
-                db.query(AgentModel).filter(AgentModel.id == request.agent_id).first()
+                db.query(AgentModel)
+                .filter(
+                    AgentModel.id == request.agent_id, AgentModel.user_id == user.id
+                )
+                .first()
             )
             if agent_db and agent_db.models:
                 agent_models = agent_db.models
-                llm_names_to_use = [
-                    str(agent_models.get("general"))
-                    if agent_models.get("general")
-                    else None,
-                    str(agent_models.get("small_fast"))
-                    if agent_models.get("small_fast")
-                    else None,
-                    str(agent_models.get("visual"))
-                    if agent_models.get("visual")
-                    else None,
-                    str(agent_models.get("compact"))
-                    if agent_models.get("compact")
-                    else None,
-                ]
+                # Agent Builder stores references that may be DB PKs; normalize to internal
+                # model_id only if the current user has access.
+                llm_ids_to_use = _normalize_llm_refs(
+                    [
+                        agent_models.get("general"),
+                        agent_models.get("small_fast"),
+                        agent_models.get("visual"),
+                        agent_models.get("compact"),
+                    ]
+                )
                 logger.info(
-                    f"Using agent {request.agent_id} model configuration: {llm_names_to_use}"
+                    f"Using agent {request.agent_id} model configuration (llm_ids): {llm_ids_to_use}"
                 )
 
+        # Normalize any refs (pk/model_name/model_id) to internal model_id strings,
+        # but only if the current user has access to the model.
+        if llm_ids_to_use:
+            llm_ids_to_use = _normalize_llm_refs(llm_ids_to_use)
+
         default_llm, fast_llm, vision_llm, compact_llm = resolve_llms_from_names(
-            llm_names_to_use, db, int(user.id)
+            llm_ids_to_use, db, int(user.id)
         )
 
-        # Extract model names from resolved LLM instances for database storage
+        # Extract provider model names from resolved LLM instances for database storage
         default_model_name = default_llm.model_name if default_llm else None
         fast_model_name = fast_llm.model_name if fast_llm else None
         visual_model_name = vision_llm.model_name if vision_llm else None
         compact_model_name = compact_llm.model_name if compact_llm else None
+
+        # Persist both:
+        # - *_model_id: internal stable identifier (preferred for selection)
+        # - *_model_name: provider-facing model name (useful for display/audit)
+        default_model_id: Optional[str] = None
+        fast_model_id: Optional[str] = None
+        visual_model_id: Optional[str] = None
+        compact_model_id: Optional[str] = None
+
+        if llm_ids_to_use and len(llm_ids_to_use) == 4:
+            default_model_id = llm_ids_to_use[0]
+            fast_model_id = llm_ids_to_use[1]
+            visual_model_id = llm_ids_to_use[2]
+            compact_model_id = llm_ids_to_use[3]
+
+        if (
+            default_model_id is None
+            or fast_model_id is None
+            or visual_model_id is None
+            or compact_model_id is None
+        ):
+            default_ids = _get_default_internal_model_ids()
+            default_model_id = default_model_id or default_ids.get("general")
+            fast_model_id = fast_model_id or default_ids.get("small_fast")
+            visual_model_id = visual_model_id or default_ids.get("visual")
+            compact_model_id = compact_model_id or default_ids.get("compact")
 
         # Convert agent_type string to enum
         agent_type_enum = AgentType.STANDARD
@@ -1473,6 +1580,10 @@ async def create_task(
             title=request.title,
             description=task_description,
             status=TaskStatus.PENDING,
+            model_id=default_model_id,
+            small_fast_model_id=fast_model_id,
+            visual_model_id=visual_model_id,
+            compact_model_id=compact_model_id,
             model_name=default_model_name,
             small_fast_model_name=fast_model_name,
             visual_model_name=visual_model_name,
@@ -1491,10 +1602,16 @@ async def create_task(
         db.refresh(task)
 
         # Set LLM configuration for this task in agent manager
+        task_llm_ids_to_set = [
+            default_model_id,
+            fast_model_id,
+            visual_model_id,
+            compact_model_id,
+        ]
         logger.info(
-            f"Setting LLM configuration for task {task.id} with llm_names: {request.llm_names}"
+            f"Setting LLM configuration for task {task.id} with llm_ids: {task_llm_ids_to_set}"
         )
-        get_agent_manager(request).set_task_llms(int(task.id), request.llm_names, db)
+        get_agent_manager(request).set_task_llms(int(task.id), task_llm_ids_to_set, db)
 
         return TaskCreateResponse(
             task_id=task.id,
@@ -1503,9 +1620,14 @@ async def create_task(
             created_at=format_datetime_for_api(task.created_at)
             if task.created_at
             else None,
+            model_id=task.model_id,
+            small_fast_model_id=task.small_fast_model_id,
+            visual_model_id=task.visual_model_id,
+            compact_model_id=task.compact_model_id,
             model_name=task.model_name,
             small_fast_model_name=task.small_fast_model_name,
             visual_model_name=task.visual_model_name,
+            compact_model_name=task.compact_model_name,
             vibe_mode=task.vibe_mode,
         )
 
@@ -1624,6 +1746,10 @@ async def get_tasks(
                         "status": status_value,
                         "created_at": format_datetime_for_api(task.created_at),
                         "updated_at": format_datetime_for_api(task.updated_at),
+                        "model_id": task.model_id,
+                        "small_fast_model_id": task.small_fast_model_id,
+                        "visual_model_id": task.visual_model_id,
+                        "compact_model_id": task.compact_model_id,
                         "model_name": task.model_name,
                         "small_fast_model_name": task.small_fast_model_name,
                         "visual_model_name": task.visual_model_name,
@@ -1722,6 +1848,11 @@ async def get_task(
                     else None,
                 }
 
+            # If model_id columns are not populated (legacy rows), best-effort resolve them
+            # from stored provider-facing model_name values.
+            llm_ids = get_agent_manager()._get_task_llm_ids(task, db)
+            model_id, small_fast_model_id, visual_model_id, compact_model_id = llm_ids
+
             return {
                 "task_id": task.id,
                 "title": task.title,
@@ -1729,9 +1860,14 @@ async def get_task(
                 "status": status_value,
                 "created_at": format_datetime_for_api(task.created_at),
                 "updated_at": format_datetime_for_api(task.updated_at),
+                "model_id": model_id,
+                "small_fast_model_id": small_fast_model_id,
+                "visual_model_id": visual_model_id,
+                "compact_model_id": compact_model_id,
                 "model_name": task.model_name,
                 "small_fast_model_name": task.small_fast_model_name,
                 "visual_model_name": task.visual_model_name,
+                "compact_model_name": task.compact_model_name,
                 "dag_data": dag_data,
                 "input_tokens": task.input_tokens or 0,
                 "output_tokens": task.output_tokens or 0,
@@ -1778,15 +1914,23 @@ async def get_task_status(
             else:
                 status_value = "unknown"
 
+            llm_ids = get_agent_manager()._get_task_llm_ids(task, db)
+            model_id, small_fast_model_id, visual_model_id, compact_model_id = llm_ids
+
             return {
                 "task_id": task.id,
                 "title": task.title,
                 "status": status_value,
                 "created_at": format_datetime_for_api(task.created_at),
                 "updated_at": format_datetime_for_api(task.updated_at),
+                "model_id": model_id,
+                "small_fast_model_id": small_fast_model_id,
+                "visual_model_id": visual_model_id,
+                "compact_model_id": compact_model_id,
                 "model_name": task.model_name,
                 "small_fast_model_name": task.small_fast_model_name,
                 "visual_model_name": task.visual_model_name,
+                "compact_model_name": task.compact_model_name,
                 "input_tokens": task.input_tokens or 0,
                 "output_tokens": task.output_tokens or 0,
                 "total_tokens": task.total_tokens or 0,

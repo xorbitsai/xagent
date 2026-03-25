@@ -43,64 +43,105 @@ dependencies = [
   "pillow >= 10.0.0",
   "lancedb>=0.13.0",
   "pyarrow>=16.1.0",
-  # Document parsing libraries
+  # Basic document processing (keep pypdf for basic PDF support)
   "pypdf>=4.0.0",
+  "tiktoken>=0.8.0",
+  # Database ORM and migrations (core for web interface)
+  "sqlalchemy>=2.0.0",
+  "alembic>=1.13.0",
+  "python-jose[cryptography]>=3.3.0",
+  # Utilities
+  "docker>=7.1.0",
+  "json-repair==0.35.0",
+  "jsonschema>=4.25.1",
+  "beartype>=0.18.5",
+  "matplotlib>=3.5.0",
+  "google-auth-oauthlib>=1.2.0",
+  "google-api-python-client>=2.111.0",
+  "boxlite>=0.6.0; (sys_platform == 'linux' and platform_machine == 'x86_64') or (sys_platform == 'darwin' and platform_machine == 'arm64')",
+  "filelock>=3.0.0",
+  "cloudpickle>=3.0.0",
+  # Data science libraries (core for RAG and analysis)
+  "pandas>=1.3.0",
+  # Special handling - AI-enhanced document processing
+  "deepdoc-lib==0.2.0",
+]
+
+[project.optional-dependencies]
+# document processing libraries(Non-AI)
+document-processing = [
   "pdfplumber>=0.10.0",
   "unstructured>=0.15.0",
   "pymupdf>=1.23.0,<1.27.0",
   "python-docx>=1.1.0",
   "openpyxl>=3.1.0",
   "python-pptx>=0.6.0",
-  "docker>=7.1.0",
   "pypdf2>=3.0.1",
-  "docling>=2.68.0",
-  "tiktoken>=0.8.0",
-  # Database dependencies
-  "sqlalchemy>=2.0.0",
-  "alembic>=1.13.0",
-  "python-jose[cryptography]>=3.3.0",
-  "psycopg2-binary>=2.9.0",
-  "json-repair==0.35.0",
-  "pre-commit>=4.3.0",
-  "jsonschema>=4.25.1",
-  "playwright>=1.40.0",
-  "beartype>=0.18.5",
-  "matplotlib>=3.5.0",
-  "google-auth-oauthlib>=1.2.0",
-  "google-api-python-client>=2.111.0",
-  "boxlite>=0.6.0; sys_platform == 'linux' and platform_machine == 'x86_64'",
-  "boxlite>=0.6.0; sys_platform == 'darwin' and platform_machine == 'arm64'",
-  "filelock>=3.0.0",
-  "cloudpickle>=3.0.0",
 ]
 
-[project.optional-dependencies]
-deepdoc = [
-  "deepdoc-lib @ git+https://github.com/xorbitsai/deepdoc-lib.git@356098f9aaa063c74cb5c55b05fd1add75ceb8d4",
+# AI-related document processing
+ai-document = ["docling>=2.68.0"]
+
+# PostgreSQL driver (uses psycopg2-binary for convenience)
+# Note: For production, consider installing psycopg2 from source instead
+postgresql = ["psycopg2-binary>=2.9.0"]
+
+# Browser automation
+browser = ["playwright>=1.40.0"]
+
+# Alternative vector databases (optional alternatives to LanceDB)
+chromadb = ["chromadb"]
+milvus = ["pymilvus>=2.6.9,<3.0.0"]
+
+# All optional extras (for users who want everything)
+# Note: List packages directly since optional-dependencies doesn't support include-group
+all = [
+  "unstructured>=0.15.0",
+  "pymupdf>=1.23.0,<1.27.0",
+  "python-docx>=1.1.0",
+  "openpyxl>=3.1.0",
+  "python-pptx>=0.6.0",
+  "pypdf2>=3.0.1",
+  "docling>=2.68.0",
+  "psycopg2-binary>=2.9.0",
+  "playwright>=1.40.0",
+  "chromadb",
+  "pymilvus>=2.6.9,<3.0.0"
 ]
+
+[dependency-groups]
+# Development tools (linting, formatting)
 dev = [
   "pre-commit>=4.2.0",
+  "ruff>=0.12.3",
+  "flake8>=7.3.0",
+  "mypy>=1.16.1",
+  { include-group = "test" },
+  { include-group = "static-type-check" },
+]
+
+# Testing dependencies
+test = [
   "pytest>=8.0",
   "pytest-mock>=3.14.1",
   "pytest-cov>=6.2.1",
   "pytest-asyncio>=0.24.0",
   "pytest-xdist>=3.0",
-  "ruff>=0.12.3",
-  "flake8>=7.3.0",
-  "mypy>=1.16.1",
+  "pytest-dotenv>=0.5.2",
+  "pytest-timeout>=2.4.0",
+  "pytest-socket>=0.7.0",
   "chromadb",
   "pymilvus>=2.6.9,<3.0.0",
-  "pytest-dotenv>=0.5.2",
+  "copilotkit==0.1.69",
+  "openpyxl>=3.1.5",
+]
+
+# Static type checking
+static-type-check = [
   "types-PyYAML>=6.0",
   "types-requests>=2.0.0",
   "types-openpyxl>=3.1.5",
-  "openpyxl>=3.1.5",
-  "pytest-timeout>=2.4.0",
   "types-setuptools>=69.0.0",
-  "pytest-socket>=0.7.0",
-  # Data science libraries for testing
-  "numpy>=1.21.0",
-  "pandas>=1.3.0",
   "types-docker>=7.1.0.20251009",
 ]
 
@@ -124,6 +165,7 @@ asyncio_mode = "auto"
 markers = [
   "integration: marks tests as integration tests",
   "slow: marks tests as slow running tests",
+  "postgresql: marks tests that require PostgreSQL database",
 ]
 
 [tool.mypy]
@@ -131,10 +173,7 @@ mypy_path = "src:stubs"
 disallow_any_unimported = true
 no_implicit_optional = true
 check_untyped_defs = true
-exclude = [
-    "src/xagent/web/uploads/",
-    "src/xagent/migrations/",
-]
+exclude = ["src/xagent/web/uploads/", "src/xagent/migrations/"]
 warn_return_any = true
 show_error_codes = true
 warn_unused_ignores = true

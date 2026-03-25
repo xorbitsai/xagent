@@ -1,12 +1,24 @@
+from __future__ import annotations
+
 import asyncio
+from types import ModuleType
 from typing import Any, Dict, List, Optional, Set
 
-from openpyxl import load_workbook
-from openpyxl.cell.cell import Cell
-from openpyxl.comments import Comment
-from openpyxl.styles import Font
-from openpyxl.utils import get_column_letter
-from openpyxl.worksheet.worksheet import Worksheet
+# Optional import for openpyxl
+openpyxl: ModuleType | None = None
+try:
+    import openpyxl
+    from openpyxl import load_workbook
+    from openpyxl.cell.cell import Cell
+    from openpyxl.comments import Comment
+    from openpyxl.styles import Font
+    from openpyxl.utils import get_column_letter
+    from openpyxl.worksheet.worksheet import Worksheet
+except ImportError:
+    openpyxl_not_installed_exception = RuntimeError(
+        "openpyxl is not installed. "
+        "Install with: pip install 'xagent[document-processing]'"
+    )
 
 
 def calculate_cell_size_from_font(
@@ -124,6 +136,9 @@ async def read_excel_cells(file_path: str, sheet_name: str = "Sheet1") -> List[s
     Returns:
         List[str]: List containing all cell positions and content
     """
+    if not openpyxl:
+        raise openpyxl_not_installed_exception
+
     try:
         workbook = load_workbook(filename=file_path)
         sheet = workbook[sheet_name]
@@ -180,6 +195,9 @@ async def update_excel_cells(
     Returns:
         str: Result information of the batch update operation.
     """
+    if not openpyxl:
+        raise openpyxl_not_installed_exception
+
     loop = asyncio.get_running_loop()
 
     try:

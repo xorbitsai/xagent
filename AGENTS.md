@@ -143,12 +143,40 @@ ls $(npm root -g)/pptxgenjs  # Should show the package directory
 
 ### Installation and Setup
 ```bash
-# Install the package in development mode
+# Install the package with core dependencies only (SQLite, basic PDF support)
 pip install -e .
 
-# Install development dependencies
-pip install -e ".[dev]"
+# Install development dependencies (requires pip >= 25.1 or uv)
+pip install -e . --group dev
+
+# Install optional extras for additional features
+pip install -e ".[document-processing]" # Document processing libraries
+pip install -e ".[ai-document]"         # AI-related document processing (docling)
+pip install -e ".[postgresql]"          # PostgreSQL database driver
+pip install -e ".[browser]"             # Browser automation (playwright)
+pip install -e ".[chromadb]"            # ChromaDB vector database
+pip install -e ".[milvus]"              # Milvus vector database
+pip install -e ".[all]"                 # Install all optional extras
+
+# For development with all features:
+pip install -e ".[all]" --group dev
+
+# For older pip versions, use uv instead:
+# uv sync --group dev --extra all
 ```
+
+**Optional Extras:**
+| Extra | Description |
+|-------|-------------|
+| `document-processing` | document processing libraries (pdfplumber, unstructured, pymupdf, etc.) |
+| `ai-document` | AI-related document processing (docling) |
+| `postgresql` | PostgreSQL driver (uses psycopg2-binary; for production consider psycopg2) |
+| `browser` | Browser automation (playwright) |
+| `chromadb` | ChromaDB vector database (alternative to LanceDB) |
+| `milvus` | Milvus vector database (alternative to LanceDB) |
+| `all` | All optional extras combined |
+
+**Note**: Pre-commit hooks are installed via `--group dev`, not as an optional extra.
 
 ### Running Tests
 ```bash

@@ -3,6 +3,7 @@
 import Link from "next/link"
 import { usePathname, useRouter } from "next/navigation"
 import { cn } from "@/lib/utils"
+import { SearchInput } from "@/components/ui/search-input"
 import { useState, useEffect, useCallback, useRef } from "react"
 import { getApiUrl } from "@/lib/utils"
 import { apiRequest } from "@/lib/api-wrapper"
@@ -296,6 +297,12 @@ export function Sidebar({ className }: SidebarProps) {
   pathnameRef.current = pathname // Synchronous update during render
   const displayVersion = versionInfo?.display_version || "unknown"
 
+  // Search state
+  const [searchQuery, setSearchQuery] = useState("")
+  const searchRef = useRef("")
+  const [isSearchFocused, setIsSearchFocused] = useState(false)
+  const [isSearchHovered, setIsSearchHovered] = useState(false)
+
   // Loading state ref for polling interval
   const loadingRef = useRef({ isLoadingTasks, isLoadingMore })
   loadingRef.current = { isLoadingTasks, isLoadingMore }
@@ -394,7 +401,8 @@ export function Sidebar({ className }: SidebarProps) {
     }
 
     try {
-      const response = await apiRequest(`${getApiUrl()}/api/chat/tasks?exclude_agent_type=text2sql&page=${pageNum}&per_page=10`)
+      const searchParam = searchRef.current ? `&search=${encodeURIComponent(searchRef.current)}` : ''
+      const response = await apiRequest(`${getApiUrl()}/api/chat/tasks?exclude_agent_type=text2sql&page=${pageNum}&per_page=10${searchParam}`)
       if (response.ok) {
         const data = await response.json()
         // Handle new API response format {tasks: [...], pagination: {...}}
@@ -504,6 +512,23 @@ export function Sidebar({ className }: SidebarProps) {
       loadTasks(1, false)
     }
   }, [isHistoryExpanded, loadTasks, state.lastTaskUpdate])
+
+  // Debounce search query
+  useEffect(() => {
+    const timer = setTimeout(() => {
+      if (searchRef.current !== searchQuery) {
+        searchRef.current = searchQuery
+
+        // Auto-expand when searching
+        if (searchQuery && !isHistoryExpanded) {
+          setIsHistoryExpanded(true)
+        } else if (isHistoryExpanded) {
+          loadTasks(1, false)
+        }
+      }
+    }, 500)
+    return () => clearTimeout(timer)
+  }, [searchQuery, loadTasks, isHistoryExpanded])
 
   const handleScroll = (e: React.UIEvent<HTMLElement>) => {
     const { scrollTop, scrollHeight, clientHeight } = e.currentTarget
@@ -692,11 +717,31 @@ export function Sidebar({ className }: SidebarProps) {
         {/* History Section */}
         <div>
           <div
-            className="px-4 py-2 text-xs font-bold text-slate-400 uppercase tracking-wider mb-1 flex items-center justify-between cursor-pointer hover:text-slate-300 transition-colors"
-            onClick={() => setIsHistoryExpanded(!isHistoryExpanded)}
+            className="px-4 py-2 text-xs font-bold text-slate-400 uppercase tracking-wider mb-1 flex items-center justify-between transition-colors group h-8"
+            onMouseEnter={() => setIsSearchHovered(true)}
+            onMouseLeave={() => setIsSearchHovered(false)}
           >
-            <span>{t('nav.history')}</span>
-            {isHistoryExpanded ? <ChevronDown className="h-3 w-3" /> : <ChevronRight className="h-3 w-3" />}
+            {(isSearchHovered || isSearchFocused || searchQuery) ? (
+              <div className="flex-1 relative mr-2 h-full flex items-center">
+                <SearchInput
+                  placeholder={t('nav.search')}
+                  value={searchQuery}
+                  onChange={setSearchQuery}
+                  onFocus={() => setIsSearchFocused(true)}
+                  onBlur={() => setIsSearchFocused(false)}
+                  containerClassName="w-full h-7"
+                  className="h-7 text-xs text-black bg-transparent border-slate-500/50 focus:border-primary"
+                />
+              </div>
+            ) : (
+              <span className="flex-1 truncate">{t('nav.history')}</span>
+            )}
+            <div
+              className="cursor-pointer p-1 -mr-1 hover:bg-slate-200 dark:hover:bg-slate-700 rounded transition-colors"
+              onClick={() => setIsHistoryExpanded(!isHistoryExpanded)}
+            >
+              {isHistoryExpanded ? <ChevronDown className="h-3 w-3" /> : <ChevronRight className="h-3 w-3" />}
+            </div>
           </div>
 
           {isHistoryExpanded && (

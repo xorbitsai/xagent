@@ -216,7 +216,7 @@ export function ConfigDialog({ onConfigChange, currentConfig, trigger }: ConfigD
                     options={models.map(m => ({
                       value: m.model_id,
                       label: m.model_name,
-                      description: `${m.model_name}${m.description ? ' - ' + m.description : ''} (${m.model_provider})`,
+                      description: `${m.model_name}${m.description ? ' - ' + m.description : ''} (${m.model_provider}) [${m.model_id}]`,
                       isDefault: m.is_default,
                       isSmallFast: m.is_small_fast,
                       isVisual: m.is_visual
@@ -241,7 +241,7 @@ export function ConfigDialog({ onConfigChange, currentConfig, trigger }: ConfigD
                       ...models.map(m => ({
                         value: m.model_id,
                         label: m.model_name,
-                        description: `${m.model_name}${m.description ? ' - ' + m.description : ''} (${m.model_provider})${m.is_small_fast ? t('agent.configDialog.modelSelect.smallFast.options.tagFast') : ''}`,
+                        description: `${m.model_name}${m.description ? ' - ' + m.description : ''} (${m.model_provider}) [${m.model_id}]${m.is_small_fast ? t('agent.configDialog.modelSelect.smallFast.options.tagFast') : ''}`,
                         isDefault: m.is_default,
                         isSmallFast: m.is_small_fast,
                         isVisual: m.is_visual
@@ -267,7 +267,7 @@ export function ConfigDialog({ onConfigChange, currentConfig, trigger }: ConfigD
                       ...models.map(m => ({
                         value: m.model_id,
                         label: m.model_name,
-                        description: `${m.model_name}${m.description ? ' - ' + m.description : ''} (${m.model_provider})${m.is_visual ? t('agent.configDialog.modelSelect.visual.options.tagVisual') : ''}`,
+                        description: `${m.model_name}${m.description ? ' - ' + m.description : ''} (${m.model_provider})[${m.model_id}]${m.is_visual ? t('agent.configDialog.modelSelect.visual.options.tagVisual') : ''}`,
                         isDefault: m.is_default,
                         isSmallFast: m.is_small_fast,
                         isVisual: m.is_visual
@@ -293,7 +293,7 @@ export function ConfigDialog({ onConfigChange, currentConfig, trigger }: ConfigD
                       ...models.map(m => ({
                         value: m.model_id,
                         label: m.model_name,
-                        description: `${m.model_name}${m.description ? ' - ' + m.description : ''} (${m.model_provider})${m.is_compact ? t('agent.configDialog.modelSelect.compact.options.tagCompact') : ''}`,
+                        description: `${m.model_name}${m.description ? ' - ' + m.description : ''} (${m.model_provider})[${m.model_id}]${m.is_compact ? t('agent.configDialog.modelSelect.compact.options.tagCompact') : ''}`,
                         isDefault: m.is_default,
                         isSmallFast: m.is_small_fast,
                         isVisual: m.is_visual,

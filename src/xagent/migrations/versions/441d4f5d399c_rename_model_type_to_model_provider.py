@@ -29,32 +29,83 @@ def get_cipher() -> Fernet:
 
 
 def upgrade() -> None:
-    cipher = get_cipher()
+    from sqlalchemy.engine.reflection import Inspector
+
     bind = op.get_bind()
+    inspector = Inspector.from_engine(bind)
 
-    with op.batch_alter_table("models") as batch_op:
-        # Add encrypted column
-        batch_op.add_column(
-            sa.Column(
-                "_api_key_encrypted", sa.String(500), nullable=False, server_default=""
+    # Check if models table exists
+    tables = inspector.get_table_names()
+    if "models" not in tables:
+        # Table doesn't exist yet, will be created by SQLAlchemy
+        return
+
+    # Get current columns in models table
+    columns = [col["name"] for col in inspector.get_columns("models")]
+
+    cipher = get_cipher()
+
+    # Check if migration is already applied
+    if "model_provider" in columns and "_api_key_encrypted" in columns:
+        # Already migrated, skip
+        return
+
+    # Check if we need to do the migration
+    if "model_type" in columns and "model_provider" not in columns:
+        # Old schema: need to migrate
+        with op.batch_alter_table("models") as batch_op:
+            # Add encrypted column
+            if "_api_key_encrypted" not in columns:
+                batch_op.add_column(
+                    sa.Column(
+                        "_api_key_encrypted",
+                        sa.String(500),
+                        nullable=False,
+                        server_default="",
+                    )
+                )
+            # Rename column
+            batch_op.alter_column("model_type", new_column_name="model_provider")
+
+        # Encrypt existing keys
+        result = bind.execute(text("SELECT id, api_key FROM models"))
+        for row in result.fetchall():
+            if row.api_key:
+                encrypted = cipher.encrypt(row.api_key.encode()).decode()
+                bind.execute(
+                    text("UPDATE models SET _api_key_encrypted = :enc WHERE id = :id"),
+                    {"enc": encrypted, "id": row.id},
+                )
+
+        # Drop old column
+        with op.batch_alter_table("models") as batch_op:
+            batch_op.drop_column("api_key")
+
+    elif "api_key" in columns and "_api_key_encrypted" not in columns:
+        # Has api_key but not encrypted yet, just add encryption
+        with op.batch_alter_table("models") as batch_op:
+            batch_op.add_column(
+                sa.Column(
+                    "_api_key_encrypted",
+                    sa.String(500),
+                    nullable=False,
+                    server_default="",
+                )
             )
-        )
-        # Rename column
-        batch_op.alter_column("model_type", new_column_name="model_provider")
 
-    # Encrypt existing keys
-    result = bind.execute(text("SELECT id, api_key FROM models"))
-    for row in result.fetchall():
-        if row.api_key:
-            encrypted = cipher.encrypt(row.api_key.encode()).decode()
-            bind.execute(
-                text("UPDATE models SET _api_key_encrypted = :enc WHERE id = :id"),
-                {"enc": encrypted, "id": row.id},
-            )
+        # Encrypt existing keys
+        result = bind.execute(text("SELECT id, api_key FROM models"))
+        for row in result.fetchall():
+            if row.api_key:
+                encrypted = cipher.encrypt(row.api_key.encode()).decode()
+                bind.execute(
+                    text("UPDATE models SET _api_key_encrypted = :enc WHERE id = :id"),
+                    {"enc": encrypted, "id": row.id},
+                )
 
-    # Drop old column
-    with op.batch_alter_table("models") as batch_op:
-        batch_op.drop_column("api_key")
+        # Drop old column
+        with op.batch_alter_table("models") as batch_op:
+            batch_op.drop_column("api_key")
 
 
 def downgrade() -> None:

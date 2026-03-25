@@ -3,7 +3,7 @@
 from datetime import datetime
 from typing import Any, Dict, List, Optional
 
-from pydantic import BaseModel
+from pydantic import BaseModel, model_validator
 
 
 class ChatMessage(BaseModel):
@@ -51,9 +51,9 @@ class TaskCreateRequest(BaseModel):
     title: str
     description: Optional[str] = None
     agent_id: Optional[int] = None  # Agent Builder agent ID
-    files: Optional[List[str]] = None
-    llm_names: Optional[List[Optional[str]]] = (
-        None  # LLM names to use: exactly 4 elements in order [default, fast_small, vision, compact]
+    files: Optional[List[str]] = None  # List of filenames to associate with the task
+    llm_ids: Optional[List[Optional[str]]] = (
+        None  # Model identifiers to use: exactly 4 elements in order [default, fast_small, vision, compact]
     )
     memory_similarity_threshold: Optional[float] = (
         1.5  # Memory search similarity threshold
@@ -68,6 +68,17 @@ class TaskCreateRequest(BaseModel):
     )
     examples: Optional[List[ExampleItem]] = None  # Process mode: input/output examples
 
+    @model_validator(mode="before")
+    @classmethod
+    def coerce_llm_names_to_llm_ids(cls, data: Any) -> Any:
+        """Backward compatibility: accept deprecated `llm_names` and map to `llm_ids`."""
+        if not isinstance(data, dict):
+            return data
+        if data.get("llm_ids") is None and data.get("llm_names") is not None:
+            data = dict(data)
+            data["llm_ids"] = data.get("llm_names")
+        return data
+
 
 class TaskCreateResponse(BaseModel):
     """Create task response"""
@@ -76,9 +87,14 @@ class TaskCreateResponse(BaseModel):
     title: str
     status: str
     created_at: str
+    model_id: Optional[str] = None
+    small_fast_model_id: Optional[str] = None
+    visual_model_id: Optional[str] = None
+    compact_model_id: Optional[str] = None
     model_name: Optional[str] = None
     small_fast_model_name: Optional[str] = None
     visual_model_name: Optional[str] = None
+    compact_model_name: Optional[str] = None
     vibe_mode: Optional[str] = None
 
 

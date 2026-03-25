@@ -2,7 +2,7 @@
 
 import logging
 import os
-from typing import Any, List, Optional, Tuple, Union
+from typing import Any, Callable, List, Optional, Tuple, Union
 
 from sqlalchemy.orm import Session
 
@@ -865,3 +865,20 @@ def create_llm_from_env() -> Optional[BaseLLM]:
             logger.error(f"Error creating Claude LLM from env: {e}")
 
     return None
+
+
+def make_normalize_model_id(core_storage: CoreStorage) -> Callable:
+    def normalize_model_id(model_id: Any, model_name: Any) -> Optional[str]:
+        if model_id:
+            db_model = core_storage.get_db_model(model_id)
+            if db_model:
+                return str(db_model.model_id)
+            # Preserve stored identifier even if the backing model row no longer exists.
+            # This avoids API inconsistencies when models are deleted/migrated.
+            return str(model_id).strip() if isinstance(model_id, str) else str(model_id)
+        if model_name:
+            db_model = core_storage.get_db_model(str(model_name))
+            return str(db_model.model_id) if db_model else None
+        return None
+
+    return normalize_model_id

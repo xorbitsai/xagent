@@ -53,8 +53,25 @@ import { useI18n } from "@/contexts/i18n-context"
 import { ScrollArea } from "@/components/ui/scroll-area"
 import { toast } from "sonner"
 
-function doubleEncodeModelId(modelId: string): string {
-  return encodeURIComponent(encodeURIComponent(modelId))
+function getModelDetailUrl(modelId: string): string {
+  return `${getApiUrl()}/api/models/by-id/${encodeURIComponent(modelId)}`
+}
+
+function randomHex8(): string {
+  try {
+    const bytes = new Uint8Array(4)
+    crypto.getRandomValues(bytes)
+    return Array.from(bytes, (b) => b.toString(16).padStart(2, "0")).join("")
+  } catch {
+    return Math.random().toString(16).slice(2, 10).padEnd(8, "0")
+  }
+}
+
+function generateModelId(modelName: string, modelProvider: string, userId?: string): string {
+  const suffix = randomHex8()
+  // Fallback to 'user' if ID is missing to prevent "undefined" in string
+  const uid = userId || 'unknown'
+  return `${modelName}-${modelProvider}-${uid}-${suffix}`
 }
 
 // Interfaces from models-1.tsx
@@ -389,7 +406,7 @@ export function ModelsPage() {
           // Remove array field from payload to match backend expectation
           const { model_names, ...rest } = payload as any
           if (!rest.model_id) {
-            rest.model_id = `${name}-${rest.model_provider}-${user?.id}`
+            rest.model_id = generateModelId(name, rest.model_provider, user?.id)
           }
 
           // Handle default type for specific model in batch
@@ -404,9 +421,8 @@ export function ModelsPage() {
         const payload = { ...data }
         // Remove array field
         const { model_names, ...rest } = payload as any
-
         if (!editingModel && !rest.model_id && rest.model_name && rest.model_provider) {
-          rest.model_id = `${rest.model_name}-${rest.model_provider}-${user?.id}`
+          rest.model_id = generateModelId(rest.model_name, rest.model_provider, user?.id)
         }
 
         // Handle default type for single model
@@ -419,7 +435,7 @@ export function ModelsPage() {
 
       for (const payload of payloads) {
         const url = editingModel
-          ? `${getApiUrl()}/api/models/${doubleEncodeModelId(editingModel.model_id)}`
+          ? getModelDetailUrl(editingModel.model_id)
           : `${getApiUrl()}/api/models/`
 
         const response = await apiRequest(url, {
@@ -590,7 +606,7 @@ export function ModelsPage() {
     if (!confirm(t('models.deleteConfirm'))) return
 
     try {
-      const response = await apiRequest(`${getApiUrl()}/api/models/${doubleEncodeModelId(modelId)}`, {
+      const response = await apiRequest(getModelDetailUrl(modelId), {
         method: "DELETE",
         headers: {}
       })
@@ -738,7 +754,7 @@ export function ModelsPage() {
 
          const payload: ModelCreate = {
             ...formData,
-            model_id: `${model.id}-${formData.model_provider}-${user?.id}`,
+            model_id: generateModelId(model.id, formData.model_provider, user?.id),
             model_name: model.id,
             // Use abilities from provider model instead of form data
             abilities: (model as any).abilities || formData.abilities,

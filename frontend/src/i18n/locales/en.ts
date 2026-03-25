@@ -47,6 +47,7 @@ const en = {
     agentDev: "Agent Development",
     task: "Task",
     history: "All Tasks",
+    search: "Search Tasks",
     templates: "Templates",
     sections: {
       agentDevelopment: "Agent Development",
@@ -1512,6 +1513,7 @@ Build when you need.`
       embeddingBatchSize: "Batch Size",
       startImport: "Start Import",
       saveConfig: "Save Configuration",
+      savingConfig: "Saving configuration...",
     },
     detail: {
       viewingDetails: "Viewing details for {name}",

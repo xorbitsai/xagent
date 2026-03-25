@@ -90,6 +90,12 @@ class Task(Base):  # type: ignore
         String(255), nullable=True
     )  # Compact model if configured
 
+    # Internal model identifiers (preferred over *_model_name for selection)
+    model_id = Column(String(255), nullable=True)
+    small_fast_model_id = Column(String(255), nullable=True)
+    visual_model_id = Column(String(255), nullable=True)
+    compact_model_id = Column(String(255), nullable=True)
+
     # Agent configuration
     agent_id = Column(
         Integer, ForeignKey("agents.id"), nullable=True

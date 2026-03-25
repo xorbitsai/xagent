@@ -12,6 +12,7 @@ from typing import Any, Callable, Dict, Optional, Sequence, Union
 
 import sqlalchemy as sa
 from alembic import op
+from sqlalchemy.engine.reflection import Inspector
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import Session
 
@@ -24,12 +25,11 @@ depends_on: Union[str, Sequence[str], None] = None
 logger = logging.getLogger(__name__)
 
 
-def get_json_type() -> Any:
+def get_json_type(bind) -> Any:
     """
     Get the appropriate JSON type based on the database dialect.
     Returns postgresql.JSON for PostgreSQL, sa.JSON for other databases (SQLite).
     """
-    bind = op.get_bind()
     dialect_name = bind.dialect.name
 
     if dialect_name == "postgresql":
@@ -383,20 +383,32 @@ def migrate_data_orm() -> None:
 
 def upgrade() -> None:
     """Upgrade to new MCP server structure using ORM."""
+    from alembic import context
+
+    bind = context.get_bind()
+    inspector = Inspector.from_engine(bind)
+
     logger.info("Starting upgrade to new MCP server structure")
 
     try:
-        # Rename old table to preserve it
-        logger.info("Renaming old table mcp_servers to mcp_servers_legacy")
-        op.rename_table("mcp_servers", "mcp_servers_legacy")
+        # Check if old table exists and rename it to preserve it
+        existing_tables = inspector.get_table_names()
+        if (
+            "mcp_servers" in existing_tables
+            and "mcp_servers_legacy" not in existing_tables
+        ):
+            logger.info("Renaming old table mcp_servers to mcp_servers_legacy")
+            op.rename_table("mcp_servers", "mcp_servers_legacy")
 
-        # Create new tables
-        logger.info("Creating new tables")
-        create_new_tables()
+        # Create new tables if they don't exist
+        if "mcp_servers" not in existing_tables:
+            logger.info("Creating new tables")
+            create_new_tables()
 
-        # Migrate data using ORM
-        logger.info("Migrating data using ORM")
-        migrate_data_orm()
+        # Migrate data using ORM if legacy table exists
+        if "mcp_servers_legacy" in existing_tables:
+            logger.info("Migrating data using ORM")
+            migrate_data_orm()
 
         logger.info("Successfully completed upgrade to new MCP server structure")
     except Exception as e:
@@ -406,81 +418,115 @@ def upgrade() -> None:
 
 def create_new_tables() -> None:
     """Create the new normalized table structure."""
-    # Get the appropriate JSON type for the current database
-    json_type = get_json_type()
+    from alembic import context
 
-    # Create new mcp_servers table
-    op.create_table(
-        "mcp_servers",
-        sa.Column("id", sa.Integer(), nullable=False),
-        sa.Column("name", sa.String(length=100), nullable=False),
-        sa.Column("description", sa.Text(), nullable=True),
-        sa.Column("managed", sa.String(length=20), nullable=False),
-        sa.Column("transport", sa.String(length=50), nullable=False),
-        sa.Column("command", sa.String(length=500), nullable=True),
-        sa.Column("args", json_type, nullable=True),
-        sa.Column("url", sa.String(length=500), nullable=True),
-        sa.Column("env", json_type, nullable=True),
-        sa.Column("cwd", sa.String(length=500), nullable=True),
-        sa.Column("headers", json_type, nullable=True),
-        sa.Column("docker_url", sa.String(length=500), nullable=True),
-        sa.Column("docker_image", sa.String(length=200), nullable=True),
-        sa.Column("docker_environment", json_type, nullable=True),
-        sa.Column("docker_working_dir", sa.String(length=500), nullable=True),
-        sa.Column("volumes", json_type, nullable=True),
-        sa.Column("bind_ports", json_type, nullable=True),
-        sa.Column(
-            "restart_policy", sa.String(length=50), nullable=False, server_default="no"
-        ),
-        sa.Column("auto_start", sa.Boolean(), nullable=True),
-        sa.Column("container_id", sa.String(length=100), nullable=True),
-        sa.Column("container_name", sa.String(length=200), nullable=True),
-        sa.Column("container_logs", json_type, nullable=True),
-        sa.Column(
-            "created_at",
-            sa.DateTime(timezone=True),
-            server_default=sa.text("now()"),
-            nullable=True,
-        ),
-        sa.Column(
-            "updated_at",
-            sa.DateTime(timezone=True),
-            server_default=sa.text("now()"),
-            nullable=True,
-        ),
-        sa.PrimaryKeyConstraint("id"),
-        sa.UniqueConstraint("name"),
+    bind = context.get_bind()
+    inspector = Inspector.from_engine(bind)
+    dialect_name = bind.dialect.name
+
+    # Get the appropriate JSON type for the current database
+    json_type = get_json_type(bind)
+
+    # Get the appropriate timestamp default for the current database
+    # PostgreSQL uses now(), SQLite uses CURRENT_TIMESTAMP
+    timestamp_default = (
+        sa.text("now()")
+        if dialect_name == "postgresql"
+        else sa.text("CURRENT_TIMESTAMP")
     )
+
+    # Check and create new mcp_servers table
+    existing_tables = inspector.get_table_names()
+    if "mcp_servers" not in existing_tables:
+        op.create_table(
+            "mcp_servers",
+            sa.Column("id", sa.Integer(), nullable=False),
+            sa.Column("name", sa.String(length=100), nullable=False),
+            sa.Column("description", sa.Text(), nullable=True),
+            sa.Column("managed", sa.String(length=20), nullable=False),
+            sa.Column("transport", sa.String(length=50), nullable=False),
+            sa.Column("command", sa.String(length=500), nullable=True),
+            sa.Column("args", json_type, nullable=True),
+            sa.Column("url", sa.String(length=500), nullable=True),
+            sa.Column("env", json_type, nullable=True),
+            sa.Column("cwd", sa.String(length=500), nullable=True),
+            sa.Column("headers", json_type, nullable=True),
+            sa.Column("docker_url", sa.String(length=500), nullable=True),
+            sa.Column("docker_image", sa.String(length=200), nullable=True),
+            sa.Column("docker_environment", json_type, nullable=True),
+            sa.Column("docker_working_dir", sa.String(length=500), nullable=True),
+            sa.Column("volumes", json_type, nullable=True),
+            sa.Column("bind_ports", json_type, nullable=True),
+            sa.Column(
+                "restart_policy",
+                sa.String(length=50),
+                nullable=False,
+                server_default="no",
+            ),
+            sa.Column("auto_start", sa.Boolean(), nullable=True),
+            sa.Column("container_id", sa.String(length=100), nullable=True),
+            sa.Column("container_name", sa.String(length=200), nullable=True),
+            sa.Column("container_logs", json_type, nullable=True),
+            sa.Column(
+                "created_at",
+                sa.DateTime(timezone=True),
+                server_default=timestamp_default,
+                nullable=True,
+            ),
+            sa.Column(
+                "updated_at",
+                sa.DateTime(timezone=True),
+                server_default=timestamp_default,
+                nullable=True,
+            ),
+            sa.PrimaryKeyConstraint("id"),
+            sa.UniqueConstraint("name"),
+        )
 
     # Create user_mcpservers relationship table
-    op.create_table(
-        "user_mcpservers",
-        sa.Column("id", sa.Integer(), nullable=False),
-        sa.Column("user_id", sa.Integer(), nullable=False),
-        sa.Column("mcpserver_id", sa.Integer(), nullable=False),
-        sa.Column("is_owner", sa.Boolean(), nullable=False, server_default="false"),
-        sa.Column("can_edit", sa.Boolean(), nullable=False, server_default="false"),
-        sa.Column("can_delete", sa.Boolean(), nullable=False, server_default="false"),
-        sa.Column("is_shared", sa.Boolean(), nullable=False, server_default="false"),
-        sa.Column("is_active", sa.Boolean(), nullable=False, server_default="true"),
-        sa.Column("is_default", sa.Boolean(), nullable=False, server_default="false"),
-        sa.Column(
-            "created_at",
-            sa.DateTime(timezone=True),
-            server_default=sa.text("now()"),
-            nullable=True,
-        ),
-        sa.Column("updated_at", sa.DateTime(timezone=True), nullable=True),
-        sa.ForeignKeyConstraint(
-            ["mcpserver_id"], ["mcp_servers.id"], ondelete="CASCADE"
-        ),
-        sa.ForeignKeyConstraint(["user_id"], ["users.id"], ondelete="CASCADE"),
-        sa.PrimaryKeyConstraint("id"),
-        sa.UniqueConstraint("user_id", "mcpserver_id", name="uq_user_mcpservers"),
+    if "user_mcpservers" not in existing_tables:
+        op.create_table(
+            "user_mcpservers",
+            sa.Column("id", sa.Integer(), nullable=False),
+            sa.Column("user_id", sa.Integer(), nullable=False),
+            sa.Column("mcpserver_id", sa.Integer(), nullable=False),
+            sa.Column("is_owner", sa.Boolean(), nullable=False, server_default="false"),
+            sa.Column("can_edit", sa.Boolean(), nullable=False, server_default="false"),
+            sa.Column(
+                "can_delete", sa.Boolean(), nullable=False, server_default="false"
+            ),
+            sa.Column(
+                "is_shared", sa.Boolean(), nullable=False, server_default="false"
+            ),
+            sa.Column("is_active", sa.Boolean(), nullable=False, server_default="true"),
+            sa.Column(
+                "is_default", sa.Boolean(), nullable=False, server_default="false"
+            ),
+            sa.Column(
+                "created_at",
+                sa.DateTime(timezone=True),
+                server_default=timestamp_default,
+                nullable=True,
+            ),
+            sa.Column("updated_at", sa.DateTime(timezone=True), nullable=True),
+            sa.ForeignKeyConstraint(
+                ["mcpserver_id"], ["mcp_servers.id"], ondelete="CASCADE"
+            ),
+            sa.ForeignKeyConstraint(["user_id"], ["users.id"], ondelete="CASCADE"),
+            sa.PrimaryKeyConstraint("id"),
+            sa.UniqueConstraint("user_id", "mcpserver_id", name="uq_user_mcpservers"),
+        )
+
+    # Check and create index
+    existing_indexes = (
+        [idx["name"] for idx in inspector.get_indexes("user_mcpservers")]
+        if "user_mcpservers" in existing_tables
+        else []
     )
-    op.create_index(
-        op.f("ix_user_mcpservers_id"), "user_mcpservers", ["id"], unique=False
-    )
+    if "ix_user_mcpservers_id" not in existing_indexes:
+        op.create_index(
+            op.f("ix_user_mcpservers_id"), "user_mcpservers", ["id"], unique=False
+        )
 
 
 def downgrade() -> None:

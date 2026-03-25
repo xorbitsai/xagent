@@ -2,6 +2,7 @@
 
 import logging
 import time
+import urllib.parse
 from typing import Any, List, Optional
 
 from fastapi import APIRouter, Body, Depends, HTTPException, Query
@@ -36,6 +37,60 @@ logger = logging.getLogger(__name__)
 
 # Create router
 model_router = APIRouter(prefix="/api/models", tags=["models"])
+
+
+def _decode_model_identifier(model_id: str) -> str:
+    """Decode a model identifier from the URL path."""
+
+    return urllib.parse.unquote(model_id)
+
+
+def _resolve_accessible_model(
+    db: Session, user: User, model_id: str
+) -> tuple[CoreStorage, DBModel, UserModel]:
+    """Resolve a model and the current user's access relationship."""
+
+    decoded_model_id = _decode_model_identifier(model_id)
+    model_storage = CoreStorage(db, DBModel)
+    db_model = model_storage.get_db_model(decoded_model_id)
+    if not db_model:
+        raise HTTPException(status_code=404, detail="Model not found")
+
+    user_model = (
+        db.query(UserModel)
+        .filter(UserModel.model_id == db_model.id, UserModel.user_id == user.id)
+        .first()
+    )
+    if not user_model:
+        raise HTTPException(status_code=404, detail="Model not found or access denied")
+
+    return model_storage, db_model, user_model
+
+
+def _serialize_model_with_access(
+    db_model: DBModel, user_model: UserModel
+) -> dict[str, Any]:
+    """Build a model response payload with user access info."""
+
+    return {
+        "id": db_model.id,
+        "model_id": db_model.model_id,
+        "category": db_model.category,
+        "model_provider": db_model.model_provider,
+        "model_name": db_model.model_name,
+        "base_url": db_model.base_url,
+        "temperature": db_model.temperature,
+        "dimension": db_model.dimension,
+        "abilities": db_model.abilities,
+        "description": db_model.description,
+        "created_at": db_model.created_at.isoformat() if db_model.created_at else None,
+        "updated_at": db_model.updated_at.isoformat() if db_model.updated_at else None,
+        "is_active": db_model.is_active,
+        "is_owner": user_model.is_owner,
+        "can_edit": user_model.can_edit,
+        "can_delete": user_model.can_delete,
+        "is_shared": user_model.is_shared,
+    }
 
 
 @model_router.post("/", response_model=ModelWithAccessInfo)
@@ -399,58 +454,39 @@ async def get_user_default_models(
         return []
 
 
+@model_router.get("/by-id/{model_id:path}", response_model=ModelWithAccessInfo)
+async def get_model_by_path(
+    model_id: str, db: Session = Depends(get_db), user: User = Depends(get_current_user)
+) -> ModelWithAccessInfo:
+    """Get a specific model configuration, including slash-containing model IDs."""
+
+    _, db_model, user_model = _resolve_accessible_model(db, user, model_id)
+    return ModelWithAccessInfo.model_validate(
+        _serialize_model_with_access(db_model, user_model)
+    )
+
+
 @model_router.get("/{model_id}", response_model=ModelWithAccessInfo)
 async def get_model(
     model_id: str, db: Session = Depends(get_db), user: User = Depends(get_current_user)
 ) -> ModelWithAccessInfo:
     """Get a specific model configuration"""
-    # Decode URL-encoded model_id (supports double-encoding for slashes)
-    import urllib.parse
-
-    decoded_model_id = urllib.parse.unquote(model_id)
-
-    model_storage = CoreStorage(db, DBModel)
-
-    # Check if model exists (resolves by ID, model_id, or model_name)
-    db_model = model_storage.get_db_model(decoded_model_id)
-    if not db_model:
-        raise HTTPException(status_code=404, detail="Model not found")
-
-    # Check if user has access to this model
-    user_model = (
-        db.query(UserModel)
-        .filter(UserModel.model_id == db_model.id, UserModel.user_id == user.id)
-        .first()
+    _, db_model, user_model = _resolve_accessible_model(db, user, model_id)
+    return ModelWithAccessInfo.model_validate(
+        _serialize_model_with_access(db_model, user_model)
     )
 
-    if not user_model:
-        raise HTTPException(status_code=404, detail="Model not found or access denied")
 
-    model_data = {
-        "id": user_model.model.id,
-        "model_id": user_model.model.model_id,
-        "category": user_model.model.category,
-        "model_provider": user_model.model.model_provider,
-        "model_name": user_model.model.model_name,
-        "base_url": user_model.model.base_url,
-        "temperature": user_model.model.temperature,
-        "dimension": user_model.model.dimension,
-        "abilities": user_model.model.abilities,
-        "description": user_model.model.description,
-        "created_at": user_model.model.created_at.isoformat()
-        if user_model.model.created_at
-        else None,
-        "updated_at": user_model.model.updated_at.isoformat()
-        if user_model.model.updated_at
-        else None,
-        "is_active": user_model.model.is_active,
-        "is_owner": user_model.is_owner,
-        "can_edit": user_model.can_edit,
-        "can_delete": user_model.can_delete,
-        "is_shared": user_model.is_shared,
-    }
+@model_router.put("/by-id/{model_id:path}", response_model=ModelWithAccessInfo)
+async def update_model_by_path(
+    model_id: str,
+    model_update: ModelUpdate,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+) -> ModelWithAccessInfo:
+    """Update a model configuration, including slash-containing model IDs."""
 
-    return ModelWithAccessInfo.model_validate(model_data)
+    return await update_model(model_id, model_update, db, user)
 
 
 @model_router.put("/{model_id}", response_model=ModelWithAccessInfo)
@@ -461,29 +497,7 @@ async def update_model(
     user: User = Depends(get_current_user),
 ) -> ModelWithAccessInfo:
     """Update a model configuration"""
-    # Decode URL-encoded model_id (supports double-encoding for slashes)
-    import urllib.parse
-
-    decoded_model_id = urllib.parse.unquote(model_id)
-
-    model_storage = CoreStorage(db, DBModel)
-
-    # Resolve model first
-    db_model_resolved = model_storage.get_db_model(decoded_model_id)
-    if not db_model_resolved:
-        raise HTTPException(status_code=404, detail="Model not found")
-
-    # Check if user has access to this model and can edit
-    user_model = (
-        db.query(UserModel)
-        .filter(
-            UserModel.model_id == db_model_resolved.id, UserModel.user_id == user.id
-        )
-        .first()
-    )
-
-    if not user_model:
-        raise HTTPException(status_code=404, detail="Model not found or access denied")
+    _, _, user_model = _resolve_accessible_model(db, user, model_id)
 
     if not user_model.can_edit:
         raise HTTPException(status_code=403, detail="No permission to edit this model")
@@ -556,27 +570,18 @@ async def update_model(
     db.refresh(db_model)
 
     # Return updated model with access info
-    model_data = {
-        "id": db_model.id,
-        "model_id": db_model.model_id,
-        "category": db_model.category,
-        "model_provider": db_model.model_provider,
-        "model_name": db_model.model_name,
-        "base_url": db_model.base_url,
-        "temperature": db_model.temperature,
-        "dimension": db_model.dimension,
-        "abilities": db_model.abilities,
-        "description": db_model.description,
-        "created_at": db_model.created_at.isoformat() if db_model.created_at else None,
-        "updated_at": db_model.updated_at.isoformat() if db_model.updated_at else None,
-        "is_active": db_model.is_active,
-        "is_owner": user_model.is_owner,
-        "can_edit": user_model.can_edit,
-        "can_delete": user_model.can_delete,
-        "is_shared": user_model.is_shared,
-    }
+    return ModelWithAccessInfo.model_validate(
+        _serialize_model_with_access(db_model, user_model)
+    )
 
-    return ModelWithAccessInfo.model_validate(model_data)
+
+@model_router.delete("/by-id/{model_id:path}")
+async def delete_model_by_path(
+    model_id: str, db: Session = Depends(get_db), user: User = Depends(get_current_user)
+) -> dict:
+    """Delete a model configuration, including slash-containing model IDs."""
+
+    return await delete_model(model_id, db, user)
 
 
 @model_router.delete("/{model_id}")
@@ -584,27 +589,7 @@ async def delete_model(
     model_id: str, db: Session = Depends(get_db), user: User = Depends(get_current_user)
 ) -> dict:
     """Delete a model configuration"""
-    # Decode URL-encoded model_id (supports double-encoding for slashes)
-    import urllib.parse
-
-    decoded_model_id = urllib.parse.unquote(model_id)
-
-    model_storage = CoreStorage(db, DBModel)
-
-    # Resolve model first
-    db_model = model_storage.get_db_model(decoded_model_id)
-    if not db_model:
-        raise HTTPException(status_code=404, detail="Model not found")
-
-    # Check if user has access to this model and can delete
-    user_model = (
-        db.query(UserModel)
-        .filter(UserModel.model_id == db_model.id, UserModel.user_id == user.id)
-        .first()
-    )
-
-    if not user_model:
-        raise HTTPException(status_code=404, detail="Model not found or access denied")
+    model_storage, _, user_model = _resolve_accessible_model(db, user, model_id)
 
     if not user_model.can_delete:
         raise HTTPException(
@@ -620,7 +605,7 @@ async def delete_model(
     ).delete()
 
     # Delete the model using CoreStorage
-    model_storage.delete(decoded_model_id)
+    model_storage.delete(user_model.model.model_id)
 
     return {"message": "Model deleted successfully"}
 

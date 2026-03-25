@@ -47,6 +47,7 @@ const zh = {
     agentDev: "Agent 构建与部署",
     task: "任务",
     history: "全部任务",
+    search: "搜索任务",
     templates: "模板",
     sections: {
       agentDevelopment: "Agent 开发",
@@ -1512,6 +1513,7 @@ Build when you need.`
       embeddingBatchSize: "批处理大小",
       startImport: "开始导入",
       saveConfig: "保存配置",
+      savingConfig: "正在保存配置...",
     },
     detail: {
       viewingDetails: "正在查看知识库 {name} 的详情",

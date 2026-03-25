@@ -10,6 +10,7 @@ from typing import Sequence, Union
 
 import sqlalchemy as sa
 from alembic import op
+from sqlalchemy.engine.reflection import Inspector
 
 # revision identifiers, used by Alembic.
 revision: str = "20250128_add_token_tracking"
@@ -30,42 +31,83 @@ def upgrade() -> None:
 
     Compatible with both SQLite and PostgreSQL.
     """
+    from alembic import context
+
+    bind = context.get_bind()
+    inspector = Inspector.from_engine(bind)
+
+    # Check if tasks table exists
+    tables = inspector.get_table_names()
+    if "tasks" not in tables:
+        # Table doesn't exist yet, will be created by SQLAlchemy or a later migration
+        return
+
+    # Check which columns already exist
+    existing_columns = [col["name"] for col in inspector.get_columns("tasks")]
+
     # Add input_tokens column
-    op.add_column(
-        "tasks",
-        sa.Column("input_tokens", sa.Integer(), nullable=False, server_default="0"),
-    )
+    if "input_tokens" not in existing_columns:
+        op.add_column(
+            "tasks",
+            sa.Column("input_tokens", sa.Integer(), nullable=False, server_default="0"),
+        )
 
     # Add output_tokens column
-    op.add_column(
-        "tasks",
-        sa.Column("output_tokens", sa.Integer(), nullable=False, server_default="0"),
-    )
+    if "output_tokens" not in existing_columns:
+        op.add_column(
+            "tasks",
+            sa.Column(
+                "output_tokens", sa.Integer(), nullable=False, server_default="0"
+            ),
+        )
 
     # Add total_tokens column
-    op.add_column(
-        "tasks",
-        sa.Column("total_tokens", sa.Integer(), nullable=False, server_default="0"),
-    )
+    if "total_tokens" not in existing_columns:
+        op.add_column(
+            "tasks",
+            sa.Column("total_tokens", sa.Integer(), nullable=False, server_default="0"),
+        )
 
     # Add llm_calls column
-    op.add_column(
-        "tasks",
-        sa.Column("llm_calls", sa.Integer(), nullable=False, server_default="0"),
-    )
+    if "llm_calls" not in existing_columns:
+        op.add_column(
+            "tasks",
+            sa.Column("llm_calls", sa.Integer(), nullable=False, server_default="0"),
+        )
 
     # Add token_usage_details column (JSON)
     # For SQLite, JSON is stored as TEXT with JSON validation
     # For PostgreSQL, it's stored as JSONB with efficient querying
-    op.add_column("tasks", sa.Column("token_usage_details", sa.JSON(), nullable=True))
+    if "token_usage_details" not in existing_columns:
+        op.add_column(
+            "tasks", sa.Column("token_usage_details", sa.JSON(), nullable=True)
+        )
 
 
 def downgrade() -> None:
     """Remove token usage tracking columns from tasks table."""
+    from alembic import context
+
+    bind = context.get_bind()
+    inspector = Inspector.from_engine(bind)
+
+    # Check if tasks table exists
+    tables = inspector.get_table_names()
+    if "tasks" not in tables:
+        # Table doesn't exist yet, will be created by SQLAlchemy or a later migration
+        return
+
+    # Check which columns exist before dropping
+    existing_columns = [col["name"] for col in inspector.get_columns("tasks")]
 
     # Remove columns in reverse order
-    op.drop_column("tasks", "token_usage_details")
-    op.drop_column("tasks", "llm_calls")
-    op.drop_column("tasks", "total_tokens")
-    op.drop_column("tasks", "output_tokens")
-    op.drop_column("tasks", "input_tokens")
+    if "token_usage_details" in existing_columns:
+        op.drop_column("tasks", "token_usage_details")
+    if "llm_calls" in existing_columns:
+        op.drop_column("tasks", "llm_calls")
+    if "total_tokens" in existing_columns:
+        op.drop_column("tasks", "total_tokens")
+    if "output_tokens" in existing_columns:
+        op.drop_column("tasks", "output_tokens")
+    if "input_tokens" in existing_columns:
+        op.drop_column("tasks", "input_tokens")

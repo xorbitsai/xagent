@@ -241,6 +241,10 @@ interface Task {
   createdAt: string | number
   updatedAt: string | number
   // Model configuration
+  modelId?: string
+  smallFastModelId?: string
+  visualModelId?: string
+  compactModelId?: string
   modelName?: string
   smallFastModelName?: string
   visualModelName?: string
@@ -987,6 +991,10 @@ export function AppProvider({ children, token }: { children: React.ReactNode; to
                 status: taskData.status,
                 createdAt: taskData.created_at,
                 updatedAt: taskData.updated_at,
+                modelId: taskData.model_id,
+                smallFastModelId: taskData.small_fast_model_id,
+                visualModelId: taskData.visual_model_id,
+                compactModelId: taskData.compact_model_id,
                 modelName: taskData.model_name,
                 smallFastModelName: taskData.small_fast_model_name,
                 visualModelName: taskData.visual_model_name,
@@ -3417,24 +3425,24 @@ export function AppProvider({ children, token }: { children: React.ReactNode; to
     }
   }, [])
 
-  const getLLMNamesFromConfig = (config?: any) => {
+  const getLLMIdsFromConfig = (config?: any) => {
     if (!config || !config.model) {
       return null
     }
 
     // Debug log to see what config is being passed
-    console.log('getLLMNamesFromConfig called with:', config)
+    console.log('getLLMIdsFromConfig called with:', config)
 
     // Always return exactly 4 elements in fixed order: [default, fast_small, vision, compact]
     // Use null for unconfigured models
-    const llmNames = [
+    const llmIds = [
       config.model,                           // Default model (required)
       config.smallFastModel || null,         // Fast small model (optional)
       config.visualModel || null,            // Vision model (optional)
       config.compactModel || null            // Compact model (optional)
     ]
 
-    return llmNames
+    return llmIds
   }
 
   const sendMessage = useCallback(async (message: string, config?: any, files?: File[]) => {
@@ -3445,8 +3453,8 @@ export function AppProvider({ children, token }: { children: React.ReactNode; to
       try {
         const apiUrl = getApiUrl()
 
-        // Build LLM names from config
-        const llmNames = getLLMNamesFromConfig(config)
+        // Build internal model identifiers from config
+        const llmIds = getLLMIdsFromConfig(config)
 
         // For process mode, message is already processDescription (from handleSendMessage)
         // For task mode, message is user input
@@ -3465,8 +3473,8 @@ export function AppProvider({ children, token }: { children: React.ReactNode; to
         }
 
         // Add LLM configuration
-        if (llmNames) {
-          requestBody.llm_names = llmNames
+        if (llmIds) {
+          requestBody.llm_ids = llmIds
         }
 
         if (config?.vibeMode?.processDescription) {
@@ -3514,6 +3522,10 @@ export function AppProvider({ children, token }: { children: React.ReactNode; to
             description: taskData.description || message,
             createdAt: taskData.created_at,
             updatedAt: taskData.updated_at,
+            modelId: taskData.model_id,
+            smallFastModelId: taskData.small_fast_model_id,
+            visualModelId: taskData.visual_model_id,
+            compactModelId: taskData.compact_model_id,
             modelName: taskData.model_name || taskData.modelName, // API response field
             smallFastModelName: taskData.small_fast_model_name || taskData.smallFastModelName, // API response field
             visualModelName: taskData.visual_model_name || taskData.visual_model_name,

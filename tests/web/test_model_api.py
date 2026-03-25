@@ -3,6 +3,7 @@
 import os
 import tempfile
 from unittest.mock import patch
+from urllib.parse import quote
 
 import pytest
 from fastapi import FastAPI
@@ -339,6 +340,64 @@ class TestModelAPI:
             f"/api/models/{model_id_str}", headers=regular_headers
         )
         assert get_response.status_code == 404
+
+    def test_get_model_by_path_with_slash_id(
+        self, test_db, regular_user, regular_headers, sample_model_data
+    ):
+        """Test getting a model whose model_id contains a slash."""
+        sample_model_data["model_id"] = "google/gemini-2.5-flash"
+
+        create_response = client.post(
+            "/api/models/", json=sample_model_data, headers=regular_headers
+        )
+        assert create_response.status_code == 200
+
+        response = client.get(
+            f"/api/models/by-id/{quote(sample_model_data['model_id'], safe='')}",
+            headers=regular_headers,
+        )
+        assert response.status_code == 200
+        data = response.json()
+        assert data["model_id"] == sample_model_data["model_id"]
+
+    def test_update_model_by_path_with_slash_id(
+        self, test_db, regular_user, regular_headers, sample_model_data
+    ):
+        """Test updating a model whose model_id contains a slash."""
+        sample_model_data["model_id"] = "google/gemini-2.5-flash"
+
+        create_response = client.post(
+            "/api/models/", json=sample_model_data, headers=regular_headers
+        )
+        assert create_response.status_code == 200
+
+        response = client.put(
+            f"/api/models/by-id/{quote(sample_model_data['model_id'], safe='')}",
+            json={"temperature": 0.5, "description": "Slash-safe update"},
+            headers=regular_headers,
+        )
+        assert response.status_code == 200
+        data = response.json()
+        assert data["temperature"] == 0.5
+        assert data["description"] == "Slash-safe update"
+
+    def test_delete_model_by_path_with_slash_id(
+        self, test_db, regular_user, regular_headers, sample_model_data
+    ):
+        """Test deleting a model whose model_id contains a slash."""
+        sample_model_data["model_id"] = "google/gemini-2.5-flash"
+
+        create_response = client.post(
+            "/api/models/", json=sample_model_data, headers=regular_headers
+        )
+        assert create_response.status_code == 200
+
+        delete_response = client.delete(
+            f"/api/models/by-id/{quote(sample_model_data['model_id'], safe='')}",
+            headers=regular_headers,
+        )
+        assert delete_response.status_code == 200
+        assert delete_response.json()["message"] == "Model deleted successfully"
 
     def test_delete_shared_model_as_non_owner_fails(
         self,

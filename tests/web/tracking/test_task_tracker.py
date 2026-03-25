@@ -80,6 +80,23 @@ class TestTaskTracker:
         assert task_tracker.is_tracking
 
     @pytest.mark.asyncio
+    async def test_start_tracking_uses_existing_task_totals(self, db_session):
+        mock_task = db_session.query.return_value.filter.return_value.first.return_value
+        mock_task.input_tokens = 120
+        mock_task.output_tokens = 80
+        mock_task.llm_calls = 4
+        mock_task.token_usage_details = [{"type": "input", "tokens": 120}]
+
+        tracker = TaskTracker(task_id=123, db_session=db_session)
+        await tracker.start_tracking()
+
+        usage = get_token_usage()
+        assert usage.input_tokens == 120
+        assert usage.output_tokens == 80
+        assert usage.llm_calls == 4
+        assert usage.details == [{"type": "input", "tokens": 120}]
+
+    @pytest.mark.asyncio
     async def test_start_tracking_already_tracking(self, task_tracker, caplog):
         """Test starting tracking when already tracking."""
         await task_tracker.start_tracking()

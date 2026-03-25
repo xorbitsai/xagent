@@ -2,11 +2,11 @@ import asyncio
 import logging
 import mimetypes
 from pathlib import Path
+from types import ModuleType
 from typing import Any, Dict, Optional, Tuple
 
 from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, UploadFile
 from fastapi.responses import FileResponse, HTMLResponse, StreamingResponse
-from pptx import Presentation
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
@@ -22,6 +22,16 @@ from .legacy_file import (
     resolve_legacy_file_path,
     resolve_legacy_file_path_cross_user,
 )
+
+# Optional import for openpyxl
+pptx: ModuleType | None = None
+try:
+    import pptx
+except ImportError:
+    pptx_not_installed_exception = RuntimeError(
+        "python-pptx is not installed. "
+        "Install with: pip install 'xagent[document-processing]'"
+    )
 
 logger = logging.getLogger(__name__)
 
@@ -355,7 +365,10 @@ async def _try_convert_pptx_to_pdf(path: Path) -> Optional[StreamingResponse]:
 
 
 def _pptx_fallback_html(path: Path) -> HTMLResponse:
-    prs = Presentation(str(path))
+    if not pptx:
+        raise pptx_not_installed_exception
+
+    prs = pptx.Presentation(str(path))
     html_content = """
     <!DOCTYPE html>
     <html>

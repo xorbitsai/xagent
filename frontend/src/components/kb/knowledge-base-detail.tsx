@@ -15,6 +15,7 @@ import { Badge } from "@/components/ui/badge"
 import { apiRequest } from "@/lib/api-wrapper"
 import { getApiUrl } from "@/lib/utils"
 import { appendIngestionConfigToFormData } from "@/lib/ingestion-form"
+import { parseSeparatorsInput, formatSeparatorsOutput } from "@/lib/separators"
 import { useI18n } from "@/contexts/i18n-context"
 import { toast } from "sonner"
 
@@ -248,9 +249,13 @@ export function KnowledgeBaseDetailContent({ collectionName }: { collectionName:
 
       // Update ingestion config if saved in backend
       if (collection.ingestion_config) {
+        const fetchedConfig = { ...collection.ingestion_config }
+        if (Array.isArray(fetchedConfig.separators)) {
+          fetchedConfig.separators = formatSeparatorsOutput(fetchedConfig.separators)
+        }
         setIngestionConfig(prev => ({
           ...prev,
-          ...collection.ingestion_config
+          ...fetchedConfig
         }))
       }
     } catch (err) {
@@ -573,12 +578,20 @@ export function KnowledgeBaseDetailContent({ collectionName }: { collectionName:
   const handleSaveConfig = async () => {
     setIsSavingConfig(true)
     try {
+      const payload: any = { ...ingestionConfig }
+
+      if (payload.chunk_strategy === "recursive" && typeof payload.separators === "string" && payload.separators.trim() !== "") {
+        payload.separators = parseSeparatorsInput(payload.separators)
+      } else {
+        delete payload.separators
+      }
+
       const response = await apiRequest(`${getApiUrl()}/api/kb/collections/${encodeURIComponent(collectionName)}/config`, {
         method: "POST",
         headers: {
           "Content-Type": "application/json",
         },
-        body: JSON.stringify(ingestionConfig)
+        body: JSON.stringify(payload)
       })
 
       if (!response.ok) {
@@ -953,7 +966,7 @@ export function KnowledgeBaseDetailContent({ collectionName }: { collectionName:
                   {isSavingConfig ? (
                     <>
                       <Loader2 className="mr-2 h-4 w-4 animate-spin" />
-                      {t("kb.index.savingConfig") || "Saving..."}
+                      {t("kb.index.savingConfig")}
                     </>
                   ) : (
                     t("kb.index.saveConfig")

@@ -4,6 +4,8 @@ Pdf parser providers module.
 This module provides various pdf parser backends
 """
 
+from typing import Type
+
 from xagent.providers.pdf_parser.base import (
     DocumentParser,
     FigureParsing,
@@ -18,12 +20,17 @@ from xagent.providers.pdf_parser.base import (
 )
 
 from .basic import PdfPlumberParser, PyMuPdfParser, PyPdfParser, UnstructuredParser
-from .deepdoc import DeepDocParser
+
+DeepDocParser: Type | None
+try:
+    from .deepdoc import DeepDocParser
+except ImportError:
+    DeepDocParser = None
 
 __all__ = [
     "ParseResult",
     "FigureParsing",
-    "DeepDocParser",
+    "DeepDocParser",  # Will be None if deepdoc is not installed
     "PyPdfParser",
     "PdfPlumberParser",
     "UnstructuredParser",

@@ -28,6 +28,26 @@ export function parseSeparatorsInput(input: string): string[] {
   return result
 }
 
+export function formatSeparatorsOutput(separators: string[] | undefined | null): string {
+  if (!Array.isArray(separators) || separators.length === 0) return ""
+
+  return separators.map(sep => {
+    let escaped = ""
+    for (let i = 0; i < sep.length; i++) {
+      const char = sep[i]
+      switch (char) {
+        case "\n": escaped += "\\n"; break;
+        case "\t": escaped += "\\t"; break;
+        case "\r": escaped += "\\r"; break;
+        case ",": escaped += "\\,"; break;
+        case "\\": escaped += "\\\\"; break;
+        default: escaped += char;
+      }
+    }
+    return escaped
+  }).join(", ")
+}
+
 function unescapeSeparatorItem(item: string): string {
   const out: string[] = []
   for (let i = 0; i < item.length; i++) {

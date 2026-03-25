@@ -191,6 +191,11 @@ def reset_token_usage() -> TokenUsage:
     return new_usage
 
 
+def set_token_usage(usage: TokenUsage) -> TokenUsage:
+    token_context.set(usage)
+    return usage
+
+
 def get_and_reset_token_usage() -> TokenUsage:
     """Get current usage and reset the context."""
     usage = token_context.get()

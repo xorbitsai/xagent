@@ -24,22 +24,48 @@ def upgrade() -> None:
 
     bind = context.get_bind()
     inspector = Inspector.from_engine(bind)
+
+    # Check if agents table exists
+    tables = inspector.get_table_names()
+    if "agents" not in tables:
+        # Table doesn't exist yet, will be created by SQLAlchemy or a later migration
+        return
+
     columns = [col["name"] for col in inspector.get_columns("agents")]
+    dialect_name = bind.dialect.name
 
     if "model_config" in columns and "models" not in columns:
-        # Use batch mode for SQLite to rename column
-        with op.batch_alter_table("agents", recreate="auto") as batch_op:
-            batch_op.alter_column("model_config", new_column_name="models")
+        # Rename model_config to models
+        if dialect_name == "sqlite":
+            # SQLite requires batch mode for ALTER TABLE operations
+            with op.batch_alter_table("agents", recreate="auto") as batch_op:
+                batch_op.alter_column("model_config", new_column_name="models")
+        else:
+            # PostgreSQL and other databases support native ALTER TABLE
+            op.execute("ALTER TABLE agents RENAME COLUMN model_config TO models")
     elif "models" in columns and "model_config" in columns:
         # Both columns exist - drop model_config as models is the newer one
-        with op.batch_alter_table("agents", recreate="auto") as batch_op:
-            batch_op.drop_column("model_config")
+        if dialect_name == "sqlite":
+            with op.batch_alter_table("agents", recreate="auto") as batch_op:
+                batch_op.drop_column("model_config")
+        else:
+            op.drop_column("agents", "model_config")
     elif "models" in columns:
         # Column already renamed, skip
         pass
 
 
 def downgrade() -> None:
-    # Use batch mode for SQLite to revert column name
-    with op.batch_alter_table("agents", recreate="auto") as batch_op:
-        batch_op.alter_column("models", new_column_name="model_config")
+    from alembic import context
+
+    bind = context.get_bind()
+    dialect_name = bind.dialect.name
+
+    # Revert column name from models to model_config
+    if dialect_name == "sqlite":
+        # SQLite requires batch mode for ALTER TABLE operations
+        with op.batch_alter_table("agents", recreate="auto") as batch_op:
+            batch_op.alter_column("models", new_column_name="model_config")
+    else:
+        # PostgreSQL and other databases support native ALTER TABLE
+        op.execute("ALTER TABLE agents RENAME COLUMN models TO model_config")

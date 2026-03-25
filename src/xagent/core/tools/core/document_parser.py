@@ -287,7 +287,9 @@ document_parser_registry.register_parser("pypdf", PyPdfParser)
 document_parser_registry.register_parser("pdfplumber", PdfPlumberParser)
 document_parser_registry.register_parser("unstructured", UnstructuredParser)
 document_parser_registry.register_parser("pymupdf", PyMuPdfParser)
-document_parser_registry.register_parser("deepdoc", DeepDocParser)
+# Only register deepdoc parser if it's available
+if DeepDocParser is not None:
+    document_parser_registry.register_parser("deepdoc", DeepDocParser)
 
 
 class BaseFormatter:

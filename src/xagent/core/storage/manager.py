@@ -128,11 +128,9 @@ Base = declarative_base()
 
 def create_db_session() -> Session:
     database_url = get_default_db_url()
+    connect_args = {"check_same_thread": False} if "sqlite" in database_url else {}
     # Create database engine
-    engine = create_engine(
-        database_url,
-        connect_args={"check_same_thread": False},
-    )
+    engine = create_engine(database_url, connect_args=connect_args)
     # Create session factory
     SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 

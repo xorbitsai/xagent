@@ -5,7 +5,6 @@ import { Button } from "@/components/ui/button"
 import { Settings, Cpu, Zap, Eye } from "lucide-react"
 import { cn, getApiUrl } from "@/lib/utils"
 import { apiRequest } from "@/lib/api-wrapper"
-import { useAuth } from "@/contexts/auth-context"
 import { useState, useEffect } from "react"
 import { useI18n } from "@/contexts/i18n-context";
 
@@ -33,6 +32,10 @@ interface Task {
   description: string
   createdAt: string | number
   updatedAt: string | number
+  modelId?: string
+  smallFastModelId?: string
+  visualModelId?: string
+  compactModelId?: string
   modelName?: string
   smallFastModelName?: string
   visualModelName?: string
@@ -46,14 +49,12 @@ interface ModelInfoDisplayProps {
 
 export function ModelInfoDisplay({ currentTask, onConfigChange, className }: ModelInfoDisplayProps) {
   const [models, setModels] = useState<Model[]>([])
-  const [loading, setLoading] = useState(false)
   const { t } = useI18n();
 
   // Fetch models for mapping
   useEffect(() => {
     const fetchModels = async () => {
       try {
-        setLoading(true)
         const response = await apiRequest(`${getApiUrl()}/api/models/?category=llm`)
         if (response.ok) {
           const data = await response.json()
@@ -61,30 +62,57 @@ export function ModelInfoDisplay({ currentTask, onConfigChange, className }: Mod
         }
       } catch (error) {
         console.error('Failed to fetch models:', error)
-      } finally {
-        setLoading(false)
       }
     }
 
-    // Only fetch if we have a task with model names
-    if (currentTask && (currentTask.modelName || currentTask.smallFastModelName || currentTask.visualModelName)) {
+    // Only fetch if we have a task with model info
+    if (
+      currentTask &&
+      (
+        currentTask.modelId ||
+        currentTask.smallFastModelId ||
+        currentTask.visualModelId ||
+        currentTask.compactModelId ||
+        currentTask.modelName ||
+        currentTask.smallFastModelName ||
+        currentTask.visualModelName
+      )
+    ) {
       fetchModels()
     }
   }, [currentTask])
 
-  // Create mapping from model_name to model_id
-  const modelNameToIdMap = models.reduce((acc, model) => {
-    acc[model.model_name] = model.model_id
+  const modelIdToNameMap = models.reduce((acc, model) => {
+    acc[model.model_id] = model.model_name
     return acc
   }, {} as Record<string, string>)
 
-  // Get display names (prefer model_id, fallback to model_name)
-  const getDisplayName = (modelName?: string) => {
-    if (!modelName) return null
-    return modelNameToIdMap[modelName] || modelName
+  const getDisplayName = (modelId?: string, modelName?: string) => {
+    if (modelName) return modelName
+    if (modelId) return modelIdToNameMap[modelId] || modelId
+    return null
   }
 
-  if (!currentTask || (!currentTask.modelName && !currentTask.smallFastModelName && !currentTask.visualModelName)) {
+  const getTitle = (label: string, modelId?: string, modelName?: string) => {
+    const displayName = getDisplayName(modelId, modelName)
+    if (!displayName) return label
+    if (modelId && modelName && modelId !== modelName) {
+      return `${label}: ${modelName} (${modelId})`
+    }
+    return `${label}: ${displayName}`
+  }
+
+  if (
+    !currentTask ||
+    (
+      !currentTask.modelId &&
+      !currentTask.smallFastModelId &&
+      !currentTask.visualModelId &&
+      !currentTask.modelName &&
+      !currentTask.smallFastModelName &&
+      !currentTask.visualModelName
+    )
+  ) {
     // If no task or no model info, show config button
     // But if onConfigChange is undefined, don't show button (handled by parent)
     if (!onConfigChange) {
@@ -107,9 +135,9 @@ export function ModelInfoDisplay({ currentTask, onConfigChange, className }: Mod
     )
   }
 
-  const mainModelDisplay = getDisplayName(currentTask.modelName)
-  const smallFastModelDisplay = getDisplayName(currentTask.smallFastModelName)
-  const visualModelDisplay = getDisplayName(currentTask.visualModelName)
+  const mainModelDisplay = getDisplayName(currentTask.modelId, currentTask.modelName)
+  const smallFastModelDisplay = getDisplayName(currentTask.smallFastModelId, currentTask.smallFastModelName)
+  const visualModelDisplay = getDisplayName(currentTask.visualModelId, currentTask.visualModelName)
 
   return (
     <div className="flex items-center gap-2">
@@ -118,7 +146,7 @@ export function ModelInfoDisplay({ currentTask, onConfigChange, className }: Mod
         <Badge
           variant="secondary"
           className="text-xs bg-blue-500/10 text-blue-600 border-blue-500/20 flex items-center gap-1"
-          title={`${t('agent.configDialog.modelSelect.main.label')} (${currentTask.modelName})`}
+          title={getTitle(t('agent.configDialog.modelSelect.main.label'), currentTask.modelId, currentTask.modelName)}
         >
           <Cpu className="h-3 w-3" />
           {mainModelDisplay}
@@ -130,7 +158,7 @@ export function ModelInfoDisplay({ currentTask, onConfigChange, className }: Mod
         <Badge
           variant="secondary"
           className="text-xs bg-green-500/10 text-green-600 border-green-500/20 flex items-center gap-1"
-          title={`${t('agent.configDialog.modelSelect.smallFast.label')} (${currentTask.smallFastModelName})`}
+          title={getTitle(t('agent.configDialog.modelSelect.smallFast.label'), currentTask.smallFastModelId, currentTask.smallFastModelName)}
         >
           <Zap className="h-3 w-3" />
           {smallFastModelDisplay}
@@ -142,7 +170,7 @@ export function ModelInfoDisplay({ currentTask, onConfigChange, className }: Mod
         <Badge
           variant="secondary"
           className="text-xs bg-purple-500/10 text-purple-600 border-purple-500/20 flex items-center gap-1"
-          title={`${t('agent.configDialog.modelSelect.visual.label')} (${currentTask.visualModelName})`}
+          title={getTitle(t('agent.configDialog.modelSelect.visual.label'), currentTask.visualModelId, currentTask.visualModelName)}
         >
           <Eye className="h-3 w-3" />
           {visualModelDisplay}

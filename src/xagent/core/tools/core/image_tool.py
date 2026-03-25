@@ -143,16 +143,17 @@ Images are automatically saved to workspace.
             return
 
         # Get default model IDs for marking
-        default_generate_id = (
-            getattr(self._default_generate_model, "model_name", None)
-            if self._default_generate_model
-            else None
-        )
-        default_edit_id = (
-            getattr(self._default_edit_model, "model_name", None)
-            if self._default_edit_model
-            else None
-        )
+        default_generate_id = None
+        if self._default_generate_model:
+            default_generate_id = getattr(
+                self._default_generate_model, "model_id", None
+            ) or getattr(self._default_generate_model, "model_name", None)
+
+        default_edit_id = None
+        if self._default_edit_model:
+            default_edit_id = getattr(
+                self._default_edit_model, "model_id", None
+            ) or getattr(self._default_edit_model, "model_name", None)
 
         # Generate info for generate-capable models only (for generate_image)
         # Put default model first, then others

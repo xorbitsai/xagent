@@ -443,9 +443,10 @@ function TaskDetailContent() {
               onPause={pauseTask}
               onResume={resumeTask}
               taskConfig={state.currentTask ? {
-                model: state.currentTask.modelName,
-                smallFastModel: state.currentTask.smallFastModelName,
-                visualModel: state.currentTask.visualModelName
+                model: state.currentTask.modelId || state.currentTask.modelName,
+                smallFastModel: state.currentTask.smallFastModelId,
+                visualModel: state.currentTask.visualModelId,
+                compactModel: state.currentTask.compactModelId
               } : undefined}
               readOnlyConfig={true}
             />

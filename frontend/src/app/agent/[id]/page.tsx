@@ -11,8 +11,8 @@ import { useApp } from "@/contexts/app-context-chat"
 import { ChatStartScreen } from "@/components/chat/ChatStartScreen"
 import { toast } from "sonner"
 
-function doubleEncodeModelId(modelId: string): string {
-  return encodeURIComponent(encodeURIComponent(modelId))
+function getModelDetailUrl(modelId: string | number): string {
+  return `${getApiUrl()}/api/models/by-id/${encodeURIComponent(String(modelId))}`
 }
 
 interface Agent {
@@ -40,7 +40,7 @@ export default function AgentChatPage() {
 
   const [agent, setAgent] = useState<Agent | null>(null)
   const [loading, setLoading] = useState(true)
-  const [agentModelName, setAgentModelName] = useState<string>("")
+  const [agentModelId, setAgentModelId] = useState<string>("")
   const [isSending, setIsSending] = useState(false)
   const [inputValue, setInputValue] = useState("")
   const [files, setFiles] = useState<File[]>([])
@@ -55,13 +55,13 @@ export default function AgentChatPage() {
           const data = await response.json()
           setAgent(data)
 
-          // Fetch model name if agent has general model configured
+          // Fetch model identifier if agent has general model configured
           if (data.models?.general) {
             try {
-              const modelResponse = await apiRequest(`${getApiUrl()}/api/models/${doubleEncodeModelId(data.models.general)}`)
+              const modelResponse = await apiRequest(getModelDetailUrl(data.models.general))
               if (modelResponse.ok) {
                 const modelData = await modelResponse.json()
-                setAgentModelName(modelData.model_id || modelData.name || "")
+                setAgentModelId(modelData.model_id || modelData.name || "")
               }
             } catch (err) {
               console.error("Failed to load model name:", err)
@@ -185,7 +185,7 @@ export default function AgentChatPage() {
               files={files}
               onFilesChange={setFiles}
               readOnlyConfig={true}
-              taskConfig={{ model: agentModelName }}
+              taskConfig={{ model: agentModelId }}
             />
           </main>
         </div>

@@ -234,13 +234,24 @@ class OpenAILLM(BaseLLM):
                 for tool_call in message.tool_calls:
                     # Only handle function tool calls, not custom tool calls
                     if hasattr(tool_call, "function"):
+                        func = tool_call.function
+                        args = func.arguments if func.arguments else ""
+
+                        # Validate arguments are not empty
+                        if not args or args.strip() == "":
+                            raise RuntimeError(
+                                f"Tool '{func.name}' has empty arguments. "
+                                f"This is a bug in the LLM provider's tool calling implementation. "
+                                f"Model: {self._model_name}"
+                            )
+
                         tool_calls.append(
                             {
                                 "id": tool_call.id,
                                 "type": tool_call.type,
                                 "function": {
-                                    "name": tool_call.function.name,
-                                    "arguments": tool_call.function.arguments,
+                                    "name": func.name,
+                                    "arguments": args,
                                 },
                             }
                         )
@@ -529,13 +540,24 @@ class OpenAILLM(BaseLLM):
                 for tool_call in message.tool_calls:
                     # Only handle function tool calls, not custom tool calls
                     if hasattr(tool_call, "function"):
+                        func = tool_call.function
+                        args = func.arguments if func.arguments else ""
+
+                        # Validate arguments are not empty
+                        if not args or args.strip() == "":
+                            raise RuntimeError(
+                                f"Tool '{func.name}' has empty arguments. "
+                                f"This is a bug in the LLM provider's tool calling implementation. "
+                                f"Model: {self._model_name}"
+                            )
+
                         tool_calls.append(
                             {
                                 "id": tool_call.id,
                                 "type": tool_call.type,
                                 "function": {
-                                    "name": tool_call.function.name,
-                                    "arguments": tool_call.function.arguments,
+                                    "name": func.name,
+                                    "arguments": args,
                                 },
                             }
                         )
@@ -935,22 +957,26 @@ class OpenAILLM(BaseLLM):
 
             for tool_call in delta.tool_calls:
                 call_id = tool_call.id
+                index = tool_call.index
+                func = tool_call.function if hasattr(tool_call, "function") else None
 
                 # Handle Azure OpenAI's incremental tool call format
                 # where later chunks may have null id but have arguments
-                if call_id is None and accumulated_tool_calls:
-                    # Try to associate with the most recent tool call by index
-                    if tool_call.index is not None:
-                        # Find the tool call with the same index
+                # Also handle qwen's empty string id format
+                if call_id is None or call_id == "":
+                    if accumulated_tool_calls and index is not None:
+                        # Try to associate with the most recent tool call by index
                         for existing_id, existing_tc in accumulated_tool_calls.items():
-                            if existing_tc.get("index") == tool_call.index:
+                            if existing_tc.get("index") == index:
                                 call_id = existing_id
                                 break
 
                 # Initialize or update accumulated tool call
-                if call_id and call_id not in accumulated_tool_calls:
+                # FIXED: Use 'call_id not in accumulated_tool_calls' instead of 'if call_id'
+                # to handle empty string ids
+                if call_id is not None and call_id not in accumulated_tool_calls:
                     accumulated_tool_calls[call_id] = {
-                        "index": tool_call.index,
+                        "index": index,
                         "id": call_id,
                         "type": getattr(tool_call, "type", "function"),
                         "function": {
@@ -959,19 +985,21 @@ class OpenAILLM(BaseLLM):
                         },
                     }
 
-                # Only process if we have a valid call_id
-                if call_id:
+                # Update function information (even if call_id is empty string)
+                if call_id is not None:
                     # Update function information
-                    if hasattr(tool_call, "function") and tool_call.function:
-                        func = tool_call.function
+                    if func:
                         if hasattr(func, "name") and func.name:
                             accumulated_tool_calls[call_id]["function"]["name"] = (
                                 func.name
                             )
-                        if hasattr(func, "arguments") and func.arguments:
+                        # FIXED: Always accumulate arguments, even if empty string
+                        # Some models send empty chunks before/after actual arguments
+                        if hasattr(func, "arguments"):
+                            args_to_add = func.arguments if func.arguments else ""
                             accumulated_tool_calls[call_id]["function"][
                                 "arguments"
-                            ] += func.arguments
+                            ] += args_to_add
 
             # Return current accumulated tool calls
             tool_calls_list = list(accumulated_tool_calls.values())
@@ -986,9 +1014,23 @@ class OpenAILLM(BaseLLM):
         if hasattr(choice, "finish_reason") and choice.finish_reason:
             # If there are tool calls, return complete tool calls
             if accumulated_tool_calls:
+                tool_calls_list = list(accumulated_tool_calls.values())
+
+                # Validate all tool calls have non-empty arguments
+                for tool_call_dict in tool_calls_list:
+                    func_info = tool_call_dict.get("function", {})
+                    args = func_info.get("arguments", "")
+                    if not args or args.strip() == "":
+                        tool_name = func_info.get("name", "unknown")
+                        raise RuntimeError(
+                            f"Tool '{tool_name}' has empty arguments in streaming response. "
+                            f"This is a bug in the LLM provider's tool calling implementation. "
+                            f"Model: {self._model_name}, raw tool call: {tool_call_dict}"
+                        )
+
                 return StreamChunk(
                     type=ChunkType.TOOL_CALL,
-                    tool_calls=list(accumulated_tool_calls.values()),
+                    tool_calls=tool_calls_list,
                     finish_reason=choice.finish_reason,
                     raw=raw_chunk,
                 )

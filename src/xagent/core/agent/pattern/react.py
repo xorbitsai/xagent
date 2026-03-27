@@ -878,7 +878,8 @@ class ReActPattern(AgentPattern):
                     }
 
                 # Add observation to conversation for tool results
-                observation_content = f"Observation: {result['content']}"
+                # Use a clearer format to help LLM understand this is a tool result
+                observation_content = f"Tool result from {result.get('tool_name', 'unknown')}:\n{result['content']}\n\nBased on this result, if you have enough information to answer the user's question, provide your final answer as a direct text response. Do NOT call another tool unless absolutely necessary."
                 messages.append({"role": "user", "content": observation_content})
 
                 # Update stored messages
@@ -1212,34 +1213,61 @@ You must respond with a structured action in the following JSON format:
 Available tools:
 {chr(10).join(tool_descriptions)}
 
-Rules:
-1. You must respond with valid JSON only
-2. Use "tool_call" ONLY when you need to call one of the available tools listed above
-3. Use "final_answer" when you need to provide analysis, synthesis, or final conclusions
-4. For analysis tasks (like "analyze", "summarize", "synthesize", etc.), always use "final_answer" directly
-5. Do NOT invent tool names - only use tools from the available list
-6. Always provide clear reasoning for your actions
-7. Tool arguments must match the tool's schema
-8. LANGUAGE: You MUST respond in the SAME LANGUAGE as the user's task. If the task is in Chinese, respond in Chinese. If the task is in English, respond in English.
+CRITICAL INSTRUCTIONS - READ CAREFULLY:
 
-Examples:
+1. You can use native function calling to invoke tools when needed
 
-Tool call example:
-{{
-    "type": "tool_call",
-    "reasoning": "I need to calculate the sum of 5 and 3",
-    "tool_name": "calculator",
-    "tool_args": {{"expression": "5 + 3"}}
-}}
+2. AFTER EACH TOOL CALL - STOP AND DECIDE:
+   - Review the tool execution result carefully
+   - Ask yourself: "Do I have enough information to answer the user's question?"
+   - If YES → Provide final answer immediately as direct text
+   - If NO → Call another tool
 
-Analysis/Final answer example:
-{{
-    "type": "final_answer",
-    "reasoning": "Based on the search results, I need to analyze the key design elements",
-    "answer": "The key design elements for notification charts include: 1) Clear visual hierarchy, 2) Consistent color coding, 3) Proper spacing and alignment, 4) Readable typography, 5) Responsive design considerations."
-}}
+3. STOP CALLING TOOLS when:
+   - You have obtained the information the user requested
+   - The tool result directly answers the user's question
+   - You have completed the requested operation (calculation, code execution, search, etc.)
+   - Another tool call would be redundant or unhelpful
+   - The user is asking for a simple task that only needs ONE tool call
 
-Remember: For tasks like "analyze", "summarize", "synthesize", "summarize", etc., always use "final_answer" directly. Do NOT try to call an "analysis" tool."""
+4. PROVIDE FINAL ANSWER:
+   - As direct text response (NOT JSON, NOT another tool call)
+   - Include the relevant information from tool results
+   - Be clear and comprehensive
+
+5. ONE TOOL AT A TIME:
+   - Never call multiple tools in one response
+   - Call one tool, review result, then decide what to do next
+
+6. LANGUAGE: Respond in the SAME LANGUAGE as the user's task
+
+COMMON MISTAKES TO AVOID:
+❌ Don't keep calling tools after getting the answer
+❌ Don't call the same tool twice with similar inputs
+❌ Don't call tools when you already have the answer
+❌ Don't use JSON format for the final answer - use plain text
+
+EXAMPLES:
+
+Example 1 - Generate random number:
+User: Generate a random number between 1 and 100
+You: (call execute_python_code tool)
+→ Tool result: 42
+You: The random number is 42. (STOP - provide final answer)
+
+Example 2 - Search and summarize:
+User: What is the capital of France?
+You: (call search tool)
+→ Tool result: Paris is the capital of France
+You: The capital of France is Paris. (STOP - provide final answer)
+
+Example 3 - Execute code:
+User: Calculate 5 + 3 using Python
+You: (call execute_python_code tool)
+→ Tool result: 8
+You: The result of 5 + 3 is 8. (STOP - provide final answer)
+
+Remember: After getting a useful tool result, ALWAYS provide the final answer instead of calling more tools!"""
             )
 
         return prompt
@@ -1439,6 +1467,8 @@ After using tools, provide a clear summary of the results in the SAME LANGUAGE a
         else:
             # Pass tools to LLM for native tool calling
             chat_kwargs["tools"] = tool_schemas
+            # Explicitly set tool_choice to auto to ensure tools are used
+            chat_kwargs["tool_choice"] = "auto"
 
         # Disable thinking mode if supported
         if (
@@ -1470,7 +1500,7 @@ After using tools, provide a clear summary of the results in the SAME LANGUAGE a
                 "has_tools": bool(tool_schemas),
                 "tools_count": len(tool_schemas),
                 "tools": tool_schemas if tool_schemas else [],
-                "tool_choice": chat_kwargs.get("tool_choice", "none"),
+                "tool_choice": chat_kwargs.get("tool_choice", "auto"),
                 "thinking_mode": chat_kwargs.get("thinking", "not set"),
                 "step_name": getattr(self, "_current_step_name", "main"),
                 "step_id": step_id,
@@ -1601,10 +1631,48 @@ After using tools, provide a clear summary of the results in the SAME LANGUAGE a
         if isinstance(response, dict) and response.get("type") == "tool_call":
             return self._convert_native_tool_call_to_action(response)
 
-        # Handle direct text response (when using native tool calling)
-        # This happens when LLM returns text directly instead of JSON-formatted action
-        # Treat text responses as final_answer
+        # Handle dict response with type="final_answer" (from native tool calling)
+        if isinstance(response, dict) and response.get("type") == "final_answer":
+            # Convert dict to Action
+            try:
+                return Action.model_validate(response)
+            except Exception as e:
+                logger.warning(f"Failed to validate final_answer dict: {e}")
+                # Fallback: extract answer field
+                return Action(
+                    type="final_answer",
+                    reasoning="LLM provided final answer",
+                    answer=response.get("answer", str(response)),
+                    success=response.get("success", True),
+                    error=response.get("error"),
+                )
+
+        # Handle string response - try to parse as JSON first
         if isinstance(response, str):
+            # Try to parse as JSON first (for final_answer with success/error fields)
+            try:
+                parsed = json.loads(response.strip())
+                if isinstance(parsed, dict) and parsed.get("type") == "final_answer":
+                    # Successfully parsed as final_answer JSON
+                    try:
+                        return Action.model_validate(parsed)
+                    except Exception as e:
+                        logger.warning(f"Failed to validate final_answer JSON: {e}")
+                        # Fallback: extract fields manually
+                        return Action(
+                            type="final_answer",
+                            reasoning=parsed.get(
+                                "reasoning", "LLM provided final answer"
+                            ),
+                            answer=parsed.get("answer", response.strip()),
+                            success=parsed.get("success", True),
+                            error=parsed.get("error"),
+                        )
+            except (json.JSONDecodeError, AttributeError):
+                # Not valid JSON, treat as direct text response
+                pass
+
+            # If not JSON or parsing failed, treat as direct text response
             logger.debug(
                 f"LLM returned direct text response (length: {len(response)}), treating as final_answer"
             )
@@ -1622,22 +1690,6 @@ After using tools, provide a clear summary of the results in the SAME LANGUAGE a
             # Note: We don't have access to task_id/step_id here, so we'll trace at the return point
             # The actual trace happens in the caller (run method)
             return action
-
-        # Handle dict response with type="final_answer" (from native tool calling)
-        if isinstance(response, dict) and response.get("type") == "final_answer":
-            # Convert dict to Action
-            try:
-                return Action.model_validate(response)
-            except Exception as e:
-                logger.warning(f"Failed to validate final_answer dict: {e}")
-                # Fallback: extract answer field
-                return Action(
-                    type="final_answer",
-                    reasoning="LLM provided final answer",
-                    answer=response.get("answer", str(response)),
-                    success=response.get("success", True),
-                    error=response.get("error"),
-                )
 
         # Parse JSON response (for when response_format="json_object" is enforced)
         try:
@@ -1785,11 +1837,13 @@ After using tools, provide a clear summary of the results in the SAME LANGUAGE a
                     pattern_name="ReAct", message="Tool call missing tool_name"
                 )
 
-            # Add action to conversation history
+            # For native tool calling, add a minimal assistant message
+            # Don't include the full tool call JSON as it confuses the LLM
+            # Just add a placeholder to maintain conversation flow
             messages.append(
                 {
                     "role": "assistant",
-                    "content": json.dumps(action.model_dump(), indent=2),
+                    "content": f"[Calling tool: {action.tool_name}]",
                 }
             )
 

@@ -1,5 +1,6 @@
 """Test nested agent architecture using AgentTool"""
 
+import json
 from typing import Any, List
 
 import pytest
@@ -11,6 +12,7 @@ from xagent.core.agent.tools.agent_tool import AgentTool, CompactMode
 from xagent.core.memory.base import MemoryResponse, MemoryStore
 from xagent.core.memory.in_memory import InMemoryMemoryStore
 from xagent.core.model.chat.basic.base import BaseLLM
+from xagent.core.model.chat.types import ChunkType, StreamChunk
 from xagent.core.tools.adapters.vibe import Tool, ToolMetadata
 from xagent.core.workspace import TaskWorkspace
 
@@ -23,7 +25,7 @@ class MockLLM(BaseLLM):
 
     @property
     def abilities(self) -> List[str]:
-        return ["chat"]
+        return ["chat", "tool_calling"]
 
     @property
     def model_name(self) -> str:
@@ -43,6 +45,57 @@ class MockLLM(BaseLLM):
 
         # Default response
         return '{"type": "final_answer", "content": "Task completed by sub-agent", "answer": "Task completed by sub-agent", "reasoning": "The task has been completed"}'
+
+    async def stream_chat(self, messages: list[dict[str, str]], **kwargs):
+        """Stream chat implementation for testing native tool calling."""
+        if self.call_count >= len(self.responses):
+            # Default response
+            response_json = {
+                "type": "final_answer",
+                "answer": "Task completed by sub-agent",
+                "reasoning": "The task has been completed",
+            }
+        else:
+            # Parse the response
+            response_text = self.responses[self.call_count]
+            self.call_count += 1
+            try:
+                response_json = json.loads(response_text)
+            except json.JSONDecodeError:
+                # If not JSON, treat as final answer
+                response_json = {
+                    "type": "final_answer",
+                    "reasoning": "Response received",
+                    "answer": response_text,
+                }
+
+        # Check if this is a tool call
+        if response_json.get("type") == "tool_call":
+            # Return native tool call format
+            tool_name = response_json.get("tool_name", "")
+            tool_args = response_json.get("tool_args", {})
+
+            yield StreamChunk(
+                type=ChunkType.TOOL_CALL,
+                content="",
+                delta="",
+                tool_calls=[
+                    {
+                        "function": {
+                            "name": tool_name,
+                            "arguments": json.dumps(tool_args),
+                        }
+                    }
+                ],
+            )
+            yield StreamChunk(type=ChunkType.END, finish_reason="tool_calls")
+        else:
+            # Return text content (final_answer)
+            answer = response_json.get(
+                "answer", response_json.get("content", "Task completed")
+            )
+            yield StreamChunk(type=ChunkType.TOKEN, content=answer, delta=answer)
+            yield StreamChunk(type=ChunkType.END, finish_reason="stop")
 
 
 class MockCalculatorTool(Tool):

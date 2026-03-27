@@ -811,6 +811,11 @@ class ClaudeLLM(BaseLLM):
             )
 
             # Process streaming response
+            # Note: We manually parse events instead of using SDK's tool parsing because:
+            # 1. We need real-time streaming with per-event processing
+            # 2. We need custom timeout controls during streaming
+            # 3. We need unified StreamChunk format across different LLM providers
+            # 4. We need to handle tool calls incrementally as they stream in
             async for event in stream:
                 current_time = time.time()
 
@@ -866,11 +871,25 @@ class ClaudeLLM(BaseLLM):
                             )
                         elif delta.type == "input_json_delta":
                             # Tool arguments update
-                            tool_id = (
-                                event.index
-                                if hasattr(event, "index")
-                                else list(accumulated_tool_calls.keys())[0]
-                            )
+                            # IMPORTANT: event.index is an INTEGER (content block position 0, 1, 2, ...)
+                            # NOT the tool_id string (like "toolu_01GK595WLP7ewvoLiMRV6sG4")
+                            # We must use event.index to look up the correct tool_id
+                            if hasattr(event, "index") and accumulated_tool_calls:
+                                # Get tool_id by index (event.index is the position in content blocks)
+                                tool_ids = list(accumulated_tool_calls.keys())
+                                if 0 <= event.index < len(tool_ids):
+                                    tool_id = tool_ids[event.index]
+                                else:
+                                    # Fallback to first tool if index is out of range
+                                    logger.warning(
+                                        f"event.index {event.index} out of range [0, {len(tool_ids)}), using first tool"
+                                    )
+                                    tool_id = tool_ids[0]
+                            else:
+                                # Fallback to first tool if no index
+                                logger.warning("No event.index, using first tool")
+                                tool_id = list(accumulated_tool_calls.keys())[0]
+
                             if tool_id in accumulated_tool_calls:
                                 args = (
                                     delta.partial_json
@@ -878,6 +897,10 @@ class ClaudeLLM(BaseLLM):
                                     else ""
                                 )
                                 accumulated_tool_calls[tool_id]["arguments"] += args
+                            else:
+                                logger.warning(
+                                    f"tool_id {tool_id} not found in accumulated_tool_calls"
+                                )
 
                 elif event.type == "content_block_stop":
                     # End of content block

@@ -4,16 +4,61 @@ tool sharing, concurrency, and error scenarios.
 """
 
 import asyncio
+import json
 from unittest.mock import Mock
 
 import pytest
 
 from xagent.core.agent.pattern.dag_plan_execute import DAGPlanExecutePattern
 from xagent.core.model.chat.basic.openai import OpenAILLM
+from xagent.core.model.chat.types import ChunkType, StreamChunk
 from xagent.core.tools.adapters.vibe.workspace_file_tool import (
     create_workspace_file_tools,
 )
 from xagent.core.workspace import TaskWorkspace
+
+
+def create_mock_stream_chat(mock_llm):
+    """Create a mock stream_chat function that properly handles tool calls."""
+
+    async def mock_stream_chat(**kwargs):
+        # Get response from chat mock
+        content = await mock_llm.chat(**kwargs)
+
+        # Try to parse as JSON to determine response type
+        try:
+            response_data = json.loads(content)
+            if response_data.get("type") == "tool_call":
+                # Return native tool call format
+                tool_name = response_data.get("tool_name", "")
+                tool_args = response_data.get("tool_args", {})
+                yield StreamChunk(
+                    type=ChunkType.TOOL_CALL,
+                    content="",
+                    delta="",
+                    tool_calls=[
+                        {
+                            "function": {
+                                "name": tool_name,
+                                "arguments": json.dumps(tool_args),
+                            }
+                        }
+                    ],
+                )
+                yield StreamChunk(type=ChunkType.END, finish_reason="tool_calls")
+                return
+        except (json.JSONDecodeError, AttributeError):
+            pass
+
+        # Yield as text stream chunk (for final_answer)
+        yield StreamChunk(
+            type=ChunkType.TOKEN,
+            content=content,
+            delta=content,
+        )
+        yield StreamChunk(type=ChunkType.END, finish_reason="stop")
+
+    return mock_stream_chat
 
 
 class TestDAGComprehensive:
@@ -478,17 +523,45 @@ class TestDAGComprehensive:
 
         # Mock stream_chat to work with the ReAct pattern
         async def mock_stream_chat(**kwargs):
+            import json
+
             from xagent.core.model.chat.types import ChunkType, StreamChunk
 
             # Get response from chat mock
             content = await mock_llm.chat(**kwargs)
 
-            # Yield as a stream chunk
+            # Try to parse as JSON to determine response type
+            try:
+                response_data = json.loads(content)
+                if response_data.get("type") == "tool_call":
+                    # Return native tool call format
+                    tool_name = response_data.get("tool_name", "")
+                    tool_args = response_data.get("tool_args", {})
+                    yield StreamChunk(
+                        type=ChunkType.TOOL_CALL,
+                        content="",
+                        delta="",
+                        tool_calls=[
+                            {
+                                "function": {
+                                    "name": tool_name,
+                                    "arguments": json.dumps(tool_args),
+                                }
+                            }
+                        ],
+                    )
+                    yield StreamChunk(type=ChunkType.END, finish_reason="tool_calls")
+                    return
+            except (json.JSONDecodeError, AttributeError):
+                pass
+
+            # Yield as text stream chunk (for final_answer)
             yield StreamChunk(
                 type=ChunkType.TOKEN,
                 content=content,
                 delta=content,
             )
+            yield StreamChunk(type=ChunkType.END, finish_reason="stop")
 
         mock_llm.stream_chat = mock_stream_chat
 
@@ -687,21 +760,8 @@ class TestDAGComprehensive:
 
             mock_llm.chat = mock_chat
 
-            # Mock stream_chat to work with the ReAct pattern
-            async def mock_stream_chat(**kwargs):
-                from xagent.core.model.chat.types import ChunkType, StreamChunk
-
-                # Get response from chat mock
-                content = await mock_llm.chat(**kwargs)
-
-                # Yield as a stream chunk
-                yield StreamChunk(
-                    type=ChunkType.TOKEN,
-                    content=content,
-                    delta=content,
-                )
-
-            mock_llm.stream_chat = mock_stream_chat
+            # Mock stream_chat using the helper function
+            mock_llm.stream_chat = create_mock_stream_chat(mock_llm)
 
             # Create async mock for tracer
             async def async_trace_event(*args, **kwargs):
@@ -838,21 +898,8 @@ class TestDAGComprehensive:
 
             mock_llm.chat = mock_chat
 
-            # Mock stream_chat to work with the ReAct pattern
-            async def mock_stream_chat(**kwargs):
-                from xagent.core.model.chat.types import ChunkType, StreamChunk
-
-                # Get response from chat mock
-                content = await mock_llm.chat(**kwargs)
-
-                # Yield as a stream chunk
-                yield StreamChunk(
-                    type=ChunkType.TOKEN,
-                    content=content,
-                    delta=content,
-                )
-
-            mock_llm.stream_chat = mock_stream_chat
+            # Mock stream_chat using the helper function
+            mock_llm.stream_chat = create_mock_stream_chat(mock_llm)
 
             # Create async mock for tracer
             async def async_trace_event(*args, **kwargs):
@@ -998,21 +1045,8 @@ class TestDAGComprehensive:
 
             mock_llm.chat = mock_chat
 
-            # Mock stream_chat to work with the ReAct pattern
-            async def mock_stream_chat(**kwargs):
-                from xagent.core.model.chat.types import ChunkType, StreamChunk
-
-                # Get response from chat mock
-                content = await mock_llm.chat(**kwargs)
-
-                # Yield as a stream chunk
-                yield StreamChunk(
-                    type=ChunkType.TOKEN,
-                    content=content,
-                    delta=content,
-                )
-
-            mock_llm.stream_chat = mock_stream_chat
+            # Mock stream_chat using the helper function
+            mock_llm.stream_chat = create_mock_stream_chat(mock_llm)
 
             # Create async mock for tracer
             async def async_trace_event(*args, **kwargs):

@@ -1242,34 +1242,30 @@ CRITICAL INSTRUCTIONS - READ CAREFULLY:
    - Do NOT include tool names or arguments in the JSON
    - The system will guide you through tool invocation in a follow-up call
 
-2. RESPONSE FORMAT:
-   - Always respond with valid JSON
+2. RESPONSE FORMAT (CRITICAL - MUST FOLLOW):
+   - Your entire response must be EXACTLY ONE JSON object - nothing more, nothing less
+   - Do NOT return multiple JSON objects
+   - Do NOT return JSON followed by other text
+   - Do NOT return multiple responses
+   - The JSON object must be the ONLY thing you return
    - Use the exact format shown below
-   - Do NOT use markdown or backticks
 
 3. LANGUAGE: Respond in the SAME LANGUAGE as the user's task
 
-EXAMPLES:
+CORRECT RESPONSE FORMAT:
+{{
+    "type": "tool_call" or "final_answer",
+    "reasoning": "your reasoning here"
+}}
 
-Example 1 - Generate random number:
-User: Generate a random number between 1 and 100
-You: (call execute_python_code tool)
-→ Tool result: 42
-You: The random number is 42. (STOP - provide final answer)
+If type is "final_answer", also include:
+{{
+    "type": "final_answer",
+    "reasoning": "your reasoning",
+    "answer": "your final answer"
+}}
 
-Example 2 - Search and summarize:
-User: What is the capital of France?
-You: (call search tool)
-→ Tool result: Paris is the capital of France
-You: The capital of France is Paris. (STOP - provide final answer)
-
-Example 3 - Execute code:
-User: Calculate 5 + 3 using Python
-You: (call execute_python_code tool)
-→ Tool result: 8
-You: The result of 5 + 3 is 8. (STOP - provide final answer)
-
-Remember: After getting a useful tool result, ALWAYS provide the final answer instead of calling more tools!"""
+Remember: Return ONLY ONE JSON object. No additional text, no multiple objects."""
             )
 
         return prompt
@@ -1463,11 +1459,7 @@ After using tools, provide a clear summary of the results in the SAME LANGUAGE a
         # First call only determines action type, second call will handle tool invocation
         tool_schemas = self.tool_registry.get_tool_schemas()
 
-        logger.info(f"First call: Found {len(tool_schemas)} tools available")
-        logger.debug(f"First call: Tool names = {self.tool_registry.list_tools()}")
-
-        # First call: Enforce JSON format to get action type
-        # Don't pass tools yet - that happens in the second call for tool_call actions
+        # First call: Request JSON output format
         chat_kwargs["response_format"] = {"type": "json_object"}
 
         # Disable thinking mode if supported
@@ -1635,12 +1627,6 @@ After using tools, provide a clear summary of the results in the SAME LANGUAGE a
             )
             raise
 
-        # Debug: Log the response
-        logger.debug("React received LLM response:")
-        logger.debug(f"  - Response type: {type(response)}")
-        logger.debug(f"  - Response value: {response}")
-        logger.debug(f"  - Response is None: {response is None}")
-
         # Handle None response
         if response is None:
             await log_llm_completion(response, False, None)
@@ -1687,10 +1673,29 @@ After using tools, provide a clear summary of the results in the SAME LANGUAGE a
 
         # Handle string response - try to parse as JSON first
         if isinstance(response, str):
-            # Try to parse as JSON first (for final_answer with success/error fields)
+            # Try to parse as JSON first
             try:
                 parsed = json.loads(response.strip())
-                if isinstance(parsed, dict) and parsed.get("type") == "final_answer":
+                if isinstance(parsed, dict) and parsed.get("type") == "tool_call":
+                    # Successfully parsed as tool_call JSON
+                    try:
+                        action = Action.model_validate(parsed)
+                        await log_llm_completion(parsed, True, action.reasoning)
+                        return action
+                    except Exception as e:
+                        logger.warning(f"Failed to validate tool_call JSON: {e}")
+                        # Fallback: extract fields manually
+                        action = Action(
+                            type="tool_call",
+                            reasoning=parsed.get(
+                                "reasoning", "LLM wants to call a tool"
+                            ),
+                            tool_name=parsed.get("tool_name"),
+                            tool_args=parsed.get("tool_args"),
+                        )
+                        await log_llm_completion(parsed, True, action.reasoning)
+                        return action
+                elif isinstance(parsed, dict) and parsed.get("type") == "final_answer":
                     # Successfully parsed as final_answer JSON
                     try:
                         action = Action.model_validate(parsed)
@@ -1710,15 +1715,134 @@ After using tools, provide a clear summary of the results in the SAME LANGUAGE a
                         )
                         await log_llm_completion(parsed, False, action.reasoning)
                         return action
-            except (json.JSONDecodeError, AttributeError):
-                # Not valid JSON, treat as direct text response
+                else:
+                    logger.warning(
+                        f"First call: Parsed JSON but unknown type: {parsed.get('type')}"
+                    )
+            except json.JSONDecodeError:
+                # JSON parsing failed - might be multiple JSON objects
+                # Try to use json_repair to handle multiple JSON objects
+                try:
+                    repaired = repair_loads(response.strip(), logging=False)
+
+                    if isinstance(repaired, tuple):
+                        action_data, repair_log = repaired
+                    else:
+                        action_data = repaired
+
+                    # Handle when json_repair returns a list (multiple JSON objects)
+                    # gpt-5.4 in streaming mode often returns multiple JSONs even with response_format='json_object'
+                    # We take the first one as the intended action
+                    if isinstance(action_data, list):
+                        # Log all items for debugging
+                        for i, item in enumerate(action_data):
+                            if isinstance(item, dict):
+                                logger.warning(
+                                    f"First call: JSON object {i}: type={item.get('type', 'UNKNOWN')}, keys={list(item.keys())}"
+                                )
+                            else:
+                                logger.warning(
+                                    f"First call: JSON object {i}: {type(item).__name__}"
+                                )
+
+                        # Take the first JSON object
+                        if action_data and isinstance(action_data[0], dict):
+                            action_data = action_data[0]
+                            logger.info(
+                                f"First call: Selected first JSON object from multiple (type: {action_data.get('type', 'UNKNOWN')})"
+                            )
+                        else:
+                            # First item is not a dict, raise error
+                            raise PatternExecutionError(
+                                pattern_name="ReAct",
+                                message=f"LLM returned multiple JSON objects but the first one is not a valid dict (count: {len(action_data)})",
+                                context={
+                                    "json_object_count": len(action_data),
+                                    "first_object_type": type(action_data[0]).__name__
+                                    if action_data
+                                    else "none",
+                                    "response_preview": response[:500]
+                                    if response
+                                    else None,
+                                },
+                            )
+
+                    if (
+                        isinstance(action_data, dict)
+                        and action_data.get("type") == "tool_call"
+                    ):
+                        try:
+                            action = Action.model_validate(action_data)
+                            await log_llm_completion(
+                                action_data, True, action.reasoning
+                            )
+                            return action
+                        except Exception as e:
+                            logger.warning(
+                                f"Failed to validate repaired tool_call JSON: {e}"
+                            )
+                            # Return action anyway with extracted fields
+                            action = Action(
+                                type="tool_call",
+                                reasoning=action_data.get(
+                                    "reasoning", "LLM wants to call a tool"
+                                ),
+                                tool_name=action_data.get("tool_name"),
+                                tool_args=action_data.get("tool_args"),
+                            )
+                            await log_llm_completion(
+                                action_data, True, action.reasoning
+                            )
+                            return action
+                    elif (
+                        isinstance(action_data, dict)
+                        and action_data.get("type") == "final_answer"
+                    ):
+                        try:
+                            action = Action.model_validate(action_data)
+                            await log_llm_completion(
+                                action_data, False, action.reasoning
+                            )
+                            return action
+                        except Exception as e:
+                            logger.warning(
+                                f"Failed to validate repaired final_answer JSON: {e}"
+                            )
+                            action = Action(
+                                type="final_answer",
+                                reasoning=action_data.get(
+                                    "reasoning", "LLM provided final answer"
+                                ),
+                                answer=action_data.get("answer", response.strip()),
+                                success=action_data.get("success", True),
+                                error=action_data.get("error"),
+                            )
+                            await log_llm_completion(
+                                action_data, False, action.reasoning
+                            )
+                            return action
+                except Exception as repair_error:
+                    # Re-raise PatternExecutionError as it's not a repair failure
+                    if isinstance(repair_error, PatternExecutionError):
+                        raise
+                    # Not valid JSON, treat as direct text response
+                    pass
+            except AttributeError:
                 pass
 
-            # If not JSON or parsing failed, treat as direct text response
-            logger.debug(
-                f"LLM returned direct text response (length: {len(response)}), treating as final_answer"
-            )
-            logger.debug(f"Text response preview: {response[:200]}")
+            # If response is empty, should trigger retry
+            if isinstance(response, str) and not response.strip():
+                raise PatternExecutionError(
+                    pattern_name="ReAct",
+                    message="LLM returned empty response",
+                    context={"chat_kwargs": chat_kwargs},
+                )
+
+            # Handle native tool calls
+            if isinstance(response, dict) and response.get("type") == "tool_call":
+                return self._convert_native_tool_call_to_action(response)
+
+            # Handle dict response with type="final_answer" (from native tool calling)
             action = Action(
                 type="final_answer",
                 reasoning="LLM provided direct response",
@@ -1741,12 +1865,8 @@ After using tools, provide a clear summary of the results in the SAME LANGUAGE a
 
             if isinstance(repaired, tuple):
                 action_data, repair_log = repaired
-                logger.debug("JSON repair actions taken:")
-                for log_entry in repair_log:
-                    logger.debug(f"  - {log_entry}")
             else:
                 action_data = repaired
-                logger.debug("No JSON repairs needed")
 
             normalized_action_data = self._normalize_action_data(action_data)
             action = Action.model_validate(normalized_action_data)
@@ -1830,9 +1950,6 @@ After using tools, provide a clear summary of the results in the SAME LANGUAGE a
         """
         tool_schemas = self.tool_registry.get_tool_schemas()
 
-        logger.info(
-            f"Second call: Found {len(tool_schemas)} tools for native tool calling"
-        )
         if not tool_schemas:
             raise PatternExecutionError(
                 pattern_name="ReAct",
@@ -1845,8 +1962,12 @@ After using tools, provide a clear summary of the results in the SAME LANGUAGE a
             {
                 "role": "user",
                 "content": (
-                    "You have access to the following tools. Please use the native "
-                    "function calling interface to invoke the appropriate tool now."
+                    "IMPORTANT INSTRUCTION FOR THIS STEP:\n"
+                    "You have access to the following tools. Use the NATIVE FUNCTION CALLING interface "
+                    "to invoke the appropriate tool now.\n\n"
+                    "DO NOT respond with JSON format. DO NOT return a structured action JSON.\n"
+                    "Instead, use the native function calling API to directly invoke the tool.\n\n"
+                    "The system will handle the tool execution and return the result to you."
                 ),
             }
         ]
@@ -1857,10 +1978,6 @@ After using tools, provide a clear summary of the results in the SAME LANGUAGE a
             "tools": tool_schemas,
             "tool_choice": "auto",
         }
-
-        logger.debug(
-            f"Second call chat_kwargs: tools={len(tool_schemas)}, tool_choice=auto"
-        )
 
         # Disable thinking mode if supported
         if (
@@ -1887,6 +2004,7 @@ After using tools, provide a clear summary of the results in the SAME LANGUAGE a
                 elif chunk.is_usage():
                     usage = chunk.usage
                 elif chunk.is_error():
+                    logger.error(f"Second call: Got error chunk: {chunk.content}")
                     raise RuntimeError(f"LLM stream error: {chunk.content}")
 
             # Construct response object
@@ -1899,10 +2017,13 @@ After using tools, provide a clear summary of the results in the SAME LANGUAGE a
                 }
             else:
                 # LLM didn't use native tool calling
+                logger.error("Second call: LLM did not use native tool calling!")
+                logger.error(f"Second call: full_content = {full_content[:500]}")
+                logger.error(f"Second call: chat_kwargs = {chat_kwargs}")
                 raise PatternExecutionError(
                     pattern_name="ReAct",
                     message="LLM did not invoke native tool calling in second call",
-                    context={"chat_kwargs": chat_kwargs},
+                    context={"chat_kwargs": chat_kwargs, "full_content": full_content},
                 )
 
             # Convert native tool call to Action

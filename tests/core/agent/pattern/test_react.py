@@ -526,7 +526,9 @@ async def test_react_failure_detection_with_context():
 @pytest.mark.asyncio
 async def test_react_truncated_json():
     """Test ReAct pattern with truncated JSON response in native tool calling mode"""
-    # Truncated JSON (missing closing brace) - treated as text response
+    # Truncated JSON (missing closing brace)
+    # json_repair can repair this by adding the missing brace, so it becomes valid tool_call
+    # This triggers a second call which returns the default final_answer
     truncated_json = '{"type": "tool_call", "reasoning": "I need to calculate", "tool_name": "calculator", "tool_args": {"expression": "2+2"'
 
     responses = [truncated_json]
@@ -543,10 +545,49 @@ async def test_react_truncated_json():
         context=AgentContext(),
     )
 
-    # In native tool calling mode, truncated JSON is treated as text response
+    # json_repair repairs the truncated JSON to valid tool_call
+    # which triggers second call that returns default final_answer
     assert result["success"] is True
-    assert result["output"] == truncated_json
+    assert result["output"] == "Task completed successfully"
     assert "execution_history" in result
+
+
+@pytest.mark.asyncio
+async def test_react_multiple_json_objects():
+    """Test ReAct pattern with multiple JSON objects - should select first one"""
+
+    # Multiple JSON objects concatenated - gpt-5.4 behavior in streaming mode
+    # First JSON is tool_call, second is something else (code), third is final_answer
+    multiple_jsons = '{"type": "tool_call", "reasoning": "Need to calculate"}{"code":"import random","capture_output":true}{"type": "final_answer", "reasoning": "Done", "answer": "Result"}'
+
+    # Override stream_chat to return multiple JSONs
+    class AlwaysMultipleJSONsLLM(MockReActLLM):
+        async def stream_chat(self, messages, **kwargs):
+            # Always return multiple JSONs
+            yield StreamChunk(
+                type=ChunkType.TOKEN, content=multiple_jsons, delta=multiple_jsons
+            )
+            yield StreamChunk(type=ChunkType.END, finish_reason="stop")
+
+    llm = AlwaysMultipleJSONsLLM([])
+    memory = DummyMemoryStore()
+    tools = [MockCalculatorTool()]
+    pattern = ReActPattern(
+        llm, max_iterations=1
+    )  # Only 1 iteration to avoid retry loop
+
+    # Should fail because first JSON (tool_call) doesn't have tool_name/tool_args
+    # This will cause second call to fail with "LLM did not invoke native tool calling"
+    # After max_iterations is reached, it should raise MaxIterationsError
+    from xagent.core.agent.exceptions import MaxIterationsError
+
+    with pytest.raises(MaxIterationsError):
+        await pattern.run(
+            task="Test multiple JSONs",
+            memory=memory,
+            tools=tools,
+            context=AgentContext(),
+        )
 
 
 @pytest.mark.asyncio

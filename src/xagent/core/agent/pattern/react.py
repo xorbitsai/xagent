@@ -1463,6 +1463,9 @@ After using tools, provide a clear summary of the results in the SAME LANGUAGE a
         # First call only determines action type, second call will handle tool invocation
         tool_schemas = self.tool_registry.get_tool_schemas()
 
+        logger.info(f"First call: Found {len(tool_schemas)} tools available")
+        logger.debug(f"First call: Tool names = {self.tool_registry.list_tools()}")
+
         # First call: Enforce JSON format to get action type
         # Don't pass tools yet - that happens in the second call for tool_call actions
         chat_kwargs["response_format"] = {"type": "json_object"}
@@ -1827,6 +1830,16 @@ After using tools, provide a clear summary of the results in the SAME LANGUAGE a
         """
         tool_schemas = self.tool_registry.get_tool_schemas()
 
+        logger.info(
+            f"Second call: Found {len(tool_schemas)} tools for native tool calling"
+        )
+        if not tool_schemas:
+            raise PatternExecutionError(
+                pattern_name="ReAct",
+                message="No tools available for tool calling",
+                context={"available_tools": self.tool_registry.list_tools()},
+            )
+
         # Add a system prompt to guide LLM to use native tool calling
         messages_with_prompt = messages + [
             {
@@ -1844,6 +1857,10 @@ After using tools, provide a clear summary of the results in the SAME LANGUAGE a
             "tools": tool_schemas,
             "tool_choice": "auto",
         }
+
+        logger.debug(
+            f"Second call chat_kwargs: tools={len(tool_schemas)}, tool_choice=auto"
+        )
 
         # Disable thinking mode if supported
         if (

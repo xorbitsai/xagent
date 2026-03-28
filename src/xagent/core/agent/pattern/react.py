@@ -791,24 +791,30 @@ class ReActPattern(AgentPattern):
                     },
                 )
 
-                # Get structured action from LLM
+                # Get structured action from LLM (first call: determine action type)
                 action = await self._get_action_from_llm(messages)
 
-                # Emit reasoning trace before executing tool to keep UI in sync
-                if action.type == "tool_call" and action.reasoning:
-                    await trace_ai_message(
-                        self.tracer,
-                        task_id,
-                        message=action.reasoning,
-                        data={
-                            "content": action.reasoning,
-                            "message_type": "reasoning",
-                            "action_type": action.type,
-                            "tool_name": action.tool_name,
-                            "step_id": step_id,
-                            "step_name": getattr(self, "_current_step_name", "main"),
-                        },
-                    )
+                # If action is tool_call, make a second LLM call to get actual tool invocation
+                if action.type == "tool_call":
+                    # Emit reasoning trace before second call
+                    if action.reasoning:
+                        await trace_ai_message(
+                            self.tracer,
+                            task_id,
+                            message=action.reasoning,
+                            data={
+                                "content": action.reasoning,
+                                "message_type": "reasoning",
+                                "action_type": action.type,
+                                "step_id": step_id,
+                                "step_name": getattr(
+                                    self, "_current_step_name", "main"
+                                ),
+                            },
+                        )
+
+                    # Second call: Invoke tool using native tool calling
+                    action = await self._invoke_tool_via_native_call(messages)
 
                 # Execute the action
                 result = await self._execute_action(action, messages, task_id, step_id)
@@ -1474,18 +1480,13 @@ After using tools, provide a clear summary of the results in the SAME LANGUAGE a
             "messages": final_messages,
         }
 
-        # Get tool schemas
+        # Get tool schemas (but don't pass to LLM in first call)
+        # First call only determines action type, second call will handle tool invocation
         tool_schemas = self.tool_registry.get_tool_schemas()
 
-        # Only enforce JSON format when NO tools available
-        # When tools are available, let LLM use native tool call without JSON format restriction
-        if not tool_schemas:
-            chat_kwargs["response_format"] = {"type": "json_object"}
-        else:
-            # Pass tools to LLM for native tool calling
-            chat_kwargs["tools"] = tool_schemas
-            # Explicitly set tool_choice to auto to ensure tools are used
-            chat_kwargs["tool_choice"] = "auto"
+        # First call: Enforce JSON format to get action type
+        # Don't pass tools yet - that happens in the second call for tool_call actions
+        chat_kwargs["response_format"] = {"type": "json_object"}
 
         # Disable thinking mode if supported
         if (
@@ -1833,6 +1834,90 @@ After using tools, provide a clear summary of the results in the SAME LANGUAGE a
                 pattern_name="ReAct",
                 message=f"Invalid action format: {str(e)}",
                 context={"response": response},
+            )
+
+    async def _invoke_tool_via_native_call(
+        self, messages: List[Dict[str, str]]
+    ) -> Action:
+        """
+        Second LLM call to invoke tool using native tool calling API.
+
+        This method is called when the first LLM call returns action.type == "tool_call".
+        It makes a second call with tool_schemas, prompting the LLM to use native
+        function calling to select and invoke the appropriate tool.
+        """
+        tool_schemas = self.tool_registry.get_tool_schemas()
+
+        # Add a system prompt to guide LLM to use native tool calling
+        messages_with_prompt = messages + [
+            {
+                "role": "user",
+                "content": (
+                    "You have access to the following tools. Please use the native "
+                    "function calling interface to invoke the appropriate tool now."
+                ),
+            }
+        ]
+
+        # Prepare chat parameters for native tool calling
+        chat_kwargs: Dict[str, Any] = {
+            "messages": messages_with_prompt,
+            "tools": tool_schemas,
+            "tool_choice": "auto",
+        }
+
+        # Disable thinking mode if supported
+        if (
+            hasattr(self.llm, "supports_thinking_mode")
+            and self.llm.supports_thinking_mode
+        ):
+            chat_kwargs["thinking"] = {"type": "disabled"}
+
+        try:
+            # Clean messages before sending to LLM
+            cleaned_messages = clean_messages(messages)
+            chat_kwargs["messages"] = cleaned_messages
+
+            # Get LLM response using streaming API
+            full_content = ""
+            usage = {}
+            tool_calls_from_stream = []
+
+            async for chunk in self.llm.stream_chat(**chat_kwargs):
+                if chunk.is_token():
+                    full_content += chunk.delta
+                elif chunk.is_tool_call():
+                    tool_calls_from_stream = chunk.tool_calls
+                elif chunk.is_usage():
+                    usage = chunk.usage
+                elif chunk.is_error():
+                    raise RuntimeError(f"LLM stream error: {chunk.content}")
+
+            # Construct response object
+            if tool_calls_from_stream:
+                response = {
+                    "type": "tool_call",
+                    "tool_calls": tool_calls_from_stream,
+                    "reasoning": full_content.strip() if full_content else "",
+                    "raw": {"usage": usage} if usage else {},
+                }
+            else:
+                # LLM didn't use native tool calling
+                raise PatternExecutionError(
+                    pattern_name="ReAct",
+                    message="LLM did not invoke native tool calling in second call",
+                    context={"chat_kwargs": chat_kwargs},
+                )
+
+            # Convert native tool call to Action
+            return self._convert_native_tool_call_to_action(response)
+
+        except Exception as e:
+            logger.error(f"Tool invocation via native call failed: {str(e)}")
+            raise PatternExecutionError(
+                pattern_name="ReAct",
+                message=f"Failed to invoke tool via native calling: {str(e)}",
+                context={"error": str(e), "chat_kwargs": chat_kwargs},
             )
 
     def _normalize_action_data(self, action_data: Any) -> Any:

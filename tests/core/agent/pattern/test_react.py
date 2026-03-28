@@ -163,7 +163,11 @@ class DummyMemoryStore(MemoryStore):
 async def test_react_basic_execution():
     """Test basic ReAct pattern execution"""
     responses = [
-        '{"type": "tool_call", "reasoning": "I need to calculate 2+2", "tool_name": "calculator", "tool_args": {"expression": "2+2"}}',
+        # First call: return action type
+        '{"type": "tool_call", "reasoning": "I need to calculate 2+2"}',
+        # Second call: return native tool call
+        '{"type": "tool_call", "reasoning": "Calling calculator", "tool_name": "calculator", "tool_args": {"expression": "2+2"}}',
+        # Third call: return final answer
         '{"type": "final_answer", "reasoning": "The calculation is complete", "answer": "The result is 4", "success": true, "error": null}',
     ]
 
@@ -181,7 +185,7 @@ async def test_react_basic_execution():
 
     assert result["success"] is True
     assert result["output"] == "The result is 4"
-    assert result["iterations"] == 2
+    assert result["iterations"] == 2  # Still 2 iterations (tool_call + final_answer)
     assert "execution_history" in result
 
 
@@ -219,7 +223,11 @@ async def test_react_with_context():
 async def test_react_tool_execution():
     """Test ReAct pattern with tool execution"""
     responses = [
-        '{"type": "tool_call", "reasoning": "I need to calculate something", "tool_name": "calculator", "tool_args": {"expression": "10*5"}}',
+        # First call: return action type
+        '{"type": "tool_call", "reasoning": "I need to calculate something"}',
+        # Second call: return native tool call
+        '{"type": "tool_call", "reasoning": "Calling calculator", "tool_name": "calculator", "tool_args": {"expression": "10*5"}}',
+        # Third call: return final answer
         '{"type": "final_answer", "reasoning": "The calculation is complete", "answer": "The calculation result is 50", "success": true, "error": null}',
     ]
 
@@ -244,10 +252,16 @@ async def test_react_tool_execution():
 async def test_react_max_iterations():
     """Test ReAct pattern hitting max iterations"""
     # Return tool calls that never lead to final answer
+    # Each iteration now requires 2 calls: action type + native tool call
     responses = [
-        '{"type": "tool_call", "reasoning": "I need to calculate something", "tool_name": "calculator", "tool_args": {"expression": "1+1"}}',
-        '{"type": "tool_call", "reasoning": "I need to calculate more", "tool_name": "calculator", "tool_args": {"expression": "2+2"}}',
-        '{"type": "tool_call", "reasoning": "Still calculating", "tool_name": "calculator", "tool_args": {"expression": "3+3"}}',
+        # Iteration 1, call 1: action type
+        '{"type": "tool_call", "reasoning": "I need to calculate something"}',
+        # Iteration 1, call 2: native tool call
+        '{"type": "tool_call", "reasoning": "Calling calculator", "tool_name": "calculator", "tool_args": {"expression": "1+1"}}',
+        # Iteration 2, call 1: action type
+        '{"type": "tool_call", "reasoning": "I need to calculate more"}',
+        # Iteration 2, call 2: native tool call
+        '{"type": "tool_call", "reasoning": "Still calculating", "tool_name": "calculator", "tool_args": {"expression": "2+2"}}',
     ]
 
     llm = MockReActLLM(responses)
@@ -293,7 +307,11 @@ async def test_react_invalid_json():
 async def test_react_tool_not_found():
     """Test ReAct pattern with non-existent tool"""
     responses = [
-        '{"type": "tool_call", "reasoning": "Trying to use non-existent tool", "tool_name": "nonexistent", "tool_args": {}}',
+        # First call: action type
+        '{"type": "tool_call", "reasoning": "Trying to use non-existent tool"}',
+        # Second call: native tool call with non-existent tool
+        '{"type": "tool_call", "reasoning": "Calling nonexistent", "tool_name": "nonexistent", "tool_args": {}}',
+        # Third call: final answer after tool failure
         '{"type": "final_answer", "reasoning": "Could not complete task due to missing tool", "answer": "Could not complete task due to missing tool"}',
     ]
 
@@ -343,8 +361,15 @@ async def test_react_none_response():
 async def test_react_self_reflection():
     """Test ReAct pattern with self-reflection on failure"""
     responses = [
-        '{"type": "tool_call", "reasoning": "Trying calculator", "tool_name": "calculator", "tool_args": {"expression": "invalid expression"}}',
-        '{"type": "tool_call", "reasoning": "The previous action failed, let me try a different approach", "tool_name": "calculator", "tool_args": {"expression": "2+2"}}',
+        # Iteration 1, call 1: action type
+        '{"type": "tool_call", "reasoning": "Trying calculator"}',
+        # Iteration 1, call 2: native tool call (will fail)
+        '{"type": "tool_call", "reasoning": "Calling calculator with invalid expr", "tool_name": "calculator", "tool_args": {"expression": "invalid expression"}}',
+        # Iteration 2, call 1: action type
+        '{"type": "tool_call", "reasoning": "The previous action failed, let me try a different approach"}',
+        # Iteration 2, call 2: native tool call
+        '{"type": "tool_call", "reasoning": "Calling calculator with valid expr", "tool_name": "calculator", "tool_args": {"expression": "2+2"}}',
+        # Final answer
         '{"type": "final_answer", "reasoning": "After retrying, the answer is 4", "answer": "After retrying, the answer is 4"}',
     ]
 

@@ -794,6 +794,22 @@ class ReActPattern(AgentPattern):
                 # Get structured action from LLM
                 action = await self._get_action_from_llm(messages)
 
+                # Emit reasoning trace before executing tool to keep UI in sync
+                if action.type == "tool_call" and action.reasoning:
+                    await trace_ai_message(
+                        self.tracer,
+                        task_id,
+                        message=action.reasoning,
+                        data={
+                            "content": action.reasoning,
+                            "message_type": "reasoning",
+                            "action_type": action.type,
+                            "tool_name": action.tool_name,
+                            "step_id": step_id,
+                            "step_name": getattr(self, "_current_step_name", "main"),
+                        },
+                    )
+
                 # Execute the action
                 result = await self._execute_action(action, messages, task_id, step_id)
 
@@ -811,6 +827,7 @@ class ReActPattern(AgentPattern):
                         "result_type": result["type"],
                         "step_id": step_id,
                         "step_name": getattr(self, "_current_step_name", "main"),
+                        "reasoning": action.reasoning,
                     },
                 )
 
@@ -1205,8 +1222,6 @@ You must respond with a structured action in the following JSON format:
 {{
     "type": "tool_call" | "final_answer",
     "reasoning": "Your reasoning for this action",
-    "tool_name": "name_of_tool" (only if type is "tool_call"),
-    "tool_args": {{}} (only if type is "tool_call"),
     "answer": "your final answer" (only if type is "final_answer"),
    }}
 
@@ -1216,6 +1231,8 @@ Available tools:
 CRITICAL INSTRUCTIONS - READ CAREFULLY:
 
 1. You can use native function calling to invoke tools when needed
+   - When you decide to call a tool, ONLY set "type" to "tool_call" and explain your reasoning
+   - Do NOT include tool names or arguments in the JSON; the system will invoke the tool automatically
 
 2. AFTER EACH TOOL CALL - STOP AND DECIDE:
    - Review the tool execution result carefully
@@ -1339,8 +1356,6 @@ You must respond with a structured action in the following JSON format:
 {{
     "type": "tool_call" | "final_answer",
     "reasoning": "Your reasoning for this action",
-    "tool_name": "name_of_tool" (only if type is "tool_call"),
-    "tool_args": {{}} (only if type is "tool_call"),
     "answer": "your final answer" (only if type is "final_answer"),
     "success": true (only if type is "final_answer"),
     "error": null (only if type is "final_answer")
@@ -1350,7 +1365,9 @@ Available tools:
 {chr(10).join(tool_descriptions)}
 
 You have access to the above tools. Use them when needed to complete the task.
-The tools will be called automatically through the native function calling API.
+When you decide to call a tool, ONLY set the action type to "tool_call" and explain why.
+Do NOT include tool names or arguments in the JSON; the system will automatically invoke
+the appropriate tool through the native function calling API based on your decision.
 After using tools, provide a clear summary of the results in the SAME LANGUAGE as the user's task.
 """
 
@@ -1507,6 +1524,41 @@ After using tools, provide a clear summary of the results in the SAME LANGUAGE a
             },
         )
 
+        response: Any = None
+        llm_trace_sent = False
+
+        async def log_llm_completion(
+            response_payload: Any,
+            is_tool_call_flag: bool,
+            reasoning_value: Optional[str],
+        ) -> None:
+            nonlocal llm_trace_sent
+            if llm_trace_sent:
+                return
+            await trace_action_end(
+                self.tracer,
+                task_id,
+                step_id,
+                TraceCategory.LLM,
+                data={
+                    "action": "LLM call completed",
+                    "model_name": getattr(
+                        self.llm, "model_name", type(self.llm).__name__
+                    ),
+                    "task_type": "LLM call",
+                    "attempt": 1,
+                    "response_type": type(response_payload).__name__,
+                    "is_tool_call": is_tool_call_flag,
+                    "response": response_payload,
+                    "chat_kwargs": chat_kwargs,
+                    "usage": usage,
+                    "step_id": step_id,
+                    "step_name": getattr(self, "_current_step_name", "main"),
+                    "reasoning": reasoning_value,
+                },
+            )
+            llm_trace_sent = True
+
         try:
             # Clean messages before sending to LLM
             cleaned_messages = clean_messages(messages)
@@ -1536,61 +1588,56 @@ After using tools, provide a clear summary of the results in the SAME LANGUAGE a
                 )
 
             # Construct response object (maintaining compatibility with original chat() format)
-            response: Any
+            reasoning_text = full_content.strip()
+            if reasoning_text:
+                extracted_reasoning: Optional[str] = None
+                try:
+                    parsed_reasoning = repair_loads(reasoning_text, logging=False)
+                    if isinstance(parsed_reasoning, dict):
+                        extracted_reasoning = parsed_reasoning.get("reasoning")
+                        if not extracted_reasoning:
+                            # Some models put the explanation under "content"
+                            content_value = parsed_reasoning.get("content")
+                            if isinstance(content_value, str):
+                                extracted_reasoning = content_value
+                    elif isinstance(parsed_reasoning, list):
+                        # Look for first dict item with reasoning/content fields
+                        for item in parsed_reasoning:
+                            if isinstance(item, dict):
+                                extracted_reasoning = item.get("reasoning") or item.get(
+                                    "content"
+                                )
+                                if extracted_reasoning:
+                                    break
+                except Exception:
+                    extracted_reasoning = None
+
+                if extracted_reasoning:
+                    reasoning_text = extracted_reasoning.strip()
+
             if tool_calls_from_stream:
                 response = {
                     "type": "tool_call",
                     "tool_calls": tool_calls_from_stream,
                     "raw": {"usage": usage} if usage else {},
                 }
+                if reasoning_text:
+                    # Preserve assistant text so reasoning is not lost in traces
+                    response["reasoning"] = reasoning_text
+                    response["content"] = reasoning_text
             else:
                 response = full_content
 
-            # Trace LLM call end
-            # Parse response to check if it contains tool calls
-            is_tool_call = False
-            parsed_response: Any = None
-
-            # Use consistent tool call detection with execution logic
-            if isinstance(response, dict) and response.get("type") == "tool_call":
-                is_tool_call = True
-                parsed_response = response
-            elif isinstance(response, str):
-                try:
-                    parsed_response = json.loads(response)
-                    if (
-                        isinstance(parsed_response, dict)
-                        and parsed_response.get("type") == "tool_call"
-                    ):
-                        is_tool_call = True
-                except (json.JSONDecodeError, AttributeError):
-                    parsed_response = response
-            else:
-                parsed_response = response
-
-            await trace_action_end(
-                self.tracer,
-                task_id,
-                step_id,
-                TraceCategory.LLM,
-                data={
-                    "action": "LLM call completed",
-                    "model_name": getattr(
-                        self.llm, "model_name", type(self.llm).__name__
-                    ),
-                    "task_type": "LLM call",
-                    "attempt": 1,
-                    "response_type": type(response).__name__,
-                    "is_tool_call": is_tool_call,
-                    "response": parsed_response,
-                    "chat_kwargs": chat_kwargs,
-                    "usage": usage,  # Add token statistics
-                    "step_id": step_id,
-                    "step_name": getattr(self, "_current_step_name", "main"),
-                },
-            )
         except Exception as e:
             # Trace LLM call error
+            try:
+                await log_llm_completion(
+                    response,
+                    isinstance(response, dict) and response.get("type") == "tool_call",
+                    None,
+                )
+            except Exception:
+                pass
             await trace_error(
                 self.tracer,
                 task_id,
@@ -1613,6 +1660,7 @@ After using tools, provide a clear summary of the results in the SAME LANGUAGE a
 
         # Handle None response
         if response is None:
+            await log_llm_completion(response, False, None)
             raise PatternExecutionError(
                 pattern_name="ReAct",
                 message="LLM returned None response",
@@ -1621,6 +1669,7 @@ After using tools, provide a clear summary of the results in the SAME LANGUAGE a
 
         # Handle empty response - should trigger retry
         if isinstance(response, str) and not response.strip():
+            await log_llm_completion(response, False, None)
             raise PatternExecutionError(
                 pattern_name="ReAct",
                 message="LLM returned empty response",
@@ -1629,23 +1678,29 @@ After using tools, provide a clear summary of the results in the SAME LANGUAGE a
 
         # Handle native tool calls
         if isinstance(response, dict) and response.get("type") == "tool_call":
-            return self._convert_native_tool_call_to_action(response)
+            action = self._convert_native_tool_call_to_action(response)
+            await log_llm_completion(response, True, action.reasoning)
+            return action
 
         # Handle dict response with type="final_answer" (from native tool calling)
         if isinstance(response, dict) and response.get("type") == "final_answer":
             # Convert dict to Action
             try:
-                return Action.model_validate(response)
+                action = Action.model_validate(response)
+                await log_llm_completion(response, False, action.reasoning)
+                return action
             except Exception as e:
                 logger.warning(f"Failed to validate final_answer dict: {e}")
                 # Fallback: extract answer field
-                return Action(
+                action = Action(
                     type="final_answer",
                     reasoning="LLM provided final answer",
                     answer=response.get("answer", str(response)),
                     success=response.get("success", True),
                     error=response.get("error"),
                 )
+                await log_llm_completion(response, False, action.reasoning)
+                return action
 
         # Handle string response - try to parse as JSON first
         if isinstance(response, str):
@@ -1655,11 +1710,13 @@ After using tools, provide a clear summary of the results in the SAME LANGUAGE a
                 if isinstance(parsed, dict) and parsed.get("type") == "final_answer":
                     # Successfully parsed as final_answer JSON
                     try:
-                        return Action.model_validate(parsed)
+                        action = Action.model_validate(parsed)
+                        await log_llm_completion(parsed, False, action.reasoning)
+                        return action
                     except Exception as e:
                         logger.warning(f"Failed to validate final_answer JSON: {e}")
                         # Fallback: extract fields manually
-                        return Action(
+                        action = Action(
                             type="final_answer",
                             reasoning=parsed.get(
                                 "reasoning", "LLM provided final answer"
@@ -1668,6 +1725,8 @@ After using tools, provide a clear summary of the results in the SAME LANGUAGE a
                             success=parsed.get("success", True),
                             error=parsed.get("error"),
                         )
+                        await log_llm_completion(parsed, False, action.reasoning)
+                        return action
             except (json.JSONDecodeError, AttributeError):
                 # Not valid JSON, treat as direct text response
                 pass
@@ -1684,6 +1743,7 @@ After using tools, provide a clear summary of the results in the SAME LANGUAGE a
                 success=True,
                 error=None,
             )
+            await log_llm_completion(response, False, action.reasoning)
 
             # Since we're bypassing _execute_action, we need to trace here
             # Check if we have context for tracing
@@ -1706,10 +1766,55 @@ After using tools, provide a clear summary of the results in the SAME LANGUAGE a
                 logger.debug("No JSON repairs needed")
 
             normalized_action_data = self._normalize_action_data(action_data)
-            return Action.model_validate(normalized_action_data)
+            action = Action.model_validate(normalized_action_data)
+            await log_llm_completion(
+                normalized_action_data, action.type == "tool_call", action.reasoning
+            )
+
+            if action.type == "tool_call":
+                if tool_schemas:
+                    # JSON responses must not attempt to specify tool details.
+                    # Require the model to trigger native function calling.
+                    messages.append(
+                        {
+                            "role": "user",
+                            "content": (
+                                "SYSTEM REMINDER: Tool calls must be executed via the native "
+                                "function calling interface. Respond again, trigger the tool "
+                                'directly, and only set "type" to "tool_call" in your JSON.'
+                            ),
+                        }
+                    )
+                    raise PatternExecutionError(
+                        pattern_name="ReAct",
+                        message=(
+                            "Tool call requested via JSON without a native tool call. "
+                            "Tools must be invoked through the function calling API."
+                        ),
+                        context={"response": response},
+                    )
+                else:
+                    # No tools available but model attempted to call one.
+                    messages.append(
+                        {
+                            "role": "user",
+                            "content": (
+                                "SYSTEM REMINDER: No tools are available for this task. "
+                                "Provide a final answer JSON instead of requesting a tool."
+                            ),
+                        }
+                    )
+                    raise PatternExecutionError(
+                        pattern_name="ReAct",
+                        message="Tool call requested when no tools are available.",
+                        context={"response": response},
+                    )
+
+            return action
         except json.JSONDecodeError as e:
             logging.info(f"invalid json response: {content}")
             # JSON parsing failed - raise error for retry
+            await log_llm_completion(response, False, None)
             raise PatternExecutionError(
                 pattern_name="ReAct",
                 message=f"JSON response is invalid: {str(e)}",
@@ -1723,6 +1828,7 @@ After using tools, provide a clear summary of the results in the SAME LANGUAGE a
                 },
             )
         except ValidationError as e:
+            await log_llm_completion(response, False, None)
             raise PatternExecutionError(
                 pattern_name="ReAct",
                 message=f"Invalid action format: {str(e)}",
@@ -1768,13 +1874,11 @@ After using tools, provide a clear summary of the results in the SAME LANGUAGE a
 
             return {
                 "type": "final_answer",
-                "reasoning": "LLM returned a list; using first element as final answer text",
                 "answer": primary,
             }
 
         return {
             "type": "final_answer",
-            "reasoning": "LLM returned unsupported list item; stringified as final answer",
             "answer": str(primary),
         }
 
@@ -1816,9 +1920,11 @@ After using tools, provide a clear summary of the results in the SAME LANGUAGE a
         if tool_name.startswith("functions."):
             tool_name = tool_name[len("functions.") :]
 
+        reasoning = response.get("reasoning") or response.get("content") or ""
+
         return Action(
             type="tool_call",
-            reasoning="Tool call initiated by LLM",
+            reasoning=reasoning,
             tool_name=tool_name,
             tool_args=json.loads(function_info.get("arguments", "{}")),
         )

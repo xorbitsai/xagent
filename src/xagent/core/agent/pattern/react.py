@@ -1236,39 +1236,18 @@ Available tools:
 
 CRITICAL INSTRUCTIONS - READ CAREFULLY:
 
-1. You can use native function calling to invoke tools when needed
-   - When you decide to call a tool, ONLY set "type" to "tool_call" and explain your reasoning
-   - Do NOT include tool names or arguments in the JSON; the system will invoke the tool automatically
+1. DECIDE YOUR NEXT ACTION:
+   - If you need to use a tool to accomplish the task, set "type" to "tool_call" and explain why
+   - If you have enough information to answer, set "type" to "final_answer" and provide your answer
+   - Do NOT include tool names or arguments in the JSON
+   - The system will guide you through tool invocation in a follow-up call
 
-2. AFTER EACH TOOL CALL - STOP AND DECIDE:
-   - Review the tool execution result carefully
-   - Ask yourself: "Do I have enough information to answer the user's question?"
-   - If YES → Provide final answer immediately as direct text
-   - If NO → Call another tool
+2. RESPONSE FORMAT:
+   - Always respond with valid JSON
+   - Use the exact format shown below
+   - Do NOT use markdown or backticks
 
-3. STOP CALLING TOOLS when:
-   - You have obtained the information the user requested
-   - The tool result directly answers the user's question
-   - You have completed the requested operation (calculation, code execution, search, etc.)
-   - Another tool call would be redundant or unhelpful
-   - The user is asking for a simple task that only needs ONE tool call
-
-4. PROVIDE FINAL ANSWER:
-   - As direct text response (NOT JSON, NOT another tool call)
-   - Include the relevant information from tool results
-   - Be clear and comprehensive
-
-5. ONE TOOL AT A TIME:
-   - Never call multiple tools in one response
-   - Call one tool, review result, then decide what to do next
-
-6. LANGUAGE: Respond in the SAME LANGUAGE as the user's task
-
-COMMON MISTAKES TO AVOID:
-❌ Don't keep calling tools after getting the answer
-❌ Don't call the same tool twice with similar inputs
-❌ Don't call tools when you already have the answer
-❌ Don't use JSON format for the final answer - use plain text
+3. LANGUAGE: Respond in the SAME LANGUAGE as the user's task
 
 EXAMPLES:
 
@@ -1875,7 +1854,7 @@ After using tools, provide a clear summary of the results in the SAME LANGUAGE a
 
         try:
             # Clean messages before sending to LLM
-            cleaned_messages = clean_messages(messages)
+            cleaned_messages = clean_messages(messages_with_prompt)
             chat_kwargs["messages"] = cleaned_messages
 
             # Get LLM response using streaming API

@@ -887,8 +887,14 @@ class ClaudeLLM(BaseLLM):
                                     tool_id = tool_ids[0]
                             else:
                                 # Fallback to first tool if no index
-                                logger.warning("No event.index, using first tool")
-                                tool_id = list(accumulated_tool_calls.keys())[0]
+                                if accumulated_tool_calls:
+                                    logger.warning("No event.index, using first tool")
+                                    tool_id = list(accumulated_tool_calls.keys())[0]
+                                else:
+                                    logger.warning(
+                                        "No event.index and accumulated_tool_calls is empty, skipping chunk"
+                                    )
+                                    continue
 
                             if tool_id in accumulated_tool_calls:
                                 args = (

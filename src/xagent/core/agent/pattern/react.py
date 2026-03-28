@@ -1678,23 +1678,14 @@ After using tools, provide a clear summary of the results in the SAME LANGUAGE a
                 parsed = json.loads(response.strip())
                 if isinstance(parsed, dict) and parsed.get("type") == "tool_call":
                     # Successfully parsed as tool_call JSON
-                    try:
-                        action = Action.model_validate(parsed)
-                        await log_llm_completion(parsed, True, action.reasoning)
-                        return action
-                    except Exception as e:
-                        logger.warning(f"Failed to validate tool_call JSON: {e}")
-                        # Fallback: extract fields manually
-                        action = Action(
-                            type="tool_call",
-                            reasoning=parsed.get(
-                                "reasoning", "LLM wants to call a tool"
-                            ),
-                            tool_name=parsed.get("tool_name"),
-                            tool_args=parsed.get("tool_args"),
-                        )
-                        await log_llm_completion(parsed, True, action.reasoning)
-                        return action
+                    # Note: Any tool_name/tool_args in the JSON will be ignored.
+                    # The second call uses native function calling to select tools.
+                    action = Action(
+                        type="tool_call",
+                        reasoning=parsed.get("reasoning", "LLM wants to call a tool"),
+                    )
+                    await log_llm_completion(parsed, True, action.reasoning)
+                    return action
                 elif isinstance(parsed, dict) and parsed.get("type") == "final_answer":
                     # Successfully parsed as final_answer JSON
                     try:

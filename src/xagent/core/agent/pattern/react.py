@@ -795,7 +795,7 @@ class ReActPattern(AgentPattern):
                 action = await self._get_action_from_llm(messages)
 
                 # If action is tool_call, make a second LLM call to get actual tool invocation
-                # Skip second call for DAG steps (where step_id != "main") to maintain backward compatibility
+                # Only do this for main ReAct mode (not DAG mode which uses native calling from start)
                 if action.type == "tool_call" and step_id == "main":
                     # Emit reasoning trace before second call
                     if action.reasoning:
@@ -1456,12 +1456,26 @@ After using tools, provide a clear summary of the results in the SAME LANGUAGE a
             "messages": final_messages,
         }
 
-        # Get tool schemas (but don't pass to LLM in first call)
-        # First call only determines action type, second call will handle tool invocation
+        # Get tool schemas
         tool_schemas = self.tool_registry.get_tool_schemas()
 
-        # First call: Request JSON output format
-        chat_kwargs["response_format"] = {"type": "json_object"}
+        # Determine if we're in DAG mode (step_id != "main")
+        # In DAG mode, use traditional single-phase tool calling for backward compatibility
+        # In main ReAct mode, use two-phase tool calling
+        is_dag_mode = (
+            hasattr(self, "_current_step_id")
+            and self._current_step_id
+            and self._current_step_id != "main"
+        )
+
+        if not is_dag_mode:
+            # First call: Request JSON output format for action type decision
+            chat_kwargs["response_format"] = {"type": "json_object"}
+        else:
+            # DAG mode: Use native tool calling from the start
+            if tool_schemas:
+                chat_kwargs["tools"] = tool_schemas
+                chat_kwargs["tool_choice"] = "auto"
 
         # Disable thinking mode if supported
         if (

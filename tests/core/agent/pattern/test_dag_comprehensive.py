@@ -498,15 +498,19 @@ class TestDAGComprehensive:
         # Mock the LLM to return tool call responses that trigger tool execution
         async def mock_chat(messages, **kwargs):
             # Return a proper ReAct response that triggers tool execution
-            # Extract the tool name from the step description
-            last_message = messages[-1]["content"] if messages else ""
+            # Extract the tool name from messages
             tool_name = None
-            if "step A" in last_message or "Execute step A" in last_message:
-                tool_name = "tool_A"
-            elif "step B" in last_message or "Execute step B" in last_message:
-                tool_name = "tool_B"
-            elif "step C" in last_message or "Execute step C" in last_message:
-                tool_name = "tool_C"
+            for msg in messages:
+                content = msg.get("content", "")
+                if "step A" in content or "Execute step A" in content:
+                    tool_name = "tool_A"
+                    break
+                elif "step B" in content or "Execute step B" in content:
+                    tool_name = "tool_B"
+                    break
+                elif "step C" in content or "Execute step C" in content:
+                    tool_name = "tool_C"
+                    break
 
             if tool_name:
                 # Return a proper ReAct tool_call response without extra content field

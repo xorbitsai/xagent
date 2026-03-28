@@ -795,7 +795,8 @@ class ReActPattern(AgentPattern):
                 action = await self._get_action_from_llm(messages)
 
                 # If action is tool_call, make a second LLM call to get actual tool invocation
-                if action.type == "tool_call":
+                # Skip second call for DAG steps (where step_id != "main") to maintain backward compatibility
+                if action.type == "tool_call" and step_id == "main":
                     # Emit reasoning trace before second call
                     if action.reasoning:
                         await trace_ai_message(

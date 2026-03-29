@@ -902,8 +902,7 @@ class ReActPattern(AgentPattern):
                     }
 
                 # Add observation to conversation for tool results
-                # Use a clearer format to help LLM understand this is a tool result
-                observation_content = f"Tool result from {result.get('tool_name', 'unknown')}:\n{result['content']}\n\nBased on this result, if you have enough information to answer the user's question, provide your final answer as a direct text response. Do NOT call another tool unless absolutely necessary."
+                observation_content = f"Tool result from {result.get('tool_name', 'unknown')}:\n{result['content']}\n\nBased on this result, if you have enough information to answer the user's question, provide your final answer. Otherwise, call another tool."
                 messages.append({"role": "user", "content": observation_content})
 
                 # Update stored messages
@@ -1858,10 +1857,6 @@ After using tools, provide a clear summary of the results in the SAME LANGUAGE a
             )
             await log_llm_completion(response, False, action.reasoning)
 
-            # Since we're bypassing _execute_action, we need to trace here
-            # Check if we have context for tracing
-            # Note: We don't have access to task_id/step_id here, so we'll trace at the return point
-            # The actual trace happens in the caller (run method)
             return action
 
         # Parse JSON response (for when response_format="json_object" is enforced)
@@ -2082,11 +2077,13 @@ After using tools, provide a clear summary of the results in the SAME LANGUAGE a
 
             return {
                 "type": "final_answer",
+                "reasoning": "Fallback: converted list response to final answer",
                 "answer": primary,
             }
 
         return {
             "type": "final_answer",
+            "reasoning": "Fallback: converted list response to final answer",
             "answer": str(primary),
         }
 

@@ -495,6 +495,9 @@ class TestDAGComprehensive:
         mock_llm.abilities = ["chat"]
         mock_llm.supports_thinking_mode = False
 
+        # Track which tools have been called to prevent infinite loops
+        _executed_tools = set()
+
         # Mock the LLM to return tool call responses that trigger tool execution
         async def mock_chat(messages, **kwargs):
             # Return a proper ReAct response that triggers tool execution
@@ -513,6 +516,10 @@ class TestDAGComprehensive:
                     break
 
             if tool_name:
+                # Check if this tool was already executed — if so, return final answer
+                if tool_name in _executed_tools:
+                    return '{"type": "final_answer", "content": "Task completed successfully", "answer": "Task completed successfully", "reasoning": "The task has been completed"}'
+                _executed_tools.add(tool_name)
                 # Return a proper ReAct tool_call response without extra content field
                 return (
                     '{"type": "tool_call", "reasoning": "I need to execute the tool for this step", "tool_name": "'

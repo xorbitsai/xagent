@@ -24,6 +24,49 @@ from .base import BaseLLM
 logger = logging.getLogger(__name__)
 
 
+def _handle_union_type(schema: Dict[str, Any], union_key: str) -> Dict[str, Any]:
+    """Simplify anyOf/oneOf for Claude API compatibility.
+
+    Claude doesn't support anyOf/oneOf, so we resolve to a single concrete type:
+    - Optional[T] → T
+    - Union[str, List[str]] → array of strings
+    - Otherwise → first option
+    """
+    options = schema[union_key]
+    if not isinstance(options, list) or not options:
+        schema = {"type": "string"}
+        schema.pop(union_key, None)
+        return schema
+
+    has_null = any(
+        opt.get("type") == "null" or opt is None
+        for opt in options
+        if isinstance(opt, dict)
+    )
+    if has_null and len(options) == 2:
+        # Optional[T] — use the non-null type
+        for opt in options:
+            if isinstance(opt, dict) and opt.get("type") != "null":
+                result = _fix_pydantic_schema_for_claude(opt)
+                schema = (
+                    result.copy() if isinstance(result, dict) else {"type": "string"}
+                )
+                break
+    elif len(options) == 2:
+        types = [opt.get("type") for opt in options if isinstance(opt, dict)]
+        if set(types) == {"string", "array"}:
+            schema = {"type": "array", "items": {"type": "string"}}
+        else:
+            first_option = options[0] if isinstance(options[0], dict) else {}
+            schema = _fix_pydantic_schema_for_claude(first_option)
+    else:
+        first_option = options[0] if isinstance(options[0], dict) else {}
+        schema = _fix_pydantic_schema_for_claude(first_option)
+
+    schema.pop(union_key, None)
+    return schema
+
+
 def _fix_pydantic_schema_for_claude(schema: Dict[str, Any]) -> Dict[str, Any]:
     """
     Fix Pydantic-generated schema for Claude API compatibility.
@@ -52,91 +95,10 @@ def _fix_pydantic_schema_for_claude(schema: Dict[str, Any]) -> Dict[str, Any]:
 
     # Handle anyOf/oneOf - Claude doesn't support these
     # We need to simplify to a single type
-    if "anyOf" in schema:
-        options = schema["anyOf"]
-        if isinstance(options, list) and len(options) > 0:
-            # Check if this is Optional[T] (anyOf with null)
-            has_null = any(
-                opt.get("type") == "null" or opt is None
-                for opt in options
-                if isinstance(opt, dict)
-            )
-            if has_null and len(options) == 2:
-                # Optional[T] - use the non-null type
-                for opt in options:
-                    if isinstance(opt, dict) and opt.get("type") != "null":
-                        result = _fix_pydantic_schema_for_claude(opt)
-                        # Continue processing the rest
-                        schema = (
-                            result.copy()
-                            if isinstance(result, dict)
-                            else {"type": "string"}
-                        )
-                        break
-            else:
-                # Check if this is Union[str, List[str]] - convert to array
-                if len(options) == 2:
-                    types = [
-                        opt.get("type") for opt in options if isinstance(opt, dict)
-                    ]
-                    if set(types) == {"string", "array"}:
-                        # Union[str, List[str]] - use array to support both
-                        schema = {"type": "array", "items": {"type": "string"}}
-                    else:
-                        # Default: use first option
-                        first_option = (
-                            options[0] if isinstance(options[0], dict) else {}
-                        )
-                        schema = _fix_pydantic_schema_for_claude(first_option)
-                else:
-                    # More than 2 options or other cases - use first
-                    first_option = options[0] if isinstance(options[0], dict) else {}
-                    schema = _fix_pydantic_schema_for_claude(first_option)
-        else:
-            # Invalid anyOf - default to string
-            schema = {"type": "string"}
-        # Remove anyOf key and continue processing
-        schema.pop("anyOf", None)
-
-    if "oneOf" in schema:
-        options = schema["oneOf"]
-        if isinstance(options, list) and len(options) > 0:
-            # Check if this is Optional[T] (oneOf with null)
-            has_null = any(
-                opt.get("type") == "null" or opt is None
-                for opt in options
-                if isinstance(opt, dict)
-            )
-            if has_null and len(options) == 2:
-                for opt in options:
-                    if isinstance(opt, dict) and opt.get("type") != "null":
-                        result = _fix_pydantic_schema_for_claude(opt)
-                        schema = (
-                            result.copy()
-                            if isinstance(result, dict)
-                            else {"type": "string"}
-                        )
-                        break
-            else:
-                # Check if this is Union[str, List[str]]
-                if len(options) == 2:
-                    types = [
-                        opt.get("type") for opt in options if isinstance(opt, dict)
-                    ]
-                    if set(types) == {"string", "array"}:
-                        schema = {"type": "array", "items": {"type": "string"}}
-                    else:
-                        first_option = (
-                            options[0] if isinstance(options[0], dict) else {}
-                        )
-                        schema = _fix_pydantic_schema_for_claude(first_option)
-                else:
-                    first_option = options[0] if isinstance(options[0], dict) else {}
-                    schema = _fix_pydantic_schema_for_claude(first_option)
-        else:
-            schema = {"type": "string"}
-        # Remove oneOf key
-        schema.pop("oneOf", None)
+    for union_key in ("anyOf", "oneOf"):
+        if union_key in schema:
+            schema = _handle_union_type(schema, union_key)
+            break  # Only process the first match
 
     # If this is an object type, add additionalProperties: false
     if schema.get("type") == "object":

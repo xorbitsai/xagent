@@ -970,11 +970,12 @@ class OpenAILLM(BaseLLM):
                             if existing_tc.get("index") == index:
                                 call_id = existing_id
                                 break
+                    else:
+                        # Cannot associate this chunk — skip it
+                        continue
 
                 # Initialize or update accumulated tool call
-                # FIXED: Use 'call_id not in accumulated_tool_calls' instead of 'if call_id'
-                # to handle empty string ids
-                if call_id is not None and call_id not in accumulated_tool_calls:
+                if call_id not in accumulated_tool_calls:
                     accumulated_tool_calls[call_id] = {
                         "index": index,
                         "id": call_id,

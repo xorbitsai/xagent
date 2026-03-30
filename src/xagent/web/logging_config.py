@@ -28,14 +28,7 @@ def setup_logging(level: LogLevel | None = None) -> None:
         level = cast(LogLevel, level.upper())
     # Validate and fallback to INFO if invalid
     original_level = level
-    if invalid_level := level not in (
-        "DEBUG",
-        "INFO",
-        "WARNING",
-        "ERROR",
-        "CRITICAL",
-        "FATAL",
-    ):
+    if invalid_level := level not in ("DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"):
         level = "INFO"
     # apply logging config
     dictConfig(

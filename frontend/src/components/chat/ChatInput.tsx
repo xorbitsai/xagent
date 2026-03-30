@@ -10,6 +10,7 @@ import { ConfigDialog } from "@/components/config-dialog";
 import { apiRequest } from "@/lib/api-wrapper";
 import { useFileMention, FileItem } from "@/hooks/use-file-mention";
 import { FileMentionDropdown } from "./FileMentionDropdown";
+import { toast } from "sonner";
 import {
   AlertDialog,
   AlertDialogAction,
@@ -49,9 +50,7 @@ export function ChatInput({
   isLoading,
   files = [],
   onFilesChange,
-  showModeToggle,
   mode,
-  onModeChange,
   inputValue,
   onInputChange,
   taskStatus,

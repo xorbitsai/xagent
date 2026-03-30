@@ -110,9 +110,8 @@ Examples:
     )
     parser.add_argument(
         "--log-level",
-        choices=["debug", "info", "warning", "error"],
-        default="info",
-        help="Log level (default: info)",
+        choices=["debug", "info", "warning", "error", "critical"],
+        help="Log level (respects XAGENT_LOG_LEVEL env var, default: info)",
     )
 
     return parser.parse_args()
@@ -124,7 +123,7 @@ def main() -> None:
 
     # Configure logging BEFORE importing app
     log_level = "debug" if args.debug else args.log_level
-    setup_logging(level=cast(LogLevel, log_level.upper()))
+    setup_logging(level=cast(LogLevel, log_level) if log_level else None)
 
     logger = logging.getLogger(__name__)
     warn_if_example_jwt_config(logger)

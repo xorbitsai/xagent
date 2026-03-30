@@ -1,13 +1,43 @@
 """Unified logging configuration for xagent web application."""
 
+import logging
+import os
 from logging.config import dictConfig
-from typing import Literal
+from typing import Literal, cast
 
 LogLevel = Literal["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"]
 
 
-def setup_logging(level: LogLevel = "INFO") -> None:
-    """Configure logging for the entire application."""
+_is_applied = False
+
+
+def setup_logging(level: LogLevel | None = None) -> None:
+    """Configure logging for the entire application.
+
+    Args:
+        level: Log level. If None, reads from XAGENT_LOG_LEVEL env var,
+               defaults to "INFO" if env var is not set or invalid.
+    """
+    global _is_applied
+    if _is_applied:
+        return
+    # Read log level from env var if not provided
+    if level is None:
+        level = cast(LogLevel, os.getenv("XAGENT_LOG_LEVEL", "INFO").upper())
+    else:
+        level = cast(LogLevel, level.upper())
+    # Validate and fallback to INFO if invalid
+    original_level = level
+    if invalid_level := level not in (
+        "DEBUG",
+        "INFO",
+        "WARNING",
+        "ERROR",
+        "CRITICAL",
+        "FATAL",
+    ):
+        level = "INFO"
+    # apply logging config
     dictConfig(
         {
             "version": 1,
@@ -39,3 +69,10 @@ def setup_logging(level: LogLevel = "INFO") -> None:
             },
         }
     )
+
+    if invalid_level:
+        logging.warning(
+            "Invalid log level '%r', falling back to 'INFO'", original_level
+        )
+
+    _is_applied = True

@@ -27,9 +27,12 @@ from .api.tools import tools_router
 from .api.websocket import ws_router
 from .config import UPLOADS_DIR
 from .dynamic_memory_store import get_memory_store
+from .logging_config import setup_logging
 from .models.database import init_db
 
-# Logger will not configured by __main__.py, because this module is already imported in __init__.py of the subpackage.
+# Configure logging when running under gunicorn/uwsgi (no __main__.py)
+setup_logging()  # Uses XAGENT_LOG_LEVEL env var or defaults to INFO
+
 logger = logging.getLogger(__name__)
 
 # 导出全局 memory store 供其他模块使用

@@ -64,11 +64,6 @@ jobs:
           POSTGRES_USER: xagent
           POSTGRES_PASSWORD: xagent
           POSTGRES_DB: xagent_test
-        healthcheck:
-          test: ["CMD-SHELL", "pg_isready -U xagent"]
-          interval: 10s
-          timeout: 5s
-          retries: 5
         ports:
           - 5432:5432
         options: >-

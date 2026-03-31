@@ -1,12 +1,14 @@
 """Dynamic memory store manager for web application."""
 
 import logging
+import os
 import threading
 from typing import Optional, Union
 
-from xagent.core.memory.in_memory import InMemoryMemoryStore
-from xagent.core.memory.lancedb import LanceDBMemoryStore
-
+from ..core.memory.in_memory import InMemoryMemoryStore
+from ..core.memory.lancedb import LanceDBMemoryStore
+from ..core.model.embedding import DashScopeEmbedding
+from ..core.storage.manager import get_storage_root
 from .models.database import get_db
 from .models.model import Model as DBModel
 from .models.user import UserDefaultModel
@@ -117,10 +119,6 @@ class DynamicMemoryStoreManager:
     ) -> UserIsolatedMemoryStore:
         """Create LanceDB store with the given embedding model."""
         try:
-            import os
-
-            from xagent.core.model.embedding import DashScopeEmbedding
-
             # Check legacy location (project root) first for backward compatibility
             legacy_dir = os.path.join(
                 os.path.dirname(
@@ -133,9 +131,9 @@ class DynamicMemoryStoreManager:
                 db_dir = legacy_dir
             else:
                 # Use new default location
-                new_dir = os.path.expanduser("~/.xagent/memory_store")
+                new_dir = get_storage_root() / "memory_store"
                 os.makedirs(new_dir, exist_ok=True)
-                db_dir = new_dir
+                db_dir = str(new_dir)
 
             if embedding_model.model_provider == "dashscope":
                 lancedb_store = LanceDBMemoryStore(

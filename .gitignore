@@ -251,7 +251,6 @@ docs/openapi.yaml
 docs/API.md
 
 default.yaml
-.xagent/skills/
 fenixaos_web.db
 
 .claude/

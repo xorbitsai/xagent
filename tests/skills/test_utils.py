@@ -104,20 +104,26 @@ class TestParseSkillDirs:
 class TestGetDefaultSkillDirs:
     """Tests for _get_default_skill_dirs function"""
 
-    def test_returns_two_directories(self):
-        """Test returns exactly two directories"""
+    def test_returns_three_directories(self):
+        """Test returns exactly three directories"""
         result = _get_default_skill_dirs()
-        assert len(result) == 2
+        assert len(result) == 3
 
     def test_builtin_directory_exists(self):
         """Test builtin directory exists"""
         result = _get_default_skill_dirs()
         assert result[0].exists()
 
-    def test_user_directory_created(self):
-        """Test user directory is created"""
+    def test_project_directory_is_relative(self):
+        """Test project directory is relative path './skills/'"""
         result = _get_default_skill_dirs()
-        assert result[1].exists()  # Should be created automatically
+        assert result[1] == Path("skills")
+
+    def test_user_directory_path(self):
+        """Test user directory is ~/.xagent/skills"""
+        result = _get_default_skill_dirs()
+        assert result[2].name == "skills"
+        # Parent should be .xagent (or whatever get_storage_root returns)
 
 
 class TestCreateSkillManager:
@@ -128,8 +134,8 @@ class TestCreateSkillManager:
         with patch.dict(os.environ, {}, clear=True):
             manager = create_skill_manager()
             assert manager is not None
-            # Should use default directories
-            assert len(manager.skills_roots) == 2
+            # Should use default directories (builtin, project, user)
+            assert len(manager.skills_roots) == 3
 
     def test_with_environment_variable(self):
         """Test with XAGENT_EXTERNAL_SKILLS_LIBRARY_DIRS set"""
@@ -139,10 +145,10 @@ class TestCreateSkillManager:
             ):
                 manager = create_skill_manager()
                 assert manager is not None
-                # Should have 2 default dirs + 1 external dir
-                assert len(manager.skills_roots) == 3
+                # Should have 3 default dirs + 1 external dir
+                assert len(manager.skills_roots) == 4
                 # Last one should be the external dir
-                assert manager.skills_roots[2] == Path(tmpdir)
+                assert manager.skills_roots[3] == Path(tmpdir)
 
     def test_with_multiple_directories(self):
         """Test with multiple directories in environment variable"""
@@ -154,11 +160,11 @@ class TestCreateSkillManager:
                 ):
                     manager = create_skill_manager()
                     assert manager is not None
-                    # Should have 2 default dirs + 2 external dirs
-                    assert len(manager.skills_roots) == 4
+                    # Should have 3 default dirs + 2 external dirs
+                    assert len(manager.skills_roots) == 5
                     # Last two should be the external dirs
-                    assert manager.skills_roots[2] == Path(tmpdir1)
-                    assert manager.skills_roots[3] == Path(tmpdir2)
+                    assert manager.skills_roots[3] == Path(tmpdir1)
+                    assert manager.skills_roots[4] == Path(tmpdir2)
 
     def test_with_invalid_environment_variable_falls_back_to_default(self):
         """Test invalid external paths are skipped but defaults remain"""
@@ -168,7 +174,7 @@ class TestCreateSkillManager:
             manager = create_skill_manager()
             assert manager is not None
             # Should have default dirs (external path is skipped)
-            assert len(manager.skills_roots) == 2
+            assert len(manager.skills_roots) == 3
 
     def test_explicit_skills_roots_parameter(self):
         """Test explicit skills_roots parameter overrides environment"""
@@ -190,9 +196,9 @@ class TestCreateSkillManager:
             ):
                 manager = create_skill_manager()
                 assert manager is not None
-                # Should have 2 default dirs + 1 valid external dir (URLs skipped)
-                assert len(manager.skills_roots) == 3
-                assert manager.skills_roots[2] == Path(tmpdir)
+                # Should have 3 default dirs + 1 valid external dir (URLs skipped)
+                assert len(manager.skills_roots) == 4
+                assert manager.skills_roots[3] == Path(tmpdir)
 
     def test_path_expansion_in_environment_variable(self):
         """Test path expansion works in environment variable"""
@@ -206,9 +212,9 @@ class TestCreateSkillManager:
             ):
                 manager = create_skill_manager()
                 assert manager is not None
-                # Should have 2 default dirs + 1 external dir
-                assert len(manager.skills_roots) == 3
-                assert manager.skills_roots[2] == test_dir
+                # Should have 3 default dirs + 1 external dir
+                assert len(manager.skills_roots) == 4
+                assert manager.skills_roots[3] == test_dir
         finally:
             test_dir.rmdir()
 

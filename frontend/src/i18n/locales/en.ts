@@ -589,6 +589,8 @@ Build when you need.`
     },
     database: {
       addConnection: "Add Connection",
+      manageConnections: "Manage Connections",
+      existingConnections: "Existing Connections",
       connectionBadge: "SQL",
       maskedValue: "Connection Preview",
       save: "Save Connection",
@@ -634,11 +636,17 @@ Build when you need.`
     },
     credentials: {
       configured: "Configured",
+      configOnly: "Config only",
       notConfigured: "Not configured",
       configure: "Configure",
       save: "Save credentials",
       saveFailed: "Failed to save credentials",
       currentSource: "Current source",
+      setup: {
+        title: "Search Provider Setup",
+        description: "Configure this provider here, even if its runtime tool is not visible yet.",
+        helper: "Set up web-search providers from this page before they appear in the runtime tool list.",
+      },
       status: {
         db: "Stored in web config",
         env: "From environment variable",

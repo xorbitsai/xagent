@@ -589,6 +589,8 @@ Build when you need.`
     },
     database: {
       addConnection: "添加连接",
+      manageConnections: "管理连接",
+      existingConnections: "已有连接",
       connectionBadge: "SQL",
       maskedValue: "连接预览",
       save: "保存连接",
@@ -634,11 +636,17 @@ Build when you need.`
     },
     credentials: {
       configured: "已配置",
+      configOnly: "仅配置",
       notConfigured: "未配置",
       configure: "配置凭据",
       save: "保存凭据",
       saveFailed: "保存凭据失败",
       currentSource: "当前来源",
+      setup: {
+        title: "搜索 Provider 配置",
+        description: "即使对应的运行时工具还没显示，也可以先在这里配置这个 Provider。",
+        helper: "先在这个页面配置网页搜索 Provider，保存完成后它们才会出现在运行时工具列表里。",
+      },
       status: {
         db: "来自网页配置",
         env: "来自环境变量",

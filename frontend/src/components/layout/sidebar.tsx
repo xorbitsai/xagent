@@ -146,13 +146,6 @@ const navigationGroups: NavigationGroup[] = [
         color: "text-gray-500"
       },
       {
-        name: "Tool Config",
-        nameKey: "nav.toolConfig",
-        href: "/tools/config",
-        icon: Settings,
-        color: "text-gray-500"
-      },
-      {
         name: "Memory",
         nameKey: "nav.memory",
         href: "/memory",

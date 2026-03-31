@@ -1273,7 +1273,7 @@ async def handle_chat_message(
                         context["file_info"] = file_info_list
                         file_summary = "\n".join(
                             [
-                                f"- {f['name']} ({f['size']} bytes, {f['type']})"
+                                f"- {f['name']} (ID: {f['file_id']}, {f['size']} bytes, {f['type']})"
                                 for f in file_info_list
                             ]
                         )
@@ -2772,7 +2772,7 @@ async def handle_build_preview_execution(
                 if file_info_list:
                     file_summary = "\n".join(
                         [
-                            f"- {f['name']} ({f['size']} bytes, {f['type']})"
+                            f"- {f['name']} (ID: {f['file_id']}, {f['size']} bytes, {f['type']})"
                             for f in file_info_list
                         ]
                     )

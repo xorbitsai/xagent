@@ -768,8 +768,8 @@ class TaskWorkspace:
                                 "size": file_record.file_size,
                                 "mime_type": file_record.mime_type,
                                 "task_id": file_record.task_id,
-                                "uploaded_at": file_record.uploaded_at.isoformat()
-                                if file_record.uploaded_at
+                                "uploaded_at": file_record.created_at.isoformat()
+                                if file_record.created_at
                                 else None,
                                 "in_current_workspace": file_path.is_relative_to(
                                     self.workspace_dir

@@ -251,7 +251,7 @@ This tool can understand and interpret images, including:
 
 Parameters:
 - images (required): Single image path/URL or list of image paths/URLs. Supports:
-  * Local file paths (e.g., "/path/to/image.jpg", "image.png")
+  * Local file paths or file IDs (e.g., MUST use the exact `file_id` or filename from the uploaded files list in the system prompt)
   * Remote URLs (e.g., "https://example.com/image.jpg")
   * Multiple images as a list
 - question (required): Question to ask about the images
@@ -287,7 +287,7 @@ This tool provides automated image description capabilities, perfect for:
 - Automated image analysis workflows
 
 Parameters:
-- images (required): The image parameter name is "images". Provide a single image file path, URL, or a list of multiple image paths/URLs
+- images (required): The image parameter name is "images". Provide a single image file path, URL, or a list of multiple image paths/URLs. Supports local file paths or file IDs (e.g., MUST use the exact `file_id` or filename from the uploaded files list in the system prompt)
 - detail_level (optional): Level of detail ("simple", "normal", "detailed") - default: "normal"
   * "simple": Brief, concise description
   * "normal": Standard description with main elements
@@ -307,7 +307,7 @@ Detect objects in images with optional bounding box annotation.
 This unified tool can both detect objects and optionally create marked images with visual annotations. Simply describe what you want to find in natural language.
 
 Parameters:
-- images (required): The image parameter name is "images". Provide a single image file path, URL, or a list of multiple image paths/URLs. For best results, use single images.
+- images (required): The image parameter name is "images". Provide a single image file path, URL, or a list of multiple image paths/URLs. For best results, use single images. Supports local file paths or file IDs (e.g., MUST use the exact `file_id` or filename from the uploaded files list in the system prompt).
 - task (required): Describe what you want to detect in plain language. Examples:
   * "Find all people in the image"
   * "Detect workers not wearing safety helmets"

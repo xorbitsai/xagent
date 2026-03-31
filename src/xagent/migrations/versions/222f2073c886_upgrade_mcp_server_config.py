@@ -485,6 +485,21 @@ def create_new_tables() -> None:
 
     # Create user_mcpservers relationship table
     if "user_mcpservers" not in existing_tables:
+        # Build table constraints dynamically based on what tables exist
+        foreign_keys = [
+            sa.ForeignKeyConstraint(
+                ["mcpserver_id"], ["mcp_servers.id"], ondelete="CASCADE"
+            )
+        ]
+
+        # Only add users foreign key if users table exists
+        # This handles the case where migrations are run from empty database
+        # and users table hasn't been created yet (will be created by SQLAlchemy)
+        if "users" in existing_tables:
+            foreign_keys.append(
+                sa.ForeignKeyConstraint(["user_id"], ["users.id"], ondelete="CASCADE")
+            )
+
         op.create_table(
             "user_mcpservers",
             sa.Column("id", sa.Integer(), nullable=False),
@@ -509,10 +524,7 @@ def create_new_tables() -> None:
                 nullable=True,
             ),
             sa.Column("updated_at", sa.DateTime(timezone=True), nullable=True),
-            sa.ForeignKeyConstraint(
-                ["mcpserver_id"], ["mcp_servers.id"], ondelete="CASCADE"
-            ),
-            sa.ForeignKeyConstraint(["user_id"], ["users.id"], ondelete="CASCADE"),
+            *foreign_keys,
             sa.PrimaryKeyConstraint("id"),
             sa.UniqueConstraint("user_id", "mcpserver_id", name="uq_user_mcpservers"),
         )

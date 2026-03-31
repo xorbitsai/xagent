@@ -38,7 +38,7 @@ def get_default_tool_configs() -> list[Dict[str, Any]]:
             "tool_name": "web_search",
             "tool_type": "builtin",
             "category": "search",
-            "display_name": "网络搜索",
+            "display_name": "Google 网络搜索",
             "description": "使用 Google 搜索引擎进行网络搜索",
             "enabled": True,
             "config": {

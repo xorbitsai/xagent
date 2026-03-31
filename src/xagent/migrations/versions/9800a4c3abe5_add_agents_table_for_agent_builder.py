@@ -28,6 +28,18 @@ def upgrade() -> None:
     # Check if table already exists
     existing_tables = inspector.get_table_names()
     if "agents" not in existing_tables:
+        # Build table constraints dynamically based on what tables exist
+        # This handles the case where migrations are run from empty database
+        # and users table hasn't been created yet (will be created by SQLAlchemy)
+        foreign_keys = []
+
+        if "users" in existing_tables:
+            foreign_keys.append(
+                sa.ForeignKeyConstraint(
+                    ["user_id"], ["users.id"], name="fk_agents_user_id_users"
+                )
+            )
+
         # Create agents table
         op.create_table(
             "agents",
@@ -48,9 +60,7 @@ def upgrade() -> None:
             sa.Column("published_at", sa.DateTime(timezone=True), nullable=True),
             sa.Column("created_at", sa.DateTime(timezone=True), nullable=False),
             sa.Column("updated_at", sa.DateTime(timezone=True), nullable=False),
-            sa.ForeignKeyConstraint(
-                ["user_id"], ["users.id"], name="fk_agents_user_id_users"
-            ),
+            *foreign_keys,
             sa.PrimaryKeyConstraint("id"),
         )
 

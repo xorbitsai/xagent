@@ -38,15 +38,22 @@ def upgrade() -> None:
 
     dialect_name = bind.dialect.name
     if dialect_name == "sqlite":
-        # Use batch mode for SQLite to add column with foreign key
-        # Use recreate="never" to avoid table reflection issues when users table doesn't exist
-        with op.batch_alter_table("agents", recreate="never") as batch_op:
-            batch_op.add_column(sa.Column("model_id", sa.Integer(), nullable=True))
-            # Only create foreign key if models table exists
-            if "models" in tables:
-                batch_op.create_foreign_key(
-                    "fk_agents_model_id_models", "models", ["model_id"], ["id"]
-                )
+        # SQLite: Try batch_alter_table with auto recreate first
+        # If reflection fails (users table doesn't exist), fall back to simple add_column
+        try:
+            with op.batch_alter_table("agents", recreate="auto") as batch_op:
+                batch_op.add_column(sa.Column("model_id", sa.Integer(), nullable=True))
+                # Only create foreign key if models table exists
+                if "models" in tables:
+                    batch_op.create_foreign_key(
+                        "fk_agents_model_id_models", "models", ["model_id"], ["id"]
+                    )
+        except sa.exc.NoSuchTableError:
+            # Reflection failed due to missing referenced table (users)
+            # Fall back to simple column addition without batch mode
+            op.add_column("agents", sa.Column("model_id", sa.Integer(), nullable=True))
+            # Note: Foreign key not created in this case
+            # SQLAlchemy will handle FK creation when it creates the full schema
     else:
         # For PostgreSQL and other databases, use native operations
         op.add_column("agents", sa.Column("model_id", sa.Integer(), nullable=True))

@@ -39,6 +39,8 @@ class TelegramBotInstance:
         self.bot: Bot
         self.dp: Dispatcher
         self.polling_task: Optional[asyncio.Task] = None
+        self.user_message_queues: Dict[int, list] = {}
+        self.user_message_tasks: Dict[int, asyncio.Task] = {}
 
         # Load active tasks state
         self.active_tasks_file = Path(f"data/telegram_active_tasks_{instance_id}.json")
@@ -127,7 +129,26 @@ class TelegramBotInstance:
             logger.info(
                 f"Received message from {message.from_user.id} on bot {self.instance_id}: {msg_content}"
             )
-            asyncio.create_task(self._process_user_message(message))
+
+            user_id = message.from_user.id
+            if user_id not in self.user_message_queues:
+                self.user_message_queues[user_id] = []
+            self.user_message_queues[user_id].append(message)
+
+            if (
+                user_id not in self.user_message_tasks
+                or self.user_message_tasks[user_id].done()
+            ):
+                self.user_message_tasks[user_id] = asyncio.create_task(
+                    self._process_user_queue(user_id)
+                )
+
+    async def _process_user_queue(self, user_id: int) -> None:
+        await asyncio.sleep(1.0)
+        messages = self.user_message_queues.pop(user_id, [])
+        if not messages:
+            return
+        await self._process_user_messages_batch(user_id, messages)
 
     async def _extract_message_content(
         self, message: types.Message
@@ -137,20 +158,12 @@ class TelegramBotInstance:
 
         if message.document:
             files.append(message.document)
-            if not text:
-                text = f"Please process this file: {message.document.file_name}"
         elif message.photo:
             files.append(message.photo[-1])
-            if not text:
-                text = "Please process this image."
         elif message.audio:
             files.append(message.audio)
-            if not text:
-                text = "Please process this audio."
         elif message.video:
             files.append(message.video)
-            if not text:
-                text = "Please process this video."
 
         return text, files
 
@@ -254,10 +267,28 @@ class TelegramBotInstance:
 
         return uploaded_files_info
 
-    async def _process_user_message(self, message: types.Message) -> None:
-        user_id = message.from_user.id
+    async def _process_user_messages_batch(
+        self, user_id: int, messages: list[types.Message]
+    ) -> None:
+        combined_text = ""
+        combined_files = []
 
-        text, files = await self._extract_message_content(message)
+        # We'll use the last message for answering
+        last_message = messages[-1]
+
+        for msg in messages:
+            text, files = await self._extract_message_content(msg)
+            if text:
+                if combined_text:
+                    combined_text += "\n" + text
+                else:
+                    combined_text = text
+            if files:
+                combined_files.extend(files)
+
+        text = combined_text
+        files = combined_files
+
         if not text and not files:
             return
 
@@ -279,14 +310,14 @@ class TelegramBotInstance:
                         if channel.config:
                             allowed_users = channel.config.get("allowed_users")
                             if allowed_users is not None:
-                                if str(message.from_user.id) not in allowed_users:
-                                    await message.answer(
+                                if str(last_message.from_user.id) not in allowed_users:
+                                    await last_message.answer(
                                         "🚫 You are not authorized to use this bot."
                                     )
                                     return
 
                 if not user:
-                    await message.answer(
+                    await last_message.answer(
                         "Configuration error: Cannot find the owner of this bot."
                     )
                     return
@@ -304,6 +335,7 @@ class TelegramBotInstance:
                     )
 
                 is_new_task = False
+                was_completed_or_failed = False
                 if not task:
                     task = Task(
                         user_id=user.id,
@@ -320,6 +352,10 @@ class TelegramBotInstance:
                     self._save_active_tasks()
                     is_new_task = True
                 else:
+                    was_completed_or_failed = task.status in [
+                        TaskStatus.COMPLETED,
+                        TaskStatus.FAILED,
+                    ]
                     task.status = TaskStatus.PENDING
                     db.commit()
 
@@ -356,18 +392,26 @@ class TelegramBotInstance:
                     )
                     if uploaded_info:
                         file_info_list = [
-                            f"{info['name']} (ID: {info['file_id']})"
+                            f"[{info['name']}](file://{info['file_id']})"
                             for info in uploaded_info
                         ]
-                        text += f"\n\n{', '.join(file_info_list)}"
+                        if text:
+                            text += f"\n\n{' '.join(file_info_list)}"
+                        else:
+                            text = " ".join(file_info_list)
                         if is_new_task:
                             task.description = text  # type: ignore
+                            if not task.title:
+                                title_str = (
+                                    text if len(text) <= 50 else f"{text[:50]}..."
+                                )
+                                task.title = title_str  # type: ignore
                             db.commit()
 
                         context["state"] = context.get("state", {})
                         context["state"]["file_info"] = uploaded_info
 
-                loading_msg = await message.answer(
+                loading_msg = await last_message.answer(
                     f"⏳ <b>Task #{task.id} is processing...</b>\n<i>Please wait for the result.</i>",
                     parse_mode=ParseMode.HTML,
                 )
@@ -375,19 +419,22 @@ class TelegramBotInstance:
                 tg_handler = TelegramTraceHandler(
                     int(task.id),  # type: ignore
                     self.bot,
-                    message.chat.id,
+                    last_message.chat.id,
                     message_id=loading_msg.message_id,
                 )
                 agent_service.tracer.add_handler(tg_handler)
 
                 from ...user_isolated_memory import UserContext
 
+                force_fresh_execution = not is_new_task and was_completed_or_failed
+                actual_task_id = None if force_fresh_execution else str(task.id)
+
                 with UserContext(int(user.id)):  # type: ignore
                     result = await agent_manager.execute_task(
                         agent_service=agent_service,
                         task=text,
                         context=context,
-                        task_id=str(task.id),
+                        task_id=actual_task_id,
                         tracking_task_id=str(task.id),
                         db_session=db,
                     )
@@ -400,6 +447,37 @@ class TelegramBotInstance:
                 db.commit()
 
                 output = result.get("output", "")
+
+                chat_response = result.get("chat_response")
+                if isinstance(chat_response, dict):
+                    interactions = chat_response.get("interactions", [])
+                    if interactions:
+                        interaction_texts = []
+                        for interaction in interactions:
+                            label = interaction.get("label") or interaction.get(
+                                "field", "Input"
+                            )
+                            options = interaction.get("options", [])
+                            if options:
+                                opts = []
+                                for opt in options:
+                                    if isinstance(opt, dict):
+                                        opts.append(
+                                            str(opt.get("label", opt.get("value", "")))
+                                        )
+                                    else:
+                                        opts.append(str(opt))
+                                interaction_texts.append(
+                                    f"• {label}\n  Options: {', '.join(opts)}"
+                                )
+                            else:
+                                interaction_texts.append(f"• {label}")
+                        if interaction_texts:
+                            output += (
+                                "\n\n<b>Please provide the following information:</b>\n"
+                                + "\n".join(interaction_texts)
+                            )
+
                 if not output or not str(output).strip():
                     output = "Task completed, but no output was generated."
 
@@ -422,9 +500,9 @@ class TelegramBotInstance:
                 for chunk in text_chunks[1:]:
                     try:
                         html_chunk = markdown_to_tg_html(chunk)
-                        await message.answer(html_chunk, parse_mode=ParseMode.HTML)
+                        await last_message.answer(html_chunk, parse_mode=ParseMode.HTML)
                     except Exception:
-                        await message.answer(chunk)
+                        await last_message.answer(chunk)
 
             finally:
                 try:
@@ -433,7 +511,7 @@ class TelegramBotInstance:
                     pass
         except Exception as e:
             logger.error(f"Error processing Telegram message: {e}")
-            await message.answer(
+            await last_message.answer(
                 "Sorry, an error occurred while processing your request."
             )
 

@@ -39,8 +39,8 @@ def upgrade() -> None:
     dialect_name = bind.dialect.name
     if dialect_name == "sqlite":
         # Use batch mode for SQLite to add column with foreign key
-        # Use recreate=False to avoid table reflection issues when users table doesn't exist
-        with op.batch_alter_table("agents", recreate=False) as batch_op:
+        # Use recreate="never" to avoid table reflection issues when users table doesn't exist
+        with op.batch_alter_table("agents", recreate="never") as batch_op:
             batch_op.add_column(sa.Column("model_id", sa.Integer(), nullable=True))
             # Only create foreign key if models table exists
             if "models" in tables:

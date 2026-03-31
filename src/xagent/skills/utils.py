@@ -13,7 +13,9 @@ from .manager import SkillManager
 logger = logging.getLogger(__name__)
 
 
-def create_skill_manager(skills_roots: Optional[List[Path]] = None) -> SkillManager:
+def create_skill_manager(
+    skills_roots: Optional[List[Path]] = None,
+) -> "SkillManager":
     """
     Create skill_manager (not initialized)
 
@@ -35,6 +37,9 @@ def create_skill_manager(skills_roots: Optional[List[Path]] = None) -> SkillMana
         if external_dirs := _parse_skill_dirs(env_dirs):
             skills_roots = skills_roots + external_dirs
             logger.info(f"Appended {len(external_dirs)} external skill directories")
+
+    # Import here to avoid circular import
+    from .manager import SkillManager
 
     # Create skill_manager (not initialized)
     skill_manager = SkillManager(skills_roots=skills_roots)
@@ -65,18 +70,12 @@ def _parse_skill_dirs(env_value: str) -> List[Path]:
             continue
 
         # Expand environment variables and user home directory
-        expanded_path = os.path.expandvars(dir_path)
+        expanded_path = os.path.expanduser(os.path.expandvars(dir_path))
         path = Path(expanded_path).expanduser()
 
-        # Validate and add path
-        if path.exists():
-            if path.is_dir():
-                skills_roots.append(path)
-                logger.info(f"Added skills directory: {path}")
-            else:
-                logger.warning(f"Path is not a directory: {path}")
-        else:
-            logger.warning(f"Skills directory does not exist: {path}")
+        # Add path (directory may be created or replaced after xagent starts)
+        skills_roots.append(path)
+        logger.info(f"Added skills directory: {path}")
 
     return skills_roots
 
@@ -93,7 +92,7 @@ def _get_default_skill_dirs() -> List[Path]:
     Returns:
         List of default skill directory paths
     """
-    builtin_skills_dir = Path(__file__).parent / "builtin"
+    builtin_skills_dir = SkillManager.get_builtin_root()
     project_skills_dir = Path("skills")
     user_skills_dir = get_storage_root() / "skills"
 

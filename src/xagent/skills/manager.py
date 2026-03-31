@@ -25,10 +25,6 @@ class SkillManager:
         """
         self.skills_roots = [Path(p) for p in skills_roots]
 
-        # Ensure user-defined directories exist
-        for root in self.skills_roots[1:]:
-            root.mkdir(parents=True, exist_ok=True)
-
         self._skills_cache: Dict[str, Dict] = {}
         self._initialized = False
         self._init_task: Optional[Any] = None
@@ -67,8 +63,8 @@ class SkillManager:
 
         # Scan all directories in order (later ones override earlier ones)
         for skills_root in self.skills_roots:
-            if not skills_root.exists():
-                logger.warning(f"Skills directory does not exist: {skills_root}")
+            if not skills_root.is_dir():
+                # Skip non-existent directories silently
                 continue
 
             logger.debug(f"Scanning directory: {skills_root}")
@@ -79,14 +75,17 @@ class SkillManager:
                     continue
 
                 if not (skill_dir / "SKILL.md").exists():
-                    logger.debug(f"Skipping {skill_dir.name}: no SKILL.md found")
+                    logger.warning("Skipping %r: no SKILL.md found", skill_dir)
                     continue
 
                 try:
                     skill_info = SkillParser.parse(skill_dir)
                     self._skills_cache[skill_info["name"]] = skill_info
+                    # Determine source by checking if it's the builtin directory
                     source = (
-                        "builtin" if skills_root == self.skills_roots[0] else "user"
+                        "builtin"
+                        if skills_root == self.get_builtin_root()
+                        else skills_root.name
                     )
                     logger.info(f"  ✓ Loaded: {skill_info['name']} ({source})")
                     found_count += 1
@@ -216,9 +215,10 @@ class SkillManager:
         """Check if there are available skills"""
         return len(self._skills_cache) > 0
 
-    def get_builtin_root(self) -> Path:
+    @classmethod
+    def get_builtin_root(cls) -> Path:
         """Get built-in skills directory"""
-        return self.skills_roots[0]
+        return Path(__file__).parent / "builtin"
 
     def get_user_root(self) -> Path:
         """Get user-defined skills directory (returns builtin if not available)"""

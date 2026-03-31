@@ -473,10 +473,7 @@ class TelegramBotInstance:
                             else:
                                 interaction_texts.append(f"• {label}")
                         if interaction_texts:
-                            output += (
-                                "\n\n<b>Please provide the following information:</b>\n"
-                                + "\n".join(interaction_texts)
-                            )
+                            output += "\n\n" + "\n".join(interaction_texts)
 
                 if not output or not str(output).strip():
                     output = "Task completed, but no output was generated."

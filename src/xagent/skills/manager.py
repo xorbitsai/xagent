@@ -219,9 +219,3 @@ class SkillManager:
     def get_builtin_root(cls) -> Path:
         """Get built-in skills directory"""
         return Path(__file__).parent / "builtin"
-
-    def get_user_root(self) -> Path:
-        """Get user-defined skills directory (returns builtin if not available)"""
-        if len(self.skills_roots) > 1:
-            return self.skills_roots[1]
-        return self.skills_roots[0]

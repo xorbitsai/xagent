@@ -33,6 +33,8 @@ export default function ChannelsPage() {
     channel_type: "telegram",
     channel_name: "",
     bot_token: "",
+    app_id: "",
+    app_secret: "",
     allowed_users: "",
     is_active: true
   })
@@ -65,6 +67,8 @@ export default function ChannelsPage() {
         channel_type: channel.channel_type,
         channel_name: channel.channel_name,
         bot_token: channel.config.bot_token || "",
+        app_id: channel.config.app_id || "",
+        app_secret: channel.config.app_secret || "",
         allowed_users: channel.config.allowed_users ? channel.config.allowed_users.join(", ") : "",
         is_active: channel.is_active
       })
@@ -74,6 +78,8 @@ export default function ChannelsPage() {
         channel_type: defaultType,
         channel_name: "",
         bot_token: "",
+        app_id: "",
+        app_secret: "",
         allowed_users: "",
         is_active: true
       })
@@ -83,7 +89,17 @@ export default function ChannelsPage() {
 
   const handleSubmit = async () => {
     try {
-      if (!formData.channel_name || !formData.bot_token) {
+      if (!formData.channel_name) {
+        toast.error(t("channels.messages.fill_required"))
+        return
+      }
+
+      if (formData.channel_type === "telegram" && !formData.bot_token) {
+        toast.error(t("channels.messages.fill_required"))
+        return
+      }
+
+      if (formData.channel_type === "feishu" && (!formData.app_id || !formData.app_secret)) {
         toast.error(t("channels.messages.fill_required"))
         return
       }
@@ -92,7 +108,9 @@ export default function ChannelsPage() {
         channel_type: formData.channel_type,
         channel_name: formData.channel_name,
         config: {
-          bot_token: formData.bot_token,
+          bot_token: formData.channel_type === "telegram" ? formData.bot_token : undefined,
+          app_id: formData.channel_type === "feishu" ? formData.app_id : undefined,
+          app_secret: formData.channel_type === "feishu" ? formData.app_secret : undefined,
           allowed_users: formData.allowed_users.trim() ? formData.allowed_users.split(",").map(u => u.trim()).filter(Boolean) : null
         },
         is_active: formData.is_active
@@ -235,6 +253,64 @@ export default function ChannelsPage() {
             )}
           </CardContent>
         </Card>
+
+        {/* Feishu Bots Card */}
+        <Card>
+          <CardHeader className="flex flex-row items-center justify-between">
+            <div>
+              <CardTitle className="flex items-center gap-2">
+                <MessageSquare className="h-5 w-5" />
+                {t("channels.feishu_bots")}
+              </CardTitle>
+              <CardDescription>
+                {t("channels.description", { platform: t("channels.feishu_bots") })}
+              </CardDescription>
+            </div>
+            <Button onClick={() => handleOpenDialog(undefined, "feishu")} size="sm">
+              <Plus className="h-4 w-4 mr-2" />
+              {t("channels.add_feishu")}
+            </Button>
+          </CardHeader>
+          <CardContent>
+            {loading ? (
+              <div className="text-sm text-muted-foreground">{t("common.loading")}</div>
+            ) : channels.filter(c => c.channel_type === "feishu").length === 0 ? (
+              <div className="text-sm text-muted-foreground py-4 text-center border rounded-md bg-muted/20">
+                {t("channels.no_channels")}
+              </div>
+            ) : (
+              <div className="space-y-4">
+                {channels.filter(c => c.channel_type === "feishu").map((channel) => (
+                  <div key={channel.id} className="flex items-center justify-between p-4 border rounded-lg">
+                    <div className="flex items-center gap-4">
+                      <div className="h-10 w-10 rounded-full bg-primary/10 flex items-center justify-center">
+                        <MessageSquare className="h-5 w-5 text-primary" />
+                      </div>
+                      <div>
+                        <div className="font-medium">{channel.channel_name}</div>
+                        <div className="text-xs text-muted-foreground capitalize">
+                          {channel.channel_type} • {channel.is_active ? t("channels.status.active") : t("channels.status.inactive")}
+                        </div>
+                      </div>
+                    </div>
+                    <div className="flex items-center gap-3">
+                      <Switch
+                        checked={channel.is_active}
+                        onCheckedChange={() => toggleActive(channel)}
+                      />
+                      <Button variant="ghost" size="icon" onClick={() => handleOpenDialog(channel)} title={t("channels.actions.edit")}>
+                        <Edit className="h-4 w-4" />
+                      </Button>
+                      <Button variant="ghost" size="icon" onClick={() => handleDelete(channel.id)} title={t("channels.actions.delete")}>
+                        <Trash2 className="h-4 w-4 text-destructive" />
+                      </Button>
+                    </div>
+                  </div>
+                ))}
+              </div>
+            )}
+          </CardContent>
+        </Card>
       </div>
 
       <Dialog open={isDialogOpen} onOpenChange={setIsDialogOpen}>
@@ -253,6 +329,7 @@ export default function ChannelsPage() {
                 onValueChange={(val) => setFormData(prev => ({ ...prev, channel_type: val }))}
                 options={[
                   { value: "telegram", label: t("channels.dialog.telegram_bot") },
+                  { value: "feishu", label: t("channels.dialog.feishu_bot") },
                 ]}
                 disabled={!!editingChannel}
               />
@@ -265,15 +342,42 @@ export default function ChannelsPage() {
                 onChange={(e) => setFormData(prev => ({ ...prev, channel_name: e.target.value }))}
               />
             </div>
-            <div className="space-y-2">
-              <Label>{t("channels.dialog.bot_token")}</Label>
-              <Input
-                type="password"
-                placeholder="123456789:ABCdefGHIjklmNOPqrsTUVwxyz"
-                value={formData.bot_token}
-                onChange={(e) => setFormData(prev => ({ ...prev, bot_token: e.target.value }))}
-              />
-            </div>
+
+            {formData.channel_type === "telegram" && (
+              <div className="space-y-2">
+                <Label>{t("channels.dialog.bot_token")}</Label>
+                <Input
+                  type="password"
+                  placeholder="123456789:ABCdefGHIjklmNOPqrsTUVwxyz"
+                  value={formData.bot_token}
+                  onChange={(e) => setFormData(prev => ({ ...prev, bot_token: e.target.value }))}
+                />
+              </div>
+            )}
+
+            {formData.channel_type === "feishu" && (
+              <>
+                <div className="space-y-2">
+                  <Label>{t("channels.dialog.app_id")}</Label>
+                  <Input
+                    type="text"
+                    placeholder="cli_a1b2c3d4e5f6g7h8"
+                    value={formData.app_id}
+                    onChange={(e) => setFormData(prev => ({ ...prev, app_id: e.target.value }))}
+                  />
+                </div>
+                <div className="space-y-2">
+                  <Label>{t("channels.dialog.app_secret")}</Label>
+                  <Input
+                    type="password"
+                    placeholder="a1B2c3D4e5F6g7H8i9J0k1L2m3N4o5P6"
+                    value={formData.app_secret}
+                    onChange={(e) => setFormData(prev => ({ ...prev, app_secret: e.target.value }))}
+                  />
+                </div>
+              </>
+            )}
+
             <div className="space-y-2">
               <Label>{t("channels.dialog.allowed_users")}</Label>
               <Input

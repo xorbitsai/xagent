@@ -67,6 +67,7 @@ dependencies = [
   "deepdoc-lib==0.2.0",
   "aiogram>=3.4.1",
   "aiohttp-socks>=0.8.4",
+  "lark-oapi>=1.5.3",
 ]
 
 [project.optional-dependencies]
@@ -210,6 +211,8 @@ module = [
   "xinference_client",
   "aiogram",
   "aiogram.*",
+  "lark_oapi",
+  "lark_oapi.*",
 ]
 ignore_missing_imports = true
 

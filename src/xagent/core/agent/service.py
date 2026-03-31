@@ -249,8 +249,15 @@ class AgentService:
             RuntimeError: If agent execution fails
             NotImplementedError: If task continuation is requested but not supported
         """
+        has_files = False
+        if context:
+            has_files = bool(context.get("uploaded_files")) or bool(
+                context.get("file_info")
+            )
+
         if not task or not task.strip():
-            raise ValueError("Task cannot be empty or whitespace-only")
+            if not has_files:
+                raise ValueError("Task cannot be empty or whitespace-only")
 
         # Ensure tools are initialized before execution
         await self._ensure_tools_initialized()

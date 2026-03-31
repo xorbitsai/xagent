@@ -211,6 +211,7 @@ async def startup_event() -> None:
     try:
         import asyncio
 
+        from .channels.feishu.bot import get_feishu_channel
         from .channels.telegram.bot import get_telegram_channel
 
         telegram_channel = get_telegram_channel()
@@ -218,6 +219,9 @@ async def startup_event() -> None:
             logger.info("Initializing Telegram channel manager...")
             app.state.telegram_task = asyncio.create_task(telegram_channel.start())
             logger.info("Telegram channel background task created successfully")
+
+        feishu_channel = get_feishu_channel()
+        app.state.feishu_task = asyncio.create_task(feishu_channel.start())
     except Exception as e:
         logger.error(f"Failed to start Telegram channel manager: {e}", exc_info=True)
 
@@ -230,12 +234,16 @@ async def shutdown_event() -> None:
             app.state.telegram_task.cancel()
             logger.info("Cancelled Telegram polling task")
 
+        from .channels.feishu.bot import get_feishu_channel
         from .channels.telegram.bot import get_telegram_channel
 
         telegram_channel = get_telegram_channel()
         if telegram_channel.enabled:
             await telegram_channel.stop()
             logger.info("Telegram channel stopped successfully")
+
+        feishu_channel = get_feishu_channel()
+        await feishu_channel.stop()
     except Exception as e:
         logger.error(f"Failed to stop Telegram channel: {e}", exc_info=True)
 

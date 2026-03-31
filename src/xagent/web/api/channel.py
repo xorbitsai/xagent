@@ -42,6 +42,25 @@ def trigger_telegram_sync() -> None:
         logger.error(f"Failed to trigger telegram sync: {e}")
 
 
+def trigger_feishu_sync() -> None:
+    """Helper to safely trigger feishu bot sync in background"""
+    from xagent.web.channels.feishu.bot import get_feishu_channel
+
+    fs = get_feishu_channel()
+
+    from xagent.web.app import app
+
+    try:
+        if hasattr(app.state, "feishu_task"):
+            loop = app.state.feishu_task.get_loop()
+            asyncio.run_coroutine_threadsafe(fs._sync_bots_async(), loop)
+            logger.info("Successfully triggered feishu sync in main event loop")
+        else:
+            logger.warning("Feishu task not found in app state.")
+    except Exception as e:
+        logger.error(f"Failed to trigger feishu sync: {e}")
+
+
 @router.get("", response_model=List[UserChannelResponse])
 def get_user_channels(
     current_user: User = Depends(get_current_user),
@@ -92,6 +111,8 @@ def create_user_channel(
     # Trigger bot reload via background task
     if channel.channel_type == "telegram":
         background_tasks.add_task(trigger_telegram_sync)
+    elif channel.channel_type == "feishu":
+        background_tasks.add_task(trigger_feishu_sync)
 
     return channel
 
@@ -148,6 +169,8 @@ def update_user_channel(
 
     if channel.channel_type == "telegram":
         background_tasks.add_task(trigger_telegram_sync)
+    elif channel.channel_type == "feishu":
+        background_tasks.add_task(trigger_feishu_sync)
 
     return channel
 
@@ -175,5 +198,7 @@ def delete_user_channel(
 
     if channel_type == "telegram":
         background_tasks.add_task(trigger_telegram_sync)
+    elif channel_type == "feishu":
+        background_tasks.add_task(trigger_feishu_sync)
 
     return {"status": "success"}

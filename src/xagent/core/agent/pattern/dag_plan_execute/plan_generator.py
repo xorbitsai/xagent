@@ -648,16 +648,7 @@ class PlanGenerator:
                 tool_description = getattr(tool, "description", f"Execute {tool_name}")
 
             tool_names.append(tool_name)
-
-            # Get parameter schema if available
-            args_schema = None
-            if hasattr(tool, "args_type") and callable(tool.args_type):
-                try:
-                    args_schema = tool.args_type().model_json_schema()
-                except Exception:
-                    pass
-
-            tool_info_list.append((tool_name, tool_description, args_schema))
+            tool_info_list.append((tool_name, tool_description))
 
         # Build the new format
         context_parts = []
@@ -666,22 +657,12 @@ class PlanGenerator:
         context_parts.append("AVAILABLE TOOLS:\n")
         context_parts.append(", ".join(tool_names) + "\n")
 
-        # Part 2: Detailed descriptions (by tool) with parameter schemas
+        # Part 2: Detailed descriptions (by tool)
+        # Note: We keep descriptions concise in plan phase to focus on strategy,
+        # not implementation details. Parameter schemas are only shown in execute phase.
         context_parts.append("TOOL DESCRIPTIONS:\n\n")
-        for tool_name, tool_description, args_schema in tool_info_list:
-            context_parts.append(f"{tool_name}:\n")
-            context_parts.append(f"  {tool_description}\n")
-
-            # Add structured parameter information if schema is available
-            if args_schema and "properties" in args_schema:
-                context_parts.append("  Parameters (JSON schema):\n")
-                import json
-
-                # Pretty print the schema with proper indentation
-                schema_str = json.dumps(args_schema, indent=2)
-                for line in schema_str.split("\n"):
-                    context_parts.append(f"    {line}\n")
-                context_parts.append("\n")
+        for tool_name, tool_description in tool_info_list:
+            context_parts.append(f"{tool_name}:\n  {tool_description}\n\n")
 
         # Part 3: Collaboration examples
         has_browser = any("browser" in name.lower() for name in tool_names)

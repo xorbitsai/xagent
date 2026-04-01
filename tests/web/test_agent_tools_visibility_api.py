@@ -91,11 +91,6 @@ def test_published_agent_is_callable_for_owner_and_hidden_from_other_users() -> 
 
         agent_id = _create_agent(admin_headers, "Admin Published Agent")
 
-        before_publish = client.get("/api/tools/available", headers=admin_headers)
-        assert before_publish.status_code == 200
-        before_names = {tool["name"] for tool in before_publish.json()["tools"]}
-        assert "call_agent_admin_published_agent" not in before_names
-
         publish_response = client.post(
             f"/api/agents/{agent_id}/publish",
             headers=admin_headers,

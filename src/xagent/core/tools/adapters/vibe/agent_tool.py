@@ -16,6 +16,9 @@ class CreateAgentToolArgs(BaseModel):
     """Arguments for creating a new agent."""
 
     name: str = Field(description="Name of the agent to create")
+    description: str = Field(
+        description="IMPORTANT: Description of when to use this agent (e.g., 'Use this agent for data analysis tasks involving CSV files'). This helps users understand the agent's purpose and when to call it."
+    )
     instructions: str = Field(description="System instructions/prompt for the agent")
     tool_categories: Optional[list[str]] = Field(
         default=None,
@@ -95,14 +98,38 @@ class CreateAgentTool(AbstractBaseTool):
     @property
     def description(self) -> str:
         """Tool description."""
+        # Get available tool categories
+        from .base import ToolCategory
+
+        available_categories = [cat.value for cat in ToolCategory]
+
+        # Get available skills (from builtin skills directory)
+        import os
+
+        skills_dir = os.path.join(
+            os.path.dirname(__file__), "../../../../skills/builtin"
+        )
+        available_skills = []
+        if os.path.exists(skills_dir):
+            for skill_dir in os.listdir(skills_dir):
+                skill_path = os.path.join(skills_dir, skill_dir)
+                if os.path.isdir(skill_path):
+                    available_skills.append(skill_dir)
+
+        skills_list = ", ".join(available_skills) if available_skills else "none"
+        categories_list = ", ".join(available_categories)
+
         return (
             "Create a new agent with specific capabilities during task execution. "
             "The agent will be created in DRAFT status and can be called immediately using the returned tool name.\n\n"
             "Parameters:\n"
             "- name: A short, descriptive name for the agent (e.g., 'researcher', 'data_analyzer')\n"
-            "- instructions: System prompt/instructions defining the agent's behavior and expertise\n"
-            "- tool_categories (optional): List of tool categories to allow (e.g., ['file', 'knowledge', 'basic'])\n"
-            "- skills (optional): List of skill names to allow\n\n"
+            "- description: IMPORTANT - Clear description of when to use this agent (e.g., 'Use this agent for data analysis tasks involving CSV files'). This helps users understand the agent's purpose.\n"
+            f"- tool_categories (optional): Available categories: {categories_list}\n"
+            f"  Example: ['file', 'knowledge', 'basic']\n"
+            f"- skills (optional): Available skills: {skills_list}\n"
+            f"  Example: ['presentation-generator', 'poster-design']\n"
+            "- instructions: System prompt/instructions defining the agent's behavior and expertise\n\n"
             "Returns:\n"
             "- agent_id: Database ID of the created agent\n"
             "- agent_name: Name of the agent\n"
@@ -138,6 +165,7 @@ class CreateAgentTool(AbstractBaseTool):
 
         try:
             agent_name = args.get("name", "").strip()
+            agent_description = args.get("description", "").strip()
             instructions = args.get("instructions", "").strip()
 
             if not agent_name:
@@ -148,6 +176,16 @@ class CreateAgentTool(AbstractBaseTool):
                     markdown_link="",
                     status="error",
                     message="Error: Agent name is required",
+                ).model_dump()
+
+            if not agent_description:
+                return CreateAgentToolResult(
+                    agent_id=0,
+                    agent_name="",
+                    tool_name="",
+                    markdown_link="",
+                    status="error",
+                    message="Error: Agent description is required. Please describe when to use this agent.",
                 ).model_dump()
 
             if not instructions:
@@ -205,7 +243,7 @@ class CreateAgentTool(AbstractBaseTool):
             agent = Agent(
                 user_id=self._user_id,
                 name=agent_name,
-                description=f"Auto-created agent for task: {self._task_id or 'unknown'}",
+                description=agent_description,
                 instructions=instructions,
                 execution_mode="graph",
                 models=models_config if models_config else None,
@@ -524,6 +562,7 @@ def get_published_agents_tools(
     workspace_base_dir: str = "uploads",
     excluded_agent_id: Optional[int] = None,
     include_draft: bool = False,
+    draft_agent_ids_to_include: Optional[list[int]] = None,
 ) -> list[AbstractBaseTool]:
     """
     Get tools for published (and optionally draft) agents.
@@ -535,6 +574,7 @@ def get_published_agents_tools(
         workspace_base_dir: Base directory for workspace files
         excluded_agent_id: Optional agent ID to exclude (to prevent self-calls)
         include_draft: Whether to include DRAFT agents (useful for dynamically created agents)
+        draft_agent_ids_to_include: Specific DRAFT agent IDs to include (for agents created in current task)
 
     Returns:
         List of AgentTool instances
@@ -563,6 +603,23 @@ def get_published_agents_tools(
             query = query.filter(Agent.id != excluded_agent_id)
 
         agents = query.all()
+
+        # If specific DRAFT agents should be included, add them
+        if draft_agent_ids_to_include:
+            draft_agents = (
+                db.query(Agent)
+                .filter(
+                    Agent.id.in_(draft_agent_ids_to_include),
+                    Agent.user_id == user_id,
+                    Agent.status == "draft",
+                )
+                .all()
+            )
+            # Merge without duplicates
+            existing_ids = {agent.id for agent in agents}
+            for draft_agent in draft_agents:
+                if draft_agent.id not in existing_ids:
+                    agents.append(draft_agent)
 
         agent_types = "PUBLISHED and DRAFT" if include_draft else "PUBLISHED"
         logger.info(
@@ -623,14 +680,15 @@ async def create_agent_tools(config: "WebToolConfig") -> list[AbstractBaseTool]:
 
         excluded_agent_id = config.get_excluded_agent_id() if config else None
 
-        # Include DRAFT agents to support dynamically created agents
+        # Only include PUBLISHED agents by default
+        # DRAFT agents are only available within the same task context after creation
         return get_published_agents_tools(
             db=db,
             user_id=user_id,
             task_id=config.get_task_id(),
             workspace_base_dir="uploads",
             excluded_agent_id=excluded_agent_id,
-            include_draft=True,  # Include DRAFT agents
+            include_draft=False,  # Only PUBLISHED agents
         )
     except Exception as e:
         logger.warning(f"Failed to create agent tools: {e}")

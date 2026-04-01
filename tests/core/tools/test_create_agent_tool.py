@@ -65,6 +65,7 @@ class TestCreateAgentTool:
                 result = await tool.run_json_async(
                     {
                         "name": "test_agent",
+                        "description": "A test agent for unit testing",
                         "instructions": "You are a test agent for unit testing.",
                     }
                 )
@@ -126,6 +127,7 @@ class TestCreateAgentTool:
                 result = await tool.run_json_async(
                     {
                         "name": "filtered_agent",
+                        "description": "Agent with filtered tools",
                         "instructions": "Agent with filtered tools",
                         "tool_categories": ["file", "knowledge"],
                         "skills": ["web_search"],
@@ -188,6 +190,7 @@ class TestCreateAgentTool:
                 result = await tool.run_json_async(
                     {
                         "name": "duplicate_name",
+                        "description": "Duplicate name test agent",
                         "instructions": "This should fail",
                     }
                 )
@@ -219,6 +222,7 @@ class TestCreateAgentTool:
             result = await tool.run_json_async(
                 {
                     "name": "",
+                    "description": "Test missing name",
                     "instructions": "Instructions without name",
                 }
             )
@@ -250,6 +254,7 @@ class TestCreateAgentTool:
             result = await tool.run_json_async(
                 {
                     "name": "test",
+                    "description": "Test missing instructions",
                     "instructions": "",
                 }
             )
@@ -444,6 +449,7 @@ class TestCreateAndCallAgent:
                 create_result = await create_tool.run_json_async(
                     {
                         "name": "simple_calculator",
+                        "description": "A simple calculator for basic math operations",
                         "instructions": "You are a calculator. Return the result.",
                     }
                 )

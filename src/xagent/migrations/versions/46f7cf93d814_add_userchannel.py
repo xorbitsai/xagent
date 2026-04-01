@@ -70,6 +70,13 @@ def downgrade() -> None:
     existing_tables = inspector.get_table_names()
 
     if "user_telegram_bots" not in existing_tables:
+        # Build foreign key constraints dynamically based on what tables exist
+        foreign_keys = []
+        if "users" in existing_tables:
+            foreign_keys.append(
+                sa.ForeignKeyConstraint(["user_id"], ["users.id"], ondelete="CASCADE")
+            )
+
         op.create_table(
             "user_telegram_bots",
             sa.Column("id", sa.Integer(), nullable=False),
@@ -84,7 +91,7 @@ def downgrade() -> None:
                 nullable=True,
             ),
             sa.Column("updated_at", sa.DateTime(), nullable=True),
-            sa.ForeignKeyConstraint(["user_id"], ["users.id"], ondelete="CASCADE"),
+            *foreign_keys,
             sa.PrimaryKeyConstraint("id"),
             sa.UniqueConstraint("user_id"),
         )

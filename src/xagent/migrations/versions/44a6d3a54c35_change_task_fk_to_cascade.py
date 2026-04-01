@@ -8,8 +8,8 @@ Create Date: 2026-03-11 00:47:06.197244
 
 from typing import Sequence, Union
 
-import sqlalchemy as sa
 from alembic import op
+from sqlalchemy.engine.reflection import Inspector
 
 # revision identifiers, used by Alembic.
 revision: str = "44a6d3a54c35"
@@ -19,31 +19,58 @@ depends_on: Union[str, Sequence[str], None] = None
 
 
 def upgrade() -> None:
-    bind = op.get_bind()
+    from alembic import context
+
+    bind = context.get_bind()
+    inspector = Inspector.from_engine(bind)
     dialect = bind.dialect.name
+
+    # Check if uploaded_files table exists
+    existing_tables = inspector.get_table_names()
+    if "uploaded_files" not in existing_tables:
+        return
 
     if dialect == "sqlite":
         # SQLite doesn't support ALTER CONSTRAINT directly
         # Need to recreate the table with the new foreign key
         op.execute("PRAGMA foreign_keys=off")
 
-        # Create new table with CASCADE constraint
-        op.execute("""
-            CREATE TABLE uploaded_files_new (
-                id INTEGER PRIMARY KEY,
-                file_id VARCHAR(36) UNIQUE NOT NULL,
-                user_id INTEGER NOT NULL,
-                task_id INTEGER,
-                filename VARCHAR(512) NOT NULL,
-                storage_path VARCHAR(2048) NOT NULL UNIQUE,
-                mime_type VARCHAR(255),
-                file_size INTEGER NOT NULL DEFAULT 0,
-                created_at DATETIME,
-                updated_at DATETIME,
-                FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE,
-                FOREIGN KEY(task_id) REFERENCES tasks(id) ON DELETE CASCADE
-            )
-        """)
+        # Check if tasks table exists before creating FK
+        if "tasks" in existing_tables:
+            # Create new table with CASCADE constraint to tasks
+            op.execute("""
+                CREATE TABLE uploaded_files_new (
+                    id INTEGER PRIMARY KEY,
+                    file_id VARCHAR(36) UNIQUE NOT NULL,
+                    user_id INTEGER NOT NULL,
+                    task_id INTEGER,
+                    filename VARCHAR(512) NOT NULL,
+                    storage_path VARCHAR(2048) NOT NULL UNIQUE,
+                    mime_type VARCHAR(255),
+                    file_size INTEGER NOT NULL DEFAULT 0,
+                    created_at DATETIME,
+                    updated_at DATETIME,
+                    FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE,
+                    FOREIGN KEY(task_id) REFERENCES tasks(id) ON DELETE CASCADE
+                )
+            """)
+        else:
+            # Create new table without tasks FK
+            op.execute("""
+                CREATE TABLE uploaded_files_new (
+                    id INTEGER PRIMARY KEY,
+                    file_id VARCHAR(36) UNIQUE NOT NULL,
+                    user_id INTEGER NOT NULL,
+                    task_id INTEGER,
+                    filename VARCHAR(512) NOT NULL,
+                    storage_path VARCHAR(2048) NOT NULL UNIQUE,
+                    mime_type VARCHAR(255),
+                    file_size INTEGER NOT NULL DEFAULT 0,
+                    created_at DATETIME,
+                    updated_at DATETIME,
+                    FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE
+                )
+            """)
 
         # Copy data from old table to new table
         op.execute("""
@@ -64,7 +91,10 @@ def upgrade() -> None:
         op.execute("PRAGMA foreign_keys=on")
     else:
         # For PostgreSQL and others that support ALTER TABLE
-        inspector = sa.inspect(bind)
+        # Only proceed if tasks table exists
+        if "tasks" not in existing_tables:
+            return
+
         fks = inspector.get_foreign_keys("uploaded_files")
         fk_name = None
         for fk in fks:
@@ -89,30 +119,57 @@ def upgrade() -> None:
 
 
 def downgrade() -> None:
-    bind = op.get_bind()
+    from alembic import context
+
+    bind = context.get_bind()
+    inspector = Inspector.from_engine(bind)
     dialect = bind.dialect.name
+
+    # Check if uploaded_files table exists
+    existing_tables = inspector.get_table_names()
+    if "uploaded_files" not in existing_tables:
+        return
 
     if dialect == "sqlite":
         # Revert back to SET NULL
         op.execute("PRAGMA foreign_keys=off")
 
-        # Create table with SET NULL constraint
-        op.execute("""
-            CREATE TABLE uploaded_files_new (
-                id INTEGER PRIMARY KEY,
-                file_id VARCHAR(36) UNIQUE NOT NULL,
-                user_id INTEGER NOT NULL,
-                task_id INTEGER,
-                filename VARCHAR(512) NOT NULL,
-                storage_path VARCHAR(2048) NOT NULL UNIQUE,
-                mime_type VARCHAR(255),
-                file_size INTEGER NOT NULL DEFAULT 0,
-                created_at DATETIME,
-                updated_at DATETIME,
-                FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE,
-                FOREIGN KEY(task_id) REFERENCES tasks(id) ON DELETE SET NULL
-            )
-        """)
+        # Check if tasks table exists before creating FK
+        if "tasks" in existing_tables:
+            # Create table with SET NULL constraint to tasks
+            op.execute("""
+                CREATE TABLE uploaded_files_new (
+                    id INTEGER PRIMARY KEY,
+                    file_id VARCHAR(36) UNIQUE NOT NULL,
+                    user_id INTEGER NOT NULL,
+                    task_id INTEGER,
+                    filename VARCHAR(512) NOT NULL,
+                    storage_path VARCHAR(2048) NOT NULL UNIQUE,
+                    mime_type VARCHAR(255),
+                    file_size INTEGER NOT NULL DEFAULT 0,
+                    created_at DATETIME,
+                    updated_at DATETIME,
+                    FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE,
+                    FOREIGN KEY(task_id) REFERENCES tasks(id) ON DELETE SET NULL
+                )
+            """)
+        else:
+            # Create table without tasks FK
+            op.execute("""
+                CREATE TABLE uploaded_files_new (
+                    id INTEGER PRIMARY KEY,
+                    file_id VARCHAR(36) UNIQUE NOT NULL,
+                    user_id INTEGER NOT NULL,
+                    task_id INTEGER,
+                    filename VARCHAR(512) NOT NULL,
+                    storage_path VARCHAR(2048) NOT NULL UNIQUE,
+                    mime_type VARCHAR(255),
+                    file_size INTEGER NOT NULL DEFAULT 0,
+                    created_at DATETIME,
+                    updated_at DATETIME,
+                    FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE
+                )
+            """)
 
         # Copy data
         op.execute("""
@@ -131,7 +188,10 @@ def downgrade() -> None:
         op.execute("PRAGMA foreign_keys=on")
     else:
         # For PostgreSQL and others
-        inspector = sa.inspect(bind)
+        # Only proceed if tasks table exists
+        if "tasks" not in existing_tables:
+            return
+
         fks = inspector.get_foreign_keys("uploaded_files")
         fk_name = None
         for fk in fks:

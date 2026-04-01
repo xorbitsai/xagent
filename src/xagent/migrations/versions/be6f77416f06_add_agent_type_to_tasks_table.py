@@ -129,7 +129,7 @@ def downgrade() -> None:
                 nullable=True,
             ),
             *foreign_keys,
-            sa.PrimaryKeyConstraint("id", name=op.f("mcp_servers_pkey")),
+            sa.PrimaryKeyConstraint("id", name="mcp_servers_legacy_pkey"),
         )
     else:
         # Use generic types for SQLite

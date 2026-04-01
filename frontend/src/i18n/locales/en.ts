@@ -295,8 +295,6 @@ Build when you need.`
       platform: "Platform",
       telegram_bot: "Telegram Bot",
       feishu_bot: "Feishu Bot",
-      name: "Name",
-      name_placeholder: "e.g. My Personal Bot",
       bot_token: "Bot Token",
       app_id: "App ID",
       app_secret: "App Secret",

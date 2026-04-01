@@ -31,7 +31,6 @@ export default function ChannelsPage() {
 
   const [formData, setFormData] = useState({
     channel_type: "telegram",
-    channel_name: "",
     bot_token: "",
     app_id: "",
     app_secret: "",
@@ -65,7 +64,6 @@ export default function ChannelsPage() {
       setEditingChannel(channel)
       setFormData({
         channel_type: channel.channel_type,
-        channel_name: channel.channel_name,
         bot_token: channel.config.bot_token || "",
         app_id: channel.config.app_id || "",
         app_secret: channel.config.app_secret || "",
@@ -76,7 +74,6 @@ export default function ChannelsPage() {
       setEditingChannel(null)
       setFormData({
         channel_type: defaultType,
-        channel_name: "",
         bot_token: "",
         app_id: "",
         app_secret: "",
@@ -89,11 +86,6 @@ export default function ChannelsPage() {
 
   const handleSubmit = async () => {
     try {
-      if (!formData.channel_name) {
-        toast.error(t("channels.messages.fill_required"))
-        return
-      }
-
       if (formData.channel_type === "telegram" && !formData.bot_token) {
         toast.error(t("channels.messages.fill_required"))
         return
@@ -106,7 +98,7 @@ export default function ChannelsPage() {
 
       const payload = {
         channel_type: formData.channel_type,
-        channel_name: formData.channel_name,
+        channel_name: "", // Always send empty to force auto-fetch on backend
         config: {
           bot_token: formData.channel_type === "telegram" ? formData.bot_token : undefined,
           app_id: formData.channel_type === "feishu" ? formData.app_id : undefined,
@@ -332,14 +324,6 @@ export default function ChannelsPage() {
                   { value: "feishu", label: t("channels.dialog.feishu_bot") },
                 ]}
                 disabled={!!editingChannel}
-              />
-            </div>
-            <div className="space-y-2">
-              <Label>{t("channels.dialog.name")}</Label>
-              <Input
-                placeholder={t("channels.dialog.name_placeholder")}
-                value={formData.channel_name}
-                onChange={(e) => setFormData(prev => ({ ...prev, channel_name: e.target.value }))}
               />
             </div>
 

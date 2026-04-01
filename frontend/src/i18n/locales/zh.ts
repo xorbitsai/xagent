@@ -295,8 +295,6 @@ Build when you need.`
       platform: "平台",
       telegram_bot: "Telegram 机器人",
       feishu_bot: "飞书机器人",
-      name: "名称",
-      name_placeholder: "例如：我的专属机器人",
       bot_token: "Bot Token",
       app_id: "App ID",
       app_secret: "App Secret",

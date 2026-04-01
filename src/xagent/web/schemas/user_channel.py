@@ -6,7 +6,7 @@ from pydantic import BaseModel, Field
 
 class UserChannelBase(BaseModel):
     channel_type: str = Field(..., description="e.g. telegram, feishu")
-    channel_name: str = Field(..., description="User-friendly name")
+    channel_name: Optional[str] = Field(None, description="User-friendly name")
     config: Dict[str, Any] = Field(..., description="Channel specific configuration")
     is_active: bool = True
 

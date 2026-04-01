@@ -1,4 +1,4 @@
-import React from 'react'
+import React, { useEffect, useState } from 'react'
 import ReactMarkdown, { defaultUrlTransform } from 'react-markdown'
 import remarkGfm from 'remark-gfm'
 import remarkMath from 'remark-math'
@@ -6,6 +6,16 @@ import rehypeKatex from 'rehype-katex'
 import type { Components } from 'react-markdown'
 import { getApiUrl } from '@/lib/utils'
 import { apiRequest } from '@/lib/api-wrapper'
+import { AgentCard } from '@/components/chat/AgentCard'
+
+
+interface AgentInfo {
+  id: number
+  name: string
+  description?: string
+  status: 'draft' | 'published'
+  instructions?: string
+}
 
 // Enhanced Markdown detection function: covers broader Markdown features not limited to starting with #
 const isLikelyMarkdown = (s: string): boolean => {
@@ -28,6 +38,7 @@ interface MarkdownRendererProps {
   content: string
   className?: string
   onFileClick?: (filePath: string, fileName: string) => void
+  onAgentClick?: (agentId: string, agentName: string) => void
 }
 
 const safeUrlTransform = (url: string): string => {
@@ -35,6 +46,106 @@ const safeUrlTransform = (url: string): string => {
   if (url.startsWith('file:')) return url
   return defaultUrlTransform(url)
 }
+
+// Hook to fetch agent details
+function useAgentInfo(agentId: string) {
+  const [agentInfo, setAgentInfo] = useState<AgentInfo | null>(null)
+  const [loading, setLoading] = useState(true)
+  const [error, setError] = useState<Error | null>(null)
+
+  useEffect(() => {
+    let cancelled = false
+
+    async function fetchAgentInfo() {
+      try {
+        setLoading(true)
+        setError(null)
+
+        const apiUrl = getApiUrl()
+        const response = await apiRequest(`${apiUrl}/api/agents/${agentId}`)
+
+        if (!response.ok) {
+          throw new Error(`Failed to fetch agent: ${response.statusText}`)
+        }
+
+        const data: AgentInfo = await response.json()
+
+        if (!cancelled) {
+          setAgentInfo(data)
+        }
+      } catch (err) {
+        if (!cancelled) {
+          setError(err as Error)
+        }
+      } finally {
+        if (!cancelled) {
+          setLoading(false)
+        }
+      }
+    }
+
+    fetchAgentInfo()
+
+    return () => {
+      cancelled = true
+    }
+  }, [agentId])
+
+  return { agentInfo, loading, error }
+}
+
+
+// Agent Card Container component that fetches data
+function AgentCardContainer({
+  agentId,
+  agentName: initialAgentName,
+  onAgentClick,
+}: {
+  agentId: string
+  agentName: string
+  onAgentClick?: (agentId: string, agentName: string) => void
+}) {
+  const { agentInfo, loading, error } = useAgentInfo(agentId)
+
+  // Show loading state
+  if (loading) {
+    return (
+      <div className="inline-flex items-center gap-2 bg-muted/50 border border-border rounded-lg p-3 my-2 max-w-sm">
+        <div className="w-8 h-8 rounded-md bg-muted animate-pulse" />
+        <div className="flex-1">
+          <div className="h-4 bg-muted rounded animate-pulse w-32 mb-1" />
+          <div className="h-3 bg-muted rounded animate-pulse w-24" />
+        </div>
+      </div>
+    )
+  }
+
+  // Show error state with fallback name
+  if (error || !agentInfo) {
+    return (
+      <AgentCard
+        agentId={agentId}
+        agentName={initialAgentName}
+        description="无法加载 Agent 详情"
+        status="draft"
+        onClick={onAgentClick ? () => onAgentClick(agentId, initialAgentName) : undefined}
+      />
+    )
+  }
+
+  // Show agent info
+  // If onAgentClick is provided, use it; otherwise AgentCard will navigate by default
+  return (
+    <AgentCard
+      agentId={agentId}
+      agentName={agentInfo.name}
+      description={agentInfo.description || agentInfo.instructions}
+      status={agentInfo.status}
+      onClick={onAgentClick ? () => onAgentClick(agentId, agentInfo.name) : undefined}
+    />
+  )
+}
+
 
 const UUID_PATTERN =
   /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i
@@ -118,7 +229,7 @@ function MarkdownFileImage({
   )
 }
 
-export function MarkdownRenderer({ content, className = '', onFileClick }: MarkdownRendererProps) {
+export function MarkdownRenderer({ content, className = '', onFileClick, onAgentClick }: MarkdownRendererProps) {
   const components = React.useMemo<Components>(
     () => ({
       a({ node: _node, href, title, children, ...props }) {
@@ -150,6 +261,23 @@ export function MarkdownRenderer({ content, className = '', onFileClick }: Markd
               {children}
             </a>
           )
+        }
+
+        if (href && href.startsWith('agent:')) {
+          const agentId = href.replace(/^agent:\/\//, '')
+          const agentNameFromLink =
+            (typeof children === 'string' ? children : undefined) ??
+            (Array.isArray(children)
+              ? children.map((c: any) => (typeof c === 'string' ? c : '')).join('').trim() || undefined
+              : undefined) ?? `Agent ${agentId}`
+
+          // Render as AgentCardContainer that fetches agent details
+          return React.createElement(AgentCardContainer, {
+            key: `agent-${agentId}`,
+            agentId: agentId,
+            agentName: agentNameFromLink,
+            onAgentClick: onAgentClick,
+          })
         }
 
         return (
@@ -197,20 +325,21 @@ interface JsonRendererProps {
   data: any
   className?: string
   onFileClick?: (filePath: string, fileName: string) => void
+  onAgentClick?: (agentId: string, agentName: string) => void
 }
 
-export function JsonRenderer({ data, className = '', onFileClick }: JsonRendererProps) {
+export function JsonRenderer({ data, className = '', onFileClick, onAgentClick }: JsonRendererProps) {
   const [expanded, setExpanded] = React.useState(true)
 
   if (typeof data === 'string') {
     // Try to parse as JSON first
     try {
       const parsed = JSON.parse(data)
-      return <JsonRenderer data={parsed} className={className} onFileClick={onFileClick} />
+      return <JsonRenderer data={parsed} className={className} onFileClick={onFileClick} onAgentClick={onAgentClick} />
     } catch {
       // If not JSON, try to identify Markdown more comprehensively
       if (isLikelyMarkdown(data)) {
-        return <MarkdownRenderer content={data} className={className} onFileClick={onFileClick} />
+        return <MarkdownRenderer content={data} className={className} onFileClick={onFileClick} onAgentClick={onAgentClick} />
       }
       // Otherwise display as plain text
       return (
@@ -232,7 +361,7 @@ export function JsonRenderer({ data, className = '', onFileClick }: JsonRenderer
           </div>
           <div className="border-t border-border pt-3">
             <div className="text-sm font-medium text-foreground mb-2">Result:</div>
-            <MarkdownRenderer content={data.output} onFileClick={onFileClick} />
+            <MarkdownRenderer content={data.output} onFileClick={onFileClick} onAgentClick={onAgentClick} />
           </div>
         </div>
       )

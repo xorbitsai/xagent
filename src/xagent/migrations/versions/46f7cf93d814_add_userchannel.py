@@ -25,6 +25,16 @@ def upgrade() -> None:
     existing_tables = inspector.get_table_names()
 
     if "user_channels" not in existing_tables:
+        # Build foreign key constraints dynamically based on what tables exist
+        # This handles running migrations from empty database
+        foreign_keys = []
+
+        # Only add user_id FK if users table exists
+        if "users" in existing_tables:
+            foreign_keys.append(
+                sa.ForeignKeyConstraint(["user_id"], ["users.id"], ondelete="CASCADE")
+            )
+
         op.create_table(
             "user_channels",
             sa.Column("id", sa.Integer(), nullable=False),
@@ -40,7 +50,7 @@ def upgrade() -> None:
                 nullable=True,
             ),
             sa.Column("updated_at", sa.DateTime(timezone=True), nullable=True),
-            sa.ForeignKeyConstraint(["user_id"], ["users.id"], ondelete="CASCADE"),
+            *foreign_keys,
             sa.PrimaryKeyConstraint("id"),
         )
         op.create_index(

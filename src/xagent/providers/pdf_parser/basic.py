@@ -52,6 +52,7 @@ class UnstructuredParser(
         ".txt",
         ".md",
         ".json",
+        ".html",
     ]
 
     async def _parse_impl(self, file_path: str, **kwargs: Any) -> ParseResult:
@@ -169,6 +170,10 @@ async def extract_text_with_unstructured(file_path: str, **kwargs: Any) -> Parse
             from unstructured.partition.xlsx import partition_xlsx
 
             elements = partition_xlsx(filename=file_path)
+        elif file_ext == ".html":
+            from unstructured.partition.html import partition_html
+
+            elements = partition_html(filename=file_path)
         elif file_ext in (".txt", ".md", ".json"):
             # For plain text files, read directly
             with open(file_path, "r", encoding="utf-8") as f:

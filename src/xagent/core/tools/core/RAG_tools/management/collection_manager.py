@@ -229,7 +229,38 @@ class CollectionManager:
                     table.delete(f"name = '{safe_name}'")
 
                 # Add new record
-                table.add([data])
+                # Ensure data strictly matches table schema to prevent LanceDB schema errors
+                # (e.g. "missing=[owners]" or "contains null values")
+                import pyarrow as pa  # type: ignore[import-not-found]
+
+                clean_data: dict[str, Any] = {}
+                for field in table.schema:
+                    val = data.get(field.name)
+                    if val is None:
+                        # Provide default for missing or None values if not nullable
+                        if not field.nullable:
+                            if pa.types.is_string(
+                                field.type
+                            ) or pa.types.is_large_string(field.type):
+                                clean_data[field.name] = ""
+                            elif pa.types.is_integer(field.type):
+                                clean_data[field.name] = 0
+                            elif pa.types.is_floating(field.type):
+                                clean_data[field.name] = 0.0
+                            elif pa.types.is_boolean(field.type):
+                                clean_data[field.name] = False
+                            elif pa.types.is_timestamp(field.type):
+                                clean_data[field.name] = datetime.now(
+                                    timezone.utc
+                                ).replace(tzinfo=None)
+                            else:
+                                clean_data[field.name] = ""
+                        else:
+                            clean_data[field.name] = None
+                    else:
+                        clean_data[field.name] = val
+
+                table.add([clean_data])
                 return
 
             except Exception as e:

@@ -134,6 +134,7 @@ async def parse_document(
                 ".txt",
                 ".md",
                 ".json",
+                ".html",
             )
             and "unstructured" in available_parsers
         ):

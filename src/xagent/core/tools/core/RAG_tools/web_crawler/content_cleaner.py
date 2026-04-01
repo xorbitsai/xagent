@@ -45,6 +45,9 @@ class ContentCleaner:
             # Extract title
             title = self._extract_title(soup)
 
+            # Extract meta descriptions and keywords before removing unwanted elements
+            meta_content = self._extract_meta_content(soup)
+
             # Remove unwanted elements
             self._remove_unwanted(soup)
 
@@ -63,6 +66,13 @@ class ContentCleaner:
             # Convert to markdown
             markdown = self._to_markdown(soup)
 
+            # Enhance markdown with meta content if it exists
+            if meta_content:
+                if markdown:
+                    markdown = f"{meta_content}\n\n{markdown}"
+                else:
+                    markdown = meta_content
+
             return {
                 "title": title,
                 "content_markdown": markdown,
@@ -76,6 +86,38 @@ class ContentCleaner:
                 "content_markdown": "",
                 "content_length": 0,
             }
+
+    def _extract_meta_content(self, soup: BeautifulSoup) -> str:
+        """Extract description and keywords from meta tags.
+
+        Args:
+            soup: BeautifulSoup object
+
+        Returns:
+            Formatted string of meta content or empty string
+        """
+        from bs4 import Tag
+
+        meta_parts = []
+
+        # Extract description
+        desc_tag = soup.find("meta", attrs={"name": "description"})
+        if not desc_tag:
+            desc_tag = soup.find("meta", property="og:description")
+
+        if isinstance(desc_tag, Tag):
+            content = desc_tag.get("content")
+            if isinstance(content, str) and content.strip():
+                meta_parts.append(content.strip())
+
+        # Extract keywords
+        keywords_tag = soup.find("meta", attrs={"name": "keywords"})
+        if isinstance(keywords_tag, Tag):
+            content = keywords_tag.get("content")
+            if isinstance(content, str) and content.strip():
+                meta_parts.append(f"Keywords: {content.strip()}")
+
+        return "\n\n".join(meta_parts)
 
     def _extract_title(self, soup: BeautifulSoup) -> Optional[str]:
         """Extract page title from HTML.

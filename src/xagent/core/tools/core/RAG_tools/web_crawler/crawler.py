@@ -198,7 +198,7 @@ class WebCrawler:
 
                 # Validate content
                 content = cleaned["content_markdown"]
-                if not self.content_cleaner.is_valid_content(content):
+                if not self.content_cleaner.is_valid_content(content, min_length=10):
                     logger.warning(f"Insufficient content at {url}")
                     self.failed_urls[url] = "Insufficient content"
                     return None, set()

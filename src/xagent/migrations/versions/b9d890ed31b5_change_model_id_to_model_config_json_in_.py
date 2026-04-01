@@ -49,13 +49,13 @@ def upgrade() -> None:
                 with op.batch_alter_table("agents", recreate="auto") as batch_op:
                     batch_op.drop_column("model_id")
         else:
-            # PostgreSQL: drop constraint first, then column
-            try:
+            # PostgreSQL: check if FK constraint exists before dropping
+            fks = inspector.get_foreign_keys("agents")
+            fk_exists = any(fk["name"] == "fk_agents_model_id_models" for fk in fks)
+            if fk_exists:
                 op.drop_constraint(
                     "fk_agents_model_id_models", "agents", type_="foreignkey"
                 )
-            except Exception:
-                pass  # Constraint might not exist
             op.drop_column("agents", "model_id")
 
     # Add model_config column if it doesn't exist

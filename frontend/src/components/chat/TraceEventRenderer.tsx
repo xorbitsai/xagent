@@ -1,4 +1,5 @@
 import { useState, useRef, useEffect, useCallback, useMemo } from 'react';
+import { useRouter } from 'next/navigation';
 import { motion, AnimatePresence } from 'framer-motion';
 import {
   CheckCircle2,
@@ -394,7 +395,7 @@ const CopyButton = ({ text, title }: { text: string, title?: string }) => {
   );
 };
 
-const ToolOutputDisplay = ({ action, isRunning, t }: { action: StepAction, isRunning: boolean, t: any }) => (
+const ToolOutputDisplay = ({ action, isRunning, t, onFileClick, onAgentClick }: { action: StepAction, isRunning: boolean, t: any, onFileClick?: (filePath: string, fileName: string) => void, onAgentClick?: (agentId: string, agentName: string) => void }) => (
   <>
     {action.data.output !== undefined && action.data.output !== '' && (
       <div className="mt-4 flex flex-col gap-1.5">
@@ -402,8 +403,19 @@ const ToolOutputDisplay = ({ action, isRunning, t }: { action: StepAction, isRun
           <span>{t('traceEventRenderer.output')}</span>
           <CopyButton text={typeof action.data.output === 'string' ? action.data.output : JSON.stringify(action.data.output, null, 2)} />
         </div>
-        <div className="p-3 bg-muted/30 border border-border/50 rounded-xl text-[10px] sm:text-xs font-mono overflow-x-auto text-foreground/80 whitespace-pre-wrap break-all">
-          {typeof action.data.output === 'string' ? action.data.output : JSON.stringify(action.data.output, null, 2)}
+        <div className="p-3 bg-muted/30 border border-border/50 rounded-xl text-[10px] sm:text-xs overflow-x-auto">
+          {typeof action.data.output === 'string' ? (
+            <MarkdownRenderer
+              content={action.data.output}
+              onFileClick={onFileClick}
+              onAgentClick={onAgentClick}
+              className="prose-sm max-w-none"
+            />
+          ) : (
+            <pre className="text-foreground/80 whitespace-pre-wrap break-all font-mono">
+              {JSON.stringify(action.data.output, null, 2)}
+            </pre>
+          )}
         </div>
       </div>
     )}
@@ -428,7 +440,7 @@ const ToolErrorDisplay = ({ action, t }: { action: StepAction, t: any }) => {
   return null;
 };
 
-const PythonToolRenderer = ({ action, onOpenTerminal, isRunning, t }: any) => {
+const PythonToolRenderer = ({ action, onOpenTerminal, isRunning, t, onFileClick, onAgentClick }: any) => {
   const code = action.data.code;
   const filePath = action.data.args?.file_path;
   return (
@@ -455,12 +467,12 @@ const PythonToolRenderer = ({ action, onOpenTerminal, isRunning, t }: any) => {
           </div>
         </div>
       )}
-      <ToolOutputDisplay action={action} isRunning={isRunning} t={t} />
+      <ToolOutputDisplay action={action} isRunning={isRunning} t={t} onFileClick={onFileClick} onAgentClick={onAgentClick} />
     </div>
   );
 };
 
-const BashToolRenderer = ({ action, onOpenTerminal, isRunning, t }: any) => {
+const BashToolRenderer = ({ action, onOpenTerminal, isRunning, t, onFileClick, onAgentClick }: any) => {
   const command = action.data.args?.command || JSON.stringify(action.data.args);
   return (
     <div className="pt-2">
@@ -476,12 +488,12 @@ const BashToolRenderer = ({ action, onOpenTerminal, isRunning, t }: any) => {
           </div>
         </div>
       )}
-      <ToolOutputDisplay action={action} isRunning={isRunning} t={t} />
+      <ToolOutputDisplay action={action} isRunning={isRunning} t={t} onFileClick={onFileClick} onAgentClick={onAgentClick} />
     </div>
   );
 };
 
-const SearchToolRenderer = ({ action, isRunning, t }: any) => {
+const SearchToolRenderer = ({ action, isRunning, t, onFileClick, onAgentClick }: any) => {
   const query = action.data.args?.query || JSON.stringify(action.data.args);
   return (
     <div className="pt-2">
@@ -495,12 +507,12 @@ const SearchToolRenderer = ({ action, isRunning, t }: any) => {
           <span className="italic text-foreground/80 whitespace-pre-wrap break-all">{query}</span>
         </div>
       </div>
-      <ToolOutputDisplay action={action} isRunning={isRunning} t={t} />
+      <ToolOutputDisplay action={action} isRunning={isRunning} t={t} onFileClick={onFileClick} onAgentClick={onAgentClick} />
     </div>
   );
 };
 
-const FileToolRenderer = ({ action, onOpenTerminal, isRunning, t }: any) => {
+const FileToolRenderer = ({ action, onOpenTerminal, isRunning, t, onFileClick, onAgentClick }: any) => {
   const { args, tool } = action.data;
   const filePath = args?.file_path || args?.path;
   const content = args?.content || args?.text || args?.code;
@@ -540,12 +552,12 @@ const FileToolRenderer = ({ action, onOpenTerminal, isRunning, t }: any) => {
           )}
         </div>
       </div>
-      <ToolOutputDisplay action={action} isRunning={isRunning} t={t} />
+      <ToolOutputDisplay action={action} isRunning={isRunning} t={t} onFileClick={onFileClick} onAgentClick={onAgentClick} />
     </div>
   );
 };
 
-const DefaultToolRenderer = ({ action, isRunning, t }: any) => {
+const DefaultToolRenderer = ({ action, isRunning, t, onFileClick, onAgentClick }: any) => {
   const args = JSON.stringify(action.data.args, null, 2);
   return (
     <div className="pt-2">
@@ -558,24 +570,24 @@ const DefaultToolRenderer = ({ action, isRunning, t }: any) => {
           <pre className="whitespace-pre-wrap break-all">{args}</pre>
         </div>
       </div>
-      <ToolOutputDisplay action={action} isRunning={isRunning} t={t} />
+      <ToolOutputDisplay action={action} isRunning={isRunning} t={t} onFileClick={onFileClick} onAgentClick={onAgentClick} />
     </div>
   );
 };
 
-const ToolDetailsRenderer = ({ action, onOpenTerminal, isRunning, t }: any) => {
+const ToolDetailsRenderer = ({ action, onOpenTerminal, isRunning, t, onFileClick, onAgentClick }: any) => {
   const toolName = action.data.tool;
   let rendererContent = null;
   if (toolName === 'python_executor') {
-    rendererContent = <PythonToolRenderer action={action} onOpenTerminal={onOpenTerminal} isRunning={isRunning} t={t} />;
+    rendererContent = <PythonToolRenderer action={action} onOpenTerminal={onOpenTerminal} isRunning={isRunning} t={t} onFileClick={onFileClick} onAgentClick={onAgentClick} />;
   } else if (toolName === 'bash') {
-    rendererContent = <BashToolRenderer action={action} onOpenTerminal={onOpenTerminal} isRunning={isRunning} t={t} />;
+    rendererContent = <BashToolRenderer action={action} onOpenTerminal={onOpenTerminal} isRunning={isRunning} t={t} onFileClick={onFileClick} onAgentClick={onAgentClick} />;
   } else if (toolName === 'web_search' || toolName === 'tavily_web_search') {
-    rendererContent = <SearchToolRenderer action={action} isRunning={isRunning} t={t} />;
+    rendererContent = <SearchToolRenderer action={action} isRunning={isRunning} t={t} onFileClick={onFileClick} onAgentClick={onAgentClick} />;
   } else if (toolName && (toolName.includes('file') || toolName === 'list_directory')) {
-    rendererContent = <FileToolRenderer action={action} onOpenTerminal={onOpenTerminal} isRunning={isRunning} t={t} />;
+    rendererContent = <FileToolRenderer action={action} onOpenTerminal={onOpenTerminal} isRunning={isRunning} t={t} onFileClick={onFileClick} onAgentClick={onAgentClick} />;
   } else {
-    rendererContent = <DefaultToolRenderer action={action} isRunning={isRunning} t={t} />;
+    rendererContent = <DefaultToolRenderer action={action} isRunning={isRunning} t={t} onFileClick={onFileClick} onAgentClick={onAgentClick} />;
   }
 
   return (
@@ -594,9 +606,10 @@ interface StepActionItemProps {
   onViewDetail: (action: StepAction) => void;
   onOpenTerminal: (code: string, output: string, toolName: string, filePath?: string) => void;
   onFileClick?: (filePath: string, fileName: string) => void;
+  onAgentClick?: (agentId: string, agentName: string) => void;
 }
 
-function StepActionItem({ action, onViewDetail, onOpenTerminal, onFileClick }: StepActionItemProps) {
+function StepActionItem({ action, onViewDetail, onOpenTerminal, onFileClick, onAgentClick }: StepActionItemProps) {
   const { t } = useI18n();
   const scrollRef = useRef<HTMLDivElement>(null);
   const [isExpanded, setIsExpanded] = useState(false);
@@ -765,7 +778,7 @@ function StepActionItem({ action, onViewDetail, onOpenTerminal, onFileClick }: S
                 onClick={() => onViewDetail(action)}
               >
                 {action.type === 'tool' && (
-                  <ToolDetailsRenderer action={action} onOpenTerminal={onOpenTerminal} isRunning={isRunning} t={t} />
+                  <ToolDetailsRenderer action={action} onOpenTerminal={onOpenTerminal} isRunning={isRunning} t={t} onFileClick={onFileClick} onAgentClick={onAgentClick} />
                 )}
 
                 {action.type === 'error' && (
@@ -789,9 +802,10 @@ interface StepItemProps {
   onOpenTerminal: (code: string, output: string, toolName: string, filePath?: string) => void;
   onViewDetail: (action: StepAction) => void;
   onFileClick?: (filePath: string, fileName: string) => void;
+  onAgentClick?: (agentId: string, agentName: string) => void;
 }
 
-function StepItem({ step, index, onOpenTerminal, onViewDetail, onFileClick }: StepItemProps) {
+function StepItem({ step, index, onOpenTerminal, onViewDetail, onFileClick, onAgentClick }: StepItemProps) {
   const isCompleted = step.status === 'completed';
   const isFailed = step.status === 'failed';
   const [isExpanded, setIsExpanded] = useState(true); // Default to expanded
@@ -848,6 +862,7 @@ function StepItem({ step, index, onOpenTerminal, onViewDetail, onFileClick }: St
                   onViewDetail={onViewDetail}
                   onOpenTerminal={onOpenTerminal}
                   onFileClick={onFileClick}
+                  onAgentClick={onAgentClick}
                 />
               ))}
             </div>
@@ -862,8 +877,13 @@ function StepItem({ step, index, onOpenTerminal, onViewDetail, onFileClick }: St
 export function TraceEventRenderer({ events }: TraceEventRendererProps) {
   const { t } = useI18n();
   const steps = useProcessedSteps(events);
+  const router = useRouter();
 
   const { openFilePreview, dispatch } = useApp();
+
+  const handleAgentClick = useCallback((agentId: string, agentName: string) => {
+    router.push(`/agent/${agentId}`);
+  }, [router]);
 
   const skillSelection = useMemo(() => {
     for (let i = events.length - 1; i >= 0; i--) {
@@ -955,6 +975,7 @@ export function TraceEventRenderer({ events }: TraceEventRendererProps) {
               onOpenTerminal={handleOpenTerminal}
               onViewDetail={handleViewActionDetail}
               onFileClick={openFilePreview}
+              onAgentClick={handleAgentClick}
             />
           ))}
         </div>

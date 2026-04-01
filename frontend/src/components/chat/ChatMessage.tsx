@@ -1,5 +1,6 @@
 import React, { useState, useRef, useEffect } from "react";
 import { Bot, ChevronDown, ChevronUp, Copy, Check } from "lucide-react";
+import { useRouter } from "next/navigation";
 import { cn } from "@/lib/utils";
 import { TraceEventRenderer } from "./TraceEventRenderer";
 import { useI18n } from "@/contexts/i18n-context";
@@ -254,6 +255,8 @@ export function ChatMessage({
   timestamp,
 }: ChatMessageProps) {
   const { t } = useI18n();
+  const { openFilePreview } = useApp();
+  const router = useRouter();
   const isUser = role === "user";
   const [copied, setCopied] = useState(false);
 
@@ -265,6 +268,14 @@ export function ChatMessage({
       setCopied(true);
       setTimeout(() => setCopied(false), 2000);
     }
+  };
+
+  const handleAgentClick = (agentId: string, agentName: string) => {
+    router.push(`/agent/${agentId}`);
+  };
+
+  const handleFileClick = (filePath: string, fileName: string) => {
+    openFilePreview?.(filePath, fileName, [{ fileName, fileId: filePath }]);
   };
 
   const formattedTime = timestamp
@@ -350,6 +361,8 @@ export function ChatMessage({
                   <MarkdownRenderer
                     content={content}
                     className="prose-sm pt-2 leading-relaxed"
+                    onAgentClick={handleAgentClick}
+                    onFileClick={handleFileClick}
                   />
                 )
               ) : (

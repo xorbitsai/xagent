@@ -2154,7 +2154,7 @@ export function AppProvider({ children, token }: { children: React.ReactNode; to
                     <span>{t('agent.logs.event.messages.metaTitle')}</span>
                   </div>
                   <div className="ml-6">
-                    <JsonRenderer data={metaInfo} onFileClick={openFilePreview} />
+                    <JsonRenderer data={metaInfo} onFileClick={openFilePreview} onAgentClick={(agentId) => router.push(`/agent/${agentId}`)} />
                   </div>
                 </div>
               )
@@ -2256,7 +2256,7 @@ export function AppProvider({ children, token }: { children: React.ReactNode; to
             if (finalOutput && finalOutput.trim() !== '') {
               const resultContent = (
                 <div>
-                  <JsonRenderer data={finalOutput} onFileClick={openFilePreview} />
+                  <JsonRenderer data={finalOutput} onFileClick={openFilePreview} onAgentClick={(agentId) => router.push(`/agent/${agentId}`)} />
                 </div>
               )
               if (!isDuplicateResult(`📊 ${t('agent.logs.event.messages.executionResultPrefix')} ${finalOutput}`)) {

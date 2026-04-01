@@ -44,6 +44,7 @@ interface MarkdownRendererProps {
 const safeUrlTransform = (url: string): string => {
   if (!url) return ''
   if (url.startsWith('file:')) return url
+  if (url.startsWith('agent:')) return url
   return defaultUrlTransform(url)
 }
 
@@ -272,12 +273,16 @@ export function MarkdownRenderer({ content, className = '', onFileClick, onAgent
               : undefined) ?? `Agent ${agentId}`
 
           // Render as AgentCardContainer that fetches agent details
-          return React.createElement(AgentCardContainer, {
+          // Wrap in div to ensure it appears on its own line
+          return React.createElement('div', {
+            className: 'my-2',
+            key: `agent-${agentId}-wrapper`
+          }, React.createElement(AgentCardContainer, {
             key: `agent-${agentId}`,
             agentId: agentId,
             agentName: agentNameFromLink,
             onAgentClick: onAgentClick,
-          })
+          }))
         }
 
         return (

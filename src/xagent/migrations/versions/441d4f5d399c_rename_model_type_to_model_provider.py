@@ -109,8 +109,16 @@ def upgrade() -> None:
 
 
 def downgrade() -> None:
+    from sqlalchemy.engine.reflection import Inspector
+
     cipher = get_cipher()
     bind = op.get_bind()
+    inspector = Inspector.from_engine(bind)
+
+    # Check if models table exists
+    tables = inspector.get_table_names()
+    if "models" not in tables:
+        return
 
     with op.batch_alter_table("models") as batch_op:
         # Add back plain column

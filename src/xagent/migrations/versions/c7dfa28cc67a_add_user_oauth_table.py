@@ -148,19 +148,28 @@ def downgrade() -> None:
 
         if dialect_name == "sqlite":
             # SQLite workaround for reverting changes
-            with op.batch_alter_table("uploaded_files", schema=None) as batch_op:
-                if "uq_uploaded_files_storage_path" in existing_constraints:
-                    batch_op.drop_constraint(
-                        batch_op.f("uq_uploaded_files_storage_path"), type_="unique"
+            # Try-except to handle case where FK references don't exist (e.g., users table)
+            try:
+                with op.batch_alter_table("uploaded_files", schema=None) as batch_op:
+                    if "uq_uploaded_files_storage_path" in existing_constraints:
+                        batch_op.drop_constraint(
+                            batch_op.f("uq_uploaded_files_storage_path"), type_="unique"
+                        )
+                    if "ix_uploaded_files_file_id" in existing_indexes:
+                        batch_op.drop_index(batch_op.f("ix_uploaded_files_file_id"))
+                    batch_op.create_index(
+                        "ix_uploaded_files_file_id", ["file_id"], unique=False
                     )
-                if "ix_uploaded_files_file_id" in existing_indexes:
-                    batch_op.drop_index(batch_op.f("ix_uploaded_files_file_id"))
-                batch_op.create_index(
-                    "ix_uploaded_files_file_id", ["file_id"], unique=False
-                )
-                batch_op.alter_column(
-                    "id", existing_type=sa.INTEGER(), nullable=True, autoincrement=True
-                )
+                    batch_op.alter_column(
+                        "id",
+                        existing_type=sa.INTEGER(),
+                        nullable=True,
+                        autoincrement=True,
+                    )
+            except sa.exc.NoSuchTableError:
+                # FK reflection failed because referenced table doesn't exist
+                # Skip this migration step - the table will be in its correct state
+                pass
         else:
             # For PostgreSQL and other databases, use native operations
             if "uq_uploaded_files_storage_path" in existing_constraints:

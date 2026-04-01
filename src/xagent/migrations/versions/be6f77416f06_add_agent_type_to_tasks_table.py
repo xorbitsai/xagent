@@ -82,42 +82,82 @@ def downgrade() -> None:
                 op.drop_index(op.f("ix_mcp_servers_id"), table_name="mcp_servers")
             except Exception:
                 pass  # Index might not exist
-    op.create_table(
-        "mcp_servers_legacy",
-        sa.Column("id", sa.INTEGER(), autoincrement=True, nullable=False),
-        sa.Column("user_id", sa.INTEGER(), autoincrement=False, nullable=False),
-        sa.Column("name", sa.VARCHAR(length=100), autoincrement=False, nullable=False),
-        sa.Column("description", sa.TEXT(), autoincrement=False, nullable=True),
-        sa.Column(
-            "transport", sa.VARCHAR(length=50), autoincrement=False, nullable=False
-        ),
-        sa.Column(
-            "config",
-            postgresql.JSON(astext_type=sa.Text()),
-            autoincrement=False,
-            nullable=False,
-        ),
-        sa.Column("is_active", sa.BOOLEAN(), autoincrement=False, nullable=True),
-        sa.Column("is_default", sa.BOOLEAN(), autoincrement=False, nullable=True),
-        sa.Column(
-            "created_at",
-            postgresql.TIMESTAMP(timezone=True),
-            server_default=sa.text("now()"),
-            autoincrement=False,
-            nullable=True,
-        ),
-        sa.Column(
-            "updated_at",
-            postgresql.TIMESTAMP(timezone=True),
-            server_default=sa.text("now()"),
-            autoincrement=False,
-            nullable=True,
-        ),
-        sa.ForeignKeyConstraint(
-            ["user_id"], ["users.id"], name=op.f("mcp_servers_user_id_fkey")
-        ),
-        sa.PrimaryKeyConstraint("id", name=op.f("mcp_servers_pkey")),
-    )
+
+    # Recreate mcp_servers_legacy table, conditionally with FK to users
+    dialect_name = bind.dialect.name
+    foreign_keys = []
+    if "users" in tables:
+        foreign_keys.append(
+            sa.ForeignKeyConstraint(
+                ["user_id"], ["users.id"], name=op.f("mcp_servers_user_id_fkey")
+            )
+        )
+
+    if dialect_name == "postgresql":
+        # Use PostgreSQL-specific types
+        op.create_table(
+            "mcp_servers_legacy",
+            sa.Column("id", sa.INTEGER(), autoincrement=True, nullable=False),
+            sa.Column("user_id", sa.INTEGER(), autoincrement=False, nullable=False),
+            sa.Column(
+                "name", sa.VARCHAR(length=100), autoincrement=False, nullable=False
+            ),
+            sa.Column("description", sa.TEXT(), autoincrement=False, nullable=True),
+            sa.Column(
+                "transport", sa.VARCHAR(length=50), autoincrement=False, nullable=False
+            ),
+            sa.Column(
+                "config",
+                postgresql.JSON(astext_type=sa.Text()),
+                autoincrement=False,
+                nullable=False,
+            ),
+            sa.Column("is_active", sa.BOOLEAN(), autoincrement=False, nullable=True),
+            sa.Column("is_default", sa.BOOLEAN(), autoincrement=False, nullable=True),
+            sa.Column(
+                "created_at",
+                postgresql.TIMESTAMP(timezone=True),
+                server_default=sa.text("now()"),
+                autoincrement=False,
+                nullable=True,
+            ),
+            sa.Column(
+                "updated_at",
+                postgresql.TIMESTAMP(timezone=True),
+                server_default=sa.text("now()"),
+                autoincrement=False,
+                nullable=True,
+            ),
+            *foreign_keys,
+            sa.PrimaryKeyConstraint("id", name=op.f("mcp_servers_pkey")),
+        )
+    else:
+        # Use generic types for SQLite
+        op.create_table(
+            "mcp_servers_legacy",
+            sa.Column("id", sa.INTEGER(), nullable=False),
+            sa.Column("user_id", sa.INTEGER(), nullable=False),
+            sa.Column("name", sa.String(length=100), nullable=False),
+            sa.Column("description", sa.Text(), nullable=True),
+            sa.Column("transport", sa.String(length=50), nullable=False),
+            sa.Column("config", sa.JSON(), nullable=False),
+            sa.Column("is_active", sa.Boolean(), nullable=True),
+            sa.Column("is_default", sa.Boolean(), nullable=True),
+            sa.Column(
+                "created_at",
+                sa.DateTime(timezone=True),
+                server_default=sa.text("CURRENT_TIMESTAMP"),
+                nullable=True,
+            ),
+            sa.Column(
+                "updated_at",
+                sa.DateTime(timezone=True),
+                server_default=sa.text("CURRENT_TIMESTAMP"),
+                nullable=True,
+            ),
+            *foreign_keys,
+            sa.PrimaryKeyConstraint("id"),
+        )
     op.create_index(
         op.f("ix_mcp_servers_id"), "mcp_servers_legacy", ["id"], unique=False
     )

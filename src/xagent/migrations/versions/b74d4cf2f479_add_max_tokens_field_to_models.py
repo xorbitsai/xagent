@@ -43,6 +43,12 @@ def downgrade() -> None:
     bind = context.get_bind()
     inspector = Inspector.from_engine(bind)
 
+    # Check if models table exists
+    tables = inspector.get_table_names()
+    if "models" not in tables:
+        # Table doesn't exist, nothing to drop
+        return
+
     # Check if column exists before dropping
     existing_columns = [col["name"] for col in inspector.get_columns("models")]
     if "max_tokens" in existing_columns:

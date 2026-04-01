@@ -638,10 +638,6 @@ async def download_file(
     if not full_path.exists():
         raise HTTPException(status_code=404, detail="File not found")
 
-    converted_pdf = await _try_convert_pptx_to_pdf(full_path)
-    if converted_pdf is not None:
-        return converted_pdf
-
     # For images and other viewable content, set Content-Disposition to inline
     # to allow browser to display the file instead of downloading it
     content_disposition = (
@@ -745,6 +741,12 @@ async def public_preview_file(
     converted_pdf = await _try_convert_pptx_to_pdf(target_path)
     if converted_pdf is not None:
         return converted_pdf
+
+    if target_path.suffix.lower() == ".pptx":
+        try:
+            return _pptx_fallback_html(target_path)
+        except Exception:
+            pass
 
     return FileResponse(
         path=str(target_path),

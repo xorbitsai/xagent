@@ -45,33 +45,35 @@ export function FilePreviewContent({ open }: FilePreviewContentProps) {
             const contentType = response.headers.get('content-type') || ''
             const mimeType = contentType.split(';')[0].trim()
 
-          // Determine file type based on MIME type instead of file extension
-          const isImage = mimeType.startsWith('image/')
-          const isPdf = mimeType.startsWith('application/pdf') || mimeType === 'application/pdf'
-          const isDocx = mimeType === 'application/vnd.openxmlformats-officedocument.wordprocessingml.document'
+            // Determine file type based on MIME type instead of file extension
+            const isImage = mimeType.startsWith('image/')
+            const isPdf = mimeType.startsWith('application/pdf') || mimeType === 'application/pdf'
+            const isDocx = mimeType === 'application/vnd.openxmlformats-officedocument.wordprocessingml.document'
+            const isTextType = mimeType.startsWith('text/') || mimeType === 'application/json' || mimeType === 'application/xml' || mimeType === 'application/javascript'
 
-          console.log('File preview debug:', {
-            fileName: filePreview.fileName,
-            mimeType,
-            isImage,
-            isDocx,
-            isPdf,
-            contentType: response.headers.get('content-type')
-          })
-
-          if (isImage || isPdf || isDocx || filePreview.fileName.match(/\.(docx|pdf|jpg|jpeg|png|gif|webp|svg|pptx)$/i)) {
-            const arrayBuffer = await response.arrayBuffer()
-
-            // Use modern, efficient base64 conversion
-            const bytes = new Uint8Array(arrayBuffer)
-            const binaryString = Array.from(bytes, (byte) => String.fromCharCode(byte)).join('')
-            fileContent = btoa(binaryString)
-
-            console.log('Base64 conversion completed:', {
+            console.log('File preview debug:', {
+              fileName: filePreview.fileName,
               mimeType,
-              originalSize: arrayBuffer.byteLength,
-              base64Size: fileContent.length
+              isImage,
+              isDocx,
+              isPdf,
+              isTextType,
+              contentType: response.headers.get('content-type')
             })
+
+            if (!isTextType) {
+              const arrayBuffer = await response.arrayBuffer()
+
+              // Use modern, efficient base64 conversion
+              const bytes = new Uint8Array(arrayBuffer)
+              const binaryString = Array.from(bytes, (byte) => String.fromCharCode(byte)).join('')
+              fileContent = btoa(binaryString)
+
+              console.log('Base64 conversion completed:', {
+                mimeType,
+                originalSize: arrayBuffer.byteLength,
+                base64Size: fileContent.length
+              })
             } else {
               fileContent = await response.text()
             }
@@ -83,20 +85,20 @@ export function FilePreviewContent({ open }: FilePreviewContentProps) {
           } else {
             dispatch({
               type: "SET_FILE_PREVIEW_CONTENT",
-              payload: { content: "", error: t('files.previewDialog.errors.loadFailed') }
+              payload: { content: "", mimeType: undefined, error: t('files.previewDialog.errors.loadFailed') }
             })
           }
         } catch (error) {
           if ((error as any)?.name === 'TypeError' && (error as any)?.message?.includes('Failed to fetch')) {
             dispatch({
               type: "SET_FILE_PREVIEW_CONTENT",
-              payload: { content: "", error: t('files.previewDialog.errors.cors') }
+              payload: { content: "", mimeType: undefined, error: t('files.previewDialog.errors.cors') }
             })
           } else {
             const msg = (error as any)?.message || t('common.errors.unknown')
             dispatch({
               type: "SET_FILE_PREVIEW_CONTENT",
-              payload: { content: "", error: t('files.previewDialog.errors.networkErrorWithMsg', { msg }) }
+              payload: { content: "", mimeType: undefined, error: t('files.previewDialog.errors.networkErrorWithMsg', { msg }) }
             })
           }
         }

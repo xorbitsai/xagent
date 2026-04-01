@@ -36,7 +36,7 @@ export function FilePreviewDialog({ open, onOpenChange }: FilePreviewDialogProps
 
           // Check if this is a PPTX file that needs preview conversion
           const isPptxFile = filePreview.fileName.toLowerCase().endsWith('.pptx') ||
-                           filePreview.fileName.toLowerCase().endsWith('.ppt')
+            filePreview.fileName.toLowerCase().endsWith('.ppt')
           const isDocxFile = filePreview.fileName.toLowerCase().endsWith('.docx')
 
           let url: string
@@ -55,14 +55,12 @@ export function FilePreviewDialog({ open, onOpenChange }: FilePreviewDialogProps
           })
 
           if (response.ok) {
-            // For PPTX files (when preview endpoint returns HTML), use text()
-            // For binary files (images, PDFs), use arrayBuffer to get binary data
-            // For text files (HTML, etc.), use text() for proper encoding
+            const contentType = response.headers.get('content-type') || ''
+            const mimeType = contentType.split(';')[0].trim().toLowerCase()
+            const isTextType = mimeType.startsWith('text/') || mimeType === 'application/json' || mimeType === 'application/xml' || mimeType === 'application/javascript'
+
             let fileContent
-            if (isPptxFile) {
-              // PPTX preview endpoint returns HTML
-              fileContent = await response.text()
-            } else if (isDocxFile || baseFileName.match(/\.(jpg|jpeg|png|gif|webp|svg|pdf)$/i)) {
+            if (!isTextType) {
               const arrayBuffer = await response.arrayBuffer()
 
               // Convert binary data to base64 using chunks to avoid stack overflow
@@ -83,12 +81,12 @@ export function FilePreviewDialog({ open, onOpenChange }: FilePreviewDialogProps
 
             dispatch({
               type: "SET_FILE_PREVIEW_CONTENT",
-              payload: { content: fileContent, error: null }
+              payload: { content: fileContent, mimeType, error: null }
             })
           } else {
             dispatch({
               type: "SET_FILE_PREVIEW_CONTENT",
-              payload: { content: "", error: "Failed to load file" }
+              payload: { content: "", mimeType: undefined, error: "Failed to load file" }
             })
           }
         } catch (error) {
@@ -98,12 +96,12 @@ export function FilePreviewDialog({ open, onOpenChange }: FilePreviewDialogProps
           if ((error as any)?.name === 'TypeError' && (error as any)?.message?.includes('Failed to fetch')) {
             dispatch({
               type: "SET_FILE_PREVIEW_CONTENT",
-              payload: { content: "", error: `CORS error: Unable to access file. This might be a browser caching issue. Try refreshing the page.` }
+              payload: { content: "", mimeType: undefined, error: `CORS error: Unable to access file. This might be a browser caching issue. Try refreshing the page.` }
             })
           } else {
             dispatch({
               type: "SET_FILE_PREVIEW_CONTENT",
-              payload: { content: "", error: `Network error: ${(error as any)?.message || 'Unknown error'}` }
+              payload: { content: "", mimeType: undefined, error: `Network error: ${(error as any)?.message || 'Unknown error'}` }
             })
           }
         }
@@ -147,7 +145,7 @@ export function FilePreviewDialog({ open, onOpenChange }: FilePreviewDialogProps
     if (filePreview.fileId) {
       // Check if this is a PPTX file
       const isPptxFile = filePreview.fileName.toLowerCase().endsWith('.pptx') ||
-                        filePreview.fileName.toLowerCase().endsWith('.ppt')
+        filePreview.fileName.toLowerCase().endsWith('.ppt')
 
       let fileUrl: string
       const apiUrl = getApiUrl()
@@ -216,7 +214,7 @@ export function FilePreviewDialog({ open, onOpenChange }: FilePreviewDialogProps
             {/* File switching UI - only show when multiple files are available */}
             {filePreview.availableFiles.length > 1 && (
               <div className="flex items-center gap-2">
-                    <Button
+                <Button
                   variant="outline"
                   size="sm"
                   onClick={handlePreviousFile}

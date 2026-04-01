@@ -1660,6 +1660,7 @@ After using tools, provide a clear summary of the results in the SAME LANGUAGE a
             )
 
         # Handle native tool calls
+        action: Optional[Action] = None
         if isinstance(response, dict) and response.get("type") == "tool_call":
             action = self._convert_native_tool_call_to_action(response)
             await log_llm_completion(response, True, action.reasoning)
@@ -1668,8 +1669,9 @@ After using tools, provide a clear summary of the results in the SAME LANGUAGE a
         # Handle dict response with type="final_answer" (from native tool calling)
         if isinstance(response, dict) and response.get("type") == "final_answer":
             action = self._try_parse_action_from_dict(response, str(response))
-            await log_llm_completion(response, False, action.reasoning)
-            return action
+            if action:
+                await log_llm_completion(response, False, action.reasoning)
+                return action
 
         # Handle string response - try to parse as JSON first
         if isinstance(response, str):
@@ -1677,9 +1679,7 @@ After using tools, provide a clear summary of the results in the SAME LANGUAGE a
             try:
                 parsed = json.loads(response.strip())
                 if isinstance(parsed, dict):
-                    action = self._try_parse_action_from_dict(
-                        parsed, response.strip()
-                    )
+                    action = self._try_parse_action_from_dict(parsed, response.strip())
                     if action:
                         await log_llm_completion(
                             parsed, action.type == "tool_call", action.reasoning
@@ -1757,7 +1757,7 @@ After using tools, provide a clear summary of the results in the SAME LANGUAGE a
             except AttributeError:
                 pass
 
-            # Fallback: treat unparseable string as direct text response
+            # Fallback: treat unparsable string as direct text response
             action = Action(
                 type="final_answer",
                 reasoning="LLM provided direct response",

@@ -19,6 +19,22 @@ def upgrade() -> None:
     # Check if table already exists
     existing_tables = inspector.get_table_names()
     if "task_chat_messages" not in existing_tables:
+        # Build foreign key constraints dynamically based on what tables exist
+        # This handles running migrations from empty database
+        foreign_keys = []
+
+        # Only add task_id FK if tasks table exists
+        if "tasks" in existing_tables:
+            foreign_keys.append(
+                sa.ForeignKeyConstraint(["task_id"], ["tasks.id"], ondelete="CASCADE")
+            )
+
+        # Only add user_id FK if users table exists
+        if "users" in existing_tables:
+            foreign_keys.append(
+                sa.ForeignKeyConstraint(["user_id"], ["users.id"], ondelete="CASCADE")
+            )
+
         op.create_table(
             "task_chat_messages",
             sa.Column("id", sa.Integer(), nullable=False),
@@ -36,8 +52,7 @@ def upgrade() -> None:
             sa.Column(
                 "created_at", sa.DateTime(timezone=True), server_default=sa.func.now()
             ),
-            sa.ForeignKeyConstraint(["task_id"], ["tasks.id"], ondelete="CASCADE"),
-            sa.ForeignKeyConstraint(["user_id"], ["users.id"], ondelete="CASCADE"),
+            *foreign_keys,
             sa.PrimaryKeyConstraint("id"),
         )
 

@@ -129,20 +129,18 @@ function AgentCardContainer({
         agentName={initialAgentName}
         description="无法加载 Agent 详情"
         status="draft"
-        onClick={onAgentClick ? () => onAgentClick(agentId, initialAgentName) : undefined}
       />
     )
   }
 
   // Show agent info
-  // If onAgentClick is provided, use it; otherwise AgentCard will navigate by default
+  // Don't pass onClick - let AgentCard handle navigation internally based on status
   return (
     <AgentCard
       agentId={agentId}
       agentName={agentInfo.name}
       description={agentInfo.description || agentInfo.instructions}
       status={agentInfo.status}
-      onClick={onAgentClick ? () => onAgentClick(agentId, agentInfo.name) : undefined}
     />
   )
 }

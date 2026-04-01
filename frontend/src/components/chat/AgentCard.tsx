@@ -38,14 +38,19 @@ export function AgentCard({
       // Use custom onClick if provided
       onClick();
     } else {
-      // Default: navigate to agent page
-      router.push(`/agent/${agentId}`);
+      // Default: navigate based on agent status
+      // DRAFT agents go to builder (edit), PUBLISHED agents go to chat
+      if (status === 'draft') {
+        router.push(`/build/${agentId}`);
+      } else {
+        router.push(`/agent/${agentId}`);
+      }
     }
   };
 
   const statusBadge =
     status === "draft" ? (
-      <span className="text-[10px] px-1.5 py-0.5 rounded bg-yellow-500/20 text-yellow-300 border border-yellow-500/30">
+      <span className="text-[10px] px-1.5 py-0.5 rounded bg-yellow-500/30 text-yellow-700 border border-yellow-500/50">
         DRAFT
       </span>
     ) : (
@@ -113,8 +118,13 @@ export function AgentChip({
       // Use custom onClick if provided
       onClick();
     } else {
-      // Default: navigate to agent page
-      router.push(`/agent/${agentId}`);
+      // Default: navigate based on agent status
+      // DRAFT agents go to builder (edit), PUBLISHED agents go to chat
+      if (status === 'draft') {
+        router.push(`/build/${agentId}`);
+      } else {
+        router.push(`/agent/${agentId}`);
+      }
     }
   };
 

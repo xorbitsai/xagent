@@ -1667,63 +1667,28 @@ After using tools, provide a clear summary of the results in the SAME LANGUAGE a
 
         # Handle dict response with type="final_answer" (from native tool calling)
         if isinstance(response, dict) and response.get("type") == "final_answer":
-            # Convert dict to Action
-            try:
-                action = Action.model_validate(response)
-                await log_llm_completion(response, False, action.reasoning)
-                return action
-            except Exception as e:
-                logger.warning(f"Failed to validate final_answer dict: {e}")
-                # Fallback: extract answer field
-                action = Action(
-                    type="final_answer",
-                    reasoning="LLM provided final answer",
-                    answer=response.get("answer", str(response)),
-                    success=response.get("success", True),
-                    error=response.get("error"),
-                )
-                await log_llm_completion(response, False, action.reasoning)
-                return action
+            action = self._try_parse_action_from_dict(response, str(response))
+            await log_llm_completion(response, False, action.reasoning)
+            return action
 
         # Handle string response - try to parse as JSON first
         if isinstance(response, str):
             # Try to parse as JSON first
             try:
                 parsed = json.loads(response.strip())
-                if isinstance(parsed, dict) and parsed.get("type") == "tool_call":
-                    # Successfully parsed as tool_call JSON
-                    # Note: Any tool_name/tool_args in the JSON will be ignored.
-                    # The second call uses native function calling to select tools.
-                    action = Action(
-                        type="tool_call",
-                        reasoning=parsed.get("reasoning", "LLM wants to call a tool"),
+                if isinstance(parsed, dict):
+                    action = self._try_parse_action_from_dict(
+                        parsed, response.strip()
                     )
-                    await log_llm_completion(parsed, True, action.reasoning)
-                    return action
-                elif isinstance(parsed, dict) and parsed.get("type") == "final_answer":
-                    # Successfully parsed as final_answer JSON
-                    try:
-                        action = Action.model_validate(parsed)
-                        await log_llm_completion(parsed, False, action.reasoning)
-                        return action
-                    except Exception as e:
-                        logger.warning(f"Failed to validate final_answer JSON: {e}")
-                        # Fallback: extract fields manually
-                        action = Action(
-                            type="final_answer",
-                            reasoning=parsed.get(
-                                "reasoning", "LLM provided final answer"
-                            ),
-                            answer=parsed.get("answer", response.strip()),
-                            success=parsed.get("success", True),
-                            error=parsed.get("error"),
+                    if action:
+                        await log_llm_completion(
+                            parsed, action.type == "tool_call", action.reasoning
                         )
-                        await log_llm_completion(parsed, False, action.reasoning)
                         return action
-                else:
-                    logger.warning(
-                        f"First call: Parsed JSON but unknown type: {parsed.get('type')}"
-                    )
+                    else:
+                        logger.warning(
+                            f"First call: Parsed JSON but unknown type: {parsed.get('type')}"
+                        )
             except json.JSONDecodeError:
                 # JSON parsing failed - might be multiple JSON objects
                 # Try to use json_repair to handle multiple JSON objects
@@ -1772,58 +1737,15 @@ After using tools, provide a clear summary of the results in the SAME LANGUAGE a
                                 },
                             )
 
-                    if (
-                        isinstance(action_data, dict)
-                        and action_data.get("type") == "tool_call"
-                    ):
-                        try:
-                            action = Action.model_validate(action_data)
+                    if isinstance(action_data, dict):
+                        action = self._try_parse_action_from_dict(
+                            action_data, response.strip()
+                        )
+                        if action:
                             await log_llm_completion(
-                                action_data, True, action.reasoning
-                            )
-                            return action
-                        except Exception as e:
-                            logger.warning(
-                                f"Failed to validate repaired tool_call JSON: {e}"
-                            )
-                            # Return action anyway with extracted fields
-                            action = Action(
-                                type="tool_call",
-                                reasoning=action_data.get(
-                                    "reasoning", "LLM wants to call a tool"
-                                ),
-                                tool_name=action_data.get("tool_name"),
-                                tool_args=action_data.get("tool_args"),
-                            )
-                            await log_llm_completion(
-                                action_data, True, action.reasoning
-                            )
-                            return action
-                    elif (
-                        isinstance(action_data, dict)
-                        and action_data.get("type") == "final_answer"
-                    ):
-                        try:
-                            action = Action.model_validate(action_data)
-                            await log_llm_completion(
-                                action_data, False, action.reasoning
-                            )
-                            return action
-                        except Exception as e:
-                            logger.warning(
-                                f"Failed to validate repaired final_answer JSON: {e}"
-                            )
-                            action = Action(
-                                type="final_answer",
-                                reasoning=action_data.get(
-                                    "reasoning", "LLM provided final answer"
-                                ),
-                                answer=action_data.get("answer", response.strip()),
-                                success=action_data.get("success", True),
-                                error=action_data.get("error"),
-                            )
-                            await log_llm_completion(
-                                action_data, False, action.reasoning
+                                action_data,
+                                action.type == "tool_call",
+                                action.reasoning,
                             )
                             return action
                 except Exception as repair_error:
@@ -1835,19 +1757,7 @@ After using tools, provide a clear summary of the results in the SAME LANGUAGE a
             except AttributeError:
                 pass
 
-            # If response is empty, should trigger retry
-            if isinstance(response, str) and not response.strip():
-                raise PatternExecutionError(
-                    pattern_name="ReAct",
-                    message="LLM returned empty response",
-                    context={"chat_kwargs": chat_kwargs},
-                )
-
-            # Handle native tool calls
-            if isinstance(response, dict) and response.get("type") == "tool_call":
-                return self._convert_native_tool_call_to_action(response)
-
-            # Handle dict response with type="final_answer" (from native tool calling)
+            # Fallback: treat unparseable string as direct text response
             action = Action(
                 type="final_answer",
                 reasoning="LLM provided direct response",
@@ -2037,6 +1947,45 @@ After using tools, provide a clear summary of the results in the SAME LANGUAGE a
                 message=f"Failed to invoke tool via native calling: {str(e)}",
                 context={"error": str(e), "chat_kwargs": chat_kwargs},
             )
+
+    def _try_parse_action_from_dict(
+        self, data: dict, answer_fallback: str = ""
+    ) -> Optional[Action]:
+        """Try to create an Action from a parsed dict.
+
+        Attempts strict validation first (model_validate), then falls back
+        to manual field extraction. Returns None when the type field is
+        neither 'tool_call' nor 'final_answer'.
+
+        Args:
+            data: Parsed dict with at least a "type" key.
+            answer_fallback: Default answer text used when the "answer"
+                key is absent in *data*.
+        """
+        action_type = data.get("type")
+        if action_type not in ("tool_call", "final_answer"):
+            return None
+
+        try:
+            return Action.model_validate(data)
+        except Exception as e:
+            logger.warning(f"Failed to validate {action_type} dict: {e}")
+
+            if action_type == "tool_call":
+                return Action(
+                    type="tool_call",
+                    reasoning=data.get("reasoning", "LLM wants to call a tool"),
+                    tool_name=data.get("tool_name"),
+                    tool_args=data.get("tool_args"),
+                )
+            else:
+                return Action(
+                    type="final_answer",
+                    reasoning=data.get("reasoning", "LLM provided final answer"),
+                    answer=data.get("answer", answer_fallback),
+                    success=data.get("success", True),
+                    error=data.get("error"),
+                )
 
     def _normalize_action_data(self, action_data: Any) -> Any:
         """

@@ -44,7 +44,7 @@ def upgrade() -> None:
                         "fk_agents_model_id_models", type_="foreignkey"
                     )
                     batch_op.drop_column("model_id")
-            except Exception:
+            except sa.exc.OperationalError:
                 # FK constraint doesn't exist, just drop the column
                 with op.batch_alter_table("agents", recreate="auto") as batch_op:
                     batch_op.drop_column("model_id")

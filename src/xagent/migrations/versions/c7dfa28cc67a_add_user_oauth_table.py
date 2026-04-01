@@ -148,8 +148,8 @@ def downgrade() -> None:
 
         if dialect_name == "sqlite":
             # SQLite workaround for reverting changes
-            # Try-except to handle case where FK references don't exist (e.g., users table)
-            try:
+            # Skip batch_alter_table if users table doesn't exist (FK reflection fails)
+            if "users" in existing_tables:
                 with op.batch_alter_table("uploaded_files", schema=None) as batch_op:
                     if "uq_uploaded_files_storage_path" in existing_constraints:
                         batch_op.drop_constraint(
@@ -166,10 +166,6 @@ def downgrade() -> None:
                         nullable=True,
                         autoincrement=True,
                     )
-            except sa.exc.NoSuchTableError:
-                # FK reflection failed because referenced table doesn't exist
-                # Skip this migration step - the table will be in its correct state
-                pass
         else:
             # For PostgreSQL and other databases, use native operations
             if "uq_uploaded_files_storage_path" in existing_constraints:

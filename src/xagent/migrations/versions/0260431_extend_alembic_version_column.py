@@ -1,6 +1,6 @@
 """extend alembic_version column to support longer revision IDs
 
-Revision ID: extend_alembic_version
+Revision ID: 0260431_extend_alembic_version
 Revises: 441d4f5d399c
 Create Date: 2026-03-31
 
@@ -98,7 +98,7 @@ def downgrade() -> None:
             )
             count = result.scalar()
             if count and count > 0:
-                raise Exception(
+                raise RuntimeError(
                     f"Cannot downgrade: {count} revision IDs are longer than 32 characters"
                 )
 

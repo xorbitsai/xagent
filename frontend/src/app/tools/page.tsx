@@ -38,6 +38,7 @@ import { getApiUrl } from "@/lib/utils"
 import { apiRequest } from "@/lib/api-wrapper"
 import { useI18n } from "@/contexts/i18n-context"
 import { useAuth } from "@/contexts/auth-context"
+import { toast } from "sonner"
 
 interface Tool {
   name: string
@@ -131,6 +132,8 @@ export default function ToolsPage() {
   const [editingConfigTool, setEditingConfigTool] = useState<ConfigurableTool | null>(null)
   const [credentialValues, setCredentialValues] = useState<Record<string, string>>({})
   const [isSavingCredentials, setIsSavingCredentials] = useState(false)
+  const [pendingToolToggles, setPendingToolToggles] = useState<Record<string, boolean>>({})
+  const [pendingSqlDeletes, setPendingSqlDeletes] = useState<Record<string, boolean>>({})
   const [isSqlManagerOpen, setIsSqlManagerOpen] = useState(false)
   const [sqlFormName, setSqlFormName] = useState("")
   const [sqlFormType, setSqlFormType] = useState<SqlDbType>('postgresql')
@@ -326,7 +329,7 @@ export default function ToolsPage() {
     })
 
     if (Object.keys(payload).length === 0) {
-      setIsCredentialDialogOpen(false)
+      toast.error(t('tools.credentials.validation.required'))
       return
     }
 
@@ -340,16 +343,17 @@ export default function ToolsPage() {
 
       if (!response.ok) {
         const err = await response.json()
-        alert(err.detail || t('tools.credentials.saveFailed'))
+        toast.error(err.detail || t('tools.credentials.saveFailed'))
         return
       }
 
       await loadConfigurableTools()
       await loadTools()
       setIsCredentialDialogOpen(false)
+      toast.success(t('tools.credentials.saveSuccess'))
     } catch (error) {
       console.error('Failed to save credentials:', error)
-      alert(t('tools.credentials.saveFailed'))
+      toast.error(t('tools.credentials.saveFailed'))
     } finally {
       setIsSavingCredentials(false)
     }
@@ -358,7 +362,7 @@ export default function ToolsPage() {
   const handleSaveSqlConnection = async () => {
     const name = sqlFormName.trim()
     if (!name) {
-      alert(t('tools.database.validation.required'))
+      toast.error(t('tools.database.validation.required'))
       return
     }
 
@@ -366,7 +370,7 @@ export default function ToolsPage() {
     if (sqlFormType === 'sqlite') {
       const sqlitePath = sqlFormSqlitePath.trim()
       if (!sqlitePath) {
-        alert(t('tools.database.validation.sqlitePathRequired'))
+        toast.error(t('tools.database.validation.sqlitePathRequired'))
         return
       }
       connectionUrl = `sqlite:///${sqlitePath}`
@@ -379,7 +383,7 @@ export default function ToolsPage() {
       const params = sqlFormParams.trim()
 
       if (!host || !database || !username) {
-        alert(t('tools.database.validation.required'))
+        toast.error(t('tools.database.validation.required'))
         return
       }
 
@@ -401,23 +405,26 @@ export default function ToolsPage() {
 
       if (!response.ok) {
         const err = await response.json()
-        alert(err.detail || t('tools.database.saveFailed'))
+        toast.error(err.detail || t('tools.database.saveFailed'))
         return
       }
 
       resetSqlForm()
       await loadSqlConnections()
+      toast.success(t('tools.database.saveSuccess'))
     } catch (error) {
       console.error('Failed to save SQL connection:', error)
-      alert(t('tools.database.saveFailed'))
+      toast.error(t('tools.database.saveFailed'))
     } finally {
       setIsSavingSql(false)
     }
   }
 
   const handleDeleteSqlConnection = async (name: string) => {
+    if (pendingSqlDeletes[name]) return
     if (!confirm(t('tools.database.deleteConfirm', { name }))) return
 
+    setPendingSqlDeletes((prev) => ({ ...prev, [name]: true }))
     try {
       const response = await apiRequest(`${getApiUrl()}/api/tools/sql-connections/${encodeURIComponent(name)}`, {
         method: 'DELETE',
@@ -425,14 +432,17 @@ export default function ToolsPage() {
 
       if (!response.ok) {
         const err = await response.json()
-        alert(err.detail || t('tools.database.deleteFailed'))
+        toast.error(err.detail || t('tools.database.deleteFailed'))
         return
       }
 
       await loadSqlConnections()
+      toast.success(t('tools.database.deleteSuccess'))
     } catch (error) {
       console.error('Failed to delete SQL connection:', error)
-      alert(t('tools.database.deleteFailed'))
+      toast.error(t('tools.database.deleteFailed'))
+    } finally {
+      setPendingSqlDeletes((prev) => ({ ...prev, [name]: false }))
     }
   }
 
@@ -460,7 +470,7 @@ export default function ToolsPage() {
 
   const handleSaveMcpServer = async () => {
     if (!mcpFormData.name.trim()) {
-      alert(t('tools.mcp.alerts.nameRequired'))
+      toast.error(t('tools.mcp.alerts.nameRequired'))
       return
     }
     setIsLoading(true)
@@ -481,17 +491,20 @@ export default function ToolsPage() {
         setIsMcpDialogOpen(false)
       } else {
         const error = await response.json()
-        alert(error.detail || t('tools.mcp.alerts.saveFailed'))
+        toast.error(error.detail || t('tools.mcp.alerts.saveFailed'))
       }
     } catch (error) {
       console.error("Failed to save MCP server:", error)
-      alert(t('tools.mcp.alerts.saveFailed'))
+      toast.error(t('tools.mcp.alerts.saveFailed'))
     } finally {
       setIsLoading(false)
     }
   }
 
   const handleToggleToolEnabled = async (tool: Tool) => {
+    if (pendingToolToggles[tool.name]) return
+
+    setPendingToolToggles((prev) => ({ ...prev, [tool.name]: true }))
     try {
       const response = await apiRequest(`${getApiUrl()}/api/tools/${tool.name}/enabled`, {
         method: "PUT",
@@ -500,13 +513,16 @@ export default function ToolsPage() {
       })
       if (!response.ok) {
         const err = await response.json()
-        alert(err.detail || t('tools.policy.toggleFailed'))
+        toast.error(err.detail || t('tools.policy.toggleFailed'))
         return
       }
       await loadTools()
+      toast.success(t(tool.enabled ? 'tools.policy.toggleSuccessDisabled' : 'tools.policy.toggleSuccessEnabled'))
     } catch (error) {
       console.error("Failed to toggle tool enabled:", error)
-      alert(t('tools.policy.toggleFailed'))
+      toast.error(t('tools.policy.toggleFailed'))
+    } finally {
+      setPendingToolToggles((prev) => ({ ...prev, [tool.name]: false }))
     }
   }
 
@@ -699,6 +715,7 @@ export default function ToolsPage() {
     const canConfigureCredentials = isAdmin && Boolean(configurableTool)
     const canManageSqlConnections = isAdmin && tool.category === 'database'
     const hasSecondaryAction = canConfigureCredentials || canManageSqlConnections
+    const isTogglePending = Boolean(pendingToolToggles[tool.name])
     const configButtonLabel = canConfigureCredentials
       ? t('tools.credentials.configure')
       : t('tools.database.manageConnections')
@@ -765,7 +782,9 @@ export default function ToolsPage() {
               size="sm"
               className={hasSecondaryAction ? 'flex-1' : 'w-full'}
               onClick={() => handleToggleToolEnabled(tool)}
+              disabled={isTogglePending}
             >
+              {isTogglePending && <Loader2 className="mr-2 h-4 w-4 animate-spin" />}
               {tool.enabled ? t('tools.policy.disableAction') : t('tools.policy.enableAction')}
             </Button>
           </div>
@@ -1005,48 +1024,53 @@ export default function ToolsPage() {
                 </div>
               ) : (
                 <div className="grid grid-cols-1 gap-4 md:grid-cols-2">
-                  {sqlConnections.map((item) => (
-                    <Card key={item.name} className="group border-border/60">
-                      <CardContent className="p-5">
-                        <div className="mb-4 flex items-start justify-between gap-3">
-                          <div className="flex items-start gap-3 min-w-0">
-                            <div className="mt-0.5 rounded-lg bg-muted/60 p-2.5 h-fit">
-                              <Database className="h-5 w-5 text-slate-600" />
-                            </div>
-                            <div className="min-w-0">
-                              <h3 className="truncate font-semibold text-base text-foreground">{item.name}</h3>
-                              <div className="mt-1 flex flex-wrap items-center gap-2">
-                                <Badge variant="outline" className="text-[11px]">
-                                  {t('tools.database.connectionBadge')}
-                                </Badge>
-                                <Badge variant={item.source === 'db' ? 'secondary' : 'outline'} className="text-[11px]">
-                                  {t(`tools.credentials.status.${item.source}`)}
-                                </Badge>
+                  {sqlConnections.map((item) => {
+                    const isDeleting = Boolean(pendingSqlDeletes[item.name])
+
+                    return (
+                      <Card key={item.name} className="group border-border/60">
+                        <CardContent className="p-5">
+                          <div className="mb-4 flex items-start justify-between gap-3">
+                            <div className="flex items-start gap-3 min-w-0">
+                              <div className="mt-0.5 rounded-lg bg-muted/60 p-2.5 h-fit">
+                                <Database className="h-5 w-5 text-slate-600" />
+                              </div>
+                              <div className="min-w-0">
+                                <h3 className="truncate font-semibold text-base text-foreground">{item.name}</h3>
+                                <div className="mt-1 flex flex-wrap items-center gap-2">
+                                  <Badge variant="outline" className="text-[11px]">
+                                    {t('tools.database.connectionBadge')}
+                                  </Badge>
+                                  <Badge variant={item.source === 'db' ? 'secondary' : 'outline'} className="text-[11px]">
+                                    {t(`tools.credentials.status.${item.source}`)}
+                                  </Badge>
+                                </div>
                               </div>
                             </div>
+
+                            {item.source === 'db' ? (
+                              <Button
+                                variant="ghost"
+                                size="icon"
+                                className="h-8 w-8 opacity-80 group-hover:opacity-100"
+                                onClick={() => handleDeleteSqlConnection(item.name)}
+                                disabled={isDeleting}
+                              >
+                                {isDeleting ? <Loader2 className="h-4 w-4 animate-spin" /> : <Trash2 className="h-4 w-4" />}
+                              </Button>
+                            ) : null}
                           </div>
 
-                          {item.source === 'db' ? (
-                            <Button
-                              variant="ghost"
-                              size="icon"
-                              className="h-8 w-8 opacity-80 group-hover:opacity-100"
-                              onClick={() => handleDeleteSqlConnection(item.name)}
-                            >
-                              <Trash2 className="h-4 w-4" />
-                            </Button>
-                          ) : null}
-                        </div>
-
-                        <div className="space-y-2">
-                          <p className="text-xs font-medium text-muted-foreground">{t('tools.database.maskedValue')}</p>
-                          <div className="rounded-md border border-border/70 bg-muted/30 px-3 py-2">
-                            <p className="break-all text-xs leading-relaxed text-foreground/80">{item.masked || '--'}</p>
+                          <div className="space-y-2">
+                            <p className="text-xs font-medium text-muted-foreground">{t('tools.database.maskedValue')}</p>
+                            <div className="rounded-md border border-border/70 bg-muted/30 px-3 py-2">
+                              <p className="break-all text-xs leading-relaxed text-foreground/80">{item.masked || '--'}</p>
+                            </div>
                           </div>
-                        </div>
                       </CardContent>
                     </Card>
-                  ))}
+                    )
+                  })}
                 </div>
               )}
             </div>

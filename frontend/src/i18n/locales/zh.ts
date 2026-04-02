@@ -586,6 +586,8 @@ Build when you need.`
       enableAction: "启用",
       disableAction: "禁用",
       toggleFailed: "更新工具状态失败",
+      toggleSuccessEnabled: "工具已启用",
+      toggleSuccessDisabled: "工具已禁用",
     },
     database: {
       addConnection: "添加连接",
@@ -594,7 +596,9 @@ Build when you need.`
       connectionBadge: "SQL",
       maskedValue: "连接预览",
       save: "保存连接",
+      saveSuccess: "数据库连接已保存",
       saveFailed: "保存数据库连接失败",
+      deleteSuccess: "数据库连接已删除",
       deleteFailed: "删除数据库连接失败",
       deleteConfirm: "确认删除数据库连接 {name} 吗？",
       connectionName: "连接名称",
@@ -640,8 +644,12 @@ Build when you need.`
       notConfigured: "未配置",
       configure: "配置凭据",
       save: "保存凭据",
+      saveSuccess: "凭据已保存",
       saveFailed: "保存凭据失败",
       currentSource: "当前来源",
+      validation: {
+        required: "请至少填写一个凭据字段",
+      },
       setup: {
         title: "搜索 Provider 配置",
         description: "即使对应的运行时工具还没显示，也可以先在这里配置这个 Provider。",

@@ -586,6 +586,8 @@ Build when you need.`
       enableAction: "Enable",
       disableAction: "Disable",
       toggleFailed: "Failed to update tool status",
+      toggleSuccessEnabled: "Tool enabled",
+      toggleSuccessDisabled: "Tool disabled",
     },
     database: {
       addConnection: "Add Connection",
@@ -594,7 +596,9 @@ Build when you need.`
       connectionBadge: "SQL",
       maskedValue: "Connection Preview",
       save: "Save Connection",
+      saveSuccess: "SQL connection saved",
       saveFailed: "Failed to save SQL connection",
+      deleteSuccess: "SQL connection deleted",
       deleteFailed: "Failed to delete SQL connection",
       deleteConfirm: "Delete SQL connection {name}?",
       connectionName: "Connection Name",
@@ -640,8 +644,12 @@ Build when you need.`
       notConfigured: "Not configured",
       configure: "Configure",
       save: "Save credentials",
+      saveSuccess: "Credentials saved",
       saveFailed: "Failed to save credentials",
       currentSource: "Current source",
+      validation: {
+        required: "Please fill in at least one credential field",
+      },
       setup: {
         title: "Search Provider Setup",
         description: "Configure this provider here, even if its runtime tool is not visible yet.",

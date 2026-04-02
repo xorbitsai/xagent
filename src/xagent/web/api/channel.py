@@ -1,4 +1,3 @@
-import asyncio
 import logging
 import os
 from typing import Any, List
@@ -21,44 +20,28 @@ router = APIRouter()
 logger = logging.getLogger(__name__)
 
 
-def trigger_telegram_sync() -> None:
+async def trigger_telegram_sync() -> None:
     """Helper to safely trigger telegram bot sync in background"""
     from xagent.web.channels.telegram.bot import get_telegram_channel
 
     tg = get_telegram_channel()
 
-    # Send a request to the main event loop to sync bots
-    # We shouldn't create a new event loop and run aiogram tasks
-    # because they need to run in the main thread/event loop
-    from xagent.web.app import app
-
     try:
-        if hasattr(app.state, "telegram_task"):
-            # Get the running loop where telegram_task was created
-            loop = app.state.telegram_task.get_loop()
-            asyncio.run_coroutine_threadsafe(tg._sync_bots_async(), loop)
-            logger.info("Successfully triggered telegram sync in main event loop")
-        else:
-            logger.warning("Telegram task not found in app state.")
+        await tg._sync_bots_async()
+        logger.info("Successfully triggered telegram sync in main event loop")
     except Exception as e:
         logger.error(f"Failed to trigger telegram sync: {e}")
 
 
-def trigger_feishu_sync() -> None:
+async def trigger_feishu_sync() -> None:
     """Helper to safely trigger feishu bot sync in background"""
     from xagent.web.channels.feishu.bot import get_feishu_channel
 
     fs = get_feishu_channel()
 
-    from xagent.web.app import app
-
     try:
-        if hasattr(app.state, "feishu_task"):
-            loop = app.state.feishu_task.get_loop()
-            asyncio.run_coroutine_threadsafe(fs._sync_bots_async(), loop)
-            logger.info("Successfully triggered feishu sync in main event loop")
-        else:
-            logger.warning("Feishu task not found in app state.")
+        await fs._sync_bots_async()
+        logger.info("Successfully triggered feishu sync in main event loop")
     except Exception as e:
         logger.error(f"Failed to trigger feishu sync: {e}")
 

@@ -12,7 +12,7 @@ import { ChatInput } from "@/components/chat/ChatInput"
 import { ChatMessage } from "@/components/chat/ChatMessage"
 import { apiRequest } from "@/lib/api-wrapper"
 import { getApiUrl, getWsUrl } from "@/lib/utils"
-import { PlusCircle, MessageSquare, Upload, Download, Settings2, Check, Zap, BookOpen, ChevronLeft, Sparkles, Loader2, Trash2 } from "lucide-react"
+import { PlusCircle, MessageSquare, Upload, Download, Settings2, Check, Zap, BookOpen, ChevronLeft, Sparkles, Loader2, XCircle, Trash2 } from "lucide-react"
 import { useI18n } from "@/contexts/i18n-context"
 import { useAuth } from "@/contexts/auth-context"
 import { FileAttachment } from "@/components/file/file-attachment"
@@ -110,6 +110,7 @@ interface AgentBuilderProps {
 }
 
 export function AgentBuilder({ agentId }: AgentBuilderProps) {
+  const MAX_INSTRUCTIONS_LENGTH = 8192;
   const { t, locale } = useI18n()
   const { token } = useAuth()
   const router = useRouter()
@@ -191,6 +192,34 @@ export function AgentBuilder({ agentId }: AgentBuilderProps) {
     // Remove zero-width spaces if any (sometimes added by contentEditable)
     text = text.replace(/\u200B/g, '');
 
+    if (text.length > MAX_INSTRUCTIONS_LENGTH) {
+      text = text.substring(0, MAX_INSTRUCTIONS_LENGTH);
+
+      let html = text
+        .replace(/&/g, "&amp;")
+        .replace(/</g, "&lt;")
+        .replace(/>/g, "&gt;");
+
+      html = html.replace(/\[([^\]]+)\]\(file:\/\/([^)]+)\)/g, (match, filename, id) => {
+        return createFileChipHTML(id, id, filename);
+      });
+
+      html = html.replace(/\n/g, "<br>");
+      if (html.endsWith("<br>")) {
+        html += "<br>";
+      }
+
+      editor.innerHTML = html;
+
+      // Move cursor to the end
+      const range = document.createRange();
+      const sel = window.getSelection();
+      range.selectNodeContents(editor);
+      range.collapse(false);
+      sel?.removeAllRanges();
+      sel?.addRange(range);
+    }
+
     lastInstructionsRef.current = text;
     setInstructions(text);
 
@@ -202,7 +231,20 @@ export function AgentBuilder({ agentId }: AgentBuilderProps) {
   const handleInstructionsPaste = (e: React.ClipboardEvent<HTMLDivElement>) => {
     e.preventDefault();
     const text = e.clipboardData.getData("text/plain");
-    document.execCommand("insertText", false, text);
+
+    const currentLength = lastInstructionsRef.current.length;
+    const availableSpace = MAX_INSTRUCTIONS_LENGTH - currentLength;
+
+    if (availableSpace <= 0) {
+      return;
+    }
+
+    let textToInsert = text;
+    if (text.length > availableSpace) {
+      textToInsert = text.substring(0, availableSpace);
+    }
+
+    document.execCommand("insertText", false, textToInsert);
     handleInstructionsInput();
   };
 
@@ -1182,7 +1224,7 @@ export function AgentBuilder({ agentId }: AgentBuilderProps) {
               <div
                 ref={instructionsRef}
                 contentEditable={!isOptimizing}
-                className="min-h-[150px] w-full rounded-md bg-transparent px-3 py-2 font-mono text-sm outline-none overflow-y-auto break-words whitespace-pre-wrap text-left"
+                className="min-h-[150px] max-h-[300px] w-full rounded-md bg-transparent px-3 py-2 font-mono text-sm outline-none overflow-y-auto break-words whitespace-pre-wrap text-left"
                 onInput={handleInstructionsInput}
                 onKeyDown={fileMention.handleKeyDown}
                 onPaste={handleInstructionsPaste as any}
@@ -1197,6 +1239,12 @@ export function AgentBuilder({ agentId }: AgentBuilderProps) {
                 </div>
               )}
             </div>
+            {instructions.length >= MAX_INSTRUCTIONS_LENGTH && (
+              <div className="flex items-center gap-2 mt-2 text-destructive bg-destructive/10 px-3 py-2 rounded-md text-sm">
+                <XCircle className="h-4 w-4" />
+                <span>{t("builds.configForm.instructions.maxLengthExceeded")}</span>
+              </div>
+            )}
           </div>
         </div>
 

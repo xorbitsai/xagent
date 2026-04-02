@@ -1748,6 +1748,7 @@ Build when you need.`
         optimizing: "优化中...",
         optimizeError: "优化指令失败",
         optimizeSuccess: "优化指令成功",
+        maxLengthExceeded: "指令长度不能超过8kb，超出部分已截断",
       },
       executionMode: {
         label: "执行模式",

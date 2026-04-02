@@ -1748,6 +1748,7 @@ Build when you need.`
         optimizing: "Optimizing...",
         optimizeError: "Failed to optimize instructions",
         optimizeSuccess: "Instructions optimized successfully",
+        maxLengthExceeded: "The instruction length cannot exceed 8 KB; any excess has been truncated.",
       },
       executionMode: {
         label: "Execution Mode",

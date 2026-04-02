@@ -184,17 +184,16 @@ export default function BuildsPage() {
                               {agent.name}
                             </h3>
                             <div className="mt-2">
-                              <span className={`inline-flex text-[11px] px-2 py-0.5 rounded-full capitalize font-medium ${
-                                agent.status === 'published'
-                                  ? 'bg-green-100 text-green-700 dark:bg-green-900/20 dark:text-green-400'
-                                  : 'bg-gray-100 text-gray-600 dark:bg-gray-800 dark:text-gray-400'
-                              }`}>
+                              <span className={`inline-flex text-[11px] px-2 py-0.5 rounded-full capitalize font-medium ${agent.status === 'published'
+                                ? 'bg-green-100 text-green-700 dark:bg-green-900/20 dark:text-green-400'
+                                : 'bg-gray-100 text-gray-600 dark:bg-gray-800 dark:text-gray-400'
+                                }`}>
                                 {agent.status === 'published' ? t('builds.list.status.published') : t('builds.list.status.draft')}
                               </span>
                             </div>
                           </div>
                         </div>
-                        <div className="absolute right-4 top-1 opacity-0 group-hover:opacity-100 transition-opacity" onClick={(e) => e.stopPropagation()}>
+                        <div className="absolute right-4 top-1" onClick={(e) => e.stopPropagation()}>
                           <Popover>
                             <PopoverTrigger asChild>
                               <Button variant="ghost" size="icon" className="h-8 w-8 text-muted-foreground hover:text-foreground">

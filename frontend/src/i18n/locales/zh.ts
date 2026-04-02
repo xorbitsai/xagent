@@ -25,6 +25,7 @@ const zh = {
     collapse: "收起",
     noOptions: "暂无选项",
     rename: "重命名",
+    clear: "清除",
     errors: {
       unknown: "未知错误",
     },

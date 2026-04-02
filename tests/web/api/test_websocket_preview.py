@@ -79,3 +79,54 @@ async def test_handle_build_preview_execution_empty_tool_categories():
         # Assert
         # Verify WebToolConfig was called (this is where MinimalRequest is used)
         assert MockWebToolConfig.called
+
+
+@pytest.mark.asyncio
+async def test_websocket_build_preview_endpoint_clear_context():
+    """
+    Test that websocket_build_preview_endpoint handles 'clear_context' message correctly.
+    """
+    import json
+    from unittest.mock import MagicMock, patch
+
+    from xagent.web.api.websocket import websocket_build_preview_endpoint
+
+    mock_websocket = AsyncMock()
+    # Setup websocket state
+    mock_websocket.state = MagicMock()
+    mock_memory = MagicMock()
+    mock_websocket.state.preview_memory = mock_memory
+    mock_websocket.state.preview_history = [{"role": "user", "content": "hello"}]
+
+    # Mock user
+    mock_user = MagicMock(spec=User)
+    mock_user.id = 1
+
+    # Setup sequence of events: receive 'clear_context', then raise WebSocketDisconnect to exit loop
+    from fastapi import WebSocketDisconnect
+
+    mock_websocket.receive_text.side_effect = [
+        json.dumps({"type": "clear_context"}),
+        WebSocketDisconnect(),
+    ]
+
+    with patch(
+        "xagent.web.api.websocket.get_authenticated_user", return_value=mock_user
+    ):
+        await websocket_build_preview_endpoint(mock_websocket)
+
+    # Verify accept was called
+    mock_websocket.accept.assert_called_once()
+
+    # Verify memory was cleared
+    mock_memory.clear.assert_called_once()
+
+    # Verify history was cleared
+    assert mock_websocket.state.preview_history == []
+
+    # Verify a response was sent
+    send_text_calls = mock_websocket.send_text.call_args_list
+    assert len(send_text_calls) == 1
+    sent_data = json.loads(send_text_calls[0][0][0])
+    assert sent_data["type"] == "context_cleared"
+    assert "timestamp" in sent_data

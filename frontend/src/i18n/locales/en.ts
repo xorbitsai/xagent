@@ -25,6 +25,7 @@ const en = {
     collapse: "Collapse",
     noOptions: "No options available",
     rename: "Rename",
+    clear: "Clear",
     errors: {
       unknown: "Unknown error",
     },

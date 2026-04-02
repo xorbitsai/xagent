@@ -2397,6 +2397,20 @@ async def websocket_build_preview_endpoint(
 
             if message_type == "preview":
                 await handle_build_preview_execution(websocket, message_data, user)
+            elif message_type == "clear_context":
+                if hasattr(websocket.state, "preview_memory"):
+                    websocket.state.preview_memory.clear()
+                if hasattr(websocket.state, "preview_history"):
+                    websocket.state.preview_history = []
+                await websocket.send_text(
+                    json.dumps(
+                        {
+                            "type": "context_cleared",
+                            "timestamp": datetime.now(timezone.utc).timestamp(),
+                        }
+                    )
+                )
+                logger.info(f"Cleared build preview context for user {user.id}")
             else:
                 await websocket.send_text(
                     json.dumps(
@@ -2667,7 +2681,13 @@ async def handle_build_preview_execution(
             use_dag_pattern = False
 
         # Create agent service (using WebSocket tracer)
-        memory = InMemoryMemoryStore()
+        if not hasattr(websocket.state, "preview_memory"):
+            websocket.state.preview_memory = InMemoryMemoryStore()
+        memory = websocket.state.preview_memory
+
+        if not hasattr(websocket.state, "preview_history"):
+            websocket.state.preview_history = []
+
         agent_service = AgentService(
             name="build_preview_agent",
             llm=default_llm,
@@ -2853,12 +2873,25 @@ async def handle_build_preview_execution(
         if file_info_list:
             execution_context["file_info"] = file_info_list
 
+        # Load preserved history from the connection state
+        if websocket.state.preview_history:
+            agent_service.set_conversation_history(websocket.state.preview_history)
+
         with UserContext(int(user.id)):
             result = await agent_service.execute_task(
                 task=user_message,
                 context=execution_context if execution_context else None,
                 task_id=preview_task_id,
             )
+
+        # Append the new interaction to the history
+        websocket.state.preview_history.append(
+            {"role": "user", "content": user_message}
+        )
+        assistant_output = result.get("output", "")
+        websocket.state.preview_history.append(
+            {"role": "assistant", "content": assistant_output}
+        )
 
         # Send preview completion event
         await websocket.send_text(

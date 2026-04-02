@@ -295,7 +295,10 @@ async def optimize_instructions(
             ]
         )
 
-        content = response if isinstance(response, str) else str(response)
+        if isinstance(response, dict) and "content" in response:
+            content = response["content"]
+        else:
+            content = response if isinstance(response, str) else str(response)
 
         return {"optimized_instructions": content}
 

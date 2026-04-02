@@ -2396,7 +2396,72 @@ async def websocket_build_preview_endpoint(
             message_type = message_data.get("type")
 
             if message_type == "preview":
-                await handle_build_preview_execution(websocket, message_data, user)
+                # Cancel existing task if running
+                if (
+                    hasattr(websocket.state, "preview_task")
+                    and websocket.state.preview_task
+                    and not websocket.state.preview_task.done()
+                ):
+                    websocket.state.preview_task.cancel()
+
+                # Run execution in background task to not block message receiving
+                websocket.state.preview_task = asyncio.create_task(
+                    handle_build_preview_execution(websocket, message_data, user)
+                )
+            elif message_type == "pause":
+                if (
+                    hasattr(websocket.state, "preview_agent_service")
+                    and websocket.state.preview_agent_service
+                ):
+                    if hasattr(
+                        websocket.state.preview_agent_service, "pause_execution"
+                    ):
+                        await websocket.state.preview_agent_service.pause_execution()
+                        await websocket.send_text(
+                            json.dumps(
+                                {
+                                    "type": "task_paused",
+                                    "timestamp": datetime.now(timezone.utc).timestamp(),
+                                }
+                            )
+                        )
+                        logger.info(f"Paused build preview for user {user.id}")
+                else:
+                    await websocket.send_text(
+                        json.dumps(
+                            {
+                                "type": "error",
+                                "message": "No active agent to pause",
+                            }
+                        )
+                    )
+            elif message_type == "resume":
+                if (
+                    hasattr(websocket.state, "preview_agent_service")
+                    and websocket.state.preview_agent_service
+                ):
+                    if hasattr(
+                        websocket.state.preview_agent_service, "resume_execution"
+                    ):
+                        await websocket.state.preview_agent_service.resume_execution()
+                        await websocket.send_text(
+                            json.dumps(
+                                {
+                                    "type": "task_resumed",
+                                    "timestamp": datetime.now(timezone.utc).timestamp(),
+                                }
+                            )
+                        )
+                        logger.info(f"Resumed build preview for user {user.id}")
+                else:
+                    await websocket.send_text(
+                        json.dumps(
+                            {
+                                "type": "error",
+                                "message": "No active agent to resume",
+                            }
+                        )
+                    )
             elif message_type == "clear_context":
                 if hasattr(websocket.state, "preview_memory"):
                     websocket.state.preview_memory.clear()
@@ -2703,6 +2768,9 @@ async def handle_build_preview_execution(
             task_id=preview_task_id,
             tracer=preview_tracer,
         )
+
+        # Save agent service to websocket state for pause functionality
+        websocket.state.preview_agent_service = agent_service
 
         # Send preview start event
         await websocket.send_text(

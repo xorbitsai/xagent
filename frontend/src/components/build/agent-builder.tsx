@@ -269,6 +269,7 @@ export function AgentBuilder({ agentId }: AgentBuilderProps) {
   }, [t])
 
   const [isChatLoading, setIsChatLoading] = useState(false)
+  const [taskStatus, setTaskStatus] = useState<"idle" | "running" | "paused">("idle")
   const messagesEndRef = useRef<HTMLDivElement>(null)
   const fileInputRef = useRef<HTMLInputElement>(null)
   const [files, setFiles] = useState<File[]>([])
@@ -318,6 +319,7 @@ export function AgentBuilder({ agentId }: AgentBuilderProps) {
             // Handle different message types
             if (message.type === 'preview_started') {
               setIsChatLoading(true)
+              setTaskStatus('running')
               previewStepsRef.current = []
               traceEventsRef.current = []
               // Add a placeholder message for the assistant response
@@ -327,6 +329,10 @@ export function AgentBuilder({ agentId }: AgentBuilderProps) {
                 traceEvents: [],
                 timestamp: Date.now()
               }])
+            } else if (message.type === 'task_paused') {
+              setTaskStatus('paused')
+            } else if (message.type === 'task_resumed') {
+              setTaskStatus('running')
             } else if (message.type === 'trace_event') {
               // Collect trace events and steps
               traceEventsRef.current.push(message)
@@ -348,6 +354,7 @@ export function AgentBuilder({ agentId }: AgentBuilderProps) {
               })
             } else if (message.type === 'task_completed') {
               setIsChatLoading(false)
+              setTaskStatus('idle')
               setMessages(prev => {
                 const newMessages = [...prev]
                 const lastMsg = newMessages[newMessages.length - 1]
@@ -362,6 +369,7 @@ export function AgentBuilder({ agentId }: AgentBuilderProps) {
               })
             } else if (message.type === 'task_error') {
               setIsChatLoading(false)
+              setTaskStatus('idle')
               setMessages(prev => [...prev, {
                 role: "assistant",
                 content: `Error: ${message.error}`,
@@ -681,6 +689,18 @@ export function AgentBuilder({ agentId }: AgentBuilderProps) {
     a.click();
     document.body.removeChild(a);
   };
+
+  const handlePause = () => {
+    if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
+      wsRef.current.send(JSON.stringify({ type: "pause" }))
+    }
+  }
+
+  const handleResume = () => {
+    if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
+      wsRef.current.send(JSON.stringify({ type: "resume" }))
+    }
+  }
 
   const handleSendMessage = async (content: string, _config?: any) => {
     // Construct UI message with files if present
@@ -1574,6 +1594,7 @@ export function AgentBuilder({ agentId }: AgentBuilderProps) {
                 traceEvents={msg.traceEvents}
                 showProcessView={true}
                 timestamp={msg.timestamp}
+                taskStatus={index === messages.length - 1 && msg.role === 'assistant' ? taskStatus : undefined}
               />
             ))}
             <div ref={messagesEndRef} />
@@ -1590,6 +1611,9 @@ export function AgentBuilder({ agentId }: AgentBuilderProps) {
             hideConfig={true}
             files={files}
             onFilesChange={setFiles}
+            taskStatus={taskStatus as any}
+            onPause={handlePause}
+            onResume={handleResume}
           />
         </div>
       </div>

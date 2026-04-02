@@ -130,3 +130,52 @@ async def test_websocket_build_preview_endpoint_clear_context():
     sent_data = json.loads(send_text_calls[0][0][0])
     assert sent_data["type"] == "context_cleared"
     assert "timestamp" in sent_data
+
+
+@pytest.mark.asyncio
+async def test_websocket_build_preview_endpoint_pause_resume():
+    """
+    Test that websocket_build_preview_endpoint handles 'pause' and 'resume' messages correctly.
+    """
+    import json
+    from unittest.mock import MagicMock, patch
+
+    from xagent.web.api.websocket import websocket_build_preview_endpoint
+
+    mock_websocket = AsyncMock()
+    mock_websocket.state = MagicMock()
+
+    mock_agent_service = AsyncMock()
+    mock_websocket.state.preview_agent_service = mock_agent_service
+
+    mock_user = MagicMock(spec=User)
+    mock_user.id = 1
+
+    from fastapi import WebSocketDisconnect
+
+    mock_websocket.receive_text.side_effect = [
+        json.dumps({"type": "pause"}),
+        json.dumps({"type": "resume"}),
+        WebSocketDisconnect(),
+    ]
+
+    with patch(
+        "xagent.web.api.websocket.get_authenticated_user", return_value=mock_user
+    ):
+        await websocket_build_preview_endpoint(mock_websocket)
+
+    # Verify pause and resume were called
+    mock_agent_service.pause_execution.assert_awaited_once()
+    mock_agent_service.resume_execution.assert_awaited_once()
+
+    # Verify responses were sent
+    send_text_calls = mock_websocket.send_text.call_args_list
+    assert len(send_text_calls) == 2
+
+    pause_data = json.loads(send_text_calls[0][0][0])
+    assert pause_data["type"] == "task_paused"
+    assert "timestamp" in pause_data
+
+    resume_data = json.loads(send_text_calls[1][0][0])
+    assert resume_data["type"] == "task_resumed"
+    assert "timestamp" in resume_data

@@ -2,19 +2,40 @@ id: delivery-assistant
 name: Delivery Assistant
 category: Finance, LMS & Ops
 tags:
+  en:
   - logistics
   - delivery
   - tracking
   - shipping
+  zh:
+  - 物流
+  - 配送
+  - 追踪
+  - 发货
 descriptions:
   en: Answers delivery general questions
   zh: 处理配送咨询、进度查询与异常处理。
 author: Xagent
-version: "1.0"
-
+version: '1.0'
 agent_config:
-  instructions: |
-    You are a logistics and delivery coordination assistant. Help manage delivery schedules, track shipments, handle customer delivery inquiries, provide ETAs, and resolve delivery issues. Communicate clearly and professionally with customers about their orders.
+  instructions: 'You are a logistics and delivery coordination assistant. Help manage
+    delivery schedules, track shipments, handle customer delivery inquiries, provide
+    ETAs, and resolve delivery issues. Communicate clearly and professionally with
+    customers about their orders.
+
+    '
   skills: []
   tool_categories: []
-  execution_mode: "react"
+  execution_mode: react
+features:
+  en:
+  - Automated analysis and processing
+  - Real-time intelligent insights
+  - Easy integration and deployment
+  zh:
+  - 自动化分析与处理
+  - 实时智能洞察
+  - 轻松集成与部署
+setup_time:
+  en: 5 min setup
+  zh: 5分钟配置

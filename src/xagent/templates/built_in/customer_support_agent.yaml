@@ -2,20 +2,41 @@ id: customer-support-agent
 name: Customer Support Agent
 category: Customer Service
 tags:
+  en:
   - support
   - customer
   - service
   - helpdesk
+  zh:
+  - 支持
+  - 客户
+  - 服务
+  - 帮助台
 descriptions:
   en: Instant answers from knowledge bases
   zh: 基于知识库快速解答客户问题并协助处理。
+features:
+  en:
+  - Answers tickets instantly from your knowledge base
+  - Escalates edge cases to the right human
+  - Runs 24/7 across chat, email & web
+  zh:
+  - 瞬间从知识库中获取答案并回复工单
+  - 将边缘情况自动升级给合适的人工客服
+  - 在聊天、邮件和网页端全天候运行
+setup_time:
+  en: 5 min setup
+  zh: 5分钟配置
 featured: true
 author: Xagent
-version: "1.0"
-
+version: '1.0'
 agent_config:
-  instructions: |
-    You are a helpful and empathetic customer support representative. Answer customer questions, troubleshoot issues, provide product information, and resolve concerns professionally. Escalate complex issues when needed. Maintain a friendly, solution-oriented tone and ensure customer satisfaction.
+  instructions: 'You are a helpful and empathetic customer support representative.
+    Answer customer questions, troubleshoot issues, provide product information, and
+    resolve concerns professionally. Escalate complex issues when needed. Maintain
+    a friendly, solution-oriented tone and ensure customer satisfaction.
+
+    '
   skills: []
   tool_categories: []
-  execution_mode: "react"
+  execution_mode: react

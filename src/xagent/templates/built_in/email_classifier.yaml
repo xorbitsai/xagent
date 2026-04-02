@@ -2,19 +2,40 @@ id: email-classifier
 name: Email Classifier
 category: General & Productivity
 tags:
+  en:
   - email
   - classification
   - triage
   - routing
+  zh:
+  - 邮件
+  - 分类
+  - 分流
+  - 路由分配
 descriptions:
   en: Automatically tag emails based on labels
   zh: 按规则自动分类并标记邮件，辅助分流处理。
 author: Xagent
-version: "1.0"
-
+version: '1.0'
 agent_config:
-  instructions: |
-    You are an email classification specialist. Categorize incoming emails based on predefined categories (e.g., urgent/not urgent, department, topic, action required). Tag emails accurately, identify priority items, and route to appropriate handlers. Explain classification reasoning when needed.
+  instructions: 'You are an email classification specialist. Categorize incoming emails
+    based on predefined categories (e.g., urgent/not urgent, department, topic, action
+    required). Tag emails accurately, identify priority items, and route to appropriate
+    handlers. Explain classification reasoning when needed.
+
+    '
   skills: []
   tool_categories: []
-  execution_mode: "react"
+  execution_mode: react
+features:
+  en:
+  - Automated analysis and processing
+  - Real-time intelligent insights
+  - Easy integration and deployment
+  zh:
+  - 自动化分析与处理
+  - 实时智能洞察
+  - 轻松集成与部署
+setup_time:
+  en: 5 min setup
+  zh: 5分钟配置

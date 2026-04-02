@@ -5,7 +5,7 @@ Provides REST API endpoints for managing and using agent templates.
 """
 
 import logging
-from typing import Optional
+from typing import Any, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from pydantic import BaseModel, Field
@@ -22,28 +22,30 @@ logger = logging.getLogger(__name__)
 # ===== Helper Functions =====
 
 
-def get_localized_description(
-    descriptions: dict[str, str], lang: Optional[str] = None
-) -> str:
+def get_localized_value(
+    values: Any, lang: Optional[str] = None, default: Any = None
+) -> Any:
     """
-    根据语言偏好获取本地化的描述
+    Get localized values based on language preference
 
     Args:
-        descriptions: 描述字典 {en: "...", zh: "..."}
-        lang: 语言代码，如果为 None 则尝试从英文 fallback
+        values: The values (can be a dict {en: "...", zh: "..."} or direct string/list)
+        lang: Language code, if None attempts to fallback to English
+        default: Default value
 
     Returns:
-        本地化的描述字符串
+        Localized values
     """
-    if not descriptions:
-        return ""
+    if values is None:
+        return default
 
-    # 如果指定了语言且存在，返回该语言
-    if lang and lang in descriptions:
-        return descriptions[lang]
+    if isinstance(values, dict):
+        if lang and lang in values:
+            return values[lang]
+        return values.get("en", default)
 
-    # Fallback to English
-    return descriptions.get("en", "")
+    # If not a dictionary, return the original value directly
+    return values
 
 
 # ===== Pydantic Models =====
@@ -72,6 +74,8 @@ class TemplateInfo(BaseModel):
         default=False, description="Whether the template is featured"
     )
     description: str = Field(..., description="Template description")
+    features: list[str] = Field(default_factory=list, description="Template features")
+    setup_time: str = Field(default="5 min setup", description="Setup time")
     tags: list[str] = Field(default_factory=list, description="Template tags")
     author: str = Field(..., description="Template author")
     version: str = Field(..., description="Template version")
@@ -125,7 +129,7 @@ async def list_templates(
     lang: Optional[str] = Query(None, description="Language code (e.g., 'en', 'zh')"),
 ) -> list[TemplateInfo]:
     """
-    列出所有可用的 templates（包含统计数据）
+    List all available templates (including statistics)
 
     Args:
         lang: Optional language code for localized descriptions
@@ -142,9 +146,13 @@ async def list_templates(
         template_id = template["id"]
         stats = get_or_create_template_stats(db, template_id)
 
-        # Get localized description
-        descriptions = template.get("descriptions", {})
-        description = get_localized_description(descriptions, lang)
+        # Get localized values
+        description = get_localized_value(template.get("descriptions", {}), lang, "")
+        features = get_localized_value(template.get("features", {}), lang, [])
+        setup_time = get_localized_value(
+            template.get("setup_time", {}), lang, "5 min setup"
+        )
+        tags = get_localized_value(template.get("tags", {}), lang, [])
 
         result.append(
             TemplateInfo(
@@ -153,7 +161,9 @@ async def list_templates(
                 category=template.get("category", ""),
                 featured=bool(template.get("featured", False)),
                 description=description,
-                tags=template.get("tags", []),
+                features=features,
+                setup_time=setup_time,
+                tags=tags,
                 author=template.get("author", ""),
                 version=template.get("version", ""),
                 views=stats.views,
@@ -174,7 +184,7 @@ async def get_template(
     lang: Optional[str] = Query(None, description="Language code (e.g., 'en', 'zh')"),
 ) -> TemplateDetail:
     """
-    获取单个 template 详情（包含 agent_config）
+    Get details of a single template (including agent_config)
 
     Args:
         template_id: ID of the template to retrieve
@@ -199,9 +209,13 @@ async def get_template(
     stats.views += 1
     db.commit()
 
-    # Get localized description
-    descriptions = template.get("descriptions", {})
-    description = get_localized_description(descriptions, lang)
+    # Get localized values
+    description = get_localized_value(template.get("descriptions", {}), lang, "")
+    features = get_localized_value(template.get("features", {}), lang, [])
+    setup_time = get_localized_value(
+        template.get("setup_time", {}), lang, "5 min setup"
+    )
+    tags = get_localized_value(template.get("tags", {}), lang, [])
 
     return TemplateDetail(
         id=template["id"],
@@ -209,7 +223,9 @@ async def get_template(
         category=template.get("category", ""),
         featured=bool(template.get("featured", False)),
         description=description,
-        tags=template.get("tags", []),
+        features=features,
+        setup_time=setup_time,
+        tags=tags,
         author=template.get("author", ""),
         version=template.get("version", ""),
         views=stats.views,
@@ -231,7 +247,7 @@ async def like_template(
     db: Session = Depends(get_db),
 ) -> LikeResponse:
     """
-    点赞或取消点赞 template
+    Like or unlike a template
 
     Args:
         template_id: ID of the template to like/unlike
@@ -265,7 +281,7 @@ async def use_template(
     db: Session = Depends(get_db),
 ) -> dict:
     """
-    使用 template 创建 agent（记录使用次数）
+    Use a template to create an agent (records usage count)
 
     Args:
         template_id: ID of the template to use

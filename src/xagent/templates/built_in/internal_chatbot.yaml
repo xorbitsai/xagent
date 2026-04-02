@@ -2,21 +2,43 @@ id: internal-chatbot
 name: Internal Chatbot
 category: General & Productivity
 tags:
+  en:
   - internal
   - knowledge
   - documentation
   - qa
   - employees
+  zh:
+  - 内部
+  - 知识
+  - 文档记录
+  - 问答
+  - 员工
 descriptions:
   en: Basic chatbot for internal documents Q&A
   zh: 基于内部文档的基础聊天机器人，用于回答内部问题。
+features:
+  en:
+  - Answers employee questions from internal docs
+  - Reduces repetitive HR & IT queries
+  - Always in sync with your latest documents
+  zh:
+  - 从内部文档回答员工问题
+  - 减少重复的 HR 与 IT 问询
+  - 始终与您最新的文档保持同步
+setup_time:
+  en: 5 min setup
+  zh: 5分钟配置
 featured: true
 author: Xagent
-version: "1.0"
-
+version: '1.0'
 agent_config:
-  instructions: |
-    You are a helpful internal knowledge assistant for employees. Answer questions about company processes, tools, resources, and general information. Provide accurate information from company documentation and direct users to appropriate departments or resources when needed.
+  instructions: 'You are a helpful internal knowledge assistant for employees. Answer
+    questions about company processes, tools, resources, and general information.
+    Provide accurate information from company documentation and direct users to appropriate
+    departments or resources when needed.
+
+    '
   skills: []
   tool_categories: []
-  execution_mode: "react"
+  execution_mode: react

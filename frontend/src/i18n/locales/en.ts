@@ -897,36 +897,6 @@ Build when you need.`
       knowledge: "Knowledge & Research",
       sales: "Sales & Outreach"
     },
-    items: {
-      internal_qa: {
-        title: "Internal Q&A",
-        description: "Connect to internal docs and answer employee questions automatically."
-      },
-      deep_research: {
-        title: "Deep Research",
-        description: "Research companies, web, and reports to compile comprehensive data."
-      },
-      outbound_bdr: {
-        title: "Outbound BDR",
-        description: "Scrape leads and draft personalized outreach emails."
-      },
-      inbound_lead: {
-        title: "Inbound Lead Processing",
-        description: "Qualify incoming leads and auto-schedule meetings."
-      },
-      crm_enrichment: {
-        title: "CRM Enrichment",
-        description: "Enrich CRM contacts with data from the web and LinkedIn."
-      },
-      sales_call_notes: {
-        title: "Sales Call Notes",
-        description: "Transcribe and summarize sales calls for follow-ups."
-      },
-      invoice_automation: {
-        title: "Invoice Automation",
-        description: "Extract data from invoices and update accounting systems."
-      }
-    }
   },
   sidebar: {
     tasks: {

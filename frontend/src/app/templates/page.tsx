@@ -5,6 +5,8 @@ import {
   Play,
   Heart,
   Loader2,
+  Clock,
+  ChevronRight
 } from "lucide-react";
 import { useState, useEffect } from "react";
 import { cn, getApiUrl } from "@/lib/utils";
@@ -197,36 +199,46 @@ export default function TemplatesPage() {
   return (
     <div className="flex flex-col h-full bg-background/50">
       {/* Header */}
-      <div className="flex justify-between items-start w-full p-8">
-        <div>
-          <h1 className="text-3xl font-bold mb-1">{t("templates.title")}</h1>
-          <p className="text-muted-foreground">{t("templates.subtitle")}</p>
+      <div className="w-full px-8 pt-8 pb-4">
+        <div className="flex justify-between items-start mb-6">
+          <div>
+            <h1 className="text-3xl font-bold mb-1 text-foreground">
+              {t("templates.title")}
+            </h1>
+            <p className="text-muted-foreground">{t("templates.subtitle")}</p>
+          </div>
+          <SearchInput
+            placeholder={t("templates.searchPlaceholder")}
+            value={searchQuery}
+            onChange={setSearchQuery}
+            containerClassName="w-80"
+            className="bg-transparent border-border rounded-lg focus:bg-background transition-all"
+          />
         </div>
-        <SearchInput
-          placeholder={t("templates.searchPlaceholder")}
-          value={searchQuery}
-          onChange={setSearchQuery}
-          containerClassName="w-72"
-          className="bg-secondary/50 border-border/50 focus:bg-background transition-all"
-        />
+        <hr className="border-border/60" />
       </div>
 
       {/* Category Filter */}
-      <div className="w-full px-8 pb-6 flex gap-2 overflow-x-auto scrollbar-hide">
-        {categories.map((category) => (
-          <button
-            key={category.id}
-            onClick={() => setSelectedCategory(category.id)}
-            className={cn(
-              "px-4 py-1.5 rounded-full text-sm font-medium transition-all whitespace-nowrap",
-              selectedCategory === category.id
-                ? "bg-primary text-primary-foreground shadow-sm"
-                : "bg-secondary/50 text-muted-foreground hover:bg-secondary hover:text-foreground",
-            )}
-          >
-            {category.label}
-          </button>
-        ))}
+      <div className="w-full px-8 pb-6 flex justify-between items-center gap-2 overflow-x-auto scrollbar-hide">
+        <div className="flex gap-2">
+          {categories.map((category) => (
+            <button
+              key={category.id}
+              onClick={() => setSelectedCategory(category.id)}
+              className={cn(
+                "px-4 py-1.5 rounded-full text-sm font-medium transition-all whitespace-nowrap border",
+                selectedCategory === category.id
+                  ? "bg-primary text-primary-foreground border-primary shadow-md"
+                  : "bg-transparent text-muted-foreground border-border hover:bg-secondary hover:text-foreground",
+              )}
+            >
+              {category.label}
+            </button>
+          ))}
+        </div>
+        <div className="px-4 py-1.5 rounded-full text-sm font-medium text-primary bg-primary/10 border border-primary/20 whitespace-nowrap flex-shrink-0">
+          {filteredTemplates.length} {filteredTemplates.length === 1 ? "template" : "templates"}
+        </div>
       </div>
 
       {/* Content */}
@@ -236,46 +248,94 @@ export default function TemplatesPage() {
             <Loader2 className="w-8 h-8 animate-spin text-muted-foreground" />
           </div>
         ) : (
-          <div className="w-full px-8 py-8 space-y-10">
+          <div className="w-full px-8 pb-8 space-y-10">
             {filteredSections.map((section) => (
               <div key={section.id} className="animate-fade-in">
                 {/* Section Header */}
-                <div className="gap-2 mb-4 text-foreground/90 font-medium">
-                  <h2>{section.title}</h2>
+                <div className="flex items-center gap-4 mb-6">
+                  <h2 className="text-primary font-bold text-sm tracking-widest uppercase whitespace-nowrap">
+                    {section.title}
+                  </h2>
+                  <div className="h-[1px] flex-grow bg-border/60" />
                 </div>
 
                 {/* Templates Grid */}
-                <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-4 2xl:grid-cols-5 gap-4">
+                <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 gap-6">
                   {section.templates.map((template) => {
                     return (
                       <div
                         key={template.id}
-                        onClick={() => handleUseTemplate(template.id)}
-                        className="cursor-pointer shadow-md p-5 rounded-xl border border-border/40 bg-card hover:border-primary/20 hover:shadow-lg transition-all duration-300"
+                        className="flex flex-col bg-card rounded-2xl border border-border/60 shadow-sm hover:shadow-md transition-shadow p-6 group"
                       >
-                        <h3 className="font-semibold text-base mb-2 group-hover:text-primary transition-colors">
+                        {/* Card Header: Category & Setup Time */}
+                        <div className="flex justify-between items-center mb-4">
+                          <span className="text-xs font-bold text-primary tracking-wide uppercase">
+                            {categories.find((cat) => cat.id === template.category)?.label || ""}
+                          </span>
+                          <div className="flex items-center gap-1.5 text-muted-foreground text-xs">
+                            <Clock className="w-3.5 h-3.5" />
+                            <span>{template.setup_time || "5 min setup"}</span>
+                          </div>
+                        </div>
+
+                        {/* Title */}
+                        <h3 className="font-bold text-xl mb-4 text-foreground group-hover:text-primary transition-colors line-clamp-1">
                           {template.name}
                         </h3>
-                        <p className="text-sm text-muted-foreground line-clamp-2 mb-4 h-10">
-                          {template.description}
-                        </p>
 
-                        <div className="flex items-center justify-between text-xs text-muted-foreground mb-4">
-                          <div className="flex items-center gap-3">
-                            <div className="flex items-center gap-1">
-                              <Play className="w-3 h-3 fill-current" />
+                        {/* Description/Features */}
+                        <div className="flex-1 space-y-2 mb-6">
+                          {(template.features && template.features.length > 0) ? (
+                            template.features.map((feature, idx) => (
+                              <div key={idx} className="flex items-start gap-2 text-sm text-muted-foreground">
+                                <ChevronRight className="w-4 h-4 text-primary shrink-0 mt-0.5" />
+                                <span className="line-clamp-2">{feature}</span>
+                              </div>
+                            ))
+                          ) : (
+                            <div className="flex items-start gap-2 text-sm text-muted-foreground">
+                              <ChevronRight className="w-4 h-4 text-primary shrink-0 mt-0.5" />
+                              <span className="line-clamp-4">{template.description}</span>
+                            </div>
+                          )}
+                        </div>
+
+                        {/* Tags */}
+                        {template.tags && template.tags.length > 0 && (
+                          <div className="flex flex-wrap gap-2 mb-6">
+                            {template.tags.map((tag, idx) => (
+                              <span
+                                key={idx}
+                                className="px-2.5 py-1 bg-primary/10 text-primary text-xs font-medium rounded-full"
+                              >
+                                {tag}
+                              </span>
+                            ))}
+                          </div>
+                        )}
+
+                        {/* Footer: Stats & Action */}
+                        <div className="mt-auto">
+                          <div className="flex items-center gap-4 text-sm text-muted-foreground mb-4">
+                            <div className="flex items-center gap-1.5">
+                              <Play className="w-3.5 h-3.5 fill-current" />
                               <span>{template.used_count}</span>
                             </div>
                             <button
-                              onClick={(e) =>
-                                handleLikeTemplate(template.id, e)
-                              }
-                              className="flex items-center gap-1 hover:text-pink-500 transition-colors"
+                              onClick={(e) => handleLikeTemplate(template.id, e)}
+                              className="flex items-center gap-1.5 hover:text-pink-500 transition-colors"
                             >
-                              <Heart className="w-3 h-3 fill-current" />
+                              <Heart className="w-3.5 h-3.5 fill-current" />
                               <span>{template.likes}</span>
                             </button>
                           </div>
+
+                          <button
+                            onClick={() => handleUseTemplate(template.id)}
+                            className="w-full py-2.5 text-primary text-sm font-semibold rounded-lg border border-primary/30 hover:bg-primary/5 transition-colors"
+                          >
+                            {t("templates.useTemplate")}
+                          </button>
                         </div>
                       </div>
                     );

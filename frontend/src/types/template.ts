@@ -12,6 +12,8 @@ export interface Template {
   category: string;
   featured?: boolean;
   description: string;
+  features: string[];
+  setup_time: string;
   tags: string[];
   author: string;
   version: string;

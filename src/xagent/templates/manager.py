@@ -107,6 +107,8 @@ class TemplateManager:
 
         # 设置默认值
         data.setdefault("tags", [])
+        data.setdefault("features", [])
+        data.setdefault("setup_time", "5 min setup")
         data.setdefault("author", "xAgent")
         data.setdefault("version", "1.0")
         data.setdefault("featured", False)
@@ -129,6 +131,8 @@ class TemplateManager:
                 "category": template.get("category", ""),
                 "featured": template.get("featured", False),
                 "descriptions": template.get("descriptions", {}),
+                "features": template.get("features", []),
+                "setup_time": template.get("setup_time", "5 min setup"),
                 "tags": template.get("tags", []),
                 "author": template.get("author", ""),
                 "version": template.get("version", ""),

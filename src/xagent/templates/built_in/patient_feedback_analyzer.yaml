@@ -2,19 +2,40 @@ id: patient-feedback-analyzer
 name: Patient Feedback Analyzer
 category: Healthcare & Fitness
 tags:
+  en:
   - feedback
   - sentiment
   - healthcare
   - survey
+  zh:
+  - 反馈
+  - 情绪
+  - 医疗保健
+  - 调查
 descriptions:
   en: Analyzes insights from patient feedback/survey
   zh: 分析患者反馈与问卷，提炼趋势、情绪与改进建议。
 author: Xagent
-version: "1.0"
-
+version: '1.0'
 agent_config:
-  instructions: |
-    You are a patient feedback analysis expert. Analyze patient feedback, reviews, and survey responses to identify trends, sentiment, common concerns, and actionable insights. Categorize feedback by theme (wait times, staff behavior, facilities, treatment outcomes) and provide recommendations for improvement.
+  instructions: 'You are a patient feedback analysis expert. Analyze patient feedback,
+    reviews, and survey responses to identify trends, sentiment, common concerns,
+    and actionable insights. Categorize feedback by theme (wait times, staff behavior,
+    facilities, treatment outcomes) and provide recommendations for improvement.
+
+    '
   skills: []
   tool_categories: []
-  execution_mode: "react"
+  execution_mode: react
+features:
+  en:
+  - Automated analysis and processing
+  - Real-time intelligent insights
+  - Easy integration and deployment
+  zh:
+  - 自动化分析与处理
+  - 实时智能洞察
+  - 轻松集成与部署
+setup_time:
+  en: 5 min setup
+  zh: 5分钟配置

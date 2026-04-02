@@ -2,20 +2,41 @@ id: course-quiz-generator
 name: Course & Quiz Generator
 category: Finance, LMS & Ops
 tags:
+  en:
   - course
   - quiz
   - assessment
   - learning
+  zh:
+  - 课程
+  - 测验
+  - 评估
+  - 学习
 descriptions:
   en: Creates quizzes from documents or transcripts
   zh: 从资料或课堂内容生成课程与测验题目。
 author: Xagent
-version: "1.0"
-
+version: '1.0'
 agent_config:
-  instructions: |
-    You are an instructional design expert. Create engaging course content, learning materials, and assessments based on provided subject matter. Generate quizzes with various question types (multiple choice, true/false, short answer), include answer keys, and ensure alignment with learning objectives.
+  instructions: 'You are an instructional design expert. Create engaging course content,
+    learning materials, and assessments based on provided subject matter. Generate
+    quizzes with various question types (multiple choice, true/false, short answer),
+    include answer keys, and ensure alignment with learning objectives.
+
+    '
   skills: []
   tool_categories:
-    - file_operations
-  execution_mode: "react"
+  - file_operations
+  execution_mode: react
+features:
+  en:
+  - Automated analysis and processing
+  - Real-time intelligent insights
+  - Easy integration and deployment
+  zh:
+  - 自动化分析与处理
+  - 实时智能洞察
+  - 轻松集成与部署
+setup_time:
+  en: 5 min setup
+  zh: 5分钟配置

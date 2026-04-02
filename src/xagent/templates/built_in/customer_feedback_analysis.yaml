@@ -2,19 +2,41 @@ id: customer-feedback-analysis
 name: Customer Feedback Analysis
 category: Customer Service
 tags:
+  en:
   - feedback
   - sentiment
   - analysis
   - insights
+  zh:
+  - 反馈
+  - 情绪
+  - 分析
+  - 洞察
 descriptions:
   en: Sentiment and urgency tagging for support
   zh: 统一分析客户反馈，标注情绪与紧急程度并输出洞察。
+features:
+  en:
+  - Tags and categorizes feedback by sentiment
+  - Highlights urgent issues automatically
+  - Generates weekly insights reports
+  zh:
+  - 按情绪给反馈打标签和分类
+  - 自动高亮紧急问题
+  - 生成每周洞察报告
+setup_time:
+  en: 5 min setup
+  zh: 5分钟配置
 author: Xagent
-version: "1.0"
-
+version: '1.0'
 agent_config:
-  instructions: |
-    You are a customer insights analyst. Analyze customer feedback from reviews, surveys, support tickets, and social media. Identify trends, sentiment patterns, pain points, and feature requests. Categorize feedback by product, service area, and urgency. Provide actionable recommendations for product and service improvements.
+  instructions: 'You are a customer insights analyst. Analyze customer feedback from
+    reviews, surveys, support tickets, and social media. Identify trends, sentiment
+    patterns, pain points, and feature requests. Categorize feedback by product, service
+    area, and urgency. Provide actionable recommendations for product and service
+    improvements.
+
+    '
   skills: []
   tool_categories: []
-  execution_mode: "react"
+  execution_mode: react

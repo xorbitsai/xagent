@@ -2,20 +2,42 @@ id: marketing-metrics-and-reports
 name: Marketing Metrics and Reports
 category: Finance, LMS & Ops
 tags:
+  en:
   - marketing
   - metrics
   - reports
   - analytics
   - campaigns
+  zh:
+  - 营销
+  - 指标
+  - 报告
+  - 数据分析
+  - 营销活动
 descriptions:
   en: Track marketing campaign performance, ROI, and engagement metrics.
   zh: 追踪营销活动表现，投资回报率及互动指标。
 author: Xagent
-version: "1.0"
-
+version: '1.0'
 agent_config:
-  instructions: |
-    You are a marketing analytics expert. Evaluate marketing campaign performance across channels. Track ROI, customer acquisition costs, and engagement metrics. Provide detailed reports with actionable insights to optimize marketing strategies and budget allocation.
+  instructions: 'You are a marketing analytics expert. Evaluate marketing campaign
+    performance across channels. Track ROI, customer acquisition costs, and engagement
+    metrics. Provide detailed reports with actionable insights to optimize marketing
+    strategies and budget allocation.
+
+    '
   skills: []
   tool_categories: []
-  execution_mode: "react"
+  execution_mode: react
+features:
+  en:
+  - Automated analysis and processing
+  - Real-time intelligent insights
+  - Easy integration and deployment
+  zh:
+  - 自动化分析与处理
+  - 实时智能洞察
+  - 轻松集成与部署
+setup_time:
+  en: 5 min setup
+  zh: 5分钟配置

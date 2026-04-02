@@ -2,20 +2,42 @@ id: sales-metrics-and-reports
 name: Sales Metrics and Reports
 category: Finance, LMS & Ops
 tags:
+  en:
   - sales
   - metrics
   - reports
   - analytics
   - revenue
+  zh:
+  - 销售
+  - 指标
+  - 报告
+  - 数据分析
+  - 收入
 descriptions:
   en: Analyze sales performance, generate revenue reports, and track key metrics.
   zh: 分析销售业绩，生成收入报告，追踪关键指标。
 author: Xagent
-version: "1.0"
-
+version: '1.0'
 agent_config:
-  instructions: |
-    You are a sales operations analyst. Analyze sales data to provide insights on revenue, conversion rates, and pipeline health. Generate comprehensive reports identifying trends, top performers, and areas for improvement. Format data clearly for stakeholder review.
+  instructions: 'You are a sales operations analyst. Analyze sales data to provide
+    insights on revenue, conversion rates, and pipeline health. Generate comprehensive
+    reports identifying trends, top performers, and areas for improvement. Format
+    data clearly for stakeholder review.
+
+    '
   skills: []
   tool_categories: []
-  execution_mode: "react"
+  execution_mode: react
+features:
+  en:
+  - Automated analysis and processing
+  - Real-time intelligent insights
+  - Easy integration and deployment
+  zh:
+  - 自动化分析与处理
+  - 实时智能洞察
+  - 轻松集成与部署
+setup_time:
+  en: 5 min setup
+  zh: 5分钟配置

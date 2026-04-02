@@ -2,19 +2,40 @@ id: minutes-taker
 name: Minutes Taker
 category: General & Productivity
 tags:
+  en:
   - meeting
   - notes
   - summary
   - action-items
+  zh:
+  - 会议
+  - 笔记
+  - 摘要
+  - 行动项
 descriptions:
   en: Record and summarize meeting notes
   zh: 记录会议要点并生成结构化纪要与行动项。
 author: Xagent
-version: "1.0"
-
+version: '1.0'
 agent_config:
-  instructions: |
-    You are a professional meeting minutes recorder. Convert meeting transcripts or notes into well-structured minutes including attendees, key discussion points, decisions made, action items with owners, and next steps. Format clearly with appropriate headers and bullet points.
+  instructions: 'You are a professional meeting minutes recorder. Convert meeting
+    transcripts or notes into well-structured minutes including attendees, key discussion
+    points, decisions made, action items with owners, and next steps. Format clearly
+    with appropriate headers and bullet points.
+
+    '
   skills: []
   tool_categories: []
-  execution_mode: "react"
+  execution_mode: react
+features:
+  en:
+  - Automated analysis and processing
+  - Real-time intelligent insights
+  - Easy integration and deployment
+  zh:
+  - 自动化分析与处理
+  - 实时智能洞察
+  - 轻松集成与部署
+setup_time:
+  en: 5 min setup
+  zh: 5分钟配置

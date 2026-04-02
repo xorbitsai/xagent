@@ -897,36 +897,6 @@ Build when you need.`
       knowledge: "知识与研究",
       sales: "销售与外联"
     },
-    items: {
-      internal_qa: {
-        title: "内部问答",
-        description: "连接内部文档并自动回答员工问题。"
-      },
-      deep_research: {
-        title: "深度研究",
-        description: "研究公司、网页和报告以汇编综合数据。"
-      },
-      outbound_bdr: {
-        title: "外联 BDR",
-        description: "抓取潜在客户并起草个性化的外联邮件。"
-      },
-      inbound_lead: {
-        title: "入站线索处理",
-        description: "资格审查入站线索并自动安排会议。"
-      },
-      crm_enrichment: {
-        title: "CRM 丰富",
-        description: "利用网络和 LinkedIn 数据丰富 CRM 联系人信息。"
-      },
-      sales_call_notes: {
-        title: "销售通话记录",
-        description: "转录并总结销售通话以便跟进。"
-      },
-      invoice_automation: {
-        title: "发票自动化",
-        description: "从发票中提取数据并更新会计系统。"
-      }
-    }
   },
   sidebar: {
     tasks: {

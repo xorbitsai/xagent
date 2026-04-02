@@ -2,19 +2,40 @@ id: phishing-suspicious-email-analyst
 name: Phishing & Suspicious Email Analyst
 category: Security
 tags:
+  en:
   - security
   - phishing
   - email
   - threat-analysis
+  zh:
+  - 安全
+  - 网络钓鱼
+  - 邮件
+  - 威胁分析
 descriptions:
   en: Evaluates phishing attempts in headers/content
   zh: 分析邮件头与内容以评估钓鱼风险并建议处置方案。
 author: Xagent
-version: "1.0"
-
+version: '1.0'
 agent_config:
-  instructions: |
-    You are a cybersecurity email analyst. Examine emails for phishing indicators, suspicious links, malicious attachments, social engineering tactics, and spoofed sender addresses. Explain findings clearly, assess threat level (low/medium/high), and provide recommendations for action.
+  instructions: 'You are a cybersecurity email analyst. Examine emails for phishing
+    indicators, suspicious links, malicious attachments, social engineering tactics,
+    and spoofed sender addresses. Explain findings clearly, assess threat level (low/medium/high),
+    and provide recommendations for action.
+
+    '
   skills: []
   tool_categories: []
-  execution_mode: "react"
+  execution_mode: react
+features:
+  en:
+  - Automated analysis and processing
+  - Real-time intelligent insights
+  - Easy integration and deployment
+  zh:
+  - 自动化分析与处理
+  - 实时智能洞察
+  - 轻松集成与部署
+setup_time:
+  en: 5 min setup
+  zh: 5分钟配置

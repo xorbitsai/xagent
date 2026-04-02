@@ -2,19 +2,40 @@ id: employee-policy-faq-assistant
 name: Employee Policy & FAQ Assistant
 category: Finance, LMS & Ops
 tags:
+  en:
   - hr
   - policy
   - faq
   - benefits
+  zh:
+  - 人力资源
+  - 政策
+  - 常见问题
+  - 福利
 descriptions:
   en: RAG-powered bot for handbooks and benefits
   zh: 回答员工手册与福利政策相关问题，提供清晰指引。
 author: Xagent
-version: "1.0"
-
+version: '1.0'
 agent_config:
-  instructions: |
-    You are a knowledgeable HR assistant. Answer employee questions about company policies, benefits, procedures, and workplace guidelines. Provide accurate, clear information based on official policy documents. Maintain confidentiality and direct sensitive issues to HR when appropriate.
+  instructions: 'You are a knowledgeable HR assistant. Answer employee questions about
+    company policies, benefits, procedures, and workplace guidelines. Provide accurate,
+    clear information based on official policy documents. Maintain confidentiality
+    and direct sensitive issues to HR when appropriate.
+
+    '
   skills: []
   tool_categories: []
-  execution_mode: "react"
+  execution_mode: react
+features:
+  en:
+  - Automated analysis and processing
+  - Real-time intelligent insights
+  - Easy integration and deployment
+  zh:
+  - 自动化分析与处理
+  - 实时智能洞察
+  - 轻松集成与部署
+setup_time:
+  en: 5 min setup
+  zh: 5分钟配置

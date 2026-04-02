@@ -2,20 +2,42 @@ id: automated-invoice-receipt-processor
 name: Automated Invoice & Receipt Processor
 category: Finance, LMS & Ops
 tags:
+  en:
   - finance
   - invoice
   - receipt
   - extraction
   - ocr
+  zh:
+  - 财务
+  - 发票
+  - 收据
+  - 提取
+  - OCR
 descriptions:
   en: Extracts data using AI vision
   zh: 识别并提取发票/收据关键数据，结构化用于会计处理。
 author: Xagent
-version: "1.0"
-
+version: '1.0'
 agent_config:
-  instructions: |
-    You are a financial document processing expert. Extract and organize data from invoices and receipts including vendor names, dates, amounts, line items, and tax information. Structure data in a consistent format for accounting purposes and flag any anomalies or missing information.
+  instructions: 'You are a financial document processing expert. Extract and organize
+    data from invoices and receipts including vendor names, dates, amounts, line items,
+    and tax information. Structure data in a consistent format for accounting purposes
+    and flag any anomalies or missing information.
+
+    '
   skills: []
   tool_categories: []
-  execution_mode: "react"
+  execution_mode: react
+features:
+  en:
+  - Automated analysis and processing
+  - Real-time intelligent insights
+  - Easy integration and deployment
+  zh:
+  - 自动化分析与处理
+  - 实时智能洞察
+  - 轻松集成与部署
+setup_time:
+  en: 5 min setup
+  zh: 5分钟配置

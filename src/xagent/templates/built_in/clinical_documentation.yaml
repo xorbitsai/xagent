@@ -2,20 +2,42 @@ id: clinical-documentation
 name: Clinical Documentation
 category: Healthcare & Fitness
 tags:
+  en:
   - medical
   - documentation
   - SOAP
   - healthcare
+  zh:
+  - 医疗
+  - 文档记录
+  - SOAP
+  - 医疗保健
 descriptions:
   en: Summarizes patient consultations into structured medical notes
   zh: 将问诊内容整理为结构化临床文档（SOAP、病程记录等）。
+features:
+  en:
+  - Summarizes patient consultations into structured notes
+  - Cuts documentation time per visit by 80%
+  - Outputs SOAP-format notes ready to review
+  zh:
+  - 将患者问诊总结为结构化笔记
+  - 每次就诊的文档记录时间缩短 80%
+  - 输出准备好供审核的 SOAP 格式笔记
+setup_time:
+  en: 10 min setup
+  zh: 10分钟配置
 featured: true
 author: Xagent
-version: "1.0"
-
+version: '1.0'
 agent_config:
-  instructions: |
-    You are a clinical documentation assistant. Transform patient encounter notes, verbal conversations, and clinical observations into structured, professional medical documentation following standard clinical formats (SOAP notes, progress notes, etc.). Ensure accuracy, clarity, and compliance with medical documentation standards.
+  instructions: 'You are a clinical documentation assistant. Transform patient encounter
+    notes, verbal conversations, and clinical observations into structured, professional
+    medical documentation following standard clinical formats (SOAP notes, progress
+    notes, etc.). Ensure accuracy, clarity, and compliance with medical documentation
+    standards.
+
+    '
   skills: []
   tool_categories: []
-  execution_mode: "react"
+  execution_mode: react

@@ -2,19 +2,40 @@ id: virtual-tutor-feedback-coach
 name: Virtual Tutor & Feedback Coach
 category: Finance, LMS & Ops
 tags:
+  en:
   - tutoring
   - feedback
   - education
   - learning
+  zh:
+  - 家教
+  - 反馈
+  - 教育
+  - 学习
 descriptions:
   en: 24/7 instant feedback for learners
   zh: 为学习者提供实时辅导与反馈，帮助提升学习效果。
 author: Xagent
-version: "1.0"
-
+version: '1.0'
 agent_config:
-  instructions: |
-    You are a patient and knowledgeable virtual tutor. Provide personalized explanations, answer questions, give constructive feedback on student work, and adapt teaching approach to student needs. Break down complex concepts, use examples, and encourage learning through guided discovery.
+  instructions: 'You are a patient and knowledgeable virtual tutor. Provide personalized
+    explanations, answer questions, give constructive feedback on student work, and
+    adapt teaching approach to student needs. Break down complex concepts, use examples,
+    and encourage learning through guided discovery.
+
+    '
   skills: []
   tool_categories: []
-  execution_mode: "react"
+  execution_mode: react
+features:
+  en:
+  - Automated analysis and processing
+  - Real-time intelligent insights
+  - Easy integration and deployment
+  zh:
+  - 自动化分析与处理
+  - 实时智能洞察
+  - 轻松集成与部署
+setup_time:
+  en: 5 min setup
+  zh: 5分钟配置

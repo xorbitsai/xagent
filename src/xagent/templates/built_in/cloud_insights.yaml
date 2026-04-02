@@ -2,20 +2,42 @@ id: cloud-insights
 name: Cloud Insights
 category: Finance, LMS & Ops
 tags:
+  en:
   - cloud
   - cost
   - optimization
   - infrastructure
+  zh:
+  - 云服务
+  - 成本
+  - 优化
+  - 基础设施
 descriptions:
-  en: Connect your cloud provider to get real-time infrastructure insights and cost optimization suggestions
+  en: Connect your cloud provider to get real-time infrastructure insights and cost
+    optimization suggestions
   zh: 获取云资源洞察与成本优化建议，发现性能与费用问题。
+features:
+  en:
+  - Connects to your cloud provider in real time
+  - Identifies cost optimization opportunities instantly
+  - Flags infrastructure anomalies before they escalate
+  zh:
+  - 实时连接到您的云提供商
+  - 瞬间发现成本优化机会
+  - 在基础设施异常升级前进行标记预警
+setup_time:
+  en: 10 min setup
+  zh: 10分钟配置
 featured: true
 author: Xagent
-version: "1.0"
-
+version: '1.0'
 agent_config:
-  instructions: |
-    You are a cloud infrastructure and cost optimization expert. Analyze cloud usage data, identify cost-saving opportunities, detect performance issues, and provide recommendations for optimization across AWS, Azure, and GCP. Explain technical findings in clear, actionable terms.
+  instructions: 'You are a cloud infrastructure and cost optimization expert. Analyze
+    cloud usage data, identify cost-saving opportunities, detect performance issues,
+    and provide recommendations for optimization across AWS, Azure, and GCP. Explain
+    technical findings in clear, actionable terms.
+
+    '
   skills: []
   tool_categories: []
-  execution_mode: "react"
+  execution_mode: react

@@ -2,19 +2,40 @@ id: personal-trainer
 name: Personal Trainer
 category: Healthcare & Fitness
 tags:
+  en:
   - fitness
   - workout
   - coaching
   - training
+  zh:
+  - 健身
+  - 锻炼
+  - 辅导
+  - 培训
 descriptions:
   en: Crafts personalized workout plans and provides real-time fitness coaching
   zh: 生成个性化训练计划并提供健身指导与反馈。
 author: Xagent
-version: "1.0"
-
+version: '1.0'
 agent_config:
-  instructions: |
-    You are an experienced personal trainer and fitness coach. Create personalized workout plans, provide exercise guidance, track progress, and offer motivation. Consider fitness goals, experience level, available equipment, and any physical limitations. Provide clear instructions and safety tips.
+  instructions: 'You are an experienced personal trainer and fitness coach. Create
+    personalized workout plans, provide exercise guidance, track progress, and offer
+    motivation. Consider fitness goals, experience level, available equipment, and
+    any physical limitations. Provide clear instructions and safety tips.
+
+    '
   skills: []
   tool_categories: []
-  execution_mode: "react"
+  execution_mode: react
+features:
+  en:
+  - Automated analysis and processing
+  - Real-time intelligent insights
+  - Easy integration and deployment
+  zh:
+  - 自动化分析与处理
+  - 实时智能洞察
+  - 轻松集成与部署
+setup_time:
+  en: 5 min setup
+  zh: 5分钟配置

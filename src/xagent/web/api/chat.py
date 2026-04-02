@@ -3,7 +3,6 @@
 import asyncio
 import logging
 import os
-import shutil
 from pathlib import Path
 from typing import Any, Dict, List, Optional, cast
 
@@ -751,6 +750,17 @@ class AgentServiceManager:
                             "memory_similarity_threshold"
                         ]
 
+                    # Build allowed external directories (user's upload directory for knowledge base files)
+                    allowed_external_dirs = []
+                    if user and user.id:
+                        user_upload_dir = UPLOADS_DIR / f"user_{user.id}"
+                        allowed_external_dirs.append(str(user_upload_dir))
+
+                    # Add configured external upload directories (for knowledge base files from other projects)
+                    allowed_external_dirs.extend(
+                        [str(d) for d in ALLOWED_EXTERNAL_UPLOAD_DIRS]
+                    )
+
                     # Create AgentService first (this creates the workspace)
                     self._agents[task_id] = AgentService(
                         name=f"web_chat_agent_task_{task_id}",
@@ -771,6 +781,7 @@ class AgentServiceManager:
                         workspace_base_dir=str(
                             UPLOADS_DIR / f"user_{user.id}"
                         ),  # Use user-isolated base directory
+                        allowed_external_dirs=allowed_external_dirs,  # Add allowed external directories
                         task_id=str(task_id),  # Pass task_id for proper tracing
                         memory_similarity_threshold=memory_similarity_threshold,  # Set from task config
                         system_prompt=system_prompt,  # Pass agent builder instructions
@@ -809,12 +820,10 @@ class AgentServiceManager:
                             if not source_path.exists() or not source_path.is_file():
                                 continue
 
-                            target_path = _build_unique_workspace_target(
-                                workspace.input_dir, source_path.name
-                            )
-                            shutil.copy2(source_path, target_path)
+                            # Use the source file directly (user's upload directory) instead of copying
+                            # This avoids duplicate files across the system
                             workspace.register_file(
-                                str(target_path), file_id=selected_file_id
+                                str(source_path), file_id=selected_file_id
                             )
 
                 pattern_info = (
@@ -1040,6 +1049,15 @@ class AgentServiceManager:
                 database_name = config.get("database_name", "Unknown Database")
                 database_type = self._infer_database_type(database_url)
 
+                # Build allowed external directories
+                allowed_external_dirs = []
+                if user and user.id:
+                    user_upload_dir = UPLOADS_DIR / f"user_{user.id}"
+                    allowed_external_dirs.append(str(user_upload_dir))
+                allowed_external_dirs.extend(
+                    [str(d) for d in ALLOWED_EXTERNAL_UPLOAD_DIRS]
+                )
+
                 # Create AgentService with Text2SQL agent type
 
                 agent_service = AgentService(
@@ -1063,6 +1081,7 @@ class AgentServiceManager:
                     read_only=config.get("read_only", True),
                     available_tables=config.get("available_tables"),
                     workspace_base_dir=str(UPLOADS_DIR / f"user_{user.id}"),
+                    allowed_external_dirs=allowed_external_dirs,
                 )
 
                 # Use Text2SQLAgent's execute method directly, not AgentService
@@ -1248,6 +1267,15 @@ class AgentServiceManager:
                     task_compact_llm = None
                 use_dag = task_llm is not None
 
+                # Build allowed external directories
+                allowed_external_dirs = []
+                if user_id is not None:
+                    user_upload_dir = UPLOADS_DIR / f"user_{user_id}"
+                    allowed_external_dirs.append(str(user_upload_dir))
+                allowed_external_dirs.extend(
+                    [str(d) for d in ALLOWED_EXTERNAL_UPLOAD_DIRS]
+                )
+
                 # Create agent with basic configuration
                 if user_id is not None:
                     with UserContext(int(user_id)):
@@ -1268,6 +1296,7 @@ class AgentServiceManager:
                             workspace_base_dir=str(
                                 UPLOADS_DIR / f"user_{user_id}"
                             ),  # Use user-isolated base directory
+                            allowed_external_dirs=allowed_external_dirs,
                             task_id=str(task_id),
                             memory_similarity_threshold=None,  # Reconstructed agents use default
                         )

@@ -23,7 +23,7 @@ from fastapi.responses import RedirectResponse
 from sqlalchemy.orm import Session
 
 from ..auth_dependencies import get_user_from_websocket_token
-from ..config import UPLOADS_DIR
+from ..config import ALLOWED_EXTERNAL_UPLOAD_DIRS, UPLOADS_DIR
 from ..models.database import get_db
 from ..models.task import Task
 from ..models.uploaded_file import UploadedFile
@@ -965,7 +965,6 @@ async def handle_file_upload_for_task(
 ) -> dict:
     """Handle file upload for task"""
     try:
-        import shutil
         from pathlib import Path
 
         from ..models.uploaded_file import UploadedFile
@@ -1006,27 +1005,15 @@ async def handle_file_upload_for_task(
 
             try:
                 # Add file to workspace, use original filename
-                import shutil
                 from pathlib import Path
-
-                # Get target directory
-                if agent_service.workspace and hasattr(
-                    agent_service.workspace, "input_dir"
-                ):
-                    target_dir = agent_service.workspace.input_dir
-                elif agent_service.workspace:
-                    target_dir = agent_service.workspace.workspace_dir / "input"
-                    target_dir.mkdir(parents=True, exist_ok=True)
-                else:
-                    raise ValueError("Agent service workspace is not available")
 
                 # Use normalized filename instead of original
                 original_file_name = Path(file_name).name
                 normalized_file_name = normalize_filename(original_file_name)
-                target_path = build_unique_target_path(target_dir, normalized_file_name)
 
-                # Copy file to workspace
-                shutil.copy2(source_path, target_path)
+                # Do not copy file to workspace input directory to avoid duplication
+                # Use the user directory file directly
+                target_path = source_path
                 uploaded_files.append(str(target_path))
 
                 if file_record.task_id is None:
@@ -1054,7 +1041,7 @@ async def handle_file_upload_for_task(
                 )
 
                 logger.info(
-                    f"File added to workspace: {target_path} (original: {original_file_name} -> normalized: {normalized_file_name})"
+                    f"File added to workspace without copying: {target_path} (original: {original_file_name} -> normalized: {normalized_file_name})"
                 )
 
             except Exception as e:
@@ -1273,12 +1260,12 @@ async def handle_chat_message(
                         context["file_info"] = file_info_list
                         file_summary = "\n".join(
                             [
-                                f"- {f['name']} (ID: {f['file_id']}, {f['size']} bytes, {f['type']})"
+                                f"- {f['name']} (ID: {f['file_id']}, {f['size']} bytes, {f['type']}, Path: {f['path']})"
                                 for f in file_info_list
                             ]
                         )
                         file_prompt = (
-                            "Uploaded files are available in workspace input directory.\n"
+                            "Uploaded files are available at the following absolute paths:\n"
                             f"{file_summary}"
                         )
                         existing_prompt = context.get("system_prompt")
@@ -2651,6 +2638,13 @@ async def handle_build_preview_execution(
         else:  # simple mode - not implemented yet, fallback to react
             use_dag_pattern = False
 
+        # Build allowed external directories
+        allowed_external_dirs = []
+        if user and user.id:
+            user_upload_dir = UPLOADS_DIR / f"user_{user.id}"
+            allowed_external_dirs.append(str(user_upload_dir))
+        allowed_external_dirs.extend([str(d) for d in ALLOWED_EXTERNAL_UPLOAD_DIRS])
+
         # Create agent service (using WebSocket tracer)
         memory = InMemoryMemoryStore()
         agent_service = AgentService(
@@ -2665,6 +2659,7 @@ async def handle_build_preview_execution(
             id=preview_task_id,
             enable_workspace=True,
             workspace_base_dir=str(UPLOADS_DIR / "build_preview"),
+            allowed_external_dirs=allowed_external_dirs,
             task_id=preview_task_id,
             tracer=preview_tracer,
         )
@@ -2686,7 +2681,6 @@ async def handle_build_preview_execution(
         file_prompt = ""
         if files_data:
             try:
-                import shutil
                 from pathlib import Path
 
                 from ..models.uploaded_file import UploadedFile
@@ -2718,15 +2712,7 @@ async def handle_build_preview_execution(
                         continue
 
                     try:
-                        # Get workspace's input directory
-                        if agent_service.workspace and hasattr(
-                            agent_service.workspace, "input_dir"
-                        ):
-                            target_dir = agent_service.workspace.input_dir
-                        elif agent_service.workspace:
-                            target_dir = agent_service.workspace.workspace_dir / "input"
-                            target_dir.mkdir(parents=True, exist_ok=True)
-                        else:
+                        if not agent_service.workspace:
                             logger.warning(
                                 "Agent service workspace is not available for file upload"
                             )
@@ -2735,12 +2721,10 @@ async def handle_build_preview_execution(
                         # Normalize filename
                         original_file_name = Path(file_name).name
                         normalized_file_name = normalize_filename(original_file_name)
-                        target_path = build_unique_target_path(
-                            target_dir, normalized_file_name
-                        )
 
-                        # Copy file to workspace
-                        shutil.copy2(source_path, target_path)
+                        # Do not copy file to workspace input directory to avoid duplication
+                        # Use the user directory file directly
+                        target_path = source_path
                         uploaded_files.append(str(target_path))
 
                         if agent_service.workspace:
@@ -2772,12 +2756,12 @@ async def handle_build_preview_execution(
                 if file_info_list:
                     file_summary = "\n".join(
                         [
-                            f"- {f['name']} (ID: {f['file_id']}, {f['size']} bytes, {f['type']})"
+                            f"- {f['name']} (ID: {f['file_id']}, {f['size']} bytes, {f['type']}, Path: {f['path']})"
                             for f in file_info_list
                         ]
                     )
                     file_prompt = (
-                        "Uploaded files are available in workspace input directory.\n"
+                        "Uploaded files are available at the following absolute paths:\n"
                         f"{file_summary}"
                     )
 

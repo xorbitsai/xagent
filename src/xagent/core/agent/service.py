@@ -35,6 +35,7 @@ class AgentService:
         workspace: Optional[TaskWorkspace] = None,
         workspace_base_dir: str = "uploads",
         enable_workspace: bool = True,
+        allowed_external_dirs: Optional[List[str]] = None,
         task_id: Optional[str] = None,
         fast_llm: Optional[BaseLLM] = None,
         vision_llm: Optional[BaseLLM] = None,
@@ -94,6 +95,7 @@ class AgentService:
         self.id = id
         self.workspace_base_dir = workspace_base_dir
         self.enable_workspace = enable_workspace
+        self.allowed_external_dirs = allowed_external_dirs
 
         # Use workspace from tool_config if available and no explicit workspace was provided
         if (
@@ -110,6 +112,7 @@ class AgentService:
             self.workspace = workspace_manager.get_or_create_workspace(
                 ws_config.get("base_dir", self.workspace_base_dir),
                 ws_config.get("task_id", self.id),
+                self.allowed_external_dirs,
             )
         else:
             # Use provided workspace or create new one later in _setup_workspace()
@@ -632,7 +635,9 @@ class AgentService:
     def _setup_workspace(self) -> None:
         """Set up workspace for this agent service."""
         if not self.workspace:
-            self.workspace = create_workspace(self.id, self.workspace_base_dir)
+            self.workspace = create_workspace(
+                self.id, self.workspace_base_dir, self.allowed_external_dirs
+            )
 
         logger.info(
             f"AgentService '{self.name}' using workspace: {self.workspace.workspace_dir}"

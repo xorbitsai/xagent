@@ -85,10 +85,23 @@ class TaskWorkspace:
             raise FileNotFoundError(f"File not found for registration: {file_path}")
 
         workspace_abs = self.workspace_dir.resolve()
+        is_valid = False
         try:
             resolved_path.relative_to(workspace_abs)
-        except ValueError as exc:
-            raise ValueError(f"Path {file_path} is outside workspace") from exc
+            is_valid = True
+        except ValueError:
+            for allowed_dir in self.allowed_external_dirs:
+                try:
+                    resolved_path.relative_to(allowed_dir.resolve())
+                    is_valid = True
+                    break
+                except ValueError:
+                    pass
+
+        if not is_valid:
+            raise ValueError(
+                f"Path {file_path} is outside workspace and allowed directories"
+            )
 
         # Check if file already exists in database
         existing_file_id = self._get_file_id_from_db(resolved_path, db_session)
@@ -842,18 +855,23 @@ class TaskWorkspace:
 
 
 # Simple workspace management functions
-def create_workspace(id: str, base_dir: str = "uploads") -> TaskWorkspace:
+def create_workspace(
+    id: str,
+    base_dir: str = "uploads",
+    allowed_external_dirs: Optional[List[str]] = None,
+) -> TaskWorkspace:
     """
     Create a new workspace for the given id.
 
     Args:
         id: Workspace identifier
         base_dir: Base directory for workspaces
+        allowed_external_dirs: List of allowed external directories
 
     Returns:
         TaskWorkspace instance
     """
-    return TaskWorkspace(id, base_dir)
+    return TaskWorkspace(id, base_dir, allowed_external_dirs)
 
 
 def get_workspace_output_files(
@@ -884,13 +902,19 @@ class WorkspaceManager:
     def __init__(self) -> None:
         self._workspaces: Dict[str, TaskWorkspace] = {}
 
-    def get_or_create_workspace(self, base_dir: str, task_id: str) -> TaskWorkspace:
+    def get_or_create_workspace(
+        self,
+        base_dir: str,
+        task_id: str,
+        allowed_external_dirs: Optional[List[str]] = None,
+    ) -> TaskWorkspace:
         """
         Get existing workspace or create new one.
 
         Args:
             base_dir: Base directory for workspaces
             task_id: Task/workspace identifier
+            allowed_external_dirs: List of allowed external directories
 
         Returns:
             TaskWorkspace instance
@@ -898,7 +922,7 @@ class WorkspaceManager:
         cache_key = f"{base_dir}:{task_id}"
 
         if cache_key not in self._workspaces:
-            workspace = TaskWorkspace(task_id, base_dir)
+            workspace = TaskWorkspace(task_id, base_dir, allowed_external_dirs)
             self._workspaces[cache_key] = workspace
 
         return self._workspaces[cache_key]

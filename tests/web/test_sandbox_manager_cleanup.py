@@ -52,6 +52,7 @@ async def test_cleanup_deletes_on_image_change(
     with patch.dict(
         "os.environ",
         {"SANDBOX_IMAGE": "new:v1", "SANDBOX_CPUS": "1", "SANDBOX_MEMORY": "512"},
+        clear=True,
     ):
         await manager.cleanup()
 
@@ -70,6 +71,7 @@ async def test_cleanup_deletes_on_cpus_change(
     with patch.dict(
         "os.environ",
         {"SANDBOX_IMAGE": "img:v1", "SANDBOX_CPUS": "4", "SANDBOX_MEMORY": "512"},
+        clear=True,
     ):
         await manager.cleanup()
 
@@ -88,6 +90,7 @@ async def test_cleanup_deletes_on_memory_change(
     with patch.dict(
         "os.environ",
         {"SANDBOX_IMAGE": "img:v1", "SANDBOX_CPUS": "1", "SANDBOX_MEMORY": "1024"},
+        clear=True,
     ):
         await manager.cleanup()
 
@@ -115,6 +118,7 @@ async def test_cleanup_deletes_on_volumes_change(
         patch.dict(
             "os.environ",
             {"SANDBOX_IMAGE": "img:v1", "SANDBOX_CPUS": "1", "SANDBOX_MEMORY": "512"},
+            clear=True,
         ),
         patch("xagent.web.sandbox_manager.UPLOADS_DIR", new_uploads),
     ):
@@ -149,6 +153,7 @@ async def test_cleanup_stops_when_config_matches(
         patch.dict(
             "os.environ",
             {"SANDBOX_IMAGE": "img:v1", "SANDBOX_CPUS": "1", "SANDBOX_MEMORY": "512"},
+            clear=True,
         ),
         patch("xagent.web.sandbox_manager.UPLOADS_DIR", uploads),
     ):
@@ -170,6 +175,7 @@ async def test_cleanup_deletes_on_multiple_changes(
     with patch.dict(
         "os.environ",
         {"SANDBOX_IMAGE": "new:v2", "SANDBOX_CPUS": "8", "SANDBOX_MEMORY": "2048"},
+        clear=True,
     ):
         await manager.cleanup()
 
@@ -190,6 +196,7 @@ async def test_cleanup_handles_non_managed_sandbox(
     with patch.dict(
         "os.environ",
         {"SANDBOX_IMAGE": "img:v1", "SANDBOX_CPUS": "1", "SANDBOX_MEMORY": "512"},
+        clear=True,
     ):
         await manager.cleanup()
 

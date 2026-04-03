@@ -38,16 +38,50 @@ class MockLLM(BaseLLM):
         return False
 
     async def chat(self, messages: list[dict[str, str]], **kwargs) -> str:
+        # Check if this is phase 2 (tools provided) or phase 1 (no tools)
+        has_tools = "tools" in kwargs and kwargs["tools"]
+
         if self.call_count < len(self.responses):
-            response = self.responses[self.call_count]
+            response_text = self.responses[self.call_count]
+            try:
+                response_json = json.loads(response_text)
+            except json.JSONDecodeError:
+                # If not JSON, return as-is and move to next response
+                self.call_count += 1
+                return response_text
+
+            # Handle two-phase tool calling
+            if response_json.get("type") == "tool_call":
+                if not has_tools:
+                    # Phase 1: Return decision without tool_name and tool_args
+                    # Don't increment call_count yet - Phase 2 will use the same response
+                    phase1_response = {
+                        "type": "tool_call",
+                        "reasoning": response_json.get(
+                            "reasoning", "I need to use a tool"
+                        ),
+                    }
+                    return json.dumps(phase1_response)
+                else:
+                    # Phase 2: Return tool_call with tool_name
+                    # Now increment call_count since both phases are done
+                    self.call_count += 1
+                    # Return the full response with tool_name and tool_args
+                    return response_text
+
+            # final_answer or other types (not tool_call)
+            # For non-tool_call responses, return directly and move to next
             self.call_count += 1
-            return response
+            return response_text
 
         # Default response
         return '{"type": "final_answer", "content": "Task completed by sub-agent", "answer": "Task completed by sub-agent", "reasoning": "The task has been completed"}'
 
     async def stream_chat(self, messages: list[dict[str, str]], **kwargs):
         """Stream chat implementation for testing native tool calling."""
+        # Check if this is phase 2 (tools provided) or phase 1 (no tools)
+        has_tools = "tools" in kwargs and kwargs["tools"]
+
         if self.call_count >= len(self.responses):
             # Default response
             response_json = {
@@ -58,44 +92,67 @@ class MockLLM(BaseLLM):
         else:
             # Parse the response
             response_text = self.responses[self.call_count]
-            self.call_count += 1
             try:
                 response_json = json.loads(response_text)
             except json.JSONDecodeError:
-                # If not JSON, treat as final answer
+                # If not JSON, treat as final answer and move to next response
+                self.call_count += 1
                 response_json = {
                     "type": "final_answer",
                     "reasoning": "Response received",
                     "answer": response_text,
                 }
 
-        # Check if this is a tool call
+        # Handle two-phase tool calling - use SAME logic as chat()
         if response_json.get("type") == "tool_call":
-            # Return native tool call format
-            tool_name = response_json.get("tool_name", "")
-            tool_args = response_json.get("tool_args", {})
+            if not has_tools:
+                # Phase 1: Return text (decision) without native tool call
+                # Don't increment call_count yet - Phase 2 will use the same response
+                reasoning = response_json.get("reasoning", "I need to use a tool")
+                phase1_json = {
+                    "type": "tool_call",
+                    "reasoning": reasoning,
+                }
+                yield StreamChunk(
+                    type=ChunkType.TOKEN,
+                    content=json.dumps(phase1_json),
+                    delta=json.dumps(phase1_json),
+                )
+                yield StreamChunk(type=ChunkType.END, finish_reason="stop")
+                return
+            else:
+                # Phase 2: Return native tool call format
+                # Now increment call_count since both phases are done
+                self.call_count += 1
+                tool_name = response_json.get("tool_name", "")
+                tool_args = response_json.get("tool_args", {})
 
-            yield StreamChunk(
-                type=ChunkType.TOOL_CALL,
-                content="",
-                delta="",
-                tool_calls=[
-                    {
-                        "function": {
-                            "name": tool_name,
-                            "arguments": json.dumps(tool_args),
+                yield StreamChunk(
+                    type=ChunkType.TOOL_CALL,
+                    content="",
+                    delta="",
+                    tool_calls=[
+                        {
+                            "function": {
+                                "name": tool_name,
+                                "arguments": json.dumps(tool_args),
+                            }
                         }
-                    }
-                ],
-            )
-            yield StreamChunk(type=ChunkType.END, finish_reason="tool_calls")
-        else:
-            # Return text content (final_answer)
-            answer = response_json.get(
-                "answer", response_json.get("content", "Task completed")
-            )
-            yield StreamChunk(type=ChunkType.TOKEN, content=answer, delta=answer)
-            yield StreamChunk(type=ChunkType.END, finish_reason="stop")
+                    ],
+                )
+                yield StreamChunk(type=ChunkType.END, finish_reason="tool_calls")
+                return
+
+        # final_answer or other types (not tool_call)
+        # For non-tool_call responses, increment call_count and return as text
+        if self.call_count < len(self.responses):
+            self.call_count += 1
+
+        answer = response_json.get(
+            "answer", response_json.get("content", "Task completed")
+        )
+        yield StreamChunk(type=ChunkType.TOKEN, content=answer, delta=answer)
+        yield StreamChunk(type=ChunkType.END, finish_reason="stop")
 
 
 class MockCalculatorTool(Tool):
@@ -166,7 +223,7 @@ async def test_agent_tool_basic():
     ]
 
     calc_llm = MockLLM(calc_responses)
-    calc_pattern = ReActPattern(calc_llm, max_iterations=3)
+    calc_pattern = ReActPattern(calc_llm, max_iterations=10)
     calc_memory = InMemoryMemoryStore()
     calc_tools = [MockCalculatorTool()]
 

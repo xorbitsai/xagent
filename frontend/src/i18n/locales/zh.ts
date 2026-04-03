@@ -774,7 +774,7 @@ Build when you need.`
     },
     createDialog: {
       title: "创建记忆",
-      description: "填写内容、关键词、标签和元数据以添加新的记忆项",
+      description: "填写内容、关键词、标签和元数据以添加新的记忆项，类别默认为\"用户添加的记忆\"。",
     },
     stats: {
       total: "记忆总数",
@@ -790,9 +790,9 @@ Build when you need.`
         placeholder: "选择类别",
       },
       categoryOptions: {
-        general: "通用",
-        react_memory: "React 记忆",
-        dag_plan_execute_memory: "DAG 规划执行记忆",
+        general: "用户添加的记忆",
+        react_memory: "运行记忆",
+        execution_memory: "任务记忆",
       },
       search: {
         label: "搜索",
@@ -814,6 +814,7 @@ Build when you need.`
       keywordPrefix: "关键词",
       tagPrefix: "标签",
       addedManually: "手动添加",
+      addedAutomatically: "自动添加",
       keywordsLabel: "关键词：",
       tagsLabel: "标签：",
     },
@@ -849,8 +850,10 @@ Build when you need.`
       contentPlaceholder: "请输入记忆内容...",
       keywordsLabel: "关键词",
       keywordsPlaceholder: "请输入关键词，使用逗号分隔",
+      keywordsTooltip: "从内容中提取的核心词汇，主要用于基于语义的相似度搜索和匹配。",
       tagsLabel: "标签",
       tagsPlaceholder: "请输入标签，使用逗号分隔",
+      tagsTooltip: "自定义的分类标识，主要用于对记忆进行精确的过滤和分组。",
       metadataLabel: "元数据（JSON）",
       metadataPlaceholder: "以 JSON 格式输入元数据，例如 {\"source\":\"web\"}",
     },

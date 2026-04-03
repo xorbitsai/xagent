@@ -11,9 +11,9 @@ import { Textarea } from "@/components/ui/textarea"
 import { ScrollArea } from "@/components/ui/scroll-area"
 import { SearchInput } from "@/components/ui/search-input"
 import { Badge } from "@/components/ui/badge"
+import { InfoTooltip } from "@/components/ui/tooltip"
 import { getApiUrl } from "@/lib/utils"
 import { apiRequest } from "@/lib/api-wrapper"
-import { useAuth } from "@/contexts/auth-context"
 import { useI18n } from "@/contexts/i18n-context"
 import { cn } from "@/lib/utils"
 import {
@@ -87,7 +87,7 @@ export function MemoryPage() {
     metadata: ""
   })
 
-  const [categories, setCategories] = useState<string[]>([])
+  const [categories, setCategories] = useState<string[]>(['execution_memory', 'react_memory', 'general'])
 
   // Search debouncing
   const searchTimeoutRef = useRef<NodeJS.Timeout | null>(null)
@@ -160,17 +160,17 @@ export function MemoryPage() {
     const csvContent = "data:text/csv;charset=utf-8,"
       + "ID,Content,Keywords,Tags,Category,Timestamp,Mime Type,Metadata\n"
       + targetMemories.map(m => {
-          const content = m.content.replace(/"/g, '""')
-          const keywords = (m.keywords || []).join("|").replace(/"/g, '""')
-          const tags = (m.tags || []).join("|").replace(/"/g, '""')
-          const metadata = JSON.stringify(m.metadata || {}).replace(/"/g, '""')
-          return `"${m.id}","${content}","${keywords}","${tags}","${m.category}","${m.timestamp}","${m.mime_type || ''}","${metadata}"`
-        }).join("\n")
+        const content = m.content.replace(/"/g, '""')
+        const keywords = (m.keywords || []).join("|").replace(/"/g, '""')
+        const tags = (m.tags || []).join("|").replace(/"/g, '""')
+        const metadata = JSON.stringify(m.metadata || {}).replace(/"/g, '""')
+        return `"${m.id}","${content}","${keywords}","${tags}","${m.category}","${m.timestamp}","${m.mime_type || ''}","${metadata}"`
+      }).join("\n")
 
     const encodedUri = encodeURI(csvContent)
     const link = document.createElement("a")
     link.setAttribute("href", encodedUri)
-    link.setAttribute("download", `memories_export_${new Date().toISOString().slice(0,10)}.csv`)
+    link.setAttribute("download", `memories_export_${new Date().toISOString().slice(0, 10)}.csv`)
     document.body.appendChild(link)
     link.click()
     document.body.removeChild(link)
@@ -211,17 +211,6 @@ export function MemoryPage() {
 
       setMemories(filteredMemories)
       setStats(statsData)
-
-      const uniqueCategories = Object.keys(statsData.category_counts || {}).sort((a, b) => {
-        return (statsData.category_counts?.[b] || 0) - (statsData.category_counts?.[a] || 0)
-      })
-      const uniqueTags = Object.keys(statsData.tag_counts || {})
-      const uniqueKeywords = Array.from(new Set(
-        memoriesData.memories.flatMap((m: MemoryItem) => m.keywords.filter((k): k is string => typeof k === 'string'))
-      ))
-
-      setCategories(uniqueCategories)
-
     } catch (err) {
       setError(err instanceof Error ? err.message : t("memory.errors.unknown"))
     } finally {
@@ -321,19 +310,18 @@ export function MemoryPage() {
   // Helper to determine icon based on category
   const getCategoryIcon = (category: string) => {
     const lower = category.toLowerCase()
-    if (lower.includes('user')) return User
-    if (lower.includes('global') || lower.includes('world')) return Globe
-    if (lower.includes('correct') || lower.includes('fix')) return Wrench
-    if (lower.includes('doc')) return FileText
+    if (lower === 'react_memory') return Wrench
+    if (lower === 'execution_memory') return FileText
+    if (lower === 'general') return User
     return Layers
   }
 
   // Helper to determine badge color
   const getCategoryColor = (category: string) => {
     const lower = category.toLowerCase()
-    if (lower.includes('user')) return "bg-purple-100 text-purple-800 dark:bg-purple-900/30 dark:text-purple-300"
-    if (lower.includes('global')) return "bg-green-100 text-green-800 dark:bg-green-900/30 dark:text-green-300"
-    if (lower.includes('correct')) return "bg-orange-100 text-orange-800 dark:bg-orange-900/30 dark:text-orange-300"
+    if (lower === 'react_memory') return "bg-purple-100 text-purple-800 dark:bg-purple-900/30 dark:text-purple-300"
+    if (lower === 'execution_memory') return "bg-blue-100 text-blue-800 dark:bg-blue-900/30 dark:text-blue-300"
+    if (lower === 'general') return "bg-slate-100 text-slate-800 dark:bg-slate-800 dark:text-slate-300"
     return "bg-slate-100 text-slate-800 dark:bg-slate-800 dark:text-slate-300"
   }
 
@@ -411,15 +399,15 @@ export function MemoryPage() {
                   <Button
                     key={cat}
                     variant={filters.category === cat ? "secondary" : "ghost"}
-                    className={cn("w-full justify-start capitalize", filters.category === cat && "font-medium")}
+                    className={cn("w-full justify-start", filters.category === cat && "font-medium")}
                     onClick={() => setFilters(prev => ({ ...prev, category: cat }))}
                   >
                     <div className={cn("h-2 w-2 rounded-full mr-2",
                       cat === 'general' ? 'bg-slate-400' :
-                      cat.includes('user') ? 'bg-purple-400' :
-                      'bg-blue-400'
+                        cat === 'react_memory' ? 'bg-purple-400' :
+                          'bg-blue-400'
                     )} />
-                    {cat.replace(/_/g, ' ')}
+                    {t(`memory.filters.categoryOptions.${cat}`)}
                     {stats?.category_counts[cat] ? (
                       <span className="ml-auto text-xs text-muted-foreground">
                         {stats.category_counts[cat]}
@@ -443,8 +431,8 @@ export function MemoryPage() {
                 checked={memories.length > 0 && selectedIds.size === memories.length}
                 onChange={handleSelectAll}
               />
-              <h2 className="text-lg font-semibold capitalize">
-                {filters.category ? `${filters.category.replace(/_/g, ' ')}` : t("memory.sidebar.allMemories")}
+              <h2 className="text-lg font-semibold">
+                {filters.category ? t(`memory.filters.categoryOptions.${filters.category}`) : t("memory.sidebar.allMemories")}
               </h2>
             </div>
             <div className="flex items-center gap-2">
@@ -453,10 +441,10 @@ export function MemoryPage() {
                 {selectedIds.size > 0 ? t("memory.actions.exportSelected", { count: selectedIds.size }) : t("memory.actions.exportCsv")}
               </Button>
               {selectedIds.size > 0 ? (
-                 <Button variant="destructive" size="sm" className="h-8 text-xs" onClick={() => setIsBulkDeleting(true)}>
-                   <Trash2 className="h-3.5 w-3.5 mr-2" />
-                   {t("memory.actions.deleteSelected", { count: selectedIds.size })}
-                 </Button>
+                <Button variant="destructive" size="sm" className="h-8 text-xs" onClick={() => setIsBulkDeleting(true)}>
+                  <Trash2 className="h-3.5 w-3.5 mr-2" />
+                  {t("memory.actions.deleteSelected", { count: selectedIds.size })}
+                </Button>
               ) : (
                 filters.category && (
                   <Button variant="ghost" size="sm" className="h-8 text-xs text-muted-foreground hover:text-foreground" onClick={() => setFilters(prev => ({ ...prev, category: undefined }))}>
@@ -484,15 +472,15 @@ export function MemoryPage() {
                 </div>
               </div>
             ) : memories.length === 0 ? (
-               <div className="flex flex-col items-center justify-center h-full text-muted-foreground">
-                 <div className="h-16 w-16 bg-muted rounded-full flex items-center justify-center mb-4">
-                   <Database className="h-8 w-8 opacity-50" />
-                 </div>
-                 <h3 className="text-lg font-medium mb-1">{t("memory.empty.title")}</h3>
-                 <p className="text-sm max-w-sm text-center">
-                   {filters.search ? t("memory.empty.searchHint") : t("memory.empty.categoryHint")}
-                 </p>
-               </div>
+              <div className="flex flex-col items-center justify-center h-full text-muted-foreground">
+                <div className="h-16 w-16 bg-muted rounded-full flex items-center justify-center mb-4">
+                  <Database className="h-8 w-8 opacity-50" />
+                </div>
+                <h3 className="text-lg font-medium mb-1">{t("memory.empty.title")}</h3>
+                <p className="text-sm max-w-sm text-center">
+                  {filters.search ? t("memory.empty.searchHint") : t("memory.empty.categoryHint")}
+                </p>
+              </div>
             ) : (
               <div className="space-y-4 mx-auto px-8">
                 {memories.map((memory) => {
@@ -517,12 +505,12 @@ export function MemoryPage() {
                           )}
                           onClick={(e) => e.stopPropagation()}
                         >
-                           <input
-                             type="checkbox"
-                             className="h-4 w-4 rounded border-gray-300 text-primary focus:ring-primary accent-primary cursor-pointer"
-                             checked={selectedIds.has(memory.id)}
-                             onChange={() => handleToggleSelect(memory.id)}
-                           />
+                          <input
+                            type="checkbox"
+                            className="h-4 w-4 rounded border-gray-300 text-primary focus:ring-primary accent-primary cursor-pointer"
+                            checked={selectedIds.has(memory.id)}
+                            onChange={() => handleToggleSelect(memory.id)}
+                          />
                         </div>
 
                         {/* Icon Box */}
@@ -534,10 +522,12 @@ export function MemoryPage() {
                         <div className="flex-1 min-w-0 space-y-2">
                           <div className="flex items-center gap-3">
                             <Badge variant="outline" className={cn("rounded-md border-0 px-2 py-0.5 text-xs font-medium uppercase tracking-wide", badgeColorClass)}>
-                              {memory.category.replace(/_/g, ' ')}
+                              {t(`memory.filters.categoryOptions.${memory.category}`) === `memory.filters.categoryOptions.${memory.category}`
+                                ? memory.category.replace(/_/g, ' ')
+                                : t(`memory.filters.categoryOptions.${memory.category}`)}
                             </Badge>
                             <span className="text-xs text-muted-foreground">
-                              {t("memory.item.addedManually")} • {formatDate(memory.timestamp)}
+                              {memory.category === 'general' ? t("memory.item.addedManually") : t("memory.item.addedAutomatically")} • {formatDate(memory.timestamp)}
                             </span>
                           </div>
 
@@ -559,16 +549,16 @@ export function MemoryPage() {
                               </div>
                             )}
 
-                             {memory.tags.length > 0 && (
-                               <div className="flex items-center gap-1 ml-2">
-                                 <span className="text-xs text-muted-foreground">{t("memory.item.tagsLabel")}</span>
-                                 {memory.tags.slice(0, 3).map(tag => (
-                                   <span key={tag} className="text-xs text-muted-foreground bg-muted/50 px-1.5 py-0.5 rounded">
-                                     #{tag}
-                                   </span>
-                                 ))}
-                               </div>
-                             )}
+                            {memory.tags.length > 0 && (
+                              <div className="flex items-center gap-1 ml-2">
+                                <span className="text-xs text-muted-foreground">{t("memory.item.tagsLabel")}</span>
+                                {memory.tags.slice(0, 3).map(tag => (
+                                  <span key={tag} className="text-xs text-muted-foreground bg-muted/50 px-1.5 py-0.5 rounded">
+                                    #{tag}
+                                  </span>
+                                ))}
+                              </div>
+                            )}
                           </div>
                         </div>
 
@@ -610,22 +600,22 @@ export function MemoryPage() {
                 </div>
 
                 <div className="grid grid-cols-2 gap-4">
-                    {viewingMemory.keywords.length > 0 && (
-                      <div>
-                        <Label className="text-xs font-medium text-muted-foreground uppercase mb-2 block">{t("memory.viewDialog.labels.keywords")}</Label>
-                        <div className="flex flex-wrap gap-2">
-                          {viewingMemory.keywords.map((k, i) => <Badge key={i} variant="outline">{k}</Badge>)}
-                        </div>
+                  {viewingMemory.keywords.length > 0 && (
+                    <div>
+                      <Label className="text-xs font-medium text-muted-foreground uppercase mb-2 block">{t("memory.viewDialog.labels.keywords")}</Label>
+                      <div className="flex flex-wrap gap-2">
+                        {viewingMemory.keywords.map((k, i) => <Badge key={i} variant="outline">{k}</Badge>)}
                       </div>
-                    )}
-                    {viewingMemory.tags.length > 0 && (
-                      <div>
-                        <Label className="text-xs font-medium text-muted-foreground uppercase mb-2 block">{t("memory.viewDialog.labels.tags")}</Label>
-                        <div className="flex flex-wrap gap-2">
-                          {viewingMemory.tags.map((t, i) => <Badge key={i} variant="outline">{t}</Badge>)}
-                        </div>
+                    </div>
+                  )}
+                  {viewingMemory.tags.length > 0 && (
+                    <div>
+                      <Label className="text-xs font-medium text-muted-foreground uppercase mb-2 block">{t("memory.viewDialog.labels.tags")}</Label>
+                      <div className="flex flex-wrap gap-2">
+                        {viewingMemory.tags.map((t, i) => <Badge key={i} variant="outline">{t}</Badge>)}
                       </div>
-                    )}
+                    </div>
+                  )}
                 </div>
 
                 {Object.keys(viewingMemory.metadata).length > 0 && (
@@ -709,7 +699,9 @@ function MemoryForm({ formData, setFormData, categories, onSubmit, onCancel }: M
   return (
     <div className="space-y-4">
       <div>
-        <Label htmlFor="content">{t("memory.form.contentLabel")}</Label>
+        <div className="mb-1.5">
+          <Label htmlFor="content">{t("memory.form.contentLabel")}</Label>
+        </div>
         <Textarea
           id="content"
           placeholder={t("memory.form.contentPlaceholder")}
@@ -720,7 +712,10 @@ function MemoryForm({ formData, setFormData, categories, onSubmit, onCancel }: M
       </div>
       <div className="grid grid-cols-2 gap-4">
         <div>
-          <Label htmlFor="keywords">{t("memory.form.keywordsLabel")}</Label>
+          <div className="flex items-center gap-1.5 mb-1.5">
+            <Label htmlFor="keywords">{t("memory.form.keywordsLabel")}</Label>
+            <InfoTooltip content={t("memory.form.keywordsTooltip")} />
+          </div>
           <Input
             id="keywords"
             placeholder={t("memory.form.keywordsPlaceholder")}
@@ -729,7 +724,10 @@ function MemoryForm({ formData, setFormData, categories, onSubmit, onCancel }: M
           />
         </div>
         <div>
-          <Label htmlFor="tags">{t("memory.form.tagsLabel")}</Label>
+          <div className="flex items-center gap-1.5 mb-1.5">
+            <Label htmlFor="tags">{t("memory.form.tagsLabel")}</Label>
+            <InfoTooltip content={t("memory.form.tagsTooltip")} />
+          </div>
           <Input
             id="tags"
             placeholder={t("memory.form.tagsPlaceholder")}
@@ -740,7 +738,9 @@ function MemoryForm({ formData, setFormData, categories, onSubmit, onCancel }: M
       </div>
       {/* Category field hidden */}
       <div>
-        <Label htmlFor="metadata">{t("memory.form.metadataLabel")}</Label>
+        <div className="mb-1.5">
+          <Label htmlFor="metadata">{t("memory.form.metadataLabel")}</Label>
+        </div>
         <Textarea
           id="metadata"
           placeholder={t("memory.form.metadataPlaceholder")}

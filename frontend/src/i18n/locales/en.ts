@@ -774,7 +774,7 @@ Build when you need.`
     },
     createDialog: {
       title: "Create Memory",
-      description: "Fill in the content, keywords, tags, and metadata to add a new memory",
+      description: "Fill in the content, keywords, tags, and metadata to add a new memory item. The category is \"User Added Memory\" by default.",
     },
     stats: {
       total: "Total Memories",
@@ -790,9 +790,9 @@ Build when you need.`
         placeholder: "Select category",
       },
       categoryOptions: {
-        general: "General",
-        react_memory: "React Memory",
-        dag_plan_execute_memory: "DAG Plan Execute Memory",
+        general: "Memory added by users",
+        react_memory: "React memory",
+        execution_memory: "Task memory",
       },
       search: {
         label: "Search",
@@ -814,6 +814,7 @@ Build when you need.`
       keywordPrefix: "Keyword",
       tagPrefix: "Tag",
       addedManually: "Added manually",
+      addedAutomatically: "Added automatically",
       keywordsLabel: "Keywords:",
       tagsLabel: "Tags:",
     },
@@ -849,8 +850,10 @@ Build when you need.`
       contentPlaceholder: "Enter memory content...",
       keywordsLabel: "Keywords",
       keywordsPlaceholder: "Enter keywords, separated by commas",
+      keywordsTooltip: "Core vocabulary extracted from the content, primarily used for semantic similarity search and matching.",
       tagsLabel: "Tags",
       tagsPlaceholder: "Enter tags, separated by commas",
+      tagsTooltip: "Custom categorization markers, primarily used for precise filtering and grouping of memories.",
       metadataLabel: "Metadata (JSON)",
       metadataPlaceholder: "Enter metadata in JSON format, e.g. {\"source\":\"web\"}",
     },

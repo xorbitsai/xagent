@@ -315,22 +315,58 @@ class WebSocketTraceHandler(TraceHandler):
         import json
         from datetime import datetime
 
+        def clean_string(value: str) -> str:
+            """Clean string data to remove problematic characters for JSON."""
+            if not isinstance(value, str):
+                return value
+
+            # Remove NULL characters and other problematic control characters
+            cleaned = value.replace("\x00", "")  # Remove NULL character
+            cleaned = cleaned.replace("\u0000", "")  # Remove Unicode NULL
+            # Remove other control characters that might cause issues
+            cleaned = "".join(
+                char for char in cleaned if ord(char) >= 32 or char in "\n\r\t"
+            )
+            return cleaned
+
         def serialize_value(value: Any) -> Any:
-            if isinstance(value, datetime):
+            # Handle Pydantic models (BaseModel)
+            if hasattr(value, "model_dump"):
+                return serialize_value(value.model_dump())
+            elif hasattr(value, "dict"):  # Fallback for older Pydantic
+                return serialize_value(value.dict())
+            elif isinstance(value, datetime):
                 if value.tzinfo is None:
                     value = value.replace(tzinfo=timezone.utc)
                 return value.timestamp()
+            elif isinstance(value, str):
+                return clean_string(value)
             elif isinstance(value, dict):
                 return {k: serialize_value(v) for k, v in value.items()}
             elif isinstance(value, (list, tuple)):
                 return [serialize_value(item) for item in value]
+            elif isinstance(value, bytes):
+                try:
+                    return clean_string(value.decode("utf-8"))
+                except UnicodeDecodeError:
+                    return f"<bytes: {len(value)}>"
             else:
                 return value
 
         try:
-            # Test if data is JSON serializable
-            json.dumps(data)
-            return data
-        except (TypeError, ValueError):
-            # If not serializable, recursively serialize it
-            return serialize_value(data)  # type: ignore[no-any-return]
+            # First clean and serialize the data
+            cleaned_data = serialize_value(data)
+
+            # Test if cleaned data is JSON serializable
+            json.dumps(cleaned_data)
+            return cleaned_data  # type: ignore[no-any-return]
+        except (TypeError, ValueError) as e:
+            # If still not serializable, return a safe fallback
+            logger.warning(
+                f"Failed to serialize data for JSON: {e}, data type: {type(data)}"
+            )
+            return {
+                "_serialization_error": f"Failed to serialize {type(data).__name__}",
+                "_original_type": type(data).__name__,
+                "_error": str(e),
+            }

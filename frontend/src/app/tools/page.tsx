@@ -47,6 +47,7 @@ interface Tool {
   category: string
   display_category?: string  // Add display_category field
   enabled: boolean
+  requires_configuration?: boolean
   status?: string
   status_reason?: string
   config?: Record<string, any>
@@ -166,14 +167,20 @@ export default function ToolsPage() {
   }, [])
 
   useEffect(() => {
-    if (!isAdmin) {
+    if (!user) {
       setConfigurableTools([])
       setSqlConnections([])
       return
     }
 
-    void Promise.all([loadConfigurableTools(), loadSqlConnections()])
-  }, [isAdmin])
+    void loadSqlConnections()
+    if (!isAdmin) {
+      setConfigurableTools([])
+      return
+    }
+
+    void loadConfigurableTools()
+  }, [isAdmin, user])
 
   const loadTools = async () => {
     try {
@@ -188,6 +195,7 @@ export default function ToolsPage() {
         category: tool.category,
         display_category: tool.display_category,  // Read display_category from API
         enabled: tool.enabled,
+        requires_configuration: Boolean(tool.requires_configuration),
         status: tool.status,
         status_reason: tool.status_reason,
         config: tool.config,
@@ -713,7 +721,7 @@ export default function ToolsPage() {
     const configToolName = getConfigToolNameForRuntimeTool(tool)
     const configurableTool = configToolName ? configurableToolByName[configToolName] : undefined
     const canConfigureCredentials = isAdmin && Boolean(configurableTool)
-    const canManageSqlConnections = isAdmin && tool.category === 'database'
+    const canManageSqlConnections = Boolean(user) && tool.category === 'database' && Boolean(tool.requires_configuration)
     const hasSecondaryAction = canConfigureCredentials || canManageSqlConnections
     const isTogglePending = Boolean(pendingToolToggles[tool.name])
     const configButtonLabel = canConfigureCredentials

@@ -41,6 +41,7 @@ def get_default_tool_configs() -> list[Dict[str, Any]]:
             "display_name": "Google 网络搜索",
             "description": "使用 Google 搜索引擎进行网络搜索",
             "enabled": True,
+            "requires_configuration": True,
             "config": {
                 "provider": "google",
                 "api_key_env": "GOOGLE_API_KEY",
@@ -55,6 +56,7 @@ def get_default_tool_configs() -> list[Dict[str, Any]]:
             "display_name": "Tavily 网络搜索",
             "description": "使用 Tavily Search API 进行网络搜索，无需 Google 账号",
             "enabled": True,
+            "requires_configuration": True,
             "config": {
                 "provider": "tavily",
                 "api_key_env": "TAVILY_API_KEY",
@@ -68,12 +70,24 @@ def get_default_tool_configs() -> list[Dict[str, Any]]:
             "display_name": "智谱网络搜索",
             "description": "使用智谱 Web Search API 进行网络搜索",
             "enabled": True,
+            "requires_configuration": True,
             "config": {
                 "provider": "zhipu",
                 "api_key_env": "ZHIPU_API_KEY",
                 "base_url_env": "ZHIPU_BASE_URL",
             },
             "dependencies": ["zhipu_api_key"],
+        },
+        {
+            "tool_name": "sql_query",
+            "tool_type": "builtin",
+            "category": "database",
+            "display_name": "SQL 查询",
+            "description": "对当前用户已配置的数据源执行 SQL 查询",
+            "enabled": True,
+            "requires_configuration": True,
+            "config": {},
+            "dependencies": [],
         },
         {
             "tool_name": "fetch_webpage",

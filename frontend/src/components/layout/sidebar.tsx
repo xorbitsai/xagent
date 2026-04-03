@@ -569,7 +569,7 @@ export function Sidebar({ className }: SidebarProps) {
 
   // Monitor task list changes, if content is not enough to fill the container and there is more data, automatically load the next page
   useEffect(() => {
-    if (!navRef.current) return
+    if (!navRef.current || !isHistoryExpanded) return
 
     const { scrollHeight, clientHeight } = navRef.current
     // If content height is less than or equal to container height (plus a buffer), and there is more data, and not loading
@@ -580,7 +580,7 @@ export function Sidebar({ className }: SidebarProps) {
       }, 100)
       return () => clearTimeout(timer)
     }
-  }, [tasks, hasMore, isLoadingMore, isLoadingTasks, page, loadTasks])
+  }, [tasks, hasMore, isLoadingMore, isLoadingTasks, page, loadTasks, isHistoryExpanded])
 
   useEffect(() => {
     if (isHistoryExpanded) {
@@ -607,7 +607,7 @@ export function Sidebar({ className }: SidebarProps) {
 
   const handleScroll = (e: React.UIEvent<HTMLElement>) => {
     const { scrollTop, scrollHeight, clientHeight } = e.currentTarget
-    if (scrollHeight - scrollTop <= clientHeight + 20 && hasMore && !isLoadingMore && !isLoadingTasks) {
+    if (isHistoryExpanded && scrollHeight - scrollTop <= clientHeight + 20 && hasMore && !isLoadingMore && !isLoadingTasks) {
       loadTasks(page + 1, true)
     }
   }

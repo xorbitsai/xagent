@@ -373,7 +373,7 @@ export function MemoryPage() {
       <div className="flex flex-1 overflow-hidden">
         {/* Left Sidebar */}
         <aside className="w-64 border-r bg-muted/10 flex flex-col flex-shrink-0 overflow-y-auto">
-          <div className="p-6 space-y-8">
+          <div className="p-4 space-y-8">
             <div className="space-y-3">
               <h3 className="text-xs font-semibold text-muted-foreground uppercase tracking-wider px-2">
                 {t("memory.sidebar.contextSource")}
@@ -402,7 +402,7 @@ export function MemoryPage() {
                     className={cn("w-full justify-start", filters.category === cat && "font-medium")}
                     onClick={() => setFilters(prev => ({ ...prev, category: cat }))}
                   >
-                    <div className={cn("h-2 w-2 rounded-full mr-2",
+                    <div className={cn("h-2 w-2 rounded-full shrink-0",
                       cat === 'general' ? 'bg-slate-400' :
                         cat === 'react_memory' ? 'bg-purple-400' :
                           'bg-blue-400'

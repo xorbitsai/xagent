@@ -138,6 +138,7 @@ test = [
   "chromadb",
   "pymilvus>=2.6.9,<3.0.0",
   "copilotkit==0.1.69",
+  "langgraph-prebuilt<1.0.9",
   "openpyxl>=3.1.5",
 ]
 

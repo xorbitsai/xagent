@@ -12,7 +12,7 @@ from sqlalchemy.orm import Session
 from sqlalchemy.orm.attributes import flag_modified
 
 from ..init_tool_configs import get_default_tool_configs
-from ..models.tool_config import ToolConfig
+from ..models.tool_config import ToolConfig, UserToolConfig
 
 ToolFieldSpec = Dict[str, Any]
 
@@ -126,6 +126,26 @@ def _get_or_create_tool_config(db: Session, tool_name: str) -> ToolConfig:
     return config
 
 
+def _get_or_create_user_tool_config(
+    db: Session, user_id: int, tool_name: str
+) -> UserToolConfig:
+    config = (
+        db.query(UserToolConfig)
+        .filter(
+            UserToolConfig.user_id == user_id,
+            UserToolConfig.tool_name == tool_name,
+        )
+        .first()
+    )
+    if config:
+        return config
+
+    config = UserToolConfig(user_id=user_id, tool_name=tool_name, config={})
+    db.add(config)
+    db.flush()
+    return config
+
+
 def _get_storage(config: ToolConfig) -> dict[str, Any]:
     raw_config = cast(Any, getattr(config, "config", None))
     payload: dict[str, Any] = {}
@@ -140,6 +160,16 @@ def _get_storage(config: ToolConfig) -> dict[str, Any]:
     return credentials
 
 
+def _get_user_tool_payload(config: UserToolConfig) -> dict[str, Any]:
+    raw_config = cast(Any, getattr(config, "config", None))
+    payload: dict[str, Any] = {}
+    if isinstance(raw_config, dict):
+        for key, value in raw_config.items():
+            payload[str(key)] = value
+    cast(Any, config).config = payload
+    return payload
+
+
 def _read_env(env_names: Iterable[str]) -> str | None:
     for name in env_names:
         value = os.getenv(name)
@@ -152,12 +182,13 @@ def _sanitize_sql_connection_name(name: str) -> str:
     return name.strip().upper()
 
 
-def _get_sql_connection_store(config: ToolConfig) -> dict[str, Any]:
-    credentials_payload: dict[str, Any] = _get_storage(config)
-    sql_connections = credentials_payload.get("sql_connections")
+def _get_user_sql_connection_store(config: UserToolConfig) -> dict[str, Any]:
+    payload = _get_user_tool_payload(config)
+    sql_connections = payload.get("sql_connections")
     if not isinstance(sql_connections, dict):
         sql_connections = {}
-    credentials_payload["sql_connections"] = sql_connections
+    payload["sql_connections"] = sql_connections
+    cast(Any, config).config = payload
     return sql_connections
 
 
@@ -169,11 +200,13 @@ def _sql_url_mask(url: str) -> str:
         return _mask_value(url)
 
 
-def _get_sql_tool_config(db: Session) -> ToolConfig:
-    return _get_or_create_tool_config(db, "sql_query")
+def _get_user_sql_tool_config(db: Session, user_id: int) -> UserToolConfig:
+    return _get_or_create_user_tool_config(db, user_id, "sql_query")
 
 
-def set_sql_connection(db: Session, name: str, connection_url: str) -> None:
+def set_sql_connection(
+    db: Session, user_id: int, name: str, connection_url: str
+) -> None:
     normalized_name = _sanitize_sql_connection_name(name)
     if not normalized_name:
         raise ValueError("Connection name is required")
@@ -193,8 +226,8 @@ def set_sql_connection(db: Session, name: str, connection_url: str) -> None:
             f"Allowed schemes: {allowed_schemes_text}"
         )
 
-    config = _get_sql_tool_config(db)
-    storage = _get_sql_connection_store(config)
+    config = _get_user_sql_tool_config(db, user_id)
+    storage = _get_user_sql_connection_store(config)
     now = datetime.now(timezone.utc).isoformat()
     storage[normalized_name] = {
         "ciphertext": _encrypt(normalized_url),
@@ -206,18 +239,22 @@ def set_sql_connection(db: Session, name: str, connection_url: str) -> None:
     db.commit()
 
 
-def delete_sql_connection(db: Session, name: str) -> None:
+def delete_sql_connection(db: Session, user_id: int, name: str) -> None:
     normalized_name = _sanitize_sql_connection_name(name)
-    config = db.query(ToolConfig).filter(ToolConfig.tool_name == "sql_query").first()
+    config = (
+        db.query(UserToolConfig)
+        .filter(
+            UserToolConfig.user_id == user_id,
+            UserToolConfig.tool_name == "sql_query",
+        )
+        .first()
+    )
     if not config:
         return
     payload = cast(Any, getattr(config, "config", None))
     if not isinstance(payload, dict):
         return
-    credentials = payload.get("credentials")
-    if not isinstance(credentials, dict):
-        return
-    sql_connections = credentials.get("sql_connections")
+    sql_connections = payload.get("sql_connections")
     if not isinstance(sql_connections, dict):
         return
     removed = False
@@ -236,24 +273,31 @@ def delete_sql_connection(db: Session, name: str) -> None:
         db.commit()
 
 
-def resolve_sql_connection(db: Session, name: str) -> str | None:
+def resolve_sql_connection(db: Session, user_id: int | None, name: str) -> str | None:
     normalized_name = _sanitize_sql_connection_name(name)
-    config = db.query(ToolConfig).filter(ToolConfig.tool_name == "sql_query").first()
+    config = None
+    if user_id is not None:
+        config = (
+            db.query(UserToolConfig)
+            .filter(
+                UserToolConfig.user_id == user_id,
+                UserToolConfig.tool_name == "sql_query",
+            )
+            .first()
+        )
     if config and isinstance(config.config, dict):
-        credentials = config.config.get("credentials")
-        if isinstance(credentials, dict):
-            sql_connections = credentials.get("sql_connections")
-            if isinstance(sql_connections, dict):
-                item = sql_connections.get(normalized_name)
-                if isinstance(item, dict) and isinstance(item.get("ciphertext"), str):
-                    decrypted = _decrypt(item["ciphertext"])
-                    if decrypted:
-                        return decrypted
+        sql_connections = config.config.get("sql_connections")
+        if isinstance(sql_connections, dict):
+            item = sql_connections.get(normalized_name)
+            if isinstance(item, dict) and isinstance(item.get("ciphertext"), str):
+                decrypted = _decrypt(item["ciphertext"])
+                if decrypted:
+                    return decrypted
 
     return os.getenv(f"{SQL_CONNECTION_ENV_PREFIX}{normalized_name}")
 
 
-def get_sql_connection_map(db: Session) -> dict[str, str]:
+def get_sql_connection_map(db: Session, user_id: int | None) -> dict[str, str]:
     result: dict[str, str] = {}
 
     for key, value in os.environ.items():
@@ -262,25 +306,33 @@ def get_sql_connection_map(db: Session) -> dict[str, str]:
             if name:
                 result[name] = value
 
-    config = db.query(ToolConfig).filter(ToolConfig.tool_name == "sql_query").first()
+    if user_id is None:
+        return result
+
+    config = (
+        db.query(UserToolConfig)
+        .filter(
+            UserToolConfig.user_id == user_id,
+            UserToolConfig.tool_name == "sql_query",
+        )
+        .first()
+    )
     if config and isinstance(config.config, dict):
-        credentials = config.config.get("credentials")
-        if isinstance(credentials, dict):
-            sql_connections = credentials.get("sql_connections")
-            if isinstance(sql_connections, dict):
-                for raw_name, item in sql_connections.items():
-                    if not isinstance(raw_name, str) or not isinstance(item, dict):
-                        continue
-                    ciphertext = item.get("ciphertext")
-                    if isinstance(ciphertext, str):
-                        decrypted = _decrypt(ciphertext)
-                        if decrypted:
-                            result[_sanitize_sql_connection_name(raw_name)] = decrypted
+        sql_connections = config.config.get("sql_connections")
+        if isinstance(sql_connections, dict):
+            for raw_name, item in sql_connections.items():
+                if not isinstance(raw_name, str) or not isinstance(item, dict):
+                    continue
+                ciphertext = item.get("ciphertext")
+                if isinstance(ciphertext, str):
+                    decrypted = _decrypt(ciphertext)
+                    if decrypted:
+                        result[_sanitize_sql_connection_name(raw_name)] = decrypted
 
     return result
 
 
-def list_sql_connections(db: Session) -> list[dict[str, Any]]:
+def list_sql_connections(db: Session, user_id: int | None) -> list[dict[str, Any]]:
     env_names = {
         key[len(SQL_CONNECTION_ENV_PREFIX) :]: value
         for key, value in os.environ.items()
@@ -288,15 +340,22 @@ def list_sql_connections(db: Session) -> list[dict[str, Any]]:
     }
 
     db_entries: dict[str, dict[str, Any]] = {}
-    config = db.query(ToolConfig).filter(ToolConfig.tool_name == "sql_query").first()
+    config = None
+    if user_id is not None:
+        config = (
+            db.query(UserToolConfig)
+            .filter(
+                UserToolConfig.user_id == user_id,
+                UserToolConfig.tool_name == "sql_query",
+            )
+            .first()
+        )
     if config and isinstance(config.config, dict):
-        credentials = config.config.get("credentials")
-        if isinstance(credentials, dict):
-            sql_connections = credentials.get("sql_connections")
-            if isinstance(sql_connections, dict):
-                for raw_name, item in sql_connections.items():
-                    if isinstance(raw_name, str) and isinstance(item, dict):
-                        db_entries[_sanitize_sql_connection_name(raw_name)] = item
+        sql_connections = config.config.get("sql_connections")
+        if isinstance(sql_connections, dict):
+            for raw_name, item in sql_connections.items():
+                if isinstance(raw_name, str) and isinstance(item, dict):
+                    db_entries[_sanitize_sql_connection_name(raw_name)] = item
 
     all_names = sorted(set(env_names.keys()) | set(db_entries.keys()))
     output: list[dict[str, Any]] = []

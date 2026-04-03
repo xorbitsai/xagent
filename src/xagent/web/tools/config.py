@@ -15,6 +15,10 @@ from ..services.tool_credentials import get_sql_connection_map, resolve_tool_cre
 class WebToolConfig(BaseToolConfig):
     """Web-specific tool configuration that loads from database."""
 
+    @staticmethod
+    def _coerce_user_id(value: Any) -> Optional[int]:
+        return value if isinstance(value, int) else None
+
     def __init__(
         self,
         db: Any,
@@ -34,7 +38,9 @@ class WebToolConfig(BaseToolConfig):
     ):
         self.db = db
         self.request = request
-        self._user_id = user_id or self._get_user_id_from_request(request)
+        self._user_id = (
+            user_id if user_id is not None else self._get_user_id_from_request(request)
+        )
         self._is_admin_value = is_admin or self._get_is_admin_from_request(request)
         # Initialize workspace_config with base_dir and task_id if provided
         if workspace_config is None:
@@ -81,12 +87,16 @@ class WebToolConfig(BaseToolConfig):
                 auth_header = request.headers.get("authorization")
                 if auth_header:
                     user = get_user_from_websocket_token(auth_header, self.db)
-                    if user:
-                        return int(user.id)
+                    if user is not None:
+                        user_id = self._coerce_user_id(getattr(user, "id", None))
+                        if user_id is not None:
+                            return user_id
 
             # If request has a user attribute directly, use it
             if hasattr(request, "user") and request.user:
-                return int(request.user.id)
+                user_id = self._coerce_user_id(getattr(request.user, "id", None))
+                if user_id is not None:
+                    return user_id
 
             # If no authentication, this should raise an exception
             raise ValueError("Authentication required")
@@ -211,7 +221,7 @@ class WebToolConfig(BaseToolConfig):
         return resolve_tool_credential(self.db, tool_name, field_name)
 
     def get_sql_connections(self) -> Dict[str, str]:
-        return get_sql_connection_map(self.db)
+        return get_sql_connection_map(self.db, self._user_id)
 
     def set_sandbox(self, sandbox: Any) -> None:
         """Set sandbox instance for this config."""

@@ -199,6 +199,12 @@ class TestToolsAvailableAPI:
         for tool in tools:
             assert "usage_count" in tool
             assert isinstance(tool["usage_count"], int)
+            assert "requires_configuration" in tool
+            assert isinstance(tool["requires_configuration"], bool)
+
+        sql_tools = [tool for tool in tools if tool["category"] == "database"]
+        assert sql_tools
+        assert all(tool["requires_configuration"] is True for tool in sql_tools)
 
     def test_get_available_tools_tool_categories(self):
         """Test that tools have correct category information."""
@@ -286,6 +292,19 @@ class TestToolsGovernanceAPI:
     def _admin_headers(self) -> dict[str, str]:
         login_response = client.post(
             "/api/auth/login", json={"username": "admin", "password": "admin123"}
+        )
+        assert login_response.status_code == 200
+        token = login_response.json()["access_token"]
+        return {"Authorization": f"Bearer {token}"}
+
+    def _user_headers(self, username: str) -> dict[str, str]:
+        register_response = client.post(
+            "/api/auth/register", json={"username": username, "password": "password123"}
+        )
+        assert register_response.status_code == 200
+
+        login_response = client.post(
+            "/api/auth/login", json={"username": username, "password": "password123"}
         )
         assert login_response.status_code == 200
         token = login_response.json()["access_token"]
@@ -400,3 +419,72 @@ class TestToolsGovernanceAPI:
 
         assert upsert.status_code == 400
         assert "Unsupported SQLAlchemy URL scheme" in upsert.json()["detail"]
+
+    def test_sql_connections_are_user_scoped(self):
+        user1_headers = self._user_headers("user1")
+        user2_headers = self._user_headers("user2")
+
+        user1_upsert = client.put(
+            "/api/tools/sql-connections/analytics",
+            headers=user1_headers,
+            json={"connection_url": "postgresql://user1:pass1@localhost:5432/user1_db"},
+        )
+        assert user1_upsert.status_code == 200
+
+        user2_initial = client.get("/api/tools/sql-connections", headers=user2_headers)
+        assert user2_initial.status_code == 200
+        assert user2_initial.json()["connections"] == []
+
+        user2_upsert = client.put(
+            "/api/tools/sql-connections/analytics",
+            headers=user2_headers,
+            json={"connection_url": "postgresql://user2:pass2@localhost:5432/user2_db"},
+        )
+        assert user2_upsert.status_code == 200
+
+        user1_items = {
+            item["name"]: item
+            for item in client.get(
+                "/api/tools/sql-connections", headers=user1_headers
+            ).json()["connections"]
+        }
+        user2_items = {
+            item["name"]: item
+            for item in client.get(
+                "/api/tools/sql-connections", headers=user2_headers
+            ).json()["connections"]
+        }
+
+        assert user1_items["ANALYTICS"]["source"] == "db"
+        assert user2_items["ANALYTICS"]["source"] == "db"
+        assert user1_items["ANALYTICS"]["masked"] != user2_items["ANALYTICS"]["masked"]
+
+        user1_delete = client.delete(
+            "/api/tools/sql-connections/analytics", headers=user1_headers
+        )
+        assert user1_delete.status_code == 200
+
+        user1_after_delete = client.get(
+            "/api/tools/sql-connections", headers=user1_headers
+        )
+        user2_after_delete = client.get(
+            "/api/tools/sql-connections", headers=user2_headers
+        )
+        assert user1_after_delete.status_code == 200
+        assert user2_after_delete.status_code == 200
+        assert user1_after_delete.json()["connections"] == []
+        remaining_user2 = {
+            item["name"]: item for item in user2_after_delete.json()["connections"]
+        }
+        assert remaining_user2["ANALYTICS"]["source"] == "db"
+
+    def test_non_admin_cannot_access_global_credentials(self):
+        user_headers = self._user_headers("nonadmin")
+
+        configurable_resp = client.get("/api/tools/configurable", headers=user_headers)
+        credential_resp = client.get(
+            "/api/tools/zhipu_web_search/credentials", headers=user_headers
+        )
+
+        assert configurable_resp.status_code == 403
+        assert credential_resp.status_code == 403

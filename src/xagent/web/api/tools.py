@@ -2,6 +2,7 @@
 
 import asyncio
 import logging
+from datetime import datetime
 from typing import Any, DefaultDict, Dict, List, Optional, cast
 
 from fastapi import APIRouter, Depends, HTTPException
@@ -26,6 +27,14 @@ from ..services.tool_credentials import (
 from ..tools.config import WebToolConfig
 
 logger = logging.getLogger(__name__)
+
+
+def _require_user_id(current_user: User) -> int:
+    user_id: object = getattr(current_user, "id", None)
+    if isinstance(user_id, int):
+        return user_id
+    raise HTTPException(status_code=500, detail="Authenticated user is missing an id")
+
 
 # Category display names (for frontend display)
 CATEGORY_DISPLAY_NAMES = {
@@ -173,6 +182,7 @@ def _create_tool_info(
         "category": category,
         "display_category": CATEGORY_DISPLAY_NAMES.get(category, category.capitalize()),
         "enabled": enabled,
+        "requires_configuration": False,
         "status": status,
         "status_reason": status_reason,
         "config": {},
@@ -198,10 +208,11 @@ async def get_available_tools(
 
     # Create WebToolConfig, now includes MCP tools
     # Note: llm=None for tool listing (display only, no execution)
+    current_user_id = _require_user_id(current_user)
     tool_config = WebToolConfig(
         db=db,
         request=MockRequest(),
-        user_id=int(current_user.id),
+        user_id=current_user_id,
         is_admin=bool(current_user.is_admin),
         llm=None,  # Not needed for tool listing
         workspace_config={
@@ -276,12 +287,20 @@ async def get_available_tools(
         tool_name = tool_item.get("name", "")
         tool_item["usage_count"] = usage_map[tool_name]
 
+    default_configs = {item["tool_name"]: item for item in get_default_tool_configs()}
     config_rows = db.query(ToolConfig).all()
     enabled_map: dict[str, bool] = {}
+    requires_configuration_map: dict[str, bool] = {
+        tool_name: bool(config.get("requires_configuration", False))
+        for tool_name, config in default_configs.items()
+    }
     for row in config_rows:
         row_tool_name = cast(Any, row.tool_name)
         if isinstance(row_tool_name, str):
             enabled_map[row_tool_name] = bool(cast(Any, row.enabled))
+            requires_configuration_map[row_tool_name] = bool(
+                cast(Any, getattr(row, "requires_configuration", False))
+            )
     for tool_item in tools:
         tool_name = str(tool_item.get("name") or "")
         if tool_name in enabled_map:
@@ -289,6 +308,10 @@ async def get_available_tools(
             if not enabled_map[tool_name]:
                 tool_item["status"] = "disabled"
                 tool_item["status_reason"] = "Disabled by tool policy"
+        requires_configuration = requires_configuration_map.get(tool_name, False)
+        if not requires_configuration and tool_item.get("category") == "database":
+            requires_configuration = requires_configuration_map.get("sql_query", False)
+        tool_item["requires_configuration"] = requires_configuration
 
     return {
         "tools": tools,
@@ -327,10 +350,7 @@ async def get_sql_connections(
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ) -> Dict[str, Any]:
-    if not bool(current_user.is_admin):
-        raise HTTPException(status_code=403, detail="Admin privileges required")
-
-    items = list_sql_connections(db)
+    items = list_sql_connections(db, _require_user_id(current_user))
     return {
         "connections": items,
         "count": len(items),
@@ -344,16 +364,14 @@ async def upsert_sql_connection(
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ) -> Dict[str, Any]:
-    if not bool(current_user.is_admin):
-        raise HTTPException(status_code=403, detail="Admin privileges required")
-
+    current_user_id = _require_user_id(current_user)
     try:
-        set_sql_connection(db, name, payload.connection_url)
+        set_sql_connection(db, current_user_id, name, payload.connection_url)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
     return {
-        "connections": list_sql_connections(db),
+        "connections": list_sql_connections(db, current_user_id),
     }
 
 
@@ -363,12 +381,10 @@ async def remove_sql_connection(
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ) -> Dict[str, Any]:
-    if not bool(current_user.is_admin):
-        raise HTTPException(status_code=403, detail="Admin privileges required")
-
-    delete_sql_connection(db, name)
+    current_user_id = _require_user_id(current_user)
+    delete_sql_connection(db, current_user_id, name)
     return {
-        "connections": list_sql_connections(db),
+        "connections": list_sql_connections(db, current_user_id),
     }
 
 
@@ -490,17 +506,21 @@ async def get_tool_usage(db: Session = Depends(get_db)) -> List[Dict[str, Any]]:
 
             result = []
             for stat in usage_stats:
+                usage_count = cast(int, getattr(stat, "usage_count", 0) or 0)
+                success_count = cast(int, getattr(stat, "success_count", 0) or 0)
+                error_count = cast(int, getattr(stat, "error_count", 0) or 0)
+                last_used_at = getattr(stat, "last_used_at", None)
                 result.append(
                     {
                         "tool_name": stat.tool_name,
-                        "usage_count": stat.usage_count,
-                        "success_count": stat.success_count,
-                        "error_count": stat.error_count,
-                        "success_rate": (stat.success_count / stat.usage_count * 100)
-                        if stat.usage_count > 0
+                        "usage_count": usage_count,
+                        "success_count": success_count,
+                        "error_count": error_count,
+                        "success_rate": (success_count / usage_count * 100)
+                        if usage_count > 0
                         else 0,
-                        "last_used_at": stat.last_used_at.isoformat()
-                        if stat.last_used_at
+                        "last_used_at": last_used_at.isoformat()
+                        if isinstance(last_used_at, datetime)
                         else None,
                     }
                 )

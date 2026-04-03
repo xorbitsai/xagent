@@ -791,7 +791,7 @@ Build when you need.`
       },
       categoryOptions: {
         general: "Memory added by users",
-        react_memory: "React memory",
+        react_memory: "Execution memory",
         execution_memory: "Task memory",
       },
       search: {

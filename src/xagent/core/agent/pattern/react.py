@@ -795,8 +795,7 @@ class ReActPattern(AgentPattern):
                 action = await self._get_action_from_llm(messages)
 
                 # If action is tool_call, make a second LLM call to get actual tool invocation
-                # Only do this for main ReAct mode (not DAG mode which uses native calling from start)
-                if action.type == "tool_call" and step_id == "main":
+                if action.type == "tool_call":
                     # Emit reasoning trace before second call
                     if action.reasoning:
                         await trace_ai_message(
@@ -1346,10 +1345,11 @@ Available tools:
 {chr(10).join(tool_descriptions)}
 
 You have access to the above tools. Use them when needed to complete the task.
+Respond in the SAME LANGUAGE as the task.
 When you decide to call a tool, ONLY set the action type to "tool_call" and explain why.
 Do NOT include tool names or arguments in the JSON; the system will automatically invoke
 the appropriate tool through the native function calling API based on your decision.
-After using tools, provide a clear summary of the results in the SAME LANGUAGE as the user's task.
+After using tools, provide a clear summary of the results in the SAME LANGUAGE as the task.
 """
 
         return existing_prompt + action_requirements
@@ -1458,23 +1458,8 @@ After using tools, provide a clear summary of the results in the SAME LANGUAGE a
         # Get tool schemas
         tool_schemas = self.tool_registry.get_tool_schemas()
 
-        # Determine if we're in DAG mode (step_id != "main")
-        # In DAG mode, use traditional single-phase tool calling for backward compatibility
-        # In main ReAct mode, use two-phase tool calling
-        is_dag_mode = (
-            hasattr(self, "_current_step_id")
-            and self._current_step_id
-            and self._current_step_id != "main"
-        )
-
-        if not is_dag_mode:
-            # First call: Request JSON output format for action type decision
-            chat_kwargs["response_format"] = {"type": "json_object"}
-        else:
-            # DAG mode: Use native tool calling from the start
-            if tool_schemas:
-                chat_kwargs["tools"] = tool_schemas
-                chat_kwargs["tool_choice"] = "auto"
+        # First call: Request JSON output format for action type decision
+        chat_kwargs["response_format"] = {"type": "json_object"}
 
         # Disable thinking mode if supported
         if (
@@ -1874,8 +1859,9 @@ After using tools, provide a clear summary of the results in the SAME LANGUAGE a
                 "role": "user",
                 "content": (
                     "IMPORTANT INSTRUCTION FOR THIS STEP:\n"
-                    "You have access to the following tools. Use the NATIVE FUNCTION CALLING interface "
-                    "to invoke the appropriate tool now.\n\n"
+                    "You indicated you want to call a tool. Now use the NATIVE FUNCTION CALLING interface "
+                    "to invoke the appropriate tool.\n\n"
+                    "Respond in the SAME LANGUAGE as the task.\n\n"
                     "DO NOT respond with JSON format. DO NOT return a structured action JSON.\n"
                     "Instead, use the native function calling API to directly invoke the tool.\n\n"
                     "The system will handle the tool execution and return the result to you."

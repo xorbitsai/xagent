@@ -1,6 +1,17 @@
 """Tool configuration models for database storage."""
 
-from sqlalchemy import JSON, Boolean, Column, DateTime, Integer, String, Text
+from sqlalchemy import (
+    JSON,
+    Boolean,
+    Column,
+    DateTime,
+    ForeignKey,
+    Integer,
+    String,
+    Text,
+    UniqueConstraint,
+)
+from sqlalchemy.orm import relationship
 from sqlalchemy.sql import func
 
 from .database import Base
@@ -18,6 +29,7 @@ class ToolConfig(Base):  # type: ignore
     display_name = Column(String(100), nullable=False)  # User-friendly name
     description = Column(Text, nullable=True)  # Tool description
     enabled = Column(Boolean, default=True)  # Whether the tool is enabled
+    requires_configuration = Column(Boolean, default=False, nullable=False)
     config = Column(JSON, nullable=True)  # Tool-specific configuration
     dependencies = Column(JSON, nullable=True)  # Required models/services
     status = Column(
@@ -41,3 +53,21 @@ class ToolUsage(Base):  # type: ignore
     last_used_at = Column(DateTime(timezone=True), nullable=True)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
     updated_at = Column(DateTime(timezone=True), onupdate=func.now())
+
+
+class UserToolConfig(Base):  # type: ignore
+    __tablename__ = "user_tool_configs"
+    __table_args__ = (
+        UniqueConstraint("user_id", "tool_name", name="uq_user_tool_config"),
+    )
+
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(
+        Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    tool_name = Column(String(100), nullable=False, index=True)
+    config = Column(JSON, nullable=True)
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+    updated_at = Column(DateTime(timezone=True), onupdate=func.now())
+
+    user = relationship("User", back_populates="tool_configs")

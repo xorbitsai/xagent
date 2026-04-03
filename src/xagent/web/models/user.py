@@ -63,6 +63,9 @@ class User(Base):  # type: ignore
     channels = relationship(
         "UserChannel", back_populates="user", cascade="all, delete-orphan"
     )
+    tool_configs = relationship(
+        "UserToolConfig", back_populates="user", cascade="all, delete-orphan"
+    )
 
     def __repr__(self) -> str:
         return f"<User(id={self.id}, username='{self.username}', is_admin={self.is_admin})>"

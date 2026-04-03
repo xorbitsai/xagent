@@ -19,16 +19,21 @@ from xagent.core.workspace import TaskWorkspace
 
 
 def create_mock_stream_chat(mock_llm):
-    """Create a mock stream_chat function that properly handles tool calls."""
+    """Create a mock stream_chat function that properly handles two-phase tool calling."""
 
     async def mock_stream_chat(**kwargs):
         # Get response from chat mock
         content = await mock_llm.chat(**kwargs)
 
+        # Check if this is phase 2 (tools provided) or phase 1 (no tools)
+        has_tools = "tools" in kwargs and kwargs["tools"]
+
         # Try to parse as JSON to determine response type
         try:
             response_data = json.loads(content)
-            if response_data.get("type") == "tool_call":
+
+            # Phase 2: Native tool calling (when tools are provided)
+            if has_tools and response_data.get("type") == "tool_call":
                 # Return native tool call format
                 tool_name = response_data.get("tool_name", "")
                 tool_args = response_data.get("tool_args", {})
@@ -50,7 +55,7 @@ def create_mock_stream_chat(mock_llm):
         except (json.JSONDecodeError, AttributeError):
             pass
 
-        # Yield as text stream chunk (for final_answer)
+        # Phase 1 or final_answer: Yield as text stream chunk
         yield StreamChunk(
             type=ChunkType.TOKEN,
             content=content,
@@ -500,6 +505,9 @@ class TestDAGComprehensive:
 
         # Mock the LLM to return tool call responses that trigger tool execution
         async def mock_chat(messages, **kwargs):
+            # Check if this is phase 2 (tools provided) or phase 1 (no tools)
+            has_tools = "tools" in kwargs and kwargs["tools"]
+
             # Return a proper ReAct response that triggers tool execution
             # Extract the tool name from messages
             tool_name = None
@@ -516,11 +524,19 @@ class TestDAGComprehensive:
                     break
 
             if tool_name:
+                # Phase 1: Return decision without tool_name (type="tool_call" only)
+                if not has_tools:
+                    # Check if this tool was already executed — if so, return final answer
+                    if tool_name in _executed_tools:
+                        return '{"type": "final_answer", "content": "Task completed successfully", "answer": "Task completed successfully", "reasoning": "The task has been completed"}'
+                    return '{"type": "tool_call", "reasoning": "I need to execute a tool for this step"}'
+
+                # Phase 2: Return tool_call with tool_name
                 # Check if this tool was already executed — if so, return final answer
                 if tool_name in _executed_tools:
                     return '{"type": "final_answer", "content": "Task completed successfully", "answer": "Task completed successfully", "reasoning": "The task has been completed"}'
                 _executed_tools.add(tool_name)
-                # Return a proper ReAct tool_call response without extra content field
+                # Return a proper ReAct tool_call response with tool_name
                 return (
                     '{"type": "tool_call", "reasoning": "I need to execute the tool for this step", "tool_name": "'
                     + tool_name
@@ -532,7 +548,7 @@ class TestDAGComprehensive:
 
         mock_llm.chat = mock_chat
 
-        # Mock stream_chat to work with the ReAct pattern
+        # Mock stream_chat to work with the two-phase ReAct pattern
         async def mock_stream_chat(**kwargs):
             import json
 
@@ -541,10 +557,15 @@ class TestDAGComprehensive:
             # Get response from chat mock
             content = await mock_llm.chat(**kwargs)
 
+            # Check if this is phase 2 (tools provided) or phase 1 (no tools)
+            has_tools = "tools" in kwargs and kwargs["tools"]
+
             # Try to parse as JSON to determine response type
             try:
                 response_data = json.loads(content)
-                if response_data.get("type") == "tool_call":
+
+                # Phase 2: Native tool calling (when tools are provided)
+                if has_tools and response_data.get("type") == "tool_call":
                     # Return native tool call format
                     tool_name = response_data.get("tool_name", "")
                     tool_args = response_data.get("tool_args", {})
@@ -566,7 +587,7 @@ class TestDAGComprehensive:
             except (json.JSONDecodeError, AttributeError):
                 pass
 
-            # Yield as text stream chunk (for final_answer)
+            # Phase 1 or final_answer: Yield as text stream chunk
             yield StreamChunk(
                 type=ChunkType.TOKEN,
                 content=content,
@@ -717,49 +738,75 @@ class TestDAGComprehensive:
             mock_llm.abilities = ["chat"]
             mock_llm.supports_thinking_mode = False
 
+            # Track which tools have been called to prevent infinite loops
+            _executed_tools = set()
+
             # Mock the LLM to return tool call responses that trigger tool execution
             async def mock_chat(messages, **kwargs):
+                # Check if this is phase 2 (tools provided) or phase 1 (no tools)
+                has_tools = "tools" in kwargs and kwargs["tools"]
+
                 # Return a tool call response that directly executes the tool
                 # Look at the most recent user message to find the step description
                 tool_name = None
 
-                # Check the most recent user message for step descriptions
-                for message in reversed(messages):
-                    if message.get("role") == "user":
-                        content = message.get("content", "")
-                        # Match exact step descriptions with correct tool names
-                        if (
-                            "Execute step A" in content
-                            and "A1" not in content
-                            and "A2" not in content
-                        ):
-                            tool_name = "tool_A"
-                        elif (
-                            "Execute step B" in content
-                            and "B1" not in content
-                            and "B2" not in content
-                        ):
-                            tool_name = "tool_B"
-                        elif "Execute step C" in content:
-                            tool_name = "tool_C"
-                        elif "Execute step D" in content:
-                            tool_name = "tool_D"
-                        elif "Execute step A1" in content:
-                            tool_name = "tool_A1"
-                        elif "Execute step A2" in content:
-                            tool_name = "tool_A2"
-                        elif "Execute step B1" in content:
-                            tool_name = "tool_B1"
-                        elif "Execute step B2" in content:
-                            tool_name = "tool_B2"
-                        elif "Execute step E" in content:
-                            tool_name = "tool_E"
-                        elif "Execute step F" in content:
-                            tool_name = "tool_F"
+                # Check all messages for step descriptions (system + user messages)
+                for message in messages:
+                    content = message.get("content", "")
+                    # Match exact step descriptions with correct tool names
+                    if (
+                        "Execute step A" in content
+                        and "A1" not in content
+                        and "A2" not in content
+                    ):
+                        tool_name = "tool_A"
+                        break
+                    elif (
+                        "Execute step B" in content
+                        and "B1" not in content
+                        and "B2" not in content
+                    ):
+                        tool_name = "tool_B"
+                        break
+                    elif "Execute step C" in content:
+                        tool_name = "tool_C"
+                        break
+                    elif "Execute step D" in content:
+                        tool_name = "tool_D"
+                        break
+                    elif "Execute step A1" in content:
+                        tool_name = "tool_A1"
+                        break
+                    elif "Execute step A2" in content:
+                        tool_name = "tool_A2"
+                        break
+                    elif "Execute step B1" in content:
+                        tool_name = "tool_B1"
+                        break
+                    elif "Execute step B2" in content:
+                        tool_name = "tool_B2"
+                        break
+                    elif "Execute step E" in content:
+                        tool_name = "tool_E"
+                        break
+                    elif "Execute step F" in content:
+                        tool_name = "tool_F"
                         break
 
                 if tool_name:
-                    # Return a proper ReAct tool_call response without extra content field
+                    # Phase 1: Return decision without tool_name (type="tool_call" only)
+                    if not has_tools:
+                        # Check if this tool was already executed — if so, return final answer
+                        if tool_name in _executed_tools:
+                            return '{"type": "final_answer", "content": "Task completed successfully", "answer": "Task completed successfully", "reasoning": "The task has been completed"}'
+                        return '{"type": "tool_call", "reasoning": "I need to execute a tool for this step"}'
+
+                    # Phase 2: Return tool_call with tool_name
+                    # Check if this tool was already executed — if so, return final answer
+                    if tool_name in _executed_tools:
+                        return '{"type": "final_answer", "content": "Task completed successfully", "answer": "Task completed successfully", "reasoning": "The task has been completed"}'
+                    _executed_tools.add(tool_name)
+                    # Return a proper ReAct tool_call response with tool_name
                     return (
                         '{"type": "tool_call", "reasoning": "I need to execute the tool for this step", "tool_name": "'
                         + tool_name
@@ -863,41 +910,71 @@ class TestDAGComprehensive:
 
             mock_llm = Mock(spec=BaseLLM)
 
+            # Add required properties to the mock
+            mock_llm.abilities = ["chat"]
+            mock_llm.supports_thinking_mode = False
+
+            # Track which tools have been executed to prevent infinite loops
+            _executed_tools = set()
+
             # Mock the LLM to return tool call responses that trigger tool execution
             async def mock_chat(messages, **kwargs):
+                # Check if this is phase 2 (tools provided) or phase 1 (no tools)
+                has_tools = "tools" in kwargs and kwargs["tools"]
+
                 # Return a tool call response that directly executes the tool
-                # Look at all messages to find the step description
+                # Look at all messages to find the step description (check both system and user messages)
                 tool_name = None
 
-                # Check all messages for step descriptions
-                for message in reversed(messages):
-                    if message.get("role") == "user":
-                        content = message.get("content", "")
-                        # More specific matches first to avoid incorrect matching
-                        if "Execute step A1" in content:
-                            tool_name = "tool_A1"
-                        elif "Execute step A2" in content:
-                            tool_name = "tool_A2"
-                        elif "Execute step B1" in content:
-                            tool_name = "tool_B1"
-                        elif "Execute step B2" in content:
-                            tool_name = "tool_B2"
-                        elif "Execute step C" in content:
-                            tool_name = "tool_C"
-                        elif "Execute step A" in content:
-                            tool_name = "tool_A"
-                        elif "Execute step B" in content:
-                            tool_name = "tool_B"
-                        elif "Execute step D" in content:
-                            tool_name = "tool_D"
-                        elif "Execute step E" in content:
-                            tool_name = "tool_E"
-                        elif "Execute step F" in content:
-                            tool_name = "tool_F"
+                # Check all messages for step descriptions (system + user messages)
+                for message in messages:
+                    content = message.get("content", "")
+                    # More specific matches first to avoid incorrect matching
+                    if "Execute step A1" in content:
+                        tool_name = "tool_A1"
+                        break
+                    elif "Execute step A2" in content:
+                        tool_name = "tool_A2"
+                        break
+                    elif "Execute step B1" in content:
+                        tool_name = "tool_B1"
+                        break
+                    elif "Execute step B2" in content:
+                        tool_name = "tool_B2"
+                        break
+                    elif "Execute step C" in content:
+                        tool_name = "tool_C"
+                        break
+                    elif "Execute step A" in content:
+                        tool_name = "tool_A"
+                        break
+                    elif "Execute step B" in content:
+                        tool_name = "tool_B"
+                        break
+                    elif "Execute step D" in content:
+                        tool_name = "tool_D"
+                        break
+                    elif "Execute step E" in content:
+                        tool_name = "tool_E"
+                        break
+                    elif "Execute step F" in content:
+                        tool_name = "tool_F"
                         break
 
                 if tool_name:
-                    # Return a proper ReAct tool_call response without extra content field
+                    # Phase 1: Return decision without tool_name (type="tool_call" only)
+                    if not has_tools:
+                        # Check if this tool was already executed — if so, return final answer
+                        if tool_name in _executed_tools:
+                            return '{"type": "final_answer", "content": "Task completed successfully", "answer": "Task completed successfully", "reasoning": "The task has been completed"}'
+                        return '{"type": "tool_call", "reasoning": "I need to execute a tool for this step"}'
+
+                    # Phase 2: Return tool_call with tool_name
+                    # Check if this tool was already executed — if so, return final answer
+                    if tool_name in _executed_tools:
+                        return '{"type": "final_answer", "content": "Task completed successfully", "answer": "Task completed successfully", "reasoning": "The task has been completed"}'
+                    _executed_tools.add(tool_name)
+                    # Return a proper ReAct tool_call response with tool_name
                     return (
                         '{"type": "tool_call", "reasoning": "I need to execute the tool for this step", "tool_name": "'
                         + tool_name
@@ -1011,40 +1088,78 @@ class TestDAGComprehensive:
 
             mock_llm = Mock(spec=BaseLLM)
 
+            # Add required properties to the mock
+            mock_llm.abilities = ["chat"]
+            mock_llm.supports_thinking_mode = False
+
+            # Track which tools have been executed to prevent infinite loops
+            _executed_tools = set()
+
             # Mock the LLM to return tool call responses that trigger tool execution
             async def mock_chat(messages, **kwargs):
+                # Check if this is phase 2 (tools provided) or phase 1 (no tools)
+                has_tools = "tools" in kwargs and kwargs["tools"]
+
                 # Return a tool call response that directly executes the tool
-                # Look at all messages to find the step description
+                # Look at all messages to find the step description (check both system and user messages)
                 tool_name = None
 
-                # Check all messages for step descriptions
-                for message in reversed(messages):
-                    if message.get("role") == "user":
-                        content = message.get("content", "")
-                        if "Execute step A" in content:
-                            tool_name = "tool_A"
-                        elif "Execute step B" in content:
-                            tool_name = "tool_B"
-                        elif "Execute step C" in content:
-                            tool_name = "tool_C"
-                        elif "Execute step D" in content:
-                            tool_name = "tool_D"
-                        elif "Execute step A1" in content:
-                            tool_name = "tool_A1"
-                        elif "Execute step A2" in content:
-                            tool_name = "tool_A2"
-                        elif "Execute step B1" in content:
-                            tool_name = "tool_B1"
-                        elif "Execute step B2" in content:
-                            tool_name = "tool_B2"
-                        elif "Execute step E" in content:
-                            tool_name = "tool_E"
-                        elif "Execute step F" in content:
-                            tool_name = "tool_F"
+                # Check all messages for step descriptions (system + user messages)
+                for message in messages:
+                    content = message.get("content", "")
+                    if (
+                        "Execute step A" in content
+                        and "A1" not in content
+                        and "A2" not in content
+                    ):
+                        tool_name = "tool_A"
+                        break
+                    elif (
+                        "Execute step B" in content
+                        and "B1" not in content
+                        and "B2" not in content
+                    ):
+                        tool_name = "tool_B"
+                        break
+                    elif "Execute step C" in content:
+                        tool_name = "tool_C"
+                        break
+                    elif "Execute step D" in content:
+                        tool_name = "tool_D"
+                        break
+                    elif "Execute step A1" in content:
+                        tool_name = "tool_A1"
+                        break
+                    elif "Execute step A2" in content:
+                        tool_name = "tool_A2"
+                        break
+                    elif "Execute step B1" in content:
+                        tool_name = "tool_B1"
+                        break
+                    elif "Execute step B2" in content:
+                        tool_name = "tool_B2"
+                        break
+                    elif "Execute step E" in content:
+                        tool_name = "tool_E"
+                        break
+                    elif "Execute step F" in content:
+                        tool_name = "tool_F"
                         break
 
                 if tool_name:
-                    # Return a proper ReAct tool_call response without extra content field
+                    # Phase 1: Return decision without tool_name (type="tool_call" only)
+                    if not has_tools:
+                        # Check if this tool was already executed — if so, return final answer
+                        if tool_name in _executed_tools:
+                            return '{"type": "final_answer", "content": "Task completed successfully", "answer": "Task completed successfully", "reasoning": "The task has been completed"}'
+                        return '{"type": "tool_call", "reasoning": "I need to execute a tool for this step"}'
+
+                    # Phase 2: Return tool_call with tool_name
+                    # Check if this tool was already executed — if so, return final answer
+                    if tool_name in _executed_tools:
+                        return '{"type": "final_answer", "content": "Task completed successfully", "answer": "Task completed successfully", "reasoning": "The task has been completed"}'
+                    _executed_tools.add(tool_name)
+                    # Return a proper ReAct tool_call response with tool_name
                     return (
                         '{"type": "tool_call", "reasoning": "I need to execute the tool for this step", "tool_name": "'
                         + tool_name

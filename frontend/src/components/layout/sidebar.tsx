@@ -46,6 +46,7 @@ import {
   Star,
   MoreHorizontal,
   Edit2,
+  Search,
 } from "lucide-react"
 import {
   Dialog,
@@ -372,7 +373,7 @@ export function Sidebar({ className }: SidebarProps) {
   const [searchQuery, setSearchQuery] = useState("")
   const searchRef = useRef("")
   const [isSearchFocused, setIsSearchFocused] = useState(false)
-  const [isSearchHovered, setIsSearchHovered] = useState(false)
+  const [isSearchVisible, setIsSearchVisible] = useState(false)
 
   // Rename state
   const [editingTaskId, setEditingTaskId] = useState<string | null>(null)
@@ -793,26 +794,62 @@ export function Sidebar({ className }: SidebarProps) {
         <div>
           <div
             className="px-4 py-2 text-xs font-bold text-slate-400 uppercase tracking-wider mb-1 flex items-center justify-between transition-colors group h-8"
-            onMouseEnter={() => setIsSearchHovered(true)}
-            onMouseLeave={() => setIsSearchHovered(false)}
           >
-            {(isSearchHovered || isSearchFocused || searchQuery) ? (
+            {(isSearchVisible || isSearchFocused || searchQuery) ? (
               <div className="flex-1 relative mr-2 h-full flex items-center">
                 <SearchInput
                   placeholder={t('nav.search')}
                   value={searchQuery}
                   onChange={setSearchQuery}
                   onFocus={() => setIsSearchFocused(true)}
-                  onBlur={() => setIsSearchFocused(false)}
+                  onBlur={() => {
+                    setIsSearchFocused(false)
+                    setIsSearchVisible(false)
+                  }}
+                  onKeyDown={(e) => {
+                    if (e.key === 'Escape') {
+                      setSearchQuery('')
+                      setIsSearchVisible(false)
+                      setIsSearchFocused(false)
+                      e.currentTarget.blur()
+                    }
+                  }}
                   containerClassName="w-full h-7"
-                  className="h-7 text-xs text-black bg-transparent border-slate-500/50 focus:border-primary"
+                  className="h-7 text-xs text-black bg-transparent border-slate-500/50 focus:border-primary [&::-webkit-search-cancel-button]:hidden"
+                  autoFocus
                 />
+                <button
+                  className={cn(
+                    "absolute right-1.5 text-slate-400 hover:text-slate-600 dark:hover:text-slate-300 p-1 rounded-full transition-colors",
+                    !searchQuery && "opacity-0 pointer-events-none"
+                  )}
+                  onMouseDown={(e) => {
+                    // 阻止默认行为以防触发 input 的 blur
+                    e.preventDefault()
+                  }}
+                  onClick={(e) => {
+                    e.stopPropagation()
+                    setSearchQuery('')
+                    setIsSearchVisible(false)
+                    setIsSearchFocused(false)
+                  }}
+                >
+                  <X className="h-3 w-3" />
+                </button>
               </div>
             ) : (
-              <span className="flex-1 truncate">{t('nav.history')}</span>
+              <div className="flex-1 flex items-center min-w-0 mr-2">
+                <span className="truncate">{t('nav.history')}</span>
+                <div
+                  className="cursor-pointer p-1 hover:bg-slate-200 dark:hover:bg-slate-700 rounded transition-colors text-slate-400 hover:text-foreground flex-shrink-0"
+                  onClick={() => setIsSearchVisible(true)}
+                >
+                  <Search className="h-3 w-3" />
+                </div>
+              </div>
             )}
             <div
-              className="cursor-pointer p-1 -mr-1 hover:bg-slate-200 dark:hover:bg-slate-700 rounded transition-colors"
+              className="cursor-pointer p-1 -mr-1 hover:bg-slate-200 dark:hover:bg-slate-700 rounded transition-colors ml-1"
               onClick={() => setIsHistoryExpanded(!isHistoryExpanded)}
             >
               {isHistoryExpanded ? <ChevronDown className="h-3 w-3" /> : <ChevronRight className="h-3 w-3" />}

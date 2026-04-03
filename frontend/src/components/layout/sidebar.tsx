@@ -824,7 +824,7 @@ export function Sidebar({ className }: SidebarProps) {
                     !searchQuery && "opacity-0 pointer-events-none"
                   )}
                   onMouseDown={(e) => {
-                    // 阻止默认行为以防触发 input 的 blur
+                    // Prevent the default behavior to avoid triggering the input’s blur event
                     e.preventDefault()
                   }}
                   onClick={(e) => {

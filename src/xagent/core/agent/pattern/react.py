@@ -95,6 +95,37 @@ class Action(BaseModel):
     class Config:
         extra = "allow"  # Allow extra fields for flexibility
 
+    @classmethod
+    def get_decision_schema(cls) -> Dict[str, Any]:
+        """
+        Get manually crafted JSON Schema for first-phase decision.
+
+        This is a simple, provider-agnostic schema that works across
+        different LLM providers (OpenAI, Gemini, etc.).
+
+        Returns:
+            OpenAI-compatible JSON Schema dict
+        """
+        return {
+            "type": "json_schema",
+            "json_schema": {
+                "name": "action_decision",
+                "strict": True,
+                "schema": {
+                    "type": "object",
+                    "properties": {
+                        "type": {
+                            "type": "string",
+                            "enum": ["tool_call", "final_answer"],
+                        },
+                        "reasoning": {"type": "string"},
+                        "answer": {"type": "string"},
+                    },
+                    "required": ["type", "reasoning"],
+                },
+            },
+        }
+
 
 class ToolRegistry:
     """Registry for managing available tools."""
@@ -1197,34 +1228,31 @@ You must respond with a structured action in JSON format. Decide your next actio
 
 CRITICAL INSTRUCTIONS:
 
-1. RESPONSE FORMAT:
-   - Your entire response must be EXACTLY ONE valid JSON object
-   - Do NOT return multiple JSON objects
-   - Do NOT return JSON followed by other text
-   - The JSON object must be the ONLY thing you return
-   - Do not include backticks or markdown formatting
+1. RESPONSE FORMAT (STRICT JSON SCHEMA):
+   Your response must be a valid JSON object matching this exact schema:
+   {{
+       "type": "tool_call" | "final_answer",
+       "reasoning": "string (required) - explanation of your decision",
+       "answer": "string (only for final_answer) - your final answer"
+   }}
+
+   For tool_call: {{"type": "tool_call", "reasoning": "..."}}
+   For final_answer: {{"type": "final_answer", "reasoning": "...", "answer": "..."}}
+
+   ⚠️ CRITICAL:
+   - Only include "answer" field when type is "final_answer"
+   - Do NOT add any other fields beyond type, reasoning, answer
+   - Do NOT include tool names or arguments in JSON
+   - Return exactly ONE JSON object, nothing else
+   - No markdown, no backticks, no additional text
 
 2. WHEN TO USE TOOLS:
    - Check if tools are available for this task
    - Use tools when they help accomplish the task more effectively
    - If no tools are available, provide a final answer directly
+   - Most tools are ATOMIC: one call completes the entire action
 
 3. LANGUAGE: Respond in the SAME LANGUAGE as the goal
-
-CORRECT RESPONSE FORMAT:
-
-For tool calls:
-{{
-    "type": "tool_call",
-    "reasoning": "I need to use a tool because..."
-}}
-
-For final answer:
-{{
-    "type": "final_answer",
-    "reasoning": "Based on my analysis...",
-    "answer": "Your comprehensive answer here..."
-}}
 
 Remember: Return ONLY ONE JSON object. No additional text, no multiple objects."""
         )
@@ -1264,17 +1292,28 @@ You must respond with a structured action in JSON format. Decide your next actio
 
 CRITICAL INSTRUCTIONS:
 
-1. RESPONSE FORMAT:
-   - Your entire response must be EXACTLY ONE valid JSON object
-   - Do NOT return multiple JSON objects
-   - Do NOT return JSON followed by other text
-   - The JSON object must be the ONLY thing you return
-   - Do not include backticks or markdown formatting
+1. RESPONSE FORMAT (STRICT JSON SCHEMA):
+   Your response must be a valid JSON object matching this schema:
+   {{
+       "type": "tool_call" | "final_answer",
+       "reasoning": "string (required)",
+       "answer": "string (for final_answer)",
+       "success": "boolean (for final_answer)",
+       "error": "string | null (for final_answer)"
+   }}
+
+   ⚠️ CRITICAL:
+   - Only include answer/success/error when type is "final_answer"
+   - Do NOT add any other fields beyond the schema
+   - Do NOT include tool names or arguments in JSON
+   - Return exactly ONE JSON object, nothing else
+   - No markdown, no backticks, no additional text
 
 2. WHEN TO USE TOOLS:
    - Check if tools are available for this task
    - Use tools when they help accomplish the task more effectively
    - If no tools are available, provide a final answer directly
+   - Most tools are ATOMIC: one call completes the entire action
 
 3. FOR TOOL CALLS:
    - ONLY set the action type to "tool_call" and explain why
@@ -1423,8 +1462,9 @@ Remember: Return ONLY ONE JSON object. No additional text, no multiple objects.
         # Get tool schemas
         tool_schemas = self.tool_registry.get_tool_schemas()
 
-        # First call: Request JSON output format for action type decision
-        chat_kwargs["response_format"] = {"type": "json_object"}
+        # First call: Request JSON output format with strict schema constraint
+        # Use centralized schema from Action class
+        chat_kwargs["response_format"] = Action.get_decision_schema()
 
         # Disable thinking mode if supported
         if (

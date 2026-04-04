@@ -7,12 +7,22 @@ For workspace-related file operations, use the workspace_file_tool.py module.
 
 import csv
 import json
+import logging
 import os
 import re
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Union
 
 from pydantic import BaseModel
+
+try:
+    from PIL import Image
+
+    PIL_AVAILABLE = True
+except ImportError:
+    PIL_AVAILABLE = False
+
+logger = logging.getLogger(__name__)
 
 
 class FileInfo(BaseModel):
@@ -25,6 +35,11 @@ class FileInfo(BaseModel):
     is_dir: bool
     modified_time: float
     encoding: Optional[str] = None
+    # Image metadata (optional)
+    image_width: Optional[int] = None
+    image_height: Optional[int] = None
+    image_format: Optional[str] = None
+    image_mode: Optional[str] = None
 
 
 class ListFilesResult(BaseModel):
@@ -236,13 +251,20 @@ def file_exists(file_path: str) -> bool:
 
 def get_file_info(file_path: str) -> FileInfo:
     """
-    Get detailed file information
+    Get detailed file information.
+
+    For image files (.jpg, .jpeg, .png, .gif, .bmp, .webp, .tiff, .tif),
+    this function also extracts image metadata including dimensions, format, and mode.
 
     Args:
         file_path: File path
 
     Returns:
-        File information object
+        File information object. For images, includes:
+        - image_width: Image width in pixels (if applicable)
+        - image_height: Image height in pixels (if applicable)
+        - image_format: Image format (e.g., "JPEG", "PNG") (if applicable)
+        - image_mode: Image mode (e.g., "RGB", "RGBA") (if applicable)
 
     Raises:
         FileNotFoundError: File doesn't exist
@@ -260,7 +282,49 @@ def get_file_info(file_path: str) -> FileInfo:
         is_file=path.is_file(),
         is_dir=path.is_dir(),
         modified_time=stat.st_mtime,
+        encoding=None,
+        **_get_image_metadata(path),
     )
+
+
+def _get_image_metadata(file_path: Path) -> Dict[str, Optional[Any]]:
+    """
+    Get image metadata if file is an image.
+
+    Args:
+        file_path: Path to the file
+
+    Returns:
+        Dictionary with image metadata (width, height, format, mode) or empty dict if not an image
+    """
+    if not PIL_AVAILABLE:
+        return {}
+
+    # Check if file is an image by extension
+    image_extensions = {
+        ".jpg",
+        ".jpeg",
+        ".png",
+        ".gif",
+        ".bmp",
+        ".webp",
+        ".tiff",
+        ".tif",
+    }
+    if file_path.suffix.lower() not in image_extensions:
+        return {}
+
+    try:
+        with Image.open(file_path) as img:
+            return {
+                "image_width": img.width,
+                "image_height": img.height,
+                "image_format": img.format,
+                "image_mode": img.mode,
+            }
+    except Exception as e:
+        logger.warning(f"Failed to read image metadata for {file_path}: {e}")
+        return {}
 
 
 def read_json_file(file_path: str, encoding: str = "utf-8") -> Any:

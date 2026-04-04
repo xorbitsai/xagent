@@ -88,6 +88,7 @@ Common use cases:
 - Add or remove elements
 - Fix imperfections or enhance quality
 - Convert image style (e.g., make it look like a painting, cartoon, etc.)
+- Resize or change image dimensions
 
 Text handling in edited images:
 - **Text modifications**: If you want to change existing text in the image, clearly describe what text should be changed and what it should become
@@ -103,7 +104,25 @@ Parameters:
 - image_url (required): single image path/URL/file_id (supports both `file_id` and `file:file_id`) or a list of image paths/URLs/file_ids for multi-image editing
 - prompt (required): description of the desired edits and changes
 - negative_prompt (optional): undesired elements in the result
+- size (optional): image resolution in "width*height" format (e.g. "1024*1024", "1280*720", "1920*1080")
+- width (optional): image width in pixels (use with height for desired dimensions)
+- height (optional): image height in pixels (use with width for desired dimensions)
+- resolution (optional): image resolution in "WIDTHxHEIGHT" format (e.g. "1920x1080")
+- aspect_ratio (optional): aspect ratio (e.g. "1:1", "3:2", "16:9", "21:9") - overrides calculated aspect ratio from size
 - model_id (optional): model name from the list above. Omit to use the default model marked with ⭐[DEFAULT].
+
+**IMPORTANT NOTES ON IMAGE SIZES:**
+- Different models have different size capabilities and constraints
+- **Gemini models**: Use aspect ratio + size bucket system (1K/2K/4K). Exact pixel dimensions are converted to the closest supported ratio and bucket. Output dimensions may vary from requested dimensions.
+- **OpenAI models**: Support only specific preset sizes (256x256, 512x512, 1024x1024, etc.)
+- **DashScope models**: Support limited size options
+- **Xinference models**: Based on Stable Diffusion, may support more flexible dimensions
+
+Size parameter priority (highest to lowest):
+1. aspect_ratio + size (aspect_ratio determines ratio, size determines resolution bucket)
+2. width + height (desired dimensions, will be approximated to closest supported values)
+3. resolution (alternative dimension format)
+4. size (simple format)
 
 Images are automatically saved to workspace.
     """.strip()
@@ -537,6 +556,12 @@ Images are automatically saved to workspace.
         image_url: str | list[str],
         negative_prompt: str = "",
         model_id: Optional[str] = None,
+        size: str = "1024*1024",
+        width: Optional[int] = None,
+        height: Optional[int] = None,
+        resolution: Optional[str] = None,
+        aspect_ratio: Optional[str] = None,
+        **kwargs: Any,
     ) -> Dict[str, Any]:
         """
         Edit an image using the configured image model.
@@ -546,6 +571,12 @@ Images are automatically saved to workspace.
             prompt: Text prompt describing the desired edits
             negative_prompt: Negative prompt for image editing
             model_id: Specific model ID to use (optional, uses first available edit-capable model if not provided)
+            size: Image size in format "width*height" (e.g., "1024*1024")
+            width: Image width in pixels (alternative to size)
+            height: Image height in pixels (alternative to size)
+            resolution: Image resolution (e.g., "1920x1080")
+            aspect_ratio: Aspect ratio (e.g., "3:2", "16:9")
+            **kwargs: Additional model-specific parameters
 
         Returns:
             Dictionary with image editing result
@@ -569,14 +600,32 @@ Images are automatically saved to workspace.
                 f"Resolved image paths: {image_inputs} -> {resolved_image_paths}"
             )
 
+            # Build parameters for image editing
+            edit_params: dict[str, Any] = {
+                "image_url": resolved_image_paths[0]
+                if len(resolved_image_paths) == 1
+                else resolved_image_paths,
+                "prompt": prompt,
+                "negative_prompt": negative_prompt,
+            }
+
+            # Add optional size parameters if provided
+            if size != "1024*1024":  # Only add if not default
+                edit_params["size"] = size
+            if width is not None:
+                edit_params["width"] = width
+            if height is not None:
+                edit_params["height"] = height
+            if resolution is not None:
+                edit_params["resolution"] = resolution
+            if aspect_ratio is not None:
+                edit_params["aspect_ratio"] = aspect_ratio
+
+            # Add any additional kwargs
+            edit_params.update(kwargs)
+
             # Edit the image
-            result = await image_model.edit_image(
-                image_url=resolved_image_paths
-                if len(resolved_image_paths) > 1
-                else resolved_image_paths[0],
-                prompt=prompt,
-                negative_prompt=negative_prompt,
-            )
+            result = await image_model.edit_image(**edit_params)
 
             # Determine the actual model used
             actual_model_id = model_id if model_id else "default_edit_model"

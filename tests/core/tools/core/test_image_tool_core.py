@@ -548,3 +548,265 @@ class TestImageGenerationToolCore:
             ],
             negative_prompt="",
         )
+
+    @pytest.mark.asyncio
+    @patch("aiohttp.ClientSession.get")
+    async def test_edit_image_with_size_parameter(
+        self, mock_get, mock_image_models, mock_workspace
+    ):
+        """Test image editing with custom size parameter"""
+        # Configure mock model to support editing
+        mock_image_models["model1"].edit_image = AsyncMock(
+            return_value={
+                "image_url": "https://example.com/edited_image.jpg",
+                "usage": {"input_tokens": 15, "output_tokens": 25},
+                "request_id": "edit_req1",
+            }
+        )
+        mock_image_models["model1"].has_ability = Mock(return_value=True)
+
+        tool = ImageGenerationToolCore(
+            mock_image_models, {"model1": "Test model 1"}, mock_workspace
+        )
+
+        # Mock HTTP response for image download
+        mock_response = Mock()
+        mock_response.status = 200
+
+        async def mock_iter_chunked(chunk_size):
+            for chunk in [b"fake_edited_image_data"]:
+                yield chunk
+
+        mock_response.content.iter_chunked = mock_iter_chunked
+        mock_get.return_value.__aenter__.return_value = mock_response
+
+        result = await tool.edit_image(
+            prompt="Make it look like a painting",
+            image_url="https://example.com/original.jpg",
+            size="2048*2048",
+        )
+
+        assert result["success"] is True
+        # Verify the model's edit_image was called with size parameter
+        mock_image_models["model1"].edit_image.assert_called_once()
+        call_kwargs = mock_image_models["model1"].edit_image.call_args.kwargs
+        assert call_kwargs["size"] == "2048*2048"
+
+    @pytest.mark.asyncio
+    @patch("aiohttp.ClientSession.get")
+    async def test_edit_image_with_width_height_parameters(
+        self, mock_get, mock_image_models, mock_workspace
+    ):
+        """Test image editing with width and height parameters"""
+        # Configure mock model to support editing
+        mock_image_models["model1"].edit_image = AsyncMock(
+            return_value={
+                "image_url": "https://example.com/edited_image.jpg",
+                "usage": {"input_tokens": 15, "output_tokens": 25},
+                "request_id": "edit_req1",
+            }
+        )
+        mock_image_models["model1"].has_ability = Mock(return_value=True)
+
+        tool = ImageGenerationToolCore(
+            mock_image_models, {"model1": "Test model 1"}, mock_workspace
+        )
+
+        # Mock HTTP response for image download
+        mock_response = Mock()
+        mock_response.status = 200
+
+        async def mock_iter_chunked(chunk_size):
+            for chunk in [b"fake_edited_image_data"]:
+                yield chunk
+
+        mock_response.content.iter_chunked = mock_iter_chunked
+        mock_get.return_value.__aenter__.return_value = mock_response
+
+        result = await tool.edit_image(
+            prompt="Make it look like a painting",
+            image_url="https://example.com/original.jpg",
+            width=1920,
+            height=1080,
+        )
+
+        assert result["success"] is True
+        # Verify the model's edit_image was called with width and height parameters
+        mock_image_models["model1"].edit_image.assert_called_once()
+        call_kwargs = mock_image_models["model1"].edit_image.call_args.kwargs
+        assert call_kwargs["width"] == 1920
+        assert call_kwargs["height"] == 1080
+
+    @pytest.mark.asyncio
+    @patch("aiohttp.ClientSession.get")
+    async def test_edit_image_with_resolution_parameter(
+        self, mock_get, mock_image_models, mock_workspace
+    ):
+        """Test image editing with resolution parameter"""
+        # Configure mock model to support editing
+        mock_image_models["model1"].edit_image = AsyncMock(
+            return_value={
+                "image_url": "https://example.com/edited_image.jpg",
+                "usage": {"input_tokens": 15, "output_tokens": 25},
+                "request_id": "edit_req1",
+            }
+        )
+        mock_image_models["model1"].has_ability = Mock(return_value=True)
+
+        tool = ImageGenerationToolCore(
+            mock_image_models, {"model1": "Test model 1"}, mock_workspace
+        )
+
+        # Mock HTTP response for image download
+        mock_response = Mock()
+        mock_response.status = 200
+
+        async def mock_iter_chunked(chunk_size):
+            for chunk in [b"fake_edited_image_data"]:
+                yield chunk
+
+        mock_response.content.iter_chunked = mock_iter_chunked
+        mock_get.return_value.__aenter__.return_value = mock_response
+
+        result = await tool.edit_image(
+            prompt="Make it look like a painting",
+            image_url="https://example.com/original.jpg",
+            resolution="1920x1080",
+        )
+
+        assert result["success"] is True
+        # Verify the model's edit_image was called with resolution parameter
+        mock_image_models["model1"].edit_image.assert_called_once()
+        call_kwargs = mock_image_models["model1"].edit_image.call_args.kwargs
+        assert call_kwargs["resolution"] == "1920x1080"
+
+    @pytest.mark.asyncio
+    @patch("aiohttp.ClientSession.get")
+    async def test_edit_image_with_aspect_ratio_parameter(
+        self, mock_get, mock_image_models, mock_workspace
+    ):
+        """Test image editing with aspect_ratio parameter"""
+        # Configure mock model to support editing
+        mock_image_models["model1"].edit_image = AsyncMock(
+            return_value={
+                "image_url": "https://example.com/edited_image.jpg",
+                "usage": {"input_tokens": 15, "output_tokens": 25},
+                "request_id": "edit_req1",
+            }
+        )
+        mock_image_models["model1"].has_ability = Mock(return_value=True)
+
+        tool = ImageGenerationToolCore(
+            mock_image_models, {"model1": "Test model 1"}, mock_workspace
+        )
+
+        # Mock HTTP response for image download
+        mock_response = Mock()
+        mock_response.status = 200
+
+        async def mock_iter_chunked(chunk_size):
+            for chunk in [b"fake_edited_image_data"]:
+                yield chunk
+
+        mock_response.content.iter_chunked = mock_iter_chunked
+        mock_get.return_value.__aenter__.return_value = mock_response
+
+        result = await tool.edit_image(
+            prompt="Make it look like a painting",
+            image_url="https://example.com/original.jpg",
+            aspect_ratio="16:9",
+        )
+
+        assert result["success"] is True
+        # Verify the model's edit_image was called with aspect_ratio parameter
+        mock_image_models["model1"].edit_image.assert_called_once()
+        call_kwargs = mock_image_models["model1"].edit_image.call_args.kwargs
+        assert call_kwargs["aspect_ratio"] == "16:9"
+
+    @pytest.mark.asyncio
+    @patch("aiohttp.ClientSession.get")
+    async def test_edit_image_with_multiple_size_parameters(
+        self, mock_get, mock_image_models, mock_workspace
+    ):
+        """Test image editing with multiple size parameters"""
+        # Configure mock model to support editing
+        mock_image_models["model1"].edit_image = AsyncMock(
+            return_value={
+                "image_url": "https://example.com/edited_image.jpg",
+                "usage": {"input_tokens": 15, "output_tokens": 25},
+                "request_id": "edit_req1",
+            }
+        )
+        mock_image_models["model1"].has_ability = Mock(return_value=True)
+
+        tool = ImageGenerationToolCore(
+            mock_image_models, {"model1": "Test model 1"}, mock_workspace
+        )
+
+        # Mock HTTP response for image download
+        mock_response = Mock()
+        mock_response.status = 200
+
+        async def mock_iter_chunked(chunk_size):
+            for chunk in [b"fake_edited_image_data"]:
+                yield chunk
+
+        mock_response.content.iter_chunked = mock_iter_chunked
+        mock_get.return_value.__aenter__.return_value = mock_response
+
+        result = await tool.edit_image(
+            prompt="Make it look like a painting",
+            image_url="https://example.com/original.jpg",
+            size="2048*2048",
+            aspect_ratio="1:1",
+        )
+
+        assert result["success"] is True
+        # Verify the model's edit_image was called with both size and aspect_ratio
+        mock_image_models["model1"].edit_image.assert_called_once()
+        call_kwargs = mock_image_models["model1"].edit_image.call_args.kwargs
+        assert call_kwargs["size"] == "2048*2048"
+        assert call_kwargs["aspect_ratio"] == "1:1"
+
+    @pytest.mark.asyncio
+    @patch("aiohttp.ClientSession.get")
+    async def test_edit_image_default_size_not_passed(
+        self, mock_get, mock_image_models, mock_workspace
+    ):
+        """Test that default size is not passed to the model"""
+        # Configure mock model to support editing
+        mock_image_models["model1"].edit_image = AsyncMock(
+            return_value={
+                "image_url": "https://example.com/edited_image.jpg",
+                "usage": {"input_tokens": 15, "output_tokens": 25},
+                "request_id": "edit_req1",
+            }
+        )
+        mock_image_models["model1"].has_ability = Mock(return_value=True)
+
+        tool = ImageGenerationToolCore(
+            mock_image_models, {"model1": "Test model 1"}, mock_workspace
+        )
+
+        # Mock HTTP response for image download
+        mock_response = Mock()
+        mock_response.status = 200
+
+        async def mock_iter_chunked(chunk_size):
+            for chunk in [b"fake_edited_image_data"]:
+                yield chunk
+
+        mock_response.content.iter_chunked = mock_iter_chunked
+        mock_get.return_value.__aenter__.return_value = mock_response
+
+        # Call without specifying size - should not pass size parameter
+        result = await tool.edit_image(
+            prompt="Make it look like a painting",
+            image_url="https://example.com/original.jpg",
+        )
+
+        assert result["success"] is True
+        # Verify the model's edit_image was called without size parameter (default)
+        mock_image_models["model1"].edit_image.assert_called_once()
+        call_kwargs = mock_image_models["model1"].edit_image.call_args.kwargs
+        assert "size" not in call_kwargs

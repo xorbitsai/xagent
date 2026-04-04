@@ -178,3 +178,66 @@ def test_specific_tool_functionality():
     finally:
         if os.path.exists(temp_file):
             delete_file(temp_file)
+
+
+def test_image_file_info():
+    """Test image file information retrieval"""
+    try:
+        from PIL import Image
+    except ImportError:
+        pytest.skip("PIL not installed")
+
+    with tempfile.NamedTemporaryFile(mode="wb", delete=False, suffix=".png") as f:
+        temp_file = f.name
+
+    try:
+        # Create a test image (800x600, RGB)
+        test_image = Image.new("RGB", (800, 600), color="red")
+        test_image.save(temp_file)
+
+        # Get file information
+        info = get_file_info(temp_file)
+
+        # Verify basic information
+        assert info.name.endswith(".png")
+        assert info.is_file
+        assert not info.is_dir
+        assert info.size > 0
+
+        # Verify image metadata
+        assert info.image_width == 800, f"Expected width 800, got {info.image_width}"
+        assert info.image_height == 600, f"Expected height 600, got {info.image_height}"
+        assert info.image_format == "PNG", (
+            f"Expected format PNG, got {info.image_format}"
+        )
+        assert info.image_mode == "RGB", f"Expected mode RGB, got {info.image_mode}"
+
+    finally:
+        if os.path.exists(temp_file):
+            delete_file(temp_file)
+
+
+def test_non_image_file_info():
+    """Test non-image file information retrieval (should not include image metadata)"""
+    with tempfile.NamedTemporaryFile(mode="w", delete=False, suffix=".txt") as f:
+        temp_file = f.name
+        f.write("Test content")
+
+    try:
+        # Get file information
+        info = get_file_info(temp_file)
+
+        # Verify basic information
+        assert info.name.endswith(".txt")
+        assert info.is_file
+        assert not info.is_dir
+
+        # Verify image metadata is None
+        assert info.image_width is None
+        assert info.image_height is None
+        assert info.image_format is None
+        assert info.image_mode is None
+
+    finally:
+        if os.path.exists(temp_file):
+            delete_file(temp_file)

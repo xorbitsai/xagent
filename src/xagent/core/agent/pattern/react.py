@@ -120,6 +120,8 @@ class Action(BaseModel):
                         },
                         "reasoning": {"type": "string"},
                         "answer": {"type": "string"},
+                        "success": {"type": "boolean"},
+                        "error": {"type": ["string", "null"]},
                     },
                     "required": ["type", "reasoning"],
                 },
@@ -1233,15 +1235,17 @@ CRITICAL INSTRUCTIONS:
    {{
        "type": "tool_call" | "final_answer",
        "reasoning": "string (required) - explanation of your decision",
-       "answer": "string (only for final_answer) - your final answer"
+       "answer": "string (for final_answer) - your final answer",
+       "success": "boolean (for final_answer) - whether the task succeeded",
+       "error": "string | null (for final_answer) - error message if failed"
    }}
 
    For tool_call: {{"type": "tool_call", "reasoning": "..."}}
-   For final_answer: {{"type": "final_answer", "reasoning": "...", "answer": "..."}}
+   For final_answer: {{"type": "final_answer", "reasoning": "...", "answer": "...", "success": true, "error": null}}
 
    ⚠️ CRITICAL:
-   - Only include "answer" field when type is "final_answer"
-   - Do NOT add any other fields beyond type, reasoning, answer
+   - Only include answer/success/error fields when type is "final_answer"
+   - Do NOT add any other fields beyond type, reasoning, answer, success, error
    - Do NOT include tool names or arguments in JSON
    - Return exactly ONE JSON object, nothing else
    - No markdown, no backticks, no additional text
@@ -1266,7 +1270,7 @@ Remember: Return ONLY ONE JSON object. No additional text, no multiple objects."
         # Build tool descriptions (may be empty)
         tool_descriptions = self._build_tool_descriptions(tool_names)
         tools_section = (
-            "No tools are available for this task."
+            "You currently have NO access to any tools."
             if not tool_names
             else f"Available tools:\n{chr(10).join(tool_descriptions)}\n\nUse these tools when needed to complete the task."
         )
@@ -1275,13 +1279,6 @@ Remember: Return ONLY ONE JSON object. No additional text, no multiple objects."
         action_requirements = f"""
 
 === ACTION FORMAT REQUIREMENTS ===
-FILE REFERENCES:
-- You may see file references in the format: [filename](file://fileId)
-- The referenced file may NOT be in the current workspace.
-- The 'fileId' part is the only valid identifier for reading the file.
-- When using tools to read files, pass the fileId directly.
-- Example: If you see [data.csv](file://123), use '123' to read the file.
-
 {tools_section}
 
 DECISION:

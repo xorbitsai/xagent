@@ -568,6 +568,7 @@ class TestImageGenerationTool:
         mock_image_models["model1"].edit_image.assert_called_once_with(
             prompt="Make it look like a painting",
             image_url="https://example.com/original.jpg",
+            size="1024*1024",
             negative_prompt="",
         )
 
@@ -642,6 +643,7 @@ class TestImageGenerationTool:
                 "https://example.com/image1.jpg",
                 "https://example.com/image2.jpg",
             ],
+            size="1024*1024",
             negative_prompt="",
         )
 

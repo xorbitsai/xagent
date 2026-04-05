@@ -16,7 +16,7 @@ from pydantic import BaseModel
 
 from ...workspace import TaskWorkspace
 from .document_parser import DocumentCapabilities, DocumentParseArgs, parse_document
-from .file_tool import EditOperation, EditResult, _get_image_metadata
+from .file_tool import EditOperation, EditResult, get_image_metadata
 
 logger = logging.getLogger(__name__)
 
@@ -161,6 +161,11 @@ class FileInfo(BaseModel):
     is_dir: bool
     modified_time: float
     encoding: Optional[str] = None
+    # Image metadata (optional)
+    image_width: Optional[int] = None
+    image_height: Optional[int] = None
+    image_format: Optional[str] = None
+    image_mode: Optional[str] = None
 
 
 class ListFilesResult(BaseModel):
@@ -432,7 +437,7 @@ class WorkspaceFileOperations:
             is_dir=resolved_path.is_dir(),
             modified_time=stat.st_mtime,
             encoding=None,  # Add encoding field
-            **_get_image_metadata(resolved_path),
+            **get_image_metadata(resolved_path),
         )
 
     def read_json_file(self, file_path_or_id: str, encoding: str = "utf-8") -> Any:

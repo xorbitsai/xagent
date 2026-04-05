@@ -451,6 +451,7 @@ class TestImageGenerationToolCore:
         mock_image_models["model1"].edit_image.assert_called_once_with(
             prompt="Make it look like a painting",
             image_url="https://example.com/original.jpg",
+            size="1024*1024",
             negative_prompt="",
         )
 
@@ -546,6 +547,7 @@ class TestImageGenerationToolCore:
                 "https://example.com/image1.jpg",
                 "https://example.com/image2.jpg",
             ],
+            size="1024*1024",
             negative_prompt="",
         )
 
@@ -770,10 +772,10 @@ class TestImageGenerationToolCore:
 
     @pytest.mark.asyncio
     @patch("aiohttp.ClientSession.get")
-    async def test_edit_image_default_size_not_passed(
+    async def test_edit_image_default_size_is_passed(
         self, mock_get, mock_image_models, mock_workspace
     ):
-        """Test that default size is not passed to the model"""
+        """Test that default size is passed to the model (consistent with generate_image)"""
         # Configure mock model to support editing
         mock_image_models["model1"].edit_image = AsyncMock(
             return_value={
@@ -799,14 +801,15 @@ class TestImageGenerationToolCore:
         mock_response.content.iter_chunked = mock_iter_chunked
         mock_get.return_value.__aenter__.return_value = mock_response
 
-        # Call without specifying size - should not pass size parameter
+        # Call without specifying size - should pass default size parameter (consistent with generate_image)
         result = await tool.edit_image(
             prompt="Make it look like a painting",
             image_url="https://example.com/original.jpg",
         )
 
         assert result["success"] is True
-        # Verify the model's edit_image was called without size parameter (default)
+        # Verify the model's edit_image was called with default size parameter (consistent with generate_image)
         mock_image_models["model1"].edit_image.assert_called_once()
         call_kwargs = mock_image_models["model1"].edit_image.call_args.kwargs
-        assert "size" not in call_kwargs
+        assert "size" in call_kwargs
+        assert call_kwargs["size"] == "1024*1024"

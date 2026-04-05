@@ -606,12 +606,11 @@ Images are automatically saved to workspace.
                 if len(resolved_image_paths) == 1
                 else resolved_image_paths,
                 "prompt": prompt,
+                "size": size,
                 "negative_prompt": negative_prompt,
             }
 
-            # Add optional size parameters if provided
-            if size != "1024*1024":  # Only add if not default
-                edit_params["size"] = size
+            # Add optional parameters if provided
             if width is not None:
                 edit_params["width"] = width
             if height is not None:

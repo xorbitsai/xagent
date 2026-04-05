@@ -24,6 +24,18 @@ except ImportError:
 
 logger = logging.getLogger(__name__)
 
+# Image extensions set (module-level constant to avoid recreation)
+IMAGE_EXTENSIONS = {
+    ".jpg",
+    ".jpeg",
+    ".png",
+    ".gif",
+    ".bmp",
+    ".webp",
+    ".tiff",
+    ".tif",
+}
+
 
 class FileInfo(BaseModel):
     """File information model"""
@@ -283,11 +295,11 @@ def get_file_info(file_path: str) -> FileInfo:
         is_dir=path.is_dir(),
         modified_time=stat.st_mtime,
         encoding=None,
-        **_get_image_metadata(path),
+        **get_image_metadata(path),
     )
 
 
-def _get_image_metadata(file_path: Path) -> Dict[str, Optional[Any]]:
+def get_image_metadata(file_path: Path) -> Dict[str, Optional[Any]]:
     """
     Get image metadata if file is an image.
 
@@ -301,17 +313,7 @@ def _get_image_metadata(file_path: Path) -> Dict[str, Optional[Any]]:
         return {}
 
     # Check if file is an image by extension
-    image_extensions = {
-        ".jpg",
-        ".jpeg",
-        ".png",
-        ".gif",
-        ".bmp",
-        ".webp",
-        ".tiff",
-        ".tif",
-    }
-    if file_path.suffix.lower() not in image_extensions:
+    if file_path.suffix.lower() not in IMAGE_EXTENSIONS:
         return {}
 
     try:

@@ -241,3 +241,27 @@ def test_non_image_file_info():
     finally:
         if os.path.exists(temp_file):
             delete_file(temp_file)
+
+
+def test_image_file_info_without_pil():
+    """Test that get_file_info handles PIL unavailability gracefully."""
+    from unittest.mock import patch
+
+    with tempfile.NamedTemporaryFile(mode="wb", delete=False, suffix=".png") as f:
+        temp_file = f.name
+        f.write(b"fake png data")
+
+    try:
+        with patch("xagent.core.tools.core.file_tool.PIL_AVAILABLE", False):
+            info = get_file_info(temp_file)
+
+            assert info.is_file
+            # When PIL is not available, image metadata should all be None
+            assert info.image_width is None
+            assert info.image_height is None
+            assert info.image_format is None
+            assert info.image_mode is None
+
+    finally:
+        if os.path.exists(temp_file):
+            delete_file(temp_file)

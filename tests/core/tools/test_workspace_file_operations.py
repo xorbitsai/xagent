@@ -352,6 +352,46 @@ class TestWorkspaceFileOperations:
         unregistered = [f for f in result["files"] if f.get("is_unregistered")]
         assert len(unregistered) == 0
 
+    def test_get_file_info_with_image(self, tmp_path):
+        """Test that workspace get_file_info returns image metadata for image files."""
+        try:
+            from PIL import Image
+        except ImportError:
+            pytest.skip("PIL not installed")
+
+        workspace = TaskWorkspace("test_image_info", str(tmp_path))
+        ops = WorkspaceFileOperations(workspace)
+
+        # Create a test image in workspace output directory
+        test_image = Image.new("RGB", (800, 600), color="red")
+        image_path = workspace.output_dir / "test.png"
+        image_path.parent.mkdir(parents=True, exist_ok=True)
+        test_image.save(str(image_path))
+
+        info = ops.get_file_info("test.png")
+
+        assert info.is_file
+        assert info.image_width == 800
+        assert info.image_height == 600
+        assert info.image_format == "PNG"
+        assert info.image_mode == "RGB"
+
+    def test_get_file_info_non_image(self, tmp_path):
+        """Test that workspace get_file_info returns None image metadata for non-image files."""
+        workspace = TaskWorkspace("test_non_image_info", str(tmp_path))
+        ops = WorkspaceFileOperations(workspace)
+
+        # Create a test text file in workspace output directory
+        ops.write_file("test.txt", "hello")
+
+        info = ops.get_file_info("test.txt")
+
+        assert info.is_file
+        assert info.image_width is None
+        assert info.image_height is None
+        assert info.image_format is None
+        assert info.image_mode is None
+
 
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])

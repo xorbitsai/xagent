@@ -862,6 +862,7 @@ Build when you need.`
       errors: {
         loadFailed: "文件加载失败",
         docxRenderFailed: "DOCX 预览渲染失败",
+        excelRenderFailed: "Excel 预览渲染失败",
         cors: "CORS 错误：无法访问文件。这可能是浏览器缓存问题，请尝试刷新页面。",
         networkErrorWithMsg: "网络错误：{msg}",
       },

@@ -862,6 +862,7 @@ Build when you need.`
       errors: {
         loadFailed: "Failed to load file",
         docxRenderFailed: "Failed to render DOCX preview",
+        excelRenderFailed: "Failed to render Excel preview",
         cors: "CORS error: Unable to access the file. This might be a browser cache issue, please try refreshing the page.",
         networkErrorWithMsg: "Network error: {msg}",
       },

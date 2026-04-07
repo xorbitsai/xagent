@@ -1,5 +1,6 @@
 import { Loader2, XIcon } from "lucide-react"
 import { DocxPreviewRenderer } from "@/components/file/docx-preview-renderer"
+import { ExcelPreviewRenderer } from "@/components/file/excel-preview-renderer"
 import { MarkdownRenderer } from "@/components/ui/markdown-renderer"
 import { useI18n } from "@/contexts/i18n-context"
 import { getApiUrl, isHtmlFile, isMarkdownFile } from "@/lib/utils"
@@ -99,6 +100,8 @@ export function FileViewer({
         </div>
       ) : mimeType?.includes('wordprocessingml') || fileName.toLowerCase().endsWith('.docx') ? (
         <DocxPreviewRenderer base64Content={content || ''} />
+      ) : mimeType?.includes('spreadsheetml') || fileName.toLowerCase().endsWith('.xlsx') || fileName.toLowerCase().endsWith('.csv') ? (
+        <ExcelPreviewRenderer base64Content={content || ''} />
       ) : isHtmlFile(fileName) ? (
         viewMode === 'code' ? (
           <pre className="p-4 text-sm font-mono whitespace-pre-wrap break-words">

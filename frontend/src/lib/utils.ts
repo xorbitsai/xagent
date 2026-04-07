@@ -135,6 +135,11 @@ export function isMarkdownFile(fileName: string): boolean {
   return fileName.toLowerCase().endsWith('.md')
 }
 
+export function isCsvFile(fileName: string): boolean {
+  if (!fileName) return false
+  return fileName.toLowerCase().endsWith('.csv')
+}
+
 export function isToggleableFile(fileName: string): boolean {
-  return isHtmlFile(fileName) || isMarkdownFile(fileName)
+  return isHtmlFile(fileName) || isMarkdownFile(fileName) || isCsvFile(fileName)
 }

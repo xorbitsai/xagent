@@ -1,7 +1,8 @@
 "use client"
 
 import React, { useState, useEffect, useRef, useMemo } from "react"
-import { ResizableSplitLayout } from "@/components/layout/resizable-split-layout"
+import { ResizableThreeColumnLayout } from "@/components/layout/resizable-three-column-layout"
+import { AgentBuilderChat } from "./agent-builder-chat"
 import { Input } from "@/components/ui/input"
 import { Textarea } from "@/components/ui/textarea"
 import { Button } from "@/components/ui/button"
@@ -1131,6 +1132,57 @@ export function AgentBuilder({ agentId }: AgentBuilderProps) {
 
   const LeftPanel = (
     <div className="p-6 space-y-8 min-h-full bg-card/50">
+      {/* Header moved to middle panel */}
+      <div className="flex justify-between items-start">
+        <div>
+          {isEditMode && (
+            <div
+              className="inline-flex items-center gap-1 mb-2 cursor-pointer hover:text-primary"
+              onClick={() => router.push("/build")}
+            >
+              <ChevronLeft className="h-4 w-4" />
+              {t("builds.editor.header.backToList")}
+            </div>
+          )}
+          <h1 className="text-3xl font-bold mb-1">{name || t("builds.editor.header.title")}</h1>
+          <p className="text-muted-foreground">{t("builds.editor.header.subtitle")}</p>
+        </div>
+        <div className="flex items-center gap-4">
+          <Button
+            onClick={handleCreate}
+            disabled={isCreating || loadingAgent || (isEditMode && !isDirty)}
+          >
+            {isCreating
+              ? isEditMode
+                ? t("builds.editor.header.updating")
+                : t("builds.editor.header.creating")
+              : isEditMode
+                ? t("builds.editor.header.update")
+                : t("builds.editor.header.create")}
+          </Button>
+
+          {isEditMode && (
+            originalData?.status === "published" ? (
+              <Button
+                variant="outline"
+                onClick={handleUnpublish}
+                disabled={isCreating || loadingAgent}
+              >
+                {t("builds.editor.header.unpublish")}
+              </Button>
+            ) : (
+              <Button
+                variant="secondary"
+                onClick={handlePublish}
+                disabled={isCreating || loadingAgent || isDirty}
+              >
+                {t("builds.editor.header.publish")}
+              </Button>
+            )
+          )}
+        </div>
+      </div>
+
       <div className="space-y-6">
         {/* Logo Upload */}
         <div className="space-y-2">
@@ -1589,7 +1641,7 @@ export function AgentBuilder({ agentId }: AgentBuilderProps) {
   )
 
   const RightPanel = (
-    <div className="flex flex-col h-full bg-background border-l">
+    <div className="flex flex-col flex-1 min-h-0 h-full bg-background border-l">
       {/* Header */}
       <div className="h-14 border-b flex items-center px-4 gap-2 bg-card/30">
         <MessageSquare className="h-5 w-5 text-muted-foreground" />
@@ -1671,64 +1723,38 @@ export function AgentBuilder({ agentId }: AgentBuilderProps) {
 
   return (
     <div className="flex flex-col h-[100vh]">
-      {/* Header */}
-      <div className="border-b flex justify-between items-center p-8">
-        <div>
-          {isEditMode && (
-            <div
-              className="inline-flex items-center gap-1 mb-2 cursor-pointer hover:text-primary"
-              onClick={() => router.push("/build")}
-            >
-              <ChevronLeft className="h-4 w-4" />
-              {t("builds.editor.header.backToList")}
-            </div>
-          )}
-          <h1 className="text-3xl font-bold mb-1">{name || t("builds.editor.header.title")}</h1>
-          <p className="text-muted-foreground">{t("builds.editor.header.subtitle")}</p>
-        </div>
-        <div className="flex items-center gap-4">
-          <Button
-            onClick={handleCreate}
-            disabled={isCreating || loadingAgent || (isEditMode && !isDirty)}
-          >
-            {isCreating
-              ? isEditMode
-                ? t("builds.editor.header.updating")
-                : t("builds.editor.header.creating")
-              : isEditMode
-                ? t("builds.editor.header.update")
-                : t("builds.editor.header.create")}
-          </Button>
-
-          {isEditMode && (
-            originalData?.status === "published" ? (
-              <Button
-                variant="outline"
-                onClick={handleUnpublish}
-                disabled={isCreating || loadingAgent}
-              >
-                {t("builds.editor.header.unpublish")}
-              </Button>
-            ) : (
-              <Button
-                variant="secondary"
-                onClick={handlePublish}
-                disabled={isCreating || loadingAgent || isDirty}
-              >
-                {t("builds.editor.header.publish")}
-              </Button>
-            )
-          )}
-        </div>
-      </div>
-
       <div className="flex-1 min-h-0">
-        <ResizableSplitLayout
-          leftPanel={LeftPanel}
+        <ResizableThreeColumnLayout
+          leftPanel={<AgentBuilderChat
+            agentConfig={{
+              name, description, instructions, executionMode, suggestedPrompts,
+              modelConfig, selectedKbs, selectedSkills, selectedToolCategories
+            }}
+            onUpdateConfig={(updates) => {
+              if (updates.name !== undefined) setName(updates.name);
+              if (updates.description !== undefined) setDescription(updates.description);
+              if (updates.instructions !== undefined) setInstructions(updates.instructions);
+              if (updates.executionMode !== undefined) setExecutionMode(updates.executionMode);
+              if (updates.suggestedPrompts !== undefined) setSuggestedPrompts(updates.suggestedPrompts);
+              if (updates.modelConfig !== undefined) setModelConfig(updates.modelConfig);
+              if (updates.selectedKbs !== undefined) setSelectedKbs(updates.selectedKbs);
+              if (updates.selectedSkills !== undefined) setSelectedSkills(updates.selectedSkills);
+              if (updates.selectedToolCategories !== undefined) setSelectedToolCategories(updates.selectedToolCategories);
+            }}
+            availableOptions={{
+              models: models.map(m => ({ id: m.id, name: m.model_name || m.model_id })),
+              knowledgeBases: kbs.map(k => ({ name: k.name })),
+              skills: skills.map(s => ({ name: s.name })),
+              toolCategories: Array.from(new Set(tools.map(t => t.category)))
+            }}
+          />}
+          middlePanel={LeftPanel}
           rightPanel={RightPanel}
-          initialLeftWidth={50}
-          minLeftWidth={30}
-          maxLeftWidth={70}
+          initialLeftWidth={20}
+          initialMiddleWidth={45}
+          minLeftWidth={15}
+          minMiddleWidth={35}
+          minRightWidth={20}
         />
       </div>
       {/* File Preview Drawer */}

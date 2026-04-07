@@ -1950,6 +1950,15 @@ Build when you need.`
         add: "+ 添加提示词",
         delete: "删除",
       },
+      chat: {
+        title: "XAgent 助手",
+        subtitle: "通过对话配置你的 Agent",
+        initialMessage: "你好！我是 XAgent 助手。请描述你想创建什么样的 Agent，我会帮你进行配置。",
+        defaultReply: "我已经根据你的要求更新了配置。",
+        errorCommunicate: "与 XAgent 助手通信失败。",
+        errorConnection: "连接错误，请重试。",
+        errorInit: "初始化连接失败。",
+      },
       actions: {
         save: "保存配置",
         reset: "重置",

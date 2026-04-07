@@ -43,6 +43,8 @@ interface ChatInputProps {
   };
   hideConfig?: boolean;
   readOnlyConfig?: boolean;
+  hideFileUpload?: boolean;
+  compact?: boolean;
 }
 
 export function ChatInput({
@@ -58,7 +60,9 @@ export function ChatInput({
   onResume,
   taskConfig,
   hideConfig = false,
-  readOnlyConfig = false
+  readOnlyConfig = false,
+  hideFileUpload = false,
+  compact = false
 }: ChatInputProps) {
   const router = useRouter();
   const [internalMessage, setInternalMessage] = useState("");
@@ -384,7 +388,7 @@ export function ChatInput({
     const items = Array.from(e.clipboardData.items || []);
     const fileItems = items.filter(item => item.kind === 'file');
 
-    if (fileItems.length > 0) {
+    if (fileItems.length > 0 && !hideFileUpload) {
       e.preventDefault();
       const pastedFiles: File[] = [];
 
@@ -536,7 +540,7 @@ export function ChatInput({
         <form
           onSubmit={handleSubmit}
           className={cn(
-            "relative rounded-2xl bg-card overflow-hidden transition-all duration-300 border",
+            "relative rounded-2xl bg-card overflow-hidden transition-all duration-300 border flex flex-col",
             isFocused
               ? "border-primary/50 shadow-md"
               : "border-border shadow-sm hover:border-border/80"
@@ -546,7 +550,8 @@ export function ChatInput({
             ref={editorRef}
             contentEditable
             className={cn(
-              "min-h-[130px] max-h-[300px] w-full rounded-md border-0 bg-transparent px-3 py-2 text-[15px] outline-none placeholder:text-muted-foreground/60 overflow-y-auto resize-none focus-visible:ring-0 focus-visible:ring-offset-0 pb-14 whitespace-pre-wrap break-words text-left",
+              "w-full rounded-md border-0 bg-transparent text-[15px] outline-none placeholder:text-muted-foreground/60 overflow-y-auto resize-none focus-visible:ring-0 focus-visible:ring-offset-0 whitespace-pre-wrap break-words text-left",
+              compact ? "min-h-[44px] px-3 py-3 pr-12 max-h-[150px]" : "min-h-[130px] px-3 py-2 pb-14 max-h-[300px]",
               isLoading ? "opacity-50 pointer-events-none" : ""
             )}
             onInput={handleInput}
@@ -563,109 +568,133 @@ export function ChatInput({
             </div>
           )}
 
-          {/* Bottom toolbar */}
-          <div className="absolute bottom-0 left-0 right-0 flex items-center justify-between px-4 py-3 bg-card">
-            <div className="flex items-center gap-2">
-              {/* Settings button - left of upload */}
-              {!hideConfig && (
-                <>
-                  {readOnlyConfig ? (
+          {/* Bottom toolbar or inline button */}
+          {compact ? (
+            <div className="absolute right-2 bottom-2">
+              <Button
+                type="submit"
+                size="icon"
+                disabled={!canSubmit()}
+                className={cn(
+                  "h-8 w-8 rounded-lg transition-all duration-300",
+                  !canSubmit() && "bg-muted text-muted-foreground/50"
+                )}
+              >
+                {isLoading ? (
+                  <Sparkles className="h-4 w-4 animate-pulse" />
+                ) : (
+                  <ArrowUp className="h-4 w-4" />
+                )}
+              </Button>
+            </div>
+          ) : (
+            <div className="absolute bottom-0 left-0 right-0 flex items-center justify-between bg-card px-4 py-3">
+              <div className="flex items-center gap-2">
+                {/* Settings button - left of upload */}
+                {!hideConfig && (
+                  <>
+                    {readOnlyConfig ? (
+                      <Button
+                        type="button"
+                        variant="ghost"
+                        size="sm"
+                        className="h-9 px-3 text-muted-foreground rounded-xl gap-2 cursor-default hover:bg-transparent"
+                        disabled={true}
+                        title={models.find(m => m.model_id === agentConfig.model)?.model_name || agentConfig.model || t("chatPage.input.noModel")}
+                      >
+                        <Globe className="h-4 w-4" />
+                        <span className="text-xs font-normal max-w-[150px] truncate hidden sm:inline-block">
+                          {models.find(m => m.model_id === agentConfig.model)?.model_name || agentConfig.model || t("chatPage.input.noModel")}
+                        </span>
+                      </Button>
+                    ) : (
+                      <ConfigDialog
+                        onConfigChange={handleConfigChange}
+                        currentConfig={agentConfig}
+                        trigger={
+                          <Button
+                            type="button"
+                            variant="ghost"
+                            size="sm"
+                            className="h-9 px-3 text-muted-foreground hover:text-foreground hover:bg-secondary/80 rounded-xl gap-2"
+                            disabled={isLoading}
+                            title={t('agent.input.actions.config')}
+                          >
+                            <Globe className="h-4 w-4" />
+                            <span className="text-xs font-normal max-w-[150px] truncate hidden sm:inline-block">
+                              {models.find(m => m.model_id === agentConfig.model)?.model_name || agentConfig.model || t("chatPage.input.noModel")}
+                            </span>
+                          </Button>
+                        }
+                      />
+                    )}
+                  </>
+                )}
+                {/* Upload button - adjacent to bottom toolbar */}
+                {!hideFileUpload && (
+                  <>
+                    <input
+                      ref={fileInputRef}
+                      type="file"
+                      multiple
+                      onChange={handleFileSelect}
+                      className="hidden"
+                      accept=".pdf,.doc,.docx,.txt,.md,.csv,.json,.xlsx,.xls,.png,.jpg,.jpeg,.gif,.webp"
+                    />
                     <Button
                       type="button"
                       variant="ghost"
                       size="sm"
-                      className="h-9 px-3 text-muted-foreground rounded-xl gap-2 cursor-default hover:bg-transparent"
-                      disabled={true}
-                      title={models.find(m => m.model_id === agentConfig.model)?.model_name || agentConfig.model || t("chatPage.input.noModel")}
+                      className="h-9 w-9 p-0 text-muted-foreground hover:text-foreground hover:bg-secondary/80 rounded-full"
+                      onClick={() => fileInputRef.current?.click()}
+                      disabled={isLoading}
+                      title={t("chatPage.input.actions.upload")}
                     >
-                      <Globe className="h-4 w-4" />
-                      <span className="text-xs font-normal max-w-[150px] truncate hidden sm:inline-block">
-                        {models.find(m => m.model_id === agentConfig.model)?.model_name || agentConfig.model || t("chatPage.input.noModel")}
-                      </span>
+                      <Paperclip className="h-4 w-4" />
                     </Button>
-                  ) : (
-                    <ConfigDialog
-                      onConfigChange={handleConfigChange}
-                      currentConfig={agentConfig}
-                      trigger={
-                        <Button
-                          type="button"
-                          variant="ghost"
-                          size="sm"
-                          className="h-9 px-3 text-muted-foreground hover:text-foreground hover:bg-secondary/80 rounded-xl gap-2"
-                          disabled={isLoading}
-                          title={t('agent.input.actions.config')}
-                        >
-                          <Globe className="h-4 w-4" />
-                          <span className="text-xs font-normal max-w-[150px] truncate hidden sm:inline-block">
-                            {models.find(m => m.model_id === agentConfig.model)?.model_name || agentConfig.model || t("chatPage.input.noModel")}
-                          </span>
-                        </Button>
-                      }
-                    />
-                  )}
-                </>
-              )}
-              {/* Upload button - adjacent to bottom toolbar */}
-              <input
-                ref={fileInputRef}
-                type="file"
-                multiple
-                onChange={handleFileSelect}
-                className="hidden"
-                accept=".pdf,.doc,.docx,.txt,.md,.csv,.json,.xlsx,.xls,.png,.jpg,.jpeg,.gif,.webp"
-              />
-              <Button
-                type="button"
-                variant="ghost"
-                size="sm"
-                className="h-9 w-9 p-0 text-muted-foreground hover:text-foreground hover:bg-secondary/80 rounded-full"
-                onClick={() => fileInputRef.current?.click()}
-                disabled={isLoading}
-                title={t("chatPage.input.actions.upload")}
-              >
-                <Paperclip className="h-4 w-4" />
-              </Button>
-            </div>
+                  </>
+                )}
+              </div>
 
-            <div className="flex items-center gap-3">
-              {taskStatus === 'running' ? (
-                <Button
-                  type="button"
-                  size="icon"
-                  onClick={onPause}
-                  className="h-8 w-8 rounded-full transition-all duration-300 bg-yellow-500 hover:bg-yellow-600 text-white"
-                >
-                  <Pause className="h-4 w-4" />
-                </Button>
-              ) : taskStatus === 'paused' ? (
-                <Button
-                  type="button"
-                  size="icon"
-                  onClick={onResume}
-                  className="h-8 w-8 rounded-full transition-all duration-300 bg-green-500 hover:bg-green-600 text-white"
-                >
-                  <Play className="h-4 w-4" />
-                </Button>
-              ) : (
-                <Button
-                  type="submit"
-                  size="icon"
-                  disabled={!canSubmit()}
-                  className={cn(
-                    "h-8 w-8 rounded-lg transition-all duration-300",
-                    !canSubmit() && "bg-muted text-muted-foreground/50"
-                  )}
-                >
-                  {isLoading ? (
-                    <Sparkles className="h-4 w-4 animate-pulse" />
-                  ) : (
-                    <ArrowUp className="h-4 w-4" />
-                  )}
-                </Button>
-              )}
+              <div className="flex items-center gap-3">
+                {taskStatus === 'running' ? (
+                  <Button
+                    type="button"
+                    size="icon"
+                    onClick={onPause}
+                    className="h-8 w-8 rounded-full transition-all duration-300 bg-yellow-500 hover:bg-yellow-600 text-white"
+                  >
+                    <Pause className="h-4 w-4" />
+                  </Button>
+                ) : taskStatus === 'paused' ? (
+                  <Button
+                    type="button"
+                    size="icon"
+                    onClick={onResume}
+                    className="h-8 w-8 rounded-full transition-all duration-300 bg-green-500 hover:bg-green-600 text-white"
+                  >
+                    <Play className="h-4 w-4" />
+                  </Button>
+                ) : (
+                  <Button
+                    type="submit"
+                    size="icon"
+                    disabled={!canSubmit()}
+                    className={cn(
+                      "h-8 w-8 rounded-lg transition-all duration-300",
+                      !canSubmit() && "bg-muted text-muted-foreground/50"
+                    )}
+                  >
+                    {isLoading ? (
+                      <Sparkles className="h-4 w-4 animate-pulse" />
+                    ) : (
+                      <ArrowUp className="h-4 w-4" />
+                    )}
+                  </Button>
+                )}
+              </div>
             </div>
-          </div>
+          )}
         </form>
       </div>
 

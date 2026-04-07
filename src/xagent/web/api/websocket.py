@@ -2343,6 +2343,163 @@ async def handle_resume_task(
         raise
 
 
+@ws_router.websocket("/ws/build/chat")
+async def websocket_builder_chat_endpoint(
+    websocket: WebSocket,
+    token: Optional[str] = Query(None, description="Authentication token"),
+) -> None:
+    """WebSocket endpoint for AI Agent Builder Assistant chat."""
+    user = await get_authenticated_user(websocket, token)
+    if not user:
+        await websocket.close(code=4001, reason="Authentication required")
+        return
+
+    await websocket.accept()
+    logger.info(f"Builder chat WebSocket connection established for user {user.id}")
+
+    try:
+        while True:
+            data = await websocket.receive_text()
+            logger.info(f"📨 Received builder chat message: {data[:200]}")
+
+            message_data = json.loads(data)
+
+            # Run in background to not block receiving
+            if (
+                hasattr(websocket.state, "chat_task")
+                and websocket.state.chat_task
+                and not websocket.state.chat_task.done()
+            ):
+                websocket.state.chat_task.cancel()
+
+            websocket.state.chat_task = asyncio.create_task(
+                handle_builder_chat(websocket, message_data, user)
+            )
+
+    except WebSocketDisconnect:
+        logger.info(f"Builder chat WebSocket disconnected for user {user.id}")
+    except (ConnectionError, RuntimeError) as e:
+        logger.error(f"Connection error in builder chat WebSocket: {e}")
+    except Exception as e:
+        logger.error(f"Unexpected error in builder chat WebSocket: {e}")
+
+
+async def handle_builder_chat(
+    websocket: WebSocket,
+    message_data: dict,
+    user: User,
+) -> None:
+    """Handle individual builder chat requests via WebSocket."""
+    import re
+
+    from ..models.database import get_db
+    from ..services.llm_utils import UserAwareModelStorage
+
+    db_gen = get_db()
+    db = next(db_gen)
+
+    try:
+        messages_in = message_data.get("messages", [])
+        current_config = message_data.get("current_config", {})
+        available_options = message_data.get("available_options", {})
+
+        system_prompt = f"""You are an expert AI Agent Builder Assistant.
+Your job is to help the user configure their custom AI agent.
+
+Current Agent Configuration:
+{current_config}
+
+Available Options for advanced configurations:
+- Models: {available_options.get("models", [])}
+- Knowledge Bases: {available_options.get("knowledgeBases", [])}
+- Skills: {available_options.get("skills", [])}
+- Tool Categories: {available_options.get("toolCategories", [])}
+
+If the user wants to change any settings (like name, description, instructions, executionMode, suggestedPrompts, modelConfig, selectedKbs, selectedSkills, or selectedToolCategories), you must output a JSON block inside ```json ... ``` tags that represents the updates to the configuration.
+Only include the fields that need to be updated.
+
+Important format instructions:
+- `modelConfig` is an object with keys: `general`, `small_fast`, `visual`, `compact`, where values are Model IDs (integers).
+- `selectedKbs`, `selectedSkills`, `selectedToolCategories` are arrays of strings (names/categories).
+
+Example JSON output if user says "change name to SupportBot and use Web Search tool":
+```json
+{{"name": "SupportBot", "selectedToolCategories": ["Web Search"]}}
+```
+
+You should also reply conversationally to acknowledge the changes or ask clarifying questions.
+"""
+        messages = [{"role": "system", "content": system_prompt}]
+
+        for msg in messages_in:
+            role = "user" if msg.get("role") == "user" else "assistant"
+            messages.append({"role": role, "content": msg.get("content", "")})
+
+        model_name = current_config.get("model")
+        resolver = UserAwareModelStorage(db)
+        llm = None
+
+        if model_name:
+            llm = resolver.get_llm_by_name_with_access(
+                model_name,
+                user_id=user.id,  # type: ignore[arg-type]
+            )
+
+        if not llm:
+            default_llm, _, _, _ = resolver.get_configured_defaults(
+                user_id=user.id  # type: ignore[arg-type]
+            )
+            llm = default_llm
+
+        if not llm:
+            await websocket.send_text(
+                json.dumps(
+                    {"type": "error", "message": "No LLM configured for builder chat"}
+                )
+            )
+            return
+
+        full_content = ""
+        try:
+            async for chunk in llm.stream_chat(messages=messages):
+                if chunk.is_token() and chunk.delta:
+                    await websocket.send_text(
+                        json.dumps({"type": "message_delta", "delta": chunk.delta})
+                    )
+                    full_content += chunk.delta
+        except Exception as stream_err:
+            logger.error(f"Streaming error in builder chat: {stream_err}")
+            await websocket.send_text(
+                json.dumps({"type": "error", "message": str(stream_err)})
+            )
+            return
+
+        config_updates = {}
+        # Look for JSON block in the response
+        json_match = re.search(r"```json\s*(.*?)\s*```", full_content, re.DOTALL)
+        if json_match:
+            try:
+                config_updates = json.loads(json_match.group(1))
+            except json.JSONDecodeError:
+                pass
+
+        # Send end message with config updates
+        await websocket.send_text(
+            json.dumps(
+                {
+                    "type": "message_end",
+                    "config_updates": config_updates if config_updates else None,
+                }
+            )
+        )
+
+    except Exception as e:
+        logger.error(f"Error handling builder chat: {e}", exc_info=True)
+        await websocket.send_text(json.dumps({"type": "error", "message": str(e)}))
+    finally:
+        db.close()
+
+
 @ws_router.websocket("/ws/build/preview")
 async def websocket_build_preview_endpoint(
     websocket: WebSocket,

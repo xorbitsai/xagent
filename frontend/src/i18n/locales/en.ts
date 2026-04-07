@@ -1945,13 +1945,22 @@ Build when you need.`
       },
       suggestedPrompts: {
         label: "Suggested Prompts",
-        description: "Provide example prompts that users can click to use directly",
+        description: "Provide some example prompts for users to click and use directly",
         placeholder: "Example prompt {index}",
         add: "+ Add Prompt",
         delete: "Delete",
       },
+      chat: {
+        title: "XAgent Assistant",
+        subtitle: "Chat to configure your agent",
+        initialMessage: "Hello! I am your XAgent Assistant. Describe what kind of agent you want to create, and I'll help you configure it.",
+        defaultReply: "I have updated the configuration based on your request.",
+        errorCommunicate: "Failed to communicate with XAgent Assistant.",
+        errorConnection: "Connection error. Please try again.",
+        errorInit: "Failed to initialize connection.",
+      },
       actions: {
-        save: "Save Configuration",
+        save: "Save Config",
         reset: "Reset",
       }
     },

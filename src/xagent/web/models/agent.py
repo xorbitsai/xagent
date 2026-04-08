@@ -3,7 +3,7 @@
 import enum
 from datetime import datetime
 
-from sqlalchemy import JSON, Column, DateTime
+from sqlalchemy import JSON, Boolean, Column, DateTime
 from sqlalchemy import Enum as SQLEnum
 from sqlalchemy import ForeignKey, Integer, String, Text
 from sqlalchemy.orm import relationship
@@ -56,6 +56,12 @@ class Agent(Base):  # type: ignore
 
     # Visual
     logo_url = Column(String(500), nullable=True)
+
+    # Widget Config
+    widget_enabled = Column(Boolean, default=True, nullable=False)
+    allowed_domains = Column(
+        JSON, nullable=True, default=list
+    )  # List of allowed domains for the widget
 
     # Status
     status: AgentStatus = Column(

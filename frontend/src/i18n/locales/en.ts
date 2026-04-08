@@ -272,6 +272,25 @@ Build when you need.`
       },
     },
   },
+  widgetChat: {
+    title: "AI Assistant",
+    status: {
+      initializing: "Initializing...",
+      connecting: "Connecting...",
+      online: "Online"
+    },
+    messages: {
+      welcome: "Hello! How can I help you today?",
+      error_init: "Error initializing chat. Please try again later.",
+      error_prefix: "Error:"
+    },
+    input: {
+      placeholder: "Type your message..."
+    },
+    footer: {
+      powered_by: "Powered by {appName}"
+    }
+  },
   channels: {
     page_title: "Channels Management",
     page_description: "Manage your communication channels and bots.",
@@ -298,6 +317,8 @@ Build when you need.`
       platform: "Platform",
       telegram_bot: "Telegram Bot",
       feishu_bot: "Feishu Bot",
+      name: "Channel Name",
+      name_placeholder: "e.g. My Customer Service",
       bot_token: "Bot Token",
       app_id: "App ID",
       app_secret: "App Secret",
@@ -2668,6 +2689,58 @@ Build when you need.`
     bashPrefix: "Bash:",
     searchPrefix: "Search:"
   },
+  deploy_agent: {
+    title: "Deploy Agent",
+    tabs: {
+      options: "Deploy Options",
+      api: "API",
+      logs: "Logs"
+    },
+    options: {
+      embed: {
+        title: "Embed Widget",
+        desc: "Add a chat widget to any website with a single script tag",
+        action: "Get snippet"
+      },
+      rest_api: {
+        title: "REST API",
+        desc: "Call the agent programmatically from your backend or app",
+        action: "View endpoints"
+      },
+      shareable_link: {
+        title: "Shareable Link",
+        desc: "Generate a public URL anyone can open to chat with this agent",
+        action: "Generate link"
+      },
+      webhook: {
+        title: "Webhook",
+        desc: "Trigger agent runs via webhook events from external systems",
+        action: "Configure"
+      }
+    },
+    api_coming_soon: "REST API documentation coming soon...",
+    logs_coming_soon: "Deployment logs coming soon...",
+    back_to_options: "Back to Deploy Options",
+    access_control: {
+      widget_enabled: "Widget Enabled",
+      widget_enabled_desc: "Allow this widget to be accessed externally.",
+      allowed_domains: "Allowed Domains",
+      allowed_domains_desc: "Restrict widget access to specific domains. Use * for any domain.",
+      domain_placeholder: "e.g. example.com",
+      add_btn: "Add",
+      no_domains: "No domains configured. Widget will block all requests unless * is added."
+    },
+    embed_snippet: {
+      title: "Embed Snippet",
+      desc: "Copy and paste this script tag into the <body> of your website.",
+      copy_btn: "Copy Snippet"
+    },
+    messages: {
+      update_success: "Widget configuration updated",
+      update_failed: "Failed to update widget configuration",
+      copied: "Copied to clipboard"
+    }
+  }
 } as const
 
 export default en

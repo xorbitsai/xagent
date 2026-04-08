@@ -31,6 +31,7 @@ export default function ChannelsPage() {
 
   const [formData, setFormData] = useState({
     channel_type: "telegram",
+    channel_name: "",
     bot_token: "",
     app_id: "",
     app_secret: "",
@@ -64,6 +65,7 @@ export default function ChannelsPage() {
       setEditingChannel(channel)
       setFormData({
         channel_type: channel.channel_type,
+        channel_name: channel.channel_name || "",
         bot_token: channel.config.bot_token || "",
         app_id: channel.config.app_id || "",
         app_secret: channel.config.app_secret || "",
@@ -74,6 +76,7 @@ export default function ChannelsPage() {
       setEditingChannel(null)
       setFormData({
         channel_type: defaultType,
+        channel_name: "",
         bot_token: "",
         app_id: "",
         app_secret: "",
@@ -98,7 +101,7 @@ export default function ChannelsPage() {
 
       const payload = {
         channel_type: formData.channel_type,
-        channel_name: "", // Always send empty to force auto-fetch on backend
+        channel_name: formData.channel_name.trim(),
         config: {
           bot_token: formData.channel_type === "telegram" ? formData.bot_token : undefined,
           app_id: formData.channel_type === "feishu" ? formData.app_id : undefined,
@@ -179,7 +182,7 @@ export default function ChannelsPage() {
   }
 
   return (
-    <div className="w-full p-8 space-y-6">
+    <div className="w-full p-8 space-y-6 overflow-auto">
       <div className="flex justify-between items-center mb-8">
         <div>
           <h1 className="text-3xl font-bold mb-1">{t("channels.page_title")}</h1>
@@ -326,6 +329,18 @@ export default function ChannelsPage() {
                 disabled={!!editingChannel}
               />
             </div>
+
+            {!!editingChannel && (
+              <div className="space-y-2">
+                <Label>{t("channels.dialog.name")}</Label>
+                <Input
+                  type="text"
+                  placeholder={t("channels.dialog.name_placeholder")}
+                  value={formData.channel_name}
+                  onChange={(e) => setFormData(prev => ({ ...prev, channel_name: e.target.value }))}
+                />
+              </div>
+            )}
 
             {formData.channel_type === "telegram" && (
               <div className="space-y-2">

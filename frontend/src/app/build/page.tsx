@@ -3,8 +3,11 @@
 import React, { useState, useEffect } from "react"
 import { SearchInput } from "@/components/ui/search-input"
 import { Button } from "@/components/ui/button"
-import { Plus, Bot, Trash2, MessageSquare, Edit, MoreVertical, Globe, Calendar, Clock } from "lucide-react"
+import { Plus, Bot, Trash2, MessageSquare, Edit, MoreVertical, Globe, Calendar, Clock, Rocket, LayoutGrid, Code2, Share, Webhook, ArrowRight, Copy, Check } from "lucide-react"
 import { Popover, PopoverTrigger, PopoverContent } from "@/components/ui/popover"
+import { Dialog, DialogContent, DialogDescription, DialogHeader, DialogTitle } from "@/components/ui/dialog"
+import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs"
+import { Card, CardHeader, CardTitle, CardDescription, CardContent } from "@/components/ui/card"
 import { useI18n } from "@/contexts/i18n-context"
 import { useRouter, useSearchParams } from "next/navigation"
 import { apiRequest } from "@/lib/api-wrapper"
@@ -15,16 +18,7 @@ import { toast } from "sonner"
 import { Dialog, DialogContent, DialogHeader, DialogTitle } from "@/components/ui/dialog"
 import { Textarea } from "@/components/ui/textarea"
 import { Sparkles, Settings2, ArrowRight } from "lucide-react"
-
-interface Agent {
-  id: number
-  name: string
-  description: string
-  logo_url: string | null
-  status: string
-  created_at: string
-  updated_at: string
-}
+import { DeployAgentDialog, Agent } from "@/components/build/deploy-agent-dialog"
 
 export default function BuildsPage() {
   const { t } = useI18n()
@@ -33,6 +27,9 @@ export default function BuildsPage() {
   const [searchTerm, setSearchTerm] = useState("")
   const [agents, setAgents] = useState<Agent[]>([])
   const [loading, setLoading] = useState(true)
+
+  // Deploy Dialog State
+  const [deployAgent, setDeployAgent] = useState<Agent | null>(null)
 
   // Check for template parameter and redirect to create page
   useEffect(() => {
@@ -188,7 +185,8 @@ export default function BuildsPage() {
                 {filteredAgents.map((agent) => (
                   <div
                     key={agent.id}
-                    className="group relative flex flex-col justify-between space-y-4 rounded-xl border bg-card p-6 shadow-sm transition-all hover:shadow-md hover:border-primary/50"
+                    className="group relative flex flex-col justify-between space-y-4 rounded-xl border bg-card p-6 shadow-sm transition-all hover:shadow-md hover:border-primary/50 cursor-pointer"
+                    onClick={() => router.push(`/build/${agent.id}`)}
                   >
                     <div className="flex-1">
                       <div className="space-y-4">
@@ -285,6 +283,16 @@ export default function BuildsPage() {
                             </Button>
                             <Button
                               variant="outline"
+                              size="icon"
+                              onClick={() => {
+                                setDeployAgent(agent);
+                              }}
+                              title="Deploy"
+                            >
+                              <Rocket className="h-4 w-4" />
+                            </Button>
+                            <Button
+                              variant="outline"
                               className="px-4"
                               onClick={() => router.push(`/build/${agent.id}`)}
                             >
@@ -334,6 +342,16 @@ export default function BuildsPage() {
         onConfirm={confirmDeleteAgent}
         isLoading={isDeletingAgent}
         description={t('builds.list.actions.deleteConfirm')}
+      />
+
+      {/* Deploy Agent Dialog */}
+      <DeployAgentDialog
+        deployAgent={deployAgent}
+        onClose={() => setDeployAgent(null)}
+        onUpdate={(updatedAgent) => {
+          setDeployAgent(updatedAgent)
+          setAgents(agents.map(a => a.id === updatedAgent.id ? updatedAgent : a))
+        }}
       />
 
       <Dialog open={isCreateModalOpen} onOpenChange={setIsCreateModalOpen}>

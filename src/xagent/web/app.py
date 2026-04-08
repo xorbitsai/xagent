@@ -29,6 +29,7 @@ from .api.templates import router as templates_router
 from .api.text2sql import text2sql_router
 from .api.tools import tools_router
 from .api.websocket import ws_router
+from .api.widget import widget_router
 from .dynamic_memory_store import get_memory_store
 from .logging_config import setup_logging
 from .models.database import init_db
@@ -161,6 +162,7 @@ app.include_router(system_router)
 app.include_router(templates_router)
 app.include_router(agents_router)
 app.include_router(channel_router, prefix="/api/channels", tags=["Channels"])
+app.include_router(widget_router)
 
 
 # initial database and skill manager

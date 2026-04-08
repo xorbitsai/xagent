@@ -74,6 +74,8 @@ class AgentUpdateRequest(BaseModel):
         None, description="Suggested prompt examples for users"
     )
     logo_base64: Optional[str] = None
+    widget_enabled: Optional[bool] = None
+    allowed_domains: Optional[List[str]] = None
 
 
 class AgentResponse(BaseModel):
@@ -95,6 +97,8 @@ class AgentResponse(BaseModel):
     published_at: Optional[str]
     created_at: str
     updated_at: str
+    widget_enabled: bool
+    allowed_domains: List[str]
 
 
 class AgentListItem(BaseModel):
@@ -107,6 +111,8 @@ class AgentListItem(BaseModel):
     status: str
     created_at: str
     updated_at: str
+    widget_enabled: bool
+    allowed_domains: List[str]
 
 
 class PublishResponse(BaseModel):
@@ -239,6 +245,8 @@ def _agent_to_response(agent: Agent, db: Session) -> AgentResponse:
         published_at=agent.published_at.isoformat() if agent.published_at else None,
         created_at=agent.created_at.isoformat(),
         updated_at=agent.updated_at.isoformat(),
+        widget_enabled=agent.widget_enabled,
+        allowed_domains=agent.allowed_domains or [],
     )
 
 
@@ -343,6 +351,8 @@ async def create_agent(
             tool_categories=agent_data.tool_categories,
             suggested_prompts=agent_data.suggested_prompts,
             status=AgentStatus.DRAFT,
+            widget_enabled=True,
+            allowed_domains=[],
         )
 
         db.add(agent)
@@ -393,6 +403,8 @@ async def list_agents(
                 updated_at=agent.updated_at.isoformat()
                 if agent.updated_at
                 else agent.created_at.isoformat(),
+                widget_enabled=agent.widget_enabled,
+                allowed_domains=agent.allowed_domains or [],
             )
             for agent in agents
         ]
@@ -493,6 +505,10 @@ async def update_agent(
             agent.execution_mode = agent_data.execution_mode  # type: ignore[assignment]
         if agent_data.suggested_prompts is not None:
             agent.suggested_prompts = agent_data.suggested_prompts  # type: ignore[assignment]
+        if agent_data.widget_enabled is not None:
+            agent.widget_enabled = agent_data.widget_enabled  # type: ignore[assignment]
+        if agent_data.allowed_domains is not None:
+            agent.allowed_domains = agent_data.allowed_domains  # type: ignore[assignment]
 
         # Handle logo
         if agent_data.logo_base64 is not None:

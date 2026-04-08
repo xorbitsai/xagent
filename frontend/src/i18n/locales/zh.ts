@@ -272,6 +272,25 @@ Build when you need.`
       },
     },
   },
+  widgetChat: {
+    title: "AI 助手",
+    status: {
+      initializing: "正在初始化...",
+      connecting: "连接中...",
+      online: "在线"
+    },
+    messages: {
+      welcome: "你好！今天我能为您做些什么？",
+      error_init: "初始化聊天失败，请稍后再试。",
+      error_prefix: "错误："
+    },
+    input: {
+      placeholder: "输入您的消息..."
+    },
+    footer: {
+      powered_by: "由 {appName} 提供"
+    }
+  },
   channels: {
     page_title: "渠道管理",
     page_description: "管理您的沟通渠道和机器人。",
@@ -298,6 +317,8 @@ Build when you need.`
       platform: "平台",
       telegram_bot: "Telegram 机器人",
       feishu_bot: "飞书机器人",
+      name: "渠道名称",
+      name_placeholder: "例如：我的客服",
       bot_token: "Bot Token",
       app_id: "App ID",
       app_secret: "App Secret",
@@ -2668,6 +2689,58 @@ Build when you need.`
     bashPrefix: "Bash命令:",
     searchPrefix: "搜索:"
   },
+  deploy_agent: {
+    title: "部署 Agent",
+    tabs: {
+      options: "部署选项",
+      api: "API",
+      logs: "日志"
+    },
+    options: {
+      embed: {
+        title: "嵌入 Widget",
+        desc: "通过单个 script 标签将聊天组件添加到任何网站",
+        action: "获取代码"
+      },
+      rest_api: {
+        title: "REST API",
+        desc: "从后端或应用以编程方式调用 Agent",
+        action: "查看接口"
+      },
+      shareable_link: {
+        title: "分享链接",
+        desc: "生成一个任何人都可以打开并与此 Agent 聊天的公开 URL",
+        action: "生成链接"
+      },
+      webhook: {
+        title: "Webhook",
+        desc: "通过外部系统的 webhook 事件触发 Agent 运行",
+        action: "配置"
+      }
+    },
+    api_coming_soon: "REST API 文档即将推出...",
+    logs_coming_soon: "部署日志即将推出...",
+    back_to_options: "返回部署选项",
+    access_control: {
+      widget_enabled: "开启 Widget",
+      widget_enabled_desc: "允许外部访问此 Widget 组件。",
+      allowed_domains: "允许的域名",
+      allowed_domains_desc: "限制 Widget 只能在特定的域名上被访问。使用 * 代表所有域名。",
+      domain_placeholder: "例如 example.com",
+      add_btn: "添加",
+      no_domains: "尚未配置域名。除非添加 *，否则 Widget 将拦截所有外部请求。"
+    },
+    embed_snippet: {
+      title: "引入代码",
+      desc: "复制此 script 标签并将其粘贴到网站的 <body> 标签中。",
+      copy_btn: "复制代码"
+    },
+    messages: {
+      update_success: "Widget 配置已更新",
+      update_failed: "Widget 配置更新失败",
+      copied: "已复制到剪贴板"
+    }
+  }
 } as const
 
 export default zh

@@ -1,5 +1,5 @@
 import React, { useState, useRef, useEffect, useCallback } from "react"
-import { Bot, Sparkles } from "lucide-react"
+import { Bot } from "lucide-react"
 import { ChatMessage } from "@/components/chat/ChatMessage"
 import { ChatInput } from "@/components/chat/ChatInput"
 import { ScrollArea } from "@/components/ui/scroll-area"
@@ -11,6 +11,8 @@ import { toast } from "sonner"
 interface Message {
   role: "user" | "assistant" | "system"
   content: string
+  traceEvents?: any[]
+  timestamp?: number
 }
 
 export interface AgentConfig {
@@ -33,12 +35,7 @@ export interface AgentConfig {
 interface AgentBuilderChatProps {
   agentConfig: AgentConfig
   onUpdateConfig: (config: Partial<AgentConfig>) => void
-  availableOptions?: {
-    models: { id: number, name: string }[]
-    knowledgeBases: { name: string }[]
-    skills: { name: string }[]
-    toolCategories: string[]
-  }
+  availableOptions?: any
 }
 
 export function AgentBuilderChat({ agentConfig, onUpdateConfig, availableOptions }: AgentBuilderChatProps) {
@@ -51,7 +48,8 @@ export function AgentBuilderChat({ agentConfig, onUpdateConfig, availableOptions
     setMessages([
       {
         role: "assistant",
-        content: t("builds.configForm.chat.initialMessage") || "Hello! I am your XAgent Assistant. Describe what kind of agent you want to create, and I'll help you configure it."
+        content: t("builds.configForm.chat.initialMessage") || "Hello! I am your XAgent Assistant. Describe what kind of agent you want to create, and I'll help you configure it.",
+        timestamp: Date.now()
       }
     ])
   }, [t])
@@ -85,20 +83,20 @@ export function AgentBuilderChat({ agentConfig, onUpdateConfig, availableOptions
   const handleSendMessage = useCallback((text: string) => {
     if (!text.trim() || isLoading) return
 
-    const newMessages: Message[] = [...messages, { role: "user", content: text }]
+    const newMessages: Message[] = [...messages, { role: "user", content: text, timestamp: Date.now() }]
     setMessages(newMessages)
     setIsLoading(true)
 
     // Add empty assistant message for streaming
-    setMessages(prev => [...prev, { role: "assistant", content: "" }])
+    setMessages(prev => [...prev, { role: "assistant", content: "", traceEvents: [], timestamp: Date.now() }])
 
     let currentReply = ""
 
     const sendPayload = (ws: WebSocket) => {
       ws.send(JSON.stringify({
-        messages: newMessages.map(m => ({ role: m.role, content: m.content })),
-        current_config: agentConfig,
-        available_options: availableOptions
+        message: text,
+        ...agentConfig,
+        models: agentConfig.modelConfig || {}
       }))
     }
 
@@ -120,37 +118,81 @@ export function AgentBuilderChat({ agentConfig, onUpdateConfig, availableOptions
           try {
             const data = JSON.parse(event.data)
 
-            if (data.type === "message_delta") {
-              currentReply += data.delta
-
-              // Clean up partial or complete JSON blocks during streaming
-              const displayReply = currentReply.replace(/```json[\s\S]*?(```|$)/gi, "").trim()
-
+            if (data.type === "trace_event") {
+              // Update the last message (assistant) with the new trace event
               setMessages(prev => {
                 const updated = [...prev]
-                updated[updated.length - 1].content = displayReply
+                const lastMsg = updated[updated.length - 1]
+                if (lastMsg && lastMsg.role === 'assistant') {
+                  updated[updated.length - 1] = {
+                    ...lastMsg,
+                    traceEvents: [...(lastMsg.traceEvents || []), data]
+                  }
+                }
                 return updated
               })
-            } else if (data.type === "message_end") {
+
+              if (data.event_type === "ai_message") {
+                if (data.data?.message_type === "reasoning") {
+                  // Do not update the main message content for reasoning.
+                  // TraceEventRenderer will handle displaying it in the execution logs.
+                } else {
+                  currentReply = data.data.content || ""
+
+                  const displayReply = currentReply.replace(/```json[\s\S]*?(```|$)/gi, "").trim()
+
+                  setMessages(prev => {
+                    const updated = [...prev]
+                    updated[updated.length - 1].content = displayReply
+                    return updated
+                  })
+                }
+              } else if (data.event_type === "tool_execution_start") {
+                // Update state to indicate tool is running if needed
+                console.log("Tool execution started:", data.data)
+              } else if (data.event_type === "tool_execution_end") {
+                // Tool finished
+                console.log("Tool execution ended:", data.data)
+                if (data.data && data.data.tool_name === "create_agent" && data.data.tool_args && typeof data.data.tool_args === 'object') {
+                  // Extract configuration updates from tool_args and agent_id from result
+                  const toolArgs = data.data.tool_args;
+                  const result = data.data.result || {};
+
+                  const configUpdates: Partial<AgentConfig> = {};
+                  if (toolArgs.name) configUpdates.name = toolArgs.name;
+                  if (toolArgs.description) configUpdates.description = toolArgs.description;
+                  if (toolArgs.instructions) configUpdates.instructions = toolArgs.instructions;
+                  if (Object.keys(configUpdates).length > 0) {
+                    onUpdateConfig(configUpdates);
+                  }
+
+                  // Update URL if agent was created
+                  if (result.status === "success" && result.agent_id) {
+                    const currentUrl = window.location.pathname;
+                    if (currentUrl === '/build/new' || currentUrl === '/build') {
+                      window.history.pushState({}, '', `/build/${result.agent_id}`);
+                    }
+                  }
+                }
+              }
+            } else if (data.type === "task_completed") {
               setIsLoading(false)
 
-              if (data.config_updates && Object.keys(data.config_updates).length > 0) {
-                onUpdateConfig(data.config_updates)
-              }
+              // The backend no longer sends config_updates in task_completed.
+              // We handle it in tool_execution_end.
 
-              // Clean up the JSON block from the final message text to make it look clean
-              const cleanReply = currentReply.replace(/```json[\s\S]*?(```|$)/gi, "").trim()
+              const finalContent = data.result || currentReply;
+              const cleanReply = finalContent.replace(/```json[\s\S]*?(```|$)/gi, "").trim()
               setMessages(prev => {
                 const updated = [...prev]
                 updated[updated.length - 1].content = cleanReply || t("builds.configForm.chat.defaultReply") || "I have updated the configuration based on your request."
                 return updated
               })
 
-              // Reset reply state for the next message on the same connection
               currentReply = ""
-            } else if (data.type === "error") {
+            } else if (data.type === "error" || data.type === "task_error") {
               setIsLoading(false)
-              toast.error(data.message || t("builds.configForm.chat.errorCommunicate") || "Failed to communicate with XAgent Assistant.")
+              toast.error(data.message || data.error || t("builds.configForm.chat.errorCommunicate") || "Failed to communicate with XAgent Assistant.")
               ws.close()
             }
           } catch (e) {
@@ -202,6 +244,9 @@ export function AgentBuilderChat({ agentConfig, onUpdateConfig, availableOptions
               key={index}
               role={msg.role}
               content={msg.content}
+              traceEvents={msg.traceEvents}
+              showProcessView={true}
+              timestamp={msg.timestamp}
             />
           ))}
         </div>

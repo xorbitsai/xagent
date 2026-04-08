@@ -8,7 +8,7 @@ import unicodedata
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Optional, cast
+from typing import Any, Dict, List, Optional, Union, cast
 from urllib.parse import unquote
 
 from fastapi import (
@@ -23,6 +23,7 @@ from fastapi.responses import RedirectResponse
 from sqlalchemy.orm import Session
 
 from ...config import get_external_upload_dirs, get_uploads_dir
+from ...core.agent.trace import TraceEvent, TraceHandler
 from ..auth_dependencies import get_user_from_websocket_token
 from ..models.database import get_db
 from ..models.task import Task
@@ -127,7 +128,7 @@ def build_unique_target_path(target_dir: Any, filename: str) -> Any:
 
 def create_stream_event(
     event_type: str,
-    task_id: int,
+    task_id: Union[int, str],
     data: Dict[str, Any],
     timestamp: Optional[Any] = None,
 ) -> Dict[str, Any]:
@@ -845,6 +846,103 @@ class BackgroundTaskManager:
 
 # Global background task manager
 background_task_manager = BackgroundTaskManager()
+
+
+class SharedWebSocketTracer(TraceHandler):
+    """Shared WebSocket tracer that sends events directly to WebSocket with proper JSON serialization."""
+
+    def __init__(self, ws: WebSocket, task_id: str, is_preview: bool = False):
+        self.ws = ws
+        self.task_id = task_id
+        self.is_preview = is_preview
+        self._closed = False
+
+    def _serialize_data(self, data: Dict[str, Any]) -> Dict[str, Any]:
+        """Recursively serialize data to ensure JSON compatibility."""
+        import json
+        from datetime import datetime, timezone
+
+        def clean_string(value: str) -> str:
+            if not isinstance(value, str):
+                return value
+            cleaned = value.replace("\x00", "").replace("\u0000", "")
+            cleaned = "".join(
+                char for char in cleaned if ord(char) >= 32 or char in "\n\r\t"
+            )
+            return cleaned
+
+        def serialize_value(value: Any) -> Any:
+            if hasattr(value, "model_dump"):
+                return serialize_value(value.model_dump())
+            elif hasattr(value, "dict"):
+                return serialize_value(value.dict())
+            elif isinstance(value, datetime):
+                if value.tzinfo is None:
+                    value = value.replace(tzinfo=timezone.utc)
+                return value.timestamp()
+            elif isinstance(value, str):
+                return clean_string(value)
+            elif isinstance(value, dict):
+                return {k: serialize_value(v) for k, v in value.items()}
+            elif isinstance(value, (list, tuple)):
+                return [serialize_value(item) for item in value]
+            elif isinstance(value, bytes):
+                try:
+                    return clean_string(value.decode("utf-8"))
+                except UnicodeDecodeError:
+                    return f"<bytes: {len(value)}>"
+            else:
+                return value
+
+        try:
+            cleaned_data = cast(Dict[str, Any], serialize_value(data))
+            json.dumps(cleaned_data)
+            return cleaned_data
+        except Exception as e:
+            logger.warning(f"Failed to serialize data for JSON: {e}")
+            return {"_serialization_error": str(e)}
+
+    async def handle_event(self, event: TraceEvent) -> None:
+        """Convert and send trace event to WebSocket."""
+        # Skip if WebSocket is already closed
+        if self._closed:
+            return
+
+        try:
+            from .ws_trace_handlers import get_event_type_mapping
+
+            # Convert trace event to stream format
+            event_type_str = get_event_type_mapping(event)
+            serialized_data = self._serialize_data(event.data)
+
+            stream_event = create_stream_event(
+                event_type_str,
+                0 if self.is_preview else self.task_id,
+                serialized_data,
+                event.timestamp,
+            )
+
+            if event.step_id:
+                stream_event["step_id"] = event.step_id
+            if event.parent_id:
+                stream_event["parent_id"] = event.parent_id
+            if self.is_preview:
+                stream_event["is_preview"] = True
+
+            await self.ws.send_text(json.dumps(stream_event))
+
+        except (RuntimeError, ConnectionError) as e:
+            error_msg = str(e)
+            if (
+                "close" in error_msg.lower()
+                or "response already completed" in error_msg.lower()
+            ):
+                self._closed = True
+                logger.debug(f"WebSocket connection closed: {e}")
+            else:
+                logger.warning(f"WebSocket error in tracer: {e}")
+        except Exception as e:
+            logger.warning(f"Failed to send trace event: {e}")
 
 
 # WebSocket router
@@ -2420,66 +2518,29 @@ async def handle_builder_chat(
         websocket.state.builder_task_id = f"builder_chat_{uuid.uuid4().hex[:8]}"
     builder_task_id = websocket.state.builder_task_id
 
-    # Custom tracer that intercepts LLM responses and streams them to frontend
-    class StreamingTracer:
-        """Tracer that streams LLM responses to frontend in real-time."""
+    from ...core.agent.trace import Tracer
 
-        def __init__(self, ws: WebSocket):
-            self.ws = ws
-            self._closed = False
-            self.current_response = ""
-
-        async def stream_delta(self, delta: str) -> None:
-            """Stream a text delta to the frontend."""
-            if self._closed:
-                return
-            try:
-                await self.ws.send_text(
-                    json.dumps({"type": "message_delta", "delta": delta})
-                )
-            except (RuntimeError, ConnectionError) as e:
-                error_msg = str(e)
-                if (
-                    "close" in error_msg.lower()
-                    or "response already completed" in error_msg.lower()
-                ):
-                    self._closed = True
-                    logger.debug(f"WebSocket connection closed for builder chat: {e}")
-                else:
-                    logger.warning(f"WebSocket error in builder chat: {e}")
-            except Exception as e:
-                logger.warning(f"Failed to send message delta: {e}")
-
-        async def send_end(self, config_updates: dict | None = None) -> None:
-            """Send message end event."""
-            if self._closed:
-                return
-            try:
-                await self.ws.send_text(
-                    json.dumps(
-                        {"type": "message_end", "config_updates": config_updates}
-                    )
-                )
-            except (RuntimeError, ConnectionError) as e:
-                error_msg = str(e)
-                if (
-                    "close" in error_msg.lower()
-                    or "response already completed" in error_msg.lower()
-                ):
-                    self._closed = True
-                    logger.debug(f"WebSocket connection closed for builder chat: {e}")
-                else:
-                    logger.warning(f"WebSocket error in builder chat: {e}")
-            except Exception as e:
-                logger.warning(f"Failed to send message end: {e}")
-
-    # Create streaming tracer
-    streaming_tracer = StreamingTracer(websocket)
+    builder_tracer = Tracer()
+    builder_tracer.add_handler(
+        SharedWebSocketTracer(websocket, builder_task_id, is_preview=False)
+    )
 
     try:
-        messages_in = message_data.get("messages", [])
-        current_config = message_data.get("current_config", {})
-        available_options = message_data.get("available_options", {})
+        user_message = message_data.get("message", "")
+        # Build current_config back from top-level keys
+        current_config = {
+            "name": message_data.get("name", ""),
+            "description": message_data.get("description", ""),
+            "instructions": message_data.get("instructions", ""),
+            "model": message_data.get("models", {}).get("general"),
+        }
+        # Build available_options back
+        available_options = {
+            "models": message_data.get("models", {}),
+            "knowledgeBases": message_data.get("knowledge_bases", []),
+            "skills": message_data.get("skills", []),
+            "toolCategories": message_data.get("tool_categories", []),
+        }
 
         # Build system prompt with context
         system_prompt = f"""You are an expert AI Agent Builder Assistant.
@@ -2573,7 +2634,7 @@ Use the create_agent tool whenever the user wants to build a new agent or modify
                 workspace_base_dir=str(get_uploads_dir() / "builder_chat"),
                 allowed_external_dirs=allowed_external_dirs,
                 task_id=builder_task_id,
-                tracer=None,  # No tracer needed for streaming
+                tracer=builder_tracer,  # Using common websocket tracer
             )
 
             # Save agent service to websocket state for reuse
@@ -2583,15 +2644,20 @@ Use the create_agent tool whenever the user wants to build a new agent or modify
             )
         else:
             agent_service = websocket.state.builder_agent_service
+            # Update tracer to the new connection
+            agent_service.tracer = builder_tracer
+            if hasattr(agent_service, "agent") and hasattr(
+                agent_service.agent, "patterns"
+            ):
+                for pattern in agent_service.agent.patterns:
+                    if hasattr(pattern, "tracer"):
+                        pattern.tracer = builder_tracer
             logger.info(
                 f"Reusing existing builder chat agent service with task_id: {builder_task_id}"
             )
 
-        # Build conversation history
-        if messages_in:
-            last_message = messages_in[-1]
-            user_message = last_message.get("content", "")
-
+        # Execute task with the agent
+        if user_message:
             # Build execution context with system prompt
             execution_context: dict[str, Any] = {
                 "system_prompt": system_prompt,
@@ -2605,17 +2671,22 @@ Use the create_agent tool whenever the user wants to build a new agent or modify
                     task_id=builder_task_id,
                 )
 
-            # Get the final output and stream it to frontend
-            output = result.get("output", "")
-            if output:
-                # Stream the output word by word for better UX
-                words = output.split()
-                for i, word in enumerate(words):
-                    chunk = word if i == len(words) - 1 else word + " "
-                    await streaming_tracer.stream_delta(chunk)
-
-            # Send message end event (no config updates from agent execution)
-            await streaming_tracer.send_end(config_updates=None)
+            # Send task_completed event to match the preview flow behavior
+            # which relies on Trace events but might need a final completion indicator
+            try:
+                await websocket.send_text(
+                    json.dumps(
+                        {
+                            "type": "task_completed",
+                            "task_id": builder_task_id,
+                            "result": result.get("output", ""),
+                            "success": result.get("success", True),
+                            "timestamp": datetime.now(timezone.utc).timestamp(),
+                        }
+                    )
+                )
+            except Exception as e:
+                logger.warning(f"Failed to send task_completed: {e}")
 
     except Exception as e:
         logger.error(f"Error handling builder chat: {e}", exc_info=True)
@@ -2758,7 +2829,7 @@ async def handle_build_preview_execution(
     from sqlalchemy.orm import Session
 
     from ...core.agent.service import AgentService
-    from ...core.agent.trace import TraceEvent, TraceHandler, Tracer
+    from ...core.agent.trace import Tracer
     from ...core.memory.in_memory import InMemoryMemoryStore
     from ..models.database import get_db
     from ..models.model import Model as DBModel
@@ -2787,60 +2858,11 @@ async def handle_build_preview_execution(
     # Generate temporary task_id
     preview_task_id = f"build_preview_{uuid.uuid4().hex[:8]}"
 
-    # Create simple WebSocket tracer with connection state tracking
-    class WebSocketTracer(TraceHandler):
-        """Simple tracer that sends events directly to WebSocket."""
-
-        def __init__(self, ws: WebSocket, task_id: str):
-            self.ws = ws
-            self.task_id = task_id
-            self._closed = False
-
-        async def handle_event(self, event: TraceEvent) -> None:
-            """Convert and send trace event to WebSocket."""
-            # Skip if WebSocket is already closed
-            if self._closed:
-                return
-
-            try:
-                from .ws_trace_handlers import get_event_type_mapping
-
-                # Convert trace event to stream format
-                event_type_str = get_event_type_mapping(event)
-
-                stream_event = create_stream_event(
-                    event_type_str,
-                    0,  # task_id not used for preview
-                    event.data,
-                    event.timestamp,
-                )
-
-                if event.step_id:
-                    stream_event["step_id"] = event.step_id
-                if event.parent_id:
-                    stream_event["parent_id"] = event.parent_id
-                stream_event["is_preview"] = True
-
-                await self.ws.send_text(json.dumps(stream_event))
-
-            except (RuntimeError, ConnectionError) as e:
-                # WebSocket connection closed - mark as closed to prevent future sends
-                error_msg = str(e)
-                if (
-                    "close" in error_msg.lower()
-                    or "response already completed" in error_msg.lower()
-                ):
-                    self._closed = True
-                    logger.debug(f"WebSocket connection closed for preview: {e}")
-                else:
-                    logger.warning(f"WebSocket error in preview tracer: {e}")
-            except Exception as e:
-                # Log other unexpected errors
-                logger.warning(f"Failed to send preview trace event: {e}")
-
     # Create Tracer instance with WebSocket handler
     preview_tracer = Tracer()
-    preview_tracer.add_handler(WebSocketTracer(websocket, preview_task_id))
+    preview_tracer.add_handler(
+        SharedWebSocketTracer(websocket, preview_task_id, is_preview=True)
+    )
 
     # Get database session
     db_gen = get_db()

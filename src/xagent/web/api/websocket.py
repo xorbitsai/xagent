@@ -2389,22 +2389,101 @@ async def handle_builder_chat(
     message_data: dict,
     user: User,
 ) -> None:
-    """Handle individual builder chat requests via WebSocket."""
-    import re
+    """Handle individual builder chat requests via WebSocket using an in-memory ReAct agent.
 
+    This creates an agent that only has access to the 'create_agent' tool, allowing
+    dynamic agent creation during the conversation.
+
+    Sends messages in the format expected by the frontend:
+    - message_delta: Streaming text chunks
+    - message_end: Final message with optional config_updates
+    - error: Error messages
+
+    Performance optimizations:
+    - Reuses AgentService across messages (only creates on first message)
+    - Pre-creates CreateAgentTool directly without full tool loading
+    - Caches LLM configuration in websocket state
+    """
+    import uuid
+
+    from ...core.agent.service import AgentService
+    from ...core.memory.in_memory import InMemoryMemoryStore
+    from ...core.tools.adapters.vibe.agent_tool import CreateAgentTool
     from ..models.database import get_db
     from ..services.llm_utils import UserAwareModelStorage
 
     db_gen = get_db()
     db = next(db_gen)
 
+    # Generate task_id for builder chat (reuse if exists)
+    if not hasattr(websocket.state, "builder_task_id"):
+        websocket.state.builder_task_id = f"builder_chat_{uuid.uuid4().hex[:8]}"
+    builder_task_id = websocket.state.builder_task_id
+
+    # Custom tracer that intercepts LLM responses and streams them to frontend
+    class StreamingTracer:
+        """Tracer that streams LLM responses to frontend in real-time."""
+
+        def __init__(self, ws: WebSocket):
+            self.ws = ws
+            self._closed = False
+            self.current_response = ""
+
+        async def stream_delta(self, delta: str) -> None:
+            """Stream a text delta to the frontend."""
+            if self._closed:
+                return
+            try:
+                await self.ws.send_text(
+                    json.dumps({"type": "message_delta", "delta": delta})
+                )
+            except (RuntimeError, ConnectionError) as e:
+                error_msg = str(e)
+                if (
+                    "close" in error_msg.lower()
+                    or "response already completed" in error_msg.lower()
+                ):
+                    self._closed = True
+                    logger.debug(f"WebSocket connection closed for builder chat: {e}")
+                else:
+                    logger.warning(f"WebSocket error in builder chat: {e}")
+            except Exception as e:
+                logger.warning(f"Failed to send message delta: {e}")
+
+        async def send_end(self, config_updates: dict | None = None) -> None:
+            """Send message end event."""
+            if self._closed:
+                return
+            try:
+                await self.ws.send_text(
+                    json.dumps(
+                        {"type": "message_end", "config_updates": config_updates}
+                    )
+                )
+            except (RuntimeError, ConnectionError) as e:
+                error_msg = str(e)
+                if (
+                    "close" in error_msg.lower()
+                    or "response already completed" in error_msg.lower()
+                ):
+                    self._closed = True
+                    logger.debug(f"WebSocket connection closed for builder chat: {e}")
+                else:
+                    logger.warning(f"WebSocket error in builder chat: {e}")
+            except Exception as e:
+                logger.warning(f"Failed to send message end: {e}")
+
+    # Create streaming tracer
+    streaming_tracer = StreamingTracer(websocket)
+
     try:
         messages_in = message_data.get("messages", [])
         current_config = message_data.get("current_config", {})
         available_options = message_data.get("available_options", {})
 
+        # Build system prompt with context
         system_prompt = f"""You are an expert AI Agent Builder Assistant.
-Your job is to help the user configure their custom AI agent.
+Your job is to help users create and configure custom AI agents.
 
 Current Agent Configuration:
 {current_config}
@@ -2415,26 +2494,22 @@ Available Options for advanced configurations:
 - Skills: {available_options.get("skills", [])}
 - Tool Categories: {available_options.get("toolCategories", [])}
 
-If the user wants to change any settings (like name, description, instructions, executionMode, suggestedPrompts, modelConfig, selectedKbs, selectedSkills, or selectedToolCategories), you must output a JSON block inside ```json ... ``` tags that represents the updates to the configuration.
-Only include the fields that need to be updated.
+When the user describes what they want to build, use the create_agent tool to create the agent for them.
+The agent will be created immediately and can be used right away.
 
-Important format instructions:
-- `modelConfig` is an object with keys: `general`, `small_fast`, `visual`, `compact`, where values are Model IDs (integers).
-- `selectedKbs`, `selectedSkills`, `selectedToolCategories` are arrays of strings (names/categories).
+Important instructions:
+1. Always create agents with clear, descriptive names and detailed descriptions
+2. The description should explain WHEN to use this agent (e.g., "Use this agent for data analysis tasks involving CSV files")
+3. Include appropriate tool_categories and skills based on the user's requirements
+4. After creating an agent, present it to the user in a clear format with the markdown link
 
-Example JSON output if user says "change name to SupportBot and use Web Search tool":
-```json
-{{"name": "SupportBot", "selectedToolCategories": ["Web Search"]}}
-```
+You have access to the following tool:
+- create_agent: Create a new agent with specific capabilities
 
-You should also reply conversationally to acknowledge the changes or ask clarifying questions.
+Use the create_agent tool whenever the user wants to build a new agent or modify their current agent configuration.
 """
-        messages = [{"role": "system", "content": system_prompt}]
 
-        for msg in messages_in:
-            role = "user" if msg.get("role") == "user" else "assistant"
-            messages.append({"role": role, "content": msg.get("content", "")})
-
+        # Get LLM configuration
         model_name = current_config.get("model")
         resolver = UserAwareModelStorage(db)
         llm = None
@@ -2446,8 +2521,10 @@ You should also reply conversationally to acknowledge the changes or ask clarify
             )
 
         if not llm:
-            default_llm, _, _, _ = resolver.get_configured_defaults(
-                user_id=user.id  # type: ignore[arg-type]
+            default_llm, fast_llm, vision_llm, compact_llm = (
+                resolver.get_configured_defaults(
+                    user_id=user.id  # type: ignore[arg-type]
+                )
             )
             llm = default_llm
 
@@ -2459,39 +2536,86 @@ You should also reply conversationally to acknowledge the changes or ask clarify
             )
             return
 
-        full_content = ""
-        try:
-            async for chunk in llm.stream_chat(messages=messages):
-                if chunk.is_token() and chunk.delta:
-                    await websocket.send_text(
-                        json.dumps({"type": "message_delta", "delta": chunk.delta})
-                    )
-                    full_content += chunk.delta
-        except Exception as stream_err:
-            logger.error(f"Streaming error in builder chat: {stream_err}")
-            await websocket.send_text(
-                json.dumps({"type": "error", "message": str(stream_err)})
-            )
-            return
+        # Create or reuse agent service (only create once)
+        if not hasattr(websocket.state, "builder_agent_service"):
+            # Create or get memory for builder chat
+            if not hasattr(websocket.state, "builder_memory"):
+                websocket.state.builder_memory = InMemoryMemoryStore()
+            memory = websocket.state.builder_memory
 
-        config_updates = {}
-        # Look for JSON block in the response
-        json_match = re.search(r"```json\s*(.*?)\s*```", full_content, re.DOTALL)
-        if json_match:
-            try:
-                config_updates = json.loads(json_match.group(1))
-            except json.JSONDecodeError:
-                pass
-
-        # Send end message with config updates
-        await websocket.send_text(
-            json.dumps(
-                {
-                    "type": "message_end",
-                    "config_updates": config_updates if config_updates else None,
-                }
+            # Create only the CreateAgentTool directly (much faster than loading all tools)
+            create_agent_tool = CreateAgentTool(
+                db=db,
+                user_id=int(user.id),
+                task_id=builder_task_id,
+                workspace_base_dir=str(get_uploads_dir() / "builder_chat"),
             )
-        )
+
+            # Build allowed external directories
+            allowed_external_dirs = []
+            if user and user.id:
+                user_upload_dir = get_uploads_dir() / f"user_{user.id}"
+                allowed_external_dirs.append(str(user_upload_dir))
+            allowed_external_dirs.extend([str(d) for d in get_external_upload_dirs()])
+
+            # Create agent service with pre-built tool (no WebToolConfig needed)
+            agent_service = AgentService(
+                name="builder_chat_agent",
+                llm=llm,
+                fast_llm=None,  # No fast llm for builder chat
+                vision_llm=None,
+                compact_llm=None,
+                memory=memory,
+                tools=[create_agent_tool],  # Direct tool creation
+                use_dag_pattern=False,  # Use ReAct pattern
+                id=builder_task_id,
+                enable_workspace=True,
+                workspace_base_dir=str(get_uploads_dir() / "builder_chat"),
+                allowed_external_dirs=allowed_external_dirs,
+                task_id=builder_task_id,
+                tracer=None,  # No tracer needed for streaming
+            )
+
+            # Save agent service to websocket state for reuse
+            websocket.state.builder_agent_service = agent_service
+            logger.info(
+                f"Created new builder chat agent service with task_id: {builder_task_id}"
+            )
+        else:
+            agent_service = websocket.state.builder_agent_service
+            logger.info(
+                f"Reusing existing builder chat agent service with task_id: {builder_task_id}"
+            )
+
+        # Build conversation history
+        if messages_in:
+            last_message = messages_in[-1]
+            user_message = last_message.get("content", "")
+
+            # Build execution context with system prompt
+            execution_context: dict[str, Any] = {
+                "system_prompt": system_prompt,
+            }
+
+            # Execute task with the agent
+            with UserContext(int(user.id)):
+                result = await agent_service.execute_task(
+                    task=user_message,
+                    context=execution_context,
+                    task_id=builder_task_id,
+                )
+
+            # Get the final output and stream it to frontend
+            output = result.get("output", "")
+            if output:
+                # Stream the output word by word for better UX
+                words = output.split()
+                for i, word in enumerate(words):
+                    chunk = word if i == len(words) - 1 else word + " "
+                    await streaming_tracer.stream_delta(chunk)
+
+            # Send message end event (no config updates from agent execution)
+            await streaming_tracer.send_end(config_updates=None)
 
     except Exception as e:
         logger.error(f"Error handling builder chat: {e}", exc_info=True)
@@ -2663,16 +2787,21 @@ async def handle_build_preview_execution(
     # Generate temporary task_id
     preview_task_id = f"build_preview_{uuid.uuid4().hex[:8]}"
 
-    # Create simple WebSocket tracer
+    # Create simple WebSocket tracer with connection state tracking
     class WebSocketTracer(TraceHandler):
         """Simple tracer that sends events directly to WebSocket."""
 
         def __init__(self, ws: WebSocket, task_id: str):
             self.ws = ws
             self.task_id = task_id
+            self._closed = False
 
         async def handle_event(self, event: TraceEvent) -> None:
             """Convert and send trace event to WebSocket."""
+            # Skip if WebSocket is already closed
+            if self._closed:
+                return
+
             try:
                 from .ws_trace_handlers import get_event_type_mapping
 
@@ -2694,7 +2823,19 @@ async def handle_build_preview_execution(
 
                 await self.ws.send_text(json.dumps(stream_event))
 
+            except (RuntimeError, ConnectionError) as e:
+                # WebSocket connection closed - mark as closed to prevent future sends
+                error_msg = str(e)
+                if (
+                    "close" in error_msg.lower()
+                    or "response already completed" in error_msg.lower()
+                ):
+                    self._closed = True
+                    logger.debug(f"WebSocket connection closed for preview: {e}")
+                else:
+                    logger.warning(f"WebSocket error in preview tracer: {e}")
             except Exception as e:
+                # Log other unexpected errors
                 logger.warning(f"Failed to send preview trace event: {e}")
 
     # Create Tracer instance with WebSocket handler

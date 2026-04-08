@@ -92,79 +92,83 @@ export function AgentBuilderChat({ agentConfig, onUpdateConfig, availableOptions
     // Add empty assistant message for streaming
     setMessages(prev => [...prev, { role: "assistant", content: "" }])
 
-    // Close existing connection if any
-    if (wsRef.current) {
-      wsRef.current.close()
+    let currentReply = ""
+
+    const sendPayload = (ws: WebSocket) => {
+      ws.send(JSON.stringify({
+        messages: newMessages.map(m => ({ role: m.role, content: m.content })),
+        current_config: agentConfig,
+        available_options: availableOptions
+      }))
     }
 
     try {
-      const wsUrl = getApiUrl().replace(/^http/, "ws") + `/ws/build/chat?token=${token}`
-      const ws = new WebSocket(wsUrl)
-      wsRef.current = ws
+      if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
+        // Reuse existing connection
+        sendPayload(wsRef.current)
+      } else {
+        // Create new connection if none exists or it was closed
+        const wsUrl = getApiUrl().replace(/^http/, "ws") + `/ws/build/chat?token=${token}`
+        const ws = new WebSocket(wsUrl)
+        wsRef.current = ws
 
-      ws.onopen = () => {
-        // Send the payload
-        ws.send(JSON.stringify({
-          messages: newMessages.map(m => ({ role: m.role, content: m.content })),
-          current_config: agentConfig,
-          available_options: availableOptions
-        }))
-      }
+        ws.onopen = () => {
+          sendPayload(ws)
+        }
 
-      let currentReply = ""
+        ws.onmessage = (event) => {
+          try {
+            const data = JSON.parse(event.data)
 
-      ws.onmessage = (event) => {
-        try {
-          const data = JSON.parse(event.data)
+            if (data.type === "message_delta") {
+              currentReply += data.delta
 
-          if (data.type === "message_delta") {
-            currentReply += data.delta
+              // Clean up partial or complete JSON blocks during streaming
+              const displayReply = currentReply.replace(/```json[\s\S]*?(```|$)/gi, "").trim()
 
-            // Clean up partial or complete JSON blocks during streaming
-            const displayReply = currentReply.replace(/```json[\s\S]*?(```|$)/gi, "").trim()
+              setMessages(prev => {
+                const updated = [...prev]
+                updated[updated.length - 1].content = displayReply
+                return updated
+              })
+            } else if (data.type === "message_end") {
+              setIsLoading(false)
 
-            setMessages(prev => {
-              const updated = [...prev]
-              updated[updated.length - 1].content = displayReply
-              return updated
-            })
-          } else if (data.type === "message_end") {
-            setIsLoading(false)
+              if (data.config_updates && Object.keys(data.config_updates).length > 0) {
+                onUpdateConfig(data.config_updates)
+              }
 
-            if (data.config_updates && Object.keys(data.config_updates).length > 0) {
-              onUpdateConfig(data.config_updates)
+              // Clean up the JSON block from the final message text to make it look clean
+              const cleanReply = currentReply.replace(/```json[\s\S]*?(```|$)/gi, "").trim()
+              setMessages(prev => {
+                const updated = [...prev]
+                updated[updated.length - 1].content = cleanReply || t("builds.configForm.chat.defaultReply") || "I have updated the configuration based on your request."
+                return updated
+              })
+
+              // Reset reply state for the next message on the same connection
+              currentReply = ""
+            } else if (data.type === "error") {
+              setIsLoading(false)
+              toast.error(data.message || t("builds.configForm.chat.errorCommunicate") || "Failed to communicate with XAgent Assistant.")
+              ws.close()
             }
-
-            // Clean up the JSON block from the final message text to make it look clean
-            const cleanReply = currentReply.replace(/```json[\s\S]*?(```|$)/gi, "").trim()
-            setMessages(prev => {
-              const updated = [...prev]
-              updated[updated.length - 1].content = cleanReply || t("builds.configForm.chat.defaultReply") || "I have updated the configuration based on your request."
-              return updated
-            })
-
-            ws.close()
-          } else if (data.type === "error") {
-            setIsLoading(false)
-            toast.error(data.message || t("builds.configForm.chat.errorCommunicate") || "Failed to communicate with XAgent Assistant.")
-            ws.close()
+          } catch (e) {
+            console.error("Error parsing WebSocket message:", e)
           }
-        } catch (e) {
-          console.error("Error parsing WebSocket message:", e)
+        }
+
+        ws.onerror = (error) => {
+          console.error("WebSocket error:", error)
+          setIsLoading(false)
+          toast.error(t("builds.configForm.chat.errorConnection") || "Connection error. Please try again.")
+        }
+
+        ws.onclose = () => {
+          setIsLoading(false)
+          wsRef.current = null
         }
       }
-
-      ws.onerror = (error) => {
-        console.error("WebSocket error:", error)
-        setIsLoading(false)
-        toast.error(t("builds.configForm.chat.errorConnection") || "Connection error. Please try again.")
-      }
-
-      ws.onclose = () => {
-        setIsLoading(false)
-        wsRef.current = null
-      }
-
     } catch (error) {
       console.error(error)
       toast.error(t("builds.configForm.chat.errorInit") || "Failed to initialize connection.")

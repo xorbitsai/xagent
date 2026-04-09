@@ -106,6 +106,28 @@ async def list_connected_accounts(
     ]
 
 
+@cloud_router.delete("/accounts/{account_id}")
+async def delete_connected_account(
+    account_id: int,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+) -> Dict[str, Any]:
+    """Delete a connected cloud account"""
+    account = (
+        db.query(UserOAuth)
+        .filter(UserOAuth.id == account_id, UserOAuth.user_id == user.id)
+        .first()
+    )
+
+    if not account:
+        raise HTTPException(status_code=404, detail="Account not found")
+
+    db.delete(account)
+    db.commit()
+
+    return {"success": True, "message": "Account deleted successfully"}
+
+
 @cloud_router.get("/google-drive/drives")
 async def list_google_drives(
     account_id: Optional[int] = Query(None),

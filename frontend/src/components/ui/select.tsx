@@ -13,6 +13,8 @@ export interface SelectOption {
   isSmallFast?: boolean
   isVisual?: boolean
   isCompact?: boolean
+  actionIcon?: React.ReactNode
+  onAction?: (e: React.MouseEvent) => void
 }
 
 interface SelectProps {
@@ -154,7 +156,17 @@ export function Select({ value, onValueChange, options = [], placeholder, classN
                         </div>
                       )}
                     </div>
-                    {value === option.value && (
+                    {option.actionIcon ? (
+                      <div
+                        className="flex-shrink-0 p-1 hover:bg-muted/50 rounded transition-colors text-muted-foreground hover:text-foreground"
+                        onClick={(e) => {
+                          e.stopPropagation()
+                          if (option.onAction) option.onAction(e)
+                        }}
+                      >
+                        {option.actionIcon}
+                      </div>
+                    ) : value === option.value && (
                       <Check className="h-4 w-4 text-primary flex-shrink-0" />
                     )}
                   </div>

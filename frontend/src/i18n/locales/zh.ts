@@ -1521,6 +1521,10 @@ Build when you need.`
           accountLabel: "账户 {id}",
           accountProviderLabel: "{email} - {provider}",
           success: "连接成功",
+          deleteAccount: "删除账户",
+          deleteConfirm: "确定要删除账户 {email} 吗？此操作无法撤销。",
+          deleteSuccess: "账户删除成功",
+          deleteFailed: "删除账户失败",
         },
         error: {
           fetchFailed: "加载文件失败",

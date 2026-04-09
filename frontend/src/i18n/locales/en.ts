@@ -1521,6 +1521,10 @@ Build when you need.`
           accountLabel: "Account {id}",
           accountProviderLabel: "{email} - {provider}",
           success: "Connected successfully",
+          deleteAccount: "Delete Account",
+          deleteConfirm: "Are you sure you want to delete account {email}? This action cannot be undone.",
+          deleteSuccess: "Account deleted successfully",
+          deleteFailed: "Failed to delete account",
         },
         error: {
           fetchFailed: "Failed to load files",

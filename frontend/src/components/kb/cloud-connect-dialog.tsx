@@ -5,6 +5,7 @@ import { Label } from "@/components/ui/label"
 import { Dialog, DialogContent, DialogHeader, DialogTitle } from "@/components/ui/dialog"
 import { ScrollArea } from "@/components/ui/scroll-area"
 import { Select } from "@/components/ui/select"
+import { ConfirmDialog } from "@/components/ui/confirm-dialog"
 import { useI18n } from "@/contexts/i18n-context"
 import { useAuth } from "@/contexts/auth-context"
 import {
@@ -15,6 +16,7 @@ import {
   Loader2,
   Search,
   RefreshCw,
+  Trash2,
 } from "lucide-react"
 import { toast } from "sonner"
 import { getApiUrl } from "@/lib/utils"
@@ -71,6 +73,8 @@ export function CloudConnectDialog({
   const [connectedAccounts, setConnectedAccounts] = useState<ConnectedAccount[]>([])
   const [driveOptions, setDriveOptions] = useState<{ value: string, label: string }[]>([])
   const [refreshTrigger, setRefreshTrigger] = useState(0)
+  const [accountToDelete, setAccountToDelete] = useState<{ id: number | null, email: string | null }>({ id: null, email: null })
+  const [isDeletingAccount, setIsDeletingAccount] = useState(false)
 
   // Helper to check if selected
   const isSelected = (id: string) => selectedFiles.some(f => f.id === id)
@@ -246,6 +250,39 @@ export function CloudConnectDialog({
     onOpenChange(false)
   }
 
+  // Handle account deletion
+  const handleDeleteAccount = async () => {
+    if (!accountToDelete) return
+
+    setIsDeletingAccount(true)
+    try {
+      const response = await apiRequest(`${getApiUrl()}/api/cloud/accounts/${accountToDelete.id}`, {
+        method: "DELETE",
+      })
+
+      if (response.ok) {
+        toast.success(t("kb.dialog.cloudConnect.auth.deleteSuccess"))
+        const accountWasSelected = connectedAccounts.find(acc => acc.id === accountToDelete.id)?.email === cloudUser ||
+          connectedAccounts.find(acc => acc.id === accountToDelete.id)?.id.toString() === cloudUser?.replace('Account ', '')
+        if (accountWasSelected) {
+          setCloudUser(undefined)
+          setSelectedDrive("")
+          setCurrentPath([])
+          setFiles([])
+        }
+        await fetchAccounts()
+      } else {
+        toast.error(t("kb.dialog.cloudConnect.auth.deleteFailed"))
+      }
+    } catch (error) {
+      console.error("Failed to delete account", error)
+      toast.error(t("kb.dialog.cloudConnect.auth.deleteFailed"))
+    } finally {
+      setIsDeletingAccount(false)
+      setAccountToDelete({ id: null, email: null })
+    }
+  }
+
   // Filter files based on search
   const filteredFiles = files.filter(f =>
     f.name.toLowerCase().includes(searchQuery.toLowerCase())
@@ -289,7 +326,12 @@ export function CloudConnectDialog({
                     value: acc.email || `Account ${acc.id}`,
                     label: acc.email
                       ? t("kb.dialog.cloudConnect.auth.accountProviderLabel", { email: acc.email, provider: provider?.name || t("kb.dialog.cloudConnect.auth.defaultProvider") })
-                      : t("kb.dialog.cloudConnect.auth.accountLabel", { id: acc.id })
+                      : t("kb.dialog.cloudConnect.auth.accountLabel", { id: acc.id }),
+                    actionIcon: <Trash2 className="h-4 w-4 text-red-500 hover:text-red-600" />,
+                    onAction: (e: React.MouseEvent) => {
+                      e.stopPropagation()
+                      setAccountToDelete({ id: acc.id, email: acc.email })
+                    }
                   })),
                 { value: "add_new", label: t("kb.dialog.cloudConnect.auth.addAccount") }
               ]}
@@ -491,6 +533,17 @@ export function CloudConnectDialog({
           </Button>
         </div>
       </DialogContent>
+
+      <ConfirmDialog
+        isOpen={accountToDelete.id !== null}
+        onOpenChange={(open) => {
+          if (!open) setAccountToDelete({ id: null, email: null })
+        }}
+        onConfirm={handleDeleteAccount}
+        isLoading={isDeletingAccount}
+        title={t("kb.dialog.cloudConnect.auth.deleteAccount")}
+        description={t("kb.dialog.cloudConnect.auth.deleteConfirm", { email: accountToDelete.email || "" })}
+      />
     </Dialog>
   )
 }

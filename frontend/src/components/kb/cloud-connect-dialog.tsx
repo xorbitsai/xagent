@@ -14,6 +14,7 @@ import {
   File,
   Loader2,
   Search,
+  RefreshCw,
 } from "lucide-react"
 import { toast } from "sonner"
 import { getApiUrl } from "@/lib/utils"
@@ -61,14 +62,15 @@ export function CloudConnectDialog({
   // Internal state
   const [cloudUser, setCloudUser] = useState<string | undefined>()
   const [selectedDrive, setSelectedDrive] = useState<string>("")
-  const [currentPath, setCurrentPath] = useState<{id: string, name: string}[]>([])
+  const [currentPath, setCurrentPath] = useState<{ id: string, name: string }[]>([])
   const [selectedFiles, setSelectedFiles] = useState<CloudFile[]>([])
   const [files, setFiles] = useState<CloudFile[]>([])
   const [searchQuery, setSearchQuery] = useState("")
   const [loading, setLoading] = useState(false)
   const [accountsLoading, setAccountsLoading] = useState(false)
   const [connectedAccounts, setConnectedAccounts] = useState<ConnectedAccount[]>([])
-  const [driveOptions, setDriveOptions] = useState<{value: string, label: string}[]>([])
+  const [driveOptions, setDriveOptions] = useState<{ value: string, label: string }[]>([])
+  const [refreshTrigger, setRefreshTrigger] = useState(0)
 
   // Helper to check if selected
   const isSelected = (id: string) => selectedFiles.some(f => f.id === id)
@@ -219,7 +221,7 @@ export function CloudConnectDialog({
     }
 
     fetchFiles()
-  }, [cloudUser, currentPath, connectedAccounts, selectedDrive, provider?.id])
+  }, [cloudUser, currentPath, connectedAccounts, selectedDrive, provider?.id, refreshTrigger])
 
   // Sync initial selection when opening
   const prevOpen = useRef(open)
@@ -330,108 +332,118 @@ export function CloudConnectDialog({
               </div>
 
               {/* Breadcrumbs */}
-              <div className="flex items-center gap-1 text-sm text-muted-foreground p-2 border-b bg-muted/20">
-                <span
-                  className="hover:underline cursor-pointer hover:text-foreground transition-colors"
-                  onClick={() => setCurrentPath([])}
+              <div className="flex items-center justify-between p-2 border-b bg-muted/20">
+                <div className="flex items-center gap-1 text-sm text-muted-foreground">
+                  <span
+                    className="hover:underline cursor-pointer hover:text-foreground transition-colors"
+                    onClick={() => setCurrentPath([])}
+                  >
+                    {provider?.hasDrives ? (driveOptions.find(o => o.value === selectedDrive)?.label || selectedDrive) : provider?.name}
+                  </span>
+                  {currentPath.map((folder, index) => (
+                    <div key={index} className="flex items-center gap-1">
+                      <ChevronRight size={14} />
+                      <span
+                        className={`hover:underline cursor-pointer hover:text-foreground transition-colors ${index === currentPath.length - 1 ? "font-medium text-foreground" : ""}`}
+                        onClick={() => setCurrentPath(prev => prev.slice(0, index + 1))}
+                      >
+                        {folder.name}
+                      </span>
+                    </div>
+                  ))}
+                </div>
+                <Button
+                  variant="ghost"
+                  size="icon"
+                  className="h-6 w-6 text-muted-foreground hover:text-foreground"
+                  onClick={() => setRefreshTrigger(prev => prev + 1)}
+                  disabled={loading || !cloudUser || (provider?.hasDrives && !selectedDrive)}
+                  title={t("common.refresh")}
                 >
-                  {provider?.hasDrives ? (driveOptions.find(o => o.value === selectedDrive)?.label || selectedDrive) : provider?.name}
-                </span>
-                {currentPath.map((folder, index) => (
-                  <div key={index} className="flex items-center gap-1">
-                    <ChevronRight size={14} />
-                    <span
-                      className={`hover:underline cursor-pointer hover:text-foreground transition-colors ${index === currentPath.length - 1 ? "font-medium text-foreground" : ""}`}
-                      onClick={() => setCurrentPath(prev => prev.slice(0, index + 1))}
-                    >
-                      {folder.name}
-                    </span>
-                  </div>
-                ))}
+                  <RefreshCw className={`h-3 w-3 ${loading ? 'animate-spin' : ''}`} />
+                </Button>
               </div>
 
-                {/* File List */}
-                <ScrollArea className="flex-1">
-                  <div className="p-2">
-                    {loading ? (
-                      <div className="flex flex-col items-center justify-center py-10 text-muted-foreground">
-                        <Loader2 className="h-8 w-8 animate-spin mb-2 opacity-50" />
-                        <span className="text-xs">{t("kb.dialog.cloudConnect.loading")}</span>
-                      </div>
-                    ) : (
-                      <>
-                        {folders.length === 0 && fileItems.length === 0 ? (
-                          <div className="text-center text-muted-foreground py-8">
-                            {searchQuery
-                              ? t("kb.dialog.cloudConnect.fileList.noMatchingFiles")
-                              : t("kb.dialog.cloudConnect.fileList.noFiles")}
-                          </div>
-                        ) : (
-                          <div className="space-y-4">
-                            {/* Folders Section */}
-                            {folders.length > 0 && (
-                              <div>
-                                <h3 className="text-xs font-semibold text-muted-foreground uppercase tracking-wider mb-2 px-2">
-                                  {t("kb.dialog.cloudConnect.fileList.headers.folders")}
-                                </h3>
-                                <div className="space-y-1">
-                                  {folders.map(folder => (
-                                    <div
-                                      key={folder.id}
-                                      className="flex items-center gap-2 p-2 hover:bg-muted/50 rounded-md cursor-pointer group"
-                                      onClick={() => setCurrentPath(prev => [...prev, { id: folder.id, name: folder.name }])}
-                                    >
-                                      <Folder className="h-5 w-5 text-blue-500 fill-blue-500/20" />
-                                      <span className="truncate flex-1 text-sm font-medium">{folder.name}</span>
-                                      <ChevronRight className="h-4 w-4 text-muted-foreground opacity-0 group-hover:opacity-100 transition-opacity" />
-                                    </div>
-                                  ))}
-                                </div>
+              {/* File List */}
+              <ScrollArea className="flex-1 overflow-auto">
+                <div className="p-2">
+                  {loading ? (
+                    <div className="flex flex-col items-center justify-center py-10 text-muted-foreground">
+                      <Loader2 className="h-8 w-8 animate-spin mb-2 opacity-50" />
+                      <span className="text-xs">{t("kb.dialog.cloudConnect.loading")}</span>
+                    </div>
+                  ) : (
+                    <>
+                      {folders.length === 0 && fileItems.length === 0 ? (
+                        <div className="text-center text-muted-foreground py-8">
+                          {searchQuery
+                            ? t("kb.dialog.cloudConnect.fileList.noMatchingFiles")
+                            : t("kb.dialog.cloudConnect.fileList.noFiles")}
+                        </div>
+                      ) : (
+                        <div className="space-y-4">
+                          {/* Folders Section */}
+                          {folders.length > 0 && (
+                            <div>
+                              <h3 className="text-xs font-semibold text-muted-foreground uppercase tracking-wider mb-2 px-2">
+                                {t("kb.dialog.cloudConnect.fileList.headers.folders")}
+                              </h3>
+                              <div className="space-y-1">
+                                {folders.map(folder => (
+                                  <div
+                                    key={folder.id}
+                                    className="flex items-center gap-2 p-2 hover:bg-muted/50 rounded-md cursor-pointer group"
+                                    onClick={() => setCurrentPath(prev => [...prev, { id: folder.id, name: folder.name }])}
+                                  >
+                                    <Folder className="h-5 w-5 text-blue-500 fill-blue-500/20" />
+                                    <span className="truncate flex-1 text-sm font-medium">{folder.name}</span>
+                                    <ChevronRight className="h-4 w-4 text-muted-foreground opacity-0 group-hover:opacity-100 transition-opacity" />
+                                  </div>
+                                ))}
                               </div>
-                            )}
+                            </div>
+                          )}
 
-                            {/* Files Section */}
-                            {fileItems.length > 0 && (
-                              <div>
-                                <h3 className="text-xs font-semibold text-muted-foreground uppercase tracking-wider mb-2 px-2">
-                                  {t("kb.dialog.cloudConnect.fileList.headers.files")}
-                                </h3>
-                                <div className="space-y-1">
-                                  {fileItems.map(file => {
-                                    const selected = isSelected(file.id)
-                                    return (
-                                      <div
-                                        key={file.id}
-                                        className={`flex items-center gap-2 p-2 rounded-md cursor-pointer transition-colors ${
-                                          selected
-                                            ? "bg-primary/10 text-primary hover:bg-primary/15"
-                                            : "hover:bg-muted/50"
+                          {/* Files Section */}
+                          {fileItems.length > 0 && (
+                            <div>
+                              <h3 className="text-xs font-semibold text-muted-foreground uppercase tracking-wider mb-2 px-2">
+                                {t("kb.dialog.cloudConnect.fileList.headers.files")}
+                              </h3>
+                              <div className="space-y-1">
+                                {fileItems.map(file => {
+                                  const selected = isSelected(file.id)
+                                  return (
+                                    <div
+                                      key={file.id}
+                                      className={`flex items-center gap-2 p-2 rounded-md cursor-pointer transition-colors ${selected
+                                        ? "bg-primary/10 text-primary hover:bg-primary/15"
+                                        : "hover:bg-muted/50"
                                         }`}
-                                        onClick={() => toggleSelection(file)}
-                                      >
-                                        <div className={`flex items-center justify-center w-4 h-4 rounded border ${
-                                          selected
-                                            ? "bg-primary border-primary text-primary-foreground"
-                                            : "border-muted-foreground/30 bg-background"
+                                      onClick={() => toggleSelection(file)}
+                                    >
+                                      <div className={`flex items-center justify-center w-4 h-4 rounded border ${selected
+                                        ? "bg-primary border-primary text-primary-foreground"
+                                        : "border-muted-foreground/30 bg-background"
                                         }`}>
-                                          {selected && <Check className="h-3 w-3" />}
-                                        </div>
-                                        <File className="h-4 w-4 text-muted-foreground" />
-                                        <div className="flex flex-col flex-1 min-w-0">
-                                          <span className="truncate text-sm font-medium">{file.name}</span>
-                                        </div>
+                                        {selected && <Check className="h-3 w-3" />}
                                       </div>
-                                    )
-                                  })}
-                                </div>
+                                      <File className="h-4 w-4 text-muted-foreground" />
+                                      <div className="flex flex-col flex-1 min-w-0">
+                                        <span className="truncate text-sm font-medium">{file.name}</span>
+                                      </div>
+                                    </div>
+                                  )
+                                })}
                               </div>
-                            )}
-                          </div>
-                        )}
-                      </>
-                    )}
-                  </div>
-                </ScrollArea>
+                            </div>
+                          )}
+                        </div>
+                      )}
+                    </>
+                  )}
+                </div>
+              </ScrollArea>
             </div>
 
             {/* Right Column: Selected Files */}

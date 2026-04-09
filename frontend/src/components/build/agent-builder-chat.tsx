@@ -51,11 +51,11 @@ export function AgentBuilderChat({ agentConfig, onUpdateConfig, availableOptions
     setMessages([
       {
         role: "assistant",
-        content: t("builds.configForm.chat.initialMessage") || "Hello! I am your XAgent Assistant. Describe what kind of agent you want to create, and I'll help you configure it.",
+        content: t("builds.configForm.chat.initialMessage", { appName: process.env.NEXT_PUBLIC_APP_NAME || "Xagent" }),
         timestamp: Date.now()
       }
     ])
-  }, [t])
+  }, [t, agentConfig.name])
 
   const [isLoading, setIsLoading] = useState(false)
   const scrollRef = useRef<HTMLDivElement>(null)
@@ -195,7 +195,7 @@ export function AgentBuilderChat({ agentConfig, onUpdateConfig, availableOptions
               currentReply = ""
             } else if (data.type === "error" || data.type === "task_error") {
               setIsLoading(false)
-              toast.error(data.message || data.error || t("builds.configForm.chat.errorCommunicate") || "Failed to communicate with XAgent Assistant.")
+              toast.error(data.message || data.error || t("builds.configForm.chat.errorCommunicate", { appName: process.env.NEXT_PUBLIC_APP_NAME || "Xagent" }))
               ws.close()
             }
           } catch (e) {
@@ -206,7 +206,7 @@ export function AgentBuilderChat({ agentConfig, onUpdateConfig, availableOptions
         ws.onerror = (error) => {
           console.error("WebSocket error:", error)
           setIsLoading(false)
-          toast.error(t("builds.configForm.chat.errorConnection") || "Connection error. Please try again.")
+          toast.error(t("builds.configForm.chat.errorConnection", { appName: process.env.NEXT_PUBLIC_APP_NAME || "Xagent" }) || "Connection error. Please try again.")
         }
 
         ws.onclose = () => {
@@ -243,7 +243,7 @@ export function AgentBuilderChat({ agentConfig, onUpdateConfig, availableOptions
           <Bot className="h-5 w-5" />
         </div>
         <div>
-          <h3 className="font-semibold text-sm">{t("builds.configForm.chat.title")}</h3>
+          <h3 className="font-semibold text-sm">{t("builds.configForm.chat.title", { appName: process.env.NEXT_PUBLIC_APP_NAME || "Xagent" })}</h3>
           <p className="text-xs text-muted-foreground">{t("builds.configForm.chat.subtitle")}</p>
         </div>
       </div>

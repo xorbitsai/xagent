@@ -1787,7 +1787,7 @@ Build when you need.`
       createModal: {
         title: "How would you like to create an agent?",
         describeTitle: "By Describing It",
-        describeDesc: "Tell us what you want — XAgent will pre-fill the configuration for you",
+        describeDesc: "Tell us what you want — {appName} will pre-fill the configuration for you",
         placeholder: "e.g. A customer support agent that answers product questions, handles refund requests, and escalates complex issues to human agents...",
         buildBtn: "Build Agent",
         manualTitle: "Manually",
@@ -1962,11 +1962,11 @@ Build when you need.`
         delete: "Delete",
       },
       chat: {
-        title: "XAgent Assistant",
+        title: "{appName} Assistant",
         subtitle: "Chat to configure your agent",
-        initialMessage: "Hello! I am your XAgent Assistant. Describe what kind of agent you want to create, and I'll help you configure it.",
+        initialMessage: "Hello! I am your {appName} Assistant. Describe what kind of agent you want to create, and I'll help you configure it.",
         defaultReply: "I have updated the configuration based on your request.",
-        errorCommunicate: "Failed to communicate with XAgent Assistant.",
+        errorCommunicate: "Failed to communicate with {appName} Assistant.",
         errorConnection: "Connection error. Please try again.",
         errorInit: "Failed to initialize connection.",
       },

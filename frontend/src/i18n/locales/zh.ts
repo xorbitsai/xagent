@@ -1787,7 +1787,7 @@ Build when you need.`
       createModal: {
         title: "你想如何创建 Agent？",
         describeTitle: "通过描述创建",
-        describeDesc: "告诉我们你的需求 —— XAgent 将为你预填配置",
+        describeDesc: "告诉我们你的需求 —— {appName} 将为你预填配置",
         placeholder: "例如：一个可以回答产品问题、处理退款请求并将复杂问题升级给人工客服的客服 Agent...",
         buildBtn: "生成 Agent",
         manualTitle: "手动创建",
@@ -1962,11 +1962,11 @@ Build when you need.`
         delete: "删除",
       },
       chat: {
-        title: "XAgent 助手",
+        title: "{appName} 助手",
         subtitle: "通过对话配置你的 Agent",
-        initialMessage: "你好！我是 XAgent 助手。请描述你想创建什么样的 Agent，我会帮你进行配置。",
+        initialMessage: "你好！我是 {appName} 助手。请描述你想创建什么样的 Agent，我会帮你进行配置。",
         defaultReply: "我已经根据你的要求更新了配置。",
-        errorCommunicate: "与 XAgent 助手通信失败。",
+        errorCommunicate: "与 {appName} 助手通信失败。",
         errorConnection: "连接错误，请重试。",
         errorInit: "初始化连接失败。",
       },

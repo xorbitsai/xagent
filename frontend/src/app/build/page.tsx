@@ -357,7 +357,7 @@ export default function BuildsPage() {
                     {t("builds.list.createModal.describeTitle")}
                   </h3>
                   <p className="text-sm text-muted-foreground">
-                    {t("builds.list.createModal.describeDesc")}
+                    {t("builds.list.createModal.describeDesc", { appName: process.env.NEXT_PUBLIC_APP_NAME || "Xagent" })}
                   </p>
                 </div>
               </div>

@@ -37,19 +37,7 @@ import {
 import { useRouter, useSearchParams } from "next/navigation"
 import { KnowledgeBaseCreationDialog } from "@/components/kb/knowledge-base-creation-dialog"
 import { toast } from "sonner"
-import { FileIcon } from "lucide-react"
 import { cn } from "@/lib/utils"
-
-interface FileItem {
-  file_id: string;
-  filename: string;
-  file_size: number;
-  modified_time: number;
-  file_type?: string;
-  relative_path?: string;
-  task_id?: number;
-  user_id?: number;
-}
 
 interface KnowledgeBase {
   name: string
@@ -117,6 +105,7 @@ export function AgentBuilder({ agentId }: AgentBuilderProps) {
   const router = useRouter()
   const searchParams = useSearchParams()
   const templateId = searchParams.get("template")
+  const initialPrompt = searchParams.get("prompt")
   const isEditMode = !!agentId
 
   // Config State
@@ -1726,6 +1715,7 @@ export function AgentBuilder({ agentId }: AgentBuilderProps) {
       <div className="flex-1 min-h-0">
         <ResizableThreeColumnLayout
           leftPanel={<AgentBuilderChat
+            initialPrompt={initialPrompt}
             agentConfig={{
               id: agentId ? parseInt(agentId) : undefined,
               name, description, instructions, executionMode, suggestedPrompts,

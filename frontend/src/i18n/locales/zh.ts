@@ -26,6 +26,7 @@ const zh = {
     noOptions: "暂无选项",
     rename: "重命名",
     clear: "清除",
+    or: "或",
     errors: {
       unknown: "未知错误",
     },
@@ -1782,6 +1783,16 @@ Build when you need.`
         delete: "删除",
         edit: "编辑",
         deleteConfirm: "确定要删除这个 Agent 吗？",
+      },
+      createModal: {
+        title: "你想如何创建 Agent？",
+        describeTitle: "通过描述创建",
+        describeDesc: "告诉我们你的需求 —— XAgent 将为你预填配置",
+        placeholder: "例如：一个可以回答产品问题、处理退款请求并将复杂问题升级给人工客服的客服 Agent...",
+        buildBtn: "生成 Agent",
+        manualTitle: "手动创建",
+        manualDesc: "打开空白表单，从头开始配置每个字段",
+        manualBtn: "前往创建面板",
       },
       chat: {
         welcome: "你好！我是 {name}。{description}\n\n你可以直接开始对话，或者选择下方的建议提示词。",

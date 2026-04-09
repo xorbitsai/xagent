@@ -26,6 +26,7 @@ const en = {
     noOptions: "No options available",
     rename: "Rename",
     clear: "Clear",
+    or: "Or",
     errors: {
       unknown: "Unknown error",
     },
@@ -1782,6 +1783,16 @@ Build when you need.`
         delete: "Delete",
         edit: "Edit",
         deleteConfirm: "Are you sure you want to delete this agent?",
+      },
+      createModal: {
+        title: "How would you like to create an agent?",
+        describeTitle: "By Describing It",
+        describeDesc: "Tell us what you want — XAgent will pre-fill the configuration for you",
+        placeholder: "e.g. A customer support agent that answers product questions, handles refund requests, and escalates complex issues to human agents...",
+        buildBtn: "Build Agent",
+        manualTitle: "Manually",
+        manualDesc: "Open a blank form and configure each field yourself from scratch",
+        manualBtn: "Go to Builder",
       },
       chat: {
         welcome: "Hello! I'm {name}. {description}\n\nYou can start a conversation directly, or select a suggested prompt below.",

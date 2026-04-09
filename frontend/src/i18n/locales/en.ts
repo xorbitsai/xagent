@@ -2346,6 +2346,7 @@ Build when you need.`
           unknown: "Unknown Operation",
         },
         actions: {
+          dag_execution: "DAG Execution Start",
           dag_step_start: "Step Start",
           dag_step_end: "Step Completed",
           dag_step_failed: "Step Failed",
@@ -2358,6 +2359,7 @@ Build when you need.`
           tool_execution_end: "Tool Call Completed",
           tool_execution_failed: "Tool Call Failed",
           tool_using: "Use Tool",
+          ai_message: "AI Message",
           trace_error: "Step Error Log",
           react_task_start: "ReAct Task Start",
           react_task_end: "ReAct Task Completed",

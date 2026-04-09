@@ -650,7 +650,7 @@ function StepActionItem({ action, onViewDetail, onOpenTerminal, onFileClick, onA
     if (action.type === 'llm') {
       if (action.data.reasoning) {
         const clean = action.data.reasoning.replace(/[\n\r\s]+/g, ' ').trim();
-        return clean.length > 70 ? clean.slice(0, 70) + '...' : clean;
+        return clean.length > 50 ? clean.slice(0, 50) + '...' : clean;
       }
       return null;
     }
@@ -677,14 +677,14 @@ function StepActionItem({ action, onViewDetail, onOpenTerminal, onFileClick, onA
       // Fallback to code snippet
       if (code) {
         const clean = code.replace(/[\n\r\s]+/g, ' ').trim();
-        return clean.length > 70 ? clean.slice(0, 70) + '...' : clean;
+        return clean.length > 50 ? clean.slice(0, 50) + '...' : clean;
       }
 
       // Fallback to generic args string
       if (args) {
         try {
           const str = JSON.stringify(args);
-          return str.length > 70 ? str.slice(0, 70) + '...' : str;
+          return str.length > 50 ? str.slice(0, 50) + '...' : str;
         } catch (e) { return null; }
       }
     }
@@ -725,30 +725,34 @@ function StepActionItem({ action, onViewDetail, onOpenTerminal, onFileClick, onA
               "bg-muted/50 border-transparent hover:bg-muted/60 text-muted-foreground/80 hover:text-foreground"
         )}
       >
-        <span className="flex items-center gap-2 overflow-hidden">
-          <span className="flex-shrink-0 flex items-center">
-            {action.type === 'tool' && <Wrench className="w-3.5 h-3.5" />}
-            {action.type === 'error' && <Info className="w-3.5 h-3.5 text-red-500" />}
-            {action.type === 'info' && <Info className="w-3.5 h-3.5" />}
-          </span>
-
-          <span className="font-medium whitespace-nowrap">{action.title}</span>
-
-          {action.data.sandboxed && (
-            <span className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded text-[10px] font-medium bg-green-500/10 text-green-600 dark:text-green-400 border border-green-500/20 whitespace-nowrap">
-              <Shield className="w-3 h-3" />
-              {t('traceEventRenderer.sandboxedExecution')}
+        <div className="flex flex-1 flex-row flex-wrap items-center gap-2 overflow-x-auto sm:items-start min-w-[0]">
+          <div className="flex items-center gap-2">
+            <span className="flex-shrink-0 flex items-center">
+              {action.type === 'tool' && <Wrench className="w-3.5 h-3.5" />}
+              {action.type === 'error' && <Info className="w-3.5 h-3.5 text-red-500" />}
+              {action.type === 'info' && <Info className="w-3.5 h-3.5" />}
             </span>
-          )}
 
-          {summary && (
-            <span className="text-muted-foreground/50 font-normal truncate ml-1 hidden sm:block max-w-[600px]">
-              - {summary}
-            </span>
-          )}
+            <span className="font-medium whitespace-nowrap">{action.title}</span>
+          </div>
 
-          {isRunning && <Loader2 className="w-3 h-3 animate-spin ml-1 flex-shrink-0" />}
-        </span>
+          <div>
+            {action.data.sandboxed && (
+              <span className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded text-[10px] font-medium bg-green-500/10 text-green-600 dark:text-green-400 border border-green-500/20 whitespace-nowrap">
+                <Shield className="w-3 h-3" />
+                {t('traceEventRenderer.sandboxedExecution')}
+              </span>
+            )}
+
+            {summary && (
+              <span className="text-muted-foreground/50 font-normal ml-1 hidden sm:block max-w-[600px]">
+                - {summary}
+              </span>
+            )}
+
+            {isRunning && <Loader2 className="w-3 h-3 animate-spin ml-1 flex-shrink-0" />}
+          </div>
+        </div>
         <div className="flex items-center gap-2 flex-shrink-0">
           <span className="text-[10px] opacity-0 group-hover:opacity-100 transition-opacity text-muted-foreground/50">
             {new Date(action.timestamp).toLocaleString([], {

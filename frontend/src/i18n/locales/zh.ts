@@ -2346,6 +2346,7 @@ Build when you need.`
           unknown: "未知操作",
         },
         actions: {
+          dag_execution: "DAG 执行开始",
           dag_step_start: "步骤开始",
           dag_step_end: "步骤完成",
           dag_step_failed: "步骤失败",
@@ -2358,6 +2359,7 @@ Build when you need.`
           tool_execution_end: "工具调用完成",
           tool_execution_failed: "工具调用失败",
           tool_using: "使用工具",
+          ai_message: "AI 消息",
           trace_error: "步骤错误（日志记录）",
           react_task_start: "ReAct模式任务开始",
           react_task_end: "ReAct模式任务完成",

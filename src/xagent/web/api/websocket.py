@@ -1192,6 +1192,7 @@ async def handle_chat_message(
     """Handle chat message"""
     try:
         user_message = message_data.get("message", "")
+
         context = message_data.get("context", {})
         files = message_data.get("files", [])
         user = message_data.get("user")
@@ -2527,6 +2528,15 @@ async def handle_builder_chat(
 
     try:
         user_message = message_data.get("message", "")
+        if (
+            not user_message
+            and "messages" in message_data
+            and isinstance(message_data["messages"], list)
+            and len(message_data["messages"]) > 0
+        ):
+            last_msg = message_data["messages"][-1]
+            if isinstance(last_msg, dict) and last_msg.get("role") == "user":
+                user_message = last_msg.get("content", "")
         # Build current_config back from top-level keys
         current_config = {
             "name": message_data.get("name", ""),

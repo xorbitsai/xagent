@@ -2507,7 +2507,7 @@ async def handle_builder_chat(
 
     from ...core.agent.service import AgentService
     from ...core.memory.in_memory import InMemoryMemoryStore
-    from ...core.tools.adapters.vibe.agent_tool import CreateAgentTool
+    from ...core.tools.adapters.vibe.agent_tool import CreateAgentTool, UpdateAgentTool
     from ..models.database import get_db
     from ..services.llm_utils import UserAwareModelStorage
 
@@ -2539,6 +2539,7 @@ async def handle_builder_chat(
                 user_message = last_msg.get("content", "")
         # Build current_config back from top-level keys
         current_config = {
+            "id": message_data.get("id"),
             "name": message_data.get("name", ""),
             "description": message_data.get("description", ""),
             "instructions": message_data.get("instructions", ""),
@@ -2565,19 +2566,21 @@ Available Options for advanced configurations:
 - Skills: {available_options.get("skills", [])}
 - Tool Categories: {available_options.get("toolCategories", [])}
 
-When the user describes what they want to build, use the create_agent tool to create the agent for them.
-The agent will be created immediately and can be used right away.
+When the user describes what they want to build, use the create_agent or update_agent tool to help them.
+The agent will be updated immediately and can be used right away.
 
 Important instructions:
-1. Always create agents with clear, descriptive names and detailed descriptions
+1. Always create/update agents with clear, descriptive names and detailed descriptions
 2. The description should explain WHEN to use this agent (e.g., "Use this agent for data analysis tasks involving CSV files")
 3. Include appropriate tool_categories and skills based on the user's requirements
-4. After creating an agent, present it to the user in a clear format with the markdown link
+4. After creating or updating an agent, present it to the user in a clear format with the markdown link
 
-You have access to the following tool:
+You have access to the following tools:
 - create_agent: Create a new agent with specific capabilities
+- update_agent: Update an existing agent with specific capabilities
 
-Use the create_agent tool whenever the user wants to build a new agent or modify their current agent configuration.
+Use the create_agent tool whenever the user wants to build a new agent and there is no agent ID in the current configuration.
+Use the update_agent tool whenever the user wants to modify their current agent configuration and an agent ID is available in the current configuration.
 """
 
         # Get LLM configuration
@@ -2614,8 +2617,14 @@ Use the create_agent tool whenever the user wants to build a new agent or modify
                 websocket.state.builder_memory = InMemoryMemoryStore()
             memory = websocket.state.builder_memory
 
-            # Create only the CreateAgentTool directly (much faster than loading all tools)
+            # Create only the CreateAgentTool and UpdateAgentTool directly (much faster than loading all tools)
             create_agent_tool = CreateAgentTool(
+                db=db,
+                user_id=int(user.id),
+                task_id=builder_task_id,
+                workspace_base_dir=str(get_uploads_dir() / "builder_chat"),
+            )
+            update_agent_tool = UpdateAgentTool(
                 db=db,
                 user_id=int(user.id),
                 task_id=builder_task_id,
@@ -2637,7 +2646,7 @@ Use the create_agent tool whenever the user wants to build a new agent or modify
                 vision_llm=None,
                 compact_llm=None,
                 memory=memory,
-                tools=[create_agent_tool],  # Direct tool creation
+                tools=[create_agent_tool, update_agent_tool],  # Direct tool creation
                 use_dag_pattern=False,  # Use ReAct pattern
                 id=builder_task_id,
                 enable_workspace=True,

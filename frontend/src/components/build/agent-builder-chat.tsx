@@ -16,6 +16,7 @@ interface Message {
 }
 
 export interface AgentConfig {
+  id?: number | string
   name: string
   description: string
   instructions: string
@@ -153,7 +154,7 @@ export function AgentBuilderChat({ agentConfig, onUpdateConfig, availableOptions
               } else if (data.event_type === "tool_execution_end") {
                 // Tool finished
                 console.log("Tool execution ended:", data.data)
-                if (data.data && data.data.tool_name === "create_agent" && data.data.tool_args && typeof data.data.tool_args === 'object') {
+                if (data.data && (data.data.tool_name === "create_agent" || data.data.tool_name === "update_agent") && data.data.tool_args && typeof data.data.tool_args === 'object') {
                   // Extract configuration updates from tool_args and agent_id from result
                   const toolArgs = data.data.tool_args;
                   const result = data.data.result || {};

@@ -1727,6 +1727,7 @@ export function AgentBuilder({ agentId }: AgentBuilderProps) {
         <ResizableThreeColumnLayout
           leftPanel={<AgentBuilderChat
             agentConfig={{
+              id: agentId ? parseInt(agentId) : undefined,
               name, description, instructions, executionMode, suggestedPrompts,
               modelConfig, selectedKbs, selectedSkills, selectedToolCategories
             }}

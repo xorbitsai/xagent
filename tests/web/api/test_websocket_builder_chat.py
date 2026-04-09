@@ -66,6 +66,9 @@ async def test_handle_builder_chat_basic():
         patch(
             "xagent.core.tools.adapters.vibe.agent_tool.CreateAgentTool"
         ) as MockCreateAgentTool,
+        patch(
+            "xagent.core.tools.adapters.vibe.agent_tool.UpdateAgentTool"
+        ) as MockUpdateAgentTool,
     ):
         # Setup mocks
         mock_storage_instance = MockStorage.return_value
@@ -111,6 +114,7 @@ async def test_handle_builder_chat_basic():
 
         # Verify CreateAgentTool was created (direct tool creation, not via WebToolConfig)
         assert MockCreateAgentTool.called
+        assert MockUpdateAgentTool.called
 
         # Verify agent service execute_task was called
         mock_agent_service.execute_task.assert_awaited_once()

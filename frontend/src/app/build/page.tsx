@@ -3,22 +3,17 @@
 import React, { useState, useEffect } from "react"
 import { SearchInput } from "@/components/ui/search-input"
 import { Button } from "@/components/ui/button"
-import { Plus, Bot, Trash2, MessageSquare, Edit, MoreVertical, Globe, Calendar, Clock, Rocket, LayoutGrid, Code2, Share, Webhook, ArrowRight, Copy, Check } from "lucide-react"
+import { Plus, Bot, Trash2, MessageSquare, Edit, MoreVertical, Globe, Calendar, Clock, Rocket, Sparkles, Settings2, ArrowRight } from "lucide-react"
 import { Popover, PopoverTrigger, PopoverContent } from "@/components/ui/popover"
-import { Dialog, DialogContent, DialogDescription, DialogHeader, DialogTitle } from "@/components/ui/dialog"
-import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs"
-import { Card, CardHeader, CardTitle, CardDescription, CardContent } from "@/components/ui/card"
+import { Dialog, DialogContent, DialogHeader, DialogTitle } from "@/components/ui/dialog"
+import { Textarea } from "@/components/ui/textarea"
+import { DeployAgentDialog, Agent } from "@/components/build/deploy-agent-dialog"
 import { useI18n } from "@/contexts/i18n-context"
 import { useRouter, useSearchParams } from "next/navigation"
 import { apiRequest } from "@/lib/api-wrapper"
 import { getApiUrl } from "@/lib/utils"
 import { ConfirmDialog } from "@/components/ui/confirm-dialog"
 import { toast } from "sonner"
-
-import { Dialog, DialogContent, DialogHeader, DialogTitle } from "@/components/ui/dialog"
-import { Textarea } from "@/components/ui/textarea"
-import { Sparkles, Settings2, ArrowRight } from "lucide-react"
-import { DeployAgentDialog, Agent } from "@/components/build/deploy-agent-dialog"
 
 export default function BuildsPage() {
   const { t } = useI18n()

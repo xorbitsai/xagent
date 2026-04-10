@@ -106,7 +106,8 @@ export function AgentBuilder({ agentId }: AgentBuilderProps) {
   const searchParams = useSearchParams()
   const templateId = searchParams.get("template")
   const initialPrompt = searchParams.get("prompt")
-  const isEditMode = !!agentId
+  const [localAgentId, setLocalAgentId] = useState<string | undefined>(agentId)
+  const isEditMode = !!localAgentId
 
   // Config State
   const [name, setName] = useState("")
@@ -547,12 +548,12 @@ export function AgentBuilder({ agentId }: AgentBuilderProps) {
 
   // Load agent data in edit mode
   useEffect(() => {
-    if (!isEditMode || !agentId) return
+    if (!isEditMode || !localAgentId) return
 
     const loadAgent = async () => {
       try {
         setLoadingAgent(true)
-        const response = await apiRequest(`${getApiUrl()}/api/agents/${agentId}`)
+        const response = await apiRequest(`${getApiUrl()}/api/agents/${localAgentId}`)
         if (response.ok) {
           const agent = await response.json()
           setOriginalData(agent)
@@ -584,7 +585,7 @@ export function AgentBuilder({ agentId }: AgentBuilderProps) {
     }
 
     loadAgent()
-  }, [isEditMode, agentId])
+  }, [isEditMode, localAgentId])
 
   // Load template data when template parameter is present
   useEffect(() => {
@@ -809,7 +810,7 @@ export function AgentBuilder({ agentId }: AgentBuilderProps) {
       // Send preview request via WebSocket
       wsRef.current.send(JSON.stringify({
         type: "preview",
-        agent_id: agentId && typeof agentId === 'string' ? parseInt(agentId) : null,  // Exclude this agent from agent tools if published
+        agent_id: localAgentId && typeof localAgentId === 'string' ? parseInt(localAgentId) : null,  // Exclude this agent from agent tools if published
         instructions,
         execution_mode: executionMode,
         models: modelConfig,
@@ -918,8 +919,8 @@ export function AgentBuilder({ agentId }: AgentBuilderProps) {
         logo_base64 = await fileToBase64(logoFile)
       }
 
-      const url = isEditMode && agentId
-        ? `${getApiUrl()}/api/agents/${agentId}`
+      const url = isEditMode && localAgentId
+        ? `${getApiUrl()}/api/agents/${localAgentId}`
         : `${getApiUrl()}/api/agents`
 
       const method = isEditMode ? "PUT" : "POST"
@@ -975,6 +976,7 @@ export function AgentBuilder({ agentId }: AgentBuilderProps) {
           const newAgent = await response.json()
           setCreatedAgent(newAgent)
           setShowSuccessDialog(true)
+          setLocalAgentId(newAgent.id.toString())
 
           // Silently update URL to include ID so refreshing works
           // We don't want to trigger a full navigation that might close the dialog or reset state if not handled carefully
@@ -999,12 +1001,12 @@ export function AgentBuilder({ agentId }: AgentBuilderProps) {
   }
 
   const handlePublish = async () => {
-    if (!agentId) return
+    if (!localAgentId) return
 
     setLoadingAgent(true)
 
     try {
-      const response = await apiRequest(`${getApiUrl()}/api/agents/${agentId}/publish`, {
+      const response = await apiRequest(`${getApiUrl()}/api/agents/${localAgentId}/publish`, {
         method: "POST",
       })
 
@@ -1027,12 +1029,12 @@ export function AgentBuilder({ agentId }: AgentBuilderProps) {
   }
 
   const handleUnpublish = async () => {
-    if (!agentId) return
+    if (!localAgentId) return
 
     setLoadingAgent(true)
 
     try {
-      const response = await apiRequest(`${getApiUrl()}/api/agents/${agentId}/unpublish`, {
+      const response = await apiRequest(`${getApiUrl()}/api/agents/${localAgentId}/unpublish`, {
         method: "POST",
       })
 
@@ -1717,11 +1719,12 @@ export function AgentBuilder({ agentId }: AgentBuilderProps) {
           leftPanel={<AgentBuilderChat
             initialPrompt={initialPrompt}
             agentConfig={{
-              id: agentId ? parseInt(agentId) : undefined,
+              id: localAgentId ? parseInt(localAgentId) : undefined,
               name, description, instructions, executionMode, suggestedPrompts,
               modelConfig, selectedKbs, selectedSkills, selectedToolCategories
             }}
             onUpdateConfig={(updates) => {
+              if (updates.id !== undefined) setLocalAgentId(updates.id.toString());
               if (updates.name !== undefined) setName(updates.name);
               if (updates.description !== undefined) setDescription(updates.description);
               if (updates.instructions !== undefined) setInstructions(updates.instructions);

@@ -48,14 +48,17 @@ export function AgentBuilderChat({ agentConfig, onUpdateConfig, availableOptions
 
   // Set initial message on mount to avoid hydration mismatch and get translation
   useEffect(() => {
-    setMessages([
-      {
-        role: "assistant",
-        content: t("builds.configForm.chat.initialMessage", { appName: process.env.NEXT_PUBLIC_APP_NAME || "Xagent" }),
-        timestamp: Date.now()
-      }
-    ])
-  }, [t, agentConfig.name])
+    setMessages(prev => {
+      if (prev.length > 0) return prev;
+      return [
+        {
+          role: "assistant",
+          content: t("builds.configForm.chat.initialMessage", { appName: process.env.NEXT_PUBLIC_APP_NAME || "Xagent" }),
+          timestamp: Date.now()
+        }
+      ]
+    })
+  }, [t])
 
   const [isLoading, setIsLoading] = useState(false)
   const scrollRef = useRef<HTMLDivElement>(null)
@@ -165,6 +168,9 @@ export function AgentBuilderChat({ agentConfig, onUpdateConfig, availableOptions
                   if (toolArgs.name) configUpdates.name = toolArgs.name;
                   if (toolArgs.description) configUpdates.description = toolArgs.description;
                   if (toolArgs.instructions) configUpdates.instructions = toolArgs.instructions;
+                  if (result.status === "success" && result.agent_id) {
+                    configUpdates.id = result.agent_id;
+                  }
                   if (Object.keys(configUpdates).length > 0) {
                     onUpdateConfig(configUpdates);
                   }

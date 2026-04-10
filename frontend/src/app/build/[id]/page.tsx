@@ -7,5 +7,5 @@ export default function BuildDetailPage() {
   const params = useParams()
   const id = Array.isArray(params.id) ? params.id[0] : params.id
 
-  return <AgentBuilder agentId={id} />
+  return <AgentBuilder key={id} agentId={id} />
 }

@@ -15,6 +15,33 @@ from .base import BaseLLM
 logger = logging.getLogger(__name__)
 
 
+def _normalize_model_list_response(
+    model_list: Any,
+) -> List[tuple[str, dict[str, Any]]]:
+    if isinstance(model_list, dict):
+        return [
+            (str(model_uid), model_info)
+            for model_uid, model_info in model_list.items()
+            if isinstance(model_info, dict)
+        ]
+
+    if isinstance(model_list, list):
+        normalized: List[tuple[str, dict[str, Any]]] = []
+        for model_info in model_list:
+            if not isinstance(model_info, dict):
+                continue
+            model_uid = str(
+                model_info.get("model_uid")
+                or model_info.get("id")
+                or model_info.get("model_name")
+                or ""
+            )
+            normalized.append((model_uid, model_info))
+        return normalized
+
+    return []
+
+
 class XinferenceLLM(BaseLLM):
     """
     Xinference LLM client using the xinference-client SDK.
@@ -83,9 +110,13 @@ class XinferenceLLM(BaseLLM):
                 base_url=self.base_url, api_key=self.api_key
             )
 
+        client = self._client
+        if client is None:
+            raise RuntimeError("Failed to initialize Xinference client")
+
         if self._model_handle is None:
             # Get the model handle (assumes model is already launched on the server)
-            self._model_handle = self._client.get_model(self._model_uid)
+            self._model_handle = client.get_model(self._model_uid)
 
     def _build_generate_config(
         self,
@@ -580,6 +611,7 @@ class XinferenceLLM(BaseLLM):
             "chat": "chat",
             "vision": "vision",
             "tool_calling": "tool_calling",
+            "embedding": "embedding",
         }
 
         # Retry logic for transient network issues
@@ -597,10 +629,10 @@ class XinferenceLLM(BaseLLM):
 
                 # Use SDK's list_models method
                 model_list = client.list_models()
+                normalized_models = _normalize_model_list_response(model_list)
 
                 result = []
-                for model_info in model_list:
-                    model_uid = model_info.get("id", "")
+                for model_uid, model_info in normalized_models:
                     if not model_uid:
                         continue
 
@@ -617,6 +649,7 @@ class XinferenceLLM(BaseLLM):
                             "chat",
                             "vision",
                             "tool_calling",
+                            "embedding",
                         ]:
                             if mapped_ability not in mapped_abilities:
                                 mapped_abilities.append(mapped_ability)

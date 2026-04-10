@@ -764,13 +764,15 @@ export function ModelsPage() {
 
       for (let i = 0; i < selectedModels.length; i++) {
          const model = selectedModels[i]
+         const providerAbilities = Array.isArray((model as any).abilities)
+           ? (model as any).abilities.filter((ability: unknown): ability is string => typeof ability === 'string' && ability.length > 0)
+           : []
 
          const payload: ModelCreate = {
             ...formData,
             model_id: generateModelId(model.id, formData.model_provider, user?.id),
             model_name: model.id,
-            // Use abilities from provider model instead of form data
-            abilities: (model as any).abilities || formData.abilities,
+            abilities: providerAbilities.length > 0 ? providerAbilities : formData.abilities,
             default_config_types: (defaultTypeToSet && defaultModelId && model.id === defaultModelId) ? [defaultTypeToSet] : []
          }
 

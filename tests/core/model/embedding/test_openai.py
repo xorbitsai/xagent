@@ -1,5 +1,7 @@
 from typing import Any, Dict, List, Type
 
+import requests
+
 import pytest
 
 from xagent.core.model.embedding import OpenAIEmbedding
@@ -48,6 +50,43 @@ class TestOpenAIEmbedding(BaseEmbeddingTest):
         """Test base URL initialization."""
         client = OpenAIEmbedding(api_key="test_key", base_url="https://custom.api.com")
         assert client.base_url == "https://custom.api.com"
+
+    def test_encode_surfaces_provider_error_detail(self, mocker):
+        mock_response = mocker.Mock()
+        mock_response.status_code = 500
+        mock_response.text = '{"detail": "upstream exploded"}'
+        mock_response.json.return_value = {
+            "detail": "upstream exploded",
+        }
+        mock_response.raise_for_status.side_effect = requests.HTTPError(
+            "500 Server Error", response=mock_response
+        )
+
+        mocker.patch("requests.Session.post", return_value=mock_response)
+
+        client = OpenAIEmbedding(api_key="test_key")
+
+        with pytest.raises(RuntimeError, match="upstream exploded"):
+            client.encode("Hello")
+
+    def test_encode_allows_custom_base_url_without_api_key(self, mocker):
+        mock_response = mocker.Mock()
+        mock_response.raise_for_status.return_value = None
+        mock_response.json.return_value = {"data": [{"embedding": [0.1, 0.2]}]}
+
+        post_mock = mocker.patch("requests.Session.post", return_value=mock_response)
+
+        client = OpenAIEmbedding(
+            api_key=None,
+            base_url="http://localhost:9997/v1",
+            model="test-embedding-model",
+        )
+
+        embedding = client.encode("Hello")
+
+        assert embedding == [0.1, 0.2]
+        post_mock.assert_called_once()
+        assert "Authorization" not in client._get_session().headers
 
 
 if __name__ == "__main__":

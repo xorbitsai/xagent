@@ -58,13 +58,42 @@ class OpenAIEmbedding(BaseEmbedding):
         """Get or create HTTP session."""
         if self._session is None:
             self._session = requests.Session()
-            self._session.headers.update(
-                {
-                    "Authorization": f"Bearer {self.api_key}",
-                    "Content-Type": "application/json",
-                }
-            )
+            headers = {"Content-Type": "application/json"}
+            if self.api_key:
+                headers["Authorization"] = f"Bearer {self.api_key}"
+            self._session.headers.update(headers)
         return self._session
+
+    def _requires_api_key(self) -> bool:
+        return self.base_url == "https://api.openai.com/v1/embeddings"
+
+    @staticmethod
+    def _extract_error_detail(response: requests.Response) -> str:
+        try:
+            payload = response.json()
+        except ValueError:
+            payload = None
+
+        if isinstance(payload, dict):
+            error = payload.get("error")
+            if isinstance(error, dict):
+                message = error.get("message") or error.get("detail")
+                if message:
+                    return str(message)
+
+            detail = payload.get("detail")
+            if detail:
+                return str(detail)
+
+            message = payload.get("message")
+            if message:
+                return str(message)
+
+        response_text = response.text.strip()
+        if response_text:
+            return response_text
+
+        return f"HTTP {response.status_code} error"
 
     def encode(
         self,
@@ -87,7 +116,7 @@ class OpenAIEmbedding(BaseEmbedding):
         Raises:
             RuntimeError: If API call fails or returns invalid response
         """
-        if not self.api_key:
+        if self._requires_api_key() and not self.api_key:
             raise RuntimeError("OPENAI_API_KEY is required")
 
         session = self._get_session()
@@ -111,6 +140,8 @@ class OpenAIEmbedding(BaseEmbedding):
         if final_dimension:
             payload["dimensions"] = final_dimension
 
+        response: Optional[requests.Response] = None
+
         try:
             response = session.post(self.base_url or "", json=payload)
             response.raise_for_status()
@@ -132,6 +163,15 @@ class OpenAIEmbedding(BaseEmbedding):
                 ]
                 return embedding_list
 
+        except requests.HTTPError as e:
+            if response is None and e.response is not None:
+                response = e.response
+
+            if response is None:
+                raise RuntimeError(f"OpenAI embedding failed: {str(e)}") from e
+
+            detail = self._extract_error_detail(response)
+            raise RuntimeError(f"OpenAI embedding failed: {detail}") from e
         except Exception as e:
             import traceback
 

@@ -1,23 +1,24 @@
 "use client"
 
-import { useState, useEffect } from "react"
+import React, { useState, useEffect } from "react"
 import { Button } from "@/components/ui/button"
 import { SearchInput } from "@/components/ui/search-input"
 import { Badge } from "@/components/ui/badge"
 import { Card } from "@/components/ui/card"
 import { getApiUrl } from "@/lib/utils"
-import { useAuth } from "@/contexts/auth-context"
 import { useI18n } from "@/contexts/i18n-context"
 import { apiRequest } from "@/lib/api-wrapper"
 import {
   Plus,
   FileText,
   FolderOpen,
-  HardDrive
+  HardDrive,
+  Trash2,
 } from "lucide-react"
 import { Sheet, SheetContent, SheetHeader, SheetTitle, SheetDescription } from "@/components/ui/sheet"
 import { KnowledgeBaseDetailContent } from "@/components/kb/knowledge-base-detail"
 import { KnowledgeBaseCreationDialog } from "@/components/kb/knowledge-base-creation-dialog"
+import { ConfirmDialog } from "@/components/ui/confirm-dialog"
 import { toast } from "sonner"
 
 interface Collection {
@@ -30,8 +31,7 @@ interface Collection {
 }
 
 export function KnowledgeBasePage() {
-  const { token } = useAuth()
-  const { t, locale } = useI18n()
+  const { t } = useI18n()
   const [collections, setCollections] = useState<Collection[]>([])
   const [loading, setLoading] = useState(true)
   const [isCreateDialogOpen, setIsCreateDialogOpen] = useState(false)
@@ -39,6 +39,8 @@ export function KnowledgeBasePage() {
   const [filteredCollections, setFilteredCollections] = useState<Collection[]>([])
   const [selectedCollection, setSelectedCollection] = useState<string | null>(null)
   const [isDrawerOpen, setIsDrawerOpen] = useState(false)
+  const [collectionToDelete, setCollectionToDelete] = useState<string | null>(null)
+  const [isDeletingCollection, setIsDeletingCollection] = useState(false)
 
   useEffect(() => {
     fetchCollections()
@@ -77,6 +79,69 @@ export function KnowledgeBasePage() {
   const handleViewDetail = (collectionName: string) => {
     setSelectedCollection(collectionName)
     setIsDrawerOpen(true)
+  }
+
+  const handleDrawerOpenChange = (open: boolean) => {
+    setIsDrawerOpen(open)
+
+    if (!open) {
+      setSelectedCollection(null)
+    }
+  }
+
+  const handleDeleteCollection = async () => {
+    if (!collectionToDelete) {
+      return
+    }
+
+    const targetCollection = collectionToDelete
+    setIsDeletingCollection(true)
+
+    try {
+      const response = await apiRequest(
+        `${getApiUrl()}/api/kb/collections/${encodeURIComponent(targetCollection)}`,
+        { method: "DELETE" }
+      )
+      const result = await response.json().catch(() => null)
+
+      if (!response.ok) {
+        const errorMessage = typeof result?.detail === "string"
+          ? result.detail
+          : typeof result?.message === "string"
+            ? result.message
+            : t("kb.errors.deleteFailed", { name: targetCollection })
+
+        throw new Error(errorMessage)
+      }
+
+      const status = typeof result?.status === "string" ? result.status : undefined
+      const message = typeof result?.message === "string" ? result.message : ""
+      const rawWarnings: unknown[] = Array.isArray(result?.warnings) ? result.warnings : []
+      const warnings = rawWarnings.filter(
+        (warning: unknown): warning is string => typeof warning === "string" && warning.length > 0
+      )
+
+      if (status === "failed") {
+        throw new Error(warnings[0] || message || t("kb.errors.deleteFailed", { name: targetCollection }))
+      }
+
+      if (status && status !== "success" && status !== "partial_success") {
+        throw new Error(warnings[0] || message || t("kb.errors.deleteFailed", { name: targetCollection }))
+      }
+
+      setCollectionToDelete(null)
+      setSelectedCollection(null)
+      setIsDrawerOpen(false)
+      await fetchCollections()
+
+      if (status === "partial_success") {
+        toast.warning(warnings[0] || message || t("kb.errors.deleteFailedGeneric"))
+      }
+    } catch (error) {
+      toast.error(error instanceof Error ? error.message : t("kb.errors.deleteFailedGeneric"))
+    } finally {
+      setIsDeletingCollection(false)
+    }
   }
 
   if (loading) {
@@ -186,13 +251,28 @@ export function KnowledgeBasePage() {
       />
 
       {/* Detail Drawer */}
-      <Sheet open={isDrawerOpen} onOpenChange={setIsDrawerOpen}>
+      <Sheet open={isDrawerOpen} onOpenChange={handleDrawerOpenChange}>
         <SheetContent className="w-[90vw] sm:max-w-[85vw] md:max-w-[1000px] overflow-y-auto">
           <SheetHeader>
-            <SheetTitle>{selectedCollection || ""}</SheetTitle>
-            <SheetDescription>
-              {selectedCollection ? t("kb.detail.viewingDetails", { name: selectedCollection }) : ""}
-            </SheetDescription>
+            <div className="flex items-start justify-between gap-4 pr-8">
+              <div className="space-y-1">
+                <SheetTitle>{selectedCollection || ""}</SheetTitle>
+                <SheetDescription>
+                  {selectedCollection ? t("kb.detail.viewingDetails", { name: selectedCollection }) : ""}
+                </SheetDescription>
+              </div>
+              {selectedCollection && (
+                <Button
+                  variant="outline"
+                  size="sm"
+                  className="shrink-0 text-destructive hover:text-destructive"
+                  onClick={() => setCollectionToDelete(selectedCollection)}
+                >
+                  <Trash2 size={16} />
+                  {t("common.delete")}
+                </Button>
+              )}
+            </div>
           </SheetHeader>
           <div className="h-full pb-10">
             {selectedCollection && (
@@ -201,6 +281,14 @@ export function KnowledgeBasePage() {
           </div>
         </SheetContent>
       </Sheet>
+
+      <ConfirmDialog
+        isOpen={!!collectionToDelete}
+        onOpenChange={(open) => !open && setCollectionToDelete(null)}
+        onConfirm={handleDeleteCollection}
+        isLoading={isDeletingCollection}
+        description={t("kb.actions.deleteConfirm", { name: collectionToDelete || "" })}
+      />
     </div>
   )
 }

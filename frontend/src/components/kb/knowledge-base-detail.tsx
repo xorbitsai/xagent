@@ -19,6 +19,8 @@ import { appendIngestionConfigToFormData } from "@/lib/ingestion-form"
 import { parseSeparatorsInput, formatSeparatorsOutput } from "@/lib/separators"
 import { useI18n } from "@/contexts/i18n-context"
 import { toast } from "sonner"
+import { CollectionDocumentInfo } from "./knowledge-base-detail-helpers"
+import { KnowledgeBaseDocumentList } from "./knowledge-base-document-list"
 
 interface CollectionInfo {
   name: string
@@ -27,6 +29,7 @@ interface CollectionInfo {
   embeddings: number
   parses: number
   document_names?: string[]
+  document_metadata?: CollectionDocumentInfo[]
   ingestion_config?: Partial<IngestionConfig>
 }
 
@@ -274,56 +277,6 @@ export function KnowledgeBaseDetailContent({ collectionName }: { collectionName:
 
   const removeFile = (index: number) => {
     setSelectedFiles(prev => prev.filter((_, i) => i !== index))
-  }
-
-  const [documentToDelete, setDocumentToDelete] = useState<string | null>(null)
-  const [isDeletingDocument, setIsDeletingDocument] = useState(false)
-
-  const confirmDeleteDocument = async () => {
-    if (!documentToDelete) return
-    const fileName = documentToDelete
-    setIsDeletingDocument(true)
-
-    try {
-      console.log("Deleting document:", fileName)
-      const response = await apiRequest(
-        `${getApiUrl()}/api/kb/collections/${encodeURIComponent(collectionName)}/documents/${encodeURIComponent(fileName)}`,
-        { method: "DELETE" }
-      )
-
-      if (!response.ok) {
-        const errorData = await response.json()
-        throw new Error(errorData.detail || t("kb.detail.errors.deleteFailed"))
-      }
-
-      const result = await response.json()
-      console.log("Delete result:", result)
-
-      // Handle partial success or failure
-      if (result.status === "partial_success") {
-        toast.error(t("kb.detail.errors.partialSuccess", { message: result.message }))
-      } else if (result.status === "failed") {
-        toast.error(t("kb.detail.errors.deleteFailedWithMessage", { message: result.message }))
-        return
-      }
-
-      // Add brief delay to ensure backend data is updated
-      await new Promise(resolve => setTimeout(resolve, 500))
-
-      // Reload collection info
-      await fetchCollectionInfo()
-      console.log("Collection info refreshed")
-      setDocumentToDelete(null)
-    } catch (error) {
-      console.error("Delete error:", error)
-      toast.error(error instanceof Error ? error.message : t("kb.detail.errors.deleteFailed"))
-    } finally {
-      setIsDeletingDocument(false)
-    }
-  }
-
-  const handleDeleteDocument = (fileName: string) => {
-    setDocumentToDelete(fileName)
   }
 
   const doUpload = async () => {
@@ -680,42 +633,12 @@ export function KnowledgeBaseDetailContent({ collectionName }: { collectionName:
                 </Button>
               </div>
 
-              {collectionInfo.document_names && collectionInfo.document_names.length > 0 ? (
-                <ScrollArea className="h-96">
-                  <div className="space-y-3">
-                    {collectionInfo.document_names.map((fileName, index) => (
-                      <div key={index} className="flex items-center justify-between p-3 border rounded-lg hover:bg-muted/50 transition-colors">
-                        <div className="flex items-center gap-3">
-                          <FileIcon className="h-5 w-5 text-blue-500" />
-                          <div className="flex-1">
-                            <p className="font-medium text-sm">{fileName.split('/').pop() || fileName}</p>
-                            <p className="text-xs text-muted-foreground">{fileName}</p>
-                          </div>
-                        </div>
-                        <div className="flex items-center gap-2">
-                          <Badge variant="secondary" className="text-xs">
-                            {t("kb.detail.uploaded.indexed")}
-                          </Badge>
-                          <Button
-                            variant="ghost"
-                            size="sm"
-                            onClick={() => handleDeleteDocument(fileName)}
-                            title={t("kb.detail.uploaded.delete") || "Delete document"}
-                          >
-                            <Trash2 size={14} />
-                          </Button>
-                        </div>
-                      </div>
-                    ))}
-                  </div>
-                </ScrollArea>
-              ) : (
-                <div className="flex flex-col items-center justify-center py-16 text-muted-foreground">
-                  <FileIcon className="h-16 w-16 mb-4 opacity-30" />
-                  <p className="text-lg font-medium mb-2">{t("kb.detail.uploaded.emptyTitle")}</p>
-                  <p className="text-sm text-center">{t("kb.detail.uploaded.emptyHint")}</p>
-                </div>
-              )}
+              <KnowledgeBaseDocumentList
+                collectionInfo={collectionInfo}
+                collectionName={collectionName}
+                onRefresh={fetchCollectionInfo}
+                t={t}
+              />
             </div>
 
             {/* Hidden Input for File Selection */}
@@ -1285,13 +1208,6 @@ export function KnowledgeBaseDetailContent({ collectionName }: { collectionName:
             )}
           </DialogContent>
         </Dialog>
-      <ConfirmDialog
-        isOpen={!!documentToDelete}
-        onOpenChange={(open) => !open && setDocumentToDelete(null)}
-        onConfirm={confirmDeleteDocument}
-        isLoading={isDeletingDocument}
-        description={t("kb.detail.uploaded.confirmDelete")}
-      />
     </div>
   )
 }

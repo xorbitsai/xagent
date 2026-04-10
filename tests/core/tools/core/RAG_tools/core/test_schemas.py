@@ -1431,7 +1431,7 @@ class TestCollectionInfo:
         assert storage_data["embedding_dimension"] == 1536
         assert storage_data["documents"] == 5
         assert storage_data["processed_documents"] == 3
-        assert storage_data["ingestion_config"] is None
+        assert storage_data["ingestion_config"] == ""
 
     def test_collection_info_immutability_by_default(self):
         """Test that CollectionInfo is immutable by default after creation."""

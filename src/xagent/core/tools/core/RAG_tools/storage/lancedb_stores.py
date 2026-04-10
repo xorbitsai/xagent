@@ -1079,10 +1079,20 @@ class LanceDBVectorIndexStore(VectorIndexStore):
         ensure_documents_table(conn)
         table = conn.open_table("documents")
 
-        # Use merge_insert for efficient upsert
-        table.merge_insert(
-            ["collection", "doc_id"]
-        ).when_matched_update_all().when_not_matched_insert_all().execute(records)
+        # Fallback to delete and add for OSS compatibility
+        for record in records:
+            collection = record.get("collection")
+            doc_id = record.get("doc_id")
+            if collection and doc_id:
+                safe_collection = escape_lancedb_string(collection)
+                safe_doc_id = escape_lancedb_string(doc_id)
+                try:
+                    table.delete(
+                        f"collection = '{safe_collection}' AND doc_id = '{safe_doc_id}'"
+                    )
+                except Exception:
+                    pass
+        table.add(records)
 
     def upsert_parses(self, records: List[Dict[str, Any]]) -> None:
         """Upsert parse records to LanceDB.
@@ -1099,10 +1109,22 @@ class LanceDBVectorIndexStore(VectorIndexStore):
         ensure_parses_table(conn)
         table = conn.open_table("parses")
 
-        # Use merge_insert for efficient upsert
-        table.merge_insert(
-            ["collection", "doc_id", "parse_hash"]
-        ).when_matched_update_all().when_not_matched_insert_all().execute(records)
+        # Fallback to delete and add for OSS compatibility
+        for record in records:
+            collection = record.get("collection")
+            doc_id = record.get("doc_id")
+            parse_hash = record.get("parse_hash")
+            if collection and doc_id and parse_hash:
+                safe_collection = escape_lancedb_string(collection)
+                safe_doc_id = escape_lancedb_string(doc_id)
+                safe_parse_hash = escape_lancedb_string(parse_hash)
+                try:
+                    table.delete(
+                        f"collection = '{safe_collection}' AND doc_id = '{safe_doc_id}' AND parse_hash = '{safe_parse_hash}'"
+                    )
+                except Exception:
+                    pass
+        table.add(records)
 
     def upsert_chunks(self, records: List[Dict[str, Any]]) -> None:
         """Upsert chunk records to LanceDB.
@@ -1119,10 +1141,24 @@ class LanceDBVectorIndexStore(VectorIndexStore):
         ensure_chunks_table(conn)
         table = conn.open_table("chunks")
 
-        # Use merge_insert for efficient upsert
-        table.merge_insert(
-            ["collection", "doc_id", "parse_hash", "chunk_id"]
-        ).when_matched_update_all().when_not_matched_insert_all().execute(records)
+        # Fallback to delete and add for OSS compatibility
+        for record in records:
+            collection = record.get("collection")
+            doc_id = record.get("doc_id")
+            parse_hash = record.get("parse_hash")
+            chunk_id = record.get("chunk_id")
+            if collection and doc_id and parse_hash and chunk_id:
+                safe_collection = escape_lancedb_string(collection)
+                safe_doc_id = escape_lancedb_string(doc_id)
+                safe_parse_hash = escape_lancedb_string(parse_hash)
+                safe_chunk_id = escape_lancedb_string(chunk_id)
+                try:
+                    table.delete(
+                        f"collection = '{safe_collection}' AND doc_id = '{safe_doc_id}' AND parse_hash = '{safe_parse_hash}' AND chunk_id = '{safe_chunk_id}'"
+                    )
+                except Exception:
+                    pass
+        table.add(records)
 
     def upsert_embeddings(self, model_tag: str, records: List[Dict[str, Any]]) -> None:
         """Upsert embedding records to LanceDB with fallback pattern.
@@ -1553,13 +1589,20 @@ class LanceDBVectorIndexStore(VectorIndexStore):
 
         table = await async_conn.open_table("documents")
 
-        # Use merge_insert for efficient upsert
-        await (
-            table.merge_insert(["collection", "doc_id"])
-            .when_matched_update_all()
-            .when_not_matched_insert_all()
-            .execute(records)
-        )
+        # Fallback to delete and add for OSS compatibility
+        for record in records:
+            collection = record.get("collection")
+            doc_id = record.get("doc_id")
+            if collection and doc_id:
+                safe_collection = escape_lancedb_string(collection)
+                safe_doc_id = escape_lancedb_string(doc_id)
+                try:
+                    await table.delete(
+                        f"collection = '{safe_collection}' AND doc_id = '{safe_doc_id}'"
+                    )
+                except Exception:
+                    pass
+        await table.add(records)
 
     async def upsert_chunks_async(self, records: List[Dict[str, Any]]) -> None:
         """Upsert chunk records using async LanceDB API."""
@@ -1576,13 +1619,24 @@ class LanceDBVectorIndexStore(VectorIndexStore):
 
         table = await async_conn.open_table("chunks")
 
-        # Use merge_insert for efficient upsert
-        await (
-            table.merge_insert(["collection", "doc_id", "parse_hash", "chunk_id"])
-            .when_matched_update_all()
-            .when_not_matched_insert_all()
-            .execute(records)
-        )
+        # Fallback to delete and add for OSS compatibility
+        for record in records:
+            collection = record.get("collection")
+            doc_id = record.get("doc_id")
+            parse_hash = record.get("parse_hash")
+            chunk_id = record.get("chunk_id")
+            if collection and doc_id and parse_hash and chunk_id:
+                safe_collection = escape_lancedb_string(collection)
+                safe_doc_id = escape_lancedb_string(doc_id)
+                safe_parse_hash = escape_lancedb_string(parse_hash)
+                safe_chunk_id = escape_lancedb_string(chunk_id)
+                try:
+                    await table.delete(
+                        f"collection = '{safe_collection}' AND doc_id = '{safe_doc_id}' AND parse_hash = '{safe_parse_hash}' AND chunk_id = '{safe_chunk_id}'"
+                    )
+                except Exception:
+                    pass
+        await table.add(records)
 
     async def upsert_embeddings_async(
         self, model_tag: str, records: List[Dict[str, Any]]

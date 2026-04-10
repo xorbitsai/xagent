@@ -257,6 +257,36 @@ def test_kb_ingest_rejects_invalid_characters_in_collection_name(
             assert "Invalid collection name" in response.json()["detail"]
 
 
+def test_kb_ingest_accepts_unicode_collection_name(test_env, temp_uploads):
+    app, headers, user, _ = test_env
+    client = TestClient(app)
+
+    collection_name = "示例知识库集合"
+    filename = "test_doc.txt"
+
+    with patch("xagent.web.api.kb.run_document_ingestion") as mock_ingest:
+        from xagent.core.tools.core.RAG_tools.core.schemas import IngestionResult
+
+        mock_ingest.return_value = IngestionResult(
+            status="success",
+            doc_id="test_doc_id",
+            parse_hash="hash",
+            failed_step="",
+            message="success",
+        )
+
+        response = client.post(
+            "/api/kb/ingest",
+            files={"file": (filename, b"content", "text/plain")},
+            data={"collection": collection_name},
+            headers=headers,
+        )
+
+        assert response.status_code == 200
+        expected_path = temp_uploads / f"user_{user.id}" / collection_name / filename
+        assert expected_path.exists()
+
+
 def test_kb_ingest_rejects_too_long_collection_name(test_env, temp_uploads):
     """Test that ingest API rejects collection names exceeding length limit."""
     app, headers, user, _ = test_env

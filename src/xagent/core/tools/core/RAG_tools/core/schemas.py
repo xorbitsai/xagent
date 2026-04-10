@@ -1258,6 +1258,18 @@ class DocumentProcessingRecord(BaseModel):
     )
 
 
+class CollectionDocumentMetadata(BaseModel):
+    filename: str = Field(..., description="Display filename for the document")
+    file_id: Optional[str] = Field(
+        default=None,
+        description="UploadedFile identifier when available",
+    )
+    doc_id: Optional[str] = Field(
+        default=None,
+        description="Knowledge base document identifier when available",
+    )
+
+
 class CollectionInfo(BaseModel):
     """Aggregate metadata for a single collection with embedding binding."""
 
@@ -1295,6 +1307,10 @@ class CollectionInfo(BaseModel):
     document_names: List[str] = Field(
         default_factory=list,
         description="Distinct source paths for documents within the collection",
+    )
+    document_metadata: List[CollectionDocumentMetadata] = Field(
+        default_factory=list,
+        description="Minimal per-document metadata for UI actions like unambiguous delete",
     )
 
     # ⚙️ Configuration management
@@ -1393,7 +1409,7 @@ class CollectionInfo(BaseModel):
         """Serialize for LanceDB storage."""
         import json
 
-        data = self.model_dump()
+        data = self.model_dump(exclude={"document_metadata"})
 
         # Serialize complex types to JSON strings for LanceDB
         data["extra_metadata"] = json.dumps(data["extra_metadata"])

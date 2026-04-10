@@ -1,8 +1,7 @@
 from typing import Any, Dict, List, Type
 
-import requests
-
 import pytest
+import requests
 
 from xagent.core.model.embedding import OpenAIEmbedding
 

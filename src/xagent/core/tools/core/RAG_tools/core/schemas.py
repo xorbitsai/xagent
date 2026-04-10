@@ -1373,6 +1373,13 @@ class CollectionInfo(BaseModel):
             if isinstance(value, float) and math.isnan(value):
                 data[key] = None
 
+        # Handle empty string fallback for string fields that might have been stored as "" to avoid non-null errors
+        if data.get("embedding_model_id") == "":
+            data["embedding_model_id"] = None
+
+        if data.get("embedding_dimension") == -1:
+            data["embedding_dimension"] = None
+
         # 3. Check version and migrate if needed (no DB access on read path)
         current_version = "1.0.0"
         data_version = data.get("schema_version", "0.0.0")
@@ -1396,7 +1403,15 @@ class CollectionInfo(BaseModel):
         if data.get("ingestion_config"):
             data["ingestion_config"] = json.dumps(data["ingestion_config"])
         else:
-            data["ingestion_config"] = None
+            data["ingestion_config"] = (
+                ""  # Use empty string instead of None to prevent LanceDB non-null schema errors
+            )
+
+        if data.get("embedding_model_id") is None:
+            data["embedding_model_id"] = ""
+
+        if data.get("embedding_dimension") is None:
+            data["embedding_dimension"] = -1
 
         return data
 

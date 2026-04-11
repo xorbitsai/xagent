@@ -1117,7 +1117,6 @@ def test_delete_document_without_file_id_does_not_resurface_on_collection_refres
     client = TestClient(app)
 
     from xagent.core.tools.core.RAG_tools.core.schemas import (
-        CollectionDocumentMetadata,
         CollectionInfo,
         ListCollectionsResult,
     )
@@ -1210,7 +1209,6 @@ def test_delete_document_without_file_id_does_not_resurface_in_uploaded_file_fal
     client = TestClient(app)
 
     from xagent.core.tools.core.RAG_tools.core.schemas import (
-        CollectionDocumentMetadata,
         CollectionInfo,
         ListCollectionsResult,
     )
@@ -1686,7 +1684,6 @@ def test_list_collections_secondary_fallback_avoids_n_plus_one(test_env, temp_up
     client = TestClient(app)
 
     from xagent.core.tools.core.RAG_tools.core.schemas import (
-        CollectionDocumentMetadata,
         CollectionInfo,
         ListCollectionsResult,
     )

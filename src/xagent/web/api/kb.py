@@ -696,12 +696,12 @@ async def list_collections_api(
                 )
 
             for collection in result.collections:
-                for metadata in collection.document_metadata:
+                for document_metadata in collection.document_metadata:
                     _add_collection_document_metadata(
                         collection.name,
-                        metadata.filename,
-                        file_id=metadata.file_id,
-                        doc_id=metadata.doc_id,
+                        document_metadata.filename,
+                        file_id=document_metadata.file_id,
+                        doc_id=document_metadata.doc_id,
                     )
 
             if collections_needing_scan:
@@ -828,7 +828,7 @@ async def list_collections_api(
                         )
 
             for collection in result.collections:
-                metadata = sorted(
+                resolved_metadata = sorted(
                     document_metadata_by_collection.get(collection.name, []),
                     key=lambda item: (
                         item.filename,
@@ -836,10 +836,10 @@ async def list_collections_api(
                         item.doc_id or "",
                     ),
                 )
-                collection.document_metadata = metadata
-                if not collection.document_names and metadata:
+                collection.document_metadata = resolved_metadata
+                if not collection.document_names and resolved_metadata:
                     collection.document_names = sorted(
-                        {item.filename for item in metadata if item.filename}
+                        {item.filename for item in resolved_metadata if item.filename}
                     )
                     if collection.documents == 0:
                         collection.documents = len(collection.document_names)

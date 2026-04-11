@@ -180,6 +180,10 @@ class TestSanitizePathComponent:
             with pytest.raises(ValueError, match="contains invalid characters"):
                 sanitize_path_component(name, "collection")
 
+    def test_rejects_compatibility_homoglyph_forms(self):
+        with pytest.raises(ValueError, match="contains invalid characters"):
+            sanitize_path_component("Ａgent", "collection")
+
     def test_numeric_only_names(self):
         """Test that numeric-only names are accepted."""
         numeric_names = ["123", "0", "999999"]

@@ -6,6 +6,7 @@ dynamically to support environment variable changes at runtime.
 """
 
 import re
+import unicodedata
 from pathlib import Path
 from typing import Optional
 
@@ -130,6 +131,14 @@ def sanitize_path_component(name: str, component_type: str = "path") -> str:
 
     # Remove leading/trailing whitespace
     name = name.strip()
+
+    normalized_name = unicodedata.normalize("NFKC", name)
+    if normalized_name != name:
+        raise ValueError(
+            f"Invalid {component_type} name: contains invalid characters. "
+            f"Only letters, numbers, underscores, and hyphens are allowed."
+        )
+    name = normalized_name
 
     # Extract only the basename to prevent path traversal
     # This handles cases like "../../../etc" -> "etc"

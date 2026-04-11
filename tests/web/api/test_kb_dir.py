@@ -362,6 +362,22 @@ def test_kb_delete_accepts_unicode_collection_name(test_env, temp_uploads):
     assert response.status_code == 200
 
 
+def test_kb_delete_rejects_mixed_script_confusable_collection_name(test_env, temp_uploads):
+    app, headers, user, _ = test_env
+    client = TestClient(app)
+
+    from urllib.parse import quote
+
+    collection_name = "cоllection"
+    response = client.delete(
+        f"/api/kb/collections/{quote(collection_name, safe='')}",
+        headers=headers,
+    )
+
+    assert response.status_code == 422
+    assert "Invalid collection name" in response.json()["detail"]
+
+
 def test_kb_delete_physical_cleanup_failure_aborts_operation(test_env, temp_uploads):
     """Test that physical cleanup (move-to-trash) failure aborts database deletion."""
     app, headers, user, _ = test_env
@@ -936,6 +952,24 @@ def test_delete_document_accepts_unicode_collection_name(test_env, temp_uploads)
 
     assert response.status_code == 200
     assert deleted_doc_ids == ["doc-1"]
+
+
+def test_delete_document_rejects_mixed_script_confusable_collection_name(
+    test_env, temp_uploads
+):
+    app, headers, user, _ = test_env
+    client = TestClient(app)
+
+    from urllib.parse import quote
+
+    collection_name = "cоllection"
+    response = client.delete(
+        f"/api/kb/collections/{quote(collection_name, safe='')}/documents/demo.txt",
+        headers=headers,
+    )
+
+    assert response.status_code == 422
+    assert "Invalid collection name" in response.json()["detail"]
 
 
 def test_delete_document_rejects_path_traversal_in_collection_name(

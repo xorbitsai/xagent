@@ -9,10 +9,10 @@ from fastapi.testclient import TestClient
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 
+from xagent.core.tools.core.RAG_tools.storage.contracts import DocumentRecord
 from xagent.core.tools.core.RAG_tools.utils.string_utils import (
     generate_deterministic_doc_id,
 )
-from xagent.core.tools.core.RAG_tools.storage.contracts import DocumentRecord
 from xagent.web.api.auth import hash_password
 from xagent.web.api.kb import kb_router
 from xagent.web.models.database import Base, get_db

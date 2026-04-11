@@ -1117,6 +1117,7 @@ def test_delete_document_without_file_id_does_not_resurface_on_collection_refres
     client = TestClient(app)
 
     from xagent.core.tools.core.RAG_tools.core.schemas import (
+        CollectionDocumentMetadata,
         CollectionInfo,
         ListCollectionsResult,
     )
@@ -1209,6 +1210,7 @@ def test_delete_document_without_file_id_does_not_resurface_in_uploaded_file_fal
     client = TestClient(app)
 
     from xagent.core.tools.core.RAG_tools.core.schemas import (
+        CollectionDocumentMetadata,
         CollectionInfo,
         ListCollectionsResult,
     )
@@ -1509,24 +1511,39 @@ def test_delete_document_reports_cleanup_commit_failure(test_env, temp_uploads):
     def _fake_delete_document(collection_name, doc_id, user_id, is_admin):
         document_state.clear()
 
-    def _failing_commit(self):
+    def _failing_commit():
         raise RuntimeError("commit failed")
 
-    with (
-        patch(
-            "xagent.web.api.kb._list_documents_for_user",
-            side_effect=_fake_list_documents_for_user,
-        ),
-        patch(
-            "xagent.core.tools.core.RAG_tools.management.collections.delete_document",
-            side_effect=_fake_delete_document,
-        ),
-        patch("sqlalchemy.orm.session.Session.commit", new=_failing_commit),
-    ):
-        response = client.delete(
-            f"/api/kb/collections/demo/documents/commit-failure.txt?file_id={target_file_id}",
-            headers=headers,
-        )
+    original_override = app.dependency_overrides[get_db]
+
+    def override_get_db_with_failing_commit():
+        db = TestingSessionLocal()
+        original_commit = db.commit
+        db.commit = _failing_commit
+        try:
+            yield db
+        finally:
+            db.commit = original_commit
+            db.close()
+
+    app.dependency_overrides[get_db] = override_get_db_with_failing_commit
+    try:
+        with (
+            patch(
+                "xagent.web.api.kb._list_documents_for_user",
+                side_effect=_fake_list_documents_for_user,
+            ),
+            patch(
+                "xagent.core.tools.core.RAG_tools.management.collections.delete_document",
+                side_effect=_fake_delete_document,
+            ),
+        ):
+            response = client.delete(
+                f"/api/kb/collections/demo/documents/commit-failure.txt?file_id={target_file_id}",
+                headers=headers,
+            )
+    finally:
+        app.dependency_overrides[get_db] = original_override
 
     assert response.status_code == 200
     payload = response.json()
@@ -1669,6 +1686,7 @@ def test_list_collections_secondary_fallback_avoids_n_plus_one(test_env, temp_up
     client = TestClient(app)
 
     from xagent.core.tools.core.RAG_tools.core.schemas import (
+        CollectionDocumentMetadata,
         CollectionInfo,
         ListCollectionsResult,
     )
@@ -1704,3 +1722,102 @@ def test_list_collections_secondary_fallback_avoids_n_plus_one(test_env, temp_up
 
     assert response.status_code == 200
     assert call_counts["list_documents"] == 0
+
+
+def test_list_collections_skips_document_scan_when_names_are_complete(test_env):
+    app, headers, user, _ = test_env
+    client = TestClient(app)
+
+    from xagent.core.tools.core.RAG_tools.core.schemas import (
+        CollectionDocumentMetadata,
+        CollectionInfo,
+        ListCollectionsResult,
+    )
+
+    fake_result = ListCollectionsResult(
+        status="success",
+        collections=[
+            CollectionInfo(
+                name="complete",
+                documents=1,
+                document_names=["a.md"],
+                document_metadata=[
+                    CollectionDocumentMetadata(
+                        filename="a.md",
+                        file_id="file-1",
+                        doc_id="doc-1",
+                    )
+                ],
+            ),
+        ],
+        total_count=1,
+        message="ok",
+        warnings=[],
+    )
+
+    with (
+        patch("xagent.web.api.kb.list_collections", return_value=fake_result),
+        patch(
+            "xagent.web.api.kb._list_documents_for_user",
+            side_effect=AssertionError("_list_documents_for_user should not be called"),
+        ),
+    ):
+        response = client.get("/api/kb/collections", headers=headers)
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["collections"][0]["name"] == "complete"
+    assert payload["collections"][0]["document_names"] == ["a.md"]
+
+
+def test_list_collections_skips_document_scan_when_duplicate_names_have_metadata(
+    test_env,
+):
+    app, headers, user, _ = test_env
+    client = TestClient(app)
+
+    from xagent.core.tools.core.RAG_tools.core.schemas import (
+        CollectionDocumentMetadata,
+        CollectionInfo,
+        ListCollectionsResult,
+    )
+
+    fake_result = ListCollectionsResult(
+        status="success",
+        collections=[
+            CollectionInfo(
+                name="duplicate",
+                documents=2,
+                document_names=["shared.txt"],
+                document_metadata=[
+                    CollectionDocumentMetadata(
+                        filename="shared.txt",
+                        file_id="file-1",
+                        doc_id="doc-1",
+                    ),
+                    CollectionDocumentMetadata(
+                        filename="shared.txt",
+                        file_id="file-2",
+                        doc_id="doc-2",
+                    ),
+                ],
+            ),
+        ],
+        total_count=1,
+        message="ok",
+        warnings=[],
+    )
+
+    with (
+        patch("xagent.web.api.kb.list_collections", return_value=fake_result),
+        patch(
+            "xagent.web.api.kb._list_documents_for_user",
+            side_effect=AssertionError("_list_documents_for_user should not be called"),
+        ),
+    ):
+        response = client.get("/api/kb/collections", headers=headers)
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["collections"][0]["name"] == "duplicate"
+    assert len(payload["collections"][0]["document_metadata"]) == 2

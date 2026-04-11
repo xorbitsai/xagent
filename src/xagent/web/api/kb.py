@@ -636,11 +636,26 @@ async def list_collections_api(
         # the backfill migration (backfill_documents_file_id.py), this should no longer
         # be needed and can be removed.
         if result.collections:
-            collection_name_set = {c.name for c in result.collections}
             document_metadata_by_collection: Dict[
                 str, List[CollectionDocumentMetadata]
             ] = {}
             document_metadata_seen: Dict[str, set[tuple[str, str, str]]] = {}
+            fallback_names: Dict[str, set[str]] = {}
+
+            def _collection_needs_document_scan(collection: Any) -> bool:
+                if collection.document_metadata:
+                    return False
+                return (not collection.document_names) or (
+                    collection.documents != len(collection.document_names)
+                )
+
+            collections_needing_scan = [
+                collection
+                for collection in result.collections
+                if _collection_needs_document_scan(collection)
+                and not document_metadata_by_collection.get(collection.name)
+            ]
+            scan_target_names = {c.name for c in collections_needing_scan}
 
             def _normalize_optional_identifier(value: Any) -> Optional[str]:
                 if not isinstance(value, str):
@@ -655,8 +670,6 @@ async def list_collections_api(
                 file_id: Optional[str] = None,
                 doc_id: Optional[str] = None,
             ) -> None:
-                if collection_name not in collection_name_set:
-                    return
                 if not isinstance(filename, str):
                     return
                 normalized_filename = filename.strip()
@@ -682,164 +695,139 @@ async def list_collections_api(
                     )
                 )
 
-            try:
-                doc_records = _list_documents_for_user(
-                    user_id=int(_user.id),
-                    is_admin=bool(_user.is_admin),
-                )
-            except Exception as exc:  # noqa: BLE001
-                logger.warning(
-                    "Failed to list documents for metadata fallback: %s", exc
-                )
-                doc_records = []
-
-            if doc_records:
-                filename_map = _build_uploaded_filename_map(
-                    db,
-                    user_id=int(_user.id),
-                    file_ids=[
-                        file_id
-                        for file_id in (
-                            _get_document_record_file_id(record)
-                            for record in doc_records
-                        )
-                        if file_id
-                    ],
-                )
-                for doc_rec in doc_records:
-                    rec_collection = doc_rec.get("collection")
-                    if not isinstance(rec_collection, str) or not rec_collection:
-                        continue
-                    if rec_collection not in collection_name_set:
-                        continue
-                    resolved_filename = _resolve_document_filename(
-                        doc_rec, filename_map
-                    )
-                    resolved_doc_id = _normalize_optional_identifier(
-                        doc_rec.get("doc_id")
-                    )
+            for collection in result.collections:
+                for metadata in collection.document_metadata:
                     _add_collection_document_metadata(
-                        rec_collection,
-                        resolved_filename or resolved_doc_id,
-                        file_id=_get_document_record_file_id(doc_rec),
-                        doc_id=resolved_doc_id,
+                        collection.name,
+                        metadata.filename,
+                        file_id=metadata.file_id,
+                        doc_id=metadata.doc_id,
                     )
 
-            collections_needing_fallback = [
-                c
-                for c in result.collections
-                if not document_metadata_by_collection.get(c.name)
-            ]
+            if collections_needing_scan:
+                try:
+                    doc_records = _list_documents_for_user(
+                        user_id=int(_user.id),
+                        is_admin=bool(_user.is_admin),
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning(
+                        "Failed to list documents for metadata fallback: %s", exc
+                    )
+                    doc_records = []
 
-            if collections_needing_fallback:
-                # Filter at SQL level to only load relevant uploaded files
-                collection_patterns = [
-                    _like_contains_pattern(f"/user_{int(_user.id)}/{c.name}/")
-                    for c in collections_needing_fallback
+                if doc_records:
+                    filename_map = _build_uploaded_filename_map(
+                        db,
+                        user_id=int(_user.id),
+                        file_ids=[
+                            file_id
+                            for file_id in (
+                                _get_document_record_file_id(record)
+                                for record in doc_records
+                            )
+                            if file_id
+                        ],
+                    )
+                    for doc_rec in doc_records:
+                        rec_collection = doc_rec.get("collection")
+                        if not isinstance(rec_collection, str) or not rec_collection:
+                            continue
+                        if rec_collection not in scan_target_names:
+                            continue
+                        resolved_filename = _resolve_document_filename(
+                            doc_rec, filename_map
+                        )
+                        resolved_doc_id = _normalize_optional_identifier(
+                            doc_rec.get("doc_id")
+                        )
+                        _add_collection_document_metadata(
+                            rec_collection,
+                            resolved_filename or resolved_doc_id,
+                            file_id=_get_document_record_file_id(doc_rec),
+                            doc_id=resolved_doc_id,
+                        )
+
+                collections_needing_fallback = [
+                    collection
+                    for collection in collections_needing_scan
+                    if not document_metadata_by_collection.get(collection.name)
                 ]
 
-                uploaded_records = []
-                if len(collection_patterns) == 1:
-                    uploaded_records = (
-                        db.query(UploadedFile)
-                        .filter(
-                            UploadedFile.user_id == int(_user.id),
-                            UploadedFile.storage_path.like(
-                                collection_patterns[0],
-                                escape=_SQL_LIKE_ESCAPE,
-                            ),
-                        )
-                        .all()
-                    )
-                else:
-                    # Multiple collections: use OR logic
-                    from sqlalchemy import or_
+                if collections_needing_fallback:
+                    # Filter at SQL level to only load relevant uploaded files
+                    collection_patterns = [
+                        _like_contains_pattern(f"/user_{int(_user.id)}/{c.name}/")
+                        for c in collections_needing_fallback
+                    ]
 
-                    uploaded_records = (
-                        db.query(UploadedFile)
-                        .filter(
-                            UploadedFile.user_id == int(_user.id),
-                            or_(
-                                *[
-                                    UploadedFile.storage_path.like(
-                                        pattern,
-                                        escape=_SQL_LIKE_ESCAPE,
-                                    )
-                                    for pattern in collection_patterns
-                                ]
-                            ),
+                    uploaded_records = []
+                    if len(collection_patterns) == 1:
+                        uploaded_records = (
+                            db.query(UploadedFile)
+                            .filter(
+                                UploadedFile.user_id == int(_user.id),
+                                UploadedFile.storage_path.like(
+                                    collection_patterns[0],
+                                    escape=_SQL_LIKE_ESCAPE,
+                                ),
+                            )
+                            .all()
                         )
-                        .all()
-                    )
+                    else:
+                        # Multiple collections: use OR logic
+                        from sqlalchemy import or_
 
-                fallback_names: Dict[str, set[str]] = {}
-                user_segment = f"user_{int(_user.id)}"
-                for rec in uploaded_records:
-                    storage_path = Path(str(getattr(rec, "storage_path", "")))
-                    parts = storage_path.parts
-                    if user_segment not in parts:
-                        continue
-                    user_idx = parts.index(user_segment)
-                    if user_idx + 2 >= len(parts):
-                        continue
-                    collection_name = parts[user_idx + 1]
-                    if collection_name not in collection_name_set:
-                        continue
-                    fallback_filename = str(getattr(rec, "filename", "")).strip()
-                    fallback_names.setdefault(collection_name, set()).add(
-                        fallback_filename
-                    )
-                    fallback_file_id = _normalize_optional_identifier(
-                        getattr(rec, "file_id", None)
-                    )
-                    fallback_doc_id = None
-                    if str(getattr(rec, "storage_path", "")).strip():
-                        fallback_doc_id = generate_deterministic_doc_id(
+                        uploaded_records = (
+                            db.query(UploadedFile)
+                            .filter(
+                                UploadedFile.user_id == int(_user.id),
+                                or_(
+                                    *[
+                                        UploadedFile.storage_path.like(
+                                            pattern,
+                                            escape=_SQL_LIKE_ESCAPE,
+                                        )
+                                        for pattern in collection_patterns
+                                    ]
+                                ),
+                            )
+                            .all()
+                        )
+
+                    user_segment = f"user_{int(_user.id)}"
+                    for rec in uploaded_records:
+                        storage_path = Path(str(getattr(rec, "storage_path", "")))
+                        parts = storage_path.parts
+                        if user_segment not in parts:
+                            continue
+                        user_idx = parts.index(user_segment)
+                        if user_idx + 2 >= len(parts):
+                            continue
+                        collection_name = parts[user_idx + 1]
+                        if collection_name not in scan_target_names:
+                            continue
+                        fallback_filename = str(getattr(rec, "filename", "")).strip()
+                        fallback_names.setdefault(collection_name, set()).add(
+                            fallback_filename
+                        )
+                        fallback_file_id = _normalize_optional_identifier(
+                            getattr(rec, "file_id", None)
+                        )
+                        fallback_doc_id = None
+                        if str(getattr(rec, "storage_path", "")).strip():
+                            fallback_doc_id = generate_deterministic_doc_id(
+                                collection_name,
+                                str(getattr(rec, "storage_path", "")).strip(),
+                            )
+                        _add_collection_document_metadata(
                             collection_name,
-                            str(getattr(rec, "storage_path", "")).strip(),
+                            fallback_filename,
+                            file_id=fallback_file_id,
+                            doc_id=fallback_doc_id,
                         )
-                    _add_collection_document_metadata(
-                        collection_name,
-                        fallback_filename,
-                        file_id=fallback_file_id,
-                        doc_id=fallback_doc_id,
-                    )
-
-                for collection in result.collections:
-                    metadata = sorted(
-                        document_metadata_by_collection.get(collection.name, []),
-                        key=lambda item: (
-                            item.filename,
-                            item.file_id or "",
-                            item.doc_id or "",
-                        ),
-                    )
-                    if metadata:
-                        collection.document_metadata = metadata
-                    if collection.document_names:
-                        continue
-                    if metadata:
-                        collection.document_names = sorted(
-                            {item.filename for item in metadata if item.filename}
-                        )
-                        if collection.documents == 0:
-                            collection.documents = len(collection.document_names)
-                        continue
-                    fallback = sorted(
-                        name
-                        for name in fallback_names.get(collection.name, set())
-                        if name
-                    )
-                    if fallback:
-                        collection.document_names = fallback
-                        # Keep UI card counters aligned with visible files when docs table is unreadable.
-                        if collection.documents == 0:
-                            collection.documents = len(fallback)
-                        continue
 
             for collection in result.collections:
-                if collection.document_metadata:
-                    continue
                 metadata = sorted(
                     document_metadata_by_collection.get(collection.name, []),
                     key=lambda item: (
@@ -848,14 +836,22 @@ async def list_collections_api(
                         item.doc_id or "",
                     ),
                 )
-                if metadata:
-                    collection.document_metadata = metadata
+                collection.document_metadata = metadata
                 if not collection.document_names and metadata:
                     collection.document_names = sorted(
                         {item.filename for item in metadata if item.filename}
                     )
                     if collection.documents == 0:
                         collection.documents = len(collection.document_names)
+                    continue
+
+                fallback = sorted(
+                    name for name in fallback_names.get(collection.name, set()) if name
+                )
+                if fallback:
+                    collection.document_names = fallback
+                    if collection.documents == 0:
+                        collection.documents = len(fallback)
 
         return result
     except asyncio.TimeoutError:
@@ -1643,6 +1639,59 @@ async def delete_document_api(
 
         return None
 
+    def _build_resolved_document_match(
+        summary_doc_id: str,
+        summary_basename: Optional[str],
+        normalized_source_path: str,
+        *,
+        matched_file_id: Optional[str],
+        matched_filename: Optional[str],
+    ) -> dict[str, Any]:
+        return {
+            "doc_id": summary_doc_id,
+            "file_id": matched_file_id,
+            "filename": matched_filename or summary_basename or filename,
+            "source_path": normalized_source_path or None,
+        }
+
+    def _match_uploaded_file_summary(
+        uploaded_file_record: UploadedFile,
+        summary_doc_id: str,
+        summary_basename: Optional[str],
+        normalized_source_path: str,
+    ) -> Optional[dict[str, Any]]:
+        uploaded_storage_path = str(
+            getattr(uploaded_file_record, "storage_path", "")
+        ).strip()
+        uploaded_filename = str(getattr(uploaded_file_record, "filename", "")).strip()
+
+        if normalized_source_path == uploaded_storage_path:
+            return _build_resolved_document_match(
+                summary_doc_id,
+                summary_basename,
+                normalized_source_path,
+                matched_file_id=file_id,
+                matched_filename=uploaded_filename,
+            )
+
+        if not uploaded_storage_path:
+            return None
+
+        derived_doc_id = generate_deterministic_doc_id(
+            safe_collection_name,
+            uploaded_storage_path,
+        )
+        if derived_doc_id != summary_doc_id:
+            return None
+
+        return _build_resolved_document_match(
+            summary_doc_id,
+            summary_basename,
+            normalized_source_path,
+            matched_file_id=file_id,
+            matched_filename=uploaded_filename,
+        )
+
     def _resolve_list_documents_match() -> Optional[dict[str, Any]]:
         uploaded_file_record: Optional[UploadedFile] = None
         if file_id:
@@ -1678,68 +1727,42 @@ async def delete_document_api(
             if doc_id and summary_doc_id != doc_id:
                 continue
 
-            if file_id:
-                if uploaded_file_record is not None:
-                    uploaded_storage_path = str(
-                        getattr(uploaded_file_record, "storage_path", "")
-                    ).strip()
-                    if normalized_source_path == uploaded_storage_path:
-                        return {
-                            "doc_id": summary_doc_id,
-                            "file_id": file_id,
-                            "filename": (
-                                str(
-                                    getattr(uploaded_file_record, "filename", "")
-                                ).strip()
-                                or summary_basename
-                                or filename
-                            ),
-                            "source_path": normalized_source_path or None,
-                        }
-                    if uploaded_storage_path:
-                        derived_doc_id = generate_deterministic_doc_id(
-                            safe_collection_name,
-                            uploaded_storage_path,
-                        )
-                        if derived_doc_id == summary_doc_id:
-                            return {
-                                "doc_id": summary_doc_id,
-                                "file_id": file_id,
-                                "filename": (
-                                    str(
-                                        getattr(uploaded_file_record, "filename", "")
-                                    ).strip()
-                                    or summary_basename
-                                    or filename
-                                ),
-                                "source_path": normalized_source_path or None,
-                            }
+            if not file_id:
+                return _build_resolved_document_match(
+                    summary_doc_id,
+                    summary_basename,
+                    normalized_source_path,
+                    matched_file_id=None,
+                    matched_filename=None,
+                )
 
-                if uploaded_file_record is None:
-                    if doc_id:
-                        return {
-                            "doc_id": summary_doc_id,
-                            "file_id": None,
-                            "filename": summary_basename or filename,
-                            "source_path": normalized_source_path or None,
-                        }
-                    continue
-
+            if uploaded_file_record is None:
                 if doc_id:
-                    raise HTTPException(
-                        status_code=409,
-                        detail=(
-                            "Provided `file_id` and `doc_id` do not reference the same document"
-                        ),
+                    return _build_resolved_document_match(
+                        summary_doc_id,
+                        summary_basename,
+                        normalized_source_path,
+                        matched_file_id=None,
+                        matched_filename=None,
                     )
                 continue
 
-            return {
-                "doc_id": summary_doc_id,
-                "file_id": None,
-                "filename": summary_basename or filename,
-                "source_path": normalized_source_path or None,
-            }
+            uploaded_match = _match_uploaded_file_summary(
+                uploaded_file_record,
+                summary_doc_id,
+                summary_basename,
+                normalized_source_path,
+            )
+            if uploaded_match is not None:
+                return uploaded_match
+
+            if doc_id:
+                raise HTTPException(
+                    status_code=409,
+                    detail=(
+                        "Provided `file_id` and `doc_id` do not reference the same document"
+                    ),
+                )
 
         return None
 

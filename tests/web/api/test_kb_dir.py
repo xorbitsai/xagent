@@ -362,7 +362,9 @@ def test_kb_delete_accepts_unicode_collection_name(test_env, temp_uploads):
     assert response.status_code == 200
 
 
-def test_kb_delete_rejects_mixed_script_confusable_collection_name(test_env, temp_uploads):
+def test_kb_delete_rejects_mixed_script_confusable_collection_name(
+    test_env, temp_uploads
+):
     app, headers, user, _ = test_env
     client = TestClient(app)
 

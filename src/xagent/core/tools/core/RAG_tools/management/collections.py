@@ -21,6 +21,7 @@ from ..core.config import (
     DEFAULT_VECTOR_STORE_EXTENDED_SCAN_LIMIT,
 )
 from ..core.schemas import (
+    CollectionDocumentMetadata,
     CollectionInfo,
     CollectionOperationDetail,
     CollectionOperationResult,
@@ -524,18 +525,65 @@ async def list_collections(
             is_admin=is_admin,
         )
 
-        # Collect document names using storage abstraction
         document_names: Dict[str, Set[str]] = defaultdict(set)
+        document_metadata: Dict[str, List[CollectionDocumentMetadata]] = defaultdict(
+            list
+        )
+        document_metadata_seen: Dict[str, Set[tuple[str, str, str]]] = defaultdict(set)
+
+        def _normalize_optional_identifier(value: Any) -> Optional[str]:
+            if not isinstance(value, str):
+                return None
+            normalized = value.strip()
+            return normalized or None
+
+        def _add_document_entry(
+            collection_key: str,
+            source_value: Any,
+            doc_id_value: Any,
+            file_id_value: Any,
+        ) -> None:
+            import os
+
+            normalized_doc_id = _normalize_optional_identifier(doc_id_value)
+            normalized_file_id = _normalize_optional_identifier(file_id_value)
+            display_name = None
+            if source_value:
+                display_name = os.path.basename(str(source_value))
+            display_name = (display_name or normalized_doc_id or "").strip()
+            if not display_name:
+                return
+
+            document_names[collection_key].add(display_name)
+
+            dedupe_key = (
+                display_name,
+                normalized_file_id or "",
+                normalized_doc_id or "",
+            )
+            seen_keys = document_metadata_seen[collection_key]
+            if dedupe_key in seen_keys:
+                return
+            seen_keys.add(dedupe_key)
+            document_metadata[collection_key].append(
+                CollectionDocumentMetadata(
+                    filename=display_name,
+                    file_id=normalized_file_id,
+                    doc_id=normalized_doc_id,
+                )
+            )
 
         def _collect_document_names() -> None:
             for batch in vector_store.iter_batches(
                 table_name="documents",
-                columns=["collection", "source_path"],
+                columns=["collection", "source_path", "doc_id", "file_id"],
                 user_id=user_id,
                 is_admin=is_admin,
             ):
                 collection_idx = batch.schema.get_field_index("collection")
                 source_idx = batch.schema.get_field_index("source_path")
+                doc_id_idx = batch.schema.get_field_index("doc_id")
+                file_id_idx = batch.schema.get_field_index("file_id")
                 if collection_idx == -1:
                     continue
                 collection_array = batch.column(collection_idx)
@@ -544,18 +592,27 @@ async def list_collections(
                     if source_idx != -1
                     else pa.array([None] * batch.num_rows)
                 )
+                doc_id_array = (
+                    batch.column(doc_id_idx)
+                    if doc_id_idx != -1
+                    else pa.array([None] * batch.num_rows)
+                )
+                file_id_array = (
+                    batch.column(file_id_idx)
+                    if file_id_idx != -1
+                    else pa.array([None] * batch.num_rows)
+                )
                 for idx in range(batch.num_rows):
                     collection_raw = collection_array[idx].as_py()
                     if not collection_raw:
                         continue
                     collection_key = str(collection_raw)
-                    source_value = source_array[idx].as_py()
-                    if source_value:
-                        import os
-
-                        document_names[collection_key].add(
-                            os.path.basename(str(source_value))
-                        )
+                    _add_document_entry(
+                        collection_key,
+                        source_array[idx].as_py(),
+                        doc_id_array[idx].as_py(),
+                        file_id_array[idx].as_py(),
+                    )
 
         _collect_document_names()
 
@@ -594,6 +651,14 @@ async def list_collections(
                     "parses"
                 ],  # Use parses count as processed documents
                 document_names=sorted(document_names[collection]),
+                document_metadata=sorted(
+                    document_metadata[collection],
+                    key=lambda item: (
+                        item.filename,
+                        item.file_id or "",
+                        item.doc_id or "",
+                    ),
+                ),
                 ingestion_config=collection_configs.get(collection),
             )
             for collection in collection_keys

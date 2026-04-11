@@ -86,9 +86,7 @@ ALLOWED_EXTENSIONS = {
 # Maximum file size (100MB)
 MAX_FILE_SIZE = 100 * 1024 * 1024
 
-# Allowed characters for collection and folder names (alphanumeric, underscore, hyphen)
-# This prevents path traversal and other security issues
-ALLOWED_NAME_PATTERN = re.compile(r"^[a-zA-Z0-9_-]+$")
+ALLOWED_NAME_PATTERN = re.compile(r"^[\w-]+$")
 
 # Maximum length for collection and folder names (reasonable limit for file system and database)
 # This prevents path length issues and database field overflow
@@ -158,7 +156,7 @@ def sanitize_path_component(name: str, component_type: str = "path") -> str:
     if not ALLOWED_NAME_PATTERN.match(safe_name):
         raise ValueError(
             f"Invalid {component_type} name: contains invalid characters. "
-            f"Only alphanumeric characters, underscores, and hyphens are allowed."
+            f"Only letters, numbers, underscores, and hyphens are allowed."
         )
 
     # Ensure the sanitized name matches the original (after stripping)

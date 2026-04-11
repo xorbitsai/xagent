@@ -98,6 +98,17 @@ from .cloud_storage import get_google_credentials
 T = TypeVar("T", bound=Callable[..., Any])
 logger = logging.getLogger(__name__)
 
+_SQL_LIKE_ESCAPE = "\\"
+
+
+def _like_contains_pattern(value: str) -> str:
+    escaped = (
+        value.replace(_SQL_LIKE_ESCAPE, _SQL_LIKE_ESCAPE * 2)
+        .replace("%", f"{_SQL_LIKE_ESCAPE}%")
+        .replace("_", f"{_SQL_LIKE_ESCAPE}_")
+    )
+    return f"%{escaped}%"
+
 
 def handle_kb_exceptions(func: T) -> T:
     """Decorator to handle common exceptions in KB API routes."""
@@ -723,7 +734,7 @@ async def list_collections_api(
             if collections_needing_fallback:
                 # Filter at SQL level to only load relevant uploaded files
                 collection_patterns = [
-                    f"%/user_{int(_user.id)}/{c.name}/%"
+                    _like_contains_pattern(f"/user_{int(_user.id)}/{c.name}/")
                     for c in collections_needing_fallback
                 ]
 
@@ -733,7 +744,10 @@ async def list_collections_api(
                         db.query(UploadedFile)
                         .filter(
                             UploadedFile.user_id == int(_user.id),
-                            UploadedFile.storage_path.like(collection_patterns[0]),
+                            UploadedFile.storage_path.like(
+                                collection_patterns[0],
+                                escape=_SQL_LIKE_ESCAPE,
+                            ),
                         )
                         .all()
                     )
@@ -747,7 +761,10 @@ async def list_collections_api(
                             UploadedFile.user_id == int(_user.id),
                             or_(
                                 *[
-                                    UploadedFile.storage_path.like(pattern)
+                                    UploadedFile.storage_path.like(
+                                        pattern,
+                                        escape=_SQL_LIKE_ESCAPE,
+                                    )
                                     for pattern in collection_patterns
                                 ]
                             ),
@@ -1586,7 +1603,10 @@ async def delete_document_api(
         user_segment = f"/user_{user_id_int}/{safe_collection_name}/"
         uploaded_query = db.query(UploadedFile).filter(
             UploadedFile.user_id == user_id_int,
-            UploadedFile.storage_path.like(f"%{user_segment}%"),
+            UploadedFile.storage_path.like(
+                _like_contains_pattern(user_segment),
+                escape=_SQL_LIKE_ESCAPE,
+            ),
         )
         if normalized_filename:
             uploaded_query = uploaded_query.filter(
@@ -1612,6 +1632,14 @@ async def delete_document_api(
 
         if len(matched_file_ids) == 1:
             return next(iter(matched_file_ids))
+        if len(matched_file_ids) > 1:
+            logger.warning(
+                "Multiple UploadedFile candidates matched cleanup resolution "
+                "(collection=%s, filename=%s, doc_id=%s)",
+                safe_collection_name,
+                normalized_filename,
+                normalized_doc_id,
+            )
 
         return None
 
@@ -1686,6 +1714,16 @@ async def delete_document_api(
                                 ),
                                 "source_path": normalized_source_path or None,
                             }
+
+                if uploaded_file_record is None:
+                    if doc_id:
+                        return {
+                            "doc_id": summary_doc_id,
+                            "file_id": None,
+                            "filename": summary_basename or filename,
+                            "source_path": normalized_source_path or None,
+                        }
+                    continue
 
                 if doc_id:
                     raise HTTPException(
@@ -1778,7 +1816,10 @@ async def delete_document_api(
             .filter(
                 UploadedFile.user_id == user_id_int,
                 UploadedFile.file_id == file_id,
-                UploadedFile.storage_path.like(f"%{user_segment}%"),
+                UploadedFile.storage_path.like(
+                    _like_contains_pattern(user_segment),
+                    escape=_SQL_LIKE_ESCAPE,
+                ),
             )
             .all()
         )
@@ -1816,7 +1857,10 @@ async def delete_document_api(
         user_segment = f"/user_{user_id_int}/{safe_collection_name}/"
         uploaded_query = db.query(UploadedFile).filter(
             UploadedFile.user_id == user_id_int,
-            UploadedFile.storage_path.like(f"%{user_segment}%"),
+            UploadedFile.storage_path.like(
+                _like_contains_pattern(user_segment),
+                escape=_SQL_LIKE_ESCAPE,
+            ),
         )
         if file_id:
             uploaded_query = uploaded_query.filter(UploadedFile.file_id == file_id)
@@ -1916,17 +1960,20 @@ async def delete_document_api(
         }
 
     for doc_info in matching_docs:
-        doc_id = doc_info["doc_id"]
-        if not isinstance(doc_id, str) or not doc_id:
+        resolved_doc_id = doc_info["doc_id"]
+        if not isinstance(resolved_doc_id, str) or not resolved_doc_id:
             error_msg = "Failed to delete document: resolved doc_id is missing"
             deletion_errors.append(error_msg)
             logger.error("%s", error_msg)
             continue
         try:
             delete_document(
-                safe_collection_name, doc_id, int(_user.id), bool(_user.is_admin)
+                safe_collection_name,
+                resolved_doc_id,
+                int(_user.id),
+                bool(_user.is_admin),
             )
-            deleted_doc_ids.append(doc_id)
+            deleted_doc_ids.append(resolved_doc_id)
             current_file_id = _resolve_cleanup_file_id(doc_info)
             if current_file_id:
                 remaining_file_ids.discard(current_file_id)
@@ -1940,11 +1987,11 @@ async def delete_document_api(
             logger.info(
                 "Deleted document '%s' (doc_id: %s) from collection '%s'",
                 doc_info.get("filename", filename),
-                doc_id,
+                resolved_doc_id,
                 safe_collection_name,
             )
         except Exception as e:
-            error_msg = f"Failed to delete doc_id {doc_id}: {str(e)}"
+            error_msg = f"Failed to delete doc_id {resolved_doc_id}: {str(e)}"
             deletion_errors.append(error_msg)
             logger.error("%s", error_msg)
 

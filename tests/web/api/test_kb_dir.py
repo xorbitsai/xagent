@@ -1352,6 +1352,62 @@ def test_delete_document_by_file_id_resolves_doc_id_via_list_documents(
     assert deleted_doc_ids == [expected_doc_id]
 
 
+def test_delete_document_by_doc_id_succeeds_without_uploaded_file_record(
+    test_env, temp_uploads
+):
+    app, headers, user, _ = test_env
+    client = TestClient(app)
+
+    from xagent.core.tools.core.RAG_tools.core.schemas import (
+        DocumentListResult,
+        DocumentSummary,
+    )
+
+    file_path = temp_uploads / f"user_{user.id}" / "demo" / "already-cleaned.txt"
+    file_path.parent.mkdir(parents=True, exist_ok=True)
+    file_path.write_text("content")
+
+    expected_doc_id = "doc-existing-without-file-row"
+    deleted_doc_ids: list[str] = []
+
+    def _fake_delete_document(collection_name, doc_id, user_id, is_admin):
+        deleted_doc_ids.append(doc_id)
+
+    doc_list = DocumentListResult(
+        status="success",
+        documents=[
+            DocumentSummary(
+                collection="demo",
+                doc_id=expected_doc_id,
+                source_path=str(file_path),
+            )
+        ],
+        total_count=1,
+        message="ok",
+        warnings=[],
+    )
+
+    with (
+        patch("xagent.web.api.kb._list_documents_for_user", return_value=[]),
+        patch("xagent.web.api.kb.list_documents", return_value=doc_list),
+        patch(
+            "xagent.core.tools.core.RAG_tools.management.collections.delete_document",
+            side_effect=_fake_delete_document,
+        ),
+    ):
+        response = client.delete(
+            (
+                "/api/kb/collections/demo/documents/already-cleaned.txt"
+                f"?file_id=missing-file-id&doc_id={expected_doc_id}"
+            ),
+            headers=headers,
+        )
+
+    assert response.status_code == 200
+    assert response.json()["deleted_doc_ids"] == [expected_doc_id]
+    assert deleted_doc_ids == [expected_doc_id]
+
+
 def test_delete_document_by_file_id_rejects_unlinked_basename_match(
     test_env, temp_uploads
 ):

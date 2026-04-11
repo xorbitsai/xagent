@@ -55,9 +55,9 @@ export function KnowledgeBaseDocumentList({
         return
       }
 
+      setDocumentToDelete(null)
       await new Promise(resolve => setTimeout(resolve, 500))
       await onRefresh()
-      setDocumentToDelete(null)
     } catch (error) {
       toast.error(error instanceof Error ? error.message : t("kb.detail.errors.deleteFailed"))
     } finally {

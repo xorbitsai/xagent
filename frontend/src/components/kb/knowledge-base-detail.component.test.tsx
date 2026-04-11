@@ -197,6 +197,33 @@ describe("KnowledgeBaseDetailContent delete flow", () => {
     })
   })
 
+  it("closes the confirm dialog before refresh failures surface", async () => {
+    installApiMocks()
+    const onRefresh = vi.fn().mockRejectedValue(new Error("refresh failed"))
+
+    renderDocumentList({
+      name: "demo",
+      documents: 1,
+      chunks: 0,
+      embeddings: 0,
+      parses: 0,
+      document_names: ["report.pdf"],
+      document_metadata: [{ filename: "report.pdf", file_id: "file-123" }],
+    }, onRefresh)
+
+    fireEvent.click(screen.getByTitle("kb.detail.uploaded.delete"))
+    fireEvent.click(screen.getByText("confirm-delete"))
+
+    await waitFor(() => {
+      expect(screen.queryByText("confirm-delete")).not.toBeInTheDocument()
+    })
+
+    await waitFor(() => {
+      expect(onRefresh).toHaveBeenCalledTimes(1)
+      expect(toastErrorMock).toHaveBeenCalledWith("refresh failed")
+    })
+  })
+
   it("keeps duplicate filenames with different identifiers addressable for delete", async () => {
     installApiMocks()
 

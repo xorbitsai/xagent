@@ -314,12 +314,9 @@ def test_kb_delete_rejects_path_traversal_in_collection_name(test_env, temp_uplo
     app, headers, user, _ = test_env
     client = TestClient(app)
 
-    # Note: Paths with special characters in URL path parameter may cause 404
-    # due to URL encoding/routing issues. Test with URL-encoded versions or
-    # simpler invalid names that still trigger validation
     malicious_collections = [
-        "collection/../other",  # Path separator
-        "collection%2Fother",  # URL-encoded path separator
+        r"collection\\other",
+        r"collection\\..\\other",
     ]
 
     for collection_name in malicious_collections:
@@ -329,11 +326,40 @@ def test_kb_delete_rejects_path_traversal_in_collection_name(test_env, temp_uplo
         encoded_name = quote(collection_name, safe="")
         response = client.delete(f"/api/kb/collections/{encoded_name}", headers=headers)
 
-        # Should reject with 422 (validation error) or 404 (if routing fails)
-        # If routing fails, the validation happens but returns 404
-        assert response.status_code in [422, 404]
-        if response.status_code == 422:
-            assert "Invalid collection name" in response.json()["detail"]
+        assert response.status_code == 422
+        assert "Invalid collection name" in response.json()["detail"]
+
+
+def test_kb_delete_accepts_unicode_collection_name(test_env, temp_uploads):
+    app, headers, user, _ = test_env
+    client = TestClient(app)
+
+    from urllib.parse import quote
+
+    collection_name = "示例知识库集合"
+    coll_dir = temp_uploads / f"user_{user.id}" / collection_name
+    coll_dir.mkdir(parents=True, exist_ok=True)
+    (coll_dir / "some_file.txt").write_text("data")
+
+    with patch("xagent.web.api.kb.delete_collection") as mock_delete:
+        from xagent.core.tools.core.RAG_tools.core.schemas import (
+            CollectionOperationResult,
+        )
+
+        mock_delete.return_value = CollectionOperationResult(
+            status="success",
+            collection=collection_name,
+            message="deleted",
+            affected_documents=[],
+            deleted_counts={},
+        )
+
+        response = client.delete(
+            f"/api/kb/collections/{quote(collection_name, safe='')}",
+            headers=headers,
+        )
+
+    assert response.status_code == 200
 
 
 def test_kb_delete_physical_cleanup_failure_aborts_operation(test_env, temp_uploads):
@@ -866,6 +892,74 @@ def test_delete_document_prefers_file_id_and_cleans_orphan_file(test_env, temp_u
         assert deleted_record is None
     finally:
         session.close()
+
+
+def test_delete_document_accepts_unicode_collection_name(test_env, temp_uploads):
+    app, headers, user, _ = test_env
+    client = TestClient(app)
+
+    from urllib.parse import quote
+
+    collection_name = "示例知识库集合"
+    file_path = temp_uploads / f"user_{user.id}" / collection_name / "demo.txt"
+    file_path.parent.mkdir(parents=True, exist_ok=True)
+    file_path.write_text("content")
+
+    deleted_doc_ids: list[str] = []
+    document_state = [
+        {
+            "collection": collection_name,
+            "doc_id": "doc-1",
+            "file_id": None,
+            "source_path": str(file_path),
+        }
+    ]
+
+    def _fake_delete_document(collection_name_arg, doc_id, user_id, is_admin):
+        deleted_doc_ids.append(doc_id)
+        assert collection_name_arg == collection_name
+
+    with (
+        patch(
+            "xagent.web.api.kb._list_documents_for_user",
+            return_value=document_state,
+        ),
+        patch(
+            "xagent.core.tools.core.RAG_tools.management.collections.delete_document",
+            side_effect=_fake_delete_document,
+        ),
+    ):
+        response = client.delete(
+            f"/api/kb/collections/{quote(collection_name, safe='')}/documents/demo.txt?doc_id=doc-1",
+            headers=headers,
+        )
+
+    assert response.status_code == 200
+    assert deleted_doc_ids == ["doc-1"]
+
+
+def test_delete_document_rejects_path_traversal_in_collection_name(
+    test_env, temp_uploads
+):
+    app, headers, user, _ = test_env
+    client = TestClient(app)
+
+    from urllib.parse import quote
+
+    malicious_collections = [
+        r"collection\\other",
+        r"collection\\..\\other",
+    ]
+
+    for collection_name in malicious_collections:
+        encoded_name = quote(collection_name, safe="")
+        response = client.delete(
+            f"/api/kb/collections/{encoded_name}/documents/demo.txt",
+            headers=headers,
+        )
+
+        assert response.status_code == 422
+        assert "Invalid collection name" in response.json()["detail"]
 
 
 def test_delete_document_by_filename_refuses_ambiguous_match(test_env, temp_uploads):

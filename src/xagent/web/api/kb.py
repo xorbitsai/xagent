@@ -1265,6 +1265,7 @@ async def delete_collection_api(
     Raises:
         HTTPException: If physical deletion fails (prevents database deletion)
     """
+    safe_collection = collection_name
     try:
         try:
             safe_collection = sanitize_path_component(collection_name, "collection")
@@ -1297,7 +1298,7 @@ async def delete_collection_api(
 
         vector_store = get_vector_index_store()
         collection_records = vector_store.list_document_records(
-            collection_name=collection_name,
+            collection_name=safe_collection,
             user_id=int(_user.id),
             is_admin=bool(_user.is_admin),
         )
@@ -1309,7 +1310,7 @@ async def delete_collection_api(
             if file_id
         }
 
-        result = delete_collection(collection_name, int(_user.id), bool(_user.is_admin))
+        result = delete_collection(safe_collection, int(_user.id), bool(_user.is_admin))
 
         remaining_records = vector_store.list_document_records(
             collection_name=None,
@@ -1334,7 +1335,7 @@ async def delete_collection_api(
             logger.info(
                 "Deleted %s UploadedFile record(s) for collection %s",
                 deleted_uploaded_files,
-                collection_name,
+                safe_collection,
             )
 
         # Step 3: Add physical cleanup status to warnings and message for visibility
@@ -1400,7 +1401,7 @@ async def delete_collection_api(
         # Re-raise HTTP exceptions (including physical deletion failures)
         raise
     except Exception as e:
-        logger.exception(f"Failed to delete collection '{collection_name}': {e}")
+        logger.exception(f"Failed to delete collection '{safe_collection}': {e}")
         raise HTTPException(
             status_code=500,
             detail=f"Failed to delete collection: {str(e)}",
@@ -1517,6 +1518,13 @@ async def delete_document_api(
     # NOTE: Exceptions are normalized by @handle_kb_exceptions for consistent API responses.
     from ...core.tools.core.RAG_tools.management.collections import delete_document
 
+    try:
+        safe_collection_name = sanitize_path_component(collection_name, "collection")
+    except ValueError as e:
+        raise HTTPException(
+            status_code=422, detail=f"Invalid collection name: {str(e)}"
+        ) from e
+
     def _collect_candidate_doc_ids(
         docs: list[dict[str, Any]],
     ) -> list[str]:
@@ -1534,7 +1542,9 @@ async def delete_document_api(
         storage_path = str(getattr(rec, "storage_path", "")).strip()
         if not storage_path:
             return False
-        derived_doc_id = generate_deterministic_doc_id(collection_name, storage_path)
+        derived_doc_id = generate_deterministic_doc_id(
+            safe_collection_name, storage_path
+        )
         if doc_id and derived_doc_id != doc_id:
             raise HTTPException(
                 status_code=409,
@@ -1573,7 +1583,7 @@ async def delete_document_api(
 
         normalized_filename = str(doc_info.get("filename") or "").strip()
         normalized_doc_id = str(doc_info.get("doc_id") or "").strip()
-        user_segment = f"/user_{user_id_int}/{collection_name}/"
+        user_segment = f"/user_{user_id_int}/{safe_collection_name}/"
         uploaded_query = db.query(UploadedFile).filter(
             UploadedFile.user_id == user_id_int,
             UploadedFile.storage_path.like(f"%{user_segment}%"),
@@ -1593,7 +1603,7 @@ async def delete_document_api(
                 if not candidate_storage_path:
                     continue
                 derived_doc_id = generate_deterministic_doc_id(
-                    collection_name,
+                    safe_collection_name,
                     candidate_storage_path,
                 )
                 if derived_doc_id != normalized_doc_id:
@@ -1618,7 +1628,7 @@ async def delete_document_api(
             )
 
         doc_list = list_documents(
-            collection=collection_name,
+            collection=safe_collection_name,
             user_id=user_id_int,
             is_admin=bool(_user.is_admin),
         )
@@ -1660,7 +1670,7 @@ async def delete_document_api(
                         }
                     if uploaded_storage_path:
                         derived_doc_id = generate_deterministic_doc_id(
-                            collection_name,
+                            safe_collection_name,
                             uploaded_storage_path,
                         )
                         if derived_doc_id == summary_doc_id:
@@ -1701,13 +1711,13 @@ async def delete_document_api(
         records = _list_documents_for_user(
             user_id=user_id_int,
             is_admin=bool(_user.is_admin),
-            collection_name=collection_name,
+            collection_name=safe_collection_name,
         )
     except Exception as exc:
         # Degrade gracefully when LanceDB cannot decode legacy rows.
         logger.warning(
             "Failed to read documents for delete resolution (collection=%s): %s",
-            collection_name,
+            safe_collection_name,
             exc,
         )
     filename_map = _build_uploaded_filename_map(
@@ -1762,7 +1772,7 @@ async def delete_document_api(
         )
 
     if not matching_docs and file_id:
-        user_segment = f"/user_{user_id_int}/{collection_name}/"
+        user_segment = f"/user_{user_id_int}/{safe_collection_name}/"
         uploaded_candidates = (
             db.query(UploadedFile)
             .filter(
@@ -1783,7 +1793,7 @@ async def delete_document_api(
             if resolved_match is None:
                 raise HTTPException(
                     status_code=404,
-                    detail=f"Document not found in collection '{collection_name}'",
+                    detail=f"Document not found in collection '{safe_collection_name}'",
                 )
 
             matching_docs.append(resolved_match)
@@ -1793,7 +1803,7 @@ async def delete_document_api(
             # If validation fails, err on the side of caution and refuse deletion
             logger.warning(
                 "Failed to validate document existence for deletion (collection=%s): %s",
-                collection_name,
+                safe_collection_name,
                 exc,
             )
             raise HTTPException(
@@ -1803,7 +1813,7 @@ async def delete_document_api(
 
     if not matching_docs:
         # Fallback 1: derive doc_id from UploadedFile linkage for uploaded docs.
-        user_segment = f"/user_{user_id_int}/{collection_name}/"
+        user_segment = f"/user_{user_id_int}/{safe_collection_name}/"
         uploaded_query = db.query(UploadedFile).filter(
             UploadedFile.user_id == user_id_int,
             UploadedFile.storage_path.like(f"%{user_segment}%"),
@@ -1832,7 +1842,7 @@ async def delete_document_api(
         # Fallback 2: allow web-ingested docs to be deleted by doc_id-like filename.
         try:
             doc_list = list_documents(
-                collection=collection_name,
+                collection=safe_collection_name,
                 user_id=user_id_int,
                 is_admin=bool(_user.is_admin),
             )
@@ -1853,7 +1863,7 @@ async def delete_document_api(
         except Exception as exc:
             logger.warning(
                 "Fallback doc resolution via list_documents failed (collection=%s): %s",
-                collection_name,
+                safe_collection_name,
                 exc,
             )
 
@@ -1883,6 +1893,7 @@ async def delete_document_api(
         remaining_records = _list_documents_for_user(
             user_id=user_id_int,
             is_admin=bool(_user.is_admin),
+            collection_name=safe_collection_name,
         )
         remaining_file_ids = {
             current_file_id
@@ -1913,7 +1924,7 @@ async def delete_document_api(
             continue
         try:
             delete_document(
-                collection_name, doc_id, int(_user.id), bool(_user.is_admin)
+                safe_collection_name, doc_id, int(_user.id), bool(_user.is_admin)
             )
             deleted_doc_ids.append(doc_id)
             current_file_id = _resolve_cleanup_file_id(doc_info)
@@ -1930,7 +1941,7 @@ async def delete_document_api(
                 "Deleted document '%s' (doc_id: %s) from collection '%s'",
                 doc_info.get("filename", filename),
                 doc_id,
-                collection_name,
+                safe_collection_name,
             )
         except Exception as e:
             error_msg = f"Failed to delete doc_id {doc_id}: {str(e)}"
@@ -1945,7 +1956,7 @@ async def delete_document_api(
         deletion_errors.append(f"Failed to persist orphan cleanup changes: {str(exc)}")
         logger.error(
             "Failed to commit orphan cleanup changes for collection %s: %s",
-            collection_name,
+            safe_collection_name,
             exc,
         )
 
@@ -1953,7 +1964,7 @@ async def delete_document_api(
         return {
             "status": "partial_success" if deleted_doc_ids else "failed",
             "message": f"Deleted {len(deleted_doc_ids)} of {len(matching_docs)} documents",
-            "collection": collection_name,
+            "collection": safe_collection_name,
             "filename": filename,
             "deleted_doc_ids": deleted_doc_ids,
             "errors": deletion_errors,
@@ -1962,7 +1973,7 @@ async def delete_document_api(
     return {
         "status": "success",
         "message": f"Successfully deleted {len(deleted_doc_ids)} document(s)",
-        "collection": collection_name,
+        "collection": safe_collection_name,
         "filename": filename,
         "deleted_doc_ids": deleted_doc_ids,
     }

@@ -165,7 +165,6 @@ class TestSanitizePathComponent:
             "collection中文",
             "collectioné",
             "collectionñ",
-            "collectionα",
             "示例知识库集合",
             "collection١٢٣",
             "知识库_123-β",
@@ -175,9 +174,14 @@ class TestSanitizePathComponent:
             result = sanitize_path_component(name, "collection")
             assert result == name
 
-        invalid_unicode_names = ["collection🚀"]
+        invalid_unicode_names = [
+            "collection🚀",
+            "collectiοn",  # Greek omicron mixed with Latin
+            "cоllection",  # Cyrillic o mixed with Latin
+            "collectionα",  # Greek alpha mixed with Latin
+        ]
         for name in invalid_unicode_names:
-            with pytest.raises(ValueError, match="contains invalid characters"):
+            with pytest.raises(ValueError, match="contains"):
                 sanitize_path_component(name, "collection")
 
     def test_rejects_compatibility_homoglyph_forms(self):

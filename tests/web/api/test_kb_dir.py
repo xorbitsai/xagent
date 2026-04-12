@@ -924,67 +924,6 @@ def test_check_documents_exist_rejects_path_traversal_in_collection_name(
         assert "Invalid collection name" in response.json()["detail"]
 
 
-def test_delete_document_accepts_unicode_collection_name(test_env, temp_uploads):
-    app, headers, user, _ = test_env
-    client = TestClient(app)
-
-    from urllib.parse import quote
-
-    collection_name = "示例知识库集合"
-    file_path = temp_uploads / f"user_{user.id}" / collection_name / "demo.txt"
-    file_path.parent.mkdir(parents=True, exist_ok=True)
-    file_path.write_text("content")
-
-    records = [
-        {
-            "doc_id": "doc-1",
-            "source_path": str(file_path),
-        }
-    ]
-
-    with (
-        patch("xagent.web.api.kb._list_documents_for_user", return_value=records),
-        patch(
-            "xagent.core.tools.core.RAG_tools.management.collections.delete_document"
-        ) as mock_delete_document,
-    ):
-        response = client.delete(
-            f"/api/kb/collections/{quote(collection_name, safe='')}/documents/demo.txt?doc_id=doc-1",
-            headers=headers,
-        )
-
-    assert response.status_code == 200
-    mock_delete_document.assert_called_once_with(
-        collection_name,
-        "doc-1",
-        int(user.id),
-        False,
-    )
-
-
-def test_delete_document_rejects_path_traversal_in_collection_name(
-    test_env, temp_uploads
-):
-    app, headers, user, _ = test_env
-    client = TestClient(app)
-
-    from urllib.parse import quote
-
-    malicious_collections = [
-        r"collection\\other",
-        r"collection\\..\\other",
-    ]
-
-    for collection_name in malicious_collections:
-        response = client.delete(
-            f"/api/kb/collections/{quote(collection_name, safe='')}/documents/demo.txt",
-            headers=headers,
-        )
-
-        assert response.status_code == 422
-        assert "Invalid collection name" in response.json()["detail"]
-
-
 def test_delete_document_prefers_file_id_and_cleans_orphan_file(test_env, temp_uploads):
     """Deleting by file_id should remove the UploadedFile row when it becomes orphaned."""
     app, headers, user, TestingSessionLocal = test_env

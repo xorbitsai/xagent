@@ -2,7 +2,12 @@
 
 import pytest
 
-from xagent.web.config import MAX_COLLECTION_NAME_LENGTH, sanitize_path_component
+from xagent.web.config import (
+    FILE_STORAGE_URL_BASE,
+    MAX_COLLECTION_NAME_LENGTH,
+    get_file_url,
+    sanitize_path_component,
+)
 
 
 class TestSanitizePathComponent:
@@ -201,3 +206,17 @@ class TestSanitizePathComponent:
         for name in mixed_names:
             result = sanitize_path_component(name, "collection")
             assert result == name
+
+
+class TestGetFileUrl:
+    def test_get_file_url_encodes_unicode_collection_and_filename(self):
+        collection_name = "示例知识库集合"
+        filename = "报告.txt"
+
+        url = get_file_url(filename, user_id=7, collection=collection_name)
+
+        assert url == (
+            f"{FILE_STORAGE_URL_BASE}/user_7/"
+            "%E7%A4%BA%E4%BE%8B%E7%9F%A5%E8%AF%86%E5%BA%93%E9%9B%86%E5%90%88/"
+            "%E6%8A%A5%E5%91%8A.txt"
+        )

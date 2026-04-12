@@ -9,6 +9,7 @@ import re
 import unicodedata
 from pathlib import Path
 from typing import Optional
+from urllib.parse import quote
 
 from ..config import get_uploads_dir
 
@@ -87,6 +88,7 @@ ALLOWED_EXTENSIONS = {
 # Maximum file size (100MB)
 MAX_FILE_SIZE = 100 * 1024 * 1024
 
+# Word characters (\w = letters/digits/underscore in any language) and hyphens.
 ALLOWED_NAME_PATTERN = re.compile(r"^[\w-]+$")
 _CONFUSABLE_SCRIPT_FAMILIES = ("LATIN", "GREEK", "CYRILLIC")
 
@@ -308,17 +310,24 @@ def get_file_url(
         if collection:
             # SECURITY: Sanitize collection name to prevent path traversal and URL injection
             safe_collection = sanitize_path_component(collection, "collection")
-            return f"{FILE_STORAGE_URL_BASE}/user_{user_id}/{safe_collection}/{safe_filename}"
+            encoded_collection = quote(safe_collection, safe="")
+            encoded_filename = quote(safe_filename, safe="")
+            return f"{FILE_STORAGE_URL_BASE}/user_{user_id}/{encoded_collection}/{encoded_filename}"
         if task_id and folder:
-            return f"{FILE_STORAGE_URL_BASE}/{safe_filename}"
+            encoded_filename = quote(safe_filename, safe="")
+            return f"{FILE_STORAGE_URL_BASE}/{encoded_filename}"
         else:
-            return f"{FILE_STORAGE_URL_BASE}/user_{user_id}/{safe_filename}"
+            encoded_filename = quote(safe_filename, safe="")
+            return f"{FILE_STORAGE_URL_BASE}/user_{user_id}/{encoded_filename}"
     elif task_id and folder:
         # SECURITY: Sanitize folder name to prevent path traversal and URL injection
         safe_folder = sanitize_path_component(folder, "folder")
-        return f"{FILE_STORAGE_URL_BASE}/task_{task_id}/{safe_folder}/{safe_filename}"
+        encoded_folder = quote(safe_folder, safe="")
+        encoded_filename = quote(safe_filename, safe="")
+        return f"{FILE_STORAGE_URL_BASE}/task_{task_id}/{encoded_folder}/{encoded_filename}"
     else:
-        return f"{FILE_STORAGE_URL_BASE}/{safe_filename}"
+        encoded_filename = quote(safe_filename, safe="")
+        return f"{FILE_STORAGE_URL_BASE}/{encoded_filename}"
 
 
 def is_allowed_file(filename: str, task_type: str = "general") -> bool:

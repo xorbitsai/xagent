@@ -16,7 +16,7 @@ services:
 
   # Xagent Frontend (Next.js)
   frontend:
-    image: xprobe/xagent-frontend:0.3.0
+    image: xprobe/xagent-frontend:0.3.1
     container_name: xagent_frontend
     restart: unless-stopped
     networks:
@@ -30,7 +30,7 @@ services:
 
   # Xagent Backend (FastAPI)
   backend:
-    image: xprobe/xagent-backend:0.3.0
+    image: xprobe/xagent-backend:0.3.1
     container_name: xagent_backend
     restart: unless-stopped
     # Don't expose ports, only accessible through nginx
@@ -40,7 +40,7 @@ services:
       - BACKEND_PORT=8000
       - XAGENT_UPLOADS_DIR=/root/.xagent/uploads
       - SANDBOX_ENABLED=true
-      - SANDBOX_IMAGE=xprobe/xagent-sandbox:0.3.0 # pinned version (`latest` may lead to caching problems)
+      - SANDBOX_IMAGE=xprobe/xagent-sandbox:0.3.1 # pinned version (`latest` may lead to caching problems)
       - SANDBOX_CPUS=1
       - SANDBOX_MEMORY=512
       - BOXLITE_HOME_DIR=/root/.xagent/boxlite

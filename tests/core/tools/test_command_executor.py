@@ -3,6 +3,7 @@ Tests for CommandExecutor tool
 """
 
 import os
+import shlex
 import sys
 
 import pytest
@@ -60,9 +61,11 @@ class TestCommandExecutorTool:
         assert "banana" in result["output"]
         assert result["return_code"] == 0
 
-    def test_list_directory(self, command_executor):
+    def test_list_directory(self, command_executor, temp_dir):
         """Test listing directory contents"""
-        result = command_executor.run_json_sync({"command": "ls -la /tmp"})
+        result = command_executor.run_json_sync(
+            {"command": f"ls -la {shlex.quote(temp_dir)}"}
+        )
 
         assert result["success"] is True
         assert len(result["output"]) > 0

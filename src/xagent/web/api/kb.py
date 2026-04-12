@@ -1457,10 +1457,19 @@ async def check_documents_exist_api(
         if not requested:
             return {"existing_filenames": []}
 
+        try:
+            safe_collection_name = sanitize_path_component(
+                collection_name, "collection"
+            )
+        except ValueError as e:
+            raise HTTPException(
+                status_code=422, detail=f"Invalid collection name: {str(e)}"
+            ) from e
+
         # Use storage abstraction layer to fetch document records
         vector_store = get_vector_index_store()
         records = vector_store.list_document_records(
-            collection_name=collection_name,
+            collection_name=safe_collection_name,
             user_id=int(_user.id),
             is_admin=False,
             max_results=DEFAULT_VECTOR_STORE_SCAN_LIMIT,
@@ -2256,6 +2265,13 @@ async def get_parse_result_api(
     from ...core.tools.core.RAG_tools.core.exceptions import DocumentNotFoundError
     from ...core.tools.core.RAG_tools.utils.string_utils import sanitize_for_doc_id
 
+    try:
+        safe_collection_name = sanitize_path_component(collection_name, "collection")
+    except ValueError as e:
+        raise HTTPException(
+            status_code=422, detail=f"Invalid collection name: {str(e)}"
+        ) from e
+
     safe_doc_id = sanitize_for_doc_id(doc_id)
     if safe_doc_id != doc_id:
         logger.warning("Invalid doc_id format detected: %s", doc_id)
@@ -2270,7 +2286,7 @@ async def get_parse_result_api(
 
     try:
         elements, actual_parse_hash = reconstruct_parse_result_from_db(
-            collection_name,
+            safe_collection_name,
             doc_id,
             parse_hash,
             user_id=int(_user.id),

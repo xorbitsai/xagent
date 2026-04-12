@@ -9,6 +9,7 @@ from fastapi.testclient import TestClient
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 
+from xagent.core.tools.core.RAG_tools.core.config import DEFAULT_VECTOR_STORE_SCAN_LIMIT
 from xagent.core.tools.core.RAG_tools.storage.contracts import DocumentRecord
 from xagent.core.tools.core.RAG_tools.utils.string_utils import (
     generate_deterministic_doc_id,
@@ -350,7 +351,6 @@ def test_kb_delete_rejects_path_traversal_in_collection_name(test_env, temp_uplo
     ]
 
     for collection_name in malicious_collections:
-        # URL encode the collection name for the path parameter
         from urllib.parse import quote
 
         encoded_name = quote(collection_name, safe="")
@@ -870,6 +870,119 @@ def test_check_documents_exist_prefers_uploaded_file_filename(test_env, temp_upl
 
     assert response.status_code == 200
     assert response.json()["existing_filenames"] == ["actual_name.txt", "old_name.txt"]
+
+
+def test_check_documents_exist_accepts_unicode_collection_name(test_env, temp_uploads):
+    app, headers, user, _ = test_env
+    client = TestClient(app)
+
+    from urllib.parse import quote
+
+    collection_name = "示例知识库集合"
+
+    with patch("xagent.web.api.kb.get_vector_index_store") as mock_get_store:
+        mock_store = mock_get_store.return_value
+        mock_store.list_document_records.return_value = []
+
+        response = client.post(
+            f"/api/kb/collections/{quote(collection_name, safe='')}/documents/check",
+            json={"filenames": ["demo.txt"]},
+            headers=headers,
+        )
+
+    assert response.status_code == 200
+    mock_store.list_document_records.assert_called_once_with(
+        collection_name=collection_name,
+        user_id=int(user.id),
+        is_admin=False,
+        max_results=DEFAULT_VECTOR_STORE_SCAN_LIMIT,
+    )
+    assert response.json()["existing_filenames"] == []
+
+
+def test_check_documents_exist_rejects_path_traversal_in_collection_name(
+    test_env, temp_uploads
+):
+    app, headers, user, _ = test_env
+    client = TestClient(app)
+
+    from urllib.parse import quote
+
+    malicious_collections = [
+        r"collection\\other",
+        r"collection\\..\\other",
+    ]
+
+    for collection_name in malicious_collections:
+        response = client.post(
+            f"/api/kb/collections/{quote(collection_name, safe='')}/documents/check",
+            json={"filenames": ["demo.txt"]},
+            headers=headers,
+        )
+
+        assert response.status_code == 422
+        assert "Invalid collection name" in response.json()["detail"]
+
+
+def test_delete_document_accepts_unicode_collection_name(test_env, temp_uploads):
+    app, headers, user, _ = test_env
+    client = TestClient(app)
+
+    from urllib.parse import quote
+
+    collection_name = "示例知识库集合"
+    file_path = temp_uploads / f"user_{user.id}" / collection_name / "demo.txt"
+    file_path.parent.mkdir(parents=True, exist_ok=True)
+    file_path.write_text("content")
+
+    records = [
+        {
+            "doc_id": "doc-1",
+            "source_path": str(file_path),
+        }
+    ]
+
+    with (
+        patch("xagent.web.api.kb._list_documents_for_user", return_value=records),
+        patch(
+            "xagent.core.tools.core.RAG_tools.management.collections.delete_document"
+        ) as mock_delete_document,
+    ):
+        response = client.delete(
+            f"/api/kb/collections/{quote(collection_name, safe='')}/documents/demo.txt?doc_id=doc-1",
+            headers=headers,
+        )
+
+    assert response.status_code == 200
+    mock_delete_document.assert_called_once_with(
+        collection_name,
+        "doc-1",
+        int(user.id),
+        False,
+    )
+
+
+def test_delete_document_rejects_path_traversal_in_collection_name(
+    test_env, temp_uploads
+):
+    app, headers, user, _ = test_env
+    client = TestClient(app)
+
+    from urllib.parse import quote
+
+    malicious_collections = [
+        r"collection\\other",
+        r"collection\\..\\other",
+    ]
+
+    for collection_name in malicious_collections:
+        response = client.delete(
+            f"/api/kb/collections/{quote(collection_name, safe='')}/documents/demo.txt",
+            headers=headers,
+        )
+
+        assert response.status_code == 422
+        assert "Invalid collection name" in response.json()["detail"]
 
 
 def test_delete_document_prefers_file_id_and_cleans_orphan_file(test_env, temp_uploads):
@@ -1742,6 +1855,64 @@ def test_kb_delete_collection_cleans_file_id_managed_root_file(test_env, temp_up
         assert deleted_record is None
     finally:
         session.close()
+
+
+def test_get_parse_result_accepts_unicode_collection_name(test_env, temp_uploads):
+    app, headers, user, _ = test_env
+    client = TestClient(app)
+
+    from urllib.parse import quote
+
+    collection_name = "示例知识库集合"
+    elements = [{"type": "text", "text": "hello", "metadata": {}}]
+    pagination = {"page": 1, "page_size": 20, "total_count": 1, "total_pages": 1}
+
+    with (
+        patch(
+            "xagent.web.api.kb.reconstruct_parse_result_from_db",
+            return_value=(elements, "hash-1"),
+        ) as mock_reconstruct,
+        patch(
+            "xagent.web.api.kb.paginate_parse_results",
+            return_value=(elements, pagination),
+        ),
+    ):
+        response = client.get(
+            f"/api/kb/collections/{quote(collection_name, safe='')}/parses/doc-1/parse_result",
+            headers=headers,
+        )
+
+    assert response.status_code == 200
+    mock_reconstruct.assert_called_once_with(
+        collection_name,
+        "doc-1",
+        None,
+        user_id=int(user.id),
+        is_admin=False,
+    )
+
+
+def test_get_parse_result_rejects_path_traversal_in_collection_name(
+    test_env, temp_uploads
+):
+    app, headers, user, _ = test_env
+    client = TestClient(app)
+
+    from urllib.parse import quote
+
+    malicious_collections = [
+        r"collection\\other",
+        r"collection\\..\\other",
+    ]
+
+    for collection_name in malicious_collections:
+        response = client.get(
+            f"/api/kb/collections/{quote(collection_name, safe='')}/parses/doc-1/parse_result",
+            headers=headers,
+        )
+
+        assert response.status_code == 422
+        assert "Invalid collection name" in response.json()["detail"]
 
 
 def test_list_collections_secondary_fallback_avoids_n_plus_one(test_env, temp_uploads):

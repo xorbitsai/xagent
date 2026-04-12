@@ -64,6 +64,20 @@ def get_default_tool_configs() -> list[Dict[str, Any]]:
             "dependencies": ["tavily_api_key"],
         },
         {
+            "tool_name": "exa_web_search",
+            "tool_type": "builtin",
+            "category": "search",
+            "display_name": "Exa AI Search",
+            "description": "AI-powered web search using Exa, with content extraction and category filtering",
+            "enabled": True,
+            "requires_configuration": True,
+            "config": {
+                "provider": "exa",
+                "api_key_env": "EXA_API_KEY",
+            },
+            "dependencies": ["exa_api_key"],
+        },
+        {
             "tool_name": "zhipu_web_search",
             "tool_type": "builtin",
             "category": "search",

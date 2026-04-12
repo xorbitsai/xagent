@@ -18,6 +18,14 @@ ToolFieldSpec = Dict[str, Any]
 
 
 TOOL_CREDENTIAL_SPECS: Dict[str, Dict[str, ToolFieldSpec]] = {
+    "exa_web_search": {
+        "api_key": {
+            "secret": True,
+            "env": ["EXA_API_KEY"],
+            "required": True,
+            "label": "API Key",
+        }
+    },
     "zhipu_web_search": {
         "api_key": {
             "secret": True,

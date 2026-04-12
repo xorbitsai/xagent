@@ -27,6 +27,8 @@ async def create_basic_tools(config: "BaseToolConfig") -> List[Any]:
     google_api_key = config.get_tool_credential("web_search", "api_key")
     google_cse_id = config.get_tool_credential("web_search", "cse_id")
 
+    exa_api_key = config.get_tool_credential("exa_web_search", "api_key")
+
     if zhipu_api_key:
         from .zhipu_web_search import ZhipuWebSearchTool
 
@@ -35,6 +37,10 @@ async def create_basic_tools(config: "BaseToolConfig") -> List[Any]:
         from .tavily_web_search import TavilyWebSearchTool
 
         tools.append(TavilyWebSearchTool(api_key=tavily_api_key))
+    elif exa_api_key:
+        from .exa_web_search import ExaWebSearchTool
+
+        tools.append(ExaWebSearchTool(api_key=exa_api_key))
     elif google_api_key and google_cse_id:
         from .web_search import WebSearchTool
 

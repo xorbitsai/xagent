@@ -85,7 +85,7 @@ class TestExaWebSearchTool:
         mock_client.headers = {}
 
         with patch.dict(os.environ, {"EXA_API_KEY": "test_key"}):
-            with patch("xagent.core.tools.core.exa_web_search.Exa", return_value=mock_client):
+            with patch("exa_py.Exa", return_value=mock_client):
                 result = await exa_search_tool.run_json_async(
                     {"query": "test search", "num_results": 2, "content_mode": "highlights"}
                 )
@@ -105,7 +105,7 @@ class TestExaWebSearchTool:
         mock_client.headers = {}
 
         with patch.dict(os.environ, {"EXA_API_KEY": "test_key"}):
-            with patch("xagent.core.tools.core.exa_web_search.Exa", return_value=mock_client):
+            with patch("exa_py.Exa", return_value=mock_client):
                 result = await exa_search_tool.run_json_async(
                     {"query": "test search", "content_mode": "text"}
                 )
@@ -122,7 +122,7 @@ class TestExaWebSearchTool:
         mock_client.headers = {}
 
         with patch.dict(os.environ, {"EXA_API_KEY": "test_key"}):
-            with patch("xagent.core.tools.core.exa_web_search.Exa", return_value=mock_client):
+            with patch("exa_py.Exa", return_value=mock_client):
                 result = await exa_search_tool.run_json_async(
                     {"query": "test search", "content_mode": "summary"}
                 )
@@ -139,7 +139,7 @@ class TestExaWebSearchTool:
         mock_client.headers = {}
 
         with patch.dict(os.environ, {"EXA_API_KEY": "test_key"}):
-            with patch("xagent.core.tools.core.exa_web_search.Exa", return_value=mock_client):
+            with patch("exa_py.Exa", return_value=mock_client):
                 result = await exa_search_tool.run_json_async(
                     {"query": "test search", "content_mode": "none"}
                 )
@@ -158,7 +158,7 @@ class TestExaWebSearchTool:
         mock_client.headers = {}
 
         with patch.dict(os.environ, {"EXA_API_KEY": "test_key"}):
-            with patch("xagent.core.tools.core.exa_web_search.Exa", return_value=mock_client):
+            with patch("exa_py.Exa", return_value=mock_client):
                 await exa_search_tool.run_json_async(
                     {
                         "query": "AI startups",
@@ -186,7 +186,7 @@ class TestExaWebSearchTool:
         mock_client.headers = {}
 
         with patch.dict(os.environ, {"EXA_API_KEY": "test_key"}):
-            with patch("xagent.core.tools.core.exa_web_search.Exa", return_value=mock_client):
+            with patch("exa_py.Exa", return_value=mock_client):
                 await exa_search_tool.run_json_async({"query": "test"})
 
                 assert mock_client.headers["x-exa-integration"] == "xagent"
@@ -200,7 +200,7 @@ class TestExaWebSearchTool:
         mock_client.headers = {}
 
         with patch.dict(os.environ, {"EXA_API_KEY": "test_key"}):
-            with patch("xagent.core.tools.core.exa_web_search.Exa", return_value=mock_client):
+            with patch("exa_py.Exa", return_value=mock_client):
                 result = await exa_search_tool.run_json_async(
                     {"query": "nonexistent query"}
                 )
@@ -215,7 +215,7 @@ class TestExaWebSearchTool:
         mock_client.headers = {}
 
         with patch.dict(os.environ, {"EXA_API_KEY": "test_key"}):
-            with patch("xagent.core.tools.core.exa_web_search.Exa", return_value=mock_client):
+            with patch("exa_py.Exa", return_value=mock_client):
                 with pytest.raises(ValueError, match="Error during Exa search"):
                     await exa_search_tool.run_json_async({"query": "test"})
 
@@ -228,7 +228,7 @@ class TestExaWebSearchTool:
         mock_client.headers = {}
 
         with patch.dict(os.environ, {"EXA_API_KEY": "test_key"}):
-            with patch("xagent.core.tools.core.exa_web_search.Exa", return_value=mock_client):
+            with patch("exa_py.Exa", return_value=mock_client):
                 # Test with num_results > 100 (should be limited to 100)
                 await exa_search_tool.run_json_async(
                     {"query": "test", "num_results": 150}

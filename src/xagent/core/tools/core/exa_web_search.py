@@ -3,6 +3,7 @@ Exa Web Search Tool
 Standalone web search functionality using Exa AI-powered search API.
 """
 
+import asyncio
 import logging
 import os
 from typing import Any, Dict, List, Optional
@@ -66,57 +67,54 @@ class ExaWebSearchCore:
 
         num_results = min(max(1, num_results), 100)
 
+        from exa_py import Exa
+
+        client = Exa(api_key=api_key)
+        client.headers["x-exa-integration"] = "xagent"
+
+        # Build search kwargs
+        search_kwargs: Dict[str, Any] = {
+            "query": query,
+            "num_results": num_results,
+            "type": search_type,
+        }
+
+        if category:
+            search_kwargs["category"] = category
+        if include_domains:
+            search_kwargs["include_domains"] = include_domains
+        if exclude_domains:
+            search_kwargs["exclude_domains"] = exclude_domains
+        if include_text:
+            search_kwargs["include_text"] = include_text
+        if exclude_text:
+            search_kwargs["exclude_text"] = exclude_text
+        if start_published_date:
+            search_kwargs["start_published_date"] = start_published_date
+        if end_published_date:
+            search_kwargs["end_published_date"] = end_published_date
+
+        # Build contents parameter based on content_mode
+        contents_param = self._build_contents_param(content_mode)
+
         try:
-            from exa_py import Exa
-
-            client = Exa(api_key=api_key)
-            client.headers["x-exa-integration"] = "xagent"
-
-            # Build search kwargs
-            search_kwargs: Dict[str, Any] = {
-                "query": query,
-                "num_results": num_results,
-                "type": search_type,
-            }
-
-            if category:
-                search_kwargs["category"] = category
-            if include_domains:
-                search_kwargs["include_domains"] = include_domains
-            if exclude_domains:
-                search_kwargs["exclude_domains"] = exclude_domains
-            if include_text:
-                search_kwargs["include_text"] = include_text
-            if exclude_text:
-                search_kwargs["exclude_text"] = exclude_text
-            if start_published_date:
-                search_kwargs["start_published_date"] = start_published_date
-            if end_published_date:
-                search_kwargs["end_published_date"] = end_published_date
-
-            # Build contents parameter based on content_mode
-            contents_param = self._build_contents_param(content_mode)
-
             if contents_param is not None:
                 search_kwargs.update(contents_param)
-                response = client.search_and_contents(**search_kwargs)
+                response = await asyncio.to_thread(
+                    lambda: client.search_and_contents(**search_kwargs)
+                )
             else:
-                response = client.search(**search_kwargs)
-
-            logger.info("✅ Exa API request successful")
-            return self._normalize_results(response, content_mode)
-
-        except ImportError:
-            logger.error("❌ exa-py package not installed")
-            raise ValueError(
-                "exa-py package is required for Exa search. "
-                "Install it with: pip install exa-py"
-            )
+                response = await asyncio.to_thread(
+                    lambda: client.search(**search_kwargs)
+                )
         except ValueError:
             raise
         except Exception as e:
             logger.error("❌ Error during Exa search: %s", str(e))
             raise ValueError(f"Error during Exa search: {str(e)}") from e
+
+        logger.info("✅ Exa API request successful")
+        return self._normalize_results(response, content_mode)
 
     @staticmethod
     def _build_contents_param(content_mode: str) -> Optional[Dict[str, Any]]:
@@ -130,7 +128,10 @@ class ExaWebSearchCore:
         elif content_mode == "none":
             return None
         else:
-            return {"highlights": {"max_characters": 4000}}
+            raise ValueError(
+                f"Unknown content_mode '{content_mode}'. "
+                "Must be one of: 'highlights', 'text', 'summary', 'none'"
+            )
 
     @staticmethod
     def _normalize_results(

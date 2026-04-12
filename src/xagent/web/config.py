@@ -198,10 +198,10 @@ def sanitize_path_component(name: str, component_type: str = "path") -> str:
             f"Only letters, numbers, underscores, and hyphens are allowed."
         )
 
-        if _has_mixed_confusable_scripts(safe_name):
-            raise ValueError(
-                f"Invalid {component_type} name: contains mixed-script confusable characters"
-            )
+    if _has_mixed_confusable_scripts(safe_name):
+        raise ValueError(
+            f"Invalid {component_type} name: contains mixed-script confusable characters"
+        )
 
     # Ensure the sanitized name matches the original (after stripping)
     # This prevents silent truncation of valid names

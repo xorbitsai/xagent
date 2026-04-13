@@ -2,7 +2,7 @@
 
 import React from "react";
 import { Bot, ChevronRight } from "lucide-react";
-import { useRouter } from "next/navigation";
+import { useRouter, usePathname } from "next/navigation";
 import { cn } from "@/lib/utils";
 
 // Base styles for agent card
@@ -32,6 +32,7 @@ export function AgentCard({
   onClick,
 }: AgentCardProps) {
   const router = useRouter();
+  const pathname = usePathname();
 
   const handleClick = () => {
     if (onClick) {
@@ -44,7 +45,7 @@ export function AgentCard({
 
       // If we are already on the target URL, do nothing to prevent reloading the page
       // and losing the current chat history or unsaved form changes
-      if (window.location.pathname === targetUrl) {
+      if (pathname === targetUrl) {
         return;
       }
 

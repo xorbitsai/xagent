@@ -90,6 +90,7 @@ MAX_FILE_SIZE = 100 * 1024 * 1024
 
 # Word characters (\w = letters/digits/underscore in any language), spaces, and hyphens.
 ALLOWED_NAME_PATTERN = re.compile(r"^[\w -]+$")
+ALLOWED_NAME_PATTERN_NO_SPACES = re.compile(r"^[\w-]+$")
 _CONFUSABLE_SCRIPT_FAMILIES = ("LATIN", "GREEK", "CYRILLIC")
 
 
@@ -195,12 +196,25 @@ def sanitize_path_component(name: str, component_type: str = "path") -> str:
             f"Invalid {component_type} name: exceeds maximum byte length of {MAX_COLLECTION_NAME_BYTES}"
         )
 
+    # Collections allow internal spaces, but task folders remain stricter to
+    # preserve existing upload path semantics and security expectations.
+    allowed_pattern = (
+        ALLOWED_NAME_PATTERN
+        if component_type == "collection"
+        else ALLOWED_NAME_PATTERN_NO_SPACES
+    )
+
     # Validate against allowed character pattern
     # This ensures only safe characters are used
-    if not ALLOWED_NAME_PATTERN.match(safe_name):
+    if not allowed_pattern.match(safe_name):
+        allowed_chars = (
+            "Only letters, numbers, spaces, underscores, and hyphens are allowed."
+            if component_type == "collection"
+            else "Only letters, numbers, underscores, and hyphens are allowed."
+        )
         raise ValueError(
             f"Invalid {component_type} name: contains invalid characters. "
-            f"Only letters, numbers, spaces, underscores, and hyphens are allowed."
+            f"{allowed_chars}"
         )
 
     if _has_mixed_confusable_scripts(safe_name):

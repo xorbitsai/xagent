@@ -8,6 +8,7 @@ import json
 import logging
 import mimetypes
 import shutil
+import uuid
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, TypeVar, cast
 
@@ -46,9 +47,14 @@ from ...core.tools.core.RAG_tools.core.schemas import (
 )
 from ...core.tools.core.RAG_tools.management.collections import (
     delete_collection,
+    delete_document,
     list_collections,
     list_documents,
 )
+from ...core.tools.core.RAG_tools.management.collection_manager import (
+    get_collection_sync,
+)
+from ...core.tools.core.RAG_tools.management.status import clear_ingestion_status
 from ...core.tools.core.RAG_tools.parse.parse_display import (
     paginate_parse_results,
     reconstruct_parse_result_from_db,
@@ -106,6 +112,11 @@ T = TypeVar("T", bound=Callable[..., Any])
 logger = logging.getLogger(__name__)
 
 _SQL_LIKE_ESCAPE = "\\"
+_PDF_ONLY_PARSE_METHODS = {
+    ParseMethod.PYPDF,
+    ParseMethod.PDFPLUMBER,
+    ParseMethod.PYMUPDF,
+}
 
 
 def _like_contains_pattern(value: str) -> str:
@@ -115,6 +126,188 @@ def _like_contains_pattern(value: str) -> str:
         .replace("_", f"{_SQL_LIKE_ESCAPE}_")
     )
     return f"%{escaped}%"
+
+
+def _normalize_parse_method_for_filename(
+    parse_method: Optional[ParseMethod], filename: str
+) -> ParseMethod:
+    normalized = parse_method if parse_method is not None else ParseMethod.DEFAULT
+    if Path(filename).suffix.lower() == ".pdf":
+        return normalized
+    if normalized in _PDF_ONLY_PARSE_METHODS:
+        logger.warning(
+            "Falling back to default parser for non-PDF file %s (requested parser: %s)",
+            filename,
+            normalized.value,
+        )
+        return ParseMethod.DEFAULT
+    return normalized
+
+
+def _get_completed_step_metadata(
+    result: IngestionResult, step_name: str
+) -> Optional[Dict[str, Any]]:
+    for step in result.completed_steps:
+        current_name = (
+            step.get("name") if isinstance(step, dict) else getattr(step, "name", None)
+        )
+        if current_name != step_name:
+            continue
+        metadata = (
+            step.get("metadata")
+            if isinstance(step, dict)
+            else getattr(step, "metadata", None)
+        )
+        return metadata if isinstance(metadata, dict) else None
+    return None
+
+
+def _restore_ingest_file_backup(
+    *,
+    file_path: Path,
+    backup_path: Optional[Path],
+    had_existing_file: bool,
+) -> None:
+    if backup_path is not None and backup_path.exists():
+        try:
+            if file_path.exists():
+                file_path.unlink()
+            backup_path.replace(file_path)
+            logger.info("Restored pre-ingest backup for %s", file_path)
+            return
+        except OSError as exc:
+            logger.warning(
+                "Failed to restore pre-ingest backup for %s: %s", file_path, exc
+            )
+
+    if had_existing_file:
+        return
+
+    try:
+        if file_path.exists():
+            file_path.unlink()
+            logger.info("Removed failed-ingest file %s", file_path)
+    except OSError as exc:
+        logger.warning("Failed to remove failed-ingest file %s: %s", file_path, exc)
+
+
+def _rollback_failed_ingestion(
+    *,
+    db: Session,
+    user: User,
+    collection_name: str,
+    result: IngestionResult,
+    file_path: Path,
+    file_record: UploadedFile,
+    collection_existed_before: bool,
+    uploaded_file_existed_before: bool,
+    file_backup_path: Optional[Path],
+    had_existing_file: bool,
+) -> None:
+    user_id = int(user.id)
+    vector_store = get_vector_index_store()
+    register_metadata = _get_completed_step_metadata(result, "register_document") or {}
+    register_created = bool(register_metadata.get("created"))
+    doc_id = result.doc_id if isinstance(result.doc_id, str) and result.doc_id else None
+
+    try:
+        if not collection_existed_before:
+            collection_records = vector_store.list_document_records(
+                collection_name=collection_name,
+                user_id=user_id,
+                is_admin=bool(user.is_admin),
+            )
+            collection_file_ids = {
+                file_id
+                for file_id in (
+                    _get_document_record_file_id(record)
+                    for record in collection_records
+                )
+                if file_id
+            }
+
+            delete_collection(collection_name, user_id, bool(user.is_admin))
+
+            physical_cleanup = delete_collection_physical_dir(
+                user_id=user_id,
+                collection_name=collection_name,
+            )
+            remaining_records = vector_store.list_document_records(
+                collection_name=None,
+                user_id=user_id,
+                is_admin=bool(user.is_admin),
+            )
+            remaining_file_ids = {
+                file_id
+                for file_id in (
+                    _get_document_record_file_id(record) for record in remaining_records
+                )
+                if file_id
+            }
+            delete_collection_uploaded_files(
+                db,
+                user_id=user_id,
+                collection_file_ids=collection_file_ids,
+                remaining_file_ids=remaining_file_ids,
+                collection_dir=physical_cleanup.collection_dir,
+            )
+            if not uploaded_file_existed_before:
+                refreshed_file_record = (
+                    db.query(UploadedFile)
+                    .filter(UploadedFile.file_id == file_record.file_id)
+                    .first()
+                )
+                if refreshed_file_record is not None:
+                    db.delete(refreshed_file_record)
+            db.commit()
+            _restore_ingest_file_backup(
+                file_path=file_path,
+                backup_path=file_backup_path,
+                had_existing_file=had_existing_file,
+            )
+            return
+
+        if register_created and doc_id:
+            delete_document(collection_name, doc_id, user_id, bool(user.is_admin))
+            remaining_records = vector_store.list_document_records(
+                collection_name=None,
+                user_id=user_id,
+                is_admin=bool(user.is_admin),
+            )
+            remaining_file_ids = {
+                current_file_id
+                for current_file_id in (
+                    _get_document_record_file_id(record) for record in remaining_records
+                )
+                if current_file_id
+            }
+            _delete_uploaded_file_if_orphaned(
+                db,
+                file_id=str(file_record.file_id),
+                user_id=user_id,
+                remaining_file_ids=remaining_file_ids,
+            )
+            db.commit()
+        else:
+            if doc_id:
+                clear_ingestion_status(collection_name, doc_id, user_id=user_id)
+            if not uploaded_file_existed_before:
+                db.delete(file_record)
+                db.commit()
+
+        _restore_ingest_file_backup(
+            file_path=file_path,
+            backup_path=file_backup_path,
+            had_existing_file=had_existing_file,
+        )
+    except Exception as exc:
+        db.rollback()
+        logger.warning(
+            "Failed to fully roll back ingest for %s/%s: %s",
+            collection_name,
+            file_path.name,
+            exc,
+        )
 
 
 def handle_kb_exceptions(func: T) -> T:
@@ -353,6 +546,26 @@ async def ingest(
         ) from e
 
     try:
+        get_collection_sync(safe_collection)
+        collection_existed_before = True
+    except ValueError:
+        collection_existed_before = False
+
+    existing_file_record = (
+        db.query(UploadedFile)
+        .filter(UploadedFile.storage_path == str(file_path))
+        .first()
+    )
+    uploaded_file_existed_before = existing_file_record is not None
+    had_existing_file = file_path.exists()
+    file_backup_path: Optional[Path] = None
+    if had_existing_file:
+        file_backup_path = file_path.with_name(
+            f"{file_path.name}.rollback-{uuid.uuid4().hex}"
+        )
+        shutil.copy2(file_path, file_backup_path)
+
+    try:
         total_size = 0
         # Must not shadow the Form parameter ``chunk_size`` (see issue #199).
         file_read_buffer_size = 1024 * 1024  # 1MB streaming read buffer only
@@ -381,8 +594,11 @@ async def ingest(
     except HTTPException:
         # Ensure partial file is removed on early abort (e.g., file too large)
         try:
-            if file_path.exists():
-                file_path.unlink()
+            _restore_ingest_file_backup(
+                file_path=file_path,
+                backup_path=file_backup_path,
+                had_existing_file=had_existing_file,
+            )
         except OSError:
             pass
         raise
@@ -425,8 +641,12 @@ async def ingest(
             final_strategy.value,
         )
 
+    normalized_parse_method = _normalize_parse_method_for_filename(
+        parse_method, safe_filename
+    )
+
     config = IngestionConfig(
-        parse_method=parse_method if parse_method is not None else ParseMethod.DEFAULT,
+        parse_method=normalized_parse_method,
         chunk_strategy=final_strategy,
         chunk_size=final_chunk_size,
         chunk_overlap=final_chunk_overlap,
@@ -458,8 +678,25 @@ async def ingest(
         future = executor.submit(_run_ingestion)
         result: IngestionResult = future.result()
 
+    if result.status in {"error", "partial"}:
+        _rollback_failed_ingestion(
+            db=db,
+            user=_user,
+            collection_name=collection,
+            result=result,
+            file_path=file_path,
+            file_record=file_record,
+            collection_existed_before=collection_existed_before,
+            uploaded_file_existed_before=uploaded_file_existed_before,
+            file_backup_path=file_backup_path,
+            had_existing_file=had_existing_file,
+        )
+
     if result.status == "error":
-        return JSONResponse(status_code=500, content=result.model_dump())
+        return JSONResponse(
+            status_code=500,
+            content={**result.model_dump(), "status": "error"},
+        )
     if result.status == "partial":
         logger.warning(
             "KB ingest partially completed (collection=%s, filename=%s, user_id=%s): %s",
@@ -468,6 +705,16 @@ async def ingest(
             _user.id,
             result.message,
         )
+        return JSONResponse(
+            status_code=500,
+            content={**result.model_dump(), "status": "error"},
+        )
+
+    if file_backup_path is not None and file_backup_path.exists():
+        try:
+            file_backup_path.unlink()
+        except OSError:
+            logger.warning("Failed to remove ingest backup %s", file_backup_path)
 
     return JSONResponse(
         status_code=200,
@@ -2414,33 +2661,7 @@ async def delete_document_api(
 
     deleted_doc_ids = []
     deletion_errors = []
-
-    remaining_file_ids: set[str] = set()
-    try:
-        remaining_records = _list_documents_for_user(
-            user_id=user_id_int,
-            is_admin=bool(_user.is_admin),
-            collection_name=safe_collection_name,
-        )
-        remaining_file_ids = {
-            current_file_id
-            for current_file_id in (
-                _get_document_record_file_id(record) for record in remaining_records
-            )
-            if current_file_id
-        }
-    except Exception as exc:
-        logger.warning(
-            "Failed to read remaining docs for orphan cleanup; fallback to UploadedFile set: %s",
-            exc,
-        )
-        remaining_file_ids = {
-            str(rec.file_id)
-            for rec in db.query(UploadedFile)
-            .filter(UploadedFile.user_id == user_id_int)
-            .all()
-            if getattr(rec, "file_id", None)
-        }
+    cleanup_candidate_file_ids: set[str] = set()
 
     for doc_info in matching_docs:
         resolved_doc_id = doc_info["doc_id"]
@@ -2450,23 +2671,31 @@ async def delete_document_api(
             logger.error("%s", error_msg)
             continue
         try:
-            delete_document(
+            delete_result = delete_document(
                 safe_collection_name,
                 resolved_doc_id,
                 int(_user.id),
                 bool(_user.is_admin),
             )
+            delete_status = getattr(delete_result, "status", None)
+            if delete_status != "success":
+                error_msg = getattr(
+                    delete_result,
+                    "message",
+                    f"Failed to delete doc_id {resolved_doc_id}",
+                )
+                deletion_errors.append(str(error_msg))
+                logger.error(
+                    "Delete operation returned non-success status for doc_id %s: %s",
+                    resolved_doc_id,
+                    error_msg,
+                )
+                continue
+
             deleted_doc_ids.append(resolved_doc_id)
             current_file_id = _resolve_cleanup_file_id(doc_info)
             if current_file_id:
-                remaining_file_ids.discard(current_file_id)
-                if _delete_uploaded_file_if_orphaned(
-                    db,
-                    file_id=current_file_id,
-                    user_id=user_id_int,
-                    remaining_file_ids=remaining_file_ids,
-                ):
-                    pass
+                cleanup_candidate_file_ids.add(current_file_id)
             logger.info(
                 "Deleted document '%s' (doc_id: %s) from collection '%s'",
                 doc_info.get("filename", filename),
@@ -2477,6 +2706,34 @@ async def delete_document_api(
             error_msg = f"Failed to delete doc_id {resolved_doc_id}: {str(e)}"
             deletion_errors.append(error_msg)
             logger.error("%s", error_msg)
+
+    if cleanup_candidate_file_ids:
+        try:
+            remaining_records = _list_documents_for_user(
+                user_id=user_id_int,
+                is_admin=bool(_user.is_admin),
+            )
+            remaining_file_ids = {
+                current_file_id
+                for current_file_id in (
+                    _get_document_record_file_id(record) for record in remaining_records
+                )
+                if current_file_id
+            }
+        except Exception as exc:
+            logger.warning(
+                "Failed to refresh remaining docs for orphan cleanup; skipping orphan cleanup for %s file(s): %s",
+                len(cleanup_candidate_file_ids),
+                exc,
+            )
+        else:
+            for cleanup_file_id in cleanup_candidate_file_ids:
+                _delete_uploaded_file_if_orphaned(
+                    db,
+                    file_id=cleanup_file_id,
+                    user_id=user_id_int,
+                    remaining_file_ids=remaining_file_ids,
+                )
 
     # Commit all orphan file cleanups in a single batch after the loop
     try:

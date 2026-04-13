@@ -128,6 +128,20 @@ def temp_uploads():
             yield temp_path
 
 
+def _successful_delete_result(collection_name: str, doc_id: str):
+    from xagent.core.tools.core.RAG_tools.core.schemas import DocumentOperationResult
+
+    return DocumentOperationResult(
+        status="success",
+        collection=collection_name,
+        doc_id=doc_id,
+        new_status="failed",
+        message="Document deleted successfully.",
+        warnings=[],
+        details={},
+    )
+
+
 def test_kb_ingest_creates_collection_dir(test_env, temp_uploads):
     """Test that ingesting a document creates a collection-specific directory"""
     app, headers, user, _ = test_env
@@ -162,6 +176,127 @@ def test_kb_ingest_creates_collection_dir(test_env, temp_uploads):
         expected_path = temp_uploads / f"user_{user.id}" / collection_name / filename
         assert expected_path.exists()
         assert expected_path.is_file()
+
+
+def test_kb_ingest_rolls_back_new_collection_on_partial_failure(test_env, temp_uploads):
+    """Partial ingest failures should not leave a new KB file or UploadedFile row behind."""
+    app, headers, user, TestingSessionLocal = test_env
+    client = TestClient(app)
+
+    collection_name = "rollback_new_collection"
+    filename = "failed.xlsx"
+
+    with patch("xagent.web.api.kb.run_document_ingestion") as mock_ingest:
+        from xagent.core.tools.core.RAG_tools.core.schemas import (
+            IngestionResult,
+            IngestionStepResult,
+        )
+
+        mock_ingest.return_value = IngestionResult(
+            status="partial",
+            doc_id="doc-failed",
+            parse_hash="parse-failed",
+            completed_steps=[
+                IngestionStepResult(name="initialize_collection"),
+                IngestionStepResult(name="resolve_embedding_adapter"),
+                IngestionStepResult(
+                    name="register_document",
+                    metadata={"doc_id": "doc-failed", "created": True},
+                ),
+            ],
+            failed_step="compute_embeddings",
+            message="embedding failed",
+        )
+
+        response = client.post(
+            "/api/kb/ingest",
+            files={"file": (filename, b"new content", "application/vnd.ms-excel")},
+            data={"collection": collection_name},
+            headers=headers,
+        )
+
+    assert response.status_code == 500
+    expected_path = temp_uploads / f"user_{user.id}" / collection_name / filename
+    assert not expected_path.exists()
+
+    session = TestingSessionLocal()
+    try:
+        uploaded = session.query(UploadedFile).all()
+        assert uploaded == []
+    finally:
+        session.close()
+
+
+def test_kb_ingest_rolls_back_existing_file_content_on_partial_failure(
+    test_env, temp_uploads
+):
+    """Partial ingest failures should restore overwritten files in existing KBs."""
+    app, headers, user, TestingSessionLocal = test_env
+    client = TestClient(app)
+
+    collection_name = "existing_collection"
+    filename = "existing.xlsx"
+    expected_path = temp_uploads / f"user_{user.id}" / collection_name / filename
+    expected_path.parent.mkdir(parents=True, exist_ok=True)
+    expected_path.write_text("old content")
+
+    session = TestingSessionLocal()
+    try:
+        file_record = UploadedFile(
+            user_id=int(user.id),
+            filename=filename,
+            storage_path=str(expected_path),
+            mime_type="application/vnd.ms-excel",
+            file_size=len("old content"),
+        )
+        session.add(file_record)
+        session.commit()
+    finally:
+        session.close()
+
+    with (
+        patch("xagent.web.api.kb.get_collection_sync", return_value=object()),
+        patch("xagent.web.api.kb.clear_ingestion_status", return_value=None),
+        patch("xagent.web.api.kb.run_document_ingestion") as mock_ingest,
+    ):
+        from xagent.core.tools.core.RAG_tools.core.schemas import (
+            IngestionResult,
+            IngestionStepResult,
+        )
+
+        mock_ingest.return_value = IngestionResult(
+            status="partial",
+            doc_id="doc-existing",
+            parse_hash="parse-existing",
+            completed_steps=[
+                IngestionStepResult(name="initialize_collection"),
+                IngestionStepResult(name="resolve_embedding_adapter"),
+                IngestionStepResult(
+                    name="register_document",
+                    metadata={"doc_id": "doc-existing", "created": False},
+                ),
+            ],
+            failed_step="compute_embeddings",
+            message="embedding failed",
+        )
+
+        response = client.post(
+            "/api/kb/ingest",
+            files={"file": (filename, b"new content", "application/vnd.ms-excel")},
+            data={"collection": collection_name},
+            headers=headers,
+        )
+
+    assert response.status_code == 500
+    assert expected_path.read_text() == "old content"
+
+    session = TestingSessionLocal()
+    try:
+        uploaded = session.query(UploadedFile).all()
+        assert len(uploaded) == 1
+        assert uploaded[0].storage_path == str(expected_path)
+    finally:
+        session.close()
 
 
 def test_kb_delete_cleans_physical_dir(test_env, temp_uploads):
@@ -350,6 +485,43 @@ def test_kb_ingest_normalizes_padded_collection_name(test_env, temp_uploads):
     assert captured_collections == ["team notes"]
     expected_path = temp_uploads / f"user_{user.id}" / "team notes" / filename
     assert expected_path.exists()
+
+
+def test_kb_ingest_falls_back_from_pdf_only_parser_for_xlsx(test_env, temp_uploads):
+    app, headers, user, _ = test_env
+    client = TestClient(app)
+
+    captured_parse_methods: list[str] = []
+
+    def _capture_ingest(**kwargs):
+        from xagent.core.tools.core.RAG_tools.core.schemas import IngestionResult
+
+        ingestion_config = kwargs["ingestion_config"]
+        captured_parse_methods.append(str(ingestion_config.parse_method))
+        return IngestionResult(
+            status="success",
+            doc_id="test_doc_id",
+            parse_hash="hash",
+            failed_step="",
+            message="success",
+        )
+
+    with patch("xagent.web.api.kb.run_document_ingestion", side_effect=_capture_ingest):
+        response = client.post(
+            "/api/kb/ingest",
+            files={
+                "file": (
+                    "table.xlsx",
+                    b"content",
+                    "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                )
+            },
+            data={"collection": "xlsx-demo", "parse_method": "pypdf"},
+            headers=headers,
+        )
+
+    assert response.status_code == 200
+    assert captured_parse_methods == ["default"]
 
 
 def test_kb_ingest_rejects_too_long_collection_name(test_env, temp_uploads):
@@ -551,6 +723,49 @@ def test_kb_delete_accepts_unicode_collection_name(test_env, temp_uploads):
         )
 
     assert response.status_code == 200
+
+
+def test_kb_delete_removes_empty_metadata_only_collection_from_listing(
+    test_env, temp_uploads
+):
+    """Deleting a collection should remove empty metadata-only collections too."""
+    app, headers, user, _ = test_env
+    client = TestClient(app)
+
+    from xagent.core.tools.core.RAG_tools.core.schemas import CollectionInfo
+    from xagent.core.tools.core.RAG_tools.storage.factory import get_metadata_store
+
+    import asyncio
+
+    asyncio.run(
+        get_metadata_store().save_collection(CollectionInfo(name="empty_collection"))
+    )
+    asyncio.run(
+        get_metadata_store().save_collection_config(
+            "empty_collection",
+            "{}",
+            user_id=int(user.id),
+        )
+    )
+
+    list_before = client.get("/api/kb/collections", headers=headers)
+    assert list_before.status_code == 200
+    assert any(
+        item["name"] == "empty_collection" for item in list_before.json()["collections"]
+    )
+
+    delete_response = client.delete(
+        "/api/kb/collections/empty_collection",
+        headers=headers,
+    )
+
+    assert delete_response.status_code == 200
+
+    list_after = client.get("/api/kb/collections", headers=headers)
+    assert list_after.status_code == 200
+    assert all(
+        item["name"] != "empty_collection" for item in list_after.json()["collections"]
+    )
 
 
 def test_kb_delete_rejects_mixed_script_confusable_collection_name(
@@ -1311,6 +1526,7 @@ def test_delete_document_prefers_file_id_and_cleans_orphan_file(test_env, temp_u
 
     def _fake_delete_document(collection_name, doc_id, user_id, is_admin):
         document_state.clear()
+        return _successful_delete_result(collection_name, doc_id)
 
     # Don't mock delete_uploaded_file_if_orphaned - let it actually run and delete the file
     with (
@@ -1351,6 +1567,279 @@ def test_delete_document_prefers_file_id_and_cleans_orphan_file(test_env, temp_u
         session.close()
 
 
+def test_delete_document_keeps_uploaded_file_when_other_docs_still_reference_it(
+    test_env, temp_uploads
+):
+    """Deleting one collection's doc should not orphan-clean a file still referenced elsewhere."""
+    app, headers, user, TestingSessionLocal = test_env
+    client = TestClient(app)
+
+    file_path = temp_uploads / f"user_{user.id}" / "shared.txt"
+    file_path.parent.mkdir(parents=True, exist_ok=True)
+    file_path.write_text("content")
+
+    session = TestingSessionLocal()
+    try:
+        file_record = UploadedFile(
+            user_id=int(user.id),
+            filename="shared.txt",
+            storage_path=str(file_path),
+            mime_type="text/plain",
+            file_size=7,
+        )
+        session.add(file_record)
+        session.commit()
+        session.refresh(file_record)
+        target_file_id = str(file_record.file_id)
+    finally:
+        session.close()
+
+    document_state = [
+        {
+            "collection": "demo",
+            "doc_id": "doc-demo",
+            "file_id": target_file_id,
+            "source_path": str(file_path),
+        },
+        {
+            "collection": "other",
+            "doc_id": "doc-other",
+            "file_id": target_file_id,
+            "source_path": str(file_path),
+        },
+    ]
+
+    def _fake_list_documents_for_user(*args, **kwargs):
+        collection_name = kwargs.get("collection_name")
+        if collection_name:
+            return [
+                record
+                for record in document_state
+                if record["collection"] == collection_name
+            ]
+        return list(document_state)
+
+    def _fake_delete_document(collection_name, doc_id, user_id, is_admin):
+        document_state[:] = [
+            record for record in document_state if record["doc_id"] != doc_id
+        ]
+        return _successful_delete_result(collection_name, doc_id)
+
+    with (
+        patch(
+            "xagent.web.api.kb._list_documents_for_user",
+            side_effect=_fake_list_documents_for_user,
+        ),
+        patch(
+            "xagent.core.tools.core.RAG_tools.management.collections.delete_document",
+            side_effect=_fake_delete_document,
+        ),
+    ):
+        response = client.delete(
+            f"/api/kb/collections/demo/documents/shared.txt?file_id={target_file_id}",
+            headers=headers,
+        )
+
+    assert response.status_code == 200
+    assert file_path.exists()
+
+    session = TestingSessionLocal()
+    try:
+        remaining_record = (
+            session.query(UploadedFile)
+            .filter(UploadedFile.file_id == target_file_id)
+            .first()
+        )
+        assert remaining_record is not None
+    finally:
+        session.close()
+
+
+def test_delete_document_skips_orphan_cleanup_when_remaining_doc_refresh_fails(
+    test_env, temp_uploads
+):
+    """Refresh failures after delete should not guess orphan state for shared files."""
+    app, headers, user, TestingSessionLocal = test_env
+    client = TestClient(app)
+
+    file_path = temp_uploads / f"user_{user.id}" / "shared-refresh-failure.txt"
+    file_path.parent.mkdir(parents=True, exist_ok=True)
+    file_path.write_text("content")
+
+    session = TestingSessionLocal()
+    try:
+        file_record = UploadedFile(
+            user_id=int(user.id),
+            filename="shared-refresh-failure.txt",
+            storage_path=str(file_path),
+            mime_type="text/plain",
+            file_size=7,
+        )
+        session.add(file_record)
+        session.commit()
+        session.refresh(file_record)
+        target_file_id = str(file_record.file_id)
+    finally:
+        session.close()
+
+    document_state = [
+        {
+            "collection": "demo",
+            "doc_id": "doc-demo",
+            "file_id": target_file_id,
+            "source_path": str(file_path),
+        },
+        {
+            "collection": "other",
+            "doc_id": "doc-other",
+            "file_id": target_file_id,
+            "source_path": str(file_path),
+        },
+    ]
+    call_count = {"value": 0}
+
+    def _fake_list_documents_for_user(*args, **kwargs):
+        call_count["value"] += 1
+        collection_name = kwargs.get("collection_name")
+        if collection_name:
+            return [
+                record
+                for record in document_state
+                if record["collection"] == collection_name
+            ]
+        if call_count["value"] >= 2:
+            raise RuntimeError("refresh failed")
+        return list(document_state)
+
+    def _fake_delete_document(collection_name, doc_id, user_id, is_admin):
+        document_state[:] = [
+            record for record in document_state if record["doc_id"] != doc_id
+        ]
+        return _successful_delete_result(collection_name, doc_id)
+
+    with (
+        patch(
+            "xagent.web.api.kb._list_documents_for_user",
+            side_effect=_fake_list_documents_for_user,
+        ),
+        patch(
+            "xagent.core.tools.core.RAG_tools.management.collections.delete_document",
+            side_effect=_fake_delete_document,
+        ),
+    ):
+        response = client.delete(
+            f"/api/kb/collections/demo/documents/shared-refresh-failure.txt?file_id={target_file_id}",
+            headers=headers,
+        )
+
+    assert response.status_code == 200
+    assert file_path.exists()
+
+    session = TestingSessionLocal()
+    try:
+        remaining_record = (
+            session.query(UploadedFile)
+            .filter(UploadedFile.file_id == target_file_id)
+            .first()
+        )
+        assert remaining_record is not None
+    finally:
+        session.close()
+
+
+def test_delete_document_does_not_cleanup_uploaded_file_when_delete_fails(
+    test_env, temp_uploads
+):
+    """Uploaded file cleanup must only happen after a successful KB delete."""
+    app, headers, user, TestingSessionLocal = test_env
+    client = TestClient(app)
+
+    from xagent.core.tools.core.RAG_tools.core.schemas import DocumentOperationResult
+
+    file_path = temp_uploads / f"user_{user.id}" / "delete-failure.txt"
+    file_path.parent.mkdir(parents=True, exist_ok=True)
+    file_path.write_text("content")
+
+    session = TestingSessionLocal()
+    try:
+        file_record = UploadedFile(
+            user_id=int(user.id),
+            filename="delete-failure.txt",
+            storage_path=str(file_path),
+            mime_type="text/plain",
+            file_size=7,
+        )
+        session.add(file_record)
+        session.commit()
+        session.refresh(file_record)
+        target_file_id = str(file_record.file_id)
+    finally:
+        session.close()
+
+    document_state = [
+        {
+            "collection": "demo",
+            "doc_id": "doc-failed",
+            "file_id": target_file_id,
+            "source_path": str(file_path),
+        }
+    ]
+
+    def _fake_list_documents_for_user(*args, **kwargs):
+        collection_name = kwargs.get("collection_name")
+        if collection_name:
+            return [
+                record
+                for record in document_state
+                if record["collection"] == collection_name
+            ]
+        return list(document_state)
+
+    def _fake_delete_document(collection_name, doc_id, user_id, is_admin):
+        return DocumentOperationResult(
+            status="error",
+            collection=collection_name,
+            doc_id=doc_id,
+            new_status="failed",
+            message="simulated delete failure",
+            warnings=[],
+            details={},
+        )
+
+    with (
+        patch(
+            "xagent.web.api.kb._list_documents_for_user",
+            side_effect=_fake_list_documents_for_user,
+        ),
+        patch(
+            "xagent.core.tools.core.RAG_tools.management.collections.delete_document",
+            side_effect=_fake_delete_document,
+        ),
+    ):
+        response = client.delete(
+            f"/api/kb/collections/demo/documents/delete-failure.txt?file_id={target_file_id}",
+            headers=headers,
+        )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["status"] == "failed"
+    assert payload["deleted_doc_ids"] == []
+    assert "simulated delete failure" in payload["errors"][0]
+    assert file_path.exists()
+
+    session = TestingSessionLocal()
+    try:
+        remaining_record = (
+            session.query(UploadedFile)
+            .filter(UploadedFile.file_id == target_file_id)
+            .first()
+        )
+        assert remaining_record is not None
+    finally:
+        session.close()
+
+
 def test_delete_document_accepts_unicode_collection_name(test_env, temp_uploads):
     app, headers, user, _ = test_env
     client = TestClient(app)
@@ -1375,6 +1864,7 @@ def test_delete_document_accepts_unicode_collection_name(test_env, temp_uploads)
     def _fake_delete_document(collection_name_arg, doc_id, user_id, is_admin):
         deleted_doc_ids.append(doc_id)
         assert collection_name_arg == collection_name
+        return _successful_delete_result(collection_name_arg, doc_id)
 
     with (
         patch(
@@ -1508,6 +1998,7 @@ def test_delete_document_by_doc_id_disambiguates_duplicate_filename(
 
     def _fake_delete_document(collection_name, doc_id, user_id, is_admin):
         deleted_doc_ids.append(doc_id)
+        return _successful_delete_result(collection_name, doc_id)
 
     with (
         patch(
@@ -1560,6 +2051,7 @@ def test_delete_document_by_file_id_survives_degraded_document_listing(
 
     def _fake_delete_document(collection_name, doc_id, user_id, is_admin):
         deleted_doc_ids.append(doc_id)
+        return _successful_delete_result(collection_name, doc_id)
 
     with (
         patch(
@@ -1631,6 +2123,7 @@ def test_delete_document_without_file_id_does_not_resurface_on_collection_refres
 
     def _fake_delete_document(collection_name, doc_id, user_id, is_admin):
         document_state.clear()
+        return _successful_delete_result(collection_name, doc_id)
 
     fake_result = ListCollectionsResult(
         status="success",
@@ -1677,7 +2170,7 @@ def test_delete_document_without_file_id_does_not_resurface_on_collection_refres
         session.close()
 
 
-def test_delete_document_without_file_id_does_not_resurface_in_uploaded_file_fallback(
+def test_delete_document_without_file_id_preserves_uploaded_file_on_cleanup_refresh_failure(
     test_env, temp_uploads
 ):
     app, headers, user, TestingSessionLocal = test_env
@@ -1703,6 +2196,8 @@ def test_delete_document_without_file_id_does_not_resurface_in_uploaded_file_fal
         )
         session.add(file_record)
         session.commit()
+        session.refresh(file_record)
+        target_file_id = str(file_record.file_id)
     finally:
         session.close()
 
@@ -1723,6 +2218,7 @@ def test_delete_document_without_file_id_does_not_resurface_in_uploaded_file_fal
 
     def _fake_delete_document(collection_name, doc_id, user_id, is_admin):
         document_state.clear()
+        return _successful_delete_result(collection_name, doc_id)
 
     fake_result = ListCollectionsResult(
         status="success",
@@ -1754,8 +2250,14 @@ def test_delete_document_without_file_id_does_not_resurface_in_uploaded_file_fal
 
     assert refresh_response.status_code == 200
     collection = refresh_response.json()["collections"][0]
-    assert collection["document_names"] == []
-    assert collection["document_metadata"] == []
+    assert collection["document_names"] == ["fallback-refresh.txt"]
+    assert collection["document_metadata"] == [
+        {
+            "filename": "fallback-refresh.txt",
+            "file_id": target_file_id,
+            "doc_id": generate_deterministic_doc_id("demo", str(file_path)),
+        }
+    ]
 
 
 def test_delete_document_by_file_id_resolves_doc_id_via_list_documents(
@@ -1794,6 +2296,7 @@ def test_delete_document_by_file_id_resolves_doc_id_via_list_documents(
 
     def _fake_delete_document(collection_name, doc_id, user_id, is_admin):
         deleted_doc_ids.append(doc_id)
+        return _successful_delete_result(collection_name, doc_id)
 
     doc_list = DocumentListResult(
         status="success",
@@ -1847,6 +2350,7 @@ def test_delete_document_by_doc_id_succeeds_without_uploaded_file_record(
 
     def _fake_delete_document(collection_name, doc_id, user_id, is_admin):
         deleted_doc_ids.append(doc_id)
+        return _successful_delete_result(collection_name, doc_id)
 
     doc_list = DocumentListResult(
         status="success",
@@ -1983,6 +2487,7 @@ def test_delete_document_reports_cleanup_commit_failure(test_env, temp_uploads):
 
     def _fake_delete_document(collection_name, doc_id, user_id, is_admin):
         document_state.clear()
+        return _successful_delete_result(collection_name, doc_id)
 
     def _failing_commit():
         raise RuntimeError("commit failed")

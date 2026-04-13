@@ -200,6 +200,22 @@ class CollectionManager:
         async with lock:
             await self._save_collection_with_retry(collection)
 
+    async def delete_collection_metadata(
+        self,
+        collection_name: str,
+        user_id: Optional[int],
+        is_admin: bool = False,
+    ) -> dict[str, int]:
+        """Delete persisted metadata/config rows for a collection."""
+        lock = _get_collection_lock(collection_name)
+
+        async with lock:
+            return await self._metadata_store.delete_collection_metadata(
+                collection_name,
+                user_id=user_id,
+                is_admin=is_admin,
+            )
+
     async def _save_collection_with_retry(
         self, collection: CollectionInfo, max_retries: int = 3
     ) -> None:
@@ -590,6 +606,19 @@ def mark_collection_accessed_sync(collection_name: str) -> None:
         collection_name: Name of the collection to mark as accessed
     """
     _sync_wrapper(collection_manager.mark_collection_accessed)(collection_name)
+
+
+def delete_collection_metadata_sync(
+    collection_name: str,
+    user_id: Optional[int],
+    is_admin: bool = False,
+) -> dict[str, int]:
+    """Synchronous version of delete_collection_metadata."""
+    return _sync_wrapper(collection_manager.delete_collection_metadata)(
+        collection_name,
+        user_id,
+        is_admin,
+    )
 
 
 def resolve_effective_embedding_model_sync(

@@ -307,12 +307,26 @@ class MetadataStore(ABC):
         """Create or update collection metadata."""
 
     @abstractmethod
+    async def list_collections(
+        self,
+        user_id: Optional[int] = None,
+        is_admin: bool = False,
+    ) -> Sequence[CollectionInfo]:
+        """List persisted collection metadata rows visible to the caller."""
+
+    @abstractmethod
     async def delete_collection(self, collection_name: str) -> None:
         """Delete collection metadata entry."""
 
     @abstractmethod
-    async def list_collections(self) -> Sequence[CollectionInfo]:
-        """List all collections from metadata table."""
+    async def delete_collection_metadata(
+        self,
+        collection_name: str,
+        user_id: Optional[int],
+        is_admin: bool = False,
+        delete_orphaned_metadata: bool = False,
+    ) -> dict[str, int]:
+        """Delete persisted metadata/config rows for a collection."""
 
     @abstractmethod
     async def ensure_collection_metadata_table(self) -> None:

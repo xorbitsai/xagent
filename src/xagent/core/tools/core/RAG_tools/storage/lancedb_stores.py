@@ -113,6 +113,50 @@ class LanceDBMetadataStore(MetadataStore):
         finally:
             _safe_close_table(table)
 
+    async def list_collections(self) -> List[CollectionInfo]:
+        conn = await self._get_connection()
+        await self.ensure_collection_metadata_table()
+        table = conn.open_table("collection_metadata")
+        rows = table.search().to_arrow().to_pylist()
+        return [CollectionInfo.from_storage(row) for row in rows]
+
+    async def delete_collection_metadata(
+        self,
+        collection_name: str,
+        user_id: Optional[int],
+        is_admin: bool = False,
+    ) -> dict[str, int]:
+        from ..LanceDB.schema_manager import ensure_collection_config_table
+
+        conn = await self._get_connection()
+        await self.ensure_collection_metadata_table()
+        ensure_collection_config_table(conn)
+
+        metadata_table = conn.open_table("collection_metadata")
+        safe_collection = escape_lancedb_string(collection_name)
+        metadata_rows = (
+            metadata_table.search().where(f"name = '{safe_collection}'").to_arrow()
+        )
+        metadata_deleted = len(metadata_rows)
+        if metadata_deleted:
+            metadata_table.delete(f"name = '{safe_collection}'")
+
+        config_table = conn.open_table("collection_config")
+        if is_admin or user_id is None:
+            config_where = f"collection = '{safe_collection}'"
+        else:
+            config_where = f"collection = '{safe_collection}' AND user_id = {user_id}"
+
+        config_rows = config_table.search().where(config_where).to_arrow()
+        config_deleted = len(config_rows)
+        if config_deleted:
+            config_table.delete(config_where)
+
+        return {
+            "metadata_rows": metadata_deleted,
+            "config_rows": config_deleted,
+        }
+
     async def ensure_collection_metadata_table(self) -> None:
         conn = await self._get_connection()
         schema = pa.schema(

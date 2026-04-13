@@ -34,6 +34,7 @@ from src.xagent.core.tools.core.RAG_tools.management import (
     list_documents,
     retry_document,
 )
+from src.xagent.core.tools.core.RAG_tools.storage.factory import get_metadata_store
 from src.xagent.core.tools.core.RAG_tools.management.status import load_ingestion_status
 from src.xagent.core.tools.core.RAG_tools.storage import get_vector_index_store
 from src.xagent.providers.vector_store.lancedb import get_connection_from_env
@@ -259,6 +260,47 @@ async def test_list_collections_admin_includes_config_from_other_user(
     assert result.total_count == 1
     info = next(c for c in result.collections if c.name == collection)
     assert info.ingestion_config is not None
+
+
+@pytest.mark.asyncio
+async def test_list_collections_includes_empty_metadata_only_collection(
+    temp_lancedb_dir: str,
+) -> None:
+    """Persisted collection metadata should keep empty collections visible."""
+
+    from src.xagent.core.tools.core.RAG_tools.core.schemas import CollectionInfo
+
+    await get_metadata_store().save_collection(CollectionInfo(name="empty_collection"))
+
+    result = await list_collections(user_id=None, is_admin=True)
+
+    assert result.status == "success"
+    collection_map = {info.name: info for info in result.collections}
+    assert "empty_collection" in collection_map
+    collection_info = collection_map["empty_collection"]
+    assert collection_info.documents == 0
+    assert collection_info.document_names == []
+
+
+@pytest.mark.asyncio
+async def test_delete_collection_removes_empty_collection_metadata(
+    temp_lancedb_dir: str,
+) -> None:
+    """Deleting a collection should remove metadata-only empty collections too."""
+
+    from src.xagent.core.tools.core.RAG_tools.core.schemas import CollectionInfo
+
+    store = get_metadata_store()
+    await store.save_collection(CollectionInfo(name="empty_collection"))
+    await store.save_collection_config("empty_collection", "{}", user_id=1)
+
+    result = delete_collection("empty_collection", user_id=1, is_admin=False)
+
+    assert result.status == "success"
+
+    listed = await list_collections(user_id=None, is_admin=True)
+    collection_names = {info.name for info in listed.collections}
+    assert "empty_collection" not in collection_names
 
 
 def test_get_document_stats_missing_document(temp_lancedb_dir: str) -> None:

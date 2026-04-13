@@ -41,6 +41,7 @@ from ..management.status import (
     load_ingestion_status,
     write_ingestion_status,
 )
+from .collection_manager import delete_collection_metadata_sync
 from ..storage.factory import get_metadata_store, get_vector_index_store
 from ..utils.lancedb_query_utils import _safe_count_rows
 from ..utils.string_utils import build_lancedb_filter_expression, escape_lancedb_string
@@ -534,7 +535,22 @@ async def list_collections(
     warnings: List[str] = []
 
     try:
+        metadata_store = get_metadata_store()
         vector_store = get_vector_index_store()
+        metadata_collections: List[CollectionInfo] = []
+        metadata_collection_names: Set[str] = set()
+        try:
+            metadata_collections = list(
+                await metadata_store.list_collections(
+                    user_id=user_id,
+                    is_admin=is_admin,
+                )
+            )
+            metadata_collection_names = {
+                collection.name for collection in metadata_collections if collection.name
+            }
+        except Exception as exc:
+            logger.warning("Could not load persisted collection metadata: %s", exc)
 
         document_names: Dict[str, Set[str]] = defaultdict(set)
         owners: Dict[str, Set[int]] = defaultdict(set)
@@ -645,17 +661,13 @@ async def list_collections(
                     except (TypeError, ValueError):
                         pass
 
-        collection_keys = sorted(document_names.keys())
+        collection_keys = sorted(document_names.keys() | metadata_collection_names)
 
         # Step 2: Get stats. Try metadata cache first; fallback to realtime scan.
         stats: Dict[str, Dict[str, int]] = {}
         if not force_realtime:
             try:
-                from ..storage.factory import get_metadata_store
-
-                metadata_store = get_metadata_store()
-                cached = await metadata_store.list_collections()
-                for info in cached:
+                for info in metadata_collections:
                     if info.name in collection_keys or is_admin:
                         stats[info.name] = {
                             "documents": info.documents,
@@ -695,8 +707,6 @@ async def list_collections(
         # Async write stats back to metadata cache for next request
         if used_realtime:
             try:
-                from ..storage.factory import get_metadata_store
-
                 metadata_store = get_metadata_store()
                 for collection in collection_keys:
                     info = CollectionInfo(
@@ -720,6 +730,9 @@ async def list_collections(
                     await metadata_store.save_collection(info)
             except Exception as exc:
                 logger.debug("Failed to cache collection metadata: %s", exc)
+        collection_keys = sorted(
+            stats.keys() | document_names.keys() | metadata_collection_names
+        )
 
         # Load configs for collections (admin sees cross-tenant configs)
         collection_configs: Dict[str, IngestionConfig] = {}
@@ -1103,6 +1116,7 @@ def delete_collection(
     """
 
     warnings: List[str] = []
+    metadata_cleanup_counts: dict[str, int] = {}
 
     try:
         # Use storage abstraction for deletion
@@ -1130,6 +1144,12 @@ def delete_collection(
                 logger.warning(warning)
                 warnings.append(warning)
 
+        metadata_cleanup_counts = delete_collection_metadata_sync(
+            collection_name=collection,
+            user_id=user_id,
+            is_admin=is_admin,
+        )
+
     except Exception as exc:  # noqa: BLE001 - convert to structured failure
         logger.error(
             "Failed to delete collection '%s': %s", collection, exc, exc_info=True
@@ -1153,7 +1173,8 @@ def delete_collection(
         for doc_id in doc_ids
     ]
 
-    if not doc_ids and not deleted_counts:
+    metadata_cleanup_total = sum(metadata_cleanup_counts.values())
+    if not doc_ids and not deleted_counts and metadata_cleanup_total == 0:
         summary = f"No documents found in collection '{collection}'."
         return CollectionOperationResult(
             status="success",
@@ -1164,16 +1185,20 @@ def delete_collection(
             deleted_counts={},
         )
 
-    if affected and not warnings:
+    if (affected or metadata_cleanup_total > 0) and not warnings:
         status = "success"
-    elif affected:
+    elif affected or metadata_cleanup_total > 0:
         status = "partial_success"
     else:
         status = "error"
 
-    summary = f"Deleted {len(affected)} documents from collection '{collection}'."
+    summary = f"Deleted collection '{collection}'."
     logger.info(
-        f"Deleted collection '{collection}' - {sum(deleted_counts.values())} total rows across {len(deleted_counts)} tables"
+        "Deleted collection '%s' - %s vector rows across %s tables, %s metadata/config rows",
+        collection,
+        sum(deleted_counts.values()),
+        len(deleted_counts),
+        metadata_cleanup_total,
     )
     return CollectionOperationResult(
         status=status,

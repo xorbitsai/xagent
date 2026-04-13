@@ -4,6 +4,7 @@ import pytest
 
 from xagent.web.config import (
     FILE_STORAGE_URL_BASE,
+    MAX_COLLECTION_NAME_BYTES,
     MAX_COLLECTION_NAME_LENGTH,
     get_file_url,
     sanitize_path_component,
@@ -17,6 +18,7 @@ class TestSanitizePathComponent:
         """Test that valid collection names are accepted."""
         valid_names = [
             "my_collection",
+            "my collection",
             "collection-123",
             "test123",
             "a",
@@ -84,10 +86,29 @@ class TestSanitizePathComponent:
         ):
             sanitize_path_component(too_long_name, "collection")
 
+    def test_utf8_byte_length_limit(self):
+        """Test that UTF-8 byte-length limits are enforced for Unicode names."""
+        within_limit_name = "知" * (
+            MAX_COLLECTION_NAME_BYTES // len("知".encode("utf-8"))
+        )
+        assert (
+            sanitize_path_component(within_limit_name, "collection")
+            == within_limit_name
+        )
+
+        over_limit_name = "知" * (
+            (MAX_COLLECTION_NAME_BYTES // len("知".encode("utf-8"))) + 1
+        )
+        assert len(over_limit_name) < MAX_COLLECTION_NAME_LENGTH
+        with pytest.raises(
+            ValueError,
+            match=f"exceeds maximum byte length of {MAX_COLLECTION_NAME_BYTES}",
+        ):
+            sanitize_path_component(over_limit_name, "collection")
+
     def test_invalid_characters(self):
         """Test that invalid characters are rejected."""
         invalid_names = [
-            "collection name",  # Space
             "collection@name",  # @ symbol
             "collection#name",  # # symbol
             "collection$name",  # $ symbol
@@ -119,10 +140,12 @@ class TestSanitizePathComponent:
                 sanitize_path_component(name, "collection")
 
     def test_valid_special_characters(self):
-        """Test that allowed special characters (underscore, hyphen) are accepted."""
+        """Test that allowed spaces and special characters are accepted."""
         valid_names = [
+            "collection name",
             "collection_name",
             "collection-name",
+            "collection name-123",
             "collection_name-123",
             "collection-123_name",
             "_collection",
@@ -138,9 +161,9 @@ class TestSanitizePathComponent:
     def test_whitespace_stripping(self):
         """Test that leading/trailing whitespace is stripped before validation."""
         # Valid name with whitespace should be stripped and accepted
-        name_with_whitespace = "  my_collection  "
+        name_with_whitespace = "  my collection  "
         result = sanitize_path_component(name_with_whitespace, "collection")
-        assert result == "my_collection"
+        assert result == "my collection"
 
         # But if after stripping it becomes invalid, it should be rejected
         with pytest.raises(ValueError, match="cannot be empty"):

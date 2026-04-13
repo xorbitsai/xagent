@@ -229,7 +229,7 @@ def generate_deterministic_doc_id(collection: str, source_path: str) -> str:
 
 
 # Security validation patterns
-_COLLECTION_NAME_PATTERN: re.Pattern[str] = re.compile(r"^[\w-]+$")
+_COLLECTION_NAME_PATTERN: re.Pattern[str] = re.compile(r"^[\w -]+$")
 _DOC_ID_PATTERN: re.Pattern[str] = re.compile(r"^[a-zA-Z0-9_.-]+$")
 
 
@@ -237,9 +237,9 @@ def validate_collection_name(name: str) -> str:
     """
     Validate collection name for safe use in LanceDB queries.
 
-    Allows Unicode word characters (letters, numbers, underscore) and hyphens.
-    This prevents injection attacks while remaining compatible with
-    internationalized collection names.
+    Allows Unicode word characters (letters, numbers, underscore), spaces,
+    and hyphens. This prevents injection attacks while remaining compatible
+    with internationalized collection names.
 
     Args:
         name: Collection name to validate
@@ -252,12 +252,13 @@ def validate_collection_name(name: str) -> str:
     """
     if not isinstance(name, str):
         raise ValueError(f"Collection name must be a string, got {type(name)}")
-    if not name:
+    if not name or not name.strip():
         raise ValueError("Collection name cannot be empty")
+    name = name.strip()
     if not _COLLECTION_NAME_PATTERN.match(name):
         raise ValueError(
             f"Invalid collection name '{name}'. "
-            "Only letters, numbers, underscores, and hyphens are allowed."
+            "Only letters, numbers, spaces, underscores, and hyphens are allowed."
         )
     return name
 

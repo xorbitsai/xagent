@@ -88,8 +88,8 @@ ALLOWED_EXTENSIONS = {
 # Maximum file size (100MB)
 MAX_FILE_SIZE = 100 * 1024 * 1024
 
-# Word characters (\w = letters/digits/underscore in any language) and hyphens.
-ALLOWED_NAME_PATTERN = re.compile(r"^[\w-]+$")
+# Word characters (\w = letters/digits/underscore in any language), spaces, and hyphens.
+ALLOWED_NAME_PATTERN = re.compile(r"^[\w -]+$")
 _CONFUSABLE_SCRIPT_FAMILIES = ("LATIN", "GREEK", "CYRILLIC")
 
 
@@ -122,6 +122,7 @@ def _has_mixed_confusable_scripts(value: str) -> bool:
 # Maximum length for collection and folder names (reasonable limit for file system and database)
 # This prevents path length issues and database field overflow
 MAX_COLLECTION_NAME_LENGTH = 100
+MAX_COLLECTION_NAME_BYTES = 255
 MIN_COLLECTION_NAME_LENGTH = 1
 
 
@@ -166,7 +167,7 @@ def sanitize_path_component(name: str, component_type: str = "path") -> str:
     if normalized_name != name:
         raise ValueError(
             f"Invalid {component_type} name: contains invalid characters. "
-            f"Only letters, numbers, underscores, and hyphens are allowed."
+            f"Only letters, numbers, spaces, underscores, and hyphens are allowed."
         )
     name = normalized_name
 
@@ -189,13 +190,17 @@ def sanitize_path_component(name: str, component_type: str = "path") -> str:
         raise ValueError(
             f"Invalid {component_type} name: exceeds maximum length of {MAX_COLLECTION_NAME_LENGTH} characters"
         )
+    if len(safe_name.encode("utf-8")) > MAX_COLLECTION_NAME_BYTES:
+        raise ValueError(
+            f"Invalid {component_type} name: exceeds maximum byte length of {MAX_COLLECTION_NAME_BYTES}"
+        )
 
     # Validate against allowed character pattern
     # This ensures only safe characters are used
     if not ALLOWED_NAME_PATTERN.match(safe_name):
         raise ValueError(
             f"Invalid {component_type} name: contains invalid characters. "
-            f"Only letters, numbers, underscores, and hyphens are allowed."
+            f"Only letters, numbers, spaces, underscores, and hyphens are allowed."
         )
 
     if _has_mixed_confusable_scripts(safe_name):

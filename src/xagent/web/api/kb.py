@@ -1487,15 +1487,6 @@ async def check_documents_exist_api(
         if not requested:
             return {"existing_filenames": []}
 
-        try:
-            safe_collection_name = sanitize_path_component(
-                collection_name, "collection"
-            )
-        except ValueError as e:
-            raise HTTPException(
-                status_code=422, detail=f"Invalid collection name: {str(e)}"
-            ) from e
-
         # Use storage abstraction layer to fetch document records
         vector_store = get_vector_index_store()
         records = vector_store.list_document_records(

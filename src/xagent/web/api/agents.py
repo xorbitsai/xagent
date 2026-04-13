@@ -1,11 +1,10 @@
 """Agent Builder API endpoints for creating and managing custom AI agents."""
 
-import json
 import logging
 import os
 import uuid
 from datetime import datetime
-from typing import Any, Dict, List, Optional
+from typing import Dict, List, Optional
 
 from fastapi import APIRouter, Body, Depends, HTTPException
 from pydantic import BaseModel, Field
@@ -14,6 +13,7 @@ from sqlalchemy.orm import Session
 from ...config import get_uploads_dir
 from ...core.agent.service import AgentService
 from ...core.memory.in_memory import InMemoryMemoryStore
+from ...core.utils.type_check import ensure_list
 from ..auth_dependencies import get_current_user
 from ..models.agent import Agent, AgentStatus
 from ..models.database import get_db
@@ -227,22 +227,6 @@ def _delete_logo(logo_url: str) -> None:
         logger.error(f"Failed to delete logo {logo_url}: {e}")
 
 
-def _ensure_list(val: Any) -> List[str]:
-    if not val:
-        return []
-    if isinstance(val, list):
-        return [str(v) for v in val]
-    if isinstance(val, str):
-        try:
-            parsed = json.loads(val)
-            if isinstance(parsed, list):
-                return [str(v) for v in parsed]
-        except json.JSONDecodeError:
-            pass
-        return [val]
-    return []
-
-
 def _agent_to_response(agent: Agent, db: Session) -> AgentResponse:
     """Convert Agent model to response."""
     return AgentResponse(
@@ -253,17 +237,17 @@ def _agent_to_response(agent: Agent, db: Session) -> AgentResponse:
         instructions=agent.instructions,
         execution_mode=agent.execution_mode or "graph",
         models=agent.models,
-        knowledge_bases=_ensure_list(agent.knowledge_bases),
-        skills=_ensure_list(agent.skills),
-        tool_categories=_ensure_list(agent.tool_categories),
-        suggested_prompts=_ensure_list(agent.suggested_prompts),
+        knowledge_bases=ensure_list(agent.knowledge_bases) or [],
+        skills=ensure_list(agent.skills) or [],
+        tool_categories=ensure_list(agent.tool_categories) or [],
+        suggested_prompts=ensure_list(agent.suggested_prompts) or [],
         logo_url=agent.logo_url,
         status=agent.status.value,
         published_at=agent.published_at.isoformat() if agent.published_at else None,
         created_at=agent.created_at.isoformat(),
         updated_at=agent.updated_at.isoformat(),
         widget_enabled=agent.widget_enabled,
-        allowed_domains=_ensure_list(agent.allowed_domains),
+        allowed_domains=ensure_list(agent.allowed_domains) or [],
     )
 
 

@@ -2,6 +2,7 @@
 Agent Tool - Convert published agents into callable tools
 """
 
+import json
 import logging
 from typing import TYPE_CHECKING, Any, Mapping, Optional, Type
 
@@ -240,6 +241,21 @@ class CreateAgentTool(AbstractBaseTool):
         from .....web.models.agent import Agent, AgentStatus
         from .....web.services.llm_utils import UserAwareModelStorage
 
+        def _ensure_list(val: Any) -> list[str] | None:
+            if val is None:
+                return None
+            if isinstance(val, list):
+                return [str(v) for v in val]
+            if isinstance(val, str):
+                try:
+                    parsed = json.loads(val)
+                    if isinstance(parsed, list):
+                        return [str(v) for v in parsed]
+                except json.JSONDecodeError:
+                    pass
+                return [val]
+            return None
+
         try:
             agent_name = args.get("name", "").strip()
             agent_description = args.get("description", "").strip()
@@ -325,8 +341,8 @@ class CreateAgentTool(AbstractBaseTool):
                 execution_mode="graph",
                 models=models_config if models_config else None,
                 knowledge_bases=None,  # No KB by default
-                skills=args.get("skills"),
-                tool_categories=args.get("tool_categories"),
+                skills=_ensure_list(args.get("skills")),
+                tool_categories=_ensure_list(args.get("tool_categories")),
                 suggested_prompts=[],
                 status=AgentStatus.DRAFT,  # Create as DRAFT, not PUBLISHED
             )
@@ -484,6 +500,21 @@ class UpdateAgentTool(AbstractBaseTool):
         """Update an existing agent with the given configuration."""
         from .....web.models.agent import Agent, AgentStatus
 
+        def _ensure_list(val: Any) -> list[str] | None:
+            if val is None:
+                return None
+            if isinstance(val, list):
+                return [str(v) for v in val]
+            if isinstance(val, str):
+                try:
+                    parsed = json.loads(val)
+                    if isinstance(parsed, list):
+                        return [str(v) for v in parsed]
+                except json.JSONDecodeError:
+                    pass
+                return [val]
+            return None
+
         try:
             agent_id = args.get("agent_id")
 
@@ -573,13 +604,13 @@ class UpdateAgentTool(AbstractBaseTool):
                 changes.append("instructions updated")
 
             # Update tool_categories if provided
-            new_tool_categories = args.get("tool_categories")
+            new_tool_categories = _ensure_list(args.get("tool_categories"))
             if new_tool_categories is not None:
                 agent.tool_categories = new_tool_categories
                 changes.append(f"tool_categories → {new_tool_categories}")
 
             # Update skills if provided
-            new_skills = args.get("skills")
+            new_skills = _ensure_list(args.get("skills"))
             if new_skills is not None:
                 agent.skills = new_skills
                 changes.append(f"skills → {new_skills}")

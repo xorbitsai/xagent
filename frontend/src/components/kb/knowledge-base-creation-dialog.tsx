@@ -1,4 +1,4 @@
-import { useState, useEffect, useRef } from "react"
+import React, { useState, useEffect, useRef } from "react"
 import { Button } from "@/components/ui/button"
 import { Input } from "@/components/ui/input"
 import { Label } from "@/components/ui/label"
@@ -11,7 +11,7 @@ import { ScrollArea } from "@/components/ui/scroll-area"
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs"
 import { Select } from "@/components/ui/select"
 import { getApiUrl } from "@/lib/utils"
-import { appendIngestionConfigToFormData } from "@/lib/ingestion-form"
+import { appendIngestionConfigToFormData, normalizeIngestionConfigForFilename } from "@/lib/ingestion-form"
 import { useI18n } from "@/contexts/i18n-context"
 import { apiRequest } from "@/lib/api-wrapper"
 import { Model } from "@/lib/models"
@@ -117,6 +117,10 @@ export function KnowledgeBaseCreationDialog({ open, onOpenChange, onSuccess }: K
 
   // Embedding models state
   const [embeddingModels, setEmbeddingModels] = useState<Model[]>([])
+  const trimmedCollectionName = newCollectionName.trim()
+  const requiresExplicitCollectionName =
+    (activeImportTab === "file" && selectedFiles.length > 1) ||
+    (activeImportTab === "cloud" && totalCloudFiles > 1)
 
   useEffect(() => {
     if (open) {
@@ -256,6 +260,11 @@ export function KnowledgeBaseCreationDialog({ open, onOpenChange, onSuccess }: K
       return
     }
 
+    if (selectedFiles.length > 1 && !trimmedCollectionName) {
+      toast.error(t("kb.errors.multiFileNameRequired"))
+      return
+    }
+
     setIsUploading(true)
     setUploadProgress(0)
     setIngestionResults([])
@@ -267,11 +276,14 @@ export function KnowledgeBaseCreationDialog({ open, onOpenChange, onSuccess }: K
         const file = selectedFiles[i]
         const formData = new FormData()
 
-        const collectionName = newCollectionName || file.name.replace(/\.[^/.]+$/, "")
+        const collectionName = trimmedCollectionName || file.name.replace(/\.[^/.]+$/, "")
 
         formData.append("file", file)
         formData.append("collection", collectionName)
-        appendIngestionConfigToFormData(formData, ingestionConfig)
+        appendIngestionConfigToFormData(
+          formData,
+          normalizeIngestionConfigForFilename(ingestionConfig, file.name)
+        )
 
         const response = await apiRequest(`${getApiUrl()}/api/kb/ingest`, {
           method: "POST",
@@ -325,7 +337,7 @@ export function KnowledgeBaseCreationDialog({ open, onOpenChange, onSuccess }: K
     try {
       const formData = new FormData()
 
-      const collectionName = newCollectionName || "web_collection"
+      const collectionName = trimmedCollectionName || "web_collection"
 
       formData.append("collection", collectionName)
       formData.append("start_url", webIngestionConfig.start_url)
@@ -398,7 +410,12 @@ export function KnowledgeBaseCreationDialog({ open, onOpenChange, onSuccess }: K
       )
 
       // Determine collection name
-      let collectionName = newCollectionName
+      if (filesToIngest.length > 1 && !trimmedCollectionName) {
+        toast.error(t("kb.errors.multiFileNameRequired"))
+        return
+      }
+
+      let collectionName = trimmedCollectionName
       if (!collectionName && filesToIngest.length > 0) {
         // Use first file name without extension as default collection name
         collectionName = filesToIngest[0].fileName.replace(/\.[^/.]+$/, "")
@@ -503,6 +520,11 @@ export function KnowledgeBaseCreationDialog({ open, onOpenChange, onSuccess }: K
                   onChange={(e) => setNewCollectionName(e.target.value)}
                   placeholder={t("kb.dialog.basicInfo.namePlaceholder")}
                 />
+                {requiresExplicitCollectionName && !trimmedCollectionName && (
+                  <p className="mt-2 text-sm text-destructive">
+                    {t("kb.dialog.basicInfo.multiFileRequiredHint")}
+                  </p>
+                )}
               </div>
               <div>
                 <Label htmlFor="collection_description">{t("kb.dialog.basicInfo.descriptionLabel")}</Label>
@@ -1042,9 +1064,9 @@ export function KnowledgeBaseCreationDialog({ open, onOpenChange, onSuccess }: K
                 }
               }}
               disabled={
-                (activeImportTab === "file" && selectedFiles.length === 0) ||
+                (activeImportTab === "file" && (selectedFiles.length === 0 || (selectedFiles.length > 1 && !trimmedCollectionName))) ||
                 (activeImportTab === "web" && !webIngestionConfig.start_url) ||
-                (activeImportTab === "cloud" && totalCloudFiles === 0) ||
+                (activeImportTab === "cloud" && (totalCloudFiles === 0 || (totalCloudFiles > 1 && !trimmedCollectionName))) ||
                 isUploading ||
                 isWebIngesting ||
                 isCloudConnecting

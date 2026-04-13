@@ -190,21 +190,28 @@ async def save_collection_config(
     """Save ingestion configuration for a specific collection."""
     from ...core.tools.core.RAG_tools.storage.factory import get_metadata_store
 
+    try:
+        safe_collection = sanitize_path_component(collection, "collection")
+    except ValueError as e:
+        raise HTTPException(
+            status_code=422, detail=f"Invalid collection name: {str(e)}"
+        ) from e
+
     config_json = config.model_dump_json(exclude_unset=True)
 
     try:
         metadata_store = get_metadata_store()
         await metadata_store.save_collection_config(
-            collection=collection,
+            collection=safe_collection,
             config_json=config_json,
             user_id=int(_user.id),
         )
 
         return CollectionOperationResult(
             status="success",
-            collection=collection,
+            collection=safe_collection,
             operation="save_config",
-            message=f"Configuration saved for collection '{collection}'",
+            message=f"Configuration saved for collection '{safe_collection}'",
         )
     except Exception as e:
         logger.error(f"Failed to save collection config: {e}", exc_info=True)
@@ -304,6 +311,7 @@ async def ingest(
     try:
         # SECURITY: Validate collection name at API boundary
         safe_collection = sanitize_path_component(collection, "collection")
+        collection = safe_collection
 
         try:
             file_path = get_upload_path(
@@ -460,6 +468,13 @@ async def ingest_cloud(
     _user: User = Depends(get_current_user),
 ) -> List[IngestionResult]:
     """Ingest files from cloud storage."""
+    try:
+        safe_collection = sanitize_path_component(request.collection, "collection")
+    except ValueError as e:
+        raise HTTPException(
+            status_code=422, detail=f"Invalid collection name: {str(e)}"
+        ) from e
+
     results = []
 
     # Common configuration setup
@@ -556,7 +571,7 @@ async def ingest_cloud(
                     try:
                         result = await asyncio.to_thread(
                             run_document_ingestion,
-                            collection=request.collection,
+                            collection=safe_collection,
                             source_path=str(file_path),
                             ingestion_config=config,
                             progress_manager=progress_manager,
@@ -952,6 +967,13 @@ async def search(
     if not collection or not query_text:
         raise HTTPException(status_code=422, detail="Missing required parameters")
 
+    try:
+        safe_collection = sanitize_path_component(collection, "collection")
+    except ValueError as e:
+        raise HTTPException(
+            status_code=422, detail=f"Invalid collection name: {str(e)}"
+        ) from e
+
     if not embedding_model_id:
         raise HTTPException(
             status_code=422,
@@ -979,7 +1001,7 @@ async def search(
 
     progress_manager = get_progress_manager()
     result = run_document_search(
-        collection=collection,
+        collection=safe_collection,
         query_text=query_text,
         config=config,
         progress_manager=progress_manager,
@@ -1278,7 +1300,6 @@ async def delete_collection_api(
     Raises:
         HTTPException: If physical deletion fails (prevents database deletion)
     """
-    safe_collection = collection_name
     try:
         try:
             safe_collection = sanitize_path_component(collection_name, "collection")
@@ -1442,6 +1463,15 @@ async def check_documents_exist_api(
     for admins), so "already exists" matches what will be overwritten on re-upload.
     """
     try:
+        try:
+            safe_collection_name = sanitize_path_component(
+                collection_name, "collection"
+            )
+        except ValueError as e:
+            raise HTTPException(
+                status_code=422, detail=f"Invalid collection name: {str(e)}"
+            ) from e
+
         filenames = body.get("filenames")
         if not isinstance(filenames, list):
             raise HTTPException(
@@ -2092,11 +2122,6 @@ async def rename_collection_api(
             detail="New collection name cannot be empty",
         )
 
-    new_name = new_name.strip()
-
-    if new_name == collection_name:
-        return {"status": "success", "message": "Collection name unchanged"}
-
     warnings: list[str] = []
 
     # SECURITY: Validate both old and new collection names to prevent path traversal
@@ -2108,12 +2133,15 @@ async def rename_collection_api(
             status_code=422, detail=f"Invalid collection name: {str(e)}"
         ) from e
 
+    if safe_new_collection == safe_old_collection:
+        return {"status": "success", "message": "Collection name unchanged"}
+
     physical_rename_status = "not_found"
     physical_rename_error: Optional[str] = None
     old_collection_dir: Optional[Path] = None
     new_collection_dir: Optional[Path] = None
     collection_records = vector_store.list_document_records(
-        collection_name=collection_name,
+        collection_name=safe_old_collection,
         user_id=int(_user.id),
         is_admin=bool(_user.is_admin),
     )
@@ -2156,25 +2184,25 @@ async def rename_collection_api(
     vector_store = get_vector_index_store()
     warnings.extend(
         vector_store.rename_collection_data(
-            collection_name=collection_name,
-            new_name=new_name,
+            collection_name=safe_old_collection,
+            new_name=safe_new_collection,
         )
     )
 
     # Migrate ingestion status from old collection name to new
     try:
-        status_entries = load_ingestion_status(collection=collection_name)
+        status_entries = load_ingestion_status(collection=safe_old_collection)
         for entry in status_entries:
             doc_id = entry.get("doc_id")
             if doc_id:
                 write_ingestion_status(
-                    new_name,
+                    safe_new_collection,
                     doc_id,
                     status=entry.get("status", "pending"),
                     message=entry.get("message", ""),
                     parse_hash=entry.get("parse_hash", ""),
                 )
-                clear_ingestion_status(collection_name, doc_id)
+                clear_ingestion_status(safe_old_collection, doc_id)
     except Exception as e:
         logger.warning("Failed to update ingestion status: %s", e)
         warnings.append(f"Failed to update ingestion status: {e}")
@@ -2213,7 +2241,9 @@ async def rename_collection_api(
             rename_info_message = " Database rename succeeded, but physical directory rename encountered issues."
 
     # Step 5: Build final message
-    base_message = f"Collection renamed from '{collection_name}' to '{new_name}'"
+    base_message = (
+        f"Collection renamed from '{safe_old_collection}' to '{safe_new_collection}'"
+    )
     if warnings and len(warnings) > (1 if physical_rename_status != "not_found" else 0):
         final_message = f"{base_message} with some warnings"
     else:

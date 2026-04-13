@@ -236,7 +236,6 @@ def test_kb_ingest_rejects_invalid_characters_in_collection_name(
     client = TestClient(app)
 
     invalid_collections = [
-        "collection name",  # Space
         "collection@name",  # @ symbol
         "collection#name",  # # symbol
         "collection/name",  # Path separator
@@ -288,6 +287,70 @@ def test_kb_ingest_accepts_unicode_collection_name(test_env, temp_uploads):
         assert expected_path.exists()
 
 
+def test_kb_ingest_accepts_space_collection_name(test_env, temp_uploads):
+    app, headers, user, _ = test_env
+    client = TestClient(app)
+
+    collection_name = "team notes"
+    filename = "test_doc.txt"
+
+    with patch("xagent.web.api.kb.run_document_ingestion") as mock_ingest:
+        from xagent.core.tools.core.RAG_tools.core.schemas import IngestionResult
+
+        mock_ingest.return_value = IngestionResult(
+            status="success",
+            doc_id="test_doc_id",
+            parse_hash="hash",
+            failed_step="",
+            message="success",
+        )
+
+        response = client.post(
+            "/api/kb/ingest",
+            files={"file": (filename, b"content", "text/plain")},
+            data={"collection": collection_name},
+            headers=headers,
+        )
+
+        assert response.status_code == 200
+        expected_path = temp_uploads / f"user_{user.id}" / collection_name / filename
+        assert expected_path.exists()
+
+
+def test_kb_ingest_normalizes_padded_collection_name(test_env, temp_uploads):
+    app, headers, user, _ = test_env
+    client = TestClient(app)
+
+    collection_name = "  team notes  "
+    filename = "test_doc.txt"
+    captured_collections: list[str] = []
+
+    def _capture_ingest(*, collection=None, **kwargs):
+        captured_collections.append(str(collection))
+        from xagent.core.tools.core.RAG_tools.core.schemas import IngestionResult
+
+        return IngestionResult(
+            status="success",
+            doc_id="test_doc_id",
+            parse_hash="hash",
+            failed_step="",
+            message="success",
+        )
+
+    with patch("xagent.web.api.kb.run_document_ingestion", side_effect=_capture_ingest):
+        response = client.post(
+            "/api/kb/ingest",
+            files={"file": (filename, b"content", "text/plain")},
+            data={"collection": collection_name},
+            headers=headers,
+        )
+
+    assert response.status_code == 200
+    assert captured_collections == ["team notes"]
+    expected_path = temp_uploads / f"user_{user.id}" / "team notes" / filename
+    assert expected_path.exists()
+
+
 def test_kb_ingest_rejects_too_long_collection_name(test_env, temp_uploads):
     """Test that ingest API rejects collection names exceeding length limit."""
     app, headers, user, _ = test_env
@@ -321,7 +384,6 @@ def test_kb_ingest_validates_derived_collection_name_from_filename(
     # Note: "../../../etc.txt" becomes "etc.txt" after basename, which is valid
     # So we test actual invalid cases
     malicious_filenames = [
-        "file name.txt",  # Would create "file name" with space
         "file@name.txt",  # Would create "file@name" with invalid character
     ]
 
@@ -338,6 +400,104 @@ def test_kb_ingest_validates_derived_collection_name_from_filename(
             assert response.status_code == 422
             detail = response.json().get("detail", "")
             assert "Invalid collection name" in detail or "invalid" in detail.lower()
+
+
+def test_kb_ingest_accepts_derived_collection_name_with_spaces(test_env, temp_uploads):
+    app, headers, user, _ = test_env
+    client = TestClient(app)
+
+    filename = "file name.txt"
+
+    with patch("xagent.web.api.kb.run_document_ingestion") as mock_ingest:
+        from xagent.core.tools.core.RAG_tools.core.schemas import IngestionResult
+
+        mock_ingest.return_value = IngestionResult(
+            status="success",
+            doc_id="test_doc_id",
+            parse_hash="hash",
+            failed_step="",
+            message="success",
+        )
+
+        response = client.post(
+            "/api/kb/ingest",
+            files={"file": (filename, b"content", "text/plain")},
+            data={},
+            headers=headers,
+        )
+
+        assert response.status_code == 200
+        expected_path = temp_uploads / f"user_{user.id}" / "file name" / filename
+        assert expected_path.exists()
+
+
+def test_kb_delete_accepts_space_collection_name(test_env, temp_uploads):
+    app, headers, user, _ = test_env
+    client = TestClient(app)
+
+    from urllib.parse import quote
+
+    collection_name = "team notes"
+    coll_dir = temp_uploads / f"user_{user.id}" / collection_name
+    coll_dir.mkdir(parents=True, exist_ok=True)
+    (coll_dir / "some_file.txt").write_text("data")
+
+    with patch("xagent.web.api.kb.delete_collection") as mock_delete:
+        from xagent.core.tools.core.RAG_tools.core.schemas import (
+            CollectionOperationResult,
+        )
+
+        mock_delete.return_value = CollectionOperationResult(
+            status="success",
+            collection=collection_name,
+            message="deleted",
+            affected_documents=[],
+            deleted_counts={},
+        )
+
+        response = client.delete(
+            f"/api/kb/collections/{quote(collection_name, safe='')}",
+            headers=headers,
+        )
+
+    assert response.status_code == 200
+
+
+def test_kb_delete_normalizes_padded_collection_name(test_env, temp_uploads):
+    app, headers, user, _ = test_env
+    client = TestClient(app)
+
+    from urllib.parse import quote
+
+    collection_name = "team notes"
+    coll_dir = temp_uploads / f"user_{user.id}" / collection_name
+    coll_dir.mkdir(parents=True, exist_ok=True)
+    (coll_dir / "some_file.txt").write_text("data")
+
+    deleted_collections: list[str] = []
+
+    def _capture_delete(collection, user_id, is_admin):
+        deleted_collections.append(str(collection))
+        from xagent.core.tools.core.RAG_tools.core.schemas import (
+            CollectionOperationResult,
+        )
+
+        return CollectionOperationResult(
+            status="success",
+            collection=collection,
+            message="deleted",
+            affected_documents=[],
+            deleted_counts={},
+        )
+
+    with patch("xagent.web.api.kb.delete_collection", side_effect=_capture_delete):
+        response = client.delete(
+            f"/api/kb/collections/{quote('  team notes  ', safe='')}",
+            headers=headers,
+        )
+
+    assert response.status_code == 200
+    assert deleted_collections == [collection_name]
 
 
 def test_kb_delete_rejects_path_traversal_in_collection_name(test_env, temp_uploads):
@@ -408,6 +568,93 @@ def test_kb_delete_rejects_mixed_script_confusable_collection_name(
 
     assert response.status_code == 422
     assert "Invalid collection name" in response.json()["detail"]
+
+
+def test_kb_ingest_rejects_utf8_byte_overflow_collection_name(test_env, temp_uploads):
+    app, headers, user, _ = test_env
+    client = TestClient(app)
+
+    collection_name = "知" * 86
+    filename = "test_doc.txt"
+
+    with patch("xagent.web.api.kb.run_document_ingestion"):
+        response = client.post(
+            "/api/kb/ingest",
+            files={"file": (filename, b"content", "text/plain")},
+            data={"collection": collection_name},
+            headers=headers,
+        )
+
+    assert response.status_code == 422
+    assert "maximum byte length" in response.json()["detail"]
+
+
+def test_save_collection_config_normalizes_padded_collection_name(
+    test_env, temp_uploads
+):
+    app, headers, user, _ = test_env
+    client = TestClient(app)
+
+    from unittest.mock import AsyncMock, MagicMock
+
+    mock_store = MagicMock()
+    mock_store.save_collection_config = AsyncMock()
+
+    with patch(
+        "xagent.core.tools.core.RAG_tools.storage.factory.get_metadata_store",
+        return_value=mock_store,
+    ):
+        response = client.post(
+            "/api/kb/collections/%20%20team%20notes%20%20/config",
+            json={},
+            headers=headers,
+        )
+
+    assert response.status_code == 200
+    mock_store.save_collection_config.assert_awaited_once_with(
+        collection="team notes",
+        config_json="{}",
+        user_id=int(user.id),
+    )
+    assert response.json()["collection"] == "team notes"
+
+
+def test_kb_search_normalizes_padded_collection_name(test_env, temp_uploads):
+    app, headers, user, _ = test_env
+    client = TestClient(app)
+
+    captured_collections: list[str] = []
+
+    def _capture_search(*, collection=None, **kwargs):
+        captured_collections.append(str(collection))
+        from xagent.core.tools.core.RAG_tools.core.schemas import (
+            SearchPipelineResult,
+            SearchType,
+        )
+
+        return SearchPipelineResult(
+            status="success",
+            search_type=SearchType.HYBRID,
+            results=[],
+            result_count=0,
+            warnings=[],
+            message="ok",
+            used_rerank=False,
+        )
+
+    with patch("xagent.web.api.kb.run_document_search", side_effect=_capture_search):
+        response = client.post(
+            "/api/kb/search",
+            data={
+                "collection": "  team notes  ",
+                "query_text": "hello",
+                "embedding_model_id": "text-embedding-v4",
+            },
+            headers=headers,
+        )
+
+    assert response.status_code == 200
+    assert captured_collections == ["team notes"]
 
 
 def test_kb_delete_physical_cleanup_failure_aborts_operation(test_env, temp_uploads):
@@ -615,6 +862,47 @@ def test_kb_rename_physical_directory_rename(test_env, temp_uploads):
             # If database operations failed, old directory should still exist
             # (physical rename might have happened but was rolled back, or didn't happen)
             pass
+
+
+def test_kb_rename_normalizes_padded_collection_names(test_env, temp_uploads):
+    app, headers, user, _ = test_env
+    client = TestClient(app)
+
+    old_collection_name = "team notes"
+    new_collection_name = "project archive"
+
+    old_coll_dir = temp_uploads / f"user_{user.id}" / old_collection_name
+    old_coll_dir.mkdir(parents=True, exist_ok=True)
+    (old_coll_dir / "some_file.txt").write_text("data")
+
+    with (
+        patch(
+            "xagent.core.tools.core.RAG_tools.management.collections._list_table_names"
+        ) as mock_list_tables,
+        patch("xagent.web.api.kb.get_vector_index_store") as mock_store_factory,
+    ):
+        from unittest.mock import MagicMock
+
+        mock_list_tables.return_value = []
+        mock_store = MagicMock()
+        mock_db_conn = MagicMock()
+        mock_table = MagicMock()
+        mock_table.count_rows.return_value = 0
+        mock_db_conn.open_table.return_value = mock_table
+        mock_store.get_raw_connection.return_value = mock_db_conn
+        mock_store_factory.return_value = mock_store
+
+        response = client.put(
+            "/api/kb/collections/%20%20team%20notes%20%20",
+            data={"new_name": "  project archive  "},
+            headers=headers,
+        )
+
+    assert response.status_code in [200, 500]
+    if response.status_code == 200:
+        new_coll_dir = temp_uploads / f"user_{user.id}" / new_collection_name
+        assert new_coll_dir.exists()
+        assert not old_coll_dir.exists()
 
 
 def test_kb_rename_physical_rename_failure_aborts_operation(test_env, temp_uploads):

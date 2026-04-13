@@ -99,10 +99,11 @@ export function AgentBuilderChat({ agentConfig, onUpdateConfig, availableOptions
     let currentReply = ""
 
     const sendPayload = (ws: WebSocket) => {
+      const { modelConfig, ...restConfig } = agentConfig
       ws.send(JSON.stringify({
         message: text,
-        ...agentConfig,
-        models: agentConfig.modelConfig || {}
+        ...restConfig,
+        models: modelConfig || {}
       }))
     }
 

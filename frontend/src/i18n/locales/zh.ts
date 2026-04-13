@@ -1860,6 +1860,8 @@ Build when you need.`
         unpublishFailed: "取消发布 Agent 失败",
         kbToolsNotEnabled: "选择了知识库但未启用知识库工具，请在工具类别中勾选「知识库」工具后再保存。",
         unknown: "发生未知错误",
+        notFound: "Agent 不存在",
+        notFoundDesc: "该 Agent 不存在或已被删除",
       },
       kbToolWarning: {
         title: "需要启用知识库工具",

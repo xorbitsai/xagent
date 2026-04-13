@@ -1860,6 +1860,8 @@ Build when you need.`
         unpublishFailed: "Failed to unpublish agent",
         kbToolsNotEnabled: "Knowledge bases are selected but the Knowledge tool category is not enabled. Please enable the Knowledge tools before saving.",
         unknown: "An unknown error occurred",
+        notFound: "Agent not found",
+        notFoundDesc: "The agent you are looking for does not exist or has been deleted.",
       },
       kbToolWarning: {
         title: "Knowledge Tools Required",

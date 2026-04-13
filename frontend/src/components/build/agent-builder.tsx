@@ -13,7 +13,7 @@ import { ChatInput } from "@/components/chat/ChatInput"
 import { ChatMessage } from "@/components/chat/ChatMessage"
 import { apiRequest } from "@/lib/api-wrapper"
 import { getApiUrl, getWsUrl } from "@/lib/utils"
-import { PlusCircle, MessageSquare, Upload, Download, Settings2, Check, Zap, BookOpen, ChevronLeft, Sparkles, Loader2, XCircle, Trash2 } from "lucide-react"
+import { PlusCircle, MessageSquare, Upload, Download, Settings2, Check, Zap, BookOpen, ChevronLeft, Sparkles, Loader2, XCircle, Trash2, Bot } from "lucide-react"
 import { useI18n } from "@/contexts/i18n-context"
 import { useAuth } from "@/contexts/auth-context"
 import { FileAttachment } from "@/components/file/file-attachment"
@@ -133,6 +133,7 @@ export function AgentBuilder({ agentId }: AgentBuilderProps) {
   const [isKbModalOpen, setIsKbModalOpen] = useState(false)
   const [isModelConfigOpen, setIsModelConfigOpen] = useState(false)
   const [configSynced, setConfigSynced] = useState(false)
+  const [notFound, setNotFound] = useState(false)
   const isFirstRender = useRef(true)
 
   useEffect(() => {
@@ -576,6 +577,8 @@ export function AgentBuilder({ agentId }: AgentBuilderProps) {
               compact: agent.models.compact || null,
             })
           }
+        } else if (response.status === 404) {
+          setNotFound(true)
         }
       } catch (error) {
         console.error("Failed to load agent:", error)
@@ -1711,6 +1714,21 @@ export function AgentBuilder({ agentId }: AgentBuilderProps) {
       </div>
     </div>
   )
+
+  if (notFound) {
+    return (
+      <div className="flex flex-col items-center justify-center h-[100vh] w-full bg-background text-center p-4">
+        <Bot className="w-16 h-16 text-muted-foreground mb-4 opacity-20" />
+        <h2 className="text-2xl font-bold mb-2">{t("builds.editor.error.notFound")}</h2>
+        <p className="text-muted-foreground max-w-md mb-6">
+          {t("builds.editor.error.notFoundDesc")}
+        </p>
+        <Button onClick={() => router.push("/build/new")}>
+          {t("builds.editor.header.create")}
+        </Button>
+      </div>
+    )
+  }
 
   return (
     <div className="flex flex-col h-[100vh]">

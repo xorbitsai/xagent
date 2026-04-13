@@ -40,11 +40,15 @@ export function AgentCard({
     } else {
       // Default: navigate based on agent status
       // DRAFT agents go to builder (edit), PUBLISHED agents go to chat
-      if (status === 'draft') {
-        router.push(`/build/${agentId}`);
-      } else {
-        router.push(`/agent/${agentId}`);
+      const targetUrl = status === 'draft' ? `/build/${agentId}` : `/agent/${agentId}`;
+
+      // If we are already on the target URL, do nothing to prevent reloading the page
+      // and losing the current chat history or unsaved form changes
+      if (window.location.pathname === targetUrl) {
+        return;
       }
+
+      router.push(targetUrl);
     }
   };
 

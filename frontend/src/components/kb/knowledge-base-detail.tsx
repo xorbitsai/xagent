@@ -15,7 +15,7 @@ import { Badge } from "@/components/ui/badge"
 import { ConfirmDialog } from "@/components/ui/confirm-dialog"
 import { apiRequest } from "@/lib/api-wrapper"
 import { getApiUrl } from "@/lib/utils"
-import { appendIngestionConfigToFormData } from "@/lib/ingestion-form"
+import { appendIngestionConfigToFormData, normalizeIngestionConfigForFilename } from "@/lib/ingestion-form"
 import { parseSeparatorsInput, formatSeparatorsOutput } from "@/lib/separators"
 import { useI18n } from "@/contexts/i18n-context"
 import { toast } from "sonner"
@@ -293,7 +293,10 @@ export function KnowledgeBaseDetailContent({ collectionName }: { collectionName:
 
         formData.append("file", file)
         formData.append("collection", collectionName)
-        appendIngestionConfigToFormData(formData, ingestionConfig)
+        appendIngestionConfigToFormData(
+          formData,
+          normalizeIngestionConfigForFilename(ingestionConfig, file.name)
+        )
 
         const response = await apiRequest(`${getApiUrl()}/api/kb/ingest`, {
           method: "POST",

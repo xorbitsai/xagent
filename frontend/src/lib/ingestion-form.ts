@@ -13,6 +13,23 @@ export interface IngestionConfigForm {
   retry_delay: number
 }
 
+const PDF_ONLY_PARSE_METHODS = new Set(["pypdf", "pdfplumber", "pymupdf"])
+
+export function normalizeIngestionConfigForFilename<T extends IngestionConfigForm>(
+  config: T,
+  filename: string
+): T {
+  const isPdf = filename.toLowerCase().endsWith(".pdf")
+  if (isPdf || !PDF_ONLY_PARSE_METHODS.has(config.parse_method)) {
+    return config
+  }
+
+  return {
+    ...config,
+    parse_method: "default",
+  }
+}
+
 /**
  * Appends ingestion config fields (including optional separators when chunk_strategy is recursive)
  * to the given FormData. Use for both /api/kb/ingest and /api/kb/ingest-web requests.

@@ -32,6 +32,16 @@ def test_get_supported_parsers_uses_dynamic_mapping_for_docx() -> None:
     assert "deepdoc" in parsers
 
 
+def test_get_supported_parsers_uses_dynamic_mapping_for_spreadsheets() -> None:
+    """Spreadsheet extensions should surface non-PDF parsers ahead of fallback parsers."""
+    xlsx_parsers = get_supported_parsers(".xlsx")
+    csv_parsers = get_supported_parsers(".csv")
+
+    assert "deepdoc" in xlsx_parsers
+    assert "unstructured" in xlsx_parsers
+    assert "deepdoc" in csv_parsers
+
+
 class TestGetSupportedParsers:
     """Test getting supported parsers for file extensions."""
 

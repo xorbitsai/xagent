@@ -122,6 +122,11 @@ async def parse_document(
             logger.info(
                 f"Auto-selected 'deepdoc' parser for .pdf file: {resolved_file_path}"
             )
+        elif ext in (".xlsx", ".xls", ".csv") and "deepdoc" in available_parsers:
+            selected_parser = "deepdoc"
+            logger.info(
+                f"Auto-selected 'deepdoc' parser for spreadsheet file {ext}: {resolved_file_path}"
+            )
         elif (
             ext
             in (
@@ -129,12 +134,11 @@ async def parse_document(
                 ".pptx",
                 ".doc",
                 ".docx",
-                ".xlsx",
-                ".xls",
                 ".txt",
                 ".md",
                 ".json",
                 ".html",
+                ".csv",
             )
             and "unstructured" in available_parsers
         ):

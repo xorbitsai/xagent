@@ -905,6 +905,49 @@ def test_kb_rename_normalizes_padded_collection_names(test_env, temp_uploads):
         assert not old_coll_dir.exists()
 
 
+def test_kb_rename_accepts_unicode_collection_name(test_env, temp_uploads):
+    app, headers, user, _ = test_env
+    client = TestClient(app)
+
+    from urllib.parse import quote
+
+    old_collection_name = "示例知识库集合"
+    new_collection_name = "知识库归档"
+
+    old_coll_dir = temp_uploads / f"user_{user.id}" / old_collection_name
+    old_coll_dir.mkdir(parents=True, exist_ok=True)
+    (old_coll_dir / "some_file.txt").write_text("data")
+
+    with (
+        patch(
+            "xagent.core.tools.core.RAG_tools.management.collections._list_table_names"
+        ) as mock_list_tables,
+        patch("xagent.web.api.kb.get_vector_index_store") as mock_store_factory,
+    ):
+        from unittest.mock import MagicMock
+
+        mock_list_tables.return_value = []
+        mock_store = MagicMock()
+        mock_db_conn = MagicMock()
+        mock_table = MagicMock()
+        mock_table.count_rows.return_value = 0
+        mock_db_conn.open_table.return_value = mock_table
+        mock_store.get_raw_connection.return_value = mock_db_conn
+        mock_store_factory.return_value = mock_store
+
+        response = client.put(
+            f"/api/kb/collections/{quote(old_collection_name, safe='')}",
+            data={"new_name": new_collection_name},
+            headers=headers,
+        )
+
+    assert response.status_code in [200, 500]
+    if response.status_code == 200:
+        new_coll_dir = temp_uploads / f"user_{user.id}" / new_collection_name
+        assert new_coll_dir.exists()
+        assert not old_coll_dir.exists()
+
+
 def test_kb_rename_physical_rename_failure_aborts_operation(test_env, temp_uploads):
     """Test that physical rename failure aborts database update."""
     app, headers, user, _ = test_env

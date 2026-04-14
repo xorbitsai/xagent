@@ -1,6 +1,6 @@
 """Test cases for TaskTracker and TaskTrackerManager."""
 
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 import pytest
 
@@ -99,13 +99,15 @@ class TestTaskTracker:
     @pytest.mark.asyncio
     async def test_start_tracking_already_tracking(self, task_tracker, caplog):
         """Test starting tracking when already tracking."""
-        await task_tracker.start_tracking()
+        with patch("xagent.web.tracking.task_tracker.logger.warning") as mock_warning:
+            await task_tracker.start_tracking()
 
-        # Try to start again
-        await task_tracker.start_tracking()
+            # Try to start again
+            await task_tracker.start_tracking()
 
         # Should log warning
-        assert "already being tracked" in caplog.text
+        assert mock_warning.called
+        assert "already being tracked" in mock_warning.call_args.args[0]
 
     @pytest.mark.asyncio
     async def test_periodic_update(self, task_tracker):
@@ -131,10 +133,12 @@ class TestTaskTracker:
         """Test periodic update when not tracking."""
         # Don't start tracking
 
-        await task_tracker.periodic_update()
+        with patch("xagent.web.tracking.task_tracker.logger.warning") as mock_warning:
+            await task_tracker.periodic_update()
 
         # Should log warning
-        assert "not being tracked" in caplog.text
+        assert mock_warning.called
+        assert "not being tracked" in mock_warning.call_args.args[0]
 
     @pytest.mark.asyncio
     async def test_complete_tracking(self, task_tracker):
@@ -201,14 +205,16 @@ class TestTaskTracker:
     @pytest.mark.asyncio
     async def test_start_periodic_updates_already_active(self, task_tracker, caplog):
         """Test starting periodic updates when already active."""
-        await task_tracker.start_tracking()
-        await task_tracker.start_periodic_updates()
+        with patch("xagent.web.tracking.task_tracker.logger.warning") as mock_warning:
+            await task_tracker.start_tracking()
+            await task_tracker.start_periodic_updates()
 
-        # Try to start again
-        await task_tracker.start_periodic_updates()
+            # Try to start again
+            await task_tracker.start_periodic_updates()
 
         # Should log warning
-        assert "already active" in caplog.text
+        assert mock_warning.called
+        assert "already active" in mock_warning.call_args.args[0]
 
 
 class TestTaskTrackerManager:

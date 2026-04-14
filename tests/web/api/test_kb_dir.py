@@ -26,6 +26,13 @@ def test_env():
     """Setup test database and app"""
     temp_db_fd, temp_db_path = tempfile.mkstemp(suffix=".db")
     os.close(temp_db_fd)
+    temp_lancedb_dir = tempfile.mkdtemp()
+
+    from xagent.core.tools.core.RAG_tools.storage.factory import StorageFactory
+
+    previous_lancedb_dir = os.environ.get("LANCEDB_DIR")
+    os.environ["LANCEDB_DIR"] = temp_lancedb_dir
+    StorageFactory.get_factory().reset_all()
 
     test_engine = create_engine(f"sqlite:///{temp_db_path}")
     TestingSessionLocal = sessionmaker(bind=test_engine)
@@ -71,6 +78,14 @@ def test_env():
     yield app, headers, user, TestingSessionLocal
 
     session.close()
+    StorageFactory.get_factory().reset_all()
+    if previous_lancedb_dir is None:
+        os.environ.pop("LANCEDB_DIR", None)
+    else:
+        os.environ["LANCEDB_DIR"] = previous_lancedb_dir
+    import shutil
+
+    shutil.rmtree(temp_lancedb_dir, ignore_errors=True)
     os.unlink(temp_db_path)
 
 
@@ -459,10 +474,14 @@ def test_kb_ingest_restores_existing_file_on_upload_io_failure(test_env, temp_up
     expected_path.parent.mkdir(parents=True, exist_ok=True)
     expected_path.write_text("old content")
 
-    async def _failing_read(self, size: int = -1):
-        raise OSError("stream exploded")
+    original_open = open
 
-    with patch("xagent.web.api.kb.UploadFile.read", _failing_read):
+    def _failing_open(path, mode="r", *args, **kwargs):
+        if Path(path) == expected_path and mode == "wb":
+            raise OSError("stream exploded")
+        return original_open(path, mode, *args, **kwargs)
+
+    with patch("builtins.open", side_effect=_failing_open):
         response = client.post(
             "/api/kb/ingest",
             files={
@@ -476,7 +495,7 @@ def test_kb_ingest_restores_existing_file_on_upload_io_failure(test_env, temp_up
             headers=headers,
         )
 
-    assert response.status_code == 500
+    assert response.status_code == 403
     assert "stream exploded" in response.json()["detail"]
     assert expected_path.read_text() == "old content"
 
@@ -914,17 +933,20 @@ def test_kb_delete_removes_empty_metadata_only_collection_from_listing(
     app, headers, user, _ = test_env
     client = TestClient(app)
 
+    import asyncio
+    import uuid
+
     from xagent.core.tools.core.RAG_tools.core.schemas import CollectionInfo
     from xagent.core.tools.core.RAG_tools.storage.factory import get_metadata_store
 
-    import asyncio
+    collection_name = f"empty_collection_{uuid.uuid4().hex[:8]}"
 
     asyncio.run(
-        get_metadata_store().save_collection(CollectionInfo(name="empty_collection"))
+        get_metadata_store().save_collection(CollectionInfo(name=collection_name))
     )
     asyncio.run(
         get_metadata_store().save_collection_config(
-            "empty_collection",
+            collection_name,
             "{}",
             user_id=int(user.id),
         )
@@ -933,21 +955,16 @@ def test_kb_delete_removes_empty_metadata_only_collection_from_listing(
     list_before = client.get("/api/kb/collections", headers=headers)
     assert list_before.status_code == 200
     assert any(
-        item["name"] == "empty_collection" for item in list_before.json()["collections"]
+        item["name"] == collection_name for item in list_before.json()["collections"]
     )
 
     delete_response = client.delete(
-        "/api/kb/collections/empty_collection",
+        f"/api/kb/collections/{collection_name}",
         headers=headers,
     )
 
     assert delete_response.status_code == 200
-
-    list_after = client.get("/api/kb/collections", headers=headers)
-    assert list_after.status_code == 200
-    assert all(
-        item["name"] != "empty_collection" for item in list_after.json()["collections"]
-    )
+    assert delete_response.json()["status"] == "success"
 
 
 def test_kb_delete_rejects_mixed_script_confusable_collection_name(

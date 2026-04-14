@@ -21,11 +21,11 @@ from xagent.core.tools.core.RAG_tools.core.schemas import (
     IngestionConfig,
     IngestionResult,
     ParseDocumentResponse,
-    ParseMethod,
     ParsedParagraph,
+    ParseMethod,
 )
-from xagent.core.tools.core.RAG_tools.progress.manager import ProgressManager
 from xagent.core.tools.core.RAG_tools.pipelines import document_ingestion
+from xagent.core.tools.core.RAG_tools.progress.manager import ProgressManager
 
 
 class _StubEmbeddingAdapter(BaseEmbedding):

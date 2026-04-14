@@ -44,14 +44,14 @@ from ...core.tools.core.RAG_tools.core.schemas import (
     WebCrawlConfig,
     WebIngestionResult,
 )
+from ...core.tools.core.RAG_tools.management.collection_manager import (
+    get_collection_sync,
+)
 from ...core.tools.core.RAG_tools.management.collections import (
     delete_collection,
     delete_document,
     list_collections,
     list_documents,
-)
-from ...core.tools.core.RAG_tools.management.collection_manager import (
-    get_collection_sync,
 )
 from ...core.tools.core.RAG_tools.management.status import clear_ingestion_status
 from ...core.tools.core.RAG_tools.parse.parse_display import (
@@ -698,11 +698,13 @@ async def ingest(
         safe_collection = sanitize_path_component(collection, "collection")
         collection = safe_collection
 
-        file_path = get_upload_path(
-            safe_filename,
-            user_id=int(_user.id),
-            collection=safe_collection,
-            collection_is_sanitized=True,
+        file_path = Path(
+            get_upload_path(
+                safe_filename,
+                user_id=int(_user.id),
+                collection=safe_collection,
+                collection_is_sanitized=True,
+            )
         )
     except ValueError as e:
         logger.warning("Invalid collection name rejected: %s - %s", collection, e)
@@ -782,9 +784,7 @@ async def ingest(
                 "Failed to restore ingest file after upload error for "
                 f"{collection}/{file_path.name}: {restore_exc}"
             ) from restore_exc
-        raise RollbackFailureError(
-            f"Upload failed while writing {collection}/{file_path.name}: {upload_exc}"
-        ) from upload_exc
+        raise upload_exc
 
     # Register file in unified file management (file_id) for KB + file APIs.
     mime_type = (
@@ -996,7 +996,7 @@ async def ingest_cloud(
                 safe_filename,
                 file_info.fileId,
             )
-            file_path = get_upload_path(storage_filename, user_id=int(_user.id))
+            file_path = Path(get_upload_path(storage_filename, user_id=int(_user.id)))
             try:
                 if file_info.provider == "google-drive":
                     # Get credentials (run in thread to avoid blocking)

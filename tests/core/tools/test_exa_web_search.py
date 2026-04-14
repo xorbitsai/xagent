@@ -20,7 +20,9 @@ def exa_search_tool():
     return ExaWebSearchTool()
 
 
-def _make_mock_result(title="Test Article", url="https://example.com/article", **kwargs):
+def _make_mock_result(
+    title="Test Article", url="https://example.com/article", **kwargs
+):
     """Create a mock Exa result object."""
     result = MagicMock()
     result.title = title
@@ -73,7 +75,9 @@ class TestExaWebSearchTool:
     async def test_missing_api_key(self, exa_search_tool):
         """Test behavior when API key is missing"""
         with patch.dict(os.environ, {}, clear=True):
-            with pytest.raises(ValueError, match="Missing required environment variable EXA_API_KEY"):
+            with pytest.raises(
+                ValueError, match="Missing required environment variable EXA_API_KEY"
+            ):
                 await exa_search_tool.run_json_async({"query": "test search"})
 
     @pytest.mark.asyncio
@@ -87,7 +91,11 @@ class TestExaWebSearchTool:
         with patch.dict(os.environ, {"EXA_API_KEY": "test_key"}):
             with patch("exa_py.Exa", return_value=mock_client):
                 result = await exa_search_tool.run_json_async(
-                    {"query": "test search", "num_results": 2, "content_mode": "highlights"}
+                    {
+                        "query": "test search",
+                        "num_results": 2,
+                        "content_mode": "highlights",
+                    }
                 )
 
                 assert result["results"]
@@ -211,7 +219,9 @@ class TestExaWebSearchTool:
     async def test_api_error_handling(self, exa_search_tool):
         """Test handling of Exa API errors"""
         mock_client = MagicMock()
-        mock_client.search_and_contents.side_effect = Exception("API rate limit exceeded")
+        mock_client.search_and_contents.side_effect = Exception(
+            "API rate limit exceeded"
+        )
         mock_client.headers = {}
 
         with patch.dict(os.environ, {"EXA_API_KEY": "test_key"}):

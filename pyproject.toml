@@ -219,6 +219,8 @@ module = [
   "aiogram.*",
   "lark_oapi",
   "lark_oapi.*",
+  "exa_py",
+  "exa_py.*",
 ]
 ignore_missing_imports = true
 

@@ -134,9 +134,7 @@ class ExaWebSearchCore:
             )
 
     @staticmethod
-    def _normalize_results(
-        response: Any, content_mode: str
-    ) -> List[Dict[str, str]]:
+    def _normalize_results(response: Any, content_mode: str) -> List[Dict[str, str]]:
         """Normalize Exa search results into xagent's standard format."""
         results: List[Dict[str, str]] = []
 

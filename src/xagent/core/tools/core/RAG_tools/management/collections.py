@@ -42,13 +42,13 @@ from ..management.status import (
     load_ingestion_status,
     write_ingestion_status,
 )
-from .collection_manager import delete_collection_metadata_sync
 from ..storage.factory import get_metadata_store, get_vector_index_store
 from ..utils.lancedb_query_utils import _safe_count_rows
 from ..utils.string_utils import build_lancedb_filter_expression, escape_lancedb_string
 from ..utils.user_permissions import UserPermissions
 from ..utils.user_scope import resolve_user_scope
 from ..version_management.cascade_cleaner import cleanup_document_cascade
+from .collection_manager import delete_collection_metadata_sync
 
 logger = logging.getLogger(__name__)
 

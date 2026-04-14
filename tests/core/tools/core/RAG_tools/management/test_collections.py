@@ -36,9 +36,9 @@ from src.xagent.core.tools.core.RAG_tools.management import (
     list_documents,
     retry_document,
 )
-from src.xagent.core.tools.core.RAG_tools.storage.factory import get_metadata_store
 from src.xagent.core.tools.core.RAG_tools.management.status import load_ingestion_status
 from src.xagent.core.tools.core.RAG_tools.storage import get_vector_index_store
+from src.xagent.core.tools.core.RAG_tools.storage.factory import get_metadata_store
 from src.xagent.providers.vector_store.lancedb import get_connection_from_env
 from xagent.core.tools.core.RAG_tools.file.register_document import register_document
 

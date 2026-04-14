@@ -16,6 +16,7 @@ import { ConfirmDialog } from "@/components/ui/confirm-dialog"
 import { apiRequest } from "@/lib/api-wrapper"
 import { getApiUrl } from "@/lib/utils"
 import { appendIngestionConfigToFormData, normalizeIngestionConfigForFilename } from "@/lib/ingestion-form"
+import { findMatchingIngestionTask, getKBTaskProgressDetail, getKBTaskProgressPercent, KBProgressTask } from "@/lib/kb-progress"
 import { parseSeparatorsInput, formatSeparatorsOutput } from "@/lib/separators"
 import { useI18n } from "@/contexts/i18n-context"
 import { toast } from "sonner"
@@ -91,7 +92,10 @@ export function KnowledgeBaseDetailContent({ collectionName }: { collectionName:
   const [selectedFiles, setSelectedFiles] = useState<File[]>([])
   const [isUploading, setIsUploading] = useState(false)
   const [uploadProgress, setUploadProgress] = useState(0)
+  const [uploadProgressDetail, setUploadProgressDetail] = useState<string | null>(null)
   const [ingestionResults, setIngestionResults] = useState<any[]>([])
+  const [currentUploadFileName, setCurrentUploadFileName] = useState<string | null>(null)
+  const [completedUploadCount, setCompletedUploadCount] = useState(0)
   const [isAddSourceOpen, setIsAddSourceOpen] = useState(false)
   const [activeAddSourceMode, setActiveAddSourceMode] = useState<"web" | "file" | null>(null)
   const [isDragging, setIsDragging] = useState(false)
@@ -193,6 +197,40 @@ export function KnowledgeBaseDetailContent({ collectionName }: { collectionName:
     fetchEmbeddingModels()
   }, [collectionName])
 
+  useEffect(() => {
+    if (!isUploading || !currentUploadFileName) return
+
+    let cancelled = false
+
+    const pollProgress = async () => {
+      try {
+        const response = await apiRequest(`${getApiUrl()}/api/progress?task_type=ingestion`)
+        if (!response.ok) return
+        const data = await response.json()
+        const tasks = (data.tasks || []) as KBProgressTask[]
+        const task = findMatchingIngestionTask(tasks, collectionName, currentUploadFileName)
+        if (!task || cancelled) return
+
+        const detail = getKBTaskProgressDetail(task)
+        const taskPercent = getKBTaskProgressPercent(task)
+        if (detail) setUploadProgressDetail(detail)
+        if (typeof taskPercent === "number") {
+          const overall = ((completedUploadCount + taskPercent / 100) / Math.max(selectedFiles.length, 1)) * 100
+          setUploadProgress(Math.max(0, Math.min(100, overall)))
+        }
+      } catch {
+        // Ignore transient polling failures during upload.
+      }
+    }
+
+    pollProgress()
+    const interval = window.setInterval(pollProgress, 1000)
+    return () => {
+      cancelled = true
+      window.clearInterval(interval)
+    }
+  }, [isUploading, currentUploadFileName, completedUploadCount, selectedFiles.length, collectionName])
+
   const fetchEmbeddingModels = async () => {
     try {
       const response = await apiRequest(`${getApiUrl()}/api/models/?category=embedding`)
@@ -284,12 +322,16 @@ export function KnowledgeBaseDetailContent({ collectionName }: { collectionName:
 
     setIsUploading(true)
     setUploadProgress(0)
+    setUploadProgressDetail(null)
     setIngestionResults([])
+    setCompletedUploadCount(0)
 
     try {
       for (let i = 0; i < selectedFiles.length; i++) {
         const file = selectedFiles[i]
         const formData = new FormData()
+        setCurrentUploadFileName(file.name)
+        setUploadProgressDetail(null)
 
         formData.append("file", file)
         formData.append("collection", collectionName)
@@ -314,6 +356,7 @@ export function KnowledgeBaseDetailContent({ collectionName }: { collectionName:
 
         const result = await response.json()
         setIngestionResults(prev => [...prev, result])
+        setCompletedUploadCount(i + 1)
         setUploadProgress(((i + 1) / selectedFiles.length) * 100)
       }
 
@@ -326,6 +369,8 @@ export function KnowledgeBaseDetailContent({ collectionName }: { collectionName:
       toast.error(err instanceof Error ? err.message : t("kb.detail.errors.uploadFailedGeneric"))
     } finally {
       setIsUploading(false)
+      setCurrentUploadFileName(null)
+      setUploadProgressDetail(null)
     }
   }
 
@@ -1093,8 +1138,11 @@ export function KnowledgeBaseDetailContent({ collectionName }: { collectionName:
                           t("kb.detail.files.upload")
                         )}
                       </Button>
+                      {isUploading && uploadProgressDetail && (
+                        <p className="text-xs text-muted-foreground text-center">{uploadProgressDetail}</p>
+                      )}
                     </div>
-                 )}
+                  )}
               </div>
             ) : (
               <div className="space-y-4">

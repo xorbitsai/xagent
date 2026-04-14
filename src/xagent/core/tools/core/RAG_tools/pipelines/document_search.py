@@ -672,7 +672,11 @@ def search_documents(
                         warnings.extend(_serialize_warnings(hybrid_response.warnings))
                         results = list(hybrid_response.results)
                         status = hybrid_response.status or "success"
-                        message = "Hybrid search completed successfully"
+                        message = (
+                            "Hybrid search completed successfully"
+                            if status == "success"
+                            else "Hybrid search completed with warnings"
+                        )
 
         # Apply optional rerank
         current_step = "apply_rerank"

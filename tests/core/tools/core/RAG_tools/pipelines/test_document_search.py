@@ -17,6 +17,9 @@ from xagent.core.tools.core.RAG_tools.chunk.chunk_document import chunk_document
 from xagent.core.tools.core.RAG_tools.core.config import IndexPolicy
 from xagent.core.tools.core.RAG_tools.core.schemas import (
     ChunkEmbeddingData,
+    FusionConfig,
+    HybridSearchResponse,
+    IndexStatus,
     ParseMethod,
     SearchConfig,
     SearchPipelineResult,
@@ -671,3 +674,42 @@ def test_apply_rerank_rrf_fallback_with_scores(
     # RRF should reorder based on ranks
     # Both results should be present, order may vary based on RRF calculation
     assert all(r.text in ["doc1", "doc2"] for r in reranked)
+
+
+def test_hybrid_partial_success_uses_warning_message(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Hybrid partial_success should not claim unconditional success."""
+    monkeypatch.setattr(
+        "xagent.core.tools.core.RAG_tools.management.collection_manager.resolve_effective_embedding_model_sync",
+        lambda collection, model_id=None: "resolved-embed",
+    )
+    _patch_embedding_adapter(monkeypatch, "resolved-embed")
+    monkeypatch.setattr(
+        document_search,
+        "search_hybrid",
+        lambda **kwargs: HybridSearchResponse(
+            results=[],
+            total_count=0,
+            status="partial_success",
+            warnings=[],
+            fusion_config=kwargs["fusion_config"] or FusionConfig(),
+            dense_count=0,
+            sparse_count=0,
+            index_status=IndexStatus.INDEX_READY,
+            index_advice=None,
+        ),
+    )
+
+    result = document_search.search_documents(
+        collection="kb1",
+        query_text="test query",
+        config=SearchConfig(
+            search_type=SearchType.HYBRID,
+            top_k=5,
+            embedding_model_id="placeholder-model",
+        ),
+    )
+
+    assert result.status == "partial_success"
+    assert result.message == "Hybrid search completed with warnings"

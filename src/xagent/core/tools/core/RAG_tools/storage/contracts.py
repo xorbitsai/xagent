@@ -438,11 +438,15 @@ class VectorIndexStore(ABC):
     def delete_collection_data(
         self,
         collection_name: str,
+        user_id: Optional[int],
+        is_admin: bool,
     ) -> Dict[str, int]:
         """Delete all data for a collection from vector-side tables.
 
         Args:
             collection_name: Name of the collection to delete.
+            user_id: User ID for multi-tenancy filtering.
+            is_admin: Whether the caller has admin privileges.
 
         Returns:
             Dictionary mapping table names to deleted row counts.

@@ -67,21 +67,6 @@ class LanceDBMetadataStore(MetadataStore):
         finally:
             _safe_close_table(table)
 
-    async def list_collections(self) -> list[CollectionInfo]:
-        """List all collections from metadata table."""
-        conn = await self._get_connection()
-        await self.ensure_collection_metadata_table()
-
-        try:
-            table = conn.open_table("collection_metadata")
-            result = table.search().to_arrow()
-            if len(result) == 0:
-                return []
-            return [CollectionInfo.from_storage(row) for row in result.to_pylist()]
-        except Exception as exc:
-            logger.debug("Failed to list collections from metadata: %s", exc)
-            return []
-
     async def delete_collection(self, collection_name: str) -> None:
         """Delete a collection entry from metadata table."""
         conn = await self._get_connection()
@@ -113,11 +98,40 @@ class LanceDBMetadataStore(MetadataStore):
         finally:
             _safe_close_table(table)
 
-    async def list_collections(self) -> List[CollectionInfo]:
+    async def list_collections(
+        self,
+        user_id: Optional[int] = None,
+        is_admin: bool = False,
+    ) -> List[CollectionInfo]:
         conn = await self._get_connection()
         await self.ensure_collection_metadata_table()
         table = conn.open_table("collection_metadata")
         rows = table.search().to_arrow().to_pylist()
+
+        if is_admin:
+            return [CollectionInfo.from_storage(row) for row in rows]
+
+        if user_id is None:
+            return []
+
+        from ..LanceDB.schema_manager import ensure_collection_config_table
+
+        ensure_collection_config_table(conn)
+        config_table = conn.open_table("collection_config")
+        config_rows = (
+            config_table.search().where(f"user_id = {user_id}").to_arrow().to_pylist()
+        )
+        visible_names = {
+            str(row.get("collection", "")).strip()
+            for row in config_rows
+            if str(row.get("collection", "")).strip()
+        }
+        if not visible_names:
+            return []
+
+        rows = [
+            row for row in rows if str(row.get("name", "")).strip() in visible_names
+        ]
         return [CollectionInfo.from_storage(row) for row in rows]
 
     async def delete_collection_metadata(
@@ -125,6 +139,7 @@ class LanceDBMetadataStore(MetadataStore):
         collection_name: str,
         user_id: Optional[int],
         is_admin: bool = False,
+        delete_orphaned_metadata: bool = False,
     ) -> dict[str, int]:
         from ..LanceDB.schema_manager import ensure_collection_config_table
 
@@ -134,16 +149,13 @@ class LanceDBMetadataStore(MetadataStore):
 
         metadata_table = conn.open_table("collection_metadata")
         safe_collection = escape_lancedb_string(collection_name)
-        metadata_rows = (
-            metadata_table.search().where(f"name = '{safe_collection}'").to_arrow()
-        )
-        metadata_deleted = len(metadata_rows)
-        if metadata_deleted:
-            metadata_table.delete(f"name = '{safe_collection}'")
+        metadata_deleted = 0
 
         config_table = conn.open_table("collection_config")
-        if is_admin or user_id is None:
+        if is_admin:
             config_where = f"collection = '{safe_collection}'"
+        elif user_id is None:
+            config_where = f"collection = '{safe_collection}' AND user_id = 0"
         else:
             config_where = f"collection = '{safe_collection}' AND user_id = {user_id}"
 
@@ -151,6 +163,23 @@ class LanceDBMetadataStore(MetadataStore):
         config_deleted = len(config_rows)
         if config_deleted:
             config_table.delete(config_where)
+
+        should_delete_metadata = is_admin
+        if delete_orphaned_metadata and not is_admin:
+            remaining_configs = (
+                config_table.search()
+                .where(f"collection = '{safe_collection}'")
+                .to_arrow()
+            )
+            should_delete_metadata = len(remaining_configs) == 0
+
+        if should_delete_metadata:
+            metadata_rows = (
+                metadata_table.search().where(f"name = '{safe_collection}'").to_arrow()
+            )
+            metadata_deleted = len(metadata_rows)
+            if metadata_deleted:
+                metadata_table.delete(f"name = '{safe_collection}'")
 
         return {
             "metadata_rows": metadata_deleted,
@@ -634,6 +663,8 @@ class LanceDBVectorIndexStore(VectorIndexStore):
     def delete_collection_data(
         self,
         collection_name: str,
+        user_id: Optional[int],
+        is_admin: bool,
     ) -> Dict[str, int]:
         """Delete all data for a collection from vector-side tables."""
         from ..LanceDB.schema_manager import (
@@ -643,8 +674,15 @@ class LanceDBVectorIndexStore(VectorIndexStore):
         )
 
         deleted_counts: Dict[str, int] = {}
+        failed_tables: List[str] = []
         conn = self._get_connection()
-        safe_collection = escape_lancedb_string(collection_name)
+        filter_expr = self.build_filter_expression(
+            build_filter_from_dict({"collection": collection_name}),
+            user_id=user_id,
+            is_admin=is_admin,
+        )
+        if not filter_expr:
+            return deleted_counts
 
         # Ensure tables exist before attempting deletion
         ensure_documents_table(conn)
@@ -655,13 +693,14 @@ class LanceDBVectorIndexStore(VectorIndexStore):
         for table_name in ["documents", "parses", "chunks"]:
             try:
                 table = self._get_table(table_name)
-                original_count = table.count_rows()
-                table.delete(f"collection = '{safe_collection}'")
-                deleted_count = original_count - table.count_rows()
+                original_count = table.count_rows(filter_expr)
+                table.delete(filter_expr)
+                deleted_count = original_count - table.count_rows(filter_expr)
                 if deleted_count > 0:
                     deleted_counts[table_name] = deleted_count
             except Exception as exc:  # noqa: BLE001
                 logger.warning("Failed to delete from '%s': %s", table_name, exc)
+                failed_tables.append(f"{table_name}: {exc}")
 
         # Delete embeddings data (use cached handles; do NOT close them)
         for table_name in self.list_table_names():
@@ -669,13 +708,20 @@ class LanceDBVectorIndexStore(VectorIndexStore):
                 continue
             try:
                 table = self._get_table(table_name)
-                original_count = table.count_rows()
-                table.delete(f"collection = '{safe_collection}'")
-                deleted_count = original_count - table.count_rows()
+                original_count = table.count_rows(filter_expr)
+                table.delete(filter_expr)
+                deleted_count = original_count - table.count_rows(filter_expr)
                 if deleted_count > 0:
                     deleted_counts[table_name] = deleted_count
             except Exception as exc:  # noqa: BLE001
                 logger.warning("Failed to delete from '%s': %s", table_name, exc)
+                failed_tables.append(f"{table_name}: {exc}")
+
+        if failed_tables:
+            raise RuntimeError(
+                "Failed to delete collection data from one or more tables: "
+                + "; ".join(failed_tables)
+            )
 
         # Clear cache so subsequent reads see the deletion and fd is released
         self.invalidate_table_cache()

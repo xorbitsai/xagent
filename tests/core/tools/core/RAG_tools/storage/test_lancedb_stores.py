@@ -295,6 +295,58 @@ def test_vector_store_rename_collection_data_updates_expected_tables(
     assert mock_table.update.call_count == 4
 
 
+@patch(
+    "xagent.core.tools.core.RAG_tools.storage.lancedb_stores.get_connection_from_env"
+)
+def test_delete_collection_data_raises_when_any_table_delete_fails(
+    mock_get_connection: Mock,
+) -> None:
+    """Collection deletes should fail loudly if any table cleanup fails."""
+
+    mock_conn = Mock()
+    mock_get_connection.return_value = mock_conn
+    mock_conn.table_names.return_value = [
+        "documents",
+        "parses",
+        "chunks",
+        "embeddings_text_embedding_v4",
+    ]
+
+    def _build_table(
+        *, before: int, after: int = 0, delete_side_effect: Exception | None = None
+    ):
+        table = Mock()
+        if delete_side_effect is None:
+            table.count_rows.side_effect = [before, after]
+        else:
+            table.count_rows.return_value = before
+            table.delete.side_effect = delete_side_effect
+        return table
+
+    documents_table = _build_table(before=1)
+    parses_table = _build_table(
+        before=1, delete_side_effect=RuntimeError("parse delete failed")
+    )
+    chunks_table = _build_table(before=0)
+    embeddings_table = _build_table(before=2)
+    tables = {
+        "documents": documents_table,
+        "parses": parses_table,
+        "chunks": chunks_table,
+        "embeddings_text_embedding_v4": embeddings_table,
+    }
+    mock_conn.open_table.side_effect = lambda name: tables[name]
+
+    store = LanceDBVectorIndexStore()
+
+    with pytest.raises(RuntimeError, match="parse delete failed"):
+        store.delete_collection_data("demo", user_id=1, is_admin=False)
+
+    documents_table.delete.assert_called_once()
+    parses_table.delete.assert_called_once()
+    embeddings_table.delete.assert_called_once()
+
+
 # --- Upsert Fallback Tests ---
 
 

@@ -14,14 +14,17 @@ from xagent.core.tools.core.RAG_tools.core.exceptions import (
 )
 from xagent.core.tools.core.RAG_tools.core.schemas import (
     ChunkForEmbedding,
+    ChunkStrategy,
     DocumentProcessingStatus,
     EmbeddingReadResponse,
     EmbeddingWriteResponse,
     IngestionConfig,
     IngestionResult,
     ParseDocumentResponse,
+    ParseMethod,
     ParsedParagraph,
 )
+from xagent.core.tools.core.RAG_tools.progress.manager import ProgressManager
 from xagent.core.tools.core.RAG_tools.pipelines import document_ingestion
 
 
@@ -258,15 +261,240 @@ def test_process_document_success(monkeypatch: pytest.MonkeyPatch) -> None:
     assert result.status == "success"
     assert result.embedding_count == 2
     assert result.vector_count == 2
+
+
+def test_process_document_applies_spreadsheet_safeguards(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Spreadsheet ingestion should force safer token-based chunking and batching."""
+
+    _patch_pipeline_dependencies(monkeypatch)
+
+    captured_chunk_kwargs: Dict[str, object] = {}
+    encode_batch_sizes: List[int] = []
+
+    stub_config = EmbeddingModelConfig(
+        id="embedding-default",
+        model_name="text-embedding-v3",
+        model_provider="dashscope",
+        dimension=2,
+    )
+
+    class _RecordingEmbeddingAdapter(_StubEmbeddingAdapter):
+        def encode(  # type: ignore[override]
+            self,
+            text: Union[str, List[str]],
+            dimension: int | None = None,
+            instruct: str | None = None,
+        ) -> Union[List[float], List[List[float]]]:
+            encode_batch_sizes.append(1 if isinstance(text, str) else len(text))
+            return super().encode(text, dimension, instruct)
+
+    monkeypatch.setattr(
+        document_ingestion,
+        "_resolve_embedding_adapter",
+        lambda _cfg: (stub_config, _RecordingEmbeddingAdapter()),
+    )
+
+    def _capture_chunk_document(**kwargs: object) -> dict:
+        captured_chunk_kwargs.update(kwargs)
+        return {"chunk_count": 2, "created": True}
+
+    monkeypatch.setattr(document_ingestion, "chunk_document", _capture_chunk_document)
+
+    result = document_ingestion.process_document(
+        collection="demo",
+        source_path="/tmp/table.xlsx",
+        config=IngestionConfig(
+            parse_method=ParseMethod.DEFAULT,
+            chunk_strategy=ChunkStrategy.FIXED_SIZE,
+            chunk_size=1600,
+            chunk_overlap=200,
+            use_token_count=False,
+            embedding_batch_size=10,
+        ),
+    )
+
+    assert result.status == "success"
+    assert captured_chunk_kwargs["chunk_strategy"] == ChunkStrategy.RECURSIVE
+    assert captured_chunk_kwargs["chunk_size"] == 512
+    assert captured_chunk_kwargs["chunk_overlap"] == 64
+    assert captured_chunk_kwargs["use_token_count"] is True
+    compute_step = next(
+        step for step in result.completed_steps if step.name == "compute_embeddings"
+    )
+    assert compute_step.metadata.get("use_async") is True
+    assert encode_batch_sizes == [1, 1]
+
+
+def test_process_document_preserves_stricter_spreadsheet_limits(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Spreadsheet safeguards should not enlarge already strict caller limits."""
+
+    _patch_pipeline_dependencies(monkeypatch)
+
+    captured_chunk_kwargs: Dict[str, object] = {}
+    captured_parse_method: Dict[str, object] = {}
+
+    def _capture_parse_document(**kwargs: object) -> dict:
+        captured_parse_method["parse_method"] = kwargs["parse_method"]
+        return ParseDocumentResponse(
+            doc_id="doc-1",
+            parse_hash="hash-1",
+            paragraphs=[ParsedParagraph(text="para", metadata={})],
+            written=True,
+        ).model_dump()
+
+    def _capture_chunk_document(**kwargs: object) -> dict:
+        captured_chunk_kwargs.update(kwargs)
+        return {"chunk_count": 2, "created": True}
+
+    monkeypatch.setattr(document_ingestion, "parse_document", _capture_parse_document)
+    monkeypatch.setattr(document_ingestion, "chunk_document", _capture_chunk_document)
+
+    result = document_ingestion.process_document(
+        collection="demo",
+        source_path="/tmp/small.csv",
+        config=IngestionConfig(
+            chunk_strategy=ChunkStrategy.RECURSIVE,
+            chunk_size=128,
+            chunk_overlap=16,
+            use_token_count=False,
+            embedding_batch_size=1,
+        ),
+    )
+
+    assert result.status == "success"
+    assert captured_parse_method["parse_method"] == ParseMethod.DEFAULT
+    assert captured_chunk_kwargs["chunk_size"] == 128
+    assert captured_chunk_kwargs["chunk_overlap"] == 16
+    assert captured_chunk_kwargs["use_token_count"] is True
+
+
+def test_process_document_uses_async_writes_for_spreadsheets(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Spreadsheet safeguards should keep provider calls single-row while allowing batched DB writes."""
+
+    _patch_pipeline_dependencies(monkeypatch)
+
+    write_calls: List[int] = []
+
+    def _record_write_vectors_to_db(**kwargs: object) -> EmbeddingWriteResponse:
+        embeddings = kwargs.get("embeddings", [])
+        write_calls.append(len(embeddings))
+        return EmbeddingWriteResponse(
+            upsert_count=len(embeddings),
+            deleted_stale_count=0,
+            index_status="created",
+        )
+
+    monkeypatch.setattr(
+        document_ingestion,
+        "write_vectors_to_db",
+        _record_write_vectors_to_db,
+    )
+
+    result = document_ingestion.process_document(
+        collection="demo",
+        source_path="/tmp/table.xlsx",
+        config=IngestionConfig(
+            embedding_use_async=False,
+            embedding_batch_size=8,
+            embedding_concurrent=3,
+        ),
+    )
+
+    assert result.status == "success"
+    compute_step = next(
+        step for step in result.completed_steps if step.name == "compute_embeddings"
+    )
+    assert compute_step.metadata.get("use_async") is True
+    assert compute_step.metadata.get("concurrent") == 3
+    assert write_calls == [2]
+
+
+def test_process_document_reports_embedding_progress_metadata(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Progress manager should expose completed/remaining counts for embedding and vector writes."""
+
+    _patch_pipeline_dependencies(monkeypatch)
+    manager = ProgressManager()
+    manager._active_tasks.clear()
+
+    result = document_ingestion.process_document(
+        collection="demo",
+        source_path="/tmp/table.xlsx",
+        config=IngestionConfig(
+            embedding_use_async=False,
+            embedding_batch_size=8,
+            embedding_concurrent=2,
+        ),
+        progress_manager=manager,
+        user_id=1,
+    )
+
+    assert result.status == "success"
+    task_id = "ingest_demo__tmp_table_xlsx"
+    task = manager.get_task_progress(task_id)
+    assert task is not None
+    assert task.metadata.get("steps") is not None
+
+    compute_step = task.metadata["steps"]["compute_embeddings"]
+    assert compute_step["current_count"] == 2
+    assert compute_step["total_count"] == 2
+    assert compute_step["message"] == "Completed"
+
+    write_step = task.metadata["steps"]["write_vectors_to_db"]
+    assert write_step["current_count"] == 2
+    assert write_step["total_count"] == 2
+    assert write_step["message"] == "Completed"
+
+
+def test_process_document_rejects_oversized_spreadsheet_row(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Spreadsheet rows larger than the token budget should fail before embedding."""
+
+    _patch_pipeline_dependencies(monkeypatch)
+
+    monkeypatch.setattr(
+        document_ingestion,
+        "read_chunks_for_embedding",
+        lambda **_: EmbeddingReadResponse(
+            chunks=[
+                ChunkForEmbedding(
+                    doc_id="doc-1",
+                    chunk_id="chunk-1",
+                    index=0,
+                    parse_hash="hash-1",
+                    text="x " * 2000,
+                    chunk_hash="chunk-hash-1",
+                    metadata={"file_type": "xlsx", "row_type": "data"},
+                )
+            ],
+            pending_count=1,
+            total_count=1,
+        ),
+    )
+
+    result = document_ingestion.process_document(
+        collection="demo",
+        source_path="/tmp/table.xlsx",
+        config=IngestionConfig(),
+    )
+
+    assert result.status == "partial"
+    assert result.failed_step == "read_chunks_for_embedding"
+    assert "token budget" in result.message.lower()
     assert {step.name for step in result.completed_steps} == {
         "initialize_collection",
         "resolve_embedding_adapter",
         "register_document",
         "parse_document",
         "chunk_document",
-        "read_chunks_for_embedding",
-        "compute_embeddings",
-        "write_vectors_to_db",
     }
     assert STATUS_EVENTS == [
         {
@@ -279,8 +507,8 @@ def test_process_document_success(monkeypatch: pytest.MonkeyPatch) -> None:
         {
             "collection": "demo",
             "doc_id": "doc-1",
-            "status": DocumentProcessingStatus.SUCCESS.value,
-            "message": "Document ingestion completed successfully.",
+            "status": DocumentProcessingStatus.FAILED.value,
+            "message": result.message,
             "parse_hash": "hash-1",
         },
     ]

@@ -1,9 +1,54 @@
 export interface KBProgressStepData {
+  completed?: boolean
   current_count?: number
   total_count?: number
   step_progress?: number
   message?: string
   metadata?: Record<string, unknown>
+}
+
+function clampPercent(value: number): number {
+  return Math.max(0, Math.min(100, value))
+}
+
+function getStepPercent(step: KBProgressStepData | undefined): number | null {
+  if (!step) return null
+
+  if (
+    typeof step.current_count === "number" &&
+    typeof step.total_count === "number" &&
+    step.total_count > 0
+  ) {
+    return clampPercent((step.current_count / step.total_count) * 100)
+  }
+
+  if (typeof step.step_progress === "number") {
+    return clampPercent(step.step_progress * 100)
+  }
+
+  if (step.completed) {
+    return 100
+  }
+
+  return null
+}
+
+function getStepsOverallPercent(task: KBProgressTask): number | null {
+  const steps = task.metadata?.steps
+  if (!steps) return null
+
+  const stepEntries = Object.values(steps)
+  if (stepEntries.length === 0) return null
+
+  const stepPercents = stepEntries
+    .map(step => getStepPercent(step))
+    .filter((value): value is number => value !== null)
+
+  if (stepPercents.length === 0) return null
+
+  return clampPercent(
+    stepPercents.reduce((sum, value) => sum + value, 0) / stepPercents.length
+  )
 }
 
 export interface KBProgressTask {
@@ -59,17 +104,21 @@ export function getKBTaskProgressPercent(task: KBProgressTask | null): number | 
 
   const currentStepName = task.current_step || ""
   const currentStep = task.metadata?.steps?.[currentStepName]
-  if (
-    currentStep &&
-    typeof currentStep.current_count === "number" &&
-    typeof currentStep.total_count === "number" &&
-    currentStep.total_count > 0
-  ) {
-    return Math.max(0, Math.min(100, (currentStep.current_count / currentStep.total_count) * 100))
-  }
+  const currentStepPercent = getStepPercent(currentStep)
+  const stepsOverallPercent = getStepsOverallPercent(task)
 
   if (typeof task.overall_progress === "number") {
-    return Math.max(0, Math.min(100, task.overall_progress * 100))
+    return clampPercent(
+      Math.max(task.overall_progress * 100, stepsOverallPercent ?? 0, currentStepPercent ?? 0)
+    )
+  }
+
+  if (stepsOverallPercent !== null) {
+    return stepsOverallPercent
+  }
+
+  if (currentStepPercent !== null) {
+    return currentStepPercent
   }
 
   return null

@@ -26,7 +26,7 @@ describe("kb progress helpers", () => {
     expect(task?.task_id).toBe("latest")
   })
 
-  it("extracts detailed step message and percent from step counts", () => {
+  it("extracts detailed step message and keeps percent monotonic", () => {
     const task = {
       task_id: "task-1",
       status: "running",
@@ -46,6 +46,33 @@ describe("kb progress helpers", () => {
     }
 
     expect(getKBTaskProgressDetail(task)).toBe("Embedding 37/254")
-    expect(getKBTaskProgressPercent(task)).toBeCloseTo((37 / 254) * 100)
+    expect(getKBTaskProgressPercent(task)).toBeCloseTo(20)
+  })
+
+  it("keeps progress monotonic across multiple tracked steps", () => {
+    const task = {
+      task_id: "task-2",
+      status: "running",
+      current_step: "write_vectors_to_db",
+      overall_progress: 0.25,
+      metadata: {
+        collection: "demo",
+        source_path: "/tmp/demo/file.xlsx",
+        steps: {
+          compute_embeddings: {
+            completed: true,
+            step_progress: 1,
+            message: "Embeddings complete",
+          },
+          write_vectors_to_db: {
+            current_count: 10,
+            total_count: 20,
+            message: "Writing 10/20",
+          },
+        },
+      },
+    }
+
+    expect(getKBTaskProgressPercent(task)).toBeCloseTo(75)
   })
 })

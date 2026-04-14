@@ -1,6 +1,7 @@
 from pathlib import Path
 
 import pytest
+from openpyxl import Workbook
 
 from xagent.providers.pdf_parser.base import ParseResult
 from xagent.providers.pdf_parser.deepdoc import DeepDocParser
@@ -217,3 +218,32 @@ async def test_deepdoc_excel_details(resource_path: Path):
     assert len(result.text_segments) > 1
     # Check content of a known row/cell if possible (highly dependent on test file content)
     # For now, we just ensure segments are created.
+
+
+@pytest.mark.asyncio
+async def test_deepdoc_xlsx_parses_rows_without_repeating_title(tmp_path: Path):
+    file_path = tmp_path / "structured.xlsx"
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "Sheet1"
+    ws.append(["Quarterly Enrollment Review"])
+    ws.append(["Track", "Candidate ID", "Name", "Status"])
+    ws.append(["Direct Entry", "A-0001", "Student One", "Passed"])
+    ws.append(["Direct Entry", "A-0002", "Student Two", "Passed"])
+    wb.save(file_path)
+
+    parser = DeepDocParser()
+    result = await parser.parse(str(file_path))
+
+    assert result.text_segments[0].metadata["row_type"] == "title"
+    assert result.text_segments[0].text == "Quarterly Enrollment Review"
+    assert result.text_segments[1].metadata["row_type"] == "header"
+    assert result.text_segments[1].text == "Track | Candidate ID | Name | Status"
+
+    first_data_row = result.text_segments[2]
+    assert first_data_row.metadata["row_type"] == "data"
+    assert "Quarterly Enrollment Review" not in first_data_row.text
+    assert (
+        first_data_row.text
+        == "Track: Direct Entry | Candidate ID: A-0001 | Name: Student One | Status: Passed"
+    )

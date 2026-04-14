@@ -10,6 +10,7 @@ from deepdoc import MarkdownParser as DeepDocMarkdownParser
 from deepdoc import PdfParser as DeepDocPdfParser
 from deepdoc import TxtParser as DeepDocTxtParser
 from deepdoc.parser import DoclingParser as DeepDocDoclingParser
+from openpyxl import load_workbook
 
 from ...core.tools.core.RAG_tools.core.config import ARTIFACTS_DIR
 from ...core.tools.core.RAG_tools.utils.string_utils import sanitize_for_doc_id
@@ -515,6 +516,9 @@ class DeepDocParser(
                 **base_kwargs,
             }
 
+            if ext == ".xlsx":
+                return _parse_xlsx_rows(file_path, **metadata)
+
             # Dispatch to correct parser method and translator
             if ext == ".md":
                 if isinstance(file_path, BytesIO):
@@ -548,6 +552,7 @@ class DeepDocParser(
             # Most other parsers are callable
             parser_call_kwargs: dict[str, Any] = {}
             bboxes: List[Dict[str, Any]] = []
+            raw_output: Any = None
 
             if ext == ".pdf":
                 parser_call_kwargs = base_kwargs.copy()
@@ -645,3 +650,85 @@ class DeepDocParser(
         except RuntimeError:
             # Fallback if no loop is running (unlikely in async method, but safe)
             return _sync_parse()
+
+
+def _normalize_spreadsheet_cell(value: Any) -> str:
+    if value is None:
+        return ""
+    return str(value).strip()
+
+
+def _is_title_row(cells: List[str]) -> bool:
+    return len(cells) == 1 and len(cells[0]) > 4
+
+
+def _format_spreadsheet_row(headers: List[str] | None, cells: List[str]) -> str:
+    if headers:
+        pairs = []
+        for index, value in enumerate(cells):
+            if not value:
+                continue
+            header = (
+                headers[index]
+                if index < len(headers) and headers[index]
+                else f"col_{index + 1}"
+            )
+            pairs.append(f"{header}: {value}")
+        if pairs:
+            return " | ".join(pairs)
+    return " | ".join(value for value in cells if value)
+
+
+def _parse_xlsx_rows(file_path: str | BytesIO, **kwargs: Any) -> ParseResult:
+    if isinstance(file_path, BytesIO):
+        file_path.seek(0)
+        workbook = load_workbook(filename=file_path, read_only=True, data_only=True)
+    else:
+        workbook = load_workbook(filename=file_path, read_only=True, data_only=True)
+
+    text_segments: List[ParsedTextSegment] = []
+    multiple_sheets = len(workbook.sheetnames) > 1
+
+    for sheet in workbook.worksheets:
+        headers: List[str] | None = None
+        title_seen = False
+        for row_number, row in enumerate(sheet.iter_rows(values_only=True), start=1):
+            cells = [_normalize_spreadsheet_cell(cell) for cell in row]
+            non_empty = [cell for cell in cells if cell]
+            if not non_empty:
+                continue
+
+            metadata = {
+                **kwargs,
+                "sheet_name": sheet.title,
+                "row_number": row_number,
+            }
+
+            if not title_seen and _is_title_row(non_empty):
+                title_seen = True
+                text = non_empty[0]
+                if multiple_sheets:
+                    text = f"[{sheet.title}] {text}"
+                metadata["row_type"] = "title"
+                text_segments.append(ParsedTextSegment(text=text, metadata=metadata))
+                continue
+
+            if headers is None and len(non_empty) > 1:
+                headers = cells
+                header_text = " | ".join(value for value in headers if value)
+                if header_text:
+                    if multiple_sheets:
+                        header_text = f"[{sheet.title}] {header_text}"
+                    metadata["row_type"] = "header"
+                    text_segments.append(
+                        ParsedTextSegment(text=header_text, metadata=metadata)
+                    )
+                continue
+
+            row_text = _format_spreadsheet_row(headers, cells)
+            if not row_text:
+                continue
+            metadata["row_type"] = "data"
+            text_segments.append(ParsedTextSegment(text=row_text, metadata=metadata))
+
+    return ParseResult(text_segments=text_segments)

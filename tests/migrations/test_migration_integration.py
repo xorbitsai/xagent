@@ -21,6 +21,7 @@ from alembic import command
 from alembic.config import Config
 from alembic.script import ScriptDirectory
 from sqlalchemy import create_engine, inspect, text
+from sqlalchemy.exc import SQLAlchemyError
 
 # Project root directory
 project_root = Path(__file__).parent.parent.parent
@@ -44,18 +45,30 @@ class MigrationTester:
             db_url = f"sqlite:///{path}"
             self.temp_db_file = path
         elif self.db_type == "postgresql":
-            db_url = os.getenv(
-                "DATABASE_URL", "postgresql://xagent:xagent@localhost:5432/xagent_test"
+            configured_postgres_url = os.getenv("POSTGRES_TEST_DATABASE_URL")
+            if not configured_postgres_url:
+                database_url = os.getenv("DATABASE_URL")
+                if database_url and database_url.startswith("postgresql"):
+                    configured_postgres_url = database_url
+
+            db_url = configured_postgres_url or os.getenv(
+                "XAGENT_TEST_POSTGRES_URL",
+                "postgresql://xagent:xagent@localhost:5432/xagent_test",
             )
 
         os.environ["DATABASE_URL"] = db_url
-        self.engine = create_engine(db_url)
+        try:
+            self.engine = create_engine(db_url)
 
-        # Clean database for PostgreSQL
-        if self.db_type == "postgresql":
-            with self.engine.begin() as conn:
-                conn.execute(text("DROP SCHEMA public CASCADE"))
-                conn.execute(text("CREATE SCHEMA public"))
+            # Clean database for PostgreSQL
+            if self.db_type == "postgresql":
+                with self.engine.begin() as conn:
+                    conn.execute(text("DROP SCHEMA public CASCADE"))
+                    conn.execute(text("CREATE SCHEMA public"))
+        except SQLAlchemyError as exc:
+            if self.db_type == "postgresql":
+                pytest.skip(f"PostgreSQL test database unavailable: {exc}")
+            raise
 
         # Configure Alembic
         self.alembic_cfg = Config(str(project_root / "alembic.ini"))

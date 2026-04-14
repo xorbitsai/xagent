@@ -26,6 +26,7 @@ from ..storage.factory import get_vector_index_store
 from ..utils.hash_utils import compute_chunk_hash
 from ..utils.metadata_utils import deserialize_metadata, serialize_metadata
 from .chunk_strategies import (
+    _create_chunk_record,
     apply_fixed_size_strategy,
     apply_markdown_strategy,
     apply_recursive_strategy,
@@ -33,6 +34,35 @@ from .chunk_strategies import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+def _should_use_spreadsheet_row_chunks(paragraphs: List[Dict[str, Any]]) -> bool:
+    non_empty = [p for p in paragraphs if str(p.get("text", "")).strip()]
+    if not non_empty:
+        return False
+
+    allowed_row_types = {"title", "header", "data"}
+    for paragraph in non_empty:
+        metadata = paragraph.get("metadata") or {}
+        file_type = str(metadata.get("file_type") or "").lower()
+        file_ext = str(metadata.get("file_ext") or "").lower()
+        if file_type not in {"xlsx", ".xlsx"} and file_ext != ".xlsx":
+            return False
+        if metadata.get("row_type") not in allowed_row_types:
+            return False
+    return True
+
+
+def _create_spreadsheet_row_chunks(
+    paragraphs: List[Dict[str, Any]],
+) -> List[Dict[str, Any]]:
+    chunks: List[Dict[str, Any]] = []
+    for paragraph in paragraphs:
+        text = str(paragraph.get("text", "")).strip()
+        if not text:
+            continue
+        chunks.append(_create_chunk_record(text, paragraph))
+    return chunks
 
 
 def chunk_document(
@@ -142,12 +172,18 @@ def chunk_document(
             f"No parsed content found for doc_id={doc_id}, parse_hash={parse_hash}"
         )
 
-    # Apply chunking strategy
-    try:
-        chunks = _apply_chunking_strategy(paragraphs, chunk_strategy, params)
-    except Exception as e:
-        logger.error(f"Document chunking failed: {e}")
-        raise DocumentValidationError(f"Chunking failed: {e}") from e
+    # Spreadsheet row data benefits from deterministic one-row-per-chunk output
+    # for retrieval quality; bypass generic recursive merge when parse metadata
+    # already marks row boundaries explicitly.
+    if _should_use_spreadsheet_row_chunks(paragraphs):
+        chunks = _create_spreadsheet_row_chunks(paragraphs)
+    else:
+        # Apply chunking strategy
+        try:
+            chunks = _apply_chunking_strategy(paragraphs, chunk_strategy, params)
+        except Exception as e:
+            logger.error(f"Document chunking failed: {e}")
+            raise DocumentValidationError(f"Chunking failed: {e}") from e
 
     # P2: Attach surrounding context to table/image chunks
     if chunks and (

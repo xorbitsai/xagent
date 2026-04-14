@@ -88,8 +88,17 @@ class ProgressManager:
 
         with self._lock:
             if task_id in self._active_tasks:
-                logger.warning(f"Task {task_id} already exists, reusing")
-                return task_id
+                existing_task = self._active_tasks[task_id]
+                if existing_task.status in (
+                    DocumentProcessingStatus.SUCCESS,
+                    DocumentProcessingStatus.FAILED,
+                    DocumentProcessingStatus.CANCELLED,
+                ):
+                    logger.info(f"Task {task_id} exists in terminal state, resetting")
+                    self._active_tasks.pop(task_id, None)
+                else:
+                    logger.warning(f"Task {task_id} already exists, reusing")
+                    return task_id
 
             task_progress = TaskProgress(
                 task_id=task_id,
@@ -160,7 +169,15 @@ class ProgressManager:
             if overall_progress is not None:
                 task.overall_progress = max(0.0, min(1.0, overall_progress))
             if metadata:
-                task.metadata.update(metadata)
+                for key, value in metadata.items():
+                    if (
+                        key == "steps"
+                        and isinstance(value, dict)
+                        and isinstance(task.metadata.get("steps"), dict)
+                    ):
+                        task.metadata["steps"].update(value)
+                    else:
+                        task.metadata[key] = value
 
             # Update timestamps
             import time

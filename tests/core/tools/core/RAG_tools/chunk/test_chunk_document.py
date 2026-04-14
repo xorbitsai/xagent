@@ -10,6 +10,7 @@ import uuid
 
 import pandas as pd
 import pytest
+from openpyxl import Workbook
 
 from xagent.core.tools.core.RAG_tools.chunk.chunk_document import (
     chunk_document,
@@ -288,6 +289,73 @@ class TestChunkDocument:
         assert fixed_result["created"] is True
         assert recursive_result["chunk_count"] > 0
         assert fixed_result["chunk_count"] > 0
+
+    def test_chunk_xlsx_uses_one_row_per_chunk(
+        self, temp_lancedb_dir, test_collection, test_doc_id, tmp_path
+    ):
+        """Spreadsheet row paragraphs should bypass generic merging and stay one row per chunk."""
+        xlsx_path = tmp_path / "structured.xlsx"
+        wb = Workbook()
+        ws = wb.active
+        ws.title = "Sheet1"
+        ws.append(["Quarterly Enrollment Review"])
+        ws.append(["Track", "Candidate ID", "Name", "Status"])
+        ws.append(["Direct Entry", "A-0001", "Student One", "Passed"])
+        ws.append(["Direct Entry", "A-0002", "Student Two", "Passed"])
+        wb.save(xlsx_path)
+
+        register_document(
+            collection=test_collection,
+            source_path=str(xlsx_path),
+            doc_id=test_doc_id,
+            user_id=1,
+        )
+        parse_result = parse_document(
+            collection=test_collection,
+            doc_id=test_doc_id,
+            parse_method="default",
+            user_id=1,
+            is_admin=True,
+        )
+        parse_hash = parse_result["parse_hash"]
+
+        chunk_result = chunk_document(
+            collection=test_collection,
+            doc_id=test_doc_id,
+            parse_hash=parse_hash,
+            chunk_strategy=ChunkStrategy.RECURSIVE,
+            chunk_size=10,
+            chunk_overlap=2,
+            user_id=1,
+        )
+
+        assert chunk_result["created"] is True
+        assert chunk_result["chunk_count"] == 4
+
+        from xagent.providers.vector_store.lancedb import get_connection_from_env
+
+        conn = get_connection_from_env()
+        table = conn.open_table("chunks")
+        df = (
+            table.search()
+            .where(
+                f"collection == '{test_collection}' AND doc_id == '{test_doc_id}' AND parse_hash == '{parse_hash}'"
+            )
+            .to_pandas()
+            .sort_values("index")
+        )
+
+        assert len(df) == 4
+        assert "Quarterly Enrollment Review" == df.iloc[0]["text"]
+        assert "Track | Candidate ID | Name | Status" == df.iloc[1]["text"]
+        assert (
+            df.iloc[2]["text"]
+            == "Track: Direct Entry | Candidate ID: A-0001 | Name: Student One | Status: Passed"
+        )
+        assert (
+            df.iloc[3]["text"]
+            == "Track: Direct Entry | Candidate ID: A-0002 | Name: Student Two | Status: Passed"
+        )
 
     def test_chunk_fine_grained_functions(
         self, temp_lancedb_dir, test_collection, test_doc_id

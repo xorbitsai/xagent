@@ -253,7 +253,6 @@ def test_kb_ingest_rolls_back_existing_file_content_on_partial_failure(
         session.commit()
     finally:
         session.close()
-
     with (
         patch("xagent.web.api.kb.get_collection_sync", return_value=object()),
         patch("xagent.web.api.kb.clear_ingestion_status", return_value=None),
@@ -297,6 +296,189 @@ def test_kb_ingest_rolls_back_existing_file_content_on_partial_failure(
         assert uploaded[0].storage_path == str(expected_path)
     finally:
         session.close()
+
+
+def test_kb_ingest_returns_explicit_error_when_rollback_fails(test_env, temp_uploads):
+    """Direct ingest should surface rollback failures instead of hiding them in logs."""
+
+    app, headers, user, _ = test_env
+    client = TestClient(app)
+
+    from xagent.core.tools.core.RAG_tools.core.schemas import (
+        CollectionOperationResult,
+        IngestionResult,
+        IngestionStepResult,
+    )
+
+    with (
+        patch("xagent.web.api.kb.delete_collection") as mock_delete_collection,
+        patch("xagent.web.api.kb.run_document_ingestion") as mock_ingest,
+    ):
+        mock_delete_collection.return_value = CollectionOperationResult(
+            status="error",
+            collection="rollback_new_collection",
+            message="parse cleanup failed",
+            affected_documents=[],
+            deleted_counts={},
+        )
+        mock_ingest.return_value = IngestionResult(
+            status="partial",
+            doc_id="doc-failed",
+            parse_hash="parse-failed",
+            completed_steps=[
+                IngestionStepResult(name="initialize_collection"),
+                IngestionStepResult(name="resolve_embedding_adapter"),
+                IngestionStepResult(
+                    name="register_document",
+                    metadata={"doc_id": "doc-failed", "created": True},
+                ),
+            ],
+            failed_step="compute_embeddings",
+            message="embedding failed",
+        )
+
+        response = client.post(
+            "/api/kb/ingest",
+            files={"file": ("failed.xlsx", b"new content", "application/vnd.ms-excel")},
+            data={"collection": "rollback_new_collection"},
+            headers=headers,
+        )
+
+    assert response.status_code == 500
+    assert "Failed to fully roll back ingest" in response.json()["detail"]
+
+
+def test_kb_ingest_returns_explicit_error_when_physical_rollback_fails(
+    test_env, temp_uploads
+):
+    """Direct ingest should surface collection-directory rollback failures."""
+
+    app, headers, user, _ = test_env
+    client = TestClient(app)
+
+    from xagent.core.tools.core.RAG_tools.core.schemas import (
+        CollectionOperationResult,
+        IngestionResult,
+        IngestionStepResult,
+    )
+    from xagent.web.services.kb_collection_service import CollectionPhysicalDeleteResult
+
+    with (
+        patch("xagent.web.api.kb.delete_collection") as mock_delete_collection,
+        patch(
+            "xagent.web.api.kb.delete_collection_physical_dir"
+        ) as mock_physical_delete,
+        patch("xagent.web.api.kb.run_document_ingestion") as mock_ingest,
+    ):
+        mock_delete_collection.return_value = CollectionOperationResult(
+            status="success",
+            collection="rollback_new_collection",
+            message="deleted",
+            affected_documents=[],
+            deleted_counts={},
+        )
+        mock_physical_delete.return_value = CollectionPhysicalDeleteResult(
+            status="failed",
+            error="trash lock busy",
+            collection_dir=temp_uploads / f"user_{user.id}" / "rollback_new_collection",
+        )
+        mock_ingest.return_value = IngestionResult(
+            status="partial",
+            doc_id="doc-failed",
+            parse_hash="parse-failed",
+            completed_steps=[
+                IngestionStepResult(name="initialize_collection"),
+                IngestionStepResult(name="resolve_embedding_adapter"),
+                IngestionStepResult(
+                    name="register_document",
+                    metadata={"doc_id": "doc-failed", "created": True},
+                ),
+            ],
+            failed_step="compute_embeddings",
+            message="embedding failed",
+        )
+
+        response = client.post(
+            "/api/kb/ingest",
+            files={"file": ("failed.xlsx", b"new content", "application/vnd.ms-excel")},
+            data={"collection": "rollback_new_collection"},
+            headers=headers,
+        )
+
+    assert response.status_code == 500
+    assert (
+        "delete collection physical directory during rollback failed"
+        in response.json()["detail"]
+    )
+
+
+def test_kb_ingest_surfaces_restore_failure_on_upload_abort(test_env, temp_uploads):
+    """Upload aborts should return rollback failure if backup restore fails."""
+
+    app, headers, user, _ = test_env
+    client = TestClient(app)
+
+    collection_name = "existing_collection"
+    filename = "too-large.xlsx"
+    expected_path = temp_uploads / f"user_{user.id}" / collection_name / filename
+    expected_path.parent.mkdir(parents=True, exist_ok=True)
+    expected_path.write_text("old content")
+
+    oversized = b"x" * (11 * 1024 * 1024)
+
+    with patch(
+        "xagent.web.api.kb._restore_ingest_file_backup",
+        side_effect=OSError("restore exploded"),
+    ):
+        response = client.post(
+            "/api/kb/ingest",
+            files={
+                "file": (
+                    filename,
+                    oversized,
+                    "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                )
+            },
+            data={"collection": collection_name},
+            headers=headers,
+        )
+
+    assert response.status_code == 500
+    assert "Failed to fully roll back ingest" in response.json()["detail"]
+
+
+def test_kb_ingest_restores_existing_file_on_upload_io_failure(test_env, temp_uploads):
+    """Non-HTTP upload I/O failures should restore the previous file contents."""
+
+    app, headers, user, _ = test_env
+    client = TestClient(app)
+
+    collection_name = "existing_collection"
+    filename = "stream-failure.xlsx"
+    expected_path = temp_uploads / f"user_{user.id}" / collection_name / filename
+    expected_path.parent.mkdir(parents=True, exist_ok=True)
+    expected_path.write_text("old content")
+
+    async def _failing_read(self, size: int = -1):
+        raise OSError("stream exploded")
+
+    with patch("xagent.web.api.kb.UploadFile.read", _failing_read):
+        response = client.post(
+            "/api/kb/ingest",
+            files={
+                "file": (
+                    filename,
+                    b"new content",
+                    "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                )
+            },
+            data={"collection": collection_name},
+            headers=headers,
+        )
+
+    assert response.status_code == 500
+    assert "stream exploded" in response.json()["detail"]
+    assert expected_path.read_text() == "old content"
 
 
 def test_kb_delete_cleans_physical_dir(test_env, temp_uploads):
@@ -984,6 +1166,47 @@ def test_kb_delete_returns_physical_cleanup_status(test_env, temp_uploads):
             )
 
 
+def test_kb_delete_skips_uploaded_file_cleanup_when_logical_delete_fails(
+    test_env, temp_uploads
+):
+    """API should not delete UploadedFile rows/files when collection delete returns error."""
+
+    app, headers, user, _ = test_env
+    client = TestClient(app)
+
+    collection_name = "kb_delete_error"
+    coll_dir = temp_uploads / f"user_{user.id}" / collection_name
+    coll_dir.mkdir(parents=True, exist_ok=True)
+    (coll_dir / "some_file.txt").write_text("data")
+
+    with (
+        patch("xagent.web.api.kb.delete_collection") as mock_delete,
+        patch("xagent.web.api.kb.delete_collection_uploaded_files") as mock_cleanup,
+        patch("xagent.web.api.kb.get_vector_index_store") as mock_get_store,
+    ):
+        from xagent.core.tools.core.RAG_tools.core.schemas import (
+            CollectionOperationResult,
+        )
+
+        mock_delete.return_value = CollectionOperationResult(
+            status="error",
+            collection=collection_name,
+            message="vector cleanup failed",
+            affected_documents=[],
+            deleted_counts={},
+        )
+        mock_get_store.return_value.list_document_records.return_value = []
+
+        response = client.delete(
+            f"/api/kb/collections/{collection_name}",
+            headers=headers,
+        )
+
+    assert response.status_code == 200
+    assert response.json()["status"] == "error"
+    mock_cleanup.assert_not_called()
+
+
 def test_kb_rename_rejects_path_traversal_in_collection_names(test_env, temp_uploads):
     """Test that rename_collection_api rejects path traversal in old and new names."""
     app, headers, user, _ = test_env
@@ -1389,6 +1612,378 @@ def test_kb_ingest_cloud_passes_file_id_to_pipeline(test_env, temp_uploads):
         )
         assert file_record is not None
         assert file_record.filename == "cloud.txt"
+    finally:
+        session.close()
+
+
+def test_kb_ingest_cloud_normalizes_parser_and_rolls_back_partial_failure(
+    test_env, temp_uploads
+):
+    """Cloud ingest should normalize parser choice and invoke rollback on partial failures."""
+
+    from xagent.core.tools.core.RAG_tools.core.schemas import (
+        IngestionResult,
+        IngestionStepResult,
+        ParseMethod,
+    )
+
+    app, headers, user, _ = test_env
+    client = TestClient(app)
+    captured_parse_methods = []
+
+    class _FakeFilesService:
+        def get_media(self, fileId: str):
+            return {"fileId": fileId}
+
+    class _FakeDriveService:
+        def files(self):
+            return _FakeFilesService()
+
+    class _FakeDownloader:
+        def __init__(self, fh, request_file):
+            self._fh = fh
+
+        def next_chunk(self):
+            self._fh.write(b"cloud-content")
+            return None, True
+
+    def _capture_ingest(*, ingestion_config=None, **kwargs):
+        assert ingestion_config is not None
+        captured_parse_methods.append(ingestion_config.parse_method)
+        return IngestionResult(
+            status="partial",
+            doc_id="cloud-doc-id",
+            parse_hash="hash",
+            completed_steps=[
+                IngestionStepResult(
+                    name="register_document",
+                    metadata={"doc_id": "cloud-doc-id", "created": True},
+                )
+            ],
+            failed_step="parse_document",
+            message="partial failure",
+        )
+
+    with (
+        patch("xagent.web.api.kb.get_google_credentials", return_value=object()),
+        patch("xagent.web.api.kb.build", return_value=_FakeDriveService()),
+        patch("xagent.web.api.kb.MediaIoBaseDownload", _FakeDownloader),
+        patch(
+            "xagent.web.api.kb.get_collection_sync",
+            side_effect=ValueError("missing collection"),
+        ),
+        patch("xagent.web.api.kb.run_document_ingestion", side_effect=_capture_ingest),
+        patch("xagent.web.api.kb._rollback_failed_cloud_ingestion") as mock_rollback,
+    ):
+        response = client.post(
+            "/api/kb/ingest-cloud",
+            json={
+                "collection": "cloud_coll",
+                "parse_method": ParseMethod.PYPDF.value,
+                "files": [
+                    {
+                        "provider": "google-drive",
+                        "fileId": "drive-file-1",
+                        "fileName": "cloud.csv",
+                    }
+                ],
+            },
+            headers=headers,
+        )
+
+    assert response.status_code == 200
+    assert captured_parse_methods == [ParseMethod.DEFAULT]
+    mock_rollback.assert_called_once()
+
+
+def test_kb_ingest_cloud_returns_rollback_failure_message(test_env, temp_uploads):
+    """Cloud ingest should return explicit rollback failure messages per file."""
+
+    from xagent.core.tools.core.RAG_tools.core.schemas import (
+        IngestionResult,
+        IngestionStepResult,
+    )
+    from xagent.web.api.kb import RollbackFailureError
+
+    app, headers, user, _ = test_env
+    client = TestClient(app)
+
+    class _FakeFilesService:
+        def get_media(self, fileId: str):
+            return {"fileId": fileId}
+
+    class _FakeDriveService:
+        def files(self):
+            return _FakeFilesService()
+
+    class _FakeDownloader:
+        def __init__(self, fh, request_file):
+            self._fh = fh
+
+        def next_chunk(self):
+            self._fh.write(b"cloud-content")
+            return None, True
+
+    with (
+        patch("xagent.web.api.kb.get_google_credentials", return_value=object()),
+        patch("xagent.web.api.kb.build", return_value=_FakeDriveService()),
+        patch("xagent.web.api.kb.MediaIoBaseDownload", _FakeDownloader),
+        patch(
+            "xagent.web.api.kb.get_collection_sync",
+            side_effect=ValueError("missing collection"),
+        ),
+        patch(
+            "xagent.web.api.kb.run_document_ingestion",
+            return_value=IngestionResult(
+                status="partial",
+                doc_id="cloud-doc-id",
+                parse_hash="hash",
+                completed_steps=[
+                    IngestionStepResult(
+                        name="register_document",
+                        metadata={"doc_id": "cloud-doc-id", "created": True},
+                    )
+                ],
+                failed_step="parse_document",
+                message="partial failure",
+            ),
+        ),
+        patch(
+            "xagent.web.api.kb._rollback_failed_cloud_ingestion",
+            side_effect=RollbackFailureError("cloud rollback failed"),
+        ),
+    ):
+        response = client.post(
+            "/api/kb/ingest-cloud",
+            json={
+                "collection": "cloud_coll",
+                "files": [
+                    {
+                        "provider": "google-drive",
+                        "fileId": "drive-file-1",
+                        "fileName": "cloud.csv",
+                    }
+                ],
+            },
+            headers=headers,
+        )
+
+    assert response.status_code == 200
+    data = response.json()
+    assert data[0]["status"] == "error"
+    assert "cloud rollback failed" in data[0]["message"]
+
+
+def test_kb_ingest_cloud_surfaces_restore_failure_on_download_error(
+    test_env, temp_uploads
+):
+    """Cloud download failures should surface backup-restore errors per file."""
+
+    app, headers, user, _ = test_env
+    client = TestClient(app)
+
+    class _FakeFilesService:
+        def get_media(self, fileId: str):
+            return {"fileId": fileId}
+
+    class _FakeDriveService:
+        def files(self):
+            return _FakeFilesService()
+
+    class _FailingDownloader:
+        def __init__(self, fh, request_file):
+            self._fh = fh
+
+        def next_chunk(self):
+            raise RuntimeError("download blew up")
+
+    with (
+        patch("xagent.web.api.kb.get_google_credentials", return_value=object()),
+        patch("xagent.web.api.kb.build", return_value=_FakeDriveService()),
+        patch("xagent.web.api.kb.MediaIoBaseDownload", _FailingDownloader),
+        patch(
+            "xagent.web.api.kb._restore_ingest_file_backup",
+            side_effect=OSError("restore exploded"),
+        ),
+    ):
+        response = client.post(
+            "/api/kb/ingest-cloud",
+            json={
+                "collection": "cloud_coll",
+                "files": [
+                    {
+                        "provider": "google-drive",
+                        "fileId": "drive-file-1",
+                        "fileName": "cloud.csv",
+                    }
+                ],
+            },
+            headers=headers,
+        )
+
+    assert response.status_code == 200
+    data = response.json()
+    assert data[0]["status"] == "error"
+    assert "Failed to fully roll back cloud ingest" in data[0]["message"]
+
+
+def test_kb_ingest_cloud_surfaces_restore_failure_on_unexpected_error(
+    test_env, temp_uploads
+):
+    """Cloud unexpected errors should also surface restore failures per file."""
+
+    app, headers, user, _ = test_env
+    client = TestClient(app)
+
+    class _FakeFilesService:
+        def get_media(self, fileId: str):
+            return {"fileId": fileId}
+
+    class _FakeDriveService:
+        def files(self):
+            return _FakeFilesService()
+
+    class _DownloaderWithSuccess:
+        def __init__(self, fh, request_file):
+            self._fh = fh
+
+        def next_chunk(self):
+            self._fh.write(b"partial")
+            return None, True
+
+    with (
+        patch("xagent.web.api.kb.get_google_credentials", return_value=object()),
+        patch("xagent.web.api.kb.build", return_value=_FakeDriveService()),
+        patch("xagent.web.api.kb.MediaIoBaseDownload", _DownloaderWithSuccess),
+        patch(
+            "xagent.web.api.kb._upsert_uploaded_file_record",
+            side_effect=ValueError("unexpected post-download failure"),
+        ),
+        patch(
+            "xagent.web.api.kb._restore_ingest_file_backup",
+            side_effect=OSError("restore exploded"),
+        ),
+    ):
+        response = client.post(
+            "/api/kb/ingest-cloud",
+            json={
+                "collection": "cloud_coll",
+                "files": [
+                    {
+                        "provider": "google-drive",
+                        "fileId": "drive-file-2",
+                        "fileName": "cloud.csv",
+                    }
+                ],
+            },
+            headers=headers,
+        )
+
+    assert response.status_code == 200
+    data = response.json()
+    assert data[0]["status"] == "error"
+    assert "Failed to fully roll back cloud ingest" in data[0]["message"]
+
+
+def test_restore_ingest_file_backup_raises_when_existing_backup_is_missing(
+    temp_uploads,
+):
+    """Rollback should fail loudly when an overwritten file's backup is missing."""
+
+    from xagent.web.api.kb import _restore_ingest_file_backup
+
+    file_path = temp_uploads / "orphaned.xlsx"
+    file_path.write_text("new content")
+
+    with pytest.raises(FileNotFoundError, match="Missing ingest backup"):
+        _restore_ingest_file_backup(
+            file_path=file_path,
+            backup_path=None,
+            had_existing_file=True,
+        )
+
+
+def test_kb_ingest_cloud_uses_unique_storage_paths_for_duplicate_filenames(
+    test_env, temp_uploads
+):
+    """Same-name cloud files in one batch should not collide on storage_path."""
+
+    from xagent.core.tools.core.RAG_tools.core.schemas import IngestionResult
+
+    app, headers, user, TestingSessionLocal = test_env
+    client = TestClient(app)
+    captured_paths: list[str] = []
+
+    class _FakeFilesService:
+        def get_media(self, fileId: str):
+            return {"fileId": fileId}
+
+    class _FakeDriveService:
+        def files(self):
+            return _FakeFilesService()
+
+    class _FakeDownloader:
+        def __init__(self, fh, request_file):
+            self._fh = fh
+            self._request_file = request_file
+
+        def next_chunk(self):
+            self._fh.write(str(self._request_file["fileId"]).encode("utf-8"))
+            return None, True
+
+    def _capture_ingest(*, source_path=None, **kwargs):
+        assert source_path is not None
+        captured_paths.append(str(source_path))
+        return IngestionResult(
+            status="success",
+            doc_id=f"doc-{len(captured_paths)}",
+            parse_hash="hash",
+            failed_step="",
+            message="success",
+        )
+
+    with (
+        patch("xagent.web.api.kb.get_google_credentials", return_value=object()),
+        patch("xagent.web.api.kb.build", return_value=_FakeDriveService()),
+        patch("xagent.web.api.kb.MediaIoBaseDownload", _FakeDownloader),
+        patch(
+            "xagent.web.api.kb.get_collection_sync",
+            side_effect=ValueError("missing collection"),
+        ),
+        patch("xagent.web.api.kb.run_document_ingestion", side_effect=_capture_ingest),
+    ):
+        response = client.post(
+            "/api/kb/ingest-cloud",
+            json={
+                "collection": "cloud_coll",
+                "files": [
+                    {
+                        "provider": "google-drive",
+                        "fileId": "drive-file-1",
+                        "fileName": "same-name.csv",
+                    },
+                    {
+                        "provider": "google-drive",
+                        "fileId": "drive-file-2",
+                        "fileName": "same-name.csv",
+                    },
+                ],
+            },
+            headers=headers,
+        )
+
+    assert response.status_code == 200
+    assert len(captured_paths) == 2
+    assert len(set(captured_paths)) == 2
+
+    session = TestingSessionLocal()
+    try:
+        records = (
+            session.query(UploadedFile).order_by(UploadedFile.storage_path.asc()).all()
+        )
+        assert len(records) == 2
+        assert len({record.storage_path for record in records}) == 2
+        assert {record.filename for record in records} == {"same-name.csv"}
     finally:
         session.close()
 

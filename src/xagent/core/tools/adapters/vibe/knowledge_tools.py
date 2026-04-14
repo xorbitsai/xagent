@@ -22,7 +22,6 @@ async def create_knowledge_tools(config: "BaseToolConfig") -> List[Any]:
             get_list_knowledge_bases_tool,
         )
 
-        embedding_model = config.get_embedding_model()
         allowed_collections = config.get_allowed_collections()
         user_id = config.get_user_id()
         is_admin = config.is_admin()
@@ -37,7 +36,6 @@ async def create_knowledge_tools(config: "BaseToolConfig") -> List[Any]:
 
         # Add search tool
         knowledge_tool = get_knowledge_search_tool(
-            embedding_model_id=embedding_model,
             allowed_collections=allowed_collections,
             user_id=user_id,
             is_admin=is_admin,

@@ -10,8 +10,38 @@ from xagent.core.tools.adapters.vibe.document_search import (
     get_knowledge_search_tool,
     get_list_knowledge_bases_tool,
 )
+from xagent.core.tools.adapters.vibe.knowledge_tools import create_knowledge_tools
 from xagent.core.tools.core.document_search import _format_search_results
-from xagent.core.tools.core.RAG_tools.core.schemas import CollectionInfo
+from xagent.core.tools.core.RAG_tools.core.schemas import (
+    CollectionInfo,
+    SearchPipelineResult,
+)
+
+
+def _successful_pipeline_result(results):
+    normalized_results = []
+    for idx, result in enumerate(results, start=1):
+        metadata = dict(result.get("metadata", {}))
+        normalized_results.append(
+            {
+                "doc_id": metadata.get("doc_id", f"doc{idx}"),
+                "chunk_id": metadata.get("chunk_id", f"chunk{idx}"),
+                "text": result.get("text", ""),
+                "score": result.get("score", 0.0),
+                "parse_hash": result.get("parse_hash", f"parse{idx}"),
+                "model_tag": result.get("model_tag", "test-model"),
+                "metadata": metadata or None,
+            }
+        )
+    return SearchPipelineResult(
+        status="success",
+        search_type="hybrid",
+        results=normalized_results,
+        result_count=len(normalized_results),
+        warnings=[],
+        message="ok",
+        used_rerank=False,
+    )
 
 
 class TestListKnowledgeBasesTool:
@@ -188,6 +218,22 @@ class TestKnowledgeSearchTool:
         assert "search" in tool.description.lower()
 
     @pytest.mark.asyncio
+    async def test_factory_does_not_inject_global_default_embedding_model(self):
+        """Factory should let each knowledge base use its own indexed embedding model."""
+        config = MagicMock()
+        config.get_allowed_collections.return_value = ["kb1"]
+        config.get_user_id.return_value = 7
+        config.is_admin.return_value = False
+        config.get_embedding_model.return_value = "global-default-embed"
+
+        tools = await create_knowledge_tools(config)
+
+        knowledge_tool = next(tool for tool in tools if tool.name == "knowledge_search")
+        assert isinstance(knowledge_tool, KnowledgeSearchTool)
+        assert knowledge_tool.embedding_model_id is None
+        assert knowledge_tool.allowed_collections == ["kb1"]
+
+    @pytest.mark.asyncio
     async def test_search_no_collections_available(self):
         """Test searching when no collections exist."""
         mock_result = MagicMock()
@@ -232,14 +278,15 @@ class TestKnowledgeSearchTool:
         mock_list_result.collections = mock_collections
 
         # Mock search result
-        mock_search_result = MagicMock()
-        mock_search_result.results = [
-            {
-                "text": "Test content",
-                "score": 0.85,
-                "metadata": {"doc_id": "doc1", "chunk_id": "chunk1"},
-            }
-        ]
+        mock_search_result = _successful_pipeline_result(
+            [
+                {
+                    "text": "Test content",
+                    "score": 0.85,
+                    "metadata": {"doc_id": "doc1", "chunk_id": "chunk1"},
+                }
+            ]
+        )
 
         with patch(
             "xagent.core.tools.core.document_search.list_collections",
@@ -313,8 +360,7 @@ class TestKnowledgeSearchTool:
         mock_list_result = MagicMock()
         mock_list_result.collections = mock_collections
 
-        mock_search_result = MagicMock()
-        mock_search_result.results = []
+        mock_search_result = _successful_pipeline_result([])
 
         with patch(
             "xagent.core.tools.core.document_search.list_collections",
@@ -359,8 +405,7 @@ class TestKnowledgeSearchTool:
         mock_list_result = MagicMock()
         mock_list_result.collections = mock_collections
 
-        mock_search_result = MagicMock()
-        mock_search_result.results = []
+        mock_search_result = _successful_pipeline_result([])
 
         with patch(
             "xagent.core.tools.core.document_search.list_collections",
@@ -413,8 +458,7 @@ class TestKnowledgeSearchTool:
         mock_list_result = MagicMock()
         mock_list_result.collections = mock_collections
 
-        mock_search_result = MagicMock()
-        mock_search_result.results = []
+        mock_search_result = _successful_pipeline_result([])
 
         with patch(
             "xagent.core.tools.core.document_search.list_collections",
@@ -506,8 +550,9 @@ class TestKnowledgeSearchTool:
         mock_list_result = MagicMock()
         mock_list_result.collections = mock_collections
 
-        mock_search_result = MagicMock()
-        mock_search_result.results = [{"text": "Test content", "score": 0.85}]
+        mock_search_result = _successful_pipeline_result(
+            [{"text": "Test content", "score": 0.85}]
+        )
 
         with patch(
             "xagent.core.tools.core.document_search.list_collections",
@@ -554,8 +599,7 @@ class TestKnowledgeSearchTool:
         mock_list_result = MagicMock()
         mock_list_result.collections = mock_collections
 
-        mock_search_result = MagicMock()
-        mock_search_result.results = []
+        mock_search_result = _successful_pipeline_result([])
 
         with patch(
             "xagent.core.tools.core.document_search.list_collections",
@@ -583,6 +627,182 @@ class TestKnowledgeSearchTool:
                     call[1]["collection"] for call in mock_search.call_args_list
                 }
                 assert searched_collections == {"kb1", "kb2"}
+
+    @pytest.mark.asyncio
+    async def test_search_surfaces_pipeline_errors_in_summary(self):
+        """Pipeline failures should not be silently reported as empty results."""
+        mock_collections = [
+            CollectionInfo(
+                name="kb1",
+                total_documents=10,
+                embeddings=100,
+                document_names=["doc1.pdf"],
+            )
+        ]
+
+        mock_list_result = MagicMock()
+        mock_list_result.collections = mock_collections
+
+        with patch(
+            "xagent.core.tools.core.document_search.list_collections",
+            return_value=mock_list_result,
+        ):
+            with patch(
+                "xagent.core.tools.core.document_search.run_document_search",
+                return_value=SearchPipelineResult(
+                    status="error",
+                    search_type="hybrid",
+                    results=[],
+                    result_count=0,
+                    warnings=["initialize failed: missing embedding model"],
+                    message="initialize failed: missing embedding model",
+                    used_rerank=False,
+                ),
+            ):
+                tool = get_knowledge_search_tool()
+                result = await tool.run_json_async(
+                    {
+                        "query": "test query",
+                        "collections": ["kb1"],
+                        "search_type": "hybrid",
+                        "top_k": 5,
+                        "min_score": 0.3,
+                    }
+                )
+
+        assert "Knowledge base search failed" in result.summary
+        assert "kb1" in result.summary
+        assert "missing embedding model" in result.summary
+
+    @pytest.mark.asyncio
+    async def test_search_failed_status_is_reported_as_error(self):
+        """Failed pipeline statuses should remain hard failures."""
+        mock_collections = [
+            CollectionInfo(
+                name="kb1",
+                total_documents=10,
+                embeddings=100,
+                document_names=["doc1.pdf"],
+            )
+        ]
+
+        mock_list_result = MagicMock()
+        mock_list_result.collections = mock_collections
+
+        with patch(
+            "xagent.core.tools.core.document_search.list_collections",
+            return_value=mock_list_result,
+        ):
+            with patch(
+                "xagent.core.tools.core.document_search.run_document_search",
+                return_value=SearchPipelineResult(
+                    status="failed",
+                    search_type="hybrid",
+                    results=[],
+                    result_count=0,
+                    warnings=["index unavailable"],
+                    message="index unavailable",
+                    used_rerank=False,
+                ),
+            ):
+                tool = get_knowledge_search_tool()
+                result = await tool.run_json_async(
+                    {
+                        "query": "test query",
+                        "collections": ["kb1"],
+                        "search_type": "hybrid",
+                        "top_k": 5,
+                        "min_score": 0.3,
+                    }
+                )
+
+        assert "Knowledge base search failed" in result.summary
+        assert "kb1" in result.summary
+        assert "index unavailable" in result.summary
+
+    @pytest.mark.asyncio
+    async def test_search_partial_success_is_reported_as_warning_not_failure(self):
+        """Partial-success pipeline responses should not be treated as hard failures."""
+        mock_collections = [
+            CollectionInfo(
+                name="kb1",
+                total_documents=10,
+                embeddings=100,
+                document_names=["doc1.pdf"],
+            )
+        ]
+
+        mock_list_result = MagicMock()
+        mock_list_result.collections = mock_collections
+
+        with patch(
+            "xagent.core.tools.core.document_search.list_collections",
+            return_value=mock_list_result,
+        ):
+            with patch(
+                "xagent.core.tools.core.document_search.run_document_search",
+                return_value=SearchPipelineResult(
+                    status="partial_success",
+                    search_type="hybrid",
+                    results=[],
+                    result_count=0,
+                    warnings=["FTS fallback used"],
+                    message="Hybrid search completed with warnings",
+                    used_rerank=False,
+                ),
+            ):
+                tool = get_knowledge_search_tool()
+                result = await tool.run_json_async(
+                    {
+                        "query": "test query",
+                        "collections": ["kb1"],
+                        "search_type": "hybrid",
+                        "top_k": 5,
+                        "min_score": 0.3,
+                    }
+                )
+
+        assert "Knowledge base search failed" not in result.summary
+        assert "No relevant documents found" in result.summary
+        assert "Warnings:" in result.summary
+        assert "Hybrid search completed with warnings" in result.summary
+
+    @pytest.mark.asyncio
+    async def test_search_collection_exception_is_surfaced_in_summary(self):
+        """Per-collection exceptions should be surfaced instead of hidden as empty results."""
+        mock_collections = [
+            CollectionInfo(
+                name="kb1",
+                total_documents=10,
+                embeddings=100,
+                document_names=["doc1.pdf"],
+            )
+        ]
+
+        mock_list_result = MagicMock()
+        mock_list_result.collections = mock_collections
+
+        with patch(
+            "xagent.core.tools.core.document_search.list_collections",
+            return_value=mock_list_result,
+        ):
+            with patch(
+                "xagent.core.tools.core.document_search.run_document_search",
+                side_effect=RuntimeError("boom"),
+            ):
+                tool = get_knowledge_search_tool()
+                result = await tool.run_json_async(
+                    {
+                        "query": "test query",
+                        "collections": ["kb1"],
+                        "search_type": "hybrid",
+                        "top_k": 5,
+                        "min_score": 0.3,
+                    }
+                )
+
+        assert "Knowledge base search failed" in result.summary
+        assert "kb1: boom" in result.summary
 
 
 class TestFormatSearchResults:

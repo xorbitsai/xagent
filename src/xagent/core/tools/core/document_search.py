@@ -225,6 +225,8 @@ async def search_knowledge_base(
 
         # Search across collections and aggregate results
         all_results = []
+        collection_errors: list[str] = []
+        collection_warnings: list[str] = []
         total_searched = 0
 
         for collection_info in collections_to_iterate:
@@ -250,6 +252,26 @@ async def search_knowledge_base(
                     is_admin=is_admin,
                 )
 
+                if result.status not in {"success", "partial_success"}:
+                    error_message = result.message or "; ".join(result.warnings)
+                    collection_errors.append(
+                        f"{collection_name}: {error_message or 'search failed'}"
+                    )
+                    logger.warning(
+                        "Search pipeline returned status '%s' for collection '%s': %s",
+                        result.status,
+                        collection_name,
+                        error_message,
+                    )
+                    continue
+
+                if result.status != "success" or result.warnings:
+                    warning_message = result.message or "; ".join(result.warnings)
+                    if warning_message:
+                        collection_warnings.append(
+                            f"{collection_name}: {warning_message}"
+                        )
+
                 if result.results:
                     for res in result.results:
                         res_dict = dict(res)
@@ -259,21 +281,38 @@ async def search_knowledge_base(
                     total_searched += collection_info.documents
 
             except Exception as e:
+                collection_errors.append(f"{collection_name}: {e}")
                 logger.warning(f"Failed to search collection '{collection_name}': {e}")
                 continue
 
         if not all_results:
-            return KnowledgeSearchResult(
-                results=[],
-                summary=f"No relevant documents found in any knowledge base. "
+            if collection_errors:
+                summary = (
+                    "Knowledge base search failed for one or more collections: "
+                    + " | ".join(collection_errors)
+                )
+                if collection_warnings:
+                    summary = (
+                        summary + "\n\nWarnings: " + " | ".join(collection_warnings)
+                    )
+                return KnowledgeSearchResult(results=[], summary=summary)
+            summary = (
+                f"No relevant documents found in any knowledge base. "
                 f"Searched {total_searched} documents across "
-                f"{len(collections_result.collections)} collections. Query: {tool_args.query}",
+                f"{len(collections_result.collections)} collections. Query: {tool_args.query}"
             )
+            if collection_warnings:
+                summary = summary + "\n\nWarnings: " + " | ".join(collection_warnings)
+            return KnowledgeSearchResult(results=[], summary=summary)
 
         # Format results (structured + summary)
         formatted_results, summary = _format_search_results(
             all_results, tool_args.query, total_searched
         )
+        if collection_warnings:
+            summary = summary + "\n\nWarnings: " + " | ".join(collection_warnings)
+        if collection_errors:
+            summary = summary + "\n\nErrors: " + " | ".join(collection_errors)
 
         return KnowledgeSearchResult(results=formatted_results, summary=summary)
 
@@ -296,7 +335,7 @@ def _format_search_results(
         collection = result.get("collection", "unknown")
         score = result.get("score", 0.0)
         text = result.get("text", "")
-        metadata = result.get("metadata", {})
+        metadata = result.get("metadata") or {}
 
         # Extract file information from metadata
         source_path = metadata.get("source", "")

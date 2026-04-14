@@ -4,7 +4,10 @@ from unittest.mock import Mock, patch
 
 import pytest
 
-from xagent.core.tools.core.RAG_tools.core.schemas import CollectionInfo
+from xagent.core.tools.core.RAG_tools.core.schemas import (
+    CollectionInfo,
+    IngestionConfig,
+)
 from xagent.core.tools.core.RAG_tools.management.collection_manager import (
     CollectionManager,
     get_collection_sync,
@@ -314,6 +317,88 @@ class TestResolveEffectiveEmbeddingModel:
             "test_collection", config_model_id="text-embedding-v4"
         )
         assert resolved == "text-embedding-v4"
+
+    @patch(
+        "xagent.core.tools.core.RAG_tools.management.collection_manager.mark_collection_accessed_sync"
+    )
+    @patch(
+        "xagent.core.tools.core.RAG_tools.management.collection_manager.get_collection_sync"
+    )
+    def test_ingestion_config_model_used_when_bound_model_missing(
+        self, mock_get_collection: Mock, _mock_mark: Mock
+    ) -> None:
+        """Collection ingestion config should supply the search embedding model."""
+        mock_get_collection.return_value = CollectionInfo(
+            name="test_collection",
+            embedding_model_id=None,
+            embedding_dimension=None,
+            ingestion_config=IngestionConfig(embedding_model_id="kb-index-embed"),
+        )
+
+        resolved = resolve_effective_embedding_model_sync(
+            "test_collection", config_model_id=None
+        )
+
+        assert resolved == "kb-index-embed"
+
+    @patch(
+        "xagent.core.tools.core.RAG_tools.management.collection_manager.mark_collection_accessed_sync"
+    )
+    @patch(
+        "xagent.core.tools.core.RAG_tools.management.collection_manager.get_collection_sync"
+    )
+    def test_none_placeholder_does_not_override_ingestion_config_model(
+        self, mock_get_collection: Mock, _mock_mark: Mock
+    ) -> None:
+        """Tool placeholder values should still fall back to the indexed model."""
+        mock_get_collection.return_value = CollectionInfo(
+            name="test_collection",
+            embedding_model_id=None,
+            embedding_dimension=None,
+            ingestion_config=IngestionConfig(embedding_model_id="kb-index-embed"),
+        )
+
+        resolved = resolve_effective_embedding_model_sync(
+            "test_collection", config_model_id="none"
+        )
+
+        assert resolved == "kb-index-embed"
+
+    @patch(
+        "xagent.core.tools.core.RAG_tools.management.collection_manager._sync_wrapper"
+    )
+    @patch(
+        "xagent.core.tools.core.RAG_tools.management.collection_manager.mark_collection_accessed_sync"
+    )
+    @patch(
+        "xagent.core.tools.core.RAG_tools.management.collection_manager.get_collection_sync"
+    )
+    @patch(
+        "xagent.core.tools.core.RAG_tools.utils.migration_utils._infer_embedding_config_from_collection"
+    )
+    def test_infers_model_from_existing_embeddings_when_metadata_missing(
+        self,
+        mock_infer: Mock,
+        mock_get_collection: Mock,
+        _mock_mark: Mock,
+        mock_sync_wrapper: Mock,
+    ) -> None:
+        """Legacy collections should infer the model from existing embedding tables."""
+        mock_get_collection.return_value = CollectionInfo(
+            name="legacy_collection",
+            embedding_model_id=None,
+            embedding_dimension=None,
+            embeddings=12,
+            ingestion_config=None,
+        )
+        mock_infer.return_value = ("legacy-index-embed", 768)
+        mock_save = Mock()
+        mock_sync_wrapper.return_value = mock_save
+
+        resolved = resolve_effective_embedding_model_sync("legacy_collection")
+
+        assert resolved == "legacy-index-embed"
+        mock_save.assert_called_once()
 
 
 # --- rebuild_collection_metadata Tests (Issue #14) ---

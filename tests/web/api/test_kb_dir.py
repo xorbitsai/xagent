@@ -2025,6 +2025,7 @@ def test_delete_document_by_file_id_survives_degraded_document_listing(
 ):
     app, headers, user, TestingSessionLocal = test_env
     client = TestClient(app)
+    from unittest.mock import MagicMock
 
     file_path = temp_uploads / f"user_{user.id}" / "demo" / "fallback.txt"
     file_path.parent.mkdir(parents=True, exist_ok=True)
@@ -2047,7 +2048,9 @@ def test_delete_document_by_file_id_survives_degraded_document_listing(
         session.close()
 
     deleted_doc_ids: list[str] = []
-    expected_doc_id = generate_deterministic_doc_id("demo", str(file_path))
+    expected_doc_id = generate_deterministic_doc_id("demo", target_file_id)
+    mock_store = MagicMock()
+    mock_store.iter_batches.return_value = []
 
     def _fake_delete_document(collection_name, doc_id, user_id, is_admin):
         deleted_doc_ids.append(doc_id)
@@ -2062,6 +2065,7 @@ def test_delete_document_by_file_id_survives_degraded_document_listing(
             "xagent.web.api.kb.list_documents",
             side_effect=RuntimeError("documents unavailable"),
         ),
+        patch("xagent.web.api.kb.get_vector_index_store", return_value=mock_store),
         patch(
             "xagent.core.tools.core.RAG_tools.management.collections.delete_document",
             side_effect=_fake_delete_document,
@@ -2075,6 +2079,80 @@ def test_delete_document_by_file_id_survives_degraded_document_listing(
     assert response.status_code == 200
     assert response.json()["deleted_doc_ids"] == [expected_doc_id]
     assert deleted_doc_ids == [expected_doc_id]
+
+
+def test_delete_document_by_file_id_prefers_documents_table_doc_id(
+    test_env, temp_uploads
+):
+    app, headers, user, TestingSessionLocal = test_env
+    client = TestClient(app)
+    from unittest.mock import MagicMock
+
+    file_path = temp_uploads / f"user_{user.id}" / "demo" / "resolved-from-docs.txt"
+    file_path.parent.mkdir(parents=True, exist_ok=True)
+    file_path.write_text("content")
+
+    session = TestingSessionLocal()
+    try:
+        file_record = UploadedFile(
+            user_id=int(user.id),
+            filename="resolved-from-docs.txt",
+            storage_path=str(file_path),
+            mime_type="text/plain",
+            file_size=7,
+        )
+        session.add(file_record)
+        session.commit()
+        session.refresh(file_record)
+        target_file_id = str(file_record.file_id)
+    finally:
+        session.close()
+
+    deleted_doc_ids: list[str] = []
+    expected_doc_id = "doc-from-documents-table"
+
+    mock_batch = MagicMock()
+    mock_batch.to_pylist.return_value = [
+        {"doc_id": expected_doc_id, "source_path": str(file_path)}
+    ]
+    mock_store = MagicMock()
+    mock_store.iter_batches.return_value = [mock_batch]
+
+    def _fake_delete_document(collection_name, doc_id, user_id, is_admin):
+        deleted_doc_ids.append(doc_id)
+        return _successful_delete_result(collection_name, doc_id)
+
+    with (
+        patch(
+            "xagent.web.api.kb._list_documents_for_user",
+            side_effect=RuntimeError("documents unavailable"),
+        ),
+        patch(
+            "xagent.web.api.kb.list_documents",
+            side_effect=RuntimeError("documents unavailable"),
+        ),
+        patch("xagent.web.api.kb.get_vector_index_store", return_value=mock_store),
+        patch(
+            "xagent.core.tools.core.RAG_tools.management.collections.delete_document",
+            side_effect=_fake_delete_document,
+        ),
+    ):
+        response = client.delete(
+            f"/api/kb/collections/demo/documents/ignored.txt?file_id={target_file_id}",
+            headers=headers,
+        )
+
+    assert response.status_code == 200
+    assert response.json()["deleted_doc_ids"] == [expected_doc_id]
+    assert deleted_doc_ids == [expected_doc_id]
+    mock_store.iter_batches.assert_called_once_with(
+        table_name="documents",
+        columns=["doc_id", "source_path"],
+        batch_size=10,
+        filters={"collection": "demo", "file_id": target_file_id},
+        user_id=None,
+        is_admin=True,
+    )
 
 
 def test_delete_document_without_file_id_does_not_resurface_on_collection_refresh(

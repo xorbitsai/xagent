@@ -1,7 +1,6 @@
 """Knowledge base API route handlers"""
 
 import asyncio
-import concurrent.futures
 import functools
 import hashlib
 import json
@@ -674,9 +673,8 @@ async def ingest(
             file_id=str(file_record.file_id),
         )
 
-    with concurrent.futures.ThreadPoolExecutor() as executor:
-        future = executor.submit(_run_ingestion)
-        result: IngestionResult = future.result()
+    loop = asyncio.get_running_loop()
+    result: IngestionResult = await loop.run_in_executor(None, _run_ingestion)
 
     if result.status in {"error", "partial"}:
         _rollback_failed_ingestion(
@@ -2255,6 +2253,66 @@ async def delete_document_api(
                 candidate.add(raw)
         return sorted(candidate)
 
+    def _resolve_doc_id_for_uploaded_file(
+        *,
+        file_id_str: str,
+        storage_path: str,
+    ) -> str:
+        """Resolve the stored doc_id for an owned UploadedFile.
+
+        Prefer the exact documents-table row keyed by `file_id`, then fall back
+        to the same deterministic key ingestion uses for modern uploads.
+        """
+        vector_store = get_vector_index_store()
+        exact_matches: list[tuple[str, str]] = []
+
+        try:
+            for batch in vector_store.iter_batches(
+                table_name="documents",
+                columns=["doc_id", "source_path"],
+                batch_size=10,
+                filters={
+                    "collection": safe_collection_name,
+                    "file_id": file_id_str,
+                },
+                user_id=None,
+                is_admin=True,
+            ):
+                rows = batch.to_pylist()
+                for row in rows:
+                    raw_doc_id = str(row.get("doc_id") or "").strip()
+                    if not raw_doc_id:
+                        continue
+                    raw_source_path = str(row.get("source_path") or "").strip()
+                    exact_matches.append((raw_doc_id, raw_source_path))
+        except Exception as exc:
+            logger.warning(
+                "Failed to resolve doc_id by file_id for delete fallback "
+                "(collection=%s, file_id=%s): %s",
+                safe_collection_name,
+                file_id_str,
+                exc,
+            )
+        else:
+            if len(exact_matches) == 1:
+                return exact_matches[0][0]
+
+            if len(exact_matches) > 1:
+                for raw_doc_id, raw_source_path in exact_matches:
+                    if raw_source_path == storage_path:
+                        return raw_doc_id
+                logger.warning(
+                    "Multiple documents matched file_id fallback "
+                    "(collection=%s, file_id=%s); using deterministic fallback",
+                    safe_collection_name,
+                    file_id_str,
+                )
+
+        if file_id_str:
+            return generate_deterministic_doc_id(safe_collection_name, file_id_str)
+
+        return generate_deterministic_doc_id(safe_collection_name, storage_path)
+
     def _append_matching_uploaded_file_candidate(rec: UploadedFile) -> bool:
         file_id_str = str(getattr(rec, "file_id", "")).strip()
         if not file_id_str:
@@ -2262,8 +2320,9 @@ async def delete_document_api(
         storage_path = str(getattr(rec, "storage_path", "")).strip()
         if not storage_path:
             return False
-        derived_doc_id = generate_deterministic_doc_id(
-            safe_collection_name, storage_path
+        derived_doc_id = _resolve_doc_id_for_uploaded_file(
+            file_id_str=file_id_str,
+            storage_path=storage_path,
         )
         if doc_id and derived_doc_id != doc_id:
             raise HTTPException(

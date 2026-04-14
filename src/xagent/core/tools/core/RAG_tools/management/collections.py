@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 import warnings as py_warnings
 from collections import defaultdict
 from datetime import datetime
@@ -52,6 +53,55 @@ from ..version_management.cascade_cleaner import cleanup_document_cascade
 logger = logging.getLogger(__name__)
 
 DEFAULT_BATCH_SIZE = DEFAULT_LANCEDB_SCAN_BATCH_SIZE
+
+
+def _extract_user_id_from_source_path(source_path: Optional[str]) -> Optional[int]:
+    """Recover an owning user ID from legacy upload paths."""
+    if not source_path:
+        return None
+
+    match = re.search(r"/user_(\d+)(?:/|$)", source_path)
+    if match is None:
+        return None
+
+    try:
+        return int(match.group(1))
+    except (TypeError, ValueError):
+        return None
+
+
+def _load_document_owner_context(
+    collection: str, doc_id: str
+) -> Optional[Dict[str, Any]]:
+    """Load exact document ownership metadata without applying user filters."""
+    vector_store = get_vector_index_store()
+
+    for batch in vector_store.iter_batches(
+        table_name="documents",
+        columns=["collection", "doc_id", "user_id", "source_path"],
+        batch_size=1,
+        filters={"collection": collection, "doc_id": doc_id},
+        user_id=None,
+        is_admin=True,
+    ):
+        if getattr(batch, "num_rows", 0) == 0:
+            continue
+
+        rows = batch.to_pylist()
+        if not rows:
+            continue
+
+        row = rows[0]
+        raw_user_id = row.get("user_id")
+        owner_user_id = int(raw_user_id) if raw_user_id is not None else None
+        source_path = row.get("source_path")
+
+        return {
+            "owner_user_id": owner_user_id,
+            "source_path": str(source_path) if source_path is not None else None,
+        }
+
+    return None
 
 
 def _iter_batches(
@@ -1225,6 +1275,66 @@ def delete_document(
     Returns:
         DocumentOperationResult: Operation result with deletion counts.
     """
+    vector_store = get_vector_index_store()
+
+    authorized_via_legacy_source_path = False
+
+    try:
+        document_count = vector_store.count_rows(
+            table_name="documents",
+            filters={"collection": collection, "doc_id": doc_id},
+            user_id=user_id,
+            is_admin=is_admin,
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.error(
+            "Failed to authorize document deletion %s/%s: %s",
+            collection,
+            doc_id,
+            exc,
+        )
+        return DocumentOperationResult(
+            status="error",
+            collection=collection,
+            doc_id=doc_id,
+            new_status=DocumentProcessingStatus.FAILED,
+            message=f"Failed to delete document: {exc}",
+            warnings=[],
+            details={},
+        )
+
+    if document_count == 0:
+        owner_context = _load_document_owner_context(collection, doc_id)
+        if owner_context is None:
+            return DocumentOperationResult(
+                status="error",
+                collection=collection,
+                doc_id=doc_id,
+                new_status=DocumentProcessingStatus.FAILED,
+                message="Document not found or not accessible.",
+                warnings=[],
+                details={},
+            )
+
+        owner_user_id = owner_context.get("owner_user_id")
+        if owner_user_id is None:
+            owner_user_id = _extract_user_id_from_source_path(
+                owner_context.get("source_path")
+            )
+
+        if not is_admin and owner_user_id != user_id:
+            return DocumentOperationResult(
+                status="error",
+                collection=collection,
+                doc_id=doc_id,
+                new_status=DocumentProcessingStatus.FAILED,
+                message="Document not found or not accessible.",
+                warnings=[],
+                details={},
+            )
+
+        authorized_via_legacy_source_path = owner_context.get("owner_user_id") is None
+
     try:
         # Use cascade cleanup to delete all related data
         counts = cleanup_document_cascade(
@@ -1235,7 +1345,12 @@ def delete_document(
             preview_only=False,
             confirm=True,
         )
-        clear_ingestion_status(collection, doc_id)
+        clear_ingestion_status(
+            collection,
+            doc_id,
+            user_id=None if authorized_via_legacy_source_path else user_id,
+            is_admin=is_admin or authorized_via_legacy_source_path,
+        )
     except Exception as exc:  # noqa: BLE001
         logger.error("Failed to delete document %s/%s: %s", collection, doc_id, exc)
         return DocumentOperationResult(

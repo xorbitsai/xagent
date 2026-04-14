@@ -6,6 +6,7 @@ import os
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Dict, List
+from unittest.mock import MagicMock, patch
 
 import pytest
 
@@ -29,6 +30,7 @@ from src.xagent.core.tools.core.RAG_tools.management import (
 )
 from src.xagent.core.tools.core.RAG_tools.management import (
     delete_collection,
+    delete_document,
     get_document_stats,
     list_collections,
     list_documents,
@@ -479,8 +481,6 @@ def test_e2e_register_and_list_documents_with_legacy_empty_string_file_id(
     assert list_result.status == "success"
     listed_ids = {doc.doc_id for doc in list_result.documents}
     assert reg_result["doc_id"] in listed_ids
-
-
 # --- list_collections force_realtime Tests ---
 
 
@@ -617,3 +617,149 @@ async def test_delete_collection_clears_metadata_cache(temp_lancedb_dir: str) ->
     result = await list_collections(user_id=None, is_admin=True)
     remaining = [c.name for c in result.collections]
     assert collection not in remaining
+
+
+def test_delete_document_authorizes_before_cascade() -> None:
+    vector_store = MagicMock()
+    vector_store.count_rows.return_value = 0
+    vector_store.iter_batches.return_value = []
+
+    with (
+        patch.object(
+            collections_module, "get_vector_index_store", return_value=vector_store
+        ),
+        patch.object(collections_module, "cleanup_document_cascade") as mock_cleanup,
+        patch.object(collections_module, "clear_ingestion_status") as mock_clear,
+    ):
+        result = delete_document("demo", "doc-1", user_id=7, is_admin=False)
+
+    assert result.status == "error"
+    assert result.message == "Document not found or not accessible."
+    vector_store.count_rows.assert_called_once_with(
+        table_name="documents",
+        filters={"collection": "demo", "doc_id": "doc-1"},
+        user_id=7,
+        is_admin=False,
+    )
+    mock_cleanup.assert_not_called()
+    mock_clear.assert_not_called()
+
+
+def test_delete_document_allows_legacy_owner_recovered_from_source_path() -> None:
+    vector_store = MagicMock()
+    vector_store.count_rows.return_value = 0
+
+    legacy_batch = MagicMock()
+    legacy_batch.num_rows = 1
+    legacy_batch.to_pylist.return_value = [
+        {
+            "collection": "demo",
+            "doc_id": "doc-legacy",
+            "user_id": None,
+            "source_path": "/uploads/user_7/demo/legacy.csv",
+        }
+    ]
+    vector_store.iter_batches.return_value = [legacy_batch]
+
+    with (
+        patch.object(
+            collections_module, "get_vector_index_store", return_value=vector_store
+        ),
+        patch.object(
+            collections_module,
+            "cleanup_document_cascade",
+            return_value={"documents": 1, "main_pointers": 1},
+        ) as mock_cleanup,
+        patch.object(collections_module, "clear_ingestion_status") as mock_clear,
+    ):
+        result = delete_document("demo", "doc-legacy", user_id=7, is_admin=False)
+
+    assert result.status == "success"
+    mock_cleanup.assert_called_once_with(
+        collection="demo",
+        doc_id="doc-legacy",
+        user_id=7,
+        is_admin=False,
+        preview_only=False,
+        confirm=True,
+    )
+    mock_clear.assert_called_once_with(
+        "demo",
+        "doc-legacy",
+        user_id=None,
+        is_admin=True,
+    )
+    vector_store.iter_batches.assert_called_once_with(
+        table_name="documents",
+        columns=["collection", "doc_id", "user_id", "source_path"],
+        batch_size=1,
+        filters={"collection": "demo", "doc_id": "doc-legacy"},
+        user_id=None,
+        is_admin=True,
+    )
+
+
+def test_delete_document_rejects_legacy_row_owned_by_another_user() -> None:
+    vector_store = MagicMock()
+    vector_store.count_rows.return_value = 0
+
+    foreign_batch = MagicMock()
+    foreign_batch.num_rows = 1
+    foreign_batch.to_pylist.return_value = [
+        {
+            "collection": "demo",
+            "doc_id": "doc-foreign",
+            "user_id": None,
+            "source_path": "/uploads/user_99/demo/foreign.csv",
+        }
+    ]
+    vector_store.iter_batches.return_value = [foreign_batch]
+
+    with (
+        patch.object(
+            collections_module, "get_vector_index_store", return_value=vector_store
+        ),
+        patch.object(collections_module, "cleanup_document_cascade") as mock_cleanup,
+        patch.object(collections_module, "clear_ingestion_status") as mock_clear,
+    ):
+        result = delete_document("demo", "doc-foreign", user_id=7, is_admin=False)
+
+    assert result.status == "error"
+    assert result.message == "Document not found or not accessible."
+    mock_cleanup.assert_not_called()
+    mock_clear.assert_not_called()
+
+
+def test_delete_document_clears_status_with_caller_scope() -> None:
+    vector_store = MagicMock()
+    vector_store.count_rows.return_value = 1
+
+    with (
+        patch.object(
+            collections_module, "get_vector_index_store", return_value=vector_store
+        ),
+        patch.object(
+            collections_module,
+            "cleanup_document_cascade",
+            return_value={"documents": 1, "main_pointers": 1},
+        ) as mock_cleanup,
+        patch.object(collections_module, "clear_ingestion_status") as mock_clear,
+    ):
+        result = delete_document("demo", "doc-1", user_id=9, is_admin=True)
+
+    assert result.status == "success"
+    assert result.details == {"documents": 1, "main_pointers": 1}
+    mock_cleanup.assert_called_once_with(
+        collection="demo",
+        doc_id="doc-1",
+        user_id=9,
+        is_admin=True,
+        preview_only=False,
+        confirm=True,
+    )
+    mock_clear.assert_called_once_with(
+        "demo",
+        "doc-1",
+        user_id=9,
+        is_admin=True,
+    )

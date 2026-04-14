@@ -205,6 +205,7 @@ class CollectionManager:
         collection_name: str,
         user_id: Optional[int],
         is_admin: bool = False,
+        delete_orphaned_metadata: bool = False,
     ) -> dict[str, int]:
         """Delete persisted metadata/config rows for a collection."""
         lock = _get_collection_lock(collection_name)
@@ -214,6 +215,7 @@ class CollectionManager:
                 collection_name,
                 user_id=user_id,
                 is_admin=is_admin,
+                delete_orphaned_metadata=delete_orphaned_metadata,
             )
 
     async def _save_collection_with_retry(
@@ -612,12 +614,14 @@ def delete_collection_metadata_sync(
     collection_name: str,
     user_id: Optional[int],
     is_admin: bool = False,
+    delete_orphaned_metadata: bool = False,
 ) -> dict[str, int]:
     """Synchronous version of delete_collection_metadata."""
     return _sync_wrapper(collection_manager.delete_collection_metadata)(
         collection_name,
         user_id,
         is_admin,
+        delete_orphaned_metadata,
     )
 
 

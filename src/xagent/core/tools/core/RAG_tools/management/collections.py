@@ -1183,21 +1183,38 @@ def delete_collection(
         doc_ids = sorted({r.doc_id for r in doc_records})
 
         # Delete all data using storage abstraction
-        deleted_counts = vector_store.delete_collection_data(collection_name=collection)
+        deleted_counts = vector_store.delete_collection_data(
+            collection_name=collection,
+            user_id=user_id,
+            is_admin=is_admin,
+        )
 
         # Clear ingestion status for all documents
         for doc_id in doc_ids:
             try:
-                clear_ingestion_status(collection, doc_id)
+                clear_ingestion_status(
+                    collection,
+                    doc_id,
+                    user_id=user_id,
+                    is_admin=is_admin,
+                )
             except Exception as exc:  # noqa: BLE001
                 warning = f"Failed to clear ingestion status for '{doc_id}': {exc}"
                 logger.warning(warning)
                 warnings.append(warning)
 
+        remaining_collection_records = vector_store.list_document_records(
+            collection_name=collection,
+            user_id=None,
+            is_admin=True,
+            max_results=1,
+        )
+
         metadata_cleanup_counts = delete_collection_metadata_sync(
             collection_name=collection,
             user_id=user_id,
             is_admin=is_admin,
+            delete_orphaned_metadata=not remaining_collection_records,
         )
 
     except Exception as exc:  # noqa: BLE001 - convert to structured failure

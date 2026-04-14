@@ -285,6 +285,28 @@ async def test_list_collections_includes_empty_metadata_only_collection(
 
 
 @pytest.mark.asyncio
+async def test_list_collections_non_admin_only_sees_owned_metadata_only_collections(
+    temp_lancedb_dir: str,
+) -> None:
+    """Non-admin listing should not expose other users' metadata-only collections."""
+
+    from src.xagent.core.tools.core.RAG_tools.core.schemas import CollectionInfo
+
+    store = get_metadata_store()
+    await store.save_collection(CollectionInfo(name="mine_only"))
+    await store.save_collection(CollectionInfo(name="theirs_only"))
+    await store.save_collection_config("mine_only", "{}", user_id=1)
+    await store.save_collection_config("theirs_only", "{}", user_id=2)
+
+    result = await list_collections(user_id=1, is_admin=False)
+
+    assert result.status == "success"
+    collection_names = {info.name for info in result.collections}
+    assert "mine_only" in collection_names
+    assert "theirs_only" not in collection_names
+
+
+@pytest.mark.asyncio
 async def test_delete_collection_removes_empty_collection_metadata(
     temp_lancedb_dir: str,
 ) -> None:
@@ -303,6 +325,65 @@ async def test_delete_collection_removes_empty_collection_metadata(
     listed = await list_collections(user_id=None, is_admin=True)
     collection_names = {info.name for info in listed.collections}
     assert "empty_collection" not in collection_names
+
+
+@pytest.mark.asyncio
+async def test_delete_collection_preserves_other_users_shared_collection_data(
+    temp_lancedb_dir: str,
+) -> None:
+    """Tenant-scoped deletes should not wipe another user's shared collection rows."""
+
+    from src.xagent.core.tools.core.RAG_tools.core.schemas import CollectionInfo
+
+    collection = "shared_collection"
+    now = datetime.now(timezone.utc)
+    store = get_metadata_store()
+    await store.save_collection(CollectionInfo(name=collection))
+    await store.save_collection_config(collection, "{}", user_id=1)
+    await store.save_collection_config(collection, "{}", user_id=2)
+
+    _insert_documents(
+        [
+            {
+                "collection": collection,
+                "doc_id": "doc-user-1",
+                "source_path": "/path/user-1.pdf",
+                "file_type": "pdf",
+                "content_hash": "hash-user-1",
+                "uploaded_at": now,
+                "title": "User 1",
+                "language": "zh",
+                "user_id": 1,
+            },
+            {
+                "collection": collection,
+                "doc_id": "doc-user-2",
+                "source_path": "/path/user-2.pdf",
+                "file_type": "pdf",
+                "content_hash": "hash-user-2",
+                "uploaded_at": now,
+                "title": "User 2",
+                "language": "en",
+                "user_id": 2,
+            },
+        ]
+    )
+
+    result = delete_collection(collection, user_id=1, is_admin=False)
+
+    assert result.status == "success"
+
+    user_one_documents = list_documents(
+        collection=collection, user_id=1, is_admin=False
+    )
+    user_two_documents = list_documents(
+        collection=collection, user_id=2, is_admin=False
+    )
+    assert user_one_documents.documents == []
+    assert {doc.doc_id for doc in user_two_documents.documents} == {"doc-user-2"}
+
+    listed_for_admin = await list_collections(user_id=None, is_admin=True)
+    assert collection in {info.name for info in listed_for_admin.collections}
 
 
 def test_get_document_stats_missing_document(temp_lancedb_dir: str) -> None:
@@ -423,7 +504,7 @@ def test_delete_collection_invokes_cleanup_all_documents(
 
     cleared_calls: List[tuple[str, str]] = []
 
-    def _fake_clear(collection: str, doc_id: str) -> None:
+    def _fake_clear(collection: str, doc_id: str, **_: object) -> None:
         cleared_calls.append((collection, doc_id))
 
     monkeypatch.setattr(

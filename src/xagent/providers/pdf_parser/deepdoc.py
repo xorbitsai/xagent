@@ -4,6 +4,7 @@ import uuid
 from io import BytesIO
 from pathlib import Path
 from typing import Any, Dict, List, Tuple
+from zipfile import BadZipFile
 
 from deepdoc import ExcelParser as DeepDocExcelParser
 from deepdoc import MarkdownParser as DeepDocMarkdownParser
@@ -11,6 +12,7 @@ from deepdoc import PdfParser as DeepDocPdfParser
 from deepdoc import TxtParser as DeepDocTxtParser
 from deepdoc.parser import DoclingParser as DeepDocDoclingParser
 from openpyxl import load_workbook
+from openpyxl.utils.exceptions import InvalidFileException
 
 from ...core.tools.core.RAG_tools.core.config import ARTIFACTS_DIR
 from ...core.tools.core.RAG_tools.utils.string_utils import sanitize_for_doc_id
@@ -407,6 +409,40 @@ def _translate_markdown_output(raw_output: Any, **kwargs: Any) -> ParseResult:
     return ParseResult(text_segments=text_segments)
 
 
+def _parse_docx_with_python_docx(
+    file_path: str | BytesIO,
+) -> Tuple[List[Tuple[str, str]], List[List[str]]]:
+    """Fallback DOCX parser when Docling is unavailable."""
+    from docx import Document as DocxDocument
+
+    if isinstance(file_path, BytesIO):
+        file_path.seek(0)
+        document = DocxDocument(file_path)
+        file_path.seek(0)
+    else:
+        document = DocxDocument(file_path)
+
+    sections: List[Tuple[str, str]] = []
+    for paragraph in document.paragraphs:
+        text = paragraph.text.strip()
+        if not text:
+            continue
+        style_name = paragraph.style.name if paragraph.style is not None else ""
+        sections.append((text, style_name))
+
+    tables: List[List[str]] = []
+    for table in document.tables:
+        rows: List[str] = []
+        for row in table.rows:
+            cells = [cell.text.strip() for cell in row.cells if cell.text.strip()]
+            if cells:
+                rows.append(" | ".join(cells))
+        if rows:
+            tables.append(rows)
+
+    return sections, tables
+
+
 class DeepDocParser(
     DocumentParser, TextParsing, FigureParsing, SegmentedTextResult, LocalParsing
 ):
@@ -527,8 +563,8 @@ class DeepDocParser(
                 else:
                     with open(file_path, "r", encoding="utf-8") as f:
                         markdown_text = f.read()
-                raw_output = parser.extract_tables_and_remainder(markdown_text)
-                return _translate_markdown_output(raw_output, **metadata)
+                markdown_output = parser.extract_tables_and_remainder(markdown_text)
+                return _translate_markdown_output(markdown_output, **metadata)
 
             # For TXT files, read directly to preserve original format and punctuation
             if ext == ".txt":
@@ -591,10 +627,17 @@ class DeepDocParser(
                             file_bytes: bytes = file_path.getvalue()
                             raw_output = parser(file_bytes, **parser_call_kwargs)
                         else:
-                            # Use DoclingParser.parse_docx() for DOCX files
-                            raw_output = parser.parse_docx(
-                                file_path, **parser_call_kwargs
-                            )
+                            # Use DoclingParser.parse_docx() for DOCX files when available,
+                            # otherwise fall back to python-docx parsing.
+                            if (
+                                getattr(parser, "check_installation", None)
+                                and not parser.check_installation()
+                            ):
+                                raw_output = _parse_docx_with_python_docx(file_path)
+                            else:
+                                raw_output = parser.parse_docx(
+                                    file_path, **parser_call_kwargs
+                                )
                     else:
                         # DeepDoc ExcelParser expects bytes if not path, not BytesIO
                         input_arg: str | BytesIO | bytes = file_path
@@ -680,11 +723,15 @@ def _format_spreadsheet_row(headers: List[str] | None, cells: List[str]) -> str:
 
 
 def _parse_xlsx_rows(file_path: str | BytesIO, **kwargs: Any) -> ParseResult:
-    if isinstance(file_path, BytesIO):
-        file_path.seek(0)
-        workbook = load_workbook(filename=file_path, read_only=True, data_only=True)
-    else:
-        workbook = load_workbook(filename=file_path, read_only=True, data_only=True)
+    try:
+        if isinstance(file_path, BytesIO):
+            file_path.seek(0)
+            workbook = load_workbook(filename=file_path, read_only=True, data_only=True)
+        else:
+            workbook = load_workbook(filename=file_path, read_only=True, data_only=True)
+    except (BadZipFile, InvalidFileException, OSError, ValueError):
+        logger.warning("Failed to parse spreadsheet rows from %s", file_path)
+        return ParseResult(text_segments=[])
 
     text_segments: List[ParsedTextSegment] = []
     multiple_sheets = len(workbook.sheetnames) > 1

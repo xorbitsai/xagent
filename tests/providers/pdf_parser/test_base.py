@@ -1,6 +1,7 @@
 import zipfile
 from pathlib import Path
 from typing import Any
+from unittest.mock import patch
 
 import pytest
 
@@ -256,18 +257,17 @@ def test_validate_office_file_format_warning_mode(
     tmp_path: Path, caplog: pytest.LogCaptureFixture
 ) -> None:
     """Test validation logs warning instead of raising when strict=False."""
-    import logging
-
     doc_file = tmp_path / "test.docx"
     # OLE2 file header
     doc_file.write_bytes(
         bytes([0xD0, 0xCF, 0x11, 0xE0, 0xA1, 0xB1, 0x1A, 0xE1]) + b"rest"
     )
-    with caplog.at_level(logging.WARNING):
+    with patch("xagent.providers.pdf_parser.base.logger.warning") as mock_warning:
         validate_office_file_format(
             str(doc_file), ".docx", strict=False, parser_name="test_parser"
         )
-    assert "legacy .doc (OLE2) format" in caplog.text
+    assert mock_warning.called
+    assert "legacy .doc (OLE2) format" in mock_warning.call_args.args[0]
 
 
 def test_validate_office_file_format_non_office_file(tmp_path: Path) -> None:

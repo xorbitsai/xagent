@@ -1,5 +1,3 @@
-from pathlib import Path
-
 import pytest
 
 from xagent.core.tools.core.document_parser import (

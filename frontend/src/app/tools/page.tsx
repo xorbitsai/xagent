@@ -36,8 +36,11 @@ import {
 } from "lucide-react"
 import { getApiUrl } from "@/lib/utils"
 import { apiRequest } from "@/lib/api-wrapper"
+import { ConnectMcpDialog } from "@/components/mcp/connect-mcp-dialog"
+import { OfficialMcpSettingsDialog } from "@/components/mcp/official-mcp-settings-dialog"
 import { useI18n } from "@/contexts/i18n-context"
 import { useAuth } from "@/contexts/auth-context"
+import { useMcpApps } from "@/contexts/mcp-apps-context"
 import { toast } from "sonner"
 
 interface Tool {
@@ -67,6 +70,9 @@ interface MCPServer {
   transport_display: string
   created_at: string
   updated_at: string
+  connected_account?: string
+  app_id?: string
+  provider?: string
 }
 
 interface TransportConfig {
@@ -128,6 +134,9 @@ export default function ToolsPage() {
   const [configurableTools, setConfigurableTools] = useState<ConfigurableTool[]>([])
   const [sqlConnections, setSqlConnections] = useState<SqlConnectionItem[]>([])
   const [isLoading, setIsLoading] = useState(false)
+  const [isConnectMcpOpen, setIsConnectMcpOpen] = useState(false)
+  const [isOfficialAppDialogOpen, setIsOfficialAppDialogOpen] = useState(false)
+  const [editingOfficialApp, setEditingOfficialApp] = useState<any>(null)
   const [isMcpDialogOpen, setIsMcpDialogOpen] = useState(false)
   const [isCredentialDialogOpen, setIsCredentialDialogOpen] = useState(false)
   const [editingConfigTool, setEditingConfigTool] = useState<ConfigurableTool | null>(null)
@@ -158,6 +167,7 @@ export default function ToolsPage() {
 
   const { t } = useI18n()
   const { user } = useAuth()
+  const { getAppIcon } = useMcpApps()
   const isAdmin = Boolean(user?.is_admin)
 
   useEffect(() => {
@@ -454,26 +464,49 @@ export default function ToolsPage() {
     }
   }
 
-  const handleAddMcpServer = () => {
-    setEditingServer(null)
-    setMcpFormData({
-      name: "",
-      transport: "stdio",
-      description: "",
-      config: {}
-    })
-    setIsMcpDialogOpen(true)
-  }
-
   const handleEditMcpServer = (server: MCPServer) => {
-    setEditingServer(server)
-    setMcpFormData({
-      name: server.name,
-      transport: server.transport,
-      description: server.description || "",
-      config: server.config
-    })
-    setIsMcpDialogOpen(true)
+    // Check if this is an official integration (from library)
+    const isOfficial = server.transport === 'oauth'
+
+    if (isOfficial) {
+      // Use provider from backend if available, fallback to basic logic
+      const isGoogle = server.name.toLowerCase().includes('google') || server.name.toLowerCase() === 'gmail'
+      const provider = server.provider || (isGoogle ? 'google' : 'linkedin')
+
+      // Use app_id from backend if available, fallback to basic logic
+      const appId = server.app_id || server.name.toLowerCase().replace(/\s+/g, '-')
+
+      // We need to fetch the icon or use a generic one
+      let icon = getAppIcon(server.name) || "";
+
+      // Create an AppIntegration-like object for the dialog
+      setEditingOfficialApp({
+        id: appId, // Store the app ID for OAuth flow
+        server_id: server.id, // Store the actual server ID for disconnect
+        name: server.name,
+        description: server.description || "",
+        icon: icon,
+        is_connected: true,
+        provider: provider,
+        connected_account: server.connected_account,
+        is_custom: false
+      })
+      setIsOfficialAppDialogOpen(true)
+    } else {
+      // For custom servers, show the detail dialog first
+      setEditingOfficialApp({
+        id: server.id.toString(),
+        server_id: server.id,
+        name: server.name,
+        description: server.description || "",
+        icon: "", // Use generic icon
+        is_connected: true,
+        provider: "custom",
+        is_custom: true,
+        server: server
+      })
+      setIsOfficialAppDialogOpen(true)
+    }
   }
 
   const handleSaveMcpServer = async () => {
@@ -541,12 +574,12 @@ export default function ToolsPage() {
     // Special cases for correct capitalization
     const categoryDisplayMap: Record<string, string> = {
       ppt: "PPT",
-    pptx: "PPTX",
-    ai: "AI",
-    api: "API",
-    llm: "LLM",
-    ai2: "AI2",
-      }
+      pptx: "PPTX",
+      ai: "AI",
+      api: "API",
+      llm: "LLM",
+      ai2: "AI2",
+    }
 
     // Check special cases first
     if (categoryDisplayMap[category]) {
@@ -573,6 +606,13 @@ export default function ToolsPage() {
   const getToolIcon = (name: string, type: string, category?: string) => {
     const lowerName = name.toLowerCase()
     const lowerCategory = (category || "").toLowerCase()
+    if (type === 'mcp') {
+      const appIcon = getAppIcon(name)
+      if (appIcon) {
+        return <img src={appIcon} alt={name} className="h-6 w-6 rounded-sm object-contain" />
+      }
+      return <Server className="h-6 w-6 text-green-600" />
+    }
 
     if (lowerName.includes('firecrawl')) return <Flame className="h-6 w-6 text-orange-500" />
     if (lowerName.includes('google')) return <Globe className="h-6 w-6 text-blue-500" />
@@ -582,8 +622,6 @@ export default function ToolsPage() {
     if (lowerCategory === 'file') return <FileText className="h-6 w-6 text-amber-500" />
     if (lowerCategory === 'knowledge') return <Book className="h-6 w-6 text-indigo-500" />
     if (lowerCategory === 'audio') return <Mic className="h-6 w-6 text-green-500" />
-
-    if (type === 'mcp') return <Server className="h-6 w-6 text-green-600" />
     if (type === 'builtin' || lowerCategory === 'basic') return <Wrench className="h-6 w-6 text-slate-500" />
 
     return <Code className="h-6 w-6 text-slate-500" />
@@ -601,11 +639,16 @@ export default function ToolsPage() {
   }
 
   // Get unique categories
-  const categories = Array.from(new Set(tools.map(t => t.category).filter(Boolean))).sort()
+  const categories = Array.from(new Set(
+    tools
+      .map(t => t.category)
+      .filter(Boolean)
+      .filter(c => c !== 'mcp')
+  )).sort()
 
   const filteredTools = tools.filter(t => {
     const matchesSearch = t.name.toLowerCase().includes(searchQuery.toLowerCase()) ||
-                          t.description.toLowerCase().includes(searchQuery.toLowerCase())
+      t.description.toLowerCase().includes(searchQuery.toLowerCase())
 
     // For 'all' tab, show everything (except MCP type which are handled separately if we want,
     // but here we filter 'mcp' type out from tools array usually, let's check filteredApiTools logic)
@@ -846,13 +889,11 @@ export default function ToolsPage() {
             onChange={setSearchQuery}
             className="w-64 bg-background"
           />
+          <Button className="bg-primary text-primary-foreground hover:bg-primary/90" onClick={() => setIsConnectMcpOpen(true)}>
+            <Plus className="h-4 w-4 mr-2" />
+            {t('tools.mcp.addServer')}
+          </Button>
           <Dialog open={isMcpDialogOpen} onOpenChange={setIsMcpDialogOpen}>
-            <DialogTrigger asChild>
-              <Button className="bg-primary text-primary-foreground hover:bg-primary/90" onClick={handleAddMcpServer}>
-                <Plus className="h-4 w-4 mr-2" />
-                {t('tools.mcp.addServer')}
-              </Button>
-            </DialogTrigger>
             <DialogContent className="max-w-2xl max-h-[80vh] overflow-y-auto">
               <DialogHeader>
                 <DialogTitle>
@@ -949,7 +990,7 @@ export default function ToolsPage() {
 
       {/* Tabs */}
       <Tabs value={activeTab} onValueChange={setActiveTab} className="w-full">
-        <TabsList className="w-full justify-start bg-transparent p-0 h-auto border-b border-border/80 rounded-none flex">
+        <TabsList className="w-full justify-start bg-transparent p-0 h-auto border-b border-border/80 rounded-none flex overflow-x-auto">
           <div className="flex space-x-4">
             <TabsTrigger
               value="all"
@@ -997,10 +1038,10 @@ export default function ToolsPage() {
                 filteredSearchProviderTools.length === 0 &&
                 ((activeTab !== 'all' && activeTab !== 'mcp') || (activeTab === 'all' && filteredMcpServers.length === 0)) &&
                 (activeTab !== 'mcp' || filteredMcpServers.length === 0)) && (
-                <div className="col-span-full flex justify-center">
-                  <EmptyState />
-                </div>
-              )}
+                  <div className="col-span-full flex justify-center">
+                    <EmptyState />
+                  </div>
+                )}
 
               {/* Special case: Tab is MCP and no servers */}
               {activeTab === 'mcp' && filteredMcpServers.length === 0 && (
@@ -1075,8 +1116,8 @@ export default function ToolsPage() {
                               <p className="break-all text-xs leading-relaxed text-foreground/80">{item.masked || '--'}</p>
                             </div>
                           </div>
-                      </CardContent>
-                    </Card>
+                        </CardContent>
+                      </Card>
                     )
                   })}
                 </div>
@@ -1216,8 +1257,8 @@ export default function ToolsPage() {
             <DialogDescription>
               {editingConfigTool
                 ? t('tools.credentials.dialog.description', {
-                    tool: editingConfigTool.display_name || editingConfigTool.tool_name,
-                  })
+                  tool: editingConfigTool.display_name || editingConfigTool.tool_name,
+                })
                 : ''}
             </DialogDescription>
           </DialogHeader>
@@ -1257,6 +1298,33 @@ export default function ToolsPage() {
           </DialogFooter>
         </DialogContent>
       </Dialog>
+      <ConnectMcpDialog
+        open={isConnectMcpOpen}
+        onOpenChange={setIsConnectMcpOpen}
+        globalMcpServers={mcpServers}
+        selectedMcpServers={[]} // No pre-selection logic on tools page
+        onSuccess={loadMCPServers}
+      />
+      <OfficialMcpSettingsDialog
+        open={isOfficialAppDialogOpen}
+        onOpenChange={setIsOfficialAppDialogOpen}
+        app={editingOfficialApp}
+        isGloballyConnected={true} // In tools page, official apps are always already connected
+        onSuccess={loadMCPServers}
+        onConfigure={(app) => {
+          if (app.is_custom && app.server) {
+            setIsOfficialAppDialogOpen(false);
+            setEditingServer(app.server);
+            setMcpFormData({
+              name: app.server.name,
+              transport: app.server.transport,
+              description: app.server.description || "",
+              config: app.server.config
+            });
+            setIsMcpDialogOpen(true);
+          }
+        }}
+      />
     </div>
   )
 }

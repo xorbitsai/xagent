@@ -13,9 +13,11 @@ import { ChatInput } from "@/components/chat/ChatInput"
 import { ChatMessage } from "@/components/chat/ChatMessage"
 import { apiRequest } from "@/lib/api-wrapper"
 import { getApiUrl, getWsUrl } from "@/lib/utils"
-import { PlusCircle, MessageSquare, Upload, Download, Settings2, Check, Zap, BookOpen, ChevronLeft, Sparkles, Loader2, XCircle, Trash2, Bot } from "lucide-react"
+import { PlusCircle, MessageSquare, Upload, Download, Settings2, Check, Zap, BookOpen, ChevronLeft, Sparkles, Loader2, X, XCircle, Trash2, Bot } from "lucide-react"
+import { ConnectMcpDialog } from "@/components/mcp/connect-mcp-dialog"
 import { useI18n } from "@/contexts/i18n-context"
 import { useAuth } from "@/contexts/auth-context"
+import { useMcpApps } from "@/contexts/mcp-apps-context"
 import { FileAttachment } from "@/components/file/file-attachment"
 import { createFileChipHTML } from "@/components/chat/FileChip"
 import { MultiSelect } from "@/components/ui/multi-select"
@@ -102,6 +104,7 @@ export function AgentBuilder({ agentId }: AgentBuilderProps) {
   const MAX_INSTRUCTIONS_LENGTH = 8192;
   const { t, locale } = useI18n()
   const { token } = useAuth()
+  const { getAppIcon } = useMcpApps()
   const router = useRouter()
   const searchParams = useSearchParams()
   const templateId = searchParams.get("template")
@@ -124,6 +127,7 @@ export function AgentBuilder({ agentId }: AgentBuilderProps) {
   const [selectedKbs, setSelectedKbs] = useState<string[]>([])
   const [selectedSkills, setSelectedSkills] = useState<string[]>([])
   const [selectedToolCategories, setSelectedToolCategories] = useState<string[]>([])
+  const [selectedMcpServers, setSelectedMcpServers] = useState<string[]>([])
   const [logoFile, setLogoFile] = useState<File | null>(null)
   const [logoUrl, setLogoUrl] = useState<string | null>(null)  // Existing logo URL
   const [isCreating, setIsCreating] = useState(false)
@@ -155,6 +159,8 @@ export function AgentBuilder({ agentId }: AgentBuilderProps) {
   const [kbs, setKbs] = useState<KnowledgeBase[]>([])
   const [skills, setSkills] = useState<Skill[]>([])
   const [tools, setTools] = useState<Tool[]>([])
+  const [mcpServers, setMcpServers] = useState<any[]>([])
+  const [isConnectMcpOpen, setIsConnectMcpOpen] = useState(false)
 
   // File picker state for Instructions
   const instructionsRef = useRef<HTMLDivElement>(null)
@@ -463,12 +469,13 @@ export function AgentBuilder({ agentId }: AgentBuilderProps) {
   useEffect(() => {
     const fetchData = async () => {
       try {
-        const [kbRes, skillsRes, toolsRes, modelsRes, userDefaultsRes] = await Promise.all([
+        const [kbRes, skillsRes, toolsRes, modelsRes, userDefaultsRes, mcpRes] = await Promise.all([
           apiRequest(`${getApiUrl()}/api/kb/collections`),
           apiRequest(`${getApiUrl()}/api/skills/`),
           apiRequest(`${getApiUrl()}/api/tools/available`),
           apiRequest(`${getApiUrl()}/api/models/?category=llm`),
-          apiRequest(`${getApiUrl()}/api/models/user-default`)
+          apiRequest(`${getApiUrl()}/api/models/user-default`),
+          apiRequest(`${getApiUrl()}/api/mcp/servers`)
         ])
 
         if (kbRes.ok) {
@@ -488,6 +495,11 @@ export function AgentBuilder({ agentId }: AgentBuilderProps) {
           const toolsData = await toolsRes.json()
           // Filter only enabled tools
           setTools((toolsData.tools || []).filter((t: Tool) => t.enabled))
+        }
+
+        if (mcpRes.ok) {
+          const mcpData = await mcpRes.json()
+          setMcpServers(mcpData || [])
         }
 
         let availableModels: Model[] = []
@@ -565,7 +577,11 @@ export function AgentBuilder({ agentId }: AgentBuilderProps) {
           setSuggestedPrompts(agent.suggested_prompts || [])
           setSelectedKbs(agent.knowledge_bases || [])
           setSelectedSkills(agent.skills || [])
-          setSelectedToolCategories(agent.tool_categories || [])
+
+          const rawToolCategories = agent.tool_categories || []
+          setSelectedToolCategories(rawToolCategories.filter((c: string) => !c.startsWith('mcp:')))
+          setSelectedMcpServers(rawToolCategories.filter((c: string) => c.startsWith('mcp:')).map((c: string) => c.replace('mcp:', '')))
+
           setLogoUrl(agent.logo_url || null)
 
           // Load models
@@ -641,7 +657,7 @@ export function AgentBuilder({ agentId }: AgentBuilderProps) {
 
   // Group tools by category for category selection
   const toolCategories = Array.from(
-    new Set((Array.isArray(tools) ? tools : []).map(t => t.category))
+    new Set((Array.isArray(tools) ? tools : []).map(t => t.category).filter(c => c !== 'mcp'))
   ).sort()
 
   const toolCategoryOptions = toolCategories.map(category => {
@@ -810,6 +826,12 @@ export function AgentBuilder({ agentId }: AgentBuilderProps) {
         backendMessage = `Uploaded files: ${processedFiles.map(f => f.name).join(', ')}`
       }
 
+      // Add selected MCP servers back into tool_categories
+      const finalToolCategories = [...selectedToolCategories];
+      selectedMcpServers.forEach(server => {
+        finalToolCategories.push(`mcp:${server}`);
+      });
+
       // Send preview request via WebSocket
       wsRef.current.send(JSON.stringify({
         type: "preview",
@@ -819,7 +841,7 @@ export function AgentBuilder({ agentId }: AgentBuilderProps) {
         models: modelConfig,
         knowledge_bases: selectedKbs,
         skills: selectedSkills,
-        tool_categories: selectedToolCategories,
+        tool_categories: finalToolCategories,
         message: backendMessage,
         files: processedFiles
       }))
@@ -878,7 +900,17 @@ export function AgentBuilder({ agentId }: AgentBuilderProps) {
     if (normalizePrompts(suggestedPrompts) !== normalizePrompts(originalData.suggested_prompts)) return true
     if (normalize(selectedKbs) !== normalize(originalData.knowledge_bases)) return true
     if (normalize(selectedSkills) !== normalize(originalData.skills)) return true
-    if (normalize(selectedToolCategories) !== normalize(originalData.tool_categories)) return true
+
+    // Check MCP servers by extracting them from originalData.tool_categories
+    const originalMcpServers = (originalData.tool_categories || [])
+      .filter((c: string) => c.startsWith('mcp:'))
+      .map((c: string) => c.replace('mcp:', ''))
+    if (normalize(selectedMcpServers) !== normalize(originalMcpServers)) return true
+
+    // Check non-MCP tool categories
+    const nonMcpCategories = selectedToolCategories.filter(c => !c.startsWith('mcp:'))
+    const originalNonMcpCategories = (originalData.tool_categories || []).filter((c: string) => !c.startsWith('mcp:'))
+    if (normalize(nonMcpCategories) !== normalize(originalNonMcpCategories)) return true
 
     // Compare models
     const origModels = originalData.models || {}
@@ -888,7 +920,7 @@ export function AgentBuilder({ agentId }: AgentBuilderProps) {
     if ((modelConfig.compact || null) !== (origModels.compact || null)) return true
 
     return false
-  }, [name, description, instructions, executionMode, logoFile, suggestedPrompts, selectedKbs, selectedSkills, selectedToolCategories, modelConfig, originalData])
+  }, [name, description, instructions, executionMode, logoFile, suggestedPrompts, selectedKbs, selectedSkills, selectedToolCategories, selectedMcpServers, modelConfig, originalData])
 
   const handleCreate = async () => {
     // Validation
@@ -910,8 +942,12 @@ export function AgentBuilder({ agentId }: AgentBuilderProps) {
     let finalToolCategories = [...selectedToolCategories]
     if (selectedKbs.length > 0 && !finalToolCategories.includes("knowledge")) {
       finalToolCategories.push("knowledge")
-      setSelectedToolCategories(finalToolCategories)
     }
+
+    // Add selected MCP servers back into tool_categories
+    selectedMcpServers.forEach(server => {
+      finalToolCategories.push(`mcp:${server}`)
+    })
 
     setIsCreating(true)
 
@@ -1586,6 +1622,46 @@ export function AgentBuilder({ agentId }: AgentBuilderProps) {
               })}
             </div>
           )}
+          <div className="flex flex-col gap-2">
+            {mcpServers.filter((s: any) => selectedMcpServers.includes(s.name)).map((server, index) => {
+              const icon = getAppIcon(server.name)
+              return (
+                <div key={index} className="flex items-center gap-3 p-2 rounded-md border">
+                  <div className="bg-slate-100 p-1.5 rounded">
+                    {icon ? (
+                      <img src={icon} alt={server.name} className="h-5 w-5 object-contain" />
+                    ) : (
+                      <span className="text-xl">🔌</span>
+                    )}
+                  </div>
+                  <div>
+                    <div className="text-sm font-medium">{server.name}</div>
+                    <div className="text-xs text-muted-foreground">{server.description}</div>
+                  </div>
+                  <div className="ml-auto">
+                    <Button
+                      variant="ghost"
+                      size="sm"
+                      className="h-8 w-8 p-0 text-red-500 hover:text-red-600 hover:bg-red-50"
+                      onClick={() => setSelectedMcpServers(prev => prev.filter(name => name !== server.name))}
+                    >
+                      <X className="h-4 w-4" />
+                    </Button>
+                  </div>
+                </div>
+              )
+            })}
+            <Button
+              type="button"
+              variant="outline"
+              size="sm"
+              onClick={() => setIsConnectMcpOpen(true)}
+              className="w-auto self-start text-blue-600 border-blue-200 hover:bg-blue-50"
+            >
+              <PlusCircle className="h-4 w-4 mr-2" />
+              {t('tools.mcp.dialog.connectMcp')}
+            </Button>
+          </div>
         </div>
 
         {/* Suggested Prompts */}
@@ -1856,6 +1932,22 @@ export function AgentBuilder({ agentId }: AgentBuilderProps) {
               setSelectedToolCategories(prev => [...prev, "knowledge"])
             }
           }
+        }}
+      />
+
+      <ConnectMcpDialog
+        open={isConnectMcpOpen}
+        onOpenChange={setIsConnectMcpOpen}
+        globalMcpServers={mcpServers}
+        selectedMcpServers={selectedMcpServers}
+        onConnectSelected={(selectedApps) => {
+          setSelectedMcpServers(selectedApps)
+        }}
+        onSuccess={() => {
+          apiRequest(`${getApiUrl()}/api/mcp/servers`)
+            .then(res => res.json())
+            .then(data => setMcpServers(data || []))
+            .catch(console.error)
         }}
       />
     </div>

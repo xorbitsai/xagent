@@ -220,7 +220,7 @@ async def get_available_tools(
             "base_dir": str(get_uploads_dir()),
             "task_id": "tools_list",  # Use a generic task ID for workspace creation
         },
-        include_mcp_tools=True,  # Enable MCP tools
+        include_mcp_tools=False,  # Disable MCP tools listing to avoid slow loading
         task_id="tools_list",  # Generic task ID for tool listing
         browser_tools_enabled=True,  # Enable browser automation tools
     )

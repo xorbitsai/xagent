@@ -105,7 +105,7 @@ export function CloudConnectDialog({
     const left = window.screen.width / 2 - width / 2
     const top = window.screen.height / 2 - height / 2
 
-    const authUrl = `${getApiUrl()}/api/auth/${provider?.authPath}/login?token=${token || ''}`
+    const authUrl = `${getApiUrl()}/api/auth/${provider?.authPath}/login?app_id=${provider?.id}&token=${token || ''}`
 
     window.open(
       authUrl,

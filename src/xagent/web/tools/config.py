@@ -6,11 +6,100 @@ and other web-specific sources.
 """
 
 import logging
+import os
+from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional
+
+import requests
 
 from ...config import get_uploads_dir
 from ...core.tools.adapters.vibe.config import BaseToolConfig
 from ..services.tool_credentials import get_sql_connection_map, resolve_tool_credential
+
+logger = logging.getLogger(__name__)
+
+
+def refresh_oauth_token_if_needed(
+    db: Any, oauth_account: Any, provider_name: str
+) -> bool:
+    """Check if token is expired (or close to expiring) and refresh if needed."""
+    if not oauth_account.expires_at:
+        return True  # Assume valid if no expiration is set
+
+    # Check if expired (or expiring within 5 minutes)
+    now = datetime.now(timezone.utc)
+
+    # Handle timezone naive vs aware
+    expires_at = oauth_account.expires_at
+    if expires_at.tzinfo is None:
+        expires_at = expires_at.replace(tzinfo=timezone.utc)
+
+    if expires_at > now + timedelta(minutes=5):
+        return True  # Token is still valid
+
+    if not oauth_account.refresh_token:
+        logger.warning(
+            f"Token expired for {provider_name} but no refresh_token available."
+        )
+        return False
+
+    logger.info(f"Token expired for {provider_name}, attempting to refresh...")
+    try:
+        from ..mcp_apps import OAUTH_PROVIDERS
+
+        provider_config = OAUTH_PROVIDERS.get(provider_name)
+        if not provider_config:
+            logger.warning(f"Unknown provider for refresh: {provider_name}")
+            return False
+
+        client_id = os.environ.get(provider_config["client_id_env"])
+        client_secret = os.environ.get(provider_config["client_secret_env"])
+
+        if not client_id or not client_secret:
+            logger.warning(
+                f"{provider_name} OAuth not configured (missing CLIENT_ID or SECRET)."
+            )
+            return False
+
+        data = {
+            "grant_type": "refresh_token",
+            "refresh_token": oauth_account.refresh_token,
+            "client_id": client_id,
+            "client_secret": client_secret,
+        }
+
+        headers = {}
+        if provider_name == "linkedin":
+            headers["Content-Type"] = "application/x-www-form-urlencoded"
+
+        response = requests.post(
+            provider_config["token_url"], data=data, headers=headers, timeout=10
+        )
+
+        if response.status_code == 200:
+            data = response.json()
+            if "access_token" in data:
+                oauth_account.access_token = data["access_token"]
+                if "refresh_token" in data:
+                    oauth_account.refresh_token = data["refresh_token"]
+                if "expires_in" in data:
+                    oauth_account.expires_at = datetime.now(timezone.utc) + timedelta(
+                        seconds=data["expires_in"]
+                    )
+                db.commit()
+                logger.info(
+                    f"Successfully refreshed {provider_name} token for user {oauth_account.user_id}"
+                )
+                return True
+        else:
+            logger.error(f"Failed to refresh {provider_name} token: {response.text}")
+
+    except Exception as e:
+        logger.error(
+            f"Exception refreshing token for {provider_name}: {e}", exc_info=True
+        )
+
+    return False
 
 
 class WebToolConfig(BaseToolConfig):
@@ -167,6 +256,9 @@ class WebToolConfig(BaseToolConfig):
 
     def get_mcp_server_configs(self) -> List[Dict[str, Any]]:
         """Load MCP server configurations from database."""
+        if not self._include_mcp_tools:
+            return []
+
         if self._cached_mcp_configs is None:
             self._cached_mcp_configs = self._load_mcp_server_configs()
         return self._cached_mcp_configs
@@ -392,6 +484,122 @@ class WebToolConfig(BaseToolConfig):
 
                 # Add transport-specific configuration
                 transport_config = {}
+
+                # Handle OAuth credentials
+                if server.transport == "oauth":
+                    # Find corresponding OAuth account
+                    # The provider might be linkedin, google, etc. based on the app config
+                    from ...web.mcp_apps import MCP_APPS_LIBRARY
+                    from ...web.models.user_oauth import UserOAuth
+
+                    app_info = next(
+                        (
+                            app
+                            for app in MCP_APPS_LIBRARY
+                            if app.get("name") == server.name
+                        ),
+                        None,
+                    )
+                    provider_name = (
+                        app_info.get("provider") if app_info else server.name.lower()
+                    )
+
+                    # Some oauth records might be saved with the app_id as provider instead of the general provider_name
+                    # For example, "google-drive" instead of "google"
+                    app_id = app_info.get("id") if app_info else None
+
+                    if app_id:
+                        providers_to_check = [provider_name, app_id]
+                        oauth_account = (
+                            self.db.query(UserOAuth)
+                            .filter(
+                                UserOAuth.user_id == self._user_id,
+                                UserOAuth.provider.in_(providers_to_check),
+                            )
+                            .first()
+                        )
+                        logger.info(
+                            f"🔑 OAUTH CONFIG: Checked providers {providers_to_check} for user {self._user_id}. Found: {oauth_account is not None}"
+                        )
+                    else:
+                        oauth_account = (
+                            self.db.query(UserOAuth)
+                            .filter(
+                                UserOAuth.user_id == self._user_id,
+                                UserOAuth.provider == provider_name,
+                            )
+                            .first()
+                        )
+                        logger.info(
+                            f"🔑 OAUTH CONFIG: Checked provider '{provider_name}' for user {self._user_id}. Found: {oauth_account is not None}"
+                        )
+
+                    if oauth_account and oauth_account.access_token:
+                        logger.info(
+                            f"🔑 OAUTH CONFIG: Token found for '{provider_name}'. Refresh token present: {oauth_account.refresh_token is not None}, Expires: {oauth_account.expires_at}"
+                        )
+                        # Check and refresh token if needed before using it
+                        is_valid = refresh_oauth_token_if_needed(
+                            self.db,
+                            oauth_account,
+                            str(provider_name) if provider_name else "",
+                        )
+
+                        if is_valid and app_info:
+                            app_id = app_info.get("id")
+                            logger.info(
+                                f"🔑 OAUTH CONFIG: Mapping '{app_id}' to executable proxy"
+                            )
+
+                            launch_config = app_info.get("launch_config")
+                            if launch_config:
+                                config["transport"] = "stdio"
+                                transport_config["transport"] = "stdio"
+                                transport_config["command"] = launch_config["command"]
+                                transport_config["args"] = launch_config.get(
+                                    "args", []
+                                ).copy()
+
+                                env = {}
+                                for env_key, token_type in launch_config.get(
+                                    "env_mapping", {}
+                                ).items():
+                                    if token_type == "access_token":
+                                        env[env_key] = oauth_account.access_token
+
+                                env.update(
+                                    {
+                                        "HTTPS_PROXY": os.environ.get(
+                                            "HTTPS_PROXY", ""
+                                        ),
+                                        "HTTP_PROXY": os.environ.get("HTTP_PROXY", ""),
+                                        "https_proxy": os.environ.get(
+                                            "https_proxy", ""
+                                        ),
+                                        "http_proxy": os.environ.get("http_proxy", ""),
+                                    }
+                                )
+                                transport_config["env"] = env  # type: ignore
+                            else:
+                                config["transport"] = "stdio"
+                                transport_config["transport"] = "stdio"
+                                transport_config["command"] = "npx"
+                                transport_config["args"] = [  # type: ignore
+                                    "-y",
+                                    f"@mcp-servers/{str(server.name).lower().replace(' ', '-')}",
+                                ]
+                                transport_config["env"] = {  # type: ignore
+                                    f"{str(server.name).upper().replace(' ', '_')}_ACCESS_TOKEN": oauth_account.access_token,
+                                    "HTTPS_PROXY": os.environ.get("HTTPS_PROXY", ""),
+                                    "HTTP_PROXY": os.environ.get("HTTP_PROXY", ""),
+                                    "https_proxy": os.environ.get("https_proxy", ""),
+                                    "http_proxy": os.environ.get("http_proxy", ""),
+                                }
+
+                    else:
+                        logger.info(
+                            f"🔑 OAUTH CONFIG: No valid token found for '{provider_name}'."
+                        )
 
                 if server.transport == "stdio":
                     if server.command:

@@ -2883,7 +2883,9 @@ async def handle_build_preview_execution(
     models_config = message_data.get("models", {})
     knowledge_bases = message_data.get("knowledge_bases", [])
     skills = message_data.get("skills", [])
-    tool_categories = message_data.get("tool_categories", [])
+    tool_categories = message_data.get(
+        "selectedToolCategories", []
+    ) or message_data.get("tool_categories", [])
     user_message = message_data.get("message", "")
     files_data = message_data.get("files", [])
 
@@ -2996,7 +2998,7 @@ async def handle_build_preview_execution(
                 user_id=int(user.id),
                 is_admin=bool(user.is_admin),
                 workspace_config=None,
-                include_mcp_tools=False,
+                include_mcp_tools=True,
                 task_id=None,
                 browser_tools_enabled=True,
             )
@@ -3009,11 +3011,28 @@ async def handle_build_preview_execution(
                 for tool in all_tools:
                     if hasattr(tool, "metadata") and hasattr(tool.metadata, "category"):
                         category = str(tool.metadata.category.value)
+                        tool_name = getattr(tool, "name", None)
+
                         if category in tool_categories:
-                            # Tool protocol doesn't guarantee name attribute, use getattr
-                            tool_name = getattr(tool, "name", None)
                             if tool_name:
                                 allowed_tools.append(tool_name)
+                        elif category == "mcp" and tool_name:
+                            for tc in tool_categories:
+                                if tc.startswith("mcp:"):
+                                    server_name = (
+                                        tc.split(":", 1)[1]
+                                        .replace(" ", "_")
+                                        .replace("-", "_")
+                                    )
+                                    logger.info(
+                                        f"🔍 Checking MCP tool: '{tool_name}' vs 'mcp_{server_name}_'"
+                                    )
+                                    # Use case-insensitive matching for MCP server prefix
+                                    if tool_name.lower().startswith(
+                                        f"mcp_{server_name.lower()}_"
+                                    ):
+                                        allowed_tools.append(tool_name)
+                                        break
 
                 return allowed_tools
 
@@ -3034,6 +3053,7 @@ async def handle_build_preview_execution(
             task_id=preview_task_id,
             workspace_base_dir=str(get_uploads_dir() / "build_preview"),
             vision_model=vision_llm,  # Pass vision model for tool creation
+            include_mcp_tools=True,
         )
 
         # Create sandbox for preview task

@@ -6,6 +6,8 @@ import os
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, Optional, cast
 
+import requests
+
 # Relax token scope verification as Google might add extra scopes (like openid)
 os.environ["OAUTHLIB_RELAX_TOKEN_SCOPE"] = "1"
 
@@ -744,26 +746,68 @@ def get_google_client_config() -> Optional[Dict[str, Any]]:
     }
 
 
-GOOGLE_SCOPES = [
-    "https://www.googleapis.com/auth/userinfo.email",
-    "https://www.googleapis.com/auth/userinfo.profile",
-    "https://www.googleapis.com/auth/drive.readonly",
-]
+def get_google_scopes_for_app(app_id: Optional[str]) -> list[str]:
+    """Get Google OAuth scopes based on the requested app_id"""
+    base_scopes = [
+        "https://www.googleapis.com/auth/userinfo.email",
+        "https://www.googleapis.com/auth/userinfo.profile",
+    ]
+
+    if not app_id:
+        # Fallback to base scopes if no specific app is requested
+        return base_scopes
+
+    from ..mcp_apps import MCP_APPS_LIBRARY
+
+    app_info = next((app for app in MCP_APPS_LIBRARY if app.get("id") == app_id), None)
+    if app_info and "oauth_scopes" in app_info:
+        return base_scopes + list(app_info["oauth_scopes"])
+
+    # Raise error if unknown app_id is requested
+    raise ValueError(f"Unknown Google app_id: {app_id}")
 
 
-@auth_router.get("/google/login")
+def _ensure_user_mcp_server(
+    db: Session, user_id: str, app_info: Dict[str, Any]
+) -> None:
+    """Ensure MCPServer and UserMCPServer records exist for an OAuth app."""
+    from ..models.mcp import MCPServer, UserMCPServer
+
+    mcp_server = db.query(MCPServer).filter(MCPServer.name == app_info["name"]).first()
+    if not mcp_server:
+        mcp_server = MCPServer(
+            name=app_info["name"],
+            description=app_info["description"],
+            managed="external",
+            transport="oauth",
+        )
+        db.add(mcp_server)
+        db.flush()
+
+    user_mcp = (
+        db.query(UserMCPServer)
+        .filter(
+            UserMCPServer.user_id == user_id,
+            UserMCPServer.mcpserver_id == mcp_server.id,
+        )
+        .first()
+    )
+
+    if not user_mcp:
+        user_mcp = UserMCPServer(
+            user_id=user_id, mcpserver_id=mcp_server.id, is_owner=True, is_active=True
+        )
+        db.add(user_mcp)
+
+
 async def google_login(
-    token: Optional[str] = None, db: Session = Depends(get_db)
+    token: Optional[str] = None,
+    app_id: Optional[str] = None,
+    db: Session = Depends(get_db),
 ) -> Any:
     """Initiate Google OAuth flow"""
     client_config = get_google_client_config()
     if not client_config:
-        # Fallback for demo/development if no env vars
-        # In production, this should raise an error
-        # raise HTTPException(
-        #     status_code=500,
-        #     detail="Google OAuth not configured (GOOGLE_CLIENT_ID/SECRET missing)",
-        # )
         return HTMLResponse(
             "<h1>Google OAuth Config Missing</h1><p>Please set GOOGLE_CLIENT_ID and GOOGLE_CLIENT_SECRET env vars.</p>",
             status_code=500,
@@ -781,7 +825,7 @@ async def google_login(
                 user_id = user.id
 
     # Create state token containing user_id
-    state_data = {"user_id": user_id, "type": "oauth_state"}
+    state_data = {"user_id": user_id, "type": "oauth_state", "app_id": app_id}
     state = create_access_token(state_data, expires_delta=timedelta(minutes=10))
 
     # Redirect URI
@@ -793,7 +837,9 @@ async def google_login(
         )
 
     flow = Flow.from_client_config(
-        client_config, scopes=GOOGLE_SCOPES, redirect_uri=redirect_uri
+        client_config,
+        scopes=get_google_scopes_for_app(app_id),
+        redirect_uri=redirect_uri,
     )
 
     authorization_url, _ = flow.authorization_url(
@@ -819,7 +865,6 @@ async def google_login(
     return response
 
 
-@auth_router.get("/google/callback")
 async def google_callback(request: Request, db: Session = Depends(get_db)) -> Any:
     """Handle Google OAuth callback"""
     code = request.query_params.get("code")
@@ -834,6 +879,7 @@ async def google_callback(request: Request, db: Session = Depends(get_db)) -> An
         return HTMLResponse("<h1>Error: Invalid or expired state</h1>", status_code=400)
 
     user_id = payload.get("user_id")
+    app_id = payload.get("app_id")
 
     client_config = get_google_client_config()
     if not client_config:
@@ -851,7 +897,7 @@ async def google_callback(request: Request, db: Session = Depends(get_db)) -> An
     try:
         flow = Flow.from_client_config(
             client_config,
-            scopes=GOOGLE_SCOPES,
+            scopes=get_google_scopes_for_app(app_id),
             redirect_uri=redirect_uri,
         )
 
@@ -882,24 +928,19 @@ async def google_callback(request: Request, db: Session = Depends(get_db)) -> An
 
         # Save to DB if user_id is present
         if user_id:
-            # Check if exists by provider_user_id (Google user ID)
-            oauth_account = (
-                db.query(UserOAuth)
-                .filter(
-                    UserOAuth.user_id == user_id,
-                    UserOAuth.provider == "google-drive",
-                    UserOAuth.provider_user_id == provider_user_id,
-                )
-                .first()
-            )
+            # Delete any existing records for this app to ensure only the latest account is kept
+            # This handles the case where previous bugs might have left multiple records
+            db.query(UserOAuth).filter(
+                UserOAuth.user_id == user_id,
+                UserOAuth.provider == app_id,
+            ).delete()
 
-            if not oauth_account:
-                oauth_account = UserOAuth(
-                    user_id=user_id,
-                    provider="google-drive",
-                    provider_user_id=provider_user_id,
-                )
-                db.add(oauth_account)
+            oauth_account = UserOAuth(
+                user_id=user_id,
+                provider=app_id,
+                provider_user_id=provider_user_id,
+            )
+            db.add(oauth_account)
 
             oauth_account.access_token = credentials.token
             oauth_account.refresh_token = credentials.refresh_token
@@ -910,6 +951,15 @@ async def google_callback(request: Request, db: Session = Depends(get_db)) -> An
             oauth_account.email = email
             if credentials.expiry:
                 oauth_account.expires_at = credentials.expiry
+
+            # Make sure there are MCPServer records for Google apps so they show up in /tools and /build
+            from ..mcp_apps import MCP_APPS_LIBRARY
+
+            # Only connect the specific app the user requested
+            google_apps = [app for app in MCP_APPS_LIBRARY if app.get("id") == app_id]
+
+            for app_info in google_apps:
+                _ensure_user_mcp_server(db, user_id, app_info)
 
             db.commit()
         else:
@@ -928,7 +978,7 @@ async def google_callback(request: Request, db: Session = Depends(get_db)) -> An
                     window.opener.postMessage({{
                         type: 'oauth-success',
                         email: '{email}',
-                        provider: 'google-drive'
+                        provider: '{app_id}'
                     }}, "*");
                     window.close();
                 </script>
@@ -946,9 +996,245 @@ async def google_callback(request: Request, db: Session = Depends(get_db)) -> An
         return response
 
     except Exception as e:
-        import traceback
+        import logging
 
-        traceback.print_exc()
+        logger = logging.getLogger(__name__)
+        logger.exception("Google OAuth callback failed")
         return HTMLResponse(
             f"<h1>Authentication Failed</h1><p>{str(e)}</p>", status_code=500
+        )
+
+
+# LinkedIn OAuth Constants
+LINKEDIN_AUTH_URL = "https://www.linkedin.com/oauth/v2/authorization"
+LINKEDIN_TOKEN_URL = "https://www.linkedin.com/oauth/v2/accessToken"
+
+
+async def linkedin_login(
+    token: Optional[str] = None, db: Session = Depends(get_db)
+) -> Any:
+    """Start LinkedIn OAuth flow"""
+    client_id = os.environ.get("LINKEDIN_CLIENT_ID")
+    redirect_uri = os.environ.get(
+        "LINKEDIN_REDIRECT_URI", "http://localhost:8000/api/auth/linkedin/callback"
+    )
+
+    if not client_id:
+        return HTMLResponse(
+            "<h1>Error: LinkedIn OAuth not configured</h1><p>LINKEDIN_CLIENT_ID missing</p>",
+            status_code=500,
+        )
+
+    # Verify user token if provided
+    user_id = None
+    if token:
+        payload = verify_token(token)
+        if payload and payload.get("type") == "access":
+            # We need to find the user ID from username (sub)
+            username = payload.get("sub")
+            user = db.query(User).filter(User.username == username).first()
+            if user:
+                user_id = user.id
+
+    if not user_id:
+        return HTMLResponse(
+            "<h1>Error: Not authenticated</h1><p>Please provide a valid token.</p>",
+            status_code=401,
+        )
+
+    # Create state token
+    state_payload = {"type": "oauth_state", "user_id": user_id, "provider": "linkedin"}
+    state = create_access_token(data=state_payload, expires_delta=timedelta(minutes=10))
+
+    # Standard LinkedIn scopes plus social posting and reading
+    scope = "openid profile email w_member_social r_member_social"
+
+    auth_url = f"{LINKEDIN_AUTH_URL}?response_type=code&client_id={client_id}&redirect_uri={redirect_uri}&state={state}&scope={scope}"
+
+    return RedirectResponse(auth_url)
+
+
+async def linkedin_callback(request: Request, db: Session = Depends(get_db)) -> Any:
+    """Handle LinkedIn OAuth callback"""
+    code = request.query_params.get("code")
+    state = request.query_params.get("state")
+    error = request.query_params.get("error")
+    error_description = request.query_params.get("error_description")
+
+    if error:
+        return HTMLResponse(
+            f"<h1>Error: {error}</h1><p>{error_description}</p>", status_code=400
+        )
+
+    if not code or not state:
+        return HTMLResponse("<h1>Error: Missing code or state</h1>", status_code=400)
+
+    # Verify state
+    payload = verify_token(state)
+    if (
+        not payload
+        or payload.get("type") != "oauth_state"
+        or payload.get("provider") != "linkedin"
+    ):
+        return HTMLResponse("<h1>Error: Invalid or expired state</h1>", status_code=400)
+
+    user_id = payload.get("user_id")
+    client_id = os.environ.get("LINKEDIN_CLIENT_ID")
+    client_secret = os.environ.get("LINKEDIN_CLIENT_SECRET")
+    redirect_uri = os.environ.get(
+        "LINKEDIN_REDIRECT_URI", "http://localhost:8000/api/auth/linkedin/callback"
+    )
+
+    if not client_id or not client_secret:
+        return HTMLResponse(
+            "<h1>Error: LinkedIn OAuth not configured</h1>", status_code=500
+        )
+
+    try:
+        # Exchange code for token
+        data = {
+            "grant_type": "authorization_code",
+            "code": code,
+            "client_id": client_id,
+            "client_secret": client_secret,
+            "redirect_uri": redirect_uri,
+        }
+        headers = {"Content-Type": "application/x-www-form-urlencoded"}
+
+        token_response = requests.post(LINKEDIN_TOKEN_URL, data=data, headers=headers)
+        token_data = token_response.json()
+
+        if "error" in token_data:
+            return HTMLResponse(
+                f"<h1>Error exchanging token</h1><p>{token_data.get('error_description', token_data.get('error'))}</p>",
+                status_code=400,
+            )
+
+        access_token = token_data.get("access_token")
+        expires_in = token_data.get("expires_in")
+
+        # Get user profile info
+        profile_url = "https://api.linkedin.com/v2/userinfo"
+        profile_headers = {
+            "Authorization": f"Bearer {access_token}",
+            "Connection": "close",
+        }
+
+        # Add connection pooling to prevent EOF errors and retry automatically
+        session = requests.Session()
+        adapter = requests.adapters.HTTPAdapter(max_retries=3)
+        session.mount("https://", adapter)
+
+        profile_response = session.get(profile_url, headers=profile_headers, timeout=10)
+        profile_response.raise_for_status()
+        profile_data = profile_response.json()
+
+        provider_user_id = profile_data.get("sub")
+        email = profile_data.get("email")
+
+        if user_id:
+            # Delete any existing records to ensure only the latest account is kept
+            db.query(UserOAuth).filter(
+                UserOAuth.user_id == user_id, UserOAuth.provider == "linkedin"
+            ).delete()
+
+            oauth_account = UserOAuth(
+                user_id=user_id,
+                provider="linkedin",
+                provider_user_id=provider_user_id,
+            )
+            db.add(oauth_account)
+
+            setattr(oauth_account, "access_token", access_token)
+            setattr(oauth_account, "token_type", "Bearer")
+            setattr(
+                oauth_account, "scope", token_data.get("scope", "openid profile email")
+            )
+            setattr(oauth_account, "provider_user_id", provider_user_id)
+            setattr(oauth_account, "email", email)
+            if "refresh_token" in token_data:
+                setattr(oauth_account, "refresh_token", token_data.get("refresh_token"))
+            if expires_in:
+                setattr(
+                    oauth_account,
+                    "expires_at",
+                    datetime.now(timezone.utc) + timedelta(seconds=expires_in),
+                )
+
+            # Make sure there is an MCPServer record for LinkedIn so it shows up in /tools
+            from ..mcp_apps import MCP_APPS_LIBRARY
+
+            linkedin_apps = [
+                app for app in MCP_APPS_LIBRARY if app.get("provider") == "linkedin"
+            ]
+
+            for app_info in linkedin_apps:
+                _ensure_user_mcp_server(db, user_id, app_info)
+
+            db.commit()
+
+        return HTMLResponse(
+            f"""
+        <html>
+            <head>
+                <title>LinkedIn Connected</title>
+                <script>
+                    window.opener.postMessage({{
+                        type: 'oauth-success',
+                        email: '{email}',
+                        provider: 'linkedin'
+                    }}, "*");
+                    window.close();
+                </script>
+            </head>
+            <body>
+                <h1>LinkedIn Connected Successfully</h1>
+                <p>You can close this window now.</p>
+            </body>
+        </html>
+        """
+        )
+    except Exception as e:
+        import logging
+
+        logger = logging.getLogger(__name__)
+        logger.exception("LinkedIn OAuth callback failed")
+        return HTMLResponse(
+            f"<h1>Authentication Failed</h1><p>{str(e)}</p>", status_code=500
+        )
+
+
+# --- Unified OAuth Routes ---
+
+
+@auth_router.get("/{provider}/login")
+async def oauth_login(
+    provider: str,
+    token: Optional[str] = None,
+    app_id: Optional[str] = None,
+    db: Session = Depends(get_db),
+) -> Any:
+    """Unified entry point for OAuth login"""
+    if provider == "google":
+        return await google_login(token, app_id, db)
+    elif provider == "linkedin":
+        return await linkedin_login(token, db)
+    else:
+        return HTMLResponse(
+            f"<h1>Unsupported provider: {provider}</h1>", status_code=400
+        )
+
+
+@auth_router.get("/{provider}/callback")
+async def oauth_callback(
+    provider: str, request: Request, db: Session = Depends(get_db)
+) -> Any:
+    """Unified entry point for OAuth callback"""
+    if provider == "google":
+        return await google_callback(request, db)
+    elif provider == "linkedin":
+        return await linkedin_callback(request, db)
+    else:
+        return HTMLResponse(
+            f"<h1>Unsupported provider: {provider}</h1>", status_code=400
         )

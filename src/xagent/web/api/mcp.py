@@ -18,6 +18,7 @@ from sqlalchemy.orm import Session
 from ...core.tools.core.mcp.data_config import MCPServerConfig
 from ...core.tools.core.mcp.manager.db import DatabaseMCPServerManager
 from ..auth_dependencies import get_current_user
+from ..mcp_apps import MCP_APPS_LIBRARY, get_app_by_name
 from ..models.database import get_db
 from ..models.mcp import MCPServer, UserMCPServer
 from ..models.user import User
@@ -64,6 +65,9 @@ class MCPServerResponse(BaseModel):
     transport_display: str
     created_at: str
     updated_at: str
+    connected_account: Optional[str] = None
+    app_id: Optional[str] = None
+    provider: Optional[str] = None
 
     class Config:
         from_attributes = True
@@ -347,6 +351,9 @@ def _db_server_to_response(
     server: MCPServer,
     user_mcp: UserMCPServer,
     manager: DatabaseMCPServerManager,
+    connected_account: Optional[str] = None,
+    app_id: Optional[str] = None,
+    provider: Optional[str] = None,
 ) -> MCPServerResponse:
     """Convert database MCPServer to response model."""
     # Get status from manager if available
@@ -375,7 +382,146 @@ def _db_server_to_response(
         transport_display=server.transport_display,
         created_at=str(server.created_at.isoformat()),
         updated_at=str(server.updated_at.isoformat()),
+        connected_account=connected_account,
+        app_id=app_id,
+        provider=provider,
     )
+
+
+def _enrich_oauth_server_info(
+    server: MCPServer, oauth_emails: dict
+) -> tuple[Optional[str], Optional[str], Optional[str]]:
+    """
+    Return (app_id, provider, connected_account) for an OAuth-based MCPServer.
+    This encapsulates the logic of looking up app information in O(1) time.
+    """
+    if server.transport != "oauth":
+        return None, None, None
+
+    app_info = get_app_by_name(str(server.name))
+    if not app_info:
+        return None, None, None
+
+    provider = app_info.get("provider")
+    app_id = app_info.get("id")
+    connected_account = oauth_emails.get(app_id) or oauth_emails.get(provider)
+
+    return app_id, provider, connected_account
+
+
+@mcp_router.get("/apps", response_model=List[dict])
+async def list_mcp_apps(
+    search: Optional[str] = None,
+    category: Optional[str] = "All",
+    location: Optional[str] = "remote",
+    status: Optional[str] = "all",
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> List[dict]:
+    """Get the list of available MCP applications in the library."""
+
+    # Query connected servers for the current user
+    user_mcps = (
+        db.query(MCPServer, UserMCPServer)
+        .join(UserMCPServer, UserMCPServer.mcpserver_id == MCPServer.id)
+        .filter(UserMCPServer.user_id == current_user.id)
+        .all()
+    )
+
+    # Also fetch user oauth accounts to get the connected email
+    from ..models.user_oauth import UserOAuth
+
+    oauth_accounts = (
+        db.query(UserOAuth).filter(UserOAuth.user_id == current_user.id).all()
+    )
+    oauth_emails = {
+        str(oauth.provider): str(oauth.email) for oauth in oauth_accounts if oauth.email
+    }
+
+    # Try to map connected names to emails
+    connected_apps = {}
+    for server, _ in user_mcps:
+        connected_apps[server.name.lower()] = server.id
+
+    results = []
+
+    if location in ["remote", "all"]:
+        for app in MCP_APPS_LIBRARY:
+            if search:
+                search_lower = search.lower()
+                if (
+                    search_lower not in app["name"].lower()
+                    and search_lower not in app.get("description", "").lower()
+                ):
+                    continue
+
+            if category and category != "All":
+                if app.get("category") != category:
+                    continue
+
+            app_copy = app.copy()
+            is_connected = (
+                app["name"].lower() in connected_apps
+                or app["id"].lower() in connected_apps
+            )
+            app_copy["is_connected"] = is_connected
+
+            if is_connected:
+                # Find the server id
+                server_id = connected_apps.get(
+                    app["name"].lower()
+                ) or connected_apps.get(app["id"].lower())
+                app_copy["server_id"] = server_id
+
+                # Find connected email
+                provider = app.get("provider")
+                app_id = app.get("id")
+                # Check for email in both provider and app_id keys
+                email = oauth_emails.get(str(app_id)) if app_id else None
+                if not email and provider:
+                    email = oauth_emails.get(str(provider))
+                if email:
+                    app_copy["connected_account"] = email
+
+            if status == "verified" and not app_copy["is_connected"]:
+                continue
+
+            results.append(app_copy)
+
+    if location in ["local", "all"]:
+        library_names = {app["name"].lower() for app in MCP_APPS_LIBRARY}
+        for server, user_mcp in user_mcps:
+            if server.name.lower() in library_names:
+                continue
+
+            if search:
+                search_lower = search.lower()
+                if search_lower not in server.name.lower() and (
+                    server.description
+                    and search_lower not in server.description.lower()
+                ):
+                    continue
+
+            if category and category != "All":
+                continue
+
+            results.append(
+                {
+                    "id": server.name,
+                    "name": server.name,
+                    "description": server.description or "Custom MCP Server",
+                    "icon": "",
+                    "users": "1",
+                    "transport": server.transport,
+                    "is_connected": True,
+                    "provider": "custom",
+                    "category": "Local",
+                    "is_local": True,
+                    "server_id": server.id,
+                }
+            )
+
+    return results
 
 
 @mcp_router.get("/servers", response_model=List[MCPServerResponse])
@@ -399,10 +545,28 @@ async def list_mcp_servers(
 
         logger.info(f"user_mcps: {user_mcps}")
 
-        return [
-            _db_server_to_response(server, user_mcp, manager)
-            for user_mcp, server in user_mcps
-        ]
+        # Fetch oauth emails
+        from ..models.user_oauth import UserOAuth
+
+        oauth_accounts = db.query(UserOAuth).filter(UserOAuth.user_id == user_id).all()
+        oauth_emails = {
+            str(oauth.provider): str(oauth.email)
+            for oauth in oauth_accounts
+            if oauth.email
+        }
+
+        responses = []
+        for user_mcp, server in user_mcps:
+            app_id, provider, connected_account = _enrich_oauth_server_info(
+                server, oauth_emails
+            )
+            responses.append(
+                _db_server_to_response(
+                    server, user_mcp, manager, connected_account, app_id, provider
+                )
+            )
+
+        return responses
 
     except Exception as e:
         logger.error(f"Failed to list MCP servers: {e}")
@@ -437,7 +601,22 @@ async def get_mcp_server(
             )
 
         user_mcp, server = result
-        return _db_server_to_response(server, user_mcp, manager)
+
+        # Fetch oauth emails for this user to enrich the server info
+        from ..models.user_oauth import UserOAuth
+
+        oauth_accounts = db.query(UserOAuth).filter(UserOAuth.user_id == user_id).all()
+        oauth_emails = {
+            oauth.provider: oauth.email for oauth in oauth_accounts if oauth.email
+        }
+
+        app_id, provider, connected_account = _enrich_oauth_server_info(
+            server, oauth_emails
+        )
+
+        return _db_server_to_response(
+            server, user_mcp, manager, connected_account, app_id, provider
+        )
 
     except HTTPException:
         raise
@@ -627,6 +806,27 @@ async def delete_mcp_server(
 
         user_mcp, server = result
         server_name = server.name
+
+        # If it's an OAuth server, also delete the corresponding OAuth tokens
+        if server.transport == "oauth":
+            from ..models.user_oauth import UserOAuth
+
+            # Find the corresponding app_id and provider
+            app_info = next(
+                (app for app in MCP_APPS_LIBRARY if app.get("name") == server.name),
+                None,
+            )
+            if app_info:
+                provider = app_info.get("provider")
+                app_id = app_info.get("id")
+
+                # Delete tokens for this specific app
+                providers_to_delete = [p for p in [provider, app_id] if p is not None]
+                if providers_to_delete:
+                    db.query(UserOAuth).filter(
+                        UserOAuth.user_id == user_id,
+                        UserOAuth.provider.in_(providers_to_delete),
+                    ).delete(synchronize_session=False)
 
         # Remove user-server association
         db.delete(user_mcp)

@@ -10,6 +10,7 @@ import { getBrandingFromEnv } from "@/lib/branding";
 import { I18nProvider } from "@/contexts/i18n-context";
 import { getThemeFromEnv, themes } from "@/lib/theme";
 import { Toaster } from "@/components/ui/sonner";
+import { McpAppsProvider } from "@/contexts/mcp-apps-context";
 
 const branding = getBrandingFromEnv();
 
@@ -121,10 +122,12 @@ export default async function RootLayout({
         <I18nProvider initialLocale={initialLocale}>
           <ThemeProvider>
             <AuthProvider>
-              <AuthGuard>
-                <LayoutContent>{children}</LayoutContent>
-                <Toaster />
-              </AuthGuard>
+              <McpAppsProvider>
+                <AuthGuard>
+                  <LayoutContent>{children}</LayoutContent>
+                  <Toaster />
+                </AuthGuard>
+              </McpAppsProvider>
             </AuthProvider>
           </ThemeProvider>
         </I18nProvider>

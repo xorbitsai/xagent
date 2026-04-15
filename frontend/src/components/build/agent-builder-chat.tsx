@@ -38,9 +38,10 @@ interface AgentBuilderChatProps {
   onUpdateConfig: (config: Partial<AgentConfig>) => void
   availableOptions?: any
   initialPrompt?: string | null
+  toolCategories?: string[]
 }
 
-export function AgentBuilderChat({ agentConfig, onUpdateConfig, availableOptions, initialPrompt }: AgentBuilderChatProps) {
+export function AgentBuilderChat({ agentConfig, onUpdateConfig, availableOptions, initialPrompt, toolCategories = [] }: AgentBuilderChatProps) {
   const { t } = useI18n()
   const { token } = useAuth()
   const [messages, setMessages] = useState<Message[]>([])
@@ -99,10 +100,17 @@ export function AgentBuilderChat({ agentConfig, onUpdateConfig, availableOptions
     let currentReply = ""
 
     const sendPayload = (ws: WebSocket) => {
+      // Add selected MCP servers back into tool_categories
+      const finalToolCategories = [...(agentConfig.selectedToolCategories || [])];
+      toolCategories.forEach(server => {
+        finalToolCategories.push(`mcp:${server}`);
+      });
+
       const { modelConfig, ...restConfig } = agentConfig
       ws.send(JSON.stringify({
         message: text,
         ...restConfig,
+        tool_categories: finalToolCategories,
         models: modelConfig || {}
       }))
     }

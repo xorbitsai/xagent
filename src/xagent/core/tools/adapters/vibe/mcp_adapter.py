@@ -58,6 +58,9 @@ class MCPToolAdapter(AbstractBaseTool):
         self._name_prefix = name_prefix or ""
         self._visibility = visibility or ToolVisibility.PRIVATE
         self._allow_users = allow_users
+        from .base import ToolCategory
+
+        self.category = ToolCategory.MCP
 
         # Build models from MCP tool schema
         self._args_type = self._build_args_model()
@@ -65,8 +68,11 @@ class MCPToolAdapter(AbstractBaseTool):
 
     @property
     def name(self) -> str:
-        """Get tool name with optional prefix."""
-        return f"{self._name_prefix}{self.mcp_tool.name}"
+        """Get tool name with optional prefix, formatted for LLM requirements."""
+        raw_name = f"{self._name_prefix}{self.mcp_tool.name}"
+        # Replace spaces and dashes with underscores to match LLM tool naming constraints
+        # This matches the frontend/chat.py filtering logic
+        return raw_name.replace(" ", "_").replace("-", "_")
 
     @property
     def description(self) -> str:
@@ -135,7 +141,7 @@ class MCPToolAdapter(AbstractBaseTool):
                 else:
                     # Optional field with default
                     default_value = field_schema.get("default", None)
-                    fields[field_name] = (field_type, default_value)
+                    fields[field_name] = (Optional[field_type], default_value)
 
             # Create the model
             model_name = f"{self.mcp_tool.name.title().replace('_', '')}Args"
@@ -167,6 +173,12 @@ class MCPToolAdapter(AbstractBaseTool):
         """Convert JSON schema type to Python type."""
         schema_type = schema.get("type", "string")
 
+        # Handle list types (e.g. ["string", "null"])
+        if isinstance(schema_type, list):
+            # Pick the first non-null type
+            types = [t for t in schema_type if t != "null"]
+            schema_type = types[0] if types else "string"
+
         type_mapping = {
             "string": str,
             "integer": int,
@@ -195,7 +207,7 @@ class MCPToolAdapter(AbstractBaseTool):
 
             # Validate arguments
             parsed_args = self._args_type(**args)
-            tool_args = parsed_args.model_dump()
+            tool_args = parsed_args.model_dump(exclude_none=True)
 
             logger.debug(
                 f"Executing MCP tool {self.mcp_tool.name} with args: {tool_args} for user {current_user_id}"
@@ -230,8 +242,23 @@ class MCPToolAdapter(AbstractBaseTool):
 
         except Exception as e:
             logger.error(f"MCP tool {self.mcp_tool.name} execution failed: {e}")
+
+            # Extract real errors from ExceptionGroup if present
+            error_msg = str(e)
+            if isinstance(e, BaseExceptionGroup):
+                sub_msgs: list[str] = []
+                for sub_e in e.exceptions:
+                    if isinstance(sub_e, BaseExceptionGroup):
+                        sub_msgs.extend(
+                            str(sub_sub_e) for sub_sub_e in sub_e.exceptions
+                        )
+                    else:
+                        sub_msgs.append(str(sub_e))
+                if sub_msgs:
+                    error_msg = f"{error_msg}: " + ", ".join(sub_msgs)
+
             return {
-                "content": [{"text": f"Error executing MCP tool: {str(e)}"}],
+                "content": [{"text": f"Error executing MCP tool: {error_msg}"}],
                 "is_error": True,
             }
 
@@ -337,11 +364,16 @@ async def load_mcp_tools_as_agent_tools(
                 # Convert each MCP tool to Agent tool
                 for mcp_tool in mcp_tools:
                     try:
+                        # Clean server name for prefix (replace spaces/dashes with underscores)
+                        clean_server_name = server_name.replace(" ", "_").replace(
+                            "-", "_"
+                        )
+
                         # Create tool name with server prefix
                         tool_prefix = (
-                            f"{name_prefix}{server_name}_"
+                            f"{name_prefix}{clean_server_name}_"
                             if name_prefix
-                            else f"{server_name}_"
+                            else f"{clean_server_name}_"
                         )
 
                         adapter = MCPToolAdapter(

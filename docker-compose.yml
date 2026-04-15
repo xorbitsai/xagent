@@ -39,6 +39,7 @@ services:
       - POSTGRES_PASSWORD=${POSTGRES_PASSWORD:-xagent_password}
       - BACKEND_PORT=8000
       - XAGENT_UPLOADS_DIR=/root/.xagent/uploads
+      - XAGENT_MAX_UPLOAD_SIZE=${XAGENT_MAX_UPLOAD_SIZE:-100M}
     env_file:
       - .env
     volumes:

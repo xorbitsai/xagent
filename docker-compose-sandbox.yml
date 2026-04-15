@@ -39,6 +39,7 @@ services:
       - POSTGRES_PASSWORD=${POSTGRES_PASSWORD:-xagent_password}
       - BACKEND_PORT=8000
       - XAGENT_UPLOADS_DIR=/root/.xagent/uploads
+      - XAGENT_MAX_UPLOAD_SIZE=${XAGENT_MAX_UPLOAD_SIZE:-100M}
       - SANDBOX_ENABLED=true
       - SANDBOX_IMAGE=xprobe/xagent-sandbox:0.3.1 # pinned version (`latest` may lead to caching problems)
       - SANDBOX_CPUS=1

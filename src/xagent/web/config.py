@@ -11,7 +11,7 @@ from pathlib import Path
 from typing import Optional
 from urllib.parse import quote
 
-from ..config import get_uploads_dir
+from ..config import format_file_size, get_max_upload_size_bytes, get_uploads_dir
 
 # File storage paths for AI tools (computed dynamically when needed)
 FILE_STORAGE_URL_BASE = "/uploads"
@@ -85,8 +85,9 @@ ALLOWED_EXTENSIONS = {
     "image": [".png", ".jpg", ".jpeg", ".gif", ".bmp", ".webp", ".svg", ".ico"],
 }
 
-# Maximum file size (100MB)
-MAX_FILE_SIZE = 100 * 1024 * 1024
+# Maximum file size (configurable via XAGENT_MAX_UPLOAD_SIZE)
+MAX_FILE_SIZE = get_max_upload_size_bytes()
+MAX_FILE_SIZE_LABEL = format_file_size(MAX_FILE_SIZE)
 
 # Word characters (\w = letters/digits/underscore in any language), spaces, and hyphens.
 ALLOWED_NAME_PATTERN = re.compile(r"^[\w -]+$")

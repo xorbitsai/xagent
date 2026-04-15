@@ -147,7 +147,7 @@ Configuration is managed through environment variables:
 - `WEB_HOST`: Server host (default: `0.0.0.0`)
 - `WEB_PORT`: Server port (default: `8000`)
 - `CORS_ORIGINS`: Allowed CORS origins
-- `MAX_UPLOAD_SIZE`: Maximum file upload size in bytes
+- `XAGENT_MAX_UPLOAD_SIZE`: Maximum per-file upload size (supports bytes or values like `100M`); nginx defers file-size enforcement to the backend so multipart overhead does not trigger premature 413 responses
 
 ## Testing
 

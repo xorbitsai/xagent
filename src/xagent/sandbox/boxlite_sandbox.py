@@ -16,7 +16,7 @@ from typing import Optional
 import boxlite  # type: ignore[import-not-found]
 from boxlite import SimpleBox  # type: ignore[unused-ignore]
 
-from . import DEFAULT_SANDBOX_IMAGE
+from ..config import get_sandbox_image
 from .base import (
     CodeType,
     ExecResult,
@@ -29,6 +29,8 @@ from .base import (
 )
 
 logger = logging.getLogger(__name__)
+
+DEFAULT_SANDBOX_IMAGE = get_sandbox_image()
 
 
 class BoxliteStore(abc.ABC):
@@ -188,13 +190,14 @@ class BoxliteSandbox(Sandbox):
             return await self.exec("python", "-c", code, env=env)
         elif code_type == "javascript":
             return await self.exec("node", "-e", code, env=env)
+        raise ValueError(f"Unsupported code type: {code_type}")
 
     # --- File Operations ---
 
     async def upload_file(
         self, local_path: str, remote_path: str, overwrite: bool = False
     ) -> None:
-        if not os.path.exists(local_path):
+        if not os.path.isfile(local_path):
             raise FileNotFoundError(f"Local file not found: {local_path}")
 
         if not overwrite:

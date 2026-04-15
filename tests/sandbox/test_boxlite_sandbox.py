@@ -19,7 +19,11 @@ except ImportError:
 
 from xagent.sandbox import DEFAULT_SANDBOX_IMAGE
 from xagent.sandbox.base import SandboxConfig, SandboxTemplate
-from xagent.sandbox.boxlite_sandbox import BoxliteSandboxService, MemBoxliteStore
+from xagent.sandbox.boxlite_sandbox import (
+    BoxliteSandbox,
+    BoxliteSandboxService,
+    MemBoxliteStore,
+)
 
 
 @pytest.fixture(scope="module")
@@ -55,6 +59,18 @@ requires_boxlite = pytest.mark.skipif(
 def boxlite_service():
     """Provide a shared Boxlite sandbox service for integration-style tests."""
     return BoxliteSandboxService(MemBoxliteStore())
+
+
+class TestBoxliteSandboxRunCodeValidation:
+    """Test lightweight run_code validation paths."""
+
+    @pytest.mark.asyncio
+    async def test_run_code_rejects_unsupported_code_type(self):
+        """Unsupported code types should fail explicitly."""
+        sandbox = object.__new__(BoxliteSandbox)
+
+        with pytest.raises(ValueError, match="Unsupported code type: ruby"):
+            await sandbox.run_code("puts 'hi'", code_type="ruby")  # type: ignore[arg-type]
 
 
 @requires_boxlite

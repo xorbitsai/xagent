@@ -50,5 +50,5 @@ class SandboxSnapshot(Base):  # type: ignore[no-any-unimported]
     sandbox_type = Column(String(50), nullable=False, index=True)
     snapshot_id = Column(String(255), nullable=False, index=True)
     metadata_json = Column("metadata", Text, nullable=False)
-    created_at = Column(String(64), nullable=True)
+    created_at = Column(DateTime, nullable=True)
     updated_at = Column(DateTime, default=func.now(), onupdate=func.now())

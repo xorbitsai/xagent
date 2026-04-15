@@ -6,10 +6,12 @@ from __future__ import annotations
 
 import asyncio
 import os
+import socket
 import tempfile
 
 import pytest
 
+import xagent.sandbox.docker_sandbox as docker_sandbox_module
 from xagent.sandbox import DEFAULT_SANDBOX_IMAGE
 from xagent.sandbox.base import SandboxConfig, SandboxTemplate
 from xagent.sandbox.docker_sandbox import (
@@ -38,6 +40,86 @@ def docker_service():
     return DockerSandboxService(MemDockerStore())
 
 
+class _FakeContainerCollection:
+    """Minimal Docker container collection stub for service unit tests."""
+
+    def __init__(self, containers=()):
+        self._containers = containers
+
+    def list(self, *args, **kwargs):
+        return list(self._containers)
+
+
+class _FakeDockerClient:
+    """Minimal Docker client stub for service unit tests."""
+
+    def __init__(self, containers=()):
+        self.containers = _FakeContainerCollection(containers)
+
+    def ping(self):
+        return True
+
+
+class _FailingStartContainer:
+    """Container stub whose start fails before sandbox initialization finishes."""
+
+    def __init__(self) -> None:
+        self.remove_calls: list[bool] = []
+
+    def start(self) -> None:
+        raise RuntimeError("port conflict")
+
+    def remove(self, force: bool = False) -> None:
+        self.remove_calls.append(force)
+
+
+def _get_free_host_port() -> int:
+    """Reserve an ephemeral host port for Docker port-mapping tests."""
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        sock.bind(("127.0.0.1", 0))
+        sock.listen(1)
+        return int(sock.getsockname()[1])
+
+
+class TestDockerSandboxServiceFailures:
+    """Test failure cleanup paths that do not require Docker."""
+
+    @pytest.mark.asyncio
+    async def test_get_or_create_removes_container_when_start_fails(self, monkeypatch):
+        """Failed startup should remove the newly-created container."""
+        created_container = _FailingStartContainer()
+
+        async def fake_create_container(*args, **kwargs):
+            return created_container
+
+        monkeypatch.setattr(
+            docker_sandbox_module, "_create_container", fake_create_container
+        )
+        service = DockerSandboxService(MemDockerStore(), client=_FakeDockerClient())
+
+        with pytest.raises(RuntimeError, match="port conflict"):
+            await service.get_or_create(
+                "start-failure",
+                template=SandboxTemplate(type="image", image=DEFAULT_SANDBOX_IMAGE),
+                config=SandboxConfig(),
+            )
+
+        assert len(created_container.remove_calls) == 1
+        assert created_container.remove_calls[0] is True
+
+
+class TestDockerSandboxRunCodeValidation:
+    """Test lightweight run_code validation paths."""
+
+    @pytest.mark.asyncio
+    async def test_run_code_rejects_unsupported_code_type(self):
+        """Unsupported code types should fail explicitly."""
+        sandbox = object.__new__(docker_sandbox_module.DockerSandbox)
+
+        with pytest.raises(ValueError, match="Unsupported code type: ruby"):
+            await sandbox.run_code("puts 'hi'", code_type="ruby")  # type: ignore[arg-type]
+
+
 @requires_docker
 class TestDockerSandboxService:
     """Test DockerSandboxService service layer functionality"""
@@ -61,6 +143,7 @@ class TestDockerSandboxService:
             template = SandboxTemplate(type="image", image=DEFAULT_SANDBOX_IMAGE)
 
             temp_dir = tempfile.mkdtemp()
+            host_port = _get_free_host_port()
             config = SandboxConfig(
                 cpus=2,
                 memory=1024,
@@ -72,7 +155,7 @@ class TestDockerSandboxService:
                 ],
                 network_isolated=False,
                 ports=[
-                    (8080, 80),  # Host 8080 -> Container 80
+                    (host_port, 80),  # Host dynamic port -> Container 80
                 ],
             )
             sandbox = await service.get_or_create(
@@ -91,7 +174,7 @@ class TestDockerSandboxService:
             assert info.template.image == template.image
             assert info.config.cpus == config.cpus
             assert info.config.memory == config.memory
-            assert info.created_at == info.created_at
+            assert info.created_at is not None
 
             # Verify environment variables are effective
             result = await sandbox.exec("sh", "-c", "echo $MY_VAR")
@@ -118,15 +201,17 @@ class TestDockerSandboxService:
             )
             await asyncio.sleep(2)  # Wait for server to start
 
-            # Send HTTP request from host to mapped port (host 8080 -> container 80)
+            # Send HTTP request from host to mapped port.
             import urllib.request
 
             try:
-                response = urllib.request.urlopen("http://127.0.0.1:8080", timeout=3)
+                response = urllib.request.urlopen(
+                    f"http://127.0.0.1:{host_port}", timeout=3
+                )
                 status_code = response.getcode()
                 if status_code == 200:
                     print(
-                        "✓ Port mapping configuration effective (host 8080 -> container 80, HTTP request successful)"
+                        f"✓ Port mapping configuration effective (host {host_port} -> container 80, HTTP request successful)"
                     )
                 else:
                     print(f"⚠ Port mapping test: HTTP status code {status_code}")

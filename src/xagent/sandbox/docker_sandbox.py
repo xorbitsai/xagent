@@ -6,7 +6,6 @@ from __future__ import annotations
 
 import abc
 import asyncio
-import collections
 import io
 import logging
 import os
@@ -25,7 +24,7 @@ from docker.errors import APIError, ImageNotFound, NotFound
 
 import docker
 
-from . import DEFAULT_SANDBOX_IMAGE
+from ..config import get_sandbox_image
 from .base import (
     CodeType,
     ExecResult,
@@ -42,6 +41,8 @@ if TYPE_CHECKING:
     from docker.models.containers import Container
 
 logger = logging.getLogger(__name__)
+
+DEFAULT_SANDBOX_IMAGE = get_sandbox_image()
 
 LABEL_MANAGED = "xagent.managed"
 LABEL_SANDBOX_NAME = "xagent.sandbox.name"
@@ -313,13 +314,9 @@ def _extract_single_file_from_tar(
 
 
 def _archive_path_exists(container: Container, remote_path: str) -> bool:
-    """Check file existence through Docker archive APIs, not container user perms."""
-    try:
-        stream, _ = container.get_archive(remote_path)
-    except NotFound:
-        return False
-    collections.deque(stream, maxlen=0)
-    return True
+    """Check file existence."""
+    result = container.exec_run(["test", "-e", remote_path], stdout=False, stderr=False)
+    return cast(int, result.exit_code) == 0
 
 
 @dataclass
@@ -489,12 +486,13 @@ class DockerSandbox(Sandbox):
             return await self.exec("python", "-c", code, env=env)
         elif code_type == "javascript":
             return await self.exec("node", "-e", code, env=env)
+        raise ValueError(f"Unsupported code type: {code_type}")
 
     async def upload_file(
         self, local_path: str, remote_path: str, overwrite: bool = False
     ) -> None:
         """Upload a local file into the sandbox filesystem."""
-        if not os.path.exists(local_path):
+        if not os.path.isfile(local_path):
             raise FileNotFoundError(f"Local file not found: {local_path}")
 
         async with self._control.operation():
@@ -610,7 +608,9 @@ async def _ensure_image(client: Any, image: str) -> None:
     try:
         await asyncio.to_thread(client.images.get, image)
     except ImageNotFound:
+        logger.info("Start pulling sandbox image: %s", image)
         await asyncio.to_thread(client.images.pull, image)
+        logger.info("Finish pulling sandbox image: %s", image)
 
 
 async def _create_container(
@@ -757,7 +757,11 @@ class DockerSandboxService(SandboxService):
                 template,
                 cfg,
             )
-            await asyncio.to_thread(container.start)
+            try:
+                await asyncio.to_thread(container.start)
+            except Exception:
+                await asyncio.to_thread(container.remove, force=True)
+                raise
             await asyncio.to_thread(container.reload)
             runtime_info = _parse_container_config(container)
             stored_info = SandboxInfo(

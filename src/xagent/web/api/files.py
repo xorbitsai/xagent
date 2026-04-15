@@ -16,6 +16,7 @@ from ..auth_dependencies import get_current_user
 from ..config import (
     BINARY_EXTENSIONS,
     MAX_FILE_SIZE,
+    MAX_FILE_SIZE_LABEL,
     get_upload_path,
     is_allowed_file,
 )
@@ -42,6 +43,37 @@ except ImportError:
 logger = logging.getLogger(__name__)
 
 file_router = APIRouter(prefix="/api/files", tags=["files"])
+
+
+async def _write_upload_with_size_limit(uploaded: UploadFile, target_path: Path) -> int:
+    """Persist an uploaded file while enforcing the configured size limit."""
+    total_size = 0
+    read_buffer_size = 1024 * 1024  # 1MB chunks keep memory bounded for large files.
+
+    try:
+        with open(target_path, "wb") as buffer:
+            while True:
+                chunk = await uploaded.read(read_buffer_size)
+                if not chunk:
+                    break
+                total_size += len(chunk)
+                if total_size > MAX_FILE_SIZE:
+                    raise HTTPException(
+                        status_code=413,
+                        detail=(
+                            f"File size exceeds maximum limit of {MAX_FILE_SIZE_LABEL}"
+                        ),
+                    )
+                buffer.write(chunk)
+    except Exception:
+        try:
+            if target_path.exists():
+                target_path.unlink()
+        except OSError:
+            pass
+        raise
+
+    return total_size
 
 
 def _user_id_value(user: User) -> int:
@@ -435,74 +467,80 @@ async def upload_file(
     single_file_mode = file is not None and (not files)
     parsed_task_id = _parse_task_id(task_id)
     uploaded_files = []
+    written_paths: list[Path] = []
 
-    for uploaded in upload_items:
-        if not uploaded.filename or not uploaded.filename.strip():
-            raise HTTPException(status_code=422, detail="No filename provided")
-        if not is_allowed_file(uploaded.filename, task_type):
-            raise HTTPException(
-                status_code=500,
-                detail=f"File type {Path(uploaded.filename).suffix.lower()} not supported for task type {task_type}",
-            )
-
-        content = await uploaded.read()
-        if len(content) > MAX_FILE_SIZE:
-            raise HTTPException(
-                status_code=500,
-                detail=f"File size exceeds maximum limit of {MAX_FILE_SIZE // (1024 * 1024)}MB",
-            )
-
-        # get_upload_path may raise ValueError for invalid folder/collection names
-        try:
-            target_path = _build_unique_file_path(
-                get_upload_path(
-                    uploaded.filename, task_id, folder, _user_id_value(user)
+    try:
+        for uploaded in upload_items:
+            if not uploaded.filename or not uploaded.filename.strip():
+                raise HTTPException(status_code=422, detail="No filename provided")
+            if not is_allowed_file(uploaded.filename, task_type):
+                raise HTTPException(
+                    status_code=500,
+                    detail=f"File type {Path(uploaded.filename).suffix.lower()} not supported for task type {task_type}",
                 )
-            )
-        except ValueError as e:
-            logger.warning(f"Invalid folder name rejected: {folder!r} - {e}")
-            raise HTTPException(
-                status_code=422, detail=f"Invalid folder name: {str(e)}"
-            ) from e
-        with open(target_path, "wb") as buffer:
-            buffer.write(content)
 
-        file_record = UploadedFile(
-            user_id=_user_id_value(user),
-            task_id=parsed_task_id,
-            filename=Path(uploaded.filename).name,
-            storage_path=str(target_path),
-            mime_type=uploaded.content_type,
-            file_size=len(content),
-        )
-        db.add(file_record)
-        db.flush()
-
-        content_preview = ""
-        # Skip preview generation for binary files (images, videos, etc.)
-        file_extension = Path(uploaded.filename).suffix.lower()
-        if file_extension not in BINARY_EXTENSIONS:
+            # get_upload_path may raise ValueError for invalid folder/collection names
             try:
-                preview_content = read_file(str(target_path))
-                content_preview = (
-                    preview_content[:500] + "..."
-                    if isinstance(preview_content, str) and len(preview_content) > 500
-                    else preview_content
+                target_path = _build_unique_file_path(
+                    get_upload_path(
+                        uploaded.filename, task_id, folder, _user_id_value(user)
+                    )
                 )
-            except Exception:
-                content_preview = ""
+            except ValueError as e:
+                logger.warning(f"Invalid folder name rejected: {folder!r} - {e}")
+                raise HTTPException(
+                    status_code=422, detail=f"Invalid folder name: {str(e)}"
+                ) from e
 
-        uploaded_files.append(
-            {
-                "file_id": file_record.file_id,
-                "filename": file_record.filename,
-                "file_size": file_record.file_size,
-                "mime_type": file_record.mime_type,
-                "content_preview": content_preview,
-            }
-        )
+            file_size = await _write_upload_with_size_limit(uploaded, target_path)
+            written_paths.append(target_path)
 
-    db.commit()
+            file_record = UploadedFile(
+                user_id=_user_id_value(user),
+                task_id=parsed_task_id,
+                filename=Path(uploaded.filename).name,
+                storage_path=str(target_path),
+                mime_type=uploaded.content_type,
+                file_size=file_size,
+            )
+            db.add(file_record)
+            db.flush()
+
+            content_preview = ""
+            # Skip preview generation for binary files (images, videos, etc.)
+            file_extension = Path(uploaded.filename).suffix.lower()
+            if file_extension not in BINARY_EXTENSIONS:
+                try:
+                    preview_content = read_file(str(target_path))
+                    content_preview = (
+                        preview_content[:500] + "..."
+                        if isinstance(preview_content, str)
+                        and len(preview_content) > 500
+                        else preview_content
+                    )
+                except Exception:
+                    content_preview = ""
+
+            uploaded_files.append(
+                {
+                    "file_id": file_record.file_id,
+                    "filename": file_record.filename,
+                    "file_size": file_record.file_size,
+                    "mime_type": file_record.mime_type,
+                    "content_preview": content_preview,
+                }
+            )
+
+        db.commit()
+    except Exception:
+        db.rollback()
+        for path in written_paths:
+            try:
+                if path.exists():
+                    path.unlink()
+            except OSError:
+                pass
+        raise
 
     if single_file_mode:
         first_file = uploaded_files[0]

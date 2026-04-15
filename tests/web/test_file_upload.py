@@ -326,6 +326,46 @@ class TestFileUpload:
         # as the API response will indicate success/failure
         assert response.status_code in [200, 201]
 
+    def test_upload_file_returns_413_when_size_exceeds_limit(
+        self, client, test_db, temp_uploads_dir, auth_headers, monkeypatch
+    ):
+        """Upload endpoint should return 413 with a friendly message when too large."""
+        import xagent.web.api.files
+
+        monkeypatch.setattr(xagent.web.api.files, "MAX_FILE_SIZE", 4)
+
+        response = client.post(
+            "/api/files/upload",
+            files={"file": ("big.txt", b"12345", "text/plain")},
+            data={"task_type": "general"},
+            headers=auth_headers,
+        )
+
+        assert response.status_code == 413
+        assert "maximum limit" in response.json()["detail"].lower()
+
+    def test_upload_multiple_files_cleans_up_partial_writes_on_limit_error(
+        self, client, test_db, temp_uploads_dir, auth_headers, monkeypatch
+    ):
+        """A later oversized file should not leave earlier uploaded files on disk."""
+        import xagent.web.api.files
+
+        monkeypatch.setattr(xagent.web.api.files, "MAX_FILE_SIZE", 4)
+        monkeypatch.setattr(xagent.web.api.files, "MAX_FILE_SIZE_LABEL", "4B")
+
+        response = client.post(
+            "/api/files/upload",
+            files=[
+                ("files", ("small.txt", b"1234", "text/plain")),
+                ("files", ("big.txt", b"12345", "text/plain")),
+            ],
+            data={"task_type": "general"},
+            headers=auth_headers,
+        )
+
+        assert response.status_code == 413
+        assert [path for path in temp_uploads_dir.rglob("*") if path.is_file()] == []
+
 
 class TestFileManagement:
     """Test file management operations"""

@@ -3,12 +3,15 @@
 import tempfile
 from pathlib import Path
 
+import pytest
+
 from xagent.config import (
     BOXLITE_HOME_DIR,
     DATABASE_URL,
     EXTERNAL_SKILLS_LIBRARY_DIRS,
     EXTERNAL_UPLOAD_DIRS,
     LANCEDB_PATH,
+    MAX_UPLOAD_SIZE,
     SANDBOX_CPUS,
     SANDBOX_ENV,
     SANDBOX_IMAGE,
@@ -17,12 +20,14 @@ from xagent.config import (
     STORAGE_ROOT,
     UPLOADS_DIR,
     WEB_DIR,
+    format_file_size,
     get_boxlite_home_dir,
     get_database_url,
     get_default_sqlite_db_path,
     get_external_skills_dirs,
     get_external_upload_dirs,
     get_lancedb_path,
+    get_max_upload_size_bytes,
     get_sandbox_cpus,
     get_sandbox_env,
     get_sandbox_image,
@@ -60,6 +65,38 @@ class TestEnvironmentVariableConstants:
 
     def test_database_url_constant(self):
         assert DATABASE_URL == "DATABASE_URL"
+
+    def test_max_upload_size_constant(self):
+        assert MAX_UPLOAD_SIZE == "XAGENT_MAX_UPLOAD_SIZE"
+
+
+class TestGetMaxUploadSizeBytes:
+    """Test get_max_upload_size_bytes() function."""
+
+    def test_default_max_upload_size(self, monkeypatch):
+        monkeypatch.delenv(MAX_UPLOAD_SIZE, raising=False)
+        assert get_max_upload_size_bytes() == 100 * 1024 * 1024
+
+    def test_numeric_max_upload_size(self, monkeypatch):
+        monkeypatch.setenv(MAX_UPLOAD_SIZE, "2048")
+        assert get_max_upload_size_bytes() == 2048
+
+    def test_human_readable_max_upload_size(self, monkeypatch):
+        monkeypatch.setenv(MAX_UPLOAD_SIZE, "150M")
+        assert get_max_upload_size_bytes() == 150 * 1024 * 1024
+
+    def test_invalid_max_upload_size_raises(self, monkeypatch):
+        monkeypatch.setenv(MAX_UPLOAD_SIZE, "banana")
+        with pytest.raises(ValueError, match="XAGENT_MAX_UPLOAD_SIZE"):
+            get_max_upload_size_bytes()
+
+
+class TestFormatFileSize:
+    def test_formats_kilobytes(self):
+        assert format_file_size(512 * 1024) == "512KB"
+
+    def test_formats_fractional_megabytes(self):
+        assert format_file_size(1572864) == "1.5MB"
 
 
 class TestGetUploadsDir:

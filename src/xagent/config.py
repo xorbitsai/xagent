@@ -31,6 +31,7 @@ WEB_DIR = "XAGENT_WEB_DIR"
 EXTERNAL_UPLOAD_DIRS = "XAGENT_EXTERNAL_UPLOAD_DIRS"
 EXTERNAL_SKILLS_LIBRARY_DIRS = "XAGENT_EXTERNAL_SKILLS_LIBRARY_DIRS"
 STORAGE_ROOT = "XAGENT_STORAGE_ROOT"
+MAX_UPLOAD_SIZE = "XAGENT_MAX_UPLOAD_SIZE"
 SANDBOX_IMAGE = "SANDBOX_IMAGE"
 LANCEDB_PATH = "LANCEDB_PATH"
 DATABASE_URL = "DATABASE_URL"
@@ -78,6 +79,81 @@ def get_uploads_dir() -> Path:
     # Default: web/uploads
     web_dir = get_web_dir()
     return web_dir / "uploads"
+
+
+def get_max_upload_size_bytes() -> int:
+    """Get the maximum allowed upload size in bytes.
+
+    Priority:
+    1. XAGENT_MAX_UPLOAD_SIZE environment variable
+    2. Default to 100MB
+
+    Supported formats:
+    - Raw bytes: ``104857600``
+    - Human-readable: ``100M``, ``100MB``, ``1G``, ``512K``
+
+    Returns:
+        Maximum upload size in bytes.
+
+    Raises:
+        ValueError: If the configured value is invalid.
+    """
+
+    env_value = os.getenv(MAX_UPLOAD_SIZE)
+    if not env_value:
+        return 100 * 1024 * 1024
+
+    normalized = env_value.strip().upper()
+    if not normalized:
+        return 100 * 1024 * 1024
+
+    suffix_multipliers = [
+        ("GB", 1024 * 1024 * 1024),
+        ("G", 1024 * 1024 * 1024),
+        ("MB", 1024 * 1024),
+        ("M", 1024 * 1024),
+        ("KB", 1024),
+        ("K", 1024),
+        ("B", 1),
+    ]
+
+    for suffix, multiplier in suffix_multipliers:
+        if normalized.endswith(suffix):
+            number_part = normalized[: -len(suffix)].strip()
+            if not number_part:
+                raise ValueError(
+                    f"Invalid {MAX_UPLOAD_SIZE} value: {env_value!r}. Missing numeric value."
+                )
+            try:
+                return int(float(number_part) * multiplier)
+            except ValueError as exc:
+                raise ValueError(
+                    f"Invalid {MAX_UPLOAD_SIZE} value: {env_value!r}."
+                ) from exc
+
+    try:
+        return int(normalized)
+    except ValueError as exc:
+        raise ValueError(f"Invalid {MAX_UPLOAD_SIZE} value: {env_value!r}.") from exc
+
+
+def format_file_size(size_bytes: int) -> str:
+    """Format a byte count for user-facing messages."""
+    if size_bytes < 1024:
+        return f"{size_bytes}B"
+    if size_bytes < 1024 * 1024:
+        value = size_bytes / 1024
+        unit = "KB"
+    elif size_bytes < 1024 * 1024 * 1024:
+        value = size_bytes / (1024 * 1024)
+        unit = "MB"
+    else:
+        value = size_bytes / (1024 * 1024 * 1024)
+        unit = "GB"
+
+    if float(value).is_integer():
+        return f"{int(value)}{unit}"
+    return f"{value:.1f}{unit}"
 
 
 def get_external_upload_dirs() -> list[Path]:

@@ -13,7 +13,7 @@ import { Select } from "@/components/ui/select"
 import { getApiUrl } from "@/lib/utils"
 import { appendIngestionConfigToFormData } from "@/lib/ingestion-form"
 import { useI18n } from "@/contexts/i18n-context"
-import { apiRequest } from "@/lib/api-wrapper"
+import { apiRequest, getUploadErrorMessage, parseApiResponse } from "@/lib/api-wrapper"
 import { Model } from "@/lib/models"
 import {
   Upload,
@@ -273,21 +273,30 @@ export function KnowledgeBaseCreationDialog({ open, onOpenChange, onSuccess }: K
         formData.append("collection", collectionName)
         appendIngestionConfigToFormData(formData, ingestionConfig)
 
-        const response = await apiRequest(`${getApiUrl()}/api/kb/ingest`, {
-          method: "POST",
-          body: formData
-        })
+      const response = await apiRequest(`${getApiUrl()}/api/kb/ingest`, {
+        method: "POST",
+        body: formData
+      })
 
-        if (!response.ok) {
-          const errorData = await response.json()
+      const parsed = await parseApiResponse(response)
+
+      if (!response.ok) {
+          const errorData = parsed.data || {}
           if (errorData.status === 'error') {
             setIngestionResults(prev => [...prev, errorData])
             throw new Error(errorData.message || t("kb.errors.uploadFailedFile", { name: file.name }))
           }
-          throw new Error(errorData.detail || t("kb.errors.uploadFailedFile", { name: file.name }))
+          throw new Error(getUploadErrorMessage(response, parsed, {
+            generic: t("kb.errors.uploadFailedFile", { name: file.name }) || `Failed to upload file: ${file.name}`,
+            tooLarge: t("files.fileTooLarge") || "File is too large",
+            proxy: t("files.uploadProxyError") || "Upload failed before reaching the application. Please check the server upload limit.",
+          }))
         }
 
-        const result = await response.json()
+        const result = parsed.data
+        if (!result) {
+          throw new Error(t("kb.errors.uploadFailedFile", { name: file.name }))
+        }
         setIngestionResults(prev => [...prev, result])
 
         if (result.status === "partial" && result.failed_step) {
@@ -358,18 +367,27 @@ export function KnowledgeBaseCreationDialog({ open, onOpenChange, onSuccess }: K
         body: formData
       })
 
+      const parsed = await parseApiResponse(response)
+
       setWebIngestionProgress(50)
 
       if (!response.ok) {
-        const errorData = await response.json()
+        const errorData = parsed.data || {}
         if (errorData.status === 'error') {
           setWebIngestionResult(errorData)
           throw new Error(errorData.message || t("kb.errors.webIngestFailed"))
         }
-        throw new Error(errorData.detail || t("kb.errors.webIngestFailed"))
+        throw new Error(getUploadErrorMessage(response, parsed, {
+          generic: t("kb.errors.webIngestFailed") || "Website import failed",
+          tooLarge: t("files.fileTooLarge") || "File is too large",
+          proxy: t("files.uploadProxyError") || "Upload failed before reaching the application. Please check the server upload limit.",
+        }))
       }
 
-      const result: WebIngestionResult = await response.json()
+      const result: WebIngestionResult | null = parsed.data
+      if (!result) {
+        throw new Error(t("kb.errors.webIngestFailed"))
+      }
       setWebIngestionResult(result)
       setWebIngestionProgress(100)
 
@@ -440,12 +458,17 @@ export function KnowledgeBaseCreationDialog({ open, onOpenChange, onSuccess }: K
         body: JSON.stringify(requestBody)
       })
 
+      const parsed = await parseApiResponse(response)
+
       if (!response.ok) {
-        const errorData = await response.json().catch(() => ({}))
-        throw new Error(errorData.detail || t("kb.errors.cloudIngestFailed"))
+        throw new Error(getUploadErrorMessage(response, parsed, {
+          generic: t("kb.errors.cloudIngestFailed") || "Cloud ingest failed",
+          tooLarge: t("files.fileTooLarge") || "File is too large",
+          proxy: t("files.uploadProxyError") || "Upload failed before reaching the application. Please check the server upload limit.",
+        }))
       }
 
-      const results: IngestionResult[] = await response.json()
+      const results: IngestionResult[] = parsed.data || []
       setIngestionResults(results)
 
       // Check for errors

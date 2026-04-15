@@ -13,7 +13,7 @@ import { ScrollArea } from "@/components/ui/scroll-area"
 import { Select } from "@/components/ui/select"
 import { Badge } from "@/components/ui/badge"
 import { ConfirmDialog } from "@/components/ui/confirm-dialog"
-import { apiRequest } from "@/lib/api-wrapper"
+import { apiRequest, getUploadErrorMessage, parseApiResponse } from "@/lib/api-wrapper"
 import { getApiUrl } from "@/lib/utils"
 import { appendIngestionConfigToFormData } from "@/lib/ingestion-form"
 import { parseSeparatorsInput, formatSeparatorsOutput } from "@/lib/separators"
@@ -300,16 +300,25 @@ export function KnowledgeBaseDetailContent({ collectionName }: { collectionName:
           body: formData
         })
 
+        const parsed = await parseApiResponse(response)
+
         if (!response.ok) {
-          const errorData = await response.json()
+          const errorData = parsed.data || {}
           if (errorData.status === 'error') {
             setIngestionResults(prev => [...prev, errorData])
             throw new Error(errorData.message || t("kb.errors.uploadFailedFile", { name: file.name }))
           }
-          throw new Error(errorData.detail || t("kb.detail.errors.uploadFailedWithName", { name: file.name }))
+          throw new Error(getUploadErrorMessage(response, parsed, {
+            generic: t("kb.detail.errors.uploadFailedWithName", { name: file.name }) || `Failed to upload file: ${file.name}`,
+            tooLarge: t("files.fileTooLarge") || "File is too large",
+            proxy: t("files.uploadProxyError") || "Upload failed before reaching the application. Please check the server upload limit.",
+          }))
         }
 
-        const result = await response.json()
+        const result = parsed.data
+        if (!result) {
+          throw new Error(t("kb.detail.errors.uploadFailedWithName", { name: file.name }))
+        }
         setIngestionResults(prev => [...prev, result])
         setUploadProgress(((i + 1) / selectedFiles.length) * 100)
       }
@@ -422,18 +431,27 @@ export function KnowledgeBaseDetailContent({ collectionName }: { collectionName:
         body: formData
       })
 
+      const parsed = await parseApiResponse(response)
+
       setWebIngestionProgress(50)
 
       if (!response.ok) {
-        const errorData = await response.json()
+        const errorData = parsed.data || {}
         if (errorData.status === 'error') {
           setWebIngestionResult(errorData)
           throw new Error(errorData.message || t("kb.errors.webIngestFailed"))
         }
-        throw new Error(errorData.detail || t("kb.detail.errors.webImportFailed"))
+        throw new Error(getUploadErrorMessage(response, parsed, {
+          generic: t("kb.detail.errors.webImportFailed") || "Website import failed",
+          tooLarge: t("files.fileTooLarge") || "File is too large",
+          proxy: t("files.uploadProxyError") || "Upload failed before reaching the application. Please check the server upload limit.",
+        }))
       }
 
-      const result: WebIngestionResult = await response.json()
+      const result: WebIngestionResult | null = parsed.data
+      if (!result) {
+        throw new Error(t("kb.detail.errors.webImportFailed"))
+      }
       setWebIngestionResult(result)
       setWebIngestionProgress(100)
 

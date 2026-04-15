@@ -69,6 +69,7 @@ from ...core.tools.core.RAG_tools.utils.string_utils import (
 from ..auth_dependencies import get_current_user
 from ..config import (
     MAX_FILE_SIZE,
+    MAX_FILE_SIZE_LABEL,
     get_upload_path,
     is_allowed_file,
     sanitize_path_component,
@@ -343,10 +344,9 @@ async def ingest(
                 total_size += len(chunk)
                 if total_size > MAX_FILE_SIZE:
                     raise HTTPException(
-                        status_code=422,
+                        status_code=413,
                         detail=(
-                            "File size exceeds maximum limit of "
-                            f"{MAX_FILE_SIZE // (1024 * 1024)}MB"
+                            f"File size exceeds maximum limit of {MAX_FILE_SIZE_LABEL}"
                         ),
                     )
                 buffer.write(chunk)

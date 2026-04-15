@@ -167,6 +167,23 @@ def test_ingest_separators_missing_uses_none(app_with_kb, mock_user):
     assert captured_config[0].separators is None
 
 
+def test_ingest_returns_413_when_file_exceeds_limit(app_with_kb, monkeypatch):
+    """KB ingest should return 413 when the uploaded file exceeds the configured limit."""
+    import xagent.web.api.kb
+
+    monkeypatch.setattr(xagent.web.api.kb, "MAX_FILE_SIZE", 4)
+
+    client = TestClient(app_with_kb)
+    response = client.post(
+        "/api/kb/ingest",
+        data={"collection": "test_coll"},
+        files={"file": ("big.txt", io.BytesIO(b"12345"), "text/plain")},
+    )
+
+    assert response.status_code == 413
+    assert "maximum limit" in response.json()["detail"].lower()
+
+
 def test_ingest_separators_invalid_json_request_succeeds_uses_default(
     app_with_kb, mock_user
 ):

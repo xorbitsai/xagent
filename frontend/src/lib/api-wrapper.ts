@@ -239,6 +239,83 @@ export async function apiRequest(
   return response
 }
 
+export interface ParsedApiResponse {
+  data: any | null
+  text: string | null
+  isHtml: boolean
+}
+
+export async function parseApiResponse(response: Response): Promise<ParsedApiResponse> {
+  const contentType = response.headers.get("content-type")?.toLowerCase() || ""
+
+  if (contentType.includes("application/json")) {
+    try {
+      return {
+        data: await response.json(),
+        text: null,
+        isHtml: false,
+      }
+    } catch {
+      // Fall through to text parsing for broken proxy responses.
+    }
+  }
+
+  const text = await response.text().catch(() => "")
+  if (text) {
+    try {
+      return {
+        data: JSON.parse(text),
+        text,
+        isHtml: /^\s*</.test(text),
+      }
+    } catch {
+      return {
+        data: null,
+        text,
+        isHtml: contentType.includes("text/html") || /^\s*</.test(text),
+      }
+    }
+  }
+
+  return {
+    data: null,
+    text: null,
+    isHtml: contentType.includes("text/html"),
+  }
+}
+
+export function getUploadErrorMessage(
+  response: Response,
+  parsed: ParsedApiResponse,
+  messages: {
+    generic: string
+    tooLarge: string
+    proxy: string
+  }
+): string {
+  if (typeof parsed.data?.detail === "string" && parsed.data.detail.trim()) {
+    return parsed.data.detail
+  }
+
+  if (typeof parsed.data?.message === "string" && parsed.data.message.trim()) {
+    return parsed.data.message
+  }
+
+  if (response.status === 413) {
+    return messages.tooLarge
+  }
+
+  if (parsed.isHtml) {
+    return messages.proxy
+  }
+
+  if (parsed.text?.trim()) {
+    return parsed.text
+  }
+
+  return messages.generic
+}
+
 // Convenience methods
 export const api = {
   get: (url: string, options?: RequestInit) =>

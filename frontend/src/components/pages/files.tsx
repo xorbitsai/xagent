@@ -5,7 +5,7 @@ import { Button } from "@/components/ui/button"
 import { Input } from "@/components/ui/input"
 import { Badge } from "@/components/ui/badge"
 import { getApiUrl } from "@/lib/utils"
-import { apiRequest } from "@/lib/api-wrapper"
+import { apiRequest, getUploadErrorMessage, parseApiResponse } from "@/lib/api-wrapper"
 import { useI18n } from "@/contexts/i18n-context"
 import { StandaloneFilePreviewDialog } from "@/components/file/standalone-file-preview-dialog"
 import { SearchInput } from "@/components/ui/search-input"
@@ -180,14 +180,23 @@ export function FilesPage() {
         body: formData
       })
 
+      const parsed = await parseApiResponse(response)
+
       if (response.ok) {
         await loadFiles()
         if (fileInputRef.current) {
           fileInputRef.current.value = ''
         }
+      } else {
+        throw new Error(getUploadErrorMessage(response, parsed, {
+          generic: t('files.actions.upload') || 'Upload failed',
+          tooLarge: t('files.fileTooLarge') || 'File is too large',
+          proxy: t('files.uploadProxyError') || 'Upload failed before reaching the application. Please check the server upload limit.',
+        }))
       }
     } catch (error) {
       console.error('Upload failed:', error)
+      toast.error(error instanceof Error ? error.message : (t('files.actions.upload') || 'Upload failed'))
     } finally {
       setUploading(false)
     }

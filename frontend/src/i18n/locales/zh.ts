@@ -816,7 +816,8 @@ Build when you need.`
     },
   },
   files: {
-    fileTooLarge: "文件过大（最大 100MB）",
+    fileTooLarge: "文件大小超过当前配置的上传限制",
+    uploadProxyError: "上传在到达应用前被拦截，请检查服务器上传大小限制。",
     header: {
       title: "文件管理",
       description: "管理项目文件：上传、预览、下载与删除",

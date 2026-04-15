@@ -7,7 +7,7 @@ import { cn, getApiUrl } from "@/lib/utils";
 import { useI18n } from "@/contexts/i18n-context";
 import { useApp } from "@/contexts/app-context-chat";
 import { ConfigDialog } from "@/components/config-dialog";
-import { apiRequest } from "@/lib/api-wrapper";
+import { apiRequest, getUploadErrorMessage, parseApiResponse } from "@/lib/api-wrapper";
 import { useFileMention, FileItem } from "@/hooks/use-file-mention";
 import { FileMentionDropdown } from "./FileMentionDropdown";
 import { toast } from "sonner";
@@ -191,6 +191,7 @@ export function ChatInput({
     });
 
     const failedFiles = new Set<File>();
+    let uploadErrorMessage: string | null = null;
 
     // Upload files individually to ensure better reliability and progress tracking
     await Promise.all(newFiles.map(async (file) => {
@@ -210,8 +211,10 @@ export function ChatInput({
           signal: controller.signal
         });
 
-        if (response.ok) {
-          const data = await response.json();
+        const parsed = await parseApiResponse(response);
+
+        if (response.ok && parsed.data) {
+          const data = parsed.data;
           if (data.success && data.file_id) {
             // Attach file_id to the File object
             (file as any).file_id = data.file_id;
@@ -220,6 +223,11 @@ export function ChatInput({
           }
         } else {
           failedFiles.add(file);
+          uploadErrorMessage = uploadErrorMessage || getUploadErrorMessage(response, parsed, {
+            generic: t("files.uploadFailed") || "Failed to upload some files",
+            tooLarge: t("files.fileTooLarge") || "File is too large",
+            proxy: t("files.uploadProxyError") || "Upload failed before reaching the application. Please check the server upload limit.",
+          });
         }
       } catch (error: any) {
         if (error.name === 'AbortError') {
@@ -227,6 +235,7 @@ export function ChatInput({
         } else {
           console.error("Error uploading file:", error);
           failedFiles.add(file);
+          uploadErrorMessage = uploadErrorMessage || (error instanceof Error ? error.message : null);
         }
       } finally {
         uploadAbortControllersRef.current.delete(fileId);
@@ -240,7 +249,7 @@ export function ChatInput({
 
     // Handle failed files
     if (failedFiles.size > 0) {
-      toast.error(t("files.uploadFailed") || "Failed to upload some files");
+      toast.error(uploadErrorMessage || t("files.uploadFailed") || "Failed to upload some files");
       if (onFilesChange) {
         onFilesChange(filesRef.current.filter(f => !failedFiles.has(f)));
       }

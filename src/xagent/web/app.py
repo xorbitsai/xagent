@@ -1,4 +1,5 @@
 import asyncio
+import json
 import logging
 import os
 from contextlib import suppress
@@ -81,8 +82,6 @@ async def validation_exception_handler(
         for key, value in error.items():
             # Try to serialize each value to check if it's JSON-serializable
             try:
-                import json
-
                 json.dumps(value)
                 sanitized_error[key] = value
             except (TypeError, ValueError):

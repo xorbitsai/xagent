@@ -2,6 +2,8 @@
 
 import { useEffect, useRef, useState, useCallback } from "react"
 import { useAuth } from "@/contexts/auth-context"
+import { apiRequest, getUploadErrorMessage, parseApiResponse } from "@/lib/api-wrapper"
+import { toast } from "sonner"
 import { getWsUrl, getApiUrl } from "@/lib/utils"
 
 // Duplicate message detection: record recently sent messages
@@ -444,15 +446,24 @@ export function useWebSocket(options: UseWebSocketOptions = {}) {
             formData.append('task_id', taskIdRef.current.toString())
           }
 
-          fetch(`${getApiUrl()}/api/files/upload`, {
+          apiRequest(`${getApiUrl()}/api/files/upload`, {
             method: 'POST',
             headers: {
               'Authorization': `Bearer ${token || localStorage.getItem('token') || ''}`
             },
             body: formData
           })
-            .then(res => res.json())
-            .then(data => {
+            .then(async res => ({ response: res, parsed: await parseApiResponse(res) }))
+            .then(({ response, parsed }) => {
+              if (!response.ok || !parsed.data) {
+                throw new Error(getUploadErrorMessage(response, parsed, {
+                  generic: 'Upload failed',
+                  tooLarge: 'File is too large. Please reduce the upload size and try again.',
+                  proxy: 'Upload failed before reaching the application. Please check the server upload limit.',
+                }))
+              }
+
+              const data = parsed.data
               messageData.files = [...preUploadedFiles];
               if (data.success && data.files) {
                 // Send file_ids in the websocket message
@@ -482,11 +493,7 @@ export function useWebSocket(options: UseWebSocketOptions = {}) {
             })
             .catch(err => {
               console.error('Failed to upload files:', err)
-              if (preUploadedFiles.length > 0) {
-                messageData.files = preUploadedFiles;
-              }
-              // Send without newly uploaded files if upload fails
-              socketRef.current?.send(JSON.stringify(messageData))
+              toast.error(err instanceof Error ? err.message : 'Upload failed')
             })
         } else {
           messageData.files = preUploadedFiles;

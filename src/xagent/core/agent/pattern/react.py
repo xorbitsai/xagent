@@ -129,6 +129,26 @@ class Action(BaseModel):
         }
 
 
+def _truncate_for_display(
+    s: Optional[str], max_len: int = 200, suffix: str = "..."
+) -> str:
+    """Truncate string for display/logging to avoid excessive length.
+
+    Args:
+        s: String to truncate (None returns empty string)
+        max_len: Maximum length before truncation
+        suffix: Suffix to add when truncated
+
+    Returns:
+        Truncated string if longer than max_len, original string otherwise
+    """
+    if not s:
+        return ""
+    if len(s) <= max_len:
+        return s
+    return s[:max_len] + suffix
+
+
 class ToolRegistry:
     """Registry for managing available tools."""
 
@@ -932,6 +952,13 @@ class ReActPattern(AgentPattern):
                         "execution_history": messages,
                         "pattern": "react",
                     }
+                elif result["type"] != "observation":
+                    # Defensive programming: should never happen
+                    # result["type"] must be either "final_answer" or "observation"
+                    raise PatternExecutionError(
+                        pattern_name="ReAct",
+                        message=f"Unknown result type: {result['type']}",
+                    )
 
                 # Add observation to conversation for tool results
                 observation_content = f"Tool result from {result.get('tool_name', 'unknown')}:\n{result['content']}\n\nBased on this result, if you have enough information to answer the user's question, provide your final answer. Otherwise, call another tool."
@@ -939,6 +966,67 @@ class ReActPattern(AgentPattern):
 
                 # Update stored messages
                 self._last_messages = messages.copy()
+
+            except PatternExecutionError as e:
+                # PatternExecutionError indicates a "pattern failure" - the LLM returned
+                # invalid format (RecursionError, JSONDecodeError, ValidationError, etc.)
+                # Unlike task execution failures, these should be converted to observations
+                # so the LLM can see the error and attempt to correct the format.
+
+                # Get error message from exception
+                error_msg = str(e)
+
+                # Generate insights and store memories even for failures
+                try:
+                    await self._generate_and_store_react_memories(
+                        task_description,
+                        f"Pattern execution error at iteration {iteration + 1}: {error_msg}",
+                        iteration + 1,
+                        messages,
+                    )
+                except Exception as mem_error:
+                    logger.error(f"Failed to store failure memories: {mem_error}")
+
+                # Trace error
+                await trace_error(
+                    self.tracer,
+                    task_id,
+                    step_id,
+                    error_type="PatternExecutionError",
+                    error_message=f"Iteration {iteration + 1} failed with pattern error: {error_msg}",
+                    data={
+                        "task": task_description[:100],
+                        "messages_count": len(messages),
+                        "iteration": iteration + 1,
+                        "step_id": step_id,
+                        "step_name": getattr(self, "_current_step_name", "main"),
+                        "action_id": action_id,
+                        "pattern_error_context": e.context,
+                    },
+                )
+
+                # Build observation message from the error
+                # Use LLM-friendly language: "Failed to parse your response" instead of technical jargon
+                error_observation = f"Failed to parse your response: {error_msg}"
+                if e.context:
+                    # Add useful context information (truncated if too long)
+                    context_str = _truncate_for_display(str(e.context), max_len=500)
+                    error_observation += f"\nError context: {context_str}"
+
+                logger.warning(
+                    f"Iteration {iteration + 1} failed with pattern error: {error_msg}. "
+                    f"Converting to observation so LLM can see and retry."
+                )
+
+                # Add to messages as observation - this is the KEY FIX
+                # LLM will see this error in the next iteration and can try to correct the format
+                messages.append(
+                    {"role": "user", "content": f"Observation: {error_observation}"}
+                )
+                self._last_messages = messages.copy()
+
+                # Continue to next iteration - LLM now has error context to recover
+                continue
 
             except Exception as e:
                 # Generate insights and store memories even for failures
@@ -1628,6 +1716,14 @@ Remember: Return ONLY ONE JSON object. No additional text, no multiple objects.
             )
             raise
 
+        # Debug: Log the response (with preview for long responses)
+        response_preview = _truncate_for_display(str(response), max_len=200)
+        logger.debug(
+            "React received LLM response:\n"
+            f"  - Response type: {type(response).__name__}\n"
+            f"  - Response length: {len(str(response)) if response else 0} chars\n"
+            f"  - Response preview: {response_preview}"
+        )
         # Handle None response
         if response is None:
             await log_llm_completion(response, False, None)
@@ -1739,12 +1835,30 @@ Remember: Return ONLY ONE JSON object. No additional text, no multiple objects.
                     # Re-raise PatternExecutionError as it's not a repair failure
                     if isinstance(repair_error, PatternExecutionError):
                         raise
+                    # Convert other parsing errors (RecursionError, JSONDecodeError, ValidationError)
+                    # to PatternExecutionError so they can be converted to observations for LLM to see
+                    if isinstance(
+                        repair_error,
+                        (RecursionError, json.JSONDecodeError, ValidationError),
+                    ):
+                        raise PatternExecutionError(
+                            pattern_name="ReAct",
+                            message=f"Failed to parse LLM response: {str(repair_error)}",
+                            context={
+                                "error_type": type(repair_error).__name__,
+                                "response_preview": response[:200]
+                                if response
+                                else None,
+                            },
+                            cause=repair_error,
+                        )
                     # Not valid JSON, treat as direct text response
                     pass
             except AttributeError:
                 pass
 
             # Fallback: treat unparsable string as direct text response
+            # This should only be reached for truly unparsable content, not JSON parsing errors
             action = Action(
                 type="final_answer",
                 reasoning="LLM provided direct response",
@@ -1759,7 +1873,22 @@ Remember: Return ONLY ONE JSON object. No additional text, no multiple objects.
         # Parse JSON response (for when response_format="json_object" is enforced)
         try:
             content = self._extract_content(response)
-            repaired = repair_loads(content, logging=True)
+            try:
+                repaired = repair_loads(content, logging=True)
+            except (RecursionError, json.JSONDecodeError) as repair_error:
+                # repair_loads failed due to deeply nested or malformed JSON
+                # Convert to PatternExecutionError so it gets converted to observation
+                raise PatternExecutionError(
+                    pattern_name="ReAct",
+                    message=f"Failed to parse LLM response: {str(repair_error)}",
+                    context={
+                        "error_type": type(repair_error).__name__,
+                        "response_preview": _truncate_for_display(
+                            str(response), max_len=200
+                        ),
+                    },
+                    cause=repair_error,
+                )
 
             if isinstance(repaired, tuple):
                 action_data, repair_log = repaired
@@ -1767,51 +1896,74 @@ Remember: Return ONLY ONE JSON object. No additional text, no multiple objects.
                 action_data = repaired
 
             normalized_action_data = self._normalize_action_data(action_data)
-            action = Action.model_validate(normalized_action_data)
-            await log_llm_completion(
-                normalized_action_data, action.type == "tool_call", action.reasoning
-            )
 
-            if action.type == "tool_call":
-                if tool_schemas:
-                    # JSON responses must not attempt to specify tool details.
-                    # Require the model to trigger native function calling.
-                    messages.append(
-                        {
-                            "role": "user",
-                            "content": (
-                                "SYSTEM REMINDER: Tool calls must be executed via the native "
-                                "function calling interface. Respond again, trigger the tool "
-                                'directly, and only set "type" to "tool_call" in your JSON.'
-                            ),
-                        }
-                    )
-                    raise PatternExecutionError(
-                        pattern_name="ReAct",
-                        message=(
-                            "Tool call requested via JSON without a native tool call. "
-                            "Tools must be invoked through the function calling API."
-                        ),
-                        context={"response": response},
-                    )
-                else:
-                    # No tools available but model attempted to call one.
-                    messages.append(
-                        {
-                            "role": "user",
-                            "content": (
-                                "SYSTEM REMINDER: No tools are available for this task. "
-                                "Provide a final answer JSON instead of requesting a tool."
-                            ),
-                        }
-                    )
-                    raise PatternExecutionError(
-                        pattern_name="ReAct",
-                        message="Tool call requested when no tools are available.",
-                        context={"response": response},
-                    )
+            try:
+                action = Action.model_validate(normalized_action_data)
+                await log_llm_completion(
+                    normalized_action_data, action.type == "tool_call", action.reasoning
+                )
 
-            return action
+                if action.type == "tool_call":
+                    if tool_schemas:
+                        # JSON responses must not attempt to specify tool details.
+                        # Require the model to trigger native function calling.
+                        messages.append(
+                            {
+                                "role": "user",
+                                "content": (
+                                    "SYSTEM REMINDER: Tool calls must be executed via the native "
+                                    "function calling interface. Respond again, trigger the tool "
+                                    'directly, and only set "type" to "tool_call" in your JSON.'
+                                ),
+                            }
+                        )
+                        raise PatternExecutionError(
+                            pattern_name="ReAct",
+                            message=(
+                                "Tool call requested via JSON without a native tool call. "
+                                "Tools must be invoked through the function calling API."
+                            ),
+                            context={"response": response},
+                        )
+                    else:
+                        # No tools available but model attempted to call one.
+                        messages.append(
+                            {
+                                "role": "user",
+                                "content": (
+                                    "SYSTEM REMINDER: No tools are available for this task. "
+                                    "Provide a final answer JSON instead of requesting a tool."
+                                ),
+                            }
+                        )
+                        raise PatternExecutionError(
+                            pattern_name="ReAct",
+                            message="Tool call requested when no tools are available.",
+                            context={"response": response},
+                        )
+
+                return action
+            except RecursionError as e:
+                # RecursionError means JSON is too deeply nested
+                # This is a pattern failure - raise PatternExecutionError so it gets
+                # converted to observation and LLM can see the error.
+                # Raise error for retry.
+                logger.error(
+                    f"RecursionError in JSON repair: JSON too deeply nested. "
+                    f"Content length: {len(content) if content else 0}. "
+                    f"This indicates the LLM returned malformed JSON with excessive nesting."
+                )
+                raise PatternExecutionError(
+                    pattern_name="ReAct",
+                    message=f"JSON parsing failed due to excessive nesting: {str(e)}",
+                    context={
+                        "error_type": "RecursionError",
+                        "content_length": len(content) if content else 0,
+                        "content_preview": _truncate_for_display(content, max_len=200),
+                        "suggestion": "The LLM returned JSON with excessive nesting. This may indicate a generation loop or malformed response.",
+                    },
+                    cause=e,
+                )
         except json.JSONDecodeError as e:
             logging.info(f"invalid json response: {content}")
             # JSON parsing failed - raise error for retry
@@ -1823,9 +1975,7 @@ Remember: Return ONLY ONE JSON object. No additional text, no multiple objects.
                     "response": response,
                     "json_error": str(e),
                     "content_length": len(content),
-                    "content_preview": content[:200] + "..."
-                    if len(content) > 200
-                    else content,
+                    "content_preview": _truncate_for_display(content, max_len=200),
                 },
             )
         except ValidationError as e:
@@ -2064,11 +2214,32 @@ Remember: Return ONLY ONE JSON object. No additional text, no multiple objects.
 
         reasoning = response.get("reasoning") or response.get("content") or ""
 
+        # Parse tool arguments from JSON string
+        # This may raise RecursionError if arguments contain deeply nested JSON
+        arguments_str = function_info.get("arguments", "{}")
+        try:
+            tool_args = json.loads(arguments_str)
+        except (RecursionError, json.JSONDecodeError) as e:
+            # JSON parsing failed - convert to PatternExecutionError
+            # This will be caught by the caller and converted to observation
+            raise PatternExecutionError(
+                pattern_name="ReAct",
+                message=f"Failed to parse tool arguments JSON: {str(e)}",
+                context={
+                    "error_type": type(e).__name__,
+                    "tool_name": tool_name,
+                    "arguments_preview": _truncate_for_display(
+                        arguments_str, max_len=200
+                    ),
+                },
+                cause=e,
+            )
+
         return Action(
             type="tool_call",
             reasoning=reasoning,
             tool_name=tool_name,
-            tool_args=json.loads(function_info.get("arguments", "{}")),
+            tool_args=tool_args,
         )
 
     async def _execute_action(

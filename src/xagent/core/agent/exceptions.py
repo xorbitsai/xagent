@@ -5,7 +5,14 @@ This module defines specific exceptions for different failure scenarios
 in agent execution, replacing generic string error handling.
 """
 
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, TypedDict
+
+
+class AgentExceptionDict(TypedDict):
+    type: str
+    message: str
+    context: Dict[str, Any]
+    cause: Optional[str]
 
 
 class AgentException(Exception):
@@ -21,7 +28,7 @@ class AgentException(Exception):
         self.context = context or {}
         self.cause = cause
 
-    def to_dict(self) -> Dict[str, Any]:
+    def to_dict(self) -> AgentExceptionDict:
         """Convert exception to dictionary for serialization."""
         return {
             "type": self.__class__.__name__,

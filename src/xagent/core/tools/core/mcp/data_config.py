@@ -6,6 +6,7 @@ runtime status, and management. It combines connection details with lifecycle
 management information to provide a single source of truth for all MCP servers.
 """
 
+import re
 from datetime import datetime
 from enum import Enum
 from pathlib import Path
@@ -83,17 +84,27 @@ class MCPServerConfig(BaseModel):
     @classmethod
     def validate_name(cls, v: str) -> str:
         """Validate server name format."""
-        if not v.replace("-", "").replace("_", "").isalnum():
+        if not v or not v.strip():
+            raise ValueError("Name cannot be empty")
+
+        if not re.match(r"^[a-zA-Z0-9_-]+$", v):
             raise ValueError(
                 "Name can only contain letters, numbers, hyphens and underscores"
             )
-        return v
+
+        return v.strip()
 
     @field_validator("transport")
     @classmethod
     def validate_transport(cls, v: str) -> str:
         """Validate transport type."""
-        valid_transports = {"stdio", "sse", "websocket", "streamable_http"}
+        valid_transports = {
+            "stdio",
+            "sse",
+            "websocket",
+            "streamable_http",
+            "custom_api",
+        }
         if v not in valid_transports:
             raise ValueError(
                 f"Invalid transport '{v}'. "

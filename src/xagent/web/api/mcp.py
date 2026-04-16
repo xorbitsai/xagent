@@ -17,6 +17,7 @@ from sqlalchemy.orm import Session
 
 from ...core.tools.core.mcp.data_config import MCPServerConfig
 from ...core.tools.core.mcp.manager.db import DatabaseMCPServerManager
+from ...core.utils.encryption import encrypt_value
 from ..auth_dependencies import get_current_user
 from ..mcp_apps import MCP_APPS_LIBRARY, get_app_by_name
 from ..models.database import get_db
@@ -32,7 +33,8 @@ class MCPServerCreate(BaseModel):
 
     name: str = Field(..., min_length=1, max_length=100, description="Server name")
     transport: str = Field(
-        ..., description="Transport type (stdio, sse, websocket, streamable_http)"
+        ...,
+        description="Transport type (stdio, sse, websocket, streamable_http, custom_api)",
     )
     description: Optional[str] = Field(None, description="Server description")
     config: dict = Field(..., description="Transport-specific configuration")
@@ -206,6 +208,7 @@ class TransportFieldValidator:
         "sse": {"url"},
         "websocket": {"url"},
         "streamable_http": {"url"},
+        "custom_api": set(),
     }
 
     TRANSPORT_OPTIONAL_FIELDS = {
@@ -213,6 +216,7 @@ class TransportFieldValidator:
         "sse": {"headers"},
         "websocket": {"headers"},
         "streamable_http": {"headers"},
+        "custom_api": {"env"},
     }
 
     @classmethod
@@ -251,6 +255,32 @@ def _build_server_config(
                     parsed_value = _parse_config_field(
                         field_name, value, server_data.transport
                     )
+
+                    # Encrypt custom_api env values
+                    if (
+                        server_data.transport == "custom_api"
+                        and field_name == "env"
+                        and isinstance(parsed_value, dict)
+                    ):
+                        encrypted_env = {}
+                        existing_env: dict = (
+                            existing_server.env
+                            if existing_server and isinstance(existing_server.env, dict)
+                            else {}
+                        )
+                        for k, v in parsed_value.items():
+                            if v == "********":
+                                # Retain existing encrypted value if masked
+                                if k in existing_env:
+                                    encrypted_env[k] = existing_env[k]
+                                else:
+                                    logger.warning(
+                                        f"Masked key {k} not found in existing env, skipping"
+                                    )
+                            else:
+                                encrypted_env[k] = encrypt_value(v)
+                        parsed_value = encrypted_env
+
                     if parsed_value is not None:
                         config_dict[field_name] = parsed_value
                 except ValueError as e:
@@ -365,8 +395,19 @@ def _db_server_to_response(
         if value is None:
             serialized_config[key] = None
         elif isinstance(value, (dict, list)):
-            # Convert to JSON string for frontend display
-            serialized_config[key] = json.dumps(value, ensure_ascii=False, indent=2)
+            if (
+                server.transport == "custom_api"
+                and key == "env"
+                and isinstance(value, dict)
+            ):
+                # For custom API, mask the env values so frontend receives '********'
+                masked_env = {k: "********" for k in value.keys()}
+                serialized_config[key] = json.dumps(
+                    masked_env, ensure_ascii=False, indent=2
+                )
+            else:
+                # Convert to JSON string for frontend display
+                serialized_config[key] = json.dumps(value, ensure_ascii=False, indent=2)
         else:
             serialized_config[key] = value
 

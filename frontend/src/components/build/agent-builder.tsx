@@ -1659,7 +1659,7 @@ export function AgentBuilder({ agentId }: AgentBuilderProps) {
               className="w-auto self-start text-blue-600 border-blue-200 hover:bg-blue-50"
             >
               <PlusCircle className="h-4 w-4 mr-2" />
-              {t('tools.mcp.dialog.connectMcp')}
+              {t('tools.mcp.dialog.connector')}
             </Button>
           </div>
         </div>

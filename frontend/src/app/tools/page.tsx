@@ -38,6 +38,8 @@ import { getApiUrl } from "@/lib/utils"
 import { apiRequest } from "@/lib/api-wrapper"
 import { ConnectMcpDialog, AppIntegration } from "@/components/mcp/connect-mcp-dialog"
 import { OfficialMcpSettingsDialog } from "@/components/mcp/official-mcp-settings-dialog"
+import { CustomApiForm } from "@/components/mcp/custom-api-form"
+import { CustomMcpForm } from "@/components/mcp/custom-mcp-form"
 import { useI18n } from "@/contexts/i18n-context"
 import { useAuth } from "@/contexts/auth-context"
 import { useMcpApps } from "@/contexts/mcp-apps-context"
@@ -138,6 +140,7 @@ export default function ToolsPage() {
   const [isOfficialAppDialogOpen, setIsOfficialAppDialogOpen] = useState(false)
   const [editingOfficialApp, setEditingOfficialApp] = useState<AppIntegration | null>(null)
   const [isMcpDialogOpen, setIsMcpDialogOpen] = useState(false)
+  const [customApiEnv, setCustomApiEnv] = useState<{ key: string, value: string }[]>([{ key: "", value: "" }])
   const [isCredentialDialogOpen, setIsCredentialDialogOpen] = useState(false)
   const [editingConfigTool, setEditingConfigTool] = useState<ConfigurableTool | null>(null)
   const [credentialValues, setCredentialValues] = useState<Record<string, string>>({})
@@ -492,14 +495,26 @@ export default function ToolsPage() {
         is_custom: false
       })
       setIsOfficialAppDialogOpen(true)
-    } else {
-      // For custom servers, show the detail dialog first
+    } else if (server.transport === "custom_api") {
       setEditingOfficialApp({
         id: server.id.toString(),
         server_id: server.id,
         name: server.name,
         description: server.description || "",
-        icon: "", // Use generic icon
+        icon: "",
+        is_connected: true,
+        provider: "custom_api",
+        is_custom: true,
+        server: server
+      })
+      setIsOfficialAppDialogOpen(true)
+    } else {
+      setEditingOfficialApp({
+        id: server.id.toString(),
+        server_id: server.id,
+        name: server.name,
+        description: server.description || "",
+        icon: "",
         is_connected: true,
         provider: "custom",
         is_custom: true,
@@ -514,6 +529,27 @@ export default function ToolsPage() {
       toast.error(t('tools.mcp.alerts.nameRequired'))
       return
     }
+
+    const nameRegex = /^[a-zA-Z0-9_-]+$/;
+    if (!nameRegex.test(mcpFormData.name.trim())) {
+      toast.error(t('tools.mcp.alerts.nameInvalidFormat') || "Name can only contain letters, numbers, hyphens and underscores");
+      return;
+    }
+
+    const payload = { ...mcpFormData }
+    if (payload.transport === "custom_api") {
+      const validEnv = customApiEnv.filter(env => env.key.trim() && env.value.trim());
+      if (validEnv.length === 0) {
+        toast.error(t('tools.mcp.alerts.atLeastOneSecret') || "At least one valid secret is required");
+        return;
+      }
+      const envObj: Record<string, string> = {};
+      validEnv.forEach(env => {
+        envObj[env.key.trim()] = env.value.trim();
+      });
+      payload.config = { ...payload.config, env: envObj };
+    }
+
     setIsLoading(true)
     try {
       const url = editingServer
@@ -525,7 +561,7 @@ export default function ToolsPage() {
         headers: {
           'Content-Type': 'application/json',
         },
-        body: JSON.stringify(mcpFormData)
+        body: JSON.stringify(payload)
       })
       if (response.ok) {
         await loadMCPServers()
@@ -891,94 +927,62 @@ export default function ToolsPage() {
           />
           <Button className="bg-primary text-primary-foreground hover:bg-primary/90" onClick={() => setIsConnectMcpOpen(true)}>
             <Plus className="h-4 w-4 mr-2" />
-            {t('tools.mcp.addServer')}
+            {t('tools.mcp.addConnector')}
           </Button>
           <Dialog open={isMcpDialogOpen} onOpenChange={setIsMcpDialogOpen}>
             <DialogContent className="max-w-2xl max-h-[80vh] overflow-y-auto">
               <DialogHeader>
                 <DialogTitle>
-                  {editingServer ? t('tools.mcp.dialog.editTitle') : t('tools.mcp.dialog.addTitle')}
+                  {editingServer ? mcpFormData.transport === 'custom_api' ? t('tools.mcp.dialog.editCustomApi') : t('tools.mcp.dialog.editTitle') : mcpFormData.transport === 'custom_api' ? t('tools.mcp.dialog.addCustomApi') : t('tools.mcp.dialog.addTitle')}
                 </DialogTitle>
                 <DialogDescription>
-                  {t('tools.mcp.dialog.description')}
+                  {mcpFormData.transport === 'custom_api' ? t('tools.mcp.dialog.customApiDescription') : t('tools.mcp.dialog.description')}
                 </DialogDescription>
               </DialogHeader>
               <div className="space-y-4">
-                <div className="space-y-2">
-                  <Label htmlFor="name">{t('tools.mcp.form.nameLabel')}</Label>
-                  <Input
-                    id="name"
-                    value={mcpFormData.name}
-                    onChange={(e) => setMcpFormData(prev => ({ ...prev, name: e.target.value }))}
-                    placeholder={t('tools.mcp.form.namePlaceholder')}
-                  />
-                </div>
-                <div className="space-y-2">
-                  <Label htmlFor="transport">{t('tools.mcp.form.transportLabel')}</Label>
-                  <Select
-                    value={mcpFormData.transport}
-                    onValueChange={(value: string) => setMcpFormData(prev => ({ ...prev, transport: value }))}
-                    options={transports}
-                    placeholder={t('tools.mcp.form.transportPlaceholder')}
-                  />
-                </div>
-                <div className="space-y-2">
-                  <Label htmlFor="description">{t('tools.mcp.form.descriptionLabel')}</Label>
-                  <Textarea
-                    id="description"
-                    value={mcpFormData.description}
-                    onChange={(e) => setMcpFormData(prev => ({ ...prev, description: e.target.value }))}
-                    placeholder={t('tools.mcp.form.descriptionPlaceholder')}
-                    rows={3}
-                  />
-                </div>
-                {(() => {
-                  const selectedTransport = transports.find(t => t.value === mcpFormData.transport);
-                  return selectedTransport?.fields?.map((field) => (
-                    <div key={field.name} className="space-y-2">
-                      <Label htmlFor={field.name}>{field.label} {field.required && "*"}</Label>
-                      {field.type === 'textarea' ? (
-                        <Textarea
-                          id={field.name}
-                          value={mcpFormData.config[field.name] || ''}
-                          onChange={(e) => setMcpFormData(prev => ({
-                            ...prev,
-                            config: { ...prev.config, [field.name]: e.target.value }
-                          }))}
-                          placeholder={field.placeholder}
-                          rows={3}
-                        />
-                      ) : field.type === 'select' ? (
-                        <Select
-                          value={mcpFormData.config[field.name] || ''}
-                          onValueChange={(value: string) => setMcpFormData(prev => ({
-                            ...prev,
-                            config: { ...prev.config, [field.name]: value }
-                          }))}
-                          options={field.options || []}
-                          placeholder={field.placeholder}
-                        />
-                      ) : (
-                        <Input
-                          id={field.name}
-                          type={field.type === 'number' ? 'number' : 'text'}
-                          value={mcpFormData.config[field.name] || ''}
-                          onChange={(e) => setMcpFormData(prev => ({
-                            ...prev,
-                            config: { ...prev.config, [field.name]: field.type === 'number' ? Number(e.target.value) : e.target.value }
-                          }))}
-                          placeholder={field.placeholder}
-                        />
-                      )}
-                    </div>
-                  ));
-                })()}
+                {mcpFormData.transport === 'custom_api' ? (
+                  <>
+                    <CustomApiForm
+                      mcpFormData={mcpFormData}
+                      setMcpFormData={setMcpFormData}
+                      customApiEnv={customApiEnv}
+                      setCustomApiEnv={setCustomApiEnv}
+                      originalEnvObj={(() => {
+                        let originalEnvObj: Record<string, any> = {};
+                        if (editingServer?.config?.env) {
+                          originalEnvObj = typeof editingServer.config.env === 'string'
+                            ? JSON.parse(editingServer.config.env)
+                            : editingServer.config.env;
+                        }
+                        return originalEnvObj;
+                      })()}
+                    />
+                  </>
+                ) : (
+                  <>
+                    <CustomMcpForm
+                      mcpFormData={mcpFormData}
+                      setMcpFormData={setMcpFormData}
+                      transports={transports}
+                    />
+                  </>
+                )}
               </div>
               <DialogFooter>
                 <Button variant="outline" onClick={() => setIsMcpDialogOpen(false)}>
                   {t('tools.mcp.buttons.cancel')}
                 </Button>
-                <Button onClick={handleSaveMcpServer} disabled={isLoading}>
+                <Button
+                  onClick={handleSaveMcpServer}
+                  disabled={
+                    isLoading ||
+                    (mcpFormData.transport === 'custom_api' && (
+                      !mcpFormData.name.trim() ||
+                      customApiEnv.length === 0 ||
+                      customApiEnv.some(env => !env.key.trim() || !env.value.trim())
+                    ))
+                  }
+                >
                   {isLoading && <Loader2 className="h-4 w-4 mr-2 animate-spin" />}
                   {t('tools.mcp.buttons.save')}
                 </Button>
@@ -1319,8 +1323,18 @@ export default function ToolsPage() {
               name: app.server.name,
               transport: app.server.transport,
               description: app.server.description || "",
-              config: app.server.config
+              config: app.server.config || {}
             });
+            if (app.server.transport === "custom_api") {
+              const envObj = app.server.config?.env || {};
+              const envList = typeof envObj === 'object' && !Array.isArray(envObj)
+                ? Object.entries(envObj).map(([k, v]) => ({ key: k, value: v as string }))
+                : [];
+              if (envList.length === 0) {
+                envList.push({ key: "", value: "" });
+              }
+              setCustomApiEnv(envList);
+            }
             setIsMcpDialogOpen(true);
           }
         }}

@@ -2507,7 +2507,6 @@ async def handle_builder_chat(
 
     from ...core.agent.service import AgentService
     from ...core.memory.in_memory import InMemoryMemoryStore
-    from ...core.tools.adapters.vibe.agent_tool import CreateAgentTool, UpdateAgentTool
     from ..models.database import get_db
     from ..services.llm_utils import UserAwareModelStorage
 
@@ -2578,9 +2577,13 @@ Important instructions:
 You have access to the following tools:
 - create_agent: Create a new agent with specific capabilities
 - update_agent: Update an existing agent with specific capabilities
+- list_available_skills: Query the list of skills you can assign to an agent
+- list_tool_categories: Query the list of tool categories you can assign to an agent
+- list_knowledge_bases: Query the list of knowledge bases you can associate with an agent
 
 Use the create_agent tool whenever the user wants to build a new agent and there is no agent ID in the current configuration.
 Use the update_agent tool whenever the user wants to modify their current agent configuration and an agent ID is available in the current configuration.
+If the user wants to add skills, tool categories, or knowledge bases but you are unsure which ones exist, use the list_* tools to find out before calling create_agent or update_agent.
 """
 
         # Get LLM configuration
@@ -2617,7 +2620,17 @@ Use the update_agent tool whenever the user wants to modify their current agent 
                 websocket.state.builder_memory = InMemoryMemoryStore()
             memory = websocket.state.builder_memory
 
-            # Create only the CreateAgentTool and UpdateAgentTool directly (much faster than loading all tools)
+            from ...core.tools.adapters.vibe.agent_tool import (
+                CreateAgentTool,
+                ListAvailableSkillsTool,
+                ListToolCategoriesTool,
+                UpdateAgentTool,
+            )
+            from ...core.tools.adapters.vibe.document_search import (
+                ListKnowledgeBasesTool,
+            )
+
+            # Create only the necessary tools directly (much faster than loading all tools)
             create_agent_tool = CreateAgentTool(
                 db=db,
                 user_id=int(user.id),
@@ -2629,6 +2642,11 @@ Use the update_agent tool whenever the user wants to modify their current agent 
                 user_id=int(user.id),
                 task_id=builder_task_id,
                 workspace_base_dir=str(get_uploads_dir() / "builder_chat"),
+            )
+            list_skills_tool = ListAvailableSkillsTool()
+            list_tool_categories_tool = ListToolCategoriesTool()
+            list_kbs_tool = ListKnowledgeBasesTool(
+                user_id=int(user.id), is_admin=bool(user.is_admin)
             )
 
             # Build allowed external directories
@@ -2646,7 +2664,13 @@ Use the update_agent tool whenever the user wants to modify their current agent 
                 vision_llm=None,
                 compact_llm=None,
                 memory=memory,
-                tools=[create_agent_tool, update_agent_tool],  # Direct tool creation
+                tools=[
+                    create_agent_tool,
+                    update_agent_tool,
+                    list_skills_tool,
+                    list_tool_categories_tool,
+                    list_kbs_tool,
+                ],
                 use_dag_pattern=False,  # Use ReAct pattern
                 id=builder_task_id,
                 enable_workspace=True,

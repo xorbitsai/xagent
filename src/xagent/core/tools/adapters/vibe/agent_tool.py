@@ -152,6 +152,106 @@ class AgentToolResult(BaseModel):
     response: str = Field(description="The agent's response")
 
 
+class ListAvailableSkillsArgs(BaseModel):
+    pass
+
+
+class ListAvailableSkillsResult(BaseModel):
+    skills: list[str] = Field(description="List of available skill names")
+
+
+class ListAvailableSkillsTool(AbstractBaseTool):
+    """Tool for listing available skills."""
+
+    category: ToolCategory = ToolCategory.AGENT
+
+    def __init__(
+        self,
+        db: Any = None,
+        user_id: Optional[int] = None,
+        task_id: Optional[str] = None,
+        workspace_base_dir: Optional[str] = None,
+    ):
+        self._visibility = ToolVisibility.PUBLIC
+
+    @property
+    def name(self) -> str:
+        return "list_available_skills"
+
+    @property
+    def description(self) -> str:
+        return "List all available skills that can be assigned to an agent."
+
+    def args_type(self) -> Type[BaseModel]:
+        return ListAvailableSkillsArgs
+
+    def return_type(self) -> Type[BaseModel]:
+        return ListAvailableSkillsResult
+
+    def run_json_sync(self, args: Mapping[str, Any]) -> Any:
+        raise NotImplementedError("Only supports async execution.")
+
+    async def run_json_async(self, args: Mapping[str, Any]) -> Any:
+        import os
+
+        skills_dir = os.path.join(
+            os.path.dirname(__file__), "../../../../skills/builtin"
+        )
+        available_skills = []
+        if os.path.exists(skills_dir):
+            for skill_dir in os.listdir(skills_dir):
+                skill_path = os.path.join(skills_dir, skill_dir)
+                if os.path.isdir(skill_path):
+                    available_skills.append(skill_dir)
+        return ListAvailableSkillsResult(skills=available_skills).model_dump()
+
+
+class ListToolCategoriesArgs(BaseModel):
+    pass
+
+
+class ListToolCategoriesResult(BaseModel):
+    categories: list[str] = Field(description="List of available tool categories")
+
+
+class ListToolCategoriesTool(AbstractBaseTool):
+    """Tool for listing available tool categories."""
+
+    category: ToolCategory = ToolCategory.AGENT
+
+    def __init__(
+        self,
+        db: Any = None,
+        user_id: Optional[int] = None,
+        task_id: Optional[str] = None,
+        workspace_base_dir: Optional[str] = None,
+    ):
+        self._visibility = ToolVisibility.PUBLIC
+
+    @property
+    def name(self) -> str:
+        return "list_tool_categories"
+
+    @property
+    def description(self) -> str:
+        return "List all available tool categories that can be assigned to an agent."
+
+    def args_type(self) -> Type[BaseModel]:
+        return ListToolCategoriesArgs
+
+    def return_type(self) -> Type[BaseModel]:
+        return ListToolCategoriesResult
+
+    def run_json_sync(self, args: Mapping[str, Any]) -> Any:
+        raise NotImplementedError("Only supports async execution.")
+
+    async def run_json_async(self, args: Mapping[str, Any]) -> Any:
+        from .base import ToolCategory
+
+        available_categories = [cat.value for cat in ToolCategory]
+        return ListToolCategoriesResult(categories=available_categories).model_dump()
+
+
 class CreateAgentTool(AbstractBaseTool):
     """
     Tool for creating a new draft agent during task execution.

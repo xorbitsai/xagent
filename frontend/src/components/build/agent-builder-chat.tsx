@@ -169,6 +169,9 @@ export function AgentBuilderChat({ agentConfig, onUpdateConfig, availableOptions
                   if (toolArgs.name) configUpdates.name = toolArgs.name;
                   if (toolArgs.description) configUpdates.description = toolArgs.description;
                   if (toolArgs.instructions) configUpdates.instructions = toolArgs.instructions;
+                  if (toolArgs.knowledge_bases) configUpdates.selectedKbs = toolArgs.knowledge_bases;
+                  if (toolArgs.skills) configUpdates.selectedSkills = toolArgs.skills;
+                  if (toolArgs.tool_categories) configUpdates.selectedToolCategories = toolArgs.tool_categories;
                   if (result.status === "success" && result.agent_id) {
                     configUpdates.id = result.agent_id;
                   }

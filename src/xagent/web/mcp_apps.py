@@ -33,7 +33,7 @@ MCP_APPS_LIBRARY: List[Dict[str, Any]] = [
         "oauth_scopes": ["openid", "profile", "email", "w_member_social"],
         "launch_config": {
             "command": "uv",
-            "args": ["run", "python", "-m", "xagent.web.tools.linkedin_mcp"],
+            "args": ["run", "python", "-m", "xagent.web.tools.mcp.linkedin"],
             "env_mapping": {"LINKEDIN_ACCESS_TOKEN": "access_token"},
         },
     },
@@ -48,7 +48,7 @@ MCP_APPS_LIBRARY: List[Dict[str, Any]] = [
         "oauth_scopes": ["https://www.googleapis.com/auth/gmail.modify"],
         "launch_config": {
             "command": "uv",
-            "args": ["run", "python", "-m", "xagent.web.tools.gmail_mcp"],
+            "args": ["run", "python", "-m", "xagent.web.tools.mcp.gmail"],
             "env_mapping": {"GOOGLE_ACCESS_TOKEN": "access_token"},
         },
     },
@@ -63,7 +63,7 @@ MCP_APPS_LIBRARY: List[Dict[str, Any]] = [
         "oauth_scopes": ["https://www.googleapis.com/auth/drive"],
         "launch_config": {
             "command": "uv",
-            "args": ["run", "python", "-m", "xagent.web.tools.google_drive_mcp"],
+            "args": ["run", "python", "-m", "xagent.web.tools.mcp.google_drive"],
             "env_mapping": {"GOOGLE_ACCESS_TOKEN": "access_token"},
         },
     },
@@ -78,7 +78,7 @@ MCP_APPS_LIBRARY: List[Dict[str, Any]] = [
         "oauth_scopes": ["https://www.googleapis.com/auth/calendar"],
         "launch_config": {
             "command": "uv",
-            "args": ["run", "python", "-m", "xagent.web.tools.calendar_mcp"],
+            "args": ["run", "python", "-m", "xagent.web.tools.mcp.calendar"],
             "env_mapping": {"GOOGLE_ACCESS_TOKEN": "access_token"},
         },
     },

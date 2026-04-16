@@ -619,13 +619,13 @@ export function AgentBuilder({ agentId }: AgentBuilderProps) {
   }, [templateId, isEditMode, locale])
 
   // Convert kbs to MultiSelect options
-  const kbOptions = kbs.map((kb) => ({
+  const kbOptions = (Array.isArray(kbs) ? kbs : []).map((kb) => ({
     value: kb.name,
     label: kb.name,
   }))
 
   // Convert skills to MultiSelect options
-  const skillOptions = skills.map((skill) => ({
+  const skillOptions = (Array.isArray(skills) ? skills : []).map((skill) => ({
     value: skill.name,
     label: skill.name,
     description: skill.description || skill.when_to_use || undefined,
@@ -633,7 +633,7 @@ export function AgentBuilder({ agentId }: AgentBuilderProps) {
 
   const modelOptions = [
     { value: "", label: "--" },
-    ...models.map((model) => ({
+    ...(Array.isArray(models) ? models : []).map((model) => ({
       value: model.id.toString(),
       label: model.model_name,
     }))
@@ -641,11 +641,11 @@ export function AgentBuilder({ agentId }: AgentBuilderProps) {
 
   // Group tools by category for category selection
   const toolCategories = Array.from(
-    new Set(tools.map(t => t.category))
+    new Set((Array.isArray(tools) ? tools : []).map(t => t.category))
   ).sort()
 
   const toolCategoryOptions = toolCategories.map(category => {
-    const toolsInCategory = tools.filter(t => t.category === category)
+    const toolsInCategory = (Array.isArray(tools) ? tools : []).filter(t => t.category === category)
     const categoryDesc = getCategoryDescription(category)
     return {
       value: category,
@@ -1488,7 +1488,7 @@ export function AgentBuilder({ agentId }: AgentBuilderProps) {
           </div>
 
           <MultiSelect
-            values={selectedKbs}
+            values={selectedKbs || []}
             onValuesChange={(newValues) => {
               setSelectedKbs(newValues)
               if (newValues.length > 0 && !selectedToolCategories.includes("knowledge")) {
@@ -1528,7 +1528,7 @@ export function AgentBuilder({ agentId }: AgentBuilderProps) {
           </div>
           {skills.length > 0 ? (
             <MultiSelect
-              values={selectedSkills}
+              values={selectedSkills || []}
               onValuesChange={setSelectedSkills}
               options={skillOptions}
               placeholder={t("builds.configForm.skills.placeholder")}
@@ -1568,7 +1568,7 @@ export function AgentBuilder({ agentId }: AgentBuilderProps) {
           </div>
           {toolCategories.length > 0 ? (
             <MultiSelect
-              values={selectedToolCategories}
+              values={selectedToolCategories || []}
               onValuesChange={setSelectedToolCategories}
               options={toolCategoryOptions}
               placeholder={t("builds.configForm.tools.placeholder")}
@@ -1594,8 +1594,8 @@ export function AgentBuilder({ agentId }: AgentBuilderProps) {
           <div className="text-xs text-muted-foreground mb-2">
             {t("builds.configForm.suggestedPrompts.description")}
           </div>
-          <div className="space-y-2">
-            {suggestedPrompts.map((prompt, index) => (
+          <div className="space-y-3">
+            {(suggestedPrompts || []).map((prompt, index) => (
               <div key={index} className="flex gap-2 items-start">
                 <Input
                   value={prompt}
@@ -1754,10 +1754,10 @@ export function AgentBuilder({ agentId }: AgentBuilderProps) {
               if (updates.selectedToolCategories !== undefined) setSelectedToolCategories(updates.selectedToolCategories);
             }}
             availableOptions={{
-              models: models.map(m => ({ id: m.id, name: m.model_name || m.model_id })),
-              knowledgeBases: kbs.map(k => ({ name: k.name })),
-              skills: skills.map(s => ({ name: s.name })),
-              toolCategories: Array.from(new Set(tools.map(t => t.category)))
+              models: (Array.isArray(models) ? models : []).map(m => ({ id: m.id, name: m.model_name || m.model_id })),
+              knowledgeBases: (Array.isArray(kbs) ? kbs : []).map(k => ({ name: k.name })),
+              skills: (Array.isArray(skills) ? skills : []).map(s => ({ name: s.name })),
+              toolCategories: Array.from(new Set((Array.isArray(tools) ? tools : []).map(t => t.category)))
             }}
           />}
           middlePanel={LeftPanel}

@@ -169,9 +169,22 @@ export function AgentBuilderChat({ agentConfig, onUpdateConfig, availableOptions
                   if (toolArgs.name) configUpdates.name = toolArgs.name;
                   if (toolArgs.description) configUpdates.description = toolArgs.description;
                   if (toolArgs.instructions) configUpdates.instructions = toolArgs.instructions;
-                  if (toolArgs.knowledge_bases) configUpdates.selectedKbs = toolArgs.knowledge_bases;
-                  if (toolArgs.skills) configUpdates.selectedSkills = toolArgs.skills;
-                  if (toolArgs.tool_categories) configUpdates.selectedToolCategories = toolArgs.tool_categories;
+                  if (toolArgs.knowledge_bases) {
+                    const kbs = Array.isArray(toolArgs.knowledge_bases) ? toolArgs.knowledge_bases : [toolArgs.knowledge_bases];
+                    configUpdates.selectedKbs = kbs.map((kb: any) => typeof kb === 'string' ? kb : kb.name || kb.value).filter(Boolean);
+                  }
+                  if (toolArgs.skills) {
+                    const skills = Array.isArray(toolArgs.skills) ? toolArgs.skills : [toolArgs.skills];
+                    configUpdates.selectedSkills = skills.map((skill: any) => typeof skill === 'string' ? skill : skill.name || skill.value).filter(Boolean);
+                  }
+                  if (toolArgs.tool_categories) {
+                    const tcs = Array.isArray(toolArgs.tool_categories) ? toolArgs.tool_categories : [toolArgs.tool_categories];
+                    configUpdates.selectedToolCategories = tcs.map((tc: any) => typeof tc === 'string' ? tc : tc.name || tc.category || tc.value).filter(Boolean);
+                  }
+                  if (toolArgs.suggested_prompts) {
+                    const sp = Array.isArray(toolArgs.suggested_prompts) ? toolArgs.suggested_prompts : [toolArgs.suggested_prompts];
+                    configUpdates.suggestedPrompts = sp.map((p: any) => typeof p === 'string' ? p : p.value || p.prompt).filter(Boolean);
+                  }
                   if (result.status === "success" && result.agent_id) {
                     configUpdates.id = result.agent_id;
                   }

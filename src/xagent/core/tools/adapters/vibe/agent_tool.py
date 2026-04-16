@@ -26,9 +26,17 @@ class CreateAgentToolArgs(BaseModel):
         default=None,
         description="List of tool categories to allow (e.g., ['file', 'knowledge']). If None, all tools are available",
     )
+    knowledge_bases: Optional[list[str]] = Field(
+        default=None,
+        description="List of knowledge base names or IDs to associate with this agent. (optional)",
+    )
     skills: Optional[list[str]] = Field(
         default=None,
         description="List of skill names to allow. If None, all skills are available",
+    )
+    execution_mode: Optional[str] = Field(
+        default="react",
+        description="Execution mode for the agent: 'react' (fast, simple reasoning, default) or 'graph' (complex planning and execution).",
     )
 
 
@@ -66,9 +74,17 @@ class UpdateAgentToolArgs(BaseModel):
         default=None,
         description="New list of tool categories to allow (optional). If None, existing value is kept",
     )
+    knowledge_bases: Optional[list[str]] = Field(
+        default=None,
+        description="New list of knowledge base IDs or names to associate with this agent. (optional). If None, existing value is kept",
+    )
     skills: Optional[list[str]] = Field(
         default=None,
         description="New list of skill names to allow (optional). If None, existing value is kept",
+    )
+    execution_mode: Optional[str] = Field(
+        default=None,
+        description="New execution mode for the agent: 'react' (fast, simple reasoning) or 'graph' (complex planning and execution).",
     )
 
 
@@ -106,6 +122,9 @@ class AgentInfo(BaseModel):
     tool_name: str = Field(description="Tool name to call this agent")
     markdown_link: str = Field(description="Markdown link to the agent")
     execution_mode: str = Field(description="Execution mode: react or graph")
+    knowledge_bases: Optional[list[str]] = Field(
+        default=None, description="Associated knowledge bases"
+    )
     tool_categories: Optional[list[str]] = Field(
         default=None, description="Allowed tool categories"
     )
@@ -205,9 +224,11 @@ class CreateAgentTool(AbstractBaseTool):
             "- description: IMPORTANT - Clear description of when to use this agent (e.g., 'Use this agent for data analysis tasks involving CSV files'). This helps users understand the agent's purpose.\n"
             f"- tool_categories (optional): Available categories: {categories_list}\n"
             f"  Example: ['file', 'knowledge', 'basic']\n"
+            f"- knowledge_bases (optional): List of knowledge base names or IDs to link to this agent.\n"
             f"- skills (optional): Available skills: {skills_list}\n"
             f"  Example: ['presentation-generator', 'poster-design']\n"
-            "- instructions: System prompt/instructions defining the agent's behavior and expertise\n\n"
+            "- instructions: System prompt/instructions defining the agent's behavior and expertise\n"
+            "- execution_mode (optional): 'react' (fast, simple reasoning, default) or 'graph' (complex planning and execution)\n\n"
             "Returns:\n"
             "- agent_id: Database ID of the created agent\n"
             "- agent_name: Name of the agent\n"
@@ -239,7 +260,7 @@ class CreateAgentTool(AbstractBaseTool):
     async def run_json_async(self, args: Mapping[str, Any]) -> Any:
         """Create a new agent with the given configuration."""
         from .....web.models.agent import Agent, AgentStatus
-        from .....web.services.llm_utils import UserAwareModelStorage
+        from .....web.models.user import UserDefaultModel, UserModel
 
         try:
             agent_name = args.get("name", "").strip()
@@ -293,29 +314,52 @@ class CreateAgentTool(AbstractBaseTool):
                 ).model_dump()
 
             # Get user's default model configuration
-            storage = UserAwareModelStorage(self._db)
-            default_llm, fast_llm, vision_llm, compact_llm = (
-                storage.get_configured_defaults(self._user_id)
+            user_defaults = (
+                self._db.query(UserDefaultModel)
+                .join(UserModel, UserDefaultModel.model_id == UserModel.model_id)
+                .filter(
+                    UserDefaultModel.user_id == self._user_id,
+                    UserModel.user_id == self._user_id,
+                )
+                .all()
             )
 
             # Prepare models configuration
             models_config = {}
-            if default_llm:
-                models_config["general"] = (
-                    default_llm.model_id if hasattr(default_llm, "model_id") else None
+            for default in user_defaults:
+                if default.config_type in [
+                    "general",
+                    "small_fast",
+                    "visual",
+                    "compact",
+                ]:
+                    models_config[default.config_type] = default.model_id
+
+            missing_types = [
+                t
+                for t in ["general", "small_fast", "visual", "compact"]
+                if t not in models_config
+            ]
+            if missing_types:
+                # Fill missing with admin shared defaults
+                admin_defaults = (
+                    self._db.query(UserDefaultModel)
+                    .join(UserModel, UserDefaultModel.model_id == UserModel.model_id)
+                    .filter(
+                        UserDefaultModel.config_type.in_(missing_types),
+                        UserModel.is_shared,
+                    )
+                    .all()
                 )
-            if fast_llm:
-                models_config["small_fast"] = (
-                    fast_llm.model_id if hasattr(fast_llm, "model_id") else None
-                )
-            if vision_llm:
-                models_config["visual"] = (
-                    vision_llm.model_id if hasattr(vision_llm, "model_id") else None
-                )
-            if compact_llm:
-                models_config["compact"] = (
-                    compact_llm.model_id if hasattr(compact_llm, "model_id") else None
-                )
+                for admin_default in admin_defaults:
+                    if admin_default.config_type not in models_config:
+                        models_config[admin_default.config_type] = (
+                            admin_default.model_id
+                        )
+
+            execution_mode = args.get("execution_mode", "react")
+            if execution_mode not in ["react", "graph"]:
+                execution_mode = "react"
 
             # Create the agent in DRAFT status
             agent = Agent(
@@ -323,9 +367,9 @@ class CreateAgentTool(AbstractBaseTool):
                 name=agent_name,
                 description=agent_description,
                 instructions=instructions,
-                execution_mode="graph",
+                execution_mode=execution_mode,
                 models=models_config if models_config else None,
-                knowledge_bases=None,  # No KB by default
+                knowledge_bases=ensure_list(args.get("knowledge_bases")),
                 skills=ensure_list(args.get("skills")),
                 tool_categories=ensure_list(args.get("tool_categories")),
                 suggested_prompts=[],
@@ -450,9 +494,11 @@ class UpdateAgentTool(AbstractBaseTool):
             "- description (optional): New description of when to use this agent\n"
             f"- tool_categories (optional): Available categories: {categories_list}\n"
             f"  Example: ['file', 'knowledge', 'basic']\n"
+            f"- knowledge_bases (optional): New list of knowledge base names or IDs to link to this agent.\n"
             f"- skills (optional): Available skills: {skills_list}\n"
             f"  Example: ['presentation-generator', 'poster-design']\n"
-            "- instructions (optional): New system prompt/instructions defining the agent's behavior\n\n"
+            "- instructions (optional): New system prompt/instructions defining the agent's behavior\n"
+            "- execution_mode (optional): 'react' (fast, simple reasoning) or 'graph' (complex planning and execution)\n\n"
             "Returns:\n"
             "- agent_id: Database ID of the updated agent\n"
             "- agent_name: Name of the agent\n"
@@ -579,11 +625,23 @@ class UpdateAgentTool(AbstractBaseTool):
                 agent.tool_categories = new_tool_categories
                 changes.append(f"tool_categories → {new_tool_categories}")
 
+            # Update knowledge_bases if provided
+            new_knowledge_bases = ensure_list(args.get("knowledge_bases"))
+            if new_knowledge_bases is not None:
+                agent.knowledge_bases = new_knowledge_bases
+                changes.append(f"knowledge_bases → {new_knowledge_bases}")
+
             # Update skills if provided
             new_skills = ensure_list(args.get("skills"))
             if new_skills is not None:
                 agent.skills = new_skills
                 changes.append(f"skills → {new_skills}")
+
+            # Update execution_mode if provided
+            new_execution_mode = args.get("execution_mode")
+            if new_execution_mode in ["react", "graph"]:
+                agent.execution_mode = new_execution_mode
+                changes.append(f"execution_mode → {new_execution_mode}")
 
             # Check if there were any changes
             if not changes:
@@ -768,6 +826,7 @@ class ListAgentsTool(AbstractBaseTool):
                     tool_name=tool_name,
                     markdown_link=markdown_link,
                     execution_mode=agent.execution_mode or "react",
+                    knowledge_bases=agent.knowledge_bases,
                     tool_categories=agent.tool_categories,
                     skills=agent.skills if agent.skills else None,
                 )

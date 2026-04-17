@@ -983,7 +983,7 @@ class AgentService:
                 def get_image_models(self) -> Dict[str, Any]:
                     return {}
 
-                def get_mcp_server_configs(self) -> List[Dict[str, Any]]:
+                async def get_mcp_server_configs(self) -> List[Dict[str, Any]]:
                     return []
 
                 def get_embedding_model(self) -> Optional[str]:

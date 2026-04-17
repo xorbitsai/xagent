@@ -4,6 +4,18 @@ import urllib.request
 
 def setup_proxy_env() -> None:
     """Setup proxy environment variables from system proxies if missing."""
+    # Filter out empty proxy vars to prevent httplib2 hangs
+    for var in [
+        "HTTP_PROXY",
+        "HTTPS_PROXY",
+        "http_proxy",
+        "https_proxy",
+        "ALL_PROXY",
+        "all_proxy",
+    ]:
+        if var in os.environ and not os.environ[var]:
+            del os.environ[var]
+
     system_proxies = urllib.request.getproxies()
     if (
         "https" in system_proxies

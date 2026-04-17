@@ -679,7 +679,7 @@ class AgentServiceManager:
                                             break
 
                     logger.info(
-                        f"🔧 Tool categories {tool_categories} mapped to {len(allowed_tools)} tools for task {task_id}"
+                        f"Tool categories {tool_categories} mapped to {len(allowed_tools)} tools for task {task_id}"
                     )
 
                 # Get or create sandbox for this user
@@ -729,7 +729,7 @@ class AgentServiceManager:
                             else {}
                         )
                         logger.info(
-                            f"🔧 Extracting Text2SQL config: {list(config.keys())}"
+                            f"Extracting Text2SQL config: {list(config.keys())}"
                         )
                         agent_kwargs.update(
                             {
@@ -746,7 +746,7 @@ class AgentServiceManager:
                             f"Text2SQL kwargs prepared: {list(agent_kwargs.keys())}"
                         )
                         logger.info(
-                            f"🔗 Database URL: {config.get('database_url', 'NOT FOUND')}"
+                            f"Database URL: {config.get('database_url', 'NOT FOUND')}"
                         )
 
                     # Unpack tools and tool_config from create_default_tools

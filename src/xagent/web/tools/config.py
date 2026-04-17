@@ -10,7 +10,7 @@ import os
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional
 
-import requests
+import httpx
 
 from ...config import get_uploads_dir
 from ...core.tools.adapters.vibe.config import BaseToolConfig
@@ -19,7 +19,7 @@ from ..services.tool_credentials import get_sql_connection_map, resolve_tool_cre
 logger = logging.getLogger(__name__)
 
 
-def refresh_oauth_token_if_needed(
+async def refresh_oauth_token_if_needed(
     db: Any, oauth_account: Any, provider_name: str
 ) -> bool:
     """Check if token is expired (or close to expiring) and refresh if needed."""
@@ -72,9 +72,10 @@ def refresh_oauth_token_if_needed(
         if provider_name == "linkedin":
             headers["Content-Type"] = "application/x-www-form-urlencoded"
 
-        response = requests.post(
-            provider_config["token_url"], data=data, headers=headers, timeout=10
-        )
+        async with httpx.AsyncClient() as client:
+            response = await client.post(
+                provider_config["token_url"], data=data, headers=headers, timeout=10.0
+            )
 
         if response.status_code == 200:
             data = response.json()
@@ -254,13 +255,13 @@ class WebToolConfig(BaseToolConfig):
             self._cached_image_edit_model = self._load_image_edit_model()
         return self._cached_image_edit_model
 
-    def get_mcp_server_configs(self) -> List[Dict[str, Any]]:
+    async def get_mcp_server_configs(self) -> List[Dict[str, Any]]:
         """Load MCP server configurations from database."""
         if not self._include_mcp_tools:
             return []
 
         if self._cached_mcp_configs is None:
-            self._cached_mcp_configs = self._load_mcp_server_configs()
+            self._cached_mcp_configs = await self._load_mcp_server_configs()
         return self._cached_mcp_configs
 
     def get_embedding_model(self) -> Optional[str]:
@@ -454,7 +455,7 @@ class WebToolConfig(BaseToolConfig):
             logger.warning(f"Failed to load default TTS model: {e}")
             return None
 
-    def _load_mcp_server_configs(self) -> List[Dict[str, Any]]:
+    async def _load_mcp_server_configs(self) -> List[Dict[str, Any]]:
         """Load MCP server configurations from database with user context."""
         logger = logging.getLogger(__name__)
         configs = []
@@ -539,7 +540,7 @@ class WebToolConfig(BaseToolConfig):
                             f"OAUTH CONFIG: Token found for '{provider_name}'. Refresh token present: {oauth_account.refresh_token is not None}, Expires: {oauth_account.expires_at}"
                         )
                         # Check and refresh token if needed before using it
-                        is_valid = refresh_oauth_token_if_needed(
+                        is_valid = await refresh_oauth_token_if_needed(
                             self.db,
                             oauth_account,
                             str(provider_name) if provider_name else "",

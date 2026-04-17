@@ -2883,9 +2883,7 @@ async def handle_build_preview_execution(
     models_config = message_data.get("models", {})
     knowledge_bases = message_data.get("knowledge_bases", [])
     skills = message_data.get("skills", [])
-    tool_categories = message_data.get(
-        "selectedToolCategories", []
-    ) or message_data.get("tool_categories", [])
+    tool_categories = message_data.get("tool_categories", [])
     user_message = message_data.get("message", "")
     files_data = message_data.get("files", [])
 

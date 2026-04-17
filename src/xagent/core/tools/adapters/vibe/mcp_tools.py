@@ -14,7 +14,7 @@ logger = logging.getLogger(__name__)
 @register_tool
 async def create_mcp_tools(config: "BaseToolConfig") -> List[Any]:
     """Create MCP tools from configuration."""
-    mcp_configs = config.get_mcp_server_configs()
+    mcp_configs = await config.get_mcp_server_configs()
     if not mcp_configs:
         return []
 

@@ -106,7 +106,7 @@ export function AgentBuilderChat({ agentConfig, onUpdateConfig, availableOptions
         finalToolCategories.push(`mcp:${server}`);
       });
 
-      const { modelConfig, ...restConfig } = agentConfig
+      const { modelConfig, selectedToolCategories, ...restConfig } = agentConfig
       ws.send(JSON.stringify({
         message: text,
         ...restConfig,

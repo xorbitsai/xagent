@@ -38,8 +38,9 @@ import { Select } from "@/components/ui/select"
 import { Textarea } from "@/components/ui/textarea"
 import { Label } from "@/components/ui/label"
 import { useEffect } from "react"
+import { MCPServer } from "@/app/tools/page"
 
-interface AppIntegration {
+export interface AppIntegration {
   id: string
   name: string
   description: string
@@ -49,7 +50,10 @@ interface AppIntegration {
   provider?: string
   category?: string
   is_local?: boolean
+  server_id?: number
   connected_account?: string
+  is_custom?: boolean
+  server?: MCPServer
 }
 
 import { OfficialMcpSettingsDialog } from "./official-mcp-settings-dialog"
@@ -245,6 +249,12 @@ export function ConnectMcpDialog({
       `${provider} OAuth`,
       `width=${width},height=${height},left=${left},top=${top},scrollbars=yes`
     );
+
+    if (!popup) {
+      toast.error("Popup blocked. Please allow popups for this site to connect.");
+      setLoadingApp(null);
+      return;
+    }
 
     // Listen for the postMessage from the popup
     const handleMessage = (event: MessageEvent) => {

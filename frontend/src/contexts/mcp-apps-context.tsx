@@ -57,17 +57,23 @@ export function McpAppsProvider({ children }: { children: React.ReactNode }) {
 
   useEffect(() => {
     fetchApps()
-  }, [user])
+  }, [user, t])
 
   const getAppIcon = (name: string): string | undefined => {
     if (!name) return undefined;
 
+    const lowerName = name.toLowerCase();
+
     // First try exact match
-    const exactMatch = apps.find(app => app.name.toLowerCase() === name.toLowerCase())
+    const exactMatch = apps.find(app => app.name.toLowerCase() === lowerName || app.id.toLowerCase() === lowerName)
     if (exactMatch?.icon) return exactMatch.icon
 
-    // Then try partial match
-    const partialMatch = apps.find(app => name.toLowerCase().includes(app.name.toLowerCase()) || app.name.toLowerCase().includes(name.toLowerCase()))
+    // Then try a more specific partial match based on provider or id prefix
+    const partialMatch = apps.find(app => {
+      const appLower = app.name.toLowerCase();
+      const idLower = app.id.toLowerCase();
+      return lowerName.startsWith(appLower + "_") || lowerName.startsWith(idLower + "_");
+    })
     if (partialMatch?.icon) return partialMatch.icon
 
     return undefined

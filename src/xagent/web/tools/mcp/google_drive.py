@@ -2,47 +2,23 @@ import io
 import json
 import logging
 import os
-import urllib.request
 from typing import Any
 
-from google.oauth2.credentials import Credentials  # type: ignore
-from googleapiclient.discovery import build  # type: ignore
-from googleapiclient.http import MediaIoBaseDownload, MediaIoBaseUpload  # type: ignore
+from google.oauth2.credentials import Credentials  # type: ignore[import-untyped]
+from googleapiclient.discovery import build  # type: ignore[import-not-found]
+from googleapiclient.http import (  # type: ignore[import-not-found]
+    MediaIoBaseDownload,
+    MediaIoBaseUpload,
+)
 from mcp.server.fastmcp import FastMCP
+
+from .utils import setup_proxy_env
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("google-drive-mcp")
 
-# Filter out empty proxy environment variables which can cause httplib2 to hang
-for proxy_var in [
-    "HTTP_PROXY",
-    "HTTPS_PROXY",
-    "http_proxy",
-    "https_proxy",
-    "ALL_PROXY",
-    "all_proxy",
-]:
-    if proxy_var in os.environ and not os.environ[proxy_var]:
-        del os.environ[proxy_var]
-
-# Fallback to system proxies if environment variables are not set
-system_proxies = urllib.request.getproxies()
-if (
-    "https" in system_proxies
-    and "HTTPS_PROXY" not in os.environ
-    and "https_proxy" not in os.environ
-):
-    os.environ["HTTPS_PROXY"] = system_proxies["https"]
-if (
-    "http" in system_proxies
-    and "HTTP_PROXY" not in os.environ
-    and "http_proxy" not in os.environ
-):
-    os.environ["HTTP_PROXY"] = system_proxies["http"]
-
-# If ALL_PROXY is set, ensure HTTPS_PROXY is also set
-if "ALL_PROXY" in os.environ and "HTTPS_PROXY" not in os.environ:
-    os.environ["HTTPS_PROXY"] = os.environ["ALL_PROXY"]
+# Ensure standard proxy environment variables are set to prevent hanging requests
+setup_proxy_env()
 
 mcp = FastMCP("google-drive-mcp")
 

@@ -519,7 +519,7 @@ class WebToolConfig(BaseToolConfig):
                             .first()
                         )
                         logger.info(
-                            f"🔑 OAUTH CONFIG: Checked providers {providers_to_check} for user {self._user_id}. Found: {oauth_account is not None}"
+                            f"OAUTH CONFIG: Checked providers {providers_to_check} for user {self._user_id}. Found: {oauth_account is not None}"
                         )
                     else:
                         oauth_account = (
@@ -531,12 +531,12 @@ class WebToolConfig(BaseToolConfig):
                             .first()
                         )
                         logger.info(
-                            f"🔑 OAUTH CONFIG: Checked provider '{provider_name}' for user {self._user_id}. Found: {oauth_account is not None}"
+                            f"OAUTH CONFIG: Checked provider '{provider_name}' for user {self._user_id}. Found: {oauth_account is not None}"
                         )
 
                     if oauth_account and oauth_account.access_token:
                         logger.info(
-                            f"🔑 OAUTH CONFIG: Token found for '{provider_name}'. Refresh token present: {oauth_account.refresh_token is not None}, Expires: {oauth_account.expires_at}"
+                            f"OAUTH CONFIG: Token found for '{provider_name}'. Refresh token present: {oauth_account.refresh_token is not None}, Expires: {oauth_account.expires_at}"
                         )
                         # Check and refresh token if needed before using it
                         is_valid = refresh_oauth_token_if_needed(
@@ -545,10 +545,20 @@ class WebToolConfig(BaseToolConfig):
                             str(provider_name) if provider_name else "",
                         )
 
+                        if not is_valid:
+                            logger.warning(
+                                f"OAUTH CONFIG: Token for '{provider_name}' is invalid and could not be refreshed. "
+                                "Deleting OAuth record to prompt user for reconnection."
+                            )
+                            # Delete the invalid oauth record so UI shows it as disconnected
+                            self.db.delete(oauth_account)
+                            self.db.commit()
+                            continue
+
                         if is_valid and app_info:
                             app_id = app_info.get("id")
                             logger.info(
-                                f"🔑 OAUTH CONFIG: Mapping '{app_id}' to executable proxy"
+                                f"OAUTH CONFIG: Mapping '{app_id}' to executable proxy"
                             )
 
                             launch_config = app_info.get("launch_config")
@@ -598,7 +608,7 @@ class WebToolConfig(BaseToolConfig):
 
                     else:
                         logger.info(
-                            f"🔑 OAUTH CONFIG: No valid token found for '{provider_name}'."
+                            f"OAUTH CONFIG: No valid token found for '{provider_name}'."
                         )
 
                 if server.transport == "stdio":

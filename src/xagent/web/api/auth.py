@@ -763,14 +763,18 @@ def get_google_scopes_for_app(app_id: Optional[str]) -> list[str]:
     if app_info and "oauth_scopes" in app_info:
         return base_scopes + list(app_info["oauth_scopes"])
 
+    from fastapi import HTTPException
+
     # Raise error if unknown app_id is requested
-    raise ValueError(f"Unknown Google app_id: {app_id}")
+    raise HTTPException(status_code=400, detail=f"Unknown Google app_id: {app_id}")
 
 
 def _ensure_user_mcp_server(
     db: Session, user_id: str, app_info: Dict[str, Any]
 ) -> None:
     """Ensure MCPServer and UserMCPServer records exist for an OAuth app."""
+    from sqlalchemy.exc import IntegrityError
+
     from ..models.mcp import MCPServer, UserMCPServer
 
     mcp_server = db.query(MCPServer).filter(MCPServer.name == app_info["name"]).first()
@@ -782,7 +786,15 @@ def _ensure_user_mcp_server(
             transport="oauth",
         )
         db.add(mcp_server)
-        db.flush()
+        try:
+            db.flush()
+        except IntegrityError:
+            db.rollback()
+            mcp_server = (
+                db.query(MCPServer).filter(MCPServer.name == app_info["name"]).first()
+            )
+            if not mcp_server:
+                raise
 
     user_mcp = (
         db.query(UserMCPServer)
@@ -803,6 +815,7 @@ def _ensure_user_mcp_server(
 async def google_login(
     token: Optional[str] = None,
     app_id: Optional[str] = None,
+    redirect: Optional[str] = None,
     db: Session = Depends(get_db),
 ) -> Any:
     """Initiate Google OAuth flow"""
@@ -825,7 +838,12 @@ async def google_login(
                 user_id = user.id
 
     # Create state token containing user_id
-    state_data = {"user_id": user_id, "type": "oauth_state", "app_id": app_id}
+    state_data = {
+        "user_id": user_id,
+        "type": "oauth_state",
+        "app_id": app_id,
+        "redirect": redirect,
+    }
     state = create_access_token(state_data, expires_delta=timedelta(minutes=10))
 
     # Redirect URI
@@ -969,6 +987,19 @@ async def google_callback(request: Request, db: Session = Depends(get_db)) -> An
             )
 
         # Return success page that posts message to opener
+        import json
+        from urllib.parse import urlparse
+
+        redirect_url = payload.get("redirect")
+        target_origin = "window.location.origin"
+        if redirect_url:
+            try:
+                parsed = urlparse(redirect_url)
+                if parsed.scheme and parsed.netloc:
+                    target_origin = json.dumps(f"{parsed.scheme}://{parsed.netloc}")
+            except Exception:
+                pass
+
         response = HTMLResponse(
             f"""
         <html>
@@ -977,9 +1008,9 @@ async def google_callback(request: Request, db: Session = Depends(get_db)) -> An
                 <script>
                     window.opener.postMessage({{
                         type: 'oauth-success',
-                        email: '{email}',
-                        provider: '{app_id}'
-                    }}, "*");
+                        email: {json.dumps(email)},
+                        provider: {json.dumps(app_id)}
+                    }}, {target_origin});
                     window.close();
                 </script>
             </head>
@@ -996,12 +1027,14 @@ async def google_callback(request: Request, db: Session = Depends(get_db)) -> An
         return response
 
     except Exception as e:
+        import html
         import logging
 
         logger = logging.getLogger(__name__)
         logger.exception("Google OAuth callback failed")
+        safe_error = html.escape(str(e))
         return HTMLResponse(
-            f"<h1>Authentication Failed</h1><p>{str(e)}</p>", status_code=500
+            f"<h1>Authentication Failed</h1><p>{safe_error}</p>", status_code=500
         )
 
 
@@ -1011,7 +1044,9 @@ LINKEDIN_TOKEN_URL = "https://www.linkedin.com/oauth/v2/accessToken"
 
 
 async def linkedin_login(
-    token: Optional[str] = None, db: Session = Depends(get_db)
+    token: Optional[str] = None,
+    redirect: Optional[str] = None,
+    db: Session = Depends(get_db),
 ) -> Any:
     """Start LinkedIn OAuth flow"""
     client_id = os.environ.get("LINKEDIN_CLIENT_ID")
@@ -1043,7 +1078,12 @@ async def linkedin_login(
         )
 
     # Create state token
-    state_payload = {"type": "oauth_state", "user_id": user_id, "provider": "linkedin"}
+    state_payload = {
+        "type": "oauth_state",
+        "user_id": user_id,
+        "provider": "linkedin",
+        "redirect": redirect,
+    }
     state = create_access_token(data=state_payload, expires_delta=timedelta(minutes=10))
 
     # Standard LinkedIn scopes plus social posting and reading
@@ -1062,8 +1102,12 @@ async def linkedin_callback(request: Request, db: Session = Depends(get_db)) -> 
     error_description = request.query_params.get("error_description")
 
     if error:
+        import html
+
+        safe_error = html.escape(str(error))
+        safe_desc = html.escape(str(error_description)) if error_description else ""
         return HTMLResponse(
-            f"<h1>Error: {error}</h1><p>{error_description}</p>", status_code=400
+            f"<h1>Error: {safe_error}</h1><p>{safe_desc}</p>", status_code=400
         )
 
     if not code or not state:
@@ -1105,8 +1149,13 @@ async def linkedin_callback(request: Request, db: Session = Depends(get_db)) -> 
         token_data = token_response.json()
 
         if "error" in token_data:
+            import html
+
+            safe_token_error = html.escape(
+                str(token_data.get("error_description", token_data.get("error")))
+            )
             return HTMLResponse(
-                f"<h1>Error exchanging token</h1><p>{token_data.get('error_description', token_data.get('error'))}</p>",
+                f"<h1>Error exchanging token</h1><p>{safe_token_error}</p>",
                 status_code=400,
             )
 
@@ -1145,20 +1194,16 @@ async def linkedin_callback(request: Request, db: Session = Depends(get_db)) -> 
             )
             db.add(oauth_account)
 
-            setattr(oauth_account, "access_token", access_token)
-            setattr(oauth_account, "token_type", "Bearer")
-            setattr(
-                oauth_account, "scope", token_data.get("scope", "openid profile email")
-            )
-            setattr(oauth_account, "provider_user_id", provider_user_id)
-            setattr(oauth_account, "email", email)
+            oauth_account.access_token = access_token
+            oauth_account.token_type = "Bearer"  # type: ignore[assignment]
+            oauth_account.scope = token_data.get("scope", "openid profile email")
+            oauth_account.provider_user_id = provider_user_id
+            oauth_account.email = email
             if "refresh_token" in token_data:
-                setattr(oauth_account, "refresh_token", token_data.get("refresh_token"))
+                oauth_account.refresh_token = token_data.get("refresh_token")
             if expires_in:
-                setattr(
-                    oauth_account,
-                    "expires_at",
-                    datetime.now(timezone.utc) + timedelta(seconds=expires_in),
+                oauth_account.expires_at = datetime.now(timezone.utc) + timedelta(  # type: ignore[assignment]
+                    seconds=expires_in
                 )
 
             # Make sure there is an MCPServer record for LinkedIn so it shows up in /tools
@@ -1173,6 +1218,19 @@ async def linkedin_callback(request: Request, db: Session = Depends(get_db)) -> 
 
             db.commit()
 
+        import json
+        from urllib.parse import urlparse
+
+        redirect_url = payload.get("redirect")
+        target_origin = "window.location.origin"
+        if redirect_url:
+            try:
+                parsed = urlparse(redirect_url)
+                if parsed.scheme and parsed.netloc:
+                    target_origin = json.dumps(f"{parsed.scheme}://{parsed.netloc}")
+            except Exception:
+                pass
+
         return HTMLResponse(
             f"""
         <html>
@@ -1181,9 +1239,9 @@ async def linkedin_callback(request: Request, db: Session = Depends(get_db)) -> 
                 <script>
                     window.opener.postMessage({{
                         type: 'oauth-success',
-                        email: '{email}',
+                        email: {json.dumps(email)},
                         provider: 'linkedin'
-                    }}, "*");
+                    }}, {target_origin});
                     window.close();
                 </script>
             </head>
@@ -1195,12 +1253,14 @@ async def linkedin_callback(request: Request, db: Session = Depends(get_db)) -> 
         """
         )
     except Exception as e:
+        import html
         import logging
 
         logger = logging.getLogger(__name__)
         logger.exception("LinkedIn OAuth callback failed")
+        safe_error = html.escape(str(e))
         return HTMLResponse(
-            f"<h1>Authentication Failed</h1><p>{str(e)}</p>", status_code=500
+            f"<h1>Authentication Failed</h1><p>{safe_error}</p>", status_code=500
         )
 
 
@@ -1212,13 +1272,14 @@ async def oauth_login(
     provider: str,
     token: Optional[str] = None,
     app_id: Optional[str] = None,
+    redirect: Optional[str] = None,
     db: Session = Depends(get_db),
 ) -> Any:
     """Unified entry point for OAuth login"""
     if provider == "google":
-        return await google_login(token, app_id, db)
+        return await google_login(token, app_id, redirect, db)
     elif provider == "linkedin":
-        return await linkedin_login(token, db)
+        return await linkedin_login(token, redirect, db)
     else:
         return HTMLResponse(
             f"<h1>Unsupported provider: {provider}</h1>", status_code=400

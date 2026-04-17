@@ -151,7 +151,9 @@ async def create_default_tools(
             "base_dir": str(get_uploads_dir() / f"user_{user.id}"),
             "task_id": task_id,
         },
-        include_mcp_tools=True,  # Include MCP tools for default agent
+        include_mcp_tools=bool(
+            allowed_tools and any(t.startswith("mcp_") for t in allowed_tools)
+        ),
         task_id=task_id,  # Pass task_id for browser session tracking
         browser_tools_enabled=True,  # Enable browser automation tools
         allowed_collections=allowed_collections,  # Agent Builder knowledge bases
@@ -741,7 +743,7 @@ class AgentServiceManager:
                             }
                         )
                         logger.info(
-                            f"✅ Text2SQL kwargs prepared: {list(agent_kwargs.keys())}"
+                            f"Text2SQL kwargs prepared: {list(agent_kwargs.keys())}"
                         )
                         logger.info(
                             f"🔗 Database URL: {config.get('database_url', 'NOT FOUND')}"

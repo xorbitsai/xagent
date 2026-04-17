@@ -36,7 +36,7 @@ import {
 } from "lucide-react"
 import { getApiUrl } from "@/lib/utils"
 import { apiRequest } from "@/lib/api-wrapper"
-import { ConnectMcpDialog } from "@/components/mcp/connect-mcp-dialog"
+import { ConnectMcpDialog, AppIntegration } from "@/components/mcp/connect-mcp-dialog"
 import { OfficialMcpSettingsDialog } from "@/components/mcp/official-mcp-settings-dialog"
 import { useI18n } from "@/contexts/i18n-context"
 import { useAuth } from "@/contexts/auth-context"
@@ -58,7 +58,7 @@ interface Tool {
   usage_count?: number
 }
 
-interface MCPServer {
+export interface MCPServer {
   id: number
   user_id: number
   name: string
@@ -136,7 +136,7 @@ export default function ToolsPage() {
   const [isLoading, setIsLoading] = useState(false)
   const [isConnectMcpOpen, setIsConnectMcpOpen] = useState(false)
   const [isOfficialAppDialogOpen, setIsOfficialAppDialogOpen] = useState(false)
-  const [editingOfficialApp, setEditingOfficialApp] = useState<any>(null)
+  const [editingOfficialApp, setEditingOfficialApp] = useState<AppIntegration | null>(null)
   const [isMcpDialogOpen, setIsMcpDialogOpen] = useState(false)
   const [isCredentialDialogOpen, setIsCredentialDialogOpen] = useState(false)
   const [editingConfigTool, setEditingConfigTool] = useState<ConfigurableTool | null>(null)

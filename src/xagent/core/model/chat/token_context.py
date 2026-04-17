@@ -6,8 +6,11 @@ statistics to be automatically collected during task execution.
 """
 
 import contextvars
+import logging
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -182,6 +185,13 @@ def add_token_usage(
         usage.add_input_tokens(input_tokens, model, call_type)
     if output_tokens:
         usage.add_output_tokens(output_tokens, model, call_type)
+
+    logger.debug(
+        f"Token usage added: input={input_tokens}, output={output_tokens}, "
+        f"model={model}, call_type={call_type}, "
+        f"total_input={usage.input_tokens}, total_output={usage.output_tokens}, "
+        f"total_calls={usage.llm_calls}"
+    )
 
 
 def reset_token_usage() -> TokenUsage:

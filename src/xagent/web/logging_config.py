@@ -11,15 +11,16 @@ LogLevel = Literal["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"]
 _is_applied = False
 
 
-def setup_logging(level: LogLevel | None = None) -> None:
+def setup_logging(level: LogLevel | None = None, force: bool = False) -> None:
     """Configure logging for the entire application.
 
     Args:
         level: Log level. If None, reads from XAGENT_LOG_LEVEL env var,
                defaults to "INFO" if env var is not set or invalid.
+        force: If True, reconfigure logging even if already applied.
     """
     global _is_applied
-    if _is_applied:
+    if _is_applied and not force:
         return
     # Read log level from env var if not provided
     if level is None:
@@ -55,6 +56,7 @@ def setup_logging(level: LogLevel | None = None) -> None:
                 "uvicorn.error": {"level": "INFO"},
                 "httpx": {"level": "WARNING"},
                 "httpcore": {"level": "WARNING"},
+                "xagent": {"level": level},
             },
             "root": {
                 "level": level,

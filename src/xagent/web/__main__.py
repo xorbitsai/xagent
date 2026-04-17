@@ -122,8 +122,8 @@ def main() -> None:
     args = parse_args()
 
     # Configure logging BEFORE importing app
-    log_level = "debug" if args.debug else args.log_level
-    setup_logging(level=cast(LogLevel, log_level) if log_level else None)
+    log_level = "DEBUG" if args.debug else (args.log_level or "").upper()
+    setup_logging(level=cast(LogLevel, log_level) if log_level else None, force=True)
 
     logger = logging.getLogger(__name__)
     warn_if_example_jwt_config(logger)
@@ -149,7 +149,7 @@ def main() -> None:
             host=args.host,
             port=args.port,
             reload=args.reload,
-            log_level=log_level,
+            log_level=log_level.lower() if log_level else None,
         )
     except KeyboardInterrupt:
         logger.info("⏹️  Service stopped")

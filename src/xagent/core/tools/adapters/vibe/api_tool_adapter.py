@@ -6,7 +6,7 @@ import logging
 import re
 from typing import Any, Dict, List, Mapping, Optional, Type
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
 from ....utils.encryption import decrypt_value
 from ...core.api_tool import call_api
@@ -35,6 +35,19 @@ class CustomApiToolArgs(BaseModel):
         default=None,
         description="JSON body for the request. You can use variables like $SECRET_KEY in string values.",
     )
+
+    @model_validator(mode="before")
+    @classmethod
+    def parse_string_to_dict(cls, data: Any) -> Any:
+        if isinstance(data, dict):
+            for field in ["headers", "params", "body"]:
+                val = data.get(field)
+                if isinstance(val, str):
+                    try:
+                        data[field] = json.loads(val)
+                    except json.JSONDecodeError:
+                        pass
+        return data
 
 
 class CustomApiToolResult(BaseModel):

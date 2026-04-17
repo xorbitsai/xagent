@@ -19,14 +19,6 @@ async def list_tools() -> list[Tool]:
             inputSchema={"type": "object", "properties": {}},
         ),
         Tool(
-            name="list_posts",
-            description="List your recent posts",
-            inputSchema={
-                "type": "object",
-                "properties": {"count": {"type": "number", "default": 10}},
-            },
-        ),
-        Tool(
             name="create_post",
             description="Publish a text post to LinkedIn",
             inputSchema={
@@ -114,19 +106,6 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
             )
             r.raise_for_status()
             return [TextContent(type="text", text=r.text)]
-
-        elif name == "list_posts":
-            count = int(arguments.get("count", 10))
-            r = requests.get(
-                "https://api.linkedin.com/v2/userinfo", headers=headers, proxies=proxies
-            )
-            r.raise_for_status()
-            sub = r.json().get("sub", "")
-            author_urn = urllib.parse.quote(f"urn:li:person:{sub}")
-            url = f"https://api.linkedin.com/rest/posts?author={author_urn}&q=author&count={count}&sortBy=LAST_MODIFIED"
-            r2 = requests.get(url, headers=headers, proxies=proxies)
-            r2.raise_for_status()
-            return [TextContent(type="text", text=r2.text)]
 
         elif name == "create_post":
             text = arguments.get("text")

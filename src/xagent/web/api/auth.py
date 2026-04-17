@@ -1086,8 +1086,8 @@ async def linkedin_login(
     }
     state = create_access_token(data=state_payload, expires_delta=timedelta(minutes=10))
 
-    # Standard LinkedIn scopes plus social posting and reading
-    scope = "openid profile email w_member_social r_member_social"
+    # Standard LinkedIn scopes plus social posting
+    scope = "openid profile email w_member_social"
 
     auth_url = f"{LINKEDIN_AUTH_URL}?response_type=code&client_id={client_id}&redirect_uri={redirect_uri}&state={state}&scope={scope}"
 

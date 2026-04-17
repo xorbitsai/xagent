@@ -102,7 +102,11 @@ export function OfficialMcpSettingsDialog({
   const handleDisconnectApp = async (appToDisconnect: any) => {
     try {
       const serverId = appToDisconnect.server_id || appToDisconnect.id; // Use server_id if available
-      const url = `${getApiUrl()}/api/mcp/servers/${serverId}`;
+      const isCustomApi = appToDisconnect.transport === 'custom_api' || appToDisconnect.server?.transport === 'custom_api';
+
+      const url = isCustomApi
+        ? `${getApiUrl()}/api/custom-apis/${serverId}`
+        : `${getApiUrl()}/api/mcp/servers/${serverId}`;
 
       const response = await apiRequest(url, {
         method: 'DELETE',

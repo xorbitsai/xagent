@@ -50,6 +50,7 @@ export interface AppIntegration {
   category?: string
   is_local?: boolean
   server_id?: number
+  transport?: string
   connected_account?: string
   is_custom?: boolean
   server?: MCPServer
@@ -191,6 +192,9 @@ export function ConnectMcpDialog({
     }
 
     const payload = { ...mcpFormData }
+    let url = "";
+    let method = editingCustomServerId ? 'PUT' : 'POST';
+
     if (payload.transport === "custom_api") {
       const validEnv = customApiEnv.filter(env => env.key.trim() && env.value.trim());
       if (validEnv.length === 0) {
@@ -201,15 +205,39 @@ export function ConnectMcpDialog({
       validEnv.forEach(env => {
         envObj[env.key.trim()] = env.value.trim();
       });
-      payload.config = { ...payload.config, env: envObj };
+      // Custom API payload structure
+      const apiPayload = {
+        name: payload.name,
+        description: payload.description,
+        env: envObj
+      };
+
+      url = editingCustomServerId
+        ? `${getApiUrl()}/api/custom-apis/${editingCustomServerId}`
+        : `${getApiUrl()}/api/custom-apis`;
+
+      setIsSavingCustom(true)
+      try {
+        const response = await apiRequest(url, {
+          method,
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(apiPayload)
+        })
+        await handleSaveResponse(response);
+      } catch (error) {
+        console.error("Failed to save custom API:", error)
+        toast.error(t('tools.mcp.alerts.saveFailed'))
+        setIsSavingCustom(false)
+      }
+      return;
     }
 
+    // Regular MCP logic
     setIsSavingCustom(true)
     try {
-      const url = editingCustomServerId
+      url = editingCustomServerId
         ? `${getApiUrl()}/api/mcp/servers/${editingCustomServerId}`
         : `${getApiUrl()}/api/mcp/servers`
-      const method = editingCustomServerId ? 'PUT' : 'POST'
 
       const response = await apiRequest(url, {
         method,
@@ -218,36 +246,40 @@ export function ConnectMcpDialog({
         },
         body: JSON.stringify(payload)
       })
-      if (response.ok) {
-        toast.success(t('tools.mcp.buttons.save'))
-        if (onSuccess) onSuccess()
-        loadApps()
-
-        // If in select mode (agent builder), switch to local tab and select the new server
-        if (isSelectMode) {
-          if (!editingCustomServerId) {
-            const newServerName = mcpFormData.name;
-            setLocalSelectedServers(prev => prev.includes(newServerName) ? prev : [...prev, newServerName]);
-            setActiveLocation("local");
-          }
-          setActiveTab("library");
-        } else {
-          // If in standalone tools page, just close the dialog
-          onOpenChange(false);
-        }
-
-        setEditingCustomServerId(null)
-        setMcpFormData({ name: "", transport: "stdio", description: "", config: {} })
-      } else {
-        const error = await response.json()
-        toast.error(error.detail || t('tools.mcp.alerts.saveFailed'))
-      }
+      await handleSaveResponse(response);
     } catch (error) {
       console.error("Failed to save custom MCP server:", error)
       toast.error(t('tools.mcp.alerts.saveFailed'))
-    } finally {
       setIsSavingCustom(false)
     }
+  }
+
+  const handleSaveResponse = async (response: any) => {
+    if (response.ok) {
+      toast.success(t('tools.mcp.buttons.save'))
+      if (onSuccess) onSuccess()
+      loadApps()
+
+      // If in select mode (agent builder), switch to local tab and select the new server
+      if (isSelectMode) {
+        if (!editingCustomServerId) {
+          const newServerName = mcpFormData.name;
+          setLocalSelectedServers(prev => prev.includes(newServerName) ? prev : [...prev, newServerName]);
+          setActiveLocation("local");
+        }
+        setActiveTab("library");
+      } else {
+        // If in standalone tools page, just close the dialog
+        onOpenChange(false);
+      }
+
+      setEditingCustomServerId(null)
+      setMcpFormData({ name: "", transport: "stdio", description: "", config: {} })
+    } else {
+      const error = await response.json()
+      toast.error(error.detail || t('tools.mcp.alerts.saveFailed'))
+    }
+    setIsSavingCustom(false)
   }
 
   const isSelectMode = !!onConnectSelected;
@@ -310,10 +342,24 @@ export function ConnectMcpDialog({
   }
 
   const handleDisconnectApp = async (app: AppIntegration) => {
-    const server = globalMcpServers.find(s => s.name.toLowerCase() === app.id.toLowerCase() || s.name.toLowerCase() === app.name.toLowerCase());
-    if (server) {
+    // Determine if it's a custom API or an MCP server
+    const isCustomApi = app.transport === 'custom_api' || app.is_custom;
+    const server = globalMcpServers.find(s =>
+      (s.name.toLowerCase() === app.id.toLowerCase() || s.name.toLowerCase() === app.name.toLowerCase()) &&
+      (isCustomApi ? s.transport === 'custom_api' : s.transport !== 'custom_api')
+    );
+
+    // For custom APIs, we might not have them in globalMcpServers since that fetches from /api/mcp/servers
+    // We should use app.server_id if available
+    const serverId = server ? server.id : app.server_id;
+
+    if (serverId) {
       try {
-        const response = await apiRequest(`${getApiUrl()}/api/mcp/servers/${server.id}`, {
+        const endpoint = isCustomApi
+          ? `${getApiUrl()}/api/custom-apis/${serverId}`
+          : `${getApiUrl()}/api/mcp/servers/${serverId}`;
+
+        const response = await apiRequest(endpoint, {
           method: 'DELETE'
         });
         if (response.ok) {
@@ -641,7 +687,7 @@ export function ConnectMcpDialog({
                   setCustomApiEnv={setCustomApiEnv}
                   originalEnvObj={
                     editingCustomServerId
-                      ? globalMcpServers.find(s => s.id === editingCustomServerId)?.config?.env || {}
+                      ? globalMcpServers.find(s => s.id === editingCustomServerId && s.transport === "custom_api")?.config?.env || {}
                       : {}
                   }
                 />
@@ -728,7 +774,11 @@ export function ConnectMcpDialog({
         app={(() => {
           if (!selectedApp) return null;
           // Find the actual server from globalMcpServers to get the real numeric ID
-          const server = globalMcpServers.find(s => s.name.toLowerCase() === selectedApp.id.toLowerCase() || s.name.toLowerCase() === selectedApp.name.toLowerCase());
+          const isCustomApi = selectedApp.transport === 'custom_api' || selectedApp.is_custom;
+          const server = globalMcpServers.find(s =>
+            (s.name.toLowerCase() === selectedApp.id.toLowerCase() || s.name.toLowerCase() === selectedApp.name.toLowerCase()) &&
+            (isCustomApi ? s.transport === 'custom_api' : s.transport !== 'custom_api')
+          );
 
           if (server) {
             // Merge the server ID into the app object so the child dialog can use it for deletion

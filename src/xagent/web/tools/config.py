@@ -628,10 +628,6 @@ class WebToolConfig(BaseToolConfig):
                     if server.headers:
                         transport_config["headers"] = server.headers
 
-                elif server.transport == "custom_api":
-                    if server.env:
-                        transport_config["env"] = server.env
-
                 # Add Docker-specific config if managed internally
                 if server.managed == "internal":
                     if server.docker_url:

@@ -600,7 +600,7 @@ Build when you need.`
       all: "全部工具",
       webSearch: "网页搜索",
       databaseConnections: "数据库连接",
-      mcp: "MCP 服务",
+      connectors: "连接器",
     },
     policy: {
       enabled: "已启用",

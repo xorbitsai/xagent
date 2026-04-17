@@ -103,7 +103,6 @@ class MCPServerConfig(BaseModel):
             "sse",
             "websocket",
             "streamable_http",
-            "custom_api",
         }
         if v not in valid_transports:
             raise ValueError(

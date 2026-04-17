@@ -95,9 +95,20 @@ class APIClientCore:
         retry_count = max(0, retry_count)
 
         # Handle API key in query parameters
-        request_params = dict(params) if params else {}
+        request_params: Dict[str, Any] = dict(params) if params else {}
         if auth_type == "api_key_query" and auth_token:
             request_params[api_key_param] = auth_token
+
+        final_request_params: Optional[Dict[str, Any]] = request_params
+
+        # Merge params directly into URL to prevent httpx from stripping existing query strings
+        if final_request_params:
+            url = str(httpx.URL(url).copy_merge_params(final_request_params))
+            final_request_params = None
+
+        # If request_params is empty, set to None
+        if not final_request_params:
+            final_request_params = None
 
         # Prepare headers
         request_headers = self._prepare_headers(headers, auth_type, auth_token, body)
@@ -116,7 +127,7 @@ class APIClientCore:
                     url=url,
                     method=method,
                     headers=request_headers,
-                    params=request_params,
+                    params=final_request_params,
                     data=request_body,
                     timeout=timeout,
                     proxy_url=proxy_url,

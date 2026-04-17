@@ -3009,15 +3009,31 @@ async def handle_build_preview_execution(
                 all_tools = await ToolFactory.create_all_tools(temp_config)
                 allowed_tools = []
 
+                # Check if we also need custom APIs
+                has_custom_api = bool(
+                    tool_categories
+                    and any(tc.startswith("mcp:") for tc in tool_categories)
+                )
+                if has_custom_api:
+                    # Manually add custom APIs since temp_config might not load them properly
+                    # if they depend on include_mcp_tools
+                    from ...core.tools.adapters.vibe.custom_api_factory import (
+                        create_db_custom_api_tools,
+                    )
+
+                    custom_tools = await create_db_custom_api_tools(temp_config)
+                    all_tools.extend(custom_tools)
+
                 for tool in all_tools:
                     if hasattr(tool, "metadata") and hasattr(tool.metadata, "category"):
                         category = str(tool.metadata.category.value)
                         tool_name = getattr(tool, "name", None)
+                        if not tool_name:
+                            continue
 
                         if category in tool_categories:
-                            if tool_name:
-                                allowed_tools.append(tool_name)
-                        elif category == "mcp" and tool_name:
+                            allowed_tools.append(tool_name)
+                        elif category == "mcp":
                             for tc in tool_categories:
                                 if tc.startswith("mcp:"):
                                     server_name = (
@@ -3031,6 +3047,25 @@ async def handle_build_preview_execution(
                                     # Use case-insensitive matching for MCP server prefix
                                     if tool_name.lower().startswith(
                                         f"mcp_{server_name.lower()}_"
+                                    ):
+                                        allowed_tools.append(tool_name)
+                                        break
+                        elif category == "other":
+                            # Check if this is a custom API that was requested as an MCP tool
+                            for tc in tool_categories:
+                                if tc.startswith("mcp:"):
+                                    server_name = (
+                                        tc.split(":", 1)[1]
+                                        .replace(" ", "_")
+                                        .replace("-", "_")
+                                    )
+                                    logger.info(
+                                        f"Checking Custom API tool: '{tool_name}' vs 'api_{server_name}_call'"
+                                    )
+                                    # Custom APIs are now prefixed with api_ and suffixed with _call
+                                    if (
+                                        tool_name.lower()
+                                        == f"api_{server_name.lower()}_call"
                                     ):
                                         allowed_tools.append(tool_name)
                                         break

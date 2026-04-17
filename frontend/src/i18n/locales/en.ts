@@ -600,7 +600,7 @@ Build when you need.`
       all: "All Tools",
       webSearch: "Web Search",
       databaseConnections: "Database Connections",
-      mcp: "MCP Servers",
+      connectors: "Connectors",
     },
     policy: {
       enabled: "Enabled",

@@ -1015,7 +1015,7 @@ export default function ToolsPage() {
               value="mcp"
               className="data-[state=active]:text-primary font-medium data-[state=active]:border-b-2 data-[state=active]:border-primary"
             >
-              {t('tools.tabs.mcp')}
+              {t('tools.tabs.connectors')}
             </TabsTrigger>
           </div>
         </TabsList>

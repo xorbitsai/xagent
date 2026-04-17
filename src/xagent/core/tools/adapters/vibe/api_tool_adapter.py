@@ -56,7 +56,7 @@ class CustomApiTool(AbstractBaseTool):
     It automatically replaces environment variables (secrets) in the request parameters.
     """
 
-    category = ToolCategory.MCP
+    category = ToolCategory.OTHER
 
     def __init__(
         self,
@@ -67,7 +67,11 @@ class CustomApiTool(AbstractBaseTool):
     ):
         # Format name for LLM (replace spaces/dashes with underscores)
         sanitized_name = name.replace(" ", "_").replace("-", "_")
-        self._name = f"mcp_{sanitized_name}_call"
+        # Ensure name doesn't start with api_ twice if already prefixed
+        if sanitized_name.startswith("api_"):
+            self._name = f"{sanitized_name}_call"
+        else:
+            self._name = f"api_{sanitized_name}_call"
 
         # Add env vars info to description so LLM knows how to use them
         env_info = ""

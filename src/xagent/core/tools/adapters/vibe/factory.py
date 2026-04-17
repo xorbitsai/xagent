@@ -63,6 +63,7 @@ class ToolRegistry:
                 audio_tool,
                 basic_tools,
                 browser_tools,
+                custom_api_factory,
                 image_tool,
                 knowledge_tools,
                 mcp_tools,
@@ -323,19 +324,8 @@ class ToolFactory:
 
             # Convert configs to connection format
             connections = {}
-            custom_api_configs = []
 
             for config in mcp_configs:
-                if config["transport"] == "custom_api":
-                    custom_api_configs.append(
-                        {
-                            "name": config["name"],
-                            "description": config.get("description", ""),
-                            "env": config.get("config", {}).get("env", {}),
-                        }
-                    )
-                    continue
-
                 connection_config = {
                     "transport": config["transport"],
                     **config["config"],
@@ -366,13 +356,6 @@ class ToolFactory:
             mcp_tools = await load_mcp_tools_as_agent_tools(connections)  # type: ignore[arg-type]
             if not mcp_tools:
                 mcp_tools = []
-
-            # Create Custom API tools
-            if custom_api_configs:
-                from .api_tool_adapter import create_custom_api_tools
-
-                custom_tools = create_custom_api_tools(custom_api_configs)
-                mcp_tools.extend(custom_tools)
 
             return mcp_tools  # type: ignore[return-value]
         except Exception as e:
@@ -413,29 +396,14 @@ class ToolFactory:
                 return []
 
             connections = {}
-            custom_api_configs = []
 
             for name, config in all_connections.items():
-                if config.get("transport") == "custom_api":
-                    custom_api_configs.append(
-                        {
-                            "name": name,
-                            "description": config.get("description", ""),
-                            "env": config.get("env", {}),
-                        }
-                    )
-                else:
-                    connections[name] = config
+                connections[name] = config
 
             # Load MCP tools
             mcp_tools = (
                 await load_mcp_tools_as_agent_tools(connections) if connections else []
             )
-
-            if custom_api_configs:
-                from .api_tool_adapter import create_custom_api_tools
-
-                mcp_tools.extend(create_custom_api_tools(custom_api_configs))
 
             return mcp_tools
         except Exception as e:

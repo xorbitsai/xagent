@@ -42,6 +42,9 @@ class User(Base):  # type: ignore
     user_mcpservers = relationship(
         "UserMCPServer", back_populates="user", cascade="all, delete-orphan"
     )
+    user_custom_apis = relationship(
+        "UserCustomApi", back_populates="user", cascade="all, delete-orphan"
+    )
     text2sql_databases = relationship(
         "Text2SQLDatabase", back_populates="user", cascade="all, delete-orphan"
     )

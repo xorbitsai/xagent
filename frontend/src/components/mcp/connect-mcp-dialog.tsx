@@ -39,6 +39,8 @@ import { Label } from "@/components/ui/label"
 import { useEffect } from "react"
 import { MCPServer } from "@/app/tools/page"
 
+import { isValidMcpName, buildCustomApiPayload } from "@/lib/mcp-utils"
+
 export interface AppIntegration {
   id: string
   name: string
@@ -185,32 +187,22 @@ export function ConnectMcpDialog({
       return
     }
 
-    const nameRegex = /^[a-zA-Z0-9_-]+$/;
-    if (!nameRegex.test(mcpFormData.name.trim())) {
+    if (!isValidMcpName(mcpFormData.name)) {
       toast.error(t('tools.mcp.alerts.nameInvalidFormat') || "Name can only contain letters, numbers, hyphens and underscores");
       return;
     }
 
-    const payload = { ...mcpFormData }
+    let payload = { ...mcpFormData };
     let url = "";
     let method = editingCustomServerId ? 'PUT' : 'POST';
 
     if (payload.transport === "custom_api") {
-      const validEnv = customApiEnv.filter(env => env.key.trim() && env.value.trim());
-      if (validEnv.length === 0) {
-        toast.error(t('tools.mcp.alerts.atLeastOneSecret'));
+      const buildResult = buildCustomApiPayload(payload, customApiEnv);
+      if (!buildResult.isValid) {
+        toast.error(t(buildResult.errorKey || 'tools.mcp.alerts.atLeastOneSecret'));
         return;
       }
-      const envObj: Record<string, string> = {};
-      validEnv.forEach(env => {
-        envObj[env.key.trim()] = env.value.trim();
-      });
-      // Custom API payload structure
-      const apiPayload = {
-        name: payload.name,
-        description: payload.description,
-        env: envObj
-      };
+      payload = buildResult.payload;
 
       url = editingCustomServerId
         ? `${getApiUrl()}/api/custom-apis/${editingCustomServerId}`
@@ -221,7 +213,7 @@ export function ConnectMcpDialog({
         const response = await apiRequest(url, {
           method,
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify(apiPayload)
+          body: JSON.stringify(payload)
         })
         await handleSaveResponse(response);
       } catch (error) {
@@ -702,8 +694,7 @@ export function ConnectMcpDialog({
                   disabled={
                     isSavingCustom ||
                     !mcpFormData.name.trim() ||
-                    customApiEnv.length === 0 ||
-                    customApiEnv.some(env => !env.key.trim() || !env.value.trim())
+                    !customApiEnv.some(env => env.key.trim() && env.value.trim())
                   }
                 >
                   {isSavingCustom && <Loader2 className="h-4 w-4 mr-2 animate-spin" />}
@@ -802,9 +793,10 @@ export function ConnectMcpDialog({
               name.toLowerCase() !== disconnectedApp.name.toLowerCase() &&
               name.toLowerCase() !== disconnectedApp.id.toLowerCase()
             );
-            // Immediately sync back to parent if we disconnected so it's globally deselected
+            // Use setTimeout to move the parent state update out of the render cycle
+            // This prevents React "setState in render" warning and potential crashes
             if (onConnectSelected) {
-              onConnectSelected(newSelection);
+              setTimeout(() => onConnectSelected(newSelection), 0);
             }
             return newSelection;
           });

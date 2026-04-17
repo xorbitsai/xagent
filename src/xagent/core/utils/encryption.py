@@ -47,4 +47,4 @@ def decrypt_value(encrypted_value: str) -> str:
         return cipher.decrypt(encrypted_value.encode()).decode()
     except InvalidToken:
         logger.error("Failed to decrypt value: Invalid token")
-        return encrypted_value
+        return ""

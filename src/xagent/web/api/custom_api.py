@@ -10,7 +10,7 @@ from datetime import datetime
 from typing import Dict, List, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, status
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, validator
 from sqlalchemy.orm import Session
 
 from ...core.utils.encryption import encrypt_value
@@ -38,6 +38,12 @@ class CustomApiCreate(BaseModel):
     )
     is_active: bool = Field(True, description="Whether the API is active")
 
+    @validator("env")
+    def validate_env(cls, v: Optional[Dict[str, str]]) -> Optional[Dict[str, str]]:
+        if v is not None and len(v) == 0:
+            raise ValueError("env must contain at least one secret if provided")
+        return v
+
 
 class CustomApiUpdate(BaseModel):
     """Request model for updating a Custom API."""
@@ -55,6 +61,12 @@ class CustomApiUpdate(BaseModel):
         None, description="Environment variables (secrets)"
     )
     is_active: Optional[bool] = Field(None, description="Whether the API is active")
+
+    @validator("env")
+    def validate_env(cls, v: Optional[Dict[str, str]]) -> Optional[Dict[str, str]]:
+        if v is not None and len(v) == 0:
+            raise ValueError("env must contain at least one secret if provided")
+        return v
 
 
 class CustomApiResponse(BaseModel):

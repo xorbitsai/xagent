@@ -667,3 +667,42 @@ class WebToolConfig(BaseToolConfig):
 
         logger.info(f"Loaded {len(configs)} MCP server configurations")
         return configs
+
+    def get_custom_api_configs(self) -> List[Dict[str, Any]]:
+        """Get custom API configurations."""
+        if not self._user_id:
+            return []
+
+        try:
+            from ..models.custom_api import UserCustomApi
+
+            user_apis = (
+                self.db.query(UserCustomApi)
+                .filter(
+                    UserCustomApi.user_id == int(self._user_id),
+                    UserCustomApi.is_active,
+                )
+                .all()
+            )
+
+            if not user_apis:
+                return []
+
+            custom_api_configs = []
+            for user_api in user_apis:
+                api = user_api.custom_api
+                if api:
+                    custom_api_configs.append(
+                        {
+                            "name": api.name,
+                            "description": api.description or "",
+                            "env": api.env or {},
+                        }
+                    )
+            return custom_api_configs
+
+        except Exception as e:
+            logger.error(
+                f"Failed to get Custom API configs from database: {e}", exc_info=True
+            )
+            return []

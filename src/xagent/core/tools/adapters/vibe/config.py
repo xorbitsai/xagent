@@ -101,6 +101,11 @@ class BaseToolConfig(ABC):
         pass
 
     @abstractmethod
+    def get_custom_api_configs(self) -> List[Dict[str, Any]]:
+        """Get custom API configurations."""
+        pass
+
+    @abstractmethod
     def get_image_edit_model(self) -> Optional[Any]:
         """Get default image editing model."""
         pass
@@ -284,6 +289,9 @@ class ToolConfig(BaseToolConfig):
 
     def get_image_generate_model(self) -> Optional[Any]:
         return None  # Standalone config doesn't have web context
+
+    def get_custom_api_configs(self) -> List[Dict[str, Any]]:
+        return []  # Standalone config doesn't have web context for custom APIs by default
 
     def get_image_edit_model(self) -> Optional[Any]:
         return None  # Standalone config doesn't have web context

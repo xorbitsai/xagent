@@ -3,6 +3,7 @@
 import asyncio
 import json
 import logging
+import re
 from typing import Any, Dict, List, Mapping, Optional, Type
 
 from pydantic import BaseModel, Field
@@ -82,8 +83,13 @@ class CustomApiTool(AbstractBaseTool):
 
         self._description = f"Custom API: {name}\n{description}{env_info}"
         self._env = {}
+        self._env_patterns = []
         for k, v in (env or {}).items():
-            self._env[k] = decrypt_value(v)
+            decrypted_v = decrypt_value(v)
+            self._env[k] = decrypted_v
+            # Pre-compile regex for this key to optimize recursive replacement
+            pattern = re.compile(rf"\${{{re.escape(k)}}}|\${re.escape(k)}(?!\w)")
+            self._env_patterns.append((pattern, decrypted_v))
         self._visibility = visibility
 
     @property
@@ -113,11 +119,8 @@ class CustomApiTool(AbstractBaseTool):
     def _replace_secrets(self, value: Any) -> Any:
         """Recursively replace $SECRET_NAME in strings."""
         if isinstance(value, str):
-            # Sort keys by length descending to prevent partial replacement
-            for k in sorted(self._env.keys(), key=len, reverse=True):
-                v = self._env[k]
-                value = value.replace(f"${k}", v)
-                value = value.replace(f"${{{k}}}", v)
+            for pattern, v in self._env_patterns:
+                value = pattern.sub(v, value)
             return value
         elif isinstance(value, dict):
             return {k: self._replace_secrets(v) for k, v in value.items()}
@@ -168,6 +171,16 @@ class CustomApiTool(AbstractBaseTool):
             ).model_dump()
 
     def run_json_sync(self, args: Mapping[str, Any]) -> Any:
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            loop = None
+
+        if loop is not None:
+            raise RuntimeError(
+                f"Event loop is already running. Use run_json_async instead for tool '{self.name}'."
+            )
+
         return asyncio.run(self.run_json_async(args))
 
     async def save_state_json(self) -> Mapping[str, Any]:

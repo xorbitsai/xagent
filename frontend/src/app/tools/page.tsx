@@ -44,6 +44,7 @@ import { useI18n } from "@/contexts/i18n-context"
 import { useAuth } from "@/contexts/auth-context"
 import { useMcpApps } from "@/contexts/mcp-apps-context"
 import { toast } from "sonner"
+import { isValidMcpName, buildCustomApiPayload } from "@/lib/mcp-utils"
 
 interface Tool {
   name: string
@@ -530,31 +531,30 @@ export default function ToolsPage() {
       return
     }
 
-    const nameRegex = /^[a-zA-Z0-9_-]+$/;
-    if (!nameRegex.test(mcpFormData.name.trim())) {
+    if (!isValidMcpName(mcpFormData.name)) {
       toast.error(t('tools.mcp.alerts.nameInvalidFormat') || "Name can only contain letters, numbers, hyphens and underscores");
       return;
     }
 
-    const payload = { ...mcpFormData }
+    let payload: any = { ...mcpFormData }
     if (payload.transport === "custom_api") {
-      const validEnv = customApiEnv.filter(env => env.key.trim() && env.value.trim());
-      if (validEnv.length === 0) {
-        toast.error(t('tools.mcp.alerts.atLeastOneSecret') || "At least one valid secret is required");
+      const buildResult = buildCustomApiPayload(payload, customApiEnv);
+      if (!buildResult.isValid) {
+        toast.error(t(buildResult.errorKey || 'tools.mcp.alerts.atLeastOneSecret') || "At least one valid secret is required");
         return;
       }
-      const envObj: Record<string, string> = {};
-      validEnv.forEach(env => {
-        envObj[env.key.trim()] = env.value.trim();
-      });
-      payload.config = { ...payload.config, env: envObj };
+      payload = buildResult.payload;
     }
 
     setIsLoading(true)
     try {
-      const url = editingServer
-        ? `${getApiUrl()}/api/mcp/servers/${editingServer.id}`
-        : `${getApiUrl()}/api/mcp/servers`
+      const url = mcpFormData.transport === 'custom_api'
+        ? (editingServer
+          ? `${getApiUrl()}/api/custom-apis/${editingServer.id}`
+          : `${getApiUrl()}/api/custom-apis`)
+        : (editingServer
+          ? `${getApiUrl()}/api/mcp/servers/${editingServer.id}`
+          : `${getApiUrl()}/api/mcp/servers`);
       const method = editingServer ? 'PUT' : 'POST'
       const response = await apiRequest(url, {
         method,

@@ -159,6 +159,7 @@ async def fetch_kimi_for_coding_models(
 # Provider registry mapping provider names to their fetch functions
 PROVIDER_FETCHERS: Dict[str, Any] = {
     "openai": fetch_openai_models,
+    "dashscope": fetch_openai_models,
     "zhipu": fetch_zhipu_models,
     "claude": fetch_claude_models,
     "anthropic": fetch_claude_models,

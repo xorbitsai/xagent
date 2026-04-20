@@ -196,6 +196,19 @@ class ModelTestResponse(BaseModel):
     error: Optional[str]
 
 
+class ModelConnectionTestRequest(BaseModel):
+    """Request schema for testing an unsaved model connection"""
+
+    model_provider: str
+    model_name: str
+    api_key: str
+    base_url: Optional[str] = None
+    category: str = "llm"
+    temperature: Optional[float] = None
+    dimension: Optional[int] = None
+    abilities: Optional[List[str]] = None
+
+
 class UserDefaultModelCreate(BaseModel):
     """User default model configuration creation schema"""
 

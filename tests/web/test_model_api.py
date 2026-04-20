@@ -2,6 +2,7 @@
 
 import os
 import tempfile
+from unittest.mock import AsyncMock, Mock, patch
 from urllib.parse import quote
 
 import pytest
@@ -167,6 +168,117 @@ def sample_embedding_model_data():
 
 class TestModelAPI:
     """Test model management API endpoints"""
+
+    def test_test_connection_embedding_uses_embedding_adapter(
+        self, test_db, regular_user, regular_headers
+    ):
+        """Embedding connection tests should use the embedding adapter instead of chat-only adapter."""
+        embedding_model = Mock()
+        embedding_model.encode = Mock(return_value=[0.1, 0.2, 0.3])
+
+        with patch(
+            "xagent.core.model.embedding.adapter.create_embedding_adapter",
+            return_value=embedding_model,
+        ):
+            response = client.post(
+                "/api/models/test-connection",
+                json={
+                    "model_provider": "openai",
+                    "model_name": "text-embedding-3-small",
+                    "api_key": "test-api-key",
+                    "base_url": "https://api.openai.com/v1",
+                    "category": "embedding",
+                    "dimension": 1536,
+                    "abilities": ["embedding"],
+                },
+                headers=regular_headers,
+            )
+
+        assert response.status_code == 200
+        data = response.json()
+        assert data["status"] == "passed"
+        embedding_model.encode.assert_called_once_with("hello")
+
+    def test_test_connection_image_fails_when_requested_ability_is_unsupported(
+        self, test_db, regular_user, regular_headers
+    ):
+        """Image connection tests should fail instead of returning a false positive."""
+        with (
+            patch(
+                "xagent.core.model.image.adapter.create_image_model",
+                return_value=Mock(),
+            ),
+            patch(
+                "xagent.web.services.model_list_service.fetch_models_from_provider",
+                new=AsyncMock(
+                    return_value=[
+                        {
+                            "id": "qwen-image",
+                            "abilities": ["generate"],
+                        }
+                    ]
+                ),
+            ),
+        ):
+            response = client.post(
+                "/api/models/test-connection",
+                json={
+                    "model_provider": "dashscope",
+                    "model_name": "qwen-image",
+                    "api_key": "test-api-key",
+                    "base_url": "https://dashscope.aliyuncs.com/api/v1/services/aigc/multimodal-generation/generation",
+                    "category": "image",
+                    "abilities": ["edit"],
+                },
+                headers=regular_headers,
+            )
+
+        assert response.status_code == 200
+        data = response.json()
+        assert data["status"] == "failed"
+        assert "does not support abilities: edit" in data["error"]
+
+    def test_test_connection_speech_xinference_supports_empty_api_key(
+        self, test_db, regular_user, regular_headers
+    ):
+        """Speech connection tests should work for Xinference without requiring an API key."""
+        with (
+            patch(
+                "xagent.web.services.model_list_service.fetch_models_from_provider",
+                new=AsyncMock(
+                    return_value=[
+                        {
+                            "id": "whisper-base",
+                            "abilities": ["asr"],
+                        }
+                    ]
+                ),
+            ),
+            patch(
+                "xagent.core.model.xinference_base.BaseXinferenceModel._ensure_model_handle",
+                new=AsyncMock(return_value=object()),
+            ),
+            patch(
+                "xagent.core.model.xinference_base.BaseXinferenceModel.aclose",
+                new=AsyncMock(return_value=None),
+            ),
+        ):
+            response = client.post(
+                "/api/models/test-connection",
+                json={
+                    "model_provider": "xinference",
+                    "model_name": "whisper-base",
+                    "api_key": "",
+                    "base_url": "http://localhost:9997",
+                    "category": "speech",
+                    "abilities": ["asr"],
+                },
+                headers=regular_headers,
+            )
+
+        assert response.status_code == 200
+        data = response.json()
+        assert data["status"] == "passed"
 
     def test_create_model_as_admin(
         self, test_db, admin_user, admin_headers, sample_model_data

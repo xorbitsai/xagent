@@ -19,7 +19,7 @@ def create_base_llm(model: ModelConfig) -> BaseLLM:
     if not isinstance(model, ChatModelConfig):
         raise TypeError(f"Invalid model type: {type(model).__name__}")
 
-    if model.model_provider == "openai":
+    if model.model_provider in ("openai", "dashscope"):
         llm: BaseLLM = OpenAILLM(
             model_name=model.model_name,
             api_key=model.api_key,

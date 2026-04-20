@@ -87,6 +87,7 @@ _SUPPORTED_PROVIDER_METADATA: tuple[dict[str, Any], ...] = (
         "name": "DashScope",
         "description": "Alibaba Cloud's DashScope models",
         "requires_base_url": False,
+        "compatibility": "openai_compatible",
     },
     {
         "id": "alibaba-coding-plan",

@@ -98,7 +98,7 @@ def create_base_chat_model(
 
     temp = temperature if temperature is not None else model.default_temperature
 
-    if model.model_provider == "openai":
+    if model.model_provider in ("openai", "dashscope"):
         return ChatOpenAI(
             model=model.model_name,
             temperature=temp,

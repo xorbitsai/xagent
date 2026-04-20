@@ -24,12 +24,31 @@ interface SelectProps {
   placeholder?: string
   className?: string
   disabled?: boolean
+  allowCustom?: boolean
+  customPlaceholder?: string
+  customButtonText?: string
+  onCustomAdd?: (value: string) => void
 }
 
-export function Select({ value, onValueChange, options = [], placeholder, className, disabled }: SelectProps) {
+export function Select({
+  value,
+  onValueChange,
+  options = [],
+  placeholder,
+  className,
+  disabled,
+  allowCustom,
+  customPlaceholder,
+  customButtonText,
+  onCustomAdd
+}: SelectProps) {
   const { t } = useI18n()
+
+  const _customPlaceholder = customPlaceholder || t('common.customPlaceholder')
+  const _customButtonText = customButtonText || t('common.add')
   const [open, setOpen] = useState(false)
   const [dropdownDirection, setDropdownDirection] = useState<'down' | 'up'>('down')
+  const [customValue, setCustomValue] = useState("")
   const buttonRef = useRef<HTMLDivElement>(null)
   const containerRef = useRef<HTMLDivElement>(null)
 
@@ -118,7 +137,7 @@ export function Select({ value, onValueChange, options = [], placeholder, classN
 
       {open && (
         <div className={cn(
-          "absolute left-0 right-0 z-[9999] bg-popover border border-border rounded-md shadow-lg",
+          "absolute left-0 right-0 z-[9999] bg-popover border border-border rounded-md shadow-lg flex flex-col",
           dropdownDirection === 'down' ? "top-full mt-1" : "bottom-full mb-1"
         )}>
           <div className="max-h-60 overflow-auto">
@@ -177,6 +196,42 @@ export function Select({ value, onValueChange, options = [], placeholder, classN
               ))
             )}
           </div>
+          {allowCustom && (
+            <div className="p-2 border-t border-border flex gap-2 bg-muted/10 shrink-0">
+              <input
+                type="text"
+                value={customValue}
+                onChange={(e) => setCustomValue(e.target.value)}
+                placeholder={_customPlaceholder}
+                className="flex h-8 w-full rounded-md border border-input bg-background px-3 py-1 text-sm shadow-sm transition-colors placeholder:text-muted-foreground focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring"
+                onClick={(e) => e.stopPropagation()}
+                onKeyDown={(e) => {
+                  e.stopPropagation()
+                  if (e.key === 'Enter' && customValue.trim()) {
+                    e.preventDefault()
+                    if (onCustomAdd) onCustomAdd(customValue.trim())
+                    setCustomValue("")
+                    setOpen(false)
+                  }
+                }}
+              />
+              <button
+                type="button"
+                onClick={(e) => {
+                  e.stopPropagation()
+                  if (customValue.trim() && onCustomAdd) {
+                    onCustomAdd(customValue.trim())
+                    setCustomValue("")
+                    setOpen(false)
+                  }
+                }}
+                disabled={!customValue.trim()}
+                className="inline-flex items-center justify-center rounded-md text-sm font-medium transition-colors focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring disabled:pointer-events-none disabled:opacity-50 bg-primary text-primary-foreground shadow hover:bg-primary/90 h-8 px-3 shrink-0"
+              >
+                {_customButtonText}
+              </button>
+            </div>
+          )}
         </div>
       )}
     </div>

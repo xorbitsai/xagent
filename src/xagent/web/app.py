@@ -450,6 +450,35 @@ async def startup_event() -> None:
                 e,
             )
 
+    # Reconcile uploaded_files when auto migration is enabled.
+    # Keep this under the same migration toggle for consistent startup behavior.
+    if auto_migrate:
+        try:
+            from .models.database import get_session_local
+            from .services.kb_file_service import reconcile_uploaded_files
+
+            def _run_uploaded_file_reconcile() -> None:
+                session_local = get_session_local()
+                db = session_local()
+                try:
+                    result = reconcile_uploaded_files(
+                        db,
+                        user_id=-1,
+                        is_admin=True,
+                        stale_ttl_hours=24 * 7,
+                        delete_stale=True,
+                    )
+                    logger.info("Uploaded files reconcile completed: %s", result)
+                finally:
+                    db.close()
+
+            await asyncio.to_thread(_run_uploaded_file_reconcile)
+        except Exception as e:
+            logger.warning(
+                "Uploaded files reconcile skipped due to error: %s",
+                e,
+            )
+
     # Warmup sandbox manager
     from .sandbox_manager import get_sandbox_manager
 

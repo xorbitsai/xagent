@@ -8,6 +8,7 @@ import json
 import logging
 import mimetypes
 import shutil
+import threading
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, TypeVar, cast
 
@@ -105,6 +106,8 @@ T = TypeVar("T", bound=Callable[..., Any])
 logger = logging.getLogger(__name__)
 
 _SQL_LIKE_ESCAPE = "\\"
+_WEB_FILE_LOCKS: Dict[str, threading.Lock] = {}
+_WEB_FILE_LOCKS_GUARD = threading.Lock()
 
 
 def _like_contains_pattern(value: str) -> str:
@@ -114,6 +117,96 @@ def _like_contains_pattern(value: str) -> str:
         .replace("_", f"{_SQL_LIKE_ESCAPE}_")
     )
     return f"%{escaped}%"
+
+
+def _get_file_sha256(file_path: Path) -> str:
+    """Compute SHA256 hash for a local file."""
+    hash_obj = hashlib.sha256()
+    with file_path.open("rb") as file_obj:
+        while True:
+            chunk = file_obj.read(1024 * 1024)
+            if not chunk:
+                break
+            hash_obj.update(chunk)
+    return hash_obj.hexdigest()
+
+
+def _atomic_replace_file(source_path: Path, target_path: Path) -> None:
+    """Atomically replace target file with source file content."""
+    temp_target = target_path.with_suffix(f"{target_path.suffix}.tmp-replace")
+    shutil.copy2(source_path, temp_target)
+    temp_target.replace(target_path)
+
+
+def _mark_uploaded_file_for_reindex(file_id: str) -> bool:
+    """Clear ingestion run markers so changed file can be re-indexed."""
+    try:
+        from ...core.tools.core.RAG_tools.LanceDB.schema_manager import (
+            ensure_documents_table,
+            ensure_ingestion_runs_table,
+        )
+        from ...core.tools.core.RAG_tools.utils.lancedb_query_utils import query_to_list
+        from ...core.tools.core.RAG_tools.utils.string_utils import (
+            escape_lancedb_string,
+        )
+        from ...providers.vector_store.lancedb import get_connection_from_env
+
+        conn = get_connection_from_env()
+        ensure_documents_table(conn)
+        ensure_ingestion_runs_table(conn)
+        documents_table = conn.open_table("documents")
+        ingestion_runs_table = conn.open_table("ingestion_runs")
+
+        safe_file_id = escape_lancedb_string(file_id)
+        rows = query_to_list(
+            documents_table.search()
+            .where(f"file_id = '{safe_file_id}'")
+            .select(["collection", "doc_id"])
+            .limit(-1)
+        )
+        for row in rows:
+            collection = str(row.get("collection") or "").strip()
+            doc_id = str(row.get("doc_id") or "").strip()
+            if not collection or not doc_id:
+                continue
+            safe_collection = escape_lancedb_string(collection)
+            safe_doc_id = escape_lancedb_string(doc_id)
+            ingestion_runs_table.delete(
+                f"collection = '{safe_collection}' and doc_id = '{safe_doc_id}'"
+            )
+        return True
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(
+            "Failed to mark uploaded file for re-index: file_id=%s, error=%s",
+            file_id,
+            exc,
+            exc_info=True,
+        )
+        return False
+
+
+class _WebFileLock:
+    """Per-key in-process lock for web ingestion file operations."""
+
+    def __init__(self, lock_key: str) -> None:
+        self._lock_key = lock_key
+        self._lock: Optional[threading.Lock] = None
+
+    def __enter__(self) -> "_WebFileLock":
+        with _WEB_FILE_LOCKS_GUARD:
+            lock = _WEB_FILE_LOCKS.get(self._lock_key)
+            if lock is None:
+                lock = threading.Lock()
+                _WEB_FILE_LOCKS[self._lock_key] = lock
+            self._lock = lock
+            # Acquire the same lock object while still under guard to avoid
+            # any follow-up lookup race on the lock registry.
+            lock.acquire()
+        return self
+
+    def __exit__(self, exc_type: Any, exc_value: Any, traceback: Any) -> None:
+        if self._lock is not None:
+            self._lock.release()
 
 
 def handle_kb_exceptions(func: T) -> T:
@@ -1269,106 +1362,177 @@ async def ingest_web(
                 sanitize_path_component(title, "filename") if title else "untitled"
             )
             filename = f"{url_hash}_{safe_title}.md"
+            lock_key = f"{int(_user.id)}:{url_hash}"
 
-            # Check if we've already processed this URL (in-memory cache)
-            if url_hash in _processed_urls:
-                existing_file_id = _processed_urls[url_hash]
-                logger.info(
-                    f"Reusing existing UploadedFile record for web ingestion: "
-                    f"url={url}, file_id={existing_file_id}"
-                )
-                # Query the database to get the storage path
-                existing_record = (
-                    db_session.query(UploadedFile)
-                    .filter(UploadedFile.file_id == existing_file_id)
-                    .first()
-                )
-                if existing_record:
-                    return FileHandlerResult(
-                        file_path=str(existing_record.storage_path),
-                        file_id=str(existing_record.file_id),
+            with _WebFileLock(lock_key):
+                # Check if we've already processed this URL (in-memory cache)
+                if url_hash in _processed_urls:
+                    existing_file_id = _processed_urls[url_hash]
+                    logger.info(
+                        f"Reusing existing UploadedFile record for web ingestion: "
+                        f"url={url}, file_id={existing_file_id}"
                     )
-                else:
+                    # Query the database to get the storage path
+                    existing_record = (
+                        db_session.query(UploadedFile)
+                        .filter(UploadedFile.file_id == existing_file_id)
+                        .first()
+                    )
+                    if existing_record:
+                        existing_path = Path(str(existing_record.storage_path))
+                        if existing_path.exists():
+                            old_hash = _get_file_sha256(existing_path)
+                            new_hash = _get_file_sha256(temp_file_path)
+                            if old_hash != new_hash:
+                                _atomic_replace_file(temp_file_path, existing_path)
+                                file_record = _upsert_uploaded_file_record(
+                                    db_session,
+                                    user_id=int(_user.id),
+                                    filename=filename,
+                                    storage_path=existing_path,
+                                    mime_type="text/markdown",
+                                    file_size=existing_path.stat().st_size,
+                                )
+                                _processed_urls[url_hash] = str(file_record.file_id)
+                                if _mark_uploaded_file_for_reindex(
+                                    str(file_record.file_id)
+                                ):
+                                    logger.info(
+                                        "Marked changed web file as PENDING_REINDEX: url=%s, file_id=%s",
+                                        url,
+                                        file_record.file_id,
+                                    )
+                                logger.info(
+                                    "Refreshed web ingestion file due to content change: url=%s, file_id=%s",
+                                    url,
+                                    file_record.file_id,
+                                )
+                        return FileHandlerResult(
+                            file_path=str(existing_record.storage_path),
+                            file_id=str(existing_record.file_id),
+                        )
                     # Cached file_id was deleted from DB, fall through to recreate
                     logger.warning(
                         f"Cached file_id {existing_file_id} not found in DB (record was deleted), "
                         f"will create new record for url={url}"
                     )
 
-            # Check database for existing file with same URL hash (cross-session deduplication)
-            existing_record = (
-                db_session.query(UploadedFile)
-                .filter(
-                    UploadedFile.user_id == int(_user.id),
-                    UploadedFile.filename == filename,
-                )
-                .first()
-            )
-
-            if existing_record:
-                logger.info(
-                    f"Found existing UploadedFile record from previous session: "
-                    f"url={url}, file_id={existing_record.file_id}"
-                )
-                _processed_urls[url_hash] = str(existing_record.file_id)
-                return FileHandlerResult(
-                    file_path=str(existing_record.storage_path),
-                    file_id=str(existing_record.file_id),
+                # Check database for existing file with same URL hash (cross-session deduplication)
+                existing_record = (
+                    db_session.query(UploadedFile)
+                    .filter(
+                        UploadedFile.user_id == int(_user.id),
+                        UploadedFile.filename == filename,
+                    )
+                    .first()
                 )
 
-            # Generate persistent file path
-            persistent_file = get_upload_path(
-                filename,
-                user_id=int(_user.id),
-                collection=collection_name,
-                collection_is_sanitized=True,
-            )
+                if existing_record:
+                    existing_path = Path(str(existing_record.storage_path))
+                    if existing_path.exists():
+                        old_hash = _get_file_sha256(existing_path)
+                        new_hash = _get_file_sha256(temp_file_path)
+                        if old_hash != new_hash:
+                            _atomic_replace_file(temp_file_path, existing_path)
+                            file_record = _upsert_uploaded_file_record(
+                                db_session,
+                                user_id=int(_user.id),
+                                filename=filename,
+                                storage_path=existing_path,
+                                mime_type="text/markdown",
+                                file_size=existing_path.stat().st_size,
+                            )
+                            _processed_urls[url_hash] = str(file_record.file_id)
+                            if _mark_uploaded_file_for_reindex(
+                                str(file_record.file_id)
+                            ):
+                                logger.info(
+                                    "Marked changed web file as PENDING_REINDEX: url=%s, file_id=%s",
+                                    url,
+                                    file_record.file_id,
+                                )
+                            logger.info(
+                                "Updated existing web ingestion file from previous session: url=%s, file_id=%s",
+                                url,
+                                file_record.file_id,
+                            )
+                    else:
+                        # Recreate missing persistent file to keep record usable.
+                        existing_path.parent.mkdir(parents=True, exist_ok=True)
+                        shutil.copy2(temp_file_path, existing_path)
+                        file_record = _upsert_uploaded_file_record(
+                            db_session,
+                            user_id=int(_user.id),
+                            filename=filename,
+                            storage_path=existing_path,
+                            mime_type="text/markdown",
+                            file_size=existing_path.stat().st_size,
+                        )
+                        _processed_urls[url_hash] = str(file_record.file_id)
 
-            # Ensure directory exists
-            persistent_file.parent.mkdir(parents=True, exist_ok=True)
+                    logger.info(
+                        f"Found existing UploadedFile record from previous session: "
+                        f"url={url}, file_id={existing_record.file_id}"
+                    )
+                    _processed_urls[url_hash] = str(existing_record.file_id)
+                    return FileHandlerResult(
+                        file_path=str(existing_record.storage_path),
+                        file_id=str(existing_record.file_id),
+                    )
 
-            try:
-                # Copy file to persistent location
-                shutil.copy2(temp_file_path, persistent_file)
-                logger.info(
-                    f"Copied web ingestion file from {temp_file_path} to {persistent_file}"
-                )
-
-                # Create UploadedFile record
-                file_record = _upsert_uploaded_file_record(
-                    db_session,
+                # Generate persistent file path
+                persistent_file = get_upload_path(
+                    filename,
                     user_id=int(_user.id),
-                    filename=filename,
-                    storage_path=persistent_file,
-                    mime_type="text/markdown",
-                    file_size=persistent_file.stat().st_size,
+                    collection=collection_name,
+                    collection_is_sanitized=True,
                 )
 
-                logger.info(
-                    f"Created UploadedFile record for web ingestion: file_id={file_record.file_id}, "
-                    f"filename={filename}, url={url}"
-                )
+                # Ensure directory exists
+                persistent_file.parent.mkdir(parents=True, exist_ok=True)
 
-                # Track this URL to prevent duplicates
-                _processed_urls[url_hash] = str(file_record.file_id)
+                try:
+                    # Copy file to persistent location
+                    shutil.copy2(temp_file_path, persistent_file)
+                    logger.info(
+                        f"Copied web ingestion file from {temp_file_path} to {persistent_file}"
+                    )
 
-                return FileHandlerResult(
-                    file_path=str(persistent_file),
-                    file_id=str(file_record.file_id),
-                )
-            except Exception:
-                # Clean up orphaned persistent file if upsert failed
-                if persistent_file.exists():
-                    try:
-                        persistent_file.unlink()
-                        logger.warning(
-                            f"Cleaned up orphaned persistent file due to upsert failure: {persistent_file}"
-                        )
-                    except Exception as cleanup_error:
-                        logger.warning(
-                            f"Failed to clean up orphaned persistent file {persistent_file}: {cleanup_error}"
-                        )
-                raise
+                    # Create UploadedFile record
+                    file_record = _upsert_uploaded_file_record(
+                        db_session,
+                        user_id=int(_user.id),
+                        filename=filename,
+                        storage_path=persistent_file,
+                        mime_type="text/markdown",
+                        file_size=persistent_file.stat().st_size,
+                    )
+
+                    logger.info(
+                        f"Created UploadedFile record for web ingestion: file_id={file_record.file_id}, "
+                        f"filename={filename}, url={url}"
+                    )
+
+                    # Track this URL to prevent duplicates
+                    _processed_urls[url_hash] = str(file_record.file_id)
+
+                    return FileHandlerResult(
+                        file_path=str(persistent_file),
+                        file_id=str(file_record.file_id),
+                    )
+                except Exception:
+                    # Clean up orphaned persistent file if upsert failed
+                    if persistent_file.exists():
+                        try:
+                            persistent_file.unlink()
+                            logger.warning(
+                                f"Cleaned up orphaned persistent file due to upsert failure: {persistent_file}"
+                            )
+                        except Exception as cleanup_error:
+                            logger.warning(
+                                f"Failed to clean up orphaned persistent file {persistent_file}: {cleanup_error}"
+                            )
+                    raise
 
         # Create a wrapper that creates a dedicated DB session for the executor thread
         # This avoids sharing the request thread's session across thread boundaries,

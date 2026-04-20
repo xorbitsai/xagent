@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 import os
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Union
 
@@ -11,16 +12,20 @@ from sqlalchemy.orm import Session
 
 from ...config import get_uploads_dir
 from ...core.tools.core.RAG_tools.LanceDB.schema_manager import ensure_documents_table
+from ...core.tools.core.RAG_tools.management.status import load_ingestion_status
 from ...core.tools.core.RAG_tools.storage.contracts import DocumentRecord
 from ...core.tools.core.RAG_tools.utils.lancedb_query_utils import query_to_list
 from ...core.tools.core.RAG_tools.utils.string_utils import (
     build_lancedb_filter_expression,
+    escape_lancedb_string,
 )
 from ...core.tools.core.RAG_tools.utils.user_permissions import UserPermissions
 from ...providers.vector_store.lancedb import get_connection_from_env
 from ..models.uploaded_file import UploadedFile
 
 logger = logging.getLogger(__name__)
+
+_FILE_STATUS_BATCH_SIZE = 200
 
 
 def upsert_uploaded_file_record(
@@ -207,3 +212,195 @@ def delete_uploaded_file_if_orphaned(
     db.delete(file_record)
     db.flush()
     return True
+
+
+def _build_file_id_in_filter(file_ids: List[str]) -> str:
+    escaped_ids = [f"'{escape_lancedb_string(file_id)}'" for file_id in file_ids]
+    return f"file_id IN ({', '.join(escaped_ids)})"
+
+
+def _combine_lancedb_filters(
+    base_filter: Optional[str], user_filter: Optional[str]
+) -> Optional[str]:
+    if base_filter and user_filter:
+        return f"({base_filter}) and ({user_filter})"
+    return base_filter or user_filter
+
+
+def aggregate_uploaded_file_statuses(
+    *,
+    file_ids: List[str],
+    user_id: int,
+    is_admin: bool,
+) -> Dict[str, str]:
+    """Aggregate file status by joining documents + ingestion status records."""
+    normalized_file_ids = sorted({file_id for file_id in file_ids if file_id})
+    if not normalized_file_ids:
+        return {}
+
+    conn = get_connection_from_env()
+    ensure_documents_table(conn)
+    documents_table = conn.open_table("documents")
+    user_filter = UserPermissions.get_user_filter(user_id, is_admin=is_admin)
+
+    doc_refs_by_file_id: Dict[str, List[tuple[str, str]]] = {
+        file_id: [] for file_id in normalized_file_ids
+    }
+    for offset in range(0, len(normalized_file_ids), _FILE_STATUS_BATCH_SIZE):
+        batch = normalized_file_ids[offset : offset + _FILE_STATUS_BATCH_SIZE]
+        base_filter = _build_file_id_in_filter(batch)
+        combined_filter = _combine_lancedb_filters(base_filter, user_filter)
+
+        query = documents_table.search()
+        if combined_filter:
+            query = query.where(combined_filter)
+        rows = query_to_list(
+            query.select(["file_id", "collection", "doc_id"]).limit(-1)
+        )
+        for row in rows:
+            file_id = str(row.get("file_id") or "").strip()
+            collection = str(row.get("collection") or "").strip()
+            doc_id = str(row.get("doc_id") or "").strip()
+            if file_id and collection and doc_id and file_id in doc_refs_by_file_id:
+                doc_refs_by_file_id[file_id].append((collection, doc_id))
+
+    collections = sorted(
+        {
+            collection
+            for doc_refs in doc_refs_by_file_id.values()
+            for collection, _ in doc_refs
+        }
+    )
+    status_by_doc: Dict[tuple[str, str], str] = {}
+    for collection in collections:
+        for entry in load_ingestion_status(
+            collection=collection,
+            user_id=user_id,
+            is_admin=is_admin,
+        ):
+            doc_id = str(entry.get("doc_id") or "").strip()
+            status = str(entry.get("status") or "").strip().lower()
+            if doc_id and status:
+                status_by_doc[(collection, doc_id)] = status
+
+    status_map: Dict[str, str] = {}
+    for file_id, doc_refs in doc_refs_by_file_id.items():
+        if not doc_refs:
+            status_map[file_id] = "UNKNOWN"
+            continue
+
+        statuses = [
+            status_by_doc.get((collection, doc_id), "")
+            for collection, doc_id in doc_refs
+        ]
+        if any(status == "running" for status in statuses):
+            status_map[file_id] = "RUNNING"
+            continue
+
+        has_failed = any(status == "failed" for status in statuses)
+        has_success = any(status == "success" for status in statuses)
+        if has_failed and not has_success:
+            status_map[file_id] = "FAILED"
+            continue
+        if has_success:
+            status_map[file_id] = "SUCCESS"
+            continue
+        status_map[file_id] = "UNKNOWN"
+
+    return status_map
+
+
+def reconcile_uploaded_files(
+    db: Session,
+    *,
+    user_id: int,
+    is_admin: bool,
+    stale_ttl_hours: int = 24 * 7,
+    delete_stale: bool = True,
+) -> Dict[str, int]:
+    """Reconcile uploaded files with document + ingestion status state."""
+    query = db.query(UploadedFile)
+    if not is_admin:
+        query = query.filter(UploadedFile.user_id == user_id)
+
+    uploaded_files = query.order_by(UploadedFile.created_at.asc()).all()
+    file_ids = [str(record.file_id) for record in uploaded_files if record.file_id]
+    status_map = aggregate_uploaded_file_statuses(
+        file_ids=file_ids,
+        user_id=user_id,
+        is_admin=is_admin,
+    )
+
+    cutoff = datetime.now(timezone.utc) - timedelta(hours=max(stale_ttl_hours, 1))
+    scanned = 0
+    deleted = 0
+    stale_candidates = 0
+    cleanup_errors = 0
+    conn = get_connection_from_env()
+    ensure_documents_table(conn)
+    documents_table = conn.open_table("documents")
+    for record in uploaded_files:
+        scanned += 1
+        file_id = str(record.file_id)
+        status = status_map.get(file_id, "UNKNOWN")
+        if status not in {"FAILED", "UNKNOWN"}:
+            continue
+
+        created_at = getattr(record, "created_at", None)
+        if created_at is not None and getattr(created_at, "tzinfo", None) is None:
+            created_at = created_at.replace(tzinfo=timezone.utc)
+        if created_at is not None and created_at > cutoff:
+            continue
+
+        stale_candidates += 1
+        if not delete_stale:
+            continue
+
+        safe_file_id = escape_lancedb_string(file_id)
+        file_path = Path(str(record.storage_path))
+        uploads_root = get_uploads_dir().resolve()
+        try:
+            resolved_path = file_path.resolve()
+            resolved_path.relative_to(uploads_root)
+        except ValueError:
+            logger.warning(
+                "Skipping stale file cleanup outside uploads root: %s",
+                file_path,
+            )
+        else:
+            if resolved_path.exists() and resolved_path.is_file():
+                try:
+                    resolved_path.unlink()
+                except OSError as exc:
+                    cleanup_errors += 1
+                    logger.error(
+                        "Failed to delete stale file %s for file_id=%s: %s",
+                        resolved_path,
+                        file_id,
+                        exc,
+                    )
+                    continue
+
+        try:
+            documents_table.delete(f"file_id = '{safe_file_id}'")
+        except Exception as exc:  # noqa: BLE001
+            cleanup_errors += 1
+            logger.error(
+                "Failed to delete documents rows for stale file_id=%s: %s",
+                file_id,
+                exc,
+            )
+            continue
+
+        db.delete(record)
+        deleted += 1
+
+    if delete_stale and deleted > 0:
+        db.commit()
+
+    return {
+        "scanned": scanned,
+        "stale_candidates": stale_candidates,
+        "deleted": deleted,
+        "cleanup_errors": cleanup_errors,
+    }

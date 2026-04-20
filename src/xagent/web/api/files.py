@@ -22,6 +22,7 @@ from ..config import (
 from ..models.database import get_db
 from ..models.uploaded_file import UploadedFile
 from ..models.user import User
+from ..services.kb_file_service import aggregate_uploaded_file_statuses
 from .legacy_file import (
     infer_user_id_from_legacy_path,
     is_valid_uuid,
@@ -535,6 +536,11 @@ async def list_files(
         query = query.filter(UploadedFile.user_id == _user_id_value(user))
 
     records = query.order_by(UploadedFile.created_at.desc()).all()
+    file_status_map = aggregate_uploaded_file_statuses(
+        file_ids=[str(record.file_id) for record in records if record.file_id],
+        user_id=_user_id_value(user),
+        is_admin=_is_admin_user(user),
+    )
     files = []
     for record in records:
         path = Path(_file_storage_path_value(record))
@@ -550,6 +556,7 @@ async def list_files(
                 "relative_path": relative_path,
                 "task_id": record.task_id,
                 "user_id": record_user_id,
+                "ingestion_status": file_status_map.get(str(record.file_id), "UNKNOWN"),
             }
         )
 

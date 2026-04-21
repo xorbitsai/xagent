@@ -338,10 +338,14 @@ def test_delete_collection_data_raises_when_any_table_delete_fails(
     mock_conn.open_table.side_effect = lambda name: tables[name]
 
     store = LanceDBVectorIndexStore()
+    warnings: List[str] = []
 
-    with pytest.raises(RuntimeError, match="parse delete failed"):
-        store.delete_collection_data("demo", user_id=1, is_admin=False)
+    deleted_counts = store.delete_collection_data(
+        "demo", user_id=1, is_admin=False, warnings_out=warnings
+    )
 
+    assert deleted_counts == {"documents": 1, "embeddings_text_embedding_v4": 2}
+    assert warnings == ["Failed to delete from 'parses': parse delete failed"]
     documents_table.delete.assert_called_once()
     parses_table.delete.assert_called_once()
     embeddings_table.delete.assert_called_once()

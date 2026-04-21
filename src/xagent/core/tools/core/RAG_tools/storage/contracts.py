@@ -440,6 +440,7 @@ class VectorIndexStore(ABC):
         collection_name: str,
         user_id: Optional[int],
         is_admin: bool,
+        warnings_out: Optional[List[str]] = None,
     ) -> Dict[str, int]:
         """Delete all data for a collection from vector-side tables.
 
@@ -447,6 +448,7 @@ class VectorIndexStore(ABC):
             collection_name: Name of the collection to delete.
             user_id: User ID for multi-tenancy filtering.
             is_admin: Whether the caller has admin privileges.
+            warnings_out: Optional list to append best-effort deletion warnings to.
 
         Returns:
             Dictionary mapping table names to deleted row counts.

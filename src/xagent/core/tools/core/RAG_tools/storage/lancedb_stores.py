@@ -665,6 +665,7 @@ class LanceDBVectorIndexStore(VectorIndexStore):
         collection_name: str,
         user_id: Optional[int],
         is_admin: bool,
+        warnings_out: Optional[List[str]] = None,
     ) -> Dict[str, int]:
         """Delete all data for a collection from vector-side tables."""
         from ..LanceDB.schema_manager import (
@@ -699,8 +700,9 @@ class LanceDBVectorIndexStore(VectorIndexStore):
                 if deleted_count > 0:
                     deleted_counts[table_name] = deleted_count
             except Exception as exc:  # noqa: BLE001
-                logger.warning("Failed to delete from '%s': %s", table_name, exc)
-                failed_tables.append(f"{table_name}: {exc}")
+                warning = f"Failed to delete from '{table_name}': {exc}"
+                logger.warning(warning)
+                failed_tables.append(warning)
 
         # Delete embeddings data (use cached handles; do NOT close them)
         for table_name in self.list_table_names():
@@ -714,14 +716,12 @@ class LanceDBVectorIndexStore(VectorIndexStore):
                 if deleted_count > 0:
                     deleted_counts[table_name] = deleted_count
             except Exception as exc:  # noqa: BLE001
-                logger.warning("Failed to delete from '%s': %s", table_name, exc)
-                failed_tables.append(f"{table_name}: {exc}")
+                warning = f"Failed to delete from '{table_name}': {exc}"
+                logger.warning(warning)
+                failed_tables.append(warning)
 
-        if failed_tables:
-            raise RuntimeError(
-                "Failed to delete collection data from one or more tables: "
-                + "; ".join(failed_tables)
-            )
+        if warnings_out is not None:
+            warnings_out.extend(failed_tables)
 
         # Clear cache so subsequent reads see the deletion and fd is released
         self.invalidate_table_cache()

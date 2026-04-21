@@ -5,6 +5,7 @@ from __future__ import annotations
 import os
 from datetime import datetime, timezone
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Dict, List
 from unittest.mock import MagicMock, patch
 
@@ -517,6 +518,41 @@ def test_delete_collection_invokes_cleanup_all_documents(
 
     assert result.status == "success"
     assert "documents" in result.deleted_counts
+
+
+def test_delete_collection_preserves_partial_vector_cleanup(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    warnings_from_store = "Failed to delete from 'parses': parse delete failed"
+
+    mock_store = MagicMock()
+    mock_store.list_document_records.side_effect = [
+        [SimpleNamespace(doc_id="doc-1")],
+        [],
+    ]
+
+    def _delete_collection_data(**kwargs):
+        kwargs["warnings_out"].append(warnings_from_store)
+        return {"documents": 1}
+
+    mock_store.delete_collection_data.side_effect = _delete_collection_data
+    monkeypatch.setattr(
+        collections_module, "get_vector_index_store", lambda: mock_store
+    )
+    monkeypatch.setattr(
+        collections_module, "clear_ingestion_status", lambda *args, **kwargs: None
+    )
+    monkeypatch.setattr(
+        collections_module,
+        "delete_collection_metadata_sync",
+        lambda **kwargs: {},
+    )
+
+    result = delete_collection("demo", user_id=1, is_admin=False)
+
+    assert result.status == "partial_success"
+    assert result.deleted_counts == {"documents": 1}
+    assert result.warnings == [warnings_from_store]
 
 
 def test_e2e_register_and_list_documents_with_legacy_empty_string_file_id(

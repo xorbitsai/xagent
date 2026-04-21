@@ -1187,6 +1187,7 @@ def delete_collection(
             collection_name=collection,
             user_id=user_id,
             is_admin=is_admin,
+            warnings_out=warnings,
         )
 
         # Clear ingestion status for all documents

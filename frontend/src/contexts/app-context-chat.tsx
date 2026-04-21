@@ -249,7 +249,7 @@ interface Task {
   smallFastModelName?: string
   visualModelName?: string
   compactModelName?: string
-  vibeMode?: "task" | "process"
+  executionMode?: "flash" | "balanced" | "think"
   isDag?: boolean
   agentId?: number
 }
@@ -999,7 +999,7 @@ export function AppProvider({ children, token }: { children: React.ReactNode; to
                 smallFastModelName: taskData.small_fast_model_name,
                 visualModelName: taskData.visual_model_name,
                 compactModelName: taskData.compact_model_name,
-                vibeMode: taskData.vibe_mode,
+                executionMode: taskData.execution_mode,
                 isDag: taskData.is_dag,
                 agentId: taskData.agent_id,
               }
@@ -3460,10 +3460,25 @@ export function AppProvider({ children, token }: { children: React.ReactNode; to
         // The backend TaskCreateRequest expects JSON with 'files' as a list of filenames (strings)
         // Since we haven't uploaded files yet, we don't include them in the task creation request
 
+        // Map executionMode to backend pattern
+        // flash -> single_call, balanced -> react, think -> dag_plan_execute
+        const getPatternFromExecutionMode = (mode: string): string => {
+          switch (mode) {
+            case "flash":
+              return "single_call"
+            case "balanced":
+              return "react"
+            case "think":
+              return "dag_plan_execute"
+            default:
+              return "react"  // Default fallback
+          }
+        }
+
         const requestBody: any = {
           title: message,
           description: message,
-          vibe_mode: config?.vibeMode?.mode || "task",
+          execution_mode: config?.executionMode?.mode || "balanced",
           memory_similarity_threshold: config?.memorySimilarityThreshold ?? 1.5,
         }
 
@@ -3475,7 +3490,7 @@ export function AppProvider({ children, token }: { children: React.ReactNode; to
           if (filesToUpload.length > 0) {
             const formData = new FormData()
             filesToUpload.forEach(f => formData.append('files', f))
-            formData.append('task_type', config?.vibeMode?.mode || 'task')
+            formData.append('task_type', config?.executionMode?.mode || 'balanced')
 
             try {
               const uploadResponse = await apiRequest(`${apiUrl}/api/files/upload`, {
@@ -3506,11 +3521,11 @@ export function AppProvider({ children, token }: { children: React.ReactNode; to
           requestBody.llm_ids = llmIds
         }
 
-        if (config?.vibeMode?.processDescription) {
-          requestBody.process_description = config.vibeMode.processDescription
+        if (config?.executionMode?.processDescription) {
+          requestBody.process_description = config.executionMode.processDescription
         }
-        if (config?.vibeMode?.examples) {
-          requestBody.examples = config.vibeMode.examples
+        if (config?.executionMode?.examples) {
+          requestBody.examples = config.executionMode.examples
         }
         if (config?.agentId) {
           requestBody.agent_id = config.agentId
@@ -3559,7 +3574,7 @@ export function AppProvider({ children, token }: { children: React.ReactNode; to
             smallFastModelName: taskData.small_fast_model_name || taskData.smallFastModelName, // API response field
             visualModelName: taskData.visual_model_name || taskData.visual_model_name,
             compactModelName: taskData.compact_model_name || taskData.compact_model_name,
-            vibeMode: taskData.vibe_mode,
+            executionMode: taskData.execution_mode,
             isDag: taskData.is_dag,
             agentId: taskData.agent_id,
           }

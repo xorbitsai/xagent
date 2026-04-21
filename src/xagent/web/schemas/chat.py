@@ -61,12 +61,14 @@ class TaskCreateRequest(BaseModel):
     agent_type: Optional[str] = "standard"  # Agent type: "standard", "text2sql", etc.
     agent_config: Optional[Dict[str, Any]] = None  # Agent-specific configuration
 
-    # VIBE mode fields
-    vibe_mode: Optional[str] = "task"  # "task" or "process"
+    # Execution mode field
+    execution_mode: Optional[str] = "balanced"  # "flash", "balanced", or "think"
     process_description: Optional[str] = (
-        None  # Process mode: detailed process description
+        None  # Process mode: detailed process description (deprecated)
     )
-    examples: Optional[List[ExampleItem]] = None  # Process mode: input/output examples
+    examples: Optional[List[ExampleItem]] = (
+        None  # Process mode: input/output examples (deprecated)
+    )
 
     @model_validator(mode="before")
     @classmethod
@@ -95,7 +97,7 @@ class TaskCreateResponse(BaseModel):
     small_fast_model_name: Optional[str] = None
     visual_model_name: Optional[str] = None
     compact_model_name: Optional[str] = None
-    vibe_mode: Optional[str] = None
+    execution_mode: Optional[str] = None
     channel_id: Optional[int] = None
     channel_name: Optional[str] = None
 

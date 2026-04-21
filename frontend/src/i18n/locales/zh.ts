@@ -458,8 +458,10 @@ Build when you need.`
         paused: "已暂停",
       },
       mode: {
-        task: "任务",
-        process: "流程",
+        flash: "快速",
+        balanced: "平衡",
+        think: "深度",
+        unknown: "未知",
       },
     },
   },
@@ -1957,13 +1959,17 @@ Build when you need.`
       },
       executionMode: {
         label: "执行模式",
-        react: {
-          title: "标准模式（推荐）",
-          description: "快速响应，灵活处理。适合大多数日常任务。",
+        flash: {
+          title: "闪电模式",
+          description: "简单快速的任务",
         },
-        graph: {
-          title: "规划模式",
-          description: "系统化拆解，步步为营。适合复杂的多步骤任务。",
+        balanced: {
+          title: "平衡模式",
+          description: "日常任务",
+        },
+        think: {
+          title: "深度思考模式",
+          description: "复杂多步骤任务",
         },
       },
       model: {
@@ -2231,19 +2237,25 @@ Build when you need.`
     },
     vibeMode: {
       tabs: {
-        task: "Task 模式",
-        process: "Process 模式",
+        flash: "快速模式",
+        flashSubtitle: "简单、快速任务",
+        balanced: "平衡模式",
+        balancedSubtitle: "日常任务",
+        think: "深度模式",
+        thinkSubtitle: "复杂、多步骤任务",
       },
       descriptions: {
-        task: {
-          title: "Task 模式",
-          text: "一次性任务模式，快速完成特定目标。适合探索和实验。",
-          examplesTitle: "使用举例：",
-          examplesText: "完成PPT编写、生成海报、制作网站等",
+        flash: {
+          title: "快速模式",
+          text: "简单的快速任务，直接调用工具，无需复杂推理。",
         },
-        process: {
-          title: "Process 模式",
-          text: "可复用的Agent流程，适合后续Build和Deploy。需要定义流程描述和输入输出样例。",
+        balanced: {
+          title: "平衡模式",
+          text: "大多数日常任务，通过逐步推理和工具执行获得最佳效果。",
+        },
+        think: {
+          title: "深度模式",
+          text: "复杂的多步骤任务，需要规划、分析和协调多个工具。",
           examplesTitle: "使用举例：",
           examplesText: "描述客服机器人流程、审计助手等",
           examples: {

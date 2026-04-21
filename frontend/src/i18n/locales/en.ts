@@ -458,8 +458,10 @@ Build when you need.`
         paused: "Paused",
       },
       mode: {
-        task: "Task",
-        process: "Process",
+        flash: "Flash",
+        balanced: "Balanced",
+        think: "Think",
+        unknown: "Unknown",
       },
     },
   },
@@ -1957,13 +1959,17 @@ Build when you need.`
       },
       executionMode: {
         label: "Execution Mode",
-        react: {
-          title: "Standard Mode (Recommended)",
-          description: "Quick response, flexible handling. Suitable for most daily tasks.",
+        flash: {
+          title: "Flash",
+          description: "Simple, quick tasks",
         },
-        graph: {
-          title: "Planning Mode",
-          description: "Systematic breakdown, step-by-step execution. Ideal for complex multi-step tasks.",
+        balanced: {
+          title: "Balanced",
+          description: "Most everyday tasks",
+        },
+        think: {
+          title: "Think",
+          description: "Complex, multi-step tasks",
         },
       },
       model: {
@@ -2231,19 +2237,25 @@ Build when you need.`
     },
     vibeMode: {
       tabs: {
-        task: "Task Mode",
-        process: "Process Mode",
+        flash: "Flash",
+        flashSubtitle: "Simple, quick tasks",
+        balanced: "Balanced",
+        balancedSubtitle: "Most everyday tasks",
+        think: "Think",
+        thinkSubtitle: "Complex, multi-step tasks",
       },
       descriptions: {
-        task: {
-          title: "Task Mode",
-          text: "One-off task mode to quickly achieve specific goals. Suitable for exploration and experimentation.",
-          examplesTitle: "Examples:",
-          examplesText: "Complete PPT writing, generate posters, build websites, etc.",
+        flash: {
+          title: "Flash Mode",
+          text: "Simple, quick tasks that require direct tool calls without complex reasoning.",
         },
-        process: {
-          title: "Process Mode",
-          text: "Reusable agent workflows suitable for Build and Deploy. Requires defining a process description and input/output examples.",
+        balanced: {
+          title: "Balanced Mode",
+          text: "Most everyday tasks that benefit from step-by-step reasoning and tool execution.",
+        },
+        think: {
+          title: "Think Mode - Process Description",
+          text: "Define the process workflow for building reusable agents. Describe how the agent should approach complex tasks.",
           examplesTitle: "Examples:",
           examplesText: "Describe customer service bot process, audit assistant, etc.",
           examples: {

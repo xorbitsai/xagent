@@ -302,19 +302,17 @@ class DAGPlanExecutePattern(AgentPattern):
         self._continuation_requested = False
         self._execution_interrupted = False
 
-        # For process mode, append examples to the task for LLM reference
+        # For execution modes with examples, append examples to the task for LLM reference
         if context and hasattr(context, "state"):
-            vibe_mode = context.state.get("vibe_mode")
-            if vibe_mode == "process":
-                examples = context.state.get("examples", [])
-                if examples:
-                    task += "\n\nTypical Example for Process Execution:\n"
-                    task += "Use this example as the concrete input when executing the workflow:\n"
-                    for i, ex in enumerate(examples, 1):
-                        task += f"Example {i}:\n"
-                        task += f"  Input: {ex.get('input', '')}\n"
-                        task += f"  Output: {ex.get('output', '')}\n"
-                    task += "\nIMPORTANT: When designing workflow steps that require specific input (e.g., search queries, API calls), use the INPUT from the example above as the concrete query string. Design the process to handle this specific case.\n"
+            examples = context.state.get("examples", [])
+            if examples:
+                task += "\n\nTypical Example for Process Execution:\n"
+                task += "Use this example as the concrete input when executing the workflow:\n"
+                for i, ex in enumerate(examples, 1):
+                    task += f"Example {i}:\n"
+                    task += f"  Input: {ex.get('input', '')}\n"
+                    task += f"  Output: {ex.get('output', '')}\n"
+                task += "\nIMPORTANT: When designing workflow steps that require specific input (e.g., search queries, API calls), use the INPUT from the example above as the concrete query string. Design the process to handle this specific case.\n"
 
         logger.info(f"Starting DAG Plan-Execute for task: {task[:100]}...")
 

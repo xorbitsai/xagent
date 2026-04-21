@@ -30,7 +30,9 @@ class AgentService:
         memory: Optional[MemoryStore] = None,
         tools: Optional[List[Tool]] = None,
         llm: Optional[BaseLLM] = None,
-        use_dag_pattern: bool = True,
+        use_dag_pattern: bool = True,  # Deprecated: Use pattern instead
+        pattern: str
+        | AgentPattern = "dag_plan_execute",  # New: "single_call", "react", "dag_plan_execute"
         tracer: Optional[Tracer] = None,
         id: Optional[str] = None,
         workspace: Optional[TaskWorkspace] = None,
@@ -55,7 +57,8 @@ class AgentService:
             memory: Memory store for agent state
             tools: Available tools for agent execution (optional, can be combined with tool_config)
             llm: Language model for agent execution (required for DAG pattern)
-            use_dag_pattern: Whether to use the DAG plan-execute pattern
+            use_dag_pattern: Deprecated: Whether to use the DAG plan-execute pattern (use pattern instead)
+            pattern: Agent pattern to use: "single_call", "react", or "dag_plan_execute"
             tracer: Tracer instance for event tracking
             id: Agent identifier for workspace management
             workspace: Pre-existing workspace to bind to
@@ -83,7 +86,13 @@ class AgentService:
             f"AgentService initialized with llm={llm.model_name if llm else None}, compact_llm={compact_llm.model_name if compact_llm else None}"
         )
         self.memory_similarity_threshold = memory_similarity_threshold
-        self.use_dag_pattern = use_dag_pattern
+
+        # Handle backward compatibility: if use_dag_pattern is explicitly set, override pattern
+        if use_dag_pattern is not True:  # If explicitly set to False
+            pattern = "react"  # Map False to react pattern
+
+        self.pattern = pattern  # Store pattern for reference
+        self.use_dag_pattern = use_dag_pattern  # Keep for backward compatibility
         self.tool_config = tool_config
         self.tracer = tracer or Tracer()  # Use provided tracer or create a new one
 
@@ -136,15 +145,38 @@ class AgentService:
         if patterns:
             self.patterns = patterns
         elif llm:
-            if self.use_dag_pattern:
-                # Get allowed_skills from tool_config if available
-                allowed_skills = None
-                if tool_config and hasattr(tool_config, "get_allowed_skills"):
-                    allowed_skills = tool_config.get_allowed_skills()
-                    if allowed_skills:
-                        logger.info(f"Allowed skills configured: {allowed_skills}")
+            # Get allowed_skills from tool_config if available
+            allowed_skills = None
+            if tool_config and hasattr(tool_config, "get_allowed_skills"):
+                allowed_skills = tool_config.get_allowed_skills()
+                if allowed_skills:
+                    logger.info(f"Allowed skills configured: {allowed_skills}")
 
-                # Create DAG pattern - automatically handles single/dual LLM configuration
+            # Create pattern based on pattern parameter
+            if self.pattern == "single_call":
+                # Create SingleCall pattern for flash mode
+                from .pattern.single_call import SingleCallPattern
+
+                single_call_pattern = SingleCallPattern(
+                    llm=llm,
+                    tracer=self.tracer,
+                    memory_store=self.memory,
+                )
+                self.patterns = [single_call_pattern]
+                logger.info(f"SingleCall pattern enabled for agent '{name}'")
+
+            elif self.pattern == "react":
+                # Create ReAct pattern for balanced mode
+                from .pattern.react import ReActPattern
+
+                react_pattern = ReActPattern(
+                    llm=llm, compact_llm=self.compact_llm or llm
+                )
+                self.patterns = [react_pattern]
+                logger.info(f"ReAct pattern enabled for agent '{name}'")
+
+            elif self.pattern == "dag_plan_execute":
+                # Create DAG pattern for think mode - automatically handles single/dual LLM configuration
                 dag_pattern = DAGPlanExecutePattern(
                     llm=llm,
                     fast_llm=self.fast_llm,
@@ -170,14 +202,14 @@ class AgentService:
                         f"DAG pattern enabled for agent '{name}' with LLM but no tools. Will generate plans without tool execution."
                     )
             else:
-                # Create simple ReAct pattern instead of DAG
+                # Unknown pattern, default to ReAct
+                logger.warning(f"Unknown pattern '{self.pattern}', defaulting to ReAct")
                 from .pattern.react import ReActPattern
 
                 react_pattern = ReActPattern(
                     llm=llm, compact_llm=self.compact_llm or llm
                 )
                 self.patterns = [react_pattern]
-                logger.info(f"ReAct pattern enabled for agent '{name}' with LLM")
         else:
             # No LLM available - cannot create functional patterns
             logger.warning(

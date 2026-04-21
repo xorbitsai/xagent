@@ -32,6 +32,8 @@ import {
   Wand2,
   Rocket,
   Target,
+  Sparkles,
+  Brain,
   Workflow
 } from "lucide-react"
 import Link from "next/link"
@@ -42,7 +44,7 @@ interface Task {
   status: "completed" | "running" | "failed" | "pending"
   created_at: string | number
   description?: string
-  vibe_mode?: "task" | "process"
+  execution_mode?: "flash" | "balanced" | "think"
 }
 
 interface FileItem {
@@ -415,16 +417,26 @@ export function DashboardPage() {
                           </div>
                         </div>
                         <div className="flex items-center space-x-2">
-                          {/* Vibe Mode Badge */}
-                          {task.vibe_mode === 'process' ? (
+                          {/* Execution Mode Badge */}
+                          {task.execution_mode === 'flash' ? (
+                            <Badge variant="outline" className="text-xs bg-yellow-500/10 text-yellow-400 border-yellow-500/30">
+                              <Zap className="h-3 w-3 mr-1" />
+                              {t('vibe.list.mode.flash')}
+                            </Badge>
+                          ) : task.execution_mode === 'balanced' ? (
+                            <Badge variant="outline" className="text-xs bg-blue-500/10 text-blue-400 border-blue-500/30">
+                              <Sparkles className="h-3 w-3 mr-1" />
+                              {t('vibe.list.mode.balanced')}
+                            </Badge>
+                          ) : task.execution_mode === 'think' ? (
                             <Badge variant="outline" className="text-xs bg-purple-500/10 text-purple-400 border-purple-500/30">
-                              <Workflow className="h-3 w-3 mr-1" />
-                              {t('vibe.list.mode.process')}
+                              <Brain className="h-3 w-3 mr-1" />
+                              {t('vibe.list.mode.think')}
                             </Badge>
                           ) : (
-                            <Badge variant="outline" className="text-xs bg-blue-500/10 text-blue-400 border-blue-500/30">
+                            <Badge variant="outline" className="text-xs bg-gray-500/10 text-gray-400 border-gray-500/30">
                               <Target className="h-3 w-3 mr-1" />
-                              {t('vibe.list.mode.task')}
+                              {t('vibe.list.mode.unknown')}
                             </Badge>
                           )}
                           {getStatusBadge(task.status)}

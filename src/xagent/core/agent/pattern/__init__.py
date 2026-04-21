@@ -1,8 +1,8 @@
 """
-Agent Pattern system with ReAct and DAG Plan Execute patterns.
+Agent Pattern system with ReAct, DAG Plan Execute, and Single Call patterns.
 """
 
-from .base import AgentPattern
+from .base import Action, AgentPattern, ToolRegistry
 from .dag_plan_execute import (
     DAGPlanExecutePattern,
     ExecutionPhase,
@@ -15,8 +15,13 @@ from .dag_plan_execute import (
 # Import ReAct components
 from .react import ReActPattern, ReActStepType
 
+# Import SingleCall components
+from .single_call import SingleCallPattern
+
 __all__ = [
     "AgentPattern",
+    "Action",
+    "ToolRegistry",
     "ReActPattern",
     "ReActStepType",
     "DAGPlanExecutePattern",
@@ -25,4 +30,5 @@ __all__ = [
     "StepStatus",
     "ExecutionPhase",
     "StepInjection",
+    "SingleCallPattern",
 ]

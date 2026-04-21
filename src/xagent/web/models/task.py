@@ -48,11 +48,12 @@ class StepStatus(enum.Enum):
     ANALYZED = "analyzed"
 
 
-class VibeMode(enum.Enum):
-    """VIBE mode enumeration"""
+class ExecutionMode(enum.Enum):
+    """Execution mode enumeration"""
 
-    TASK = "task"  # One-time task mode
-    PROCESS = "process"  # Reusable process mode (for build/deploy)
+    FLASH = "flash"  # Simple, quick tasks (single_call pattern)
+    BALANCED = "balanced"  # Most everyday tasks (react pattern)
+    THINK = "think"  # Complex, multi-step tasks (dag_plan_execute pattern)
 
 
 class AgentType(enum.Enum):
@@ -105,10 +106,10 @@ class Task(Base):  # type: ignore
     )  # SQLite compatible
     agent_config = Column(JSON, nullable=True)  # Agent-specific configuration
 
-    # VIBE mode configuration
-    vibe_mode = Column(
-        String(20), default=VibeMode.TASK.value, nullable=True
-    )  # "task" or "process"
+    # Execution mode configuration
+    execution_mode = Column(
+        String(20), default=ExecutionMode.BALANCED.value, nullable=True
+    )  # "flash" | "balanced" | "think"
     process_description = Column(
         Text, nullable=True
     )  # Process mode: detailed process description
@@ -128,17 +129,21 @@ class Task(Base):  # type: ignore
     token_usage_details = Column(JSON, nullable=True)  # Detailed breakdown
 
     @property
-    def vibe_mode_enum(self) -> VibeMode:
-        """Get vibe_mode as enum with fallback"""
+    def execution_mode_enum(self) -> ExecutionMode:
+        """Get execution_mode as enum with fallback"""
         try:
-            return VibeMode(self.vibe_mode) if self.vibe_mode else VibeMode.TASK
+            return (
+                ExecutionMode(self.execution_mode)
+                if self.execution_mode
+                else ExecutionMode.BALANCED
+            )
         except ValueError:
-            return VibeMode.TASK
+            return ExecutionMode.BALANCED
 
-    @vibe_mode_enum.setter
-    def vibe_mode_enum(self, value: VibeMode) -> None:
-        """Set vibe_mode from enum"""
-        setattr(self, "vibe_mode", value.value if value else None)
+    @execution_mode_enum.setter
+    def execution_mode_enum(self, value: ExecutionMode) -> None:
+        """Set execution_mode from enum"""
+        setattr(self, "execution_mode", value.value if value else None)
 
     @property
     def agent_type_enum(self) -> AgentType:

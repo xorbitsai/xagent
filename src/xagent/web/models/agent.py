@@ -22,9 +22,9 @@ class AgentStatus(enum.Enum):
 class ExecutionMode(enum.Enum):
     """Agent execution mode enumeration"""
 
-    SIMPLE = "simple"  # Reserved: single LLM call (not implemented yet)
-    REACT = "react"  # ReAct pattern for reasoning and acting
-    GRAPH = "graph"  # DAG/Graph plan-execute pattern for complex tasks
+    FLASH = "flash"  # Simple, quick tasks (single_call pattern)
+    BALANCED = "balanced"  # Most everyday tasks (react pattern)
+    THINK = "think"  # Complex, multi-step tasks (dag_plan_execute pattern)
 
 
 class Agent(Base):  # type: ignore

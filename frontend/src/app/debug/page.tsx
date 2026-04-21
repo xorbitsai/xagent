@@ -5,7 +5,7 @@ import { Suspense } from "react"
 import { AppProvider, useApp } from "@/contexts/app-context"
 import { Alert, AlertDescription } from "@/components/ui/alert"
 import { Badge } from "@/components/ui/badge"
-import { Wifi, WifiOff, AlertCircle, ArrowLeft, Send, Pause, Play, Zap, Workflow, Target } from "lucide-react"
+import { Wifi, WifiOff, AlertCircle, ArrowLeft, Send, Pause, Play, Zap, Workflow, Target, Sparkles, Brain } from "lucide-react"
 import Link from "next/link"
 import { useEffect, useState, useRef } from "react"
 import { Button } from "@/components/ui/button"
@@ -21,7 +21,7 @@ import { CenterPanel } from "@/components/layout/center-panel"
 import { FilePreviewDialog } from "@/components/file/file-preview-dialog"
 import { AgentInput } from "@/components/agent-input"
 import { ReplayControls } from "@/components/replay/replay-controls"
-import { VibeModeSelector, VibeModeConfig } from "@/components/vibe-mode-selector"
+import { ExecutionModeSelector, ExecutionModeConfig } from "@/components/execution-mode-selector"
 import { ConfigDialog } from "@/components/config-dialog"
 import { ModelInfoDisplay } from "@/components/model-info-display"
 import { cn, getApiUrl, getAuthHeaders } from "@/lib/utils"
@@ -49,7 +49,7 @@ interface Task {
   modelName?: string
   smallFastModelName?: string
   visualModelName?: string
-  vibeMode?: "task" | "process"
+  executionMode?: "flash" | "balanced" | "think"
 }
 
 interface DAGExecution {
@@ -112,8 +112,8 @@ function AgentContent() {
   const [hasSubmitted, setHasSubmitted] = useState(false)
   const messagesEndRef = useRef<HTMLDivElement>(null)
   const [dagLayout, setDagLayout] = useState<'TB' | 'LR'>('TB')
-  const [vibeModeConfig, setVibeModeConfig] = useState<VibeModeConfig>({
-    mode: "task",
+  const [executionModeConfig, setExecutionModeConfig] = useState<ExecutionModeConfig>({
+    mode: "balanced",
     processDescription: "",
     examples: []
   })
@@ -463,27 +463,21 @@ function AgentContent() {
   }, [state.messages])
 
   const handleSendMessage = (files?: File[]) => {
-    // Use the passed files if available, otherwise use the appropriate component state
-    const filesToSend = files || (vibeModeConfig.mode === "process" ? processModeFiles : selectedFiles)
+    // Use the passed files if available, otherwise use selectedFiles
+    const filesToSend = files || selectedFiles
 
-    // For task mode, require input message
-    // For process mode, require process description
-    const canSubmit = vibeModeConfig.mode === "task"
-      ? (inputMessage.trim() || (filesToSend && filesToSend.length > 0))
-      : (vibeModeConfig.processDescription || (filesToSend && filesToSend.length > 0))
+    // For all modes, require input message or files
+    const canSubmit = inputMessage.trim() || (filesToSend && filesToSend.length > 0)
 
     if (canSubmit) {
-      // Include vibe mode config in the agent config
-      const configWithVibeMode = {
+      // Include execution mode config in the agent config
+      const configWithExecutionMode = {
         ...agentConfig,
-        vibeMode: vibeModeConfig
+        executionMode: executionModeConfig
       }
-      // For process mode, use process description as message
-      // For task mode, use user input
-      const messageToSend = vibeModeConfig.mode === "process"
-        ? (vibeModeConfig.processDescription || "")
-        : inputMessage.trim()
-      ;(sendMessage as any)(messageToSend, configWithVibeMode, filesToSend)
+      // Use user input as message
+      const messageToSend = inputMessage.trim()
+      ;(sendMessage as any)(messageToSend, configWithExecutionMode, filesToSend)
       setInputMessage("")
       setSelectedFiles([])
       setProcessModeFiles([])
@@ -496,12 +490,10 @@ function AgentContent() {
 
   const handleBuild = () => {
     if (state.currentTask) {
-      const vibeMode = (state.currentTask as any)?.vibeMode || 'task'
+      const executionMode = (state.currentTask as any)?.executionMode || 'balanced'
 
-      // Only allow building in process mode
-      if (vibeMode !== 'process') {
-        return
-      }
+      // Allow building in any mode for now
+      // This logic may need to be adjusted based on new requirements
 
       // Navigate to build page with task ID
       window.location.href = `/build?taskId=${state.currentTask.id}`
@@ -599,20 +591,32 @@ function AgentContent() {
                 <Badge
                   variant="outline"
                   className={`text-xs ${
-                    ((state.currentTask as any)?.vibeMode || 'task') === 'process'
-                      ? 'bg-purple-500/10 text-purple-400 border-purple-500/30'
-                      : 'bg-blue-500/10 text-blue-400 border-blue-500/30'
+                    ((state.currentTask as any)?.executionMode || 'balanced') === 'flash'
+                      ? 'bg-yellow-500/10 text-yellow-400 border-yellow-500/30'
+                      : ((state.currentTask as any)?.executionMode || 'balanced') === 'balanced'
+                      ? 'bg-blue-500/10 text-blue-400 border-blue-500/30'
+                      : 'bg-purple-500/10 text-purple-400 border-purple-500/30'
                   }`}
                 >
-                  {((state.currentTask as any)?.vibeMode || 'task') === 'process' ? (
+                  {((state.currentTask as any)?.executionMode || 'balanced') === 'flash' ? (
                     <>
-                      <Workflow className="h-3 w-3 mr-1" />
-                      {t('agent.header.badge.process')}
+                      <Zap className="h-3 w-3 mr-1" />
+                      {t('vibe.list.mode.flash')}
+                    </>
+                  ) : ((state.currentTask as any)?.executionMode || 'balanced') === 'balanced' ? (
+                    <>
+                      <Sparkles className="h-3 w-3 mr-1" />
+                      {t('vibe.list.mode.balanced')}
+                    </>
+                  ) : ((state.currentTask as any)?.executionMode || 'balanced') === 'think' ? (
+                    <>
+                      <Brain className="h-3 w-3 mr-1" />
+                      {t('vibe.list.mode.think')}
                     </>
                   ) : (
                     <>
                       <Target className="h-3 w-3 mr-1" />
-                      {t('agent.header.badge.task')}
+                      {t('vibe.list.mode.unknown')}
                     </>
                   )}
                 </Badge>
@@ -663,17 +667,15 @@ function AgentContent() {
               />
             )}
 
-            {/* Build Button - only enabled for process mode */}
+            {/* Build Button - enabled for all modes */}
             {state.currentTask && state.currentTask.status === 'completed' && (
               <Button
                 onClick={handleBuild}
-                disabled={((state.currentTask as any)?.vibeMode || 'task') !== 'process'}
+                disabled={false}
                 className="bg-green-600 hover:bg-green-700 disabled:opacity-50 disabled:cursor-not-allowed"
               >
                 <Zap className="h-4 w-4 mr-2" />
-                {((state.currentTask as any)?.vibeMode || 'task') === 'process'
-                  ? t('agent.header.buildButton')
-                  : t('agent.build.onlyProcessModeShort')}
+                {t('agent.header.buildButton')}
               </Button>
             )}
           </div>
@@ -701,16 +703,16 @@ function AgentContent() {
 
               <div className="relative bg-card/80 backdrop-blur-sm border border-border rounded-2xl p-6 shadow-lg animate-in slide-in-from-bottom-4 duration-700 delay-300">
                 <div className="space-y-6">
-                  {/* VIBE Mode Selector */}
-                  <VibeModeSelector
-                    config={vibeModeConfig}
-                    onChange={setVibeModeConfig}
+                  {/* Execution Mode Selector */}
+                  <ExecutionModeSelector
+                    config={executionModeConfig}
+                    onChange={setExecutionModeConfig}
                     selectedFiles={processModeFiles}
                     onFilesChange={setProcessModeFiles}
                   />
 
-                  {/* Task Input - only show for task mode */}
-                  {vibeModeConfig.mode === "task" && (
+                  {/* Task Input - show for all modes */}
+                  {executionModeConfig.mode && (
                     <AgentInput
                       value={inputMessage}
                       onChange={(value) => setInputMessage(value)}
@@ -726,48 +728,9 @@ function AgentContent() {
                     />
                   )}
 
-                  {/* Process Mode - Model Config and Execute Button in same row */}
-                  {vibeModeConfig.mode === "process" && (
-                    <div className="flex items-center justify-between">
-                      {/* Model Configuration - left */}
-                      <ConfigDialog
-                        onConfigChange={handleConfigChange}
-                        currentConfig={agentConfig}
-                        trigger={
-                          <div className="flex items-center gap-2 text-sm text-muted-foreground">
-                            <ModelInfoDisplay
-                              currentTask={null}
-                              onConfigChange={undefined}
-                            />
-                            <Button
-                              variant="ghost"
-                              size="sm"
-                              className="h-7 px-2 text-muted-foreground hover:text-foreground hover:bg-muted rounded-md"
-                              title={t('agent.config.title')}
-                            >
-                              <Settings className="h-3.5 w-3.5" />
-                            </Button>
-                          </div>
-                        }
-                      />
-
-                      {/* Execute Button - right */}
-                      <Button
-                        onClick={() => handleSendMessage()}
-                        disabled={!vibeModeConfig.processDescription && processModeFiles.length === 0}
-                        size="lg"
-                        className="px-8"
-                      >
-                        {t('agent.process.execute')}
-                      </Button>
-                    </div>
-                  )}
-
                   <div className="text-center">
                     <p className="text-sm text-muted-foreground">
-                      {vibeModeConfig.mode === "task"
-                        ? t('agent.hints.taskMode')
-                        : t('agent.hints.processMode')}
+                      {t('agent.hints.taskMode')}
                     </p>
                   </div>
                 </div>

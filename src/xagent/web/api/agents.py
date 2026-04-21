@@ -152,9 +152,15 @@ def enhance_system_prompt_with_kb(
     """Append knowledge-base priority instructions when KBs are configured."""
     if not knowledge_bases:
         return system_prompt
+
+    kb_list = ", ".join(knowledge_bases)
+    kb_prompt = (
+        f"\n\nAvailable knowledge bases: {kb_list}. Search them directly for answers."
+    )
+
     if system_prompt:
-        return system_prompt + KB_PRIORITY_PROMPT
-    return KB_PRIORITY_PROMPT.lstrip("\n")
+        return system_prompt + kb_prompt
+    return kb_prompt.lstrip("\n")
 
 
 # ===== Helper Functions =====

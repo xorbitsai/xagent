@@ -6,19 +6,21 @@ import { Card } from "@/components/ui/card"
 import { Textarea } from "@/components/ui/textarea"
 import { Input } from "@/components/ui/input"
 import { Badge } from "@/components/ui/badge"
-import { Plus, Trash2, Zap, Workflow, Upload, XCircle, Paperclip } from "lucide-react"
+import { Plus, Trash2, Zap, Workflow, Upload, XCircle, Paperclip, Sparkles, Brain } from "lucide-react"
 import { cn } from "@/lib/utils"
 import { useI18n } from "@/contexts/i18n-context"
 
-export interface VibeModeConfig {
-  mode: "task" | "process"
+export type AgentPattern = "flash" | "balanced" | "think"
+
+export interface ExecutionModeConfig {
+  mode: AgentPattern
   processDescription?: string
   examples?: Array<{ input: string; output: string }>
 }
 
-interface VibeModeSelectorProps {
-  config: VibeModeConfig
-  onChange: (config: VibeModeConfig) => void
+interface ExecutionModeSelectorProps {
+  config: ExecutionModeConfig
+  onChange: (config: ExecutionModeConfig) => void
   disabled?: boolean
   selectedFiles?: File[]
   onFilesChange?: (files: File[]) => void
@@ -29,13 +31,7 @@ interface ExampleItem {
   output: string
 }
 
-interface VibeModeSelectorProps {
-  config: VibeModeConfig
-  onChange: (config: VibeModeConfig) => void
-  disabled?: boolean
-}
-
-export function VibeModeSelector({ config, onChange, disabled, selectedFiles: externalSelectedFiles, onFilesChange }: VibeModeSelectorProps) {
+export function ExecutionModeSelector({ config, onChange, disabled, selectedFiles: externalSelectedFiles, onFilesChange }: ExecutionModeSelectorProps) {
   const [examples, setExamples] = useState<ExampleItem[]>(
     config.examples || [
       { input: "", output: "" }
@@ -108,7 +104,7 @@ export function VibeModeSelector({ config, onChange, disabled, selectedFiles: ex
     }
   }
 
-  const handleModeChange = (mode: "task" | "process") => {
+  const handleModeChange = (mode: AgentPattern) => {
     onChange({ ...config, mode })
   }
 
@@ -144,54 +140,72 @@ export function VibeModeSelector({ config, onChange, disabled, selectedFiles: ex
   return (
     <div className="space-y-4">
       {/* Mode Selection Tabs */}
-      <div className="flex gap-2">
+      <div className="grid grid-cols-3 gap-2">
         <Button
           type="button"
-          variant={config.mode === "task" ? "default" : "outline"}
-          onClick={() => handleModeChange("task")}
+          variant={config.mode === "flash" ? "default" : "outline"}
+          onClick={() => handleModeChange("flash")}
           disabled={disabled}
-          className="flex-1"
+          className="flex-col gap-1 h-auto py-3"
         >
-          <Zap className="h-4 w-4 mr-2" />
-          {t('agent.vibeMode.tabs.task')}
+          <Zap className="h-4 w-4" />
+          <span className="text-xs font-medium">{t('agent.vibeMode.tabs.flash')}</span>
+          <span className="text-[10px] text-muted-foreground">{t('agent.vibeMode.tabs.flashSubtitle')}</span>
         </Button>
         <Button
           type="button"
-          variant={config.mode === "process" ? "default" : "outline"}
-          onClick={() => handleModeChange("process")}
+          variant={config.mode === "balanced" ? "default" : "outline"}
+          onClick={() => handleModeChange("balanced")}
           disabled={disabled}
-          className="flex-1"
+          className="flex-col gap-1 h-auto py-3"
         >
-          <Workflow className="h-4 w-4 mr-2" />
-          {t('agent.vibeMode.tabs.process')}
+          <Sparkles className="h-4 w-4" />
+          <span className="text-xs font-medium">{t('agent.vibeMode.tabs.balanced')}</span>
+          <span className="text-[10px] text-muted-foreground">{t('agent.vibeMode.tabs.balancedSubtitle')}</span>
+        </Button>
+        <Button
+          type="button"
+          variant={config.mode === "think" ? "default" : "outline"}
+          onClick={() => handleModeChange("think")}
+          disabled={disabled}
+          className="flex-col gap-1 h-auto py-3"
+        >
+          <Brain className="h-4 w-4" />
+          <span className="text-xs font-medium">{t('agent.vibeMode.tabs.think')}</span>
+          <span className="text-[10px] text-muted-foreground">{t('agent.vibeMode.tabs.thinkSubtitle')}</span>
         </Button>
       </div>
 
       {/* Mode Description */}
-      {config.mode === "task" && (
+      {config.mode === "flash" && (
         <Card className="p-4 bg-muted/30 border-border">
           <div className="text-sm space-y-2">
-            <div className="font-semibold text-foreground">{t('agent.vibeMode.descriptions.task.title')}</div>
+            <div className="font-semibold text-foreground">{t('agent.vibeMode.descriptions.flash.title')}</div>
             <div className="text-muted-foreground">
-              {t('agent.vibeMode.descriptions.task.text')}
-            </div>
-            <div className="text-xs text-muted-foreground mt-2">
-              <span className="font-medium">{t('agent.vibeMode.descriptions.task.examplesTitle')}</span>{t('agent.vibeMode.descriptions.task.examplesText')}
+              {t('agent.vibeMode.descriptions.flash.text')}
             </div>
           </div>
         </Card>
       )}
 
-      {config.mode === "process" && (
+      {config.mode === "balanced" && (
+        <Card className="p-4 bg-muted/30 border-border">
+          <div className="text-sm space-y-2">
+            <div className="font-semibold text-foreground">{t('agent.vibeMode.descriptions.balanced.title')}</div>
+            <div className="text-muted-foreground">
+              {t('agent.vibeMode.descriptions.balanced.text')}
+            </div>
+          </div>
+        </Card>
+      )}
+
+      {config.mode === "think" && (
         <div className="space-y-4">
           <Card className="p-4 bg-muted/30 border-border">
             <div className="text-sm space-y-2">
-              <div className="font-semibold text-foreground">{t('agent.vibeMode.descriptions.process.title')}</div>
+              <div className="font-semibold text-foreground">{t('agent.vibeMode.descriptions.think.title')}</div>
               <div className="text-muted-foreground">
-                {t('agent.vibeMode.descriptions.process.text')}
-              </div>
-              <div className="text-xs text-muted-foreground mt-2">
-                <span className="font-medium">{t('agent.vibeMode.descriptions.process.examplesTitle')}</span>{t('agent.vibeMode.descriptions.process.examplesText')}
+                {t('agent.vibeMode.descriptions.think.text')}
               </div>
             </div>
           </Card>
@@ -326,3 +340,7 @@ export function VibeModeSelector({ config, onChange, disabled, selectedFiles: ex
     </div>
   )
 }
+
+// Backward compatibility: export old names as aliases
+export const VibeModeSelector = ExecutionModeSelector
+export type VibeModeConfig = ExecutionModeConfig

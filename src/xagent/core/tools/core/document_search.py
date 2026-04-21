@@ -322,23 +322,7 @@ def _format_search_results(
         }
         formatted_results.append(structured_result)
 
-    # Create human-readable summary
-    summary = f"Search Results for Query: '{query}'\n"
-    summary += (
-        f"Found {len(results)} relevant results from {total_documents} documents\n"
-    )
-
-    for i, result in enumerate(formatted_results, 1):
-        summary += f"\n## Result {i} (Collection: {result['collection']}, Score: {result['score']:.4f})"
-        summary += f"\nDocument: {result['document_name']}"
-        summary += f"\n{result['text']}"
-
-        if result["doc_id"] or result["chunk_id"]:
-            meta_info = []
-            if result["doc_id"]:
-                meta_info.append(f"doc: {result['doc_id']}")
-            if result["chunk_id"]:
-                meta_info.append(f"chunk: {result['chunk_id']}")
-            summary += f"\n_Metadata: {', '.join(meta_info)}_"
+    # Create brief summary (token-efficient, no duplicate content)
+    summary = f"Found {len(results)} relevant results from {total_documents} documents for query: '{query}'"
 
     return formatted_results, summary

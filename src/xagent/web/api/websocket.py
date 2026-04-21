@@ -1332,7 +1332,7 @@ async def handle_chat_message(
                                 "small_fast_model_name": task.small_fast_model_name,
                                 "visual_model_name": task.visual_model_name,
                                 "compact_model_name": task.compact_model_name,
-                                "vibe_mode": task.vibe_mode,
+                                "execution_mode": task.execution_mode,
                                 "agent_id": task.agent_id,
                                 "is_dag": is_dag,
                                 "created_at": safe_timestamp_to_unix(task.created_at)
@@ -1461,7 +1461,7 @@ async def handle_chat_message(
                                 "small_fast_model_name": task.small_fast_model_name,
                                 "visual_model_name": task.visual_model_name,
                                 "compact_model_name": task.compact_model_name,
-                                "vibe_mode": task.vibe_mode,
+                                "execution_mode": task.execution_mode,
                                 "created_at": safe_timestamp_to_unix(task.created_at)
                                 if task.created_at
                                 else None,
@@ -1568,7 +1568,7 @@ async def handle_chat_message(
                                 "small_fast_model_name": task.small_fast_model_name,
                                 "visual_model_name": task.visual_model_name,
                                 "compact_model_name": task.compact_model_name,
-                                "vibe_mode": task.vibe_mode,
+                                "execution_mode": task.execution_mode,
                                 "agent_id": task.agent_id,
                                 "is_dag": is_dag,
                                 "created_at": safe_timestamp_to_unix(task.created_at)
@@ -1584,8 +1584,8 @@ async def handle_chat_message(
                         logger.info(f"task_info event sent for existing task {task_id}")
 
                     # Build context with vibe mode information if available
-                    if hasattr(task, "vibe_mode") and task.vibe_mode:
-                        context["vibe_mode"] = task.vibe_mode
+                    if hasattr(task, "execution_mode") and task.execution_mode:
+                        context["execution_mode"] = task.execution_mode
                     if (
                         hasattr(task, "process_description")
                         and task.process_description
@@ -1738,7 +1738,7 @@ async def handle_execute_task(
                     "small_fast_model_name": task.small_fast_model_name,
                     "visual_model_name": task.visual_model_name,
                     "compact_model_name": task.compact_model_name,
-                    "vibe_mode": task.vibe_mode,
+                    "execution_mode": task.execution_mode,
                     "created_at": safe_timestamp_to_unix(task.created_at)
                     if task.created_at
                     else None,
@@ -1773,8 +1773,8 @@ async def handle_execute_task(
             with UserContext(user.id):
                 # Build context with vibe mode information if available
                 task_context = {}
-                if hasattr(task, "vibe_mode") and task.vibe_mode:
-                    task_context["vibe_mode"] = task.vibe_mode
+                if hasattr(task, "execution_mode") and task.execution_mode:
+                    task_context["execution_mode"] = task.execution_mode
                 if hasattr(task, "process_description") and task.process_description:
                     task_context["process_description"] = task.process_description
                 if hasattr(task, "examples") and task.examples:
@@ -1930,7 +1930,7 @@ async def send_historical_data_as_stream(
                     "small_fast_model_name": task.small_fast_model_name,
                     "visual_model_name": task.visual_model_name,
                     "compact_model_name": task.compact_model_name,
-                    "vibe_mode": task.vibe_mode,
+                    "execution_mode": task.execution_mode,
                     "agent_id": task.agent_id,
                     "is_dag": is_dag,
                     "created_at": safe_timestamp_to_unix(task.created_at)
@@ -3130,17 +3130,16 @@ async def handle_build_preview_execution(
                     f"Preview is for published agent {preview_agent.id} ({preview_agent.name}), will exclude from agent tools"
                 )
 
-        # Determine execution mode (default to "graph")
-        # Map execution mode to use_dag_pattern
-        # simple: reserved (use react for now)
-        # react: ReAct pattern
-        # graph: DAG/Graph plan-execute pattern
-        if execution_mode == "graph":
-            use_dag_pattern = True
-        elif execution_mode == "react":
-            use_dag_pattern = False
-        else:  # simple mode - not implemented yet, fallback to react
-            use_dag_pattern = False
+        # Determine execution mode and map to pattern
+        # flash -> single_call (quick tasks)
+        # balanced -> react (everyday tasks)
+        # think -> dag_plan_execute (complex tasks)
+        execution_mode_to_pattern = {
+            "flash": "single_call",
+            "balanced": "react",
+            "think": "dag_plan_execute",
+        }
+        pattern = execution_mode_to_pattern.get(execution_mode, "react")
 
         # Build allowed external directories
         allowed_external_dirs = []
@@ -3148,6 +3147,8 @@ async def handle_build_preview_execution(
             user_upload_dir = get_uploads_dir() / f"user_{user.id}"
             allowed_external_dirs.append(str(user_upload_dir))
         allowed_external_dirs.extend([str(d) for d in get_external_upload_dirs()])
+
+        logger.info(f"Preview execution_mode={execution_mode} -> pattern={pattern}")
 
         # Create agent service (using WebSocket tracer)
         if not hasattr(websocket.state, "preview_memory"):
@@ -3165,7 +3166,7 @@ async def handle_build_preview_execution(
             compact_llm=compact_llm,
             memory=memory,
             tool_config=tool_config,
-            use_dag_pattern=use_dag_pattern,
+            pattern=pattern,  # Use pattern instead of use_dag_pattern
             id=preview_task_id,
             enable_workspace=True,
             workspace_base_dir=str(get_uploads_dir() / "build_preview"),

@@ -351,8 +351,8 @@ export function ChatInput({
       const trimmed = message.trim();
       const messageToSend = trimmed;
 
-      // Always send task mode config
-      const configToSend = { ...agentConfig, vibeMode: { mode: "task" } };
+      // Always send balanced mode config
+      const configToSend = { ...agentConfig, executionMode: { mode: "balanced" } };
 
       await onSend(messageToSend, configToSend);
 

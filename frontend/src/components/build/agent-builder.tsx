@@ -13,7 +13,7 @@ import { ChatInput } from "@/components/chat/ChatInput"
 import { ChatMessage } from "@/components/chat/ChatMessage"
 import { apiRequest } from "@/lib/api-wrapper"
 import { getApiUrl, getWsUrl } from "@/lib/utils"
-import { PlusCircle, MessageSquare, Upload, Download, Settings2, Check, Zap, BookOpen, ChevronLeft, Sparkles, Loader2, X, XCircle, Trash2, Bot } from "lucide-react"
+import { PlusCircle, MessageSquare, Upload, Download, Settings2, Check, Zap, BookOpen, ChevronLeft, Gauge, Sparkles, Loader2, X, XCircle, Trash2, Bot, Brain } from "lucide-react"
 import { ConnectMcpDialog } from "@/components/mcp/connect-mcp-dialog"
 import { useI18n } from "@/contexts/i18n-context"
 import { useAuth } from "@/contexts/auth-context"
@@ -116,7 +116,7 @@ export function AgentBuilder({ agentId }: AgentBuilderProps) {
   const [name, setName] = useState("")
   const [description, setDescription] = useState("")
   const [instructions, setInstructions] = useState("")
-  const [executionMode, setExecutionMode] = useState("react") // "simple", "react", "graph"
+  const [executionMode, setExecutionMode] = useState("balanced") // "flash", "balanced", "think"
   const [suggestedPrompts, setSuggestedPrompts] = useState<string[]>([])
   const [modelConfig, setModelConfig] = useState<AgentModelConfig>({
     general: null,
@@ -573,7 +573,7 @@ export function AgentBuilder({ agentId }: AgentBuilderProps) {
           setName(agent.name || "")
           setDescription(agent.description || "")
           setInstructions(agent.instructions || "")
-          setExecutionMode(agent.execution_mode || "graph")
+          setExecutionMode(agent.execution_mode || "balanced")
           setSuggestedPrompts(agent.suggested_prompts || [])
           setSelectedKbs(agent.knowledge_bases || [])
           setSelectedSkills(agent.skills || [])
@@ -1333,28 +1333,48 @@ export function AgentBuilder({ agentId }: AgentBuilderProps) {
         {/* Execution Mode */}
         <div className="space-y-2">
           <Label>{t("builds.configForm.executionMode.label")}</Label>
-          <div className="grid grid-cols-2 gap-2">
+          <div className="grid grid-cols-3 gap-2">
             <button
               type="button"
-              className={`px-3 py-2 text-sm border rounded-md transition-colors ${executionMode === "react"
+              className={`px-3 py-2 text-sm border rounded-md transition-colors ${executionMode === "flash"
                 ? "bg-primary text-primary-foreground border-primary"
                 : "bg-background hover:bg-accent"
-                }`}
-              onClick={() => setExecutionMode("react")}
+              }`}
+              onClick={() => setExecutionMode("flash")}
             >
-              <div className="font-medium">{t("builds.configForm.executionMode.react.title")}</div>
-              <div className="text-xs opacity-80">{t("builds.configForm.executionMode.react.description")}</div>
+              <div className="flex items-center justify-center gap-1 mb-1">
+                <Zap className="h-3.5 w-3.5" />
+                <div className="font-medium">{t("builds.configForm.executionMode.flash.title")}</div>
+              </div>
+              <div className="text-xs opacity-80">{t("builds.configForm.executionMode.flash.description")}</div>
             </button>
             <button
               type="button"
-              className={`px-3 py-2 text-sm border rounded-md transition-colors ${executionMode === "graph"
+              className={`px-3 py-2 text-sm border rounded-md transition-colors ${executionMode === "balanced"
                 ? "bg-primary text-primary-foreground border-primary"
                 : "bg-background hover:bg-accent"
-                }`}
-              onClick={() => setExecutionMode("graph")}
+              }`}
+              onClick={() => setExecutionMode("balanced")}
             >
-              <div className="font-medium">{t("builds.configForm.executionMode.graph.title")}</div>
-              <div className="text-xs opacity-80">{t("builds.configForm.executionMode.graph.description")}</div>
+              <div className="flex items-center justify-center gap-1 mb-1">
+                <Gauge className="h-3.5 w-3.5" />
+                <div className="font-medium">{t("builds.configForm.executionMode.balanced.title")}</div>
+              </div>
+              <div className="text-xs opacity-80">{t("builds.configForm.executionMode.balanced.description")}</div>
+            </button>
+            <button
+              type="button"
+              className={`px-3 py-2 text-sm border rounded-md transition-colors ${executionMode === "think"
+                ? "bg-primary text-primary-foreground border-primary"
+                : "bg-background hover:bg-accent"
+              }`}
+              onClick={() => setExecutionMode("think")}
+            >
+              <div className="flex items-center justify-center gap-1 mb-1">
+                <Brain className="h-3.5 w-3.5" />
+                <div className="font-medium">{t("builds.configForm.executionMode.think.title")}</div>
+              </div>
+              <div className="text-xs opacity-80">{t("builds.configForm.executionMode.think.description")}</div>
             </button>
           </div>
         </div>

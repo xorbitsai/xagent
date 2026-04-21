@@ -301,11 +301,17 @@ def test_vector_store_rename_collection_data_updates_expected_tables(
 def test_delete_collection_data_raises_when_any_table_delete_fails(
     mock_get_connection: Mock,
 ) -> None:
-    """Collection deletes should fail loudly if any table cleanup fails."""
+    """Collection deletes should preserve partial cleanup counts and warnings."""
 
     mock_conn = Mock()
     mock_get_connection.return_value = mock_conn
     mock_conn.table_names.return_value = [
+        "documents",
+        "parses",
+        "chunks",
+        "embeddings_text_embedding_v4",
+    ]
+    mock_conn.list_tables.return_value = [
         "documents",
         "parses",
         "chunks",
@@ -316,6 +322,11 @@ def test_delete_collection_data_raises_when_any_table_delete_fails(
         *, before: int, after: int = 0, delete_side_effect: Exception | None = None
     ):
         table = Mock()
+        schema = Mock(names=["collection", "doc_id", "user_id", "file_id"])
+        field = Mock()
+        field.type = "int64"
+        schema.field.return_value = field
+        table.schema = schema
         if delete_side_effect is None:
             table.count_rows.side_effect = [before, after]
         else:

@@ -608,11 +608,12 @@ class TestFormatSearchResults:
 
         formatted_results, summary = _format_search_results(results, "test query", 100)
 
+        # Summary should only contain statistics, not full content
         assert "test query" in summary
-        assert "Test content here" in summary
-        assert "kb1" in summary
-        assert "0.8500" in summary
-        assert "doc: doc1" in summary
+        assert "1 relevant results" in summary
+        assert "100 documents" in summary
+        # Content should be in formatted_results, not summary
+        assert "Test content here" not in summary
         # Check structured results
         assert len(formatted_results) == 1
         assert formatted_results[0]["collection"] == "kb1"
@@ -637,11 +638,14 @@ class TestFormatSearchResults:
 
         formatted_results, summary = _format_search_results(results, "test query", 200)
 
+        # Summary should only contain statistics, not full content
         assert "2 relevant results" in summary
-        assert "First result" in summary
-        assert "Second result" in summary
-        assert "Result 1" in summary
-        assert "Result 2" in summary
+        assert "200 documents" in summary
+        # Content should be in formatted_results, not summary
+        assert "First result" not in summary
+        assert "Second result" not in summary
+        assert "Result 1" not in summary
+        assert "Result 2" not in summary
 
     def test_format_result_without_metadata(self):
         """Test formatting result without metadata."""
@@ -656,6 +660,8 @@ class TestFormatSearchResults:
 
         formatted_results, summary = _format_search_results(results, "test query", 100)
 
-        assert "Test content" in summary
-        # Should not have metadata section
-        assert "_Metadata:" not in summary
+        # Summary should only contain statistics, not full content
+        assert "Test content" not in summary
+        assert "1 relevant results" in summary
+        # Content should be in formatted_results
+        assert formatted_results[0]["text"] == "Test content"

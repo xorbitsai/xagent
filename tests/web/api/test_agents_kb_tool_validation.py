@@ -8,7 +8,7 @@ import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
-from xagent.web.api.agents import KB_PRIORITY_PROMPT, enhance_system_prompt_with_kb
+from xagent.web.api.agents import enhance_system_prompt_with_kb
 from xagent.web.api.agents import router as agents_router
 from xagent.web.api.auth import auth_router
 from xagent.web.models.database import Base, get_db, get_engine
@@ -283,14 +283,16 @@ class TestEnhanceSystemPromptWithKb:
         result = enhance_system_prompt_with_kb("Be helpful.", ["my_kb"])
         assert result is not None
         assert result.startswith("Be helpful.")
-        assert "MUST first search the knowledge base" in result
-        assert KB_PRIORITY_PROMPT in result
+        assert "Available knowledge bases:" in result
+        assert "my_kb" in result
+        assert "Search them directly for answers" in result
 
     def test_with_kb_no_system_prompt_returns_priority_only(self):
         result = enhance_system_prompt_with_kb(None, ["kb1"])
         assert result is not None
         assert not result.startswith("\n")
-        assert "MUST first search the knowledge base" in result
+        assert "Available knowledge bases:" in result
+        assert "kb1" in result
 
     def test_with_multiple_kbs(self):
         result = enhance_system_prompt_with_kb("Assist user.", ["kb1", "kb2", "kb3"])
@@ -301,4 +303,5 @@ class TestEnhanceSystemPromptWithKb:
     def test_empty_string_prompt_with_kb(self):
         result = enhance_system_prompt_with_kb("", ["kb1"])
         assert result is not None
-        assert "MUST first search" in result
+        assert "Available knowledge bases:" in result
+        assert "kb1" in result

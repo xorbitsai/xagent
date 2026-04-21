@@ -635,10 +635,11 @@ export function ModelManagementDialog({
                             setTestConnectionStatus('testing')
                             try {
                               await handleFetchModels()
-                              setTestConnectionStatus('success')
                             } catch (err) {
-                              setTestConnectionStatus('error')
+                              // error handled in handleFetchModels
                             } finally {
+                              setTestConnectionStatus('idle')
+                              setTestConnectionError(null)
                               setConnectStep(3)
                             }
                           }}
@@ -670,7 +671,8 @@ export function ModelManagementDialog({
                           value={formData.model_name}
                           onValueChange={(val) => {
                             setFormData({ ...formData, model_name: val })
-                            handleTestConnection(val)
+                            setTestConnectionStatus('idle')
+                            setTestConnectionError(null)
                           }}
                           options={fetchedModels.map(m => ({ value: m.id, label: m.id }))}
                           placeholder={fetchedModels.length > 0 ? t('models.form.selectModel') : t('models.form.enterModelName')}
@@ -683,7 +685,8 @@ export function ModelManagementDialog({
                               : [...prev, { id: val, object: "model", created: Date.now(), owned_by: formData.model_provider }]
                             )
                             setFormData({ ...formData, model_name: val })
-                            handleTestConnection(val)
+                            setTestConnectionStatus('idle')
+                            setTestConnectionError(null)
                           }}
                         />
                       </div>

@@ -744,7 +744,7 @@ async def test_model_connection(
             # Test chat connection with minimal tokens
             # We use 10 tokens instead of 1, as some models (like Gemini) might return empty string
             # if stopped after just 1 token, causing our internal validation to throw "LLM returned empty content"
-            chat_kwargs: dict[str, Any] = {"max_tokens": 10}
+            chat_kwargs: dict[str, Any] = {"max_tokens": 1}
 
             # Claude models and OpenAI o1/o3 handle max_tokens differently or deprecate temperature
             if is_reasoning_model:
@@ -752,7 +752,7 @@ async def test_model_connection(
 
             await asyncio.wait_for(
                 llm.chat([{"role": "user", "content": "Hello"}], **chat_kwargs),
-                timeout=30.0,
+                timeout=10.0,
             )
 
         elif request.category == "embedding":

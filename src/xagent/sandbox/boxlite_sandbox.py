@@ -8,6 +8,7 @@ import abc
 import asyncio
 import logging
 import os
+import shlex
 import tempfile
 import textwrap
 import uuid
@@ -227,8 +228,24 @@ class BoxliteSandbox(Sandbox):
         if remote_dir:
             await self.exec("mkdir", "-p", remote_dir)
 
-        # Use mv command to move to target location (supports volume mounts)
-        result = await self.exec("mv", temp_remote, remote_path)
+        temp_remote_quoted = shlex.quote(temp_remote)
+        remote_path_quoted = shlex.quote(remote_path)
+
+        if overwrite:
+            result = await self.exec(
+                "sh",
+                "-c",
+                f"mv {temp_remote_quoted} {remote_path_quoted}",
+            )
+        else:
+            result = await self.exec(
+                "sh",
+                "-c",
+                f"if [ -e {remote_path_quoted} ]; then exit 100; fi; mv {temp_remote_quoted} {remote_path_quoted}",
+            )
+            if result.exit_code == 100:
+                await self.exec("rm", "-f", temp_remote)
+                raise FileExistsError(f"Remote file already exists: {remote_path}")
 
         if result.exit_code != 0:
             # Clean up temporary file

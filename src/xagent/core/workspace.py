@@ -194,7 +194,7 @@ class TaskWorkspace:
                 db.rollback()
             raise  # Re-raise so caller knows registration failed
         finally:
-            if should_close:
+            if should_close and db is not None:
                 db.close()
 
     def _get_file_id_from_db(
@@ -743,21 +743,24 @@ class TaskWorkspace:
         from ..web.models.uploaded_file import UploadedFile
         from .storage.manager import create_db_session
 
-        # Use existing session or create temporary one
-        db = self.db_session if self.db_session else create_db_session()
-        should_close = self.db_session is None
+        # Extract user_id from workspace id (e.g., 'web_task_265' -> 265)
+        task_id = None
+        user_id = None
+        try:
+            task_id = int(self.id.split("_")[-1])
+        except (ValueError, IndexError):
+            task_id = None
+
+        # Only open a database session when this workspace can actually map to a task.
+        db = None
+        should_close = False
+        if task_id is not None:
+            db = self.db_session if self.db_session else create_db_session()
+            should_close = self.db_session is None
 
         try:
-            # Extract user_id from workspace id (e.g., 'web_task_265' -> 265)
-            task_id = None
-            user_id = None
-            try:
-                task_id = int(self.id.split("_")[-1])
-            except (ValueError, IndexError):
-                task_id = None
-
-            # Try to get user_id from task if we have a valid task_id
-            if task_id:
+            # Try to get user_id from task if we have a valid task_id and db session
+            if task_id and db is not None:
                 task = db.query(Task).filter(Task.id == task_id).first()
                 if task:
                     user_id = task.user_id
@@ -766,7 +769,7 @@ class TaskWorkspace:
             result_files = []
             total_count = 0
 
-            if user_id:
+            if user_id and db is not None:
                 # Query uploaded files for this user
                 query = db.query(UploadedFile).filter(UploadedFile.user_id == user_id)
                 total_count = query.count()

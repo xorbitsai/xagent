@@ -848,7 +848,7 @@ class TaskWorkspace:
             }
 
         finally:
-            if should_close:
+            if should_close and db is not None:
                 db.close()
 
     def __enter__(self) -> "TaskWorkspace":

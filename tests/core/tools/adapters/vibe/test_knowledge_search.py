@@ -768,6 +768,132 @@ class TestKnowledgeSearchTool:
         assert "Hybrid search completed with warnings" in result.summary
 
     @pytest.mark.asyncio
+    async def test_search_partial_success_with_results_keeps_results_and_warning(
+        self,
+    ):
+        """Partial-success responses with hits should keep both results and warnings."""
+        mock_collections = [
+            CollectionInfo(
+                name="kb1",
+                total_documents=10,
+                embeddings=100,
+                document_names=["doc1.pdf"],
+            )
+        ]
+
+        mock_list_result = MagicMock()
+        mock_list_result.collections = mock_collections
+
+        with patch(
+            "xagent.core.tools.core.document_search.list_collections",
+            return_value=mock_list_result,
+        ):
+            with patch(
+                "xagent.core.tools.core.document_search.run_document_search",
+                return_value=SearchPipelineResult(
+                    status="partial_success",
+                    search_type="hybrid",
+                    results=_successful_pipeline_result(
+                        [
+                            {
+                                "text": "Recovered result",
+                                "score": 0.88,
+                                "metadata": {"doc_id": "doc1", "chunk_id": "chunk1"},
+                            }
+                        ]
+                    ).results,
+                    result_count=1,
+                    warnings=["FTS fallback used"],
+                    message="Hybrid search completed with warnings",
+                    used_rerank=False,
+                ),
+            ):
+                tool = get_knowledge_search_tool()
+                result = await tool.run_json_async(
+                    {
+                        "query": "test query",
+                        "collections": ["kb1"],
+                        "search_type": "hybrid",
+                        "top_k": 5,
+                        "min_score": 0.3,
+                    }
+                )
+
+        assert result.results
+        assert result.results[0].text == "Recovered result"
+        assert "Recovered result" in result.summary
+        assert "Warnings:" in result.summary
+        assert "Hybrid search completed with warnings" in result.summary
+        assert "Knowledge base search failed" not in result.summary
+
+    @pytest.mark.asyncio
+    async def test_search_appends_errors_alongside_successful_results(self):
+        """Mixed collection outcomes should include both hits and per-collection errors."""
+        mock_collections = [
+            CollectionInfo(
+                name="kb1",
+                total_documents=10,
+                embeddings=100,
+                document_names=["doc1.pdf"],
+            ),
+            CollectionInfo(
+                name="kb2",
+                total_documents=8,
+                embeddings=120,
+                document_names=["doc2.pdf"],
+            ),
+        ]
+
+        mock_list_result = MagicMock()
+        mock_list_result.collections = mock_collections
+
+        def _search_side_effect(*, collection, **kwargs):
+            if collection == "kb1":
+                return _successful_pipeline_result(
+                    [
+                        {
+                            "text": "Successful result",
+                            "score": 0.92,
+                            "metadata": {"doc_id": "doc1", "chunk_id": "chunk1"},
+                        }
+                    ]
+                )
+            return SearchPipelineResult(
+                status="error",
+                search_type="hybrid",
+                results=[],
+                result_count=0,
+                warnings=["index unavailable"],
+                message="index unavailable",
+                used_rerank=False,
+            )
+
+        with patch(
+            "xagent.core.tools.core.document_search.list_collections",
+            return_value=mock_list_result,
+        ):
+            with patch(
+                "xagent.core.tools.core.document_search.run_document_search",
+                side_effect=_search_side_effect,
+            ):
+                tool = get_knowledge_search_tool()
+                result = await tool.run_json_async(
+                    {
+                        "query": "test query",
+                        "collections": ["kb1", "kb2"],
+                        "search_type": "hybrid",
+                        "top_k": 5,
+                        "min_score": 0.3,
+                    }
+                )
+
+        assert result.results
+        assert result.results[0].text == "Successful result"
+        assert "Successful result" in result.summary
+        assert "Errors:" in result.summary
+        assert "kb2: index unavailable" in result.summary
+
+    @pytest.mark.asyncio
     async def test_search_collection_exception_is_surfaced_in_summary(self):
         """Per-collection exceptions should be surfaced instead of hidden as empty results."""
         mock_collections = [

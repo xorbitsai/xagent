@@ -560,12 +560,21 @@ def resolve_effective_embedding_model_sync(
         inferred_model_id: Optional[str] = None
         inferred_dimension: Optional[int] = None
         if collection_info.embeddings > 0:
-            from ..utils.migration_utils import _infer_embedding_config_from_collection
+            try:
+                from ..utils.migration_utils import (
+                    _infer_embedding_config_from_collection,
+                )
 
-            inferred_model_id, inferred_dimension = (
-                _infer_embedding_config_from_collection(collection_name)
-            )
-            inferred_model_id = _normalize_model_id(inferred_model_id)
+                inferred_model_id, inferred_dimension = (
+                    _infer_embedding_config_from_collection(collection_name)
+                )
+                inferred_model_id = _normalize_model_id(inferred_model_id)
+            except Exception as exc:
+                logger.warning(
+                    "Embedding inference failed for collection '%s': %s",
+                    collection_name,
+                    exc,
+                )
 
         if inferred_model_id:
             logger.info(

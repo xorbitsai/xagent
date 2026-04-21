@@ -400,6 +400,43 @@ class TestResolveEffectiveEmbeddingModel:
         assert resolved == "legacy-index-embed"
         mock_save.assert_called_once()
 
+    @patch(
+        "xagent.core.tools.core.RAG_tools.management.collection_manager._sync_wrapper"
+    )
+    @patch(
+        "xagent.core.tools.core.RAG_tools.management.collection_manager.mark_collection_accessed_sync"
+    )
+    @patch(
+        "xagent.core.tools.core.RAG_tools.management.collection_manager.get_collection_sync"
+    )
+    @patch(
+        "xagent.core.tools.core.RAG_tools.utils.migration_utils._infer_embedding_config_from_collection"
+    )
+    def test_inference_failure_falls_back_to_config_model(
+        self,
+        mock_infer: Mock,
+        mock_get_collection: Mock,
+        _mock_mark: Mock,
+        mock_sync_wrapper: Mock,
+    ) -> None:
+        """Inference failures should not block config fallback for legacy collections."""
+        mock_get_collection.return_value = CollectionInfo(
+            name="legacy_collection",
+            embedding_model_id=None,
+            embedding_dimension=None,
+            embeddings=12,
+            ingestion_config=None,
+        )
+        mock_infer.side_effect = RuntimeError("connection failed")
+
+        resolved = resolve_effective_embedding_model_sync(
+            "legacy_collection",
+            config_model_id="fallback-embed",
+        )
+
+        assert resolved == "fallback-embed"
+        mock_sync_wrapper.assert_not_called()
+
 
 # --- rebuild_collection_metadata Tests (Issue #14) ---
 

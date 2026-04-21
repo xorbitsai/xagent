@@ -721,7 +721,11 @@ class LanceDBVectorIndexStore(VectorIndexStore):
                 failed_tables.append(warning)
 
         if warnings_out is not None:
-            warnings_out.extend(failed_tables)
+            try:
+                warnings_out.extend(failed_tables)
+            except AttributeError:
+                for warning in failed_tables:
+                    warnings_out.append(warning)
 
         # Clear cache so subsequent reads see the deletion and fd is released
         self.invalidate_table_cache()

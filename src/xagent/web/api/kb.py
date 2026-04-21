@@ -2223,6 +2223,27 @@ def _perform_kb_collection_delete(
         _check_can_delete_collection(safe_collection, user_id, is_admin)
         result = delete_collection(safe_collection, user_id, is_admin)
 
+        if result.status == "error":
+            cleanup_warnings = list(result.warnings) if result.warnings else []
+            if physical_cleanup_status == "success":
+                cleanup_warnings.append(
+                    f"Physical directory moved to trash: {collection_dir} "
+                    "(trash cleanup requires external scheduler/cron)"
+                )
+            elif physical_cleanup_status == "not_found":
+                cleanup_warnings.append(
+                    "Physical directory cleanup: No physical directory found (collection had no files)"
+                )
+
+            return CollectionOperationResult(
+                status="error",
+                collection=result.collection,
+                message=result.message,
+                warnings=cleanup_warnings,
+                affected_documents=result.affected_documents,
+                deleted_counts=result.deleted_counts,
+            )
+
         remaining_records = vector_store.list_document_records(
             collection_name=None,
             user_id=user_id,

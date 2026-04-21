@@ -223,9 +223,14 @@ class FeishuBotInstance:
             was_completed_or_failed = False
             if not task:
                 is_new_task = True
+
+                task_title = text if text else "Untitled Task"
+                if len(task_title) > 50:
+                    task_title = task_title[:50] + "..."
+
                 task = Task(
                     user_id=user.id,
-                    title=text if len(text) <= 50 else f"{text[:50]}...",
+                    title=task_title,
                     description=text,
                     status=TaskStatus.PENDING,
                     channel_id=self.channel_id,

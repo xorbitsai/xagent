@@ -223,7 +223,7 @@ export default function WidgetChatPage() {
 
         // 1. Create task if we don't have one
         if (!currentTaskId) {
-          const taskTitle = messageToSend.substring(0, 50) + (messageToSend.length > 50 ? '...' : '')
+          const taskTitle = messageToSend
           const taskPayload: Record<string, string | number> = { title: taskTitle, description: messageToSend }
           if (agentId) {
             taskPayload.agent_id = parseInt(agentId)

@@ -213,15 +213,13 @@ async def create_widget_task(
         if agent_id is None and channel and channel.config:
             agent_id = channel.config.get("agent_id")
 
+        task_title = request.title or task_description or "Untitled Task"
+        if task_title and len(task_title) > 50:
+            task_title = task_title[:50] + "..."
+
         task = Task(
             user_id=user.id,
-            title=request.title
-            or (
-                task_description[:50] + "..."
-                if len(task_description) > 50
-                else task_description
-            )
-            or "Untitled Task",
+            title=task_title,
             description=task_description,
             status=TaskStatus.PENDING,
             channel_id=channel_id,

@@ -1257,9 +1257,13 @@ async def handle_chat_message(
                         logger.info(
                             f"Task {task_id} not found (may have been deleted). Creating new task."
                         )
+                        task_title = f"Chat: {user_message}"
+                        if len(task_title) > 50:
+                            task_title = task_title[:50] + "..."
+
                         task = Task(
                             user_id=int(user.id),  # Use authenticated user ID
-                            title=f"Chat: {user_message[:50]}...",
+                            title=task_title,
                             description=user_message,
                             status=TaskStatus.PENDING,  # Use PENDING instead of RUNNING
                         )

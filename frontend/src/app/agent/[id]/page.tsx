@@ -114,7 +114,7 @@ export default function AgentChatPage() {
       }
 
       const requestBody: any = {
-        title: content.length > 50 ? content.substring(0, 50) + "..." : content,
+        title: content,
         description: content,
         agent_id: parseInt(agentId),
       }

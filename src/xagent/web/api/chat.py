@@ -1627,9 +1627,13 @@ async def create_task(
             task_agent_config["selected_file_ids"] = selected_file_ids
 
         # Create task with PENDING status and model configuration
+        task_title = request.title if request.title else task_description
+        if task_title and len(task_title) > 50:
+            task_title = task_title[:50] + "..."
+
         task = Task(
             user_id=user.id,  # Use authenticated user ID
-            title=request.title,
+            title=task_title,
             description=task_description,
             status=TaskStatus.PENDING,
             model_id=default_model_id,

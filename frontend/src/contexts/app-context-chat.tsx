@@ -3456,18 +3456,13 @@ export function AppProvider({ children, token }: { children: React.ReactNode; to
         // Build internal model identifiers from config
         const llmIds = getLLMIdsFromConfig(config)
 
-        // For process mode, message is already processDescription (from handleSendMessage)
-        // For task mode, message is user input
-        let taskDescription = message
-        const taskTitle = message.length > 50 ? `${message.substring(0, 50)}...` : message
-
         // Note: Files will be uploaded via WebSocket after task creation
         // The backend TaskCreateRequest expects JSON with 'files' as a list of filenames (strings)
         // Since we haven't uploaded files yet, we don't include them in the task creation request
 
         const requestBody: any = {
-          title: taskTitle,
-          description: taskDescription,
+          title: message,
+          description: message,
           vibe_mode: config?.vibeMode?.mode || "task",
           memory_similarity_threshold: config?.memorySimilarityThreshold ?? 1.5,
         }

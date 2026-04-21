@@ -217,7 +217,6 @@ def test_delete_collection_allowed_for_admin_with_other_users_docs(
             deleted_counts={},
         )
 
-
         client = TestClient(app_with_kb_admin)
         resp = client.delete("/api/kb/collections/test_collection")
 

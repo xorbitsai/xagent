@@ -1,10 +1,12 @@
+from io import BytesIO
 from pathlib import Path
+from unittest.mock import Mock, patch
 
 import pytest
 from openpyxl import Workbook
 
 from xagent.providers.pdf_parser.base import ParseResult
-from xagent.providers.pdf_parser.deepdoc import DeepDocParser
+from xagent.providers.pdf_parser.deepdoc import DeepDocParser, _parse_xlsx_rows
 
 
 # A fixture to easily access test resource files
@@ -247,3 +249,34 @@ async def test_deepdoc_xlsx_parses_rows_without_repeating_title(tmp_path: Path):
         first_data_row.text
         == "Track: Direct Entry | Candidate ID: A-0001 | Name: Student One | Status: Passed"
     )
+
+
+def test_parse_xlsx_rows_closes_workbook() -> None:
+    workbook = Mock()
+    workbook.sheetnames = ["Sheet1"]
+    worksheet = Mock()
+    worksheet.title = "Sheet1"
+    worksheet.iter_rows.return_value = iter(
+        [
+            ("Quarterly Enrollment Review", None),
+            ("Track", "Status"),
+            ("Direct Entry", "Passed"),
+        ]
+    )
+    workbook.worksheets = [worksheet]
+
+    with patch(
+        "xagent.providers.pdf_parser.deepdoc.load_workbook", return_value=workbook
+    ):
+        result = _parse_xlsx_rows("structured.xlsx")
+
+    assert result.text_segments
+    workbook.close.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_deepdoc_invalid_xlsx_raises_parse_error() -> None:
+    parser = DeepDocParser()
+
+    with pytest.raises(ValueError, match="Failed to parse spreadsheet rows"):
+        await parser.parse(BytesIO(b"not-a-valid-xlsx"), file_ext=".xlsx")

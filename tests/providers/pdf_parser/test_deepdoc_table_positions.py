@@ -608,13 +608,10 @@ class TestDeepDocTablePositions:
         excel_content = b"fake excel binary content"
         excel_bytesio = BytesIO(excel_content)
 
-        result = await parser._parse_impl(
-            excel_bytesio, file_ext=".xlsx", doc_id="test_excel_bytesio"
-        )
-
-        # Should handle BytesIO input without crashing
-        assert result is not None
-        assert hasattr(result, "text_segments")
+        with pytest.raises(ValueError, match="Failed to parse spreadsheet rows"):
+            await parser._parse_impl(
+                excel_bytesio, file_ext=".xlsx", doc_id="test_excel_bytesio"
+            )
 
         # Test CSV BytesIO conversion
         csv_content = b"col1,col2\nval1,val2\nval3,val4"

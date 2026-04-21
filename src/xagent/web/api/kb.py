@@ -182,6 +182,14 @@ def _restore_ingest_file_backup(
         logger.info("Removed failed-ingest file %s", file_path)
 
 
+def _ensure_cleanup_succeeded(operation_name: str, result_obj: Any) -> None:
+    status = str(getattr(result_obj, "status", "")).strip().lower()
+    if status in {"success", "partial_success"}:
+        return
+    message = str(getattr(result_obj, "message", "cleanup failed")).strip()
+    raise RuntimeError(f"{operation_name} failed: {message}")
+
+
 def _rollback_failed_ingestion(
     *,
     db: Session,
@@ -200,13 +208,6 @@ def _rollback_failed_ingestion(
     register_metadata = _get_completed_step_metadata(result, "register_document") or {}
     register_created = bool(register_metadata.get("created"))
     doc_id = result.doc_id if isinstance(result.doc_id, str) and result.doc_id else None
-
-    def _ensure_cleanup_succeeded(operation_name: str, result_obj: Any) -> None:
-        status = str(getattr(result_obj, "status", "")).strip().lower()
-        if status in {"success", "partial_success"}:
-            return
-        message = str(getattr(result_obj, "message", "cleanup failed")).strip()
-        raise RuntimeError(f"{operation_name} failed: {message}")
 
     try:
         if not collection_existed_before:
@@ -313,7 +314,12 @@ def _rollback_failed_ingestion(
             db.commit()
         else:
             if doc_id:
-                clear_ingestion_status(collection_name, doc_id, user_id=user_id)
+                clear_ingestion_status(
+                    collection_name,
+                    doc_id,
+                    user_id=user_id,
+                    is_admin=bool(user.is_admin),
+                )
             if not uploaded_file_existed_before:
                 db.delete(file_record)
                 db.commit()
@@ -364,13 +370,6 @@ def _rollback_failed_cloud_ingestion(
     register_metadata = _get_completed_step_metadata(result, "register_document") or {}
     register_created = bool(register_metadata.get("created"))
     doc_id = result.doc_id if isinstance(result.doc_id, str) and result.doc_id else None
-
-    def _ensure_cleanup_succeeded(operation_name: str, result_obj: Any) -> None:
-        status = str(getattr(result_obj, "status", "")).strip().lower()
-        if status in {"success", "partial_success"}:
-            return
-        message = str(getattr(result_obj, "message", "cleanup failed")).strip()
-        raise RuntimeError(f"{operation_name} failed: {message}")
 
     try:
         if register_created and doc_id:
@@ -539,7 +538,7 @@ def _build_cloud_storage_filename(original_filename: str, file_id: str) -> str:
     original_path = Path(original_filename)
     suffix = original_path.suffix
     stem = original_path.stem or "cloud-file"
-    digest = hashlib.sha1(file_id.encode("utf-8")).hexdigest()[:12]
+    digest = hashlib.sha256(file_id.encode("utf-8")).hexdigest()[:12]
     return f"{stem}__{digest}{suffix}"
 
 

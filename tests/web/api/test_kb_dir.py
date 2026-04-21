@@ -1562,6 +1562,50 @@ def test_kb_ingest_passes_file_id_to_pipeline(test_env, temp_uploads):
         session.close()
 
 
+def test_kb_ingest_cloud_rollback_passes_admin_scope() -> None:
+    """Local rollback should clear ingestion status with the caller's admin scope."""
+
+    from unittest.mock import MagicMock
+
+    from xagent.core.tools.core.RAG_tools.core.schemas import IngestionResult
+    from xagent.web.api import kb as kb_module
+
+    result = IngestionResult(
+        status="partial",
+        doc_id="doc-1",
+        parse_hash="",
+        failed_step="parse_document",
+        message="partial failure",
+    )
+    user = MagicMock(id=7, is_admin=True)
+    db = MagicMock()
+
+    with (
+        patch("xagent.web.api.kb.get_vector_index_store", return_value=MagicMock()),
+        patch("xagent.web.api.kb.clear_ingestion_status") as mock_clear_status,
+        patch("xagent.web.api.kb._restore_ingest_file_backup"),
+    ):
+        kb_module._rollback_failed_ingestion(
+            db=db,
+            user=user,
+            collection_name="cloud-coll",
+            result=result,
+            file_path=Path("cloud.txt"),
+            file_record=MagicMock(file_id="file-1"),
+            collection_existed_before=True,
+            uploaded_file_existed_before=True,
+            file_backup_path=None,
+            had_existing_file=False,
+        )
+
+    mock_clear_status.assert_called_once_with(
+        "cloud-coll",
+        "doc-1",
+        user_id=7,
+        is_admin=True,
+    )
+
+
 def test_kb_ingest_cloud_passes_file_id_to_pipeline(test_env, temp_uploads):
     """Cloud ingest should also register UploadedFile before pipeline execution."""
     app, headers, user, TestingSessionLocal = test_env

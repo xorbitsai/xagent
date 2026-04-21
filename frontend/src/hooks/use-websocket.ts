@@ -2,7 +2,7 @@
 
 import { useEffect, useRef, useState, useCallback } from "react"
 import { useAuth } from "@/contexts/auth-context"
-import { apiRequest, getUploadErrorMessage, parseApiResponse } from "@/lib/api-wrapper"
+import { apiRequest, getUploadErrorMessage, isJsonRecord, parseApiResponse } from "@/lib/api-wrapper"
 import { toast } from "sonner"
 import { getWsUrl, getApiUrl } from "@/lib/utils"
 
@@ -455,7 +455,7 @@ export function useWebSocket(options: UseWebSocketOptions = {}) {
           })
             .then(async res => ({ response: res, parsed: await parseApiResponse(res) }))
             .then(({ response, parsed }) => {
-              if (!response.ok || !parsed.data) {
+              if (!response.ok || !isJsonRecord(parsed.data)) {
                 throw new Error(getUploadErrorMessage(response, parsed, {
                   generic: 'Upload failed',
                   tooLarge: 'File is too large. Please reduce the upload size and try again.',
@@ -465,14 +465,18 @@ export function useWebSocket(options: UseWebSocketOptions = {}) {
 
               const data = parsed.data
               messageData.files = [...preUploadedFiles];
-              if (data.success && data.files) {
+              if (data.success && Array.isArray(data.files)) {
                 // Send file_ids in the websocket message
-                const newUploadedFiles = data.files.map((f: any) => ({
-                  file_id: f.file_id,
-                  name: f.filename,
-                  size: f.file_size,
-                  type: f.mime_type || ''
-                }));
+                const newUploadedFiles = data.files
+                  .filter((f): f is { file_id: string; filename?: string; file_size?: number; mime_type?: string } => (
+                    isJsonRecord(f) && typeof f.file_id === 'string'
+                  ))
+                  .map((f) => ({
+                    file_id: f.file_id,
+                    name: typeof f.filename === 'string' ? f.filename : '',
+                    size: typeof f.file_size === 'number' ? f.file_size : 0,
+                    type: typeof f.mime_type === 'string' ? f.mime_type : ''
+                  }));
                 messageData.files = messageData.files.concat(newUploadedFiles);
               }
 

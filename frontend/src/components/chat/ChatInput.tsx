@@ -7,7 +7,7 @@ import { cn, getApiUrl } from "@/lib/utils";
 import { useI18n } from "@/contexts/i18n-context";
 import { useApp } from "@/contexts/app-context-chat";
 import { ConfigDialog } from "@/components/config-dialog";
-import { apiRequest, getUploadErrorMessage, parseApiResponse } from "@/lib/api-wrapper";
+import { apiRequest, getUploadErrorMessage, isJsonRecord, parseApiResponse } from "@/lib/api-wrapper";
 import { useFileMention, FileItem } from "@/hooks/use-file-mention";
 import { FileMentionDropdown } from "./FileMentionDropdown";
 import { toast } from "sonner";
@@ -213,11 +213,11 @@ export function ChatInput({
 
         const parsed = await parseApiResponse(response);
 
-        if (response.ok && parsed.data) {
+        if (response.ok && isJsonRecord(parsed.data)) {
           const data = parsed.data;
-          if (data.success && data.file_id) {
+          if (data.success && typeof data.file_id === 'string') {
             // Attach file_id to the File object
-            (file as any).file_id = data.file_id;
+            (file as File & { file_id?: string }).file_id = data.file_id;
           } else {
             failedFiles.add(file);
           }

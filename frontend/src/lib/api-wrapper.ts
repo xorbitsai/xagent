@@ -101,7 +101,7 @@ function getCurrentTokens(): { accessToken: string | null; refreshToken: string 
 
 // Refresh token
 async function refreshToken(): Promise<string | null> {
-  const { accessToken, refreshToken: refresh } = getCurrentTokens()
+  const { refreshToken: refresh } = getCurrentTokens()
   if (!refresh) return null
 
   try {
@@ -163,7 +163,7 @@ export async function apiRequest(
   url: string,
   options: RequestInit = {}
 ): Promise<Response> {
-  const { accessToken, refreshToken: refresh } = getCurrentTokens()
+  const { accessToken } = getCurrentTokens()
 
   // If no token, request directly
   if (!accessToken) {
@@ -239,10 +239,26 @@ export async function apiRequest(
   return response
 }
 
+const MAX_RAW_UPLOAD_MESSAGE_LENGTH = 200
+
+function truncateUploadMessage(text: string): string {
+  const trimmed = text.trim()
+  if (trimmed.length <= MAX_RAW_UPLOAD_MESSAGE_LENGTH) {
+    return trimmed
+  }
+  return `${trimmed.slice(0, MAX_RAW_UPLOAD_MESSAGE_LENGTH)}...`
+}
+
+type JsonRecord = Record<string, unknown>
+
 export interface ParsedApiResponse {
-  data: any | null
+  data: JsonRecord | JsonRecord[] | null
   text: string | null
   isHtml: boolean
+}
+
+export function isJsonRecord(value: unknown): value is JsonRecord {
+  return typeof value === "object" && value !== null && !Array.isArray(value)
 }
 
 export async function parseApiResponse(response: Response): Promise<ParsedApiResponse> {
@@ -293,11 +309,11 @@ export function getUploadErrorMessage(
     proxy: string
   }
 ): string {
-  if (typeof parsed.data?.detail === "string" && parsed.data.detail.trim()) {
+  if (isJsonRecord(parsed.data) && typeof parsed.data.detail === "string" && parsed.data.detail.trim()) {
     return parsed.data.detail
   }
 
-  if (typeof parsed.data?.message === "string" && parsed.data.message.trim()) {
+  if (isJsonRecord(parsed.data) && typeof parsed.data.message === "string" && parsed.data.message.trim()) {
     return parsed.data.message
   }
 
@@ -310,7 +326,7 @@ export function getUploadErrorMessage(
   }
 
   if (parsed.text?.trim()) {
-    return parsed.text
+    return truncateUploadMessage(parsed.text)
   }
 
   return messages.generic
@@ -321,7 +337,7 @@ export const api = {
   get: (url: string, options?: RequestInit) =>
     apiRequest(url, { ...options, method: "GET" }),
 
-  post: (url: string, data?: any, options?: RequestInit) =>
+  post: (url: string, data?: unknown, options?: RequestInit) =>
     apiRequest(url, {
       ...options,
       method: "POST",
@@ -332,7 +348,7 @@ export const api = {
       body: data ? JSON.stringify(data) : undefined,
     }),
 
-  put: (url: string, data?: any, options?: RequestInit) =>
+  put: (url: string, data?: unknown, options?: RequestInit) =>
     apiRequest(url, {
       ...options,
       method: "PUT",

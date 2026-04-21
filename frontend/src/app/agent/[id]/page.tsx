@@ -2,7 +2,7 @@
 
 import React, { useState, useEffect, useRef } from "react"
 import { useParams, useRouter } from "next/navigation"
-import { apiRequest, getUploadErrorMessage, parseApiResponse } from "@/lib/api-wrapper"
+import { apiRequest, getUploadErrorMessage, isJsonRecord, parseApiResponse } from "@/lib/api-wrapper"
 import { getApiUrl } from "@/lib/utils"
 import { Button } from "@/components/ui/button"
 import { ArrowLeft, Bot } from "lucide-react"
@@ -102,10 +102,12 @@ export default function AgentChatPage() {
 
           const parsed = await parseApiResponse(uploadResponse)
 
-          if (uploadResponse.ok && parsed.data) {
+          if (uploadResponse.ok && isJsonRecord(parsed.data)) {
             const uploadData = parsed.data
-            if (uploadData.success && uploadData.files) {
-              uploadedFileIds = uploadData.files.map((f: any) => f.file_id)
+            if (uploadData.success && Array.isArray(uploadData.files)) {
+              uploadedFileIds = uploadData.files
+                .filter((f): f is { file_id: string } => isJsonRecord(f) && typeof f.file_id === 'string')
+                .map(f => f.file_id)
             }
           } else {
             throw new Error(getUploadErrorMessage(uploadResponse, parsed, {

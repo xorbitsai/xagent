@@ -13,7 +13,7 @@ import { Select } from "@/components/ui/select"
 import { getApiUrl } from "@/lib/utils"
 import { appendIngestionConfigToFormData } from "@/lib/ingestion-form"
 import { useI18n } from "@/contexts/i18n-context"
-import { apiRequest, getUploadErrorMessage, parseApiResponse } from "@/lib/api-wrapper"
+import { apiRequest, getUploadErrorMessage, isJsonRecord, parseApiResponse } from "@/lib/api-wrapper"
 import { Model } from "@/lib/models"
 import {
   Upload,
@@ -35,6 +35,7 @@ interface IngestionResult {
   chunks_count: number
   status: string
   message: string
+  failed_step?: string
 }
 
 interface WebIngestionResult {
@@ -273,18 +274,18 @@ export function KnowledgeBaseCreationDialog({ open, onOpenChange, onSuccess }: K
         formData.append("collection", collectionName)
         appendIngestionConfigToFormData(formData, ingestionConfig)
 
-      const response = await apiRequest(`${getApiUrl()}/api/kb/ingest`, {
-        method: "POST",
-        body: formData
-      })
+        const response = await apiRequest(`${getApiUrl()}/api/kb/ingest`, {
+          method: "POST",
+          body: formData
+        })
 
-      const parsed = await parseApiResponse(response)
+        const parsed = await parseApiResponse(response)
 
-      if (!response.ok) {
-          const errorData = parsed.data || {}
+        if (!response.ok) {
+          const errorData = isJsonRecord(parsed.data) ? parsed.data : {}
           if (errorData.status === 'error') {
-            setIngestionResults(prev => [...prev, errorData])
-            throw new Error(errorData.message || t("kb.errors.uploadFailedFile", { name: file.name }))
+            setIngestionResults(prev => [...prev, errorData as unknown as IngestionResult])
+            throw new Error((typeof errorData.message === 'string' && errorData.message) || t("kb.errors.uploadFailedFile", { name: file.name }))
           }
           throw new Error(getUploadErrorMessage(response, parsed, {
             generic: t("kb.errors.uploadFailedFile", { name: file.name }) || `Failed to upload file: ${file.name}`,
@@ -293,7 +294,7 @@ export function KnowledgeBaseCreationDialog({ open, onOpenChange, onSuccess }: K
           }))
         }
 
-        const result = parsed.data
+        const result = isJsonRecord(parsed.data) ? parsed.data as unknown as IngestionResult : null
         if (!result) {
           throw new Error(t("kb.errors.uploadFailedFile", { name: file.name }))
         }
@@ -372,10 +373,10 @@ export function KnowledgeBaseCreationDialog({ open, onOpenChange, onSuccess }: K
       setWebIngestionProgress(50)
 
       if (!response.ok) {
-        const errorData = parsed.data || {}
+        const errorData = isJsonRecord(parsed.data) ? parsed.data : {}
         if (errorData.status === 'error') {
-          setWebIngestionResult(errorData)
-          throw new Error(errorData.message || t("kb.errors.webIngestFailed"))
+          setWebIngestionResult(errorData as unknown as WebIngestionResult)
+          throw new Error((typeof errorData.message === 'string' && errorData.message) || t("kb.errors.webIngestFailed"))
         }
         throw new Error(getUploadErrorMessage(response, parsed, {
           generic: t("kb.errors.webIngestFailed") || "Website import failed",
@@ -384,7 +385,9 @@ export function KnowledgeBaseCreationDialog({ open, onOpenChange, onSuccess }: K
         }))
       }
 
-      const result: WebIngestionResult | null = parsed.data
+      const result: WebIngestionResult | null = isJsonRecord(parsed.data)
+        ? (parsed.data as unknown as WebIngestionResult)
+        : null
       if (!result) {
         throw new Error(t("kb.errors.webIngestFailed"))
       }
@@ -468,7 +471,9 @@ export function KnowledgeBaseCreationDialog({ open, onOpenChange, onSuccess }: K
         }))
       }
 
-      const results: IngestionResult[] = parsed.data || []
+      const results: IngestionResult[] = Array.isArray(parsed.data)
+        ? (parsed.data as unknown as IngestionResult[])
+        : []
       setIngestionResults(results)
 
       // Check for errors

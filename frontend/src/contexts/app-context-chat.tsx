@@ -35,7 +35,7 @@ export interface Interaction {
 import { useWebSocket } from "@/hooks/use-websocket"
 import { useAuth } from "@/contexts/auth-context"
 import { getApiUrl } from "@/lib/utils"
-import { apiRequest, getUploadErrorMessage, parseApiResponse } from "@/lib/api-wrapper"
+import { apiRequest, getUploadErrorMessage, isJsonRecord, parseApiResponse } from "@/lib/api-wrapper"
 import { useI18n } from "@/contexts/i18n-context"
 import { normalizeTimestampMs } from "@/lib/time-utils"
 
@@ -3490,10 +3490,12 @@ export function AppProvider({ children, token }: { children: React.ReactNode; to
 
               const parsed = await parseApiResponse(uploadResponse)
 
-              if (uploadResponse.ok && parsed.data) {
+              if (uploadResponse.ok && isJsonRecord(parsed.data)) {
                 const uploadData = parsed.data
-                if (uploadData.success && uploadData.files) {
-                  uploadData.files.forEach((f: any) => uploadedFileIds.push(f.file_id))
+                if (uploadData.success && Array.isArray(uploadData.files)) {
+                  uploadData.files
+                    .filter((f): f is { file_id: string } => isJsonRecord(f) && typeof f.file_id === 'string')
+                    .forEach(f => uploadedFileIds.push(f.file_id))
                 }
               } else {
                 throw new Error(getUploadErrorMessage(uploadResponse, parsed, {

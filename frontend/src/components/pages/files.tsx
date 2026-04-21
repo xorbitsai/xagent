@@ -2,7 +2,6 @@
 
 import { useState, useEffect, useRef } from "react"
 import { Button } from "@/components/ui/button"
-import { Input } from "@/components/ui/input"
 import { Badge } from "@/components/ui/badge"
 import { getApiUrl } from "@/lib/utils"
 import { apiRequest, getUploadErrorMessage, parseApiResponse } from "@/lib/api-wrapper"
@@ -17,7 +16,6 @@ import {
   Image as ImageIcon,
   Video,
   Archive,
-  Search,
   Download,
   Trash2,
   FileCode,
@@ -182,7 +180,7 @@ export function FilesPage() {
 
       const parsed = await parseApiResponse(response)
 
-      if (response.ok) {
+      if (response.ok && parsed.data) {
         await loadFiles()
         if (fileInputRef.current) {
           fileInputRef.current.value = ''

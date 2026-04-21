@@ -81,6 +81,19 @@ class TestGetMaxUploadSizeBytes:
         monkeypatch.setenv(MAX_UPLOAD_SIZE, "2048")
         assert get_max_upload_size_bytes() == 2048
 
+    def test_numeric_float_max_upload_size(self, monkeypatch):
+        monkeypatch.setenv(MAX_UPLOAD_SIZE, "1.5")
+        assert get_max_upload_size_bytes() == 1
+
+    def test_rejects_non_positive_max_upload_size(self, monkeypatch):
+        monkeypatch.setenv(MAX_UPLOAD_SIZE, "0")
+        with pytest.raises(ValueError, match="positive"):
+            get_max_upload_size_bytes()
+
+        monkeypatch.setenv(MAX_UPLOAD_SIZE, "-1")
+        with pytest.raises(ValueError, match="positive"):
+            get_max_upload_size_bytes()
+
     def test_human_readable_max_upload_size(self, monkeypatch):
         monkeypatch.setenv(MAX_UPLOAD_SIZE, "150M")
         assert get_max_upload_size_bytes() == 150 * 1024 * 1024
@@ -97,6 +110,9 @@ class TestFormatFileSize:
 
     def test_formats_fractional_megabytes(self):
         assert format_file_size(1572864) == "1.5MB"
+
+    def test_promotes_boundary_values_to_next_unit(self):
+        assert format_file_size(1048575) == "1MB"
 
 
 class TestGetUploadsDir:

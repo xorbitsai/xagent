@@ -86,6 +86,8 @@ ALLOWED_EXTENSIONS = {
 }
 
 # Maximum file size (configurable via XAGENT_MAX_UPLOAD_SIZE)
+# These values are evaluated at import time for consistent app-wide messaging.
+# If runtime env reloading is ever needed, switch callers to the config functions instead.
 MAX_FILE_SIZE = get_max_upload_size_bytes()
 MAX_FILE_SIZE_LABEL = format_file_size(MAX_FILE_SIZE)
 

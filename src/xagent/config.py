@@ -117,6 +117,7 @@ def get_max_upload_size_bytes() -> int:
         ("B", 1),
     ]
 
+    result: int | None = None
     for suffix, multiplier in suffix_multipliers:
         if normalized.endswith(suffix):
             number_part = normalized[: -len(suffix)].strip()
@@ -125,35 +126,42 @@ def get_max_upload_size_bytes() -> int:
                     f"Invalid {MAX_UPLOAD_SIZE} value: {env_value!r}. Missing numeric value."
                 )
             try:
-                return int(float(number_part) * multiplier)
+                result = int(float(number_part) * multiplier)
             except ValueError as exc:
                 raise ValueError(
                     f"Invalid {MAX_UPLOAD_SIZE} value: {env_value!r}."
                 ) from exc
+            break
 
-    try:
-        return int(normalized)
-    except ValueError as exc:
-        raise ValueError(f"Invalid {MAX_UPLOAD_SIZE} value: {env_value!r}.") from exc
+    if result is None:
+        try:
+            result = int(float(normalized))
+        except ValueError as exc:
+            raise ValueError(
+                f"Invalid {MAX_UPLOAD_SIZE} value: {env_value!r}."
+            ) from exc
+
+    if result <= 0:
+        raise ValueError(
+            f"Invalid {MAX_UPLOAD_SIZE} value: {env_value!r}. Value must be positive."
+        )
+
+    return result
 
 
 def format_file_size(size_bytes: int) -> str:
     """Format a byte count for user-facing messages."""
-    if size_bytes < 1024:
-        return f"{size_bytes}B"
-    if size_bytes < 1024 * 1024:
-        value = size_bytes / 1024
-        unit = "KB"
-    elif size_bytes < 1024 * 1024 * 1024:
-        value = size_bytes / (1024 * 1024)
-        unit = "MB"
-    else:
-        value = size_bytes / (1024 * 1024 * 1024)
-        unit = "GB"
+    units = [("GB", 1024 * 1024 * 1024), ("MB", 1024 * 1024), ("KB", 1024)]
 
-    if float(value).is_integer():
-        return f"{int(value)}{unit}"
-    return f"{value:.1f}{unit}"
+    for unit, divisor in units:
+        value = size_bytes / divisor
+        if value >= 0.9995:
+            rounded = round(value, 1)
+            if float(rounded).is_integer():
+                return f"{int(rounded)}{unit}"
+            return f"{rounded:.1f}{unit}"
+
+    return f"{size_bytes}B"
 
 
 def get_external_upload_dirs() -> list[Path]:

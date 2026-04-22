@@ -599,7 +599,10 @@ IMPORTANT:
             chat_kwargs["messages"] = cleaned_messages
 
             # Get LLM response for final answer
-            assert self.llm is not None  # For mypy type checking
+            if self.llm is None:
+                raise LLMNotAvailableError(
+                    "LLM is required for final answer generation"
+                )
             response = await self.llm.chat(**chat_kwargs)
 
             # Extract response content

@@ -64,6 +64,13 @@ class AgentConfig(BaseModel):
     )
 
 
+class ConnectionInfo(BaseModel):
+    """Information about a connection (e.g. MCP app)"""
+
+    name: str = Field(..., description="Name of the connection")
+    logo: Optional[str] = Field(default=None, description="URL to the logo image")
+
+
 class TemplateInfo(BaseModel):
     """Template brief information"""
 
@@ -75,6 +82,9 @@ class TemplateInfo(BaseModel):
     )
     description: str = Field(..., description="Template description")
     features: list[str] = Field(default_factory=list, description="Template features")
+    connections: list[ConnectionInfo] = Field(
+        default_factory=list, description="App connections"
+    )
     setup_time: str = Field(default="5 min setup", description="Setup time")
     tags: list[str] = Field(default_factory=list, description="Template tags")
     author: str = Field(..., description="Template author")
@@ -85,9 +95,9 @@ class TemplateInfo(BaseModel):
 
 
 class TemplateDetail(TemplateInfo):
-    """Template complete information with agent config"""
+    """Detailed template response including agent configuration"""
 
-    agent_config: AgentConfig = Field(..., description="Agent configuration")
+    agent_config: dict[str, Any] = Field(..., description="Agent configuration")
 
 
 class LikeResponse(BaseModel):
@@ -152,6 +162,7 @@ async def list_templates(
         setup_time = get_localized_value(
             template.get("setup_time", {}), lang, "5 min setup"
         )
+        connections = template.get("connections", [])
         tags = get_localized_value(template.get("tags", {}), lang, [])
 
         result.append(
@@ -162,6 +173,7 @@ async def list_templates(
                 featured=bool(template.get("featured", False)),
                 description=description,
                 features=features,
+                connections=connections,
                 setup_time=setup_time,
                 tags=tags,
                 author=template.get("author", ""),
@@ -215,6 +227,7 @@ async def get_template(
     setup_time = get_localized_value(
         template.get("setup_time", {}), lang, "5 min setup"
     )
+    connections = template.get("connections", [])
     tags = get_localized_value(template.get("tags", {}), lang, [])
 
     return TemplateDetail(
@@ -224,6 +237,7 @@ async def get_template(
         featured=bool(template.get("featured", False)),
         description=description,
         features=features,
+        connections=connections,
         setup_time=setup_time,
         tags=tags,
         author=template.get("author", ""),
@@ -231,11 +245,12 @@ async def get_template(
         views=stats.views,
         likes=stats.likes,
         used_count=stats.used_count,
-        agent_config=AgentConfig(
-            instructions=template["agent_config"].get("instructions", ""),
-            skills=template["agent_config"].get("skills", []),
-            tool_categories=template["agent_config"].get("tool_categories", []),
-        ),
+        agent_config={
+            "instructions": template["agent_config"].get("instructions", ""),
+            "skills": template["agent_config"].get("skills", []),
+            "tool_categories": template["agent_config"].get("tool_categories", []),
+            "execution_mode": template["agent_config"].get("execution_mode", "react"),
+        },
     )
 
 

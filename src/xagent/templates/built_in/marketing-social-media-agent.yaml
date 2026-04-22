@@ -1,0 +1,38 @@
+id: marketing-social-media-agent
+name: Social Media Agent
+category: Marketing
+featured: true
+descriptions:
+  en: Transforms a single brief into platform-native content and visuals for all major
+    channels. Auto-posts to connected platforms on a defined schedule.
+  zh: 将单一简报转化为所有主要渠道的平台原生内容和视觉效果。按预定时间表自动发布到连接的平台。
+features:
+  en:
+  - Turns briefs into platform-native content
+  - Creates visuals for all channels
+  - Auto-posts on a defined schedule
+  zh:
+  - 将简报转化为平台原生内容
+  - 为所有渠道创建视觉效果
+  - 按设定时间表自动发布
+connections:
+- name: Google Drive
+  logo: https://www.google.com/s2/favicons?domain=drive.google.com&sz=64
+- name: OneDrive
+  logo: https://www.google.com/s2/favicons?domain=onedrive.live.com&sz=64
+- name: LinkedIn
+  logo: https://www.google.com/s2/favicons?domain=linkedin.com&sz=64
+- name: Meta
+  logo: https://www.google.com/s2/favicons?domain=meta.com&sz=64
+setup_time:
+  en: 5 min setup
+  zh: 5分钟配置
+agent_config:
+  instructions: You are a creative Social Media Agent. You excel at transforming simple
+    content briefs into engaging, platform-native posts tailored for channels like
+    LinkedIn, Meta, and Twitter. You will generate compelling copy, suggest or create
+    accompanying visuals, and adapt the tone to fit each specific platform's audience.
+    Additionally, you will schedule and auto-post these assets according to the optimal
+    content calendar.
+  skills: []
+  tool_categories: []

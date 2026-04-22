@@ -1,5 +1,5 @@
 """
-Template Manager - 管理 templates 的扫描和检索
+Template Manager - Manages the scanning and retrieval of templates
 """
 
 import asyncio
@@ -13,16 +13,16 @@ logger = logging.getLogger(__name__)
 
 
 class TemplateManager:
-    """Template 系统核心管理器"""
+    """Core manager for the Template system"""
 
     def __init__(self, templates_root: Path):
         """
         Args:
-            templates_root: templates 目录路径
+            templates_root: Path to the templates directory
         """
         self.templates_root = Path(templates_root)
 
-        # 确保目录存在
+        # Ensure directory exists
         self.templates_root.mkdir(parents=True, exist_ok=True)
 
         self._templates_cache: Dict[str, Dict] = {}
@@ -30,26 +30,26 @@ class TemplateManager:
         self._init_task: Optional[Any] = None
 
     async def ensure_initialized(self) -> None:
-        """确保已初始化（懒加载模式）"""
+        """Ensure initialization is complete (lazy loading)"""
         if self._initialized:
             return
 
-        # 如果已有初始化任务在运行，等待它完成
+        # If there is already an initialization task running, wait for it to complete
         if self._init_task is not None:
             await self._init_task
             return
 
-        # 创建并执行初始化任务
+        # Create and execute the initialization task
         self._init_task = asyncio.create_task(self._do_initialize())
         await self._init_task
 
     async def _do_initialize(self) -> None:
-        """实际的初始化逻辑"""
+        """Actual initialization logic"""
         await self.initialize()
         self._init_task = None
 
     async def initialize(self) -> None:
-        """初始化：扫描所有 templates"""
+        """Initialization: scan all templates"""
         logger.info("📂 Scanning templates...")
         logger.info(f"  from {self.templates_root}...")
         await self.reload()
@@ -57,7 +57,7 @@ class TemplateManager:
         logger.info(f"✓ Loaded {len(self._templates_cache)} templates")
 
     async def reload(self) -> None:
-        """重新加载所有 templates"""
+        """Reload all templates"""
         self._templates_cache.clear()
 
         if not self.templates_root.exists():
@@ -84,36 +84,37 @@ class TemplateManager:
         logger.info(f"Total templates loaded: {len(self._templates_cache)}")
 
     def _parse_yaml_file(self, yaml_file: Path) -> Dict[str, Any]:
-        """解析单个 YAML 文件"""
+        """Parse a single YAML file"""
         with open(yaml_file, "r", encoding="utf-8") as f:
             data: Dict[str, Any] = yaml.safe_load(f) or {}
 
-        # 验证必需字段
+        # Validate required fields
         required_fields = ["id", "name", "category", "descriptions"]
         for field in required_fields:
             if field not in data:
                 raise ValueError(f"Missing required field: {field}")
 
-        # 验证 descriptions 包含英文
+        # Validate descriptions contains English
         descriptions = data.get("descriptions", {})
         if not isinstance(descriptions, dict):
             raise ValueError("'descriptions' must be a dictionary")
         if "en" not in descriptions:
             raise ValueError("'descriptions' must contain at least 'en' key")
 
-        # 确保 agent_config 存在
+        # Ensure agent_config exists
         if "agent_config" not in data:
             data["agent_config"] = {}
 
-        # 设置默认值
+        # Set default values
         data.setdefault("tags", [])
         data.setdefault("features", [])
+        data.setdefault("connections", [])
         data.setdefault("setup_time", "5 min setup")
         data.setdefault("author", "xAgent")
         data.setdefault("version", "1.0")
         data.setdefault("featured", False)
 
-        # agent_config 默认值
+        # agent_config default values
         agent_config = data["agent_config"]
         agent_config.setdefault("instructions", "")
         agent_config.setdefault("skills", [])
@@ -121,30 +122,66 @@ class TemplateManager:
 
         return data
 
-    async def list_templates(self) -> List[Dict]:
-        """列出所有 templates（简要信息）"""
-        await self.ensure_initialized()
-        return [
-            {
-                "id": template["id"],
-                "name": template["name"],
-                "category": template.get("category", ""),
-                "featured": template.get("featured", False),
-                "descriptions": template.get("descriptions", {}),
-                "features": template.get("features", []),
-                "setup_time": template.get("setup_time", "5 min setup"),
-                "tags": template.get("tags", []),
-                "author": template.get("author", ""),
-                "version": template.get("version", ""),
-            }
-            for template in self._templates_cache.values()
-        ]
+    def _enrich_template(self, template: Dict[str, Any]) -> Dict[str, Any]:
+        """Merge connections into agent_config.tool_categories"""
+        connections = template.get("connections", [])
 
-    async def get_template(self, template_id: str) -> Optional[Dict]:
-        """获取单个 template（完整信息）"""
+        # The agent_config could be an AgentConfig pydantic model or a dict
+        agent_config = template.get("agent_config", {})
+
+        if hasattr(agent_config, "model_dump"):
+            agent_config_dict = agent_config.model_dump()
+        elif hasattr(agent_config, "dict"):
+            agent_config_dict = agent_config.dict()
+        else:
+            agent_config_dict = dict(agent_config)
+
+        tool_categories = agent_config_dict.get("tool_categories", [])
+        if not isinstance(tool_categories, list):
+            tool_categories = list(tool_categories) if tool_categories else []
+
+        for conn in connections:
+            conn_name = conn.get("name") if isinstance(conn, dict) else conn
+            if not conn_name:
+                continue
+            mcp_category = f"mcp:{conn_name}"
+            if mcp_category not in tool_categories:
+                tool_categories.append(mcp_category)
+
+        agent_config_dict["tool_categories"] = tool_categories
+
+        return {
+            "id": template["id"],
+            "name": template["name"],
+            "category": template.get("category", ""),
+            "featured": template.get("featured", False),
+            "descriptions": template.get("descriptions", {}),
+            "features": template.get("features", []),
+            "connections": connections,
+            "setup_time": template.get("setup_time", "5 min setup"),
+            "tags": template.get("tags", []),
+            "author": template.get("author", ""),
+            "version": template.get("version", ""),
+            "agent_config": agent_config_dict,
+        }
+
+    async def list_templates(self) -> List[Dict]:
+        """List all templates (summary information)"""
         await self.ensure_initialized()
-        return self._templates_cache.get(template_id)
+
+        result = []
+        for template in self._templates_cache.values():
+            result.append(self._enrich_template(template))
+        return result
+
+    async def get_template(self, template_id: str) -> Optional[Dict[str, Any]]:
+        """Get a single template (full information)"""
+        await self.ensure_initialized()
+        template = self._templates_cache.get(template_id)
+        if template:
+            return self._enrich_template(template)
+        return None
 
     def has_templates(self) -> bool:
-        """是否有可用的 templates"""
+        """Check if any templates are available"""
         return len(self._templates_cache) > 0

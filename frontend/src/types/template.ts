@@ -6,6 +6,11 @@ export interface AgentConfig {
   tool_categories: string[];
 }
 
+export interface ConnectionInfo {
+  name: string;
+  logo?: string;
+}
+
 export interface Template {
   id: string;
   name: string;
@@ -13,6 +18,7 @@ export interface Template {
   featured?: boolean;
   description: string;
   features: string[];
+  connections: ConnectionInfo[];
   setup_time: string;
   tags: string[];
   author: string;

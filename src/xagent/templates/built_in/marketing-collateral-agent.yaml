@@ -1,0 +1,37 @@
+id: marketing-collateral-agent
+name: Collateral Agent
+category: Marketing
+featured: false
+descriptions:
+  en: Generates on-brand sales and marketing collateral including decks, one-pagers,
+    posters, and presentation materials.
+  zh: 生成符合品牌的销售和营销抵押品，包括演示文稿、单页、海报和展示材料。
+features:
+  en:
+  - Creates decks, one-pagers & posters
+  - Generates on-brand presentation materials
+  - Produces ready-to-use sales collateral
+  zh:
+  - 创建演示文稿、单页和海报
+  - 生成符合品牌的展示材料
+  - 制作随时可用的销售材料
+connections:
+- name: Google Drive
+  logo: https://www.google.com/s2/favicons?domain=drive.google.com&sz=64
+- name: OneDrive
+  logo: https://www.google.com/s2/favicons?domain=onedrive.live.com&sz=64
+- name: Gemini
+  logo: https://www.google.com/s2/favicons?domain=gemini.google.com&sz=64
+- name: DALL-E
+  logo: https://www.google.com/s2/favicons?domain=openai.com&sz=64
+setup_time:
+  en: 5 min setup
+  zh: 5分钟配置
+agent_config:
+  instructions: You are a dedicated Marketing Collateral Agent. Your focus is on generating
+    high-impact, on-brand sales and marketing materials. You will create professional
+    pitch decks, concise one-pagers, engaging posters, and comprehensive presentation
+    materials. You will leverage design principles and brand assets to produce ready-to-use
+    collateral that empowers the sales team to close deals effectively.
+  skills: []
+  tool_categories: []

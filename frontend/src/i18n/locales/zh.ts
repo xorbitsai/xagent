@@ -1056,6 +1056,9 @@ Build when you need.`
     categoryTitles: {
       all: "全部",
       featured: "推荐模板",
+      sales: "销售",
+      marketing: "营销",
+      support: "支持",
       healthcare_fitness: "医疗与健康",
       general_productivity: "通用与效率",
       customer_service: "客户服务",

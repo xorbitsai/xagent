@@ -1,0 +1,40 @@
+id: support-voice-agent
+name: Voice Agent (Support)
+category: Support
+featured: false
+descriptions:
+  en: Makes outbound follow-ups to resolve customer issues conversationally. Escalates
+    complex cases to human agents.
+  zh: 进行出站跟进以通过对话解决客户问题。将复杂案件升级给人工代理。
+features:
+  en:
+  - Makes outbound follow-up calls
+  - Resolves issues conversationally
+  - Escalates complex cases to humans
+  zh:
+  - 拨打出站跟进电话
+  - 通过对话解决问题
+  - 将复杂案件升级给人工
+connections:
+- name: Hubspot
+  logo: https://www.google.com/s2/favicons?domain=hubspot.com&sz=64
+- name: Salesforce
+  logo: https://www.google.com/s2/favicons?domain=salesforce.com&sz=64
+- name: aircall
+  logo: https://www.google.com/s2/favicons?domain=aircall.io&sz=64
+- name: dialpad
+  logo: https://www.google.com/s2/favicons?domain=dialpad.com&sz=64
+- name: justcall
+  logo: https://www.google.com/s2/favicons?domain=justcall.io&sz=64
+setup_time:
+  en: 5 min setup
+  zh: 5分钟配置
+agent_config:
+  instructions: You are a conversational Support Voice Agent. You specialize in making
+    outbound follow-up calls to customers to resolve their ongoing issues or gather
+    feedback. You will engage in natural, empathetic conversations to understand customer
+    pain points and provide solutions. For highly complex or sensitive cases, you
+    will intelligently escalate the call to human support agents, providing them with
+    a complete summary of the interaction.
+  skills: []
+  tool_categories: []

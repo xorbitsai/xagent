@@ -622,7 +622,33 @@ export function AgentBuilder({ agentId }: AgentBuilderProps) {
           setDescription(template.description || "")
           setInstructions(template.agent_config?.instructions || "")
           setSelectedSkills(template.agent_config?.skills || [])
-          setSelectedToolCategories(template.agent_config?.tool_categories || [])
+
+          // Separate regular tools from MCP servers
+          const allCategories = template.agent_config?.tool_categories || []
+          setSelectedToolCategories(allCategories.filter((c: string) => !c.startsWith('mcp:')))
+
+          const explicitlyConfiguredMcps = allCategories
+            .filter((c: string) => c.startsWith('mcp:'))
+            .map((c: string) => c.replace('mcp:', ''))
+
+          let connectedMcpApps: string[] = [...explicitlyConfiguredMcps]
+
+          // Use the template's 'connections' to figure out which MCP apps to select
+          if (template.connections && Array.isArray(template.connections)) {
+            // Find which connections the user actually has connected
+            template.connections.forEach((conn: any) => {
+              const connName = typeof conn === 'string' ? conn : conn.name;
+              if (!connName) return;
+
+              // Find the actual server object to use its exact name, to avoid case mismatches
+              const server = mcpServers.find(s => s.name.toLowerCase() === connName.toLowerCase() || s.app_id?.toLowerCase() === connName.toLowerCase().replace(/\s+/g, '-'))
+              if (server && !connectedMcpApps.includes(server.name)) {
+                connectedMcpApps.push(server.name)
+              }
+            });
+          }
+
+          setSelectedMcpServers(connectedMcpApps)
         }
       } catch (error) {
         console.error("Failed to load template:", error)

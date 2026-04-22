@@ -1,0 +1,38 @@
+id: marketing-content-agent
+name: Content Agent
+category: Marketing
+featured: false
+descriptions:
+  en: Produces research-backed, long-form content including blogs, articles, and email
+    sequences. Optimises for SEO and stays on-brand using uploaded brand materials.
+  zh: 制作以研究为基础的长篇内容，包括博客、文章和电子邮件序列。针对SEO进行优化，并使用上传的品牌材料保持品牌一致性。
+features:
+  en:
+  - Writes blogs, articles & email sequences
+  - Optimises content for SEO
+  - Stays on-brand using your materials
+  zh:
+  - 撰写博客、文章和电子邮件序列
+  - 优化SEO内容
+  - 使用您的材料保持品牌一致性
+connections:
+- name: Google
+  logo: https://www.google.com/s2/favicons?domain=google.com&sz=64
+- name: Firecrawl
+  logo: https://www.google.com/s2/favicons?domain=firecrawl.dev&sz=64
+- name: Google Drive
+  logo: https://www.google.com/s2/favicons?domain=drive.google.com&sz=64
+- name: OneDrive
+  logo: https://www.google.com/s2/favicons?domain=onedrive.live.com&sz=64
+setup_time:
+  en: 5 min setup
+  zh: 5分钟配置
+agent_config:
+  instructions: You are an expert Content Marketing Agent. Your mission is to produce
+    authoritative, research-backed long-form content, including SEO-optimized blog
+    posts, detailed articles, and nurturing email sequences. You will deeply analyze
+    uploaded brand guidelines and reference materials to ensure a consistent brand
+    voice. Every piece of content must be structured for readability, keyword optimization,
+    and audience engagement.
+  skills: []
+  tool_categories: []

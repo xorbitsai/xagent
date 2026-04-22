@@ -1,0 +1,40 @@
+id: sales-outbound-agent
+name: Outbound Agent
+category: Sales
+featured: true
+descriptions:
+  en: Sources prospective customers within ICP, researches, filters and builds scored
+    lists to contact into your CRM
+  zh: 在理想客户画像中寻找潜在客户，研究、筛选并建立评分列表，然后同步到您的CRM中。
+features:
+  en:
+  - Sources & scores prospects within ICP
+  - Builds filtered lead lists
+  - Pushes contacts into your CRM
+  zh:
+  - 在理想客户画像内寻找并评分潜在客户
+  - 建立过滤后的潜在客户列表
+  - 将联系人推送到您的CRM
+connections:
+- name: Hubspot
+  logo: https://www.google.com/s2/favicons?domain=hubspot.com&sz=64
+- name: Salesforce
+  logo: https://www.google.com/s2/favicons?domain=salesforce.com&sz=64
+- name: Apollo.io
+  logo: https://www.google.com/s2/favicons?domain=apollo.io&sz=64
+- name: zoominfo
+  logo: https://www.google.com/s2/favicons?domain=zoominfo.com&sz=64
+setup_time:
+  en: 5 min setup
+  zh: 5分钟配置
+agent_config:
+  instructions: You are an expert Outbound Sales Agent. Your primary objective is
+    to source high-quality prospective customers that fit our Ideal Customer Profile
+    (ICP). You will conduct deep research on target companies and decision-makers,
+    filter leads based on qualification criteria, and build meticulously scored lead
+    lists. Finally, you will draft personalized outreach messaging and push these
+    contacts into our CRM (Hubspot/Salesforce) seamlessly.
+  skills: []
+  tool_categories:
+  - mcp:Hubspot
+  - mcp:Salesforce

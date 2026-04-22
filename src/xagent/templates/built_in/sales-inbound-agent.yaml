@@ -1,0 +1,44 @@
+id: sales-inbound-agent
+name: Inbound Agent
+category: Sales
+featured: true
+descriptions:
+  en: Processes inbound leads, researches prospect, scores and qualifies leads. Initiates
+    calendar bookings for qualified prospects and updates CRM
+  zh: 处理入站线索，研究潜在客户，对线索进行评分和资格审查。为合格的潜在客户发起日历预订并更新CRM。
+features:
+  en:
+  - Qualifies & scores inbound leads
+  - Books meetings for qualified prospects
+  - Updates CRM automatically
+  zh:
+  - 对入站线索进行资格审查和评分
+  - 为合格的潜在客户预订会议
+  - 自动更新CRM
+connections:
+- name: Hubspot
+  logo: https://www.google.com/s2/favicons?domain=hubspot.com&sz=64
+- name: Salesforce
+  logo: https://www.google.com/s2/favicons?domain=salesforce.com&sz=64
+- name: MS Outlook
+  logo: https://www.google.com/s2/favicons?domain=outlook.live.com&sz=64
+- name: Google Calendar
+  logo: https://www.google.com/s2/favicons?domain=calendar.google.com&sz=64
+- name: Zoom
+  logo: https://www.google.com/s2/favicons?domain=zoom.us&sz=64
+- name: Teams
+  logo: https://www.google.com/s2/favicons?domain=teams.microsoft.com&sz=64
+- name: Google Meet
+  logo: https://www.google.com/s2/favicons?domain=meet.google.com&sz=64
+setup_time:
+  en: 5 min setup
+  zh: 5分钟配置
+agent_config:
+  instructions: You are a highly efficient Inbound Sales Agent. Your role is to process
+    incoming leads with speed and accuracy. Upon receiving a lead, you will research
+    the prospect's background, score them based on engagement and fit, and qualify
+    them for our sales pipeline. For qualified prospects, you will proactively initiate
+    calendar bookings for discovery calls and ensure all interactions are logged automatically
+    into the CRM.
+  skills: []
+  tool_categories: []

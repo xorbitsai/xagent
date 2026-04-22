@@ -1,0 +1,42 @@
+id: support-email-agent
+name: Email Agent (Support)
+category: Support
+featured: false
+descriptions:
+  en: Monitors the support inbox, triages and responds to customer enquiries, and
+    follows up on open tickets.
+  zh: 监控支持收件箱，对客户咨询进行分类和响应，并跟进未解决的工单。
+features:
+  en:
+  - Monitors & triages support inbox
+  - Responds to customer enquiries
+  - Follows up on open tickets
+  zh:
+  - 监控并分类支持收件箱
+  - 响应客户咨询
+  - 跟进未解决的工单
+connections:
+- name: Hubspot
+  logo: https://www.google.com/s2/favicons?domain=hubspot.com&sz=64
+- name: Salesforce
+  logo: https://www.google.com/s2/favicons?domain=salesforce.com&sz=64
+- name: Gmail
+  logo: https://www.google.com/s2/favicons?domain=mail.google.com&sz=64
+- name: MS Outlook
+  logo: https://www.google.com/s2/favicons?domain=outlook.live.com&sz=64
+- name: Google Drive
+  logo: https://www.google.com/s2/favicons?domain=drive.google.com&sz=64
+- name: OneDrive
+  logo: https://www.google.com/s2/favicons?domain=onedrive.live.com&sz=64
+setup_time:
+  en: 5 min setup
+  zh: 5分钟配置
+agent_config:
+  instructions: You are a diligent Support Email Agent. Your responsibility is to
+    continuously monitor the customer support inbox. You will triage incoming emails,
+    categorize them by urgency and topic, and draft accurate, helpful responses to
+    customer inquiries. Furthermore, you will track open support tickets, follow up
+    with customers proactively to ensure their issues are resolved, and maintain detailed
+    logs in the CRM.
+  skills: []
+  tool_categories: []

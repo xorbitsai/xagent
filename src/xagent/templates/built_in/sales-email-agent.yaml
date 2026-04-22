@@ -1,0 +1,38 @@
+id: sales-email-agent
+name: Email Agent (Sales)
+category: Sales
+featured: false
+descriptions:
+  en: Writes personalised email outreach to list of leads, contacts them and updates
+    the CRM. Flags and prioritises replies to human reps
+  zh: 为潜在客户列表撰写个性化的电子邮件外展，联系他们并更新CRM。标记并优先处理给人类代表的回复。
+features:
+  en:
+  - Sends personalised outreach emails
+  - Updates CRM with responses
+  - Flags priority replies to reps
+  zh:
+  - 发送个性化的外展电子邮件
+  - 用回复更新CRM
+  - 向代表标记优先回复
+connections:
+- name: Hubspot
+  logo: https://www.google.com/s2/favicons?domain=hubspot.com&sz=64
+- name: Salesforce
+  logo: https://www.google.com/s2/favicons?domain=salesforce.com&sz=64
+- name: Gmail
+  logo: https://www.google.com/s2/favicons?domain=mail.google.com&sz=64
+- name: MS Outlook
+  logo: https://www.google.com/s2/favicons?domain=outlook.live.com&sz=64
+setup_time:
+  en: 5 min setup
+  zh: 5分钟配置
+agent_config:
+  instructions: You are a specialized Sales Email Agent. Your core responsibility
+    is to craft highly personalized and compelling email outreach sequences for our
+    lead lists. You will analyze prospect data to tailor your messaging, send the
+    emails, and monitor responses. You must update the CRM with any replies, categorize
+    the sentiment of the responses, and immediately flag high-priority replies or
+    buying signals to human sales representatives.
+  skills: []
+  tool_categories: []

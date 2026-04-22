@@ -1056,6 +1056,9 @@ Build when you need.`
     categoryTitles: {
       featured: "Featured Templates",
       all: "All",
+      sales: "Sales",
+      marketing: "Marketing",
+      support: "Support",
       healthcare_fitness: "Healthcare & Fitness",
       general_productivity: "General & Productivity",
       customer_service: "Customer Service",

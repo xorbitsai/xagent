@@ -1,0 +1,39 @@
+id: sales-voice-agent
+name: Voice Agent (Sales)
+category: Sales
+featured: false
+descriptions:
+  en: Calls prospects, qualifies leads, and books meetings autonomously.
+  zh: 自动拨打潜在客户电话，审查线索资格，并预约会议。
+features:
+  en:
+  - Calls prospects autonomously
+  - Qualifies leads via conversation
+  - Books meetings without human input
+  zh:
+  - 自动拨打潜在客户电话
+  - 通过对话进行线索资格审查
+  - 无需人工干预预订会议
+connections:
+- name: Hubspot
+  logo: https://www.google.com/s2/favicons?domain=hubspot.com&sz=64
+- name: Salesforce
+  logo: https://www.google.com/s2/favicons?domain=salesforce.com&sz=64
+- name: aircall
+  logo: https://www.google.com/s2/favicons?domain=aircall.io&sz=64
+- name: dialpad
+  logo: https://www.google.com/s2/favicons?domain=dialpad.com&sz=64
+- name: justcall
+  logo: https://www.google.com/s2/favicons?domain=justcall.io&sz=64
+setup_time:
+  en: 5 min setup
+  zh: 5分钟配置
+agent_config:
+  instructions: You are an autonomous Voice Sales Agent. Your purpose is to conduct
+    conversational outreach to prospects. You will initiate calls, engage in natural
+    and persuasive dialogue to qualify leads, handle basic objections, and identify
+    buying intent. When a lead is fully qualified, you will autonomously schedule
+    follow-up meetings or demos on the calendar, ensuring a smooth handoff to the
+    closing team.
+  skills: []
+  tool_categories: []

@@ -1,0 +1,37 @@
+id: support-ai-chatbot-agent
+name: AI Chatbot Agent
+category: Support
+featured: true
+descriptions:
+  en: Responds to live chat enquiries instantly
+  zh: 实时响应实时聊天咨询。
+features:
+  en:
+  - Responds to live chat instantly
+  - Handles enquiries 24/7
+  - Resolves common questions automatically
+  zh:
+  - 即时响应实时聊天
+  - 全天候处理咨询
+  - 自动解决常见问题
+connections:
+- name: Google Drive
+  logo: https://www.google.com/s2/favicons?domain=drive.google.com&sz=64
+- name: OneDrive
+  logo: https://www.google.com/s2/favicons?domain=onedrive.live.com&sz=64
+- name: Hubspot
+  logo: https://www.google.com/s2/favicons?domain=hubspot.com&sz=64
+- name: Salesforce
+  logo: https://www.google.com/s2/favicons?domain=salesforce.com&sz=64
+setup_time:
+  en: 5 min setup
+  zh: 5分钟配置
+agent_config:
+  instructions: You are a responsive AI Chatbot Agent for Customer Support. You operate
+    24/7 to provide instant, accurate, and empathetic responses to live chat inquiries.
+    You will resolve common customer questions using the knowledge base, guide users
+    through troubleshooting steps, and ensure a seamless support experience. If an
+    issue exceeds your resolution capabilities, you will smoothly route the conversation
+    to the appropriate human team.
+  skills: []
+  tool_categories: []

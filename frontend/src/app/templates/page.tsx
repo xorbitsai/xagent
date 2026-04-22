@@ -8,6 +8,7 @@ import {
   Clock,
   ChevronRight
 } from "lucide-react";
+import Image from "next/image";
 import { useState, useEffect } from "react";
 import { cn, getApiUrl } from "@/lib/utils";
 import { useRouter } from "next/navigation";
@@ -33,23 +34,9 @@ export default function TemplatesPage() {
   const categories = [
     { id: "All", label: t("templates.categoryTitles.all") },
     { id: "Featured", label: t("templates.categoryTitles.featured") },
-    {
-      id: "Healthcare & Fitness",
-      label: t("templates.categoryTitles.healthcare_fitness"),
-    },
-    {
-      id: "General & Productivity",
-      label: t("templates.categoryTitles.general_productivity"),
-    },
-    {
-      id: "Customer Service",
-      label: t("templates.categoryTitles.customer_service"),
-    },
-    {
-      id: "Finance, LMS & Ops",
-      label: t("templates.categoryTitles.finance_lms_ops"),
-    },
-    { id: "Security", label: t("templates.categoryTitles.security") },
+    { id: "Sales", label: t("templates.categoryTitles.sales") },
+    { id: "Marketing", label: t("templates.categoryTitles.marketing") },
+    { id: "Support", label: t("templates.categoryTitles.support") },
   ];
 
   // Category display configuration
@@ -57,20 +44,14 @@ export default function TemplatesPage() {
     Featured: {
       title: t("templates.categoryTitles.featured"),
     },
-    "Healthcare & Fitness": {
-      title: t("templates.categoryTitles.healthcare_fitness"),
+    Sales: {
+      title: t("templates.categoryTitles.sales"),
     },
-    "General & Productivity": {
-      title: t("templates.categoryTitles.general_productivity"),
+    Marketing: {
+      title: t("templates.categoryTitles.marketing"),
     },
-    "Customer Service": {
-      title: t("templates.categoryTitles.customer_service"),
-    },
-    "Finance, LMS & Ops": {
-      title: t("templates.categoryTitles.finance_lms_ops"),
-    },
-    Security: {
-      title: t("templates.categoryTitles.security"),
+    Support: {
+      title: t("templates.categoryTitles.support"),
     },
   };
 
@@ -300,39 +281,62 @@ export default function TemplatesPage() {
                           )}
                         </div>
 
-                        {/* Tags */}
-                        {template.tags && template.tags.length > 0 && (
-                          <div className="flex flex-wrap gap-2 mb-6">
-                            {template.tags.map((tag, idx) => (
-                              <span
-                                key={idx}
-                                className="px-2.5 py-1 bg-primary/10 text-primary text-xs font-medium rounded-full"
-                              >
-                                {tag}
-                              </span>
-                            ))}
-                          </div>
-                        )}
+                        {/* Divider */}
+                        <div className="h-[1px] bg-border/60 mb-4" />
 
-                        {/* Footer: Stats & Action */}
+                        {/* Footer: Connections, Stats & Action */}
                         <div className="mt-auto">
-                          <div className="flex items-center gap-4 text-sm text-muted-foreground mb-4">
-                            <div className="flex items-center gap-1.5">
-                              <Play className="w-3.5 h-3.5 fill-current" />
-                              <span>{template.used_count}</span>
+                          <div className="flex items-center justify-between text-sm text-muted-foreground mb-4">
+                            <div className="flex items-center">
+                              {template.connections && template.connections.length > 0 ? (
+                                <div className="flex gap-1.5">
+                                  {template.connections.slice(0, 4).map((conn, idx) => (
+                                    <div key={idx} className="w-8 h-8 rounded-lg bg-background border border-border flex items-center justify-center overflow-hidden transition-transform">
+                                      {conn.logo ? <img
+                                        src={conn.logo}
+                                        alt={conn.name}
+                                        width={20}
+                                        height={20}
+                                        className="object-contain"
+                                        onError={(e) => {
+                                          // Fallback to initial letters if icon is not found
+                                          e.currentTarget.style.display = 'none';
+                                          e.currentTarget.nextElementSibling?.classList.remove('hidden');
+                                        }}
+                                      /> :
+                                        <span className="text-[10px] font-medium hidden text-primary/70">{conn.name.substring(0, 2).toUpperCase()}</span>
+                                      }
+                                    </div>
+                                  ))}
+                                  {template.connections.length > 4 && (
+                                    <div className="w-8 h-8 rounded-lg bg-muted border border-border flex items-center justify-center text-muted-foreground">
+                                      <span className="text-[10px] font-medium">+{template.connections.length - 4}</span>
+                                    </div>
+                                  )}
+                                </div>
+                              ) : (
+                                <div className="h-8" />
+                              )}
                             </div>
-                            <button
-                              onClick={(e) => handleLikeTemplate(template.id, e)}
-                              className="flex items-center gap-1.5 hover:text-pink-500 transition-colors"
-                            >
-                              <Heart className="w-3.5 h-3.5 fill-current" />
-                              <span>{template.likes}</span>
-                            </button>
+
+                            <div className="flex items-center gap-3">
+                              <div className="flex items-center gap-1.5">
+                                <Play className="w-3.5 h-3.5 fill-current text-primary/70" />
+                                <span className="font-semibold text-foreground/80">{template.used_count}</span>
+                              </div>
+                              <button
+                                onClick={(e) => handleLikeTemplate(template.id, e)}
+                                className="flex items-center gap-1.5 hover:text-pink-500 transition-colors"
+                              >
+                                <Heart className="w-3.5 h-3.5 fill-current text-blue-400/70" />
+                                <span className="font-semibold text-foreground/80">{template.likes}</span>
+                              </button>
+                            </div>
                           </div>
 
                           <button
                             onClick={() => handleUseTemplate(template.id)}
-                            className="w-full py-2.5 text-primary text-sm font-semibold rounded-lg border border-primary/30 hover:bg-primary/5 transition-colors"
+                            className="w-full py-2.5 text-primary text-sm font-bold uppercase tracking-wide rounded-lg border border-primary/20 hover:bg-primary/5 transition-colors"
                           >
                             {t("templates.useTemplate")}
                           </button>

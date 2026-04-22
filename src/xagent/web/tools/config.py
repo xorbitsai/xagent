@@ -45,15 +45,20 @@ async def refresh_oauth_token_if_needed(
 
     logger.info(f"Token expired for {provider_name}, attempting to refresh...")
     try:
-        from ..mcp_apps import OAUTH_PROVIDERS
+        from ...core.utils.encryption import decrypt_value
+        from ..models.oauth_provider import OAuthProvider
 
-        provider_config = OAUTH_PROVIDERS.get(provider_name)
+        provider_config = (
+            db.query(OAuthProvider)
+            .filter(OAuthProvider.provider_name == provider_name)
+            .first()
+        )
         if not provider_config:
             logger.warning(f"Unknown provider for refresh: {provider_name}")
             return False
 
-        client_id = os.environ.get(provider_config["client_id_env"])
-        client_secret = os.environ.get(provider_config["client_secret_env"])
+        client_id = decrypt_value(provider_config.client_id)
+        client_secret = decrypt_value(provider_config.client_secret)
 
         if not client_id or not client_secret:
             logger.warning(
@@ -74,7 +79,7 @@ async def refresh_oauth_token_if_needed(
 
         async with httpx.AsyncClient() as client:
             response = await client.post(
-                provider_config["token_url"], data=data, headers=headers, timeout=10.0
+                provider_config.token_url, data=data, headers=headers, timeout=10.0
             )
 
         if response.status_code == 200:
@@ -490,17 +495,10 @@ class WebToolConfig(BaseToolConfig):
                 if server.transport == "oauth":
                     # Find corresponding OAuth account
                     # The provider might be linkedin, google, etc. based on the app config
-                    from ...web.mcp_apps import MCP_APPS_LIBRARY
+                    from ...web.mcp_apps import get_app_by_name
                     from ...web.models.user_oauth import UserOAuth
 
-                    app_info = next(
-                        (
-                            app
-                            for app in MCP_APPS_LIBRARY
-                            if app.get("name") == server.name
-                        ),
-                        None,
-                    )
+                    app_info = get_app_by_name(self.db, str(server.name))
                     provider_name = (
                         app_info.get("provider") if app_info else server.name.lower()
                     )

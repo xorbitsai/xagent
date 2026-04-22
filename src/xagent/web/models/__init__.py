@@ -4,6 +4,8 @@ from .custom_api import CustomApi, UserCustomApi
 from .database import Base, get_db, get_engine, get_session_local
 from .mcp import MCPServer, UserMCPServer
 from .model import Model
+from .oauth_provider import OAuthProvider
+from .public_mcp import PublicMCPApp
 from .sandbox import SandboxInfo, SandboxSnapshot
 from .system_setting import SystemSetting
 from .task import DAGExecution, Task
@@ -42,4 +44,6 @@ __all__ = [
     "UploadedFile",
     "SandboxInfo",
     "SandboxSnapshot",
+    "OAuthProvider",
+    "PublicMCPApp",
 ]

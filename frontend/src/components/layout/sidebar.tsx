@@ -206,6 +206,13 @@ const getUserMenuItemsForUser = (user: any): NavigationItem[] => {
       icon: Users,
       color: "text-blue-400"
     })
+    menuItems.splice(-1, 0, {
+      name: "Public MCP Apps",
+      nameKey: "nav.adminMcp",
+      href: "/admin-mcp/",
+      icon: Server,
+      color: "text-blue-400"
+    })
   }
 
   return menuItems

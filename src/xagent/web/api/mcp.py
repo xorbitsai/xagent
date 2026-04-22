@@ -18,7 +18,7 @@ from sqlalchemy.orm import Session
 from ...core.tools.core.mcp.data_config import MCPServerConfig
 from ...core.tools.core.mcp.manager.db import DatabaseMCPServerManager
 from ..auth_dependencies import get_current_user
-from ..mcp_apps import MCP_APPS_LIBRARY, get_app_by_name
+from ..mcp_apps import get_all_mcp_apps, get_app_by_name
 from ..models.database import get_db
 from ..models.mcp import MCPServer, UserMCPServer
 from ..models.user import User
@@ -389,7 +389,7 @@ def _db_server_to_response(
 
 
 def _enrich_oauth_server_info(
-    server: MCPServer, oauth_emails: dict
+    db: Session, server: MCPServer, oauth_emails: dict
 ) -> tuple[Optional[str], Optional[str], Optional[str]]:
     """
     Return (app_id, provider, connected_account) for an OAuth-based MCPServer.
@@ -398,7 +398,7 @@ def _enrich_oauth_server_info(
     if server.transport != "oauth":
         return None, None, None
 
-    app_info = get_app_by_name(str(server.name))
+    app_info = get_app_by_name(db, str(server.name))
     if not app_info:
         return None, None, None
 
@@ -410,7 +410,7 @@ def _enrich_oauth_server_info(
 
 
 @mcp_router.get("/apps", response_model=List[dict])
-async def list_mcp_apps(
+def list_mcp_apps(
     search: Optional[str] = None,
     category: Optional[str] = "All",
     location: Optional[str] = "remote",
@@ -446,7 +446,7 @@ async def list_mcp_apps(
     results = []
 
     if location in ["remote", "all"]:
-        for app in MCP_APPS_LIBRARY:
+        for app in get_all_mcp_apps(db):
             if search:
                 search_lower = search.lower()
                 if (
@@ -489,7 +489,7 @@ async def list_mcp_apps(
             results.append(app_copy)
 
     if location in ["local", "all"]:
-        library_names = {app["name"].lower() for app in MCP_APPS_LIBRARY}
+        library_names = {app["name"].lower() for app in get_all_mcp_apps(db)}
         for server, user_mcp in user_mcps:
             if server.name.lower() in library_names:
                 continue
@@ -563,7 +563,7 @@ async def list_mcp_apps(
 
 
 @mcp_router.get("/servers", response_model=List[MCPServerResponse])
-async def list_mcp_servers(
+def get_mcp_servers(
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ) -> List[MCPServerResponse]:
@@ -596,7 +596,7 @@ async def list_mcp_servers(
         responses = []
         for user_mcp, server in user_mcps:
             app_id, provider, connected_account = _enrich_oauth_server_info(
-                server, oauth_emails
+                db, server, oauth_emails
             )
             responses.append(
                 _db_server_to_response(
@@ -647,7 +647,7 @@ async def list_mcp_servers(
 
 
 @mcp_router.get("/servers/{server_id}", response_model=MCPServerResponse)
-async def get_mcp_server(
+def get_mcp_server(
     server_id: int,
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
@@ -681,7 +681,7 @@ async def get_mcp_server(
         }
 
         app_id, provider, connected_account = _enrich_oauth_server_info(
-            server, oauth_emails
+            db, server, oauth_emails
         )
 
         return _db_server_to_response(
@@ -701,7 +701,7 @@ async def get_mcp_server(
 @mcp_router.post(
     "/servers", response_model=MCPServerResponse, status_code=status.HTTP_201_CREATED
 )
-async def create_mcp_server(
+def create_mcp_server(
     server_data: MCPServerCreate,
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
@@ -764,7 +764,7 @@ async def create_mcp_server(
 
 
 @mcp_router.put("/servers/{server_id}", response_model=MCPServerResponse)
-async def update_mcp_server(
+def update_mcp_server(
     server_id: int,
     server_data: MCPServerUpdate,
     current_user: User = Depends(get_current_user),
@@ -851,7 +851,7 @@ async def update_mcp_server(
 
 
 @mcp_router.delete("/servers/{server_id}", status_code=status.HTTP_204_NO_CONTENT)
-async def delete_mcp_server(
+def delete_mcp_server(
     server_id: int,
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
@@ -879,13 +879,11 @@ async def delete_mcp_server(
 
         # If it's an OAuth server, also delete the corresponding OAuth tokens
         if server.transport == "oauth":
+            from ..mcp_apps import get_app_by_name
             from ..models.user_oauth import UserOAuth
 
             # Find the corresponding app_id and provider
-            app_info = next(
-                (app for app in MCP_APPS_LIBRARY if app.get("name") == server.name),
-                None,
-            )
+            app_info = get_app_by_name(db, str(server.name))
             if app_info:
                 provider = app_info.get("provider")
                 app_id = app_info.get("id")

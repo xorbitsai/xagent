@@ -10,6 +10,7 @@ from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
 
 from ..config import get_uploads_dir
+from .api.admin_mcp import admin_mcp_router
 from .api.admin_users import router as admin_users_router
 from .api.agents import router as agents_router
 from .api.auth import auth_router
@@ -159,6 +160,7 @@ app.include_router(custom_api_router)
 app.include_router(text2sql_router)
 app.include_router(tools_router)
 app.include_router(admin_users_router)
+app.include_router(admin_mcp_router)
 app.include_router(skills_router)
 app.include_router(system_router)
 app.include_router(templates_router)

@@ -45,6 +45,7 @@ const zh = {
     knowledgeBase: "知识库",
     knowledgeBaseDetail: "知识库详情",
     userManagement: "用户管理",
+    adminMcp: "公共 MCP",
     login: "登录",
     register: "注册",
     agentStore: "Agent Store",
@@ -2844,6 +2845,89 @@ Build when you need.`
       update_success: "Widget 配置已更新",
       update_failed: "Widget 配置更新失败",
       copied: "已复制到剪贴板"
+    }
+  },
+  adminMcp: {
+    pageTitle: "公共 MCP 配置",
+    pageDescription: "管理 OAuth 供应商和依赖它们的公共 MCP 应用。",
+    addProvider: "添加 OAuth 供应商",
+    addApp: "添加公共 MCP 应用",
+    adminRequired: "需要管理员权限",
+    providers: {
+      title: "OAuth 供应商",
+      description: "应用使用的身份来源",
+      add: "添加供应商",
+      edit: "编辑供应商",
+      new: "新供应商",
+      deleteConfirm: "确定要删除此供应商吗？",
+      deleteSuccess: "供应商已删除",
+      deleteFailed: "删除供应商失败",
+      saveSuccess: "供应商已保存",
+      saveFailed: "保存供应商失败",
+      noData: "未配置供应商",
+      linkedApps: "{count} 个关联应用",
+      linkedAppsPlural: "{count} 个关联应用",
+      form: {
+        selectLabel: "选择供应商",
+        selectPlaceholder: "选择供应商",
+        noOAuth: "不需要 OAuth (stdio/sse)",
+        orCreateNew: "或创建一个新的供应商配置",
+        addNew: "添加新供应商",
+        providerId: "供应商 ID (例如 google)",
+        displayName: "显示名称",
+        clientId: "客户端 ID (Client ID)",
+        clientSecret: "客户端密钥 (Client Secret)",
+        authUrl: "授权 URL (Auth URL)",
+        tokenUrl: "令牌 URL (Token URL)",
+        redirectUri: "重定向 URI (可选)",
+        redirectUriPlaceholder: "留空以使用环境变量默认值",
+        userinfoUrl: "用户信息 URL (可选)",
+        userIdPath: "用户 ID 路径 (例如 sub)",
+        emailPath: "邮箱路径 (Email Path)",
+        defaultScopes: "默认权限范围 (逗号分隔)"
+      }
+    },
+    apps: {
+      title: "公共 MCP 应用",
+      description: "工作区中注册的应用",
+      searchPlaceholder: "搜索应用...",
+      deleteConfirm: "确定要删除此应用吗？",
+      deleteSuccess: "应用已删除",
+      deleteFailed: "删除应用失败",
+      saveSuccess: "应用已保存",
+      saveFailed: "保存应用失败",
+      noData: "未配置应用",
+      columns: {
+        appId: "应用 ID",
+        provider: "供应商",
+        transport: "传输协议"
+      },
+      form: {
+        appId: "应用 ID (例如 gmail)",
+        displayName: "显示名称",
+        description: "描述",
+        iconUrl: "图标 URL",
+        category: "分类",
+        transport: "传输协议",
+        oauthScopes: "OAuth 权限范围 (逗号分隔)",
+        launchConfig: "启动配置 (JSON)",
+        invalidJson: "launch_config 中存在无效的 JSON"
+      }
+    },
+    modal: {
+      step1: "第一步：OAuth 供应商",
+      step1Desc: "选择一个现有的供应商或配置一个新的。",
+      step2: "第二步：MCP 应用详情",
+      step2Desc: "配置应用程序参数。",
+      step3: "第三步：测试与完成",
+      step3Desc: "应用创建成功。您现在可以测试它。",
+      next: "下一步",
+      back: "返回",
+      saveProvider: "保存供应商",
+      saveApp: "保存应用",
+      finish: "完成",
+      successTitle: "配置已保存！",
+      successDesc: "该 MCP 应用程序已添加到公共注册表中。用户现在可以从他们的工具菜单中看到并连接到这个应用。"
     }
   }
 } as const

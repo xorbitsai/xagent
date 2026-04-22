@@ -39,12 +39,15 @@ def encrypt_value(value: str) -> str:
 
 
 def decrypt_value(encrypted_value: str) -> str:
-    """Decrypt an encrypted string value."""
+    """Decrypt an encrypted string value. If it is not encrypted or invalid, return the original value."""
     if not encrypted_value:
         return encrypted_value
     try:
         cipher = get_cipher()
         return cipher.decrypt(encrypted_value.encode()).decode()
     except InvalidToken:
-        logger.error("Failed to decrypt value: Invalid token")
-        return ""
+        logger.debug("Failed to decrypt value: Invalid token (might be plain text)")
+        return encrypted_value
+    except Exception as e:
+        logger.debug(f"Failed to decrypt value: {e} (might be plain text)")
+        return encrypted_value

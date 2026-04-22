@@ -45,6 +45,7 @@ const en = {
     knowledgeBase: "Knowledge Base",
     knowledgeBaseDetail: "KB Detail",
     userManagement: "User Management",
+    adminMcp: "Public MCP Apps",
     login: "Login",
     register: "Register",
     agentStore: "Agent Store",
@@ -2844,6 +2845,89 @@ Build when you need.`
       update_success: "Widget configuration updated",
       update_failed: "Failed to update widget configuration",
       copied: "Copied to clipboard"
+    }
+  },
+  adminMcp: {
+    pageTitle: "Public MCP Configuration",
+    pageDescription: "Manage OAuth providers and the public MCP apps that depend on them.",
+    addProvider: "Add OAuth Provider",
+    addApp: "Add Public MCP App",
+    adminRequired: "Admin access required",
+    providers: {
+      title: "OAuth Providers",
+      description: "Identity sources used by your apps",
+      add: "Add Provider",
+      edit: "Edit Provider",
+      new: "New Provider",
+      deleteConfirm: "Are you sure you want to delete this provider?",
+      deleteSuccess: "Provider deleted",
+      deleteFailed: "Failed to delete provider",
+      saveSuccess: "Provider saved",
+      saveFailed: "Failed to save provider",
+      noData: "No providers configured",
+      linkedApps: "{count} linked app",
+      linkedAppsPlural: "{count} linked apps",
+      form: {
+        selectLabel: "Select Provider",
+        selectPlaceholder: "Select provider",
+        noOAuth: "No OAuth required (stdio/sse)",
+        orCreateNew: "Or create a new provider configuration",
+        addNew: "Add New Provider",
+        providerId: "Provider ID (e.g. google)",
+        displayName: "Display Name",
+        clientId: "Client ID",
+        clientSecret: "Client Secret",
+        authUrl: "Auth URL",
+        tokenUrl: "Token URL",
+        redirectUri: "Redirect URI (Optional)",
+        redirectUriPlaceholder: "Leave blank to use environment default",
+        userinfoUrl: "UserInfo URL (Optional)",
+        userIdPath: "User ID Path (e.g. sub)",
+        emailPath: "Email Path",
+        defaultScopes: "Default Scopes (comma separated)"
+      }
+    },
+    apps: {
+      title: "Public MCP Apps",
+      description: "Apps registered in your workspace",
+      searchPlaceholder: "Search apps...",
+      deleteConfirm: "Are you sure you want to delete this app?",
+      deleteSuccess: "App deleted",
+      deleteFailed: "Failed to delete app",
+      saveSuccess: "App saved",
+      saveFailed: "Failed to save app",
+      noData: "No apps configured",
+      columns: {
+        appId: "APP ID",
+        provider: "PROVIDER",
+        transport: "TRANSPORT"
+      },
+      form: {
+        appId: "App ID (e.g. gmail)",
+        displayName: "Display Name",
+        description: "Description",
+        iconUrl: "Icon URL",
+        category: "Category",
+        transport: "Transport",
+        oauthScopes: "OAuth Scopes (comma separated)",
+        launchConfig: "Launch Config (JSON)",
+        invalidJson: "Invalid JSON in launch_config"
+      }
+    },
+    modal: {
+      step1: "Step 1: OAuth Provider",
+      step1Desc: "Select an existing provider or configure a new one.",
+      step2: "Step 2: MCP App Details",
+      step2Desc: "Configure the application parameters.",
+      step3: "Step 3: Test & Finish",
+      step3Desc: "App created successfully. You can now test it.",
+      next: "Next Step",
+      back: "Back",
+      saveProvider: "Save Provider",
+      saveApp: "Save Application",
+      finish: "Finish",
+      successTitle: "Configuration Saved!",
+      successDesc: "The MCP application has been added to the public registry. Users can now see and connect to this app from their Tools menu."
     }
   }
 } as const

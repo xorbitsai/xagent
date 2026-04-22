@@ -46,6 +46,8 @@ def init_db(db_url: str | None = None) -> None:
     from . import (  # noqa: F401
         MCPServer,
         Model,
+        OAuthProvider,
+        PublicMCPApp,
         SystemSetting,
         Task,
         TaskChatMessage,

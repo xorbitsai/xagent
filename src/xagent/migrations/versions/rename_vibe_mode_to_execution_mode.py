@@ -52,7 +52,6 @@ def upgrade() -> None:
             SET execution_mode = CASE
                 WHEN vibe_mode = 'task' THEN 'balanced'
                 WHEN vibe_mode = 'process' THEN 'think'
-                WHEN vibe_mode IN ('flash', 'balanced', 'think') THEN vibe_mode  -- Already new values
                 ELSE 'balanced'  -- Default for NULL or unknown values
             END
         """)
@@ -93,7 +92,7 @@ def downgrade() -> None:
             SET vibe_mode = CASE
                 WHEN execution_mode = 'balanced' THEN 'task'
                 WHEN execution_mode = 'think' THEN 'process'
-                WHEN execution_mode = 'flash' THEN 'task'  # Flash mode didn't exist before, map to task
+                WHEN execution_mode = 'flash' THEN 'task'  -- Flash mode didn't exist before, map to task
                 ELSE 'task'  -- Default
             END
         """)

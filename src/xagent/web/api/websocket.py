@@ -35,6 +35,14 @@ from ..utils.db_timezone import safe_timestamp_to_unix
 
 logger = logging.getLogger(__name__)
 
+# Execution mode to pattern mapping
+# flash -> single_call, balanced -> react, think -> dag_plan_execute
+EXECUTION_MODE_TO_PATTERN = {
+    "flash": "single_call",
+    "balanced": "react",
+    "think": "dag_plan_execute",
+}
+
 
 def _resolve_task_llm_ids(
     task: Any, db: Session
@@ -1307,7 +1315,7 @@ async def handle_chat_message(
                                 .first()
                             )
                             if agent:
-                                is_dag = agent.execution_mode == "graph"
+                                is_dag = agent.execution_mode == "think"
 
                         (
                             model_id,
@@ -1543,7 +1551,7 @@ async def handle_chat_message(
                                 .first()
                             )
                             if agent:
-                                is_dag = agent.execution_mode == "graph"
+                                is_dag = agent.execution_mode == "think"
 
                         (
                             model_id,
@@ -1904,7 +1912,7 @@ async def send_historical_data_as_stream(
             if task.agent_id:
                 agent = db.query(Agent).filter(Agent.id == task.agent_id).first()
                 if agent:
-                    is_dag = agent.execution_mode == "graph"
+                    is_dag = agent.execution_mode == "think"
 
             (
                 model_id,
@@ -3134,12 +3142,7 @@ async def handle_build_preview_execution(
         # flash -> single_call (quick tasks)
         # balanced -> react (everyday tasks)
         # think -> dag_plan_execute (complex tasks)
-        execution_mode_to_pattern = {
-            "flash": "single_call",
-            "balanced": "react",
-            "think": "dag_plan_execute",
-        }
-        pattern = execution_mode_to_pattern.get(execution_mode, "react")
+        pattern = EXECUTION_MODE_TO_PATTERN.get(execution_mode, "react")
 
         # Build allowed external directories
         allowed_external_dirs = []

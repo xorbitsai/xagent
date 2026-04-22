@@ -281,10 +281,8 @@ class SingleCallPattern(AgentPattern):
                 "task_type": "SingleCall execution",
                 "attempt": 1,
                 "messages_count": len(messages),
-                "messages": messages,
                 "has_tools": bool(tool_schemas),
                 "tools_count": len(tool_schemas),
-                "tools": tool_schemas if tool_schemas else [],
                 "tool_choice": chat_kwargs.get("tool_choice", "auto"),
                 "step_name": "main",
                 "step_id": step_id,
@@ -297,7 +295,10 @@ class SingleCallPattern(AgentPattern):
             chat_kwargs["messages"] = cleaned_messages
 
             # Get LLM response
-            assert self.llm is not None  # For mypy type checking
+            if not self.llm:
+                raise PatternExecutionError(
+                    self.__class__.__name__, "SingleCall pattern requires an LLM"
+                )
             response = await self.llm.chat(**chat_kwargs)
 
             logger.info(f"SingleCall LLM response type: {type(response)}")
@@ -309,7 +310,14 @@ class SingleCallPattern(AgentPattern):
                     tool_call = tool_calls[0]
                     function_info = tool_call.get("function", {})
                     tool_name = function_info.get("name", "")
-                    tool_args = json.loads(function_info.get("arguments", "{}"))
+                    arguments_str = function_info.get("arguments", "{}")
+                    try:
+                        tool_args = json.loads(arguments_str)
+                    except json.JSONDecodeError as e:
+                        raise PatternExecutionError(
+                            self.__class__.__name__,
+                            f"Failed to parse tool arguments as JSON: {e}",
+                        ) from e
 
                     logger.info(
                         f"SingleCall executing tool: {tool_name} with args: {tool_args}"

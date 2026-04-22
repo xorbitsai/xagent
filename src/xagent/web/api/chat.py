@@ -36,6 +36,14 @@ from .ws_trace_handlers import WebSocketTraceHandler
 
 logger = logging.getLogger(__name__)
 
+# Execution mode to pattern mapping
+# flash -> single_call, balanced -> react, think -> dag_plan_execute
+EXECUTION_MODE_TO_PATTERN = {
+    "flash": "single_call",
+    "balanced": "react",
+    "think": "dag_plan_execute",
+}
+
 # Create router
 chat_router = APIRouter(prefix="/api/chat", tags=["chat"])
 
@@ -501,12 +509,6 @@ class AgentServiceManager:
             # Get LLM configuration from task database record
             logger.info(f"Loading LLM configuration for task {task_id} from database")
             agent_config = None  # Initialize agent_config to use later
-            # Map execution_mode to pattern: flash->single_call, balanced->react, think->dag_plan_execute
-            execution_mode_to_pattern = {
-                "flash": "single_call",
-                "balanced": "react",
-                "think": "dag_plan_execute",
-            }
             # Default to react pattern if not specified
             task_pattern = "react"  # Default pattern
             use_dag = True  # Default to DAG pattern (for backward compatibility)
@@ -544,7 +546,7 @@ class AgentServiceManager:
                     task_execution_mode = (
                         getattr(task, "execution_mode", None) or "balanced"
                     )
-                    task_pattern = execution_mode_to_pattern.get(
+                    task_pattern = EXECUTION_MODE_TO_PATTERN.get(
                         task_execution_mode, "react"
                     )
                     logger.info(
@@ -586,13 +588,8 @@ class AgentServiceManager:
                             agent_execution_mode = agent_config.get(
                                 "execution_mode", "balanced"
                             )
-                            execution_mode_to_pattern = {
-                                "flash": "single_call",
-                                "balanced": "react",
-                                "think": "dag_plan_execute",
-                            }
-                            task_pattern = execution_mode_to_pattern.get(
-                                agent_execution_mode, "balanced"
+                            task_pattern = EXECUTION_MODE_TO_PATTERN.get(
+                                agent_execution_mode, "react"
                             )
                             logger.info(
                                 f"Task {task_id} using Agent Builder execution mode: {agent.execution_mode} -> pattern={task_pattern}"

@@ -40,6 +40,7 @@ interface ChatInputProps {
     smallFastModel?: string;
     visualModel?: string;
     compactModel?: string;
+    executionMode?: "flash" | "balanced" | "think";
   };
   hideConfig?: boolean;
   readOnlyConfig?: boolean;
@@ -172,6 +173,7 @@ export function ChatInput({
     visualModel?: string;
     compactModel?: string;
     memorySimilarityThreshold?: number;
+    executionMode?: "flash" | "balanced" | "think";
   }>({ model: "", memorySimilarityThreshold: 1.5 });
   const [models, setModels] = useState<any[]>([]);
 
@@ -314,7 +316,8 @@ export function ChatInput({
         model: taskConfig.model || prev.model,
         smallFastModel: taskConfig.smallFastModel || prev.smallFastModel,
         visualModel: taskConfig.visualModel || prev.visualModel,
-        compactModel: taskConfig.compactModel || prev.compactModel
+        compactModel: taskConfig.compactModel || prev.compactModel,
+        executionMode: taskConfig.executionMode
       }));
     }
   }, [taskConfig]);
@@ -325,6 +328,7 @@ export function ChatInput({
     visualModel?: string;
     compactModel?: string;
     memorySimilarityThreshold?: number;
+    executionMode?: "flash" | "balanced" | "think";
   }) => {
     setAgentConfig(config);
   };
@@ -351,8 +355,8 @@ export function ChatInput({
       const trimmed = message.trim();
       const messageToSend = trimmed;
 
-      // Always send balanced mode config
-      const configToSend = { ...agentConfig, executionMode: { mode: "balanced" } };
+      // Use executionMode from taskConfig if provided, otherwise default to balanced
+      const configToSend = { ...agentConfig, executionMode: { mode: taskConfig?.executionMode || "balanced" } };
 
       await onSend(messageToSend, configToSend);
 

@@ -3460,21 +3460,6 @@ export function AppProvider({ children, token }: { children: React.ReactNode; to
         // The backend TaskCreateRequest expects JSON with 'files' as a list of filenames (strings)
         // Since we haven't uploaded files yet, we don't include them in the task creation request
 
-        // Map executionMode to backend pattern
-        // flash -> single_call, balanced -> react, think -> dag_plan_execute
-        const getPatternFromExecutionMode = (mode: string): string => {
-          switch (mode) {
-            case "flash":
-              return "single_call"
-            case "balanced":
-              return "react"
-            case "think":
-              return "dag_plan_execute"
-            default:
-              return "react"  // Default fallback
-          }
-        }
-
         const requestBody: any = {
           title: message,
           description: message,

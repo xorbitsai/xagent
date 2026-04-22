@@ -1,6 +1,8 @@
 """Tests for SingleCall pattern"""
 
+import ast
 import json
+import operator
 from typing import Any
 
 import pytest
@@ -12,6 +14,40 @@ from xagent.core.memory.base import MemoryResponse, MemoryStore
 from xagent.core.model.chat.basic.base import BaseLLM
 from xagent.core.model.chat.types import ChunkType, StreamChunk
 from xagent.core.tools.adapters.vibe import Tool, ToolMetadata
+
+# Safe calculator for testing (replaces eval())
+_SAFE_OPERATORS = {
+    ast.Add: operator.add,
+    ast.Sub: operator.sub,
+    ast.Mult: operator.mul,
+    ast.Div: operator.truediv,
+    ast.Mod: operator.mod,
+    ast.Pow: operator.pow,
+}
+
+
+def _safe_calculate(expression: str) -> float:
+    """Safely evaluate a simple arithmetic expression."""
+    try:
+        node = ast.parse(expression, mode="eval")
+
+        def _eval(node):
+            if isinstance(node, ast.Constant):
+                return node.value
+            elif isinstance(node, ast.BinOp):
+                left = _eval(node.left)
+                right = _eval(node.right)
+                op_type = type(node.op)
+                if op_type in _SAFE_OPERATORS:
+                    return _SAFE_OPERATORS[op_type](left, right)
+                else:
+                    raise ValueError(f"Unsupported operator: {op_type}")
+            else:
+                raise ValueError(f"Unsupported expression: {type(node)}")
+
+        return _eval(node.body)
+    except (ValueError, SyntaxError):
+        raise ValueError("Invalid expression")
 
 
 class MockSingleCallLLM(BaseLLM):
@@ -115,7 +151,7 @@ class MockCalculatorTool(Tool):
     async def run_json_async(self, args: dict[str, Any]) -> Any:
         expression = args.get("expression", "")
         try:
-            result = eval(expression)
+            result = _safe_calculate(expression)
             return {"result": result}
         except Exception:
             return {"error": "Invalid expression"}

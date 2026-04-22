@@ -38,7 +38,7 @@ class AgentCreateRequest(BaseModel):
     description: Optional[str] = Field(None, description="Agent description")
     instructions: Optional[str] = Field(None, description="System instructions/prompt")
     execution_mode: Optional[str] = Field(
-        "react", description="Execution mode: simple, react, or graph"
+        "balanced", description="Execution mode: flash, balanced, or think"
     )
     models: Optional[dict] = Field(
         None, description="Model config: {general, small_fast, visual, compact}"
@@ -65,7 +65,7 @@ class AgentUpdateRequest(BaseModel):
     description: Optional[str] = None
     instructions: Optional[str] = None
     execution_mode: Optional[str] = Field(
-        None, description="Execution mode: simple, react, or graph"
+        None, description="Execution mode: flash, balanced, or think"
     )
     models: Optional[dict] = None
     knowledge_bases: Optional[List[str]] = None
@@ -707,7 +707,7 @@ class AgentPreviewRequest(BaseModel):
 
     instructions: Optional[str] = Field(None, description="System instructions/prompt")
     execution_mode: Optional[str] = Field(
-        "react", description="Execution mode: simple, react, or graph"
+        "balanced", description="Execution mode: flash, balanced, or think"
     )
     models: Optional[dict] = Field(
         None, description="Model config: {general, small_fast, visual, compact}"
@@ -819,18 +819,20 @@ async def preview_agent(
             workspace_base_dir=str(get_uploads_dir() / "preview"),
         )
 
-        # Determine execution mode (default to "graph")
-        execution_mode = request.execution_mode or "graph"
+        # Determine execution mode (default to "think")
+        execution_mode = request.execution_mode or "think"
 
         # Map execution mode to use_dag_pattern
-        # simple: reserved (use react for now)
-        # react: ReAct pattern
-        # graph: DAG/Graph plan-execute pattern
-        if execution_mode == "graph":
+        # flash: SingleCall pattern (quick tasks)
+        # balanced: ReAct pattern (everyday tasks)
+        # think: DAG/Graph plan-execute pattern (complex tasks)
+        if execution_mode == "think":
             use_dag_pattern = True
-        elif execution_mode == "react":
+        elif execution_mode == "balanced":
             use_dag_pattern = False
-        else:  # simple mode - not implemented yet, fallback to react
+        elif execution_mode == "flash":
+            use_dag_pattern = False  # SingleCall doesn't use DAG
+        else:  # fallback to balanced (react)
             use_dag_pattern = False
 
         # Create agent service (no tracer - no database logging for preview)

@@ -19,6 +19,9 @@ from .trace import Tracer
 
 logger = logging.getLogger(__name__)
 
+# Sentinel value for distinguishing "not set" from False
+_UNSET = object()
+
 
 class AgentService:
     """Service for managing agent execution with proper configuration and error handling."""
@@ -30,7 +33,7 @@ class AgentService:
         memory: Optional[MemoryStore] = None,
         tools: Optional[List[Tool]] = None,
         llm: Optional[BaseLLM] = None,
-        use_dag_pattern: bool = True,  # Deprecated: Use pattern instead
+        use_dag_pattern: bool | object = _UNSET,  # Deprecated: Use pattern instead
         pattern: str
         | AgentPattern = "dag_plan_execute",  # New: "single_call", "react", "dag_plan_execute"
         tracer: Optional[Tracer] = None,
@@ -88,8 +91,15 @@ class AgentService:
         self.memory_similarity_threshold = memory_similarity_threshold
 
         # Handle backward compatibility: if use_dag_pattern is explicitly set, override pattern
-        if use_dag_pattern is not True:  # If explicitly set to False
-            pattern = "react"  # Map False to react pattern
+        if use_dag_pattern is _UNSET:
+            # Not set, use the pattern parameter as-is
+            pass
+        elif use_dag_pattern is True:
+            # Explicitly set to True, use dag_plan_execute
+            pattern = "dag_plan_execute"
+        else:
+            # Explicitly set to False (or any other value), use react
+            pattern = "react"
 
         self.pattern = pattern  # Store pattern for reference
         self.use_dag_pattern = use_dag_pattern  # Keep for backward compatibility

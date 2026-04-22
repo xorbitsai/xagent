@@ -446,7 +446,8 @@ function TaskDetailContent() {
                 model: state.currentTask.modelId || state.currentTask.modelName,
                 smallFastModel: state.currentTask.smallFastModelId,
                 visualModel: state.currentTask.visualModelId,
-                compactModel: state.currentTask.compactModelId
+                compactModel: state.currentTask.compactModelId,
+                executionMode: state.currentTask.executionMode
               } : undefined}
               readOnlyConfig={true}
             />

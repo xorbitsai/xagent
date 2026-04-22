@@ -3,7 +3,7 @@ import logging
 from abc import ABC, abstractmethod
 from typing import Any, Dict, List, Optional
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 
 from ...memory import MemoryStore
 from ...tools.adapters.vibe import Tool
@@ -76,8 +76,7 @@ class Action(BaseModel):
     # Allow additional fields for flexibility
     code: Optional[str] = Field(None, description="Code content for programming tasks")
 
-    class Config:
-        extra = "allow"  # Allow extra fields for flexibility
+    model_config = ConfigDict(extra="allow")  # Allow extra fields for flexibility
 
     @classmethod
     def get_decision_schema(cls) -> Dict[str, Any]:

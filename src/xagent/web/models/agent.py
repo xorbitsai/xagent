@@ -40,8 +40,8 @@ class Agent(Base):  # type: ignore
 
     # Configuration
     execution_mode = Column(
-        String(20), nullable=False, default="react"
-    )  # Execution mode: simple, react, graph
+        String(20), nullable=False, default="balanced"
+    )  # Execution mode: flash, balanced, think
     models = Column(
         JSON, nullable=True
     )  # Model config: {general: id, small_fast: id, visual: id, compact: id}

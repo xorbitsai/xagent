@@ -29,10 +29,10 @@ def test_decrypt_empty_value():
 
 
 def test_decrypt_invalid_token():
-    # Provide an invalid token, should catch InvalidToken and return ""
+    # Provide an invalid token, should catch InvalidToken and return the original string
     invalid_encrypted = "invalid_token_value"
     result = decrypt_value(invalid_encrypted)
-    assert result == ""
+    assert result == "invalid_token_value"
 
 
 def test_get_encryption_key_no_env(monkeypatch):

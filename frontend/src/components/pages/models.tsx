@@ -306,7 +306,7 @@ export function ModelsPage() {
     return groups
   }, [filteredModels])
 
-  const handleManageProvider = (_models: Model[], providerId: string) => {
+  const handleManageProvider = (providerId: string) => {
     setDialogState(prev => ({
       isOpen: true,
       viewMode: 'list',
@@ -502,7 +502,7 @@ export function ModelsPage() {
                         )}
                       </div>
 
-                      <Button variant="ghost" size="sm" onClick={() => handleManageProvider(providerModels, providerId)} className="h-8 px-2 text-muted-foreground hover:text-foreground">
+                      <Button variant="ghost" size="sm" onClick={() => handleManageProvider(providerId)} className="h-8 px-2 text-muted-foreground hover:text-foreground">
                         <Settings className="w-4 h-4 mr-2" />
                         {t('models.card.actions.manage')}
                       </Button>

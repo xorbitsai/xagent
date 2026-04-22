@@ -148,6 +148,8 @@ async def _validate_provider_model_listing(
 ) -> None:
     """Validate provider connectivity by fetching the provider model list."""
 
+    import asyncio
+
     from ..services.model_list_service import (
         PROVIDER_FETCHERS,
         fetch_models_from_provider,
@@ -159,7 +161,10 @@ async def _validate_provider_model_listing(
             f"Connection test is not supported for provider '{provider}' in this category yet"
         )
 
-    models = await fetch_models_from_provider(provider, api_key or "", base_url)
+    models = await asyncio.wait_for(
+        fetch_models_from_provider(provider, api_key or "", base_url),
+        timeout=10.0,
+    )
     provider_model = _find_provider_model(models, model_name)
     if provider_model is None:
         raise ValueError(f"Model '{model_name}' was not found in provider '{provider}'")
@@ -225,7 +230,7 @@ async def create_model(
             model_name=model.model_name,
             model_provider=model.model_provider,
             base_url=base_url,
-            api_key=model.api_key,
+            api_key=model.api_key or "",
             default_temperature=model.temperature,
             timeout=180.0,
             abilities=model.abilities,
@@ -237,7 +242,7 @@ async def create_model(
             model_name=model.model_name,
             model_provider=model.model_provider,
             base_url=base_url,
-            api_key=model.api_key,
+            api_key=model.api_key or "",
             timeout=180.0,
             abilities=model.abilities,
             description=model.description,
@@ -249,7 +254,7 @@ async def create_model(
             model_name=model.model_name,
             model_provider=model.model_provider,
             base_url=base_url,
-            api_key=model.api_key,
+            api_key=model.api_key or "",
             default_temperature=model.temperature,
             timeout=180.0,
             abilities=model.abilities,
@@ -263,7 +268,7 @@ async def create_model(
             model_name=model.model_name,
             model_provider=model.model_provider,
             base_url=base_url,
-            api_key=model.api_key,
+            api_key=model.api_key or "",
             timeout=180.0,
             abilities=model.abilities,
             description=model.description,
@@ -650,7 +655,8 @@ async def update_model(
     # Update model configuration in-place
     update_data = model_update.model_dump(exclude_unset=True)
     for field, value in update_data.items():
-        # Don't update api_key with empty string
+        # Don't update api_key with empty string unless explicitly needed, but allow setting to empty if intended
+        # We will keep the previous behavior: skip empty strings for api_key updates to prevent accidental wiping.
         if field == "api_key" and value == "":
             continue
         # Skip share_with_users as it's handled separately
@@ -717,13 +723,24 @@ async def test_model_connection(
     from xagent.core.model.xinference_base import BaseXinferenceModel
 
     start_time = time.time()
+    timeout_seconds = 10.0
     try:
+        from xagent.core.model.providers import default_base_url_for_provider
+
+        base_url = request.base_url or default_base_url_for_provider(
+            request.model_provider
+        )
+
         if request.category == "llm":
             # For some reasoning models (like o1, o3, claude reasoning variants), temperature might be deprecated
             # and max_tokens might be replaced by max_completion_tokens. We use a more minimal test strategy here.
+            model_name_lower = request.model_name.lower()
             is_reasoning_model = (
-                request.model_name.lower().startswith(("o1", "o3"))
-                or "-o1" in request.model_name.lower()
+                model_name_lower.startswith(("o1", "o3"))
+                or "-o1" in model_name_lower
+                or "-o3" in model_name_lower
+                or "thinking" in model_name_lower
+                or "reasoner" in model_name_lower
             )
 
             config_kwargs: dict[str, Any] = {
@@ -731,7 +748,7 @@ async def test_model_connection(
                 "model_provider": request.model_provider,
                 "model_name": request.model_name,
                 "api_key": request.api_key,
-                "base_url": request.base_url,
+                "base_url": base_url,
             }
 
             # Add temperature only if it's not a known reasoning model that rejects it
@@ -742,8 +759,6 @@ async def test_model_connection(
             llm = create_base_llm(config)
 
             # Test chat connection with minimal tokens
-            # We use 10 tokens instead of 1, as some models (like Gemini) might return empty string
-            # if stopped after just 1 token, causing our internal validation to throw "LLM returned empty content"
             chat_kwargs: dict[str, Any] = {"max_tokens": 1}
 
             # Claude models and OpenAI o1/o3 handle max_tokens differently or deprecate temperature
@@ -752,7 +767,7 @@ async def test_model_connection(
 
             await asyncio.wait_for(
                 llm.chat([{"role": "user", "content": "Hello"}], **chat_kwargs),
-                timeout=10.0,
+                timeout=timeout_seconds,
             )
 
         elif request.category == "embedding":
@@ -761,12 +776,15 @@ async def test_model_connection(
                 model_provider=request.model_provider,
                 model_name=request.model_name,
                 api_key=request.api_key,
-                base_url=request.base_url,
+                base_url=base_url,
                 dimension=request.dimension or 1536,
                 abilities=request.abilities or ["embedding"],
             )
             embedding_model = create_embedding_adapter(embedding_config)
-            embedding_model.encode("hello")
+            await asyncio.wait_for(
+                asyncio.to_thread(embedding_model.encode, "hello"),
+                timeout=timeout_seconds,
+            )
 
         elif request.category == "image":
             image_config = ImageModelConfig(
@@ -774,7 +792,7 @@ async def test_model_connection(
                 model_provider=request.model_provider,
                 model_name=request.model_name,
                 api_key=request.api_key,
-                base_url=request.base_url,
+                base_url=base_url,
                 abilities=request.abilities or ["generate"],
             )
             create_image_model(image_config)
@@ -783,10 +801,10 @@ async def test_model_connection(
                     provider=request.model_provider,
                     model_name=request.model_name,
                     api_key=request.api_key,
-                    base_url=request.base_url,
+                    base_url=base_url,
                     requested_abilities=request.abilities,
                 ),
-                timeout=30.0,
+                timeout=timeout_seconds,
             )
 
         elif request.category == "speech":
@@ -801,20 +819,22 @@ async def test_model_connection(
                     provider=request.model_provider,
                     model_name=request.model_name,
                     api_key=request.api_key,
-                    base_url=request.base_url,
+                    base_url=base_url,
                     requested_abilities=requested_abilities,
                 ),
-                timeout=30.0,
+                timeout=timeout_seconds,
             )
 
             probe_model = BaseXinferenceModel(
                 model=request.model_name,
                 model_uid=request.model_name,
-                base_url=request.base_url,
+                base_url=base_url,
                 api_key=request.api_key or None,
             )
             try:
-                await asyncio.wait_for(probe_model._ensure_model_handle(), timeout=30.0)
+                await asyncio.wait_for(
+                    probe_model._ensure_model_handle(), timeout=timeout_seconds
+                )
             finally:
                 await probe_model.aclose()
 
@@ -838,7 +858,7 @@ async def test_model_connection(
             status="failed",
             response_time=response_time,
             message="Connection timed out",
-            error="Connection timed out after 30 seconds. Please check your network connection and provider status.",
+            error=f"Connection timed out after {int(timeout_seconds)} seconds. Please check your network connection and provider status.",
         )
     except Exception as e:
         logger.error(f"Model connection test failed: {e}")

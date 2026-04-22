@@ -128,6 +128,7 @@ _SUPPORTED_PROVIDER_METADATA: tuple[dict[str, Any], ...] = (
         "name": "MiniMax Coding Plan (International)",
         "description": "MiniMax coding plan via api.minimax.io",
         "requires_base_url": False,
+        "compatibility": "claude_compatible",
         "default_base_url": "https://api.minimax.io/anthropic",
     },
     {
@@ -135,6 +136,7 @@ _SUPPORTED_PROVIDER_METADATA: tuple[dict[str, Any], ...] = (
         "name": "MiniMax Coding Plan (China)",
         "description": "MiniMax coding plan via api.minimaxi.com",
         "requires_base_url": False,
+        "compatibility": "claude_compatible",
         "default_base_url": "https://api.minimaxi.com/anthropic",
     },
     {

@@ -2,6 +2,7 @@ import os
 
 from ....model import ChatModelConfig, ModelConfig
 from ....retry import create_retry_wrapper
+from ...providers import provider_compatibility_for_provider
 from ..error import retry_on
 from .azure_openai import AzureOpenAILLM
 from .base import BaseLLM
@@ -19,7 +20,9 @@ def create_base_llm(model: ModelConfig) -> BaseLLM:
     if not isinstance(model, ChatModelConfig):
         raise TypeError(f"Invalid model type: {type(model).__name__}")
 
-    if model.model_provider in ("openai", "dashscope"):
+    compatibility = provider_compatibility_for_provider(model.model_provider)
+
+    if model.model_provider == "openai" or compatibility == "openai_compatible":
         llm: BaseLLM = OpenAILLM(
             model_name=model.model_name,
             api_key=model.api_key,
@@ -29,26 +32,7 @@ def create_base_llm(model: ModelConfig) -> BaseLLM:
             timeout=model.timeout,
             abilities=model.abilities,
         )
-    elif model.model_provider in (
-        "alibaba-coding-plan",
-        "alibaba-coding-plan-cn",
-        "zai-coding-plan",
-        "zhipuai-coding-plan",
-    ):
-        llm = OpenAILLM(
-            model_name=model.model_name,
-            api_key=model.api_key,
-            base_url=model.base_url,
-            default_temperature=model.default_temperature,
-            default_max_tokens=model.default_max_tokens,
-            timeout=model.timeout,
-            abilities=model.abilities,
-        )
-    elif model.model_provider in (
-        "minimax-coding-plan",
-        "minimax-cn-coding-plan",
-        "kimi-for-coding",
-    ):
+    elif model.model_provider == "claude" or compatibility == "claude_compatible":
         llm = ClaudeLLM(
             model_name=model.model_name,
             api_key=model.api_key,
@@ -81,16 +65,6 @@ def create_base_llm(model: ModelConfig) -> BaseLLM:
         )
     elif model.model_provider == "gemini":
         llm = GeminiLLM(
-            model_name=model.model_name,
-            api_key=model.api_key,
-            base_url=model.base_url,
-            default_temperature=model.default_temperature,
-            default_max_tokens=model.default_max_tokens,
-            timeout=model.timeout,
-            abilities=model.abilities,
-        )
-    elif model.model_provider == "claude":
-        llm = ClaudeLLM(
             model_name=model.model_name,
             api_key=model.api_key,
             base_url=model.base_url,

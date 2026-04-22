@@ -68,7 +68,7 @@ export function ModelManagementDialog({
 
   const [viewMode, setViewMode] = useState<'list' | 'connect' | 'form'>(initialViewMode)
   const [editingModel, setEditingModel] = useState<Model | null>(initialEditingModel || null)
-  const [managingProviderId] = useState<string | null>(initialProviderId || null)
+  const managingProviderId = initialProviderId || null
   const [loading, setLoading] = useState(false)
 
   const [connectStep, setConnectStep] = useState<1 | 2 | 3 | 4>(initialProviderId && initialViewMode === 'connect' ? 2 : 1)
@@ -82,6 +82,7 @@ export function ModelManagementDialog({
 
   const [modelToDelete, setModelToDelete] = useState<string | null>(null)
   const [isDeletingModel, setIsDeletingModel] = useState(false)
+  const [hasInitializedDefaults, setHasInitializedDefaults] = useState(false)
 
   const getDefaultAbilitiesForCategory = (category: string): string[] => {
     if (category === 'llm') return ['chat']
@@ -771,15 +772,19 @@ export function ModelManagementDialog({
                             }
 
                             // Initialize default logic based on whether they have one
-                            const targetType = formData.category === 'llm' ? 'general' : formData.category === 'embedding' ? 'embedding' : formData.category === 'image' ? 'image' : formData.category === 'speech' ? 'asr' : null;
-                            if (targetType) {
-                              const hasDefault = (defaultModels as any)[targetType];
-                              if (!hasDefault) {
-                                setFormData(prev => ({
-                                  ...prev,
-                                  default_config_types: Array.from(new Set([...(prev.default_config_types || []), targetType]))
-                                }))
+                            // only do this once per session so we don't overwrite if they remove it
+                            if (!hasInitializedDefaults) {
+                              const targetType = formData.category === 'llm' ? 'general' : formData.category === 'embedding' ? 'embedding' : formData.category === 'image' ? 'image' : formData.category === 'speech' ? 'asr' : null;
+                              if (targetType) {
+                                const hasDefault = (defaultModels as any)[targetType];
+                                if (!hasDefault) {
+                                  setFormData(prev => ({
+                                    ...prev,
+                                    default_config_types: Array.from(new Set([...(prev.default_config_types || []), targetType]))
+                                  }))
+                                }
                               }
+                              setHasInitializedDefaults(true)
                             }
 
                             setConnectStep(4)

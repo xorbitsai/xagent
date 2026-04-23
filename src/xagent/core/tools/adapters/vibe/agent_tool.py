@@ -35,8 +35,8 @@ class CreateAgentToolArgs(BaseModel):
         description="List of skill names to allow. If None, all skills are available",
     )
     execution_mode: Optional[str] = Field(
-        default="react",
-        description="Execution mode for the agent: 'react' (fast, simple reasoning, default) or 'graph' (complex planning and execution).",
+        default="balanced",
+        description="Execution mode for the agent: 'flash', 'balanced' (default), or 'think'.",
     )
 
 
@@ -84,7 +84,7 @@ class UpdateAgentToolArgs(BaseModel):
     )
     execution_mode: Optional[str] = Field(
         default=None,
-        description="New execution mode for the agent: 'react' (fast, simple reasoning) or 'graph' (complex planning and execution).",
+        description="New execution mode for the agent: 'flash', 'balanced', or 'think'.",
     )
 
 
@@ -121,7 +121,7 @@ class AgentInfo(BaseModel):
     status: str = Field(description="Agent status: draft, published, or archived")
     tool_name: str = Field(description="Tool name to call this agent")
     markdown_link: str = Field(description="Markdown link to the agent")
-    execution_mode: str = Field(description="Execution mode: react or graph")
+    execution_mode: str = Field(description="Execution mode: flash, balanced, or think")
     knowledge_bases: Optional[list[str]] = Field(
         default=None, description="Associated knowledge bases"
     )
@@ -153,7 +153,9 @@ class AgentToolResult(BaseModel):
 
 
 class ListAvailableSkillsArgs(BaseModel):
-    pass
+    query: Optional[str] = Field(
+        default=None, description="Optional search query to filter skills"
+    )
 
 
 class ListAvailableSkillsResult(BaseModel):
@@ -207,7 +209,9 @@ class ListAvailableSkillsTool(AbstractBaseTool):
 
 
 class ListToolCategoriesArgs(BaseModel):
-    pass
+    query: Optional[str] = Field(
+        default=None, description="Optional search query to filter categories"
+    )
 
 
 class ListToolCategoriesResult(BaseModel):
@@ -328,7 +332,7 @@ class CreateAgentTool(AbstractBaseTool):
             f"- skills (optional): Available skills: {skills_list}\n"
             f"  Example: ['presentation-generator', 'poster-design']\n"
             "- instructions: System prompt/instructions defining the agent's behavior and expertise\n"
-            "- execution_mode (optional): 'react' (fast, simple reasoning, default) or 'graph' (complex planning and execution)\n\n"
+            "- execution_mode (optional): 'flash', 'balanced' (default), or 'think'\n\n"
             "Returns:\n"
             "- agent_id: Database ID of the created agent\n"
             "- agent_name: Name of the agent\n"
@@ -457,9 +461,9 @@ class CreateAgentTool(AbstractBaseTool):
                             admin_default.model_id
                         )
 
-            execution_mode = args.get("execution_mode", "react")
-            if execution_mode not in ["react", "graph"]:
-                execution_mode = "react"
+            execution_mode = args.get("execution_mode", "balanced")
+            if execution_mode not in ["flash", "balanced", "think"]:
+                execution_mode = "balanced"
 
             # Create the agent in DRAFT status
             agent = Agent(
@@ -598,7 +602,7 @@ class UpdateAgentTool(AbstractBaseTool):
             f"- skills (optional): Available skills: {skills_list}\n"
             f"  Example: ['presentation-generator', 'poster-design']\n"
             "- instructions (optional): New system prompt/instructions defining the agent's behavior\n"
-            "- execution_mode (optional): 'react' (fast, simple reasoning) or 'graph' (complex planning and execution)\n\n"
+            "- execution_mode (optional): 'flash', 'balanced', or 'think'\n\n"
             "Returns:\n"
             "- agent_id: Database ID of the updated agent\n"
             "- agent_name: Name of the agent\n"
@@ -739,7 +743,7 @@ class UpdateAgentTool(AbstractBaseTool):
 
             # Update execution_mode if provided
             new_execution_mode = args.get("execution_mode")
-            if new_execution_mode in ["react", "graph"]:
+            if new_execution_mode in ["flash", "balanced", "think"]:
                 agent.execution_mode = new_execution_mode
                 changes.append(f"execution_mode → {new_execution_mode}")
 
@@ -858,7 +862,7 @@ class ListAgentsTool(AbstractBaseTool):
             "  - status: draft, published, or archived\n"
             "  - tool_name: Tool name to call this agent\n"
             "  - markdown_link: Markdown link [Agent Name](agent://id)\n"
-            "  - execution_mode: react or graph\n"
+            "  - execution_mode: flash, balanced, or think\n"
             "  - tool_categories: Allowed tool categories\n"
             "  - skills: Allowed skills\n"
             "- total_count: Total number of agents\n"

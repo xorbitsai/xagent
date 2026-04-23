@@ -9,6 +9,7 @@ import { MarkdownRenderer } from "@/components/ui/markdown-renderer";
 import { Button } from "@/components/ui/button";
 import { normalizeTimestampMs } from "@/lib/time-utils";
 import { FileChip } from "./FileChip";
+import { ClarificationForm } from "./clarification-form";
 
 interface ToolArgs {
   code?: string;
@@ -67,9 +68,11 @@ export interface ChatMessageProps {
   isVirtual?: boolean;
   taskStatus?: string;
   timestamp?: number | string;
+  interactions?: any[];
+  onSendInteraction?: (message: string, files?: File[], metadata?: any) => Promise<void> | void;
 }
 
-function GeneratingIndicator({latestTitle, taskStatus, errorMessage}: {latestTitle?: string, taskStatus?: string, errorMessage?: string}) {
+function GeneratingIndicator({ latestTitle, taskStatus, errorMessage }: { latestTitle?: string, taskStatus?: string, errorMessage?: string }) {
   const { t } = useI18n();
 
   if (taskStatus === 'failed' && errorMessage) {
@@ -230,15 +233,15 @@ function ExpandableMessage({ content }: { content: string }) {
       )}
       {isOverflowing && isExpanded && (
         <div className="mt-3 flex justify-center">
-           <Button
-              variant="outline"
-              size="sm"
-              className="h-7 px-3 rounded-full shadow-sm bg-background hover:bg-accent text-xs text-foreground border"
-              onClick={() => setIsExpanded(false)}
-            >
-              <ChevronUp className="w-3.5 h-3.5 mr-1" />
-              {t("common.collapse")}
-            </Button>
+          <Button
+            variant="outline"
+            size="sm"
+            className="h-7 px-3 rounded-full shadow-sm bg-background hover:bg-accent text-xs text-foreground border"
+            onClick={() => setIsExpanded(false)}
+          >
+            <ChevronUp className="w-3.5 h-3.5 mr-1" />
+            {t("common.collapse")}
+          </Button>
         </div>
       )}
     </div>
@@ -253,6 +256,8 @@ export function ChatMessage({
   showProcessView,
   taskStatus,
   timestamp,
+  interactions,
+  onSendInteraction,
 }: ChatMessageProps) {
   const { t } = useI18n();
   const { openFilePreview } = useApp();
@@ -280,12 +285,12 @@ export function ChatMessage({
 
   const formattedTime = timestamp
     ? new Date(normalizeTimestampMs(timestamp)).toLocaleString([], {
-        month: 'numeric',
-        day: 'numeric',
-        hour: '2-digit',
-        minute: '2-digit',
-        second: '2-digit'
-      })
+      month: 'numeric',
+      day: 'numeric',
+      hour: '2-digit',
+      minute: '2-digit',
+      second: '2-digit'
+    })
     : "";
 
   const shouldShowProcess =
@@ -312,8 +317,8 @@ export function ChatMessage({
     for (let i = traceEvents.length - 1; i >= 0; i--) {
       const event = traceEvents[i];
       if (['trace_error', 'task_failed', 'react_task_failed', 'dag_step_failed', 'agent_error'].includes(event.event_type || '')) {
-         errorMessage = (event.data?.error as string) || (event.data?.message as string) || "";
-         if (errorMessage) break;
+        errorMessage = (event.data?.error as string) || (event.data?.message as string) || "";
+        if (errorMessage) break;
       }
     }
   }
@@ -370,6 +375,11 @@ export function ChatMessage({
               )
             ) : (
               !isUser && <GeneratingIndicator latestTitle={latestTitle} taskStatus={taskStatus} errorMessage={errorMessage} />
+            )}
+            {!isUser && interactions && interactions.length > 0 && (
+              <div className="mt-4 border-t pt-4">
+                <ClarificationForm interactions={interactions} onSend={onSendInteraction} />
+              </div>
             )}
           </div>
         </div>

@@ -11,22 +11,33 @@ import { useApp } from "@/contexts/app-context-chat"
 import { useI18n } from "@/contexts/i18n-context"
 import { toast } from "sonner"
 import { Collapsible, CollapsibleContent, CollapsibleTrigger } from "@/components/ui/collapsible"
-import { ChevronDown, ChevronRight, MessageSquare, Upload, File as FileIcon, X } from "lucide-react"
+import { ChevronDown, ChevronRight, MessageSquare, Upload, File as FileIcon, X, Globe } from "lucide-react"
 
 interface ClarificationFormProps {
   message?: string
   interactions: Interaction[]
   messageId?: string
+  onSend?: (message: string, files?: File[], metadata?: any) => Promise<void> | void
 }
 
-export function ClarificationForm({ interactions, messageId }: ClarificationFormProps) {
-  const { state, sendMessage } = useApp()
+export function ClarificationForm({ interactions, messageId, onSend }: ClarificationFormProps) {
+  // If onSend is provided, use it (e.g., from builder chat), otherwise use useApp
+  let state, sendMessage: any;
+  try {
+    const appCtx = useApp();
+    state = appCtx.state;
+    sendMessage = appCtx.sendMessage;
+  } catch (e) {
+    // We might not be in the app context (e.g., agent builder chat)
+    state = { currentTask: { status: "completed" } };
+  }
+
   const { t } = useI18n()
   const [formState, setFormState] = useState<Record<string, any>>({})
   const [isSubmitting, setIsSubmitting] = useState(false)
   const [isOpen, setIsOpen] = useState(true)
 
-  const isTaskRunning = state.currentTask?.status === "running"
+  const isTaskRunning = state?.currentTask?.status === "running"
 
   const handleInputChange = (field: string, value: any) => {
     setFormState((prev) => ({ ...prev, [field]: value }))
@@ -34,16 +45,17 @@ export function ClarificationForm({ interactions, messageId }: ClarificationForm
 
   const handleSubmit = async () => {
     // Construct the message
-    const lines = interactions.map(interaction => {
+    const metadata: any = {}
+    const lines = interactions.flatMap(interaction => {
       const value = formState[interaction.field]
 
       // Skip empty values unless it's a boolean (confirm) which might be false
       if (value === undefined || value === null || (typeof value === "string" && value.trim() === "") || (Array.isArray(value) && value.length === 0)) {
-          // If it's a confirm type, default to false if undefined? Or maybe it's required?
-          if (interaction.type === "confirm" && value === undefined) {
-              return { field: interaction.field, label: interaction.label || interaction.field, value: t("chatPage.clarification.no"), isFile: false }
-          }
-          return null
+        // If it's a confirm type, default to false if undefined? Or maybe it's required?
+        if (interaction.type === "confirm" && value === undefined) {
+          return [{ field: interaction.field, label: interaction.label || interaction.field, value: t("chatPage.clarification.no"), isFile: false }]
+        }
+        return []
       }
 
       let displayValue = value
@@ -52,21 +64,37 @@ export function ClarificationForm({ interactions, messageId }: ClarificationForm
       if (interaction.type === "select_multiple" && Array.isArray(value)) {
         const labels = value.map(v => interaction.options?.find(o => o.value === v)?.label || v)
         displayValue = labels.join(", ")
-      } else if (interaction.type === "select_one") {
-         const label = interaction.options?.find(o => o.value === value)?.label || value
-         displayValue = label
+      } else if (interaction.type === "select_one" || interaction.type === "action_cards") {
+        const label = interaction.options?.find(o => o.value === value)?.label || value
+        displayValue = label
       } else if (interaction.type === "confirm") {
         displayValue = value ? t("chatPage.clarification.yes") : t("chatPage.clarification.no")
       } else if (interaction.type === "file_upload") {
-         isFile = true
+        isFile = true
       }
 
-      return { field: interaction.field, label: interaction.label || interaction.field, value: isFile ? value : displayValue, isFile }
+      const results = [{ field: interaction.field, label: interaction.label || interaction.field, value: isFile ? value : displayValue, isFile }]
+
+      // For action_cards, if files were uploaded alongside it, add them too
+      if (interaction.type === "action_cards") {
+        const fileValue = formState[`${interaction.field}_files`]
+        if (fileValue && ((fileValue instanceof FileList && fileValue.length > 0) || (Array.isArray(fileValue) && fileValue.length > 0))) {
+          results.push({ field: `${interaction.field}_files`, label: t("chatPage.clarification.uploadedFiles"), value: fileValue, isFile: true })
+        }
+
+        const urlValue = formState[`${interaction.field}_url`]
+        if (urlValue && typeof urlValue === "string" && urlValue.trim() !== "") {
+          results.push({ field: `${interaction.field}_url`, label: t("chatPage.clarification.websiteUrl") || "Website URL", value: urlValue, isFile: false })
+          metadata.url = urlValue
+        }
+      }
+
+      return results
     }).filter(Boolean) as any[]
 
     if (lines.length === 0) {
-        toast.error(t("chatPage.clarification.required"))
-        return
+      toast.error(t("chatPage.clarification.required"))
+      return
     }
 
     // Separate files and text
@@ -77,30 +105,35 @@ export function ClarificationForm({ interactions, messageId }: ClarificationForm
     const files: File[] = []
 
     fileParts.forEach(part => {
-        if (part.value instanceof FileList) {
-            for (let i = 0; i < part.value.length; i++) {
-                files.push(part.value[i])
-            }
-        } else if (Array.isArray(part.value)) {
-             // Assuming array of Files
-             part.value.forEach((f: any) => {
-                 if (f instanceof File) files.push(f)
-             })
+      if (part.value instanceof FileList) {
+        for (let i = 0; i < part.value.length; i++) {
+          files.push(part.value[i])
         }
+      } else if (Array.isArray(part.value)) {
+        // Assuming array of Files
+        part.value.forEach((f: any) => {
+          if (f instanceof File) files.push(f)
+        })
+      }
     })
 
     try {
-        setIsSubmitting(true)
-        // If textMessage is empty but we have files, send a generic message?
-        const finalMessage = textMessage || (files.length > 0 ? t("chatPage.clarification.uploadedFiles") : t("chatPage.clarification.confirmed"))
+      setIsSubmitting(true)
+      // If textMessage is empty but we have files, send a generic message?
+      const finalMessage = textMessage || (files.length > 0 ? t("chatPage.clarification.uploadedFiles") : t("chatPage.clarification.confirmed"))
 
-        await sendMessage(finalMessage, { force: true }, files)
-        setIsOpen(false) // Collapse after submission
+      if (onSend) {
+        await onSend(finalMessage, files, metadata);
+      } else if (sendMessage) {
+        await sendMessage(finalMessage, { force: true, metadata }, files)
+      }
+
+      setIsOpen(false) // Collapse after submission
     } catch (error) {
-        console.error("Failed to send clarification response", error)
-        toast.error(t("chatPage.clarification.sendError"))
+      console.error("Failed to send clarification response", error)
+      toast.error(t("chatPage.clarification.sendError"))
     } finally {
-        setIsSubmitting(false)
+      setIsSubmitting(false)
     }
   }
 
@@ -232,6 +265,57 @@ export function ClarificationForm({ interactions, messageId }: ClarificationForm
               onCheckedChange={(checked) => handleInputChange(interaction.field, checked)}
             />
             <Label htmlFor={interaction.field}>{t("chatPage.clarification.yes")}</Label>
+          </div>
+        )
+
+      case "action_cards":
+        const isUploadSelected = typeof value === 'string' && (value.toLowerCase().includes('upload') || value.toLowerCase().includes('file'));
+        const isWebsiteSelected = typeof value === 'string' && (value.toLowerCase().includes('website') || value.toLowerCase().includes('url') || value.toLowerCase().includes('import'));
+
+        return (
+          <div className="flex flex-col gap-4 w-full">
+            <div className="grid w-full grid-cols-1 sm:grid-cols-2 gap-4">
+              {interaction.options?.map((opt) => (
+                <div
+                  key={opt.value}
+                  className={`flex flex-col items-center justify-center gap-2 rounded-lg border p-6 cursor-pointer transition-all ${value === opt.value ? 'border-primary bg-primary/5 shadow-sm ring-1 ring-primary' : 'bg-card hover:bg-muted/50 hover:border-muted-foreground/30'
+                    }`}
+                  onClick={() => handleInputChange(interaction.field, opt.value)}
+                >
+                  <div className="flex h-10 w-10 items-center justify-center rounded-full bg-primary/10">
+                    {opt.value.toLowerCase().includes('upload') || opt.value.toLowerCase().includes('file') ? (
+                      <Upload className="h-5 w-5 text-primary" />
+                    ) : opt.value.toLowerCase().includes('no') || opt.value.toLowerCase().includes('skip') ? (
+                      <X className="h-5 w-5 text-primary" />
+                    ) : (
+                      <Globe className="h-5 w-5 text-primary" />
+                    )}
+                  </div>
+                  <div className="flex flex-col items-center text-center gap-1">
+                    <span className="font-medium text-sm text-foreground">{opt.label}</span>
+                    {opt.description && <span className="text-xs text-muted-foreground">{opt.description}</span>}
+                  </div>
+                </div>
+              ))}
+            </div>
+            {isUploadSelected && (
+              <div className="mt-2 w-full animate-in fade-in slide-in-from-top-4">
+                <div className="text-sm font-medium mb-2">{t("chatPage.fileUpload.hintDragClick")}</div>
+                {renderField({ ...interaction, type: "file_upload", field: `${interaction.field}_files` })}
+              </div>
+            )}
+            {isWebsiteSelected && (
+              <div className="mt-2 w-full animate-in fade-in slide-in-from-top-4">
+                <div className="text-sm font-medium mb-2">Enter website URL</div>
+                {renderField({
+                  ...interaction,
+                  type: "text_input",
+                  field: `${interaction.field}_url`,
+                  placeholder: "https://...",
+                  default: interaction.default_value
+                })}
+              </div>
+            )}
           </div>
         )
 

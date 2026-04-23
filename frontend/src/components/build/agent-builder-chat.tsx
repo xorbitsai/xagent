@@ -5,14 +5,20 @@ import { ChatInput } from "@/components/chat/ChatInput"
 import { ScrollArea } from "@/components/ui/scroll-area"
 import { useAuth } from "@/contexts/auth-context"
 import { getApiUrl } from "@/lib/utils"
+import { apiRequest } from "@/lib/api-wrapper"
 import { useI18n } from "@/contexts/i18n-context"
 import { toast } from "sonner"
 
+import { Interaction } from "@/contexts/app-context-chat"
+
+import { FileAttachment } from "@/components/file/file-attachment"
+
 interface Message {
   role: "user" | "assistant" | "system"
-  content: string
+  content: string | React.ReactNode
   traceEvents?: any[]
   timestamp?: number
+  interactions?: Interaction[]
 }
 
 export interface AgentConfig {
@@ -87,10 +93,23 @@ export function AgentBuilderChat({ agentConfig, onUpdateConfig, availableOptions
     }
   }, [messages])
 
-  const handleSendMessage = useCallback((text: string) => {
-    if (!text.trim() || isLoading) return
+  const handleSendMessage = useCallback(async (text: string, files?: File[], metadata?: any) => {
+    if ((!text.trim() && (!files || files.length === 0)) || isLoading) return
 
-    const newMessages: Message[] = [...messages, { role: "user", content: text, timestamp: Date.now() }]
+    let displayMessage: string | React.ReactNode = text || t("chatPage.clarification.uploadedFiles")
+    if (files && files.length > 0) {
+      displayMessage = (
+        <div className="space-y-2">
+          <div className="whitespace-pre-wrap max-h-60 overflow-y-auto">{text || t("chatPage.clarification.uploadedFiles")}</div>
+          <FileAttachment
+            files={files.map(f => ({ name: f.name, type: f.type, size: f.size, path: '' }))}
+            variant="user-message"
+          />
+        </div>
+      )
+    }
+
+    const newMessages: Message[] = [...messages, { role: "user", content: displayMessage, timestamp: Date.now() }]
     setMessages(newMessages)
     setIsLoading(true)
 
@@ -98,6 +117,42 @@ export function AgentBuilderChat({ agentConfig, onUpdateConfig, availableOptions
     setMessages(prev => [...prev, { role: "assistant", content: "", traceEvents: [], timestamp: Date.now() }])
 
     let currentReply = ""
+    let finalMessage = text;
+
+    if (files && files.length > 0) {
+      try {
+        // Create a more meaningful name from the first file, falling back to a generic name
+        let baseName = files[0].name.split('.')[0].replace(/[^a-zA-Z0-9_-]/g, '_');
+        if (!baseName || baseName.length < 2) baseName = 'documents';
+        const collectionName = `${baseName}_${Math.floor(Date.now() / 1000)}`;
+
+        for (const file of files) {
+          const formData = new FormData();
+          formData.append('file', file);
+          formData.append('collection', collectionName);
+
+          const response = await apiRequest(`${getApiUrl()}/api/kb/ingest`, {
+            method: 'POST',
+            body: formData,
+          });
+          if (!response.ok) {
+            throw new Error(`Upload failed: ${response.statusText}`);
+          }
+        }
+
+        finalMessage += `\n\n[System Note: The user has uploaded ${files.length} file(s). I have automatically created a knowledge base named "${collectionName}" with these files. You MUST NOT use list_knowledge_bases to check it, just ASSUME it exists. If the agent does not exist yet (no agent ID), use create_agent to build it and include "${collectionName}" in the knowledge_bases list. If it exists, use update_agent.]`;
+      } catch (err) {
+        console.error("Failed to upload files to KB", err);
+        toast.error("Failed to upload files to create knowledge base");
+        setIsLoading(false);
+        setMessages(prev => prev.slice(0, -1)); // Remove the empty assistant message
+        return;
+      }
+    } else if (metadata?.url) {
+      // Extract the URL from the structured metadata instead of matching raw text
+      const url = metadata.url;
+      finalMessage += `\n\n[System Note: The user has provided the website URL: ${url}. Please IMMEDIATELY use the \`create_knowledge_base_from_url\` tool to ingest it, then create/update the agent with the new knowledge base. Do not ask for the URL again.]`;
+    }
 
     const sendPayload = (ws: WebSocket) => {
       // Add selected MCP servers back into tool_categories
@@ -108,7 +163,7 @@ export function AgentBuilderChat({ agentConfig, onUpdateConfig, availableOptions
 
       const { modelConfig, selectedToolCategories, ...restConfig } = agentConfig
       ws.send(JSON.stringify({
-        message: text,
+        message: finalMessage,
         ...restConfig,
         tool_categories: finalToolCategories,
         models: modelConfig || {}
@@ -154,11 +209,40 @@ export function AgentBuilderChat({ agentConfig, onUpdateConfig, availableOptions
                 } else {
                   currentReply = data.data.content || ""
 
-                  const displayReply = currentReply.replace(/```json[\s\S]*?(```|$)/gi, "").trim()
+                  let displayReply = currentReply.replace(/```json[\s\S]*?(```|$)/gi, "").trim()
+                  let interactions = undefined;
+
+                  // Check if currentReply is directly a JSON object
+                  try {
+                    const parsed = JSON.parse(currentReply);
+                    if (parsed.type === 'chat' && parsed.chat?.interactions) {
+                      displayReply = parsed.chat.message || "";
+                      interactions = parsed.chat.interactions;
+                    }
+                  } catch (e) {
+                    // Check if there is a JSON block for clarification form
+                    const jsonMatch = currentReply.match(/```json\s*([\s\S]*?)\s*```/);
+                    if (jsonMatch) {
+                      try {
+                        const parsed = JSON.parse(jsonMatch[1]);
+                        if (parsed.type === 'chat' && parsed.chat?.interactions) {
+                          interactions = parsed.chat.interactions;
+                          if (parsed.chat.message && !displayReply) {
+                            displayReply = parsed.chat.message;
+                          }
+                        }
+                      } catch (e) {
+                        // ignore parse errors
+                      }
+                    }
+                  }
 
                   setMessages(prev => {
                     const updated = [...prev]
                     updated[updated.length - 1].content = displayReply
+                    if (interactions) {
+                      updated[updated.length - 1].interactions = interactions;
+                    }
                     return updated
                   })
                 }
@@ -216,10 +300,40 @@ export function AgentBuilderChat({ agentConfig, onUpdateConfig, availableOptions
               // We handle it in tool_execution_end.
 
               const finalContent = data.result || currentReply;
-              const cleanReply = finalContent.replace(/```json[\s\S]*?(```|$)/gi, "").trim()
+              let cleanReply = finalContent.replace(/```json[\s\S]*?(```|$)/gi, "").trim()
+              let interactions = undefined;
+
+              // Check if finalContent is directly a JSON object
+              try {
+                const parsed = JSON.parse(finalContent);
+                if (parsed.type === 'chat' && parsed.chat?.interactions) {
+                  cleanReply = parsed.chat.message || "";
+                  interactions = parsed.chat.interactions;
+                }
+              } catch (e) {
+                // If it's not direct JSON, check for markdown JSON blocks
+                const jsonMatch = finalContent.match(/```json\s*([\s\S]*?)\s*```/);
+                if (jsonMatch) {
+                  try {
+                    const parsed = JSON.parse(jsonMatch[1]);
+                    if (parsed.type === 'chat' && parsed.chat?.interactions) {
+                      interactions = parsed.chat.interactions;
+                      if (parsed.chat.message && !cleanReply) {
+                        cleanReply = parsed.chat.message;
+                      }
+                    }
+                  } catch (e) {
+                    // ignore parse errors
+                  }
+                }
+              }
+
               setMessages(prev => {
                 const updated = [...prev]
                 updated[updated.length - 1].content = cleanReply || t("builds.configForm.chat.defaultReply") || "I have updated the configuration based on your request."
+                if (interactions) {
+                  updated[updated.length - 1].interactions = interactions;
+                }
                 return updated
               })
 
@@ -289,6 +403,8 @@ export function AgentBuilderChat({ agentConfig, onUpdateConfig, availableOptions
               traceEvents={msg.traceEvents}
               showProcessView={true}
               timestamp={msg.timestamp}
+              interactions={msg.interactions}
+              onSendInteraction={(text, files, meta) => handleSendMessage(text, files, meta)}
             />
           ))}
         </div>

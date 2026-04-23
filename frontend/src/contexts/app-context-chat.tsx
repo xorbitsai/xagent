@@ -20,15 +20,16 @@ interface WebSocketMessage {
   event_id?: string
 }
 export interface Interaction {
-  type: "select_one" | "select_multiple" | "text_input" | "file_upload" | "confirm" | "number_input";
+  type: "select_one" | "select_multiple" | "text_input" | "file_upload" | "confirm" | "number_input" | "action_cards";
   field: string;
   label: string;
-  options?: Array<{ label: string; value: string }>;
+  options?: Array<{ label: string; value: string; description?: string; action_type?: string }>;
   placeholder?: string;
   multiline?: boolean;
   min?: number;
   max?: number;
   default?: any;
+  default_value?: string | number | boolean | null;
   accept?: string[] | string;
   multiple?: boolean;
 }
@@ -68,7 +69,7 @@ let startDelayedPlayback = () => {
 
 // Expose to window for global access
 if (typeof window !== 'undefined') {
-  ;(window as any).clearDuplicateMessageCache = clearDuplicateMessageCache
+  ; (window as any).clearDuplicateMessageCache = clearDuplicateMessageCache
 }
 // Flag to track if we're loading historical data
 let isHistoricalDataLoading = false
@@ -131,7 +132,7 @@ const normalizeInteractions = (value: unknown): Interaction[] => {
       const type = item.type
       const field = item.field
       if (
-        !["select_one", "select_multiple", "text_input", "file_upload", "confirm", "number_input"].includes(type) ||
+        !["select_one", "select_multiple", "text_input", "file_upload", "confirm", "number_input", "action_cards"].includes(type) ||
         typeof field !== "string" ||
         !field.trim()
       ) {
@@ -150,6 +151,7 @@ const normalizeInteractions = (value: unknown): Interaction[] => {
           .map((opt: any) => ({
             value: opt.value,
             label: typeof opt.label === "string" ? opt.label : opt.value,
+            description: typeof opt.description === "string" ? opt.description : undefined,
           }))
       }
 
@@ -451,13 +453,13 @@ function appReducer(state: AppState, action: AppAction): AppState {
     case "UPDATE_TASK_STATUS":
       return state.currentTask
         ? {
-            ...state,
-            currentTask: {
-              ...state.currentTask,
-              status: action.payload.status,
-              updatedAt: new Date().toISOString(),
-            },
-          }
+          ...state,
+          currentTask: {
+            ...state.currentTask,
+            status: action.payload.status,
+            updatedAt: new Date().toISOString(),
+          },
+        }
         : state
 
     case "SET_DAG_EXECUTION":
@@ -470,9 +472,9 @@ function appReducer(state: AppState, action: AppAction): AppState {
         // Update existing step - merge data intelligently to preserve existing information
         const existingStep = state.steps[existingStepIndex]
         const shouldUpdate = newStep.name !== existingStep.name ||
-                           newStep.description !== existingStep.description ||
-                           !arraysEqual(newStep.tool_names || [], existingStep.tool_names || []) ||
-                           newStep.status !== existingStep.status
+          newStep.description !== existingStep.description ||
+          !arraysEqual(newStep.tool_names || [], existingStep.tool_names || []) ||
+          newStep.status !== existingStep.status
 
         if (shouldUpdate) {
           const mergedStep = {
@@ -871,12 +873,12 @@ export function AppProvider({ children, token }: { children: React.ReactNode; to
   // Handle auto-execute pending task separately
   useEffect(() => {
     if (isConnected && pendingTaskToExecute) {
-       // Logic moved to effect
-       // But wait, pendingTaskToExecute is not state, it's a let variable.
-       // Effect won't run when it changes.
-       // But it runs when isConnected changes.
+      // Logic moved to effect
+      // But wait, pendingTaskToExecute is not state, it's a let variable.
+      // Effect won't run when it changes.
+      // But it runs when isConnected changes.
 
-       const timer = setTimeout(() => {
+      const timer = setTimeout(() => {
         if (pendingTaskToExecute) {
           const hasUserMessages = stateRef.current.messages.some(m => m.role === 'user')
           if (!hasUserMessages) {
@@ -884,8 +886,8 @@ export function AppProvider({ children, token }: { children: React.ReactNode; to
             pendingTaskToExecute = null
           }
         }
-       }, 1000)
-       return () => clearTimeout(timer)
+      }, 1000)
+      return () => clearTimeout(timer)
     }
   }, [isConnected, sendChatMessage])
 
@@ -916,7 +918,7 @@ export function AppProvider({ children, token }: { children: React.ReactNode; to
 
       // If this is historical_data_complete, start the delayed playback
       const isHistoricalComplete = message.type === "historical_data_complete" ||
-          (message.type === "trace_event" && (message as any).event_type === "historical_data_complete")
+        (message.type === "trace_event" && (message as any).event_type === "historical_data_complete")
 
       if (isHistoricalComplete) {
         // Add a small delay to ensure all events are collected before starting playback
@@ -979,7 +981,7 @@ export function AppProvider({ children, token }: { children: React.ReactNode; to
 
             // Check if status changed and trigger update if so
             if (currentState.currentTask?.id === taskData.id.toString() && currentState.currentTask?.status !== taskData.status) {
-               dispatch({ type: "TRIGGER_TASK_UPDATE" })
+              dispatch({ type: "TRIGGER_TASK_UPDATE" })
             }
 
             dispatch({
@@ -1198,11 +1200,11 @@ export function AppProvider({ children, token }: { children: React.ReactNode; to
                       <div className="grid grid-cols-2 gap-2 text-xs">
                         <div className="flex items-center gap-1 p-2 bg-muted/30 rounded">
                           <Search className="h-3 w-3" />
-                              <span>{t('agent.planDetails.memory.stats.found', { count: state.planMemoryInfo.memoriesFound })}</span>
+                          <span>{t('agent.planDetails.memory.stats.found', { count: state.planMemoryInfo.memoriesFound })}</span>
                         </div>
                         <div className="flex items-center gap-1 p-2 bg-muted/30 rounded">
                           <Target className="h-3 w-3" />
-                              <span>{t('agent.planDetails.memory.stats.used', { count: state.planMemoryInfo.memoriesUsed })}</span>
+                          <span>{t('agent.planDetails.memory.stats.used', { count: state.planMemoryInfo.memoriesUsed })}</span>
                         </div>
                       </div>
                       {state.planMemoryInfo.enhancedGoal && (
@@ -1655,7 +1657,7 @@ export function AppProvider({ children, token }: { children: React.ReactNode; to
                 }
               })
             }
-          // Task-level LLM Call End Events
+            // Task-level LLM Call End Events
           } else if (eventType === "task_end_llm") {
             const modelName = eventData.model_name || "LLM"
             const taskType = eventData.task_type || "LLM Call"
@@ -1873,11 +1875,11 @@ export function AppProvider({ children, token }: { children: React.ReactNode; to
                   id: generateMessageId("msg-tool-start"),
                   role: "assistant",
                   content: (
-                  <>
-                    <Wrench className="h-4 w-4 inline mr-2 text-orange-500" />
-                    {t('agent.logs.event.actions.tool_execution_start')}: {toolName}
-                  </>
-                ),
+                    <>
+                      <Wrench className="h-4 w-4 inline mr-2 text-orange-500" />
+                      {t('agent.logs.event.actions.tool_execution_start')}: {toolName}
+                    </>
+                  ),
                   timestamp: message.timestamp,
                   status: "completed",
                 }
@@ -1908,11 +1910,11 @@ export function AppProvider({ children, token }: { children: React.ReactNode; to
                   id: generateMessageId("msg-tool-end"),
                   role: "assistant",
                   content: (
-                  <>
-                    <CheckCircle className="h-4 w-4 inline mr-2 text-green-500" />
-                    {t('agent.logs.event.actions.tool_execution_end')}: {toolName}
-                  </>
-                ),
+                    <>
+                      <CheckCircle className="h-4 w-4 inline mr-2 text-green-500" />
+                      {t('agent.logs.event.actions.tool_execution_end')}: {toolName}
+                    </>
+                  ),
                   timestamp: message.timestamp,
                   status: "completed",
                 }
@@ -1943,11 +1945,11 @@ export function AppProvider({ children, token }: { children: React.ReactNode; to
                   id: generateMessageId("msg-tool-failed"),
                   role: "assistant",
                   content: (
-                  <>
-                    <XCircle className="h-4 w-4 inline mr-2 text-red-500" />
-                    {t('agent.logs.event.actions.tool_execution_failed')}: {toolName}
-                  </>
-                ),
+                    <>
+                      <XCircle className="h-4 w-4 inline mr-2 text-red-500" />
+                      {t('agent.logs.event.actions.tool_execution_failed')}: {toolName}
+                    </>
+                  ),
                   timestamp: message.timestamp,
                   status: "failed",
                 }
@@ -2410,97 +2412,97 @@ export function AppProvider({ children, token }: { children: React.ReactNode; to
             }
             dispatch({ type: "ADD_TRACE_EVENT", payload: traceEvent })
           } else if (eventType === "react_task_end" || eventType === "task_end_react") {
-             const traceEvent: TraceEvent = {
-                event_id: generateMessageId("react-task-end"),
-                event_type: eventType,
-                step_id: eventData.step_id,
-                timestamp: message.timestamp,
-                data: {
-                  action: t('agent.logs.event.actions.reactTaskEnd') || 'Task Completed',
-                  message: t('agent.logs.event.messages.reactTaskEnd') || 'ReAct Task Completed',
-                  ...eventData
-                }
+            const traceEvent: TraceEvent = {
+              event_id: generateMessageId("react-task-end"),
+              event_type: eventType,
+              step_id: eventData.step_id,
+              timestamp: message.timestamp,
+              data: {
+                action: t('agent.logs.event.actions.reactTaskEnd') || 'Task Completed',
+                message: t('agent.logs.event.messages.reactTaskEnd') || 'ReAct Task Completed',
+                ...eventData
               }
-              dispatch({ type: "ADD_TRACE_EVENT", payload: traceEvent })
+            }
+            dispatch({ type: "ADD_TRACE_EVENT", payload: traceEvent })
           } else if (eventType === "react_task_failed" || eventType === "task_failed_react") {
-             const traceEvent: TraceEvent = {
-                event_id: generateMessageId("react-task-failed"),
-                event_type: eventType,
-                step_id: eventData.step_id,
-                timestamp: message.timestamp,
-                data: {
-                  action: t('agent.logs.event.actions.reactTaskFailed') || 'Task Failed',
-                  message: t('agent.logs.event.messages.reactTaskFailed') || 'ReAct Task Failed',
-                  error: eventData.error || eventData.message,
-                  ...eventData
-                }
+            const traceEvent: TraceEvent = {
+              event_id: generateMessageId("react-task-failed"),
+              event_type: eventType,
+              step_id: eventData.step_id,
+              timestamp: message.timestamp,
+              data: {
+                action: t('agent.logs.event.actions.reactTaskFailed') || 'Task Failed',
+                message: t('agent.logs.event.messages.reactTaskFailed') || 'ReAct Task Failed',
+                error: eventData.error || eventData.message,
+                ...eventData
               }
-              dispatch({ type: "ADD_TRACE_EVENT", payload: traceEvent })
+            }
+            dispatch({ type: "ADD_TRACE_EVENT", payload: traceEvent })
           } else if (eventType === "react_action_start") {
-             const stepId = message.step_id || traceEventData.step_id
-             const traceEvent: TraceEvent = {
-                event_id: generateMessageId("react-action-start"),
-                event_type: eventType,
-                step_id: stepId,
-                timestamp: message.timestamp,
-                data: {
-                  action: t('agent.logs.event.actions.react_action_start') || 'Action Start',
-                  ...eventData
-                }
+            const stepId = message.step_id || traceEventData.step_id
+            const traceEvent: TraceEvent = {
+              event_id: generateMessageId("react-action-start"),
+              event_type: eventType,
+              step_id: stepId,
+              timestamp: message.timestamp,
+              data: {
+                action: t('agent.logs.event.actions.react_action_start') || 'Action Start',
+                ...eventData
               }
-              dispatch({ type: "ADD_TRACE_EVENT", payload: traceEvent })
+            }
+            dispatch({ type: "ADD_TRACE_EVENT", payload: traceEvent })
           } else if (eventType === "llm_call_start") {
-             const stepId = message.step_id || traceEventData.step_id
-             const traceEvent: TraceEvent = {
-                event_id: generateMessageId("llm-call-start"),
-                event_type: eventType,
-                step_id: stepId,
-                timestamp: message.timestamp,
-                data: {
-                  action: t('agent.logs.event.actions.llmCallStart') || 'LLM Call Start',
-                  ...eventData
-                }
+            const stepId = message.step_id || traceEventData.step_id
+            const traceEvent: TraceEvent = {
+              event_id: generateMessageId("llm-call-start"),
+              event_type: eventType,
+              step_id: stepId,
+              timestamp: message.timestamp,
+              data: {
+                action: t('agent.logs.event.actions.llmCallStart') || 'LLM Call Start',
+                ...eventData
               }
-              dispatch({ type: "ADD_TRACE_EVENT", payload: traceEvent })
+            }
+            dispatch({ type: "ADD_TRACE_EVENT", payload: traceEvent })
           } else if (eventType === "llm_call_end") {
-             const stepId = message.step_id || traceEventData.step_id
-             const traceEvent: TraceEvent = {
-                event_id: generateMessageId("llm-call-end"),
-                event_type: eventType,
-                step_id: stepId,
-                timestamp: message.timestamp,
-                data: {
-                  action: t('agent.logs.event.actions.llmCallEnd') || 'LLM Call End',
-                  ...eventData
-                }
+            const stepId = message.step_id || traceEventData.step_id
+            const traceEvent: TraceEvent = {
+              event_id: generateMessageId("llm-call-end"),
+              event_type: eventType,
+              step_id: stepId,
+              timestamp: message.timestamp,
+              data: {
+                action: t('agent.logs.event.actions.llmCallEnd') || 'LLM Call End',
+                ...eventData
               }
-              dispatch({ type: "ADD_TRACE_EVENT", payload: traceEvent })
+            }
+            dispatch({ type: "ADD_TRACE_EVENT", payload: traceEvent })
           } else if (eventType === "llm_call_failed") {
-             const stepId = message.step_id || traceEventData.step_id
-             const traceEvent: TraceEvent = {
-                event_id: generateMessageId("llm-call-failed"),
-                event_type: eventType,
-                step_id: stepId,
-                timestamp: message.timestamp,
-                data: {
-                  action: t('agent.logs.event.actions.llmCallFailed') || 'LLM Call Failed',
-                  ...eventData
-                }
+            const stepId = message.step_id || traceEventData.step_id
+            const traceEvent: TraceEvent = {
+              event_id: generateMessageId("llm-call-failed"),
+              event_type: eventType,
+              step_id: stepId,
+              timestamp: message.timestamp,
+              data: {
+                action: t('agent.logs.event.actions.llmCallFailed') || 'LLM Call Failed',
+                ...eventData
               }
-              dispatch({ type: "ADD_TRACE_EVENT", payload: traceEvent })
+            }
+            dispatch({ type: "ADD_TRACE_EVENT", payload: traceEvent })
           } else if (eventType === "react_action_end") {
-             const stepId = message.step_id || traceEventData.step_id
-             const traceEvent: TraceEvent = {
-                event_id: generateMessageId("react-action-end"),
-                event_type: eventType,
-                step_id: stepId,
-                timestamp: message.timestamp,
-                data: {
-                  action: t('agent.logs.event.actions.react_action_end') || 'Action End',
-                  ...eventData
-                }
+            const stepId = message.step_id || traceEventData.step_id
+            const traceEvent: TraceEvent = {
+              event_id: generateMessageId("react-action-end"),
+              event_type: eventType,
+              step_id: stepId,
+              timestamp: message.timestamp,
+              data: {
+                action: t('agent.logs.event.actions.react_action_end') || 'Action End',
+                ...eventData
               }
-              dispatch({ type: "ADD_TRACE_EVENT", payload: traceEvent })
+            }
+            dispatch({ type: "ADD_TRACE_EVENT", payload: traceEvent })
           } else if (eventType === "task_completion") {
             // Trace task completion event
             const traceEvent: TraceEvent = {
@@ -2600,29 +2602,29 @@ export function AppProvider({ children, token }: { children: React.ReactNode; to
           }
           // Skill Selection Events
           else if (eventType === "skill_select_start") {
-             const traceEvent: TraceEvent = {
-                event_id: generateMessageId("skill-select-start"),
-                event_type: eventType,
-                step_id: eventData.step_id,
-                timestamp: message.timestamp,
-                data: {
-                  action: t('agent.logs.event.actions.skill_select_start'),
-                  ...eventData
-                }
+            const traceEvent: TraceEvent = {
+              event_id: generateMessageId("skill-select-start"),
+              event_type: eventType,
+              step_id: eventData.step_id,
+              timestamp: message.timestamp,
+              data: {
+                action: t('agent.logs.event.actions.skill_select_start'),
+                ...eventData
               }
-              dispatch({ type: "ADD_TRACE_EVENT", payload: traceEvent })
+            }
+            dispatch({ type: "ADD_TRACE_EVENT", payload: traceEvent })
           } else if (eventType === "skill_select_end") {
-             const traceEvent: TraceEvent = {
-                event_id: generateMessageId("skill-select-end"),
-                event_type: eventType,
-                step_id: eventData.step_id,
-                timestamp: message.timestamp,
-                data: {
-                  action: t('agent.logs.event.actions.skill_select_end'),
-                  ...eventData
-                }
+            const traceEvent: TraceEvent = {
+              event_id: generateMessageId("skill-select-end"),
+              event_type: eventType,
+              step_id: eventData.step_id,
+              timestamp: message.timestamp,
+              data: {
+                action: t('agent.logs.event.actions.skill_select_end'),
+                ...eventData
               }
-              dispatch({ type: "ADD_TRACE_EVENT", payload: traceEvent })
+            }
+            dispatch({ type: "ADD_TRACE_EVENT", payload: traceEvent })
           }
           // Memory Events - Determine display location based on step_id
           else if (eventType === "task_start_memory_generate") {
@@ -3117,17 +3119,17 @@ export function AppProvider({ children, token }: { children: React.ReactNode; to
                   id: generateMessageId("msg-plan-start"),
                   role: "assistant",
                   content: (
-                  <>
-                    <FileText className="h-4 w-4 inline mr-2" />
-                    {t('agent.logs.event.messages.planStart', { phase })}
-                    <br />
-                    <Target className="h-4 w-4 inline mr-2 mt-1 text-red-500" />
-                    {t('agent.logs.event.messages.goalTitle')}: {goal}
-                    <br />
-                    <Activity className="h-4 w-4 inline mr-2 mt-1 text-blue-500" />
-                    {t('agent.logs.event.messages.stepsCount', { count: stepsCount })}
-                  </>
-                ),
+                    <>
+                      <FileText className="h-4 w-4 inline mr-2" />
+                      {t('agent.logs.event.messages.planStart', { phase })}
+                      <br />
+                      <Target className="h-4 w-4 inline mr-2 mt-1 text-red-500" />
+                      {t('agent.logs.event.messages.goalTitle')}: {goal}
+                      <br />
+                      <Activity className="h-4 w-4 inline mr-2 mt-1 text-blue-500" />
+                      {t('agent.logs.event.messages.stepsCount', { count: stepsCount })}
+                    </>
+                  ),
                   timestamp: message.timestamp,
                   status: "completed",
                 }
@@ -3141,13 +3143,13 @@ export function AppProvider({ children, token }: { children: React.ReactNode; to
                     id: generateMessageId(`msg-plan-step-${index}`),
                     role: "assistant",
                     content: (
-                  <>
-                    <Target className="h-4 w-4 inline mr-2 text-red-500" />
-                    {t('agent.logs.event.messages.execStepPrefix')}{index + 1}: {step.name || step.id}
-                    <br />
-                    <span className="ml-6">{step.description || ''}</span>
-                  </>
-                ),
+                      <>
+                        <Target className="h-4 w-4 inline mr-2 text-red-500" />
+                        {t('agent.logs.event.messages.execStepPrefix')}{index + 1}: {step.name || step.id}
+                        <br />
+                        <span className="ml-6">{step.description || ''}</span>
+                      </>
+                    ),
                     timestamp: message.timestamp,
                     status: "completed",
                   }
@@ -3161,11 +3163,11 @@ export function AppProvider({ children, token }: { children: React.ReactNode; to
                   id: generateMessageId("msg-plan-start"),
                   role: "assistant",
                   content: (
-                  <>
-                    <FileText className="h-4 w-4 inline mr-2" />
-                    {t('agent.logs.event.messages.planStart', { phase })}
-                  </>
-                ),
+                    <>
+                      <FileText className="h-4 w-4 inline mr-2" />
+                      {t('agent.logs.event.messages.planStart', { phase })}
+                    </>
+                  ),
                   timestamp: message.timestamp,
                   status: "completed",
                 }
@@ -3231,8 +3233,8 @@ export function AppProvider({ children, token }: { children: React.ReactNode; to
           const fileContent = (
             <>
               <FileText className="h-4 w-4 inline mr-2 text-green-500" />
-                    {t('agent.logs.event.messages.fileOutputsGenerated', { count: fileCount })}:
-                    <div className="mt-2 space-y-1">
+              {t('agent.logs.event.messages.fileOutputsGenerated', { count: fileCount })}:
+              <div className="mt-2 space-y-1">
                 {taskData.file_outputs.map((file: string | any, index: number) => {
                   let fileName, filePath
                   if (typeof file === 'object' && file !== null) {

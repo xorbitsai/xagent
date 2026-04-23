@@ -2555,13 +2555,10 @@ async def handle_builder_chat(
             "description": message_data.get("description", ""),
             "instructions": message_data.get("instructions", ""),
             "model": message_data.get("models", {}).get("general"),
-        }
-        # Build available_options back
-        available_options = {
-            "models": message_data.get("models", {}),
-            "knowledgeBases": message_data.get("knowledge_bases", []),
-            "skills": message_data.get("skills", []),
-            "toolCategories": message_data.get("tool_categories", []),
+            "tool_categories": message_data.get("tool_categories", []),
+            "skills": message_data.get("selectedSkills", []),
+            "knowledge_bases": message_data.get("selectedKbs", []),
+            "execution_mode": message_data.get("executionMode", "balanced"),
         }
 
         # Build system prompt with context
@@ -2571,12 +2568,6 @@ Your job is to help users create and configure custom AI agents.
 Current Agent Configuration:
 {current_config}
 
-Available Options for advanced configurations:
-- Models: {available_options.get("models", [])}
-- Knowledge Bases: {available_options.get("knowledgeBases", [])}
-- Skills: {available_options.get("skills", [])}
-- Tool Categories: {available_options.get("toolCategories", [])}
-
 When the user describes what they want to build, use the create_agent or update_agent tool to help them.
 The agent will be updated immediately and can be used right away.
 
@@ -2585,6 +2576,12 @@ Important instructions:
 2. The description should explain WHEN to use this agent (e.g., "Use this agent for data analysis tasks involving CSV files")
 3. Include appropriate tool_categories and skills based on the user's requirements
 4. After creating or updating an agent, present it to the user in a clear format with the markdown link
+5. When updating an agent, if you need to modify tools, skills, or knowledge bases, you MUST provide the FULL updated list in your tool call (combining the existing ones from Current Agent Configuration with any new ones the user requested). If you do not include the existing ones, they will be removed!
+6. If the user asks to build an agent that requires a knowledge base (e.g., answering questions from a specific website, document, or domain), ALWAYS check if a relevant knowledge base exists using `list_knowledge_bases`.
+   - If a relevant knowledge base DOES NOT exist, you MUST determine if the user has ALREADY provided a specific URL (e.g., www.example.com).
+   - If the user HAS provided a URL: Do NOT ask the user again! Instead, immediately use the `create_knowledge_base_from_url` tool to import the website, and then proceed to create or update the agent with the new knowledge base.
+   - If the user HAS NOT provided a URL or file: You MUST STOP and ask the user for clarification using the `ask_user_question` tool. Use the "action_cards" interaction type ONLY for high-level actions like "Import Website" and "Upload File". If you know the user's intended website URL but it hasn't been crawled yet, you MUST pass that URL into the "default_value" field of the interaction. For selecting from a list of existing items (like existing knowledge bases), you MUST use the "select_one" interaction type instead.
+   - Do NOT proceed to create or update the agent until the knowledge base is ready.
 
 You have access to the following tools:
 - create_agent: Create a new agent with specific capabilities
@@ -2592,8 +2589,10 @@ You have access to the following tools:
 - list_available_skills: Query the list of skills you can assign to an agent
 - list_tool_categories: Query the list of tool categories you can assign to an agent
 - list_knowledge_bases: Query the list of knowledge bases you can associate with an agent
+- ask_user_question: Ask the user a question with a clarification form when you need their input or decision (e.g., about creating a knowledge base)
+- create_knowledge_base_from_url: Create a knowledge base by crawling a given website URL (use this automatically if the user provided a URL)
 
-Use the create_agent tool whenever the user wants to build a new agent and there is no agent ID in the current configuration.
+Use the create_agent tool whenever the user wants to build a new agent and there is no agent ID in the current configuration. If a System Note says a knowledge base was created, use create_agent to build the agent and attach the knowledge base.
 Use the update_agent tool whenever the user wants to modify their current agent configuration and an agent ID is available in the current configuration.
 If the user wants to add skills, tool categories, or knowledge bases but you are unsure which ones exist, use the list_* tools to find out before calling create_agent or update_agent.
 """
@@ -2638,8 +2637,12 @@ If the user wants to add skills, tool categories, or knowledge bases but you are
                 ListToolCategoriesTool,
                 UpdateAgentTool,
             )
+            from ...core.tools.adapters.vibe.ask_user_tool import AskUserQuestionTool
             from ...core.tools.adapters.vibe.document_search import (
                 ListKnowledgeBasesTool,
+            )
+            from ...core.tools.adapters.vibe.web_ingestion_tool import (
+                CreateKnowledgeBaseFromUrlTool,
             )
 
             # Create only the necessary tools directly (much faster than loading all tools)
@@ -2658,6 +2661,10 @@ If the user wants to add skills, tool categories, or knowledge bases but you are
             list_skills_tool = ListAvailableSkillsTool()
             list_tool_categories_tool = ListToolCategoriesTool()
             list_kbs_tool = ListKnowledgeBasesTool(
+                user_id=int(user.id), is_admin=bool(user.is_admin)
+            )
+            ask_user_question_tool = AskUserQuestionTool()
+            create_kb_url_tool = CreateKnowledgeBaseFromUrlTool(
                 user_id=int(user.id), is_admin=bool(user.is_admin)
             )
 
@@ -2682,6 +2689,8 @@ If the user wants to add skills, tool categories, or knowledge bases but you are
                     list_skills_tool,
                     list_tool_categories_tool,
                     list_kbs_tool,
+                    ask_user_question_tool,
+                    create_kb_url_tool,
                 ],
                 use_dag_pattern=False,  # Use ReAct pattern
                 id=builder_task_id,

@@ -2,6 +2,7 @@ from typing import Any, Dict, List, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, status
 from pydantic import BaseModel
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from ...core.utils.encryption import encrypt_value
@@ -39,6 +40,20 @@ class OAuthProviderBase(BaseModel):
 
 class OAuthProviderCreate(OAuthProviderBase):
     pass
+
+
+class OAuthProviderUpdate(BaseModel):
+    provider_name: Optional[str] = None
+    name: Optional[str] = None
+    client_id: Optional[str] = None
+    client_secret: Optional[str] = None
+    auth_url: Optional[str] = None
+    token_url: Optional[str] = None
+    redirect_uri: Optional[str] = None
+    userinfo_url: Optional[str] = None
+    user_id_path: Optional[str] = None
+    email_path: Optional[str] = None
+    default_scopes: Optional[List[str]] = None
 
 
 class OAuthProviderResponse(OAuthProviderBase):
@@ -86,12 +101,24 @@ async def create_provider(
     db: Session = Depends(get_db),
     _: User = Depends(verify_admin),
 ) -> Any:
+    existing_provider = (
+        db.query(OAuthProvider)
+        .filter(OAuthProvider.provider_name == provider.provider_name)
+        .first()
+    )
+    if existing_provider:
+        raise HTTPException(status_code=400, detail="Provider already exists")
+
     provider_data = provider.model_dump()
     provider_data["client_id"] = encrypt_value(provider_data["client_id"])
     provider_data["client_secret"] = encrypt_value(provider_data["client_secret"])
     db_provider = OAuthProvider(**provider_data)
     db.add(db_provider)
-    db.commit()
+    try:
+        db.commit()
+    except IntegrityError:
+        db.rollback()
+        raise HTTPException(status_code=400, detail="Provider already exists") from None
     db.refresh(db_provider)
 
     # Return masked data
@@ -106,7 +133,7 @@ async def create_provider(
 @admin_mcp_router.put("/providers/{provider_id}", response_model=OAuthProviderResponse)
 async def update_provider(
     provider_id: int,
-    provider: OAuthProviderCreate,
+    provider: OAuthProviderUpdate,
     db: Session = Depends(get_db),
     _: User = Depends(verify_admin),
 ) -> Any:
@@ -116,22 +143,43 @@ async def update_provider(
     if not db_provider:
         raise HTTPException(status_code=404, detail="Provider not found")
 
-    provider_data = provider.model_dump()
+    provider_data = provider.model_dump(exclude_unset=True)
 
-    if provider_data["client_id"] == "********":
-        provider_data.pop("client_id")
-    else:
-        provider_data["client_id"] = encrypt_value(provider_data["client_id"])
+    if (
+        "provider_name" in provider_data
+        and provider_data["provider_name"] is not None
+        and provider_data["provider_name"] != db_provider.provider_name
+    ):
+        existing_provider = (
+            db.query(OAuthProvider)
+            .filter(OAuthProvider.provider_name == provider_data["provider_name"])
+            .first()
+        )
+        if existing_provider:
+            raise HTTPException(status_code=400, detail="Provider already exists")
 
-    if provider_data["client_secret"] == "********":
-        provider_data.pop("client_secret")
-    else:
-        provider_data["client_secret"] = encrypt_value(provider_data["client_secret"])
+    if "client_id" in provider_data:
+        if provider_data["client_id"] is None:
+            provider_data.pop("client_id")
+        else:
+            provider_data["client_id"] = encrypt_value(provider_data["client_id"])
+
+    if "client_secret" in provider_data:
+        if provider_data["client_secret"] is None:
+            provider_data.pop("client_secret")
+        else:
+            provider_data["client_secret"] = encrypt_value(
+                provider_data["client_secret"]
+            )
 
     for key, value in provider_data.items():
         setattr(db_provider, key, value)
 
-    db.commit()
+    try:
+        db.commit()
+    except IntegrityError:
+        db.rollback()
+        raise HTTPException(status_code=400, detail="Provider already exists") from None
     db.refresh(db_provider)
 
     # Return masked data
@@ -152,6 +200,19 @@ async def delete_provider(
     )
     if not db_provider:
         raise HTTPException(status_code=404, detail="Provider not found")
+    linked_apps_count = (
+        db.query(PublicMCPApp)
+        .filter(PublicMCPApp.provider_name == db_provider.provider_name)
+        .count()
+    )
+    if linked_apps_count > 0:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "Provider is referenced by one or more MCP apps. "
+                "Remove or update linked apps before deleting this provider."
+            ),
+        )
     db.delete(db_provider)
     db.commit()
     return {"success": True}
@@ -172,9 +233,18 @@ async def create_app(
     db: Session = Depends(get_db),
     _: User = Depends(verify_admin),
 ) -> Any:
+    existing_app = (
+        db.query(PublicMCPApp).filter(PublicMCPApp.app_id == app.app_id).first()
+    )
+    if existing_app:
+        raise HTTPException(status_code=400, detail="App already exists")
     db_app = PublicMCPApp(**app.model_dump())
     db.add(db_app)
-    db.commit()
+    try:
+        db.commit()
+    except IntegrityError:
+        db.rollback()
+        raise HTTPException(status_code=400, detail="App already exists") from None
     db.refresh(db_app)
     return db_app
 

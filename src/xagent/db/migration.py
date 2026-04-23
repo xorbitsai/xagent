@@ -33,10 +33,10 @@ def try_upgrade_db(engine: Engine) -> None:
         if version is None:
             if is_database_empty(engine):
                 # new database
-                logger.info("Creating new database, stamping with latest revision.")
+                logger.info("Creating new database, upgrading to latest revision.")
                 with engine.connect() as conn:
                     alembic_cfg.attributes["connection"] = conn
-                    command.stamp(alembic_cfg, "head")
+                    command.upgrade(alembic_cfg, "head")
             else:
                 raise RuntimeError(
                     "Database exists without alembic revision information. Please initialize the database schema version manually by running: alembic stamp <revision>"

@@ -54,6 +54,7 @@ export default function AdminMcpPage() {
   const [providers, setProviders] = useState<OAuthProvider[]>([])
   const [apps, setApps] = useState<PublicMCPApp[]>([])
   const [loading, setLoading] = useState(true)
+  const [appSearchQuery, setAppSearchQuery] = useState("")
 
   // Modals state
   const [isAddModalOpen, setIsAddModalOpen] = useState(false)
@@ -84,6 +85,22 @@ export default function AdminMcpPage() {
       fetchData()
     }
   }, [user])
+
+  const normalizedAppSearchQuery = appSearchQuery.trim().toLowerCase()
+  const filteredApps = normalizedAppSearchQuery
+    ? apps.filter((a) => {
+      const haystack = [
+        a.app_id,
+        a.name,
+        a.provider_name ?? "",
+        a.transport,
+        a.category ?? "",
+      ]
+        .join(" ")
+        .toLowerCase()
+      return haystack.includes(normalizedAppSearchQuery)
+    })
+    : apps
 
   const fetchData = async () => {
     try {
@@ -166,15 +183,26 @@ export default function AdminMcpPage() {
       const method = isEdit ? 'PUT' : 'POST'
 
       try {
+        const providerPayload: any = {
+          ...newProvider,
+          default_scopes: typeof newProvider.default_scopes === 'string'
+            ? (newProvider.default_scopes as string).split(',').map(s => s.trim()).filter(Boolean)
+            : newProvider.default_scopes
+        }
+
+        if (isEdit) {
+          if (providerPayload.client_id === "********" || providerPayload.client_id == null) {
+            delete providerPayload.client_id
+          }
+          if (providerPayload.client_secret === "********" || providerPayload.client_secret == null) {
+            delete providerPayload.client_secret
+          }
+        }
+
         const res = await apiRequest(url, {
           method,
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            ...newProvider,
-            default_scopes: typeof newProvider.default_scopes === 'string'
-              ? (newProvider.default_scopes as string).split(',').map(s => s.trim()).filter(Boolean)
-              : newProvider.default_scopes
-          })
+          body: JSON.stringify(providerPayload)
         })
         if (res.ok) {
           const saved = await res.json()
@@ -204,7 +232,12 @@ export default function AdminMcpPage() {
     try {
       let parsedConfig = {}
       try {
-        parsedConfig = typeof newApp.launch_config === 'string' ? JSON.parse(newApp.launch_config) : newApp.launch_config
+        if (typeof newApp.launch_config === 'string') {
+          const raw = newApp.launch_config.trim()
+          parsedConfig = raw === "" ? {} : JSON.parse(raw)
+        } else {
+          parsedConfig = newApp.launch_config
+        }
       } catch (e) {
         toast.error(t("adminMcp.apps.form.invalidJson"))
         return
@@ -246,7 +279,7 @@ export default function AdminMcpPage() {
   // Effect to reset state when modal closes
   useEffect(() => {
     if (!isAddModalOpen) {
-      setTimeout(() => {
+      const timeoutId = window.setTimeout(() => {
         setStep(1)
         setEditingProviderId(null)
         setEditingAppId(null)
@@ -254,6 +287,7 @@ export default function AdminMcpPage() {
         setNewProvider({ provider_name: "", name: "", client_id: "", client_secret: "", auth_url: "", token_url: "", redirect_uri: "", userinfo_url: "", user_id_path: "id", email_path: "email", default_scopes: [] })
         setNewApp({ app_id: "", name: "", description: "", icon: "", transport: "oauth", category: "Communication", oauth_scopes: [], launch_config: "{}" })
       }, 300)
+      return () => window.clearTimeout(timeoutId)
     }
   }, [isAddModalOpen])
 
@@ -326,14 +360,19 @@ export default function AdminMcpPage() {
             <CardHeader className="pb-3 border-b flex flex-row items-center justify-between space-y-0">
               <div>
                 <CardTitle className="text-lg font-semibold flex items-center gap-2">
-                  {t("adminMcp.apps.title")} <Badge variant="secondary" className="rounded-full px-2 py-0 bg-blue-50 text-blue-500 font-normal">{apps.length}</Badge>
+                  {t("adminMcp.apps.title")} <Badge variant="secondary" className="rounded-full px-2 py-0 bg-blue-50 text-blue-500 font-normal">{filteredApps.length}</Badge>
                 </CardTitle>
                 <p className="text-xs text-muted-foreground mt-1 font-normal">{t("adminMcp.apps.description")}</p>
               </div>
               <div className="flex items-center gap-3">
                 <div className="relative w-64">
                   <Search className="w-4 h-4 absolute left-3 top-1/2 -translate-y-1/2 text-muted-foreground" />
-                  <Input placeholder={t("adminMcp.apps.searchPlaceholder")} className="pl-9 h-9" />
+                  <Input
+                    placeholder={t("adminMcp.apps.searchPlaceholder")}
+                    className="pl-9 h-9"
+                    value={appSearchQuery}
+                    onChange={(e) => setAppSearchQuery(e.target.value)}
+                  />
                 </div>
                 <Button size="sm" className="bg-blue-500 hover:bg-blue-600 h-9" onClick={() => { setIsAddModalOpen(true); setStep(1); setIsCreatingProvider(false); setIsStandaloneProvider(false) }}>
                   <Plus className="w-4 h-4 mr-1" /> {t("adminMcp.addApp")}
@@ -351,7 +390,7 @@ export default function AdminMcpPage() {
                   </TableRow>
                 </TableHeader>
                 <TableBody>
-                  {apps.map(a => (
+                  {filteredApps.map(a => (
                     <TableRow key={a.id} className="group">
                       <TableCell className="font-semibold text-sm">{a.app_id}</TableCell>
                       <TableCell>
@@ -372,7 +411,7 @@ export default function AdminMcpPage() {
                       </TableCell>
                     </TableRow>
                   ))}
-                  {apps.length === 0 && !loading && (
+                  {filteredApps.length === 0 && !loading && (
                     <TableRow>
                       <TableCell colSpan={4} className="text-center text-muted-foreground h-32">{t("adminMcp.apps.noData")}</TableCell>
                     </TableRow>

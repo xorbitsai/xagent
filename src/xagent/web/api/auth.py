@@ -730,10 +730,12 @@ def generic_oauth_login(
     token: Optional[str] = None,
     app_id: Optional[str] = None,
     redirect: Optional[str] = None,
-    db: Session = Depends(get_db),
+    db: Optional[Session] = None,
     db_provider: Optional[Any] = None,
 ) -> Any:
     """Start generic OAuth flow"""
+    if db is None:
+        raise RuntimeError("db session is required")
     if not db_provider:
         return HTMLResponse(
             content="<h1>Error: Provider not configured</h1>", status_code=500
@@ -795,6 +797,10 @@ def generic_oauth_login(
         "redirect_uri": redirect_uri,
         "state": state,
     }
+    if provider.lower() == "google":
+        params["access_type"] = "offline"
+        params["include_granted_scopes"] = "true"
+        params["prompt"] = "consent"
     if scope_str:
         params["scope"] = scope_str
 
@@ -848,10 +854,12 @@ def _ensure_user_mcp_server(
 def generic_oauth_callback(
     provider: str,
     request: Request,
-    db: Session = Depends(get_db),
+    db: Optional[Session] = None,
     db_provider: Optional[Any] = None,
 ) -> Any:
     """Handle generic OAuth callback"""
+    if db is None:
+        raise RuntimeError("db session is required")
     code = request.query_params.get("code")
     state = request.query_params.get("state")
     error = request.query_params.get("error")
@@ -912,7 +920,9 @@ def generic_oauth_callback(
         }
         headers = {"Content-Type": "application/x-www-form-urlencoded"}
 
-        token_response = requests.post(token_url, data=data, headers=headers)
+        token_response = requests.post(
+            token_url, data=data, headers=headers, timeout=10.0
+        )
         token_data = token_response.json()
 
         if "error" in token_data:
@@ -930,7 +940,9 @@ def generic_oauth_callback(
 
         if userinfo_url and access_token:
             info_headers = {"Authorization": f"Bearer {access_token}"}
-            info_response = requests.get(userinfo_url, headers=info_headers)
+            info_response = requests.get(
+                userinfo_url, headers=info_headers, timeout=10.0
+            )
             if info_response.status_code == 200:
                 info_data = info_response.json()
                 provider_user_id = info_data.get(db_provider.user_id_path or "id")

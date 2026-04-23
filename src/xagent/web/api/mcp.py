@@ -444,9 +444,12 @@ def list_mcp_apps(
         connected_apps[server.name.lower()] = server.id
 
     results = []
+    library_apps = (
+        get_all_mcp_apps(db) if location in ["remote", "local", "all"] else []
+    )
 
     if location in ["remote", "all"]:
-        for app in get_all_mcp_apps(db):
+        for app in library_apps:
             if search:
                 search_lower = search.lower()
                 if (
@@ -489,7 +492,7 @@ def list_mcp_apps(
             results.append(app_copy)
 
     if location in ["local", "all"]:
-        library_names = {app["name"].lower() for app in get_all_mcp_apps(db)}
+        library_names = {app["name"].lower() for app in library_apps}
         for server, user_mcp in user_mcps:
             if server.name.lower() in library_names:
                 continue

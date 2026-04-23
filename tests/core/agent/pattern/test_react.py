@@ -15,6 +15,7 @@ class MockReActLLM(BaseLLM):
     def __init__(self, responses=None):
         self.responses = responses or []
         self.call_count = 0
+        self.calls = []
         self._abilities = ["chat", "tool_calling"]
         self._model_name = "mock_react_llm"
 
@@ -44,6 +45,7 @@ class MockReActLLM(BaseLLM):
 
     async def stream_chat(self, messages: list[dict[str, str]], **kwargs):
         """Stream chat implementation for testing native tool calling."""
+        self.calls.append({"messages": messages, "kwargs": kwargs})
         if self.call_count >= len(self.responses):
             # Default response
             response_json = {
@@ -67,8 +69,10 @@ class MockReActLLM(BaseLLM):
                 yield StreamChunk(type=ChunkType.END, finish_reason="stop")
                 return
 
-        # Check if this is a tool call
-        if response_json.get("type") == "tool_call":
+        # Check if this is a native tool call request. The ReAct pattern's first
+        # call returns JSON text; only the second call passes tools and should
+        # produce native tool_calls.
+        if response_json.get("type") == "tool_call" and kwargs.get("tools"):
             # Return native tool call format
             tool_name = response_json.get("tool_name", "")
             tool_args = response_json.get("tool_args", {})
@@ -246,6 +250,38 @@ async def test_react_tool_execution():
     assert result["success"] is True
     assert result["output"] == "The calculation result is 50"
     assert result["pattern"] == "react"
+
+
+@pytest.mark.asyncio
+async def test_react_native_tool_call_includes_decision_reasoning():
+    """Second-phase native tool call should include the first-phase decision."""
+    decision_reasoning = (
+        "The previous data load failed, so I need to inspect the workbook columns"
+    )
+    responses = [
+        json.dumps({"type": "tool_call", "reasoning": decision_reasoning}),
+        '{"type": "tool_call", "reasoning": "Calling calculator", "tool_name": "calculator", "tool_args": {"expression": "2+2"}}',
+        '{"type": "final_answer", "reasoning": "Done", "answer": "Done", "success": true, "error": null}',
+    ]
+
+    llm = MockReActLLM(responses)
+    memory = DummyMemoryStore()
+    tools = [MockCalculatorTool()]
+    pattern = ReActPattern(llm, max_iterations=3)
+
+    result = await pattern.run(
+        task="Calculate 2+2",
+        memory=memory,
+        tools=tools,
+        context=AgentContext(),
+    )
+
+    assert result["success"] is True
+    assert len(llm.calls) >= 2
+    second_call_messages = llm.calls[1]["messages"]
+    second_call_prompt = second_call_messages[-1]["content"]
+    assert "Your prior decision/reasoning for this tool call was" in second_call_prompt
+    assert decision_reasoning in second_call_prompt
 
 
 @pytest.mark.asyncio

@@ -733,7 +733,7 @@ class ReActPattern(AgentPattern):
                         )
 
                     # Second call: Invoke tool using native tool calling
-                    action = await self._invoke_tool_via_native_call(messages)
+                    action = await self._invoke_tool_via_native_call(messages, action)
 
                 # Execute the action
                 result = await self._execute_action(action, messages, task_id, step_id)
@@ -1723,7 +1723,7 @@ Remember: Return ONLY ONE JSON object. No additional text, no multiple objects.
             )
 
     async def _invoke_tool_via_native_call(
-        self, messages: List[Dict[str, str]]
+        self, messages: List[Dict[str, str]], decision: Action
     ) -> Action:
         """
         Second LLM call to invoke tool using native tool calling API.
@@ -1741,7 +1741,11 @@ Remember: Return ONLY ONE JSON object. No additional text, no multiple objects.
                 context={"available_tools": self.tool_registry.list_tools()},
             )
 
-        # Add a system prompt to guide LLM to use native tool calling
+        decision_reasoning = (decision.reasoning or "").strip()
+
+        # Add a system prompt to guide LLM to use native tool calling. Include the
+        # first-phase decision so providers that are sensitive to the latest user
+        # message, such as Qwen, have the concrete intent for this tool call.
         messages_with_prompt = messages + [
             {
                 "role": "user",
@@ -1749,6 +1753,7 @@ Remember: Return ONLY ONE JSON object. No additional text, no multiple objects.
                     "IMPORTANT INSTRUCTION FOR THIS STEP:\n"
                     "You indicated you want to call a tool. Now use the NATIVE FUNCTION CALLING interface "
                     "to invoke the appropriate tool.\n\n"
+                    f"Your prior decision/reasoning for this tool call was:\n{decision_reasoning}\n\n"
                     "Respond in the SAME LANGUAGE as the task.\n\n"
                     "DO NOT respond with JSON format. DO NOT return a structured action JSON.\n"
                     "Instead, use the native function calling API to directly invoke the tool.\n\n"

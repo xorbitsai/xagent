@@ -154,6 +154,16 @@ def test_task_create_does_not_persist_inaccessible_model_ids(
     assert data2["model_id"] != other_user_model_id
 
 
+def test_standalone_task_create_defaults_to_think(test_db, user1_headers):
+    resp = client.post(
+        "/api/chat/task/create",
+        json={"title": "test", "description": "desc"},
+        headers=user1_headers,
+    )
+    assert resp.status_code == 200
+    assert resp.json()["execution_mode"] == "think"
+
+
 def test_get_task_llm_ids_preserves_stored_id_when_model_missing(test_db):
     ensure_system_initialized()
     from xagent.web.models.task import Task, TaskStatus

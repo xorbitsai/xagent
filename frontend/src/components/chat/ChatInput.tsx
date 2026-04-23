@@ -355,8 +355,10 @@ export function ChatInput({
       const trimmed = message.trim();
       const messageToSend = trimmed;
 
-      // Use executionMode from taskConfig if provided, otherwise default to balanced
-      const configToSend = { ...agentConfig, executionMode: { mode: taskConfig?.executionMode || "balanced" } };
+      const configToSend = {
+        ...agentConfig,
+        ...(taskConfig?.executionMode ? { executionMode: { mode: taskConfig.executionMode } } : {}),
+      };
 
       await onSend(messageToSend, configToSend);
 

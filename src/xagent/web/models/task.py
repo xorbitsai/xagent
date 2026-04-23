@@ -53,7 +53,7 @@ class ExecutionMode(enum.Enum):
 
     FLASH = "flash"  # Simple, quick tasks (single_call pattern)
     BALANCED = "balanced"  # Most everyday tasks (react pattern)
-    THINK = "think"  # Complex, multi-step tasks (dag_plan_execute pattern)
+    THINK = "think"  # Default task mode (dag_plan_execute pattern)
 
 
 class AgentType(enum.Enum):
@@ -108,7 +108,7 @@ class Task(Base):  # type: ignore
 
     # Execution mode configuration
     execution_mode = Column(
-        String(20), default=ExecutionMode.BALANCED.value, nullable=True
+        String(20), default=ExecutionMode.THINK.value, nullable=True
     )  # "flash" | "balanced" | "think"
     process_description = Column(
         Text, nullable=True
@@ -135,10 +135,10 @@ class Task(Base):  # type: ignore
             return (
                 ExecutionMode(self.execution_mode)
                 if self.execution_mode
-                else ExecutionMode.BALANCED
+                else ExecutionMode.THINK
             )
         except ValueError:
-            return ExecutionMode.BALANCED
+            return ExecutionMode.THINK
 
     @execution_mode_enum.setter
     def execution_mode_enum(self, value: ExecutionMode) -> None:

@@ -3459,11 +3459,12 @@ export function AppProvider({ children, token }: { children: React.ReactNode; to
         // Note: Files will be uploaded via WebSocket after task creation
         // The backend TaskCreateRequest expects JSON with 'files' as a list of filenames (strings)
         // Since we haven't uploaded files yet, we don't include them in the task creation request
+        const executionMode = config?.executionMode?.mode || (config?.agentId ? "balanced" : "think")
 
         const requestBody: any = {
           title: message,
           description: message,
-          execution_mode: config?.executionMode?.mode || "balanced",
+          execution_mode: executionMode,
           memory_similarity_threshold: config?.memorySimilarityThreshold ?? 1.5,
         }
 
@@ -3475,7 +3476,7 @@ export function AppProvider({ children, token }: { children: React.ReactNode; to
           if (filesToUpload.length > 0) {
             const formData = new FormData()
             filesToUpload.forEach(f => formData.append('files', f))
-            formData.append('task_type', config?.executionMode?.mode || 'balanced')
+            formData.append('task_type', executionMode)
 
             try {
               const uploadResponse = await apiRequest(`${apiUrl}/api/files/upload`, {

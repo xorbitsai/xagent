@@ -509,8 +509,8 @@ class AgentServiceManager:
             # Get LLM configuration from task database record
             logger.info(f"Loading LLM configuration for task {task_id} from database")
             agent_config = None  # Initialize agent_config to use later
-            # Default to react pattern if not specified
-            task_pattern = "react"  # Default pattern
+            # Default standalone tasks to DAG if no execution mode is available.
+            task_pattern = "dag_plan_execute"
             use_dag = True  # Default to DAG pattern (for backward compatibility)
             try:
                 if db is None:
@@ -544,10 +544,10 @@ class AgentServiceManager:
 
                     # Get task's execution_mode and map to pattern
                     task_execution_mode = (
-                        getattr(task, "execution_mode", None) or "balanced"
+                        getattr(task, "execution_mode", None) or "think"
                     )
                     task_pattern = EXECUTION_MODE_TO_PATTERN.get(
-                        task_execution_mode, "react"
+                        task_execution_mode, "dag_plan_execute"
                     )
                     logger.info(
                         f"Task {task_id} execution_mode={task_execution_mode} -> pattern={task_pattern}"
@@ -1653,6 +1653,10 @@ async def create_task(
         if selected_file_ids:
             task_agent_config["selected_file_ids"] = selected_file_ids
 
+        task_execution_mode = request.execution_mode
+        if not task_execution_mode:
+            task_execution_mode = "balanced" if request.agent_id else "think"
+
         # Create task with PENDING status and model configuration
         task_title = request.title if request.title else task_description
         if task_title and len(task_title) > 50:
@@ -1672,8 +1676,7 @@ async def create_task(
             visual_model_name=visual_model_name,
             compact_model_name=compact_model_name,
             agent_config=task_agent_config or None,
-            execution_mode=request.execution_mode
-            or "balanced",  # Default to balanced mode
+            execution_mode=task_execution_mode,
             process_description=request.process_description,
             examples=examples_data,
             agent_id=request.agent_id,  # Set agent_id if provided

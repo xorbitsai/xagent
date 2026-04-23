@@ -2962,13 +2962,14 @@ export function AppProvider({ children, token }: { children: React.ReactNode; to
         // For task mode, message is user input
         const taskDescription = message
         const taskTitle = message.length > 50 ? `${message.substring(0, 50)}...` : message
+        const executionMode = config?.executionMode?.mode || (config?.agentId ? "balanced" : "think")
 
         const requestBody: any = {
           title: taskTitle,
           description: taskDescription,
           llm_ids: llmIds,
           memory_similarity_threshold: config?.memorySimilarityThreshold ?? 1.5,
-          execution_mode: config?.executionMode?.mode || "balanced",
+          execution_mode: executionMode,
           process_description: config?.executionMode?.processDescription,
           examples: config?.executionMode?.examples,
         }
@@ -2981,7 +2982,7 @@ export function AppProvider({ children, token }: { children: React.ReactNode; to
           if (filesToUpload.length > 0) {
             const formData = new FormData()
             filesToUpload.forEach(f => formData.append('files', f))
-            formData.append('task_type', config?.executionMode?.mode || 'balanced')
+            formData.append('task_type', executionMode)
 
             try {
               const uploadResponse = await apiRequest(`${apiUrl}/api/files/upload`, {

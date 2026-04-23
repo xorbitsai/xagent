@@ -62,7 +62,7 @@ class TaskCreateRequest(BaseModel):
     agent_config: Optional[Dict[str, Any]] = None  # Agent-specific configuration
 
     # Execution mode field
-    execution_mode: Optional[str] = "balanced"  # "flash", "balanced", or "think"
+    execution_mode: Optional[str] = None  # "flash", "balanced", or "think"
     process_description: Optional[str] = (
         None  # Process mode: detailed process description (deprecated)
     )

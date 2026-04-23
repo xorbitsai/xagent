@@ -654,3 +654,493 @@ def test_cascade_delete_admin_vs_non_admin_user_filter_behavior(
     user_filter = table.delete.call_args[0][0]
     assert "collection == 'c_user'" in user_filter
     assert "user_id == 1" in user_filter
+
+
+@patch(
+    "xagent.core.tools.core.RAG_tools.version_management.cascade_cleaner.get_vector_store_raw_connection"
+)
+def test_cascade_delete_collection_open_table_error_uses_tenant_safe_fallback(
+    mock_get_conn: MagicMock,
+) -> None:
+    """When table introspection fails, collection delete should keep tenant scoping."""
+    conn = MagicMock()
+    conn.table_names.return_value = ["documents"]
+    conn.open_table.side_effect = RuntimeError("table unavailable")
+    mock_get_conn.return_value = conn
+
+    with patch(
+        "xagent.core.tools.core.RAG_tools.version_management.cascade_cleaner._plan_by_predicates"
+    ) as mock_plan:
+        mock_plan.return_value = {"documents": 0}
+
+        cascade_delete(
+            target="collection",
+            collection="c_err",
+            user_id=7,
+            is_admin=False,
+            preview_only=True,
+            confirm=False,
+        )
+
+    predicates = mock_plan.call_args.args[1]
+    filt = predicates["documents"]
+    assert "collection == 'c_err'" in filt
+    assert "user_id == 7" in filt
+
+
+@patch(
+    "xagent.core.tools.core.RAG_tools.version_management.cascade_cleaner.get_vector_store_raw_connection"
+)
+def test_cascade_delete_document_open_table_error_uses_tenant_safe_fallback(
+    mock_get_conn: MagicMock,
+) -> None:
+    """When table introspection fails, document delete should keep tenant scoping."""
+    conn = MagicMock()
+    conn.table_names.return_value = ["documents"]
+    conn.open_table.side_effect = RuntimeError("table unavailable")
+    mock_get_conn.return_value = conn
+
+    with patch(
+        "xagent.core.tools.core.RAG_tools.version_management.cascade_cleaner._plan_by_predicates"
+    ) as mock_plan:
+        mock_plan.return_value = {"documents": 0}
+
+        cascade_delete(
+            target="document",
+            collection="c_err",
+            doc_id="d_err",
+            user_id=7,
+            is_admin=False,
+            preview_only=True,
+            confirm=False,
+        )
+
+    predicates = mock_plan.call_args.args[1]
+    filt = predicates["documents"]
+    assert "collection == 'c_err'" in filt
+    assert "doc_id == 'd_err'" in filt
+    assert "user_id == 7" in filt
+
+
+@patch(
+    "xagent.core.tools.core.RAG_tools.version_management.cascade_cleaner.get_vector_store_raw_connection"
+)
+def test_cascade_delete_collection_open_table_error_without_user_id_denied(
+    mock_get_conn: MagicMock,
+) -> None:
+    """Unauthenticated non-admin fallback should deny access on introspection error."""
+    conn = MagicMock()
+    conn.table_names.return_value = ["documents"]
+    conn.open_table.side_effect = RuntimeError("table unavailable")
+    mock_get_conn.return_value = conn
+
+    with patch(
+        "xagent.core.tools.core.RAG_tools.version_management.cascade_cleaner._plan_by_predicates"
+    ) as mock_plan:
+        mock_plan.return_value = {"documents": 0}
+
+        cascade_delete(
+            target="collection",
+            collection="c_err",
+            user_id=None,
+            is_admin=False,
+            preview_only=True,
+            confirm=False,
+        )
+
+    predicates = mock_plan.call_args.args[1]
+    filt = predicates["documents"]
+    assert "collection == 'c_err'" in filt
+    assert "user_id IS NULL" in filt and "user_id IS NOT NULL" in filt
+
+
+@patch(
+    "xagent.core.tools.core.RAG_tools.version_management.cascade_cleaner.get_vector_store_raw_connection"
+)
+def test_cascade_delete_document_open_table_error_without_user_id_denied(
+    mock_get_conn: MagicMock,
+) -> None:
+    """Unauthenticated non-admin document fallback should deny access."""
+    conn = MagicMock()
+    conn.table_names.return_value = ["documents"]
+    conn.open_table.side_effect = RuntimeError("table unavailable")
+    mock_get_conn.return_value = conn
+
+    with patch(
+        "xagent.core.tools.core.RAG_tools.version_management.cascade_cleaner._plan_by_predicates"
+    ) as mock_plan:
+        mock_plan.return_value = {"documents": 0}
+
+        cascade_delete(
+            target="document",
+            collection="c_err",
+            doc_id="d_err",
+            user_id=None,
+            is_admin=False,
+            preview_only=True,
+            confirm=False,
+        )
+
+    predicates = mock_plan.call_args.args[1]
+    filt = predicates["documents"]
+    assert "collection == 'c_err'" in filt
+    assert "doc_id == 'd_err'" in filt
+    assert "user_id IS NULL" in filt and "user_id IS NOT NULL" in filt
+
+
+@patch(
+    "xagent.core.tools.core.RAG_tools.version_management.cascade_cleaner.get_vector_store_raw_connection"
+)
+def test_cascade_delete_document_schema_probe_error_keeps_legacy_compatible_filter(
+    mock_get_conn: MagicMock,
+) -> None:
+    """If schema.names probing fails, document delete should stay legacy-compatible."""
+    conn = MagicMock()
+    conn.table_names.return_value = ["documents"]
+    table = MagicMock()
+    schema = MagicMock()
+    # Simulate schema names probe failure in _table_has_column.
+    type(schema).names = property(
+        lambda _self: (_ for _ in ()).throw(RuntimeError("boom"))
+    )
+    table.schema = schema
+    conn.open_table.return_value = table
+    mock_get_conn.return_value = conn
+
+    with patch(
+        "xagent.core.tools.core.RAG_tools.version_management.cascade_cleaner._plan_by_predicates"
+    ) as mock_plan:
+        mock_plan.return_value = {"documents": 0}
+        cascade_delete(
+            target="document",
+            collection="c_probe",
+            doc_id="d_probe",
+            user_id=21,
+            is_admin=False,
+            preview_only=True,
+            confirm=False,
+        )
+
+    predicates = mock_plan.call_args.args[1]
+    filt = predicates["documents"]
+    assert "collection == 'c_probe'" in filt
+    assert "doc_id == 'd_probe'" in filt
+    assert "user_id ==" not in filt
+
+
+@patch(
+    "xagent.core.tools.core.RAG_tools.version_management.cascade_cleaner.get_vector_store_raw_connection"
+)
+def test_cascade_delete_document_multitable_predicates_are_consistent(
+    mock_get_conn: MagicMock,
+) -> None:
+    """Document delete should build consistent predicates across all target tables."""
+    conn = MagicMock()
+    conn.table_names.return_value = [
+        "documents",
+        "parses",
+        "chunks",
+        "main_pointers",
+        "ingestion_runs",
+        "embeddings_m1",
+    ]
+
+    table_map = {
+        "documents": _create_mock_table_with_columns(
+            ["collection", "doc_id", "user_id"]
+        ),
+        "parses": _create_mock_table_with_columns(["collection", "doc_id", "user_id"]),
+        "chunks": _create_mock_table_with_columns(
+            ["collection", "doc_id", "parse_hash", "user_id"]
+        ),
+        "main_pointers": _create_mock_table_with_columns(["collection", "doc_id"]),
+        "ingestion_runs": _create_mock_table_with_columns(
+            ["collection", "doc_id", "status", "user_id"]
+        ),
+        "embeddings_m1": _create_mock_table_with_columns(
+            ["collection", "doc_id", "parse_hash", "user_id"]
+        ),
+    }
+    conn.open_table.side_effect = lambda name: table_map[name]
+    mock_get_conn.return_value = conn
+
+    with patch(
+        "xagent.core.tools.core.RAG_tools.version_management.cascade_cleaner._plan_by_predicates"
+    ) as mock_plan:
+        mock_plan.return_value = {}
+        cascade_delete(
+            target="document",
+            collection="c_multi",
+            doc_id="d_multi",
+            user_id=5,
+            is_admin=False,
+            preview_only=True,
+            confirm=False,
+        )
+
+    predicates = mock_plan.call_args.args[1]
+
+    # Tables with user_id column should have tenant filter.
+    for table_name in (
+        "documents",
+        "parses",
+        "chunks",
+        "ingestion_runs",
+        "embeddings_m1",
+    ):
+        filt = predicates[table_name]
+        assert "collection == 'c_multi'" in filt
+        assert "doc_id == 'd_multi'" in filt
+        assert "user_id == 5" in filt
+
+    # Legacy-compatible table without user_id should not have tenant filter appended.
+    pointers_filter = predicates["main_pointers"]
+    assert "collection == 'c_multi'" in pointers_filter
+    assert "doc_id == 'd_multi'" in pointers_filter
+    assert "user_id ==" not in pointers_filter
+
+
+@patch(
+    "xagent.core.tools.core.RAG_tools.version_management.cascade_cleaner.get_vector_store_raw_connection"
+)
+def test_cascade_delete_document_model_tag_only_builds_target_embeddings_predicate(
+    mock_get_conn: MagicMock,
+) -> None:
+    """Document cascade with model_tag should only target the specified embeddings table."""
+    conn = MagicMock()
+    conn.table_names.return_value = ["embeddings_m1", "embeddings_m2"]
+
+    queried_tables: list[str] = []
+
+    def mock_open_table(table_name: str) -> MagicMock:
+        queried_tables.append(table_name)
+        if table_name == "embeddings_m2":
+            raise AssertionError(
+                "embeddings_m2 should not be queried when model_tag='m1'"
+            )
+        return _create_mock_table_with_columns(
+            ["collection", "doc_id", "parse_hash", "user_id"]
+        )
+
+    conn.open_table.side_effect = mock_open_table
+    mock_get_conn.return_value = conn
+
+    with patch(
+        "xagent.core.tools.core.RAG_tools.version_management.cascade_cleaner._plan_by_predicates"
+    ) as mock_plan:
+        mock_plan.return_value = {}
+        cascade_delete(
+            target="document",
+            collection="c_model",
+            doc_id="d_model",
+            user_id=8,
+            is_admin=False,
+            model_tag="m1",
+            preview_only=True,
+            confirm=False,
+        )
+
+    predicates = mock_plan.call_args.args[1]
+    assert "embeddings_m1" in predicates
+    assert "embeddings_m2" not in predicates
+    assert queried_tables == ["embeddings_m1"]
+
+
+@patch(
+    "xagent.core.tools.core.RAG_tools.version_management.cascade_cleaner.get_vector_store_raw_connection"
+)
+def test_cascade_delete_document_model_tag_probe_error_without_user_id_denied(
+    mock_get_conn: MagicMock,
+) -> None:
+    """If target embeddings table probing fails, unauthenticated fallback must deny access."""
+    conn = MagicMock()
+    conn.table_names.return_value = ["embeddings_m1", "embeddings_m2"]
+
+    queried_tables: list[str] = []
+
+    def mock_open_table(table_name: str) -> MagicMock:
+        queried_tables.append(table_name)
+        if table_name == "embeddings_m1":
+            raise RuntimeError("embeddings_m1 unavailable")
+        return _create_mock_table_with_columns(["collection", "doc_id", "parse_hash"])
+
+    conn.open_table.side_effect = mock_open_table
+    mock_get_conn.return_value = conn
+
+    with patch(
+        "xagent.core.tools.core.RAG_tools.version_management.cascade_cleaner._plan_by_predicates"
+    ) as mock_plan:
+        mock_plan.return_value = {}
+        cascade_delete(
+            target="document",
+            collection="c_model",
+            doc_id="d_model",
+            user_id=None,
+            is_admin=False,
+            model_tag="m1",
+            preview_only=True,
+            confirm=False,
+        )
+
+    predicates = mock_plan.call_args.args[1]
+    assert "embeddings_m1" in predicates
+    assert "embeddings_m2" not in predicates
+    filt = predicates["embeddings_m1"]
+    assert "collection == 'c_model'" in filt
+    assert "doc_id == 'd_model'" in filt
+    assert "user_id IS NULL" in filt and "user_id IS NOT NULL" in filt
+    assert queried_tables == ["embeddings_m1"]
+
+
+@patch(
+    "xagent.core.tools.core.RAG_tools.version_management.cascade_cleaner.get_vector_store_raw_connection"
+)
+def test_cascade_delete_confirm_delete_error_propagates(
+    mock_get_conn: MagicMock,
+) -> None:
+    """Confirm mode should fail fast when table.delete raises an exception."""
+    conn = MagicMock()
+    conn.table_names.return_value = ["documents"]
+    table = _create_mock_table_with_columns(["collection", "doc_id", "user_id"])
+    table.count_rows.return_value = 1
+    table.delete.side_effect = RuntimeError("delete failed")
+    conn.open_table.return_value = table
+    mock_get_conn.return_value = conn
+
+    with pytest.raises(RuntimeError, match="delete failed"):
+        cascade_delete(
+            target="document",
+            collection="c_err",
+            doc_id="d_err",
+            user_id=1,
+            is_admin=False,
+            preview_only=False,
+            confirm=True,
+        )
+
+
+@patch(
+    "xagent.core.tools.core.RAG_tools.version_management.cascade_cleaner.get_vector_store_raw_connection"
+)
+def test_cascade_delete_preview_and_confirm_counts_match_for_model_tag(
+    mock_get_conn: MagicMock,
+) -> None:
+    """Preview counts should match confirm counts in fixed-count model_tag scenario."""
+    conn = MagicMock()
+    conn.table_names.return_value = [
+        "documents",
+        "parses",
+        "chunks",
+        "main_pointers",
+        "ingestion_runs",
+        "embeddings_m1",
+        "embeddings_m2",
+    ]
+
+    table_map = {
+        "documents": _create_mock_table_with_columns(
+            ["collection", "doc_id", "user_id"]
+        ),
+        "parses": _create_mock_table_with_columns(["collection", "doc_id", "user_id"]),
+        "chunks": _create_mock_table_with_columns(["collection", "doc_id", "user_id"]),
+        "main_pointers": _create_mock_table_with_columns(["collection", "doc_id"]),
+        "ingestion_runs": _create_mock_table_with_columns(
+            ["collection", "doc_id", "status", "user_id"]
+        ),
+        "embeddings_m1": _create_mock_table_with_columns(
+            ["collection", "doc_id", "parse_hash", "user_id"]
+        ),
+        "embeddings_m2": _create_mock_table_with_columns(
+            ["collection", "doc_id", "parse_hash", "user_id"]
+        ),
+    }
+    table_map["documents"].count_rows.return_value = 1
+    table_map["parses"].count_rows.return_value = 2
+    table_map["chunks"].count_rows.return_value = 3
+    table_map["main_pointers"].count_rows.return_value = 4
+    table_map["ingestion_runs"].count_rows.return_value = 5
+    table_map["embeddings_m1"].count_rows.return_value = 6
+    table_map[
+        "embeddings_m2"
+    ].count_rows.return_value = 99  # must not be touched by model_tag
+
+    conn.open_table.side_effect = lambda name: table_map[name]
+    mock_get_conn.return_value = conn
+
+    preview = cascade_delete(
+        target="document",
+        collection="c_sync",
+        doc_id="d_sync",
+        user_id=2,
+        is_admin=False,
+        model_tag="m1",
+        preview_only=True,
+        confirm=False,
+    )
+    confirm = cascade_delete(
+        target="document",
+        collection="c_sync",
+        doc_id="d_sync",
+        user_id=2,
+        is_admin=False,
+        model_tag="m1",
+        preview_only=False,
+        confirm=True,
+    )
+    assert preview == confirm
+    assert "embeddings_m2" not in preview
+
+
+@patch(
+    "xagent.core.tools.core.RAG_tools.version_management.cascade_cleaner.get_vector_store_raw_connection"
+)
+def test_cascade_delete_confirm_deletion_order_is_stable(
+    mock_get_conn: MagicMock,
+) -> None:
+    """Confirm mode should delete tables in dependency-safe fixed order."""
+    conn = MagicMock()
+    conn.table_names.return_value = [
+        "documents",
+        "parses",
+        "chunks",
+        "main_pointers",
+        "ingestion_runs",
+        "embeddings_m1",
+    ]
+
+    delete_order: list[str] = []
+
+    def make_table(table_name: str) -> MagicMock:
+        table = _create_mock_table_with_columns(
+            ["collection", "doc_id", "parse_hash", "user_id"]
+        )
+        table.count_rows.return_value = 1
+
+        def _delete(_: str) -> None:
+            delete_order.append(table_name)
+
+        table.delete = _delete
+        return table
+
+    table_map = {name: make_table(name) for name in conn.table_names.return_value}
+    conn.open_table.side_effect = lambda name: table_map[name]
+    mock_get_conn.return_value = conn
+
+    cascade_delete(
+        target="document",
+        collection="c_order",
+        doc_id="d_order",
+        user_id=3,
+        is_admin=False,
+        preview_only=False,
+        confirm=True,
+    )
+
+    assert delete_order == [
+        "embeddings_m1",
+        "chunks",
+        "parses",
+        "main_pointers",
+        "ingestion_runs",
+        "documents",
+    ]

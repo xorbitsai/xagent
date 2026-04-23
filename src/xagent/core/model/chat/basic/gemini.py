@@ -358,6 +358,47 @@ class GeminiLLM(BaseLLM):
 
         return gemini_tools
 
+    def _build_gemini_tool_config(
+        self,
+        tools: List[Dict[str, Any]],
+        tool_choice: Optional[Union[str, Dict[str, Any]]],
+    ) -> Dict[str, Any]:
+        """Build Gemini SDK tool configuration from OpenAI-style tool options."""
+        from google.genai import types
+
+        gemini_tools_dict = self._convert_tools_to_gemini_format(tools)
+        tool_config: Dict[str, Any] = {
+            "tools": [types.Tool(**gemini_tools_dict)],
+            "automatic_function_calling": types.AutomaticFunctionCallingConfig(
+                disable=True
+            ),
+        }
+
+        function_calling_config = None
+        if tool_choice == "none":
+            function_calling_config = types.FunctionCallingConfig(
+                mode=types.FunctionCallingConfigMode.NONE
+            )
+        elif tool_choice and tool_choice != "auto":
+            allowed_function_names = None
+            if isinstance(tool_choice, dict):
+                function_choice = tool_choice.get("function")
+                if isinstance(function_choice, dict) and function_choice.get("name"):
+                    function_name = function_choice["name"]
+                    allowed_function_names = [function_name]
+
+            function_calling_config = types.FunctionCallingConfig(
+                mode=types.FunctionCallingConfigMode.ANY,
+                allowed_function_names=allowed_function_names,
+            )
+
+        if function_calling_config is not None:
+            tool_config["tool_config"] = types.ToolConfig(
+                function_calling_config=function_calling_config
+            )
+
+        return tool_config
+
     async def chat(
         self,
         messages: List[Dict[str, Any]],
@@ -431,18 +472,7 @@ class GeminiLLM(BaseLLM):
 
             # Add tools if available - wrap in types.Tool
             if tools:
-                gemini_tools_dict = self._convert_tools_to_gemini_format(tools)
-                gemini_tools = types.Tool(**gemini_tools_dict)
-                merged_config["tools"] = [gemini_tools]
-                merged_config["automatic_function_calling"] = (
-                    types.AutomaticFunctionCallingConfig(disable=True)
-                )
-                if tool_choice and tool_choice not in ("auto", "none"):
-                    merged_config["tool_config"] = types.ToolConfig(
-                        function_calling_config=types.FunctionCallingConfig(
-                            mode=types.FunctionCallingConfigMode.ANY
-                        )
-                    )
+                merged_config.update(self._build_gemini_tool_config(tools, tool_choice))
 
             # Add config if present
             if merged_config:
@@ -629,18 +659,7 @@ class GeminiLLM(BaseLLM):
 
             # Add tools if available - wrap in types.Tool
             if tools:
-                gemini_tools_dict = self._convert_tools_to_gemini_format(tools)
-                gemini_tools = types.Tool(**gemini_tools_dict)
-                merged_config["tools"] = [gemini_tools]
-                merged_config["automatic_function_calling"] = (
-                    types.AutomaticFunctionCallingConfig(disable=True)
-                )
-                if tool_choice and tool_choice not in ("auto", "none"):
-                    merged_config["tool_config"] = types.ToolConfig(
-                        function_calling_config=types.FunctionCallingConfig(
-                            mode=types.FunctionCallingConfigMode.ANY
-                        )
-                    )
+                merged_config.update(self._build_gemini_tool_config(tools, tool_choice))
 
             # Add config if present
             if merged_config:

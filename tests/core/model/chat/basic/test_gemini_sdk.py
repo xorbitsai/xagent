@@ -7,6 +7,7 @@ import pytest
 import pytest_mock
 
 from xagent.core.model.chat.basic.gemini import GeminiLLM
+from xagent.core.model.chat.types import ChunkType
 
 
 @pytest.fixture
@@ -25,6 +26,28 @@ class TestGeminiLLMSDK:
     def llm(self, gemini_llm_config: Dict[str, str]) -> GeminiLLM:
         """Fixture providing Gemini LLM instance."""
         return GeminiLLM(**gemini_llm_config)  # type: ignore[arg-type]
+
+    @staticmethod
+    def _weather_tools() -> list[dict[str, Any]]:
+        return [
+            {
+                "type": "function",
+                "function": {
+                    "name": "get_weather",
+                    "description": "Get the current weather for a location",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "location": {
+                                "type": "string",
+                                "description": "The city and state",
+                            }
+                        },
+                        "required": ["location"],
+                    },
+                },
+            }
+        ]
 
     @pytest.mark.asyncio
     async def test_basic_chat_completion_with_sdk(
@@ -242,6 +265,81 @@ class TestGeminiLLMSDK:
         assert "additional_properties" not in schema_text
         assert "anyOf" in schema_text
         assert "any_of" in schema_text
+
+    def test_tool_choice_none_disables_function_calling(self, llm: GeminiLLM) -> None:
+        """tool_choice='none' should disable Gemini function calling."""
+        from google.genai import types
+
+        config = llm._build_gemini_tool_config(
+            self._weather_tools(), tool_choice="none"
+        )
+
+        function_config = config["tool_config"].function_calling_config
+        assert function_config.mode == types.FunctionCallingConfigMode.NONE
+
+    def test_tool_choice_required_forces_function_calling(self, llm: GeminiLLM) -> None:
+        """tool_choice='required' should force a Gemini function call."""
+        from google.genai import types
+
+        config = llm._build_gemini_tool_config(
+            self._weather_tools(), tool_choice="required"
+        )
+
+        function_config = config["tool_config"].function_calling_config
+        assert function_config.mode == types.FunctionCallingConfigMode.ANY
+        assert function_config.allowed_function_names is None
+
+    def test_tool_choice_function_restricts_allowed_function_names(
+        self, llm: GeminiLLM
+    ) -> None:
+        """Dict tool_choice should restrict Gemini to the requested function."""
+        from google.genai import types
+
+        config = llm._build_gemini_tool_config(
+            self._weather_tools(),
+            tool_choice={
+                "type": "function",
+                "function": {"name": "get_weather"},
+            },
+        )
+
+        function_config = config["tool_config"].function_calling_config
+        assert function_config.mode == types.FunctionCallingConfigMode.ANY
+        assert function_config.allowed_function_names == ["get_weather"]
+
+    @pytest.mark.asyncio
+    async def test_stream_chat_yields_error_for_diagnostic_only_stream(
+        self, llm: GeminiLLM, mocker: pytest_mock.MockerFixture
+    ) -> None:
+        """A Gemini stream with diagnostics but no content/tools should emit ERROR."""
+        mock_client = MagicMock()
+        mock_chunk = MagicMock()
+        mock_candidate = MagicMock()
+        mock_candidate.finish_reason = "SAFETY"
+        mock_candidate.finish_message = "Blocked by safety filters"
+        mock_candidate.safety_ratings = [{"category": "HARM_CATEGORY_DANGEROUS"}]
+        mock_candidate.content = None
+        mock_chunk.candidates = [mock_candidate]
+        mock_chunk.usage_metadata = None
+
+        async def mock_stream():
+            yield mock_chunk
+
+        async def mock_generate_content_stream(*args, **kwargs):
+            return mock_stream()
+
+        mock_client.aio.models.generate_content_stream = mock_generate_content_stream
+        mocker.patch.object(llm, "_ensure_client")
+        llm._client = mock_client
+
+        messages = [{"role": "user", "content": "Say something unsafe."}]
+
+        chunks = [chunk async for chunk in llm.stream_chat(messages)]
+
+        assert len(chunks) == 1
+        assert chunks[0].type == ChunkType.ERROR
+        assert "Gemini stream ended without text" in chunks[0].content
+        assert "SAFETY" in chunks[0].content
 
     @pytest.mark.asyncio
     async def test_json_mode_with_sdk(

@@ -33,5 +33,6 @@ agent_config:
     through troubleshooting steps, and ensure a seamless support experience. If an
     issue exceeds your resolution capabilities, you will smoothly route the conversation
     to the appropriate human team.
+  execution_mode: flash
   skills: []
   tool_categories: []

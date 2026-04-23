@@ -60,7 +60,7 @@ class AgentConfig(BaseModel):
         default_factory=list, description="List of tool categories"
     )
     execution_mode: str = Field(
-        default="react", description="Execution mode: simple, react, or graph"
+        default="balanced", description="Execution mode: flash, balanced, or think"
     )
 
 
@@ -249,7 +249,9 @@ async def get_template(
             "instructions": template["agent_config"].get("instructions", ""),
             "skills": template["agent_config"].get("skills", []),
             "tool_categories": template["agent_config"].get("tool_categories", []),
-            "execution_mode": template["agent_config"].get("execution_mode", "react"),
+            "execution_mode": template["agent_config"].get(
+                "execution_mode", "balanced"
+            ),
         },
     )
 

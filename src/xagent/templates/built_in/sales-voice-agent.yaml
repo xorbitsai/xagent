@@ -35,5 +35,6 @@ agent_config:
     buying intent. When a lead is fully qualified, you will autonomously schedule
     follow-up meetings or demos on the calendar, ensuring a smooth handoff to the
     closing team.
+  execution_mode: balanced
   skills: []
   tool_categories: []

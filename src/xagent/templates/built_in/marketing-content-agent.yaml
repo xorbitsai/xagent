@@ -34,5 +34,6 @@ agent_config:
     uploaded brand guidelines and reference materials to ensure a consistent brand
     voice. Every piece of content must be structured for readability, keyword optimization,
     and audience engagement.
+  execution_mode: think
   skills: []
   tool_categories: []

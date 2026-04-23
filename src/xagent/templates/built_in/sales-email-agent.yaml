@@ -34,5 +34,6 @@ agent_config:
     emails, and monitor responses. You must update the CRM with any replies, categorize
     the sentiment of the responses, and immediately flag high-priority replies or
     buying signals to human sales representatives.
+  execution_mode: balanced
   skills: []
   tool_categories: []

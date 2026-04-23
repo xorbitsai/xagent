@@ -40,5 +40,6 @@ agent_config:
     them for our sales pipeline. For qualified prospects, you will proactively initiate
     calendar bookings for discovery calls and ensure all interactions are logged automatically
     into the CRM.
+  execution_mode: balanced
   skills: []
   tool_categories: []

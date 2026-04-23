@@ -4,6 +4,7 @@ export interface AgentConfig {
   instructions: string;
   skills: string[];
   tool_categories: string[];
+  execution_mode?: "flash" | "balanced" | "think";
 }
 
 export interface ConnectionInfo {

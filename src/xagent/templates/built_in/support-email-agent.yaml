@@ -38,5 +38,6 @@ agent_config:
     customer inquiries. Furthermore, you will track open support tickets, follow up
     with customers proactively to ensure their issues are resolved, and maintain detailed
     logs in the CRM.
+  execution_mode: balanced
   skills: []
   tool_categories: []

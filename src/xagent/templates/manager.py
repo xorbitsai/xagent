@@ -119,6 +119,7 @@ class TemplateManager:
         agent_config.setdefault("instructions", "")
         agent_config.setdefault("skills", [])
         agent_config.setdefault("tool_categories", [])
+        agent_config.setdefault("execution_mode", "balanced")
 
         return data
 

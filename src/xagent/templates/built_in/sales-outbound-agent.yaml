@@ -34,6 +34,7 @@ agent_config:
     filter leads based on qualification criteria, and build meticulously scored lead
     lists. Finally, you will draft personalized outreach messaging and push these
     contacts into our CRM (Hubspot/Salesforce) seamlessly.
+  execution_mode: think
   skills: []
   tool_categories:
   - mcp:Hubspot

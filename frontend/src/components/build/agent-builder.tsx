@@ -621,6 +621,7 @@ export function AgentBuilder({ agentId }: AgentBuilderProps) {
           setName(template.name || "")
           setDescription(template.description || "")
           setInstructions(template.agent_config?.instructions || "")
+          setExecutionMode(template.agent_config?.execution_mode || "balanced")
           setSelectedSkills(template.agent_config?.skills || [])
 
           // Separate regular tools from MCP servers

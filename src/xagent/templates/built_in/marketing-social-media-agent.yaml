@@ -34,5 +34,6 @@ agent_config:
     accompanying visuals, and adapt the tone to fit each specific platform's audience.
     Additionally, you will schedule and auto-post these assets according to the optimal
     content calendar.
+  execution_mode: balanced
   skills: []
   tool_categories: []

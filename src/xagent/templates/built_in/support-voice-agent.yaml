@@ -36,5 +36,6 @@ agent_config:
     pain points and provide solutions. For highly complex or sensitive cases, you
     will intelligently escalate the call to human support agents, providing them with
     a complete summary of the interaction.
+  execution_mode: balanced
   skills: []
   tool_categories: []

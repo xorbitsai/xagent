@@ -441,30 +441,6 @@ def reconcile_uploaded_files(
             continue
 
         safe_file_id = escape_lancedb_string(file_id)
-        file_path = Path(str(record.storage_path))
-        uploads_root = get_uploads_dir().resolve()
-        try:
-            resolved_path = file_path.resolve()
-            resolved_path.relative_to(uploads_root)
-        except ValueError:
-            logger.warning(
-                "Skipping stale file cleanup outside uploads root: %s",
-                file_path,
-            )
-        else:
-            if resolved_path.exists() and resolved_path.is_file():
-                try:
-                    resolved_path.unlink()
-                except OSError as exc:
-                    cleanup_errors += 1
-                    logger.error(
-                        "Failed to delete stale file %s for file_id=%s: %s",
-                        resolved_path,
-                        file_id,
-                        exc,
-                    )
-                    continue
-
         # Query documents table to get (collection, doc_id) pairs for cascade deletion
         try:
             doc_rows = query_to_list(
@@ -530,6 +506,31 @@ def reconcile_uploaded_files(
                 file_id,
             )
             continue
+
+        # After relational/vector cleanup succeeds, delete physical file.
+        file_path = Path(str(record.storage_path))
+        uploads_root = get_uploads_dir().resolve()
+        try:
+            resolved_path = file_path.resolve()
+            resolved_path.relative_to(uploads_root)
+        except ValueError:
+            logger.warning(
+                "Skipping stale file cleanup outside uploads root: %s",
+                file_path,
+            )
+        else:
+            if resolved_path.exists() and resolved_path.is_file():
+                try:
+                    resolved_path.unlink()
+                except OSError as exc:
+                    cleanup_errors += 1
+                    logger.error(
+                        "Failed to delete stale file %s for file_id=%s: %s",
+                        resolved_path,
+                        file_id,
+                        exc,
+                    )
+                    continue
 
         # Finally delete the UploadedFile record
         db.delete(record)

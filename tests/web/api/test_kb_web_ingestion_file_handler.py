@@ -20,6 +20,7 @@ from sqlalchemy import create_engine
 from sqlalchemy.orm import Session, sessionmaker
 
 from xagent.web.api.kb import (
+    _WEB_FILE_LOCKS,
     _atomic_replace_file,
     _get_file_sha256,
     _mark_uploaded_file_for_reindex,
@@ -453,6 +454,15 @@ class TestWebFileRefreshHelpers:
             thread.join()
 
         assert peak_active_count == 1
+
+    def test_web_file_lock_registry_entry_is_released_after_use(self) -> None:
+        lock_key = "1:transient-url-hash"
+        _WEB_FILE_LOCKS.pop(lock_key, None)
+
+        with _WebFileLock(lock_key):
+            assert lock_key in _WEB_FILE_LOCKS
+
+        assert lock_key not in _WEB_FILE_LOCKS
 
     def test_cache_updates_with_upsert_returned_file_id(self) -> None:
         processed_urls: dict[str, str] = {"hash-key": "old-file-id"}

@@ -108,7 +108,8 @@ T = TypeVar("T", bound=Callable[..., Any])
 logger = logging.getLogger(__name__)
 
 _SQL_LIKE_ESCAPE = "\\"
-_WEB_FILE_LOCKS: Dict[str, threading.Lock] = {}
+# lock_key -> (lock, active waiter/holder count)
+_WEB_FILE_LOCKS: Dict[str, tuple[threading.Lock, int]] = {}
 _WEB_FILE_LOCKS_GUARD = threading.Lock()
 
 
@@ -372,10 +373,13 @@ class _WebFileLock:
 
     def __enter__(self) -> "_WebFileLock":
         with _WEB_FILE_LOCKS_GUARD:
-            lock = _WEB_FILE_LOCKS.get(self._lock_key)
-            if lock is None:
+            lock_entry = _WEB_FILE_LOCKS.get(self._lock_key)
+            if lock_entry is None:
                 lock = threading.Lock()
-                _WEB_FILE_LOCKS[self._lock_key] = lock
+                _WEB_FILE_LOCKS[self._lock_key] = (lock, 1)
+            else:
+                lock, ref_count = lock_entry
+                _WEB_FILE_LOCKS[self._lock_key] = (lock, ref_count + 1)
             self._lock = lock
         # Acquire the per-key lock outside the global guard to avoid
         # blocking other threads from accessing the registry for different keys.
@@ -385,6 +389,15 @@ class _WebFileLock:
     def __exit__(self, exc_type: Any, exc_value: Any, traceback: Any) -> None:
         if self._lock is not None:
             self._lock.release()
+        with _WEB_FILE_LOCKS_GUARD:
+            lock_entry = _WEB_FILE_LOCKS.get(self._lock_key)
+            if lock_entry is None:
+                return
+            lock, ref_count = lock_entry
+            if ref_count <= 1:
+                _WEB_FILE_LOCKS.pop(self._lock_key, None)
+                return
+            _WEB_FILE_LOCKS[self._lock_key] = (lock, ref_count - 1)
 
 
 def handle_kb_exceptions(func: T) -> T:

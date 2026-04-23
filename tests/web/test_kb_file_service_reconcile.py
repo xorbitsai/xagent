@@ -303,7 +303,7 @@ def test_reconcile_uploaded_files_records_cleanup_error_when_documents_delete_fa
 
     assert result["cleanup_errors"] == 1
     assert result["deleted"] == 0
-    assert not failed_path.exists()
+    assert failed_path.exists()
     still_exists = (
         db.query(UploadedFile)
         .filter(UploadedFile.file_id == failed_file.file_id)

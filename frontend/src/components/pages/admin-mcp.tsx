@@ -1,7 +1,7 @@
 "use client"
 
 import { useState, useEffect } from "react"
-import { Plus, Trash2, Edit2, CheckCircle2, Shield, Search } from "lucide-react"
+import { Plus, Trash2, Edit2, Search } from "lucide-react"
 import { useAuth } from "@/contexts/auth-context"
 import { apiRequest } from "@/lib/api-wrapper"
 import { getApiUrl } from "@/lib/utils"
@@ -18,6 +18,7 @@ import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogFooter, DialogD
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table"
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card"
 import { Badge } from "@/components/ui/badge"
+import { Stepper } from "@/components/ui/stepper"
 
 interface OAuthProvider {
   id: number
@@ -56,7 +57,7 @@ export default function AdminMcpPage() {
 
   // Modals state
   const [isAddModalOpen, setIsAddModalOpen] = useState(false)
-  const [step, setStep] = useState(1) // 1: Provider, 2: App Details, 3: Test
+  const [step, setStep] = useState(1) // 1: Provider, 2: App Details
 
   // Form states
   const [selectedProviderName, setSelectedProviderName] = useState<string>("none")
@@ -233,21 +234,13 @@ export default function AdminMcpPage() {
       if (res.ok) {
         toast.success(isEdit ? (t("adminMcp.apps.saveSuccess")) : (t("adminMcp.apps.saveSuccess")))
         fetchData()
-        if (isEdit) {
-          setIsAddModalOpen(false)
-        } else {
-          setStep(3)
-        }
+        setIsAddModalOpen(false)
       } else {
         toast.error(isEdit ? (t("adminMcp.apps.saveFailed")) : (t("adminMcp.apps.saveFailed")))
       }
     } catch (err) {
       toast.error(t("adminMcp.apps.saveFailed"))
     }
-  }
-
-  const handleFinish = () => {
-    setIsAddModalOpen(false)
   }
 
   // Effect to reset state when modal closes
@@ -401,7 +394,6 @@ export default function AdminMcpPage() {
                 <>
                   {step === 1 && (t("adminMcp.modal.step1"))}
                   {step === 2 && (t("adminMcp.modal.step2"))}
-                  {step === 3 && (t("adminMcp.modal.step3"))}
                 </>
               )}
             </DialogTitle>
@@ -412,181 +404,270 @@ export default function AdminMcpPage() {
                 <>
                   {step === 1 && (t("adminMcp.modal.step1Desc"))}
                   {step === 2 && (t("adminMcp.modal.step2Desc"))}
-                  {step === 3 && (t("adminMcp.modal.step3Desc"))}
                 </>
               )}
             </DialogDescription>
           </DialogHeader>
 
-          {step === 1 && (
-            <div className="space-y-4 py-4">
-              {!isCreatingProvider && !isStandaloneProvider ? (
-                <div className="space-y-4">
-                  <div className="space-y-2">
-                    <Label>{t("adminMcp.providers.form.selectLabel")}</Label>
-                    <Select value={selectedProviderName} onValueChange={setSelectedProviderName}>
-                      <SelectTrigger>
-                        <SelectValue placeholder={t("adminMcp.providers.form.selectPlaceholder")} />
-                      </SelectTrigger>
-                      <SelectContent>
-                        <SelectItem value="none">{t("adminMcp.providers.form.noOAuth")}</SelectItem>
-                        {providers.map(p => (
-                          <SelectItem key={p.provider_name} value={p.provider_name}>{p.name} ({p.provider_name})</SelectItem>
-                        ))}
-                      </SelectContent>
-                    </Select>
-                  </div>
-                  <div className="pt-4 border-t flex flex-col items-center">
-                    <span className="text-sm text-muted-foreground mb-4">{t("adminMcp.providers.form.orCreateNew")}</span>
-                    <Button variant="outline" onClick={() => setIsCreatingProvider(true)}>
-                      <Plus className="w-4 h-4 mr-2" /> {t("adminMcp.providers.form.addNew")}
-                    </Button>
-                  </div>
-                </div>
-              ) : (
-                <div className="grid gap-4 py-2">
-                  {!isStandaloneProvider && (
-                    <div className="flex justify-between items-center mb-2">
-                      <h3 className="font-medium">{editingProviderId ? (t("adminMcp.providers.edit")) : (t("adminMcp.providers.new"))}</h3>
+          {isStandaloneProvider ? (
+            <>
+              {step === 1 && (
+                <div className="space-y-4 py-4">
+                  {!isCreatingProvider && !isStandaloneProvider ? (
+                    <div className="space-y-4">
+                      <div className="space-y-2">
+                        <Label>{t("adminMcp.providers.form.selectLabel")}</Label>
+                        <Select value={selectedProviderName} onValueChange={setSelectedProviderName}>
+                          <SelectTrigger>
+                            <SelectValue placeholder={t("adminMcp.providers.form.selectPlaceholder")} />
+                          </SelectTrigger>
+                          <SelectContent>
+                            <SelectItem value="none">{t("adminMcp.providers.form.noOAuth")}</SelectItem>
+                            {providers.map(p => (
+                              <SelectItem key={p.provider_name} value={p.provider_name}>{p.name} ({p.provider_name})</SelectItem>
+                            ))}
+                          </SelectContent>
+                        </Select>
+                      </div>
+                      <div className="pt-4 border-t flex flex-col items-center">
+                        <span className="text-sm text-muted-foreground mb-4">{t("adminMcp.providers.form.orCreateNew")}</span>
+                        <Button variant="outline" onClick={() => setIsCreatingProvider(true)}>
+                          <Plus className="w-4 h-4 mr-2" /> {t("adminMcp.providers.form.addNew")}
+                        </Button>
+                      </div>
+                    </div>
+                  ) : (
+                    <div className="grid gap-4 py-2">
+                      {!isStandaloneProvider && (
+                        <div className="flex justify-between items-center mb-2">
+                          <h3 className="font-medium">{editingProviderId ? (t("adminMcp.providers.edit")) : (t("adminMcp.providers.new"))}</h3>
+                        </div>
+                      )}
+                      <div className="grid grid-cols-2 gap-4">
+                        <div className="space-y-2">
+                          <Label>{t("adminMcp.providers.form.providerId")}</Label>
+                          <Input value={newProvider.provider_name} onChange={e => setNewProvider({ ...newProvider, provider_name: e.target.value })} />
+                        </div>
+                        <div className="space-y-2">
+                          <Label>{t("adminMcp.providers.form.displayName")}</Label>
+                          <Input value={newProvider.name} onChange={e => setNewProvider({ ...newProvider, name: e.target.value })} />
+                        </div>
+                      </div>
+                      <div className="grid grid-cols-2 gap-4">
+                        <div className="space-y-2">
+                          <Label>{t("adminMcp.providers.form.clientId")}</Label>
+                          <Input value={newProvider.client_id} onChange={e => setNewProvider({ ...newProvider, client_id: e.target.value })} />
+                        </div>
+                        <div className="space-y-2">
+                          <Label>{t("adminMcp.providers.form.clientSecret")}</Label>
+                          <Input type="password" value={newProvider.client_secret} onChange={e => setNewProvider({ ...newProvider, client_secret: e.target.value })} />
+                        </div>
+                      </div>
+                      <div className="space-y-2">
+                        <Label>{t("adminMcp.providers.form.authUrl")}</Label>
+                        <Input value={newProvider.auth_url} onChange={e => setNewProvider({ ...newProvider, auth_url: e.target.value })} />
+                      </div>
+                      <div className="space-y-2">
+                        <Label>{t("adminMcp.providers.form.tokenUrl")}</Label>
+                        <Input value={newProvider.token_url} onChange={e => setNewProvider({ ...newProvider, token_url: e.target.value })} />
+                      </div>
+                      <div className="space-y-2">
+                        <Label>{t("adminMcp.providers.form.redirectUri")}</Label>
+                        <Input placeholder={t("adminMcp.providers.form.redirectUriPlaceholder")} value={newProvider.redirect_uri || ""} onChange={e => setNewProvider({ ...newProvider, redirect_uri: e.target.value })} />
+                      </div>
+                      <div className="space-y-2">
+                        <Label>{t("adminMcp.providers.form.userinfoUrl")}</Label>
+                        <Input value={newProvider.userinfo_url || ""} onChange={e => setNewProvider({ ...newProvider, userinfo_url: e.target.value })} />
+                      </div>
+                      <div className="grid grid-cols-2 gap-4">
+                        <div className="space-y-2">
+                          <Label>{t("adminMcp.providers.form.userIdPath")}</Label>
+                          <Input value={newProvider.user_id_path || "id"} onChange={e => setNewProvider({ ...newProvider, user_id_path: e.target.value })} />
+                        </div>
+                        <div className="space-y-2">
+                          <Label>{t("adminMcp.providers.form.emailPath")}</Label>
+                          <Input value={newProvider.email_path || "email"} onChange={e => setNewProvider({ ...newProvider, email_path: e.target.value })} />
+                        </div>
+                      </div>
+                      <div className="space-y-2">
+                        <Label>{t("adminMcp.providers.form.defaultScopes")}</Label>
+                        <Input value={(newProvider.default_scopes as any) || ""} onChange={e => setNewProvider({ ...newProvider, default_scopes: e.target.value as any })} />
+                      </div>
                     </div>
                   )}
-                  <div className="grid grid-cols-2 gap-4">
-                    <div className="space-y-2">
-                      <Label>{t("adminMcp.providers.form.providerId")}</Label>
-                      <Input value={newProvider.provider_name} onChange={e => setNewProvider({ ...newProvider, provider_name: e.target.value })} />
-                    </div>
-                    <div className="space-y-2">
-                      <Label>{t("adminMcp.providers.form.displayName")}</Label>
-                      <Input value={newProvider.name} onChange={e => setNewProvider({ ...newProvider, name: e.target.value })} />
-                    </div>
-                  </div>
-                  <div className="grid grid-cols-2 gap-4">
-                    <div className="space-y-2">
-                      <Label>{t("adminMcp.providers.form.clientId")}</Label>
-                      <Input value={newProvider.client_id} onChange={e => setNewProvider({ ...newProvider, client_id: e.target.value })} />
-                    </div>
-                    <div className="space-y-2">
-                      <Label>{t("adminMcp.providers.form.clientSecret")}</Label>
-                      <Input type="password" value={newProvider.client_secret} onChange={e => setNewProvider({ ...newProvider, client_secret: e.target.value })} />
-                    </div>
-                  </div>
-                  <div className="space-y-2">
-                    <Label>{t("adminMcp.providers.form.authUrl")}</Label>
-                    <Input value={newProvider.auth_url} onChange={e => setNewProvider({ ...newProvider, auth_url: e.target.value })} />
-                  </div>
-                  <div className="space-y-2">
-                    <Label>{t("adminMcp.providers.form.tokenUrl")}</Label>
-                    <Input value={newProvider.token_url} onChange={e => setNewProvider({ ...newProvider, token_url: e.target.value })} />
-                  </div>
-                  <div className="space-y-2">
-                    <Label>{t("adminMcp.providers.form.redirectUri")}</Label>
-                    <Input placeholder={t("adminMcp.providers.form.redirectUriPlaceholder")} value={newProvider.redirect_uri || ""} onChange={e => setNewProvider({ ...newProvider, redirect_uri: e.target.value })} />
-                  </div>
-                  <div className="space-y-2">
-                    <Label>{t("adminMcp.providers.form.userinfoUrl")}</Label>
-                    <Input value={newProvider.userinfo_url || ""} onChange={e => setNewProvider({ ...newProvider, userinfo_url: e.target.value })} />
-                  </div>
-                  <div className="grid grid-cols-2 gap-4">
-                    <div className="space-y-2">
-                      <Label>{t("adminMcp.providers.form.userIdPath")}</Label>
-                      <Input value={newProvider.user_id_path || "id"} onChange={e => setNewProvider({ ...newProvider, user_id_path: e.target.value })} />
-                    </div>
-                    <div className="space-y-2">
-                      <Label>{t("adminMcp.providers.form.emailPath")}</Label>
-                      <Input value={newProvider.email_path || "email"} onChange={e => setNewProvider({ ...newProvider, email_path: e.target.value })} />
-                    </div>
-                  </div>
-                  <div className="space-y-2">
-                    <Label>{t("adminMcp.providers.form.defaultScopes")}</Label>
-                    <Input value={(newProvider.default_scopes as any) || ""} onChange={e => setNewProvider({ ...newProvider, default_scopes: e.target.value as any })} />
-                  </div>
                 </div>
               )}
-            </div>
-          )}
-
-          {step === 2 && (
-            <div className="grid gap-4 py-4">
-              <div className="grid grid-cols-2 gap-4">
-                <div className="space-y-2">
-                  <Label>{t("adminMcp.apps.form.appId")}</Label>
-                  <Input value={newApp.app_id} onChange={e => setNewApp({ ...newApp, app_id: e.target.value })} />
-                </div>
-                <div className="space-y-2">
-                  <Label>{t("adminMcp.apps.form.displayName")}</Label>
-                  <Input value={newApp.name} onChange={e => setNewApp({ ...newApp, name: e.target.value })} />
-                </div>
-              </div>
-              <div className="space-y-2">
-                <Label>{t("adminMcp.apps.form.description")}</Label>
-                <Input value={newApp.description || ""} onChange={e => setNewApp({ ...newApp, description: e.target.value })} />
-              </div>
-              <div className="grid grid-cols-2 gap-4">
-                <div className="space-y-2">
-                  <Label>{t("adminMcp.apps.form.iconUrl")}</Label>
-                  <Input value={newApp.icon || ""} onChange={e => setNewApp({ ...newApp, icon: e.target.value })} />
-                </div>
-                <div className="space-y-2">
-                  <Label>{t("adminMcp.apps.form.category")}</Label>
-                  <Select value={newApp.category || "Other"} onValueChange={v => setNewApp({ ...newApp, category: v })}>
-                    <SelectTrigger>
-                      <SelectValue />
-                    </SelectTrigger>
-                    <SelectContent>
-                      <SelectItem value="CRM">CRM</SelectItem>
-                      <SelectItem value="Communication">Communication</SelectItem>
-                      <SelectItem value="Support">Support</SelectItem>
-                      <SelectItem value="Marketing">Marketing</SelectItem>
-                      <SelectItem value="Scheduling">Scheduling</SelectItem>
-                      <SelectItem value="Payments">Payments</SelectItem>
-                      <SelectItem value="Analytics">Analytics</SelectItem>
-                      <SelectItem value="Other">Other</SelectItem>
-                    </SelectContent>
-                  </Select>
-                </div>
-              </div>
-              <div className="space-y-2">
-                <Label>{t("adminMcp.apps.form.transport")}</Label>
-                <Select value={newApp.transport} onValueChange={v => setNewApp({ ...newApp, transport: v })}>
-                  <SelectTrigger>
-                    <SelectValue />
-                  </SelectTrigger>
-                  <SelectContent>
-                    <SelectItem value="oauth">OAuth</SelectItem>
-                    <SelectItem value="stdio">Stdio</SelectItem>
-                    <SelectItem value="sse">SSE</SelectItem>
-                  </SelectContent>
-                </Select>
-              </div>
-              {newApp.transport === "oauth" && (
-                <div className="space-y-2">
-                  <Label>{t("adminMcp.apps.form.oauthScopes")}</Label>
-                  <Input value={(newApp.oauth_scopes as any) || ""} onChange={e => setNewApp({ ...newApp, oauth_scopes: e.target.value as any })} />
-                </div>
-              )}
-              <div className="space-y-2">
-                <Label>{t("adminMcp.apps.form.launchConfig")}</Label>
-                <p className="text-xs text-muted-foreground">Example: {`{"command": "uv", "args": ["run", "python", "-m", "xagent.web.tools.mcp.gmail"], "env_mapping": {"GOOGLE_ACCESS_TOKEN": "access_token"}}`}</p>
-                <Textarea
-                  value={typeof newApp.launch_config === 'string' ? newApp.launch_config : JSON.stringify(newApp.launch_config, null, 2)}
-                  onChange={e => setNewApp({ ...newApp, launch_config: e.target.value })}
-                  className="font-mono text-xs"
-                  rows={6}
-                />
-              </div>
-            </div>
-          )}
-
-          {step === 3 && (
-            <div className="py-8 flex flex-col items-center justify-center space-y-4">
-              <div className="w-16 h-16 bg-green-100 text-green-600 rounded-full flex items-center justify-center">
-                <CheckCircle2 className="w-8 h-8" />
-              </div>
-              <h3 className="text-xl font-medium">{t("adminMcp.modal.successTitle")}</h3>
-              <p className="text-muted-foreground text-center max-w-md">
-                {t("adminMcp.modal.successDesc")}
-              </p>
-            </div>
+            </>
+          ) : (
+            <Stepper
+              steps={[
+                {
+                  label: t("adminMcp.modal.step1"),
+                  content: (
+                    <div className="space-y-4 py-4">
+                      {!isCreatingProvider && !isStandaloneProvider ? (
+                        <div className="space-y-4">
+                          <div className="space-y-2">
+                            <Label>{t("adminMcp.providers.form.selectLabel")}</Label>
+                            <Select value={selectedProviderName} onValueChange={setSelectedProviderName}>
+                              <SelectTrigger>
+                                <SelectValue placeholder={t("adminMcp.providers.form.selectPlaceholder")} />
+                              </SelectTrigger>
+                              <SelectContent>
+                                <SelectItem value="none">{t("adminMcp.providers.form.noOAuth")}</SelectItem>
+                                {providers.map(p => (
+                                  <SelectItem key={p.provider_name} value={p.provider_name}>{p.name} ({p.provider_name})</SelectItem>
+                                ))}
+                              </SelectContent>
+                            </Select>
+                          </div>
+                          <div className="pt-4 border-t flex flex-col items-center">
+                            <span className="text-sm text-muted-foreground mb-4">{t("adminMcp.providers.form.orCreateNew")}</span>
+                            <Button variant="outline" onClick={() => setIsCreatingProvider(true)}>
+                              <Plus className="w-4 h-4 mr-2" /> {t("adminMcp.providers.form.addNew")}
+                            </Button>
+                          </div>
+                        </div>
+                      ) : (
+                        <div className="grid gap-4 py-2">
+                          {!isStandaloneProvider && (
+                            <div className="flex justify-between items-center mb-2">
+                              <h3 className="font-medium">{editingProviderId ? (t("adminMcp.providers.edit")) : (t("adminMcp.providers.new"))}</h3>
+                            </div>
+                          )}
+                          <div className="grid grid-cols-2 gap-4">
+                            <div className="space-y-2">
+                              <Label>{t("adminMcp.providers.form.providerId")}</Label>
+                              <Input value={newProvider.provider_name} onChange={e => setNewProvider({ ...newProvider, provider_name: e.target.value })} />
+                            </div>
+                            <div className="space-y-2">
+                              <Label>{t("adminMcp.providers.form.displayName")}</Label>
+                              <Input value={newProvider.name} onChange={e => setNewProvider({ ...newProvider, name: e.target.value })} />
+                            </div>
+                          </div>
+                          <div className="grid grid-cols-2 gap-4">
+                            <div className="space-y-2">
+                              <Label>{t("adminMcp.providers.form.clientId")}</Label>
+                              <Input value={newProvider.client_id} onChange={e => setNewProvider({ ...newProvider, client_id: e.target.value })} />
+                            </div>
+                            <div className="space-y-2">
+                              <Label>{t("adminMcp.providers.form.clientSecret")}</Label>
+                              <Input type="password" value={newProvider.client_secret} onChange={e => setNewProvider({ ...newProvider, client_secret: e.target.value })} />
+                            </div>
+                          </div>
+                          <div className="space-y-2">
+                            <Label>{t("adminMcp.providers.form.authUrl")}</Label>
+                            <Input value={newProvider.auth_url} onChange={e => setNewProvider({ ...newProvider, auth_url: e.target.value })} />
+                          </div>
+                          <div className="space-y-2">
+                            <Label>{t("adminMcp.providers.form.tokenUrl")}</Label>
+                            <Input value={newProvider.token_url} onChange={e => setNewProvider({ ...newProvider, token_url: e.target.value })} />
+                          </div>
+                          <div className="space-y-2">
+                            <Label>{t("adminMcp.providers.form.redirectUri")}</Label>
+                            <Input placeholder={t("adminMcp.providers.form.redirectUriPlaceholder")} value={newProvider.redirect_uri || ""} onChange={e => setNewProvider({ ...newProvider, redirect_uri: e.target.value })} />
+                          </div>
+                          <div className="space-y-2">
+                            <Label>{t("adminMcp.providers.form.userinfoUrl")}</Label>
+                            <Input value={newProvider.userinfo_url || ""} onChange={e => setNewProvider({ ...newProvider, userinfo_url: e.target.value })} />
+                          </div>
+                          <div className="grid grid-cols-2 gap-4">
+                            <div className="space-y-2">
+                              <Label>{t("adminMcp.providers.form.userIdPath")}</Label>
+                              <Input value={newProvider.user_id_path || "id"} onChange={e => setNewProvider({ ...newProvider, user_id_path: e.target.value })} />
+                            </div>
+                            <div className="space-y-2">
+                              <Label>{t("adminMcp.providers.form.emailPath")}</Label>
+                              <Input value={newProvider.email_path || "email"} onChange={e => setNewProvider({ ...newProvider, email_path: e.target.value })} />
+                            </div>
+                          </div>
+                          <div className="space-y-2">
+                            <Label>{t("adminMcp.providers.form.defaultScopes")}</Label>
+                            <Input value={(newProvider.default_scopes as any) || ""} onChange={e => setNewProvider({ ...newProvider, default_scopes: e.target.value as any })} />
+                          </div>
+                        </div>
+                      )}
+                    </div>
+                  )
+                },
+                {
+                  label: t("adminMcp.modal.step2"),
+                  content: (
+                    <div className="grid gap-4 py-4">
+                      <div className="grid grid-cols-2 gap-4">
+                        <div className="space-y-2">
+                          <Label>{t("adminMcp.apps.form.appId")}</Label>
+                          <Input value={newApp.app_id} onChange={e => setNewApp({ ...newApp, app_id: e.target.value })} />
+                        </div>
+                        <div className="space-y-2">
+                          <Label>{t("adminMcp.apps.form.displayName")}</Label>
+                          <Input value={newApp.name} onChange={e => setNewApp({ ...newApp, name: e.target.value })} />
+                        </div>
+                      </div>
+                      <div className="space-y-2">
+                        <Label>{t("adminMcp.apps.form.description")}</Label>
+                        <Input value={newApp.description || ""} onChange={e => setNewApp({ ...newApp, description: e.target.value })} />
+                      </div>
+                      <div className="grid grid-cols-2 gap-4">
+                        <div className="space-y-2">
+                          <Label>{t("adminMcp.apps.form.iconUrl")}</Label>
+                          <Input value={newApp.icon || ""} onChange={e => setNewApp({ ...newApp, icon: e.target.value })} />
+                        </div>
+                        <div className="space-y-2">
+                          <Label>{t("adminMcp.apps.form.category")}</Label>
+                          <Select value={newApp.category || "Other"} onValueChange={v => setNewApp({ ...newApp, category: v })}>
+                            <SelectTrigger>
+                              <SelectValue />
+                            </SelectTrigger>
+                            <SelectContent>
+                              <SelectItem value="CRM">CRM</SelectItem>
+                              <SelectItem value="Communication">Communication</SelectItem>
+                              <SelectItem value="Support">Support</SelectItem>
+                              <SelectItem value="Marketing">Marketing</SelectItem>
+                              <SelectItem value="Scheduling">Scheduling</SelectItem>
+                              <SelectItem value="Payments">Payments</SelectItem>
+                              <SelectItem value="Analytics">Analytics</SelectItem>
+                              <SelectItem value="Other">Other</SelectItem>
+                            </SelectContent>
+                          </Select>
+                        </div>
+                      </div>
+                      <div className="space-y-2">
+                        <Label>{t("adminMcp.apps.form.transport")}</Label>
+                        <Select value={newApp.transport} onValueChange={v => setNewApp({ ...newApp, transport: v })}>
+                          <SelectTrigger>
+                            <SelectValue />
+                          </SelectTrigger>
+                          <SelectContent>
+                            <SelectItem value="oauth">OAuth</SelectItem>
+                            <SelectItem value="stdio">Stdio</SelectItem>
+                            <SelectItem value="sse">SSE</SelectItem>
+                          </SelectContent>
+                        </Select>
+                      </div>
+                      {newApp.transport === "oauth" && (
+                        <div className="space-y-2">
+                          <Label>{t("adminMcp.apps.form.oauthScopes")}</Label>
+                          <Input value={(newApp.oauth_scopes as any) || ""} onChange={e => setNewApp({ ...newApp, oauth_scopes: e.target.value as any })} />
+                        </div>
+                      )}
+                      <div className="space-y-2">
+                        <Label>{t("adminMcp.apps.form.launchConfig")}</Label>
+                        <p className="text-xs text-muted-foreground">Example: {`{"command": "uv", "args": ["run", "python", "-m", "xagent.web.tools.mcp.gmail"], "env_mapping": {"GOOGLE_ACCESS_TOKEN": "access_token"}}`}</p>
+                        <Textarea
+                          value={typeof newApp.launch_config === 'string' ? newApp.launch_config : JSON.stringify(newApp.launch_config, null, 2)}
+                          onChange={e => setNewApp({ ...newApp, launch_config: e.target.value })}
+                          className="font-mono text-xs"
+                          rows={6}
+                        />
+                      </div>
+                    </div>
+                  )
+                }
+              ]}
+              currentStep={step}
+              className="mt-4"
+            />
           )}
 
           <DialogFooter>
@@ -605,9 +686,6 @@ export default function AdminMcpPage() {
                 <Button variant="outline" onClick={() => setStep(1)}>{t("adminMcp.modal.back")}</Button>
                 <Button onClick={handleNextStep2} disabled={!newApp.app_id || !newApp.name}>{t("adminMcp.modal.saveApp")}</Button>
               </>
-            )}
-            {step === 3 && (
-              <Button onClick={handleFinish}>{t("adminMcp.modal.finish")}</Button>
             )}
           </DialogFooter>
         </DialogContent>

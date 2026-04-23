@@ -197,6 +197,52 @@ class TestGeminiLLMSDK:
         assert tool_calls[0]["function"]["name"] == "get_weather"
         print(f"Tool calling response: {response}")
 
+    def test_tool_schema_removes_nested_additional_properties(
+        self, llm: GeminiLLM
+    ) -> None:
+        """Gemini rejects additionalProperties even inside nested anyOf schemas."""
+        tools = [
+            {
+                "type": "function",
+                "function": {
+                    "name": "search_docs",
+                    "description": "Search documents",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "filters": {
+                                "anyOf": [
+                                    {
+                                        "type": "object",
+                                        "additionalProperties": {"type": "string"},
+                                    },
+                                    {"type": "null"},
+                                ]
+                            },
+                            "options": {
+                                "any_of": [
+                                    {
+                                        "type": "object",
+                                        "additional_properties": False,
+                                    }
+                                ]
+                            },
+                        },
+                        "additionalProperties": False,
+                    },
+                },
+            }
+        ]
+
+        gemini_tools = llm._convert_tools_to_gemini_format(tools)
+        schema = gemini_tools["function_declarations"][0]["parameters"]
+        schema_text = str(schema)
+
+        assert "additionalProperties" not in schema_text
+        assert "additional_properties" not in schema_text
+        assert "anyOf" in schema_text
+        assert "any_of" in schema_text
+
     @pytest.mark.asyncio
     async def test_json_mode_with_sdk(
         self, llm: GeminiLLM, mocker: pytest_mock.MockerFixture

@@ -77,6 +77,96 @@ def _flatten_json_schema(schema: Dict[str, Any]) -> Dict[str, Any]:
     return flattened
 
 
+def _sanitize_schema_for_gemini(schema: Any) -> Any:
+    """Remove JSON Schema keywords that Gemini function declarations reject."""
+    unsupported_keys = {
+        # Pydantic/JSON Schema uses this for closed objects or dict value schemas.
+        # google-genai converts it to additional_properties, which Gemini rejects
+        # in function declaration schemas.
+        "additionalProperties",
+        "additional_properties",
+    }
+
+    if isinstance(schema, dict):
+        return {
+            key: _sanitize_schema_for_gemini(value)
+            for key, value in schema.items()
+            if key not in unsupported_keys
+        }
+    if isinstance(schema, list):
+        return [_sanitize_schema_for_gemini(item) for item in schema]
+    return schema
+
+
+def _get_obj_value(obj: Any, key: str, default: Any = None) -> Any:
+    """Read a value from either a dict-like object or SDK model object."""
+    if isinstance(obj, dict):
+        return obj.get(key, default)
+    return getattr(obj, key, default)
+
+
+def _compact_repr(value: Any, limit: int = 500) -> str:
+    """Return a bounded representation safe for diagnostics."""
+    try:
+        text = repr(value)
+    except Exception:
+        text = f"<unrepresentable {type(value).__name__}>"
+    return text if len(text) <= limit else text[:limit] + "..."
+
+
+def _gemini_candidate_diagnostics(candidate: Any) -> Dict[str, Any]:
+    """Extract useful Gemini candidate diagnostics without dumping full payloads."""
+    diagnostics: Dict[str, Any] = {}
+    for field in ("finish_reason", "finish_message", "safety_ratings"):
+        value = _get_obj_value(candidate, field)
+        if value:
+            diagnostics[field] = _compact_repr(value)
+    return diagnostics
+
+
+def _partial_arg_to_diagnostic(partial_arg: Any) -> Dict[str, Any]:
+    diagnostic: Dict[str, Any] = {}
+    for field in (
+        "json_path",
+        "string_value",
+        "number_value",
+        "bool_value",
+        "null_value",
+        "will_continue",
+    ):
+        value = _get_obj_value(partial_arg, field)
+        if value is not None:
+            diagnostic[field] = value
+    return diagnostic
+
+
+def _extract_function_call(
+    func_call: Any,
+) -> tuple[Optional[str], Dict[str, Any], list]:
+    """Extract Gemini function call data and diagnostics for partial calls."""
+    name = _get_obj_value(func_call, "name")
+    args = _get_obj_value(func_call, "args")
+    partial_args = _get_obj_value(func_call, "partial_args") or []
+
+    diagnostics = []
+    if partial_args:
+        diagnostics.append(
+            {
+                "partial_args": [
+                    _partial_arg_to_diagnostic(partial_arg)
+                    for partial_arg in partial_args
+                ],
+                "will_continue": _get_obj_value(func_call, "will_continue"),
+            }
+        )
+
+    if isinstance(args, dict):
+        return name, args, diagnostics
+    if args is None and not partial_args:
+        return name, {}, diagnostics
+    return name, {}, diagnostics
+
+
 class GeminiLLM(BaseLLM):
     """Google Gemini LLM client using the official Google Generative AI SDK."""
 
@@ -256,6 +346,7 @@ class GeminiLLM(BaseLLM):
             # Flatten JSON schema if it contains $defs or $ref
             if _contains_refs_or_defs(parameters):
                 parameters = _flatten_json_schema(parameters)
+            parameters = _sanitize_schema_for_gemini(parameters)
 
             gemini_tools["function_declarations"].append(
                 {
@@ -343,6 +434,15 @@ class GeminiLLM(BaseLLM):
                 gemini_tools_dict = self._convert_tools_to_gemini_format(tools)
                 gemini_tools = types.Tool(**gemini_tools_dict)
                 merged_config["tools"] = [gemini_tools]
+                merged_config["automatic_function_calling"] = (
+                    types.AutomaticFunctionCallingConfig(disable=True)
+                )
+                if tool_choice and tool_choice not in ("auto", "none"):
+                    merged_config["tool_config"] = types.ToolConfig(
+                        function_calling_config=types.FunctionCallingConfig(
+                            mode=types.FunctionCallingConfigMode.ANY
+                        )
+                    )
 
             # Add config if present
             if merged_config:
@@ -532,6 +632,15 @@ class GeminiLLM(BaseLLM):
                 gemini_tools_dict = self._convert_tools_to_gemini_format(tools)
                 gemini_tools = types.Tool(**gemini_tools_dict)
                 merged_config["tools"] = [gemini_tools]
+                merged_config["automatic_function_calling"] = (
+                    types.AutomaticFunctionCallingConfig(disable=True)
+                )
+                if tool_choice and tool_choice not in ("auto", "none"):
+                    merged_config["tool_config"] = types.ToolConfig(
+                        function_calling_config=types.FunctionCallingConfig(
+                            mode=types.FunctionCallingConfigMode.ANY
+                        )
+                    )
 
             # Add config if present
             if merged_config:
@@ -544,6 +653,10 @@ class GeminiLLM(BaseLLM):
             # Check if response_stream is None
             if response_stream is None:
                 raise RuntimeError("Gemini SDK returned None response stream")
+
+            candidate_diagnostics: List[Dict[str, Any]] = []
+            partial_call_diagnostics: List[Dict[str, Any]] = []
+            emitted_content_or_tool = False
 
             # Process streaming response (async iteration)
             async for chunk in response_stream:
@@ -606,6 +719,9 @@ class GeminiLLM(BaseLLM):
                     continue
 
                 candidate = chunk.candidates[0]
+                diagnostics = _gemini_candidate_diagnostics(candidate)
+                if diagnostics:
+                    candidate_diagnostics.append(diagnostics)
 
                 # Check if candidate.content exists
                 if not hasattr(candidate, "content") or candidate.content is None:
@@ -619,10 +735,20 @@ class GeminiLLM(BaseLLM):
 
                 for part in content_parts:
                     if hasattr(part, "function_call") and part.function_call:
-                        func_call = part.function_call
-                        func_name = func_call.name
-                        func_args = func_call.args
+                        func_name, func_args, func_diagnostics = _extract_function_call(
+                            part.function_call
+                        )
+                        if func_diagnostics:
+                            partial_call_diagnostics.extend(func_diagnostics)
 
+                        if not func_name:
+                            logger.warning(
+                                "Gemini streamed a function_call without a name: %s",
+                                _compact_repr(part.function_call),
+                            )
+                            continue
+
+                        emitted_content_or_tool = True
                         yield StreamChunk(
                             type=ChunkType.TOOL_CALL,
                             tool_calls=[
@@ -642,6 +768,7 @@ class GeminiLLM(BaseLLM):
                     elif hasattr(part, "text") and part.text:
                         text = part.text
                         current_content += text
+                        emitted_content_or_tool = True
 
                         yield StreamChunk(
                             type=ChunkType.TOKEN,
@@ -649,6 +776,23 @@ class GeminiLLM(BaseLLM):
                             delta=text,
                             raw=chunk,
                         )
+
+            if not emitted_content_or_tool and (
+                candidate_diagnostics or partial_call_diagnostics
+            ):
+                diagnostic_payload = {
+                    "candidate_diagnostics": candidate_diagnostics[-3:],
+                    "partial_call_diagnostics": partial_call_diagnostics[-3:],
+                }
+                yield StreamChunk(
+                    type=ChunkType.ERROR,
+                    content=(
+                        "Gemini stream ended without text or complete function calls. "
+                        f"Diagnostics: {_compact_repr(diagnostic_payload, limit=1200)}"
+                    ),
+                    raw=diagnostic_payload,
+                )
+                return
 
             # Yield end chunk
             yield StreamChunk(

@@ -278,6 +278,7 @@ def test_reconcile_uploaded_files_records_cleanup_error_when_documents_delete_fa
                 return _DeleteFailingTable()
             return real_conn.open_table(name)
 
+    # Mock kb_file_service's connection (used for querying documents)
     monkeypatch.setattr(
         "xagent.web.services.kb_file_service.get_connection_from_env",
         lambda: _DeleteFailingConn(),
@@ -285,6 +286,11 @@ def test_reconcile_uploaded_files_records_cleanup_error_when_documents_delete_fa
     monkeypatch.setattr(
         "xagent.web.services.kb_file_service.ensure_documents_table",
         lambda _conn: None,
+    )
+    # Mock cascade_cleaner's connection (used by cascade_delete)
+    monkeypatch.setattr(
+        "xagent.core.tools.core.RAG_tools.version_management.cascade_cleaner.get_vector_store_raw_connection",
+        lambda: _DeleteFailingConn(),
     )
 
     result = reconcile_uploaded_files(

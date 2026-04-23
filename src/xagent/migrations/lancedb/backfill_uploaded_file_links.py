@@ -40,12 +40,10 @@ from xagent.providers.vector_store.lancedb import get_connection_from_env
 from xagent.web.models.database import get_session_local
 from xagent.web.models.uploaded_file import UploadedFile
 
-logging.basicConfig(
-    level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s"
-)
 logger = logging.getLogger(__name__)
 
 DEFAULT_BATCH_SIZE = 500
+_MAX_BACKFILL_ITERATIONS = 10000  # Safety cap to prevent pathological infinite loops
 _migration_lock = threading.Lock()
 
 
@@ -194,10 +192,12 @@ def backfill_documents_file_links(
         "unbackfillable": 0,
         "failures": 0,
         "unbackfillable_samples": [],
+        "iterations": 0,
     }
 
     try:
-        while True:
+        while stats["iterations"] < _MAX_BACKFILL_ITERATIONS:
+            stats["iterations"] += 1
             rows = query_to_list(
                 docs_table.search().where("file_id IS NULL").limit(batch_size)
             )
@@ -247,6 +247,14 @@ def backfill_documents_file_links(
             if updated_in_batch == 0:
                 # No rows were updated in this batch, so additional loops will not make progress.
                 break
+        else:
+            # Loop terminated due to reaching max iterations (pathological case)
+            logger.warning(
+                "Backfill reached maximum iteration limit (%d). "
+                "This may indicate a pathological condition or alternating success/failure pattern.",
+                _MAX_BACKFILL_ITERATIONS,
+            )
+            stats["hit_iteration_limit"] = True
     finally:
         db.close()
 

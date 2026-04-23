@@ -452,8 +452,10 @@ async def startup_event() -> None:
 
     # Reconcile uploaded_files when auto migration is enabled.
     # Keep this under the same migration toggle for consistent startup behavior.
+    # Run in background after app starts serving to avoid blocking startup.
     if auto_migrate:
-        try:
+
+        async def run_uploaded_file_reconcile_background() -> None:
             from .models.database import get_session_local
             from .services.kb_file_service import reconcile_uploaded_files
 
@@ -472,10 +474,34 @@ async def startup_event() -> None:
                 finally:
                     db.close()
 
-            await asyncio.to_thread(_run_uploaded_file_reconcile)
+            try:
+                await asyncio.to_thread(_run_uploaded_file_reconcile)
+            except Exception as e:
+                logger.warning(
+                    "Uploaded files reconcile failed: %s",
+                    e,
+                )
+
+        # Start background task without awaiting
+        asyncio.create_task(run_uploaded_file_reconcile_background())
+        logger.info("Started background uploaded files reconcile task")
+
+        # Clean up orphaned temporary files from interrupted atomic replacements
+        try:
+            from .api.kb import cleanup_orphaned_temp_files
+
+            def _run_temp_file_cleanup() -> int:
+                return cleanup_orphaned_temp_files()
+
+            cleaned_count = await asyncio.to_thread(_run_temp_file_cleanup)
+            if cleaned_count > 0:
+                logger.info(
+                    "Startup cleanup: removed %d orphaned temporary file(s)",
+                    cleaned_count,
+                )
         except Exception as e:
             logger.warning(
-                "Uploaded files reconcile skipped due to error: %s",
+                "Temporary file cleanup skipped due to error: %s",
                 e,
             )
 

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 import os
+import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Union
@@ -20,12 +21,57 @@ from ...core.tools.core.RAG_tools.utils.string_utils import (
     escape_lancedb_string,
 )
 from ...core.tools.core.RAG_tools.utils.user_permissions import UserPermissions
+from ...core.tools.core.RAG_tools.version_management.cascade_cleaner import (
+    cascade_delete,
+)
 from ...providers.vector_store.lancedb import get_connection_from_env
 from ..models.uploaded_file import UploadedFile
 
 logger = logging.getLogger(__name__)
 
 _FILE_STATUS_BATCH_SIZE = 200
+
+
+class _FileStatusCache:
+    """Simple TTL cache for file status aggregation results.
+
+    Caches status maps keyed by (user_id, file_ids_tuple) to avoid
+    repeated LanceDB queries for the same set of files within a short window.
+    """
+
+    def __init__(self, ttl_seconds: int = 5) -> None:
+        self._cache: Dict[
+            tuple[int, tuple[str, ...]], tuple[Dict[str, str], float]
+        ] = {}
+        self._ttl = ttl_seconds
+
+    def get(self, user_id: int, file_ids: List[str]) -> Optional[Dict[str, str]]:
+        key = (user_id, tuple(sorted(file_ids)))
+        if key in self._cache:
+            result, timestamp = self._cache[key]
+            if time.time() - timestamp < self._ttl:
+                return result
+            # Expired, remove
+            del self._cache[key]
+        return None
+
+    def put(self, user_id: int, file_ids: List[str], result: Dict[str, str]) -> None:
+        key = (user_id, tuple(sorted(file_ids)))
+        self._cache[key] = (result, time.time())
+
+    def invalidate_user(self, user_id: int) -> None:
+        """Remove all cached entries for a specific user."""
+        keys_to_delete = [k for k in self._cache if k[0] == user_id]
+        for key in keys_to_delete:
+            del self._cache[key]
+
+    def clear(self) -> None:
+        """Clear all cached entries."""
+        self._cache.clear()
+
+
+# Global cache instance
+_file_status_cache = _FileStatusCache(ttl_seconds=5)
 
 
 def upsert_uploaded_file_record(
@@ -63,6 +109,10 @@ def upsert_uploaded_file_record(
         db.flush()
     db.commit()
     db.refresh(file_record)
+
+    # Invalidate cache for this user since file list may have changed
+    _file_status_cache.invalidate_user(user_id)
+
     return file_record
 
 
@@ -211,6 +261,10 @@ def delete_uploaded_file_if_orphaned(
 
     db.delete(file_record)
     db.flush()
+
+    # Invalidate cache for this user since file list changed
+    _file_status_cache.invalidate_user(user_id)
+
     return True
 
 
@@ -232,12 +286,30 @@ def aggregate_uploaded_file_statuses(
     file_ids: List[str],
     user_id: int,
     is_admin: bool,
+    use_cache: bool = True,
 ) -> Dict[str, str]:
-    """Aggregate file status by joining documents + ingestion status records."""
+    """Aggregate file status by joining documents + ingestion status records.
+
+    Args:
+        file_ids: List of file IDs to get status for
+        user_id: User ID for permission filtering
+        is_admin: Whether user has admin privileges
+        use_cache: Whether to use the in-memory cache (default: True)
+
+    Returns:
+        Dictionary mapping file_id to status (RUNNING, SUCCESS, FAILED, UNKNOWN)
+    """
     normalized_file_ids = sorted({file_id for file_id in file_ids if file_id})
     if not normalized_file_ids:
         return {}
 
+    # Check cache first
+    if use_cache:
+        cached_result = _file_status_cache.get(user_id, normalized_file_ids)
+        if cached_result is not None:
+            return cached_result
+
+    # Cache miss - compute from database
     conn = get_connection_from_env()
     ensure_documents_table(conn)
     documents_table = conn.open_table("documents")
@@ -307,6 +379,10 @@ def aggregate_uploaded_file_statuses(
             continue
         status_map[file_id] = "UNKNOWN"
 
+    # Store in cache for future requests
+    if use_cache:
+        _file_status_cache.put(user_id, normalized_file_ids, status_map)
+
     return status_map
 
 
@@ -343,7 +419,7 @@ def reconcile_uploaded_files(
         scanned += 1
         file_id = str(record.file_id)
         status = status_map.get(file_id, "UNKNOWN")
-        if status not in {"FAILED", "UNKNOWN"}:
+        if status not in {"FAILED", "UNKNOWN", "RUNNING"}:
             continue
 
         created_at = getattr(record, "created_at", None)
@@ -351,6 +427,14 @@ def reconcile_uploaded_files(
             created_at = created_at.replace(tzinfo=timezone.utc)
         if created_at is not None and created_at > cutoff:
             continue
+
+        # Log warning for RUNNING files as they may indicate crashed ingestion
+        if status == "RUNNING":
+            logger.warning(
+                "Found stale RUNNING file (possible crashed ingestion): file_id=%s, created_at=%s",
+                file_id,
+                created_at,
+            )
 
         stale_candidates += 1
         if not delete_stale:
@@ -381,19 +465,80 @@ def reconcile_uploaded_files(
                     )
                     continue
 
+        # Query documents table to get (collection, doc_id) pairs for cascade deletion
         try:
-            documents_table.delete(f"file_id = '{safe_file_id}'")
+            doc_rows = query_to_list(
+                documents_table.search()
+                .where(f"file_id = '{safe_file_id}'")
+                .select(["collection", "doc_id"])
+                .limit(-1)
+            )
         except Exception as exc:  # noqa: BLE001
             cleanup_errors += 1
             logger.error(
-                "Failed to delete documents rows for stale file_id=%s: %s",
+                "Failed to query documents for stale file_id=%s: %s",
                 file_id,
                 exc,
             )
             continue
 
+        # Cascade delete all related data for each (collection, doc_id) pair
+        # Note: We use cascade_delete for complete cleanup across all tables
+        # (parses, chunks, embeddings_*, main_pointers, ingestion_runs, documents)
+        cascade_deleted = 0
+        cascade_error = False
+        for row in doc_rows:
+            collection = str(row.get("collection") or "").strip()
+            doc_id = str(row.get("doc_id") or "").strip()
+            if not collection or not doc_id:
+                continue
+
+            try:
+                deleted_counts = cascade_delete(
+                    target="document",
+                    collection=collection,
+                    doc_id=doc_id,
+                    user_id=user_id,
+                    is_admin=is_admin,
+                    preview_only=False,
+                    confirm=True,
+                )
+                cascade_deleted += sum(int(v) for v in deleted_counts.values())
+                logger.info(
+                    "Cascade deleted %d rows for stale document: collection=%s, doc_id=%s, file_id=%s",
+                    sum(deleted_counts.values()),
+                    collection,
+                    doc_id,
+                    file_id,
+                )
+            except Exception as exc:  # noqa: BLE001
+                cascade_error = True
+                cleanup_errors += 1
+                logger.error(
+                    "Failed to cascade delete for stale document: collection=%s, doc_id=%s, file_id=%s: %s",
+                    collection,
+                    doc_id,
+                    file_id,
+                    exc,
+                )
+
+        # If cascade delete failed, skip deleting the UploadedFile record
+        # to maintain consistency (file record still references the documents)
+        if cascade_error:
+            logger.warning(
+                "Skipping UploadedFile deletion due to cascade delete errors: file_id=%s",
+                file_id,
+            )
+            continue
+
+        # Finally delete the UploadedFile record
         db.delete(record)
         deleted += 1
+        logger.info(
+            "Deleted stale UploadedFile record: file_id=%s (cascade deleted %d related rows)",
+            file_id,
+            cascade_deleted,
+        )
 
     if delete_stale and deleted > 0:
         db.commit()

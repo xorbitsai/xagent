@@ -10,6 +10,7 @@ from xagent.core.tools.adapters.vibe.document_search import (
     get_knowledge_search_tool,
     get_list_knowledge_bases_tool,
 )
+from xagent.core.tools.adapters.vibe.knowledge_tools import create_knowledge_tools
 from xagent.core.tools.core.document_search import _format_search_results
 from xagent.core.tools.core.RAG_tools.core.schemas import CollectionInfo
 
@@ -583,6 +584,38 @@ class TestKnowledgeSearchTool:
                     call[1]["collection"] for call in mock_search.call_args_list
                 }
                 assert searched_collections == {"kb1", "kb2"}
+
+
+class TestKnowledgeToolsRegistration:
+    """Test knowledge tool registration behavior."""
+
+    @pytest.mark.asyncio
+    async def test_create_knowledge_tools_includes_list_when_no_kb_selected(self):
+        """Without selected KBs, expose list_knowledge_bases for discovery."""
+        config = MagicMock()
+        config.get_embedding_model.return_value = "embedding-model"
+        config.get_allowed_collections.return_value = None
+        config.get_user_id.return_value = 1
+        config.is_admin.return_value = False
+
+        tools = await create_knowledge_tools(config)
+
+        tool_names = {tool.name for tool in tools}
+        assert tool_names == {"list_knowledge_bases", "knowledge_search"}
+
+    @pytest.mark.asyncio
+    async def test_create_knowledge_tools_skips_list_when_kb_selected(self):
+        """With selected KBs, expose only search to avoid redundant list calls."""
+        config = MagicMock()
+        config.get_embedding_model.return_value = "embedding-model"
+        config.get_allowed_collections.return_value = ["kb1"]
+        config.get_user_id.return_value = 1
+        config.is_admin.return_value = False
+
+        tools = await create_knowledge_tools(config)
+
+        tool_names = {tool.name for tool in tools}
+        assert tool_names == {"knowledge_search"}
 
 
 class TestFormatSearchResults:

@@ -285,7 +285,9 @@ class TestEnhanceSystemPromptWithKb:
         assert result.startswith("Be helpful.")
         assert "Available knowledge bases:" in result
         assert "my_kb" in result
-        assert "Search them directly for answers" in result
+        assert "already selected" in result
+        assert "Do not call list_knowledge_bases" in result
+        assert "use knowledge_search directly" in result
 
     def test_with_kb_no_system_prompt_returns_priority_only(self):
         result = enhance_system_prompt_with_kb(None, ["kb1"])

@@ -155,7 +155,10 @@ def enhance_system_prompt_with_kb(
 
     kb_list = ", ".join(knowledge_bases)
     kb_prompt = (
-        f"\n\nAvailable knowledge bases: {kb_list}. Search them directly for answers."
+        f"\n\nAvailable knowledge bases: {kb_list}. "
+        "These knowledge bases are already selected. "
+        "Do not call list_knowledge_bases to discover them; "
+        "use knowledge_search directly for answers."
     )
 
     if system_prompt:

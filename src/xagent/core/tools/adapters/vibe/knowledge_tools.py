@@ -27,13 +27,15 @@ async def create_knowledge_tools(config: "BaseToolConfig") -> List[Any]:
         user_id = config.get_user_id()
         is_admin = config.is_admin()
 
-        # Add list knowledge bases tool
-        list_tool = get_list_knowledge_bases_tool(
-            allowed_collections=allowed_collections,
-            user_id=user_id,
-            is_admin=is_admin,
-        )
-        tools.append(list_tool)
+        # If collections are already selected, agents should search them directly
+        # instead of spending a tool call rediscovering the same KB list.
+        if not allowed_collections:
+            list_tool = get_list_knowledge_bases_tool(
+                allowed_collections=allowed_collections,
+                user_id=user_id,
+                is_admin=is_admin,
+            )
+            tools.append(list_tool)
 
         # Add search tool
         knowledge_tool = get_knowledge_search_tool(

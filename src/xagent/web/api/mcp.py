@@ -287,6 +287,8 @@ def _update_server_from_config(server: MCPServer, config: MCPServerConfig) -> No
         "env": "env",
         "cwd": "cwd",
         "headers": "headers",
+        "timeout": "timeout",
+        "auth": "auth",
         "docker_url": "docker_url",
         "docker_image": "docker_image",
         "docker_environment": "docker_environment",
@@ -300,6 +302,20 @@ def _update_server_from_config(server: MCPServer, config: MCPServerConfig) -> No
     for config_field, db_field in field_mapping.items():
         if hasattr(config, config_field) and hasattr(server, db_field):
             value = getattr(config, config_field)
+            if config_field == "auth" and value and isinstance(value, dict):
+                from xagent.core.utils.encryption import encrypt_value
+
+                encrypted_auth = value.copy()
+                for key in ["bearer_token", "api_key_value", "client_secret"]:
+                    if key in encrypted_auth and encrypted_auth[key]:
+                        # If masked, retain the existing encrypted value from the database
+                        if encrypted_auth[key] == "********":
+                            existing_auth: Any = server.auth or {}
+                            encrypted_auth[key] = existing_auth.get(key)
+                        # Otherwise encrypt it if it isn't already encrypted
+                        elif not encrypted_auth[key].startswith("gAAAAAB"):
+                            encrypted_auth[key] = encrypt_value(encrypted_auth[key])
+                value = encrypted_auth
             setattr(server, db_field, value)
 
 
@@ -359,16 +375,14 @@ def _db_server_to_response(
     # Get status from manager if available
     config = server.to_config_dict()
 
-    # Ensure JSON fields are properly serialized for frontend
-    serialized_config: dict[str, Any] = {}
-    for key, value in config.items():
-        if value is None:
-            serialized_config[key] = None
-        elif isinstance(value, (dict, list)):
-            # Convert to JSON string for frontend display
-            serialized_config[key] = json.dumps(value, ensure_ascii=False, indent=2)
-        else:
-            serialized_config[key] = value
+    # Mask sensitive auth fields for the frontend
+    auth_config = config.get("auth")
+    if auth_config and isinstance(auth_config, dict):
+        masked_auth = auth_config.copy()
+        for key in ["bearer_token", "api_key_value", "client_secret"]:
+            if key in masked_auth and masked_auth[key]:
+                masked_auth[key] = "********"
+        config["auth"] = masked_auth
 
     return MCPServerResponse(
         id=server.id,
@@ -376,7 +390,7 @@ def _db_server_to_response(
         name=server.name,
         transport=server.transport,
         description=server.description,
-        config=serialized_config,
+        config=config,
         is_active=user_mcp.is_active,
         is_default=user_mcp.is_default,
         transport_display=server.transport_display,
@@ -623,6 +637,14 @@ def get_mcp_servers(
             if api.env and isinstance(api.env, dict):
                 masked_env = {k: "********" for k in api.env.keys()}
 
+            config_dict = {"env": masked_env}
+            if api.url:
+                config_dict["url"] = api.url
+            if api.method:
+                config_dict["method"] = api.method
+            if api.headers:
+                config_dict["headers"] = api.headers
+
             responses.append(
                 MCPServerResponse(
                     id=api.id,
@@ -630,7 +652,7 @@ def get_mcp_servers(
                     name=api.name,
                     transport="custom_api",
                     description=api.description,
-                    config={"env": masked_env},
+                    config=config_dict,
                     is_active=user_api.is_active,
                     is_default=user_api.is_default,
                     transport_display="Custom API",

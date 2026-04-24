@@ -38,6 +38,8 @@ def create_mcp_server_table(Base: Type[Any]) -> Type[Any]:
         env = Column(JSON, nullable=True)  # Dict[str, str]
         cwd = Column(String(500), nullable=True)
         headers = Column(JSON, nullable=True)  # Dict[str, Any]
+        timeout = Column(Integer, nullable=True)
+        auth = Column(JSON, nullable=True)  # Dict[str, Any]
 
         # Container management parameters (internal only)
         docker_url = Column(String(500), nullable=True)
@@ -125,6 +127,39 @@ def create_mcp_server_table(Base: Type[Any]) -> Type[Any]:
                 config["cwd"] = self.cwd
             if self.headers:
                 config["headers"] = self.headers
+            if getattr(self, "timeout", None) is not None:
+                config["timeout"] = self.timeout
+            if getattr(self, "auth", None) is not None:
+                auth_dict = self.auth
+                if isinstance(auth_dict, dict):
+                    # Decrypt sensitive fields
+                    from xagent.core.utils.encryption import decrypt_value
+
+                    decrypted_auth = auth_dict.copy()
+                    if (
+                        "bearer_token" in decrypted_auth
+                        and decrypted_auth["bearer_token"]
+                    ):
+                        decrypted_auth["bearer_token"] = decrypt_value(
+                            decrypted_auth["bearer_token"]
+                        )
+                    if (
+                        "api_key_value" in decrypted_auth
+                        and decrypted_auth["api_key_value"]
+                    ):
+                        decrypted_auth["api_key_value"] = decrypt_value(
+                            decrypted_auth["api_key_value"]
+                        )
+                    if (
+                        "client_secret" in decrypted_auth
+                        and decrypted_auth["client_secret"]
+                    ):
+                        decrypted_auth["client_secret"] = decrypt_value(
+                            decrypted_auth["client_secret"]
+                        )
+                    config["auth"] = decrypted_auth
+                else:
+                    config["auth"] = self.auth
 
             # Container parameters (internal only)
             if self.managed == "internal":
@@ -149,6 +184,41 @@ def create_mcp_server_table(Base: Type[Any]) -> Type[Any]:
         @classmethod
         def from_config(cls, config: Dict[str, Any]) -> MCPServer:
             """Create MCPServer instance from MCPServerConfig dictionary."""
+
+            # Encrypt sensitive auth fields before saving
+            auth_config = config.get("auth")
+            if auth_config and isinstance(auth_config, dict):
+                from xagent.core.utils.encryption import encrypt_value
+
+                encrypted_auth = auth_config.copy()
+                # Check if it's already encrypted (starts with gAAAAAB...) to avoid double encryption
+                # (Fernet tokens always start with gAAAAAB)
+                if (
+                    "bearer_token" in encrypted_auth
+                    and encrypted_auth["bearer_token"]
+                    and not encrypted_auth["bearer_token"].startswith("gAAAAAB")
+                ):
+                    encrypted_auth["bearer_token"] = encrypt_value(
+                        encrypted_auth["bearer_token"]
+                    )
+                if (
+                    "api_key_value" in encrypted_auth
+                    and encrypted_auth["api_key_value"]
+                    and not encrypted_auth["api_key_value"].startswith("gAAAAAB")
+                ):
+                    encrypted_auth["api_key_value"] = encrypt_value(
+                        encrypted_auth["api_key_value"]
+                    )
+                if (
+                    "client_secret" in encrypted_auth
+                    and encrypted_auth["client_secret"]
+                    and not encrypted_auth["client_secret"].startswith("gAAAAAB")
+                ):
+                    encrypted_auth["client_secret"] = encrypt_value(
+                        encrypted_auth["client_secret"]
+                    )
+                auth_config = encrypted_auth
+
             return cls(
                 name=config["name"],
                 description=config.get("description"),
@@ -162,6 +232,8 @@ def create_mcp_server_table(Base: Type[Any]) -> Type[Any]:
                 if isinstance(config.get("cwd"), Path)
                 else config.get("cwd"),
                 headers=config.get("headers"),
+                timeout=config.get("timeout"),
+                auth=auth_config,
                 docker_url=config.get("docker_url"),
                 docker_image=config.get("docker_image"),
                 docker_environment=config.get("docker_environment"),

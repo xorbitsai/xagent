@@ -3,7 +3,6 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 from fastapi import HTTPException
-from pydantic import ValidationError
 from sqlalchemy.orm import Session
 
 from xagent.web.api.custom_api import (
@@ -29,13 +28,13 @@ def test_custom_api_models_env_validation():
     api = CustomApiCreate(name="test")
     assert api.env is None
 
-    # Empty env dict is not allowed
-    with pytest.raises(ValidationError):
-        CustomApiCreate(name="test", env={})
+    # Empty env dict is allowed to clear secrets
+    api_empty = CustomApiCreate(name="test", env={})
+    assert api_empty.env == {}
 
     # Same for update
-    with pytest.raises(ValidationError):
-        CustomApiUpdate(name="test", env={})
+    api_update = CustomApiUpdate(name="test", env={})
+    assert api_update.env == {}
 
 
 def test_process_env_vars():

@@ -56,6 +56,12 @@ class MCPServerConfig(BaseModel):
     headers: Optional[Dict[str, Any]] = Field(
         None, description="HTTP headers (sse, streamable_http transports)"
     )
+    timeout: Optional[int] = Field(
+        None, description="Timeout in seconds for connection and execution"
+    )
+    auth: Optional[Dict[str, Any]] = Field(
+        None, description="Authentication configuration"
+    )
 
     # --- Container Management Parameters (only for 'internal' type) ---
     docker_url: Optional[str] = Field(None, description="URL to connect docker")
@@ -157,7 +163,16 @@ class MCPServerConfig(BaseModel):
         connection_config = {"transport": self.transport}
 
         # Add connection-related fields
-        connection_fields = {"command", "args", "url", "env", "cwd", "headers"}
+        connection_fields = {
+            "command",
+            "args",
+            "url",
+            "env",
+            "cwd",
+            "headers",
+            "timeout",
+            "auth",
+        }
         for field_name in connection_fields:
             value = getattr(self, field_name)
             if value is not None:

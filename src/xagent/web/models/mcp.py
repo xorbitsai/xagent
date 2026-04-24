@@ -35,6 +35,8 @@ if TYPE_CHECKING:
         env = Column(JSON, nullable=True)  # Dict[str, str]
         cwd = Column(String(500), nullable=True)
         headers = Column(JSON, nullable=True)  # Dict[str, Any]
+        timeout = Column(Integer, nullable=True)
+        auth = Column(JSON, nullable=True)  # Dict[str, Any]
 
         # Container management parameters (internal only)
         docker_url = Column(String(500), nullable=True)

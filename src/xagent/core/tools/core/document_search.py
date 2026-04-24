@@ -191,9 +191,15 @@ async def search_knowledge_base(
                 c for c in collections_result.collections if c.name in collections_set
             ]
             logger.info(f"Searching specific collections: {sorted(collections_set)}")
-        elif tool_args.allowed_collections:
+        elif tool_args.allowed_collections is not None:
             # Use allowed_collections as default
             allowed_set = set(tool_args.allowed_collections)
+
+            if not allowed_set:
+                return KnowledgeSearchResult(
+                    results=[],
+                    summary="Knowledge base search is disabled for this agent (no knowledge bases configured).",
+                )
             valid_collections = allowed_set & available_names
 
             if not valid_collections:

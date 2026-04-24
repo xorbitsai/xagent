@@ -445,6 +445,42 @@ class TestKnowledgeSearchTool:
                 assert searched_collections == {"kb1", "kb2"}
 
     @pytest.mark.asyncio
+    async def test_search_with_empty_allowed_collections_disables_search(self):
+        mock_collections = [
+            CollectionInfo(
+                name="kb1",
+                total_documents=10,
+                embeddings=100,
+                document_names=["doc1.pdf"],
+            ),
+        ]
+
+        mock_list_result = MagicMock()
+        mock_list_result.collections = mock_collections
+
+        with patch(
+            "xagent.core.tools.core.document_search.list_collections",
+            return_value=mock_list_result,
+        ):
+            with patch(
+                "xagent.core.tools.core.document_search.run_document_search"
+            ) as mock_search:
+                tool = get_knowledge_search_tool(allowed_collections=[])
+                result = await tool.run_json_async(
+                    {
+                        "query": "test query",
+                        "collections": [],
+                        "search_type": "hybrid",
+                        "top_k": 5,
+                        "min_score": 0.3,
+                    }
+                )
+
+        assert result.results == []
+        assert "disabled" in result.summary.lower()
+        mock_search.assert_not_called()
+
+    @pytest.mark.asyncio
     async def test_search_respects_allowed_collections_boundary(self):
         """Test that specified collections must be within allowed_collections."""
         mock_collections = [

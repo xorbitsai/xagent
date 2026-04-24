@@ -24,7 +24,7 @@ def get_alembic_revision(engine: Engine) -> str | None:
 
 
 def try_upgrade_db(engine: Engine) -> None:
-    """Upgrade database to latest migration or stamp with base revision if unversioned."""
+    """Upgrade database to latest migration (or stamp head for brand-new databases)."""
     try:
         logger.info("Starting database upgrade process")
         alembic_cfg = create_alembic_config(engine)
@@ -32,11 +32,10 @@ def try_upgrade_db(engine: Engine) -> None:
 
         if version is None:
             if is_database_empty(engine):
-                # new database
-                logger.info("Creating new database, upgrading to latest revision.")
+                logger.info("Creating new database, stamping to latest revision.")
                 with engine.connect() as conn:
                     alembic_cfg.attributes["connection"] = conn
-                    command.upgrade(alembic_cfg, "head")
+                    command.stamp(alembic_cfg, "head")
             else:
                 raise RuntimeError(
                     "Database exists without alembic revision information. Please initialize the database schema version manually by running: alembic stamp <revision>"

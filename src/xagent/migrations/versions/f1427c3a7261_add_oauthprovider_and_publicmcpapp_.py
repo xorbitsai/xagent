@@ -1,7 +1,7 @@
 """Add OAuthProvider and PublicMCPApp tables
 
 Revision ID: f1427c3a7261
-Revises: 654adb358ecd
+Revises: 002_update_agent_execution_mode
 Create Date: 2026-04-21 15:53:38.321174
 
 """
@@ -14,7 +14,7 @@ from alembic import op
 
 # revision identifiers, used by Alembic.
 revision: str = "f1427c3a7261"
-down_revision: Union[str, None] = "654adb358ecd"
+down_revision: Union[str, None] = "002_update_agent_execution_mode"
 branch_labels: Union[str, Sequence[str], None] = None
 depends_on: Union[str, Sequence[str], None] = None
 

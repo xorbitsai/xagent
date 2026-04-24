@@ -27,9 +27,10 @@ async def create_knowledge_tools(config: "BaseToolConfig") -> List[Any]:
         user_id = config.get_user_id()
         is_admin = config.is_admin()
 
-        # If collections are already selected, agents should search them directly
-        # instead of spending a tool call rediscovering the same KB list.
-        if not allowed_collections:
+        if allowed_collections is not None and len(allowed_collections) == 0:
+            return []
+
+        if allowed_collections is None:
             list_tool = get_list_knowledge_bases_tool(
                 allowed_collections=allowed_collections,
                 user_id=user_id,
@@ -37,7 +38,6 @@ async def create_knowledge_tools(config: "BaseToolConfig") -> List[Any]:
             )
             tools.append(list_tool)
 
-        # Add search tool
         knowledge_tool = get_knowledge_search_tool(
             embedding_model_id=embedding_model,
             allowed_collections=allowed_collections,

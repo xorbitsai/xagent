@@ -340,8 +340,6 @@ class TestFileManagement:
         assert "total_count" in data
         assert isinstance(data["files"], list)
         assert isinstance(data["total_count"], int)
-        for item in data["files"]:
-            assert "ingestion_status" in item
 
     def test_list_files_with_collections(
         self, client, test_db, sample_files, temp_uploads_dir, auth_headers
@@ -372,12 +370,6 @@ class TestFileManagement:
                 found = True
                 assert f.get("file_id"), "list should return file_id"
                 assert collection_name in f.get("relative_path", "")
-                assert f.get("ingestion_status") in {
-                    "SUCCESS",
-                    "RUNNING",
-                    "UNKNOWN",
-                    "FAILED",
-                }
                 break
         assert found, (
             "File in collection directory should appear in list (file_id design)"

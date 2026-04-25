@@ -63,19 +63,15 @@ def _build_collection_filter(
         table = conn.open_table(table_name)
         if not is_admin and user_id is not None:
             if _table_has_column(table, "user_id"):
-                base_expr = build_lancedb_filter_expression(
-                    base, user_id=user_id, is_admin=is_admin, skip_user_filter=True
-                )
+                base_expr = build_lancedb_filter_expression(base)
                 user_expr = build_user_id_filter_for_table(table, int(user_id))
                 return f"{base_expr} AND {user_expr}"
-            # Legacy schemas without user_id must remain compatible.
-            return build_lancedb_filter_expression(base)
-        return build_lancedb_filter_expression(base, user_id=user_id, is_admin=is_admin)
     except Exception:
-        # If table introspection fails, keep tenant-safe fallback.
-        return build_lancedb_filter_expression(base, user_id=user_id, is_admin=is_admin)
+        # If we cannot open the table here, fall back to base filter.
+        return build_lancedb_filter_expression(base)
     finally:
         _safe_close_table(table)
+    return build_lancedb_filter_expression(base)
 
 
 def _build_document_filter(
@@ -94,19 +90,14 @@ def _build_document_filter(
         table = conn.open_table(table_name)
         if not is_admin and user_id is not None:
             if _table_has_column(table, "user_id"):
-                base_expr = build_lancedb_filter_expression(
-                    base, user_id=user_id, is_admin=is_admin, skip_user_filter=True
-                )
+                base_expr = build_lancedb_filter_expression(base)
                 user_expr = build_user_id_filter_for_table(table, int(user_id))
                 return f"{base_expr} AND {user_expr}"
-            # Legacy schemas without user_id must remain compatible.
-            return build_lancedb_filter_expression(base)
-        return build_lancedb_filter_expression(base, user_id=user_id, is_admin=is_admin)
     except Exception:
-        # If table introspection fails, keep tenant-safe fallback.
-        return build_lancedb_filter_expression(base, user_id=user_id, is_admin=is_admin)
+        return build_lancedb_filter_expression(base)
     finally:
         _safe_close_table(table)
+    return build_lancedb_filter_expression(base)
 
 
 def _append_user_filter_if_needed(
@@ -335,9 +326,6 @@ def _delete_by_predicates(
             "documents",
         ):
             continue
-        if name.startswith("embeddings_"):
-            # Already handled in the explicit embeddings pass above.
-            continue
         if name not in table_names:
             deleted[name] = 0
             continue
@@ -523,9 +511,7 @@ def cleanup_cascade(
                 "doc_id": doc_id,
                 "parse_hash": old_parse_hash,
             }
-            base = build_lancedb_filter_expression(
-                base_filters, user_id=user_id, is_admin=is_admin, skip_user_filter=True
-            )
+            base = build_lancedb_filter_expression(base_filters)
             predicates["__embeddings__"] = _append_user_filter_for_embeddings_if_needed(
                 conn=conn,
                 base_expr=base,
@@ -578,9 +564,7 @@ def cleanup_cascade(
                 "doc_id": doc_id,
                 "parse_hash": old_parse_hash,
             }
-            base = build_lancedb_filter_expression(
-                base_filters, user_id=user_id, is_admin=is_admin, skip_user_filter=True
-            )
+            base = build_lancedb_filter_expression(base_filters)
             predicates["__embeddings__"] = _append_user_filter_for_embeddings_if_needed(
                 conn=conn,
                 base_expr=base,

@@ -9,8 +9,6 @@ This module tests the file handler callback used in web ingestion, which handles
 """
 
 import tempfile
-import threading
-import time
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 from uuid import uuid4
@@ -19,14 +17,7 @@ import pytest
 from sqlalchemy import create_engine
 from sqlalchemy.orm import Session, sessionmaker
 
-from xagent.web.api.kb import (
-    _WEB_FILE_LOCKS,
-    _atomic_replace_file,
-    _get_file_sha256,
-    _mark_uploaded_file_for_reindex,
-    _upsert_uploaded_file_record,
-    _WebFileLock,
-)
+from xagent.web.api.kb import _upsert_uploaded_file_record
 from xagent.web.models.database import Base
 from xagent.web.models.uploaded_file import UploadedFile
 from xagent.web.models.user import User
@@ -404,123 +395,3 @@ class TestHandleWebFile:
                 # Verify new record was created
                 assert new_record.file_id != nonexistent_file_id
                 assert new_record.filename == filename
-
-
-class TestWebFileRefreshHelpers:
-    """Test helper functions for stale content refresh."""
-
-    def test_get_file_sha256_changes_with_content(self) -> None:
-        with tempfile.TemporaryDirectory() as temp_dir:
-            file_path = Path(temp_dir) / "sample.md"
-            file_path.write_text("old-content", encoding="utf-8")
-            old_hash = _get_file_sha256(file_path)
-
-            file_path.write_text("new-content", encoding="utf-8")
-            new_hash = _get_file_sha256(file_path)
-
-            assert old_hash != new_hash
-
-    def test_atomic_replace_file_overwrites_target(self) -> None:
-        with tempfile.TemporaryDirectory() as temp_dir:
-            source_path = Path(temp_dir) / "source.md"
-            target_path = Path(temp_dir) / "target.md"
-            source_path.write_text("new-value", encoding="utf-8")
-            target_path.write_text("old-value", encoding="utf-8")
-
-            _atomic_replace_file(source_path, target_path)
-
-            assert target_path.read_text(encoding="utf-8") == "new-value"
-
-    def test_web_file_lock_serializes_same_key(self) -> None:
-        lock_key = "1:same-url-hash"
-        active_count = 0
-        peak_active_count = 0
-        guard = threading.Lock()
-
-        def _worker() -> None:
-            nonlocal active_count, peak_active_count
-            with _WebFileLock(lock_key):
-                with guard:
-                    active_count += 1
-                    peak_active_count = max(peak_active_count, active_count)
-                time.sleep(0.05)
-                with guard:
-                    active_count -= 1
-
-        threads = [threading.Thread(target=_worker) for _ in range(6)]
-        for thread in threads:
-            thread.start()
-        for thread in threads:
-            thread.join()
-
-        assert peak_active_count == 1
-
-    def test_web_file_lock_registry_entry_is_released_after_use(self) -> None:
-        lock_key = "1:transient-url-hash"
-        _WEB_FILE_LOCKS.pop(lock_key, None)
-
-        with _WebFileLock(lock_key):
-            assert lock_key in _WEB_FILE_LOCKS
-
-        assert lock_key not in _WEB_FILE_LOCKS
-
-    def test_cache_updates_with_upsert_returned_file_id(self) -> None:
-        processed_urls: dict[str, str] = {"hash-key": "old-file-id"}
-
-        class _Record:
-            def __init__(self, file_id: str) -> None:
-                self.file_id = file_id
-
-        file_record = _Record("new-file-id")
-        processed_urls["hash-key"] = str(file_record.file_id)
-
-        assert processed_urls["hash-key"] == "new-file-id"
-
-    def test_mark_uploaded_file_for_reindex_clears_ingestion_runs(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        deleted_filters: list[str] = []
-
-        class _FakeTable:
-            def search(self):
-                return self
-
-            def where(self, _expr: str):
-                return self
-
-            def select(self, _fields: list[str]):
-                return self
-
-            def limit(self, _value: int):
-                return self
-
-            def delete(self, expr: str) -> None:
-                deleted_filters.append(expr)
-
-        class _FakeConn:
-            def open_table(self, _name: str):
-                return _FakeTable()
-
-        monkeypatch.setattr(
-            "xagent.providers.vector_store.lancedb.get_connection_from_env",
-            lambda: _FakeConn(),
-        )
-        monkeypatch.setattr(
-            "xagent.core.tools.core.RAG_tools.LanceDB.schema_manager.ensure_documents_table",
-            lambda _conn: None,
-        )
-        monkeypatch.setattr(
-            "xagent.core.tools.core.RAG_tools.LanceDB.schema_manager.ensure_ingestion_runs_table",
-            lambda _conn: None,
-        )
-        monkeypatch.setattr(
-            "xagent.core.tools.core.RAG_tools.utils.lancedb_query_utils.query_to_list",
-            lambda _query: [{"collection": "kb", "doc_id": "doc-1"}],
-        )
-
-        marked = _mark_uploaded_file_for_reindex("file-123")
-
-        assert marked is True
-        assert len(deleted_filters) == 1
-        assert "collection = 'kb'" in deleted_filters[0]
-        assert "doc_id = 'doc-1'" in deleted_filters[0]

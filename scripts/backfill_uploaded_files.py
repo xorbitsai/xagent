@@ -29,6 +29,11 @@ sys.path.insert(0, str(project_root))
 from sqlalchemy import create_engine  # noqa: E402
 from sqlalchemy.orm import sessionmaker  # noqa: E402
 
+from xagent.web.models.task import Task  # noqa: E402
+from xagent.web.models.uploaded_file import UploadedFile  # noqa: E402
+from xagent.web.models.user import User  # noqa: E402
+from xagent.web.utils.file import to_relative_path  # noqa: E402
+
 # Setup logging
 logging.basicConfig(
     level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
@@ -79,10 +84,6 @@ def get_database_url():
 
 def scan_user_directory(user_root: Path, db_session) -> dict:
     """Scan a user's directory for unregistered files."""
-    from xagent.web.models.task import Task
-    from xagent.web.models.uploaded_file import UploadedFile
-    from xagent.web.models.user import User
-
     # Check if user exists
     try:
         user_id = int(user_root.name.replace("user_", "", 1))
@@ -94,6 +95,7 @@ def scan_user_directory(user_root: Path, db_session) -> dict:
         return {"error": f"User {user_id} not found in database", "created": 0}
 
     # Get existing file paths in database
+    # Note: existing_paths may contain both absolute (old) and relative (new) paths
     existing_paths = {
         row[0]
         for row in db_session.query(UploadedFile.storage_path)
@@ -119,7 +121,13 @@ def scan_user_directory(user_root: Path, db_session) -> dict:
         if "__pycache__" in file_path.parts or "node_modules" in file_path.parts:
             continue
 
-        storage_path = str(file_path)
+        # Use relative path for storage and comparison
+        try:
+            storage_path = to_relative_path(file_path, user_id)
+        except ValueError:
+            # File is outside UPLOADS_DIR, skip
+            continue
+
         if storage_path in existing_paths:
             skipped += 1
             continue
@@ -255,8 +263,6 @@ def check_backfill_completion(db_session) -> bool:
     """Check if backfill has been completed before."""
     # This could check a flag in the database or a marker file
     # For now, we'll just check if there are any files in the database
-    from xagent.web.models.uploaded_file import UploadedFile
-
     count = db_session.query(UploadedFile).count()
     return count > 0
 

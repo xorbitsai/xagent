@@ -32,6 +32,7 @@ from ..models.user import User
 from ..tools.config import WebToolConfig
 from ..user_isolated_memory import UserContext
 from ..utils.db_timezone import safe_timestamp_to_unix
+from ..utils.file import find_file_by_path, to_relative_path
 
 logger = logging.getLogger(__name__)
 
@@ -410,11 +411,10 @@ def _normalize_file_outputs(
             normalized_relative_path
         )
 
-        file_record = (
-            db.query(UploadedFile)
-            .filter(UploadedFile.storage_path == str(resolved_path))
-            .first()
-        )
+        # Handle both absolute and relative paths in storage_path
+        relative_storage_path = to_relative_path(resolved_path, task_user_id)
+        file_record = find_file_by_path(db, relative_storage_path, task_user_id)
+
         if file_record is None and item_file_id:
             file_record = (
                 db.query(UploadedFile)
@@ -428,7 +428,7 @@ def _normalize_file_outputs(
                 user_id=task_user_id,
                 task_id=task_id,
                 filename=item_filename or resolved_path.name,
-                storage_path=str(resolved_path),
+                storage_path=relative_storage_path,
                 mime_type=None,
                 file_size=int(resolved_path.stat().st_size),
             )
@@ -967,11 +967,15 @@ async def redirect_legacy_preview(
         raise HTTPException(status_code=404, detail="Legacy preview target not found")
 
     resolved_path, relative_path = resolved_info
-    file_record = (
-        db.query(UploadedFile)
-        .filter(UploadedFile.storage_path == str(resolved_path))
-        .first()
-    )
+
+    # Handle both absolute and relative paths in storage_path
+    # First try to infer owner from path, then find file record
+    owner_info = _infer_owner_from_relative_path(db, relative_path)
+    file_record = None
+    if owner_info:
+        owner_user_id, _ = owner_info
+        relative_storage_path = to_relative_path(resolved_path, owner_user_id)
+        file_record = find_file_by_path(db, relative_storage_path, owner_user_id)
 
     if file_record is None:
         owner_info = _infer_owner_from_relative_path(db, relative_path)
@@ -981,12 +985,13 @@ async def redirect_legacy_preview(
             )
 
         owner_user_id, task_id = owner_info
+        relative_storage_path = to_relative_path(resolved_path, owner_user_id)
         file_record = UploadedFile(
             file_id=_build_output_file_id(relative_path),
             user_id=owner_user_id,
             task_id=task_id,
             filename=resolved_path.name,
-            storage_path=str(resolved_path),
+            storage_path=relative_storage_path,
             mime_type=None,
             file_size=int(resolved_path.stat().st_size),
         )
@@ -1103,7 +1108,7 @@ async def handle_file_upload_for_task(
             file_name = file_record.filename
             file_size = file_record.file_size
             file_type = file_record.mime_type
-            source_path = Path(str(file_record.storage_path))
+            source_path = file_record.absolute_path
 
             if not source_path.exists():
                 logger.warning(f"Physical file not found: {source_path}")
@@ -3231,7 +3236,7 @@ async def handle_build_preview_execution(
                     file_name = file_record.filename
                     file_size = file_record.file_size
                     file_type = file_record.mime_type
-                    source_path = Path(str(file_record.storage_path))
+                    source_path = file_record.absolute_path
 
                     if not source_path.exists():
                         logger.warning(f"Physical file not found: {source_path}")

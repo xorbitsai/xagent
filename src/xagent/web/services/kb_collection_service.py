@@ -16,6 +16,7 @@ from ...config import get_uploads_dir
 from ..config import get_upload_path
 from ..kb_physical_sync import collection_physical_lock, move_collection_dir_to_trash
 from ..models.uploaded_file import UploadedFile
+from ..utils.file import to_relative_path
 from .kb_file_service import delete_uploaded_file_if_orphaned
 
 logger = logging.getLogger(__name__)
@@ -127,13 +128,21 @@ def delete_collection_uploaded_files(
             deleted_file_ids.add(current_file_id)
 
     if collection_dir is not None:
-        prefix = str(collection_dir.resolve()) + os.sep
-        dir_str = str(collection_dir.resolve())
+        abs_prefix = str(collection_dir.resolve()) + os.sep
+        abs_dir_str = str(collection_dir.resolve())
+        # Also compute relative prefix for new-style relative storage_path
+        rel_prefix = to_relative_path(collection_dir.resolve(), user_id)
+        if not rel_prefix.endswith(os.sep):
+            rel_prefix_str = rel_prefix + "/"
+        else:
+            rel_prefix_str = rel_prefix
         query = db.query(UploadedFile).filter(
             UploadedFile.user_id == user_id,
             or_(
-                UploadedFile.storage_path.startswith(prefix),
-                UploadedFile.storage_path == dir_str,
+                UploadedFile.storage_path.startswith(abs_prefix),
+                UploadedFile.storage_path == abs_dir_str,
+                UploadedFile.storage_path.startswith(rel_prefix_str),
+                UploadedFile.storage_path == rel_prefix,
             ),
         )
         # Exclude file_ids already deleted in the first pass to avoid double-count
@@ -198,9 +207,16 @@ def rename_collection_storage(
             )
 
         with collection_physical_lock(old_collection_dir):
-            old_str = str(old_collection_dir)
-            new_str = str(new_collection_dir)
+            old_abs = str(old_collection_dir)
+            new_abs = str(new_collection_dir)
+            old_rel = to_relative_path(old_collection_dir, user_id)
+            new_rel = to_relative_path(new_collection_dir, user_id)
             uploads_resolved = get_uploads_dir().resolve()
+
+            # Build filter to match both absolute (old data) and relative (new data) paths
+            old_abs_prefix = old_abs + os.sep
+            old_rel_prefix = old_rel + "/" if not old_rel.endswith("/") else old_rel
+
             records_query = db.query(UploadedFile).filter(
                 UploadedFile.user_id == user_id
             )
@@ -208,12 +224,16 @@ def rename_collection_storage(
                 records_query = records_query.filter(
                     or_(
                         UploadedFile.file_id.in_(sorted(collection_file_ids)),
-                        UploadedFile.storage_path.startswith(old_str + os.sep),
+                        UploadedFile.storage_path.startswith(old_abs_prefix),
+                        UploadedFile.storage_path.startswith(old_rel_prefix),
                     )
                 )
             else:
                 records_query = records_query.filter(
-                    UploadedFile.storage_path.startswith(old_str + os.sep)
+                    or_(
+                        UploadedFile.storage_path.startswith(old_abs_prefix),
+                        UploadedFile.storage_path.startswith(old_rel_prefix),
+                    )
                 )
             records = records_query.all()
             previous_paths: dict[int, str] = {
@@ -221,18 +241,30 @@ def rename_collection_storage(
                 for rec in records
             }
             for rec in records:
-                if not rec.storage_path.startswith(old_str + os.sep):
+                storage_str = str(rec.storage_path)
+                # Determine if this is absolute or relative path
+                if storage_str.startswith(old_abs_prefix):
+                    suffix = storage_str[len(old_abs) :]
+                    new_path = new_abs + suffix
+                elif storage_str.startswith(old_rel_prefix):
+                    suffix = storage_str[len(old_rel) :]
+                    new_path = new_rel + suffix
+                else:
                     continue
-                suffix = rec.storage_path[len(old_str) :]
                 if ".." in suffix:
                     logger.warning(
                         "Skipping storage_path update (invalid suffix): %s",
                         suffix,
                     )
                     continue
-                new_path = new_str + suffix
+                # Security check: ensure new path stays within uploads
                 try:
-                    Path(new_path).resolve().relative_to(uploads_resolved)
+                    if Path(new_path).is_absolute():
+                        Path(new_path).resolve().relative_to(uploads_resolved)
+                    else:
+                        (
+                            uploads_resolved / f"user_{user_id}" / new_path
+                        ).resolve().relative_to(uploads_resolved)
                 except ValueError:
                     logger.warning(
                         "Skipping storage_path update (path outside uploads directory): %s",

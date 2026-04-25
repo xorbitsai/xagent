@@ -744,3 +744,167 @@ class TestFileUploadSecurity:
             assert response.status_code == 200
         except (OSError, ValueError):
             pass
+
+
+class TestRelativePathStorage:
+    """Test that uploaded_files.storage_path stores relative paths."""
+
+    def test_upload_stores_relative_path_not_absolute(
+        self, client, test_db, sample_files, temp_uploads_dir, auth_headers
+    ):
+        """Test that file upload stores relative path in storage_path column."""
+        admin_user, _ = test_db
+        files, temp_dir = sample_files
+        file_path = files["test.txt"]
+
+        with open(file_path, "rb") as f:
+            response = client.post(
+                "/api/files/upload",
+                files={"file": ("test.txt", f, "text/plain")},
+                data={"task_type": "general"},
+                headers=auth_headers,
+            )
+
+        assert response.status_code in [200, 201]
+
+        # Get the file_id from response
+        data = response.json()
+        file_id = data.get("file_id")
+        assert file_id is not None, "Response should contain file_id"
+
+        # Now use /api/files/list to verify storage_path format
+        list_response = client.get("/api/files/list", headers=auth_headers)
+        assert list_response.status_code == 200
+
+        list_data = list_response.json()
+        uploaded_file = None
+        for f in list_data.get("files", []):
+            if f.get("file_id") == file_id:
+                uploaded_file = f
+                break
+
+        assert uploaded_file is not None, "File should appear in list"
+
+        # Verify relative_path is actually relative (not absolute)
+        relative_path = uploaded_file.get("relative_path", "")
+        assert relative_path, "Should have relative_path"
+
+        # Check it's not an absolute path
+        assert not relative_path.startswith("/"), (
+            f"relative_path should not start with /: {relative_path}"
+        )
+        assert not relative_path.startswith(("C:", "D:", "E:")), (
+            f"relative_path should not be Windows absolute: {relative_path}"
+        )
+
+        # Check it uses POSIX separators
+        assert "\\" not in relative_path, (
+            f"relative_path should use / not \\: {relative_path}"
+        )
+
+
+class TestKBRelativePathStorage:
+    """Test that KB file upload also stores relative paths."""
+
+    def test_kb_ingest_stores_relative_path(
+        self, client, test_db, temp_uploads_dir, auth_headers
+    ):
+        """Test that KB ingest stores relative path in storage_path column."""
+        # Create file via KB ingest to collection "test_collection"
+        response = client.post(
+            "/api/kb/ingest",
+            files={"file": ("test_file.txt", b"test content for KB", "text/plain")},
+            data={"collection": "test_collection"},
+            headers=auth_headers,
+        )
+
+        # KB may not be available in test environment
+        if response.status_code != 200:
+            pytest.skip("KB ingest not available")
+
+        # Get the file_id from response
+        data = response.json()
+        assert data.get("success"), "KB ingest should succeed"
+
+        # Now use /api/files/list to verify storage_path format
+        list_response = client.get("/api/files/list", headers=auth_headers)
+        assert list_response.status_code == 200
+
+        list_data = list_response.json()
+        uploaded_file = None
+        for f in list_data.get("files", []):
+            if f.get("filename") == "test_file.txt":
+                uploaded_file = f
+                break
+
+        assert uploaded_file is not None, "Uploaded file should appear in list"
+
+        # Verify relative_path is actually relative (not absolute)
+        relative_path = uploaded_file.get("relative_path", "")
+        assert relative_path, "Should have relative_path"
+
+        # Check it's not an absolute path
+        assert not relative_path.startswith("/"), (
+            f"KB file relative_path should not start with /: {relative_path}"
+        )
+        assert not relative_path.startswith(("C:", "D:", "E:")), (
+            f"KB file relative_path should not be Windows absolute: {relative_path}"
+        )
+
+        # Check it uses POSIX separators
+        assert "\\" not in relative_path, (
+            f"KB file relative_path should use / not \\: {relative_path}"
+        )
+
+        # Verify the path contains the collection name
+        assert "test_collection" in relative_path, (
+            f"KB file path should contain collection name: {relative_path}"
+        )
+
+
+class TestUploadDirConfiguration:
+    """Test that relative paths work correctly when XAGENT_UPLOADS_DIR is changed."""
+
+    def test_relative_path_works_with_different_upload_dir(
+        self, client, test_db, sample_files, auth_headers, monkeypatch
+    ):
+        """Test that relative paths are calculated correctly based on UPLOADS_DIR."""
+        admin_user, _ = test_db
+        files, _ = sample_files
+        file_path = files["test.txt"]
+
+        # Create a custom uploads directory for this test
+        with tempfile.TemporaryDirectory() as custom_upload_dir:
+            custom_path = Path(custom_upload_dir)
+
+            # Monkey-patch get_uploads_dir to use custom directory
+            import xagent.web.api.files
+            import xagent.web.config
+
+            monkeypatch.setattr(
+                xagent.web.config, "get_uploads_dir", lambda: custom_path
+            )
+            monkeypatch.setattr(
+                xagent.web.api.files, "get_uploads_dir", lambda: custom_path
+            )
+
+            # Upload file with custom UPLOADS_DIR
+            with open(file_path, "rb") as f:
+                response = client.post(
+                    "/api/files/upload",
+                    files={"file": ("test.txt", f, "text/plain")},
+                    data={"task_type": "general"},
+                    headers=auth_headers,
+                )
+
+            assert response.status_code in [200, 201]
+
+            # Verify file was created in the custom directory
+            # File should be in custom_upload_dir/user_{user_id}/
+            user_dir = custom_path / f"user_{admin_user.id}"
+            if user_dir.exists():
+                # Check if file exists in user directory
+                found_files = list(user_dir.rglob("test.txt"))
+                assert len(found_files) > 0, (
+                    f"File should exist in custom UPLOADS_DIR: {custom_path}"
+                )

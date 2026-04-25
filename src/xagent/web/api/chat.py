@@ -866,7 +866,7 @@ class AgentServiceManager:
                             if uploaded_file is None:
                                 continue
 
-                            source_path = Path(str(uploaded_file.storage_path))
+                            source_path = uploaded_file.absolute_path
                             if not source_path.exists() or not source_path.is_file():
                                 continue
 
@@ -1460,7 +1460,7 @@ async def create_task(
 
                 selected_file_ids.append(str(file_id))
 
-                file_path = Path(str(uploaded_file.storage_path))
+                file_path = uploaded_file.absolute_path
                 file_paths.append(str(file_path))
 
                 if file_path.exists():

@@ -236,6 +236,8 @@ uv.lock
 # But keep skills markdown files and test markdown files
 !src/xagent/skills/**/*.md
 !tests/resources/test_files/*.md
+# Also keep scripts markdown documentations
+!scripts/**/*.md
 
 .DS_Store
 uploads/

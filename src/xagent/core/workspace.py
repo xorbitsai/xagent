@@ -25,6 +25,23 @@ logger = logging.getLogger(__name__)
 _auto_register = contextvars.ContextVar("_auto_register", default=False)
 
 
+def _to_relative_path(file_path: Path, user_id: int) -> str:
+    """Convert absolute path to relative path for storage.
+
+    This is a local wrapper to avoid circular imports with the web module.
+    The actual implementation is in web.utils.file.to_relative_path.
+    """
+    # Import here to avoid circular dependency
+    try:
+        from ..web.utils.file import to_relative_path as web_to_relative_path
+
+        return web_to_relative_path(file_path, user_id)
+    except ImportError:
+        # Fallback for non-web contexts (e.g., tests)
+        # Store as-is absolute path
+        return str(file_path)
+
+
 @dataclass
 class AgentContext:
     """Agent execution context"""
@@ -180,7 +197,7 @@ class TaskWorkspace:
                 user_id=task.user_id,
                 task_id=task_id,
                 filename=file_path.name,
-                storage_path=str(file_path),
+                storage_path=_to_relative_path(file_path, task.user_id),
                 mime_type=mime_type,
                 file_size=file_path.stat().st_size,
             )
@@ -202,7 +219,10 @@ class TaskWorkspace:
     def _get_file_id_from_db(
         self, file_path: Path, db_session: Any = None
     ) -> Optional[str]:
-        """Get file_id from database by file path."""
+        """Get file_id from database by file path.
+
+        Handles both absolute and relative paths in storage_path column.
+        """
         from .storage.manager import create_db_session
 
         try:
@@ -216,11 +236,36 @@ class TaskWorkspace:
                 should_close = True
 
             try:
+                file_path_str = str(file_path)
+
+                # Try exact match first (handles old data with absolute paths)
                 record = (
                     db.query(UploadedFile)
-                    .filter(UploadedFile.storage_path == str(file_path))
+                    .filter(UploadedFile.storage_path == file_path_str)
                     .first()
                 )
+
+                # If not found and path is absolute, try relative path (handles new data)
+                if record is None and file_path.is_absolute():
+                    try:
+                        # Get user_id from workspace id (e.g., 'web_task_265' -> 265)
+                        try:
+                            task_id = int(self.id.split("_")[-1])
+                            from ..web.models.task import Task
+
+                            task = db.query(Task).filter(Task.id == task_id).first()
+                            if task:
+                                relative = _to_relative_path(file_path, task.user_id)
+                                record = (
+                                    db.query(UploadedFile)
+                                    .filter(UploadedFile.storage_path == relative)
+                                    .first()
+                                )
+                        except (ValueError, IndexError):
+                            pass
+                    except Exception:
+                        pass
+
                 if record:
                     return str(record.file_id)
                 return None
@@ -271,8 +316,8 @@ class TaskWorkspace:
                     .filter(UploadedFile.file_id == file_id)
                     .first()
                 )
-                if record and record.storage_path:
-                    resolved_path = Path(record.storage_path)
+                if record:
+                    resolved_path = record.absolute_path
                     if resolved_path.exists() and resolved_path.is_file():
                         return resolved_path
                 return None
@@ -776,7 +821,7 @@ class TaskWorkspace:
 
                 # Build file list from database
                 for file_record in files:
-                    file_path = Path(file_record.storage_path)
+                    file_path = file_record.absolute_path
                     if file_path.exists():
                         result_files.append(
                             {

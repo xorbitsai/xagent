@@ -22,6 +22,7 @@ from ...core.tools.core.RAG_tools.utils.string_utils import (
 from ...core.tools.core.RAG_tools.utils.user_permissions import UserPermissions
 from ...providers.vector_store.lancedb import get_connection_from_env
 from ..models.uploaded_file import UploadedFile
+from ..utils.file import find_file_by_path, to_relative_path
 
 logger = logging.getLogger(__name__)
 
@@ -37,11 +38,9 @@ def upsert_uploaded_file_record(
 ) -> UploadedFile:
     """Create or refresh an ``UploadedFile`` row for a stored file."""
     storage_path_str = str(storage_path)
-    existing = (
-        db.query(UploadedFile)
-        .filter(UploadedFile.storage_path == storage_path_str)
-        .first()
-    )
+    relative_path = to_relative_path(storage_path, user_id)
+
+    existing = find_file_by_path(db, storage_path_str, user_id)
     if existing:
         existing.filename = filename  # type: ignore[assignment]
         existing.file_size = int(file_size)  # type: ignore[assignment]
@@ -53,7 +52,7 @@ def upsert_uploaded_file_record(
         file_record = UploadedFile(
             user_id=user_id,
             filename=filename,
-            storage_path=storage_path_str,
+            storage_path=relative_path,
             mime_type=mime_type,
             file_size=int(file_size),
         )
@@ -199,7 +198,7 @@ def delete_uploaded_file_if_orphaned(
         return False
 
     uploads_root = get_uploads_dir().resolve()
-    file_path = Path(str(file_record.storage_path))
+    file_path = file_record.absolute_path
     try:
         resolved_path = file_path.resolve()
         resolved_path.relative_to(uploads_root)

@@ -813,6 +813,9 @@ Build when you need.`
         toggleFailed: "Toggle status failed",
         atLeastOneSecret: "At least one valid secret is required",
       },
+      mcpUnavailable: "MCP unavailable",
+      notConnected: "Not connected, please click connector to configure",
+      notSupported: "Platform does not support this app yet",
       delete: {
         confirm: "Are you sure to delete server \"{name}\"?",
       },

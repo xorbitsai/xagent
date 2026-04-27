@@ -20,7 +20,7 @@ connections:
   logo: https://www.google.com/s2/favicons?domain=hubspot.com&sz=64
 - name: Salesforce
   logo: https://www.google.com/s2/favicons?domain=salesforce.com&sz=64
-- name: MS Outlook
+- name: Outlook
   logo: https://www.google.com/s2/favicons?domain=outlook.live.com&sz=64
 - name: Google Calendar
   logo: https://www.google.com/s2/favicons?domain=calendar.google.com&sz=64

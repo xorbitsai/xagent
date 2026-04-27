@@ -22,7 +22,7 @@ connections:
   logo: https://www.google.com/s2/favicons?domain=salesforce.com&sz=64
 - name: Gmail
   logo: https://www.google.com/s2/favicons?domain=mail.google.com&sz=64
-- name: MS Outlook
+- name: Outlook
   logo: https://www.google.com/s2/favicons?domain=outlook.live.com&sz=64
 - name: Google Drive
   logo: https://www.google.com/s2/favicons?domain=drive.google.com&sz=64

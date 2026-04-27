@@ -104,7 +104,7 @@ export function AgentBuilder({ agentId }: AgentBuilderProps) {
   const MAX_INSTRUCTIONS_LENGTH = 8192;
   const { t, locale } = useI18n()
   const { token } = useAuth()
-  const { getAppIcon } = useMcpApps()
+  const { apps: officialApps, getAppIcon } = useMcpApps()
   const router = useRouter()
   const searchParams = useSearchParams()
   const templateId = searchParams.get("template")
@@ -636,15 +636,15 @@ export function AgentBuilder({ agentId }: AgentBuilderProps) {
 
           // Use the template's 'connections' to figure out which MCP apps to select
           if (template.connections && Array.isArray(template.connections)) {
-            // Find which connections the user actually has connected
             template.connections.forEach((conn: any) => {
               const connName = typeof conn === 'string' ? conn : conn.name;
               if (!connName) return;
 
               // Find the actual server object to use its exact name, to avoid case mismatches
               const server = mcpServers.find(s => s.name.toLowerCase() === connName.toLowerCase() || s.app_id?.toLowerCase() === connName.toLowerCase().replace(/\s+/g, '-'))
-              if (server && !connectedMcpApps.includes(server.name)) {
-                connectedMcpApps.push(server.name)
+              const finalName = server ? server.name : connName;
+              if (!connectedMcpApps.includes(finalName)) {
+                connectedMcpApps.push(finalName)
               }
             });
           }
@@ -1366,7 +1366,7 @@ export function AgentBuilder({ agentId }: AgentBuilderProps) {
               className={`px-3 py-2 text-sm border rounded-md transition-colors ${executionMode === "flash"
                 ? "bg-primary text-primary-foreground border-primary"
                 : "bg-background hover:bg-accent"
-              }`}
+                }`}
               onClick={() => setExecutionMode("flash")}
             >
               <div className="flex items-center justify-center gap-1 mb-1">
@@ -1380,7 +1380,7 @@ export function AgentBuilder({ agentId }: AgentBuilderProps) {
               className={`px-3 py-2 text-sm border rounded-md transition-colors ${executionMode === "balanced"
                 ? "bg-primary text-primary-foreground border-primary"
                 : "bg-background hover:bg-accent"
-              }`}
+                }`}
               onClick={() => setExecutionMode("balanced")}
             >
               <div className="flex items-center justify-center gap-1 mb-1">
@@ -1394,7 +1394,7 @@ export function AgentBuilder({ agentId }: AgentBuilderProps) {
               className={`px-3 py-2 text-sm border rounded-md transition-colors ${executionMode === "think"
                 ? "bg-primary text-primary-foreground border-primary"
                 : "bg-background hover:bg-accent"
-              }`}
+                }`}
               onClick={() => setExecutionMode("think")}
             >
               <div className="flex items-center justify-center gap-1 mb-1">
@@ -1670,23 +1670,46 @@ export function AgentBuilder({ agentId }: AgentBuilderProps) {
             </div>
           )}
           <div className="flex flex-col gap-2">
-            {mcpServers.filter((s: any) => selectedMcpServers.includes(s.name)).map((server, index) => {
+            {selectedMcpServers.map((serverName, index) => {
+              const isConnected = mcpServers.some((s: any) => s.name === serverName)
+              const isSupported = officialApps.some((app: any) => app.name.toLowerCase() === serverName.toLowerCase() || app.id.toLowerCase() === serverName.toLowerCase())
+
+              let statusDesc = ""
+
+              if (isConnected) {
+                const server = mcpServers.find((s: any) => s.name === serverName)
+                statusDesc = server?.description || ""
+              } else if (isSupported) {
+                statusDesc = t("tools.mcp.notConnected")
+              } else {
+                statusDesc = t("tools.mcp.notSupported")
+              }
+
+              const server = { name: serverName, description: statusDesc }
               const icon = getAppIcon(server.name)
               return (
-                <div key={index} className="flex items-center gap-3 p-2 rounded-md border">
+                <div key={index} className={cn("flex items-center gap-3 p-2 rounded-md border", !isConnected && "opacity-50 bg-muted/50")}>
                   <div className="bg-slate-100 p-1.5 rounded">
                     {icon ? (
-                      <img src={icon} alt={server.name} className="h-5 w-5 object-contain" />
+                      <img src={icon} alt={server.name} className={cn("h-5 w-5 object-contain", !isConnected && "grayscale")} />
                     ) : (
                       <span className="text-xl">🔌</span>
                     )}
                   </div>
                   <div>
-                    <div className="text-sm font-medium">{server.name}</div>
+                    <div className="text-sm font-medium flex items-center gap-2">
+                      {server.name}
+                      {!isConnected && (
+                        <span className="text-[10px] bg-yellow-100 text-yellow-700 px-1.5 py-0.5 rounded font-normal whitespace-nowrap">
+                          {t("tools.mcp.mcpUnavailable")}
+                        </span>
+                      )}
+                    </div>
                     <div className="text-xs text-muted-foreground">{server.description}</div>
                   </div>
                   <div className="ml-auto">
                     <Button
+                      type="button"
                       variant="ghost"
                       size="sm"
                       className="h-8 w-8 p-0 text-red-500 hover:text-red-600 hover:bg-red-50"

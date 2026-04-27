@@ -813,6 +813,9 @@ Build when you need.`
         toggleFailed: "切换状态失败",
         atLeastOneSecret: "至少需要一个有效的密钥",
       },
+      mcpUnavailable: "暂不可用",
+      notConnected: "未连接，请点击连接器进行配置",
+      notSupported: "平台暂未支持该应用",
       delete: {
         confirm: "确定要删除服务器 \"{name}\" 吗？",
       },

@@ -940,9 +940,9 @@ def generic_oauth_callback(
 
         if userinfo_url and access_token:
             info_headers = {"Authorization": f"Bearer {access_token}"}
-            info_response = requests.get(
-                userinfo_url, headers=info_headers, timeout=10.0
-            )
+            # Replace {{access_token}} placeholder if present
+            actual_url = userinfo_url.replace("{{access_token}}", access_token)
+            info_response = requests.get(actual_url, headers=info_headers, timeout=10.0)
             if info_response.status_code == 200:
                 info_data = info_response.json()
                 provider_user_id = info_data.get(db_provider.user_id_path or "id")

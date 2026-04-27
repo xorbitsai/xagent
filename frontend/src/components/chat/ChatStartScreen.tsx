@@ -26,6 +26,7 @@ interface ChatStartScreenProps {
   showModeToggle?: boolean;
   readOnlyConfig?: boolean;
   taskConfig?: any;
+  autoFocus?: boolean;
 }
 
 export function ChatStartScreen({
@@ -41,7 +42,8 @@ export function ChatStartScreen({
   onFilesChange,
   showModeToggle = false,
   readOnlyConfig = false,
-  taskConfig
+  taskConfig,
+  autoFocus = false
 }: ChatStartScreenProps) {
   const { t } = useI18n();
 
@@ -66,12 +68,13 @@ export function ChatStartScreen({
             onSend={(msg, config) => onSend(msg, files, config)}
             isLoading={isSending}
             files={files}
-            onFilesChange={onFilesChange || (() => {})}
+            onFilesChange={onFilesChange || (() => { })}
             showModeToggle={showModeToggle}
             inputValue={inputValue}
             onInputChange={onInputChange}
             readOnlyConfig={readOnlyConfig}
             taskConfig={taskConfig}
+            autoFocus={autoFocus}
           />
           <div className="text-xs text-muted-foreground/60 text-center">
             {t("chatPage.input.hintEnter")} · {t("chatPage.input.hintAt")}
@@ -86,29 +89,29 @@ export function ChatStartScreen({
                 const promptText = isString ? item : item.prompt;
 
                 if (isString) {
-                   return (
-                      <div
-                        key={index}
-                        onClick={() => handlePromptClick(promptText)}
-                        className="group relative p-4 h-28 rounded-xl border border-border bg-card hover:bg-muted/50 cursor-pointer transition-all duration-300 flex flex-col justify-center text-left"
-                      >
-                        <p className="text-sm text-foreground/90 line-clamp-3">{promptText}</p>
-                      </div>
-                   );
+                  return (
+                    <div
+                      key={index}
+                      onClick={() => handlePromptClick(promptText)}
+                      className="group relative p-4 h-28 rounded-xl border border-border bg-card hover:bg-muted/50 cursor-pointer transition-all duration-300 flex flex-col justify-center text-left"
+                    >
+                      <p className="text-sm text-foreground/90 line-clamp-3">{promptText}</p>
+                    </div>
+                  );
                 }
 
                 // Card style for Task Page
                 return (
-                    <div
-                      key={index}
-                      onClick={() => handlePromptClick(promptText)}
-                      className="group relative p-4 h-28 rounded-xl border border-border bg-card hover:bg-muted/50 cursor-pointer transition-all duration-300 flex flex-col justify-center items-start text-left gap-3"
-                    >
-                      <div className="flex items-center justify-center">
-                        {item.icon && <item.icon className="w-5 h-5 text-muted-foreground" />}
-                      </div>
-                      <h3 className="font-medium text-sm text-foreground/90 leading-tight">{item.title}</h3>
+                  <div
+                    key={index}
+                    onClick={() => handlePromptClick(promptText)}
+                    className="group relative p-4 h-28 rounded-xl border border-border bg-card hover:bg-muted/50 cursor-pointer transition-all duration-300 flex flex-col justify-center items-start text-left gap-3"
+                  >
+                    <div className="flex items-center justify-center">
+                      {item.icon && <item.icon className="w-5 h-5 text-muted-foreground" />}
                     </div>
+                    <h3 className="font-medium text-sm text-foreground/90 leading-tight">{item.title}</h3>
+                  </div>
                 );
               })}
             </div>

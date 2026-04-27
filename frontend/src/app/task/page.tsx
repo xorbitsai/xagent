@@ -80,6 +80,7 @@ function TaskHomePageContent() {
             inputValue={inputValue}
             onInputChange={setInputValue}
             showModeToggle={true}
+            autoFocus={true}
           />
         </main>
       </div>

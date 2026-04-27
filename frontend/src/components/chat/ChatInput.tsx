@@ -46,6 +46,7 @@ interface ChatInputProps {
   readOnlyConfig?: boolean;
   hideFileUpload?: boolean;
   compact?: boolean;
+  autoFocus?: boolean;
 }
 
 export function ChatInput({
@@ -63,7 +64,8 @@ export function ChatInput({
   hideConfig = false,
   readOnlyConfig = false,
   hideFileUpload = false,
-  compact = false
+  compact = false,
+  autoFocus = false
 }: ChatInputProps) {
   const router = useRouter();
   const [internalMessage, setInternalMessage] = useState("");
@@ -76,6 +78,23 @@ export function ChatInput({
   const isSubmittingRef = useRef(false);
   const { t } = useI18n();
   const { openFilePreview } = useApp();
+
+  useEffect(() => {
+    if (autoFocus && editorRef.current) {
+      // Focus at the end of text if any, or just focus
+      editorRef.current.focus();
+
+      // Try to place cursor at the end
+      if (typeof window !== 'undefined') {
+        const selection = window.getSelection();
+        const range = document.createRange();
+        range.selectNodeContents(editorRef.current);
+        range.collapse(false); // false means collapse to end
+        selection?.removeAllRanges();
+        selection?.addRange(range);
+      }
+    }
+  }, [autoFocus]);
 
   const handleInput = () => {
     const editor = editorRef.current;

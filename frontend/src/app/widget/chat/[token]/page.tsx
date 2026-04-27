@@ -346,6 +346,7 @@ export default function WidgetChatPage() {
             className="min-h-[44px] max-h-[120px] resize-none border-0 bg-transparent focus-visible:ring-0 p-3 shadow-none text-sm"
             rows={1}
             disabled={isInitializing || isConnecting || isWaitingForResponse}
+            autoFocus
           />
           <Button
             size="icon"

@@ -450,6 +450,7 @@ function TaskDetailContent() {
                 executionMode: state.currentTask.executionMode
               } : undefined}
               readOnlyConfig={true}
+              autoFocus={true}
             />
           </div>
         </div>

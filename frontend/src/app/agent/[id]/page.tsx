@@ -219,6 +219,7 @@ export default function AgentChatPage() {
               onFilesChange={setFiles}
               readOnlyConfig={true}
               taskConfig={{ model: agentModelId }}
+              autoFocus={true}
             />
           </main>
         </div>

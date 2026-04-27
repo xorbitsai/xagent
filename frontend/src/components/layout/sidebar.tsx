@@ -331,6 +331,7 @@ export function Sidebar({ className }: SidebarProps) {
   const [showUserMenu, setShowUserMenu] = useState(false)
   const [isAboutOpen, setIsAboutOpen] = useState(false)
   const sidebarRef = useRef<HTMLDivElement | null>(null)
+  const taskListRef = useRef<HTMLDivElement | null>(null)
   const userMenuRef = useRef<HTMLDivElement | null>(null)
 
   // Handle click outside for user menu
@@ -577,9 +578,9 @@ export function Sidebar({ className }: SidebarProps) {
 
   // Monitor task list changes, if content is not enough to fill the container and there is more data, automatically load the next page
   useEffect(() => {
-    if (!navRef.current || !isHistoryExpanded) return
+    if (!taskListRef.current || !isHistoryExpanded) return
 
-    const { scrollHeight, clientHeight } = navRef.current
+    const { scrollHeight, clientHeight } = taskListRef.current
     // If content height is less than or equal to container height (plus a buffer), and there is more data, and not loading
     if (scrollHeight <= clientHeight + 20 && hasMore && !isLoadingMore && !isLoadingTasks) {
       // Use setTimeout to avoid continuous state updates in one render cycle
@@ -615,7 +616,7 @@ export function Sidebar({ className }: SidebarProps) {
 
   const handleScroll = (e: React.UIEvent<HTMLElement>) => {
     const { scrollTop, scrollHeight, clientHeight } = e.currentTarget
-    if (isHistoryExpanded && scrollHeight - scrollTop <= clientHeight + 20 && hasMore && !isLoadingMore && !isLoadingTasks) {
+    if (scrollHeight - scrollTop <= clientHeight + 20 && hasMore && !isLoadingMore && !isLoadingTasks) {
       loadTasks(page + 1, true)
     }
   }
@@ -625,8 +626,11 @@ export function Sidebar({ className }: SidebarProps) {
   // Build page no longer automatically hides
   // /agent/[id] page does not auto-collapse (for agent chat)
   const isAgentChatPage = pathname.match(/^\/agent\/\d+$/)
-  const shouldShowSidebar = !((pathname.startsWith('/agent') && !pathname.startsWith('/agent/vibe') && !isAgentChatPage)) || isExpanded
   const isAgentPage = (pathname.startsWith('/agent') && !pathname.startsWith('/agent/vibe') && !isAgentChatPage)
+  const shouldShowSidebar = !isAgentPage || isExpanded
+
+  // Allow user to manually collapse the sidebar
+  const [isSidebarOpen, setIsSidebarOpen] = useState(true)
 
   // When in collapsible state and expanded, click outside sidebar to automatically collapse
   useEffect(() => {
@@ -668,15 +672,53 @@ export function Sidebar({ className }: SidebarProps) {
     return pathname === href || pathname.startsWith(`${href}/`)
   }
 
-  if (isAgentPage && !shouldShowSidebar) {
+  if ((isAgentPage && !shouldShowSidebar) || !isSidebarOpen) {
     return (
-      <div className="flex items-center justify-center w-12 bg-card border-r border-border">
+      <div className="flex flex-col items-center justify-start py-4 w-[60px] bg-card border-r border-border shrink-0 h-full relative">
+        <Link href="/task" className="flex items-center justify-center mb-8">
+          <img
+            src={branding.logoPath}
+            alt={branding.logoAlt}
+            className="h-8 w-8 rounded-lg"
+          />
+        </Link>
         <button
-          onClick={() => setIsExpanded(true)}
-          className="p-2 text-muted-foreground hover:text-foreground hover:bg-accent rounded-md transition-colors"
+          onClick={() => isAgentPage ? setIsExpanded(true) : setIsSidebarOpen(true)}
+          className="absolute -right-3 top-6 bg-card border border-border rounded-full p-0.5 text-muted-foreground hover:text-foreground hover:bg-accent transition-colors z-50 shadow-sm"
         >
-          <Menu className="h-5 w-5" />
+          <ChevronRight className="h-4 w-4" />
         </button>
+        <div className="flex flex-col gap-2 w-full px-2">
+          {navigationGroups.map((group) => (
+            group.items.map((item) => {
+              const isActive = isPathActive(item.href)
+              return (
+                <Link
+                  key={item.name}
+                  href={item.href}
+                  title={item.nameKey ? t(item.nameKey) : item.name}
+                  className={cn(
+                    "flex items-center justify-center p-2 rounded-lg transition-colors",
+                    isActive ? "bg-primary/10 text-primary" : "text-muted-foreground hover:bg-accent hover:text-foreground"
+                  )}
+                >
+                  <item.icon className="h-5 w-5" />
+                </Link>
+              )
+            })
+          ))}
+        </div>
+        <div className="mt-auto w-full px-2">
+          <button
+            onClick={() => isAgentPage ? setIsExpanded(true) : setIsSidebarOpen(true)}
+            className="flex items-center justify-center w-full p-2 hover:bg-accent/50 rounded-lg transition-colors"
+            title={user?.username || t('sidebar.user.defaultName')}
+          >
+            <div className="h-8 w-8 rounded-full bg-primary flex items-center justify-center text-xs font-medium text-primary-foreground uppercase shrink-0 shadow-sm">
+              {(user?.username || t('sidebar.user.defaultName')).charAt(0)}
+            </div>
+          </button>
+        </div>
       </div>
     )
   }
@@ -689,7 +731,7 @@ export function Sidebar({ className }: SidebarProps) {
       className
     )}>
       {/* Logo */}
-      <div className="flex h-16 items-center justify-between px-6 mt-2">
+      <div className="flex h-16 items-center justify-between px-6 mt-2 relative">
         <Link href="/task" className="flex items-center gap-2">
           <img
             src={branding.logoPath}
@@ -698,24 +740,21 @@ export function Sidebar({ className }: SidebarProps) {
           />
           <h1 className="text-xl font-bold text-foreground">{branding.appName}</h1>
         </Link>
-        {isAgentPage && (
-          <button
-            onClick={() => setIsExpanded(false)}
-            className="p-1 text-muted-foreground hover:text-foreground hover:bg-accent rounded-md transition-colors"
-          >
-            <X className="h-5 w-5" />
-          </button>
-        )}
+        <button
+          onClick={() => isAgentPage ? setIsExpanded(false) : setIsSidebarOpen(false)}
+          className="absolute -right-3 top-4 bg-card border border-border rounded-full p-0.5 text-muted-foreground hover:text-foreground hover:bg-accent transition-colors z-50 shadow-sm"
+        >
+          <ChevronDown className="h-4 w-4 rotate-90" />
+        </button>
       </div>
 
       {/* Navigation */}
-      <nav
-        ref={navRef}
-        className="flex-1 min-h-0 overflow-y-auto px-3 pb-4 [&::-webkit-scrollbar]:hidden [-ms-overflow-style:'none'] [scrollbar-width:'none']"
-        onScroll={handleScroll}
-      >
+      <div className="flex-1 flex flex-col min-h-0 px-3 pb-4">
         {/* Sticky Navigation Groups */}
-        <div className="sticky top-0 z-10 bg-card -mx-3 px-3 py-2">
+        <nav
+          ref={navRef}
+          className="z-10 bg-card -mx-3 px-3 py-2 overflow-y-auto [&::-webkit-scrollbar]:hidden [-ms-overflow-style:'none'] [scrollbar-width:'none']"
+        >
           {/* Groups */}
           {navigationGroups.map((group, groupIndex) => (
             <div key={group.title} className={cn("mb-6", groupIndex === 0 && "mt-0")}>
@@ -801,12 +840,12 @@ export function Sidebar({ className }: SidebarProps) {
               </div>
             </div>
           ))}
-        </div>
+        </nav>
 
         {/* History Section */}
-        <div>
+        <div className="mt-auto flex flex-col overflow-hidden shrink-0">
           <div
-            className="px-4 py-2 text-xs font-bold text-slate-400 uppercase tracking-wider mb-1 flex items-center justify-between transition-colors group h-8"
+            className="px-4 py-2 text-xs font-bold text-slate-400 uppercase tracking-wider mb-1 flex items-center justify-between transition-colors group h-8 shrink-0"
           >
             {(isSearchVisible || isSearchFocused || searchQuery) ? (
               <div className="flex-1 relative mr-2 h-full flex items-center">
@@ -870,7 +909,11 @@ export function Sidebar({ className }: SidebarProps) {
           </div>
 
           {isHistoryExpanded && (
-            <div className="space-y-1">
+            <div
+              ref={taskListRef}
+              className="space-y-1 overflow-y-auto [&::-webkit-scrollbar]:hidden [-ms-overflow-style:'none'] [scrollbar-width:'none'] max-h-[304px]"
+              onScroll={handleScroll}
+            >
               {isLoadingTasks ? (
                 <div className="flex items-center justify-center py-4">
                   <Loader2 className="h-4 w-4 animate-spin text-muted-foreground" />
@@ -988,11 +1031,10 @@ export function Sidebar({ className }: SidebarProps) {
             </div>
           )}
         </div>
-      </nav>
-
+      </div>
 
       {/* User Profile */}
-      <div className="p-4 relative mt-auto" ref={userMenuRef}>
+      <div className="p-4 relative mt-auto shrink-0" ref={userMenuRef}>
         {showUserMenu && (
           <div className="absolute bottom-full left-4 right-4 mb-2 bg-popover border border-border rounded-lg shadow-lg overflow-hidden animate-in fade-in zoom-in-95 duration-200 z-50">
             <div className="py-1">
@@ -1035,8 +1077,8 @@ export function Sidebar({ className }: SidebarProps) {
           onClick={() => setShowUserMenu(!showUserMenu)}
           className="flex w-full items-center gap-2 hover:bg-accent/50 p-2 -ml-2 rounded-lg transition-colors text-left"
         >
-          <div className="h-8 w-8 rounded-full bg-primary/10 flex items-center justify-center">
-            <User className="h-4 w-4 text-primary" />
+          <div className="h-8 w-8 rounded-full bg-primary flex items-center justify-center text-xs font-medium text-primary-foreground uppercase shrink-0">
+            {(user?.username || t('sidebar.user.defaultName')).charAt(0)}
           </div>
           <div className="ml-3 flex-1">
             <p className="text-sm font-medium text-foreground">{user?.username || t('sidebar.user.defaultName')}</p>
@@ -1129,6 +1171,6 @@ export function Sidebar({ className }: SidebarProps) {
         onConfirm={confirmDeleteTask}
         isLoading={isDeletingTask}
       />
-    </div>
+    </div >
   )
 }

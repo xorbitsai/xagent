@@ -12,7 +12,6 @@ from typing import Any, Callable, Dict, Optional, Sequence, Union
 
 import sqlalchemy as sa
 from alembic import op
-from sqlalchemy.engine.reflection import Inspector
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import Session
 
@@ -386,7 +385,7 @@ def upgrade() -> None:
     from alembic import context
 
     bind = context.get_bind()
-    inspector = Inspector.from_engine(bind)
+    inspector = sa.inspect(bind)
 
     logger.info("Starting upgrade to new MCP server structure")
 
@@ -399,6 +398,8 @@ def upgrade() -> None:
         ):
             logger.info("Renaming old table mcp_servers to mcp_servers_legacy")
             op.rename_table("mcp_servers", "mcp_servers_legacy")
+            existing_tables.remove("mcp_servers")
+            existing_tables.append("mcp_servers_legacy")
 
         # Create new tables if they don't exist
         if "mcp_servers" not in existing_tables:
@@ -421,7 +422,7 @@ def create_new_tables() -> None:
     from alembic import context
 
     bind = context.get_bind()
-    inspector = Inspector.from_engine(bind)
+    inspector = sa.inspect(bind)
     dialect_name = bind.dialect.name
 
     # Get the appropriate JSON type for the current database

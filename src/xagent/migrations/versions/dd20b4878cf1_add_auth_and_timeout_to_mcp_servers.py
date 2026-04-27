@@ -19,10 +19,34 @@ depends_on: Union[str, Sequence[str], None] = None
 
 
 def upgrade() -> None:
-    op.add_column("mcp_servers", sa.Column("timeout", sa.Integer(), nullable=True))
-    op.add_column("mcp_servers", sa.Column("auth", sa.JSON(), nullable=True))
+    from alembic import context
+
+    bind = context.get_bind()
+    inspector = sa.inspect(bind)
+
+    tables = inspector.get_table_names()
+    if "mcp_servers" not in tables:
+        return
+
+    existing_columns = [col["name"] for col in inspector.get_columns("mcp_servers")]
+    if "timeout" not in existing_columns:
+        op.add_column("mcp_servers", sa.Column("timeout", sa.Integer(), nullable=True))
+    if "auth" not in existing_columns:
+        op.add_column("mcp_servers", sa.Column("auth", sa.JSON(), nullable=True))
 
 
 def downgrade() -> None:
-    op.drop_column("mcp_servers", "auth")
-    op.drop_column("mcp_servers", "timeout")
+    from alembic import context
+
+    bind = context.get_bind()
+    inspector = sa.inspect(bind)
+
+    tables = inspector.get_table_names()
+    if "mcp_servers" not in tables:
+        return
+
+    existing_columns = [col["name"] for col in inspector.get_columns("mcp_servers")]
+    if "auth" in existing_columns:
+        op.drop_column("mcp_servers", "auth")
+    if "timeout" in existing_columns:
+        op.drop_column("mcp_servers", "timeout")

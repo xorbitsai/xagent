@@ -1272,19 +1272,12 @@ class DAGPlanExecutePattern(AgentPattern):
             "context": context or {},
         }
 
-        # 关键：不需要设置 _execution_interrupted，因为 continuation 是继续执行，不是中断执行
-        # _execution_interrupted 会导致执行循环退出，而我们只是想要进入下一个迭代
-        # self._execution_interrupted = True  # <-- 移除这行！
+        # Interrupt the current plan execution so we can start a new iteration with the user's input
+        self.interrupt_execution(reason="Task continuation requested")
 
-        # 如果暂停了，恢复执行以便处理 continuation
-        if self._pause_event.is_set():
-            logger.info("Resuming from paused state to process continuation")
-            # Use resume_execution() to properly update phase and clear events
-            self.resume_execution()
-
-        # Note: We DON'T call interrupt_execution() on plan_executor or step_patterns
-        # because continuation is NOT an interruption - it's a continuation of execution
-        # The execution loop will check _pending_continuation and continue to next iteration
+        # Note: interrupt_execution() already clears the pause event and notifies the condition,
+        # so we don't need to call resume_execution() here. The execution loop will break out
+        # of the current plan and start a new iteration.
 
     def _compile_final_result(
         self, task: str, execution_history: List[Dict[str, Any]]
@@ -1309,9 +1302,14 @@ class DAGPlanExecutePattern(AgentPattern):
 
         # Extract meaningful content from successful steps
         meaningful_content = []
+        chat_response = None
         for step in successful_steps:
             step_result = step.get("result", {})
             if step_result and isinstance(step_result, dict):
+                # Extract chat response if present
+                if "chat_response" in step_result:
+                    chat_response = step_result["chat_response"]
+
                 content = self._extract_meaningful_content(step_result)
                 if content:
                     meaningful_content.append(
@@ -1360,6 +1358,10 @@ class DAGPlanExecutePattern(AgentPattern):
             "phase": phase,
             "history": execution_history,
         }
+
+        if chat_response:
+            result["chat_response"] = chat_response
+            result["is_paused"] = True
 
         # Add file outputs if available
         file_outputs = self._extract_file_outputs()
@@ -1464,6 +1466,14 @@ class DAGPlanExecutePattern(AgentPattern):
         # Combine all meaningful content
         combined_content = "\n\n".join([item["content"] for item in meaningful_content])
 
+        # Extract chat_response if any step returned it
+        chat_response = None
+        for step in successful_steps:
+            step_result = step.get("result", {})
+            if isinstance(step_result, dict) and "chat_response" in step_result:
+                chat_response = step_result["chat_response"]
+                break
+
         result = {
             "success": len(failed_steps) == 0,
             "output": combined_content if combined_content else summary,
@@ -1475,6 +1485,9 @@ class DAGPlanExecutePattern(AgentPattern):
             "execution_results": execution_results,
             "meaningful_content": meaningful_content,
         }
+
+        if chat_response:
+            result["chat_response"] = chat_response
 
         # Add file outputs if available
         file_outputs = self._extract_file_outputs()

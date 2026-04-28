@@ -1,9 +1,10 @@
 import logging
-from typing import Any, Mapping, Optional, Type, Union
+from typing import TYPE_CHECKING, Any, Mapping, Optional, Type, Union
 
 from pydantic import BaseModel, Field
 
 from .base import AbstractBaseTool, ToolCategory, ToolVisibility
+from .factory import register_tool
 
 logger = logging.getLogger(__name__)
 
@@ -87,7 +88,11 @@ class AskUserQuestionTool(AbstractBaseTool):
             "Ask the user a question and provide a structured form for them to fill out. "
             "Use this when you need clarification, specific information, or a decision from the user "
             "before proceeding with a task. "
-            "For example, you can ask if they want to create a knowledge base (use 'action_cards' for Import/Upload), or select from a list (use 'select_one')."
+            "For example, you can ask if they want to create a knowledge base (use 'action_cards' for Import/Upload), or select from a list (use 'select_one'). "
+            "IMPORTANT AGENT CREATION WORKFLOW: "
+            "If the user wants to create an FAQ bot or an agent that requires a knowledge base, and no suitable existing knowledge base is found (via `list_knowledge_bases`), "
+            "you MUST use this tool with `action_cards` to prompt the user to provide a URL or upload a file (unless the user already provided a URL/file in their prompt, in which case use `create_knowledge_base_from_url` directly). "
+            "Only AFTER the user provides the knowledge base should you proceed to call `create_agent` or `update_agent`."
         )
 
     def args_type(self) -> Type[BaseModel]:
@@ -129,3 +134,15 @@ class AskUserQuestionTool(AbstractBaseTool):
                 "Output ONLY the JSON block."
             ),
         ).model_dump()
+
+
+if TYPE_CHECKING:
+    from xagent.web.tools.config import WebToolConfig
+
+
+@register_tool
+async def create_ask_user_question_tool(
+    config: "WebToolConfig",
+) -> list[AbstractBaseTool]:
+    """Create the AskUserQuestionTool."""
+    return [AskUserQuestionTool()]

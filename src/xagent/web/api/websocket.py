@@ -566,8 +566,14 @@ async def execute_task_background(
         try:
             task_updated = db_new.query(Task).filter(Task.id == task_id).first()
             if task_updated:
+                if result.get("is_paused", False):
+                    task_updated.status = TaskStatus.PAUSED
+                    db_new.commit()
+                    logger.info(
+                        f"Updated task {task_id} status to PAUSED (waiting for user input)"
+                    )
                 # If task current status is PAUSED, don't overwrite
-                if task_updated.status != TaskStatus.PAUSED:
+                elif task_updated.status != TaskStatus.PAUSED:
                     if result.get("success", False):
                         task_updated.status = TaskStatus.COMPLETED
                     else:
@@ -597,6 +603,11 @@ async def execute_task_background(
                     if isinstance(chat_response, dict)
                     else None,
                 )
+
+                # Get the latest status to send to frontend
+                current_status = task_updated.status.value
+            else:
+                current_status = task.status.value
         finally:
             db_new.close()
 
@@ -609,7 +620,7 @@ async def execute_task_background(
                 "task": {
                     "id": task.id,
                     "title": task.title,
-                    "status": task.status.value,
+                    "status": current_status,
                     "description": task.description,
                 },
                 "result": ai_response,
@@ -2577,10 +2588,12 @@ Important instructions:
 3. Include appropriate tool_categories and skills based on the user's requirements
 4. After creating or updating an agent, present it to the user in a clear format with the markdown link
 5. When updating an agent, if you need to modify tools, skills, or knowledge bases, you MUST provide the FULL updated list in your tool call (combining the existing ones from Current Agent Configuration with any new ones the user requested). If you do not include the existing ones, they will be removed!
-6. If the user asks to build an agent that requires a knowledge base (e.g., answering questions from a specific website, document, or domain), ALWAYS check if a relevant knowledge base exists using `list_knowledge_bases`.
+6. If the user asks to build an agent that requires a knowledge base (e.g., answering questions from a specific website, document, FAQ, or company domain), ALWAYS check if a relevant knowledge base exists using `list_knowledge_bases`.
+   - If the agent is meant to be an FAQ bot, customer service bot, or answer specific organizational questions, it ABSOLUTELY REQUIRES a knowledge base. Do NOT assume it can answer from general knowledge.
    - If a relevant knowledge base DOES NOT exist, you MUST determine if the user has ALREADY provided a specific URL (e.g., www.example.com).
    - If the user HAS provided a URL: Do NOT ask the user again! Instead, immediately use the `create_knowledge_base_from_url` tool to import the website, and then proceed to create or update the agent with the new knowledge base.
-   - If the user HAS NOT provided a URL or file: You MUST STOP and ask the user for clarification using the `ask_user_question` tool. Use the "action_cards" interaction type ONLY for high-level actions like "Import Website" and "Upload File". If you know the user's intended website URL but it hasn't been crawled yet, you MUST pass that URL into the "default_value" field of the interaction. For selecting from a list of existing items (like existing knowledge bases), you MUST use the "select_one" interaction type instead.
+   - If the user HAS NOT provided a URL or file: You MUST STOP and ask the user for clarification using the `ask_user_question` tool to request them to upload a file or provide a URL. Use the "action_cards" interaction type ONLY for high-level actions like "Import Website" and "Upload File". If you know the user's intended website URL but it hasn't been crawled yet, you MUST pass that URL into the "default_value" field of the interaction. For selecting from a list of existing items (like existing knowledge bases), you MUST use the "select_one" interaction type instead. When using "action_cards" for knowledge base, provide two options: one with `action_type="input_url"` and another with `action_type="upload"`.
+     CRITICAL INSTRUCTION: You MUST set your DECISION JSON type to "tool_call" to invoke `ask_user_question`. Your text reasoning should explain why you are asking the user. The system will then prompt you to generate the native tool call parameters. Do NOT include the "message" or "interactions" in your DECISION JSON block.
    - Do NOT proceed to create or update the agent until the knowledge base is ready.
 
 You have access to the following tools:

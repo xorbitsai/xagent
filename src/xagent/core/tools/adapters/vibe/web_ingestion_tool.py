@@ -1,9 +1,10 @@
 import logging
-from typing import Any, Mapping, Optional, Type
+from typing import TYPE_CHECKING, Any, Mapping, Optional, Type
 
 from pydantic import BaseModel, Field
 
 from .base import AbstractBaseTool, ToolCategory, ToolVisibility
+from .factory import register_tool
 
 logger = logging.getLogger(__name__)
 
@@ -127,3 +128,17 @@ class CreateKnowledgeBaseFromUrlTool(AbstractBaseTool):
             return CreateKnowledgeBaseFromUrlResult(
                 success=False, collection_name="", message=str(e), pages_crawled=0
             ).model_dump()
+
+
+if TYPE_CHECKING:
+    from xagent.web.tools.config import WebToolConfig
+
+
+@register_tool
+async def create_web_ingestion_tool(config: "WebToolConfig") -> list[AbstractBaseTool]:
+    """Create the CreateKnowledgeBaseFromUrlTool."""
+    user_id = config.get_user_id()
+    if not user_id:
+        return []
+    is_admin = getattr(config, "is_admin", False)
+    return [CreateKnowledgeBaseFromUrlTool(user_id=user_id, is_admin=is_admin)]

@@ -323,6 +323,11 @@ class CreateAgentTool(AbstractBaseTool):
         return (
             "Create a new agent with specific capabilities during task execution. "
             "The agent will be created in DRAFT status and can be called immediately using the returned tool name.\n\n"
+            "WORKFLOW FOR FAQ/KNOWLEDGE AGENTS:\n"
+            "1. Search existing: `list_knowledge_bases`\n"
+            "2. If missing & no source provided: Ask user via `ask_user_question` (use `action_cards` for file/URL)\n"
+            "3. If source provided: Ingest it directly (e.g. `create_knowledge_base_from_url`)\n"
+            "4. Link the created/selected KB when calling `create_agent`.\n\n"
             "Parameters:\n"
             "- name: A short, descriptive name for the agent (e.g., 'researcher', 'data_analyzer')\n"
             "- description: IMPORTANT - Clear description of when to use this agent (e.g., 'Use this agent for data analysis tasks involving CSV files'). This helps users understand the agent's purpose.\n"
@@ -331,7 +336,7 @@ class CreateAgentTool(AbstractBaseTool):
             f"- knowledge_bases (optional): List of knowledge base names or IDs to link to this agent.\n"
             f"- skills (optional): Available skills: {skills_list}\n"
             f"  Example: ['presentation-generator', 'poster-design']\n"
-            "- instructions: System prompt/instructions defining the agent's behavior and expertise\n"
+            "- instructions: System prompt/instructions defining the agent's behavior and expertise. For Qwen models, ensure instructions mandate strict JSON format for structured outputs.\n"
             "- execution_mode (optional): 'flash', 'balanced' (default), or 'think'\n\n"
             "Returns:\n"
             "- agent_id: Database ID of the created agent\n"
@@ -592,6 +597,11 @@ class UpdateAgentTool(AbstractBaseTool):
         return (
             "Update an existing agent with specific capabilities during task execution. "
             "Only DRAFT agents can be updated - PUBLISHED agents must be edited through the web interface.\n\n"
+            "WORKFLOW FOR FAQ/KNOWLEDGE AGENTS:\n"
+            "1. Search existing: `list_knowledge_bases`\n"
+            "2. If missing & no source provided: Ask user via `ask_user_question` (use `action_cards` for file/URL)\n"
+            "3. If source provided: Ingest it directly (e.g. `create_knowledge_base_from_url`)\n"
+            "4. Link the created/selected KB when calling `update_agent`.\n\n"
             "Parameters:\n"
             "- agent_id: The ID of the agent to update (required)\n"
             "- name (optional): New name for the agent\n"
@@ -601,7 +611,7 @@ class UpdateAgentTool(AbstractBaseTool):
             f"- knowledge_bases (optional): New list of knowledge base names or IDs to link to this agent.\n"
             f"- skills (optional): Available skills: {skills_list}\n"
             f"  Example: ['presentation-generator', 'poster-design']\n"
-            "- instructions (optional): New system prompt/instructions defining the agent's behavior\n"
+            "- instructions (optional): New system prompt/instructions defining the agent's behavior. For Qwen models, ensure instructions mandate strict JSON format for structured outputs.\n"
             "- execution_mode (optional): 'flash', 'balanced', or 'think'\n\n"
             "Returns:\n"
             "- agent_id: Database ID of the updated agent\n"
@@ -1442,3 +1452,23 @@ async def create_list_agents_tool(config: "WebToolConfig") -> list[AbstractBaseT
     except Exception as e:
         logger.warning(f"Failed to create ListAgentsTool: {e}")
         return []
+
+
+@register_tool
+async def create_list_available_skills_tool(
+    config: "WebToolConfig",
+) -> list[AbstractBaseTool]:
+    """Create the ListAvailableSkillsTool."""
+    if not config.get_enable_agent_tools():
+        return []
+    return [ListAvailableSkillsTool()]
+
+
+@register_tool
+async def create_list_tool_categories_tool(
+    config: "WebToolConfig",
+) -> list[AbstractBaseTool]:
+    """Create the ListToolCategoriesTool."""
+    if not config.get_enable_agent_tools():
+        return []
+    return [ListToolCategoriesTool()]

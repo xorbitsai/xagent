@@ -414,6 +414,7 @@ class AgentService:
                         "output": normalized_output,
                         "success": result.get("success", False),
                         "chat_response": chat_response,
+                        "is_paused": result.get("is_paused", False),
                         "dag_status": execution_status,
                         "metadata": {
                             "agent_name": self.name,

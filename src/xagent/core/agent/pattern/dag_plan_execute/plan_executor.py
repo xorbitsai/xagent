@@ -7,8 +7,8 @@ import json
 import logging
 import traceback
 from collections import deque
-from datetime import datetime
-from typing import TYPE_CHECKING, Any, Dict, List, Optional, Set
+from datetime import datetime, timezone
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Set, cast
 
 if TYPE_CHECKING:
     from .dag_plan_execute import DAGPlanExecutePattern
@@ -541,6 +541,98 @@ class PlanExecutor:
         self._execution_interrupted = True
         logger.info("Execution interrupted for plan modification")
 
+    def _extract_chat_response(self, text: str) -> Optional[Dict[str, Any]]:
+        """Extract chat response from LLM output, handling potential markdown wrappers."""
+        if not isinstance(text, str):
+            return None
+
+        # Try direct parsing first
+        try:
+            parsed = json.loads(text)
+            if (
+                isinstance(parsed, dict)
+                and parsed.get("type") == "chat"
+                and "chat" in parsed
+            ):
+                return cast(Dict[str, Any], parsed["chat"])
+        except json.JSONDecodeError:
+            pass
+
+        # Try to extract from markdown json block
+        import re
+
+        match = re.search(r"```(?:json)?\s*(.*?)\s*```", text, re.DOTALL)
+        if match:
+            try:
+                parsed = json.loads(match.group(1))
+                if (
+                    isinstance(parsed, dict)
+                    and parsed.get("type") == "chat"
+                    and "chat" in parsed
+                ):
+                    return cast(Dict[str, Any], parsed["chat"])
+            except json.JSONDecodeError:
+                pass
+
+        return None
+
+    async def _handle_chat_interaction(
+        self, chat_data: Dict[str, Any], result: Dict[str, Any]
+    ) -> None:
+        """Handle chat interaction: pause execution, update task status, and broadcast to frontend."""
+        result["chat_response"] = chat_data
+
+        # Pause execution
+        self.pause_execution()
+
+        if not self.parent_pattern or not self.parent_pattern.task_id:
+            return
+
+        task_id = int(self.parent_pattern.task_id)
+
+        # Update task status to PAUSED in DB
+        try:
+            from xagent.web.models.database import get_db
+            from xagent.web.models.task import Task, TaskStatus
+
+            db_gen = get_db()
+            db = next(db_gen)
+            try:
+                task = db.query(Task).filter(Task.id == task_id).first()
+                if task:
+                    task.status = TaskStatus.PAUSED
+                    db.commit()
+                    logger.info(f"Updated task {task_id} status to PAUSED")
+            finally:
+                db.close()
+        except Exception as e:
+            logger.error(f"Failed to update task status to PAUSED: {e}")
+
+        # Broadcast the chat response
+        try:
+            from xagent.web.api.websocket import manager
+
+            # Send task_completed event to trigger frontend rendering of the interaction
+            asyncio.create_task(
+                manager.broadcast_to_task(
+                    {
+                        "type": "task_completed",
+                        "task": {
+                            "id": task_id,
+                            "status": "paused",
+                        },
+                        "result": chat_data.get("message", ""),
+                        "output": chat_data.get("message", ""),
+                        "success": True,
+                        "chat_response": chat_data,
+                        "timestamp": datetime.now(timezone.utc).timestamp(),
+                    },
+                    task_id,
+                )
+            )
+        except Exception as e:
+            logger.error(f"Failed to broadcast chat response: {e}")
+
     async def _execute_step_with_react_agent(
         self,
         step: PlanStep,
@@ -831,24 +923,55 @@ class PlanExecutor:
                     if agent_trace_data:
                         step_trace_data["agent_data"] = agent_trace_data
 
-            await trace_step_end(
-                self.tracer,
-                trace_step_id,
-                step.id,
-                TraceCategory.DAG,
-                data=step_trace_data,
-            )
+            # Extract output correctly depending on the structure
+            if "output" in result and isinstance(result["output"], dict):
+                output_content = result["output"].get("output", "") or result[
+                    "output"
+                ].get("content", "")
+            else:
+                output_content = result.get("output", "") or result.get("content", "")
+
+            # Update trace with execution history
+            step_trace_data["execution_history"] = result.get("execution_history", [])
+
+            # We MUST NOT call trace_step_end here because we might need to update step_trace_data
+            # with branch information if it's a conditional step, or handle early returns.
+            # It will be called at the end of the method.
+
+            # --- Check for chat response (AskUserQuestionTool) BEFORE handling branches ---
+            final_answer = None
+            if isinstance(output_content, str):
+                final_answer = output_content
+                chat_data = self._extract_chat_response(final_answer)
+                if chat_data:
+                    logger.info(
+                        f"Step {step.id} returned a chat response, pausing execution for user input."
+                    )
+                    await self._handle_chat_interaction(chat_data, result)
+
+                    # CRITICAL FIX: We MUST mark the step as COMPLETED so it doesn't block the queue,
+                    # but we still pause execution so the NEXT steps don't run yet.
+                    step.status = StepStatus.COMPLETED
+                    step.completed_at = datetime.now()
+                    logger.info(f"Step {step.id} marked as COMPLETED before pausing")
+
+                    # We must trace the end of this step before we return
+                    await trace_step_end(
+                        self.tracer,
+                        trace_step_id,
+                        step.id,
+                        TraceCategory.DAG,
+                        data=step_trace_data,
+                    )
+
+                    return result
 
             # Handle conditional nodes: extract branch from final answer
             if step.is_conditional:
                 from .models import extract_branch_key_from_final_answer
 
-                # Get final answer from result
-                final_answer = None
-                if isinstance(result, dict):
-                    final_answer = result.get("final_answer") or result.get(
-                        "output", ""
-                    )
+                # We already extracted output_content earlier
+                final_answer = output_content
 
                 if final_answer:
                     valid_branches = list(step.conditional_branches.keys())
@@ -908,7 +1031,18 @@ class PlanExecutor:
                             message=error_msg,
                         )
 
+            # Remove chat response extraction from here since we already handled it
+            # and returned early if it was a chat response
             step.status = StepStatus.COMPLETED
+
+            # Now we trace the successful completion of the step with branch info if applicable
+            await trace_step_end(
+                self.tracer,
+                trace_step_id,
+                step.id,
+                TraceCategory.DAG,
+                data=step_trace_data,
+            )
 
             logger.info(
                 f"Step {step.id} completed in {(step.completed_at - step.started_at).total_seconds():.2f}s"

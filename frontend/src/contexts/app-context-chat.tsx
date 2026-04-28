@@ -3196,25 +3196,64 @@ export function AppProvider({ children, token }: { children: React.ReactNode; to
         break
 
       case "task_completed":
-        const taskData = message.data as { success?: boolean; result?: string | Record<string, unknown>; file_outputs?: string[] }
+        // Define a type for the task_completed event data
+        interface TaskCompletedEventData {
+          task?: {
+            status?: string;
+          };
+          status?: string;
+          success?: boolean;
+          output?: string;
+          result?: string;
+          file_outputs?: Array<string | { filename?: string; file_id?: string }>;
+          [key: string]: unknown;
+        }
+
+        const taskData = message.data as TaskCompletedEventData
+        const taskStatus = taskData.task?.status || taskData.status || (taskData.success ? "completed" : "failed")
+
+        // Handle clarification forms from task_completed directly
+        const clarificationFromTask = extractClarificationMessage(taskData)
+        if (clarificationFromTask) {
+          const msgId = generateMessageId("msg-clarification-task")
+          dispatch({
+            type: "ADD_MESSAGE",
+            payload: {
+              id: msgId,
+              role: "assistant",
+              content: <div className="space-y-2">
+                <MarkdownRenderer content={taskData.output || taskData.result || ""} />
+                <ClarificationForm
+                  interactions={clarificationFromTask.interactions}
+                  messageId={msgId}
+                />
+              </div>,
+              timestamp: message.timestamp,
+              status: "completed",
+              isResult: true,
+              interactions: clarificationFromTask.interactions,
+            }
+          })
+        }
+
         dispatch({
           type: "UPDATE_TASK_STATUS",
-          payload: { status: taskData.success ? "completed" : "failed" }
+          payload: { status: taskStatus as any }
         })
         dispatch({ type: "TRIGGER_TASK_UPDATE" })
         dispatch({ type: "SET_PROCESSING", payload: false })  // Stop processing on task completion
 
-        // Update DAG execution status to completed
+        // Update DAG execution status
         if (state.dagExecution) {
           const updatedDAGExecution = {
             ...state.dagExecution,
-            phase: (taskData.success ? "completed" : "failed") as "completed" | "failed",
+            phase: taskStatus as "completed" | "failed" | "executing" | "planning",
             updated_at: new Date().toISOString()
           }
-          dispatch({ type: "SET_DAG_EXECUTION", payload: updatedDAGExecution })
+          dispatch({ type: "SET_DAG_EXECUTION", payload: updatedDAGExecution as any })
         } else {
           const dagExecution: DAGExecution = {
-            phase: (taskData.success ? "completed" : "failed") as "completed" | "failed",
+            phase: taskStatus as "completed" | "failed" | "executing" | "planning" as any,
             current_plan: {},
             created_at: new Date().toISOString(),
             updated_at: new Date().toISOString()

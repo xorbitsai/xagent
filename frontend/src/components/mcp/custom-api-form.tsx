@@ -55,11 +55,20 @@ export function CustomApiForm({
         customHeaders: [] as { key: string, value: string }[],
     })
 
+    // Track if the update came from internal state changes
+    const internalUpdateRef = React.useRef(false)
+
     // Sync props to local state when external props change.
     // eslint-disable-next-line react-hooks/exhaustive-deps
     // Intentionally omits local state variables (authType, authSecret, etc.) from deps
     // because this effect must only react to prop changes, not local edits.
     useEffect(() => {
+        // Skip syncing if the change was triggered by our own internal state update
+        if (internalUpdateRef.current) {
+            internalUpdateRef.current = false
+            return
+        }
+
         let aType: "none" | "bearer" | "api_key" | "basic" = "none"
         let aHeaderName = ""
         let aSecret = ""
@@ -171,14 +180,32 @@ export function CustomApiForm({
             }
         })
 
-        setMcpFormData((prev: MCPServerFormData) => ({ ...prev, headers: newHeaders }))
-        // Only set env if auth type is not none
-        if (authType !== "none") {
-            setCustomApiEnv(newEnv)
-        } else {
-            // Keep any existing custom env vars if auth is none, or just clear them
-            setCustomApiEnv([])
-        }
+        setMcpFormData((prev: MCPServerFormData) => {
+            const currentHeaders = prev.headers || {}
+            const keysOld = Object.keys(currentHeaders)
+            const keysNew = Object.keys(newHeaders)
+
+            const isHeadersEqual = keysOld.length === keysNew.length &&
+                keysOld.every(k => currentHeaders[k] === newHeaders[k])
+
+            if (isHeadersEqual) {
+                return prev
+            }
+            internalUpdateRef.current = true
+            return { ...prev, headers: newHeaders }
+        })
+
+        setCustomApiEnv(prev => {
+            const targetEnv = authType !== "none" ? newEnv : []
+            const isEnvEqual = prev.length === targetEnv.length &&
+                prev.every((item, i) => item.key === targetEnv[i].key && item.value === targetEnv[i].value)
+
+            if (isEnvEqual) {
+                return prev
+            }
+            internalUpdateRef.current = true
+            return targetEnv
+        })
     }, [authType, authHeaderName, authSecret, basicUsername, basicPassword, customHeaders, setMcpFormData, setCustomApiEnv])
 
     const methods = ["GET", "POST", "PUT", "PATCH", "DELETE"]

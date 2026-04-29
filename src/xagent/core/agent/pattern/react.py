@@ -776,6 +776,31 @@ class ReActPattern(AgentPattern):
                         messages,
                     )
 
+                    # Try to extract chat_response if content is JSON
+                    chat_response_data = None
+                    try:
+                        import json
+
+                        from ..utils.llm_utils import extract_json_from_markdown
+
+                        # Attempt to parse content as JSON, handling markdown blocks
+                        json_str = extract_json_from_markdown(result["content"])
+                        if json_str:
+                            parsed_content = json.loads(json_str)
+                            if (
+                                isinstance(parsed_content, dict)
+                                and parsed_content.get("type") == "chat"
+                                and isinstance(parsed_content.get("chat"), dict)
+                            ):
+                                chat_response_data = parsed_content.get("chat")
+                                # Override result content to just be the message for cleaner logs
+                                if chat_response_data:
+                                    result["content"] = chat_response_data.get(
+                                        "message", result["content"]
+                                    )
+                    except Exception:
+                        pass
+
                     # Only send task completion events if NOT a sub-agent
                     # Sub-agents (DAG steps) should not trigger task-level completion
                     if not self.is_sub_agent:
@@ -792,10 +817,17 @@ class ReActPattern(AgentPattern):
 
                         logger.debug("Tracing task completion")
                         # Trace task completion
+
+                        task_completion_result = {
+                            "content": result["content"],
+                        }
+                        if chat_response_data:
+                            task_completion_result["chat_response"] = chat_response_data
+
                         await trace_task_completion(
                             self.tracer,
                             task_id,
-                            result=result["content"],
+                            result=task_completion_result,
                             success=success_status,
                         )
 
@@ -806,7 +838,7 @@ class ReActPattern(AgentPattern):
                             task_id,
                             TraceCategory.REACT,
                             data={
-                                "result": result["content"],
+                                "result": task_completion_result,
                                 "success": success_status,
                             },
                         )
@@ -814,6 +846,7 @@ class ReActPattern(AgentPattern):
                     return {
                         "success": success_status,
                         "output": result["content"],
+                        "chat_response": chat_response_data,
                         "iterations": iteration + 1,
                         "execution_history": messages,
                         "pattern": "react",

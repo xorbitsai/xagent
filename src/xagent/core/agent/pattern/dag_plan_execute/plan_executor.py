@@ -3,7 +3,6 @@ Plan execution logic for DAG plan-execute pattern.
 """
 
 import asyncio
-import json
 import logging
 import traceback
 from collections import deque
@@ -746,6 +745,8 @@ class PlanExecutor:
 
                     # Add structured parameter information
                     if args_schema and "properties" in args_schema:
+                        import json
+
                         task_message_parts.append("  Parameters (JSON schema):")
                         schema_str = json.dumps(args_schema, indent=2)
                         for line in schema_str.split("\n"):
@@ -770,6 +771,32 @@ class PlanExecutor:
             # Ensure result is properly typed
             if not isinstance(result, dict):
                 result = {"output": str(result), "success": True}
+
+            # If the result contains a chat_response (e.g. from ask_user_question), we should interrupt execution
+            # so the system can pause and ask the user
+            if result.get("chat_response"):
+                logger.info(
+                    f"Step {step.id} requested user interaction via chat_response, interrupting plan execution."
+                )
+                self.interrupt_execution()
+
+                # Forward the chat response to the parent pattern if possible
+                if self.parent_pattern:
+                    if hasattr(self.parent_pattern, "_final_answer"):
+                        # We store the raw JSON string so _compile_final_result can pick it up
+                        import json
+
+                        self.parent_pattern._final_answer = json.dumps(
+                            {"type": "chat", "chat": result["chat_response"]}
+                        )
+                    if hasattr(self.parent_pattern, "interrupt_execution"):
+                        self.parent_pattern.interrupt_execution(
+                            "User interaction required"
+                        )
+
+                # Note: We don't raise InterruptedError here because we need the trace events
+                # to fire below, and we want the step to be marked as COMPLETED.
+                # The interrupt flags set above will cleanly break the execution loops.
 
             step.completed_at = datetime.now()
 
@@ -913,6 +940,7 @@ class PlanExecutor:
             logger.info(
                 f"Step {step.id} completed in {(step.completed_at - step.started_at).total_seconds():.2f}s"
             )
+
             return result
 
         except Exception as e:

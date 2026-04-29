@@ -21,12 +21,14 @@ class SkillSelector:
    - Is this a document/report? → Do NOT select poster-design
    - Is this a web page? → Do NOT select poster-design
    - Is this a knowledge base QA/evidence retrieval? → Consider evidence-based-rag
+   - Is this about creating an agent, chatbot, or assistant? → Consider agent-builder
 
 2. **Check for NEGATIVE signals**
    - If user wants "slide", "presentation", "deck" → Reject poster-design
    - If user wants "document", "report" → Reject poster-design
    - If user wants "web page", "landing page" → Reject poster-design
    - If user wants "code", "script" → Reject all non-coding skills
+   - If user wants "create agent", "build chatbot", "create ai assistant" → Reject all non-agent-creation skills (like evidence-based-rag)
 
 3. **Select ONLY when:**
    - The skill's PRIMARY purpose matches the task type
@@ -198,6 +200,11 @@ If no skill is directly relevant, return selected: false."""
             or "verification" in task_lower
             or "due diligence" in task_lower
             or "retrieval" in task_lower,
+            "agent_creation": "agent" in task_lower
+            or "chatbot" in task_lower
+            or "assistant" in task_lower
+            or "机器人" in task_lower
+            or "智能体" in task_lower,
         }
 
         detected_types = [k for k, v in signal_words.items() if v]

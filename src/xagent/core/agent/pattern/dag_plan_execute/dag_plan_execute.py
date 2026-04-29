@@ -1349,13 +1349,40 @@ class DAGPlanExecutePattern(AgentPattern):
                 else ExecutionPhase.FAILED.value
             )
 
+        output_str = getattr(
+            self, "_final_answer", None
+        ) or self._generate_simple_summary(successful_steps, failed_steps)
+
+        # Check if the output string is a chat response JSON block (from AskUserQuestionTool)
+        chat_response_data = None
+        try:
+            import json
+
+            from ...utils.llm_utils import extract_json_from_markdown
+
+            # Attempt to parse content as JSON, handling markdown blocks
+            json_str = extract_json_from_markdown(output_str)
+            if json_str:
+                parsed_content = json.loads(json_str)
+                if (
+                    isinstance(parsed_content, dict)
+                    and parsed_content.get("type") == "chat"
+                    and isinstance(parsed_content.get("chat"), dict)
+                ):
+                    chat_response_data = parsed_content.get("chat")
+                    # Override the output string for display
+                    if chat_response_data:
+                        output_str = chat_response_data.get("message", output_str)
+        except Exception:
+            pass
+
         result = {
             "success": success,
             "error": None if success else f"{len(failed_steps)} steps failed",
             "error_details": detailed_errors if not success else None,
             "goal": task,
-            "output": getattr(self, "_final_answer", None)
-            or self._generate_simple_summary(successful_steps, failed_steps),
+            "output": output_str,
+            "chat_response": chat_response_data,
             "iterations": len(execution_history),
             "phase": phase,
             "history": execution_history,

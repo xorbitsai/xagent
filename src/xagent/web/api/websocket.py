@@ -2548,6 +2548,15 @@ async def handle_builder_chat(
             last_msg = message_data["messages"][-1]
             if isinstance(last_msg, dict) and last_msg.get("role") == "user":
                 user_message = last_msg.get("content", "")
+
+        # Inject explicit reminder for context preservation if it's a System Note about KB
+        # TODO/Workaround: Currently relying on string matching for "[System Note:" which is fragile.
+        # Consider using a structured message format (e.g., specific role or payload field) for system notes in the future.
+        if "[System Note:" in user_message and (
+            "knowledge base" in user_message or "ingest it" in user_message
+        ):
+            user_message += "\n\nCRITICAL REMINDER: Continue building the agent based on the user's ORIGINAL requirements (name, role, specific instructions) from earlier in the conversation. Do NOT generate a generic name like 'FAQ Bot' and do NOT forget the original context."
+
         # Build current_config back from top-level keys
         current_config = {
             "id": message_data.get("id"),
@@ -2577,10 +2586,12 @@ Important instructions:
 3. Include appropriate tool_categories and skills based on the user's requirements
 4. After creating or updating an agent, present it to the user in a clear format with the markdown link
 5. When updating an agent, if you need to modify tools, skills, or knowledge bases, you MUST provide the FULL updated list in your tool call (combining the existing ones from Current Agent Configuration with any new ones the user requested). If you do not include the existing ones, they will be removed!
-6. If the user asks to build an agent that requires a knowledge base (e.g., answering questions from a specific website, document, or domain), ALWAYS check if a relevant knowledge base exists using `list_knowledge_bases`.
+6. If the user asks to build an agent that requires a knowledge base (e.g., answering questions from a specific website, document, FAQ, or company domain), ALWAYS check if a relevant knowledge base exists using `list_knowledge_bases`.
+   - If the agent is meant to be an FAQ bot, customer service bot, or answer specific organizational questions, it ABSOLUTELY REQUIRES a knowledge base. Do NOT assume it can answer from general knowledge.
    - If a relevant knowledge base DOES NOT exist, you MUST determine if the user has ALREADY provided a specific URL (e.g., www.example.com).
    - If the user HAS provided a URL: Do NOT ask the user again! Instead, immediately use the `create_knowledge_base_from_url` tool to import the website, and then proceed to create or update the agent with the new knowledge base.
-   - If the user HAS NOT provided a URL or file: You MUST STOP and ask the user for clarification using the `ask_user_question` tool. Use the "action_cards" interaction type ONLY for high-level actions like "Import Website" and "Upload File". If you know the user's intended website URL but it hasn't been crawled yet, you MUST pass that URL into the "default_value" field of the interaction. For selecting from a list of existing items (like existing knowledge bases), you MUST use the "select_one" interaction type instead.
+   - If the user HAS NOT provided a URL or file: You MUST STOP and ask the user for clarification using the `ask_user_question` tool to request them to upload a file or provide a URL. Use the "action_cards" interaction type ONLY for high-level actions like "Import Website" and "Upload File". If you know the user's intended website URL but it hasn't been crawled yet, you MUST pass that URL into the "default_value" field of the interaction. For selecting from a list of existing items (like existing knowledge bases), you MUST use the "select_one" interaction type instead. When using "action_cards" for knowledge base, provide two options: one with `action_type="input_url"` and another with `action_type="upload"`.
+     CRITICAL INSTRUCTION: You MUST set your DECISION JSON type to "tool_call" to invoke `ask_user_question`. Your text reasoning should explain why you are asking the user. The system will then prompt you to generate the native tool call parameters. Do NOT include the "message" or "interactions" in your DECISION JSON block.
    - Do NOT proceed to create or update the agent until the knowledge base is ready.
 
 You have access to the following tools:
@@ -2592,7 +2603,7 @@ You have access to the following tools:
 - ask_user_question: Ask the user a question with a clarification form when you need their input or decision (e.g., about creating a knowledge base)
 - create_knowledge_base_from_url: Create a knowledge base by crawling a given website URL (use this automatically if the user provided a URL)
 
-Use the create_agent tool whenever the user wants to build a new agent and there is no agent ID in the current configuration. If a System Note says a knowledge base was created, use create_agent to build the agent and attach the knowledge base.
+Use the create_agent tool whenever the user wants to build a new agent and there is no agent ID in the current configuration. If a System Note says a knowledge base was created, use create_agent to build the agent and attach the knowledge base. CRITICAL: When continuing after a System Note about knowledge base creation, you MUST retrieve and use the user's ORIGINAL requirements (name, role, instructions, etc.) from earlier in the conversation. Do NOT generate generic names like "FAQ Bot" or "Data Q&A Agent", and do NOT forget the original context!
 Use the update_agent tool whenever the user wants to modify their current agent configuration and an agent ID is available in the current configuration.
 If the user wants to add skills, tool categories, or knowledge bases but you are unsure which ones exist, use the list_* tools to find out before calling create_agent or update_agent.
 """
@@ -2630,6 +2641,9 @@ If the user wants to add skills, tool categories, or knowledge bases but you are
             if not hasattr(websocket.state, "builder_memory"):
                 websocket.state.builder_memory = InMemoryMemoryStore()
             memory = websocket.state.builder_memory
+
+            # Initialize chat history
+            websocket.state.builder_chat_history = []
 
             from ...core.tools.adapters.vibe.agent_tool import (
                 CreateAgentTool,
@@ -2727,12 +2741,53 @@ If the user wants to add skills, tool categories, or knowledge bases but you are
                 "system_prompt": system_prompt,
             }
 
+            # Set chat history before execution
+            if hasattr(websocket.state, "builder_chat_history") and hasattr(
+                agent_service, "set_conversation_history"
+            ):
+                agent_service.set_conversation_history(
+                    websocket.state.builder_chat_history
+                )
+
             # Execute task with the agent
             with UserContext(int(user.id)):
                 result = await agent_service.execute_task(
                     task=user_message,
                     context=execution_context,
                     task_id=builder_task_id,
+                )
+
+            # Append interaction to chat history
+            if hasattr(websocket.state, "builder_chat_history"):
+                # Make sure we don't end up with consecutive user messages
+                if (
+                    websocket.state.builder_chat_history
+                    and websocket.state.builder_chat_history[-1]["role"] == "user"
+                ):
+                    # If last message was also user, replace it or handle it gracefully
+                    # Here we pop it so we just keep the newest one
+                    websocket.state.builder_chat_history.pop()
+
+                websocket.state.builder_chat_history.append(
+                    {"role": "user", "content": user_message}
+                )
+                output_content = result.get("output", "")
+                if output_content:
+                    websocket.state.builder_chat_history.append(
+                        {"role": "assistant", "content": output_content}
+                    )
+                else:
+                    # Provide a fallback assistant message to prevent consecutive user messages
+                    websocket.state.builder_chat_history.append(
+                        {
+                            "role": "assistant",
+                            "content": "I encountered an issue and couldn't generate a proper response.",
+                        }
+                    )
+
+                # Keep history size manageable (e.g. last 20 messages)
+                websocket.state.builder_chat_history = (
+                    websocket.state.builder_chat_history[-20:]
                 )
 
             # Send task_completed event to match the preview flow behavior

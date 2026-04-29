@@ -1387,8 +1387,25 @@ async def create_create_agent_tool(config: "WebToolConfig") -> list[AbstractBase
             task_id=config.get_task_id(),
             workspace_base_dir=None,  # Will use get_uploads_dir() default
         )
-        logger.debug(f"Created CreateAgentTool for user {user_id}")
-        return [tool]
+
+        list_skills_tool = ListAvailableSkillsTool(
+            db=db,
+            user_id=user_id,
+            task_id=config.get_task_id(),
+            workspace_base_dir=None,
+        )
+
+        list_categories_tool = ListToolCategoriesTool(
+            db=db,
+            user_id=user_id,
+            task_id=config.get_task_id(),
+            workspace_base_dir=None,
+        )
+
+        logger.debug(
+            f"Created CreateAgentTool and related list tools for user {user_id}"
+        )
+        return [tool, list_skills_tool, list_categories_tool]
     except Exception as e:
         logger.warning(f"Failed to create CreateAgentTool: {e}")
         return []

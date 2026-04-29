@@ -3,7 +3,9 @@ from typing import Any, Mapping, Optional, Type
 
 from pydantic import BaseModel, Field
 
+from .....web.tools.config import WebToolConfig
 from .base import AbstractBaseTool, ToolCategory, ToolVisibility
+from .factory import register_tool
 
 logger = logging.getLogger(__name__)
 
@@ -123,7 +125,27 @@ class CreateKnowledgeBaseFromUrlTool(AbstractBaseTool):
             ).model_dump()
 
         except Exception as e:
-            logger.exception("Error in create_knowledge_base_from_url tool")
+            logger.exception(f"Error creating knowledge base from URL: {e}")
             return CreateKnowledgeBaseFromUrlResult(
                 success=False, collection_name="", message=str(e), pages_crawled=0
             ).model_dump()
+
+
+@register_tool
+async def create_web_ingestion_tools(config: WebToolConfig) -> list[AbstractBaseTool]:
+    """Create web ingestion tools."""
+    try:
+        user_id = config.get_user_id()
+        is_admin = config.is_admin()
+        if not user_id:
+            return []
+
+        tool = CreateKnowledgeBaseFromUrlTool(
+            user_id=user_id,
+            is_admin=is_admin,
+        )
+        logger.debug(f"Created CreateKnowledgeBaseFromUrlTool for user {user_id}")
+        return [tool]
+    except Exception as e:
+        logger.warning(f"Failed to create CreateKnowledgeBaseFromUrlTool: {e}")
+        return []

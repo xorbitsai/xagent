@@ -1,9 +1,12 @@
+import json
 import logging
 from typing import Any, Mapping, Optional, Type, Union
 
 from pydantic import BaseModel, Field
 
+from .....web.tools.config import WebToolConfig
 from .base import AbstractBaseTool, ToolCategory, ToolVisibility
+from .factory import register_tool
 
 logger = logging.getLogger(__name__)
 
@@ -121,11 +124,17 @@ class AskUserQuestionTool(AbstractBaseTool):
                 "{\n"
                 f'  "type": "chat",\n'
                 f'  "chat": {{\n'
-                f'    "message": "{message}",\n'
-                f'    "interactions": {interactions}\n'
+                f'    "message": {json.dumps(message)},\n'
+                f'    "interactions": {json.dumps(interactions)}\n'
                 f"  }}\n"
                 "}\n"
                 "```\n\n"
                 "Output ONLY the JSON block."
             ),
         ).model_dump()
+
+
+@register_tool
+async def create_ask_user_tool(config: WebToolConfig) -> list[AbstractBaseTool]:
+    """Create ask user tool."""
+    return [AskUserQuestionTool()]

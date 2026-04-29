@@ -35,58 +35,107 @@ export function CustomApiForm({
 }: CustomApiFormProps) {
     const { t } = useI18n()
 
-    // Determine initial auth state based on existing headers
-    const initialAuthInfo = React.useMemo(() => {
-        let aType: "none" | "bearer" | "api_key" | "basic" = "none";
-        let aHeaderName = "";
-        let aSecret = "";
-        let bUsername = "";
-        let bPassword = "";
-        let cHeaders: { key: string, value: string }[] = [];
+    const [authType, setAuthType] = useState<"none" | "bearer" | "api_key" | "basic">("none")
+    const [authHeaderName, setAuthHeaderName] = useState("")
+    const [authSecret, setAuthSecret] = useState("")
+    const [basicUsername, setBasicUsername] = useState("")
+    const [basicPassword, setBasicPassword] = useState("")
+
+    const [isAdvancedOpen, setIsAdvancedOpen] = useState(false)
+    const [customHeaders, setCustomHeaders] = useState<{ key: string, value: string }[]>([])
+
+    // Tracks the last props-derived auth state we synced to local state.
+    // Only updated inside the props-sync useEffect so user edits are never compared against themselves.
+    const lastSyncedRef = React.useRef({
+        authType: "none" as "none" | "bearer" | "api_key" | "basic",
+        authHeaderName: "",
+        authSecret: "",
+        basicUsername: "",
+        basicPassword: "",
+        customHeaders: [] as { key: string, value: string }[],
+    })
+
+    // Sync props to local state when external props change.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    // Intentionally omits local state variables (authType, authSecret, etc.) from deps
+    // because this effect must only react to prop changes, not local edits.
+    useEffect(() => {
+        let aType: "none" | "bearer" | "api_key" | "basic" = "none"
+        let aHeaderName = ""
+        let aSecret = ""
+        const bUsername = ""
+        const bPassword = ""
+        const cHeaders: { key: string, value: string }[] = []
 
         if (mcpFormData.headers) {
-            let authFound = false;
+            let authFound = false
             if (mcpFormData.headers["Authorization"] === "Bearer $BEARER_TOKEN") {
-                aType = "bearer";
-                aHeaderName = "Authorization";
-                authFound = true;
-                const tokenEnv = customApiEnv.find(e => e.key === "BEARER_TOKEN");
-                if (tokenEnv) aSecret = tokenEnv.value;
+                aType = "bearer"
+                aHeaderName = "Authorization"
+                authFound = true
+                const tokenEnv = customApiEnv.find(e => e.key === "BEARER_TOKEN")
+                if (tokenEnv) aSecret = tokenEnv.value
             } else if (mcpFormData.headers["Authorization"] === "Basic $BASIC_AUTH") {
-                aType = "basic";
-                aHeaderName = "Authorization";
-                authFound = true;
-                const authEnv = customApiEnv.find(e => e.key === "BASIC_AUTH");
-                if (authEnv) aSecret = authEnv.value;
+                aType = "basic"
+                aHeaderName = "Authorization"
+                authFound = true
+                const authEnv = customApiEnv.find(e => e.key === "BASIC_AUTH")
+                if (authEnv) aSecret = authEnv.value
             } else {
                 for (const [hName, hVal] of Object.entries(mcpFormData.headers)) {
                     if (hVal === "$API_KEY") {
-                        aType = "api_key";
-                        aHeaderName = hName;
-                        authFound = true;
-                        const keyEnv = customApiEnv.find(e => e.key === "API_KEY");
-                        if (keyEnv) aSecret = keyEnv.value;
-                        break;
+                        aType = "api_key"
+                        aHeaderName = hName
+                        authFound = true
+                        const keyEnv = customApiEnv.find(e => e.key === "API_KEY")
+                        if (keyEnv) aSecret = keyEnv.value
+                        break
                     }
                 }
             }
 
             for (const [k, v] of Object.entries(mcpFormData.headers)) {
-                if (authFound && k === aHeaderName) continue;
-                cHeaders.push({ key: k, value: String(v) });
+                if (authFound && k === aHeaderName) continue
+                cHeaders.push({ key: k, value: String(v) })
             }
         }
-        return { aType, aHeaderName, aSecret, bUsername, bPassword, cHeaders };
-    }, []); // Only run once on mount
 
-    const [authType, setAuthType] = useState<"none" | "bearer" | "api_key" | "basic">(initialAuthInfo.aType)
-    const [authHeaderName, setAuthHeaderName] = useState(initialAuthInfo.aHeaderName)
-    const [authSecret, setAuthSecret] = useState(initialAuthInfo.aSecret)
-    const [basicUsername, setBasicUsername] = useState(initialAuthInfo.bUsername)
-    const [basicPassword, setBasicPassword] = useState(initialAuthInfo.bPassword)
+        const info = { authType: aType, authHeaderName: aHeaderName, authSecret: aSecret, basicUsername: bUsername, basicPassword: bPassword, customHeaders: cHeaders }
+        const snap = lastSyncedRef.current
 
-    const [isAdvancedOpen, setIsAdvancedOpen] = useState(false)
-    const [customHeaders, setCustomHeaders] = useState<{ key: string, value: string }[]>(initialAuthInfo.cHeaders)
+        // Only sync when props-derived value differs from BOTH the last synced snapshot
+        // AND the current local state. This prevents:
+        // 1. Re-syncing when props reference changed but content didn't
+        // 2. Overwriting user edits that haven't propagated back through props yet
+        if (info.authType !== snap.authType && info.authType !== authType) {
+            // When inferred authType is "none" but customApiEnv still has auth secrets,
+            // the user is in the middle of configuring auth (e.g. switched to api_key
+            // but hasn't filled the header name yet). Don't overwrite their choice.
+            if (info.authType === "none") {
+                const hasAuthSecret = customApiEnv.some(e =>
+                    e.key === "BEARER_TOKEN" || e.key === "API_KEY" || e.key === "BASIC_AUTH"
+                )
+                if (!hasAuthSecret) {
+                    setAuthType(info.authType)
+                }
+            } else {
+                setAuthType(info.authType)
+            }
+        }
+        if (info.authHeaderName !== snap.authHeaderName && info.authHeaderName !== authHeaderName) setAuthHeaderName(info.authHeaderName)
+        if (info.authSecret !== snap.authSecret && info.authSecret !== authSecret) setAuthSecret(info.authSecret)
+        if (info.basicUsername !== snap.basicUsername && info.basicUsername !== basicUsername) setBasicUsername(info.basicUsername)
+        if (info.basicPassword !== snap.basicPassword && info.basicPassword !== basicPassword) setBasicPassword(info.basicPassword)
+
+        const headersEqualSnap = info.customHeaders.length === snap.customHeaders.length &&
+            info.customHeaders.every((h, i) => h.key === snap.customHeaders[i]?.key && h.value === snap.customHeaders[i]?.value)
+        const headersEqualCurrent = info.customHeaders.length === customHeaders.length &&
+            info.customHeaders.every((h, i) => h.key === customHeaders[i]?.key && h.value === customHeaders[i]?.value)
+        if (!headersEqualSnap && !headersEqualCurrent) setCustomHeaders(info.customHeaders)
+
+        lastSyncedRef.current = info
+        // eslint-disable-next-line react-hooks/exhaustive-deps
+    }, [mcpFormData.headers, customApiEnv])
 
     useEffect(() => {
         if (!mcpFormData.method) {

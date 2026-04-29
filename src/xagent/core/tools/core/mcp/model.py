@@ -81,7 +81,7 @@ def create_mcp_server_table(Base: Type[Any]) -> Type[Any]:
 
         def to_connection_dict(self) -> Dict[str, Any]:
             """Convert to MCP connection format expected by MCP tools."""
-            connection = {
+            connection: Dict[str, Any] = {
                 "name": self.name,
                 "transport": self.transport,
             }
@@ -101,6 +101,40 @@ def create_mcp_server_table(Base: Type[Any]) -> Type[Any]:
                     connection["url"] = self.url
                 if self.headers:
                     connection["headers"] = self.headers
+
+            if getattr(self, "timeout", None) is not None:
+                connection["timeout"] = self.timeout
+            if getattr(self, "auth", None) is not None:
+                auth_dict = self.auth
+                if isinstance(auth_dict, dict):
+                    # Decrypt sensitive fields
+                    from xagent.core.utils.encryption import decrypt_value
+
+                    decrypted_auth = auth_dict.copy()
+                    if (
+                        "bearer_token" in decrypted_auth
+                        and decrypted_auth["bearer_token"]
+                    ):
+                        decrypted_auth["bearer_token"] = decrypt_value(
+                            decrypted_auth["bearer_token"]
+                        )
+                    if (
+                        "api_key_value" in decrypted_auth
+                        and decrypted_auth["api_key_value"]
+                    ):
+                        decrypted_auth["api_key_value"] = decrypt_value(
+                            decrypted_auth["api_key_value"]
+                        )
+                    if (
+                        "client_secret" in decrypted_auth
+                        and decrypted_auth["client_secret"]
+                    ):
+                        decrypted_auth["client_secret"] = decrypt_value(
+                            decrypted_auth["client_secret"]
+                        )
+                    connection["auth"] = decrypted_auth
+                else:
+                    connection["auth"] = self.auth
 
             return connection
 

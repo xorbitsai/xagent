@@ -673,6 +673,7 @@ export function ConnectMcpDialog({
 
               <div className="space-y-4">
                 <CustomApiForm
+                  key={editingCustomServerId || 'new'}
                   mcpFormData={mcpFormData}
                   setMcpFormData={setMcpFormData}
                   customApiEnv={customApiEnv}
@@ -694,7 +695,7 @@ export function ConnectMcpDialog({
                   disabled={
                     isSavingCustom ||
                     !mcpFormData.name.trim() ||
-                    !customApiEnv.some(env => env.key.trim() && env.value.trim())
+                    (customApiEnv.length > 0 && customApiEnv.some(env => !env.key.trim() || !env.value.trim()))
                   }
                 >
                   {isSavingCustom && <Loader2 className="h-4 w-4 mr-2 animate-spin" />}

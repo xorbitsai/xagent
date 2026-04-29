@@ -46,7 +46,7 @@ def downgrade() -> None:
         return
 
     existing_columns = [col["name"] for col in inspector.get_columns("mcp_servers")]
-    if "auth" in existing_columns:
-        op.drop_column("mcp_servers", "auth")
     if "timeout" in existing_columns:
         op.drop_column("mcp_servers", "timeout")
+    if "auth" in existing_columns:
+        op.drop_column("mcp_servers", "auth")

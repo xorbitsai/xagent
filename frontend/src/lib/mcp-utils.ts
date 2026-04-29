@@ -22,10 +22,6 @@ export function buildCustomApiPayload(
         });
     }
 
-    if (!mcpFormData.url?.trim()) {
-        return { isValid: false, errorKey: 'tools.mcp.alerts.urlRequired' }; // Note: you might need to add this translation key or handle it
-    }
-
     // Custom API payload structure expects env at top level, no config/transport
     const payload = { ...mcpFormData };
     payload.env = envObj || {}; // Send empty object to clear env

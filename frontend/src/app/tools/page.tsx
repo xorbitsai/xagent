@@ -939,6 +939,7 @@ export default function ToolsPage() {
                 {mcpFormData.transport === 'custom_api' ? (
                   <>
                     <CustomApiForm
+                      key={editingServer?.id || 'new'}
                       mcpFormData={mcpFormData}
                       setMcpFormData={setMcpFormData}
                       customApiEnv={customApiEnv}
@@ -946,9 +947,16 @@ export default function ToolsPage() {
                       originalEnvObj={(() => {
                         let originalEnvObj: Record<string, any> = {};
                         if (editingServer?.config?.env) {
-                          originalEnvObj = typeof editingServer.config.env === 'string'
-                            ? JSON.parse(editingServer.config.env)
-                            : editingServer.config.env;
+                          if (typeof editingServer.config.env === 'string') {
+                            try {
+                              originalEnvObj = JSON.parse(editingServer.config.env);
+                            } catch (e) {
+                              console.error("Failed to parse env:", e);
+                              originalEnvObj = {};
+                            }
+                          } else {
+                            originalEnvObj = editingServer.config.env;
+                          }
                         }
                         return originalEnvObj;
                       })()}
@@ -972,11 +980,8 @@ export default function ToolsPage() {
                   onClick={handleSaveMcpServer}
                   disabled={
                     isLoading ||
-                    (mcpFormData.transport === 'custom_api' && (
-                      !mcpFormData.name.trim() ||
-                      customApiEnv.length === 0 ||
-                      customApiEnv.some(env => !env.key.trim() || !env.value.trim())
-                    ))
+                    !mcpFormData.name.trim() ||
+                    (mcpFormData.transport === 'custom_api' && customApiEnv.length > 0 && customApiEnv.some(env => !env.key.trim() || !env.value.trim()))
                   }
                 >
                   {isLoading && <Loader2 className="h-4 w-4 mr-2 animate-spin" />}

@@ -50,6 +50,17 @@ export function CustomMcpForm({
       : []
   )
 
+  // Track original masked values to restore them on blur if empty
+  const [originalAuth, setOriginalAuth] = useState<{
+    bearer_token?: string;
+    api_key_value?: string;
+    client_secret?: string;
+  }>({
+    bearer_token: mcpFormData.config?.auth?.bearer_token === '********' ? '********' : undefined,
+    api_key_value: mcpFormData.config?.auth?.api_key_value === '********' ? '********' : undefined,
+    client_secret: mcpFormData.config?.auth?.client_secret === '********' ? '********' : undefined,
+  })
+
   const syncHeaders = (newList: { key: string, value: string }[]) => {
     setHeadersList(newList)
     const newHeadersObj: Record<string, string> = {}
@@ -68,6 +79,17 @@ export function CustomMcpForm({
           value={mcpFormData.name || ""}
           onChange={(e) => setMcpFormData((prev: MCPServerFormData) => ({ ...prev, name: e.target.value }))}
           placeholder={t('tools.mcp.form.namePlaceholder')}
+        />
+      </div>
+
+      <div className="space-y-2">
+        <Label htmlFor="description">{t('tools.mcp.form.descriptionLabel')}</Label>
+        <textarea
+          id="description"
+          className="flex min-h-[80px] w-full rounded-md border border-input bg-background px-3 py-2 text-sm ring-offset-background placeholder:text-muted-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 disabled:cursor-not-allowed disabled:opacity-50"
+          value={mcpFormData.description || ""}
+          onChange={(e) => setMcpFormData((prev: MCPServerFormData) => ({ ...prev, description: e.target.value }))}
+          placeholder={t('tools.mcp.form.descriptionPlaceholder')}
         />
       </div>
 
@@ -163,6 +185,16 @@ export function CustomMcpForm({
                 type="password"
                 value={mcpFormData.config?.auth?.bearer_token || ""}
                 onChange={(e) => updateAuth("bearer_token", e.target.value)}
+                onFocus={() => {
+                  if (mcpFormData.config?.auth?.bearer_token === "********") {
+                    updateAuth("bearer_token", "")
+                  }
+                }}
+                onBlur={() => {
+                  if ((!mcpFormData.config?.auth?.bearer_token || mcpFormData.config.auth.bearer_token === "") && originalAuth.bearer_token) {
+                    updateAuth("bearer_token", "********")
+                  }
+                }}
                 placeholder={t('tools.mcp.dialog.tokenPlaceholder')}
               />
             </div>
@@ -186,6 +218,16 @@ export function CustomMcpForm({
                   type="password"
                   value={mcpFormData.config?.auth?.api_key_value || ""}
                   onChange={(e) => updateAuth("api_key_value", e.target.value)}
+                  onFocus={() => {
+                    if (mcpFormData.config?.auth?.api_key_value === "********") {
+                      updateAuth("api_key_value", "")
+                    }
+                  }}
+                  onBlur={() => {
+                    if ((!mcpFormData.config?.auth?.api_key_value || mcpFormData.config.auth.api_key_value === "") && originalAuth.api_key_value) {
+                      updateAuth("api_key_value", "********")
+                    }
+                  }}
                   placeholder={t('tools.mcp.dialog.apiKeyPlaceholder')}
                 />
               </div>
@@ -210,6 +252,16 @@ export function CustomMcpForm({
                   type="password"
                   value={mcpFormData.config?.auth?.client_secret || ""}
                   onChange={(e) => updateAuth("client_secret", e.target.value)}
+                  onFocus={() => {
+                    if (mcpFormData.config?.auth?.client_secret === "********") {
+                      updateAuth("client_secret", "")
+                    }
+                  }}
+                  onBlur={() => {
+                    if ((!mcpFormData.config?.auth?.client_secret || mcpFormData.config.auth.client_secret === "") && originalAuth.client_secret) {
+                      updateAuth("client_secret", "********")
+                    }
+                  }}
                   placeholder={t('tools.mcp.dialog.clientSecretPlaceholder')}
                 />
               </div>

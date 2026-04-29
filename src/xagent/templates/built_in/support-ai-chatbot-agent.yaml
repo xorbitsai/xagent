@@ -142,4 +142,5 @@ agent_config:
   tool_categories:
   - basic
   - browser
+  - file
   - knowledge

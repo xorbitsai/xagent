@@ -4,8 +4,8 @@ category: Sales
 featured: true
 descriptions:
   en: Processes inbound leads, researches prospect, scores and qualifies leads. Initiates
-    calendar bookings for qualified prospects and updates CRM
-  zh: 处理入站线索，研究潜在客户，对线索进行评分和资格审查。为合格的潜在客户发起日历预订并更新CRM。
+    calendar bookings for qualified prospects.
+  zh: 处理入站线索，研究潜在客户，对线索进行评分和资格审查。为合格的潜在客户发起日历预订。
 features:
   en:
   - Captures leads from forms, chat, and email
@@ -22,6 +22,8 @@ connections:
   logo: https://www.google.com/s2/favicons?domain=mail.google.com&sz=64
 - name: Google Drive
   logo: https://www.google.com/s2/favicons?domain=drive.google.com&sz=64
+- name: HubSpot
+  logo: https://www.google.com/s2/favicons?domain=hubspot.com&sz=64
 setup_time:
   en: 5 min setup
   zh: 5分钟配置

@@ -15,7 +15,9 @@ features:
   - 自动从列表中呼叫客户
   - 识别客户身份及其问题
   - 通过自然对话解决常见问题
-connections: []
+connections:
+- name: HubSpot
+  logo: https://www.google.com/s2/favicons?domain=hubspot.com&sz=64
 setup_time:
   en: 5 min setup
   zh: 5分钟配置

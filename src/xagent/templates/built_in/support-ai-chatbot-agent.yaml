@@ -14,7 +14,9 @@ features:
   - 回答公司/群组的常见问题
   - 同时处理多个客户聊天
   - 帮助客户排查问题
-connections: []
+connections:
+- name: HubSpot
+  logo: https://www.google.com/s2/favicons?domain=hubspot.com&sz=64
 setup_time:
   en: 5 min setup
   zh: 5分钟配置

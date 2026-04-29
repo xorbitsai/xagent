@@ -1,3 +1,4 @@
+
 id: support-email-agent
 name: Email Agent (Support)
 category: Support
@@ -9,15 +10,17 @@ descriptions:
 features:
   en:
   - Sorts support tickets by urgency and deadlines
-  - Automatically replies to common customer questions
+  - Drafts replies to common customer questions for agent approval
   - Only provides accurate, verified information
   zh:
   - 按紧急程度和截止日期对支持工单进行排序
-  - 自动回复常见的客户问题
+  - 起草常见客户问题的回复以供批准
   - 仅提供准确、经过验证的信息
 connections:
 - name: Gmail
   logo: https://www.google.com/s2/favicons?domain=mail.google.com&sz=64
+- name: HubSpot
+  logo: https://www.google.com/s2/favicons?domain=hubspot.com&sz=64
 setup_time:
   en: 5 min setup
   zh: 5分钟配置

@@ -3,21 +3,23 @@ name: Email Agent (Sales)
 category: Sales
 featured: false
 descriptions:
-  en: Writes personalised email outreach to list of leads, contacts them and updates
-    the CRM. Flags and prioritises replies to human reps
-  zh: 为潜在客户列表撰写个性化的电子邮件外展，联系他们并更新CRM。标记并优先处理给人类代表的回复。
+  en: Drafts personalised email outreach to list of leads. Flags and prioritises
+    replies to human reps.
+  zh: 为潜在客户列表起草个性化的电子邮件外展。标记并优先处理给人类代表的回复。
 features:
   en:
-  - Sends personalised emails to your prospect list
+  - Drafts personalised emails for your prospect list
   - Writes replies based on past conversation history
   - Keeps emails aligned with your brand tone & style
   zh:
-  - 向您的潜在客户列表发送个性化电子邮件
+  - 为您的潜在客户列表起草个性化电子邮件
   - 根据过去的对话历史编写回复
   - 使电子邮件与您的品牌基调和风格保持一致
 connections:
 - name: Gmail
   logo: https://www.google.com/s2/favicons?domain=mail.google.com&sz=64
+- name: HubSpot
+  logo: https://www.google.com/s2/favicons?domain=hubspot.com&sz=64
 setup_time:
   en: 5 min setup
   zh: 5分钟配置

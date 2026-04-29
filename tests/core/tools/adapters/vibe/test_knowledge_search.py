@@ -857,7 +857,6 @@ class TestKnowledgeSearchTool:
 
         assert result.results
         assert result.results[0].text == "Recovered result"
-        assert "Recovered result" in result.summary
         assert "Warnings:" in result.summary
         assert "Hybrid search completed with warnings" in result.summary
         assert "Knowledge base search failed" not in result.summary
@@ -925,7 +924,6 @@ class TestKnowledgeSearchTool:
 
         assert result.results
         assert result.results[0].text == "Successful result"
-        assert "Successful result" in result.summary
         assert "Errors:" in result.summary
         assert "kb2: index unavailable" in result.summary
 

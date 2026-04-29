@@ -786,7 +786,9 @@ class ReActPattern(AgentPattern):
                     if extracted_chat_data:
                         chat_response_data = extracted_chat_data
                         # Override result content to just be the message for cleaner logs
-                        result["content"] = display_message or result["content"]
+                        # Only override if we actually extracted a message, otherwise keep the raw JSON
+                        if display_message:
+                            result["content"] = display_message
 
                     # Only send task completion events if NOT a sub-agent
                     # Sub-agents (DAG steps) should not trigger task-level completion
@@ -795,11 +797,15 @@ class ReActPattern(AgentPattern):
                             f"Tracing AI message with content length: {len(result.get('content', ''))}"
                         )
                         # Trace AI message with the final result
+                        trace_data = {"content": result["content"]}
+                        if chat_response_data:
+                            trace_data["chat_response"] = chat_response_data
+
                         await trace_ai_message(
                             self.tracer,
                             task_id,
                             message=result["content"],
-                            data={"content": result["content"]},
+                            data=trace_data,
                         )
 
                         logger.debug("Tracing task completion")

@@ -160,18 +160,11 @@ def try_extract_chat_response(content: str) -> tuple[str | None, dict | None]:
             return None, None
 
         parsed_content = json.loads(json_str)
-        if (
-            isinstance(parsed_content, dict)
-            and parsed_content.get("type") == "chat"
-            and isinstance(parsed_content.get("chat"), dict)
-        ):
+        if isinstance(parsed_content, dict) and parsed_content.get("type") == "chat":
             chat_response_data = parsed_content.get("chat")
-            display_message = (
-                chat_response_data.get("message", content)
-                if chat_response_data
-                else content
-            )
-            return display_message, chat_response_data
+            if isinstance(chat_response_data, dict):
+                display_message = chat_response_data.get("message")
+                return display_message, chat_response_data
 
     except Exception:
         pass

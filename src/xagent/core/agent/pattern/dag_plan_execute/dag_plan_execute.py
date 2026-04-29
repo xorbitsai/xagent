@@ -1360,7 +1360,8 @@ class DAGPlanExecutePattern(AgentPattern):
         display_message, extracted_chat_data = try_extract_chat_response(output_str)
         if extracted_chat_data:
             chat_response_data = extracted_chat_data
-            output_str = display_message or output_str
+            if display_message:
+                output_str = display_message
 
         result = {
             "success": success,

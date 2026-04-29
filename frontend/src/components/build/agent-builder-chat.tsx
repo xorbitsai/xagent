@@ -212,27 +212,35 @@ export function AgentBuilderChat({ agentConfig, onUpdateConfig, availableOptions
                   let displayReply = currentReply.replace(/```json[\s\S]*?(```|$)/gi, "").trim()
                   let interactions = undefined;
 
-                  // Check if currentReply is directly a JSON object
-                  try {
-                    const parsed = JSON.parse(currentReply);
-                    if (parsed.type === 'chat' && parsed.chat?.interactions) {
-                      displayReply = parsed.chat.message || "";
-                      interactions = parsed.chat.interactions;
+                  // First check if data has structured chat_response (new backend format)
+                  if (data.data?.chat_response?.interactions) {
+                    interactions = data.data.chat_response.interactions;
+                    if (data.data.chat_response.message) {
+                      displayReply = data.data.chat_response.message;
                     }
-                  } catch (e) {
-                    // Check if there is a JSON block for clarification form
-                    const jsonMatch = currentReply.match(/```json\s*([\s\S]*?)\s*```/);
-                    if (jsonMatch) {
-                      try {
-                        const parsed = JSON.parse(jsonMatch[1]);
-                        if (parsed.type === 'chat' && parsed.chat?.interactions) {
-                          interactions = parsed.chat.interactions;
-                          if (parsed.chat.message && !displayReply) {
-                            displayReply = parsed.chat.message;
+                  } else {
+                    // Fallback to checking if currentReply is directly a JSON object
+                    try {
+                      const parsed = JSON.parse(currentReply);
+                      if (parsed.type === 'chat' && parsed.chat?.interactions) {
+                        displayReply = parsed.chat.message || "";
+                        interactions = parsed.chat.interactions;
+                      }
+                    } catch (e) {
+                      // Check if there is a JSON block for clarification form
+                      const jsonMatch = currentReply.match(/```json\s*([\s\S]*?)\s*```/);
+                      if (jsonMatch) {
+                        try {
+                          const parsed = JSON.parse(jsonMatch[1]);
+                          if (parsed.type === 'chat' && parsed.chat?.interactions) {
+                            interactions = parsed.chat.interactions;
+                            if (parsed.chat.message && !displayReply) {
+                              displayReply = parsed.chat.message;
+                            }
                           }
+                        } catch (e) {
+                          // ignore parse errors
                         }
-                      } catch (e) {
-                        // ignore parse errors
                       }
                     }
                   }

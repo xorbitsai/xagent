@@ -1355,26 +1355,12 @@ class DAGPlanExecutePattern(AgentPattern):
 
         # Check if the output string is a chat response JSON block (from AskUserQuestionTool)
         chat_response_data = None
-        try:
-            import json
+        from ...utils.llm_utils import try_extract_chat_response
 
-            from ...utils.llm_utils import extract_json_from_markdown
-
-            # Attempt to parse content as JSON, handling markdown blocks
-            json_str = extract_json_from_markdown(output_str)
-            if json_str:
-                parsed_content = json.loads(json_str)
-                if (
-                    isinstance(parsed_content, dict)
-                    and parsed_content.get("type") == "chat"
-                    and isinstance(parsed_content.get("chat"), dict)
-                ):
-                    chat_response_data = parsed_content.get("chat")
-                    # Override the output string for display
-                    if chat_response_data:
-                        output_str = chat_response_data.get("message", output_str)
-        except Exception:
-            pass
+        display_message, extracted_chat_data = try_extract_chat_response(output_str)
+        if extracted_chat_data:
+            chat_response_data = extracted_chat_data
+            output_str = display_message or output_str
 
         result = {
             "success": success,

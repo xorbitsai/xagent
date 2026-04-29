@@ -778,28 +778,15 @@ class ReActPattern(AgentPattern):
 
                     # Try to extract chat_response if content is JSON
                     chat_response_data = None
-                    try:
-                        import json
+                    from ..utils.llm_utils import try_extract_chat_response
 
-                        from ..utils.llm_utils import extract_json_from_markdown
-
-                        # Attempt to parse content as JSON, handling markdown blocks
-                        json_str = extract_json_from_markdown(result["content"])
-                        if json_str:
-                            parsed_content = json.loads(json_str)
-                            if (
-                                isinstance(parsed_content, dict)
-                                and parsed_content.get("type") == "chat"
-                                and isinstance(parsed_content.get("chat"), dict)
-                            ):
-                                chat_response_data = parsed_content.get("chat")
-                                # Override result content to just be the message for cleaner logs
-                                if chat_response_data:
-                                    result["content"] = chat_response_data.get(
-                                        "message", result["content"]
-                                    )
-                    except Exception:
-                        pass
+                    display_message, extracted_chat_data = try_extract_chat_response(
+                        result["content"]
+                    )
+                    if extracted_chat_data:
+                        chat_response_data = extracted_chat_data
+                        # Override result content to just be the message for cleaner logs
+                        result["content"] = display_message or result["content"]
 
                     # Only send task completion events if NOT a sub-agent
                     # Sub-agents (DAG steps) should not trigger task-level completion

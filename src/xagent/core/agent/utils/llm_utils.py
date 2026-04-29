@@ -135,3 +135,45 @@ def clean_dict_content(data: Dict[str, Any]) -> Dict[str, Any]:
             cleaned_data[key] = value
 
     return cleaned_data
+
+
+def try_extract_chat_response(content: str) -> tuple[str | None, dict | None]:
+    """Extract structured chat response data from an LLM output string.
+
+    Checks if the string represents a JSON block with `{"type": "chat", "chat": {...}}`.
+    Returns (display_message, chat_response_data) if successful, otherwise (None, None).
+
+    Args:
+        content: The raw output string from LLM
+
+    Returns:
+        A tuple of (display_message, chat_response_data) or (None, None)
+    """
+    if not content:
+        return None, None
+
+    try:
+        import json
+
+        json_str = extract_json_from_markdown(content)
+        if not json_str:
+            return None, None
+
+        parsed_content = json.loads(json_str)
+        if (
+            isinstance(parsed_content, dict)
+            and parsed_content.get("type") == "chat"
+            and isinstance(parsed_content.get("chat"), dict)
+        ):
+            chat_response_data = parsed_content.get("chat")
+            display_message = (
+                chat_response_data.get("message", content)
+                if chat_response_data
+                else content
+            )
+            return display_message, chat_response_data
+
+    except Exception:
+        pass
+
+    return None, None

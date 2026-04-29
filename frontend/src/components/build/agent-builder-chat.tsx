@@ -299,31 +299,42 @@ export function AgentBuilderChat({ agentConfig, onUpdateConfig, availableOptions
               // The backend no longer sends config_updates in task_completed.
               // We handle it in tool_execution_end.
 
-              const finalContent = data.result || currentReply;
-              let cleanReply = finalContent.replace(/```json[\s\S]*?(```|$)/gi, "").trim()
+              let finalContent = typeof data.result === 'object' ? data.result.content : data.result;
+              finalContent = finalContent || currentReply;
+
+              let cleanReply = typeof finalContent === 'string' ? finalContent.replace(/```json[\s\S]*?(```|$)/gi, "").trim() : "";
               let interactions = undefined;
 
-              // Check if finalContent is directly a JSON object
-              try {
-                const parsed = JSON.parse(finalContent);
-                if (parsed.type === 'chat' && parsed.chat?.interactions) {
-                  cleanReply = parsed.chat.message || "";
-                  interactions = parsed.chat.interactions;
+              // Check if we have chat_response structure
+              if (typeof data.result === 'object' && data.result.chat_response) {
+                interactions = data.result.chat_response.interactions;
+                if (data.result.chat_response.message) {
+                  cleanReply = data.result.chat_response.message;
                 }
-              } catch (e) {
-                // If it's not direct JSON, check for markdown JSON blocks
-                const jsonMatch = finalContent.match(/```json\s*([\s\S]*?)\s*```/);
-                if (jsonMatch) {
-                  try {
-                    const parsed = JSON.parse(jsonMatch[1]);
-                    if (parsed.type === 'chat' && parsed.chat?.interactions) {
-                      interactions = parsed.chat.interactions;
-                      if (parsed.chat.message && !cleanReply) {
-                        cleanReply = parsed.chat.message;
+              }
+
+              // Fallback to checking finalContent if interactions is still undefined
+              if (!interactions && typeof finalContent === 'string') {
+                try {
+                  const parsed = JSON.parse(finalContent);
+                  if (parsed.type === 'chat' && parsed.chat?.interactions) {
+                    cleanReply = parsed.chat.message || cleanReply;
+                    interactions = parsed.chat.interactions;
+                  }
+                } catch (e) {
+                  const jsonMatch = finalContent.match(/```json\s*([\s\S]*?)\s*```/);
+                  if (jsonMatch) {
+                    try {
+                      const parsed = JSON.parse(jsonMatch[1]);
+                      if (parsed.type === 'chat' && parsed.chat?.interactions) {
+                        interactions = parsed.chat.interactions;
+                        if (parsed.chat.message && !cleanReply) {
+                          cleanReply = parsed.chat.message;
+                        }
                       }
+                    } catch (e) {
+                      // ignore
                     }
-                  } catch (e) {
-                    // ignore parse errors
                   }
                 }
               }

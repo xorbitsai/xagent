@@ -4,6 +4,7 @@ Skill Selector - Use LLM to select the most appropriate skill
 
 import json
 import logging
+import re
 from typing import Any, Dict, List, Optional
 
 logger = logging.getLogger(__name__)
@@ -186,23 +187,20 @@ If no skill is directly relevant, return selected: false."""
         # Extract key signal words from task
         task_lower = task.lower()
         signal_words = {
-            "slide": "slide" in task_lower or "presentation" in task_lower,
-            "poster": "poster" in task_lower or "banner" in task_lower,
-            "document": "document" in task_lower or "report" in task_lower,
-            "web": "web" in task_lower
-            or "landing" in task_lower
-            or "html page" in task_lower,
-            "code": "code" in task_lower
-            or "script" in task_lower
-            or "fix bug" in task_lower,
-            "knowledge_base_qa": "knowledge base" in task_lower
-            or "evidence" in task_lower
-            or "verification" in task_lower
-            or "due diligence" in task_lower
-            or "retrieval" in task_lower,
-            "agent_creation": "agent" in task_lower
-            or "chatbot" in task_lower
-            or "assistant" in task_lower
+            "slide": bool(re.search(r"\b(slide|presentation)\b", task_lower)),
+            "poster": bool(re.search(r"\b(poster|banner)\b", task_lower)),
+            "document": bool(re.search(r"\b(document|report)\b", task_lower)),
+            "web": bool(re.search(r"\b(web|landing|html page)\b", task_lower)),
+            "code": bool(re.search(r"\b(code|script|fix bug)\b", task_lower)),
+            "knowledge_base_qa": bool(
+                re.search(
+                    r"\b(knowledge base|evidence|verification|due diligence|retrieval)\b",
+                    task_lower,
+                )
+            ),
+            "agent_creation": bool(
+                re.search(r"\b(agent|chatbot|assistant)\b", task_lower)
+            )
             or "机器人" in task_lower
             or "智能体" in task_lower,
         }

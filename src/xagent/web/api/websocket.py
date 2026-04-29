@@ -2724,6 +2724,11 @@ If the user wants to add skills, tool categories, or knowledge bases but you are
             agent_service = websocket.state.builder_agent_service
             # Update tracer to the new connection
             agent_service.tracer = builder_tracer
+            # Defensive initialization for service reuse
+            if not hasattr(websocket.state, "builder_chat_history"):
+                websocket.state.builder_chat_history = []
+            if not hasattr(websocket.state, "builder_memory"):
+                websocket.state.builder_memory = InMemoryMemoryStore()
             if hasattr(agent_service, "agent") and hasattr(
                 agent_service.agent, "patterns"
             ):
@@ -2764,14 +2769,38 @@ If the user wants to add skills, tool categories, or knowledge bases but you are
                     websocket.state.builder_chat_history
                     and websocket.state.builder_chat_history[-1]["role"] == "user"
                 ):
-                    # If last message was also user, replace it or handle it gracefully
-                    # Here we pop it so we just keep the newest one
-                    websocket.state.builder_chat_history.pop()
+                    logger.warning(
+                        "Found consecutive user messages in builder_chat_history. Appending a placeholder assistant message."
+                    )
+                    # If last message was also user, insert a placeholder assistant message
+                    # instead of dropping the previous user message (which causes data loss)
+                    websocket.state.builder_chat_history.append(
+                        {
+                            "role": "assistant",
+                            "content": "I apologize, but my previous process was interrupted. Let's continue.",
+                        }
+                    )
 
                 websocket.state.builder_chat_history.append(
                     {"role": "user", "content": user_message}
                 )
                 output_content = result.get("output", "")
+
+                # If there's a structured chat_response, serialize it to JSON
+                # so the LLM retains the original structured interaction context
+                chat_response = result.get("chat_response")
+                if chat_response:
+                    try:
+                        # Reconstruct the expected JSON block that was stripped by react.py
+                        structured_content = json.dumps(
+                            {"type": "chat", "chat": chat_response}, ensure_ascii=False
+                        )
+                        output_content = f"```json\n{structured_content}\n```"
+                    except Exception as e:
+                        logger.warning(
+                            f"Failed to serialize chat_response for history: {e}"
+                        )
+
                 if output_content:
                     websocket.state.builder_chat_history.append(
                         {"role": "assistant", "content": output_content}
@@ -2793,12 +2822,20 @@ If the user wants to add skills, tool categories, or knowledge bases but you are
             # Send task_completed event to match the preview flow behavior
             # which relies on Trace events but might need a final completion indicator
             try:
+                # We need to pass the chat_response if it exists, along with content
+                # so the frontend can receive the structured data instead of trying to parse markdown
+                task_completion_result = {"content": result.get("output", "")}
+                if result.get("chat_response"):
+                    task_completion_result["chat_response"] = result.get(
+                        "chat_response"
+                    )
+
                 await websocket.send_text(
                     json.dumps(
                         {
                             "type": "task_completed",
                             "task_id": builder_task_id,
-                            "result": result.get("output", ""),
+                            "result": task_completion_result,
                             "success": result.get("success", True),
                             "timestamp": datetime.now(timezone.utc).timestamp(),
                         }

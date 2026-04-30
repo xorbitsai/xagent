@@ -816,6 +816,7 @@ Build when you need.`
     },
   },
   files: {
+    uploadFailed: "Upload failed",
     fileTooLarge: "File is too large for the configured upload limit",
     uploadProxyError: "Upload failed before reaching the application. Please check the server upload limit.",
     header: {

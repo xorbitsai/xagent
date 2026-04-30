@@ -111,9 +111,9 @@ export default function AgentChatPage() {
             }
           } else {
             throw new Error(getUploadErrorMessage(uploadResponse, parsed, {
-              generic: 'Upload failed',
-              tooLarge: 'File is too large. Please reduce the upload size and try again.',
-              proxy: 'Upload failed before reaching the application. Please check the server upload limit.',
+              generic: t("files.uploadFailed") || "Upload failed",
+              tooLarge: t("files.fileTooLarge") || "File is too large. Please reduce the upload size and try again.",
+              proxy: t("files.uploadProxyError") || "Upload failed before reaching the application. Please check the server upload limit.",
             }))
           }
         } catch (e) {

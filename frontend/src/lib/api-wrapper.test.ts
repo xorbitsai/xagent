@@ -47,6 +47,21 @@ describe("api-wrapper upload helpers", () => {
     expect(parsed.isHtml).toBe(false)
   })
 
+  it("preserves html proxy bodies even when content type claims json", async () => {
+    const response = new Response("<html><body>502 Bad Gateway</body></html>", {
+      status: 502,
+      headers: { "Content-Type": "application/json" },
+    })
+
+    const parsed = await parseApiResponse(response)
+    const message = getUploadErrorMessage(response, parsed, MESSAGES)
+
+    expect(parsed.data).toBeNull()
+    expect(parsed.text).toContain("502 Bad Gateway")
+    expect(parsed.isHtml).toBe(true)
+    expect(message).toBe("Proxy rejected upload")
+  })
+
   it("falls back to friendly proxy error for html responses", async () => {
     const response = new Response("<html><body>413 Request Entity Too Large</body></html>", {
       status: 413,

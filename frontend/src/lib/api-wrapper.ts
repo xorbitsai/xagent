@@ -263,40 +263,28 @@ export function isJsonRecord(value: unknown): value is JsonRecord {
 
 export async function parseApiResponse(response: Response): Promise<ParsedApiResponse> {
   const contentType = response.headers.get("content-type")?.toLowerCase() || ""
-
-  if (contentType.includes("application/json")) {
-    try {
-      return {
-        data: await response.json(),
-        text: null,
-        isHtml: false,
-      }
-    } catch {
-      // Fall through to text parsing for broken proxy responses.
-    }
-  }
-
   const text = await response.text().catch(() => "")
-  if (text) {
-    try {
-      return {
-        data: JSON.parse(text),
-        text,
-        isHtml: /^\s*</.test(text),
-      }
-    } catch {
-      return {
-        data: null,
-        text,
-        isHtml: contentType.includes("text/html") || /^\s*</.test(text),
-      }
+
+  if (!text) {
+    return {
+      data: null,
+      text: null,
+      isHtml: contentType.includes("text/html"),
     }
   }
 
-  return {
-    data: null,
-    text: null,
-    isHtml: contentType.includes("text/html"),
+  try {
+    return {
+      data: JSON.parse(text),
+      text,
+      isHtml: /^\s*</.test(text),
+    }
+  } catch {
+    return {
+      data: null,
+      text,
+      isHtml: contentType.includes("text/html") || /^\s*</.test(text),
+    }
   }
 }
 

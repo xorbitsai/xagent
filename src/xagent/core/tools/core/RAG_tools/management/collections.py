@@ -589,6 +589,8 @@ async def list_collections(
         vector_store = get_vector_index_store()
         metadata_collections: List[CollectionInfo] = []
         metadata_collection_names: Set[str] = set()
+        metadata_stats_by_name: Dict[str, Dict[str, int]] = {}
+        metadata_processed_documents_by_name: Dict[str, int] = {}
         try:
             metadata_collections = list(
                 await metadata_store.list_collections(
@@ -597,7 +599,24 @@ async def list_collections(
                 )
             )
             metadata_collection_names = {
-                collection.name for collection in metadata_collections if collection.name
+                collection.name
+                for collection in metadata_collections
+                if collection.name
+            }
+            metadata_stats_by_name = {
+                collection.name: {
+                    "documents": collection.documents,
+                    "parses": collection.parses,
+                    "chunks": collection.chunks,
+                    "embeddings": collection.embeddings,
+                }
+                for collection in metadata_collections
+                if collection.name
+            }
+            metadata_processed_documents_by_name = {
+                collection.name: collection.processed_documents
+                for collection in metadata_collections
+                if collection.name
             }
         except Exception as exc:
             logger.warning("Could not load persisted collection metadata: %s", exc)
@@ -744,15 +763,17 @@ async def list_collections(
             )
             for key in collection_keys:
                 if key not in stats:
-                    stats[key] = realtime_stats.get(
-                        key,
-                        {
+                    if key in realtime_stats:
+                        stats[key] = realtime_stats[key]
+                    elif key in metadata_stats_by_name:
+                        stats[key] = metadata_stats_by_name[key]
+                    else:
+                        stats[key] = {
                             "documents": 0,
                             "parses": 0,
                             "chunks": 0,
                             "embeddings": 0,
-                        },
-                    )
+                        }
 
         # Async write stats back to metadata cache for next request
         if used_realtime:
@@ -813,9 +834,11 @@ async def list_collections(
                 parses=stats[collection]["parses"],
                 chunks=stats[collection]["chunks"],
                 embeddings=stats[collection]["embeddings"],
-                processed_documents=stats[collection][
-                    "parses"
-                ],  # Use parses count as processed documents
+                processed_documents=(
+                    stats[collection]["parses"]
+                    if stats[collection]["parses"] > 0
+                    else metadata_processed_documents_by_name.get(collection, 0)
+                ),
                 document_names=sorted(document_names[collection]),
                 document_metadata=sorted(
                     document_metadata[collection],

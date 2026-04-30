@@ -598,6 +598,8 @@ def test_e2e_register_and_list_documents_with_legacy_empty_string_file_id(
     assert list_result.status == "success"
     listed_ids = {doc.doc_id for doc in list_result.documents}
     assert reg_result["doc_id"] in listed_ids
+
+
 # --- list_collections force_realtime Tests ---
 
 

@@ -2,7 +2,7 @@
 
 import React, { useState, useEffect, useRef } from "react"
 import { useParams, useRouter } from "next/navigation"
-import { apiRequest, getUploadErrorMessage, isJsonRecord, parseApiResponse } from "@/lib/api-wrapper"
+import { apiRequest, getUploadErrorMessage, isJsonRecord, parseApiResponse, UPLOAD_ERROR_MESSAGES } from "@/lib/api-wrapper"
 import { getApiUrl } from "@/lib/utils"
 import { Button } from "@/components/ui/button"
 import { ArrowLeft, Bot } from "lucide-react"
@@ -112,8 +112,7 @@ export default function AgentChatPage() {
           } else {
             throw new Error(getUploadErrorMessage(uploadResponse, parsed, {
               generic: t("files.uploadFailed") || "Upload failed",
-              tooLarge: t("files.fileTooLarge") || "File is too large. Please reduce the upload size and try again.",
-              proxy: t("files.uploadProxyError") || "Upload failed before reaching the application. Please check the server upload limit.",
+              ...UPLOAD_ERROR_MESSAGES,
             }))
           }
         } catch (e) {

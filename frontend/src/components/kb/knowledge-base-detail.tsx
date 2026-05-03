@@ -13,7 +13,7 @@ import { ScrollArea } from "@/components/ui/scroll-area"
 import { Select } from "@/components/ui/select"
 import { Badge } from "@/components/ui/badge"
 import { ConfirmDialog } from "@/components/ui/confirm-dialog"
-import { apiRequest, getUploadErrorMessage, isJsonRecord, parseApiResponse } from "@/lib/api-wrapper"
+import { apiRequest, getUploadErrorMessage, isJsonRecord, parseApiResponse, UPLOAD_ERROR_MESSAGES } from "@/lib/api-wrapper"
 import { getApiUrl } from "@/lib/utils"
 import { appendIngestionConfigToFormData } from "@/lib/ingestion-form"
 import { parseSeparatorsInput, formatSeparatorsOutput } from "@/lib/separators"
@@ -318,8 +318,7 @@ export function KnowledgeBaseDetailContent({ collectionName }: { collectionName:
           }
           throw new Error(getUploadErrorMessage(response, parsed, {
             generic: t("kb.detail.errors.uploadFailedWithName", { name: file.name }) || `Failed to upload file: ${file.name}`,
-            tooLarge: t("files.fileTooLarge") || "File is too large",
-            proxy: t("files.uploadProxyError") || "Upload failed before reaching the application. Please check the server upload limit.",
+            ...UPLOAD_ERROR_MESSAGES,
           }))
         }
 
@@ -451,8 +450,7 @@ export function KnowledgeBaseDetailContent({ collectionName }: { collectionName:
         }
         throw new Error(getUploadErrorMessage(response, parsed, {
           generic: t("kb.detail.errors.webImportFailed") || "Website import failed",
-          tooLarge: t("files.fileTooLarge") || "File is too large",
-          proxy: t("files.uploadProxyError") || "Upload failed before reaching the application. Please check the server upload limit.",
+          ...UPLOAD_ERROR_MESSAGES,
         }))
       }
 

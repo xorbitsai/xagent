@@ -288,6 +288,11 @@ export async function parseApiResponse(response: Response): Promise<ParsedApiRes
   }
 }
 
+export const UPLOAD_ERROR_MESSAGES = {
+  tooLarge: "File is too large. Please reduce the upload size and try again.",
+  proxy: "Upload failed before reaching the application. Please check the server upload limit.",
+}
+
 export function getUploadErrorMessage(
   response: Response,
   parsed: ParsedApiResponse,

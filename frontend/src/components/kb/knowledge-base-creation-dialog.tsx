@@ -13,7 +13,7 @@ import { Select } from "@/components/ui/select"
 import { getApiUrl } from "@/lib/utils"
 import { appendIngestionConfigToFormData } from "@/lib/ingestion-form"
 import { useI18n } from "@/contexts/i18n-context"
-import { apiRequest, getUploadErrorMessage, isJsonRecord, parseApiResponse } from "@/lib/api-wrapper"
+import { apiRequest, getUploadErrorMessage, isJsonRecord, parseApiResponse, UPLOAD_ERROR_MESSAGES } from "@/lib/api-wrapper"
 import { Model } from "@/lib/models"
 import {
   Upload,
@@ -289,8 +289,7 @@ export function KnowledgeBaseCreationDialog({ open, onOpenChange, onSuccess }: K
           }
           throw new Error(getUploadErrorMessage(response, parsed, {
             generic: t("kb.errors.uploadFailedFile", { name: file.name }) || `Failed to upload file: ${file.name}`,
-            tooLarge: t("files.fileTooLarge") || "File is too large",
-            proxy: t("files.uploadProxyError") || "Upload failed before reaching the application. Please check the server upload limit.",
+            ...UPLOAD_ERROR_MESSAGES,
           }))
         }
 
@@ -380,8 +379,7 @@ export function KnowledgeBaseCreationDialog({ open, onOpenChange, onSuccess }: K
         }
         throw new Error(getUploadErrorMessage(response, parsed, {
           generic: t("kb.errors.webIngestFailed") || "Website import failed",
-          tooLarge: t("files.fileTooLarge") || "File is too large",
-          proxy: t("files.uploadProxyError") || "Upload failed before reaching the application. Please check the server upload limit.",
+          ...UPLOAD_ERROR_MESSAGES,
         }))
       }
 
@@ -466,8 +464,7 @@ export function KnowledgeBaseCreationDialog({ open, onOpenChange, onSuccess }: K
       if (!response.ok) {
         throw new Error(getUploadErrorMessage(response, parsed, {
           generic: t("kb.errors.cloudIngestFailed") || "Cloud ingest failed",
-          tooLarge: t("files.fileTooLarge") || "File is too large",
-          proxy: t("files.uploadProxyError") || "Upload failed before reaching the application. Please check the server upload limit.",
+          ...UPLOAD_ERROR_MESSAGES,
         }))
       }
 

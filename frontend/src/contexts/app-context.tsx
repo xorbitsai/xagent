@@ -20,7 +20,7 @@ interface WebSocketMessage {
 import { useWebSocket } from "@/hooks/use-websocket"
 import { useAuth } from "@/contexts/auth-context"
 import { getApiUrl } from "@/lib/utils"
-import { apiRequest, getUploadErrorMessage, isJsonRecord, parseApiResponse } from "@/lib/api-wrapper"
+import { apiRequest, getUploadErrorMessage, isJsonRecord, parseApiResponse, UPLOAD_ERROR_MESSAGES } from "@/lib/api-wrapper"
 import { useI18n } from "@/contexts/i18n-context"
 
 // Unique ID generator for messages
@@ -3001,8 +3001,7 @@ export function AppProvider({ children, token }: { children: React.ReactNode; to
               } else {
                 throw new Error(getUploadErrorMessage(uploadResponse, parsed, {
                   generic: t("files.uploadFailed") || "Upload failed",
-                  tooLarge: t("files.fileTooLarge") || "File is too large. Please reduce the upload size and try again.",
-                  proxy: t("files.uploadProxyError") || "Upload failed before reaching the application. Please check the server upload limit.",
+                  ...UPLOAD_ERROR_MESSAGES,
                 }))
               }
             } catch (e) {

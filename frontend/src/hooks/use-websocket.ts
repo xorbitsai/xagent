@@ -2,7 +2,7 @@
 
 import { useEffect, useRef, useState, useCallback } from "react"
 import { useAuth } from "@/contexts/auth-context"
-import { apiRequest, getUploadErrorMessage, isJsonRecord, parseApiResponse } from "@/lib/api-wrapper"
+import { apiRequest, getUploadErrorMessage, isJsonRecord, parseApiResponse, UPLOAD_ERROR_MESSAGES } from "@/lib/api-wrapper"
 import { toast } from "sonner"
 import { getWsUrl, getApiUrl } from "@/lib/utils"
 
@@ -458,8 +458,7 @@ export function useWebSocket(options: UseWebSocketOptions = {}) {
               if (!response.ok || !isJsonRecord(parsed.data)) {
                 throw new Error(getUploadErrorMessage(response, parsed, {
                   generic: 'Upload failed',
-                  tooLarge: 'File is too large. Please reduce the upload size and try again.',
-                  proxy: 'Upload failed before reaching the application. Please check the server upload limit.',
+                  ...UPLOAD_ERROR_MESSAGES,
                 }))
               }
 

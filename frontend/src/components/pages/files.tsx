@@ -4,7 +4,7 @@ import { useState, useEffect, useRef } from "react"
 import { Button } from "@/components/ui/button"
 import { Badge } from "@/components/ui/badge"
 import { getApiUrl } from "@/lib/utils"
-import { apiRequest, getUploadErrorMessage, parseApiResponse } from "@/lib/api-wrapper"
+import { apiRequest, getUploadErrorMessage, parseApiResponse, UPLOAD_ERROR_MESSAGES } from "@/lib/api-wrapper"
 import { useI18n } from "@/contexts/i18n-context"
 import { StandaloneFilePreviewDialog } from "@/components/file/standalone-file-preview-dialog"
 import { SearchInput } from "@/components/ui/search-input"
@@ -188,8 +188,7 @@ export function FilesPage() {
       } else {
         throw new Error(getUploadErrorMessage(response, parsed, {
           generic: t('files.actions.upload') || 'Upload failed',
-          tooLarge: t('files.fileTooLarge') || 'File is too large',
-          proxy: t('files.uploadProxyError') || 'Upload failed before reaching the application. Please check the server upload limit.',
+          ...UPLOAD_ERROR_MESSAGES,
         }))
       }
     } catch (error) {

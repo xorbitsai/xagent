@@ -7,7 +7,7 @@ import { cn, getApiUrl } from "@/lib/utils";
 import { useI18n } from "@/contexts/i18n-context";
 import { useApp } from "@/contexts/app-context-chat";
 import { ConfigDialog } from "@/components/config-dialog";
-import { apiRequest, getUploadErrorMessage, isJsonRecord, parseApiResponse } from "@/lib/api-wrapper";
+import { apiRequest, getUploadErrorMessage, isJsonRecord, parseApiResponse, UPLOAD_ERROR_MESSAGES } from "@/lib/api-wrapper";
 import { useFileMention, FileItem } from "@/hooks/use-file-mention";
 import { FileMentionDropdown } from "./FileMentionDropdown";
 import { toast } from "sonner";
@@ -225,8 +225,7 @@ export function ChatInput({
           failedFiles.add(file);
           uploadErrorMessage = uploadErrorMessage || getUploadErrorMessage(response, parsed, {
             generic: t("files.uploadFailed") || "Failed to upload some files",
-            tooLarge: t("files.fileTooLarge") || "File is too large",
-            proxy: t("files.uploadProxyError") || "Upload failed before reaching the application. Please check the server upload limit.",
+            ...UPLOAD_ERROR_MESSAGES,
           });
         }
       } catch (error: any) {

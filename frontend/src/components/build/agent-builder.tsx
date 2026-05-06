@@ -15,6 +15,7 @@ import { apiRequest } from "@/lib/api-wrapper"
 import { getApiUrl, getWsUrl } from "@/lib/utils"
 import { PlusCircle, MessageSquare, Upload, Download, Settings2, Check, Zap, BookOpen, ChevronLeft, Gauge, Sparkles, Loader2, X, XCircle, Trash2, Bot, Brain } from "lucide-react"
 import { ConnectMcpDialog } from "@/components/mcp/connect-mcp-dialog"
+import { TemplatePrerequisiteModal } from "./template-prerequisite-modal"
 import { useI18n } from "@/contexts/i18n-context"
 import { useAuth } from "@/contexts/auth-context"
 import { useMcpApps } from "@/contexts/mcp-apps-context"
@@ -161,6 +162,13 @@ export function AgentBuilder({ agentId }: AgentBuilderProps) {
   const [tools, setTools] = useState<Tool[]>([])
   const [mcpServers, setMcpServers] = useState<any[]>([])
   const [isConnectMcpOpen, setIsConnectMcpOpen] = useState(false)
+  const [isInitialDataLoaded, setIsInitialDataLoaded] = useState(false)
+
+  // Prerequisite Modal State
+  const [showPrerequisiteModal, setShowPrerequisiteModal] = useState(false)
+  const [prerequisiteMcps, setPrerequisiteMcps] = useState<string[]>([])
+  const [prerequisiteNeedsKb, setPrerequisiteNeedsKb] = useState(false)
+  const hasShownPrerequisiteModalRef = useRef(false)
 
   // File picker state for Instructions
   const instructionsRef = useRef<HTMLDivElement>(null)
@@ -541,6 +549,8 @@ export function AgentBuilder({ agentId }: AgentBuilderProps) {
         }
       } catch (error) {
         console.error("Failed to fetch data:", error)
+      } finally {
+        setIsInitialDataLoaded(true)
       }
     }
 
@@ -659,7 +669,29 @@ export function AgentBuilder({ agentId }: AgentBuilderProps) {
     }
 
     loadTemplate()
-  }, [templateId, isEditMode, locale])
+  }, [templateId, isEditMode, locale, mcpServers])
+
+  // Check prerequisites for template and show modal
+  useEffect(() => {
+    if (!templateId || isEditMode || loadingAgent || !isInitialDataLoaded) return
+
+    const unconnected = selectedMcpServers.filter(name => !mcpServers.some(s => s.name.toLowerCase() === name.toLowerCase()))
+    const needsKb = selectedToolCategories.includes("knowledge") && selectedKbs.length === 0
+
+    if (!hasShownPrerequisiteModalRef.current && (unconnected.length > 0 || needsKb)) {
+      setPrerequisiteMcps(unconnected)
+      setPrerequisiteNeedsKb(needsKb)
+      setShowPrerequisiteModal(true)
+      hasShownPrerequisiteModalRef.current = true
+    } else if (hasShownPrerequisiteModalRef.current && showPrerequisiteModal) {
+      // Dynamic updates if modal is still open
+      setPrerequisiteMcps(unconnected)
+      setPrerequisiteNeedsKb(needsKb)
+      if (unconnected.length === 0 && !needsKb) {
+        setShowPrerequisiteModal(false)
+      }
+    }
+  }, [templateId, isEditMode, loadingAgent, isInitialDataLoaded, selectedMcpServers, mcpServers, selectedToolCategories, selectedKbs, showPrerequisiteModal])
 
   // Convert kbs to MultiSelect options
   const kbOptions = (Array.isArray(kbs) ? kbs : []).map((kb) => ({
@@ -2019,6 +2051,23 @@ export function AgentBuilder({ agentId }: AgentBuilderProps) {
             .then(data => setMcpServers(data || []))
             .catch(console.error)
         }}
+      />
+
+      <TemplatePrerequisiteModal
+        open={showPrerequisiteModal}
+        onOpenChange={setShowPrerequisiteModal}
+        unconnectedMcps={prerequisiteMcps}
+        needsKb={prerequisiteNeedsKb}
+        availableKbs={kbOptions}
+        selectedKbs={selectedKbs}
+        onKbsChange={(newValues) => {
+          setSelectedKbs(newValues)
+          if (newValues.length > 0 && !selectedToolCategories.includes("knowledge")) {
+            setSelectedToolCategories(prev => [...prev, "knowledge"])
+          }
+        }}
+        onConnectMcp={() => setIsConnectMcpOpen(true)}
+        onUploadKb={() => setIsKbModalOpen(true)}
       />
     </div>
   )

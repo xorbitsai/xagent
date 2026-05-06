@@ -1892,6 +1892,19 @@ Build when you need.`
     },
   },
   builds: {
+    prerequisites: {
+      title: "Setup Prerequisites",
+      description: "To fully utilize this template's capabilities, please complete the following configurations first:",
+      mcpTitle: "Connect Required Tools",
+      mcpDesc: "This template requires:",
+      connectBtn: "Connect",
+      kbTitle: "Knowledge Base",
+      kbDesc: "Upload or select existing references or documents that this template can utilize.",
+      uploadBtn: "Upload New",
+      selectKbPlaceholder: "Or select existing knowledge bases...",
+      skipBtn: "Skip for now",
+      doneBtn: "Got it"
+    },
     header: {
       title: "Build History",
       description: "View and manage build history",

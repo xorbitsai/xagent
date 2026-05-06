@@ -1892,6 +1892,19 @@ Build when you need.`
     },
   },
   builds: {
+    prerequisites: {
+      title: "配置向导",
+      description: "为了充分发挥该模板的能力，请先完成以下配置：",
+      mcpTitle: "连接必要工具",
+      mcpDesc: "该模板依赖：",
+      connectBtn: "去连接",
+      kbTitle: "上传或选择知识库",
+      kbDesc: "上传或选择该模板可能需要的参考文档、数据。",
+      uploadBtn: "上传新文档",
+      selectKbPlaceholder: "或者选择已有的知识库...",
+      skipBtn: "暂不配置",
+      doneBtn: "我知道了"
+    },
     header: {
       title: "构建历史",
       description: "查看和管理构建历史记录",

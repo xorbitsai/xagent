@@ -14,6 +14,7 @@ export interface MCPServerFormData {
     url?: string;
     method?: string;
     headers?: Record<string, string>;
+    body?: string;
     config?: Record<string, any>;
     [key: string]: any;
 }
@@ -213,7 +214,7 @@ export function CustomApiForm({
     return (
         <div className="space-y-4">
             <div className="space-y-2">
-                <Label htmlFor="api_name">{t('tools.mcp.dialog.customApiName')} <span className="text-red-500">*</span></Label>
+                <Label htmlFor="api_name">{t('tools.mcp.dialog.customApiName')}</Label>
                 <Input
                     id="api_name"
                     value={mcpFormData.name || ""}
@@ -443,6 +444,19 @@ export function CustomApiForm({
                         >
                             <Plus className="h-4 w-4 mr-2" /> {t('tools.mcp.dialog.addHeader')}
                         </Button>
+
+                        {mcpFormData.method && !["GET", "DELETE"].includes(mcpFormData.method) && (
+                            <div className="pt-4 border-t border-slate-200">
+                                <Label className="text-sm font-semibold">{t('tools.mcp.dialog.bodyTemplate')}</Label>
+                                <p className="text-xs text-slate-500 mb-2">{t('tools.mcp.dialog.bodyTemplateDesc')}</p>
+                                <textarea
+                                    className="flex min-h-[120px] w-full rounded-md border border-input bg-background px-3 py-2 text-sm ring-offset-background placeholder:text-muted-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 disabled:cursor-not-allowed disabled:opacity-50 font-mono"
+                                    value={mcpFormData.body || ""}
+                                    onChange={(e) => setMcpFormData((prev: MCPServerFormData) => ({ ...prev, body: e.target.value }))}
+                                    placeholder={t('tools.mcp.dialog.bodyTemplatePlaceholder')}
+                                />
+                            </div>
+                        )}
                     </div>
                 </CollapsibleContent>
             </Collapsible>

@@ -197,6 +197,11 @@ export function ConnectMcpDialog({
     let method = editingCustomServerId ? 'PUT' : 'POST';
 
     if (payload.transport === "custom_api") {
+      if (!mcpFormData.url?.trim()) {
+        toast.error(t('tools.mcp.alerts.urlRequired'));
+        return;
+      }
+
       const buildResult = buildCustomApiPayload(payload, customApiEnv);
       if (!buildResult.isValid) {
         toast.error(t(buildResult.errorKey || 'tools.mcp.alerts.atLeastOneSecret'));
@@ -694,8 +699,9 @@ export function ConnectMcpDialog({
                   onClick={handleSaveCustomMcp}
                   disabled={
                     isSavingCustom ||
-                    !mcpFormData.name.trim() ||
-                    (customApiEnv.length > 0 && customApiEnv.some(env => !env.key.trim() || !env.value.trim()))
+                    !mcpFormData.name?.trim() ||
+                    !mcpFormData.url?.trim() ||
+                    (customApiEnv.length > 0 && customApiEnv.some(env => env.key.trim() && !env.value.trim()))
                   }
                 >
                   {isSavingCustom && <Loader2 className="h-4 w-4 mr-2 animate-spin" />}
@@ -830,6 +836,7 @@ export function ConnectMcpDialog({
                 url: configObj.url || "",
                 method: configObj.method || "GET",
                 headers: configObj.headers || {},
+                body: configObj.body || "",
                 config: configObj
               });
             } else {

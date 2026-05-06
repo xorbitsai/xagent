@@ -35,6 +35,7 @@ class CustomApi(Base):  # type: ignore[no-any-unimported]
     url = Column(String(500), nullable=True)
     method = Column(String(20), nullable=True, default="GET")
     headers = Column(JSON, nullable=True)  # Dict[str, str]
+    body = Column(Text, nullable=True)  # JSON template string
     env = Column(JSON, nullable=True)  # Dict[str, str] - encrypted values
 
     # Timestamps

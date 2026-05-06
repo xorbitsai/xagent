@@ -82,6 +82,7 @@ class CustomApiTool(AbstractBaseTool):
         url: Optional[str] = None,
         method: Optional[str] = None,
         headers: Optional[Dict[str, str]] = None,
+        body: Optional[str] = None,
         visibility: ToolVisibility = ToolVisibility.PUBLIC,
     ):
         # Format name for LLM (replace spaces/dashes with underscores)
@@ -99,6 +100,8 @@ class CustomApiTool(AbstractBaseTool):
             default_info += f"\nConfigured method: {method}"
         if headers:
             default_info += "\nConfigured headers are applied automatically."
+        if body:
+            default_info += f"\nConfigured body template: {body}"
 
         # Add env vars info to description so LLM knows how to use them
         env_info = ""
@@ -111,6 +114,7 @@ class CustomApiTool(AbstractBaseTool):
         self._default_url = url
         self._default_method = method or "GET"
         self._default_headers = headers or {}
+        self._default_body = body
         self._env = {}
         self._env_patterns = []
         for k, v in (env or {}).items():
@@ -179,7 +183,16 @@ class CustomApiTool(AbstractBaseTool):
             params = (
                 self._replace_secrets(parsed_args.params) if parsed_args.params else {}
             )
-            body = self._replace_secrets(parsed_args.body) if parsed_args.body else None
+
+            body = None
+            if parsed_args.body:
+                body = self._replace_secrets(parsed_args.body)
+            elif self._default_body:
+                # Parse default body string if it exists
+                try:
+                    body = self._replace_secrets(json.loads(self._default_body))
+                except json.JSONDecodeError:
+                    body = self._replace_secrets(self._default_body)
 
             # Execute API call
             result = await call_api(
@@ -241,6 +254,7 @@ def create_custom_api_tools(configs: List[Dict[str, Any]]) -> List[CustomApiTool
             url = config.get("url")
             method = config.get("method")
             headers = config.get("headers")
+            body = config.get("body")
 
             tool = CustomApiTool(
                 name=name,
@@ -249,6 +263,7 @@ def create_custom_api_tools(configs: List[Dict[str, Any]]) -> List[CustomApiTool
                 url=url,
                 method=method,
                 headers=headers,
+                body=body,
             )
             tools.append(tool)
         except Exception as e:

@@ -33,6 +33,7 @@ class CustomApiCreate(BaseModel):
     )
     method: Optional[str] = Field("GET", description="HTTP method")
     headers: Optional[Dict[str, str]] = Field(None, description="HTTP headers")
+    body: Optional[str] = Field(None, description="HTTP body (JSON template)")
     env: Optional[Dict[str, str]] = Field(
         None, description="Environment variables (secrets)"
     )
@@ -51,6 +52,7 @@ class CustomApiUpdate(BaseModel):
     )
     method: Optional[str] = Field(None, description="HTTP method")
     headers: Optional[Dict[str, str]] = Field(None, description="HTTP headers")
+    body: Optional[str] = Field(None, description="HTTP body (JSON template)")
     env: Optional[Dict[str, str]] = Field(
         None, description="Environment variables (secrets)"
     )
@@ -67,6 +69,7 @@ class CustomApiResponse(BaseModel):
     url: Optional[str]
     method: Optional[str]
     headers: Optional[Dict[str, str]]
+    body: Optional[str]
     env: Optional[Dict[str, str]]  # Will return masked values
     is_active: bool
     is_default: bool
@@ -101,6 +104,7 @@ def _db_api_to_response(
         url=api.url,
         method=api.method,
         headers=api.headers,
+        body=api.body,
         env=masked_env,
         is_active=user_api.is_active,
         is_default=user_api.is_default,
@@ -178,6 +182,7 @@ async def create_custom_api(
         url=api_data.url,
         method=api_data.method,
         headers=api_data.headers,
+        body=api_data.body,
         env=encrypted_env,
     )
 
@@ -279,6 +284,8 @@ async def update_custom_api(
         api.method = api_data.method
     if api_data.headers is not None:
         api.headers = api_data.headers
+    if api_data.body is not None:
+        api.body = api_data.body
 
     # Process env variables
     if api_data.env is not None:

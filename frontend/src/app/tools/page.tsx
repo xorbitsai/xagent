@@ -469,7 +469,6 @@ export default function ToolsPage() {
     const isOfficial = server.transport === 'oauth'
 
     if (isOfficial) {
-      // Use provider from backend if available, fallback to basic logic
       const isGoogle = server.name.toLowerCase().includes('google') || server.name.toLowerCase() === 'gmail'
       const provider = server.provider || (isGoogle ? 'google' : 'linkedin')
 
@@ -493,31 +492,36 @@ export default function ToolsPage() {
       })
       setIsOfficialAppDialogOpen(true)
     } else if (server.transport === "custom_api") {
-      setEditingOfficialApp({
-        id: server.id.toString(),
-        server_id: server.id,
+      setEditingServer(server)
+      setMcpFormData({
         name: server.name,
+        transport: server.transport,
         description: server.description || "",
-        icon: "",
-        is_connected: true,
-        provider: "custom_api",
-        is_custom: true,
-        server: server
+        url: server.config?.url || "",
+        method: server.config?.method || "GET",
+        headers: server.config?.headers || {},
+        body: server.config?.body || "",
+        config: server.config || {}
       })
-      setIsOfficialAppDialogOpen(true)
+
+      const configObj = server.config || {};
+      const envObj = configObj.env || {};
+      const envList = Object.entries(envObj).map(([k, v]) => ({ key: k, value: v as string }));
+      if (envList.length === 0) {
+        envList.push({ key: "", value: "" });
+      }
+      setCustomApiEnv(envList);
+
+      setIsMcpDialogOpen(true)
     } else {
-      setEditingOfficialApp({
-        id: server.id.toString(),
-        server_id: server.id,
+      setEditingServer(server)
+      setMcpFormData({
         name: server.name,
+        transport: server.transport,
         description: server.description || "",
-        icon: "",
-        is_connected: true,
-        provider: "custom",
-        is_custom: true,
-        server: server
+        config: server.config || {}
       })
-      setIsOfficialAppDialogOpen(true)
+      setIsMcpDialogOpen(true)
     }
   }
 
@@ -534,6 +538,10 @@ export default function ToolsPage() {
 
     let payload: any = { ...mcpFormData }
     if (payload.transport === "custom_api") {
+      if (!mcpFormData.url?.trim()) {
+        toast.error(t('tools.mcp.alerts.urlRequired'));
+        return;
+      }
       const buildResult = buildCustomApiPayload(payload, customApiEnv);
       if (!buildResult.isValid) {
         toast.error(t(buildResult.errorKey || 'tools.mcp.alerts.atLeastOneSecret') || "At least one valid secret is required");

@@ -644,6 +644,8 @@ def get_mcp_servers(
                 config_dict["method"] = api.method
             if api.headers:
                 config_dict["headers"] = api.headers
+            if api.body:
+                config_dict["body"] = api.body
 
             responses.append(
                 MCPServerResponse(

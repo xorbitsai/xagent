@@ -2571,11 +2571,13 @@ async def handle_builder_chat(
         }
 
         # Build system prompt with context
+        import json
+
         system_prompt = f"""You are an expert AI Agent Builder Assistant.
 Your job is to help users create and configure custom AI agents.
 
-Current Agent Configuration:
-{current_config}
+Current Agent Configuration (JSON):
+{json.dumps(current_config, indent=2)}
 
 When the user describes what they want to build, use the create_agent or update_agent tool to help them.
 The agent will be updated immediately and can be used right away.

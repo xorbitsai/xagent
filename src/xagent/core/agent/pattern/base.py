@@ -159,7 +159,8 @@ class ToolRegistry:
         try:
             args_type = tool.args_type()
             if args_type:
-                return args_type.model_json_schema()
+                schema = args_type.model_json_schema()
+                return self._clean_json_schema(schema)
         except Exception as e:
             logger.warning(f"Failed to get schema for tool {tool.metadata.name}: {e}")
 
@@ -168,3 +169,32 @@ class ToolRegistry:
             "properties": {},
             "required": [],
         }
+
+    def _clean_json_schema(self, schema: Dict[str, Any]) -> Dict[str, Any]:
+        """Clean up Pydantic json schema for LLMs (e.g. remove anyOf with null)."""
+        if not isinstance(schema, dict):
+            return schema
+
+        cleaned = {}
+        for k, v in schema.items():
+            if k == "anyOf" and isinstance(v, list):
+                # Check if this is an Optional type (anyOf with null)
+                non_null_types = [
+                    t for t in v if isinstance(t, dict) and t.get("type") != "null"
+                ]
+                if len(non_null_types) == 1:
+                    # Merge the non-null type directly
+                    cleaned.update(self._clean_json_schema(non_null_types[0]))
+                    continue
+
+            if isinstance(v, dict):
+                cleaned[k] = self._clean_json_schema(v)
+            elif isinstance(v, list):
+                cleaned[k] = [
+                    self._clean_json_schema(item) if isinstance(item, dict) else item
+                    for item in v
+                ]
+            else:
+                cleaned[k] = v
+
+        return cleaned

@@ -2020,6 +2020,20 @@ Remember: Return ONLY ONE JSON object. No additional text, no multiple objects.
             try:
                 tool = self.tool_registry.get(action.tool_name)
 
+                # Normalize tool_args using the tool's Pydantic model if available
+                try:
+                    args_type = tool.args_type()
+                    if args_type:
+                        parsed_args = args_type(**tool_args)
+                        # Merge normalized args back into tool_args
+                        # exclude_unset=True ensures we only update fields that were actually provided
+                        normalized_args = parsed_args.model_dump(exclude_unset=True)
+                        tool_args.update(normalized_args)
+                except Exception as e:
+                    logger.debug(
+                        f"Failed to normalize args for tool {action.tool_name}: {e}"
+                    )
+
                 # Check if tool runs in sandbox (duck-type detection)
                 is_sandboxed = getattr(tool, "is_sandboxed", False)
 

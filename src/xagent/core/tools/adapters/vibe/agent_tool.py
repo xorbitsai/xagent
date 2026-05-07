@@ -5,7 +5,7 @@ Agent Tool - Convert published agents into callable tools
 import logging
 from typing import TYPE_CHECKING, Any, Mapping, Optional, Type
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 from .....config import get_uploads_dir
 from .....web.services.model_service import (
@@ -42,6 +42,15 @@ class CreateAgentToolArgs(BaseModel):
         default="balanced",
         description="Execution mode for the agent: 'flash', 'balanced' (default), or 'think'.",
     )
+
+    @field_validator("tool_categories", "knowledge_bases", "skills", mode="before")
+    @classmethod
+    def parse_stringified_lists(cls, v: Any) -> Any:
+        if isinstance(v, str):
+            parsed = ensure_list(v)
+            if parsed is not None:
+                return parsed
+        return v
 
 
 class CreateAgentToolResult(BaseModel):
@@ -90,6 +99,15 @@ class UpdateAgentToolArgs(BaseModel):
         default=None,
         description="New execution mode for the agent: 'flash', 'balanced', or 'think'.",
     )
+
+    @field_validator("tool_categories", "knowledge_bases", "skills", mode="before")
+    @classmethod
+    def parse_stringified_lists(cls, v: Any) -> Any:
+        if isinstance(v, str):
+            parsed = ensure_list(v)
+            if parsed is not None:
+                return parsed
+        return v
 
 
 class UpdateAgentToolResult(BaseModel):

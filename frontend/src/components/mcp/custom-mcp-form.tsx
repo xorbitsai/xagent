@@ -95,28 +95,17 @@ export function CustomMcpForm({
 
       <div className="space-y-2">
         <Label>{t('tools.mcp.dialog.transport')}</Label>
-        <div className="flex bg-slate-100 p-1 rounded-md">
-          <button
-            type="button"
-            className={`flex-1 py-1.5 text-sm font-medium rounded-md transition-colors ${transport === "sse" ? "bg-blue-600 text-white shadow" : "text-slate-600 hover:text-slate-900 hover:bg-slate-200"}`}
-            onClick={() => setMcpFormData((prev: MCPServerFormData) => ({ ...prev, transport: "sse" }))}
-          >
-            SSE / HTTP
-          </button>
-          <button
-            type="button"
-            className={`flex-1 py-1.5 text-sm font-medium rounded-md transition-colors ${transport === "stdio" ? "bg-blue-600 text-white shadow" : "text-slate-600 hover:text-slate-900 hover:bg-slate-200"}`}
-            onClick={() => setMcpFormData((prev: MCPServerFormData) => ({ ...prev, transport: "stdio" }))}
-          >
-            STDIO
-          </button>
-          <button
-            type="button"
-            className={`flex-1 py-1.5 text-sm font-medium rounded-md transition-colors ${transport === "websocket" ? "bg-blue-600 text-white shadow" : "text-slate-600 hover:text-slate-900 hover:bg-slate-200"}`}
-            onClick={() => setMcpFormData((prev: MCPServerFormData) => ({ ...prev, transport: "websocket" }))}
-          >
-            WebSocket
-          </button>
+        <div className="flex bg-slate-100 p-1 rounded-md flex-wrap gap-1">
+          {(["streamable_http", "sse", "stdio", "websocket"] as const).map((t) => (
+            <button
+              key={t}
+              type="button"
+              className={`flex-1 py-1.5 text-sm font-medium rounded-md transition-colors ${transport === t ? "bg-blue-600 text-white shadow" : "text-slate-600 hover:text-slate-900 hover:bg-slate-200"}`}
+              onClick={() => setMcpFormData((prev: MCPServerFormData) => ({ ...prev, transport: t }))}
+            >
+              {t === "sse" ? "SSE" : t === "streamable_http" ? "HTTP" : t === "stdio" ? "STDIO" : "WebSocket"}
+            </button>
+          ))}
         </div>
       </div>
 
@@ -153,7 +142,7 @@ export function CustomMcpForm({
               id="url"
               value={mcpFormData.config?.url || ""}
               onChange={(e) => updateConfig("url", e.target.value)}
-              placeholder={transport === "websocket" ? "wss://mcp.example.com/ws" : "https://mcp.example.com"}
+              placeholder={transport === "websocket" ? "wss://mcp.example.com/ws" : transport === "streamable_http" ? "https://mcp.example.com/mcp" : "https://mcp.example.com/sse"}
             />
           </div>
 

@@ -4,6 +4,7 @@ This module provides adapters to convert MCP tools into Agent system Tool format
 enabling MCP tools to be used in DAG plan-execute patterns and other agent workflows.
 """
 
+import asyncio
 import logging
 import os
 from typing import Any, Dict, List, Mapping, Optional, Type
@@ -351,47 +352,61 @@ async def load_mcp_tools_as_agent_tools(
         try:
             logger.info(f"Loading tools from MCP server: {server_name}")
 
-            # Create session and list tools
-            async with create_session(connection) as session:
-                await session.initialize()
-
-                # List available tools
-                tools_result = await session.list_tools()
-                mcp_tools = tools_result.tools if tools_result.tools else []
-
-                logger.info(f"Found {len(mcp_tools)} tools from server {server_name}")
-
-                # Convert each MCP tool to Agent tool
-                for mcp_tool in mcp_tools:
-                    try:
-                        # Clean server name for prefix (replace spaces/dashes with underscores)
-                        clean_server_name = server_name.replace(" ", "_").replace(
-                            "-", "_"
+            mcp_tools = []
+            last_error: Exception = RuntimeError(
+                f"Failed to load tools from {server_name}"
+            )
+            transport = connection.get("transport", "")
+            non_retryable = {"oauth", "unknown"}
+            max_attempts = 1 if transport in non_retryable else 3
+            for attempt in range(max_attempts):
+                try:
+                    async with create_session(connection) as session:
+                        await session.initialize()
+                        tools_result = await session.list_tools()
+                        mcp_tools = tools_result.tools if tools_result.tools else []
+                    break
+                except Exception as e:
+                    last_error = e
+                    if attempt < max_attempts - 1:
+                        logger.warning(
+                            f"Attempt {attempt + 1} failed to load tools from MCP server {server_name}: {e}, retrying..."
                         )
+                        await asyncio.sleep(1)
+            else:
+                raise last_error
 
-                        # Create tool name with server prefix
-                        tool_prefix = (
-                            f"{name_prefix}{clean_server_name}_"
-                            if name_prefix
-                            else f"{clean_server_name}_"
-                        )
+            logger.info(f"Found {len(mcp_tools)} tools from server {server_name}")
 
-                        adapter = MCPToolAdapter(
-                            mcp_tool=mcp_tool,
-                            connection=connection,
-                            name_prefix=tool_prefix,
-                            visibility=visibility,
-                            allow_users=allow_users,
-                        )
+            # Convert each MCP tool to Agent tool
+            for mcp_tool in mcp_tools:
+                try:
+                    # Clean server name for prefix (replace spaces/dashes with underscores)
+                    clean_server_name = server_name.replace(" ", "_").replace("-", "_")
 
-                        agent_tools.append(adapter)
-                        logger.debug(f"Created adapter for tool: {adapter.name}")
+                    # Create tool name with server prefix
+                    tool_prefix = (
+                        f"{name_prefix}{clean_server_name}_"
+                        if name_prefix
+                        else f"{clean_server_name}_"
+                    )
 
-                    except Exception as e:
-                        logger.error(
-                            f"Failed to create adapter for tool {mcp_tool.name}: {e}"
-                        )
-                        continue
+                    adapter = MCPToolAdapter(
+                        mcp_tool=mcp_tool,
+                        connection=connection,
+                        name_prefix=tool_prefix,
+                        visibility=visibility,
+                        allow_users=allow_users,
+                    )
+
+                    agent_tools.append(adapter)
+                    logger.debug(f"Created adapter for tool: {adapter.name}")
+
+                except Exception as e:
+                    logger.error(
+                        f"Failed to create adapter for tool {mcp_tool.name}: {e}"
+                    )
+                    continue
 
         except Exception as e:
             logger.error(f"Failed to load tools from MCP server {server_name}: {e}")

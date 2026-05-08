@@ -261,7 +261,11 @@ class TestDAGConcurrentExecution:
         execution_order = []
 
         async def mock_execute_step(
-            step, tool_map, execution_results, skill_context=None
+            step,
+            tool_map,
+            execution_results,
+            skill_context=None,
+            is_builder_context=False,
         ):
             execution_order.append(step.id)
             await asyncio.sleep(0.05)  # Simulate work
@@ -296,7 +300,11 @@ class TestDAGConcurrentExecution:
         execution_order = []
 
         async def mock_execute_step(
-            step, tool_map, execution_results, skill_context=None
+            step,
+            tool_map,
+            execution_results,
+            skill_context=None,
+            is_builder_context=False,
         ):
             execution_order.append(step.id)
             await asyncio.sleep(0.05)  # Simulate work
@@ -332,7 +340,11 @@ class TestDAGConcurrentExecution:
         execution_order = []
 
         async def mock_execute_step(
-            step, tool_map, execution_results, skill_context=None
+            step,
+            tool_map,
+            execution_results,
+            skill_context=None,
+            is_builder_context=False,
         ):
             execution_order.append(step.id)
             await asyncio.sleep(0.05)  # Simulate work
@@ -375,7 +387,11 @@ class TestDAGConcurrentExecution:
         max_concurrent_seen = [0]  # Use list to allow modification in closure
 
         async def mock_execute_step(
-            step, tool_map, execution_results, skill_context=None
+            step,
+            tool_map,
+            execution_results,
+            skill_context=None,
+            is_builder_context=False,
         ):
             current_executions.append(step.id)
             max_concurrent_seen[0] = max(
@@ -412,7 +428,11 @@ class TestDAGConcurrentExecution:
 
         # Make step2 fail
         async def mock_execute_step(
-            step, tool_map, execution_results, skill_context=None
+            step,
+            tool_map,
+            execution_results,
+            skill_context=None,
+            is_builder_context=False,
         ):
             if step.id == "step2":
                 raise Exception("Step 2 failed")
@@ -446,7 +466,11 @@ class TestDAGConcurrentExecution:
         )
 
         async def mock_execute_step(
-            step, tool_map, execution_results, skill_context=None
+            step,
+            tool_map,
+            execution_results,
+            skill_context=None,
+            is_builder_context=False,
         ):
             await asyncio.sleep(0.05)
             return {"success": True, "step_id": step.id}
@@ -531,7 +555,11 @@ class TestDAGConcurrentExecution:
         max_executions = 10  # Prevent infinite test loops
 
         async def mock_execute_step(
-            step, tool_map, execution_results, skill_context=None
+            step,
+            tool_map,
+            execution_results,
+            skill_context=None,
+            is_builder_context=False,
         ):
             nonlocal execution_count
             execution_count += 1
@@ -614,7 +642,11 @@ class TestDAGConcurrentExecution:
         tool_map = {"fast": MockTool("fast")}
 
         async def mock_execute_step(
-            step, tool_map, execution_results, skill_context=None
+            step,
+            tool_map,
+            execution_results,
+            skill_context=None,
+            is_builder_context=False,
         ):
             if step.id == "step1":
                 raise Exception("Step 1 failed")

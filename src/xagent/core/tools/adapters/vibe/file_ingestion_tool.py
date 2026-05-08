@@ -1,6 +1,8 @@
+import asyncio
 import logging
 import re
 import time
+from functools import partial
 from pathlib import Path
 from typing import Any, List, Mapping, Optional, Type
 
@@ -68,7 +70,10 @@ class CreateKnowledgeBaseFromFileTool(AbstractBaseTool):
 
             from .....web.models.database import get_db
             from .....web.models.uploaded_file import UploadedFile
-            from ...core.RAG_tools.core.schemas import IngestionConfig
+            from ...core.RAG_tools.core.schemas import (
+                DEFAULT_EMBEDDING_MODEL_ID,
+                IngestionConfig,
+            )
             from ...core.RAG_tools.pipelines.document_ingestion import (
                 run_document_ingestion,
             )
@@ -79,12 +84,12 @@ class CreateKnowledgeBaseFromFileTool(AbstractBaseTool):
             db: Session = next(db_gen)
 
             try:
-                file_records = (
-                    db.query(UploadedFile)
-                    .filter(UploadedFile.file_id.in_(tool_args.file_ids))
-                    .filter(UploadedFile.user_id == self.user_id)
-                    .all()
+                query = db.query(UploadedFile).filter(
+                    UploadedFile.file_id.in_(tool_args.file_ids)
                 )
+                if not self.is_admin:
+                    query = query.filter(UploadedFile.user_id == self.user_id)
+                file_records = query.all()
 
                 if not file_records:
                     return CreateKnowledgeBaseFromFileResult(
@@ -104,7 +109,7 @@ class CreateKnowledgeBaseFromFileTool(AbstractBaseTool):
                     )[:30]
                     collection_name = f"{base_name}_{int(time.time())}"
 
-                config = IngestionConfig(embedding_model_id="text-embedding-v4")
+                config = IngestionConfig(embedding_model_id=DEFAULT_EMBEDDING_MODEL_ID)
 
                 ingested_count = 0
                 errors = []
@@ -116,9 +121,6 @@ class CreateKnowledgeBaseFromFileTool(AbstractBaseTool):
                             f"File not found on disk: {record.filename} (file_id={record.file_id})"
                         )
                         continue
-
-                    import asyncio
-                    from functools import partial
 
                     loop = asyncio.get_running_loop()
                     func = partial(

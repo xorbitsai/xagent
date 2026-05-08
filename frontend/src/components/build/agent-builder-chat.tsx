@@ -39,6 +39,26 @@ export interface AgentConfig {
   selectedToolCategories?: string[]
 }
 
+interface BuildChatPayload {
+  message: string
+  id?: number | string
+  name: string
+  description: string
+  instructions: string
+  executionMode: string
+  suggestedPrompts: string[]
+  selectedKbs?: string[]
+  selectedSkills?: string[]
+  tool_categories: string[]
+  models: {
+    general?: number | null
+    small_fast?: number | null
+    visual?: number | null
+    compact?: number | null
+  }
+  files?: { file_id: string; name: string; size: number; type: string }[]
+}
+
 interface AgentBuilderChatProps {
   agentConfig: AgentConfig
   onUpdateConfig: (config: Partial<AgentConfig>) => void
@@ -161,7 +181,7 @@ export function AgentBuilderChat({ agentConfig, onUpdateConfig, availableOptions
       });
 
       const { modelConfig, selectedToolCategories, ...restConfig } = agentConfig
-      const payload: any = {
+      const payload: BuildChatPayload = {
         message: finalMessage,
         ...restConfig,
         tool_categories: finalToolCategories,

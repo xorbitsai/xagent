@@ -1520,14 +1520,6 @@ async def handle_chat_message(
 
                     # Continuation will be handled by old task, return directly
                     return
-                elif task_is_running and not has_continuation:
-                    logger.info(
-                        f"Task {task_id} is running with a non-DAG agent (no continuation support), "
-                        "treating as new execution turn"
-                    )
-                    # Fall through to the else branch below to start a new execution turn
-                    pass
-
                 if not (task_is_running and has_continuation):
                     # New task (PENDING/COMPLETED/FAILED) OR running non-DAG agent (new turn)
                     logger.info(

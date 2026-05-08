@@ -68,7 +68,11 @@ class CreateKnowledgeBaseFromUrlTool(AbstractBaseTool):
         try:
             import time
 
-            from ...core.RAG_tools.core.schemas import IngestionConfig, WebCrawlConfig
+            from ...core.RAG_tools.core.schemas import (
+                DEFAULT_EMBEDDING_MODEL_ID,
+                IngestionConfig,
+                WebCrawlConfig,
+            )
             from ...core.RAG_tools.pipelines.web_ingestion import run_web_ingestion
 
             tool_args = CreateKnowledgeBaseFromUrlArgs.model_validate(args)
@@ -94,7 +98,9 @@ class CreateKnowledgeBaseFromUrlTool(AbstractBaseTool):
                 max_depth=2,
             )
 
-            ingest_config = IngestionConfig(embedding_model_id="text-embedding-v4")
+            ingest_config = IngestionConfig(
+                embedding_model_id=DEFAULT_EMBEDDING_MODEL_ID
+            )
 
             logger.info(
                 f"Starting background web ingestion for {tool_args.url} into {collection_name}"

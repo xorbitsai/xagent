@@ -91,6 +91,7 @@ class PlanExecutor:
         plan: ExecutionPlan,
         tool_map: Dict[str, Tool],
         skill_context: Optional[str] = None,
+        is_builder_context: bool = False,
     ) -> List[Dict[str, Any]]:
         """Execute the plan using queue-driven concurrent execution
 
@@ -98,6 +99,7 @@ class PlanExecutor:
             plan: Execution plan with steps
             tool_map: Tool name to tool mapping
             skill_context: Optional skill context to pass to step execution
+            is_builder_context: Whether execution runs inside an agent-builder skill
         """
         logger.info(
             f"Executing plan {plan.id} with {len(plan.steps)} steps (max concurrency: {self.max_concurrency})"
@@ -175,7 +177,11 @@ class PlanExecutor:
 
                 async with self._semaphore:
                     result = await self._execute_step_with_react_agent(
-                        step, tool_map, execution_results, skill_context
+                        step,
+                        tool_map,
+                        execution_results,
+                        skill_context,
+                        is_builder_context,
                     )
 
                 # Handle successful completion
@@ -546,6 +552,7 @@ class PlanExecutor:
         tool_map: Dict[str, Tool],
         execution_results: Optional[List[Dict[str, Any]]] = None,
         skill_context: Optional[str] = None,
+        is_builder_context: bool = False,
     ) -> Dict[str, Any]:
         """Execute a single step using ReAct agent
 
@@ -554,6 +561,7 @@ class PlanExecutor:
             tool_map: Tool name to tool mapping
             execution_results: Optional list of execution results
             skill_context: Optional skill context to pass to context builder
+            is_builder_context: Whether this step runs inside an agent-builder skill
         """
         logger.info(f"Executing step {step.id}: {step.name}")
 
@@ -685,6 +693,7 @@ class PlanExecutor:
                 conversation_history=conversation_history,
                 file_info=file_info,
                 uploaded_files=uploaded_files,
+                is_builder_context=is_builder_context,
             )
 
             # Add the current step task, with tool info and original goal context

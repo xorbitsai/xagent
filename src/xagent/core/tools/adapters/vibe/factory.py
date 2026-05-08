@@ -65,6 +65,7 @@ class ToolRegistry:
                 basic_tools,
                 browser_tools,
                 custom_api_factory,
+                file_ingestion_tool,
                 image_tool,
                 knowledge_tools,
                 mcp_tools,

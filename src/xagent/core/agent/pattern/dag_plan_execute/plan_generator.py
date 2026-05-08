@@ -505,6 +505,16 @@ class PlanGenerator:
                 logger.info(
                     f"[should_chat_directly] Context state keys: {list(context.state.keys())}"
                 )
+
+                # HARD SHORT-CIRCUIT: If files are uploaded, MUST generate a plan
+                if context.state.get("file_info") or context.state.get(
+                    "uploaded_files"
+                ):
+                    logger.info(
+                        "[should_chat_directly] SHORT-CIRCUIT: Files detected in context, forcing plan execution"
+                    )
+                    return PlanGeneratorResult(type="plan")
+
                 if "system_prompt" in context.state:
                     logger.info(
                         f"[should_chat_directly] System prompt in context: {context.state['system_prompt'][:200]}..."
@@ -697,16 +707,15 @@ class PlanGenerator:
 
         # Check if custom system prompt is provided in context (e.g., file information)
         custom_prompt = ""
-        if (
-            context
-            and hasattr(context, "state")
-            and "system_prompt" in context.state
-            and context.state["system_prompt"]
-        ):
-            custom_prompt = context.state["system_prompt"]
-            logger.info(
-                f"[_build_classification_prompt] Using custom system prompt from context: {custom_prompt[:100]}..."
-            )
+        has_uploaded_files = False
+        if context and hasattr(context, "state"):
+            if "system_prompt" in context.state and context.state["system_prompt"]:
+                custom_prompt = context.state["system_prompt"]
+                logger.info(
+                    f"[_build_classification_prompt] Using custom system prompt from context: {custom_prompt[:100]}..."
+                )
+            if context.state.get("uploaded_files") or context.state.get("file_info"):
+                has_uploaded_files = True
 
         # Build tools context with new format
         tools_context = ""
@@ -714,8 +723,20 @@ class PlanGenerator:
             tools_context = self._build_tools_context(tools)
 
         # Build system prompt
+        file_force_plan_rule = ""
+        if has_uploaded_files:
+            file_force_plan_rule = (
+                "\n\n## CRITICAL OVERRIDE: Files Have Been Uploaded\n"
+                "The user has uploaded files (file_ids are present in the context above). "
+                'You MUST return `{"type": "plan"}` immediately. '
+                'Do NOT return type="chat". Do NOT ask the user to upload files again. '
+                "Do NOT create a 'wait for upload' or 'wait for file' step — the files are already available. "
+                "The plan must start directly with `create_knowledge_base_from_file` using the provided file_ids.\n\n"
+            )
+
         system_prompt = (
             custom_prompt
+            + file_force_plan_rule
             + """You are an intelligent task assistant. Analyze the user's input and decide:
 
 1. **Direct Answer (type: "chat")** - If the user asks a simple question that you can answer directly without executing any tasks
@@ -1066,16 +1087,15 @@ When you return type="chat" (direct answer mode), you are providing a TEXT RESPO
         # Check if custom system prompt is provided in context
         custom_prompt = ""
         use_custom_role = False
-        if (
-            context
-            and hasattr(context, "state")
-            and "system_prompt" in context.state
-            and context.state["system_prompt"]
-        ):
-            # User's instruction replaces the default role "You are an AI planning assistant..."
-            # But keeps the planning capability description
-            custom_prompt = context.state["system_prompt"]
-            use_custom_role = True
+        has_uploaded_files = False
+        uploaded_file_ids: list = []
+        if context and hasattr(context, "state"):
+            if "system_prompt" in context.state and context.state["system_prompt"]:
+                custom_prompt = context.state["system_prompt"]
+                use_custom_role = True
+            if context.state.get("file_info"):
+                has_uploaded_files = True
+                uploaded_file_ids = [f["file_id"] for f in context.state["file_info"]]
 
         # Build tools context with new format
         tools_context = ""
@@ -1114,6 +1134,16 @@ When you return type="chat" (direct answer mode), you are providing a TEXT RESPO
                 "\n" + skill_context + "\n\n"
                 "IMPORTANT: A skill is available above that provides domain knowledge and templates. "
                 "Use this skill's knowledge and templates to improve the quality and relevance of your plan.\n"
+            )
+
+        if has_uploaded_files and uploaded_file_ids:
+            file_ids_str = ", ".join(f'"{fid}"' for fid in uploaded_file_ids)
+            system_prompt += (
+                "\n\n## CRITICAL OVERRIDE: Files Have Been Uploaded\n"
+                f"The user has already uploaded files. Their exact UUIDs are: [{file_ids_str}]\n"
+                "You MUST NOT create a 'wait for upload' or 'wait for file' step in your plan.\n"
+                "The plan MUST start immediately with processing these files. "
+                "If the goal is to build an agent/knowledge base, start directly with `create_knowledge_base_from_file` using the file_ids listed above.\n\n"
             )
 
         system_prompt += (

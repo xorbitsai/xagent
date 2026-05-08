@@ -703,6 +703,14 @@ class PlanExecutor:
             # Special handling for conditional nodes
             if step.is_conditional:
                 valid_branches = list(step.conditional_branches.keys())
+                branches_example = (
+                    valid_branches[0] if valid_branches else "branch_name"
+                )
+                branches_hint = (
+                    f"(e.g., '{valid_branches[0]}' or '{valid_branches[1]}')"
+                    if len(valid_branches) >= 2
+                    else f"(e.g., '{branches_example}')"
+                )
                 task_message = (
                     f"{goal_reminder}"
                     f"Execute: {step.name} (Conditional Node)\n"
@@ -710,9 +718,9 @@ class PlanExecutor:
                     f"IMPORTANT: You must choose ONE of the following branches:\n"
                     f"{', '.join(valid_branches)}\n\n"
                     f"In your final JSON response, set the 'answer' field to ONLY contain the branch name "
-                    f"(e.g., '{valid_branches[0]}' or '{valid_branches[1]}').\n\n"
+                    f"{branches_hint}.\n\n"
                     f"Example:\n"
-                    f'{{\n  "type": "final_answer",\n  "reasoning": "Based on the analysis, the answer was found",\n  "answer": "{valid_branches[0]}",\n  "success": true,\n  "error": null\n}}\n'
+                    f'{{\n  "type": "final_answer",\n  "reasoning": "Based on the analysis, the answer was found",\n  "answer": "{branches_example}",\n  "success": true,\n  "error": null\n}}\n'
                 )
             elif tool_names:
                 task_message_parts = [

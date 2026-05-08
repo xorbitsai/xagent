@@ -99,18 +99,23 @@ class ContextBuilder:
         ]
 
         # Add file information if available
-        if uploaded_files and file_info:
+        if file_info:
+            file_ids_str = ", ".join(
+                f'"{f.get("file_id")}"' for f in file_info if f.get("file_id")
+            )
             messages.append(
                 {
                     "role": "user",
-                    "content": f"UPLOADED FILES: {len(uploaded_files)} files available for processing:\n"
+                    "content": f"## UPLOADED FILES: {len(file_info)} files available for processing:\n"
                     + "\n".join(
                         [
-                            f"- {f.get('name', 'unknown')} ({f.get('size', 0)} bytes, {f.get('type', 'unknown')}) - File ID: {file_id}"
-                            for f, file_id in zip(file_info, uploaded_files)
+                            f"- {f.get('name', 'unknown')} ({f.get('size', 0)} bytes, {f.get('type', 'unknown')})"
+                            for f in file_info
                         ]
                     )
-                    + "\nThese files have been uploaded and are available in the workspace.",
+                    + f"\n\nUse these exact file_ids (UUIDs) with `create_knowledge_base_from_file`:\n"
+                    f"  file_ids = [{file_ids_str}]\n\n"
+                    "IMPORTANT: Use the exact UUIDs listed above as file_ids. Do NOT use file paths as file_ids.",
                 }
             )
 

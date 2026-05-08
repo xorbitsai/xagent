@@ -1369,15 +1369,19 @@ async def handle_chat_message(
                     if file_info_list:
                         context["uploaded_files"] = uploaded_file_paths
                         context["file_info"] = file_info_list
-                        file_summary = "\n".join(
-                            [
-                                f"- {f['name']} (ID: {f['file_id']}, {f['size']} bytes, {f['type']}, Path: {f['path']})"
-                                for f in file_info_list
-                            ]
-                        )
+                        file_ids = [f["file_id"] for f in file_info_list]
+                        file_names = [f["name"] for f in file_info_list]
+                        file_id_list_str = ", ".join(f'"{fid}"' for fid in file_ids)
                         file_prompt = (
-                            "Uploaded files are available at the following absolute paths:\n"
-                            f"{file_summary}"
+                            "## UPLOADED FILES\n"
+                            f"The user has uploaded {len(file_info_list)} file(s): {file_names}\n\n"
+                            f"Use these exact file_ids (UUIDs) with `create_knowledge_base_from_file`:\n"
+                            f"  file_ids = [{file_id_list_str}]\n\n"
+                            "IMPORTANT: The file_ids above are UUIDs (e.g. '5d983e39-a83b-...'). "
+                            "Do NOT use file paths as file_ids. "
+                            "Call `create_knowledge_base_from_file` with the file_ids listed above, "
+                            "then create or update the agent with the returned collection_name. "
+                            "Do NOT generate a 'wait for upload' step — the files are already uploaded."
                         )
                         existing_prompt = context.get("system_prompt")
                         if existing_prompt:
@@ -1485,22 +1489,17 @@ async def handle_chat_message(
                     # Continuation will be handled by old task, return directly
                     return
                 elif task_is_running and not has_continuation:
-                    # Task is running but doesn't support continuation (shouldn't happen)
-                    logger.error(
-                        f"Task {task_id} is running but does not support continuation"
-                    )
-                    await manager.send_personal_message(
-                        {
-                            "type": "error",
-                            "message": "Task does not support message continuation",
-                        },
-                        websocket,
-                    )
-                    return
-                else:
-                    # New task (PENDING/COMPLETED/FAILED), execute normally
                     logger.info(
-                        f"Task {task_id} is not running (status: {task.status.value}), starting new execution"
+                        f"Task {task_id} is running with a non-DAG agent (no continuation support), "
+                        "treating as new execution turn"
+                    )
+                    # Fall through to the else branch below to start a new execution turn
+                    pass
+
+                if not (task_is_running and has_continuation):
+                    # New task (PENDING/COMPLETED/FAILED) OR running non-DAG agent (new turn)
+                    logger.info(
+                        f"Task {task_id} starting new execution turn (status: {task.status.value})"
                     )
 
                     if persisted_user_message is not None:
@@ -2549,13 +2548,33 @@ async def handle_builder_chat(
             if isinstance(last_msg, dict) and last_msg.get("role") == "user":
                 user_message = last_msg.get("content", "")
 
-        # Inject explicit reminder for context preservation if it's a System Note about KB
-        # TODO/Workaround: Currently relying on string matching for "[System Note:" which is fragile.
-        # Consider using a structured message format (e.g., specific role or payload field) for system notes in the future.
-        if "[System Note:" in user_message and (
-            "knowledge base" in user_message or "ingest it" in user_message
-        ):
-            user_message += "\n\nCRITICAL REMINDER: Continue building the agent based on the user's ORIGINAL requirements (name, role, specific instructions) from earlier in the conversation. Do NOT generate a generic name like 'FAQ Bot' and do NOT forget the original context."
+        # Handle uploaded files: upload to server and inject file_ids into message
+        files = message_data.get("files", [])
+        if files:
+            from ..models.uploaded_file import UploadedFile as _UploadedFile
+
+            file_ids = []
+            for file_info in files:
+                file_id = file_info.get("file_id")
+                if not file_id:
+                    continue
+                record = (
+                    db.query(_UploadedFile)
+                    .filter(
+                        _UploadedFile.file_id == file_id,
+                        _UploadedFile.user_id == int(user.id),
+                    )
+                    .first()
+                )
+                if record:
+                    file_ids.append(file_id)
+
+            if file_ids:
+                user_message += (
+                    f"\n\n[Uploaded file_ids: {file_ids}. "
+                    "Please call `create_knowledge_base_from_file` with these file_ids immediately, "
+                    "then create or update the agent with the resulting collection_name.]"
+                )
 
         # Build current_config back from top-level keys
         current_config = {
@@ -2594,6 +2613,11 @@ Important instructions:
      CRITICAL INSTRUCTION: You MUST set your DECISION JSON type to "tool_call" to invoke `ask_user_question`. Your text reasoning should explain why you are asking the user. The system will then prompt you to generate the native tool call parameters. Do NOT include the "message" or "interactions" in your DECISION JSON block.
    - Do NOT proceed to create or update the agent until the knowledge base is ready.
 
+File upload handling:
+- When the user uploads files, their file_ids will be provided in the message context under "uploaded_file_ids".
+- If file_ids are present, you MUST IMMEDIATELY call `create_knowledge_base_from_file` with those file_ids to create the knowledge base.
+- Do NOT ask the user to upload again if file_ids are already provided.
+
 You have access to the following tools:
 - create_agent: Create a new agent with specific capabilities
 - update_agent: Update an existing agent with specific capabilities
@@ -2602,8 +2626,10 @@ You have access to the following tools:
 - list_knowledge_bases: Query the list of knowledge bases you can associate with an agent
 - ask_user_question: Ask the user a question with a clarification form when you need their input or decision (e.g., about creating a knowledge base)
 - create_knowledge_base_from_url: Create a knowledge base by crawling a given website URL (use this automatically if the user provided a URL)
+- create_knowledge_base_from_file: Create a knowledge base from already-uploaded files using their file_ids (use this when the user has uploaded files)
 
-Use the create_agent tool whenever the user wants to build a new agent and there is no agent ID in the current configuration. If a System Note says a knowledge base was created, use create_agent to build the agent and attach the knowledge base. CRITICAL: When continuing after a System Note about knowledge base creation, you MUST retrieve and use the user's ORIGINAL requirements (name, role, instructions, etc.) from earlier in the conversation. Do NOT generate generic names like "FAQ Bot" or "Data Q&A Agent", and do NOT forget the original context!
+Use the create_agent tool whenever the user wants to build a new agent and there is no agent ID in the current configuration.
+CRITICAL: Always use the user's ORIGINAL requirements (name, role, instructions, etc.) from earlier in the conversation. Do NOT generate generic names like "FAQ Bot" or "Data Q&A Agent"!
 Use the update_agent tool whenever the user wants to modify their current agent configuration and an agent ID is available in the current configuration.
 If the user wants to add skills, tool categories, or knowledge bases but you are unsure which ones exist, use the list_* tools to find out before calling create_agent or update_agent.
 """
@@ -2655,6 +2681,9 @@ If the user wants to add skills, tool categories, or knowledge bases but you are
             from ...core.tools.adapters.vibe.document_search import (
                 ListKnowledgeBasesTool,
             )
+            from ...core.tools.adapters.vibe.file_ingestion_tool import (
+                CreateKnowledgeBaseFromFileTool,
+            )
             from ...core.tools.adapters.vibe.web_ingestion_tool import (
                 CreateKnowledgeBaseFromUrlTool,
             )
@@ -2681,6 +2710,9 @@ If the user wants to add skills, tool categories, or knowledge bases but you are
             create_kb_url_tool = CreateKnowledgeBaseFromUrlTool(
                 user_id=int(user.id), is_admin=bool(user.is_admin)
             )
+            create_kb_file_tool = CreateKnowledgeBaseFromFileTool(
+                user_id=int(user.id), is_admin=bool(user.is_admin)
+            )
 
             # Build allowed external directories
             allowed_external_dirs = []
@@ -2705,6 +2737,7 @@ If the user wants to add skills, tool categories, or knowledge bases but you are
                     list_kbs_tool,
                     ask_user_question_tool,
                     create_kb_url_tool,
+                    create_kb_file_tool,
                 ],
                 use_dag_pattern=False,  # Use ReAct pattern
                 id=builder_task_id,

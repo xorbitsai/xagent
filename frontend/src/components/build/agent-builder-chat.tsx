@@ -118,56 +118,59 @@ export function AgentBuilderChat({ agentConfig, onUpdateConfig, availableOptions
 
     let currentReply = ""
     let finalMessage = text;
+    let uploadedFileIds: { file_id: string; name: string; size: number; type: string }[] = [];
 
     if (files && files.length > 0) {
       try {
-        // Create a more meaningful name from the first file, falling back to a generic name
-        let baseName = files[0].name.split('.')[0].replace(/[^a-zA-Z0-9_-]/g, '_');
-        if (!baseName || baseName.length < 2) baseName = 'documents';
-        const collectionName = `${baseName}_${Math.floor(Date.now() / 1000)}`;
+        const formData = new FormData();
+        files.forEach(f => formData.append('files', f));
+        formData.append('task_type', 'task');
 
-        for (const file of files) {
-          const formData = new FormData();
-          formData.append('file', file);
-          formData.append('collection', collectionName);
-
-          const response = await apiRequest(`${getApiUrl()}/api/kb/ingest`, {
-            method: 'POST',
-            body: formData,
-          });
-          if (!response.ok) {
-            throw new Error(`Upload failed: ${response.statusText}`);
-          }
+        const uploadResponse = await apiRequest(`${getApiUrl()}/api/files/upload`, {
+          method: 'POST',
+          body: formData,
+        });
+        if (!uploadResponse.ok) {
+          throw new Error(`Upload failed: ${uploadResponse.statusText}`);
         }
-
-        finalMessage += `\n\n[System Note: The user has uploaded ${files.length} file(s). I have automatically created a knowledge base named "${collectionName}" with these files. You MUST NOT use list_knowledge_bases to check it, just ASSUME it exists. If the agent does not exist yet (no agent ID), use create_agent to build it and include "${collectionName}" in the knowledge_bases list. If it exists, use update_agent. CRITICAL REMINDER: CONTINUE building the agent based on the user's ORIGINAL requirements (name, role, etc.) to prevent forgetting the initial context. Do not generate generic names like "FAQ Bot" or "Data Q&A Agent".]`;
+        const uploadData = await uploadResponse.json();
+        if (uploadData.success && Array.isArray(uploadData.files)) {
+          uploadedFileIds = uploadData.files.map((f: any) => ({
+            file_id: f.file_id,
+            name: f.filename || '',
+            size: f.file_size || 0,
+            type: f.mime_type || '',
+          }));
+        }
       } catch (err) {
-        console.error("Failed to upload files to KB", err);
-        toast.error("Failed to upload files to create knowledge base");
+        console.error("Failed to upload files", err);
+        toast.error("Failed to upload files");
         setIsLoading(false);
-        setMessages(prev => prev.slice(0, -1)); // Remove the empty assistant message
+        setMessages(prev => prev.slice(0, -1));
         return;
       }
     } else if (metadata?.url) {
-      // Extract the URL from the structured metadata instead of matching raw text
       const url = metadata.url;
-      finalMessage += `\n\n[System Note: The user has provided the website URL: ${url}. Please IMMEDIATELY use the \`create_knowledge_base_from_url\` tool to ingest it, then create/update the agent with the new knowledge base. Do not ask for the URL again. CRITICAL REMINDER: CONTINUE building the agent based on the user's ORIGINAL requirements (name, role, etc.) to prevent forgetting the initial context. Do not generate generic names like "FAQ Bot" or "Data Q&A Agent".]`;
+      finalMessage += `\n\n[System Note: The user has provided the website URL: ${url}. Please IMMEDIATELY use the \`create_knowledge_base_from_url\` tool to ingest it, then create/update the agent with the new knowledge base. Do not ask for the URL again.]`;
     }
 
     const sendPayload = (ws: WebSocket) => {
-      // Add selected MCP servers back into tool_categories
       const finalToolCategories = [...(agentConfig.selectedToolCategories || [])];
       toolCategories.forEach(server => {
         finalToolCategories.push(`mcp:${server}`);
       });
 
       const { modelConfig, selectedToolCategories, ...restConfig } = agentConfig
-      ws.send(JSON.stringify({
+      const payload: any = {
         message: finalMessage,
         ...restConfig,
         tool_categories: finalToolCategories,
         models: modelConfig || {}
-      }))
+      }
+      if (uploadedFileIds.length > 0) {
+        payload.files = uploadedFileIds;
+      }
+      ws.send(JSON.stringify(payload))
     }
 
     try {

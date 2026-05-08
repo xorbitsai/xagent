@@ -1372,17 +1372,49 @@ async def handle_chat_message(
                         file_ids = [f["file_id"] for f in file_info_list]
                         file_names = [f["name"] for f in file_info_list]
                         file_id_list_str = ", ".join(f'"{fid}"' for fid in file_ids)
+
+                        # Check if this task is an agent-builder task to inject KB instructions
+                        is_agent_builder = False
+                        if task.agent_id:
+                            from ..models.agent import Agent
+
+                            agent_record = (
+                                db.query(Agent)
+                                .filter(Agent.id == task.agent_id)
+                                .first()
+                            )
+                            if agent_record and agent_record.skills:
+                                if isinstance(agent_record.skills, list):
+                                    is_agent_builder = any(
+                                        s == "agent-builder"
+                                        for s in agent_record.skills
+                                    )
+                                elif isinstance(agent_record.skills, str):
+                                    is_agent_builder = (
+                                        "agent-builder" in agent_record.skills
+                                    )
+
                         file_prompt = (
                             "## UPLOADED FILES\n"
                             f"The user has uploaded {len(file_info_list)} file(s): {file_names}\n\n"
-                            f"Use these exact file_ids (UUIDs) with `create_knowledge_base_from_file`:\n"
-                            f"  file_ids = [{file_id_list_str}]\n\n"
-                            "IMPORTANT: The file_ids above are UUIDs (e.g. '5d983e39-a83b-...'). "
-                            "Do NOT use file paths as file_ids. "
-                            "Call `create_knowledge_base_from_file` with the file_ids listed above, "
-                            "then create or update the agent with the returned collection_name. "
-                            "Do NOT generate a 'wait for upload' step — the files are already uploaded."
                         )
+
+                        if is_agent_builder:
+                            file_prompt += (
+                                f"Use these exact file_ids (UUIDs) with `create_knowledge_base_from_file`:\n"
+                                f"  file_ids = [{file_id_list_str}]\n\n"
+                                "IMPORTANT: The file_ids above are UUIDs (e.g. '5d983e39-a83b-...'). "
+                                "Do NOT use file paths as file_ids. "
+                                "Call `create_knowledge_base_from_file` with the file_ids listed above, "
+                                "then create or update the agent with the returned collection_name. "
+                                "Do NOT generate a 'wait for upload' step — the files are already uploaded."
+                            )
+                        else:
+                            file_prompt += (
+                                "These files have been successfully uploaded to the workspace and are ready for processing.\n"
+                                "You can use standard workspace tools to read, analyze, or process them."
+                            )
+
                         existing_prompt = context.get("system_prompt")
                         if existing_prompt:
                             context["system_prompt"] = (

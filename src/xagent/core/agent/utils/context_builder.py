@@ -103,19 +103,43 @@ class ContextBuilder:
             file_ids_str = ", ".join(
                 f'"{f.get("file_id")}"' for f in file_info if f.get("file_id")
             )
+
+            # Build file list string with absolute paths if uploaded_files is available
+            file_list_lines = []
+            if uploaded_files and len(uploaded_files) == len(file_info):
+                for f, fpath in zip(file_info, uploaded_files):
+                    file_list_lines.append(
+                        f"- {f.get('name', 'unknown')} ({f.get('size', 0)} bytes, {f.get('type', 'unknown')})\n  Absolute Path: {fpath}"
+                    )
+            else:
+                for f in file_info:
+                    file_list_lines.append(
+                        f"- {f.get('name', 'unknown')} ({f.get('size', 0)} bytes, {f.get('type', 'unknown')})"
+                    )
+
+            file_list_str = "\n".join(file_list_lines)
+
+            # Build content message that supports both generic file processing and KB creation
+            content_msg = f"## UPLOADED FILES: {len(file_info)} files available for processing:\n{file_list_str}\n\n"
+
+            # Only append the KB specific instruction if we are in agent builder context
+            # We can infer this loosely by checking if skill_context mentions 'agent-builder' or 'create_knowledge_base'
+            if skill_context and (
+                "agent-builder" in skill_context or "create_agent" in skill_context
+            ):
+                content_msg += (
+                    f"Use these exact file_ids (UUIDs) with `create_knowledge_base_from_file`:\n"
+                    f"  file_ids = [{file_ids_str}]\n\n"
+                    "IMPORTANT: Use the exact UUIDs listed above as file_ids. Do NOT use file paths as file_ids."
+                )
+            else:
+                # Generic instruction for normal tasks
+                content_msg += "NOTE: Use the 'Absolute Path' provided above when reading or analyzing these files with standard file tools."
+
             messages.append(
                 {
                     "role": "user",
-                    "content": f"## UPLOADED FILES: {len(file_info)} files available for processing:\n"
-                    + "\n".join(
-                        [
-                            f"- {f.get('name', 'unknown')} ({f.get('size', 0)} bytes, {f.get('type', 'unknown')})"
-                            for f in file_info
-                        ]
-                    )
-                    + f"\n\nUse these exact file_ids (UUIDs) with `create_knowledge_base_from_file`:\n"
-                    f"  file_ids = [{file_ids_str}]\n\n"
-                    "IMPORTANT: Use the exact UUIDs listed above as file_ids. Do NOT use file paths as file_ids.",
+                    "content": content_msg,
                 }
             )
 

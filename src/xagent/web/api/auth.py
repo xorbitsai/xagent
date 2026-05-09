@@ -693,7 +693,7 @@ def generic_oauth_login(
         params["include_granted_scopes"] = "true"
         params["prompt"] = "consent"
     if provider.lower() == "zoom":
-            params["prompt"] = "login"
+        params["prompt"] = "login"
     if scope_str:
         params["scope"] = scope_str
 

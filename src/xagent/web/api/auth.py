@@ -692,10 +692,13 @@ def generic_oauth_login(
         params["access_type"] = "offline"
         params["include_granted_scopes"] = "true"
         params["prompt"] = "consent"
+    if provider.lower() == "zoom":
+            params["prompt"] = "login"
     if scope_str:
         params["scope"] = scope_str
 
-    full_auth_url = f"{auth_url}?{urlencode(params)}"
+    separator = "&" if "?" in auth_url else "?"
+    full_auth_url = f"{auth_url}{separator}{urlencode(params)}"
     return RedirectResponse(full_auth_url)
 
 

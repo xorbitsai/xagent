@@ -134,3 +134,26 @@ Body-only skill instructions.
             == "Use when the requested output is a poster or image."
         )
         assert skill["tags"] == ["image", "design"]
+
+    def test_parse_frontmatter_empty_scalar_fields(self, tmp_path):
+        """Empty frontmatter scalar fields should not become list strings."""
+        skill_dir = tmp_path / "empty_frontmatter_skill"
+        skill_dir.mkdir()
+
+        (skill_dir / "SKILL.md").write_text(
+            """---
+description:
+when_to_use:
+tags:
+  - rag
+---
+
+# Empty Frontmatter Skill
+"""
+        )
+
+        skill = SkillParser.parse(skill_dir)
+
+        assert skill["description"] == ""
+        assert skill["when_to_use"] == ""
+        assert skill["tags"] == ["rag"]

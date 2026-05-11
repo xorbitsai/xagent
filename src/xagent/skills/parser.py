@@ -60,9 +60,9 @@ class SkillParser:
             "content": content,  # Complete SKILL.md content
             "template": template_content,  # template.md content (if exists)
             "description": section_description
-            or str(frontmatter.get("description", "")),
+            or SkillParser._frontmatter_string(frontmatter, "description"),
             "when_to_use": section_when_to_use
-            or str(frontmatter.get("when_to_use", "")),
+            or SkillParser._frontmatter_string(frontmatter, "when_to_use"),
             "execution_flow": SkillParser._extract_section(content, "Execution Flow"),
             "tags": tags,
             "files": SkillParser._list_files(skill_dir),
@@ -96,10 +96,12 @@ class SkillParser:
 
             stripped_line = line.strip()
             if stripped_line.startswith("- ") and current_list_key:
-                values = metadata.setdefault(current_list_key, [])
+                values = metadata.get(current_list_key)
+                if not isinstance(values, list):
+                    values = []
+                    metadata[current_list_key] = values
                 value = stripped_line[2:].strip().strip("\"'")
-                if isinstance(values, list):
-                    values.append(value)
+                values.append(value)
                 continue
 
             current_list_key = None
@@ -110,13 +112,19 @@ class SkillParser:
             key = key.strip()
             value = value.strip()
             if not value:
-                metadata[key] = []
+                metadata[key] = ""
                 current_list_key = key
                 continue
 
             metadata[key] = value.strip("\"'")
 
         return metadata
+
+    @staticmethod
+    def _frontmatter_string(frontmatter: Dict, key: str) -> str:
+        """Return a scalar frontmatter field or an empty string."""
+        value = frontmatter.get(key)
+        return value if isinstance(value, str) else ""
 
     @staticmethod
     def _extract_section(content: str, section_name: str) -> str:

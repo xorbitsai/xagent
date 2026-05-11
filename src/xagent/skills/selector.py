@@ -155,6 +155,10 @@ If no skill is directly relevant, return selected: false."""
                 logger.error(f"Content was: {content}")
                 return None
 
+        if not isinstance(result, dict):
+            logger.info("No skill selected. Reasoning: Invalid JSON response")
+            return None
+
         if not result.get("selected"):
             reasoning = result.get("reasoning", "No reasoning provided")
             logger.info(f"No skill selected. Reasoning: {reasoning}")

@@ -9,7 +9,7 @@ from xagent.skills.selector import SkillSelector
 
 
 class FakeLLM:
-    def __init__(self, response: dict[str, Any]) -> None:
+    def __init__(self, response: Any) -> None:
         self.response = response
 
     async def chat(self, **kwargs: Any) -> dict[str, str]:
@@ -68,3 +68,15 @@ async def test_selector_allows_source_bound_skill_with_explicit_scope() -> None:
     )
 
     assert selected == SOURCE_BOUND_SKILL
+
+
+@pytest.mark.asyncio
+async def test_selector_ignores_non_object_json_response() -> None:
+    selector = SkillSelector(FakeLLM(["not", "an", "object"]))
+
+    selected = await selector.select(
+        "Use the uploaded documents in the knowledge base to summarize risks.",
+        [SOURCE_BOUND_SKILL],
+    )
+
+    assert selected is None

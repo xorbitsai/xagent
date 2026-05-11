@@ -111,6 +111,7 @@ const zh = {
     },
     sections: {
       startingPrompts: "快捷指令",
+      chatWithAgents: "与智能体聊天",
     },
     agents: {
       researcher: "研究助手",

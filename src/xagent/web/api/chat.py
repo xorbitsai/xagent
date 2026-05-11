@@ -136,6 +136,7 @@ async def create_default_tools(
     allowed_skills: Optional[List[str]] = None,
     allowed_tools: Optional[List[str]] = None,
     excluded_agent_id: Optional[int] = None,
+    delegate_agent_ids: Optional[List[int]] = None,
     vision_model: Optional[Any] = None,
     sandbox: Optional[Any] = None,
     llm: Optional[Any] = None,
@@ -174,6 +175,8 @@ async def create_default_tools(
     # Store excluded_agent_id in tool_config for agent tool filtering
     if excluded_agent_id:
         tool_config._excluded_agent_id = excluded_agent_id
+    if delegate_agent_ids is not None:
+        tool_config._delegate_agent_ids = delegate_agent_ids
 
     # Use sandbox if available
     if sandbox:
@@ -742,6 +745,14 @@ class AgentServiceManager:
                         f"Tool categories {tool_categories} mapped to {len(allowed_tools)} tools for task {task_id}"
                     )
 
+                delegate_agent_ids: Optional[List[int]] = None
+                if task and isinstance(task.delegate_agent_ids, list):
+                    delegate_agent_ids = [
+                        int(agent_id)
+                        for agent_id in task.delegate_agent_ids
+                        if isinstance(agent_id, int)
+                    ]
+
                 # Create tools using ToolFactory
                 tools = await create_default_tools(
                     db,
@@ -754,6 +765,7 @@ class AgentServiceManager:
                     allowed_skills=agent_config["skills"] if agent_config else None,
                     allowed_tools=allowed_tools,
                     excluded_agent_id=excluded_agent_id,
+                    delegate_agent_ids=delegate_agent_ids,
                     vision_model=task_vision_llm,  # Pass task-specific vision model
                     sandbox=sandbox,
                     llm=task_llm,  # Pass task-specific LLM
@@ -804,6 +816,32 @@ class AgentServiceManager:
                     system_prompt = enhance_system_prompt_with_kb(
                         system_prompt, kb_list
                     )
+
+                    if delegate_agent_ids:
+                        delegate_agents = (
+                            db.query(Agent)
+                            .filter(
+                                Agent.user_id == int(user.id),
+                                Agent.id.in_(delegate_agent_ids),
+                            )
+                            .all()
+                        )
+                        if delegate_agents:
+                            delegate_lines = [
+                                f"- {agent.name}: {agent.description or 'Use this agent when its specialty matches the task.'}"
+                                for agent in delegate_agents
+                            ]
+                            delegate_prompt = (
+                                "\n\n[Delegation Instructions]\n"
+                                "You can delegate subtasks to the following selected agents.\n"
+                                "Use them when their specialization matches the user's request.\n"
+                                + "\n".join(delegate_lines)
+                            )
+                            system_prompt = (
+                                (system_prompt or "") + delegate_prompt
+                                if system_prompt
+                                else delegate_prompt.lstrip("\n")
+                            )
 
                     # Extract memory similarity threshold from agent config
                     memory_similarity_threshold = None
@@ -1443,6 +1481,8 @@ async def create_task(
 ) -> TaskCreateResponse:
     """Create new chat task"""
     try:
+        from ..models.agent import Agent as AgentModel
+
         # Build task description with file information
         task_description = request.description or ""
 
@@ -1490,6 +1530,32 @@ async def create_task(
                 else:
                     task_description = "File processing task:\n" + "\n".join(
                         file_info_list
+                    )
+
+        delegate_agent_ids: list[int] = []
+        if request.delegate_agent_ids:
+            requested_delegate_ids = [
+                int(agent_id)
+                for agent_id in request.delegate_agent_ids
+                if isinstance(agent_id, int)
+            ]
+            if requested_delegate_ids:
+                delegate_agents = (
+                    db.query(AgentModel)
+                    .filter(
+                        AgentModel.user_id == int(user.id),
+                        AgentModel.id.in_(requested_delegate_ids),
+                        AgentModel.status.in_(  # type: ignore[attr-defined]
+                            ["published"]
+                        ),
+                    )
+                    .all()
+                )
+                delegate_agent_ids = [int(agent.id) for agent in delegate_agents]
+                if len(delegate_agent_ids) != len(set(requested_delegate_ids)):
+                    raise HTTPException(
+                        status_code=400,
+                        detail="Some delegate agents are invalid or do not belong to the current user",
                     )
 
         # Set LLM configuration for this task first to get model info.
@@ -1594,8 +1660,6 @@ async def create_task(
         llm_ids_to_use = request.llm_ids
         if not llm_ids_to_use and request.agent_id:
             # Fetch model configuration from agent
-            from ..models.agent import Agent as AgentModel
-
             agent_db = (
                 db.query(AgentModel)
                 .filter(
@@ -1683,6 +1747,8 @@ async def create_task(
             task_agent_config.update(request.agent_config)
         if selected_file_ids:
             task_agent_config["selected_file_ids"] = selected_file_ids
+        if delegate_agent_ids:
+            task_agent_config["delegate_agent_ids"] = delegate_agent_ids
 
         task_execution_mode = request.execution_mode
         if not task_execution_mode:
@@ -1711,6 +1777,7 @@ async def create_task(
             process_description=request.process_description,
             examples=examples_data,
             agent_id=request.agent_id,  # Set agent_id if provided
+            delegate_agent_ids=delegate_agent_ids,
         )
 
         # Set agent_type using the property to avoid Column type issues
@@ -1751,6 +1818,8 @@ async def create_task(
             channel_name=task.channel_name,
         )
 
+    except HTTPException:
+        raise
     except Exception as e:
         logger.error(f"Create task failed: {e}")
         raise HTTPException(status_code=500, detail=str(e))

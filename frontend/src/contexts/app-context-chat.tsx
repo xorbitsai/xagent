@@ -3526,6 +3526,9 @@ export function AppProvider({ children, token }: { children: React.ReactNode; to
         if (config?.agentId) {
           requestBody.agent_id = config.agentId
         }
+        if (Array.isArray(config?.delegateAgentIds)) {
+          requestBody.delegate_agent_ids = config.delegateAgentIds
+        }
         if (config?.agentType) {
           requestBody.agent_type = config.agentType
         }

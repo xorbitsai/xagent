@@ -1,25 +1,48 @@
 import React from "react";
-import { Sparkles } from "lucide-react";
+import { Bot, Sparkles, Smartphone } from "lucide-react";
 import { ChatInput } from "@/components/chat/ChatInput";
 import { useI18n } from "@/contexts/i18n-context";
+import {
+  Tooltip,
+  TooltipContent,
+  TooltipProvider,
+  TooltipTrigger,
+} from "@/components/ui/tooltip";
+import { getApiUrl } from "@/lib/utils";
 
 export interface PromptCard {
   icon?: any;
   title?: string;
   description?: string;
   prompt: string;
+  promptHighlights?: string[];
   color?: string;
   bg?: string;
+}
+
+export interface AgentCard {
+  id: number | string;
+  name: string;
+  description?: string | null;
+  logo_url?: string | null;
+  status?: string;
 }
 
 interface ChatStartScreenProps {
   title: string;
   description?: string;
+  icon?: React.ReactNode | string; // URL string or ReactNode
   prompts?: (PromptCard | string)[];
+  agents?: AgentCard[];
+  onAgentClick?: (agent: AgentCard) => void;
+  selectedAgents?: AgentCard[];
+  onRemoveSelectedAgent?: (agentId: number | string) => void;
   onSend: (message: string, files: File[], config?: any) => void;
   isSending?: boolean;
   inputValue?: string;
   onInputChange?: (value: string) => void;
+  onPromptSelect?: (prompt: string, promptHighlights?: string[]) => void;
+  promptHighlightTerms?: string[];
   files?: File[];
   onFilesChange?: (files: File[]) => void;
   showModeToggle?: boolean;
@@ -32,11 +55,18 @@ interface ChatStartScreenProps {
 export function ChatStartScreen({
   title,
   description,
+  icon,
   prompts,
+  agents,
+  onAgentClick,
+  selectedAgents = [],
+  onRemoveSelectedAgent,
   onSend,
   isSending = false,
   inputValue,
   onInputChange,
+  onPromptSelect,
+  promptHighlightTerms = [],
   files = [],
   onFilesChange,
   showModeToggle = false,
@@ -47,7 +77,11 @@ export function ChatStartScreen({
 }: ChatStartScreenProps) {
   const { t } = useI18n();
 
-  const handlePromptClick = (prompt: string) => {
+  const handlePromptClick = (prompt: string, promptHighlights?: string[]) => {
+    if (onPromptSelect) {
+      onPromptSelect(prompt, promptHighlights);
+      return;
+    }
     if (onInputChange) {
       onInputChange(prompt);
     }
@@ -72,10 +106,13 @@ export function ChatStartScreen({
             showModeToggle={showModeToggle}
             inputValue={inputValue}
             onInputChange={onInputChange}
+            promptHighlightTerms={promptHighlightTerms}
             readOnlyConfig={readOnlyConfig}
             taskConfig={taskConfig}
             autoFocus={autoFocus}
             minHeightClass={inputMinHeightClass}
+            selectedAgents={selectedAgents}
+            onRemoveSelectedAgent={onRemoveSelectedAgent}
           />
         </div>
 
@@ -106,7 +143,7 @@ export function ChatStartScreen({
                 return (
                   <div
                     key={index}
-                    onClick={() => handlePromptClick(promptText)}
+                    onClick={() => handlePromptClick(promptText, item.promptHighlights)}
                     className="group relative px-4 py-3 min-h-[72px] rounded-xl border border-border bg-card hover:bg-muted/50 cursor-pointer transition-all duration-300 flex flex-row items-center text-left gap-4"
                   >
                     <div className="flex items-center justify-center shrink-0 h-10 w-10 rounded-lg bg-blue-50 dark:bg-blue-900/20 text-blue-500">
@@ -117,6 +154,78 @@ export function ChatStartScreen({
                 );
               })}
             </div>
+
+            {/* Chat with Agents section */}
+            {(agents && agents.length > 0) || !agents ? (
+              <>
+                <div className="flex items-center gap-2 text-xs font-bold text-slate-400 uppercase tracking-wider mb-2 mt-8 px-1">
+                  <Bot className="w-3.5 h-3.5" />
+                  <span>{t("chatPage.sections.chatWithAgents")}</span>
+                </div>
+                {/* Horizontal scroll container for agents, limited width to show about 3 items initially */}
+                <TooltipProvider delayDuration={200}>
+                  <div className="flex gap-6 mt-4 overflow-x-auto pb-4 pt-2 px-1 snap-x snap-mandatory scrollbar-hide max-w-[260px]" style={{ scrollbarWidth: 'none', msOverflowStyle: 'none' }}>
+                    {agents ? (
+                      agents.map((agent) => {
+                        const isSelected = selectedAgents.some(
+                          (selectedAgent) => selectedAgent.id === agent.id
+                        );
+
+                        return (
+                          <Tooltip key={agent.id}>
+                            <TooltipTrigger asChild>
+                              <div
+                                className="flex flex-col items-center gap-2 cursor-pointer group flex-shrink-0 snap-start w-[64px]"
+                                onClick={() => onAgentClick?.(agent)}
+                              >
+                                <div className={`w-12 h-12 rounded-full bg-blue-100 flex items-center justify-center text-blue-600 shadow-sm border overflow-hidden transition-all ${isSelected ? "border-primary ring-2 ring-primary/20" : "border-blue-200 group-hover:shadow-md"}`}>
+                                  {agent.logo_url ? (
+                                    <img src={agent.logo_url.startsWith('http') ? agent.logo_url : `${getApiUrl()}${agent.logo_url}`} alt={agent.name} className="w-full h-full object-cover" />
+                                  ) : (
+                                    <Bot className="w-6 h-6" />
+                                  )}
+                                </div>
+                                <span className={`text-xs font-medium text-center leading-tight max-w-[64px] line-clamp-2 ${isSelected ? "text-primary" : "text-muted-foreground"}`} title={agent.name}>{agent.name}</span>
+                              </div>
+                            </TooltipTrigger>
+                            {agent.description ? (
+                              <TooltipContent side="top" className="max-w-[240px] text-left">
+                                <div className="space-y-1">
+                                  <div className="font-medium">{agent.name}</div>
+                                  <p className="text-xs text-muted-foreground">{agent.description}</p>
+                                </div>
+                              </TooltipContent>
+                            ) : null}
+                          </Tooltip>
+                        );
+                      })
+                    ) : (
+                      // Fallback mocked agents to match design if no agents prop provided
+                      <>
+                        <div className="flex flex-col items-center gap-2 cursor-pointer group flex-shrink-0 snap-start w-[64px]">
+                          <div className="w-12 h-12 rounded-full bg-blue-100 flex items-center justify-center text-blue-600 shadow-sm border border-blue-200 group-hover:shadow-md transition-all">
+                            <Bot className="w-6 h-6" />
+                          </div>
+                          <span className="text-xs text-muted-foreground font-medium text-center leading-tight max-w-[64px]">{t("chatPage.agents.researcher")}</span>
+                        </div>
+                        <div className="flex flex-col items-center gap-2 cursor-pointer group flex-shrink-0 snap-start w-[64px]">
+                          <div className="w-12 h-12 rounded-full bg-purple-100 flex items-center justify-center text-purple-600 shadow-sm border border-purple-200 group-hover:shadow-md transition-all">
+                            <Sparkles className="w-6 h-6" />
+                          </div>
+                          <span className="text-xs text-muted-foreground font-medium text-center leading-tight max-w-[64px]">{t("chatPage.agents.poster")}</span>
+                        </div>
+                        <div className="flex flex-col items-center gap-2 cursor-pointer group flex-shrink-0 snap-start w-[64px]">
+                          <div className="w-12 h-12 rounded-full bg-blue-50 flex items-center justify-center text-blue-500 shadow-sm border border-blue-200 group-hover:shadow-md transition-all">
+                            <Smartphone className="w-6 h-6" />
+                          </div>
+                          <span className="text-xs text-muted-foreground font-medium text-center leading-tight max-w-[64px]">{t("chatPage.agents.linkedin")}</span>
+                        </div>
+                      </>
+                    )}
+                  </div>
+                </TooltipProvider>
+              </>
+            ) : null}
           </div>
         )}
       </div>

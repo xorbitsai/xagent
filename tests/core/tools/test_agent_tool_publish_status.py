@@ -85,3 +85,68 @@ def test_owner_sees_only_own_published_agents_not_drafts() -> None:
             os.remove(db_path)
         except OSError:
             pass
+
+
+def test_allowed_agent_ids_include_only_selected_published_user_agents() -> None:
+    db, db_path = _create_session()
+    try:
+        owner = User(username="owner3", password_hash="x", is_admin=False)
+        other_user = User(username="other3", password_hash="x", is_admin=False)
+        db.add_all([owner, other_user])
+        db.commit()
+        db.refresh(owner)
+        db.refresh(other_user)
+
+        selected_published = Agent(
+            user_id=owner.id,
+            name="Selected Published Agent",
+            status=AgentStatus.PUBLISHED,
+        )
+        selected_draft = Agent(
+            user_id=owner.id,
+            name="Selected Draft Agent",
+            status=AgentStatus.DRAFT,
+        )
+        unselected_published = Agent(
+            user_id=owner.id,
+            name="Unselected Published Agent",
+            status=AgentStatus.PUBLISHED,
+        )
+        other_users_agent = Agent(
+            user_id=other_user.id,
+            name="Other Users Agent",
+            status=AgentStatus.PUBLISHED,
+        )
+        db.add_all(
+            [
+                selected_published,
+                selected_draft,
+                unselected_published,
+                other_users_agent,
+            ]
+        )
+        db.commit()
+
+        tools = get_published_agents_tools(
+            db=db,
+            user_id=owner.id,
+            allowed_agent_ids=[
+                selected_published.id,
+                selected_draft.id,
+                other_users_agent.id,
+            ],
+        )
+        tool_names = {tool.name for tool in tools}
+
+        assert "call_agent_selected_published_agent" in tool_names
+        assert "call_agent_selected_draft_agent" not in tool_names
+        assert "call_agent_unselected_published_agent" not in tool_names
+        assert "call_agent_other_users_agent" not in tool_names
+    finally:
+        db.close()
+        try:
+            import os
+
+            os.remove(db_path)
+        except OSError:
+            pass

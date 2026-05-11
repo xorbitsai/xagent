@@ -111,6 +111,7 @@ const en = {
     },
     sections: {
       startingPrompts: "STARTING PROMPTS",
+      chatWithAgents: "CHAT WITH AGENTS",
     },
     agents: {
       researcher: "Researcher Agent",

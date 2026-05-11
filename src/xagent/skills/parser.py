@@ -6,6 +6,8 @@ import re
 from pathlib import Path
 from typing import Dict, List
 
+import yaml
+
 
 class SkillParser:
     """Parse SKILL.md files"""
@@ -47,12 +49,8 @@ class SkillParser:
         section_description = SkillParser._extract_section(content, "Description")
         section_when_to_use = SkillParser._extract_section(content, "When to Use")
         section_tags = SkillParser._extract_tags(content)
-        frontmatter_tags = frontmatter.get("tags")
-        tags = (
-            frontmatter_tags
-            if isinstance(frontmatter_tags, list) and frontmatter_tags
-            else section_tags
-        )
+        frontmatter_tags = SkillParser._frontmatter_string_list(frontmatter, "tags")
+        tags = frontmatter_tags or section_tags
 
         return {
             "name": skill_dir.name,
@@ -70,7 +68,7 @@ class SkillParser:
 
     @staticmethod
     def _extract_frontmatter(content: str) -> Dict:
-        """Extract simple YAML-style frontmatter from a skill file."""
+        """Extract YAML frontmatter from a skill file."""
         stripped = content.lstrip()
         if not stripped.startswith("---"):
             return {}
@@ -87,40 +85,13 @@ class SkillParser:
         if end_index is None:
             return {}
 
-        metadata: Dict[str, object] = {}
-        current_list_key: str | None = None
-        for raw_line in lines[1:end_index]:
-            line = raw_line.rstrip()
-            if not line.strip():
-                continue
+        frontmatter_text = "\n".join(lines[1:end_index])
+        try:
+            metadata = yaml.safe_load(frontmatter_text)
+        except yaml.YAMLError:
+            return {}
 
-            stripped_line = SkillParser._strip_yaml_comment(line).strip()
-            if not stripped_line:
-                continue
-            if stripped_line.startswith("- ") and current_list_key:
-                values = metadata.get(current_list_key)
-                if not isinstance(values, list):
-                    values = []
-                    metadata[current_list_key] = values
-                value = stripped_line[2:].strip().strip("\"'")
-                values.append(value)
-                continue
-
-            current_list_key = None
-            if ":" not in stripped_line:
-                continue
-
-            key, value = stripped_line.split(":", 1)
-            key = key.strip()
-            value = value.strip()
-            if not value:
-                metadata[key] = ""
-                current_list_key = key
-                continue
-
-            metadata[key] = value.strip("\"'")
-
-        return metadata
+        return metadata if isinstance(metadata, dict) else {}
 
     @staticmethod
     def _frontmatter_string(frontmatter: Dict, key: str) -> str:
@@ -129,28 +100,12 @@ class SkillParser:
         return value if isinstance(value, str) else ""
 
     @staticmethod
-    def _strip_yaml_comment(line: str) -> str:
-        """Strip simple YAML comments while preserving quoted # characters."""
-        quote: str | None = None
-        escaped = False
-
-        for index, char in enumerate(line):
-            if escaped:
-                escaped = False
-                continue
-            if char == "\\":
-                escaped = True
-                continue
-            if char in {"'", '"'}:
-                if quote == char:
-                    quote = None
-                elif quote is None:
-                    quote = char
-                continue
-            if char == "#" and quote is None:
-                return line[:index].rstrip()
-
-        return line
+    def _frontmatter_string_list(frontmatter: Dict, key: str) -> List[str]:
+        """Return a list of string frontmatter values or an empty list."""
+        value = frontmatter.get(key)
+        if not isinstance(value, list):
+            return []
+        return [item for item in value if isinstance(item, str)]
 
     @staticmethod
     def _extract_section(content: str, section_name: str) -> str:

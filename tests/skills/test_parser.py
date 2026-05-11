@@ -181,3 +181,34 @@ tags:
         assert skill["description"] == "Create # tagged assets."
         assert skill["when_to_use"] == "Use for visual output."
         assert skill["tags"] == ["image"]
+
+    def test_parse_frontmatter_uses_yaml_parser(self, tmp_path):
+        """Valid YAML frontmatter forms should populate routing metadata."""
+        skill_dir = tmp_path / "yaml_frontmatter_skill"
+        skill_dir.mkdir()
+
+        (skill_dir / "SKILL.md").write_text(
+            """---
+description: |
+  Create assets with multiline instructions.
+  Use C# examples when requested.
+when_to_use: >
+  Use when the task asks for visual
+  output variants.
+tags: [image, design]
+---
+
+# YAML Frontmatter Skill
+"""
+        )
+
+        skill = SkillParser.parse(skill_dir)
+
+        assert (
+            skill["description"]
+            == "Create assets with multiline instructions.\nUse C# examples when requested.\n"
+        )
+        assert skill["when_to_use"] == (
+            "Use when the task asks for visual output variants.\n"
+        )
+        assert skill["tags"] == ["image", "design"]

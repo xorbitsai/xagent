@@ -159,7 +159,7 @@ If no skill is directly relevant, return selected: false."""
             logger.info("No skill selected. Reasoning: Invalid JSON response")
             return None
 
-        if not result.get("selected"):
+        if self._llm_bool(result.get("selected")) is not True:
             reasoning = result.get("reasoning", "No reasoning provided")
             logger.info(f"No skill selected. Reasoning: {reasoning}")
             return None
@@ -197,11 +197,21 @@ If no skill is directly relevant, return selected: false."""
 
     def _should_reject_selected_skill(self, result: Dict) -> bool:
         """Reject when the LLM says the selected skill needs a missing source scope."""
-        return bool(
-            result.get("selected")
-            and result.get("source_scope_required")
-            and not result.get("source_scope_satisfied")
-        )
+        if self._llm_bool(result.get("source_scope_required")) is not True:
+            return False
+        return self._llm_bool(result.get("source_scope_satisfied")) is not True
+
+    def _llm_bool(self, value: Any) -> bool | None:
+        """Normalize boolean fields from LLM JSON responses."""
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, str):
+            normalized = value.strip().lower()
+            if normalized == "true":
+                return True
+            if normalized == "false":
+                return False
+        return None
 
     def _build_prompt(self, task: str, candidates: List[Dict]) -> str:
         """Build selection prompt"""

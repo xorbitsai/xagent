@@ -80,3 +80,46 @@ async def test_selector_ignores_non_object_json_response() -> None:
     )
 
     assert selected is None
+
+
+@pytest.mark.asyncio
+async def test_selector_normalizes_string_boolean_source_scope() -> None:
+    selector = SkillSelector(
+        FakeLLM(
+            {
+                "selected": "true",
+                "skill_name": "document-evidence-skill",
+                "reasoning": "The task needs evidence retrieval.",
+                "source_scope_required": "true",
+                "source_scope_satisfied": "false",
+                "source_scope_reasoning": "No scoped source was provided.",
+            }
+        )
+    )
+
+    selected = await selector.select(
+        "Summarize recent AI supply chain attacks and list affected vendors.",
+        [SOURCE_BOUND_SKILL],
+    )
+
+    assert selected is None
+
+
+@pytest.mark.asyncio
+async def test_selector_treats_selected_string_false_as_not_selected() -> None:
+    selector = SkillSelector(
+        FakeLLM(
+            {
+                "selected": "false",
+                "skill_name": "document-evidence-skill",
+                "reasoning": "No direct match.",
+            }
+        )
+    )
+
+    selected = await selector.select(
+        "Summarize recent AI supply chain attacks and list affected vendors.",
+        [SOURCE_BOUND_SKILL],
+    )
+
+    assert selected is None

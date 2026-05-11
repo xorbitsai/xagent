@@ -85,7 +85,7 @@ export function ChatStartScreen({
               <Sparkles className="w-3.5 h-3.5" />
               <span>{t("chatPage.sections.startingPrompts")}</span>
             </div>
-            <div className={`grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-4`}>
+            <div className={`grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-4`}>
               {prompts.map((item, index) => {
                 const isString = typeof item === 'string';
                 const promptText = isString ? item : item.prompt;

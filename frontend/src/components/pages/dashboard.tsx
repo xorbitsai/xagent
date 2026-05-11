@@ -277,7 +277,7 @@ export function DashboardPage() {
         </div>
 
         {/* Statistics cards */}
-        <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-6 mb-8">
+        <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-4 gap-6 mb-8">
           {stats.map((stat, index) => {
             // Define different gradient backgrounds for each statistic card
             const getStatGradient = () => {
@@ -312,7 +312,7 @@ export function DashboardPage() {
         {/* Main features */}
         <div className="mb-8">
           <h2 className="text-2xl font-semibold mb-6 text-foreground">{t('dashboard.features.title')}</h2>
-          <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6">
+          <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-6">
             {mainFeatures.map((feature, index) => {
               // Determine hover text color based on color
               const getHoverColor = () => {
@@ -364,7 +364,7 @@ export function DashboardPage() {
         </div>
 
         {/* Main Content */}
-        <div className="grid grid-cols-1 lg:grid-cols-3 gap-8">
+        <div className="grid grid-cols-1 xl:grid-cols-3 gap-8">
           {/* Recent Tasks */}
           <div className="lg:col-span-2">
             <div className="flex items-center justify-between mb-4">

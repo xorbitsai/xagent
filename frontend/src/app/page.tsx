@@ -229,7 +229,7 @@ export default function Home() {
 
           {/* Get Started Section */}
           <h2 className="text-[20px] font-bold mb-6 text-foreground">{t("home.getStarted.title")}</h2>
-          <div ref={getStartedSectionRef} className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-5 mb-14">
+          <div ref={getStartedSectionRef} className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-4 gap-5 mb-14">
             {[
               { title: t("home.getStarted.video.title"), desc: t("home.getStarted.video.description", { appName: branding.appName }), video: "/videos/Tutorial.mp4" },
               { title: t("home.getStarted.docs.title"), desc: t("home.getStarted.docs.description"), video: "/videos/Documentation.mp4", link: "https://docs.xagent.run/" },
@@ -298,7 +298,7 @@ export default function Home() {
                 </Link>
               </div>
 
-              <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6 mb-14">
+              <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-6 mb-14">
                 {templates.map(template => (
                   <Card key={template.id} className="flex flex-col border-border/60 hover:shadow-lg transition-all duration-300 p-6 group bg-card rounded-2xl">
                     <div className="flex justify-between items-center mb-2">

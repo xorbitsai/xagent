@@ -2,6 +2,7 @@
 
 import { usePathname } from "next/navigation";
 import { Sidebar } from "@/components/layout/sidebar";
+import { MobileHeader } from "@/components/layout/mobile-header";
 import { AppProvider } from "@/contexts/app-context-chat";
 import { useAuth } from "@/contexts/auth-context";
 import { isAuthPublicPath } from "@/lib/auth-pages";
@@ -24,10 +25,15 @@ export function LayoutContent({ children }: LayoutContentProps) {
   return (
     <AppProvider token={token || undefined}>
       <div className="flex h-screen bg-background relative">
-        <Sidebar />
-        <main className="flex-1 flex flex-col overflow-hidden bg-background">
-          {children}
-        </main>
+        <div className="hidden xl:flex xl:shrink-0">
+          <Sidebar />
+        </div>
+        <div className="flex flex-1 flex-col overflow-hidden bg-background">
+          <MobileHeader />
+          <main className="flex-1 overflow-hidden bg-background">
+            {children}
+          </main>
+        </div>
       </div>
     </AppProvider>
   );

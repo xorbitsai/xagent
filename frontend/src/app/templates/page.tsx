@@ -189,7 +189,7 @@ export default function TemplatesPage() {
 
                 {section.isFeatured ? (
                   /* Featured: horizontal wide cards, 3-col */
-                  <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-5">
+                  <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-5">
                     {section.templates.slice(0, 3).map((template) => (
                       <div
                         key={template.id}
@@ -233,7 +233,7 @@ export default function TemplatesPage() {
                   </div>
                 ) : (
                   /* Category: standard cards, 4-col */
-                  <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 gap-5">
+                  <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 2xl:grid-cols-4 gap-5">
                     {section.templates.map((template) => (
                       <div
                         key={template.id}

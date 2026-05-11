@@ -420,7 +420,7 @@ export function ModelsPage() {
               </span>
             </div>
 
-            <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6">
+            <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-6">
               {Object.entries(enabledProviders).map(([providerId, providerModels]) => {
                 const providerConfig = providers.find(p => p.id === providerId) || {
                   id: providerId,
@@ -521,7 +521,7 @@ export function ModelsPage() {
               <h2 className="text-xl font-bold">{t('models.section.exploreProviders')}</h2>
             </div>
 
-            <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6">
+            <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-6">
               {exploreProviders.map(provider => (
                 <Card key={provider.id} className="p-6 hover:shadow-md transition-shadow flex flex-col justify-between h-full relative overflow-hidden group">
                   <div>

@@ -179,7 +179,7 @@ export function DefaultModelsSettings() {
           </Alert>
         )}
 
-        <div className="grid gap-6 md:grid-cols-2 lg:grid-cols-3">
+        <div className="grid gap-6 md:grid-cols-2 xl:grid-cols-3">
           {Object.entries(modelTypeConfig).map(([configType, config]) => {
             const currentDefault = defaultModels[configType as keyof typeof modelTypeConfig]
             const Icon = config.icon

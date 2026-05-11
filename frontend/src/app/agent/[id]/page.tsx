@@ -172,7 +172,7 @@ export default function AgentChatPage() {
 
   if (loading) {
     return (
-      <div className="flex items-center justify-center h-screen">
+      <div className="flex h-full items-center justify-center">
         <div className="text-center">
           <Bot className="h-12 w-12 mx-auto mb-4 animate-pulse text-muted-foreground" />
           <p className="text-muted-foreground">{t('builds.list.chat.loading')}</p>
@@ -183,7 +183,7 @@ export default function AgentChatPage() {
 
   return (
     <>
-      {!agent ? <div className="flex items-center justify-center min-h-screen">
+      {!agent ? <div className="flex h-full items-center justify-center">
         <div className="max-w-md w-full text-center space-y-6">
           {/* Icon */}
           <div className="flex justify-center">
@@ -211,7 +211,7 @@ export default function AgentChatPage() {
             {t('builds.list.header.create')}
           </Button>
         </div>
-      </div> : <div className="h-screen bg-background flex flex-col overflow-hidden">
+      </div> : <div className="h-full bg-background flex flex-col overflow-hidden">
         <div className="flex-1 overflow-y-auto">
           <main className="container max-w-4xl mx-auto px-4 py-8">
             <ChatStartScreen

@@ -326,7 +326,7 @@ export function MemoryPage() {
   }
 
   return (
-    <div className="flex flex-col h-screen bg-background">
+    <div className="flex h-full flex-col bg-background">
       {/* Top Header */}
       <div className="border-b flex justify-between items-center p-8">
         <div>

@@ -319,7 +319,7 @@ function TaskDetailContent() {
   return (
     <div
       ref={containerRef}
-      className={`h-screen bg-background relative transition-all flex ${anyPreviewOpen ? 'flex-row items-stretch' : 'flex-col'} overflow-hidden`}
+      className={`h-full bg-background relative transition-all flex ${anyPreviewOpen ? 'flex-row items-stretch' : 'flex-col'} overflow-hidden`}
     >
       {/* Back Button - Only show if this task is from an agent */}
       {state.currentTask?.agentId && (
@@ -525,7 +525,7 @@ function TaskDetailContent() {
 
 export default function TaskDetailPage() {
   return (
-    <Suspense fallback={<div className="flex items-center justify-center h-screen"><Loader2 className="w-8 h-8 animate-spin" /></div>}>
+    <Suspense fallback={<div className="flex items-center justify-center h-full"><Loader2 className="w-8 h-8 animate-spin" /></div>}>
       <TaskDetailContent />
     </Suspense>
   );

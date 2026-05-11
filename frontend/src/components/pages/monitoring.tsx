@@ -104,7 +104,7 @@ export function MonitoringPage() {
         </div>
 
         {/* Stats cards */}
-        <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-6 mb-8">
+        <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-4 gap-6 mb-8">
           <Card className="p-6 bg-[#161B22] border-[rgba(255,255,255,0.08)]">
             <div className="flex items-center justify-between">
               <div>
@@ -163,7 +163,7 @@ export function MonitoringPage() {
         </div>
 
         {/* Stats content */}
-        <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
+        <div className="grid grid-cols-1 xl:grid-cols-2 gap-6">
           <Card className="bg-[#161B22] border-[rgba(255,255,255,0.08)]">
             <div className="p-6">
               <h3 className="text-lg font-semibold text-[#E6EDF3] mb-4">{t('monitoring.models.title')}</h3>

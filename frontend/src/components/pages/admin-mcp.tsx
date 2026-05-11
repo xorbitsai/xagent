@@ -296,7 +296,7 @@ export default function AdminMcpPage() {
   }
 
   return (
-    <div className="flex flex-col h-screen bg-background">
+    <div className="flex h-full flex-col bg-background overflow-auto">
       <div className="flex justify-between items-center p-8">
         <div>
           <h1 className="text-2xl font-bold tracking-tight mb-1">{t("adminMcp.pageTitle")}</h1>
@@ -304,7 +304,7 @@ export default function AdminMcpPage() {
         </div>
       </div>
 
-      <div className="grid gap-6 md:grid-cols-12 items-start px-8">
+      <div className="grid gap-6 md:grid-cols-12 items-start px-8 pb-8">
         <div className="md:col-span-4">
           <Card className="shadow-sm">
             <CardHeader className="pb-3 border-b flex flex-row items-center justify-between space-y-0">

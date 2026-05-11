@@ -82,7 +82,7 @@ function formatStars(stars: number): string {
   return String(stars)
 }
 
-interface NavigationItem {
+export interface NavigationItem {
   name: string
   href: string
   icon: any
@@ -92,7 +92,7 @@ interface NavigationItem {
   nameKey?: string
 }
 
-interface NavigationGroup {
+export interface NavigationGroup {
   title: string
   titleKey?: string
   items: NavigationItem[]
@@ -152,7 +152,7 @@ const getMoreResourceItemsForUser = (user: any): NavigationItem[] => {
   return items
 }
 
-const getNavigationGroupsForUser = (user: any): NavigationGroup[] => [
+export const getNavigationGroupsForUser = (user: any): NavigationGroup[] => [
   {
     title: "Agent Development",
     titleKey: "nav.sections.agentDevelopment",
@@ -227,16 +227,17 @@ const baseUserMenuItems: NavigationItem[] = [
   }
 ]
 
-const getUserMenuItemsForUser = (_user: any): NavigationItem[] => {
+export const getUserMenuItemsForUser = (_user: any): NavigationItem[] => {
   return [...baseUserMenuItems]
 }
 
 interface SidebarProps {
   isCollapsible?: boolean
   className?: string
+  allowCollapse?: boolean
 }
 
-export function Sidebar({ className }: SidebarProps) {
+export function Sidebar({ className, allowCollapse = true }: SidebarProps) {
   const pathname = usePathname()
   const router = useRouter()
   const { user, logout } = useAuth()
@@ -595,6 +596,9 @@ export function Sidebar({ className }: SidebarProps) {
     if (!taskListRef.current || !isHistoryExpanded) return
 
     const { scrollHeight, clientHeight } = taskListRef.current
+    const isVisible = taskListRef.current.getClientRects().length > 0
+    if (!isVisible || clientHeight <= 0) return
+
     // If content height is less than or equal to container height (plus a buffer), and there is more data, and not loading
     if (scrollHeight <= clientHeight + 20 && hasMore && !isLoadingMore && !isLoadingTasks) {
       // Use setTimeout to avoid continuous state updates in one render cycle
@@ -630,6 +634,8 @@ export function Sidebar({ className }: SidebarProps) {
 
   const handleScroll = (e: React.UIEvent<HTMLElement>) => {
     const { scrollTop, scrollHeight, clientHeight } = e.currentTarget
+    if (clientHeight <= 0) return
+
     if (scrollHeight - scrollTop <= clientHeight + 20 && hasMore && !isLoadingMore && !isLoadingTasks) {
       loadTasks(page + 1, true)
     }
@@ -641,7 +647,7 @@ export function Sidebar({ className }: SidebarProps) {
   // /agent/[id] page does not auto-collapse (for agent chat)
   const isAgentChatPage = pathname.match(/^\/agent\/\d+$/)
   const isAgentPage = (pathname.startsWith('/agent') && !pathname.startsWith('/agent/vibe') && !isAgentChatPage)
-  const shouldShowSidebar = !isAgentPage || isExpanded
+  const shouldShowSidebar = !isAgentPage || isExpanded || !allowCollapse
 
   // Allow user to manually collapse the sidebar
   const [isSidebarOpen, setIsSidebarOpen] = useState(true)
@@ -693,7 +699,7 @@ export function Sidebar({ className }: SidebarProps) {
     return isPathActive(item.href)
   }
 
-  if ((isAgentPage && !shouldShowSidebar) || !isSidebarOpen) {
+  if (allowCollapse && ((isAgentPage && !shouldShowSidebar) || !isSidebarOpen)) {
     return (
       <div className="flex flex-col items-center justify-start py-4 w-[60px] bg-card border-r border-border shrink-0 h-full relative">
         <Link href="/task" className="flex items-center justify-center mb-8">
@@ -780,12 +786,14 @@ export function Sidebar({ className }: SidebarProps) {
           />
           <h1 className="text-[28px] font-bold" style={{ color: "#2745A6" }}>{branding.appName}</h1>
         </Link>
-        <button
-          onClick={() => isAgentPage ? setIsExpanded(false) : setIsSidebarOpen(false)}
-          className="absolute -right-3 top-4 bg-card border border-border rounded-full p-0.5 text-muted-foreground hover:text-foreground hover:bg-accent transition-colors z-50 shadow-sm"
-        >
-          <ChevronLeft className="h-4 w-4" />
-        </button>
+        {allowCollapse && (
+          <button
+            onClick={() => isAgentPage ? setIsExpanded(false) : setIsSidebarOpen(false)}
+            className="absolute -right-3 top-4 bg-card border border-border rounded-full p-0.5 text-muted-foreground hover:text-foreground hover:bg-accent transition-colors z-50 shadow-sm"
+          >
+            <ChevronLeft className="h-4 w-4" />
+          </button>
+        )}
       </div>
 
       {/* Navigation */}

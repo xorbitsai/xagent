@@ -94,7 +94,9 @@ class SkillParser:
             if not line.strip():
                 continue
 
-            stripped_line = line.strip()
+            stripped_line = SkillParser._strip_yaml_comment(line).strip()
+            if not stripped_line:
+                continue
             if stripped_line.startswith("- ") and current_list_key:
                 values = metadata.get(current_list_key)
                 if not isinstance(values, list):
@@ -125,6 +127,30 @@ class SkillParser:
         """Return a scalar frontmatter field or an empty string."""
         value = frontmatter.get(key)
         return value if isinstance(value, str) else ""
+
+    @staticmethod
+    def _strip_yaml_comment(line: str) -> str:
+        """Strip simple YAML comments while preserving quoted # characters."""
+        quote: str | None = None
+        escaped = False
+
+        for index, char in enumerate(line):
+            if escaped:
+                escaped = False
+                continue
+            if char == "\\":
+                escaped = True
+                continue
+            if char in {"'", '"'}:
+                if quote == char:
+                    quote = None
+                elif quote is None:
+                    quote = char
+                continue
+            if char == "#" and quote is None:
+                return line[:index].rstrip()
+
+        return line
 
     @staticmethod
     def _extract_section(content: str, section_name: str) -> str:

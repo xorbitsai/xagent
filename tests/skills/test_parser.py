@@ -157,3 +157,27 @@ tags:
         assert skill["description"] == ""
         assert skill["when_to_use"] == ""
         assert skill["tags"] == ["rag"]
+
+    def test_parse_frontmatter_ignores_yaml_comments(self, tmp_path):
+        """Frontmatter comments should not leak into skill metadata."""
+        skill_dir = tmp_path / "commented_frontmatter_skill"
+        skill_dir.mkdir()
+
+        (skill_dir / "SKILL.md").write_text(
+            """---
+# Skill metadata
+description: "Create # tagged assets." # inline note
+when_to_use: Use for visual output. # routing note
+tags:
+  - image # visual
+---
+
+# Commented Frontmatter Skill
+"""
+        )
+
+        skill = SkillParser.parse(skill_dir)
+
+        assert skill["description"] == "Create # tagged assets."
+        assert skill["when_to_use"] == "Use for visual output."
+        assert skill["tags"] == ["image"]

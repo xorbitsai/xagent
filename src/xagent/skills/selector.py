@@ -171,9 +171,14 @@ If no skill is directly relevant, return selected: false."""
         selected_skill = next((s for s in candidates if s["name"] == skill_name), None)
 
         if selected_skill and self._should_reject_selected_skill(result):
+            source_reasoning = result.get(
+                "source_scope_reasoning", "No source reasoning provided"
+            )
             logger.info(
-                "Rejected selected skill '%s' after LLM source-scope check.",
+                "Rejected selected skill '%s' after LLM source-scope check. "
+                "Reasoning: %s",
                 skill_name,
+                source_reasoning,
             )
             return None
 

@@ -70,8 +70,8 @@ export function LoginPage() {
           timestamp: Date.now()
         }))
 
-        // Redirect to dashboard on success
-        window.location.href = "/task"
+        // Redirect to home on success
+        window.location.href = "/"
       } else {
         setError(t("login.alerts.auth_failed"))
       }
@@ -120,108 +120,108 @@ export function LoginPage() {
       features={features}
     >
       <Card className="p-8 bg-background/10 backdrop-blur-lg border-border shadow-2xl">
-              <div className="text-center mb-8">
-                <h2 className="text-2xl font-bold text-foreground mb-2">{t("login.title", { appName: branding.appName })}</h2>
-                <p className="text-muted-foreground">{t("login.description")}</p>
-              </div>
+        <div className="text-center mb-8">
+          <h2 className="text-2xl font-bold text-foreground mb-2">{t("login.title", { appName: branding.appName })}</h2>
+          <p className="text-muted-foreground">{t("login.description")}</p>
+        </div>
 
-              <form onSubmit={handleSubmit} className="space-y-6">
-                {error && (
-                  <div className="p-3 rounded-lg bg-destructive/20 border border-destructive/50">
-                    <p className="text-sm text-destructive-foreground">{error}</p>
-                  </div>
+        <form onSubmit={handleSubmit} className="space-y-6">
+          {error && (
+            <div className="p-3 rounded-lg bg-destructive/20 border border-destructive/50">
+              <p className="text-sm text-destructive-foreground">{error}</p>
+            </div>
+          )}
+
+          <div>
+            <label className="block text-sm font-medium text-muted-foreground mb-2">
+              {t("login.form.username")}
+            </label>
+            <div className="relative">
+              <User className="absolute left-3 top-1/2 transform -translate-y-1/2 h-4 w-4 text-muted-foreground" />
+              <Input
+                type="text"
+                name="username"
+                value={formData.username}
+                onChange={handleInputChange}
+                placeholder={t("login.form.username_placeholder")}
+                className="pl-10 bg-background/10 border-border text-foreground placeholder:text-muted-foreground focus:border-primary"
+                required
+              />
+            </div>
+          </div>
+
+          <div>
+            <label className="block text-sm font-medium text-muted-foreground mb-2">
+              {t("login.form.password")}
+            </label>
+            <div className="relative">
+              <Lock className="absolute left-3 top-1/2 transform -translate-y-1/2 h-4 w-4 text-muted-foreground" />
+              <Input
+                type={showPassword ? "text" : "password"}
+                name="password"
+                value={formData.password}
+                onChange={handleInputChange}
+                placeholder={t("login.form.password_placeholder")}
+                className="pl-10 pr-10 bg-background/10 border-border text-foreground placeholder:text-muted-foreground focus:border-primary"
+                required
+              />
+              <button
+                type="button"
+                onClick={() => setShowPassword(!showPassword)}
+                className="absolute right-3 top-1/2 transform -translate-y-1/2 text-muted-foreground hover:text-foreground"
+              >
+                {showPassword ? (
+                  <EyeOff className="h-4 w-4" />
+                ) : (
+                  <Eye className="h-4 w-4" />
                 )}
+              </button>
+            </div>
+          </div>
 
-                <div>
-                  <label className="block text-sm font-medium text-muted-foreground mb-2">
-                    {t("login.form.username")}
-                  </label>
-                  <div className="relative">
-                    <User className="absolute left-3 top-1/2 transform -translate-y-1/2 h-4 w-4 text-muted-foreground" />
-                    <Input
-                      type="text"
-                      name="username"
-                      value={formData.username}
-                      onChange={handleInputChange}
-                      placeholder={t("login.form.username_placeholder")}
-                      className="pl-10 bg-background/10 border-border text-foreground placeholder:text-muted-foreground focus:border-primary"
-                      required
-                    />
-                  </div>
-                </div>
+          <div className="flex items-center justify-between text-sm">
+            <label className="flex items-center text-muted-foreground">
+              <input type="checkbox" className="rounded mr-2" />
+              {t("login.options.remember_me")}
+            </label>
+            <a href="#" className="text-muted-foreground hover:text-foreground">
+              {t("login.options.forgot_password")}
+            </a>
+          </div>
 
-                <div>
-                  <label className="block text-sm font-medium text-muted-foreground mb-2">
-                    {t("login.form.password")}
-                  </label>
-                  <div className="relative">
-                    <Lock className="absolute left-3 top-1/2 transform -translate-y-1/2 h-4 w-4 text-muted-foreground" />
-                    <Input
-                      type={showPassword ? "text" : "password"}
-                      name="password"
-                      value={formData.password}
-                      onChange={handleInputChange}
-                      placeholder={t("login.form.password_placeholder")}
-                      className="pl-10 pr-10 bg-background/10 border-border text-foreground placeholder:text-muted-foreground focus:border-primary"
-                      required
-                    />
-                    <button
-                      type="button"
-                      onClick={() => setShowPassword(!showPassword)}
-                      className="absolute right-3 top-1/2 transform -translate-y-1/2 text-muted-foreground hover:text-foreground"
-                    >
-                      {showPassword ? (
-                        <EyeOff className="h-4 w-4" />
-                      ) : (
-                        <Eye className="h-4 w-4" />
-                      )}
-                    </button>
-                  </div>
-                </div>
-
-                <div className="flex items-center justify-between text-sm">
-                  <label className="flex items-center text-muted-foreground">
-                    <input type="checkbox" className="rounded mr-2" />
-                    {t("login.options.remember_me")}
-                  </label>
-                  <a href="#" className="text-muted-foreground hover:text-foreground">
-                    {t("login.options.forgot_password")}
-                  </a>
-                </div>
-
-                <Button
-                  type="submit"
-                  disabled={!formData.username || !formData.password || isLoading}
-                  className="w-full bg-primary hover:bg-primary/90 text-primary-foreground font-medium py-3 transition-all duration-200 transform hover:scale-[1.02] disabled:opacity-50 disabled:cursor-not-allowed disabled:transform-none"
-                >
-                  {isLoading ? (
-                    <div className="flex items-center gap-2">
-                      <div className="w-4 h-4 border-2 border-primary-foreground/30 border-t-primary-foreground rounded-full animate-spin"></div>
-                      {t("login.form.submitting")}
-                    </div>
-                  ) : (
-                    <div className="flex items-center gap-2">
-                      <LogIn className="h-4 w-4" />
-                      {t("login.form.submit")}
-                    </div>
-                  )}
-                </Button>
-              </form>
-
-              <div className="mt-8 text-center">
-                <p className="text-muted-foreground">
-                  {isStatusLoading ? null : registrationEnabled ? (
-                    <>
-                      {t("login.register_prompt")} {" "}
-                      <Link href="/register" className="text-muted-foreground hover:text-foreground font-medium">
-                        {t("login.register_link")}
-                      </Link>
-                    </>
-                  ) : (
-                    <>{t("login.register_closed")}</>
-                  )}
-                </p>
+          <Button
+            type="submit"
+            disabled={!formData.username || !formData.password || isLoading}
+            className="w-full bg-primary hover:bg-primary/90 text-primary-foreground font-medium py-3 transition-all duration-200 transform hover:scale-[1.02] disabled:opacity-50 disabled:cursor-not-allowed disabled:transform-none"
+          >
+            {isLoading ? (
+              <div className="flex items-center gap-2">
+                <div className="w-4 h-4 border-2 border-primary-foreground/30 border-t-primary-foreground rounded-full animate-spin"></div>
+                {t("login.form.submitting")}
               </div>
+            ) : (
+              <div className="flex items-center gap-2">
+                <LogIn className="h-4 w-4" />
+                {t("login.form.submit")}
+              </div>
+            )}
+          </Button>
+        </form>
+
+        <div className="mt-8 text-center">
+          <p className="text-muted-foreground">
+            {isStatusLoading ? null : registrationEnabled ? (
+              <>
+                {t("login.register_prompt")} {" "}
+                <Link href="/register" className="text-muted-foreground hover:text-foreground font-medium">
+                  {t("login.register_link")}
+                </Link>
+              </>
+            ) : (
+              <>{t("login.register_closed")}</>
+            )}
+          </p>
+        </div>
       </Card>
     </AuthPageShell>
   )

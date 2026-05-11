@@ -43,17 +43,80 @@ class SkillParser:
         template_md = skill_dir / "template.md"
         template_content = template_md.read_text() if template_md.exists() else ""
 
+        frontmatter = SkillParser._extract_frontmatter(content)
+        section_description = SkillParser._extract_section(content, "Description")
+        section_when_to_use = SkillParser._extract_section(content, "When to Use")
+        section_tags = SkillParser._extract_tags(content)
+        frontmatter_tags = frontmatter.get("tags")
+        tags = (
+            frontmatter_tags
+            if isinstance(frontmatter_tags, list) and frontmatter_tags
+            else section_tags
+        )
+
         return {
             "name": skill_dir.name,
             "path": str(skill_dir),
             "content": content,  # Complete SKILL.md content
             "template": template_content,  # template.md content (if exists)
-            "description": SkillParser._extract_section(content, "Description"),
-            "when_to_use": SkillParser._extract_section(content, "When to Use"),
+            "description": section_description
+            or str(frontmatter.get("description", "")),
+            "when_to_use": section_when_to_use
+            or str(frontmatter.get("when_to_use", "")),
             "execution_flow": SkillParser._extract_section(content, "Execution Flow"),
-            "tags": SkillParser._extract_tags(content),
+            "tags": tags,
             "files": SkillParser._list_files(skill_dir),
         }
+
+    @staticmethod
+    def _extract_frontmatter(content: str) -> Dict:
+        """Extract simple YAML-style frontmatter from a skill file."""
+        stripped = content.lstrip()
+        if not stripped.startswith("---"):
+            return {}
+
+        lines = stripped.splitlines()
+        if not lines or lines[0].strip() != "---":
+            return {}
+
+        end_index = None
+        for index, line in enumerate(lines[1:], start=1):
+            if line.strip().startswith("---"):
+                end_index = index
+                break
+        if end_index is None:
+            return {}
+
+        metadata: Dict[str, object] = {}
+        current_list_key: str | None = None
+        for raw_line in lines[1:end_index]:
+            line = raw_line.rstrip()
+            if not line.strip():
+                continue
+
+            stripped_line = line.strip()
+            if stripped_line.startswith("- ") and current_list_key:
+                values = metadata.setdefault(current_list_key, [])
+                value = stripped_line[2:].strip().strip("\"'")
+                if isinstance(values, list):
+                    values.append(value)
+                continue
+
+            current_list_key = None
+            if ":" not in stripped_line:
+                continue
+
+            key, value = stripped_line.split(":", 1)
+            key = key.strip()
+            value = value.strip()
+            if not value:
+                metadata[key] = []
+                current_list_key = key
+                continue
+
+            metadata[key] = value.strip("\"'")
+
+        return metadata
 
     @staticmethod
     def _extract_section(content: str, section_name: str) -> str:

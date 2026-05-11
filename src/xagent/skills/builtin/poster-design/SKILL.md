@@ -1,14 +1,14 @@
 ---
 
 name: poster-designer
-description: Unified poster generation skill with hard routing. Produces a single final poster image using mandatory HTML-based layout for information-heavy posters and image-first generation only for strictly visual posters.
+description: Unified poster and standalone image generation skill with hard routing. Produces one or more final poster/image assets as requested, using mandatory HTML-based layout for information-heavy posters and image-first generation only for strictly visual assets.
 ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
 
 # Poster Designer
 
 ## Overview
 
-**Poster Designer** is a unified poster generation skill that always outputs **one final poster image**, while internally selecting the appropriate generation strategy.
+**Poster Designer** is a unified poster generation skill that outputs the requested number of final poster/image assets, while internally selecting the appropriate generation strategy.
 
 Unlike soft, heuristic-based tools, this skill enforces **hard routing rules** to ensure that information-heavy posters are generated using deterministic layout rather than direct image generation.
 
@@ -26,7 +26,8 @@ Strategy selection is **final and non-negotiable** once routing conditions are m
 Use this skill whenever the desired output is:
 
 * A poster / long banner / vertical visual
-* A single image intended for publishing or long-term display
+* One or more standalone images intended for publishing or long-term display
+* Localized visual variants, such as separate Chinese and English posters/images
 
 Typical use cases include:
 
@@ -42,7 +43,8 @@ Typical use cases include:
 
 This skill always produces:
 
-* **Exactly one final poster image**
+* **The requested final poster/image assets**
+* **Exactly one final poster/image when the user does not specify a count or variants**
 
 The skill must **never** output:
 

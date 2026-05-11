@@ -68,6 +68,23 @@ class TestSkillFileAccess:
         content = skill_tools.read_skill_doc("test_skill", "SKILL.md")
         assert content == "# Test Skill\n\nThis is a test skill."
 
+    def test_read_skill_doc_defaults_to_skill_md(self, temp_skills_dir, mock_workspace):
+        """Test reading the main skill document when path is omitted or blank."""
+        skill_tools = SkillTools(mock_workspace, skills_roots=[str(temp_skills_dir)])
+
+        assert (
+            skill_tools.read_skill_doc("test_skill")
+            == "# Test Skill\n\nThis is a test skill."
+        )
+        assert (
+            skill_tools.read_skill_doc("test_skill", "")
+            == "# Test Skill\n\nThis is a test skill."
+        )
+        assert (
+            skill_tools.read_skill_doc("test_skill", ".")
+            == "# Test Skill\n\nThis is a test skill."
+        )
+
     def test_read_skill_doc_not_found(self, temp_skills_dir, mock_workspace):
         """Test FileNotFoundError when file doesn't exist."""
         skill_tools = SkillTools(mock_workspace, skills_roots=[str(temp_skills_dir)])

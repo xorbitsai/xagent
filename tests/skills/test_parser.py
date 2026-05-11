@@ -103,3 +103,34 @@ Follow the steps.
 
         assert "examples/example1.md" in skill["files"]
         assert len(skill["files"]) == 2  # SKILL.md and examples/example1.md
+
+    def test_parse_frontmatter_metadata_when_sections_are_missing(self, tmp_path):
+        """Frontmatter metadata should feed skill selection summaries."""
+        skill_dir = tmp_path / "frontmatter_skill"
+        skill_dir.mkdir()
+
+        (skill_dir / "SKILL.md").write_text(
+            """---
+name: frontmatter-name
+description: "Create standalone poster images."
+when_to_use: "Use when the requested output is a poster or image."
+tags:
+  - image
+  - design
+---
+
+# Frontmatter Skill
+
+Body-only skill instructions.
+"""
+        )
+
+        skill = SkillParser.parse(skill_dir)
+
+        assert skill["name"] == "frontmatter_skill"
+        assert skill["description"] == "Create standalone poster images."
+        assert (
+            skill["when_to_use"]
+            == "Use when the requested output is a poster or image."
+        )
+        assert skill["tags"] == ["image", "design"]

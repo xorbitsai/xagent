@@ -89,12 +89,15 @@ class SkillTools:
                 return candidate
         return None
 
-    def read_skill_doc(self, skill: str, path: str, encoding: str = "utf-8") -> str:
+    def read_skill_doc(
+        self, skill: str, path: str = "SKILL.md", encoding: str = "utf-8"
+    ) -> str:
         """Read documentation from a skill.
 
         Args:
             skill: Name of the skill
-            path: Location identifier for the documentation within the skill
+            path: Location identifier for the documentation within the skill.
+                Defaults to SKILL.md when omitted or blank.
             encoding: Text encoding (default: utf-8)
 
         Returns:
@@ -104,6 +107,10 @@ class SkillTools:
             FileNotFoundError: If the skill or doc doesn't exist
             ValueError: If skill or path contains invalid characters
         """
+        path = path.strip() if isinstance(path, str) else "SKILL.md"
+        if not path or path == ".":
+            path = "SKILL.md"
+
         _validate_skill_name(skill)
         _validate_skill_path(path)
 
@@ -239,7 +246,8 @@ class SkillTools:
                 self.read_skill_doc,
                 name="read_skill_doc",
                 description="Read documentation from a skill. "
-                "Parameters: skill (str, required), path (str, required), encoding (str, optional, default='utf-8'). "
+                "Parameters: skill (str, required), path (str, optional, default='SKILL.md'), encoding (str, optional, default='utf-8'). "
+                "Use the default path to read the skill's main documentation. "
                 "Returns the text content of the documentation file.",
             ),
             SkillTool(

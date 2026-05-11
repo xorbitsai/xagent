@@ -98,27 +98,41 @@ export function ChatInput({
     }
   }, [autoFocus]);
 
-  const handleInput = () => {
-    const editor = editorRef.current;
-    if (!editor) return;
-
-    // Serialize content: replace chips with markdown link containing file:// scheme
+  const serializeEditorContent = (editor: HTMLElement) => {
     const clone = editor.cloneNode(true) as HTMLElement;
-    const chips = clone.querySelectorAll('[data-file-path]');
-    chips.forEach((chip) => {
-      const path = chip.getAttribute('data-file-path');
-      const fileId = chip.getAttribute('data-file-id');
-      const filename = chip.getAttribute('data-filename') || path?.split('/').pop() || path;
+    const chips = clone.querySelectorAll("[data-file-path]");
 
-      // Use fileId if available, otherwise path (fallback)
+    chips.forEach((chip) => {
+      const path = chip.getAttribute("data-file-path");
+      const fileId = chip.getAttribute("data-file-id");
+      const filename =
+        chip.getAttribute("data-filename") || path?.split("/").pop() || path;
       const id = fileId || path;
       chip.replaceWith(document.createTextNode(`[${filename}](file://${id})`));
     });
 
-    // Use innerText to preserve newlines
-    let text = clone.innerText;
-    // Remove zero-width spaces if any (sometimes added by contentEditable)
-    text = text.replace(/\u200B/g, '');
+    clone.querySelectorAll("br").forEach((lineBreak) => {
+      lineBreak.replaceWith(document.createTextNode("\n"));
+    });
+
+    clone.querySelectorAll("div, p").forEach((block) => {
+      if (block.lastChild?.textContent?.endsWith("\n")) {
+        return;
+      }
+      block.appendChild(document.createTextNode("\n"));
+    });
+
+    return (clone.textContent || "")
+      .replace(/\u200B/g, "")
+      .replace(/\n{3,}/g, "\n\n")
+      .replace(/\n$/, "");
+  };
+
+  const handleInput = () => {
+    const editor = editorRef.current;
+    if (!editor) return;
+
+    const text = serializeEditorContent(editor);
 
     if (isControlled) {
       onInputChange?.(text);
@@ -497,26 +511,16 @@ export function ChatInput({
         editor.innerHTML = "";
       }
     } else if (document.activeElement !== editor) {
-      // Serialize current editor content to compare
-      const clone = editor.cloneNode(true) as HTMLElement;
-      const chips = clone.querySelectorAll('[data-file-path]');
-      chips.forEach((chip) => {
-        const path = chip.getAttribute('data-file-path');
-        const fileId = chip.getAttribute('data-file-id');
-        const filename = chip.getAttribute('data-filename') || path?.split('/').pop() || path;
-        const id = fileId || path;
-        chip.replaceWith(document.createTextNode(`[${filename}](file://${id})`));
-      });
-      const currentText = clone.innerText.replace(/\u200B/g, '');
+      const currentText = serializeEditorContent(editor);
 
       if (message !== currentText) {
         // Restore file:// links
-        let html = message.replace(/\[([^\]]+)\]\(file:\/\/([^)]+)\)/g, (match, filename, id) => {
+        let html = message.replace(/\[([^\]]+)\]\(file:\/\/([^)]+)\)/g, (_match, filename, id) => {
           // We use the ID as the path since we don't have the real path anymore
           return createFileChipHTML(id, id, filename);
         });
         // Fallback for old backticked messages to not break existing chat history
-        html = html.replace(/`([^`]+)`/g, (match, path) => {
+        html = html.replace(/`([^`]+)`/g, (_match, path) => {
           return createFileChipHTML(path);
         });
 

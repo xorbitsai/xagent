@@ -1921,7 +1921,8 @@ def test_kb_ingest_setup_failure_cleans_new_collection_config(test_env, temp_upl
     )
 
 
-def test_kb_ingest_cloud_rollback_passes_admin_scope() -> None:
+@pytest.mark.asyncio
+async def test_kb_ingest_cloud_rollback_passes_admin_scope() -> None:
     """Local rollback should clear ingestion status with the caller's admin scope."""
 
     from xagent.core.tools.core.RAG_tools.core.schemas import IngestionResult
@@ -1942,7 +1943,7 @@ def test_kb_ingest_cloud_rollback_passes_admin_scope() -> None:
         patch("xagent.web.api.kb.clear_ingestion_status") as mock_clear_status,
         patch("xagent.web.api.kb._restore_ingest_file_backup"),
     ):
-        kb_module._rollback_failed_ingestion(
+        await kb_module._rollback_failed_ingestion(
             db=db,
             user=user,
             collection_name="cloud-coll",

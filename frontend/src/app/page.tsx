@@ -17,16 +17,25 @@ import { useApp } from "@/contexts/app-context-chat";
 import { WelcomeModal } from "@/components/welcome-modal";
 import { getBrandingFromEnv } from "@/lib/branding";
 
+interface RecentTask {
+  task_id: number | string;
+  title?: string | null;
+  agent_name?: string | null;
+  agent_logo_url?: string | null;
+  created_at: string;
+}
+
 export default function Home() {
   const router = useRouter();
   const { t, locale } = useI18n();
   const { setPendingMessage, setTaskId } = useApp();
   const branding = getBrandingFromEnv();
   const [templates, setTemplates] = useState<Template[]>([]);
-  const [recentTasks, setRecentTasks] = useState<any[]>([]);
+  const [recentTasks, setRecentTasks] = useState<RecentTask[]>([]);
   const [isCreating, setIsCreating] = useState(false);
   const [visibleGetStartedVideos, setVisibleGetStartedVideos] = useState<Set<number>>(new Set());
   const getStartedSectionRef = useRef<HTMLDivElement | null>(null);
+  const homeChatInputRef = useRef<HTMLTextAreaElement | null>(null);
 
   useEffect(() => {
     const fetchData = async () => {
@@ -43,7 +52,7 @@ export default function Home() {
 
         if (tasksRes.ok) {
           const data = await tasksRes.json();
-          setRecentTasks(data.tasks || (Array.isArray(data) ? data : []));
+          setRecentTasks((data.tasks || (Array.isArray(data) ? data : [])) as RecentTask[]);
         }
       } catch (error) {
         console.error("Failed to fetch data", error);
@@ -141,7 +150,7 @@ export default function Home() {
   };
 
   const handleChatButtonClick = () => {
-    const val = (document.getElementById('home-chat-input') as HTMLInputElement)?.value;
+    const val = homeChatInputRef.current?.value;
     if (val && val.trim()) {
       handleCreateTask(val.trim());
     }
@@ -184,7 +193,7 @@ export default function Home() {
 
           <div className="w-full max-w-2xl bg-[hsl(234_30%_25%/0.4)] border border-[hsl(234_30%_35%)] rounded-[18px] p-3 flex items-end shadow-[0_12px_40px_rgba(0,0,0,0.25)] backdrop-blur-md focus-within:border-[hsl(234_50%_50%)] focus-within:shadow-[0_0_0_4px_hsl(234_50%_50%/0.2),0_12px_40px_rgba(0,0,0,0.25)] transition-all duration-200">
             <textarea
-              id="home-chat-input"
+              ref={homeChatInputRef}
               placeholder={t("home.hero.searchPlaceholder")}
               className="border-0 bg-transparent text-white text-[16px] leading-relaxed placeholder:text-[hsl(240_5%_60%)] focus-visible:ring-0 focus-visible:outline-none flex-1 resize-none overflow-hidden min-h-[28px] max-h-[120px] py-1 px-2"
               rows={1}

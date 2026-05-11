@@ -8,6 +8,7 @@ import { Textarea } from "@/components/ui/textarea"
 import { getApiUrl, getWsUrl } from "@/lib/utils"
 import { useI18n } from "@/contexts/i18n-context"
 import { MarkdownRenderer } from "@/components/ui/markdown-renderer"
+import { getBrandingFromEnv } from "@/lib/branding"
 
 export default function WidgetChatPage() {
   const { t } = useI18n()
@@ -16,6 +17,7 @@ export default function WidgetChatPage() {
   const token = params.token as string
   const guestId = searchParams.get("guest_id") || "anonymous"
   const agentId = searchParams.get("agent_id")
+  const branding = getBrandingFromEnv()
 
   const [messages, setMessages] = useState<{ role: "user" | "assistant", content: string }[]>([])
   const [inputValue, setInputValue] = useState("")
@@ -81,10 +83,10 @@ export default function WidgetChatPage() {
             // If connection fails, clear stored task ID and start fresh
             localStorage.removeItem(storageKey)
             setTaskId(null)
-            setMessages([{ role: "assistant", content: t("widgetChat.messages.welcome") }])
+            setMessages([{ role: "assistant", content: t("widgetChat.messages.welcome", { appName: branding.appName }) }])
           })
         } else {
-          setMessages([{ role: "assistant", content: t("widgetChat.messages.welcome") }])
+          setMessages([{ role: "assistant", content: t("widgetChat.messages.welcome", { appName: branding.appName }) }])
         }
       } catch (err) {
         console.error(err)
@@ -358,7 +360,7 @@ export default function WidgetChatPage() {
           </Button>
         </div>
         <div className="mt-2 text-center">
-          <span className="text-[10px] text-muted-foreground opacity-50">{t("widgetChat.footer.powered_by", { appName: process.env.NEXT_PUBLIC_APP_NAME || "Xagent" })}</span>
+          <span className="text-[10px] text-muted-foreground opacity-50">{t("widgetChat.footer.powered_by", { appName: branding.appName })}</span>
         </div>
       </div>
     </div>

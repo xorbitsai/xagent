@@ -192,7 +192,29 @@ def _ensure_cleanup_succeeded(operation_name: str, result_obj: Any) -> None:
     raise RuntimeError(f"{operation_name} failed: {message}")
 
 
-def _rollback_failed_ingestion(
+async def _cleanup_failed_new_collection_metadata(
+    *,
+    collection_name: str,
+    user: User,
+) -> None:
+    """Remove config rows left behind when a brand-new collection ingest fails."""
+    from ...core.tools.core.RAG_tools.storage.factory import get_metadata_store
+
+    metadata_store = get_metadata_store()
+    cleanup_result = await metadata_store.delete_collection_metadata(
+        collection_name=collection_name,
+        user_id=int(user.id),
+        is_admin=bool(user.is_admin),
+        delete_orphaned_metadata=True,
+    )
+    logger.info(
+        "Cleaned failed-ingest collection metadata for %s: %s",
+        collection_name,
+        cleanup_result,
+    )
+
+
+async def _rollback_failed_ingestion(
     *,
     db: Session,
     user: User,
@@ -276,6 +298,10 @@ def _rollback_failed_ingestion(
                 )
                 if refreshed_file_record is not None:
                     db.delete(refreshed_file_record)
+            await _cleanup_failed_new_collection_metadata(
+                collection_name=collection_name,
+                user=user,
+            )
             db.commit()
             _restore_ingest_file_backup(
                 file_path=file_path,
@@ -354,7 +380,7 @@ def _rollback_failed_ingestion(
         raise RollbackFailureError(message) from exc
 
 
-def _rollback_failed_cloud_ingestion(
+async def _rollback_failed_cloud_ingestion(
     *,
     db: Session,
     user: User,
@@ -420,6 +446,7 @@ def _rollback_failed_cloud_ingestion(
             is_admin=bool(user.is_admin),
             max_results=1,
         )
+        removed_new_collection = False
         if not collection_existed_before and not collection_records:
             collection_delete_result = delete_collection(
                 collection_name,
@@ -429,6 +456,13 @@ def _rollback_failed_cloud_ingestion(
             _ensure_cleanup_succeeded(
                 f"delete collection '{collection_name}' during cloud rollback",
                 collection_delete_result,
+            )
+            removed_new_collection = True
+
+        if removed_new_collection:
+            await _cleanup_failed_new_collection_metadata(
+                collection_name=collection_name,
+                user=user,
             )
 
         db.commit()
@@ -991,6 +1025,18 @@ async def ingest(
     progress_manager = get_progress_manager()
 
     try:
+        from ...core.tools.core.RAG_tools.storage.factory import get_metadata_store
+
+        metadata_store = get_metadata_store()
+        await metadata_store.save_collection_config(
+            collection=safe_collection,
+            config_json=config.model_dump_json(exclude_unset=True),
+            user_id=int(_user.id),
+        )
+    except Exception as e:
+        logger.warning("Failed to save collection config during ingest: %s", e)
+
+    try:
         file_record = _upsert_uploaded_file_record(
             db,
             user_id=int(_user.id),
@@ -1015,7 +1061,7 @@ async def ingest(
         result: IngestionResult = await loop.run_in_executor(None, _run_ingestion)
 
         if result.status in {"error", "partial"}:
-            _rollback_failed_ingestion(
+            await _rollback_failed_ingestion(
                 db=db,
                 user=_user,
                 collection_name=collection,
@@ -1065,7 +1111,7 @@ async def ingest(
                 doc_id=safe_filename,
                 message="Ingestion setup failed before completion.",
             )
-            _rollback_failed_ingestion(
+            await _rollback_failed_ingestion(
                 db=db,
                 user=_user,
                 collection_name=collection,
@@ -1076,6 +1122,16 @@ async def ingest(
                 uploaded_file_existed_before=uploaded_file_existed_before,
                 file_backup_path=file_backup_path,
                 had_existing_file=had_existing_file,
+            )
+        elif not collection_existed_before:
+            _restore_ingest_file_backup(
+                file_path=file_path,
+                backup_path=file_backup_path,
+                had_existing_file=had_existing_file,
+            )
+            await _cleanup_failed_new_collection_metadata(
+                collection_name=collection,
+                user=_user,
             )
         else:
             _restore_ingest_file_backup(
@@ -1128,6 +1184,18 @@ async def ingest_cloud(
     )
 
     progress_manager = get_progress_manager()
+    try:
+        from ...core.tools.core.RAG_tools.storage.factory import get_metadata_store
+
+        metadata_store = get_metadata_store()
+        await metadata_store.save_collection_config(
+            collection=safe_collection,
+            config_json=config.model_dump_json(exclude_unset=True),
+            user_id=int(_user.id),
+        )
+    except Exception as e:
+        logger.warning("Failed to save collection config during ingest_cloud: %s", e)
+
     try:
         get_collection_sync(safe_collection)
         collection_existed_before = True
@@ -1254,7 +1322,7 @@ async def ingest_cloud(
                             file_id=str(file_record.file_id),
                         )
                         if result.status in {"error", "partial"}:
-                            _rollback_failed_cloud_ingestion(
+                            await _rollback_failed_cloud_ingestion(
                                 db=db,
                                 user=_user,
                                 collection_name=safe_collection,
@@ -1284,7 +1352,7 @@ async def ingest_cloud(
                             doc_id=file_info.fileName,
                             message=f"Ingestion failed: {str(e)}",
                         )
-                        _rollback_failed_cloud_ingestion(
+                        await _rollback_failed_cloud_ingestion(
                             db=db,
                             user=_user,
                             collection_name=safe_collection,
@@ -1346,6 +1414,14 @@ async def ingest_cloud(
 
     # Run all file processings concurrently
     results = await asyncio.gather(*[process_file(f) for f in request.files])
+
+    if not collection_existed_before and not any(
+        result.status == "success" for result in results
+    ):
+        await _cleanup_failed_new_collection_metadata(
+            collection_name=safe_collection,
+            user=_user,
+        )
 
     return results
 
@@ -1972,6 +2048,24 @@ async def ingest_web(
             ),
         )
 
+        try:
+            get_collection_sync(safe_collection)
+            collection_existed_before = True
+        except ValueError:
+            collection_existed_before = False
+
+        try:
+            from ...core.tools.core.RAG_tools.storage.factory import get_metadata_store
+
+            metadata_store = get_metadata_store()
+            await metadata_store.save_collection_config(
+                collection=safe_collection,
+                config_json=ingestion_config.model_dump_json(exclude_unset=True),
+                user_id=int(_user.id),
+            )
+        except Exception as e:
+            logger.warning("Failed to save collection config during ingest_web: %s", e)
+
         # Track processed URLs to prevent duplicate UploadedFile records
         # Key: URL hash, Value: file_id
         # Note: For large-scale web ingestion (>10000 pages), consider using
@@ -2156,6 +2250,11 @@ async def ingest_web(
         )
 
         if result.status == "error":
+            if not collection_existed_before:
+                await _cleanup_failed_new_collection_metadata(
+                    collection_name=safe_collection,
+                    user=_user,
+                )
             return JSONResponse(status_code=500, content=result.model_dump())
         if result.status == "partial":
             logger.warning(
@@ -2171,11 +2270,21 @@ async def ingest_web(
     except HTTPException:
         raise
     except (ValueError, KeyError, TypeError) as e:
+        if "collection_existed_before" in locals() and not collection_existed_before:
+            await _cleanup_failed_new_collection_metadata(
+                collection_name=safe_collection,
+                user=_user,
+            )
         logger.error("Data format error in web ingestion: %s", e)
         raise HTTPException(
             status_code=400, detail=f"Data format error: {str(e)}"
         ) from e
     except Exception as e:
+        if "collection_existed_before" in locals() and not collection_existed_before:
+            await _cleanup_failed_new_collection_metadata(
+                collection_name=safe_collection,
+                user=_user,
+            )
         logger.exception("Unexpected error in web ingestion: %s", e)
         raise HTTPException(
             status_code=500,

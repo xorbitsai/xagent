@@ -41,6 +41,7 @@ import { useRouter, useSearchParams } from "next/navigation"
 import { KnowledgeBaseCreationDialog } from "@/components/kb/knowledge-base-creation-dialog"
 import { toast } from "sonner"
 import { cn } from "@/lib/utils"
+import { getBrandingFromEnv } from "@/lib/branding"
 
 interface KnowledgeBase {
   name: string
@@ -112,6 +113,7 @@ export function AgentBuilder({ agentId }: AgentBuilderProps) {
   const initialPrompt = searchParams.get("prompt")
   const [localAgentId, setLocalAgentId] = useState<string | undefined>(agentId)
   const isEditMode = !!localAgentId
+  const branding = getBrandingFromEnv();
 
   // Config State
   const [name, setName] = useState("")
@@ -137,6 +139,7 @@ export function AgentBuilder({ agentId }: AgentBuilderProps) {
   const [originalData, setOriginalData] = useState<any>(null)
   const [isKbModalOpen, setIsKbModalOpen] = useState(false)
   const [isModelConfigOpen, setIsModelConfigOpen] = useState(false)
+  const [showAIAssistant, setShowAIAssistant] = useState(!!initialPrompt)
   const [configSynced, setConfigSynced] = useState(false)
   const [notFound, setNotFound] = useState(false)
   const isFirstRender = useRef(true)
@@ -1238,6 +1241,20 @@ export function AgentBuilder({ agentId }: AgentBuilderProps) {
         </div>
         <div className="flex items-center gap-4">
           <Button
+            variant="outline"
+            className={cn(
+              "flex items-center gap-2 transition-colors",
+              showAIAssistant
+                ? "bg-primary/10 text-primary border-primary/20 hover:bg-primary/20 hover:text-primary"
+                : "text-muted-foreground hover:text-foreground"
+            )}
+            onClick={() => setShowAIAssistant(!showAIAssistant)}
+          >
+            <Bot className="h-4 w-4" />
+            {t("builds.editor.aiAssistant", { appName: branding.appName })}
+          </Button>
+
+          <Button
             onClick={handleCreate}
             disabled={isCreating || loadingAgent || (isEditMode && !isDirty)}
           >
@@ -1912,6 +1929,7 @@ export function AgentBuilder({ agentId }: AgentBuilderProps) {
     <div className="flex flex-col h-[100vh]">
       <div className="flex-1 min-h-0">
         <ResizableThreeColumnLayout
+          showLeftPanel={showAIAssistant}
           leftPanel={<AgentBuilderChat
             initialPrompt={initialPrompt}
             agentConfig={{

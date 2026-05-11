@@ -4,7 +4,7 @@ import io
 import json
 import tempfile
 from pathlib import Path
-from unittest.mock import MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from fastapi import FastAPI
@@ -576,3 +576,56 @@ def test_ingest_web_separators_invalid_json_request_succeeds(app_with_kb):
     assert response.status_code == 200
     assert len(captured_config) == 1
     assert captured_config[0].separators is None
+
+
+def test_ingest_web_error_cleans_new_collection_config(app_with_kb):
+    """POST ingest-web should clean saved config when a new collection fails before any docs are created."""
+    metadata_store = MagicMock()
+    metadata_store.save_collection_config = AsyncMock()
+    metadata_store.delete_collection_metadata = AsyncMock(
+        return_value={"metadata_rows": 0, "config_rows": 1}
+    )
+
+    with (
+        patch(
+            "xagent.core.tools.core.RAG_tools.storage.factory.get_metadata_store",
+            return_value=metadata_store,
+        ),
+        patch(
+            "xagent.web.api.kb.get_collection_sync", side_effect=ValueError("missing")
+        ),
+        patch(
+            "xagent.web.api.kb.run_web_ingestion",
+            return_value=WebIngestionResult(
+                status="error",
+                collection="web_new_collection",
+                total_urls_found=1,
+                pages_crawled=0,
+                pages_failed=1,
+                documents_created=0,
+                chunks_created=0,
+                embeddings_created=0,
+                crawled_urls=[],
+                failed_urls={"https://example.com": "crawl failed"},
+                message="crawl failed",
+                warnings=[],
+                elapsed_time_ms=0,
+            ),
+        ),
+    ):
+        client = TestClient(app_with_kb)
+        response = client.post(
+            "/api/kb/ingest-web",
+            data={
+                "collection": "web_new_collection",
+                "start_url": "https://example.com",
+            },
+        )
+
+    assert response.status_code == 500
+    metadata_store.delete_collection_metadata.assert_awaited_once_with(
+        collection_name="web_new_collection",
+        user_id=1,
+        is_admin=False,
+        delete_orphaned_metadata=True,
+    )

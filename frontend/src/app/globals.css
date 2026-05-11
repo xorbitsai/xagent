@@ -3,7 +3,7 @@
 @tailwind components;
 @tailwind utilities;
 
-/* XAgent Theme System - Supports dynamic theme switching */
+/* Xagent Theme System - Supports dynamic theme switching */
 :root {
   /* Default dark theme colors - Maintains backward compatibility */
   --background: 222.2 84% 4.9%;
@@ -140,7 +140,8 @@ body .hover\:\text-\[\#E6EDF3\]:hover {
   line-height: 1.6;
 }
 
-.prose ul, .prose ol {
+.prose ul,
+.prose ol {
   margin-top: 0;
   margin-bottom: 1em;
   padding-left: 1.5em;
@@ -190,7 +191,8 @@ body .hover\:\text-\[\#E6EDF3\]:hover {
   margin-bottom: 1em;
 }
 
-.prose th, .prose td {
+.prose th,
+.prose td {
   border: 1px solid var(--border);
   padding: 0.5em;
   text-align: left;
@@ -502,6 +504,7 @@ button[data-radix-collection-item] {
   0% {
     transform: rotate(0deg) translateX(40px) rotate(0deg);
   }
+
   100% {
     transform: rotate(360deg) translateX(40px) rotate(-360deg);
   }
@@ -564,8 +567,15 @@ button[data-radix-collection-item] {
 }
 
 @keyframes blink {
-  0%, 100% { opacity: 1; }
-  50% { opacity: 0.55; }
+
+  0%,
+  100% {
+    opacity: 1;
+  }
+
+  50% {
+    opacity: 0.55;
+  }
 }
 
 .animate-blink {

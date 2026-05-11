@@ -23,7 +23,7 @@ from xagent.core.tools.adapters.vibe.sandboxed_tool.runner_utils import (
 
 def _parse_args() -> argparse.Namespace:
     """Parse CLI arguments for sandboxed tool execution."""
-    parser = argparse.ArgumentParser(description="Run a sandboxed XAgent tool")
+    parser = argparse.ArgumentParser(description="Run a sandboxed Xagent tool")
     parser.add_argument("--execution-spec-b64", required=True)
     parser.add_argument("--args-b64", required=True)
     parser.add_argument("--result-file", required=True)

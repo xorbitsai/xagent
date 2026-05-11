@@ -3,17 +3,19 @@
 import React, { useState, useEffect } from "react"
 import { SearchInput } from "@/components/ui/search-input"
 import { Button } from "@/components/ui/button"
-import { Plus, Bot, Trash2, MessageSquare, Edit, MoreVertical, Globe, Calendar, Clock, Rocket, Sparkles, Settings2, ArrowRight } from "lucide-react"
+import { Plus, Bot, Trash2, MessageSquare, Edit, MoreVertical, Globe, Calendar, Clock, Rocket, Sparkles, Settings2, ArrowRight, FileText, Wrench, Database, Plug } from "lucide-react"
 import { Popover, PopoverTrigger, PopoverContent } from "@/components/ui/popover"
 import { Dialog, DialogContent, DialogHeader, DialogTitle } from "@/components/ui/dialog"
 import { Textarea } from "@/components/ui/textarea"
 import { DeployAgentDialog, Agent } from "@/components/build/deploy-agent-dialog"
+import { FeatureEmptyState } from "@/components/ui/feature-empty-state"
 import { useI18n } from "@/contexts/i18n-context"
 import { useRouter, useSearchParams } from "next/navigation"
 import { apiRequest } from "@/lib/api-wrapper"
 import { getApiUrl } from "@/lib/utils"
 import { ConfirmDialog } from "@/components/ui/confirm-dialog"
 import { toast } from "sonner"
+import { getBrandingFromEnv } from "@/lib/branding"
 
 export default function BuildsPage() {
   const { t } = useI18n()
@@ -22,6 +24,7 @@ export default function BuildsPage() {
   const [searchTerm, setSearchTerm] = useState("")
   const [agents, setAgents] = useState<Agent[]>([])
   const [loading, setLoading] = useState(true)
+  const branding = getBrandingFromEnv();
 
   // Deploy Dialog State
   const [deployAgent, setDeployAgent] = useState<Agent | null>(null)
@@ -172,6 +175,37 @@ export default function BuildsPage() {
           <div className="flex items-center justify-center h-[400px]">
             <div className="text-muted-foreground">{t("common.loading")}</div>
           </div>
+        ) : agents.length === 0 ? (
+          <FeatureEmptyState
+            icon={Bot}
+            title={t("builds.emptyState.title")}
+            description={t("builds.emptyState.description")}
+            features={[
+              {
+                icon: FileText,
+                title: t("builds.emptyState.features.instructions.title"),
+                description: t("builds.emptyState.features.instructions.description")
+              },
+              {
+                icon: Wrench,
+                title: t("builds.emptyState.features.tools.title"),
+                description: t("builds.emptyState.features.tools.description")
+              },
+              {
+                icon: Database,
+                title: t("builds.emptyState.features.knowledgeBase.title"),
+                description: t("builds.emptyState.features.knowledgeBase.description")
+              },
+              {
+                icon: Plug,
+                title: t("builds.emptyState.features.connectors.title"),
+                description: t("builds.emptyState.features.connectors.description")
+              }
+            ]}
+            actionLabel={t("builds.emptyState.action")}
+            onAction={handleCreate}
+            className="h-full mt-4"
+          />
         ) : (
           <>
             {/* List */}
@@ -370,7 +404,7 @@ export default function BuildsPage() {
                     {t("builds.list.createModal.describeTitle")}
                   </h3>
                   <p className="text-sm text-muted-foreground">
-                    {t("builds.list.createModal.describeDesc", { appName: process.env.NEXT_PUBLIC_APP_NAME || "Xagent" })}
+                    {t("builds.list.createModal.describeDesc", { appName: branding.appName })}
                   </p>
                 </div>
               </div>

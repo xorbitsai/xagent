@@ -30,7 +30,7 @@ tags:
 descriptions:
   en: Professional customer support assistant
   zh: 专业的客服助手
-author: xAgent
+author: Xagent
 version: "1.0"
 
 agent_config:
@@ -55,7 +55,7 @@ tags:
 descriptions:
   en: Professional sales assistant
   zh: 专业的销售助手
-author: xAgent
+author: Xagent
 version: "1.0"
 
 agent_config:
@@ -119,7 +119,7 @@ class TestTemplateManager:
             template["descriptions"]["en"] == "Professional customer support assistant"
         )
         assert template["descriptions"]["zh"] == "专业的客服助手"
-        assert template["author"] == "xAgent"
+        assert template["author"] == "Xagent"
         assert template["version"] == "1.0"
         assert "support" in template["tags"]
         assert "customer" in template["tags"]
@@ -173,7 +173,7 @@ tags:
 descriptions:
   en: Data analysis expert
   zh: 数据分析专家
-author: xAgent
+author: Xagent
 version: "1.0"
 
 agent_config:
@@ -229,7 +229,7 @@ descriptions:
 
         assert template is not None
         assert template["tags"] == []
-        assert template["author"] == "xAgent"
+        assert template["author"] == "Xagent"
         assert template["version"] == "1.0"
         assert template["featured"] is False
         assert template["agent_config"]["instructions"] == ""

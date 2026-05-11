@@ -88,7 +88,7 @@ tags:
 descriptions:
   en: Professional customer support assistant
   zh: 专业的客服助手
-author: xAgent
+author: Xagent
 version: "1.0"
 
 agent_config:
@@ -113,7 +113,7 @@ tags:
 descriptions:
   en: Professional sales assistant
   zh: 专业的销售助手
-author: xAgent
+author: Xagent
 version: "1.0"
 
 agent_config:

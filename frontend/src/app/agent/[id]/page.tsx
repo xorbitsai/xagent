@@ -217,7 +217,6 @@ export default function AgentChatPage() {
             <ChatStartScreen
               title={agent.name}
               description={agent.description || undefined}
-              icon={agent.logo_url ? `${getApiUrl()}${agent.logo_url}` : <Bot className="w-10 h-10 text-[hsl(var(--gradient-from))]" />}
               prompts={agent.suggested_prompts}
               onSend={(msg, filesToSend) => handleSendMessage(msg, filesToSend)}
               isSending={isSending}

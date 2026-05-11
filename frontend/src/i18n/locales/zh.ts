@@ -1,5 +1,7 @@
 const zh = {
   common: {
+    optional: "(可选)",
+    next: "下一步",
     back: "返回",
     loading: "加载中...",
     save: "保存",
@@ -58,18 +60,88 @@ const zh = {
     search: "搜索任务",
     templates: "模板",
     channels: "渠道",
+    more: "更多",
     sections: {
       agentDevelopment: "Agent 开发",
       resources: "资源",
     },
   },
+  home: {
+    hero: {
+      title: "欢迎使用 {appName}",
+      subtitle: "无需编写代码即可构建、部署并扩展属于你的智能体。",
+      searchPlaceholder: "你想做点什么？",
+    },
+    getStarted: {
+      title: "开始使用",
+      video: {
+        title: "视频教程",
+        description: "快速了解 {appName} 的核心功能。"
+      },
+      docs: {
+        title: "使用文档",
+        description: "探索各项功能的详细参考文档。"
+      },
+      guides: {
+        title: "操作指南",
+        description: "常见用例的逐步操作指南。"
+      },
+      whatsNew: {
+        title: "最新动态",
+        description: "查看最新更新、改进与发布。"
+      }
+    },
+    templates: {
+      title: "使用模板构建智能体",
+      viewAll: "查看全部",
+      setupTime: "{time} 配置",
+      useTemplate: "使用模板"
+    },
+    recent: {
+      title: "最近活动",
+      untitledTask: "未命名任务",
+      defaultAgent: "智能体"
+    }
+  },
   chatPage: {
     page: {
-      emptyTitle: "我可以帮您做些什么？",
-      emptyDescription: "描述您的目标，{appName} 会完成剩下的事。",
+      emptyTitle: "描述您的目标，{appName} 将处理剩下的工作",
+      emptyDescription: "自动将您的想法转化为可运行的智能体。只需描述您需要什么即可开始",
       startWith: "你可以从这里开始",
     },
+    sections: {
+      startingPrompts: "快捷指令",
+    },
+    agents: {
+      researcher: "研究助手",
+      poster: "海报设计师",
+      linkedin: "LinkedIn 发帖助手",
+    },
     cards: {
+      research: {
+        title: "深入研究一个话题",
+        prompt: "我需要研究人工智能领域的最新趋势。"
+      },
+      linkedin: {
+        title: "撰写 LinkedIn 动态",
+        prompt: "帮我写一篇 LinkedIn 动态，宣布新功能发布。"
+      },
+      poster: {
+        title: "设计活动海报",
+        prompt: "为即将举行的科技会议设计一张海报。"
+      },
+      compare: {
+        title: "深度对比产品",
+        prompt: "对比市场上排名前 3 的电动汽车。"
+      },
+      visual: {
+        title: "为话题创建可视化图表",
+        prompt: "创建一张神经网络工作原理的可视化图表。"
+      },
+      presentation: {
+        title: "将话题转化为演示文稿",
+        prompt: "创建一个关于可再生能源的 5 页幻灯片。"
+      },
       createPPT: {
         title: "根据报告生成一个 PPT",
         description: "销售报告，幻灯片",
@@ -93,8 +165,6 @@ const zh = {
     },
     input: {
       placeholder: "描述您的任务...",
-      hintEnter: "按 Enter 发送",
-      hintAt: "输入 @ 引用文件",
       processing: "处理中",
       actions: {
         config: "配置模型",
@@ -568,6 +638,24 @@ Build when you need.`
       title: "最近文件",
       view_all: "查看全部",
       empty: "暂无文件",
+    },
+    welcome: {
+      title: "欢迎使用 {appName}",
+      heading: "您想做什么？",
+      subtitle: "选择您想优先体验的功能。",
+      presentationBuilder: {
+        title: "演示文稿生成器",
+        description: "几秒钟内将任意主题转化为幻灯片。",
+      },
+      buildAgents: {
+        title: "通过模板构建 Agent",
+        description: "从预置模板出发，定制专属工作流。",
+      },
+      createAgent: {
+        title: "创建自定义 Agent",
+        description: "构建并配置完全贴合您需求的 Agent。",
+      },
+      skip: "跳过",
     },
   },
   monitoring: {
@@ -1109,6 +1197,10 @@ Build when you need.`
     subtitle: "使用预构建的智能体快速启动工作流。",
     searchPlaceholder: "搜索模板...",
     useTemplate: "使用模板",
+    countOne: "{count} 个模板",
+    countOther: "{count} 个模板",
+    runs: "次运行",
+    defaultSetupTime: "5 分钟配置",
     noResults: "未找到匹配的模板。",
     categoryTitles: {
       all: "全部",
@@ -1606,7 +1698,30 @@ Build when you need.`
       batchDeleteConfirm: "确定要删除选中的 {count} 个知识库吗？此操作不可撤销。",
     },
     loading: {
-      loadingKB: "正在加载知识库...",
+      loadingKB: "加载知识库...",
+    },
+    emptyState: {
+      title: "知识库如何工作",
+      description: "让你的智能体访问你自己的内容。上传文件、导入网站，并让智能体搜索你的知识以准确回答问题。",
+      features: {
+        fileUpload: {
+          title: "文件上传",
+          description: "上传 PDF、文档、电子表格等，为你的智能体构建可搜索的知识库。"
+        },
+        websiteImport: {
+          title: "网站导入",
+          description: "导入任何网站或文档页面，并在内容更改时自动保持同步。"
+        },
+        semanticSearch: {
+          title: "语义搜索",
+          description: "使用 AI 驱动的向量模型和混合搜索，在你的所有数据中找到最相关的内容。"
+        },
+        connectToAgents: {
+          title: "连接到智能体",
+          description: "将知识库直接附加到你的智能体，使其始终以准确、相关的上下文进行响应。"
+        }
+      },
+      action: "+ 创建知识库"
     },
     header: {
       title: "知识库管理",
@@ -1653,7 +1768,18 @@ Build when you need.`
       hintCreate: "点击 '新建知识库' 开始创建您的第一个知识库",
     },
     dialog: {
+      steps: {
+        stepCount: "步骤 {currentStep}",
+        nameItTitle: "命名知识库",
+        addContentTitle: "添加内容",
+        reviewTitle: "审阅与创建",
+        nameIt: "命名",
+        addContent: "添加内容",
+        filesSelected: "个文件已选择",
+        crawlStartingFrom: "爬取起始于"
+      },
       createTitle: "新建知识库",
+      createButton: "创建知识库",
       createDescription: "创建新的知识库并上传文档或从网站导入内容",
       basicInfo: {
         title: "基本信息",
@@ -1785,6 +1911,9 @@ Build when you need.`
     },
     index: {
       title: "索引配置",
+      parseMethodDesc: "文档解析的方法",
+      chunkStrategyDesc: "文本分块的策略",
+      embeddingModelDesc: "用于向量化的模型",
       parseMethod: "解析方法",
       parseOptions: {
         default: "默认",
@@ -1920,6 +2049,29 @@ Build when you need.`
         all: "所有状态"
       }
     },
+    emptyState: {
+      title: "智能体如何工作",
+      description: "智能体是你配置的 AI 助手，用于处理特定任务——它们可以使用工具、访问知识并自动运行。",
+      features: {
+        instructions: {
+          title: "指令",
+          description: "编写清晰的指令，定义智能体的角色、语气、目标以及如何处理不同的场景。"
+        },
+        tools: {
+          title: "工具",
+          description: "为智能体配备调用 API、处理数据和在现实世界中采取行动的工具。"
+        },
+        knowledgeBase: {
+          title: "知识库",
+          description: "上传文件或导入网站，让你的智能体能够使用你自己的内容和数据来回答问题。"
+        },
+        connectors: {
+          title: "连接器",
+          description: "连接 Gmail、Outlook、HubSpot 等应用——或接入你自己的 MCP 服务器和自定义 API。"
+        }
+      },
+      action: "+ 创建你的第一个智能体"
+    },
     stats: {
       total: "共 {count} 个构建"
     },
@@ -1989,6 +2141,7 @@ Build when you need.`
       }
     },
     editor: {
+      aiAssistant: "{appName} 助手",
       header: {
         title: "自定义 Agent",
         subtitle: "配置你的 AI Agent 的行为和能力。",

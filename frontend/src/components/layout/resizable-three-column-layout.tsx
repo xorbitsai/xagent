@@ -12,6 +12,7 @@ interface ResizableThreeColumnLayoutProps {
     minMiddleWidth?: number // Percentage (0-100)
     minRightWidth?: number // Percentage (0-100)
     className?: string
+    showLeftPanel?: boolean
 }
 
 export function ResizableThreeColumnLayout({
@@ -23,7 +24,8 @@ export function ResizableThreeColumnLayout({
     minLeftWidth = 15,
     minMiddleWidth = 30,
     minRightWidth = 20,
-    className
+    className,
+    showLeftPanel = true
 }: ResizableThreeColumnLayoutProps) {
     const [leftWidth, setLeftWidth] = useState(initialLeftWidth)
     const [middleWidth, setMiddleWidth] = useState(initialMiddleWidth)
@@ -96,8 +98,11 @@ export function ResizableThreeColumnLayout({
         >
             {/* Left Panel */}
             <div
-                style={{ width: `${leftWidth}%` }}
-                className="h-full flex flex-col min-h-0 overflow-hidden"
+                style={{
+                    width: `${leftWidth}%`,
+                    display: showLeftPanel ? 'flex' : 'none'
+                }}
+                className="h-full flex-col min-h-0 overflow-hidden"
             >
                 {leftPanel}
             </div>
@@ -105,6 +110,7 @@ export function ResizableThreeColumnLayout({
             {/* Left Resizer Handle */}
             <div
                 className="w-1 bg-border hover:bg-primary/50 cursor-col-resize flex items-center justify-center relative transition-colors group z-10"
+                style={{ display: showLeftPanel ? 'flex' : 'none' }}
                 onMouseDown={handleMouseDownLeft}
             >
                 <div className="absolute inset-y-0 -left-2 -right-2 z-10 cursor-col-resize" />
@@ -115,7 +121,7 @@ export function ResizableThreeColumnLayout({
 
             {/* Middle Panel */}
             <div
-                style={{ width: `${middleWidth}%` }}
+                style={{ width: `${showLeftPanel ? middleWidth : middleWidth + leftWidth}%` }}
                 className="h-full overflow-auto"
             >
                 {middlePanel}

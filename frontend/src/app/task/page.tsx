@@ -1,17 +1,19 @@
 "use client";
 
 import { useState, useEffect } from "react";
-import { Bot, Presentation, BarChart, Image as ImageIcon, Zap } from "lucide-react";
+import { Presentation, Search, Smartphone, Wand2 } from "lucide-react";
 import { useI18n } from "@/contexts/i18n-context";
 import { useApp } from "@/contexts/app-context-chat";
 import { ChatStartScreen } from "@/components/chat/ChatStartScreen";
 import { FilePreviewDialog } from "@/components/file/file-preview-dialog";
+import { getBrandingFromEnv } from "@/lib/branding";
 
 function TaskHomePageContent() {
   const { t } = useI18n();
   const { sendMessage, state, dispatch, closeFilePreview } = useApp();
   const [files, setFiles] = useState<File[]>([]);
   const [inputValue, setInputValue] = useState("");
+  const branding = getBrandingFromEnv();
 
   // Clear state on mount to ensure we are in "new task" mode
   useEffect(() => {
@@ -20,36 +22,34 @@ function TaskHomePageContent() {
 
   const samplePrompts = [
     {
+      icon: Search,
+      title: t("chatPage.cards.research.title"),
+      prompt: t("chatPage.cards.research.prompt"),
+    },
+    {
+      icon: Smartphone,
+      title: t("chatPage.cards.linkedin.title"),
+      prompt: t("chatPage.cards.linkedin.prompt"),
+    },
+    {
+      icon: Wand2,
+      title: t("chatPage.cards.poster.title"),
+      prompt: t("chatPage.cards.poster.prompt"),
+    },
+    {
+      icon: Search,
+      title: t("chatPage.cards.compare.title"),
+      prompt: t("chatPage.cards.compare.prompt"),
+    },
+    {
+      icon: Wand2,
+      title: t("chatPage.cards.visual.title"),
+      prompt: t("chatPage.cards.visual.prompt"),
+    },
+    {
       icon: Presentation,
-      title: t("chatPage.cards.createPPT.title"),
-      description: t("chatPage.cards.createPPT.description"),
-      prompt: t("chatPage.cards.createPPT.prompt"),
-      color: "text-orange-400",
-      bg: "bg-orange-400/10"
-    },
-    {
-      icon: BarChart,
-      title: t("chatPage.cards.dataAnalysis.title"),
-      description: t("chatPage.cards.dataAnalysis.description"),
-      prompt: t("chatPage.cards.dataAnalysis.prompt"),
-      color: "text-blue-400",
-      bg: "bg-blue-400/10"
-    },
-    {
-      icon: ImageIcon,
-      title: t("chatPage.cards.designPoster.title"),
-      description: t("chatPage.cards.designPoster.description"),
-      prompt: t("chatPage.cards.designPoster.prompt"),
-      color: "text-purple-400",
-      bg: "bg-purple-400/10"
-    },
-    {
-      icon: Zap,
-      title: t("chatPage.cards.automatic.title"),
-      description: t("chatPage.cards.automatic.description"),
-      prompt: t("chatPage.cards.automatic.prompt"),
-      color: "text-green-400",
-      bg: "bg-green-400/10"
+      title: t("chatPage.cards.presentation.title"),
+      prompt: t("chatPage.cards.presentation.prompt"),
     }
   ];
 
@@ -69,9 +69,8 @@ function TaskHomePageContent() {
       <div className="flex-1 overflow-y-auto">
         <main className="container max-w-4xl mx-auto px-4 py-8">
           <ChatStartScreen
-            title={t("chatPage.page.emptyTitle")}
-            description={t("chatPage.page.emptyDescription", { appName: process.env.NEXT_PUBLIC_APP_NAME || "Xagent" })}
-            icon={<Bot className="w-10 h-10 text-[hsl(var(--gradient-from))]" />}
+            title={t("chatPage.page.emptyTitle", { appName: branding.appName })}
+            description={t("chatPage.page.emptyDescription")}
             prompts={samplePrompts}
             onSend={handleSend}
             isSending={state.isProcessing}
@@ -81,6 +80,7 @@ function TaskHomePageContent() {
             onInputChange={setInputValue}
             showModeToggle={true}
             autoFocus={true}
+            inputMinHeightClass="min-h-[200px]"
           />
         </main>
       </div>

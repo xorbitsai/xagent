@@ -6,7 +6,7 @@
   var host = new URL(scriptTag.src).origin;
 
   if (!agentId && token === 'default') {
-    console.error('XAgent Widget: Missing data-agent-id attribute.');
+    console.error('Xagent Widget: Missing data-agent-id attribute.');
     return;
   }
 

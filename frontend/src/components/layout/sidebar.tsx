@@ -15,20 +15,17 @@ import { toast } from "sonner"
 import {
   Activity,
   FileText,
-  User,
   LogOut,
-  Menu,
   X,
   ChevronDown,
   ChevronRight,
+  ChevronLeft,
   Sparkles,
-  Zap,
   Settings,
   Wrench,
   Users,
   Brain,
   Server,
-  HardDrive,
   Layers,
   MessageSquare,
   Loader2,
@@ -37,7 +34,6 @@ import {
   XCircle,
   PauseCircle,
   Bot,
-  BookOpen,
   Box,
   LayoutTemplate,
   Info,
@@ -47,6 +43,8 @@ import {
   MoreHorizontal,
   Edit2,
   Search,
+  Globe,
+  ChevronsUpDown,
 } from "lucide-react"
 import {
   Dialog,
@@ -100,64 +98,7 @@ interface NavigationGroup {
   items: NavigationItem[]
 }
 
-const navigationGroups: NavigationGroup[] = [
-  {
-    title: "Agent Development",
-    titleKey: "nav.sections.agentDevelopment",
-    items: [
-      {
-        name: "Task",
-        nameKey: "nav.task",
-        href: "/task",
-        icon: MessageSquare,
-        color: "text-blue-500"
-      },
-      {
-        name: "Agents",
-        nameKey: "nav.build",
-        href: "/build",
-        icon: Bot,
-        color: "text-yellow-400"
-      },
-      {
-        name: "Templates",
-        nameKey: "nav.templates",
-        href: "/templates",
-        icon: LayoutTemplate,
-        color: "text-purple-400"
-      },
-    ]
-  },
-  {
-    title: "Resources",
-    titleKey: "nav.sections.resources",
-    items: [
-      {
-        name: "Knowledge Base",
-        nameKey: "nav.knowledgeBase",
-        href: "/kb",
-        icon: BookOpen,
-        color: "text-gray-500"
-      },
-      {
-        name: "Models",
-        nameKey: "nav.models",
-        href: "/models",
-        icon: Box,
-        color: "text-gray-500"
-      },
-      {
-        name: "Memory",
-        nameKey: "nav.memory",
-        href: "/memory",
-        icon: Brain,
-        color: "text-gray-500"
-      }
-    ]
-  }
-]
-
-const baseUserMenuItems: NavigationItem[] = [
+const baseMoreResourceItems: NavigationItem[] = [
   {
     name: "Tools",
     nameKey: "nav.tools",
@@ -185,7 +126,98 @@ const baseUserMenuItems: NavigationItem[] = [
     href: "/monitoring",
     icon: Activity,
     color: "text-blue-400"
+  }
+]
+
+const getMoreResourceItemsForUser = (user: any): NavigationItem[] => {
+  const items = [...baseMoreResourceItems]
+
+  if (user?.is_admin) {
+    items.push({
+      name: "User Management",
+      nameKey: "nav.userManagement",
+      href: "/users/",
+      icon: Users,
+      color: "text-blue-400"
+    })
+    items.push({
+      name: "Public MCP Apps",
+      nameKey: "nav.adminMcp",
+      href: "/admin-mcp/",
+      icon: Server,
+      color: "text-blue-400"
+    })
+  }
+
+  return items
+}
+
+const getNavigationGroupsForUser = (user: any): NavigationGroup[] => [
+  {
+    title: "Agent Development",
+    titleKey: "nav.sections.agentDevelopment",
+    items: [
+      {
+        name: "Task",
+        nameKey: "nav.task",
+        href: "/task",
+        icon: Sparkles,
+        color: "text-blue-500"
+      },
+      {
+        name: "Agents",
+        nameKey: "nav.build",
+        href: "/build",
+        icon: Bot,
+        color: "text-yellow-400"
+      },
+      {
+        name: "Templates",
+        nameKey: "nav.templates",
+        href: "/templates",
+        icon: LayoutTemplate,
+        color: "text-purple-400"
+      },
+    ]
   },
+  {
+    title: "Resources",
+    titleKey: "nav.sections.resources",
+    items: [
+      {
+        name: "Knowledge Base",
+        nameKey: "nav.knowledgeBase",
+        href: "/kb",
+        icon: Globe,
+        color: "text-gray-500"
+      },
+      {
+        name: "Models",
+        nameKey: "nav.models",
+        href: "/models",
+        icon: Box,
+        color: "text-gray-500"
+      },
+      {
+        name: "Memory",
+        nameKey: "nav.memory",
+        href: "/memory",
+        icon: Brain,
+        color: "text-gray-500"
+      },
+      {
+        name: "More",
+        nameKey: "nav.more",
+        href: "__resources_more__",
+        icon: Layers,
+        color: "text-gray-500",
+        children: getMoreResourceItemsForUser(user)
+      }
+    ]
+  }
+]
+
+const baseUserMenuItems: NavigationItem[] = [
   {
     name: "Settings",
     nameKey: "nav.settings",
@@ -195,27 +227,8 @@ const baseUserMenuItems: NavigationItem[] = [
   }
 ]
 
-const getUserMenuItemsForUser = (user: any): NavigationItem[] => {
-  const menuItems = [...baseUserMenuItems]
-
-  if (user?.is_admin) {
-    menuItems.splice(-1, 0, {
-      name: "User Management",
-      nameKey: "nav.userManagement",
-      href: "/users/",
-      icon: Users,
-      color: "text-blue-400"
-    })
-    menuItems.splice(-1, 0, {
-      name: "Public MCP Apps",
-      nameKey: "nav.adminMcp",
-      href: "/admin-mcp/",
-      icon: Server,
-      color: "text-blue-400"
-    })
-  }
-
-  return menuItems
+const getUserMenuItemsForUser = (_user: any): NavigationItem[] => {
+  return [...baseUserMenuItems]
 }
 
 interface SidebarProps {
@@ -234,6 +247,7 @@ export function Sidebar({ className }: SidebarProps) {
   const normalizedGithubUrl = githubUrl.replace(/\.git$/, "").replace(/\/$/, "")
   const githubRepoDisplay = normalizedGithubUrl.replace(/^https?:\/\/github\.com\//i, "")
   const licenseUrl = `${normalizedGithubUrl}/blob/main/LICENSE`
+  const navigationGroups = getNavigationGroupsForUser(user)
   const [githubStars, setGithubStars] = useState<number | null>(null)
 
   const [taskToDelete, setTaskToDelete] = useState<string | null>(null)
@@ -672,6 +686,13 @@ export function Sidebar({ className }: SidebarProps) {
     return pathname === href || pathname.startsWith(`${href}/`)
   }
 
+  const isItemActive = (item: NavigationItem) => {
+    if (item.children?.length) {
+      return item.children.some((child) => isPathActive(child.href))
+    }
+    return isPathActive(item.href)
+  }
+
   if ((isAgentPage && !shouldShowSidebar) || !isSidebarOpen) {
     return (
       <div className="flex flex-col items-center justify-start py-4 w-[60px] bg-card border-r border-border shrink-0 h-full relative">
@@ -691,7 +712,26 @@ export function Sidebar({ className }: SidebarProps) {
         <div className="flex flex-col gap-2 w-full px-2">
           {navigationGroups.map((group) => (
             group.items.map((item) => {
-              const isActive = isPathActive(item.href)
+              const isActive = isItemActive(item)
+              const hasChildren = item.children && item.children.length > 0
+
+              if (hasChildren) {
+                return (
+                  <button
+                    key={item.name}
+                    type="button"
+                    title={item.nameKey ? t(item.nameKey) : item.name}
+                    onClick={() => isAgentPage ? setIsExpanded(true) : setIsSidebarOpen(true)}
+                    className={cn(
+                      "flex w-full items-center justify-center p-2 rounded-lg transition-colors",
+                      isActive ? "bg-primary/10 text-primary" : "text-muted-foreground hover:bg-accent hover:text-foreground"
+                    )}
+                  >
+                    <item.icon className="h-5 w-5" />
+                  </button>
+                )
+              }
+
               return (
                 <Link
                   key={item.name}
@@ -725,26 +765,26 @@ export function Sidebar({ className }: SidebarProps) {
 
   return (
     <div ref={sidebarRef} className={cn(
-      "flex flex-col bg-card border-r border-border transition-all duration-300 shrink-0",
+      "flex flex-col bg-gray-100 border-r border-border transition-all duration-300 shrink-0",
       isAgentPage ? "h-full" : "h-full",
       shouldShowSidebar ? "w-72" : "w-0",
       className
     )}>
       {/* Logo */}
       <div className="flex h-16 items-center justify-between px-6 mt-2 relative">
-        <Link href="/task" className="flex items-center gap-2">
+        <Link href="/" className="flex items-center gap-2">
           <img
             src={branding.logoPath}
             alt={branding.logoAlt}
-            className="h-8 w-8 rounded-lg"
+            className="h-12 w-12 rounded-lg"
           />
-          <h1 className="text-xl font-bold text-foreground">{branding.appName}</h1>
+          <h1 className="text-[28px] font-bold" style={{ color: "#2745A6" }}>{branding.appName}</h1>
         </Link>
         <button
           onClick={() => isAgentPage ? setIsExpanded(false) : setIsSidebarOpen(false)}
           className="absolute -right-3 top-4 bg-card border border-border rounded-full p-0.5 text-muted-foreground hover:text-foreground hover:bg-accent transition-colors z-50 shadow-sm"
         >
-          <ChevronDown className="h-4 w-4 rotate-90" />
+          <ChevronLeft className="h-4 w-4" />
         </button>
       </div>
 
@@ -753,7 +793,7 @@ export function Sidebar({ className }: SidebarProps) {
         {/* Sticky Navigation Groups */}
         <nav
           ref={navRef}
-          className="z-10 bg-card -mx-3 px-3 py-2 overflow-y-auto [&::-webkit-scrollbar]:hidden [-ms-overflow-style:'none'] [scrollbar-width:'none']"
+          className="z-10 bg-transparent -mx-3 px-3 py-2 overflow-y-auto [&::-webkit-scrollbar]:hidden [-ms-overflow-style:'none'] [scrollbar-width:'none']"
         >
           {/* Groups */}
           {navigationGroups.map((group, groupIndex) => (
@@ -763,7 +803,7 @@ export function Sidebar({ className }: SidebarProps) {
               </div>
               <div className="space-y-1">
                 {group.items.map((item) => {
-                  const isActive = isPathActive(item.href)
+                  const isActive = isItemActive(item)
                   const hasChildren = item.children && item.children.length > 0
                   const isExpanded = isMenuExpanded(item.href)
 
@@ -774,7 +814,7 @@ export function Sidebar({ className }: SidebarProps) {
                     rounded-lg
                     mx-2
                   `;
-                  const inactiveStyle = "text-muted-foreground hover:bg-accent/50 hover:text-foreground mx-2 rounded-lg"
+                  const inactiveStyle = "text-muted-foreground hover:bg-slate-200/80 hover:text-foreground mx-2 rounded-lg"
 
                   if (hasChildren) {
                     return (
@@ -808,7 +848,7 @@ export function Sidebar({ className }: SidebarProps) {
                                       "group flex items-center px-4 py-2 text-sm font-medium transition-colors rounded-lg mx-2",
                                       isChildActive
                                         ? "bg-primary/10 text-primary"
-                                        : "text-muted-foreground hover:bg-accent/50 hover:text-foreground"
+                                        : "text-muted-foreground hover:bg-slate-200/80 hover:text-foreground"
                                     )}
                                   >
                                     <child.icon className={cn("h-4 w-4 mr-3", isChildActive ? "text-primary" : child.color || "text-muted-foreground")} />
@@ -1077,13 +1117,13 @@ export function Sidebar({ className }: SidebarProps) {
           onClick={() => setShowUserMenu(!showUserMenu)}
           className="flex w-full items-center gap-2 hover:bg-accent/50 p-2 -ml-2 rounded-lg transition-colors text-left"
         >
-          <div className="h-8 w-8 rounded-full bg-primary flex items-center justify-center text-xs font-medium text-primary-foreground uppercase shrink-0">
+          <div className="h-8 w-8 rounded-full bg-blue-600 flex items-center justify-center text-xs font-medium text-white uppercase shrink-0">
             {(user?.username || t('sidebar.user.defaultName')).charAt(0)}
           </div>
           <div className="ml-3 flex-1">
-            <p className="text-sm font-medium text-foreground">{user?.username || t('sidebar.user.defaultName')}</p>
+            <p className="text-sm font-bold text-foreground">{user?.username || t('sidebar.user.defaultName')}</p>
           </div>
-          <ChevronDown className={cn("h-4 w-4 text-muted-foreground transition-transform", showUserMenu && "rotate-180")} />
+          <ChevronsUpDown className="h-4 w-4 text-muted-foreground" />
         </button>
       </div>
 

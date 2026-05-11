@@ -47,6 +47,7 @@ interface ChatInputProps {
   hideFileUpload?: boolean;
   compact?: boolean;
   autoFocus?: boolean;
+  minHeightClass?: string;
 }
 
 export function ChatInput({
@@ -65,7 +66,8 @@ export function ChatInput({
   readOnlyConfig = false,
   hideFileUpload = false,
   compact = false,
-  autoFocus = false
+  autoFocus = false,
+  minHeightClass = "min-h-[130px]"
 }: ChatInputProps) {
   const router = useRouter();
   const [internalMessage, setInternalMessage] = useState("");
@@ -494,17 +496,32 @@ export function ChatInput({
       if (editor.innerHTML !== "") {
         editor.innerHTML = "";
       }
-    } else if (document.activeElement !== editor && editor.innerText.trim() === "") {
-      // Restore file:// links
-      let html = message.replace(/\[([^\]]+)\]\(file:\/\/([^)]+)\)/g, (match, filename, id) => {
-        // We use the ID as the path since we don't have the real path anymore
-        return createFileChipHTML(id, id, filename);
+    } else if (document.activeElement !== editor) {
+      // Serialize current editor content to compare
+      const clone = editor.cloneNode(true) as HTMLElement;
+      const chips = clone.querySelectorAll('[data-file-path]');
+      chips.forEach((chip) => {
+        const path = chip.getAttribute('data-file-path');
+        const fileId = chip.getAttribute('data-file-id');
+        const filename = chip.getAttribute('data-filename') || path?.split('/').pop() || path;
+        const id = fileId || path;
+        chip.replaceWith(document.createTextNode(`[${filename}](file://${id})`));
       });
-      // Fallback for old backticked messages to not break existing chat history
-      html = html.replace(/`([^`]+)`/g, (match, path) => {
-        return createFileChipHTML(path);
-      });
-      editor.innerHTML = html;
+      const currentText = clone.innerText.replace(/\u200B/g, '');
+
+      if (message !== currentText) {
+        // Restore file:// links
+        let html = message.replace(/\[([^\]]+)\]\(file:\/\/([^)]+)\)/g, (match, filename, id) => {
+          // We use the ID as the path since we don't have the real path anymore
+          return createFileChipHTML(id, id, filename);
+        });
+        // Fallback for old backticked messages to not break existing chat history
+        html = html.replace(/`([^`]+)`/g, (match, path) => {
+          return createFileChipHTML(path);
+        });
+
+        editor.innerHTML = html;
+      }
     }
   }, [message]);
 
@@ -584,7 +601,7 @@ export function ChatInput({
             contentEditable
             className={cn(
               "w-full rounded-md border-0 bg-transparent text-[15px] outline-none placeholder:text-muted-foreground/60 overflow-y-auto resize-none focus-visible:ring-0 focus-visible:ring-offset-0 whitespace-pre-wrap break-words text-left",
-              compact ? "min-h-[44px] px-3 py-3 pr-12 max-h-[150px]" : "min-h-[130px] px-3 py-2 pb-14 max-h-[300px]",
+              compact ? "min-h-[44px] px-3 py-3 pr-12 max-h-[150px]" : cn(minHeightClass, "px-4 py-3 pb-16 max-h-[400px]"),
               isLoading ? "opacity-50 pointer-events-none" : ""
             )}
             onInput={handleInput}
@@ -709,21 +726,26 @@ export function ChatInput({
                     <Play className="h-4 w-4" />
                   </Button>
                 ) : (
-                  <Button
-                    type="submit"
-                    size="icon"
-                    disabled={!canSubmit()}
-                    className={cn(
-                      "h-8 w-8 rounded-lg transition-all duration-300",
-                      !canSubmit() && "bg-muted text-muted-foreground/50"
-                    )}
-                  >
-                    {isLoading ? (
-                      <Sparkles className="h-4 w-4 animate-pulse" />
-                    ) : (
-                      <ArrowUp className="h-4 w-4" />
-                    )}
-                  </Button>
+                  <div className="flex items-center gap-2">
+                    <span className="text-[13px] font-medium text-muted-foreground/50 select-none mr-1">
+                      ⏎ {t("common.send")}
+                    </span>
+                    <Button
+                      type="submit"
+                      size="icon"
+                      disabled={!canSubmit()}
+                      className={cn(
+                        "h-8 w-8 rounded-lg transition-all duration-300",
+                        !canSubmit() && "bg-muted text-muted-foreground/50"
+                      )}
+                    >
+                      {isLoading ? (
+                        <Sparkles className="h-4 w-4 animate-pulse" />
+                      ) : (
+                        <ArrowUp className="h-4 w-4" />
+                      )}
+                    </Button>
+                  </div>
                 )}
               </div>
             </div>

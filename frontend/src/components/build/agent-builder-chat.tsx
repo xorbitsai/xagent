@@ -8,6 +8,7 @@ import { getApiUrl } from "@/lib/utils"
 import { apiRequest } from "@/lib/api-wrapper"
 import { useI18n } from "@/contexts/i18n-context"
 import { toast } from "sonner"
+import { getBrandingFromEnv } from "@/lib/branding"
 
 import { Interaction } from "@/contexts/app-context-chat"
 
@@ -72,6 +73,7 @@ export function AgentBuilderChat({ agentConfig, onUpdateConfig, availableOptions
   const { token } = useAuth()
   const [messages, setMessages] = useState<Message[]>([])
   const [hasSentInitial, setHasSentInitial] = useState(false)
+  const branding = getBrandingFromEnv()
 
   // Set initial message on mount to avoid hydration mismatch and get translation
   useEffect(() => {
@@ -80,7 +82,7 @@ export function AgentBuilderChat({ agentConfig, onUpdateConfig, availableOptions
       return [
         {
           role: "assistant",
-          content: t("builds.configForm.chat.initialMessage", { appName: process.env.NEXT_PUBLIC_APP_NAME || "Xagent" }),
+          content: t("builds.configForm.chat.initialMessage", { appName: branding.appName }),
           timestamp: Date.now()
         }
       ]
@@ -384,7 +386,7 @@ export function AgentBuilderChat({ agentConfig, onUpdateConfig, availableOptions
               currentReply = ""
             } else if (data.type === "error" || data.type === "task_error") {
               setIsLoading(false)
-              toast.error(data.message || data.error || t("builds.configForm.chat.errorCommunicate", { appName: process.env.NEXT_PUBLIC_APP_NAME || "Xagent" }))
+              toast.error(data.message || data.error || t("builds.configForm.chat.errorCommunicate", { appName: branding.appName }))
               ws.close()
             }
           } catch (e) {
@@ -395,7 +397,7 @@ export function AgentBuilderChat({ agentConfig, onUpdateConfig, availableOptions
         ws.onerror = (error) => {
           console.error("WebSocket error:", error)
           setIsLoading(false)
-          toast.error(t("builds.configForm.chat.errorConnection", { appName: process.env.NEXT_PUBLIC_APP_NAME || "Xagent" }) || "Connection error. Please try again.")
+          toast.error(t("builds.configForm.chat.errorConnection", { appName: branding.appName }))
         }
 
         ws.onclose = () => {
@@ -432,7 +434,7 @@ export function AgentBuilderChat({ agentConfig, onUpdateConfig, availableOptions
           <Bot className="h-5 w-5" />
         </div>
         <div>
-          <h3 className="font-semibold text-sm">{t("builds.configForm.chat.title", { appName: process.env.NEXT_PUBLIC_APP_NAME || "Xagent" })}</h3>
+          <h3 className="font-semibold text-sm">{t("builds.configForm.chat.title", { appName: branding.appName })}</h3>
           <p className="text-xs text-muted-foreground">{t("builds.configForm.chat.subtitle")}</p>
         </div>
       </div>

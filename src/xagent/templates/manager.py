@@ -110,7 +110,7 @@ class TemplateManager:
         data.setdefault("features", [])
         data.setdefault("connections", [])
         data.setdefault("setup_time", "5 min setup")
-        data.setdefault("author", "xAgent")
+        data.setdefault("author", "Xagent")
         data.setdefault("version", "1.0")
         data.setdefault("featured", False)
 

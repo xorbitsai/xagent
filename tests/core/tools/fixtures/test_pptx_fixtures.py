@@ -164,7 +164,7 @@ SAMPLE_SLIDES_WITH_COMPARISON = [
         "title": "Our Advantage",
         "left_title": "Traditional",
         "left_items": ["Manual", "Slow", "Expensive"],
-        "right_title": "XAgent",
+        "right_title": "Xagent",
         "right_items": ["Automated", "Fast", "Scalable"],
     }
 ]

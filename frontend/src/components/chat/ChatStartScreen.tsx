@@ -1,5 +1,5 @@
 import React from "react";
-import { Bot, Sparkles } from "lucide-react";
+import { Sparkles } from "lucide-react";
 import { ChatInput } from "@/components/chat/ChatInput";
 import { useI18n } from "@/contexts/i18n-context";
 
@@ -15,7 +15,6 @@ export interface PromptCard {
 interface ChatStartScreenProps {
   title: string;
   description?: string;
-  icon?: React.ReactNode | string; // URL string or ReactNode
   prompts?: (PromptCard | string)[];
   onSend: (message: string, files: File[], config?: any) => void;
   isSending?: boolean;
@@ -27,12 +26,12 @@ interface ChatStartScreenProps {
   readOnlyConfig?: boolean;
   taskConfig?: any;
   autoFocus?: boolean;
+  inputMinHeightClass?: string;
 }
 
 export function ChatStartScreen({
   title,
   description,
-  icon,
   prompts,
   onSend,
   isSending = false,
@@ -43,7 +42,8 @@ export function ChatStartScreen({
   showModeToggle = false,
   readOnlyConfig = false,
   taskConfig,
-  autoFocus = false
+  autoFocus = false,
+  inputMinHeightClass
 }: ChatStartScreenProps) {
   const { t } = useI18n();
 
@@ -55,7 +55,7 @@ export function ChatStartScreen({
 
   return (
     <div className="flex flex-col items-center justify-center min-h-[80vh] py-16 text-center">
-      <h2 className="text-3xl font-semibold mb-3 text-foreground">
+      <h2 className="text-3xl font-bold mb-3 text-blue-600 dark:text-blue-500">
         {title}
       </h2>
       {description && (
@@ -75,15 +75,17 @@ export function ChatStartScreen({
             readOnlyConfig={readOnlyConfig}
             taskConfig={taskConfig}
             autoFocus={autoFocus}
+            minHeightClass={inputMinHeightClass}
           />
-          <div className="text-xs text-muted-foreground/60 text-center">
-            {t("chatPage.input.hintEnter")} · {t("chatPage.input.hintAt")}
-          </div>
         </div>
 
         {prompts && prompts.length > 0 && (
-          <div className="space-y-4 pt-4">
-            <div className={`grid grid-cols-1 sm:grid-cols-2 ${prompts.length <= 3 ? 'lg:grid-cols-3' : 'lg:grid-cols-4'} gap-4`}>
+          <div className="space-y-4">
+            <div className="flex items-center gap-2 text-xs font-bold text-slate-400 uppercase tracking-wider mb-2 mt-4 px-1">
+              <Sparkles className="w-3.5 h-3.5" />
+              <span>{t("chatPage.sections.startingPrompts")}</span>
+            </div>
+            <div className={`grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-4`}>
               {prompts.map((item, index) => {
                 const isString = typeof item === 'string';
                 const promptText = isString ? item : item.prompt;
@@ -105,12 +107,12 @@ export function ChatStartScreen({
                   <div
                     key={index}
                     onClick={() => handlePromptClick(promptText)}
-                    className="group relative p-4 h-28 rounded-xl border border-border bg-card hover:bg-muted/50 cursor-pointer transition-all duration-300 flex flex-col justify-center items-start text-left gap-3"
+                    className="group relative px-4 py-3 min-h-[72px] rounded-xl border border-border bg-card hover:bg-muted/50 cursor-pointer transition-all duration-300 flex flex-row items-center text-left gap-4"
                   >
-                    <div className="flex items-center justify-center">
-                      {item.icon && <item.icon className="w-5 h-5 text-muted-foreground" />}
+                    <div className="flex items-center justify-center shrink-0 h-10 w-10 rounded-lg bg-blue-50 dark:bg-blue-900/20 text-blue-500">
+                      {item.icon && <item.icon className="w-5 h-5" />}
                     </div>
-                    <h3 className="font-medium text-sm text-foreground/90 leading-tight">{item.title}</h3>
+                    <h3 className="font-medium text-[14px] text-foreground/90 leading-snug">{item.title}</h3>
                   </div>
                 );
               })}

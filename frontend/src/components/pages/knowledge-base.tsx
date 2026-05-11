@@ -17,10 +17,16 @@ import {
   Trash2,
   Settings2,
   X,
+  Database,
+  UploadCloud,
+  Globe,
+  Search,
+  Plug
 } from "lucide-react"
 import { Sheet, SheetContent, SheetHeader, SheetTitle, SheetDescription } from "@/components/ui/sheet"
 import { KnowledgeBaseDetailContent } from "@/components/kb/knowledge-base-detail"
 import { KnowledgeBaseCreationDialog } from "@/components/kb/knowledge-base-creation-dialog"
+import { FeatureEmptyState } from "@/components/ui/feature-empty-state"
 import { ConfirmDialog } from "@/components/ui/confirm-dialog"
 import { toast } from "sonner"
 
@@ -315,9 +321,9 @@ export function KnowledgeBasePage() {
             <Badge variant="secondary" className="font-normal">
               {searchQuery
                 ? t("kb.header.matchCount", {
-                    matched: filteredCollections.length,
-                    total: collections.length,
-                  })
+                  matched: filteredCollections.length,
+                  total: collections.length,
+                })
                 : t("kb.header.totalCount", { total: collections.length })}
             </Badge>
           </div>
@@ -351,129 +357,164 @@ export function KnowledgeBasePage() {
 
       {/* Collections Grid */}
       <div className="flex-1 overflow-y-auto w-full px-8 pb-8">
-        {isManageMode && filteredCollections.length > 0 && (
-          <div className="flex items-center gap-4 mb-4 p-3 rounded-lg bg-muted/50 border">
-            <label className="flex items-center gap-2 cursor-pointer">
-              <input
-                type="checkbox"
-                checked={allVisibleSelected}
-                onChange={selectAll}
-                className="h-4 w-4 rounded border-input"
-              />
-              <span className="text-sm font-medium">
-                {allVisibleSelected ? t("kb.manage.deselectAll") : t("kb.manage.selectAll")}
-              </span>
-            </label>
-            <Button
-              variant="destructive"
-              size="sm"
-              disabled={selectedNames.size === 0}
-              onClick={handleBatchDelete}
-              className="flex items-center gap-2"
-            >
-              <Trash2 className="h-4 w-4" />
-              {t("kb.manage.deleteSelected", { count: selectedNames.size })}
-            </Button>
-          </div>
-        )}
-        {filteredCollections.length > 0 ? (
-          <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6">
-            {filteredCollections.map((collection) => (
-              <Card
-                key={collection.name}
-                className="py-0 hover:shadow-lg transition-shadow overflow-hidden flex flex-col cursor-pointer"
-                onClick={() => {
-                  if (isManageMode) toggleSelect(collection.name)
-                  else handleViewDetail(collection.name)
-                }}
-              >
-                <div className="p-6 flex-1">
-                  <div className="flex justify-between items-start mb-4">
-                    <div className="flex gap-4 min-w-0 flex-1 mr-2">
-                      {isManageMode && (
-                        <div onClick={(e) => e.stopPropagation()}>
-                          <input
-                            type="checkbox"
-                            checked={selectedNames.has(collection.name)}
-                            onChange={() => toggleSelect(collection.name)}
-                            className="h-4 w-4 rounded border-input mt-1"
-                          />
+        {collections.length === 0 ? (
+          <FeatureEmptyState
+            icon={Database}
+            title={t("kb.emptyState.title")}
+            description={t("kb.emptyState.description")}
+            features={[
+              {
+                icon: UploadCloud,
+                title: t("kb.emptyState.features.fileUpload.title"),
+                description: t("kb.emptyState.features.fileUpload.description")
+              },
+              {
+                icon: Globe,
+                title: t("kb.emptyState.features.websiteImport.title"),
+                description: t("kb.emptyState.features.websiteImport.description")
+              },
+              {
+                icon: Search,
+                title: t("kb.emptyState.features.semanticSearch.title"),
+                description: t("kb.emptyState.features.semanticSearch.description")
+              },
+              {
+                icon: Plug,
+                title: t("kb.emptyState.features.connectToAgents.title"),
+                description: t("kb.emptyState.features.connectToAgents.description")
+              }
+            ]}
+            actionLabel={t("kb.emptyState.action")}
+            onAction={() => setIsCreateDialogOpen(true)}
+            className="h-full mt-4"
+          />
+        ) : (
+          <>
+            {isManageMode && filteredCollections.length > 0 && (
+              <div className="flex items-center gap-4 mb-4 p-3 rounded-lg bg-muted/50 border">
+                <label className="flex items-center gap-2 cursor-pointer">
+                  <input
+                    type="checkbox"
+                    checked={allVisibleSelected}
+                    onChange={selectAll}
+                    className="h-4 w-4 rounded border-input"
+                  />
+                  <span className="text-sm font-medium">
+                    {allVisibleSelected ? t("kb.manage.deselectAll") : t("kb.manage.selectAll")}
+                  </span>
+                </label>
+                <Button
+                  variant="destructive"
+                  size="sm"
+                  disabled={selectedNames.size === 0}
+                  onClick={handleBatchDelete}
+                  className="flex items-center gap-2"
+                >
+                  <Trash2 className="h-4 w-4" />
+                  {t("kb.manage.deleteSelected", { count: selectedNames.size })}
+                </Button>
+              </div>
+            )}
+            {filteredCollections.length > 0 ? (
+              <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6">
+                {filteredCollections.map((collection) => (
+                  <Card
+                    key={collection.name}
+                    className="py-0 hover:shadow-lg transition-shadow overflow-hidden flex flex-col cursor-pointer"
+                    onClick={() => {
+                      if (isManageMode) toggleSelect(collection.name)
+                      else handleViewDetail(collection.name)
+                    }}
+                  >
+                    <div className="p-6 flex-1">
+                      <div className="flex justify-between items-start mb-4">
+                        <div className="flex gap-4 min-w-0 flex-1 mr-2">
+                          {isManageMode && (
+                            <div onClick={(e) => e.stopPropagation()}>
+                              <input
+                                type="checkbox"
+                                checked={selectedNames.has(collection.name)}
+                                onChange={() => toggleSelect(collection.name)}
+                                className="h-4 w-4 rounded border-input mt-1"
+                              />
+                            </div>
+                          )}
+                          <div className="h-10 w-10 rounded-lg bg-blue-100 dark:bg-blue-900/30 flex items-center justify-center flex-shrink-0">
+                            <FolderOpen className="h-5 w-5 text-blue-600 dark:text-blue-400" />
+                          </div>
+                          <div className="min-w-0">
+                            <h3 className="text-lg font-semibold truncate" title={collection.name}>{collection.name}</h3>
+                            <p className="text-sm text-muted-foreground truncate" title={collection.document_names && collection.document_names.length > 0 ? collection.document_names.join(", ") : t("kb.card.noDescription")}>
+                              {collection.document_names && collection.document_names.length > 0
+                                ? collection.document_names.join(", ")
+                                : t("kb.card.noDescription")}
+                            </p>
+                          </div>
                         </div>
-                      )}
-                      <div className="h-10 w-10 rounded-lg bg-blue-100 dark:bg-blue-900/30 flex items-center justify-center flex-shrink-0">
-                        <FolderOpen className="h-5 w-5 text-blue-600 dark:text-blue-400" />
-                      </div>
-                      <div className="min-w-0">
-                        <h3 className="text-lg font-semibold truncate" title={collection.name}>{collection.name}</h3>
-                        <p className="text-sm text-muted-foreground truncate" title={collection.document_names && collection.document_names.length > 0 ? collection.document_names.join(", ") : t("kb.card.noDescription")}>
-                          {collection.document_names && collection.document_names.length > 0
-                            ? collection.document_names.join(", ")
-                            : t("kb.card.noDescription")}
-                        </p>
-                      </div>
-                    </div>
-                    {!isManageMode && (
-                      <div className="flex flex-col items-end gap-1 ml-2 flex-shrink-0">
-                        <div className="flex items-center gap-2">
-                          <Badge variant="outline" className="text-green-600 bg-green-50 dark:bg-green-900/20 border-green-200 dark:border-green-900 whitespace-nowrap">
-                            {t("kb.card.status.active")}
-                          </Badge>
-                          <Button
-                            variant="ghost"
-                            size="icon"
-                            className="h-8 w-8 text-destructive hover:text-destructive"
-                            onClick={(e) => {
-                              e.stopPropagation()
-                              setCollectionToDelete(collection.name)
-                            }}
-                            title={t("kb.card.actions.delete")}
-                          >
-                            <Trash2 className="h-4 w-4" />
-                          </Button>
-                        </div>
-                        {user?.is_admin && collection.owners && collection.owners.length > 0 && (
-                          <p className="text-xs text-muted-foreground">
-                            {adminUsersLoadFailed
-                              ? t("kb.card.ownerFallbackLabel", { owners: collection.owners.join(", ") })
-                              : t("kb.card.ownerLabel", {
-                                  owners: collection.owners.map((id) => adminUsers[id] ?? id).join(", "),
-                                })}
-                          </p>
+                        {!isManageMode && (
+                          <div className="flex flex-col items-end gap-1 ml-2 flex-shrink-0">
+                            <div className="flex items-center gap-2">
+                              <Badge variant="outline" className="text-green-600 bg-green-50 dark:bg-green-900/20 border-green-200 dark:border-green-900 whitespace-nowrap">
+                                {t("kb.card.status.active")}
+                              </Badge>
+                              <Button
+                                variant="ghost"
+                                size="icon"
+                                className="h-8 w-8 text-destructive hover:text-destructive"
+                                onClick={(e) => {
+                                  e.stopPropagation()
+                                  setCollectionToDelete(collection.name)
+                                }}
+                                title={t("kb.card.actions.delete")}
+                              >
+                                <Trash2 className="h-4 w-4" />
+                              </Button>
+                            </div>
+                            {user?.is_admin && collection.owners && collection.owners.length > 0 && (
+                              <p className="text-xs text-muted-foreground">
+                                {adminUsersLoadFailed
+                                  ? t("kb.card.ownerFallbackLabel", { owners: collection.owners.join(", ") })
+                                  : t("kb.card.ownerLabel", {
+                                    owners: collection.owners.map((id) => adminUsers[id] ?? id).join(", "),
+                                  })}
+                              </p>
+                            )}
+                          </div>
                         )}
                       </div>
-                    )}
-                  </div>
-                </div>
+                    </div>
 
-                <div className="px-6 py-4 bg-muted/30 border-t flex justify-between items-center text-sm text-muted-foreground">
-                  <div className="flex items-center">
-                    <FileText className="h-4 w-4 mr-2" />
-                    {collection.documents} {t("kb.card.documentsLabel")}
-                  </div>
-                  <div className="flex items-center">
-                    <HardDrive className="h-4 w-4 mr-2" />
-                    {collection.chunks} {t("kb.card.chunksLabel")}
-                  </div>
-                </div>
+                    <div className="px-6 py-4 bg-muted/30 border-t flex justify-between items-center text-sm text-muted-foreground">
+                      <div className="flex items-center">
+                        <FileText className="h-4 w-4 mr-2" />
+                        {collection.documents} {t("kb.card.documentsLabel")}
+                      </div>
+                      <div className="flex items-center">
+                        <HardDrive className="h-4 w-4 mr-2" />
+                        {collection.chunks} {t("kb.card.chunksLabel")}
+                      </div>
+                    </div>
+                  </Card>
+                ))}
+              </div>
+            ) : (
+              <Card className="p-12 text-center">
+                <FolderOpen size={48} className="mx-auto mb-4 opacity-50 text-muted-foreground" />
+                <p className="text-lg mb-2 text-muted-foreground">
+                  {searchQuery ? t("kb.empty.searchNoMatch") : t("kb.empty.noKB")}
+                </p>
+                <p className="text-sm text-muted-foreground mb-4">
+                  {searchQuery ? t("kb.empty.hintSearch") : t("kb.empty.hintCreate")}
+                </p>
+                {!searchQuery && (
+                  <Button onClick={() => { setIsCreateDialogOpen(true) }} className="flex items-center gap-2">
+                    <Plus size={16} className="mr-2" />
+                    {t("kb.header.new")}
+                  </Button>
+                )}
               </Card>
-            ))}
-          </div>
-        ) : (
-          <Card className="p-12 text-center">
-            <FolderOpen size={48} className="mx-auto mb-4 opacity-50 text-muted-foreground" />
-            <p className="text-lg mb-2 text-muted-foreground">
-              {searchQuery ? t("kb.empty.searchNoMatch") : t("kb.empty.noKB")}
-            </p>
-            <p className="text-sm text-muted-foreground mb-4">
-              {searchQuery ? t("kb.empty.hintSearch") : t("kb.empty.hintCreate")}
-            </p>
-            {!searchQuery && (
-              <Button onClick={() => { setIsCreateDialogOpen(true) }} className="flex items-center gap-2">
-                <Plus size={16} className="mr-2" />
-                {t("kb.header.new")}
-              </Button>
             )}
-          </Card>
+          </>
         )}
       </div>
 

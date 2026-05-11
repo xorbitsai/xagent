@@ -1,5 +1,7 @@
 const en = {
   common: {
+    optional: "(Optional)",
+    next: "Next",
     back: "Back",
     loading: "Loading...",
     save: "Save",
@@ -58,18 +60,88 @@ const en = {
     search: "Search Tasks",
     templates: "Templates",
     channels: "Channels",
+    more: "More",
     sections: {
       agentDevelopment: "Agent Development",
       resources: "Resources",
     },
   },
+  home: {
+    hero: {
+      title: "Welcome to {appName}",
+      subtitle: "Build, deploy, and scale intelligent agents that work for you — no code required.",
+      searchPlaceholder: "What would you like to do?",
+    },
+    getStarted: {
+      title: "Get started",
+      video: {
+        title: "Video Tutorial",
+        description: "Watch a quick overview of {appName}'s core features."
+      },
+      docs: {
+        title: "Documentation",
+        description: "Explore the full reference docs for every feature."
+      },
+      guides: {
+        title: "How-to Guides",
+        description: "Step-by-step walkthroughs for common use cases."
+      },
+      whatsNew: {
+        title: "What's New",
+        description: "See the latest updates, improvements, and releases."
+      }
+    },
+    templates: {
+      title: "Build agents with templates",
+      viewAll: "View all",
+      setupTime: "{time} setup",
+      useTemplate: "Use Template"
+    },
+    recent: {
+      title: "Recent",
+      untitledTask: "Untitled Task",
+      defaultAgent: "Agent"
+    }
+  },
   chatPage: {
     page: {
-      emptyTitle: "What can I help you with?",
-      emptyDescription: "Describe your goal and {appName} will handle the rest.",
+      emptyTitle: "Describe the goal, {appName} will handle the rest",
+      emptyDescription: "Turn your ideas into working agents automatically. Just describe what you need to get started",
       startWith: "You can start with",
     },
+    sections: {
+      startingPrompts: "STARTING PROMPTS",
+    },
+    agents: {
+      researcher: "Researcher Agent",
+      poster: "Poster Maker",
+      linkedin: "LinkedIn Post Creator",
+    },
     cards: {
+      research: {
+        title: "Research a topic in depth",
+        prompt: "I need to research the latest trends in artificial intelligence."
+      },
+      linkedin: {
+        title: "Write a LinkedIn post about an achievement",
+        prompt: "Help me write a LinkedIn post announcing a new feature launch."
+      },
+      poster: {
+        title: "Design a poster for an event",
+        prompt: "Design a poster for an upcoming tech conference."
+      },
+      compare: {
+        title: "Compare products with deep research",
+        prompt: "Compare the top 3 electric vehicles on the market."
+      },
+      visual: {
+        title: "Create visual for a topic",
+        prompt: "Create a visual representation of how a neural network works."
+      },
+      presentation: {
+        title: "Turn a topic into a presentation deck",
+        prompt: "Create a 5-slide presentation on renewable energy."
+      },
       createPPT: {
         title: "Generate a PPT from a report",
         description: "Sales reports, slides",
@@ -93,8 +165,6 @@ const en = {
     },
     input: {
       placeholder: "Describe your task...",
-      hintEnter: "Press Enter to send",
-      hintAt: "Input @ to reference files",
       processing: "Processing",
       actions: {
         config: "Configure Model",
@@ -568,6 +638,24 @@ Build when you need.`
       title: "Recent Files",
       view_all: "View All",
       empty: "No files",
+    },
+    welcome: {
+      title: "WELCOME TO {appName}",
+      heading: "What would you like to do?",
+      subtitle: "Pick what you'd like to do first.",
+      presentationBuilder: {
+        title: "Presentation Builder",
+        description: "Turn any topic into a slide deck in seconds.",
+      },
+      buildAgents: {
+        title: "Build agents via Templates",
+        description: "Start from a pre-built template and customise to your workflow.",
+      },
+      createAgent: {
+        title: "Create Custom Agent",
+        description: "Build and configure agents tailored to your exact needs.",
+      },
+      skip: "Skip for now",
     },
   },
   monitoring: {
@@ -1109,6 +1197,10 @@ Build when you need.`
     subtitle: "Jumpstart your workflow with pre-built agents.",
     searchPlaceholder: "Search templates...",
     useTemplate: "Use Template",
+    countOne: "{count} template",
+    countOther: "{count} templates",
+    runs: "runs",
+    defaultSetupTime: "5 min setup",
     noResults: "No templates found matching your criteria.",
     categoryTitles: {
       featured: "Featured Templates",
@@ -1608,6 +1700,29 @@ Build when you need.`
     loading: {
       loadingKB: "Loading knowledge base...",
     },
+    emptyState: {
+      title: "How Knowledge Base Works",
+      description: "Give your agents access to your own content. Upload files, import websites, and let agents search your knowledge to answer questions accurately.",
+      features: {
+        fileUpload: {
+          title: "File Upload",
+          description: "Upload PDFs, docs, spreadsheets, and more to build a searchable knowledge store for your agents."
+        },
+        websiteImport: {
+          title: "Website Import",
+          description: "Import any website or documentation page and keep it in sync automatically as content changes."
+        },
+        semanticSearch: {
+          title: "Semantic Search",
+          description: "Find the most relevant content using AI-powered embeddings and hybrid search across all your data."
+        },
+        connectToAgents: {
+          title: "Connect to Agents",
+          description: "Attach knowledge bases directly to your agents so they always respond with accurate, relevant context."
+        }
+      },
+      action: "+ Create Knowledge Base"
+    },
     header: {
       title: "Knowledge Base Management",
       description: "Manage document collections and search indices",
@@ -1653,7 +1768,18 @@ Build when you need.`
       hintCreate: "Click 'New Knowledge Base' to create your first knowledge base",
     },
     dialog: {
+      steps: {
+        stepCount: "Step {currentStep}",
+        nameItTitle: "Name your knowledge base",
+        addContentTitle: "Add content source",
+        reviewTitle: "Review & Create",
+        nameIt: "Name it",
+        addContent: "Add Content",
+        filesSelected: "files selected",
+        crawlStartingFrom: "Crawling from"
+      },
       createTitle: "New Knowledge Base",
+      createButton: "Create Knowledge Base",
       createDescription: "Create a new knowledge base and upload documents or import from website",
       basicInfo: {
         title: "Basic Information",
@@ -1785,6 +1911,9 @@ Build when you need.`
     },
     index: {
       title: "Index Configuration",
+      parseMethodDesc: "How documents should be parsed",
+      chunkStrategyDesc: "How text should be split",
+      embeddingModelDesc: "Model used for vectorization",
       parseMethod: "Parse Method",
       parseOptions: {
         default: "Default",
@@ -1920,6 +2049,31 @@ Build when you need.`
         all: "All Statuses"
       }
     },
+    emptyState: {
+      title: "How Agents Work",
+      description: "Agents are AI assistants you configure to handle specific tasks — they can use tools, access knowledge, and run automatically.",
+      features: {
+        instructions: {
+          title: "Instructions",
+          description: "Write clear instructions that define your agent's role, tone, goals, and how it should handle different scenarios."
+        },
+        tools: {
+          title: "Tools",
+          description: "Equip agents with tools to call APIs, process data, and take actions in the real world."
+        },
+        knowledgeBase: {
+          title: "Knowledge Base",
+          description: "Upload files or import a website so your agent can answer questions using your own content and data."
+        },
+        connectors: {
+          title: "Connectors",
+          description: "Connect apps like Gmail, Outlook, HubSpot, and more — or plug in your own MCP servers and custom APIs."
+        }
+      },
+      action: "+ Create Your First Agent"
+    },
+    table: {
+    },
     stats: {
       total: "Total {count} builds"
     },
@@ -1989,6 +2143,7 @@ Build when you need.`
       }
     },
     editor: {
+      aiAssistant: "{appName} Assistant",
       header: {
         title: "Custom Agent",
         subtitle: "Configure your AI agent's behavior and capabilities.",

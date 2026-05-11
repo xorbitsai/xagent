@@ -1449,6 +1449,8 @@ async def create_agent_tools(config: "WebToolConfig") -> list[AbstractBaseTool]:
 
         excluded_agent_id = config.get_excluded_agent_id() if config else None
         delegate_agent_ids = config.get_delegate_agent_ids() if config else None
+        if not delegate_agent_ids:
+            delegate_agent_ids = None
 
         return get_published_agents_tools(
             db=db,

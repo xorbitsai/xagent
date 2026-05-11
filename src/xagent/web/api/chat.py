@@ -752,6 +752,8 @@ class AgentServiceManager:
                         for agent_id in task.delegate_agent_ids
                         if isinstance(agent_id, int)
                     ]
+                    if not delegate_agent_ids:
+                        delegate_agent_ids = None
 
                 # Create tools using ToolFactory
                 tools = await create_default_tools(
@@ -1532,7 +1534,7 @@ async def create_task(
                         file_info_list
                     )
 
-        delegate_agent_ids: list[int] = []
+        delegate_agent_ids: Optional[list[int]] = None
         if request.delegate_agent_ids:
             requested_delegate_ids = [
                 int(agent_id)

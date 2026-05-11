@@ -2003,6 +2003,46 @@ def test_kb_ingest_cloud_all_failures_clean_new_collection_config(test_env) -> N
     )
 
 
+def test_kb_ingest_cloud_denied_request_does_not_persist_collection_config(
+    test_env,
+) -> None:
+    from fastapi import HTTPException
+
+    app, headers, _user, _ = test_env
+    client = TestClient(app, raise_server_exceptions=False)
+    metadata_store = MagicMock()
+    metadata_store.save_collection_config = AsyncMock()
+
+    with (
+        patch(
+            "xagent.core.tools.core.RAG_tools.storage.factory.get_metadata_store",
+            return_value=metadata_store,
+        ),
+        patch(
+            "xagent.web.api.kb._ensure_collection_access",
+            new_callable=AsyncMock,
+            side_effect=HTTPException(status_code=403, detail="Forbidden"),
+        ),
+    ):
+        response = client.post(
+            "/api/kb/ingest-cloud",
+            json={
+                "collection": "shared_collection",
+                "files": [
+                    {
+                        "provider": "unsupported",
+                        "fileId": "file-1",
+                        "fileName": "doc.txt",
+                    }
+                ],
+            },
+            headers=headers,
+        )
+
+    assert response.status_code == 403
+    metadata_store.save_collection_config.assert_not_awaited()
+
+
 def test_kb_ingest_cloud_passes_file_id_to_pipeline(test_env, temp_uploads):
     """Cloud ingest should also register UploadedFile before pipeline execution."""
     app, headers, user, TestingSessionLocal = test_env

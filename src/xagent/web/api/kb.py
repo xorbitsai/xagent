@@ -1184,6 +1184,15 @@ async def ingest_cloud(
     )
 
     progress_manager = get_progress_manager()
+
+    try:
+        get_collection_sync(safe_collection)
+        collection_existed_before = True
+    except ValueError:
+        collection_existed_before = False
+
+    await _ensure_collection_access(safe_collection, _user, allow_create=True)
+
     try:
         from ...core.tools.core.RAG_tools.storage.factory import get_metadata_store
 
@@ -1195,14 +1204,6 @@ async def ingest_cloud(
         )
     except Exception as e:
         logger.warning("Failed to save collection config during ingest_cloud: %s", e)
-
-    try:
-        get_collection_sync(safe_collection)
-        collection_existed_before = True
-    except ValueError:
-        collection_existed_before = False
-
-    await _ensure_collection_access(safe_collection, _user, allow_create=True)
 
     # Concurrency limit for cloud ingestion to avoid overloading
     semaphore = asyncio.Semaphore(5)

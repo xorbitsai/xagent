@@ -164,6 +164,25 @@ def test_standalone_task_create_defaults_to_think(test_db, user1_headers):
     assert resp.json()["execution_mode"] == "think"
 
 
+def test_task_create_with_empty_delegate_selection_stores_none(test_db, user1_headers):
+    from xagent.web.models.task import Task
+
+    resp = client.post(
+        "/api/chat/task/create",
+        json={"title": "delegates", "description": "desc", "delegate_agent_ids": []},
+        headers=user1_headers,
+    )
+    assert resp.status_code == 200
+
+    db = next(get_db())
+    try:
+        task = db.query(Task).filter(Task.id == resp.json()["task_id"]).first()
+        assert task is not None
+        assert task.delegate_agent_ids is None
+    finally:
+        db.close()
+
+
 def test_task_create_allows_shared_model_ids(
     test_db, user1_headers, user2_headers, sample_model_data
 ):

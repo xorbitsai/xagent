@@ -362,19 +362,19 @@ export function FilesPage() {
   return (
     <div className="flex h-full flex-col bg-background">
       {/* Header (Title + Actions) */}
-      <div className="border-b flex justify-between items-center p-8">
-        <div>
-          <h1 className="text-3xl font-bold mb-1">{t('files.header.title')}</h1>
-          <p className="text-muted-foreground">{t('files.header.description')}</p>
+      <div className="border-b flex flex-col sm:flex-row justify-between items-start sm:items-center p-4 sm:p-8 gap-4">
+        <div className="space-y-1 w-full sm:w-auto">
+          <h1 className="text-2xl sm:text-3xl font-bold mb-1">{t('files.header.title')}</h1>
+          <p className="text-sm sm:text-base text-muted-foreground">{t('files.header.description')}</p>
         </div>
 
-        <div className="flex items-center gap-3">
+        <div className="flex items-center gap-3 w-full sm:w-auto">
           <SearchInput
             placeholder={t('files.search.placeholder')}
             value={searchQuery}
             onChange={setSearchQuery}
-            containerClassName="w-64"
-            className="h-9 bg-background"
+            containerClassName="flex-1 sm:w-64"
+            className="h-9 w-full bg-background"
           />
 
           <input
@@ -388,9 +388,10 @@ export function FilesPage() {
             size="sm"
             onClick={() => fileInputRef.current?.click()}
             disabled={uploading}
+            className="shrink-0"
           >
-            <Upload className="h-4 w-4 mr-2" />
-            {uploading ? t('files.actions.uploading') : t('files.actions.upload')}
+            <Upload className="h-4 w-4 sm:mr-2" />
+            <span className="hidden sm:inline">{uploading ? t('files.actions.uploading') : t('files.actions.upload')}</span>
           </Button>
         </div>
       </div>

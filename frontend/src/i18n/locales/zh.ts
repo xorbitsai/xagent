@@ -30,6 +30,7 @@ const zh = {
     clear: "清除",
     or: "或",
     add: "添加",
+    create: "创建",
     customPlaceholder: "自定义...",
     errors: {
       unknown: "未知错误",

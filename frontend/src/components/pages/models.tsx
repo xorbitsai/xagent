@@ -365,18 +365,19 @@ export function ModelsPage() {
   }
 
   return (
-    <div className="min-h-screen bg-background text-foreground overflow-y-auto">
-      <div className="w-full p-8 pb-20">
+    <div className="h-full overflow-auto bg-background text-foreground">
+      <div className="w-full p-4 sm:p-8 pb-20">
         {/* Header */}
-        <div className="flex justify-between items-center mb-8">
-          <div>
-            <h1 className="text-3xl font-bold mb-1">{t('models.header.title')}</h1>
-            <p className="text-muted-foreground">{t('models.header.description')}</p>
+        <div className="flex flex-col sm:flex-row justify-between items-start sm:items-center gap-4 mb-8">
+          <div className="space-y-1 w-full sm:w-auto">
+            <h1 className="text-2xl sm:text-3xl font-bold mb-1">{t('models.header.title')}</h1>
+            <p className="text-sm sm:text-base text-muted-foreground">{t('models.header.description')}</p>
           </div>
 
-          <Button onClick={handleAddModel} className="flex items-center gap-2">
-            <Plus size={16} className="mr-2" />
-            {t('models.header.add')}
+          <Button onClick={handleAddModel} className="flex items-center gap-2 shrink-0">
+            <Plus size={16} className="mr-1 sm:mr-2" />
+            <span className="hidden sm:inline">{t('models.header.add')}</span>
+            <span className="sm:hidden">{t('common.add') || t('models.header.add')}</span>
           </Button>
         </div>
 

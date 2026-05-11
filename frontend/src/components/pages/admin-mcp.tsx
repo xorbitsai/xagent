@@ -297,17 +297,17 @@ export default function AdminMcpPage() {
 
   return (
     <div className="flex h-full flex-col bg-background overflow-auto">
-      <div className="flex justify-between items-center p-8">
+      <div className="flex flex-col sm:flex-row justify-between items-start sm:items-center p-4 sm:p-8 gap-4">
         <div>
-          <h1 className="text-2xl font-bold tracking-tight mb-1">{t("adminMcp.pageTitle")}</h1>
-          <p className="text-sm text-muted-foreground">{t("adminMcp.pageDescription")}</p>
+          <h1 className="text-xl sm:text-2xl font-bold tracking-tight mb-1">{t("adminMcp.pageTitle")}</h1>
+          <p className="text-xs sm:text-sm text-muted-foreground">{t("adminMcp.pageDescription")}</p>
         </div>
       </div>
 
-      <div className="grid gap-6 md:grid-cols-12 items-start px-8 pb-8">
+      <div className="grid gap-6 md:grid-cols-12 items-start px-4 sm:px-8 pb-8">
         <div className="md:col-span-4">
           <Card className="shadow-sm">
-            <CardHeader className="pb-3 border-b flex flex-row items-center justify-between space-y-0">
+            <CardHeader className="pb-3 border-b flex flex-row sm:flex-row items-center justify-between gap-4 space-y-0">
               <div>
                 <CardTitle className="text-lg font-semibold flex items-center gap-2">
                   {t("adminMcp.providers.title")} <Badge variant="secondary" className="rounded-full px-2 py-0 bg-blue-50 text-blue-500 font-normal">{providers.length}</Badge>
@@ -357,15 +357,15 @@ export default function AdminMcpPage() {
 
         <div className="md:col-span-8">
           <Card className="shadow-sm">
-            <CardHeader className="pb-3 border-b flex flex-row items-center justify-between space-y-0">
+            <CardHeader className="pb-3 border-b flex flex-col sm:flex-row items-start sm:items-center justify-between gap-4 space-y-0">
               <div>
                 <CardTitle className="text-lg font-semibold flex items-center gap-2">
                   {t("adminMcp.apps.title")} <Badge variant="secondary" className="rounded-full px-2 py-0 bg-blue-50 text-blue-500 font-normal">{filteredApps.length}</Badge>
                 </CardTitle>
                 <p className="text-xs text-muted-foreground mt-1 font-normal">{t("adminMcp.apps.description")}</p>
               </div>
-              <div className="flex items-center gap-3">
-                <div className="relative w-64">
+              <div className="flex items-center gap-3 w-full sm:w-auto">
+                <div className="relative flex-1 sm:w-64">
                   <Search className="w-4 h-4 absolute left-3 top-1/2 -translate-y-1/2 text-muted-foreground" />
                   <Input
                     placeholder={t("adminMcp.apps.searchPlaceholder")}
@@ -374,8 +374,10 @@ export default function AdminMcpPage() {
                     onChange={(e) => setAppSearchQuery(e.target.value)}
                   />
                 </div>
-                <Button size="sm" className="bg-blue-500 hover:bg-blue-600 h-9" onClick={() => { setIsAddModalOpen(true); setStep(1); setIsCreatingProvider(false); setIsStandaloneProvider(false) }}>
-                  <Plus className="w-4 h-4 mr-1" /> {t("adminMcp.addApp")}
+                <Button size="sm" className="bg-blue-500 hover:bg-blue-600 h-9 shrink-0" onClick={() => { setIsAddModalOpen(true); setStep(1); setIsCreatingProvider(false); setIsStandaloneProvider(false) }}>
+                  <Plus className="w-4 h-4 mr-1" />
+                  <span className="hidden sm:inline">{t("adminMcp.addApp")}</span>
+                  <span className="sm:hidden">{t("common.add") || t("adminMcp.addApp")}</span>
                 </Button>
               </div>
             </CardHeader>

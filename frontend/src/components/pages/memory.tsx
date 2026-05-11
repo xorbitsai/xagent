@@ -328,17 +328,17 @@ export function MemoryPage() {
   return (
     <div className="flex h-full flex-col bg-background">
       {/* Top Header */}
-      <div className="border-b flex justify-between items-center p-8">
+      <div className="border-b flex flex-col sm:flex-row justify-between items-start sm:items-center gap-4 p-4 sm:p-8">
         <div>
-          <h1 className="text-3xl font-bold mb-1">{t("memory.header.title")}</h1>
-          <p className="text-muted-foreground">{t("memory.header.description")}</p>
+          <h1 className="text-2xl sm:text-3xl font-bold mb-1">{t("memory.header.title")}</h1>
+          <p className="text-sm sm:text-base text-muted-foreground">{t("memory.header.description")}</p>
         </div>
 
-        <div className="flex items-center gap-3">
+        <div className="flex items-center gap-3 w-full sm:w-auto">
           <SearchInput
             placeholder={t("memory.filters.search.placeholder")}
             className="h-9"
-            containerClassName="w-64 hidden sm:block"
+            containerClassName="flex-1 sm:w-64"
             value={searchInput}
             onChange={handleSearchChange}
             onCompositionStart={handleCompositionStart}
@@ -347,9 +347,10 @@ export function MemoryPage() {
 
           <Dialog open={isCreateDialogOpen} onOpenChange={setIsCreateDialogOpen}>
             <DialogTrigger asChild>
-              <Button size="sm" className="bg-primary hover:bg-primary/90 text-primary-foreground">
-                <Plus className="h-4 w-4 mr-2" />
-                {t("memory.header.create")}
+              <Button size="sm" className="bg-primary hover:bg-primary/90 text-primary-foreground shrink-0">
+                <Plus className="h-4 w-4 mr-1 sm:mr-2" />
+                <span className="hidden sm:inline">{t("memory.header.create")}</span>
+                <span className="sm:hidden">{t("common.create") || t("memory.header.create")}</span>
               </Button>
             </DialogTrigger>
             <DialogContent className="max-w-2xl">
@@ -370,18 +371,18 @@ export function MemoryPage() {
       </div>
 
       {/* Content Area */}
-      <div className="flex flex-1 overflow-hidden">
+      <div className="flex flex-col md:flex-row flex-1 overflow-hidden">
         {/* Left Sidebar */}
-        <aside className="w-64 border-r bg-muted/10 flex flex-col flex-shrink-0 overflow-y-auto">
-          <div className="p-4 space-y-8">
-            <div className="space-y-3">
-              <h3 className="text-xs font-semibold text-muted-foreground uppercase tracking-wider px-2">
+        <aside className="w-full md:w-64 border-b md:border-b-0 md:border-r bg-muted/10 flex flex-col flex-shrink-0 md:overflow-y-auto">
+          <div className="p-3 md:p-4 flex flex-row md:flex-col gap-4 md:space-y-8 overflow-x-auto">
+            <div className="space-y-1 md:space-y-3 shrink-0 flex items-center md:items-start md:flex-col">
+              <h3 className="hidden md:block text-xs font-semibold text-muted-foreground uppercase tracking-wider px-2">
                 {t("memory.sidebar.contextSource")}
               </h3>
-              <div className="space-y-1">
+              <div className="flex md:block space-x-2 md:space-x-0 md:space-y-1">
                 <Button
                   variant={!filters.category ? "secondary" : "ghost"}
-                  className={cn("w-full justify-start", !filters.category && "font-medium")}
+                  className={cn("whitespace-nowrap justify-start", !filters.category && "font-medium")}
                   onClick={() => setFilters(prev => ({ ...prev, category: undefined }))}
                 >
                   <Database className="h-4 w-4 mr-2" />
@@ -390,26 +391,26 @@ export function MemoryPage() {
               </div>
             </div>
 
-            <div className="space-y-3">
-              <h3 className="text-xs font-semibold text-muted-foreground uppercase tracking-wider px-2">
+            <div className="space-y-1 md:space-y-3 shrink-0 flex items-center md:items-start md:flex-col">
+              <h3 className="hidden md:block text-xs font-semibold text-muted-foreground uppercase tracking-wider px-2">
                 {t("memory.sidebar.byCategory")}
               </h3>
-              <div className="space-y-1">
+              <div className="flex md:block space-x-2 md:space-x-0 md:space-y-1">
                 {categories.map(cat => (
                   <Button
                     key={cat}
                     variant={filters.category === cat ? "secondary" : "ghost"}
-                    className={cn("w-full justify-start", filters.category === cat && "font-medium")}
+                    className={cn("whitespace-nowrap justify-start", filters.category === cat && "font-medium")}
                     onClick={() => setFilters(prev => ({ ...prev, category: cat }))}
                   >
-                    <div className={cn("h-2 w-2 rounded-full shrink-0",
+                    <div className={cn("h-2 w-2 rounded-full shrink-0 mr-2",
                       cat === 'general' ? 'bg-slate-400' :
                         cat === 'react_memory' ? 'bg-purple-400' :
                           'bg-blue-400'
                     )} />
                     {t(`memory.filters.categoryOptions.${cat}`)}
                     {stats?.category_counts[cat] ? (
-                      <span className="ml-auto text-xs text-muted-foreground">
+                      <span className="ml-2 md:ml-auto text-xs text-muted-foreground">
                         {stats.category_counts[cat]}
                       </span>
                     ) : null}
@@ -421,9 +422,9 @@ export function MemoryPage() {
         </aside>
 
         {/* Main Content */}
-        <main className="flex-1 flex flex-col bg-slate-50/50 dark:bg-background overflow-hidden">
+        <main className="flex-1 flex flex-col bg-slate-50/50 dark:bg-background overflow-hidden w-full">
           {/* Main Content Header */}
-          <div className="h-24 flex items-center justify-between px-8 bg-card flex-shrink-0">
+          <div className="h-auto md:h-24 py-4 md:py-0 flex flex-col sm:flex-row sm:items-center justify-between gap-4 px-4 sm:px-8 bg-card flex-shrink-0 border-b md:border-b-0">
             <div className="flex items-center gap-3">
               <input
                 type="checkbox"
@@ -431,7 +432,7 @@ export function MemoryPage() {
                 checked={memories.length > 0 && selectedIds.size === memories.length}
                 onChange={handleSelectAll}
               />
-              <h2 className="text-lg font-semibold">
+              <h2 className="text-base sm:text-lg font-semibold truncate">
                 {filters.category ? t(`memory.filters.categoryOptions.${filters.category}`) : t("memory.sidebar.allMemories")}
               </h2>
             </div>
@@ -459,7 +460,7 @@ export function MemoryPage() {
           {/* Memory List */}
           <div className="flex-1 overflow-y-auto">
             {error && (
-              <Alert variant="destructive" className="mb-6">
+              <Alert variant="destructive" className="mb-6 mx-4 sm:mx-8 mt-4">
                 <AlertDescription>{error}</AlertDescription>
               </Alert>
             )}
@@ -472,7 +473,7 @@ export function MemoryPage() {
                 </div>
               </div>
             ) : memories.length === 0 ? (
-              <div className="flex flex-col items-center justify-center h-full text-muted-foreground">
+              <div className="flex flex-col items-center justify-center h-full text-muted-foreground p-4">
                 <div className="h-16 w-16 bg-muted rounded-full flex items-center justify-center mb-4">
                   <Database className="h-8 w-8 opacity-50" />
                 </div>
@@ -482,7 +483,7 @@ export function MemoryPage() {
                 </p>
               </div>
             ) : (
-              <div className="space-y-4 mx-auto px-8">
+              <div className="space-y-4 mx-auto px-4 sm:px-8 py-4">
                 {memories.map((memory) => {
                   const Icon = getCategoryIcon(memory.category)
                   const badgeColorClass = getCategoryColor(memory.category)
@@ -491,79 +492,93 @@ export function MemoryPage() {
                     <Card
                       key={memory.id}
                       className={cn(
-                        "group cursor-pointer hover:shadow-md transition-all duration-200 border-border/60",
+                        "group cursor-pointer hover:shadow-md transition-all duration-200 border-border/60 relative",
                         selectedIds.has(memory.id) && "border-primary/50 bg-accent/50"
                       )}
                       onClick={() => openViewDialog(memory)}
                     >
-                      <CardContent className="p-5 flex gap-5">
-                        {/* Checkbox */}
-                        <div
-                          className={cn(
-                            "flex items-center justify-center pt-1 transition-opacity duration-200",
-                            selectedIds.has(memory.id) ? "opacity-100" : "opacity-0 group-hover:opacity-100"
-                          )}
-                          onClick={(e) => e.stopPropagation()}
-                        >
-                          <input
-                            type="checkbox"
-                            className="h-4 w-4 rounded border-gray-300 text-primary focus:ring-primary accent-primary cursor-pointer"
-                            checked={selectedIds.has(memory.id)}
-                            onChange={() => handleToggleSelect(memory.id)}
-                          />
-                        </div>
-
-                        {/* Icon Box */}
-                        <div className={cn("h-12 w-12 rounded-xl flex items-center justify-center flex-shrink-0 mt-1", badgeColorClass.split(' ')[0])}>
-                          <Icon className={cn("h-6 w-6", badgeColorClass.split(' ')[1])} />
-                        </div>
-
-                        {/* Content */}
-                        <div className="flex-1 min-w-0 space-y-2">
-                          <div className="flex items-center gap-3">
-                            <Badge variant="outline" className={cn("rounded-md border-0 px-2 py-0.5 text-xs font-medium uppercase tracking-wide", badgeColorClass)}>
-                              {t(`memory.filters.categoryOptions.${memory.category}`) === `memory.filters.categoryOptions.${memory.category}`
-                                ? memory.category.replace(/_/g, ' ')
-                                : t(`memory.filters.categoryOptions.${memory.category}`)}
-                            </Badge>
-                            <span className="text-xs text-muted-foreground">
-                              {memory.category === 'general' ? t("memory.item.addedManually") : t("memory.item.addedAutomatically")} • {formatDate(memory.timestamp)}
-                            </span>
+                      <CardContent className="p-4 sm:p-5 flex flex-col sm:flex-row gap-3 sm:gap-5">
+                        <div className="flex sm:contents items-center justify-between sm:justify-start">
+                          {/* Checkbox */}
+                          <div
+                            className={cn(
+                              "flex items-center justify-center pt-1 transition-opacity duration-200",
+                              selectedIds.has(memory.id) ? "opacity-100" : "opacity-0 sm:group-hover:opacity-100"
+                            )}
+                            onClick={(e) => e.stopPropagation()}
+                          >
+                            <input
+                              type="checkbox"
+                              className="h-4 w-4 rounded border-gray-300 text-primary focus:ring-primary accent-primary cursor-pointer"
+                              checked={selectedIds.has(memory.id)}
+                              onChange={() => handleToggleSelect(memory.id)}
+                            />
                           </div>
 
-                          <p className="text-sm text-foreground/90 leading-relaxed line-clamp-3">
-                            {memory.content}
-                          </p>
-
-                          {/* Footer / Source */}
-                          <div className="pt-1 flex items-center gap-2 flex-wrap">
-                            {/* Keywords */}
-                            {memory.keywords.length > 0 && (
-                              <div className="flex items-center gap-1 ml-2">
-                                <span className="text-xs text-muted-foreground">{t("memory.item.keywordsLabel")}</span>
-                                {memory.keywords.slice(0, 3).map(keyword => (
-                                  <Badge key={keyword} variant="secondary" className="text-[10px] px-1.5 h-5 font-normal bg-blue-50 text-blue-700 hover:bg-blue-100 dark:bg-blue-900/30 dark:text-blue-300 border-0">
-                                    {keyword}
-                                  </Badge>
-                                ))}
-                              </div>
-                            )}
-
-                            {memory.tags.length > 0 && (
-                              <div className="flex items-center gap-1 ml-2">
-                                <span className="text-xs text-muted-foreground">{t("memory.item.tagsLabel")}</span>
-                                {memory.tags.slice(0, 3).map(tag => (
-                                  <span key={tag} className="text-xs text-muted-foreground bg-muted/50 px-1.5 py-0.5 rounded">
-                                    #{tag}
-                                  </span>
-                                ))}
-                              </div>
-                            )}
+                          {/* Actions - Mobile top right */}
+                          <div className="flex sm:hidden items-center gap-1">
+                            <Button variant="ghost" size="icon" className="h-8 w-8 text-muted-foreground hover:text-foreground" onClick={(e) => { e.stopPropagation(); openEditDialog(memory); }}>
+                              <Edit className="h-4 w-4" />
+                            </Button>
+                            <Button variant="ghost" size="icon" className="h-8 w-8 text-destructive/70 hover:text-destructive" onClick={(e) => { e.stopPropagation(); setDeletingId(memory.id); }}>
+                              <Trash2 className="h-4 w-4" />
+                            </Button>
                           </div>
                         </div>
 
-                        {/* Actions */}
-                        <div className="flex items-center gap-1 opacity-0 group-hover:opacity-100 transition-opacity self-start">
+                        <div className="flex gap-3 sm:gap-5 flex-1 min-w-0">
+                          {/* Icon Box */}
+                          <div className={cn("h-10 w-10 sm:h-12 sm:w-12 rounded-xl flex items-center justify-center flex-shrink-0 mt-1", badgeColorClass.split(' ')[0])}>
+                            <Icon className={cn("h-5 w-5 sm:h-6 sm:w-6", badgeColorClass.split(' ')[1])} />
+                          </div>
+
+                          {/* Content */}
+                          <div className="flex-1 min-w-0 space-y-2">
+                            <div className="flex flex-col sm:flex-row sm:items-center gap-1 sm:gap-3">
+                              <Badge variant="outline" className={cn("w-fit rounded-md border-0 px-2 py-0.5 text-[10px] sm:text-xs font-medium uppercase tracking-wide", badgeColorClass)}>
+                                {t(`memory.filters.categoryOptions.${memory.category}`) === `memory.filters.categoryOptions.${memory.category}`
+                                  ? memory.category.replace(/_/g, ' ')
+                                  : t(`memory.filters.categoryOptions.${memory.category}`)}
+                              </Badge>
+                              <span className="text-[10px] sm:text-xs text-muted-foreground">
+                                {memory.category === 'general' ? t("memory.item.addedManually") : t("memory.item.addedAutomatically")} • {formatDate(memory.timestamp)}
+                              </span>
+                            </div>
+
+                            <p className="text-sm text-foreground/90 leading-relaxed line-clamp-3">
+                              {memory.content}
+                            </p>
+
+                            {/* Footer / Source */}
+                            <div className="pt-1 flex items-center gap-2 flex-wrap">
+                              {/* Keywords */}
+                              {memory.keywords.length > 0 && (
+                                <div className="flex items-center gap-1 sm:ml-2">
+                                  <span className="hidden sm:inline text-xs text-muted-foreground">{t("memory.item.keywordsLabel")}</span>
+                                  {memory.keywords.slice(0, 3).map(keyword => (
+                                    <Badge key={keyword} variant="secondary" className="text-[10px] px-1.5 h-5 font-normal bg-blue-50 text-blue-700 hover:bg-blue-100 dark:bg-blue-900/30 dark:text-blue-300 border-0">
+                                      {keyword}
+                                    </Badge>
+                                  ))}
+                                </div>
+                              )}
+
+                              {memory.tags.length > 0 && (
+                                <div className="flex items-center gap-1 sm:ml-2 mt-1 sm:mt-0">
+                                  <span className="hidden sm:inline text-xs text-muted-foreground">{t("memory.item.tagsLabel")}</span>
+                                  {memory.tags.slice(0, 3).map(tag => (
+                                    <span key={tag} className="text-xs text-muted-foreground bg-muted/50 px-1.5 py-0.5 rounded">
+                                      #{tag}
+                                    </span>
+                                  ))}
+                                </div>
+                              )}
+                            </div>
+                          </div>
+                        </div>
+
+                        {/* Actions - Desktop right side */}
+                        <div className="hidden sm:flex items-center gap-1 opacity-0 group-hover:opacity-100 transition-opacity self-start ml-auto">
                           <Button variant="ghost" size="icon" className="h-8 w-8 text-muted-foreground hover:text-foreground" onClick={(e) => { e.stopPropagation(); openEditDialog(memory); }}>
                             <Edit className="h-4 w-4" />
                           </Button>

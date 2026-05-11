@@ -869,16 +869,16 @@ export default function ToolsPage() {
               </Button>
             )}
             {isAdmin && (
-            <Button
-              variant="outline"
-              size="sm"
-              className={hasSecondaryAction ? 'flex-1' : 'w-full'}
-              onClick={() => handleToggleToolEnabled(tool)}
-              disabled={isTogglePending}
-            >
-              {isTogglePending && <Loader2 className="mr-2 h-4 w-4 animate-spin" />}
-              {tool.enabled ? t('tools.policy.disableAction') : t('tools.policy.enableAction')}
-            </Button>
+              <Button
+                variant="outline"
+                size="sm"
+                className={hasSecondaryAction ? 'flex-1' : 'w-full'}
+                onClick={() => handleToggleToolEnabled(tool)}
+                disabled={isTogglePending}
+              >
+                {isTogglePending && <Loader2 className="mr-2 h-4 w-4 animate-spin" />}
+                {tool.enabled ? t('tools.policy.disableAction') : t('tools.policy.enableAction')}
+              </Button>
             )}
           </div>
         </CardContent>
@@ -919,21 +919,23 @@ export default function ToolsPage() {
   return (
     <div className="w-full p-6 space-y-8 overflow-y-auto h-[calc(100vh-2rem)]">
       {/* Header */}
-      <div className="flex justify-between items-center mb-8">
-        <div className="space-y-1">
-          <h1 className="text-3xl font-bold mb-1">{t('tools.header.title')}</h1>
-          <p className="text-muted-foreground">{t('tools.header.description')}</p>
+      <div className="flex flex-col sm:flex-row justify-between items-start sm:items-center gap-4 mb-8">
+        <div className="space-y-1 w-full sm:w-auto">
+          <h1 className="text-2xl sm:text-3xl font-bold mb-1">{t('tools.header.title')}</h1>
+          <p className="text-sm sm:text-base text-muted-foreground">{t('tools.header.description')}</p>
         </div>
-        <div className="flex items-center gap-3">
+        <div className="flex items-center gap-3 w-full sm:w-auto">
           <SearchInput
             placeholder={t('tools.list.searchPlaceholder')}
             value={searchQuery}
             onChange={setSearchQuery}
-            className="w-64 bg-background"
+            className="w-full bg-background"
+            containerClassName="flex-1 sm:w-64"
           />
-          <Button className="bg-primary text-primary-foreground hover:bg-primary/90" onClick={() => setIsConnectMcpOpen(true)}>
-            <Plus className="h-4 w-4 mr-2" />
-            {t('tools.mcp.addConnector')}
+          <Button className="bg-primary text-primary-foreground hover:bg-primary/90 shrink-0" onClick={() => setIsConnectMcpOpen(true)}>
+            <Plus className="h-4 w-4 mr-1 sm:mr-2" />
+            <span className="hidden sm:inline">{t('tools.mcp.addConnector')}</span>
+            <span className="sm:hidden">{t('common.add') || t('tools.mcp.addConnector')}</span>
           </Button>
           <Dialog open={isMcpDialogOpen} onOpenChange={setIsMcpDialogOpen}>
             <DialogContent className="max-w-2xl max-h-[80vh] overflow-y-auto">

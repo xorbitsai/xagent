@@ -30,6 +30,7 @@ const en = {
     clear: "Clear",
     or: "Or",
     add: "Add",
+    create: "Create",
     customPlaceholder: "Custom...",
     errors: {
       unknown: "Unknown error",

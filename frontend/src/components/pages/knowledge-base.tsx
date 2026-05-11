@@ -314,11 +314,11 @@ export function KnowledgeBasePage() {
   return (
     <div className="flex flex-col h-full bg-background/50">
       {/* Header */}
-      <div className="flex justify-between items-start w-full p-8">
-        <div>
+      <div className="flex flex-col sm:flex-row justify-between items-start sm:items-center w-full p-4 sm:p-8 gap-4">
+        <div className="space-y-1 w-full sm:w-auto">
           <div className="flex items-center gap-3 mb-1 flex-wrap">
-            <h1 className="text-3xl font-bold">{t("kb.header.title")}</h1>
-            <Badge variant="secondary" className="font-normal">
+            <h1 className="text-2xl sm:text-3xl font-bold">{t("kb.header.title")}</h1>
+            <Badge variant="secondary" className="font-normal text-xs sm:text-sm">
               {searchQuery
                 ? t("kb.header.matchCount", {
                   matched: filteredCollections.length,
@@ -327,15 +327,15 @@ export function KnowledgeBasePage() {
                 : t("kb.header.totalCount", { total: collections.length })}
             </Badge>
           </div>
-          <p className="text-muted-foreground">{t("kb.header.description")}</p>
+          <p className="text-sm sm:text-base text-muted-foreground">{t("kb.header.description")}</p>
         </div>
 
-        <div className="flex items-center gap-4">
+        <div className="flex items-center gap-3 w-full sm:w-auto">
           <SearchInput
             placeholder={t("kb.search.placeholder")}
             value={searchQuery}
             onChange={setSearchQuery}
-            containerClassName="w-64"
+            containerClassName="flex-1 sm:w-64"
           />
           <Button
             variant={isManageMode ? "secondary" : "outline"}
@@ -343,14 +343,15 @@ export function KnowledgeBasePage() {
               setIsManageMode((m) => !m)
               setSelectedNames(new Set())
             }}
-            className="flex items-center gap-2"
+            className="flex items-center gap-1 sm:gap-2 shrink-0"
           >
-            {isManageMode ? <X size={16} className="mr-2" /> : <Settings2 size={16} className="mr-2" />}
-            {isManageMode ? t("kb.manage.exit") : t("kb.manage.enter")}
+            {isManageMode ? <X size={16} className="sm:mr-2" /> : <Settings2 size={16} className="sm:mr-2" />}
+            <span className="hidden sm:inline">{isManageMode ? t("kb.manage.exit") : t("kb.manage.enter")}</span>
           </Button>
-          <Button onClick={() => { setIsCreateDialogOpen(true) }} className="flex items-center gap-2">
-            <Plus size={16} className="mr-2" />
-            {t("kb.header.new")}
+          <Button onClick={() => { setIsCreateDialogOpen(true) }} className="flex items-center gap-1 sm:gap-2 shrink-0">
+            <Plus size={16} className="sm:mr-2" />
+            <span className="hidden sm:inline">{t("kb.header.new")}</span>
+            <span className="sm:hidden">{t("common.create") || t("kb.header.new")}</span>
           </Button>
         </div>
       </div>

@@ -4,6 +4,7 @@ Agent Tool - Convert published agents into callable tools
 
 import logging
 from typing import TYPE_CHECKING, Any, Mapping, Optional, Type
+from uuid import uuid4
 
 from pydantic import BaseModel, Field, field_validator
 
@@ -17,6 +18,7 @@ from ....utils.type_check import ensure_list
 from .base import AbstractBaseTool, ToolCategory, ToolVisibility
 
 logger = logging.getLogger(__name__)
+MAX_AGENT_NAME_LENGTH = 200
 
 
 class CreateAgentToolArgs(BaseModel):
@@ -384,6 +386,58 @@ class CreateAgentTool(AbstractBaseTool):
         """Sync execution not supported."""
         raise NotImplementedError("CreateAgentTool only supports async execution.")
 
+    def _agent_name_exists(self, agent_name: str) -> bool:
+        from .....web.models.agent import Agent
+
+        existing = (
+            self._db.query(Agent)
+            .filter(Agent.user_id == self._user_id, Agent.name == agent_name)
+            .first()
+        )
+        return existing is not None
+
+    def _build_name_candidate(self, base_name: str, suffix: str) -> str:
+        clean_base = base_name.strip()
+        if not suffix:
+            return clean_base[:MAX_AGENT_NAME_LENGTH].rstrip()
+
+        max_base_length = max(MAX_AGENT_NAME_LENGTH - len(suffix), 0)
+        truncated_base = clean_base[:max_base_length].rstrip()
+        if truncated_base:
+            return f"{truncated_base}{suffix}"
+        return suffix.strip()[:MAX_AGENT_NAME_LENGTH]
+
+    def _resolve_available_agent_name(
+        self, requested_name: str
+    ) -> tuple[str, Optional[str]]:
+        normalized_name = requested_name.strip()[:MAX_AGENT_NAME_LENGTH].rstrip()
+        if not self._agent_name_exists(normalized_name):
+            return normalized_name, None
+
+        preferred_suffixes = [" Assistant", " V2", " Bot", " Workspace"]
+        seen_candidates = {normalized_name}
+
+        for suffix in preferred_suffixes:
+            candidate = self._build_name_candidate(normalized_name, suffix)
+            if candidate not in seen_candidates and not self._agent_name_exists(
+                candidate
+            ):
+                return candidate, normalized_name
+            seen_candidates.add(candidate)
+
+        for index in range(2, 1000):
+            candidate = self._build_name_candidate(normalized_name, f" {index}")
+            if candidate not in seen_candidates and not self._agent_name_exists(
+                candidate
+            ):
+                return candidate, normalized_name
+            seen_candidates.add(candidate)
+
+        fallback_candidate = self._build_name_candidate(
+            normalized_name, f" {uuid4().hex[:8]}"
+        )
+        return fallback_candidate, normalized_name
+
     async def run_json_async(self, args: Mapping[str, Any]) -> Any:
         """Create a new agent with the given configuration."""
         from .....web.models.agent import Agent, AgentStatus
@@ -424,21 +478,10 @@ class CreateAgentTool(AbstractBaseTool):
                     message="Error: Agent instructions are required",
                 ).model_dump()
 
-            # Check for duplicate name
-            existing = (
-                self._db.query(Agent)
-                .filter(Agent.user_id == self._user_id, Agent.name == agent_name)
-                .first()
+            requested_agent_name = agent_name
+            agent_name, auto_renamed_from = self._resolve_available_agent_name(
+                requested_agent_name
             )
-            if existing:
-                return CreateAgentToolResult(
-                    agent_id=0,
-                    agent_name="",
-                    tool_name="",
-                    markdown_link="",
-                    status="error",
-                    message=f"Error: Agent with name '{agent_name}' already exists",
-                ).model_dump()
 
             # Get user's default model configuration
             from .....web.models.model import Model as DBModel
@@ -523,6 +566,13 @@ class CreateAgentTool(AbstractBaseTool):
             tool_name = gen_agent_tool_name(agent_name)
             markdown_link = f"[{agent_name}](agent://{agent.id})"
 
+            rename_note = ""
+            if auto_renamed_from:
+                rename_note = (
+                    f"**Auto-renamed:** Requested name '{auto_renamed_from}' was already in use, "
+                    f"so the agent was created as '{agent_name}'.\n\n"
+                )
+
             logger.info(
                 f"Created DRAFT agent '{agent_name}' (ID: {agent.id}) for user {self._user_id}"
             )
@@ -535,6 +585,7 @@ class CreateAgentTool(AbstractBaseTool):
                 status="success",
                 message=(
                     f"✅ Agent created successfully\n\n"
+                    f"{rename_note}"
                     f"**Agent Details:**\n"
                     f"- Agent ID: {agent.id}\n"
                     f"- Agent Name: {agent_name}\n"

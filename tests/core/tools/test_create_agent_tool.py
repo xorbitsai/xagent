@@ -158,8 +158,8 @@ class TestCreateAgentTool:
                 pass
 
     @pytest.mark.asyncio
-    async def test_create_agent_duplicate_name_error(self) -> None:
-        """Test that duplicate agent names are rejected."""
+    async def test_create_agent_duplicate_name_auto_renames(self) -> None:
+        """Test that duplicate agent names are auto-renamed and created."""
         db, db_path = _create_session()
         try:
             user = User(username="testuser3", password_hash="x", is_admin=False)
@@ -197,12 +197,88 @@ class TestCreateAgentTool:
                     {
                         "name": "duplicate_name",
                         "description": "Duplicate name test agent",
-                        "instructions": "This should fail",
+                        "instructions": "This should be auto-renamed",
                     }
                 )
 
-                assert result["status"] == "error"
-                assert "already exists" in result["message"].lower()
+                assert result["status"] == "success"
+                assert result["agent_name"] == "duplicate_name Assistant"
+                assert "auto-renamed" in result["message"].lower()
+
+                created_agent = (
+                    db.query(Agent)
+                    .filter(
+                        Agent.user_id == user.id,
+                        Agent.name == "duplicate_name Assistant",
+                    )
+                    .first()
+                )
+                assert created_agent is not None
+
+        finally:
+            db.close()
+            try:
+                import os
+
+                os.remove(db_path)
+            except OSError:
+                pass
+
+    @pytest.mark.asyncio
+    async def test_create_agent_duplicate_name_uses_next_available_variant(
+        self,
+    ) -> None:
+        """Test that auto-rename skips occupied fallback names."""
+        db, db_path = _create_session()
+        try:
+            user = User(username="testuser3b", password_hash="x", is_admin=False)
+            db.add(user)
+            db.commit()
+            db.refresh(user)
+
+            db.add_all(
+                [
+                    Agent(
+                        user_id=user.id,
+                        name="duplicate_name",
+                        status=AgentStatus.DRAFT,
+                    ),
+                    Agent(
+                        user_id=user.id,
+                        name="duplicate_name Assistant",
+                        status=AgentStatus.DRAFT,
+                    ),
+                ]
+            )
+            db.commit()
+
+            mock_llm = Mock()
+            mock_llm.model_id = "gpt-4"
+
+            with patch(
+                "xagent.web.services.llm_utils.UserAwareModelStorage"
+            ) as mock_storage_class:
+                mock_storage = Mock()
+                mock_storage.get_configured_defaults.return_value = (
+                    mock_llm,
+                    None,
+                    None,
+                    None,
+                )
+                mock_storage_class.return_value = mock_storage
+
+                tool = CreateAgentTool(db=db, user_id=user.id)
+
+                result = await tool.run_json_async(
+                    {
+                        "name": "duplicate_name",
+                        "description": "Duplicate name test agent",
+                        "instructions": "This should use the next fallback",
+                    }
+                )
+
+                assert result["status"] == "success"
+                assert result["agent_name"] == "duplicate_name V2"
 
         finally:
             db.close()

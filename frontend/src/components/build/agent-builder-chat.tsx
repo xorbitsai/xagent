@@ -173,7 +173,7 @@ export function AgentBuilderChat({ agentConfig, onUpdateConfig, availableOptions
       }
     } else if (metadata?.url) {
       const url = metadata.url;
-      finalMessage += `\n\n[System Note: The user has provided the website URL: ${url}. Please IMMEDIATELY use the \`create_knowledge_base_from_url\` tool to ingest it, then create/update the agent with the new knowledge base. Do not ask for the URL again.]`;
+      finalMessage += `\n\n[System Note: The user has provided the website URL: ${url}. Do not ask for the URL again. Before deciding whether to create a new knowledge base, you MUST first call \`list_knowledge_bases\` to check whether a relevant knowledge base for this website/domain already exists. Only if no relevant knowledge base exists should you call \`create_knowledge_base_from_url\`, then create/update the agent with that knowledge base.]`;
     }
 
     const sendPayload = (ws: WebSocket) => {

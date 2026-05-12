@@ -1,5 +1,4 @@
 ---
-name: agent-builder
 description: Expert AI Agent Builder skill. Helps users dynamically create, configure, and build custom AI agents with specific capabilities, knowledge bases, and tools.
 when_to_use: "Use this skill when the user explicitly asks to build, create, or configure an AI agent, chatbot, or assistant."
 tags:

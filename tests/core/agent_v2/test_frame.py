@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import pytest
+
 from xagent.core.agent_v2 import ExecutionFrame, ExecutionSnapshot, ExecutionStatus
 
 
@@ -38,3 +40,23 @@ def test_execution_snapshot_roundtrip() -> None:
     assert restored.status == "interrupted"
     assert restored.frames[root.frame_id].active_child_id == child.frame_id
     assert restored.frames[child.frame_id].metadata["dag_step_id"] == "step_1"
+
+
+def test_execution_snapshot_rejects_mismatched_frame_key() -> None:
+    frame = ExecutionFrame(
+        frame_id="actual",
+        root_execution_id="exec-1",
+        pattern_type="dag",
+        status=ExecutionStatus.RUNNING,
+        context={},
+        pattern_state={},
+    )
+    payload = ExecutionSnapshot(
+        root_execution_id="exec-1",
+        status=ExecutionStatus.RUNNING,
+        frames={"actual": frame},
+    ).to_dict()
+    payload["frames"]["wrong"] = payload["frames"].pop("actual")
+
+    with pytest.raises(ValueError, match="Frame key mismatch"):
+        ExecutionSnapshot.from_dict(payload)

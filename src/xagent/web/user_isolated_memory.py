@@ -5,11 +5,7 @@ from typing import Any, List, Optional
 
 from xagent.core.memory.base import MemoryStore
 from xagent.core.memory.core import MemoryNote, MemoryResponse
-
-# Context variable for current user ID
-current_user_id: contextvars.ContextVar[Optional[int]] = contextvars.ContextVar(
-    "current_user_id", default=None
-)
+from xagent.core.user_context import current_user_id
 
 
 class UserIsolatedMemoryStore(MemoryStore):

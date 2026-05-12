@@ -173,6 +173,8 @@ class ExecutionRegistry:
         handle.updated_at = _utcnow()
         handle.runner.cancel(execution_id, reason=reason)
         if handle.task is not None and not handle.task.done():
+            handle.status = ExecutionLifecycleStatus.CANCELLED
+            handle.last_error = reason or "Execution was cancelled."
             handle.task.cancel()
             return True
 
@@ -325,7 +327,11 @@ class ExecutionRegistry:
             payload.update(extra)
 
         for callback in self._subscribers.values():
-            result = callback(dict(payload))
+            try:
+                result = callback(dict(payload))
+            except Exception:
+                logger.exception("Execution registry subscriber failed")
+                continue
             if inspect.isawaitable(result):
                 task = asyncio.ensure_future(result)
                 task.add_done_callback(self._log_subscriber_error)

@@ -465,9 +465,9 @@ class ExecutionContext:
             },
             system_prompt=base.system_prompt,
             metadata=dict(base.metadata),
+            created_at=base.created_at,
             compact_config=replace(base.compact_config),
         )
-        merged.messages = base.messages.copy()
         merged.llm_calls = [replace(call) for call in base.llm_calls]
         merged._merge_contexts_from_list(contexts, strategy)
         return merged
@@ -827,6 +827,9 @@ class ExecutionContext:
                 if tool_message.tool_call_id
             }
             if expected_ids and expected_ids.issubset(received_ids):
+                sanitized.append(message)
+                sanitized.extend(tool_messages)
+            elif not expected_ids and len(tool_messages) >= len(message.tool_calls):
                 sanitized.append(message)
                 sanitized.extend(tool_messages)
 

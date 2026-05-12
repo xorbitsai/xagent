@@ -697,41 +697,12 @@ class PatternRuntime:
         return "agent.task"
 
     def _checkpoint_trace_event_type(self, trace_event: Any) -> Any:
-        fn = getattr(trace_event, "__func__", trace_event)
-        globals_payload = getattr(fn, "__globals__", {})
-        trace_event_type = globals_payload.get("TraceEventType")
-        trace_scope = globals_payload.get("TraceScope")
-        trace_action = globals_payload.get("TraceAction")
-        trace_category = globals_payload.get("TraceCategory")
-        if (
-            trace_event_type is None
-            or trace_scope is None
-            or trace_action is None
-            or trace_category is None
-        ):
-            return _CheckpointTraceEventType()
-        return trace_event_type(
-            trace_scope.TASK,
-            trace_action.UPDATE,
-            trace_category.GENERAL,
+        del trace_event
+        return TraceEventType(
+            TraceScope.TASK,
+            TraceAction.UPDATE,
+            TraceCategory.GENERAL,
         )
-
-
-@dataclass(frozen=True)
-class _TracePart:
-    value: str
-
-
-class _CheckpointTraceEventType:
-    """TraceEventType-compatible object without importing legacy agent package."""
-
-    scope = _TracePart("task")
-    action = _TracePart("update")
-    category = _TracePart("general")
-    value = "task_update_general"
-
-    def __str__(self) -> str:
-        return self.value
 
 
 def load_pattern_checkpoint(pattern: Any, checkpoint: dict[str, Any] | None) -> None:

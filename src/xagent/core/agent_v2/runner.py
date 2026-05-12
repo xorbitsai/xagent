@@ -18,7 +18,7 @@ class ExecutionControl:
     """In-memory control state for an active execution."""
 
     runtime: PatternRuntime
-    task: str
+    task: str | None
 
 
 class AgentRunner:
@@ -77,6 +77,7 @@ class AgentRunner:
             )
         if checkpoint and isinstance(checkpoint.get("context"), dict):
             context = ExecutionContext.from_dict(checkpoint["context"])
+            self.context_manager.set_context(context)
             execution_id = context.execution_id
         else:
             context = await self._build_context(
@@ -94,7 +95,8 @@ class AgentRunner:
                 content = str(message.get("content") or "").strip()
                 if role and content:
                     context.add_message(role, content)
-            context.add_user_message(task)
+            if task:
+                context.add_user_message(task)
 
         runtime = runtime or PatternRuntime(
             tracer=self.tracer,
@@ -138,7 +140,7 @@ class AgentRunner:
                     result = await pattern.run(
                         **self._build_pattern_kwargs(
                             pattern=pattern,
-                            task=task,
+                            task=task or "",
                             context=context,
                             tools=tools,
                             runtime=runtime,
@@ -320,7 +322,7 @@ class AgentRunner:
     async def _build_context(
         self,
         *,
-        task: str,
+        task: str | None,
         execution_id: str,
         user_id: str | None,
         session_id: str | None,
@@ -348,7 +350,8 @@ class AgentRunner:
         )
         if metadata:
             context.metadata.update(metadata)
-        context.metadata.setdefault("task", task)
+        if task:
+            context.metadata.setdefault("task", task)
 
         memory_session = await self._resolve_memory_session(
             execution_id=execution_id,
@@ -367,7 +370,7 @@ class AgentRunner:
         task: str | None,
         checkpoint: dict[str, Any] | None,
         execution_id: str,
-    ) -> str:
+    ) -> str | None:
         if task:
             return task
 
@@ -395,7 +398,7 @@ class AgentRunner:
         if control is not None:
             return control.task
 
-        return ""
+        return None
 
     def _workspace_state(self, workspace: Any) -> dict[str, Any]:
         state: dict[str, Any] = {
@@ -615,7 +618,10 @@ class AgentRunner:
         return fn(**self._call_signature_kwargs(fn, **kwargs))
 
     def _call_signature_kwargs(self, fn: Any, **kwargs: Any) -> dict[str, Any]:
-        signature = inspect.signature(fn)
+        try:
+            signature = inspect.signature(fn)
+        except (TypeError, ValueError):
+            return kwargs
         parameters = signature.parameters.values()
         if any(param.kind == inspect.Parameter.VAR_KEYWORD for param in parameters):
             return kwargs

@@ -83,11 +83,6 @@ class TraceEventCallback:
             data=data,
         )
 
-    def _pattern_names(self, runner: Any) -> str:
-        agent = getattr(runner, "agent", None)
-        patterns = getattr(agent, "patterns", []) if agent is not None else []
-        return ",".join(pattern.__class__.__name__ for pattern in patterns)
-
     def _context_payload(self, context: Any) -> dict[str, Any] | None:
         to_dict = getattr(context, "to_dict", None)
         if callable(to_dict):

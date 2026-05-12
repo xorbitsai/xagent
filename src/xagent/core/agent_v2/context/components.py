@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 from dataclasses import dataclass, field
 from typing import Any, Callable, Protocol, runtime_checkable
 
@@ -25,7 +26,7 @@ class WorkspaceComponent:
             workspace_id=self.workspace_id,
             workspace_path=self.workspace_path,
             cwd=self.cwd,
-            state=dict(self.state),
+            state=copy.deepcopy(self.state),
         )
 
     def to_dict(self) -> dict[str, Any]:

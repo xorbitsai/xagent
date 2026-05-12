@@ -1,20 +1,28 @@
 from __future__ import annotations
 
+import logging
+import threading
 from typing import Any
 
 from .execution import ExecutionContext
+
+logger = logging.getLogger(__name__)
 
 
 class ContextManager:
     """Singleton registry for active execution contexts."""
 
     _instance: "ContextManager" | None = None
+    _instance_lock = threading.Lock()
     _contexts: dict[str, ExecutionContext]
+    _lock: threading.RLock
 
     def __new__(cls) -> "ContextManager":
-        if cls._instance is None:
-            cls._instance = super().__new__(cls)
-            cls._instance._contexts = {}
+        with cls._instance_lock:
+            if cls._instance is None:
+                cls._instance = super().__new__(cls)
+                cls._instance._contexts = {}
+                cls._instance._lock = threading.RLock()
         return cls._instance
 
     def create_context(
@@ -52,22 +60,35 @@ class ContextManager:
                 session_id=memory_session_id,
                 snapshot=memory_snapshot,
             )
-        self._contexts[execution_id] = context
+        with self._lock:
+            if execution_id in self._contexts:
+                logger.warning("Replacing existing execution context %s", execution_id)
+            self._contexts[execution_id] = context
         return context
 
     def get_context(self, execution_id: str) -> ExecutionContext | None:
-        return self._contexts.get(execution_id)
+        with self._lock:
+            return self._contexts.get(execution_id)
 
     def set_context(self, context: ExecutionContext) -> ExecutionContext:
-        self._contexts[context.execution_id] = context
+        with self._lock:
+            if context.execution_id in self._contexts:
+                logger.warning(
+                    "Replacing existing execution context %s",
+                    context.execution_id,
+                )
+            self._contexts[context.execution_id] = context
         return context
 
     def remove_context(self, execution_id: str) -> None:
-        self._contexts.pop(execution_id, None)
+        with self._lock:
+            self._contexts.pop(execution_id, None)
 
     def list_active_contexts(
         self, user_id: str | None = None
     ) -> list[ExecutionContext]:
+        with self._lock:
+            contexts = list(self._contexts.values())
         if user_id:
-            return [ctx for ctx in self._contexts.values() if ctx.user_id == user_id]
-        return list(self._contexts.values())
+            return [ctx for ctx in contexts if ctx.user_id == user_id]
+        return contexts

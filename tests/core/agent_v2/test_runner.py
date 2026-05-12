@@ -143,6 +143,24 @@ class StatefulPattern:
         }
 
 
+class InjectingPattern:
+    def __init__(self, runner: AgentRunner, execution_id: str) -> None:
+        self.runner = runner
+        self.execution_id = execution_id
+
+    async def run(self, *, context: ExecutionContext, **_: Any) -> dict[str, Any]:
+        injected = await self.runner.inject_user_message(
+            self.execution_id,
+            "Injected while resumed.",
+            request_interrupt=False,
+        )
+        return {
+            "success": True,
+            "same_context": injected is context,
+            "messages": [message.content for message in context.messages],
+        }
+
+
 class TrackingCallback:
     def __init__(self) -> None:
         self.events: list[tuple[str, str]] = []
@@ -388,6 +406,22 @@ async def test_runner_returns_single_pattern_failure_result(tmp_path: Path) -> N
 
 
 @pytest.mark.asyncio
+async def test_runner_does_not_add_empty_user_message_for_missing_task(
+    tmp_path: Path,
+) -> None:
+    agent = Agent(name="writer", patterns=[FakePattern({"success": True})])
+    runner = AgentRunner(
+        agent=agent,
+        workspace_manager=FakeWorkspaceManager(tmp_path),
+    )
+
+    result = await runner.run(task=None, execution_id="exec-empty-task")
+
+    assert result["success"] is True
+    assert result["context"].messages == []
+
+
+@pytest.mark.asyncio
 async def test_runner_stops_on_llm_call_interrupt(tmp_path: Path) -> None:
     fallback = FakePattern({"success": True, "output": "should not run"})
     agent = Agent(name="writer", patterns=[LLMInterruptedPattern(), fallback])
@@ -437,6 +471,35 @@ async def test_runner_restores_context_and_pattern_from_checkpoint(
         "Original task",
         "restored",
     ]
+
+
+@pytest.mark.asyncio
+async def test_runner_registers_restored_context_for_live_message_injection(
+    tmp_path: Path,
+) -> None:
+    checkpoint_context = ExecutionContext(execution_id="exec-restore-inject")
+    checkpoint_context.add_user_message("Original task")
+    checkpoint = {
+        "context": checkpoint_context.to_dict(),
+        "pattern": "InjectingPattern",
+        "pattern_state": {},
+    }
+    agent = Agent(name="writer", patterns=[])
+    runner = AgentRunner(
+        agent=agent,
+        workspace_manager=FakeWorkspaceManager(tmp_path),
+    )
+    agent.patterns = [InjectingPattern(runner, "exec-restore-inject")]
+
+    result = await runner.run(
+        task=None,
+        execution_id="exec-restore-inject",
+        checkpoint=checkpoint,
+    )
+
+    assert result["success"] is True
+    assert result["same_context"] is True
+    assert result["messages"] == ["Original task", "Injected while resumed."]
 
 
 @pytest.mark.asyncio

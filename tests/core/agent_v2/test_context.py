@@ -9,12 +9,16 @@ from xagent.core.agent_v2.context import (
     MergeStrategy,
     Message,
 )
+from xagent.core.agent_v2.context import enrichment as enrichment_module
 from xagent.core.agent_v2.context.enrichment import (
     MEMORY_CONTEXT_METADATA_KEY,
     SKILL_CONTEXT_METADATA_KEY,
+    _current_user_id,
+    _lookup_relevant_memories_with_context,
     _parse_json_object,
     _skill_selection_attempt_key,
 )
+from xagent.web.user_isolated_memory import current_user_id
 
 
 @pytest.fixture(autouse=True)
@@ -38,6 +42,38 @@ def test_create_context() -> None:
     assert ctx.workspace_state["files"] == 2
     assert ctx.memory_session_id == "mem-1"
     assert ctx.memory_snapshot == {"summary": "hello"}
+
+
+def test_memory_enrichment_uses_web_user_context(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    observed_user_ids: list[int | None] = []
+
+    def fake_lookup_relevant_memories(*_: object, **__: object) -> list[dict[str, str]]:
+        observed_user_ids.append(current_user_id.get())
+        return [{"content": "memory"}]
+
+    monkeypatch.setattr(
+        enrichment_module,
+        "lookup_relevant_memories",
+        fake_lookup_relevant_memories,
+    )
+
+    assert current_user_id.get() is None
+    assert _current_user_id() is None
+    memories = _lookup_relevant_memories_with_context(
+        memory_store=object(),
+        query="query",
+        category="general",
+        include_general=True,
+        limit=5,
+        similarity_threshold=None,
+        user_id=42,
+    )
+
+    assert memories == [{"content": "memory"}]
+    assert observed_user_ids == [42]
+    assert current_user_id.get() is None
 
 
 def test_add_messages() -> None:
@@ -266,6 +302,21 @@ def test_token_truncation_preserves_tool_call_pair_boundary() -> None:
     assert messages[2]["tool_call_id"] == "call-1"
 
 
+def test_get_messages_for_llm_preserves_tool_call_pair_without_ids() -> None:
+    ctx = ExecutionContext()
+    ctx.add_assistant_message(
+        "",
+        tool_calls=[
+            {"type": "function", "function": {"name": "read_file"}},
+        ],
+    )
+    ctx.add_tool_result("read_file", {"output": "x"})
+
+    messages = ctx.get_messages_for_llm()
+
+    assert [message["role"] for message in messages[1:]] == ["assistant", "tool"]
+
+
 def test_compact_disabled() -> None:
     ctx = ExecutionContext()
     ctx.compact_config.enabled = False
@@ -357,11 +408,40 @@ def test_context_manager_lifecycle() -> None:
     assert manager.get_context("task-a") is None
 
 
+def test_context_manager_warns_on_duplicate_context(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    manager = ContextManager()
+    manager.create_context(execution_id="duplicate")
+
+    manager.create_context(execution_id="duplicate")
+
+    assert "Replacing existing execution context duplicate" in caplog.text
+
+
 def test_message_hash_and_eq() -> None:
     m1 = Message.role_user("same content")
     m2 = Message.role_user("same content")
     assert m1 == m2
     assert len({m1, m2}) == 1
+
+
+def test_message_identity_includes_tool_calls() -> None:
+    first = Message.role_assistant(
+        "",
+        tool_calls=[
+            {"id": "call-1", "type": "function", "function": {"name": "read_file"}}
+        ],
+    )
+    second = Message.role_assistant(
+        "",
+        tool_calls=[
+            {"id": "call-2", "type": "function", "function": {"name": "read_file"}}
+        ],
+    )
+
+    assert first != second
+    assert len({first, second}) == 2
 
 
 def test_extend_with_messages_auto_dedup() -> None:
@@ -392,6 +472,18 @@ def test_merge_contexts_multiple_inputs() -> None:
     )
     assert len(merged.messages) == 3
     assert merged.messages[0].content == "do task"
+
+
+def test_merge_contexts_preserves_base_created_at_and_deep_copies_workspace() -> None:
+    ctx = ExecutionContext()
+    ctx.attach_workspace("ws-1", "/tmp/ws1", state={"nested": {"count": 1}})
+    original_created_at = ctx.created_at
+
+    merged = ExecutionContext.merge_contexts([ctx])
+    merged.workspace_state["nested"]["count"] = 2
+
+    assert merged.created_at == original_created_at
+    assert ctx.workspace_state["nested"]["count"] == 1
 
 
 def test_merge_strategies_topological_and_prefer_first() -> None:

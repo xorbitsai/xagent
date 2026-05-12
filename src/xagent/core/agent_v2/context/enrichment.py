@@ -258,20 +258,6 @@ async def generate_and_store_react_memory(
             )
         return
 
-    if memory_store is None:
-        if tracer is not None and task_id:
-            await trace_memory_store_end(
-                tracer,
-                task_id,
-                data={
-                    "storage_success": False,
-                    "decision": "no_memory_store",
-                    "reason": reason,
-                    "step_id": step_id,
-                },
-            )
-        return
-
     if tracer is not None and task_id:
         await trace_memory_store_start(
             tracer,
@@ -450,7 +436,10 @@ def _build_memory_context(
     if not memories:
         return str(existing_context or "")
     enhanced = enhance_goal_with_memory(query, memories)
-    context_text = enhanced.replace(query, "", 1).strip()
+    context_text = enhanced
+    if query and enhanced.startswith(query):
+        context_text = enhanced[len(query) :].lstrip()
+    context_text = context_text.strip()
     if not context_text:
         context_text = enhanced
     if existing_context:

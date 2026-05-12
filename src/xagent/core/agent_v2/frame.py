@@ -96,13 +96,16 @@ class ExecutionSnapshot:
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> "ExecutionSnapshot":
+        frames: dict[str, ExecutionFrame] = {}
+        for frame_id, frame_payload in data.get("frames", {}).items():
+            frame = ExecutionFrame.from_dict(frame_payload)
+            if frame.frame_id != frame_id:
+                raise ValueError(f"Frame key mismatch: {frame_id} vs {frame.frame_id}")
+            frames[frame_id] = frame
         return cls(
             root_execution_id=str(data["root_execution_id"]),
             status=str(data["status"]),
-            frames={
-                frame_id: ExecutionFrame.from_dict(frame)
-                for frame_id, frame in data.get("frames", {}).items()
-            },
+            frames=frames,
             active_frame_ids=list(data.get("active_frame_ids", [])),
             control_state=dict(data.get("control_state", {})),
             updated_at=datetime.fromisoformat(data["updated_at"])

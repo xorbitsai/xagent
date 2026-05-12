@@ -250,6 +250,33 @@ async def test_registry_logs_async_subscriber_failures(
     assert logged_messages == ["Execution registry subscriber failed"]
 
 
+def test_registry_logs_sync_subscriber_failures(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    registry = ExecutionRegistry()
+    logged_messages: list[str] = []
+    events: list[dict[str, Any]] = []
+
+    def failing_subscriber(_: dict[str, Any]) -> None:
+        raise RuntimeError("subscriber failed")
+
+    def fake_exception(message: str) -> None:
+        logged_messages.append(message)
+
+    monkeypatch.setattr(registry_module.logger, "exception", fake_exception)
+    registry.subscribe(failing_subscriber)
+    registry.subscribe(events.append)
+
+    registry.register(
+        "exec-sync-subscriber-error",
+        AgentRunner(agent=Agent(name="writer", patterns=[SuccessfulPattern()])),
+        requested_task="manual task",
+    )
+
+    assert logged_messages == ["Execution registry subscriber failed"]
+    assert events[0]["type"] == "execution.registered"
+
+
 @pytest.mark.asyncio
 async def test_registry_cancel_running_execution_emits_cancelled_and_cleans_up(
     tmp_path: Path,
@@ -271,6 +298,7 @@ async def test_registry_cancel_running_execution_emits_cancelled_and_cleans_up(
     await pattern.started.wait()
 
     assert registry.cancel("exec-cancel", reason="user cancelled") is True
+    assert handle.status == ExecutionLifecycleStatus.CANCELLED
     with pytest.raises(asyncio.CancelledError):
         assert handle.task is not None
         await handle.task

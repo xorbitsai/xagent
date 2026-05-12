@@ -49,12 +49,20 @@ class Message:
         return result
 
     def __hash__(self) -> int:
-        return hash((self.role, self.content))
+        return hash(self._identity_key())
 
     def __eq__(self, other: object) -> bool:
         if not isinstance(other, Message):
             return False
-        return (self.role, self.content) == (other.role, other.content)
+        return self._identity_key() == other._identity_key()
+
+    def _identity_key(self) -> tuple[Any, ...]:
+        tool_call_ids = tuple(
+            tool_call.get("id")
+            for tool_call in self.tool_calls or []
+            if isinstance(tool_call, dict)
+        )
+        return (self.role, self.content, tool_call_ids, self.tool_call_id)
 
 
 @dataclass

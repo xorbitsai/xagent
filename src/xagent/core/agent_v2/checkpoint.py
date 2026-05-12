@@ -112,7 +112,7 @@ class TraceCheckpointStore:
             )
             if inspect.isawaitable(result):
                 result = await result
-            return str(result) if result is not None else ""
+            return str(result) if result is not None else None
 
         trace_event = getattr(self.tracer, "trace_event", None)
         if callable(trace_event):
@@ -131,7 +131,7 @@ class TraceCheckpointStore:
             )
             if inspect.isawaitable(result):
                 result = await result
-            return str(result) if result is not None else ""
+            return str(result) if result is not None else None
 
         return None
 

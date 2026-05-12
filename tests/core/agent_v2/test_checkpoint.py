@@ -60,6 +60,24 @@ class BestEffortTraceBackend:
         return "best-effort"
 
 
+class NoneReturningCheckpointBackend:
+    async def checkpoint(self, **_: Any) -> None:
+        return None
+
+
+class NoneReturningTraceEventBackend:
+    async def trace_event(
+        self,
+        event_type: Any,
+        *,
+        task_id: str | None = None,
+        data: dict[str, Any] | None = None,
+        require_persisted: bool = False,
+    ) -> None:
+        del event_type, task_id, data, require_persisted
+        return None
+
+
 class FakeLLM:
     async def chat(self, **_: Any) -> str:
         return "done"
@@ -110,6 +128,30 @@ async def test_trace_checkpoint_store_rejects_best_effort_trace_event() -> None:
             type="checkpoint",
             label="before_llm",
             execution_id="exec-best-effort",
+        )
+
+
+@pytest.mark.asyncio
+async def test_trace_checkpoint_store_rejects_none_checkpoint_writer() -> None:
+    store = TraceCheckpointStore(NoneReturningCheckpointBackend())
+
+    with pytest.raises(CheckpointPersistenceError):
+        await store.checkpoint(
+            type="checkpoint",
+            label="before_llm",
+            execution_id="exec-none-writer",
+        )
+
+
+@pytest.mark.asyncio
+async def test_trace_checkpoint_store_rejects_none_trace_event_writer() -> None:
+    store = TraceCheckpointStore(NoneReturningTraceEventBackend())
+
+    with pytest.raises(CheckpointPersistenceError):
+        await store.checkpoint(
+            type="checkpoint",
+            label="before_llm",
+            execution_id="exec-none-trace-event",
         )
 
 

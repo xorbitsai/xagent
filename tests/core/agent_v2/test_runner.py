@@ -13,8 +13,8 @@ from xagent.core.agent_v2 import (
     PatternRuntime,
     TraceEventCallback,
 )
-from xagent.core.agent_v2.runtime import LLMCallInterrupted
 from xagent.core.agent_v2.runner import AgentRunner
+from xagent.core.agent_v2.runtime import LLMCallInterrupted
 
 
 @pytest.fixture(autouse=True)

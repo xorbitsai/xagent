@@ -87,6 +87,21 @@ class FakeMemoryManager:
         }
 
 
+class AsyncMemoryManager(FakeMemoryManager):
+    async def get_or_create_session(
+        self,
+        *,
+        execution_id: str,
+        user_id: str | None = None,
+        session_id: str | None = None,
+    ) -> dict[str, Any]:
+        return super().get_or_create_session(
+            execution_id=execution_id,
+            user_id=user_id,
+            session_id=session_id,
+        )
+
+
 class FakePattern:
     def __init__(self, result: dict[str, Any]) -> None:
         self.result = result
@@ -269,6 +284,28 @@ async def test_runner_builds_context_and_invokes_pattern(tmp_path: Path) -> None
     assert isinstance(pattern_call["runtime"], PatternRuntime)
     assert workspace_manager.calls[0]["task_id"] == "exec-1"
     assert callback.events == [("start", "exec-1"), ("end", "exec-1")]
+
+
+@pytest.mark.asyncio
+async def test_runner_awaits_async_memory_manager(tmp_path: Path) -> None:
+    memory_manager = AsyncMemoryManager()
+    pattern = FakePattern({"success": True, "output": "done"})
+    agent = Agent(name="writer", patterns=[pattern])
+    runner = AgentRunner(
+        agent=agent,
+        workspace_manager=FakeWorkspaceManager(tmp_path),
+        memory_manager=memory_manager,
+    )
+
+    result = await runner.run(
+        task="Write a summary",
+        execution_id="exec-async-memory",
+        session_id="session-async",
+    )
+
+    assert result["success"] is True
+    assert result["context"].memory_session_id == "session-async"
+    assert result["context"].memory_snapshot == {"summary": "resume exec-async-memory"}
 
 
 @pytest.mark.asyncio

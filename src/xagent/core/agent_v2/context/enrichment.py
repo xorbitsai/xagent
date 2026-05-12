@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import logging
 from typing import Any, cast
@@ -69,12 +70,12 @@ async def enrich_context_with_memory(
         return cached if isinstance(cached, list) else []
 
     task_id = str(
-        getattr(runtime, "execution_id", None)
+        _runtime_attr(runtime, "execution_id")
         or getattr(context, "execution_id", None)
         or ""
     )
-    step_id = getattr(runtime, "active_react_step_id", None)
-    tracer = getattr(runtime, "tracer", None)
+    step_id = _runtime_attr(runtime, "active_react_step_id")
+    tracer = _runtime_attr(runtime, "tracer")
     user_id = _current_user_id()
 
     if tracer is not None and task_id:
@@ -145,14 +146,15 @@ async def enrich_context_with_skill(
         return attempted if isinstance(attempted, dict) else None
 
     task_id = str(
-        getattr(runtime, "execution_id", None)
+        _runtime_attr(runtime, "execution_id")
         or getattr(context, "execution_id", None)
         or ""
     )
+    tracer = _runtime_attr(runtime, "tracer")
     selected_skill = await skill_manager.select_skill(
         task=task,
         llm=_RuntimeLLMProxy(runtime=runtime, llm=llm) if runtime is not None else llm,
-        tracer=getattr(runtime, "tracer", None),
+        tracer=tracer,
         task_id=task_id or None,
         allowed_skills=allowed_skills,
     )
@@ -194,12 +196,12 @@ async def generate_and_store_react_memory(
         return
 
     task_id = str(
-        getattr(runtime, "execution_id", None)
+        _runtime_attr(runtime, "execution_id")
         or getattr(context, "execution_id", None)
         or ""
     )
-    step_id = getattr(runtime, "active_react_step_id", None)
-    tracer = getattr(runtime, "tracer", None)
+    step_id = _runtime_attr(runtime, "active_react_step_id")
+    tracer = _runtime_attr(runtime, "tracer")
     output = str(result.get("output") or result.get("response") or "")
     messages = [
         message.to_dict()
@@ -396,28 +398,48 @@ Respond with JSON:
 
 def _parse_json_object(content: str) -> dict[str, Any] | None:
     text = content.strip()
-    if text.startswith("```"):
-        newline_idx = text.find("\n")
-        if newline_idx > 0:
-            text = text[newline_idx:].strip()
-        if text.endswith("```"):
-            text = text[:-3].strip()
-    try:
-        payload = json.loads(text)
-    except json.JSONDecodeError:
+    for candidate in _json_candidates(text):
+        try:
+            payload = json.loads(candidate)
+        except json.JSONDecodeError:
+            continue
+        return payload if isinstance(payload, dict) else None
+    return None
+
+
+def _json_candidates(text: str) -> list[str]:
+    candidates = [text]
+    fence_start = text.find("```")
+    if fence_start >= 0:
+        content_start = text.find("\n", fence_start + 3)
+        fence_end = text.find("```", content_start + 1)
+        if content_start >= 0 and fence_end > content_start:
+            candidates.append(text[content_start + 1 : fence_end].strip())
+
+    object_start = text.find("{")
+    object_end = text.rfind("}")
+    if object_start >= 0 and object_end > object_start:
+        candidates.append(text[object_start : object_end + 1].strip())
+
+    return candidates
+
+
+def _runtime_attr(runtime: Any | None, name: str) -> Any | None:
+    if runtime is None:
         return None
-    return payload if isinstance(payload, dict) else None
+    return getattr(runtime, name, None)
 
 
 def _skill_selection_attempt_key(
     task: str,
     allowed_skills: list[str] | None,
 ) -> str:
-    return json.dumps(
+    payload = json.dumps(
         {"task": task, "allowed_skills": sorted(allowed_skills or [])},
         ensure_ascii=False,
         sort_keys=True,
     )
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
 def _build_memory_context(

@@ -79,7 +79,7 @@ class AgentRunner:
             context = ExecutionContext.from_dict(checkpoint["context"])
             execution_id = context.execution_id
         else:
-            context = self._build_context(
+            context = await self._build_context(
                 task=task,
                 execution_id=execution_id,
                 user_id=user_id,
@@ -304,7 +304,7 @@ class AgentRunner:
             reason=reason,
         )
 
-    def _build_context(
+    async def _build_context(
         self,
         *,
         task: str,
@@ -321,6 +321,8 @@ class AgentRunner:
             task_id=workspace_id or execution_id,
             allowed_external_dirs=allowed_external_dirs,
         )
+        if inspect.isawaitable(workspace):
+            workspace = await workspace
         context = self.context_manager.create_context(
             execution_id=execution_id,
             user_id=user_id,
@@ -335,7 +337,7 @@ class AgentRunner:
             context.metadata.update(metadata)
         context.metadata.setdefault("task", task)
 
-        memory_session = self._resolve_memory_session(
+        memory_session = await self._resolve_memory_session(
             execution_id=execution_id,
             user_id=user_id,
             session_id=session_id,
@@ -393,7 +395,7 @@ class AgentRunner:
             state["allowed_external_dirs"] = [str(path) for path in allowed_dirs]
         return state
 
-    def _resolve_memory_session(
+    async def _resolve_memory_session(
         self,
         *,
         execution_id: str,
@@ -418,6 +420,8 @@ class AgentRunner:
                 user_id=user_id,
                 session_id=session_id,
             )
+            if inspect.isawaitable(payload):
+                payload = await payload
             return self._normalize_memory_session(payload, session_id=session_id)
 
         return None

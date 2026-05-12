@@ -41,6 +41,7 @@ class CompactConfig:
     enabled: bool = True
     threshold: int = 8000
     strategy: str = "truncate"
+    max_messages: int = 20
 
 
 @dataclass
@@ -615,6 +616,7 @@ class ExecutionContext:
                 "enabled": self.compact_config.enabled,
                 "threshold": self.compact_config.threshold,
                 "strategy": self.compact_config.strategy,
+                "max_messages": self.compact_config.max_messages,
             },
             # Backward compatibility for older serialized payloads.
             "workspace_id": self.workspace_id,
@@ -657,6 +659,7 @@ class ExecutionContext:
             enabled=compact.get("enabled", True),
             threshold=compact.get("threshold", 8000),
             strategy=compact.get("strategy", "truncate"),
+            max_messages=compact.get("max_messages", 20),
         )
         created_at = (
             datetime.fromisoformat(data["created_at"])
@@ -731,7 +734,7 @@ class ExecutionContext:
     def _compact(self, llm: Any = None) -> CompactResult:
         original_count = len(self.messages)
         if self.compact_config.strategy == "truncate":
-            keep_count = min(20, original_count)
+            keep_count = min(max(0, self.compact_config.max_messages), original_count)
             self.messages = self._tail_window_preserving_tool_pairs(keep_count)
             removed = max(0, original_count - len(self.messages))
             return CompactResult(

@@ -12,6 +12,8 @@ from xagent.core.agent_v2.context import (
 from xagent.core.agent_v2.context.enrichment import (
     MEMORY_CONTEXT_METADATA_KEY,
     SKILL_CONTEXT_METADATA_KEY,
+    _parse_json_object,
+    _skill_selection_attempt_key,
 )
 
 
@@ -192,6 +194,20 @@ def test_compact_truncate() -> None:
     assert result.metadata["removed_count"] == 10
 
 
+def test_compact_truncate_uses_configured_message_limit() -> None:
+    ctx = ExecutionContext()
+    ctx.compact_config.threshold = 1
+    ctx.compact_config.max_messages = 30
+    for i in range(50):
+        ctx.add_user_message(f"message-{i}")
+
+    result = ctx.compact_if_needed()
+
+    assert result.compacted
+    assert len(ctx.messages) == 30
+    assert result.metadata["removed_count"] == 20
+
+
 def test_compact_truncate_preserves_tool_call_pair_boundary() -> None:
     ctx = ExecutionContext()
     ctx.compact_config.threshold = 1
@@ -300,6 +316,30 @@ def test_serialization_roundtrip() -> None:
     assert len(restored.messages) == 2
     assert restored.llm_calls[0].total_tokens == 15
     assert restored.llm_calls[0].prompt_message_count == 1
+    assert restored.compact_config.max_messages == ctx.compact_config.max_messages
+
+
+def test_parse_json_object_extracts_fenced_json_with_preamble() -> None:
+    content = """Here is the analysis:
+
+```json
+{"should_store": false, "reason": "routine"}
+```
+"""
+
+    parsed = _parse_json_object(content)
+
+    assert parsed == {"should_store": False, "reason": "routine"}
+
+
+def test_skill_selection_attempt_key_hashes_task_payload() -> None:
+    task = "x" * 1000
+
+    key = _skill_selection_attempt_key(task, ["b", "a"])
+
+    assert len(key) == 64
+    assert task not in key
+    assert key == _skill_selection_attempt_key(task, ["a", "b"])
 
 
 def test_context_manager_lifecycle() -> None:

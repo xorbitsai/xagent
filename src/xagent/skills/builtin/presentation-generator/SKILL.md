@@ -1,5 +1,4 @@
 ---
-name: presentation
 description: "Generate and edit PowerPoint presentations (.pptx). Use for: creating slide decks, pitch decks, or presentations from scratch; reading, parsing, or extracting content from .pptx files; editing, modifying, or updating existing presentations; combining or splitting slide files; working with templates, layouts, speaker notes, or comments. Trigger only when the user explicitly asks for a deck, slides, presentation, PPT/PPTX, or references a .pptx filename. Do not use for standalone posters, images, banners, illustrations, or social graphics unless the requested deliverable is a presentation file."
 ---
 

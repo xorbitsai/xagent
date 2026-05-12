@@ -1,6 +1,5 @@
 ---
 
-name: poster-designer
 description: Unified poster and standalone image generation skill with hard routing. Produces one or more final poster/image assets as requested, using mandatory HTML-based layout for information-heavy posters and image-first generation only for strictly visual assets.
 ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
 

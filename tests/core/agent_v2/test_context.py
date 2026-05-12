@@ -1,0 +1,429 @@
+from __future__ import annotations
+
+import pytest
+
+from xagent.core.agent_v2.context import (
+    ContextManager,
+    ExecutionContext,
+    GenericComponent,
+    MergeStrategy,
+    Message,
+)
+from xagent.core.agent_v2.context.enrichment import (
+    MEMORY_CONTEXT_METADATA_KEY,
+    SKILL_CONTEXT_METADATA_KEY,
+)
+
+
+@pytest.fixture(autouse=True)
+def reset_context_manager() -> None:
+    manager = ContextManager()
+    manager._contexts.clear()  # type: ignore[attr-defined]
+    yield
+    manager._contexts.clear()  # type: ignore[attr-defined]
+
+
+def test_create_context() -> None:
+    ctx = ExecutionContext()
+    ctx.execution_id = "task-1"
+    ctx.user_id = "user-1"
+    ctx.attach_workspace("ws-1", "/tmp/ws-1", cwd=".", state={"files": 2})
+    ctx.attach_memory_session("mem-1", {"summary": "hello"})
+
+    assert ctx.execution_id == "task-1"
+    assert ctx.user_id == "user-1"
+    assert ctx.workspace_id == "ws-1"
+    assert ctx.workspace_state["files"] == 2
+    assert ctx.memory_session_id == "mem-1"
+    assert ctx.memory_snapshot == {"summary": "hello"}
+
+
+def test_add_messages() -> None:
+    ctx = ExecutionContext()
+    user = ctx.add_user_message("hello")
+    assistant = ctx.add_assistant_message("hi there")
+    system = ctx.add_system_message("sys")
+    tool = ctx.add_tool_result("python", {"output": "done"}, tool_call_id="tool-1")
+
+    assert user.role == "user"
+    assert assistant.role == "assistant"
+    assert system.role == "system"
+    assert tool.role == "tool"
+    assert tool.metadata["tool_name"] == "python"
+    assert tool.metadata["raw_result"]["output"] == "done"
+
+
+def test_read_file_tool_result_omits_binary_like_content_from_context() -> None:
+    ctx = ExecutionContext()
+    binary_like = "PNG\x00" + ("x" * 100)
+
+    tool = ctx.add_tool_result("read_file", binary_like, tool_call_id="tool-1")
+
+    assert "binary-like content" in tool.content
+    assert binary_like not in tool.content
+    assert tool.metadata["raw_result"]["content_omitted"] is True
+    assert tool.metadata["raw_result"]["original_chars"] == len(binary_like)
+
+
+def test_read_file_tool_result_truncates_large_text_for_context() -> None:
+    ctx = ExecutionContext()
+    large_text = "a" * 13_000
+
+    tool = ctx.add_tool_result("read_file", large_text, tool_call_id="tool-1")
+
+    assert tool.metadata["raw_result"]["content_truncated"] is True
+    assert tool.metadata["raw_result"]["original_chars"] == len(large_text)
+    assert len(tool.metadata["raw_result"]["content_preview"]) == 12_000
+    assert len(tool.content) < len(large_text)
+
+
+def test_write_file_tool_call_omits_content_from_context() -> None:
+    ctx = ExecutionContext()
+    content = "<html>" + ("x" * 1000)
+    ctx.add_assistant_message(
+        "",
+        tool_calls=[
+            {
+                "id": "call-1",
+                "type": "function",
+                "function": {
+                    "name": "write_file",
+                    "arguments": (
+                        '{"file_path":"index.html","content":"' + content + '"}'
+                    ),
+                },
+            }
+        ],
+    )
+
+    tool_call = ctx.messages[-1].tool_calls[0]
+    arguments = tool_call["function"]["arguments"]
+    assert "omitted from LLM context" in arguments
+    assert content not in arguments
+    assert "content_preview" in arguments
+
+
+def test_get_messages_for_llm_filters_hidden_and_truncates() -> None:
+    ctx = ExecutionContext()
+    ctx.system_prompt = "You are helpful"
+    ctx.add_user_message("visible-1")
+    ctx.add_user_message("hidden", hidden=True)
+    ctx.add_assistant_message("visible-2", output_tokens=2)
+    ctx.add_assistant_message("visible-3", output_tokens=3)
+
+    result = ctx.get_messages_for_llm(max_tokens=4)
+    assert result[0]["role"] == "system"
+    assert result[0]["content"].startswith("You are helpful")
+    assert "Current date and time:" in result[0]["content"]
+    # Max tokens = 4 should keep only last assistant message (3 tokens)
+    assert len(result) == 2
+    assert result[-1]["content"] == "visible-3"
+
+
+def test_get_messages_for_llm_injects_time_context_without_system_prompt() -> None:
+    ctx = ExecutionContext()
+    ctx.add_user_message("what happened recently?")
+
+    result = ctx.get_messages_for_llm()
+
+    assert result[0]["role"] == "system"
+    assert "Current date and time:" in result[0]["content"]
+    assert "relative dates" in result[0]["content"]
+    assert result[1] == {"role": "user", "content": "what happened recently?"}
+
+
+def test_get_messages_for_llm_coalesces_system_messages() -> None:
+    ctx = ExecutionContext(system_prompt="Base prompt.")
+    ctx.add_system_message("Recovered system context.")
+    ctx.add_user_message("hello")
+
+    result = ctx.get_messages_for_llm()
+
+    assert [message["role"] for message in result].count("system") == 1
+    assert result[0]["role"] == "system"
+    assert "Base prompt." in result[0]["content"]
+    assert "Current date and time:" in result[0]["content"]
+    assert "Recovered system context." not in result[0]["content"]
+    assert result[1]["role"] == "user"
+    assert "Previous system-context message" in result[1]["content"]
+    assert "Recovered system context." in result[1]["content"]
+    assert result[2] == {"role": "user", "content": "hello"}
+
+
+def test_get_messages_for_llm_injects_memory_and_skill_context() -> None:
+    ctx = ExecutionContext(system_prompt="Base prompt.")
+    ctx.metadata[MEMORY_CONTEXT_METADATA_KEY] = "Remember project convention X."
+    ctx.metadata[SKILL_CONTEXT_METADATA_KEY] = "## Available Skill: docs"
+    ctx.add_user_message("Use context")
+
+    result = ctx.get_messages_for_llm()
+
+    system_content = result[0]["content"]
+    assert "Relevant memories from previous tasks" in system_content
+    assert "Remember project convention X." in system_content
+    assert "Memory usage rules" in system_content
+    assert "not as sufficient evidence for new factual claims" in system_content
+    assert "Do not ask the user whether to use memory or whether to search" in (
+        system_content
+    )
+    assert "Selected skill guidance" in system_content
+    assert "## Available Skill: docs" in system_content
+
+
+def test_get_messages_for_llm_can_skip_system_time_context() -> None:
+    ctx = ExecutionContext()
+    ctx.add_user_message("hello")
+
+    result = ctx.get_messages_for_llm(include_system=False)
+
+    assert result == [{"role": "user", "content": "hello"}]
+
+
+def test_compact_truncate() -> None:
+    ctx = ExecutionContext()
+    ctx.compact_config.threshold = 1
+    for i in range(30):
+        ctx.add_user_message(f"message-{i}")
+
+    result = ctx.compact_if_needed()
+    assert result.compacted
+    assert result.strategy == "truncate"
+    assert len(ctx.messages) == 20
+    assert result.metadata["removed_count"] == 10
+
+
+def test_compact_truncate_preserves_tool_call_pair_boundary() -> None:
+    ctx = ExecutionContext()
+    ctx.compact_config.threshold = 1
+    for i in range(10):
+        ctx.add_user_message(f"message-{i}")
+    ctx.add_assistant_message(
+        "",
+        tool_calls=[
+            {"id": "call-1", "type": "function", "function": {"name": "read_file"}},
+            {"id": "call-2", "type": "function", "function": {"name": "write_file"}},
+        ],
+    )
+    ctx.add_tool_result("read_file", {"output": "read"}, tool_call_id="call-1")
+    ctx.add_tool_result("write_file", {"output": "written"}, tool_call_id="call-2")
+    for i in range(19):
+        ctx.add_user_message(f"tail-{i}")
+
+    result = ctx.compact_if_needed()
+
+    assert result.compacted
+    assert ctx.messages[0].role == "assistant"
+    assert ctx.messages[0].tool_calls
+    assert ctx.messages[1].role == "tool"
+    assert ctx.messages[1].tool_call_id == "call-1"
+    assert ctx.messages[2].role == "tool"
+    assert ctx.messages[2].tool_call_id == "call-2"
+
+
+def test_get_messages_for_llm_drops_orphan_tool_messages() -> None:
+    ctx = ExecutionContext()
+    ctx.add_tool_result("read_file", {"output": "orphaned"}, tool_call_id="call-1")
+    ctx.add_user_message("continue")
+
+    messages = ctx.get_messages_for_llm()
+
+    assert [message["role"] for message in messages] == ["system", "user"]
+    assert messages[1]["content"] == "continue"
+
+
+def test_token_truncation_preserves_tool_call_pair_boundary() -> None:
+    ctx = ExecutionContext()
+    ctx.add_user_message("older")
+    ctx.add_assistant_message(
+        "",
+        tool_calls=[
+            {"id": "call-1", "type": "function", "function": {"name": "read_file"}},
+        ],
+    )
+    ctx.add_tool_result("read_file", {"output": "x"}, tool_call_id="call-1")
+
+    tool_tokens = max(1, len(ctx.messages[-1].content) // 4)
+    messages = ctx.get_messages_for_llm(max_tokens=tool_tokens)
+
+    assert [message["role"] for message in messages[1:]] == ["assistant", "tool"]
+    assert messages[1]["tool_calls"][0]["id"] == "call-1"
+    assert messages[2]["tool_call_id"] == "call-1"
+
+
+def test_compact_disabled() -> None:
+    ctx = ExecutionContext()
+    ctx.compact_config.enabled = False
+    for i in range(5):
+        ctx.add_user_message(f"message-{i}")
+
+    result = ctx.compact_if_needed()
+    assert not result.compacted
+    assert len(ctx.messages) == 5
+
+
+def test_token_estimate_uses_latest_prompt_usage_plus_append_delta() -> None:
+    ctx = ExecutionContext()
+    ctx.add_user_message("a" * 20)
+    ctx.record_llm_usage(input_tokens=100, output_tokens=10)
+    ctx.add_assistant_message("b" * 16)
+    ctx.add_user_message("c" * 8)
+
+    assert ctx._get_total_tokens() == 106
+
+
+def test_token_estimate_falls_back_when_history_is_rewritten() -> None:
+    ctx = ExecutionContext()
+    ctx.add_user_message("a" * 20)
+    ctx.record_llm_usage(input_tokens=100, output_tokens=10)
+    ctx.messages[0] = Message.role_user("rewritten")
+
+    assert ctx._get_total_tokens() == max(1, len("rewritten") // 4)
+
+
+def test_serialization_roundtrip() -> None:
+    ctx = ExecutionContext()
+    ctx.execution_id = "task-x"
+    ctx.system_prompt = "sys"
+    ctx.attach_workspace("ws-1", "/tmp/ws1", cwd="work")
+    ctx.attach_memory_session("mem-2", {"state": "ok"})
+    ctx.add_user_message("hi")
+    msg = Message.role_assistant("response")
+    ctx.record_llm_call(msg, input_tokens=10, output_tokens=5)
+
+    data = ctx.to_dict()
+    restored = ExecutionContext.from_dict(data)
+
+    assert restored.execution_id == "task-x"
+    assert restored.system_prompt == "sys"
+    assert restored.workspace_id == "ws-1"
+    assert restored.memory_session_id == "mem-2"
+    assert len(restored.messages) == 2
+    assert restored.llm_calls[0].total_tokens == 15
+    assert restored.llm_calls[0].prompt_message_count == 1
+
+
+def test_context_manager_lifecycle() -> None:
+    manager = ContextManager()
+    ctx = manager.create_context(
+        execution_id="task-a",
+        user_id="user-a",
+        system_prompt="sys",
+        workspace_id="ws-1",
+        workspace_path="/tmp/ws-1",
+    )
+    assert manager.get_context("task-a") is ctx
+    assert manager.list_active_contexts("user-a") == [ctx]
+    manager.remove_context("task-a")
+    assert manager.get_context("task-a") is None
+
+
+def test_message_hash_and_eq() -> None:
+    m1 = Message.role_user("same content")
+    m2 = Message.role_user("same content")
+    assert m1 == m2
+    assert len({m1, m2}) == 1
+
+
+def test_extend_with_messages_auto_dedup() -> None:
+    ctx = ExecutionContext()
+    ctx.add_user_message("question")
+    duplicate = Message.role_user("question")
+    ctx.extend_with_messages([duplicate])
+
+    assert len(ctx.messages) == 1
+    assert ctx.messages[0] is duplicate
+    assert ctx.messages[0].content == "question"
+
+
+def test_merge_contexts_multiple_inputs() -> None:
+    ctx_a = ExecutionContext()
+    ctx_a.execution_id = "A"
+    ctx_a.add_user_message("do task")
+
+    ctx_b = ctx_a.create_child_context(execution_id="B")
+    ctx_b.add_assistant_message("step B done")
+
+    ctx_c = ctx_a.create_child_context(execution_id="C")
+    ctx_c.add_assistant_message("step C done")
+
+    merged = ExecutionContext.merge_contexts(
+        [ctx_b, ctx_c],
+        strategy=MergeStrategy.CHRONOLOGICAL,
+    )
+    assert len(merged.messages) == 3
+    assert merged.messages[0].content == "do task"
+
+
+def test_merge_strategies_topological_and_prefer_first() -> None:
+    ctx_a = ExecutionContext()
+    ctx_a.execution_id = "A"
+    msg = ctx_a.add_user_message("root")
+
+    ctx_b = ctx_a.create_child_context(execution_id="B")
+    ctx_b.add_assistant_message("B first")
+
+    ctx_c = ctx_a.create_child_context(execution_id="C")
+    ctx_c.add_assistant_message("C second")
+
+    topo = ExecutionContext.merge_contexts(
+        [ctx_b, ctx_c], strategy=MergeStrategy.TOPOLOGICAL
+    )
+    assert [m.content for m in topo.messages] == ["root", "B first", "C second"]
+
+    prefer = ExecutionContext.merge_contexts(
+        [ctx_c, ctx_b], strategy=MergeStrategy.PREFER_FIRST
+    )
+    assert prefer.messages[0] == msg
+    # prefer_first should keep first unique order (ctx_c before ctx_b)
+    assert [m.content for m in prefer.messages] == ["root", "C second", "B first"]
+
+
+def test_create_child_context_isolation_and_metadata() -> None:
+    ctx = ExecutionContext(metadata={"parent": True})
+    ctx.execution_id = "parent"
+    ctx.attach_workspace("ws-1", "/tmp/ws1", cwd="work")
+    ctx.add_user_message("parent-msg")
+
+    child = ctx.create_child_context(
+        execution_id="child", task="child task", metadata={"child": True}
+    )
+    child.add_assistant_message("child-msg")
+
+    assert child.execution_id == "child"
+    assert child.metadata["parent"] is True
+    assert child.metadata["child"] is True
+    assert child.metadata["task"] == "child task"
+    assert ctx.workspace_id == child.workspace_id
+    assert (
+        len(child.messages) == len(ctx.messages) + 2
+    )  # parent history + task + child msg
+    assert ctx.messages[-1].content == "parent-msg"
+
+
+def test_llm_call_token_tracking() -> None:
+    ctx = ExecutionContext()
+    response = Message.role_assistant("result")
+    ctx.record_llm_call(response, input_tokens=8, output_tokens=3)
+
+    usage = ctx.get_total_token_usage()
+    assert usage["total"] == 11
+    assert usage["input"] == 8
+    assert usage["output"] == 3
+    assert ctx.llm_calls[0].message_index == len(ctx.messages) - 1
+
+
+def test_custom_component_roundtrip_without_context_schema_change() -> None:
+    ctx = ExecutionContext()
+    ctx.set_component(
+        "skills",
+        GenericComponent(data={"library_dirs": ["/tmp/skills"], "active": ["writer"]}),
+    )
+
+    restored = ExecutionContext.from_dict(ctx.to_dict())
+    component = restored.get_component("skills")
+
+    assert isinstance(component, GenericComponent)
+    assert component.data == {
+        "library_dirs": ["/tmp/skills"],
+        "active": ["writer"],
+    }

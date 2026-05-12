@@ -14,6 +14,7 @@ from xagent.core.agent_v2 import (
     ExecutionLifecycleStatus,
     PatternRuntime,
 )
+from xagent.core.agent_v2 import registry as registry_module
 from xagent.core.agent_v2.registry import ExecutionRegistry
 from xagent.core.agent_v2.runner import AgentRunner
 
@@ -220,6 +221,33 @@ async def test_registry_emits_lifecycle_and_message_events(
     assert events[2]["message"] == "Reply with only the number."
     assert registry.unsubscribe(subscription_id) is True
     assert registry.unsubscribe(subscription_id) is False
+
+
+@pytest.mark.asyncio
+async def test_registry_logs_async_subscriber_failures(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    registry = ExecutionRegistry()
+    logged_messages: list[str] = []
+
+    async def failing_subscriber(_: dict[str, Any]) -> None:
+        raise RuntimeError("subscriber failed")
+
+    def fake_exception(message: str) -> None:
+        logged_messages.append(message)
+
+    monkeypatch.setattr(registry_module.logger, "exception", fake_exception)
+    registry.subscribe(failing_subscriber)
+
+    registry.register(
+        "exec-subscriber-error",
+        AgentRunner(agent=Agent(name="writer", patterns=[SuccessfulPattern()])),
+        requested_task="manual task",
+    )
+    await asyncio.sleep(0)
+    await asyncio.sleep(0)
+
+    assert logged_messages == ["Execution registry subscriber failed"]
 
 
 @pytest.mark.asyncio

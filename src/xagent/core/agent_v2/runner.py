@@ -8,7 +8,7 @@ from uuid import uuid4
 
 from ..workspace import WorkspaceManager
 from .context import ContextManager, ExecutionContext
-from .runtime import PatternRuntime, load_pattern_checkpoint
+from .runtime import LLMCallInterrupted, PatternRuntime, load_pattern_checkpoint
 
 logger = logging.getLogger(__name__)
 
@@ -145,6 +145,19 @@ class AgentRunner:
                             streaming_handler=streaming_handler,
                         )
                     )
+                except LLMCallInterrupted as exc:
+                    normalized = {
+                        "success": False,
+                        "status": "interrupted",
+                        "error": str(exc),
+                        "execution_id": execution_id,
+                        "context": context,
+                        "pattern": pattern.__class__.__name__,
+                    }
+                    await self._dispatch_callback(
+                        "on_run_end", runner=self, context=context, result=normalized
+                    )
+                    return normalized
                 except Exception as exc:  # noqa: BLE001
                     logger.exception("Pattern %s failed", pattern.__class__.__name__)
                     pattern_errors.append(

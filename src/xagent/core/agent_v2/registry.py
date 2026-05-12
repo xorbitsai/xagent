@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import inspect
+import logging
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from enum import Enum
@@ -11,6 +12,8 @@ from .context import ExecutionContext
 
 if TYPE_CHECKING:
     from .runner import AgentRunner
+
+logger = logging.getLogger(__name__)
 
 
 def _utcnow() -> datetime:
@@ -324,4 +327,13 @@ class ExecutionRegistry:
         for callback in self._subscribers.values():
             result = callback(dict(payload))
             if inspect.isawaitable(result):
-                asyncio.ensure_future(result)
+                task = asyncio.ensure_future(result)
+                task.add_done_callback(self._log_subscriber_error)
+
+    def _log_subscriber_error(self, task: asyncio.Future[Any]) -> None:
+        try:
+            task.result()
+        except asyncio.CancelledError:
+            return
+        except Exception:
+            logger.exception("Execution registry subscriber failed")

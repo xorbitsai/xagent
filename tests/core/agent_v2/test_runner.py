@@ -13,6 +13,7 @@ from xagent.core.agent_v2 import (
     PatternRuntime,
     TraceEventCallback,
 )
+from xagent.core.agent_v2.runtime import LLMCallInterrupted
 from xagent.core.agent_v2.runner import AgentRunner
 
 
@@ -118,6 +119,11 @@ class FailingPattern:
 
     async def run(self, **_: Any) -> dict[str, Any]:
         return {"success": False, "error": self.error}
+
+
+class LLMInterruptedPattern:
+    async def run(self, **_: Any) -> dict[str, Any]:
+        raise LLMCallInterrupted("paused during LLM call")
 
 
 class StatefulPattern:
@@ -379,6 +385,24 @@ async def test_runner_returns_single_pattern_failure_result(tmp_path: Path) -> N
     assert result["failure_reason"] == "structured_failure"
     assert result["error"] == "failed with details"
     assert "pattern_errors" not in result
+
+
+@pytest.mark.asyncio
+async def test_runner_stops_on_llm_call_interrupt(tmp_path: Path) -> None:
+    fallback = FakePattern({"success": True, "output": "should not run"})
+    agent = Agent(name="writer", patterns=[LLMInterruptedPattern(), fallback])
+    runner = AgentRunner(
+        agent=agent,
+        workspace_manager=FakeWorkspaceManager(tmp_path),
+    )
+
+    result = await runner.run(task="Pause me", execution_id="exec-llm-interrupt")
+
+    assert result["success"] is False
+    assert result["status"] == "interrupted"
+    assert result["error"] == "paused during LLM call"
+    assert result["pattern"] == "LLMInterruptedPattern"
+    assert fallback.calls == []
 
 
 @pytest.mark.asyncio

@@ -7,6 +7,16 @@ import {
 } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent } from "@/components/ui/card";
+import {
+  AlertDialog,
+  AlertDialogAction,
+  AlertDialogCancel,
+  AlertDialogContent,
+  AlertDialogDescription,
+  AlertDialogFooter,
+  AlertDialogHeader,
+  AlertDialogTitle,
+} from "@/components/ui/alert-dialog";
 import Link from "next/link";
 import { useState, useEffect, useRef } from "react";
 import { apiRequest } from "@/lib/api-wrapper";
@@ -25,6 +35,18 @@ interface RecentTask {
   created_at: string;
 }
 
+interface LlmModel {
+  model_id: string;
+  is_default?: boolean;
+}
+
+interface DefaultModelRecord {
+  config_type?: "general" | "small_fast" | "visual" | "compact";
+  model?: {
+    model_id?: string;
+  } | null;
+}
+
 export default function Home() {
   const router = useRouter();
   const { t, locale } = useI18n();
@@ -33,6 +55,7 @@ export default function Home() {
   const [templates, setTemplates] = useState<Template[]>([]);
   const [recentTasks, setRecentTasks] = useState<RecentTask[]>([]);
   const [isCreating, setIsCreating] = useState(false);
+  const [showNoModelAlert, setShowNoModelAlert] = useState(false);
   const [visibleGetStartedVideos, setVisibleGetStartedVideos] = useState<Set<number>>(new Set());
   const getStartedSectionRef = useRef<HTMLDivElement | null>(null);
   const homeChatInputRef = useRef<HTMLTextAreaElement | null>(null);
@@ -107,13 +130,64 @@ export default function Home() {
     router.push(`/build/new?template=${templateId}`);
   };
 
+  const resolveTaskLlmIds = async (): Promise<[string, string | null, string | null, string | null] | null> => {
+    const apiUrl = getApiUrl();
+    const [modelsResponse, defaultResponse] = await Promise.all([
+      apiRequest(`${apiUrl}/api/models/?category=llm`, { headers: {} }),
+      apiRequest(`${apiUrl}/api/models/user-default`, { headers: {} }),
+    ]);
+
+    let allModels: LlmModel[] = [];
+    if (modelsResponse.ok) {
+      const modelsData = await modelsResponse.json();
+      if (Array.isArray(modelsData)) {
+        allModels = modelsData as LlmModel[];
+      }
+    }
+
+    const defaultModels: Record<string, string | undefined> = {};
+    if (defaultResponse.ok) {
+      const defaultsData = await defaultResponse.json();
+      if (Array.isArray(defaultsData)) {
+        defaultsData.forEach((defaultConfig: DefaultModelRecord) => {
+          if (defaultConfig?.config_type && defaultConfig.model?.model_id) {
+            defaultModels[defaultConfig.config_type] = defaultConfig.model.model_id;
+          }
+        });
+      }
+    }
+
+    const generalModelId =
+      defaultModels.general ||
+      allModels.find((model) => model.is_default)?.model_id ||
+      allModels[0]?.model_id;
+
+    if (!generalModelId) {
+      return null;
+    }
+
+    return [
+      generalModelId,
+      defaultModels.small_fast ?? null,
+      defaultModels.visual ?? null,
+      defaultModels.compact ?? null,
+    ];
+  };
+
   const handleCreateTask = async (content: string) => {
     if (isCreating) return;
     setIsCreating(true);
     try {
+      const llmIds = await resolveTaskLlmIds();
+      if (!llmIds) {
+        setShowNoModelAlert(true);
+        return;
+      }
+
       const requestBody = {
         title: content,
         description: content,
+        llm_ids: llmIds,
       };
 
       const taskResponse = await apiRequest(`${getApiUrl()}/api/chat/task/create`, {
@@ -222,6 +296,22 @@ export default function Home() {
           </div>
         </div>
       </div>
+      <AlertDialog open={showNoModelAlert} onOpenChange={setShowNoModelAlert}>
+        <AlertDialogContent>
+          <AlertDialogHeader>
+            <AlertDialogTitle>{t("common.notice")}</AlertDialogTitle>
+            <AlertDialogDescription>
+              {t("chatPage.input.noModelAlert")}
+            </AlertDialogDescription>
+          </AlertDialogHeader>
+          <AlertDialogFooter>
+            <AlertDialogCancel>{t("common.cancel")}</AlertDialogCancel>
+            <AlertDialogAction onClick={() => router.push("/models")}>
+              {t("common.confirm")}
+            </AlertDialogAction>
+          </AlertDialogFooter>
+        </AlertDialogContent>
+      </AlertDialog>
 
       {/* Main Content Scrollable */}
       <div className="flex-1">

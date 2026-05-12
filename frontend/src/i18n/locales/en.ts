@@ -1794,7 +1794,9 @@ Build when you need.`
       tabs: {
         file: "File Upload",
         web: "Website Import",
+        webDesc: "Import website content by crawling URLs",
         cloud: "Cloud Connect",
+        cloudDesc: "Connect cloud storage to sync documents",
       },
       cloudConnect: {
         title: "Cloud Connect",

@@ -1794,7 +1794,9 @@ Build when you need.`
       tabs: {
         file: "文件上传",
         web: "网站导入",
+        webDesc: "通过爬取 URL 导入网站内容",
         cloud: "云连接",
+        cloudDesc: "连接云存储以同步文档",
       },
       cloudConnect: {
         title: "云连接",

@@ -698,6 +698,8 @@ class PatternRuntime:
 
     def _checkpoint_trace_event_type(self, trace_event: Any) -> Any:
         del trace_event
+        # Runtime checkpoints are task-scoped progress events. Durable checkpoint
+        # persistence uses TraceCheckpointStore, which emits system-scoped events.
         return TraceEventType(
             TraceScope.TASK,
             TraceAction.UPDATE,

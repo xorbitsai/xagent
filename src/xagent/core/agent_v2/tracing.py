@@ -9,6 +9,7 @@ from ..agent.trace import (
     trace_task_completion,
     trace_user_message,
 )
+from .result import extract_assistant_message
 
 
 @dataclass
@@ -49,7 +50,7 @@ class TraceEventCallback:
             result.get("execution_id") or getattr(context, "execution_id", "") or ""
         )
         status = str(result.get("status") or "")
-        output = self._extract_assistant_message(result)
+        output = extract_assistant_message(result)
         data = {
             "agent_runtime": "v2",
             "execution_id": execution_id,
@@ -102,11 +103,4 @@ class TraceEventCallback:
                 content = getattr(message, "content", None)
                 if isinstance(content, str) and content:
                     return content
-        return None
-
-    def _extract_assistant_message(self, result: dict[str, Any]) -> str | None:
-        for key in ("response", "answer", "output", "content", "message"):
-            value = result.get(key)
-            if isinstance(value, str) and value:
-                return value
         return None

@@ -8,6 +8,7 @@ from uuid import uuid4
 
 from ..workspace import WorkspaceManager
 from .context import ContextManager, ExecutionContext
+from .result import extract_assistant_message
 from .runtime import LLMCallInterrupted, PatternRuntime, load_pattern_checkpoint
 
 logger = logging.getLogger(__name__)
@@ -584,20 +585,13 @@ class AgentRunner:
         normalized.setdefault("context", context)
         normalized.setdefault("pattern", pattern.__class__.__name__)
 
-        assistant_message = self._extract_assistant_message(normalized)
+        assistant_message = extract_assistant_message(normalized)
         if assistant_message and not self._has_assistant_message(
             context, assistant_message
         ):
             context.add_assistant_message(assistant_message)
 
         return normalized
-
-    def _extract_assistant_message(self, result: dict[str, Any]) -> str | None:
-        for key in ("response", "answer", "output", "content", "message"):
-            value = result.get(key)
-            if isinstance(value, str) and value:
-                return value
-        return None
 
     def _has_assistant_message(self, context: ExecutionContext, content: str) -> bool:
         return any(

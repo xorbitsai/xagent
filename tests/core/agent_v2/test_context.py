@@ -17,7 +17,11 @@ from xagent.core.agent_v2.context.enrichment import (
     _lookup_relevant_memories_with_context,
     _parse_json_object,
     _skill_selection_attempt_key,
+    enrich_context_with_memory,
+    enrich_context_with_skill,
+    generate_and_store_react_memory,
 )
+from xagent.core.agent_v2.runtime import LLMCallInterrupted
 from xagent.web.user_isolated_memory import current_user_id
 
 
@@ -74,6 +78,217 @@ def test_memory_enrichment_uses_web_user_context(
     assert memories == [{"content": "memory"}]
     assert observed_user_ids == [42]
     assert current_user_id.get() is None
+
+
+@pytest.mark.asyncio
+async def test_enrich_context_with_memory_caches_and_builds_context(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[str] = []
+
+    def fake_lookup_relevant_memories(*_: object, **__: object) -> list[dict[str, str]]:
+        calls.append("lookup")
+        return [{"content": "Prefer concise answers."}]
+
+    def fake_enhance_goal_with_memory(
+        query: str,
+        memories: list[dict[str, str]],
+    ) -> str:
+        return f"{query}\nMemory: {memories[0]['content']}"
+
+    monkeypatch.setattr(
+        enrichment_module,
+        "lookup_relevant_memories",
+        fake_lookup_relevant_memories,
+    )
+    monkeypatch.setattr(
+        enrichment_module,
+        "enhance_goal_with_memory",
+        fake_enhance_goal_with_memory,
+    )
+    ctx = ExecutionContext(execution_id="exec-memory")
+
+    first = await enrich_context_with_memory(
+        context=ctx,
+        query="Summarize",
+        category="general",
+        memory_store=object(),
+    )
+    second = await enrich_context_with_memory(
+        context=ctx,
+        query="Summarize",
+        category="general",
+        memory_store=object(),
+    )
+
+    assert first == [{"content": "Prefer concise answers."}]
+    assert second == first
+    assert calls == ["lookup"]
+    assert ctx.metadata[MEMORY_CONTEXT_METADATA_KEY] == (
+        "Memory: Prefer concise answers."
+    )
+
+
+class FakeSkillManager:
+    def __init__(self, selected: dict[str, str] | None) -> None:
+        self.selected = selected
+        self.calls: list[dict[str, object]] = []
+
+    async def select_skill(self, **kwargs: object) -> dict[str, str] | None:
+        self.calls.append(kwargs)
+        return self.selected
+
+
+@pytest.mark.asyncio
+async def test_enrich_context_with_skill_records_selected_skill() -> None:
+    skill = {
+        "name": "writer",
+        "description": "Writes concise copy",
+        "when_to_use": "Writing",
+        "content": "Use short sentences.",
+    }
+    manager = FakeSkillManager(skill)
+    ctx = ExecutionContext(execution_id="exec-skill")
+
+    selected = await enrich_context_with_skill(
+        context=ctx,
+        task="Write release notes",
+        llm=object(),
+        skill_manager=manager,
+        allowed_skills=["writer"],
+    )
+
+    assert selected == skill
+    assert ctx.metadata[enrichment_module.SELECTED_SKILL_METADATA_KEY]["name"] == (
+        "writer"
+    )
+    assert "Use short sentences." in ctx.metadata[SKILL_CONTEXT_METADATA_KEY]
+
+
+@pytest.mark.asyncio
+async def test_enrich_context_with_skill_caches_no_skill() -> None:
+    manager = FakeSkillManager(None)
+    ctx = ExecutionContext(execution_id="exec-skill")
+
+    first = await enrich_context_with_skill(
+        context=ctx,
+        task="No matching skill",
+        llm=object(),
+        skill_manager=manager,
+        allowed_skills=["writer"],
+    )
+    second = await enrich_context_with_skill(
+        context=ctx,
+        task="No matching skill",
+        llm=object(),
+        skill_manager=manager,
+        allowed_skills=["writer"],
+    )
+
+    assert first is None
+    assert second is None
+    assert len(manager.calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_generate_and_store_react_memory_store_and_skip(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    stored: list[dict[str, object]] = []
+
+    async def fake_generate(**_: object) -> dict[str, object]:
+        return {
+            "should_store": True,
+            "reason": "useful",
+            "core_insight": "core",
+            "tool_usage_insights": "tools",
+            "reasoning_strategy": "strategy",
+        }
+
+    def fake_store_react_task_memory(**kwargs: object) -> str:
+        stored.append(kwargs)
+        return "memory-1"
+
+    monkeypatch.setattr(
+        enrichment_module,
+        "_generate_react_memory_insights",
+        fake_generate,
+    )
+    monkeypatch.setattr(
+        enrichment_module,
+        "store_react_task_memory",
+        fake_store_react_task_memory,
+    )
+    ctx = ExecutionContext(execution_id="exec-memory")
+    ctx.add_user_message("Do work")
+
+    await generate_and_store_react_memory(
+        context=ctx,
+        task="Do work",
+        result={"success": True, "output": "Done"},
+        iterations=2,
+        llm=object(),
+        memory_store=object(),
+    )
+
+    assert stored[0]["task"] == "Do work"
+    assert stored[0]["tool_usage_insights"] == "tools"
+
+
+@pytest.mark.asyncio
+async def test_generate_and_store_react_memory_parse_failure_skips_store(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    stored: list[dict[str, object]] = []
+
+    async def fake_generate(**_: object) -> None:
+        return None
+
+    monkeypatch.setattr(
+        enrichment_module,
+        "_generate_react_memory_insights",
+        fake_generate,
+    )
+    monkeypatch.setattr(
+        enrichment_module,
+        "store_react_task_memory",
+        lambda **kwargs: stored.append(kwargs),
+    )
+
+    await generate_and_store_react_memory(
+        context=ExecutionContext(execution_id="exec-memory"),
+        task="Do work",
+        result={"success": True, "output": "Done"},
+        iterations=2,
+        llm=object(),
+        memory_store=object(),
+    )
+
+    assert stored == []
+
+
+@pytest.mark.asyncio
+async def test_generate_and_store_react_memory_propagates_interrupt(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def fake_generate(**_: object) -> None:
+        raise LLMCallInterrupted("paused")
+
+    monkeypatch.setattr(
+        enrichment_module,
+        "_generate_react_memory_insights",
+        fake_generate,
+    )
+
+    with pytest.raises(LLMCallInterrupted, match="paused"):
+        await generate_and_store_react_memory(
+            context=ExecutionContext(execution_id="exec-memory"),
+            task="Do work",
+            result={"success": True, "output": "Done"},
+            iterations=2,
+            llm=object(),
+            memory_store=object(),
+        )
 
 
 def test_add_messages() -> None:

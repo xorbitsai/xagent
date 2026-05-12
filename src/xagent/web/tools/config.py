@@ -650,10 +650,16 @@ class WebToolConfig(BaseToolConfig):
                         transport_config["cwd"] = server.cwd
 
                 elif server.transport in ["sse", "websocket", "streamable_http"]:
+                    decrypted_auth = server._decrypt_auth_config(
+                        getattr(server, "auth", None)
+                    )
                     if server.url:
                         transport_config["url"] = server.url
-                    if server.headers:
-                        transport_config["headers"] = server.headers
+                    merged_headers = server._merge_auth_headers(
+                        server.headers, decrypted_auth
+                    )
+                    if merged_headers:
+                        transport_config["headers"] = merged_headers
 
                 # Add Docker-specific config if managed internally
                 if server.managed == "internal":

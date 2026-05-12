@@ -68,7 +68,7 @@ export function CustomMcpForm({
     newList.forEach(h => {
       if (h.key.trim()) newHeadersObj[h.key.trim()] = h.value.trim()
     })
-    updateConfig("headers", Object.keys(newHeadersObj).length > 0 ? newHeadersObj : undefined)
+    updateConfig("headers", Object.keys(newHeadersObj).length > 0 ? newHeadersObj : {})
   }
 
   return (

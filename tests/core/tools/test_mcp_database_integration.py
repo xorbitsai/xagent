@@ -70,6 +70,37 @@ def sample_websocket_config():
     }
 
 
+@pytest.fixture
+def sample_streamable_http_bearer_auth_config():
+    """Sample Streamable HTTP MCP server config using bearer auth."""
+    return {
+        "name": "test_http_bearer_server",
+        "transport": "streamable_http",
+        "managed": "external",
+        "description": "Test HTTP MCP server with bearer auth",
+        "url": "http://localhost:18000/mcp",
+        "headers": {"X-Test": "true"},
+        "auth": {"type": "bearer", "bearer_token": "secret-token"},
+    }
+
+
+@pytest.fixture
+def sample_streamable_http_api_key_auth_config():
+    """Sample Streamable HTTP MCP server config using API key auth."""
+    return {
+        "name": "test_http_api_key_server",
+        "transport": "streamable_http",
+        "managed": "external",
+        "description": "Test HTTP MCP server with API key auth",
+        "url": "http://localhost:18000/mcp",
+        "auth": {
+            "type": "api_key",
+            "api_key_name": "X-API-Key",
+            "api_key_value": "secret-api-key",
+        },
+    }
+
+
 class TestDatabaseMCPServerManager:
     """Test DatabaseMCPServerManager functionality."""
 
@@ -208,6 +239,52 @@ class TestDatabaseMCPServerManager:
         assert config.transport == sample_websocket_config["transport"]
         assert config.url == sample_websocket_config["url"]
         assert config.headers == sample_websocket_config["headers"]
+
+    def test_get_connections_maps_bearer_auth_to_authorization_header(
+        self, test_db, sample_streamable_http_bearer_auth_config
+    ):
+        """Test bearer auth is converted into Authorization header."""
+        manager = DatabaseMCPServerManager(test_db)
+        config = manager.create_config(**sample_streamable_http_bearer_auth_config)
+        manager.add_server(config)
+
+        connection = manager.get_connections()[config.name]
+
+        assert connection["transport"] == "streamable_http"
+        assert connection["url"] == sample_streamable_http_bearer_auth_config["url"]
+        assert connection["headers"]["X-Test"] == "true"
+        assert connection["headers"]["Authorization"] == "Bearer secret-token"
+        assert "auth" not in connection
+
+    def test_get_connections_maps_api_key_auth_to_header(
+        self, test_db, sample_streamable_http_api_key_auth_config
+    ):
+        """Test API key auth is converted into the configured header."""
+        manager = DatabaseMCPServerManager(test_db)
+        config = manager.create_config(**sample_streamable_http_api_key_auth_config)
+        manager.add_server(config)
+
+        connection = manager.get_connections()[config.name]
+
+        assert connection["headers"]["X-API-Key"] == "secret-api-key"
+        assert "auth" not in connection
+
+    def test_get_connections_preserves_explicit_headers_over_auto_auth(
+        self, test_db, sample_streamable_http_bearer_auth_config
+    ):
+        """Test explicit custom headers take precedence over generated auth headers."""
+        manager = DatabaseMCPServerManager(test_db)
+        overridden_config = {
+            **sample_streamable_http_bearer_auth_config,
+            "name": "test_http_custom_auth_header_server",
+            "headers": {"Authorization": "Bearer custom-header-token"},
+        }
+        config = manager.create_config(**overridden_config)
+        manager.add_server(config)
+
+        connection = manager.get_connections()[config.name]
+
+        assert connection["headers"]["Authorization"] == "Bearer custom-header-token"
 
 
 class TestToolFactoryMCPIntegration:

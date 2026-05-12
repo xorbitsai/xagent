@@ -976,3 +976,46 @@ class TestWebToolConfigCustomApi:
         assert len(configs) == 1
         assert "body" in configs[0]
         assert configs[0]["body"] is None
+
+
+class TestWebToolConfigMCPAuth:
+    @pytest.mark.asyncio
+    async def test_get_mcp_server_configs_maps_bearer_auth_to_headers(self):
+        from unittest.mock import MagicMock
+
+        from xagent.web.tools.config import WebToolConfig
+
+        server = MagicMock()
+        server.name = "local"
+        server.transport = "streamable_http"
+        server.description = "Local MCP"
+        server.url = "http://127.0.0.1:18000/mcp"
+        server.headers = {"X-Test": "true"}
+        server.auth = {"type": "bearer", "bearer_token": "test-token-123"}
+        server.managed = "external"
+        server._decrypt_auth_config.side_effect = lambda auth: auth
+        server._merge_auth_headers.side_effect = lambda headers, auth: {
+            **(headers or {}),
+            "Authorization": f"Bearer {auth['bearer_token']}",
+        }
+
+        db = MagicMock()
+        db.query.return_value.join.return_value.filter.return_value.all.return_value = [
+            server
+        ]
+
+        cfg = WebToolConfig(
+            db=db,
+            request=MagicMock(),
+            user_id=1,
+            workspace_config={"base_dir": "/tmp", "task_id": "test"},
+        )
+        configs = await cfg.get_mcp_server_configs()
+
+        assert len(configs) == 1
+        assert configs[0]["name"] == "local"
+        assert configs[0]["config"]["url"] == "http://127.0.0.1:18000/mcp"
+        assert configs[0]["config"]["headers"]["X-Test"] == "true"
+        assert (
+            configs[0]["config"]["headers"]["Authorization"] == "Bearer test-token-123"
+        )

@@ -34,7 +34,7 @@ export function WelcomeModal() {
             <DialogContent
                 showCloseButton={false}
                 onInteractOutside={(e) => e.preventDefault()}
-                className="max-h-[calc(100dvh-20rem)] max-w-[90vw] overflow-y-auto rounded-2xl p-4 sm:rounded-3xl sm:p-6 md:max-w-[900px] md:p-12 lg:max-w-[1000px] gap-0"
+                className="max-h-[90vh] max-w-[90vw] overflow-y-auto rounded-2xl p-4 sm:rounded-3xl sm:p-6 md:max-w-[900px] md:p-12 lg:max-w-[1000px] gap-0"
             >
                 <div className="mb-6 flex flex-col items-center text-center sm:mb-8 md:mb-10">
                     <span className="mb-3 text-[11px] font-bold uppercase tracking-[0.2em] text-primary sm:mb-4">

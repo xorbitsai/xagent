@@ -642,6 +642,58 @@ async def test_react_pattern_final_answer_tool_persists_memory(
 
 
 @pytest.mark.asyncio
+async def test_react_pattern_final_answer_clears_trailing_pending_before_checkpoint() -> (
+    None
+):
+    llm = FakeLLM(
+        responses=[
+            {
+                "tool_calls": [
+                    {
+                        "id": "call_final",
+                        "function": {
+                            "name": "final_answer",
+                            "arguments": '{"answer":"Done."}',
+                        },
+                    },
+                    {
+                        "id": "call_calc",
+                        "function": {
+                            "name": "calculator",
+                            "arguments": '{"expression":"9+1"}',
+                        },
+                    },
+                ],
+            },
+        ]
+    )
+    pattern = ReActPattern(max_iterations=2)
+    runtime = PatternRuntime()
+    tool = FakeTool()
+    context = ExecutionContext()
+    context.add_user_message("Finish and do not continue")
+
+    result = await pattern.run(
+        context=context,
+        tools=[tool],
+        llm=llm,
+        runtime=runtime,
+    )
+
+    assert result["success"] is True
+    assert result["response"] == "Done."
+    assert tool.calls == []
+    assert pattern.pending_tool_calls == []
+    final_checkpoint = next(
+        checkpoint
+        for checkpoint in runtime.checkpoints
+        if checkpoint["label"] == "final"
+    )
+    assert final_checkpoint["pattern_state"]["status"] == "completed"
+    assert final_checkpoint["pattern_state"]["pending_tool_calls"] == []
+
+
+@pytest.mark.asyncio
 async def test_react_pattern_accepts_plain_text_response() -> None:
     llm = FakeLLM(responses=["Direct answer"])
     pattern = ReActPattern(max_iterations=1)

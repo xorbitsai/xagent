@@ -892,6 +892,8 @@ class ReActPattern(AgentPattern):
         runtime: PatternRuntime,
         response: Any,
     ) -> dict[str, Any]:
+        self.pending_tool_calls = []
+        self.waiting_for_user_request = None
         self.force_final_answer_next = False
         self.status = "completed"
         await runtime.checkpoint("final", context=context, pattern=self)

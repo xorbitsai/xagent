@@ -5,6 +5,10 @@ from ...core.RAG_tools.core.schemas import IngestionConfig
 logger = logging.getLogger(__name__)
 
 
+class AgentKnowledgeBaseError(RuntimeError):
+    """Raised when agent-triggered knowledge base setup cannot be completed."""
+
+
 class AgentKnowledgeBaseService:
     """Shared collection setup/refresh flow for agent-triggered KB creation."""
 
@@ -30,11 +34,14 @@ class AgentKnowledgeBaseService:
                 user_id=self.user_id,
             )
         except Exception as exc:
-            logger.warning(
+            logger.error(
                 "Failed to save collection config for agent knowledge base %s: %s",
                 safe_collection,
                 exc,
             )
+            raise AgentKnowledgeBaseError(
+                f"Failed to save collection config for knowledge base '{safe_collection}'"
+            ) from exc
 
         return safe_collection
 
@@ -49,8 +56,11 @@ class AgentKnowledgeBaseService:
                 force_realtime=True,
             )
         except Exception as exc:
-            logger.warning(
+            logger.error(
                 "Failed to refresh collection metadata after agent ingestion for %s: %s",
                 collection_name,
                 exc,
             )
+            raise AgentKnowledgeBaseError(
+                f"Failed to refresh knowledge base metadata for '{collection_name}'"
+            ) from exc

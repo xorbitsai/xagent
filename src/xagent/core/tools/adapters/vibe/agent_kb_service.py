@@ -48,6 +48,10 @@ class AgentKnowledgeBaseService:
     async def refresh_collection_metadata(self, collection_name: str) -> None:
         from ...core.RAG_tools.management.collections import list_collections
 
+        if not self.is_admin:
+            # Non-admin realtime refreshes do not persist metadata and only add scan cost.
+            return
+
         try:
             # Refresh metadata cache so agent-created KBs are visible like API-created ones.
             await list_collections(

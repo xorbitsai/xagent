@@ -808,8 +808,10 @@ async def test_list_collections_cache_miss_uses_realtime(
     assert result.status == "success"
     assert result.total_count >= 1
 
-    names = [c.name for c in result.collections]
-    assert collection in names
+    info = next(c for c in result.collections if c.name == collection)
+    assert info.created_at is not None
+    assert info.updated_at is not None
+    assert info.last_accessed_at is not None
 
 
 @pytest.mark.asyncio

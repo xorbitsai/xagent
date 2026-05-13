@@ -135,6 +135,29 @@ class LanceDBMetadataStore(MetadataStore):
         finally:
             _safe_close_table(table)
 
+    async def save_collections(self, collections: Sequence[CollectionInfo]) -> None:
+        from ..LanceDB.schema_manager import _safe_close_table
+
+        if not collections:
+            return
+
+        conn = await self._get_connection()
+        await self.ensure_collection_metadata_table()
+
+        rows_by_name = OrderedDict(
+            (collection.name, collection.to_storage()) for collection in collections
+        )
+        table = conn.open_table("collection_metadata")
+        try:
+            for collection_name in rows_by_name:
+                safe_name = escape_lancedb_string(collection_name)
+                existing = table.search().where(f"name = '{safe_name}'").to_arrow()
+                if len(existing) > 0:
+                    table.delete(f"name = '{safe_name}'")
+            table.add(list(rows_by_name.values()))
+        finally:
+            _safe_close_table(table)
+
     async def list_collections(
         self,
         user_id: Optional[int] = None,

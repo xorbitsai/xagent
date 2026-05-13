@@ -6,7 +6,6 @@ system, including listing collections, managing documents, and handling deletion
 
 from __future__ import annotations
 
-import asyncio
 import json
 import logging
 import os
@@ -808,11 +807,7 @@ async def list_collections(
             }
             if metadata_info is not None:
                 collection_kwargs["created_at"] = metadata_info.created_at
-                collection_kwargs["updated_at"] = (
-                    timestamp_now
-                    if timestamp_now is not None
-                    else metadata_info.updated_at
-                )
+                collection_kwargs["updated_at"] = metadata_info.updated_at
                 collection_kwargs["last_accessed_at"] = (
                     timestamp_now
                     if timestamp_now is not None
@@ -826,12 +821,14 @@ async def list_collections(
 
         # Fallback to realtime aggregation for missing collections or cache failure
         used_realtime = False
+        realtime_timestamp: Optional[datetime] = None
         if (
             force_realtime
             or not stats
             or any(key not in stats for key in collection_keys)
         ):
             used_realtime = True
+            realtime_timestamp = datetime.now(timezone.utc).replace(tzinfo=None)
             realtime_stats = vector_store.aggregate_collection_stats(
                 user_id=user_id,
                 is_admin=is_admin,
@@ -854,7 +851,6 @@ async def list_collections(
         if used_realtime and is_admin:
             try:
                 metadata_store = get_metadata_store()
-                timestamp_now = datetime.now(timezone.utc).replace(tzinfo=None)
                 refreshed_infos: Dict[str, CollectionInfo] = {}
                 for collection in collection_keys:
                     existing_metadata_info = metadata_collections_by_name.get(
@@ -869,15 +865,10 @@ async def list_collections(
                             else None
                         ),
                         processed_documents=stats[collection]["parses"],
-                        timestamp_now=timestamp_now,
+                        timestamp_now=realtime_timestamp,
                     )
                     refreshed_infos[collection] = info
-                await asyncio.gather(
-                    *(
-                        metadata_store.save_collection(info)
-                        for info in refreshed_infos.values()
-                    )
-                )
+                await metadata_store.save_collections(list(refreshed_infos.values()))
                 metadata_collections_by_name.update(refreshed_infos)
                 for collection in refreshed_infos:
                     metadata_collection_names.add(collection)
@@ -922,6 +913,7 @@ async def list_collections(
                         if stats[collection]["parses"] > 0
                         else metadata_processed_documents_by_name.get(collection, 0)
                     ),
+                    timestamp_now=realtime_timestamp if used_realtime else None,
                 )
             )
 

@@ -48,9 +48,9 @@ async def test_agent_kb_service_prepare_collection_persists_config_and_sanitizes
 
 
 @pytest.mark.asyncio
-async def test_agent_kb_service_refresh_collection_metadata_forces_realtime():
+async def test_agent_kb_service_refresh_collection_metadata_forces_realtime_for_admin():
     refresh_metadata = AsyncMock()
-    service = AgentKnowledgeBaseService(user_id=71, is_admin=False)
+    service = AgentKnowledgeBaseService(user_id=71, is_admin=True)
 
     with patch(
         "xagent.core.tools.core.RAG_tools.management.collections.list_collections",
@@ -60,9 +60,23 @@ async def test_agent_kb_service_refresh_collection_metadata_forces_realtime():
 
     refresh_metadata.assert_awaited_once_with(
         user_id=71,
-        is_admin=False,
+        is_admin=True,
         force_realtime=True,
     )
+
+
+@pytest.mark.asyncio
+async def test_agent_kb_service_refresh_collection_metadata_skips_non_admin_refresh():
+    refresh_metadata = AsyncMock()
+    service = AgentKnowledgeBaseService(user_id=71, is_admin=False)
+
+    with patch(
+        "xagent.core.tools.core.RAG_tools.management.collections.list_collections",
+        new=refresh_metadata,
+    ):
+        await service.refresh_collection_metadata("agent_url_kb")
+
+    refresh_metadata.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -89,7 +103,7 @@ async def test_agent_kb_service_prepare_collection_raises_on_config_save_failure
 @pytest.mark.asyncio
 async def test_agent_kb_service_refresh_collection_metadata_raises_on_failure():
     refresh_metadata = AsyncMock(side_effect=RuntimeError("refresh failed"))
-    service = AgentKnowledgeBaseService(user_id=71, is_admin=False)
+    service = AgentKnowledgeBaseService(user_id=71, is_admin=True)
 
     with (
         patch(

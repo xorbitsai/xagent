@@ -306,6 +306,11 @@ class MetadataStore(ABC):
     async def save_collection(self, collection: CollectionInfo) -> None:
         """Create or update collection metadata."""
 
+    async def save_collections(self, collections: Sequence[CollectionInfo]) -> None:
+        """Create or update multiple collection metadata rows."""
+        for collection in collections:
+            await self.save_collection(collection)
+
     @abstractmethod
     async def list_collections(
         self,

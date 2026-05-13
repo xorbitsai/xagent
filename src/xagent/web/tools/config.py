@@ -655,8 +655,12 @@ class WebToolConfig(BaseToolConfig):
                     )
                     if server.url:
                         transport_config["url"] = server.url
+                    raw_headers = getattr(server, "headers", None)
+                    typed_headers = (
+                        raw_headers if isinstance(raw_headers, dict) else None
+                    )
                     merged_headers = server._merge_auth_headers(
-                        server.headers, decrypted_auth
+                        typed_headers, decrypted_auth
                     )
                     if merged_headers:
                         transport_config["headers"] = merged_headers

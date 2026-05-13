@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import asyncio
+import importlib
 import re
 from typing import Any
 
 import pytest
+from langchain_core.tools import tool as langchain_tool
 from pydantic import BaseModel
 
 from xagent.core.agent_v2 import (
@@ -14,6 +16,8 @@ from xagent.core.agent_v2 import (
     ReActReasoningMode,
     ToolCallRecord,
 )
+
+react_module = importlib.import_module("xagent.core.agent_v2.pattern.react.react")
 
 
 class CalculatorArgs(BaseModel):
@@ -279,6 +283,50 @@ async def test_react_pattern_supports_plain_function_tools(
 
 
 @pytest.mark.asyncio
+async def test_react_pattern_uses_langchain_tool_schema() -> None:
+    @langchain_tool
+    def add_numbers(a: int, b: int) -> int:
+        """Add two numbers."""
+        return a + b
+
+    llm = FakeLLM(
+        responses=[
+            {
+                "tool_calls": [
+                    {
+                        "id": "call_add",
+                        "function": {
+                            "name": "add_numbers",
+                            "arguments": '{"a":2,"b":3}',
+                        },
+                    }
+                ],
+            },
+            {"content": "The result is 5.", "done": True},
+        ]
+    )
+    pattern = ReActPattern(max_iterations=3)
+    context = ExecutionContext()
+    context.add_user_message("Add 2 and 3")
+
+    result = await pattern.run(context=context, tools=[add_numbers], llm=llm)
+
+    assert result["success"] is True
+    tool_schema = next(
+        schema
+        for schema in llm.calls[0]["tools"]
+        if schema["function"]["name"] == "add_numbers"
+    )
+    parameters = tool_schema["function"]["parameters"]
+    assert parameters["properties"]["a"]["type"] == "integer"
+    assert parameters["properties"]["b"]["type"] == "integer"
+    assert parameters["required"] == ["a", "b"]
+    assert context.get_messages_by_role("tool")[-1].content == (
+        "Tool add_numbers returned: 5"
+    )
+
+
+@pytest.mark.asyncio
 async def test_react_pattern_injects_v1_memory_and_skill_context() -> None:
     llm = FakeLLM(
         responses=[
@@ -493,6 +541,49 @@ async def test_react_pattern_can_finish_with_final_answer_tool() -> None:
     assert tool.calls == [{"expression": "2+2"}]
     assert context.messages[-1].role == "assistant"
     assert context.messages[-1].content == "The result is 4."
+
+
+@pytest.mark.asyncio
+async def test_react_pattern_final_answer_tool_persists_memory(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    memory_calls: list[dict[str, Any]] = []
+
+    async def fake_generate_and_store_react_memory(**kwargs: Any) -> None:
+        memory_calls.append(kwargs)
+
+    monkeypatch.setattr(
+        react_module,
+        "generate_and_store_react_memory",
+        fake_generate_and_store_react_memory,
+    )
+    llm = FakeLLM(
+        responses=[
+            {
+                "tool_calls": [
+                    {
+                        "id": "call_final",
+                        "function": {
+                            "name": "final_answer",
+                            "arguments": '{"answer":"Done."}',
+                        },
+                    }
+                ],
+            },
+        ]
+    )
+    pattern = ReActPattern(max_iterations=2)
+    context = ExecutionContext()
+    context.add_user_message("Finish")
+
+    result = await pattern.run(context=context, tools=[], llm=llm)
+
+    assert result["success"] is True
+    assert result["response"] == "Done."
+    assert memory_calls
+    assert memory_calls[0]["task"] == "Finish"
+    assert memory_calls[0]["result"]["response"] == "Done."
+    assert memory_calls[0]["iterations"] == 1
 
 
 @pytest.mark.asyncio
@@ -813,6 +904,18 @@ async def test_react_pattern_preserves_pending_calls_after_waiting_control_tool(
     assert resumed["success"] is True
     assert tool.calls == [{"expression": "5+5"}]
     assert context.get_messages_by_role("tool")[-1].tool_call_id == "call_calc"
+    resumed_messages = resumed_llm.calls[0]["messages"]
+    resumed_tool_result = next(
+        message
+        for message in resumed_messages
+        if message.get("role") == "tool" and message.get("tool_call_id") == "call_calc"
+    )
+    resumed_tool_envelope_index = resumed_messages.index(resumed_tool_result) - 1
+    assert resumed_messages[resumed_tool_envelope_index]["role"] == "assistant"
+    assert resumed_messages[resumed_tool_envelope_index]["tool_calls"][0]["id"] == (
+        "call_calc"
+    )
+    assert "Tool calculator returned" in resumed_tool_result["content"]
 
 
 @pytest.mark.asyncio

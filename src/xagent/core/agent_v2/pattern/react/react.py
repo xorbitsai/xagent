@@ -200,9 +200,11 @@ class ReActPattern(AgentPattern):
         for iteration in range(self.current_iteration, self.max_iterations):
             self.current_iteration = iteration
             if self.pending_tool_calls:
+                self._ensure_pending_tool_call_envelope(context)
                 pending_result = await self._execute_pending_tool_calls(
                     context=context,
                     tools=tools,
+                    llm=llm,
                     runtime=runtime,
                 )
                 if pending_result is not None:
@@ -281,6 +283,7 @@ class ReActPattern(AgentPattern):
                 pending_result = await self._execute_pending_tool_calls(
                     context=context,
                     tools=tools,
+                    llm=llm,
                     runtime=runtime,
                 )
                 if pending_result is not None:
@@ -291,27 +294,12 @@ class ReActPattern(AgentPattern):
 
             await runtime.checkpoint("after_llm", context=context, pattern=self)
             if normalized.get("done", True):
-                self.force_final_answer_next = False
-                self.status = "completed"
-                await runtime.checkpoint("final", context=context, pattern=self)
-                result = PatternResult(
-                    success=True,
-                    output=assistant_content or normalized.get("raw"),
-                    metadata={
-                        "response": assistant_content or normalized.get("raw"),
-                        "status": self.status,
-                    },
-                ).to_dict()
-                await generate_and_store_react_memory(
+                return await self._finalize_success(
                     context=context,
-                    task=latest_user_text(context),
-                    result=result,
-                    iterations=self.current_iteration + 1,
                     llm=llm,
-                    memory_store=getattr(self, "_memory_store", None),
                     runtime=runtime,
+                    response=assistant_content or normalized.get("raw"),
                 )
-                return result
 
         self.status = "max_iterations"
         await runtime.checkpoint("max_iterations", context=context, pattern=self)
@@ -693,6 +681,7 @@ class ReActPattern(AgentPattern):
         self,
         tool_call: dict[str, Any],
         context: Any,
+        llm: Any,
         runtime: PatternRuntime,
     ) -> dict[str, Any] | None:
         name = tool_call["name"]
@@ -708,11 +697,12 @@ class ReActPattern(AgentPattern):
             self.status = "completed"
             if answer:
                 context.add_assistant_message(answer)
-            return PatternResult(
-                success=True,
-                output=answer,
-                metadata={"response": answer, "status": self.status},
-            ).to_dict()
+            return await self._finalize_success(
+                context=context,
+                llm=llm,
+                runtime=runtime,
+                response=answer,
+            )
 
         if name == "send_message":
             message = str(args.get("message", ""))
@@ -813,6 +803,7 @@ class ReActPattern(AgentPattern):
         *,
         context: Any,
         tools: list[Any],
+        llm: Any,
         runtime: PatternRuntime,
     ) -> dict[str, Any] | None:
         successful_tool_result = False
@@ -829,6 +820,7 @@ class ReActPattern(AgentPattern):
             control_result = await self._handle_control_tool(
                 tool_call,
                 context,
+                llm,
                 runtime,
             )
             if control_result is not None:
@@ -871,6 +863,79 @@ class ReActPattern(AgentPattern):
         if self.finalize_after_tool_result and successful_tool_result:
             self.force_final_answer_next = True
         return None
+
+    async def _finalize_success(
+        self,
+        *,
+        context: Any,
+        llm: Any,
+        runtime: PatternRuntime,
+        response: Any,
+    ) -> dict[str, Any]:
+        self.force_final_answer_next = False
+        self.status = "completed"
+        await runtime.checkpoint("final", context=context, pattern=self)
+        result = PatternResult(
+            success=True,
+            output=response,
+            metadata={"response": response, "status": self.status},
+        ).to_dict()
+        await generate_and_store_react_memory(
+            context=context,
+            task=latest_user_text(context),
+            result=result,
+            iterations=self.current_iteration + 1,
+            llm=llm,
+            memory_store=getattr(self, "_memory_store", None),
+            runtime=runtime,
+        )
+        return result
+
+    def _ensure_pending_tool_call_envelope(self, context: Any) -> None:
+        if not self.pending_tool_calls:
+            return
+        messages = [
+            message
+            for message in getattr(context, "messages", [])
+            if not getattr(message, "hidden", False)
+        ]
+        index = len(messages) - 1
+        while index >= 0 and messages[index].role == "tool":
+            index -= 1
+        if index >= 0 and messages[index].role == "assistant":
+            tool_calls = messages[index].tool_calls or []
+            existing_ids = {
+                str(tool_call.get("id"))
+                for tool_call in tool_calls
+                if isinstance(tool_call, dict) and tool_call.get("id")
+            }
+            pending_ids = {
+                str(tool_call.get("id"))
+                for tool_call in self.pending_tool_calls
+                if tool_call.get("id")
+            }
+            if pending_ids and pending_ids.issubset(existing_ids):
+                return
+            if not pending_ids and len(tool_calls) >= len(self.pending_tool_calls):
+                return
+
+        context.add_assistant_message(
+            "",
+            tool_calls=[
+                self._tool_call_for_context(tool_call)
+                for tool_call in self.pending_tool_calls
+            ],
+        )
+
+    def _tool_call_for_context(self, tool_call: dict[str, Any]) -> dict[str, Any]:
+        return {
+            "id": tool_call.get("id"),
+            "type": "function",
+            "function": {
+                "name": tool_call.get("name"),
+                "arguments": json.dumps(tool_call.get("args", {}), default=str),
+            },
+        }
 
     def _tool_result_success(self, result: Any) -> bool:
         return not (isinstance(result, dict) and result.get("success") is False)
@@ -1000,6 +1065,17 @@ class ReActPattern(AgentPattern):
             schema_type = args_type()
             if hasattr(schema_type, "model_json_schema"):
                 return cast(dict[str, Any], schema_type.model_json_schema())
+        for schema_attr in ("args_schema", "tool_call_schema"):
+            schema_type = getattr(tool, schema_attr, None)
+            if schema_type is None:
+                continue
+            if hasattr(schema_type, "model_json_schema"):
+                return cast(dict[str, Any], schema_type.model_json_schema())
+            if hasattr(schema_type, "schema"):
+                return cast(dict[str, Any], schema_type.schema())
+        args = getattr(tool, "args", None)
+        if isinstance(args, dict) and args:
+            return {"type": "object", "properties": args}
         return {"type": "object", "properties": {}}
 
     async def _execute_tool(self, tool_call: dict[str, Any], tools: list[Any]) -> Any:

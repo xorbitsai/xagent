@@ -77,6 +77,7 @@ class CreateKnowledgeBaseFromFileTool(AbstractBaseTool):
             from ...core.RAG_tools.pipelines.document_ingestion import (
                 run_document_ingestion,
             )
+            from .agent_kb_service import AgentKnowledgeBaseService
 
             tool_args = CreateKnowledgeBaseFromFileArgs.model_validate(args)
 
@@ -110,6 +111,14 @@ class CreateKnowledgeBaseFromFileTool(AbstractBaseTool):
                     collection_name = f"{base_name}_{int(time.time())}"
 
                 config = IngestionConfig(embedding_model_id=DEFAULT_EMBEDDING_MODEL_ID)
+                kb_service = AgentKnowledgeBaseService(
+                    user_id=self.user_id,
+                    is_admin=self.is_admin,
+                )
+                collection_name = await kb_service.prepare_collection(
+                    collection_name=collection_name,
+                    ingestion_config=config,
+                )
 
                 ingested_count = 0
                 errors = []
@@ -160,6 +169,8 @@ class CreateKnowledgeBaseFromFileTool(AbstractBaseTool):
                 )
                 if errors:
                     message += f" Warnings: {'; '.join(errors)}"
+
+                await kb_service.refresh_collection_metadata(collection_name)
 
                 return CreateKnowledgeBaseFromFileResult(
                     success=True,

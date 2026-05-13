@@ -74,6 +74,7 @@ class CreateKnowledgeBaseFromUrlTool(AbstractBaseTool):
                 WebCrawlConfig,
             )
             from ...core.RAG_tools.pipelines.web_ingestion import run_web_ingestion
+            from .agent_kb_service import AgentKnowledgeBaseService
 
             tool_args = CreateKnowledgeBaseFromUrlArgs.model_validate(args)
 
@@ -101,6 +102,14 @@ class CreateKnowledgeBaseFromUrlTool(AbstractBaseTool):
             ingest_config = IngestionConfig(
                 embedding_model_id=DEFAULT_EMBEDDING_MODEL_ID
             )
+            kb_service = AgentKnowledgeBaseService(
+                user_id=self.user_id,
+                is_admin=self.is_admin,
+            )
+            collection_name = await kb_service.prepare_collection(
+                collection_name=collection_name,
+                ingestion_config=ingest_config,
+            )
 
             logger.info(
                 f"Starting background web ingestion for {tool_args.url} into {collection_name}"
@@ -122,6 +131,8 @@ class CreateKnowledgeBaseFromUrlTool(AbstractBaseTool):
                     message=f"Failed to crawl website: {result.message}",
                     pages_crawled=0,
                 ).model_dump()
+
+            await kb_service.refresh_collection_metadata(collection_name)
 
             return CreateKnowledgeBaseFromUrlResult(
                 success=True,

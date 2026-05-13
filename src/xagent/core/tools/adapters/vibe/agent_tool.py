@@ -386,16 +386,6 @@ class CreateAgentTool(AbstractBaseTool):
         """Sync execution not supported."""
         raise NotImplementedError("CreateAgentTool only supports async execution.")
 
-    def _agent_name_exists(self, agent_name: str) -> bool:
-        from .....web.models.agent import Agent
-
-        existing = (
-            self._db.query(Agent)
-            .filter(Agent.user_id == self._user_id, Agent.name == agent_name)
-            .first()
-        )
-        return existing is not None
-
     def _build_name_candidate(self, base_name: str, suffix: str) -> str:
         clean_base = base_name.strip()
         if not suffix:
@@ -410,8 +400,18 @@ class CreateAgentTool(AbstractBaseTool):
     def _resolve_available_agent_name(
         self, requested_name: str
     ) -> tuple[str, Optional[str]]:
+        from .....web.models.agent import Agent
+
         normalized_name = requested_name.strip()[:MAX_AGENT_NAME_LENGTH].rstrip()
-        if not self._agent_name_exists(normalized_name):
+
+        existing_names = {
+            name
+            for (name,) in self._db.query(Agent.name)
+            .filter(Agent.user_id == self._user_id)
+            .all()
+        }
+
+        if normalized_name not in existing_names:
             return normalized_name, None
 
         preferred_suffixes = [" Assistant", " V2", " Bot", " Workspace"]
@@ -419,17 +419,13 @@ class CreateAgentTool(AbstractBaseTool):
 
         for suffix in preferred_suffixes:
             candidate = self._build_name_candidate(normalized_name, suffix)
-            if candidate not in seen_candidates and not self._agent_name_exists(
-                candidate
-            ):
+            if candidate not in seen_candidates and candidate not in existing_names:
                 return candidate, normalized_name
             seen_candidates.add(candidate)
 
         for index in range(2, 1000):
             candidate = self._build_name_candidate(normalized_name, f" {index}")
-            if candidate not in seen_candidates and not self._agent_name_exists(
-                candidate
-            ):
+            if candidate not in seen_candidates and candidate not in existing_names:
                 return candidate, normalized_name
             seen_candidates.add(candidate)
 

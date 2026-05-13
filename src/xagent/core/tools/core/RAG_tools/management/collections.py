@@ -6,6 +6,7 @@ system, including listing collections, managing documents, and handling deletion
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import os
@@ -807,8 +808,16 @@ async def list_collections(
             }
             if metadata_info is not None:
                 collection_kwargs["created_at"] = metadata_info.created_at
-                collection_kwargs["updated_at"] = metadata_info.updated_at
-                collection_kwargs["last_accessed_at"] = metadata_info.last_accessed_at
+                collection_kwargs["updated_at"] = (
+                    timestamp_now
+                    if timestamp_now is not None
+                    else metadata_info.updated_at
+                )
+                collection_kwargs["last_accessed_at"] = (
+                    timestamp_now
+                    if timestamp_now is not None
+                    else metadata_info.last_accessed_at
+                )
             elif timestamp_now is not None:
                 collection_kwargs["created_at"] = timestamp_now
                 collection_kwargs["updated_at"] = timestamp_now
@@ -842,10 +851,11 @@ async def list_collections(
                         }
 
         # Async write stats back to metadata cache for next request
-        if used_realtime:
+        if used_realtime and is_admin:
             try:
                 metadata_store = get_metadata_store()
                 timestamp_now = datetime.now(timezone.utc).replace(tzinfo=None)
+                refreshed_infos: Dict[str, CollectionInfo] = {}
                 for collection in collection_keys:
                     existing_metadata_info = metadata_collections_by_name.get(
                         collection
@@ -861,8 +871,15 @@ async def list_collections(
                         processed_documents=stats[collection]["parses"],
                         timestamp_now=timestamp_now,
                     )
-                    await metadata_store.save_collection(info)
-                    metadata_collections_by_name[collection] = info
+                    refreshed_infos[collection] = info
+                await asyncio.gather(
+                    *(
+                        metadata_store.save_collection(info)
+                        for info in refreshed_infos.values()
+                    )
+                )
+                metadata_collections_by_name.update(refreshed_infos)
+                for collection in refreshed_infos:
                     metadata_collection_names.add(collection)
             except Exception as exc:
                 logger.debug("Failed to cache collection metadata: %s", exc)

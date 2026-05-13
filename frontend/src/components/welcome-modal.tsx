@@ -34,7 +34,7 @@ export function WelcomeModal() {
             <DialogContent
                 showCloseButton={false}
                 onInteractOutside={(e) => e.preventDefault()}
-                className="max-h-[calc(100vh-1.5rem)] w-[calc(100%-1rem)] max-w-[90vw] overflow-y-auto rounded-2xl p-4 sm:w-full sm:max-w-[90vw] sm:rounded-3xl sm:p-6 md:max-w-[900px] md:p-12 lg:max-w-[1000px] gap-0"
+                className="max-h-[calc(100dvh-1.5rem)] max-w-[90vw] overflow-y-auto rounded-2xl p-4 sm:rounded-3xl sm:p-6 md:max-w-[900px] md:p-12 lg:max-w-[1000px] gap-0"
             >
                 <div className="mb-6 flex flex-col items-center text-center sm:mb-8 md:mb-10">
                     <span className="mb-3 text-[11px] font-bold uppercase tracking-[0.2em] text-primary sm:mb-4">
@@ -55,7 +55,7 @@ export function WelcomeModal() {
                         className="group flex flex-col text-left bg-card rounded-2xl border border-border/60 hover:border-primary/50 hover:shadow-[0_8px_30px_rgb(0,0,0,0.12)] dark:hover:shadow-[0_8px_30px_rgba(255,255,255,0.05)] transition-all duration-300 overflow-hidden"
                     >
                         <div className="h-[150px] w-full overflow-hidden sm:h-[180px]">
-                            <img src="/home_create_a_presentation.webp" alt="Presentation Builder" className="w-full h-full object-cover" />
+                            <img src="/home_create_a_presentation.webp" alt={t("dashboard.welcome.presentationBuilder.title")} className="w-full h-full object-cover" />
                         </div>
                         <div className="p-4 sm:p-6">
                             <h3 className="font-bold text-[16px] mb-2 text-foreground group-hover:text-primary transition-colors">
@@ -73,7 +73,7 @@ export function WelcomeModal() {
                         className="group flex flex-col text-left bg-card rounded-2xl border border-border/60 hover:border-primary/50 hover:shadow-[0_8px_30px_rgb(0,0,0,0.12)] dark:hover:shadow-[0_8px_30px_rgba(255,255,255,0.05)] transition-all duration-300 overflow-hidden"
                     >
                         <div className="h-[150px] w-full overflow-hidden sm:h-[180px]">
-                            <img src="/home_chat_with_agents.webp" alt="Chat with Agents" className="w-full h-full object-cover" />
+                            <img src="/home_chat_with_agents.webp" alt={t("dashboard.welcome.buildAgents.title")} className="w-full h-full object-cover" />
                         </div>
                         <div className="p-4 sm:p-6">
                             <h3 className="font-bold text-[16px] mb-2 text-foreground group-hover:text-primary transition-colors">
@@ -91,7 +91,7 @@ export function WelcomeModal() {
                         className="group flex flex-col text-left bg-card rounded-2xl border border-border/60 hover:border-primary/50 hover:shadow-[0_8px_30px_rgb(0,0,0,0.12)] dark:hover:shadow-[0_8px_30px_rgba(255,255,255,0.05)] transition-all duration-300 overflow-hidden"
                     >
                         <div className="h-[150px] w-full overflow-hidden sm:h-[180px]">
-                            <img src="/home_build_your_own_agents.png" alt="Build Your Own Agents" className="w-full h-full object-cover" />
+                            <img src="/home_build_your_own_agents.png" alt={t("dashboard.welcome.createAgent.title")} className="w-full h-full object-cover" />
                         </div>
                         <div className="p-4 sm:p-6">
                             <h3 className="font-bold text-[16px] mb-2 text-foreground group-hover:text-primary transition-colors">

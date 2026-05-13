@@ -92,24 +92,29 @@ class ExecutionPlan:
                     )
 
         graph = {step.id: list(step.dependencies) for step in self.steps}
-        visiting: set[str] = set()
         visited: set[str] = set()
 
-        def visit(step_id: str) -> None:
-            if step_id in visited:
-                return
-            if step_id in visiting:
-                raise PlanValidationError(
-                    f"DAG execution plan contains a dependency cycle at {step_id}."
-                )
-            visiting.add(step_id)
-            for dependency in graph[step_id]:
-                visit(dependency)
-            visiting.remove(step_id)
-            visited.add(step_id)
-
         for step in self.steps:
-            visit(step.id)
+            if step.id in visited:
+                continue
+            visiting: set[str] = set()
+            stack: list[tuple[str, bool]] = [(step.id, False)]
+            while stack:
+                step_id, expanded = stack.pop()
+                if expanded:
+                    visiting.discard(step_id)
+                    visited.add(step_id)
+                    continue
+                if step_id in visited:
+                    continue
+                if step_id in visiting:
+                    raise PlanValidationError(
+                        f"DAG execution plan contains a dependency cycle at {step_id}."
+                    )
+                visiting.add(step_id)
+                stack.append((step_id, True))
+                for dependency in reversed(graph[step_id]):
+                    stack.append((dependency, False))
         return self
 
     def to_dict(self) -> dict[str, Any]:

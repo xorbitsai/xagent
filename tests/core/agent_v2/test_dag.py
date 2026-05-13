@@ -1024,6 +1024,19 @@ def test_execution_plan_validate_raises_for_invalid_plan() -> None:
         ExecutionPlan(steps=[]).validate()
 
 
+def test_execution_plan_validate_handles_deep_dependency_chain() -> None:
+    steps = [
+        PlanStep(
+            id=f"step_{index}",
+            task=f"Task {index}",
+            dependencies=[] if index == 0 else [f"step_{index - 1}"],
+        )
+        for index in range(1200)
+    ]
+
+    assert ExecutionPlan(steps=steps).validate().steps == steps
+
+
 def test_dag_ready_steps_includes_all_active_concurrent_steps() -> None:
     pattern = DAGPattern(lambda **_: build_plan())
     pattern.plan = build_plan(

@@ -121,8 +121,10 @@ export function ResizableThreeColumnLayout({
 
             {/* Left Resizer Handle (Hidden on mobile) */}
             <div
-                className="hidden md:flex w-1 bg-border hover:bg-primary/50 cursor-col-resize items-center justify-center relative transition-colors group z-10"
-                style={{ display: showLeftPanel ? 'flex' : 'none' }}
+                className={cn(
+                    "hidden w-1 bg-border hover:bg-primary/50 cursor-col-resize items-center justify-center relative transition-colors group z-10",
+                    showLeftPanel && "md:flex"
+                )}
                 onMouseDown={handleMouseDownLeft}
             >
                 <div className="absolute inset-y-0 -left-2 -right-2 z-10 cursor-col-resize" />

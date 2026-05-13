@@ -2151,7 +2151,6 @@ Build when you need.`
       header: {
         title: "Custom Agent",
         subtitle: "Configure your AI agent's behavior and capabilities.",
-        backToList: "Back to list",
         create: "Create",
         update: "Update",
         publish: "Publish",

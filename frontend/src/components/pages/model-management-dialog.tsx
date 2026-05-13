@@ -490,10 +490,10 @@ export function ModelManagementDialog({
             </div>
           </DialogContent>
         ) : viewMode === 'connect' ? (
-          <DialogContent className="sm:max-w-2xl bg-slate-50">
-            <DialogHeader>
-              <DialogTitle className="text-2xl font-bold">{t('models.dialog.connect.title')}</DialogTitle>
-              <DialogDescription>{t('models.dialog.connect.description')}</DialogDescription>
+          <DialogContent className="w-[95vw] max-w-2xl max-h-[85vh] overflow-hidden bg-slate-50 p-0 gap-0 flex flex-col">
+            <DialogHeader className="px-4 sm:px-6 py-4 border-b bg-white pr-12">
+              <DialogTitle className="text-xl sm:text-2xl font-bold text-left leading-tight">{t('models.dialog.connect.title')}</DialogTitle>
+              <DialogDescription className="text-left">{t('models.dialog.connect.description')}</DialogDescription>
             </DialogHeader>
 
             <Stepper
@@ -502,7 +502,7 @@ export function ModelManagementDialog({
                   label: t('models.dialog.connect.step1'),
                   content: (
                     <div className="flex flex-col gap-4 h-[400px]">
-                      <div className="flex gap-4">
+                      <div className="flex flex-col sm:flex-row gap-3 sm:gap-4">
                         <Select
                           value={formData.category}
                           onValueChange={(value) => {
@@ -526,7 +526,7 @@ export function ModelManagementDialog({
                             { value: "image", label: t('models.tabs.image') },
                             { value: "speech", label: t('models.tabs.speech') }
                           ]}
-                          className="w-[180px]"
+                          className="w-full sm:w-[180px]"
                         />
                         <div className="relative flex-1">
                           <Search className="absolute left-3 top-3 w-4 h-4 text-muted-foreground" />
@@ -906,7 +906,7 @@ export function ModelManagementDialog({
                 }
               ]}
               currentStep={connectStep}
-              className="mt-6"
+              className="mt-0 px-4 sm:px-6 py-4 flex-1 min-h-0 overflow-hidden"
             />
           </DialogContent>
         ) : (

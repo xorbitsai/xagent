@@ -318,7 +318,7 @@ export function KnowledgeBasePage() {
         <div className="space-y-1 w-full sm:w-auto">
           <div className="flex items-center gap-3 mb-1 flex-wrap">
             <h1 className="text-2xl sm:text-3xl font-bold">{t("kb.header.title")}</h1>
-            <Badge variant="secondary" className="font-normal text-xs sm:text-sm">
+            <Badge variant="secondary" className="hidden sm:inline-flex font-normal text-xs sm:text-sm">
               {searchQuery
                 ? t("kb.header.matchCount", {
                   matched: filteredCollections.length,
@@ -328,6 +328,14 @@ export function KnowledgeBasePage() {
             </Badge>
           </div>
           <p className="text-sm sm:text-base text-muted-foreground">{t("kb.header.description")}</p>
+          <Badge variant="secondary" className="sm:hidden inline-flex font-normal text-xs w-fit">
+            {searchQuery
+              ? t("kb.header.matchCount", {
+                matched: filteredCollections.length,
+                total: collections.length,
+              })
+              : t("kb.header.totalCount", { total: collections.length })}
+          </Badge>
         </div>
 
         <div className="flex items-center gap-3 w-full sm:w-auto">

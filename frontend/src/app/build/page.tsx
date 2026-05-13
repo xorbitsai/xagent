@@ -149,27 +149,27 @@ export default function BuildsPage() {
   return (
     <div className="flex flex-col h-full bg-background">
       {/* Header */}
-      <div className="flex justify-between items-center p-8">
-        <div>
+      <div className="flex flex-col sm:flex-row justify-between items-start sm:items-center px-4 md:px-8 py-6 md:py-8 gap-4">
+        <div className="w-full sm:w-auto">
           <h1 className="text-3xl font-bold mb-1">{t("builds.list.header.title")}</h1>
           <p className="text-muted-foreground">{t("builds.list.header.description")}</p>
         </div>
-        <div className="flex items-center gap-4">
+        <div className="flex items-center gap-3 w-full sm:w-auto">
           <SearchInput
             placeholder={t("builds.list.search.placeholder")}
             value={searchTerm}
             onChange={setSearchTerm}
-            containerClassName="w-64"
+            containerClassName="flex-1 sm:w-64"
           />
-          <Button onClick={handleCreate}>
-            <Plus className="mr-2 h-4 w-4" />
-            {t("builds.list.header.create")}
+          <Button onClick={handleCreate} className="shrink-0 flex items-center gap-1 sm:gap-2">
+            <Plus className="h-4 w-4 sm:mr-2" />
+            <span className="hidden sm:inline">{t("builds.list.header.create")}</span>
           </Button>
         </div>
       </div>
 
       {/* Main Content */}
-      <div className="flex-1 px-6 pb-6 space-y-6 overflow-auto">
+      <div className="flex-1 px-4 md:px-6 pb-6 space-y-6 overflow-auto">
         {/* Loading State */}
         {loading ? (
           <div className="flex items-center justify-center h-[400px]">
@@ -385,10 +385,10 @@ export default function BuildsPage() {
 
       <Dialog open={isCreateModalOpen} onOpenChange={setIsCreateModalOpen}>
         <DialogContent className="sm:max-w-[550px] gap-0 p-0 overflow-hidden bg-background shadow-lg rounded-xl">
-          <DialogHeader className="px-6 py-5 border-b">
-            <DialogTitle className="flex items-center gap-2 text-xl font-semibold">
-              <Bot className="h-6 w-6" />
-              {t("builds.list.createModal.title")}
+          <DialogHeader className="px-6 py-5 border-b pr-10">
+            <DialogTitle className="flex items-start sm:items-center gap-2 text-xl font-semibold">
+              <Bot className="h-6 w-6 shrink-0 mt-0.5 sm:mt-0" />
+              <span className="leading-tight text-left">{t("builds.list.createModal.title")}</span>
             </DialogTitle>
           </DialogHeader>
 
@@ -409,12 +409,12 @@ export default function BuildsPage() {
                 </div>
               </div>
 
-              <div className="relative rounded-lg border border-input bg-background focus-within:ring-1 focus-within:ring-ring">
+              <div className="relative flex-1 w-full rounded-lg border border-input bg-background focus-within:ring-1 focus-within:ring-ring flex flex-col">
                 <Textarea
                   value={createPrompt}
                   onChange={(e) => setCreatePrompt(e.target.value)}
                   placeholder={t("builds.list.createModal.placeholder")}
-                  className="min-h-[120px] resize-none border-0 shadow-none focus-visible:ring-0 pb-14"
+                  className="min-h-[100px] flex-1 resize-none border-0 shadow-none focus-visible:ring-0"
                   onKeyDown={(e) => {
                     if (e.key === "Enter" && !e.shiftKey) {
                       e.preventDefault()
@@ -422,11 +422,11 @@ export default function BuildsPage() {
                     }
                   }}
                 />
-                <div className="absolute bottom-2 right-2">
+                <div className="p-2 flex justify-end">
                   <Button
                     onClick={handleBuildWithPrompt}
                     disabled={!createPrompt.trim()}
-                    className="bg-indigo-400 hover:bg-indigo-500 text-white shadow-none"
+                    className="bg-indigo-400 hover:bg-indigo-500 text-white shadow-none shrink-0"
                   >
                     <Sparkles className="mr-2 h-4 w-4" />
                     {t("builds.list.createModal.buildBtn")}

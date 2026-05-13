@@ -397,35 +397,37 @@ function TaskDetailContent() {
         {/* Fixed input box at bottom */}
         <div className="flex-shrink-0 z-10 glass pb-6">
           <div className="container max-w-4xl mx-auto px-4">
-            <div className="mb-4 flex items-center">
-              {state.currentTask?.isDag !== false && (
-                <div
-                  className="inline-flex items-center gap-1 rounded-xl border bg-card/80 backdrop-blur p-2 cursor-pointer hover:bg-muted/30 transition-colors text-sm"
-                  onClick={() => {
-                    closeFilePreview();
-                    setDagPreviewOpen(true);
-                  }}
-                  title={t("chatPage.executionPlan.title")}
-                >
-                  <GitMerge className="w-3.5 h-3.5" />
-                  {t("chatPage.executionPlan.title")}
-                </div>
-              )}
+            <div className="mb-4 flex flex-col gap-2 sm:flex-row sm:items-center sm:gap-3">
+              <div className="flex flex-wrap items-center gap-2">
+                {state.currentTask?.isDag !== false && (
+                  <div
+                    className="inline-flex items-center gap-1 rounded-xl border bg-card/80 backdrop-blur px-3 py-2 cursor-pointer hover:bg-muted/30 transition-colors text-sm shrink-0"
+                    onClick={() => {
+                      closeFilePreview();
+                      setDagPreviewOpen(true);
+                    }}
+                    title={t("chatPage.executionPlan.title")}
+                  >
+                    <GitMerge className="w-3.5 h-3.5" />
+                    {t("chatPage.executionPlan.title")}
+                  </div>
+                )}
 
-              <TaskFileManager
-                taskId={state.taskId}
-                onPreview={(fileId, fileName) => openFilePreview(fileId, fileName)}
-              >
-                <div
-                  className="ml-2 inline-flex items-center gap-1 rounded-xl border bg-card/80 backdrop-blur p-2 cursor-pointer hover:bg-muted/30 transition-colors text-sm"
-                  title={t("files.header.title")}
+                <TaskFileManager
+                  taskId={state.taskId}
+                  onPreview={(fileId, fileName) => openFilePreview(fileId, fileName)}
                 >
-                  <FolderOpen className="w-3.5 h-3.5" />
-                  {t("files.header.title")}
-                </div>
-              </TaskFileManager>
+                  <div
+                    className="inline-flex items-center gap-1 rounded-xl border bg-card/80 backdrop-blur px-3 py-2 cursor-pointer hover:bg-muted/30 transition-colors text-sm shrink-0"
+                    title={t("files.header.title")}
+                  >
+                    <FolderOpen className="w-3.5 h-3.5" />
+                    {t("files.header.title")}
+                  </div>
+                </TaskFileManager>
+              </div>
 
-              <div className="ml-auto">
+              <div className="sm:ml-auto">
                 <TokenUsageDisplay
                   taskId={state.taskId}
                   isRunning={state.currentTask?.status === 'running'}

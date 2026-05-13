@@ -341,8 +341,8 @@ export function ChatMessage({
           className={cn(
             "flex gap-4 transition-all duration-300",
             isUser
-              ? "bg-secondary text-secondary-foreground p-3 rounded-2xl flex-row-reverse items-center"
-              : "bg-transparent p-0 w-full"
+              ? "max-w-[85%] bg-secondary text-secondary-foreground p-3 rounded-2xl flex-row-reverse items-center"
+              : "bg-transparent p-0 w-full max-w-full"
           )}
         >
           {/* Avatar */}

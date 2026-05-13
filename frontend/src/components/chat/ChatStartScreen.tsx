@@ -164,7 +164,7 @@ export function ChatStartScreen({
                 </div>
                 {/* Horizontal scroll container for agents, limited width to show about 3 items initially */}
                 <TooltipProvider delayDuration={200}>
-                  <div className="flex gap-6 mt-4 overflow-x-auto pb-4 pt-2 px-1 snap-x snap-mandatory scrollbar-hide max-w-[260px]" style={{ scrollbarWidth: 'none', msOverflowStyle: 'none' }}>
+                  <div className="flex gap-8 mt-4 overflow-x-auto pb-4 pt-2 px-1 snap-x snap-mandatory scrollbar-hide" style={{ scrollbarWidth: 'none', msOverflowStyle: 'none' }}>
                     {agents ? (
                       agents.map((agent) => {
                         const isSelected = selectedAgents.some(

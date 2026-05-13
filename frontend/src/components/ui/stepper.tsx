@@ -23,7 +23,7 @@ export function Stepper({ steps, currentStep, className, ...props }: StepperProp
       {...props}
     >
       <div
-        className="flex items-center gap-4 mb-6"
+        className="flex items-center gap-4 mb-6 overflow-x-auto overflow-y-hidden py-2"
         role="list"
         aria-label="Steps"
       >
@@ -38,7 +38,7 @@ export function Stepper({ steps, currentStep, className, ...props }: StepperProp
                 role="listitem"
                 aria-current={isActive ? "step" : undefined}
                 className={cn(
-                  "flex items-center gap-2",
+                  "flex items-center gap-2 shrink-0",
                   isActive || isCompleted ? "text-primary" : "text-muted-foreground"
                 )}
               >
@@ -61,13 +61,13 @@ export function Stepper({ steps, currentStep, className, ...props }: StepperProp
                   {step.label}
                 </span>
               </div>
-              {index < steps.length - 1 && <div className="flex-1 h-px bg-border" aria-hidden="true" />}
+              {index < steps.length - 1 && <div className="flex-1 min-w-6 h-px bg-border" aria-hidden="true" />}
             </React.Fragment>
           )
         })}
       </div>
       <div
-        className="flex-1"
+        className="flex-1 min-h-0 overflow-y-auto"
         role="tabpanel"
         aria-label={`Content for ${steps[currentStep - 1]?.label}`}
       >

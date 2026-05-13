@@ -2149,7 +2149,6 @@ Build when you need.`
       header: {
         title: "自定义 Agent",
         subtitle: "配置你的 AI Agent 的行为和能力。",
-        backToList: "返回列表",
         create: "创建",
         update: "更新",
         publish: "发布",

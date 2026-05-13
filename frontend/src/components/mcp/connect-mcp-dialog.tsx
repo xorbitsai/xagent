@@ -396,15 +396,15 @@ export function ConnectMcpDialog({
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
       <DialogContent className="sm:max-w-5xl md:max-w-6xl w-[95vw] h-[85vh] flex flex-col p-0 overflow-hidden gap-0 bg-slate-50">
-        <DialogHeader className="px-6 py-4 border-b bg-white shrink-0">
-          <DialogTitle className="text-xl flex items-center gap-2 font-bold">
-            <Plug className="h-5 w-5 text-blue-600" /> {t('tools.mcp.dialog.connector')}
+        <DialogHeader className="px-6 py-4 border-b bg-white shrink-0 pr-10">
+          <DialogTitle className="text-xl flex items-center gap-2 font-bold text-left">
+            <Plug className="h-5 w-5 text-blue-600 shrink-0" /> {t('tools.mcp.dialog.connector')}
           </DialogTitle>
         </DialogHeader>
 
         <Tabs value={activeTab} onValueChange={setActiveTab} className="flex-1 flex flex-col overflow-hidden bg-white">
-          <div className="px-6 border-b shrink-0 bg-white">
-            <TabsList className="bg-transparent h-14 p-0 border-b-0 space-x-6">
+          <div className="px-6 border-b shrink-0 bg-white overflow-x-auto overflow-y-hidden">
+            <TabsList className="bg-transparent h-14 p-0 border-b-0 space-x-6 min-w-max">
               <TabsTrigger
                 value="library"
                 className="data-[state=active]:bg-transparent data-[state=active]:shadow-none data-[state=active]:border-b-2 data-[state=active]:border-blue-600 data-[state=active]:text-blue-600 rounded-none h-full px-0 font-semibold flex items-center gap-2"
@@ -553,6 +553,36 @@ export function ConnectMcpDialog({
             {/* Main Content Area */}
             <div className="flex-1 flex flex-col overflow-hidden bg-white">
               <div className="p-6 pb-2 shrink-0">
+                <div className="mb-4 flex md:hidden items-center gap-2">
+                  <button
+                    className={`flex-1 flex items-center justify-center gap-2 px-3 py-2 text-sm font-medium rounded-md border transition-colors ${activeLocation === 'remote'
+                      ? 'bg-blue-50 text-blue-700 border-blue-200'
+                      : 'bg-background text-slate-600 border-slate-200 hover:bg-slate-50'}`}
+                    onClick={() => setActiveLocation('remote')}
+                  >
+                    <Globe className="h-4 w-4" />
+                    <span>{t('tools.mcp.dialog.remote')}</span>
+                    {isSelectMode && selectedRemoteCount > 0 && (
+                      <Badge variant="secondary" className="h-5 px-1.5 min-w-5 flex items-center justify-center bg-blue-100 text-blue-700 border-none">
+                        {selectedRemoteCount}
+                      </Badge>
+                    )}
+                  </button>
+                  <button
+                    className={`flex-1 flex items-center justify-center gap-2 px-3 py-2 text-sm font-medium rounded-md border transition-colors ${activeLocation === 'local'
+                      ? 'bg-blue-50 text-blue-700 border-blue-200'
+                      : 'bg-background text-slate-600 border-slate-200 hover:bg-slate-50'}`}
+                    onClick={() => setActiveLocation('local')}
+                  >
+                    <Home className="h-4 w-4" />
+                    <span>{t('tools.mcp.dialog.local')}</span>
+                    {isSelectMode && selectedLocalCount > 0 && (
+                      <Badge variant="secondary" className="h-5 px-1.5 min-w-5 flex items-center justify-center bg-blue-100 text-blue-700 border-none">
+                        {selectedLocalCount}
+                      </Badge>
+                    )}
+                  </button>
+                </div>
                 <SearchInput
                   placeholder={t('tools.mcp.dialog.searchPlaceholder')}
                   value={searchQuery}

@@ -1225,21 +1225,12 @@ export function AgentBuilder({ agentId }: AgentBuilderProps) {
   const LeftPanel = (
     <div className="p-6 space-y-8 min-h-full bg-card/50">
       {/* Header moved to middle panel */}
-      <div className="flex justify-between items-start">
-        <div>
-          {isEditMode && (
-            <div
-              className="inline-flex items-center gap-1 mb-2 cursor-pointer hover:text-primary"
-              onClick={() => router.push("/build")}
-            >
-              <ChevronLeft className="h-4 w-4" />
-              {t("builds.editor.header.backToList")}
-            </div>
-          )}
-          <h1 className="text-3xl font-bold mb-1">{name || t("builds.editor.header.title")}</h1>
+      <div className="flex flex-col 2xl:flex-row 2xl:justify-between items-start gap-4">
+        <div className="w-full 2xl:flex-1 min-w-0">
+          <h1 className="text-3xl font-bold mb-1 break-words">{name || t("builds.editor.header.title")}</h1>
           <p className="text-muted-foreground">{t("builds.editor.header.subtitle")}</p>
         </div>
-        <div className="flex items-center gap-4">
+        <div className="flex w-full flex-wrap items-center gap-2 2xl:w-auto 2xl:justify-end 2xl:gap-4 shrink-0">
           <Button
             variant="outline"
             className={cn(
@@ -1382,7 +1373,7 @@ export function AgentBuilder({ agentId }: AgentBuilderProps) {
               <div
                 ref={instructionsRef}
                 contentEditable={!isOptimizing}
-                className="min-h-[150px] max-h-[300px] w-full rounded-md bg-transparent px-3 py-2 font-mono text-sm outline-none overflow-y-auto break-words whitespace-pre-wrap text-left"
+                className="min-h-[150px] w-full rounded-md bg-transparent px-3 py-2 font-mono text-sm outline-none overflow-y-auto resize-y break-words whitespace-pre-wrap text-left"
                 onInput={handleInstructionsInput}
                 onKeyDown={fileMention.handleKeyDown}
                 onPaste={handleInstructionsPaste as any}
@@ -1409,7 +1400,7 @@ export function AgentBuilder({ agentId }: AgentBuilderProps) {
         {/* Execution Mode */}
         <div className="space-y-2">
           <Label>{t("builds.configForm.executionMode.label")}</Label>
-          <div className="grid grid-cols-3 gap-2">
+          <div className="grid grid-cols-1 lg:grid-cols-3 gap-2">
             <button
               type="button"
               className={`px-3 py-2 text-sm border rounded-md transition-colors ${executionMode === "flash"
@@ -1465,8 +1456,8 @@ export function AgentBuilder({ agentId }: AgentBuilderProps) {
               className="h-6 text-xs text-muted-foreground hover:text-foreground"
               onClick={() => setIsModelConfigOpen(true)}
             >
-              <Settings2 className="mr-1.5 h-3.5 w-3.5" />
-              {t("builds.configForm.model.configure")}
+              <Settings2 className="h-3.5 w-3.5 md:mr-1.5" />
+              <span className="hidden md:inline">{t("builds.configForm.model.configure")}</span>
             </Button>
           </div>
 
@@ -1614,8 +1605,8 @@ export function AgentBuilder({ agentId }: AgentBuilderProps) {
               className="h-6 text-xs text-muted-foreground hover:text-foreground"
               onClick={() => setIsKbModalOpen(true)}
             >
-              <PlusCircle className="mr-2 h-4 w-4" />
-              {t("builds.configForm.knowledgeBase.create")}
+              <PlusCircle className="h-4 w-4 md:mr-2" />
+              <span className="hidden md:inline">{t("builds.configForm.knowledgeBase.create")}</span>
             </Button>
           </div>
 
@@ -1926,8 +1917,8 @@ export function AgentBuilder({ agentId }: AgentBuilderProps) {
   }
 
   return (
-    <div className="flex flex-col h-[100vh]">
-      <div className="flex-1 min-h-0">
+    <div className="flex flex-col h-[100vh] overflow-hidden">
+      <div className="flex-1 min-h-0 w-full overflow-y-auto md:overflow-hidden">
         <ResizableThreeColumnLayout
           showLeftPanel={showAIAssistant}
           leftPanel={<AgentBuilderChat

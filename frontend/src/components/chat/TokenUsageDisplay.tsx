@@ -62,13 +62,13 @@ export function TokenUsageDisplay({ taskId, isRunning, className }: TokenUsageDi
   if (!usage) return null;
 
   return (
-    <div className={`inline-flex items-center gap-4 px-4 py-2 text-sm ${className}`}>
-      <span className="flex items-center gap-1.5">
+    <div className={`inline-flex flex-wrap items-center gap-x-3 gap-y-1 rounded-xl border bg-card/80 px-3 py-2 text-xs sm:text-sm ${className || ""}`}>
+      <span className="flex items-center gap-1.5 whitespace-nowrap">
         <Sparkles className="w-4 h-4 text-indigo-500" />
         <span className="font-medium text-foreground">{usage.input_tokens.toLocaleString()}</span>
         <span className="text-muted-foreground">{t('chatPage.tokenUsage.input')}</span>
       </span>
-      <span className="flex items-center gap-1.5">
+      <span className="flex items-center gap-1.5 whitespace-nowrap">
         <span className="font-medium text-foreground">{usage.output_tokens.toLocaleString()}</span>
         <span className="text-muted-foreground">{t('chatPage.tokenUsage.output')}</span>
       </span>

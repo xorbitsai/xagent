@@ -321,7 +321,6 @@ export function AgentBuilder({ agentId }: AgentBuilderProps) {
 
   const [isChatLoading, setIsChatLoading] = useState(false)
   const [taskStatus, setTaskStatus] = useState<"idle" | "running" | "paused">("idle")
-  const messagesEndRef = useRef<HTMLDivElement>(null)
   const fileInputRef = useRef<HTMLInputElement>(null)
   const [files, setFiles] = useState<File[]>([])
 
@@ -772,11 +771,6 @@ export function AgentBuilder({ agentId }: AgentBuilderProps) {
     }
     return labels[category] || category
   }
-
-  // Auto-scroll chat
-  useEffect(() => {
-    messagesEndRef.current?.scrollIntoView({ behavior: "smooth" })
-  }, [messages])
 
   const [previewState, setPreviewState] = useState<{
     isOpen: boolean;
@@ -1878,7 +1872,6 @@ export function AgentBuilder({ agentId }: AgentBuilderProps) {
                 taskStatus={index === messages.length - 1 && msg.role === 'assistant' ? taskStatus : undefined}
               />
             ))}
-            <div ref={messagesEndRef} />
           </div>
         </ScrollArea>
       </div>

@@ -603,6 +603,57 @@ async def test_auto_pattern_resume_reuses_existing_decision() -> None:
 
 
 @pytest.mark.asyncio
+async def test_auto_pattern_final_answer_resume_redecides_after_new_user_message() -> (
+    None
+):
+    first_llm = FakeLLM(
+        [decision_tool_response("final_answer", "Original answer.", answer="old")]
+    )
+    first_pattern = AutoPattern()
+    context = ExecutionContext()
+    context.add_user_message("first question")
+    runtime = PatternRuntime()
+
+    def interrupt_after_decision() -> bool:
+        return bool(
+            runtime.last_checkpoint
+            and runtime.last_checkpoint.get("label") == "auto_after_decision"
+        )
+
+    runtime.interrupt_checker = interrupt_after_decision
+
+    interrupted = await first_pattern.run(
+        context=context,
+        tools=[],
+        llm=first_llm,
+        runtime=runtime,
+    )
+
+    assert interrupted["status"] == "interrupted"
+    assert runtime.last_checkpoint is not None
+    assert runtime.last_checkpoint["label"] == "auto_interrupted"
+
+    resumed_context = ExecutionContext.from_dict(runtime.last_checkpoint["context"])
+    resumed_context.add_user_message("replacement question")
+    resumed_pattern = AutoPattern()
+    resumed_pattern.load_state(runtime.last_checkpoint["pattern_state"])
+    resumed_llm = FakeLLM(
+        [decision_tool_response("final_answer", "Replacement answer.", answer="new")]
+    )
+
+    resumed = await resumed_pattern.run(
+        context=resumed_context,
+        tools=[],
+        llm=resumed_llm,
+        runtime=PatternRuntime(),
+    )
+
+    assert resumed["success"] is True
+    assert resumed["output"] == "new"
+    assert len(resumed_llm.calls) == 1
+
+
+@pytest.mark.asyncio
 async def test_auto_pattern_missing_decision_tool_call_fails() -> None:
     llm = FakeLLM(["not a tool call"])
     pattern = AutoPattern()
@@ -741,6 +792,35 @@ async def test_auto_pattern_plan_execute_without_dag_fails() -> None:
             llm=llm,
             runtime=PatternRuntime(),
         )
+
+
+def test_auto_pattern_get_execution_snapshot_builds_react_child_frame() -> None:
+    pattern = AutoPattern()
+    pattern.load_state(
+        {
+            "status": "running",
+            "decision": {"action": "react", "reason": "Needs ReAct."},
+            "selected_pattern": "react",
+            "react_state": {"iteration": 1},
+        }
+    )
+    context = ExecutionContext(execution_id="snap-1")
+    context.add_user_message("Continue")
+
+    snapshot = pattern.get_execution_snapshot(context)
+
+    assert snapshot["root_execution_id"] == "snap-1"
+    assert snapshot["status"] == "running"
+    assert snapshot["active_frame_ids"] == ["snap-1:auto", "snap-1:auto:react"]
+    assert snapshot["control_state"] == {"selected_pattern": "react"}
+    root_frame = snapshot["frames"]["snap-1:auto"]
+    assert root_frame["pattern_type"] == "auto"
+    assert root_frame["children"] == ["snap-1:auto:react"]
+    assert root_frame["active_child_id"] == "snap-1:auto:react"
+    child_frame = snapshot["frames"]["snap-1:auto:react"]
+    assert child_frame["parent_frame_id"] == "snap-1:auto"
+    assert child_frame["pattern_type"] == "react"
+    assert child_frame["pattern_state"] == {"iteration": 1}
 
 
 @pytest.mark.asyncio

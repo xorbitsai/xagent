@@ -98,7 +98,7 @@ def _coerce_bool(value: Any, *, default: bool) -> bool:
 
 @dataclass
 class _AutoChildRuntime:
-    """Runtime adapter that stores child checkpoints in the AutoPattern envelope."""
+    """Runtime adapter that captures child state before parent checkpoints."""
 
     parent: PatternRuntime
     auto_pattern: "AutoPattern"
@@ -305,6 +305,7 @@ class AutoPattern(AgentPattern):
         self.dag_pattern = dag_pattern
         self.status = "idle"
         self.decision: AutoDecision | None = None
+        self.decision_user_messages: dict[str, Any] | None = None
         self.selected_pattern: str | None = None
         self.react_state: dict[str, Any] | None = None
         self.dag_state: dict[str, Any] | None = None
@@ -355,6 +356,7 @@ class AutoPattern(AgentPattern):
         allowed_skills: list[str] | None = None,
         **kwargs: Any,
     ) -> dict[str, Any]:
+        self._invalidate_stale_final_answer_decision(context)
         if self.decision is None:
             self.status = "deciding"
             task_text = latest_user_text(context)
@@ -410,6 +412,7 @@ class AutoPattern(AgentPattern):
             self._normalize_decision()
             if self.decision is None:
                 raise RuntimeError("AutoPattern decision was not set.")
+            self.decision_user_messages = self._user_message_signature(context)
             self.selected_pattern = self.decision.action.value
             logger.info(
                 "AutoPattern selected %s for execution %s: %s",
@@ -829,6 +832,7 @@ class AutoPattern(AgentPattern):
         return {
             "status": self.status,
             "decision": self.decision.to_dict() if self.decision is not None else None,
+            "decision_user_messages": self.decision_user_messages,
             "selected_pattern": self.selected_pattern,
             "react_state": self.react_state,
             "dag_state": self.dag_state,
@@ -840,6 +844,12 @@ class AutoPattern(AgentPattern):
         decision = state.get("decision")
         self.decision = (
             AutoDecision.from_dict(decision) if isinstance(decision, dict) else None
+        )
+        decision_user_messages = state.get("decision_user_messages")
+        self.decision_user_messages = (
+            dict(decision_user_messages)
+            if isinstance(decision_user_messages, dict)
+            else None
         )
         self.selected_pattern = state.get("selected_pattern")
         self.react_state = state.get("react_state")
@@ -924,7 +934,49 @@ class AutoPattern(AgentPattern):
     def _snapshot_child_pattern(self) -> Any | None:
         if self.selected_pattern == AutoAction.PLAN_EXECUTE.value:
             return self.dag_pattern
+        # DAG exposes a rich execution snapshot for visualization. ReAct is
+        # represented by the synthetic child frame created by AutoPattern.
         return None
+
+    def _invalidate_stale_final_answer_decision(self, context: Any) -> None:
+        if (
+            self.decision is None
+            or self.decision.action != AutoAction.FINAL_ANSWER
+            or self.decision.answer is None
+        ):
+            return
+
+        current_signature = self._user_message_signature(context)
+        if self.decision_user_messages is None:
+            stale = int(current_signature.get("count", 0)) > 1
+        else:
+            stale = current_signature != self.decision_user_messages
+
+        if not stale:
+            return
+
+        logger.info(
+            "AutoPattern invalidating cached final_answer decision after new user "
+            "input. previous=%s current=%s",
+            self.decision_user_messages,
+            current_signature,
+        )
+        self.decision = None
+        self.decision_user_messages = None
+        self.selected_pattern = None
+        self.last_result = None
+        self.status = "idle"
+
+    def _user_message_signature(self, context: Any) -> dict[str, Any]:
+        user_contents = [
+            str(getattr(message, "content", ""))
+            for message in getattr(context, "messages", [])
+            if getattr(message, "role", None) == "user"
+        ]
+        return {
+            "count": len(user_contents),
+            "latest": user_contents[-1] if user_contents else "",
+        }
 
     def _child_snapshot_root_frame_id(
         self,

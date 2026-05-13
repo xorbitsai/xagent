@@ -707,6 +707,61 @@ async def test_react_pattern_resume_waiting_after_user_response_continues() -> N
 
 
 @pytest.mark.asyncio
+async def test_react_pattern_preserves_pending_calls_after_waiting_control_tool() -> (
+    None
+):
+    llm = FakeLLM(
+        responses=[
+            {
+                "content": "Need input, then calculate.",
+                "tool_calls": [
+                    {
+                        "id": "call_question",
+                        "function": {
+                            "name": "send_message",
+                            "arguments": '{"message":"Choose A or B","message_type":"question","expect_response":true}',
+                        },
+                    },
+                    {
+                        "id": "call_calc",
+                        "function": {
+                            "name": "calculator",
+                            "arguments": '{"expression":"5+5"}',
+                        },
+                    },
+                ],
+            }
+        ]
+    )
+    pattern = ReActPattern(max_iterations=4)
+    tool = FakeTool()
+    context = ExecutionContext()
+    context.add_user_message("Ask, then calculate")
+
+    first = await pattern.run(context=context, tools=[tool], llm=llm)
+
+    assert first["status"] == "waiting_for_user"
+    assert pattern.pending_tool_calls == [
+        {"id": "call_calc", "name": "calculator", "args": {"expression": "5+5"}}
+    ]
+
+    context.add_user_message("B")
+    resumed_pattern = ReActPattern(max_iterations=4)
+    resumed_pattern.load_state(pattern.get_state())
+    resumed_llm = FakeLLM([{"content": "The result is 10.", "done": True}])
+
+    resumed = await resumed_pattern.run(
+        context=context,
+        tools=[tool],
+        llm=resumed_llm,
+    )
+
+    assert resumed["success"] is True
+    assert tool.calls == [{"expression": "5+5"}]
+    assert context.get_messages_by_role("tool")[-1].tool_call_id == "call_calc"
+
+
+@pytest.mark.asyncio
 async def test_react_pattern_tool_errors_are_written_as_observations() -> None:
     llm = FakeLLM(
         responses=[

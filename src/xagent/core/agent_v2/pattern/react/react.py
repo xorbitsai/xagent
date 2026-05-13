@@ -344,8 +344,8 @@ class ReActPattern(AgentPattern):
                 "instruction for follow-up requests. If the user corrects a previous "
                 "assumption, especially about dates or freshness, revise the answer "
                 "instead of restating prior content. Do not introduce specific "
-                "entities, incidents, dates, vulnerabilities, sources, or attack "
-                "paths that are not supported by the conversation, retrieved "
+                "entities, incidents, dates, sources, or causal explanations "
+                "that are not supported by the conversation, retrieved "
                 "context, or tool results. If available context is insufficient, "
                 "say so or use an appropriate tool to verify. For recent, latest, current, or "
                 "time-sensitive requests, use the current date from the system context "
@@ -826,11 +826,10 @@ class ReActPattern(AgentPattern):
                     pattern=self,
                     metadata={"tool_call": tool_call},
                 )
-                if control_result.get("status") in {
-                    "completed",
-                    "waiting_for_user",
-                }:
+                if control_result.get("status") == "completed":
                     self.pending_tool_calls = []
+                    return control_result
+                if control_result.get("status") == "waiting_for_user":
                     return control_result
                 continue
 

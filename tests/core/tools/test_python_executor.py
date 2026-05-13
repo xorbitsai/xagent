@@ -60,6 +60,23 @@ class TestPythonExecutorTool:
         assert "y = 'hello'" in result["output"]
         assert "z = [1, 2, 3]" in result["output"]
 
+    def test_import_visible_inside_comprehension(self, python_executor):
+        """Test imported modules are visible inside nested scopes."""
+        result = python_executor.run_json_sync(
+            {
+                "code": (
+                    "import random\n"
+                    "values = [random.randint(1, 10) for _ in range(3)]\n"
+                    "print(len(values), all(1 <= value <= 10 for value in values))"
+                ),
+                "capture_output": True,
+            }
+        )
+
+        assert result["success"] is True
+        assert "3 True" in result["output"]
+        assert result["error"] == ""
+
     def test_print_output(self, python_executor):
         """Test code with print statements"""
         result = python_executor.run_json_sync(

@@ -6,6 +6,7 @@ import pytest
 
 from xagent.core.tools.adapters.vibe.config import ToolConfig
 from xagent.core.tools.adapters.vibe.factory import ToolFactory
+from xagent.core.tools.core.api_tool import APIClientCore
 
 
 class TestAPIToolIntegration:
@@ -33,7 +34,7 @@ class TestAPIToolIntegration:
         assert api_tool.category.value == "basic"
 
     @pytest.mark.asyncio
-    async def test_api_tool_execution(self):
+    async def test_api_tool_execution(self, monkeypatch):
         """Test API tool execution through the tool system"""
         config = ToolConfig({"basic_tools_enabled": True})
         tools = await ToolFactory.create_all_tools(config)
@@ -47,6 +48,20 @@ class TestAPIToolIntegration:
 
         assert api_tool is not None
 
+        async def mock_call_api(self, **kwargs):
+            assert kwargs["url"] == "https://httpbin.org/get"
+            assert kwargs["method"] == "GET"
+            assert kwargs["params"] == {"test": "value"}
+            return {
+                "success": True,
+                "status_code": 200,
+                "headers": {"content-type": "application/json"},
+                "body": {"args": kwargs["params"]},
+                "error": None,
+            }
+
+        monkeypatch.setattr(APIClientCore, "call_api", mock_call_api)
+
         # Execute a simple GET request
         result = await api_tool.run_json_async(
             {
@@ -59,9 +74,10 @@ class TestAPIToolIntegration:
         assert result["success"] is True
         assert result["status_code"] == 200
         assert "body" in result
+        assert result["body"]["args"]["test"] == "value"
 
     @pytest.mark.asyncio
-    async def test_api_tool_with_post(self):
+    async def test_api_tool_with_post(self, monkeypatch):
         """Test API tool with POST request"""
         config = ToolConfig({"basic_tools_enabled": True})
         tools = await ToolFactory.create_all_tools(config)
@@ -74,6 +90,20 @@ class TestAPIToolIntegration:
                 break
 
         assert api_tool is not None
+
+        async def mock_call_api(self, **kwargs):
+            assert kwargs["url"] == "https://httpbin.org/post"
+            assert kwargs["method"] == "POST"
+            assert kwargs["body"] == {"name": "test", "value": 123}
+            return {
+                "success": True,
+                "status_code": 200,
+                "headers": {"content-type": "application/json"},
+                "body": {"json": kwargs["body"]},
+                "error": None,
+            }
+
+        monkeypatch.setattr(APIClientCore, "call_api", mock_call_api)
 
         # Execute POST request
         result = await api_tool.run_json_async(

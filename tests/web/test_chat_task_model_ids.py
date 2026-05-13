@@ -219,6 +219,20 @@ def test_task_create_allows_shared_model_ids(
     assert data["model_id"] == shared_model_id
 
 
+def test_standalone_task_create_defaults_to_auto_in_v2(
+    test_db, user1_headers, monkeypatch
+):
+    monkeypatch.setenv("XAGENT_AGENT_RUNTIME", "v2")
+
+    resp = client.post(
+        "/api/chat/task/create",
+        json={"title": "test", "description": "desc"},
+        headers=user1_headers,
+    )
+    assert resp.status_code == 200
+    assert resp.json()["execution_mode"] == "auto"
+
+
 def test_get_task_llm_ids_preserves_stored_id_when_model_missing(test_db):
     ensure_system_initialized()
     from xagent.web.models.task import Task, TaskStatus

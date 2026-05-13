@@ -513,12 +513,14 @@ class TestWebSocket(unittest.IsolatedAsyncioTestCase):
         output_text = (
             "Legacy link: [report](/preview/web_task_12/output/report.html)\n"
             "Legacy uploads link: [img](/uploads/user_3/web_task_12/output/a.png)\n"
-            "File link: [doc](file:/preview/web_task_12/output/readme.md)"
+            "File link: [doc](file:/preview/web_task_12/output/readme.md)\n"
+            "Task-local link: [poster](output/poster.html)"
         )
         path_to_file_id = {
             "preview/web_task_12/output/report.html": "fid-report",
             "uploads/user_3/web_task_12/output/a.png": "fid-image",
             "preview/web_task_12/output/readme.md": "fid-readme",
+            "output/poster.html": "fid-poster",
         }
 
         rewritten = _rewrite_file_links_to_file_id(output_text, path_to_file_id)
@@ -526,6 +528,7 @@ class TestWebSocket(unittest.IsolatedAsyncioTestCase):
         self.assertIn("[report](file:fid-report)", rewritten)
         self.assertIn("[img](file:fid-image)", rewritten)
         self.assertIn("[doc](file:fid-readme)", rewritten)
+        self.assertIn("[poster](file:fid-poster)", rewritten)
 
     async def test_rewrite_file_links_preserves_non_legacy_urls(self):
         from xagent.web.api.websocket import _rewrite_file_links_to_file_id

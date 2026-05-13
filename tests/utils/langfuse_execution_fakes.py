@@ -302,37 +302,37 @@ class DeterministicReActLLM(BaseLLM):
         del messages, kwargs
         self._call_count += 1
         if self._call_count == 1:
-            return '{"type":"tool_call","reasoning":"Need calculator"}'
+            return {
+                "type": "tool_call",
+                "tool_calls": [
+                    {
+                        "function": {
+                            "name": "calculator",
+                            "arguments": json.dumps({"expression": "2 + 2"}),
+                        }
+                    }
+                ],
+            }
         if self._call_count == 2:
-            return (
-                '{"type":"tool_call","tool_name":"calculator",'
-                '"tool_args":{"expression":"2 + 2"}}'
-            )
-        return (
-            '{"type":"final_answer","reasoning":"Done","answer":"The result is 4",'
-            '"success":true,"error":null}'
-        )
+            return {"content": "The result is 4"}
+        return {"content": "The result is 4"}
 
     async def stream_chat(self, messages: list[dict[str, str]], **kwargs: Any) -> Any:
         response = await self.chat(messages, **kwargs)
         has_tools = bool(kwargs.get("tools"))
         if has_tools:
-            parsed = json.loads(response)
+            parsed = response if isinstance(response, dict) else json.loads(response)
             if parsed.get("type") == "tool_call":
                 yield StreamChunk(
                     type=ChunkType.TOOL_CALL,
-                    tool_calls=[
-                        {
-                            "function": {
-                                "name": parsed["tool_name"],
-                                "arguments": json.dumps(parsed["tool_args"]),
-                            }
-                        }
-                    ],
+                    tool_calls=parsed["tool_calls"],
                 )
                 yield StreamChunk(type=ChunkType.END, finish_reason="tool_calls")
                 return
-        yield StreamChunk(type=ChunkType.TOKEN, content=response, delta=response)
+        content = (
+            response.get("content", "") if isinstance(response, dict) else response
+        )
+        yield StreamChunk(type=ChunkType.TOKEN, content=content, delta=content)
         yield StreamChunk(type=ChunkType.END, finish_reason="stop")
 
 

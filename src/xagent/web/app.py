@@ -10,7 +10,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
 
-from ..config import get_uploads_dir
+from ..config import get_agent_runtime, get_uploads_dir
 from ..core.tracing.langfuse import flush_langfuse, initialize_langfuse
 from .api.admin_mcp import admin_mcp_router
 from .api.admin_users import router as admin_users_router
@@ -173,6 +173,7 @@ app.include_router(widget_router)
 @app.on_event("startup")
 async def startup_event() -> None:
     global _migration_task
+    logger.info("Agent runtime configured: %s", get_agent_runtime())
     logger.info("Initializing database...")
     init_db()
     logger.info("Database initialized successfully")

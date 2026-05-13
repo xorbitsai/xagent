@@ -80,6 +80,7 @@ class MockReActLLM(BaseLLM):
         if (
             isinstance(response_json, dict)
             and response_json.get("type") == "tool_call"
+            and response_json.get("tool_name")
             and kwargs.get("tools")
         ):
             # Return native tool call format

@@ -60,7 +60,8 @@ class AgentConfig(BaseModel):
         default_factory=list, description="List of tool categories"
     )
     execution_mode: str = Field(
-        default="balanced", description="Execution mode: flash, balanced, or think"
+        default="balanced",
+        description="Execution mode: flash, balanced, think, or auto",
     )
 
 

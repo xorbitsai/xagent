@@ -3,7 +3,7 @@
 import asyncio
 import logging
 from datetime import datetime, timezone
-from typing import Any, Optional
+from typing import Any, Dict, Optional
 
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
@@ -11,6 +11,7 @@ from sqlalchemy.orm import Session
 from ...core.agent.trace import BaseTraceHandler
 from ...core.agent.trace import TraceEvent as CoreTraceEvent
 from ...web.models.database import get_db
+from ...web.models.task import Task
 from ...web.models.task import TraceEvent as DatabaseTraceEvent
 from ...web.models.tool_config import ToolUsage
 
@@ -63,10 +64,70 @@ class DatabaseTraceHandler(BaseTraceHandler):
             if isinstance(e, ValueError) and ("missing required" in str(e)):
                 logger.error(f"Re-raising required field validation error: {e}")
                 raise
+            if getattr(event, "require_persisted", False):
+                logger.error(
+                    "Required trace event persistence failed for task %s: %s",
+                    self.task_id,
+                    e,
+                )
+                raise
 
             logger.warning(
                 f"Failed to save trace event to database for task {self.task_id}: {e}"
             )
+
+    async def load_latest_checkpoint(
+        self, execution_id: str
+    ) -> Optional[Dict[str, Any]]:
+        """Load the latest agent_v2 checkpoint persisted as a trace event."""
+        try:
+            return await asyncio.to_thread(
+                self._sync_load_latest_checkpoint,
+                execution_id,
+            )
+        except Exception as e:
+            logger.warning(
+                "Failed to load latest checkpoint for task %s execution %s: %s",
+                self.task_id,
+                execution_id,
+                e,
+            )
+            return None
+
+    def _sync_load_latest_checkpoint(
+        self,
+        execution_id: str,
+    ) -> Optional[Dict[str, Any]]:
+        from ...core.agent_v2.checkpoint import CHECKPOINT_TYPE
+
+        db = next(get_db())
+        try:
+            rows = (
+                db.query(DatabaseTraceEvent)
+                .filter(
+                    DatabaseTraceEvent.task_id == self.task_id,
+                    DatabaseTraceEvent.event_type == "system_update_general",
+                )
+                .order_by(
+                    DatabaseTraceEvent.timestamp.desc(),
+                    DatabaseTraceEvent.id.desc(),
+                )
+                .limit(100)
+                .all()
+            )
+            for row in rows:
+                data: Dict[str, Any] = row.data if isinstance(row.data, dict) else {}
+                if data.get("checkpoint_type") != CHECKPOINT_TYPE:
+                    continue
+                if str(
+                    data.get("root_execution_id") or data.get("execution_id")
+                ) != str(execution_id):
+                    continue
+                snapshot = data.get("snapshot")
+                return dict(snapshot) if isinstance(snapshot, dict) else None
+            return None
+        finally:
+            db.close()
 
     def _sync_save_to_database(self, event: CoreTraceEvent) -> None:
         """Synchronous database save operation (runs in thread pool)."""
@@ -105,6 +166,15 @@ class DatabaseTraceHandler(BaseTraceHandler):
             )
 
             db.add(trace_event)
+
+            if (
+                event_type_str == "system_update_general"
+                and isinstance(data, dict)
+                and data.get("checkpoint_type") == "agent_v2_execution_checkpoint"
+            ):
+                task = db.query(Task).filter(Task.id == self.task_id).first()
+                if task:
+                    setattr(task, "last_checkpoint_event_id", str(event.id))
 
             # Update tool usage statistics if this is a tool execution event
             if event_type_str == "tool_execution_end":
@@ -151,6 +221,13 @@ class DatabaseTraceHandler(BaseTraceHandler):
                 "trace_events_task_id_fkey" in error_text
                 or "ForeignKeyViolation" in error_text
             ):
+                if getattr(event, "require_persisted", False):
+                    logger.error(
+                        "Required trace event references missing task %s: %s",
+                        self.task_id,
+                        event.id,
+                    )
+                    raise
                 logger.debug(
                     f"Skip trace event for missing task {self.task_id}: {event.id}"
                 )
@@ -186,6 +263,8 @@ class DatabaseTraceHandler(BaseTraceHandler):
             if hasattr(value, "model_dump"):
                 # Convert Pydantic model to dict
                 return serialize_value(value.model_dump())
+            elif callable(getattr(value, "to_dict", None)):
+                return serialize_value(value.to_dict())
             elif isinstance(value, datetime):
                 if value.tzinfo is None:
                     value = value.replace(tzinfo=timezone.utc)

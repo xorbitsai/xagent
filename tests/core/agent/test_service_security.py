@@ -255,6 +255,90 @@ class TestAgentServicePauseResume:
             await service.resume_execution()
             assert not service.is_paused()
 
+    @pytest.mark.asyncio
+    async def test_v2_resume_clears_service_pause_state(self):
+        """Test that v2 resume clears the service pause flag for later pauses."""
+
+        class FakeAdapter:
+            def __init__(self):
+                self.config = type("Config", (), {"tools": []})()
+
+            def pause(self, execution_id, reason=None):
+                return True
+
+            async def resume(self, execution_id, **kwargs):
+                return {
+                    "success": False,
+                    "status": "interrupted",
+                    "execution_id": execution_id,
+                    "kwargs": kwargs,
+                }
+
+        service = AgentService(
+            name="test_v2_resume",
+            id="test_v2_resume",
+            enable_workspace=False,
+            llm=None,
+        )
+        service.agent_runtime = "v2"
+        service._v2_adapter = FakeAdapter()
+
+        await service.pause_execution()
+        assert service.is_paused()
+
+        result = await service.resume_v2_execution("test_v2_resume")
+
+        assert result is not None
+        assert result["status"] == "interrupted"
+        assert not service.is_paused()
+
+    @pytest.mark.asyncio
+    async def test_v2_resume_initializes_configured_tools(self, monkeypatch):
+        """Test that v2 resume restores dynamically configured tools."""
+
+        class FakeTool:
+            name = "restored_search"
+
+        class FakeToolConfig:
+            _workspace_config = {}
+
+            def get_allowed_tools(self):
+                return ["restored_search"]
+
+        class FakeAdapter:
+            def __init__(self):
+                self.config = type("Config", (), {"tools": []})()
+
+            async def resume(self, execution_id, **kwargs):
+                return {
+                    "success": True,
+                    "execution_id": execution_id,
+                    "tool_names": [tool.name for tool in self.config.tools],
+                }
+
+        async def fake_create_all_tools(_config):
+            return [FakeTool()]
+
+        from xagent.core.tools.adapters.vibe.factory import ToolFactory
+
+        monkeypatch.setattr(ToolFactory, "create_all_tools", fake_create_all_tools)
+
+        service = AgentService(
+            name="test_v2_resume_tools",
+            id="test_v2_resume_tools",
+            enable_workspace=False,
+            llm=None,
+            tool_config=FakeToolConfig(),
+        )
+        service.agent_runtime = "v2"
+        service._v2_adapter = FakeAdapter()
+
+        result = await service.resume_v2_execution("test_v2_resume_tools")
+
+        assert result is not None
+        assert result["tool_names"] == ["restored_search"]
+        assert service._tools_initialized is True
+
 
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])

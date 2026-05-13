@@ -569,13 +569,9 @@ class DAGPlanExecutePattern(AgentPattern):
                         )
 
                         # Get current user context to pass to the thread
-                        try:
-                            from .....web.user_isolated_memory import current_user_id
+                        from ....user_context import current_user_id
 
-                            user_id = current_user_id.get()
-                        except ImportError:
-                            # Fallback for non-web environment
-                            user_id = None
+                        user_id = current_user_id.get()
 
                         memory_task = asyncio.to_thread(
                             self._lookup_relevant_memories_with_context,
@@ -1791,23 +1787,9 @@ class DAGPlanExecutePattern(AgentPattern):
         """
         # Set user context for this thread
         if user_id is not None:
-            try:
-                from .....web.user_isolated_memory import current_user_id
+            from ....user_context import current_user_id
 
-                context_token = current_user_id.set(user_id)
-            except ImportError:
-                # Fallback for non-web environment - proceed without user context
-                from ..memory_utils import lookup_relevant_memories
-
-                return lookup_relevant_memories(
-                    memory_store,
-                    query,
-                    category,
-                    include_general,
-                    limit,
-                    similarity_threshold,
-                )
-
+            context_token = current_user_id.set(user_id)
             try:
                 # Call the original function with context set
                 from ..memory_utils import lookup_relevant_memories

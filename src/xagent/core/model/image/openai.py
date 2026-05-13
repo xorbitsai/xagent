@@ -127,7 +127,8 @@ class OpenAIImageModel(BaseImageModel):
         assert self._client is not None
 
         response_format = kwargs.pop("response_format", "url")
-        response = await self._client.images.generate(
+        images_client: Any = self._client.images
+        response = await images_client.generate(
             prompt=prompt,
             model=self.model_name,
             size=self._normalize_size(size),  # pyright: ignore[reportArgumentType]
@@ -180,7 +181,8 @@ class OpenAIImageModel(BaseImageModel):
         image_files = []
         try:
             image_files = [open(path, "rb") for path in image_paths]
-            response = await self._client.images.edit(
+            images_client: Any = self._client.images
+            response = await images_client.edit(
                 image=image_files if len(image_files) > 1 else image_files[0],
                 prompt=prompt,
                 model=self.model_name,

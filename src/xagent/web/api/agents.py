@@ -10,7 +10,7 @@ from fastapi import APIRouter, Body, Depends, HTTPException
 from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
 
-from ...config import get_uploads_dir
+from ...config import get_agent_pattern_for_execution_mode, get_uploads_dir
 from ...core.agent.service import AgentService
 from ...core.memory.in_memory import InMemoryMemoryStore
 from ...core.tracing import create_agent_tracer
@@ -39,7 +39,7 @@ class AgentCreateRequest(BaseModel):
     description: Optional[str] = Field(None, description="Agent description")
     instructions: Optional[str] = Field(None, description="System instructions/prompt")
     execution_mode: Optional[str] = Field(
-        "balanced", description="Execution mode: flash, balanced, or think"
+        "balanced", description="Execution mode: flash, balanced, think, or auto"
     )
     models: Optional[dict] = Field(
         None, description="Model config: {general, small_fast, visual, compact}"
@@ -66,7 +66,7 @@ class AgentUpdateRequest(BaseModel):
     description: Optional[str] = None
     instructions: Optional[str] = None
     execution_mode: Optional[str] = Field(
-        None, description="Execution mode: flash, balanced, or think"
+        None, description="Execution mode: flash, balanced, think, or auto"
     )
     models: Optional[dict] = None
     knowledge_bases: Optional[List[str]] = None
@@ -711,7 +711,7 @@ class AgentPreviewRequest(BaseModel):
 
     instructions: Optional[str] = Field(None, description="System instructions/prompt")
     execution_mode: Optional[str] = Field(
-        "balanced", description="Execution mode: flash, balanced, or think"
+        "balanced", description="Execution mode: flash, balanced, think, or auto"
     )
     models: Optional[dict] = Field(
         None, description="Model config: {general, small_fast, visual, compact}"
@@ -826,18 +826,7 @@ async def preview_agent(
         # Determine execution mode (default to "think")
         execution_mode = request.execution_mode or "think"
 
-        # Map execution mode to use_dag_pattern
-        # flash: SingleCall pattern (quick tasks)
-        # balanced: ReAct pattern (everyday tasks)
-        # think: DAG/Graph plan-execute pattern (complex tasks)
-        if execution_mode == "think":
-            use_dag_pattern = True
-        elif execution_mode == "balanced":
-            use_dag_pattern = False
-        elif execution_mode == "flash":
-            use_dag_pattern = False  # SingleCall doesn't use DAG
-        else:  # fallback to balanced (react)
-            use_dag_pattern = False
+        pattern = get_agent_pattern_for_execution_mode(execution_mode)
 
         tracer = create_agent_tracer(
             task_id=preview_task_id,
@@ -863,7 +852,7 @@ async def preview_agent(
             compact_llm=compact_llm,
             memory=memory,
             tool_config=tool_config,
-            use_dag_pattern=use_dag_pattern,
+            pattern=pattern,
             id=preview_task_id,
             enable_workspace=True,  # Both patterns support workspace
             workspace_base_dir=str(get_uploads_dir() / "preview"),

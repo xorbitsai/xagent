@@ -775,7 +775,12 @@ class TaskWorkspace:
                 # Query uploaded files for this user
                 query = db.query(UploadedFile).filter(UploadedFile.user_id == user_id)
                 total_count = query.count()
-                files = query.offset(offset).limit(limit).all()
+                files = (
+                    query.order_by(UploadedFile.id.desc())
+                    .offset(offset)
+                    .limit(limit)
+                    .all()
+                )
 
                 # Build file list from database
                 for file_record in files:

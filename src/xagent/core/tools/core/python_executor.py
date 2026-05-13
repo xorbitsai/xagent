@@ -56,9 +56,10 @@ class PythonExecutorCore:
             output_buffer = io.StringIO()
             error_buffer = io.StringIO()
 
-            # Create a safe globals environment
-            safe_globals = self._create_safe_globals()
-            local_vars: Dict[str, Any] = {}
+            # Use one namespace for globals and locals so imports are visible from
+            # nested scopes such as comprehensions and lambdas.
+            exec_namespace = self._create_safe_globals()
+            initial_names = set(exec_namespace)
 
             old_cwd = None
             if self.working_directory:
@@ -76,16 +77,18 @@ class PythonExecutorCore:
 
             try:
                 # Execute the code
-                exec(code, safe_globals, local_vars)
+                exec(code, exec_namespace, exec_namespace)
 
                 output = ""
                 if capture_output:
                     output = output_buffer.getvalue()
 
                 # If no output but there are variables, show them
-                if not output and local_vars:
+                if not output and exec_namespace:
                     visible_vars = {
-                        k: v for k, v in local_vars.items() if not k.startswith("_")
+                        k: v
+                        for k, v in exec_namespace.items()
+                        if k not in initial_names and not k.startswith("_")
                     }
                     if visible_vars:
                         output = "Variables created:\n"

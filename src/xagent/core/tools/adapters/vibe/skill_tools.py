@@ -247,7 +247,7 @@ class SkillTools:
                 name="read_skill_doc",
                 description="Read documentation from a skill. "
                 "Parameters: skill (str, required), path (str, optional, default='SKILL.md'), encoding (str, optional, default='utf-8'). "
-                "Use the default path to read the skill's main documentation. "
+                "If the current system context already contains selected skill guidance, do not read the main SKILL.md again; use this only for additional referenced docs, examples, or details. "
                 "Returns the text content of the documentation file.",
             ),
             SkillTool(

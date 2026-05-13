@@ -556,18 +556,25 @@ class GeminiLLM(BaseLLM):
         except Exception as e:
             logger.error("Gemini SDK API error: %s", redact_sensitive_text(str(e)))
 
-            # Check for timeout and network errors (string-based check for non-SDK exceptions)
-            if "timeout" in str(e).lower() or "network" in str(e).lower():
-                raise LLMRetryableError(str(e)) from e
+            error_text = str(e)
+            error_text_lower = error_text.lower()
 
             # Check for Google SDK specific errors
             if isinstance(e, genai_errors.ClientError):
                 # 429: Rate limit (RESOURCE_EXHAUSTED)
-                # 500, 502, 503: Server errors (retryable)
-                if e.code in [429, 500, 502, 503]:
+                # 500, 502, 503, 504: Server errors (retryable)
+                if e.code in [429, 500, 502, 503, 504]:
                     raise LLMRetryableError(
                         f"Gemini API error (code={e.code}): {str(e)}"
                     ) from e
+
+            # Check for timeout and network errors (string-based check for non-SDK exceptions)
+            if (
+                "timeout" in error_text_lower
+                or "network" in error_text_lower
+                or "deadline_exceeded" in error_text_lower
+            ):
+                raise LLMRetryableError(str(e)) from e
 
             # Fallback: string-based check for rate limit/quota (for compatibility)
             if "rate limit" in str(e).lower() or "quota" in str(e).lower():
@@ -827,18 +834,25 @@ class GeminiLLM(BaseLLM):
                 "Gemini SDK streaming error: %s", redact_sensitive_text(str(e))
             )
 
-            # Check for timeout and network errors (string-based check for non-SDK exceptions)
-            if "timeout" in str(e).lower() or "network" in str(e).lower():
-                raise LLMRetryableError(str(e)) from e
+            error_text = str(e)
+            error_text_lower = error_text.lower()
 
             # Check for Google SDK specific errors
             if isinstance(e, genai_errors.ClientError):
                 # 429: Rate limit (RESOURCE_EXHAUSTED)
-                # 500, 502, 503: Server errors (retryable)
-                if e.code in [429, 500, 502, 503]:
+                # 500, 502, 503, 504: Server errors (retryable)
+                if e.code in [429, 500, 502, 503, 504]:
                     raise LLMRetryableError(
                         f"Gemini API error (code={e.code}): {str(e)}"
                     ) from e
+
+            # Check for timeout and network errors (string-based check for non-SDK exceptions)
+            if (
+                "timeout" in error_text_lower
+                or "network" in error_text_lower
+                or "deadline_exceeded" in error_text_lower
+            ):
+                raise LLMRetryableError(str(e)) from e
 
             # Fallback: string-based check for rate limit/quota (for compatibility)
             if "rate limit" in str(e).lower() or "quota" in str(e).lower():

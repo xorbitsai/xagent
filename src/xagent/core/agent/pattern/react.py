@@ -614,13 +614,9 @@ class ReActPattern(AgentPattern):
             )
 
             # Get current user context to pass to the thread
-            try:
-                from ....web.user_isolated_memory import current_user_id
+            from ...user_context import current_user_id
 
-                user_id = current_user_id.get()
-            except ImportError:
-                # Fallback for non-web environment
-                user_id = None
+            user_id = current_user_id.get()
 
             memories = await asyncio.to_thread(
                 self._lookup_relevant_memories_with_context,
@@ -730,8 +726,11 @@ class ReActPattern(AgentPattern):
                 # Get structured action from LLM (first call: determine action type)
                 action = await self._get_action_from_llm(messages)
 
-                # If action is tool_call, make a second LLM call to get actual tool invocation
-                if action.type == "tool_call":
+                # If the first phase only decided to use a tool, make a second
+                # LLM call to get the native tool invocation. Some providers
+                # or test doubles may already return the native tool call here;
+                # in that case execute it directly instead of consuming it.
+                if action.type == "tool_call" and not action.tool_name:
                     # Emit reasoning trace before second call
                     if action.reasoning:
                         await trace_ai_message(
@@ -1053,13 +1052,9 @@ class ReActPattern(AgentPattern):
                 )
 
                 # Get current user context to pass to the thread
-                try:
-                    from ....web.user_isolated_memory import current_user_id
+                from ...user_context import current_user_id
 
-                    user_id = current_user_id.get()
-                except ImportError:
-                    # Fallback for non-web environment
-                    user_id = None
+                user_id = current_user_id.get()
 
                 memories = await asyncio.to_thread(
                     self._lookup_relevant_memories_with_context,
@@ -1453,6 +1448,13 @@ Remember: Return ONLY ONE JSON object. No additional text, no multiple objects.
             chat_kwargs["response_format"] = Action.get_decision_schema()
         elif self.llm.supports_json_object_response_format:
             chat_kwargs["response_format"] = {"type": "json_object"}
+        if tool_schemas:
+            # Allow providers that already emit native tool calls in the first
+            # phase to do so through the streaming API. The ReAct loop will
+            # execute a native tool call directly, or fall back to the second
+            # native-tool-call phase when the model only returns a JSON decision.
+            chat_kwargs["tools"] = tool_schemas
+            chat_kwargs["tool_choice"] = "auto"
 
         # Disable thinking mode if supported
         if (
@@ -1549,7 +1551,7 @@ Remember: Return ONLY ONE JSON object. No additional text, no multiple objects.
 
             # Get LLM response using streaming API
             full_content = ""
-            usage = {}
+            usage: Dict[str, Any] = {}
             tool_calls_from_stream = []
 
             async for chunk in self.llm.stream_chat(**chat_kwargs):
@@ -1572,6 +1574,7 @@ Remember: Return ONLY ONE JSON object. No additional text, no multiple objects.
 
             # Construct response object (maintaining compatibility with original chat() format)
             reasoning_text = full_content.strip()
+
             if reasoning_text:
                 extracted_reasoning: Optional[str] = None
                 try:
@@ -1664,6 +1667,21 @@ Remember: Return ONLY ONE JSON object. No additional text, no multiple objects.
         if isinstance(response, dict) and response.get("type") == "final_answer":
             action = self._try_parse_action_from_dict(response, str(response))
             if action:
+                await log_llm_completion(response, False, action.reasoning)
+                return action
+
+        # Handle normal chat adapter text payloads. Some adapters and tests return
+        # {"type": "text", "content": "..."} or simply {"content": "..."}.
+        if self._is_text_response(response):
+            answer = self._extract_content(response).strip()
+            if answer:
+                action = Action(
+                    type="final_answer",
+                    reasoning="LLM provided direct response",
+                    answer=answer,
+                    success=True,
+                    error=None,
+                )
                 await log_llm_completion(response, False, action.reasoning)
                 return action
 
@@ -2386,6 +2404,14 @@ Remember: Return ONLY ONE JSON object. No additional text, no multiple objects.
                 pattern_name="ReAct", message=f"Unknown action type: {action.type}"
             )
 
+    def _is_text_response(self, response: Any) -> bool:
+        """Return True for adapter payloads that carry direct text content."""
+
+        return isinstance(response, dict) and (
+            response.get("type") == "text"
+            or ("type" not in response and "content" in response)
+        )
+
     def _extract_content(self, response: Any) -> str:
         """Extract content from LLM response."""
         if response is None:
@@ -2707,23 +2733,9 @@ STORAGE THRESHOLD: Be extremely conservative. Only store truly exceptional insig
         """
         # Set user context for this thread
         if user_id is not None:
-            try:
-                from ....web.user_isolated_memory import current_user_id
+            from ...user_context import current_user_id
 
-                context_token = current_user_id.set(user_id)
-            except ImportError:
-                # Fallback for non-web environment - proceed without user context
-                from .memory_utils import lookup_relevant_memories
-
-                return lookup_relevant_memories(
-                    memory_store,
-                    query,
-                    category,
-                    include_general,
-                    limit,
-                    similarity_threshold,
-                )
-
+            context_token = current_user_id.set(user_id)
             try:
                 # Call the original function with context set
                 from .memory_utils import lookup_relevant_memories

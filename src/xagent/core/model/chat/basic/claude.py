@@ -2,6 +2,7 @@ import json
 import logging
 import os
 import time
+from copy import deepcopy
 from typing import TYPE_CHECKING, Any, AsyncIterator, Dict, List, Optional, Union
 
 from json_repair import loads as repair_loads
@@ -87,6 +88,7 @@ def _fix_pydantic_schema_for_claude(schema: Dict[str, Any]) -> Dict[str, Any]:
     """
     if not isinstance(schema, dict):
         return schema
+    schema = deepcopy(schema)
 
     # Handle empty schema - convert to a concrete type
     if not schema or len(schema) == 0:
@@ -117,8 +119,21 @@ def _fix_pydantic_schema_for_claude(schema: Dict[str, Any]) -> Dict[str, Any]:
         for prop in unsupported_props:
             schema.pop(prop, None)
 
-    # Recursively process nested structures
+    # Recursively process nested structures. JSON Schema keywords such as
+    # "properties" and "$defs" contain a map of subschemas, not a schema object
+    # themselves. Treating that map as a schema corrupts fields named "type".
     for key, value in list(schema.items()):
+        if key in {"properties", "$defs", "definitions", "patternProperties"}:
+            if isinstance(value, dict):
+                schema[key] = {
+                    str(prop_name): _fix_pydantic_schema_for_claude(prop_schema)
+                    for prop_name, prop_schema in value.items()
+                }
+            continue
+        if key == "additionalProperties":
+            if isinstance(value, dict):
+                schema[key] = _fix_pydantic_schema_for_claude(value)
+            continue
         if isinstance(value, dict):
             schema[key] = _fix_pydantic_schema_for_claude(value)
         elif isinstance(value, list):
@@ -223,7 +238,7 @@ class ClaudeLLM(BaseLLM):
         Returns:
             Tuple of (system_message, list of messages in Anthropic format)
         """
-        anthropic_messages = []
+        anthropic_messages: List[Dict[str, Any]] = []
         system_message = None
 
         for msg in messages:
@@ -243,12 +258,49 @@ class ClaudeLLM(BaseLLM):
                     system_message = "\n".join(text_parts)
                 continue
 
+            if role == "tool":
+                tool_result: Dict[str, Any] = {
+                    "type": "tool_result",
+                    "tool_use_id": str(msg.get("tool_call_id") or ""),
+                    "content": str(content or ""),
+                }
+                if not tool_result["tool_use_id"]:
+                    anthropic_messages.append(
+                        {
+                            "role": "user",
+                            "content": str(content or ""),
+                        }
+                    )
+                else:
+                    anthropic_messages.append(
+                        {
+                            "role": "user",
+                            "content": [tool_result],
+                        }
+                    )
+                continue
+
             # Convert roles (Anthropic uses "user" and "assistant")
             anthropic_role = "user" if role == "user" else "assistant"
 
+            tool_use_blocks = self._convert_openai_tool_calls_to_anthropic_blocks(
+                msg.get("tool_calls") or []
+            )
+
             # Handle content
             if isinstance(content, str):
-                anthropic_messages.append({"role": anthropic_role, "content": content})
+                if tool_use_blocks:
+                    anthropic_content: List[Dict[str, Any]] = []
+                    if content:
+                        anthropic_content.append({"type": "text", "text": content})
+                    anthropic_content.extend(tool_use_blocks)
+                    anthropic_messages.append(
+                        {"role": anthropic_role, "content": anthropic_content}
+                    )
+                else:
+                    anthropic_messages.append(
+                        {"role": anthropic_role, "content": content}
+                    )
             elif isinstance(content, list):
                 # Multimodal content
                 anthropic_content = []
@@ -294,14 +346,53 @@ class ClaudeLLM(BaseLLM):
                                     f"Direct image URLs not yet supported: {url[:50]}..."
                                 )
 
+                anthropic_content.extend(tool_use_blocks)
                 anthropic_messages.append(
                     {
                         "role": anthropic_role,
-                        "content": anthropic_content if anthropic_content else [],  # type: ignore[dict-item]
+                        "content": anthropic_content if anthropic_content else [],
                     }
                 )
 
         return system_message, anthropic_messages
+
+    def _convert_openai_tool_calls_to_anthropic_blocks(
+        self,
+        tool_calls: List[Any],
+    ) -> List[Dict[str, Any]]:
+        blocks: List[Dict[str, Any]] = []
+        for index, tool_call in enumerate(tool_calls):
+            if not isinstance(tool_call, dict):
+                continue
+            function_payload = tool_call.get("function")
+            if isinstance(function_payload, dict):
+                name = function_payload.get("name")
+                arguments = function_payload.get("arguments", {})
+            else:
+                name = tool_call.get("name")
+                arguments = tool_call.get("args", tool_call.get("arguments", {}))
+            if not name:
+                continue
+            blocks.append(
+                {
+                    "type": "tool_use",
+                    "id": str(tool_call.get("id") or f"toolu_{index}"),
+                    "name": str(name),
+                    "input": self._coerce_tool_input(arguments),
+                }
+            )
+        return blocks
+
+    def _coerce_tool_input(self, arguments: Any) -> Dict[str, Any]:
+        if isinstance(arguments, dict):
+            return arguments
+        if isinstance(arguments, str):
+            try:
+                payload = json.loads(arguments)
+            except json.JSONDecodeError:
+                return {"input": arguments}
+            return payload if isinstance(payload, dict) else {"input": payload}
+        return {}
 
     def _convert_tools_to_anthropic_format(
         self, tools: List[Dict[str, Any]]

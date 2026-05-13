@@ -22,27 +22,32 @@ from fastapi import (
 from fastapi.responses import RedirectResponse
 from sqlalchemy.orm import Session
 
-from ...config import get_external_upload_dirs, get_uploads_dir
+from ...config import (
+    get_agent_pattern_for_execution_mode,
+    get_agent_runtime,
+    get_default_task_execution_mode,
+    get_external_upload_dirs,
+    get_uploads_dir,
+)
 from ...core.agent.trace import TraceEvent, TraceHandler
 from ..auth_dependencies import get_user_from_websocket_token
 from ..models.database import get_db
 from ..models.task import Task
 from ..models.uploaded_file import UploadedFile
 from ..models.user import User
+from ..services.task_lease_service import (
+    acquire_task_lease,
+    mark_task_paused_if_stale,
+    release_current_runner_task_lease,
+    run_task_lease_heartbeat,
+    stop_task_lease_heartbeat,
+)
 from ..tools.config import WebToolConfig
 from ..tracing import create_ephemeral_tracer
 from ..user_isolated_memory import UserContext
 from ..utils.db_timezone import safe_timestamp_to_unix
 
 logger = logging.getLogger(__name__)
-
-# Execution mode to pattern mapping
-# flash -> single_call, balanced -> react, think -> dag_plan_execute
-EXECUTION_MODE_TO_PATTERN = {
-    "flash": "single_call",
-    "balanced": "react",
-    "think": "dag_plan_execute",
-}
 
 
 def _resolve_task_llm_ids(
@@ -135,6 +140,56 @@ def build_unique_target_path(target_dir: Any, filename: str) -> Any:
         counter += 1
 
 
+def _build_uploaded_files_context(
+    file_info_list: List[Dict[str, Any]], *, is_agent_builder: bool = False
+) -> str:
+    """Build stable LLM context for files already uploaded for this turn."""
+    if not file_info_list:
+        return ""
+
+    file_summaries = []
+    file_ids = []
+    for file_info in file_info_list:
+        file_id = str(file_info.get("file_id") or "").strip()
+        if not file_id:
+            continue
+        name = str(
+            file_info.get("original_name") or file_info.get("name") or "uploaded file"
+        )
+        file_ids.append(file_id)
+        file_summaries.append(f"- {name}: file_id={file_id}")
+
+    if not file_ids:
+        return ""
+
+    lines = [
+        "## UPLOADED FILES",
+        "The user has uploaded file(s) for this turn. Use these exact file_id values:",
+        *file_summaries,
+    ]
+    if is_agent_builder:
+        joined_file_ids = ", ".join(f'"{file_id}"' for file_id in file_ids)
+        lines.extend(
+            [
+                "",
+                "For knowledge-base creation, call `create_knowledge_base_from_file` with:",
+                f"  file_ids = [{joined_file_ids}]",
+                "Do NOT ask the user to upload again unless these file_ids fail.",
+            ]
+        )
+    return "\n".join(lines)
+
+
+def _append_uploaded_files_context_to_message(
+    message: str, uploaded_files_context: str
+) -> str:
+    if not uploaded_files_context:
+        return message
+    if uploaded_files_context in message:
+        return message
+    return f"{message.rstrip()}\n\n{uploaded_files_context}"
+
+
 def create_stream_event(
     event_type: str,
     task_id: Union[int, str],
@@ -160,6 +215,127 @@ def create_stream_event(
         "timestamp": timestamp,
         "data": data,
     }
+
+
+def _persist_agent_v2_outbound_event(task_id: int, event: Dict[str, Any]) -> None:
+    """Persist v2 agent-to-user messages so waiting prompts survive reloads."""
+
+    from ..models.task import Task as DatabaseTask
+    from ..models.task import TraceEvent as DatabaseTraceEvent
+    from ..services.chat_history_service import persist_assistant_message
+
+    db_gen = get_db()
+    db = next(db_gen)
+    try:
+        event_data = event.get("data")
+        data: Dict[str, Any] = cast(
+            Dict[str, Any], event_data if isinstance(event_data, dict) else {}
+        )
+        timestamp = event.get("timestamp")
+        if isinstance(timestamp, (int, float)):
+            event_time = datetime.fromtimestamp(float(timestamp), timezone.utc)
+        else:
+            event_time = datetime.now(timezone.utc)
+
+        trace_event = DatabaseTraceEvent(
+            task_id=task_id,
+            event_id=str(event.get("event_id") or uuid.uuid4()),
+            event_type=str(event.get("event_type") or "agent_message"),
+            timestamp=event_time,
+            step_id=str(event["step_id"]) if event.get("step_id") else None,
+            parent_event_id=None,
+            data=data,
+        )
+        db.add(trace_event)
+
+        if bool(data.get("expect_response")):
+            task = db.query(DatabaseTask).filter(DatabaseTask.id == task_id).first()
+            message = str(data.get("message") or "")
+            if task and message:
+                metadata = data.get("metadata") if isinstance(data, dict) else {}
+                interactions = (
+                    metadata.get("interactions")
+                    if isinstance(metadata, dict)
+                    and isinstance(metadata.get("interactions"), list)
+                    else None
+                )
+                persist_assistant_message(
+                    db,
+                    task_id=task_id,
+                    user_id=int(cast(Any, task.user_id)),
+                    content=message,
+                    message_type="question",
+                    interactions=interactions,
+                )
+
+        db.commit()
+    except Exception:
+        db.rollback()
+        logger.exception("Failed to persist v2 outbound message for task %s", task_id)
+    finally:
+        db.close()
+
+
+def _get_latest_waiting_question(
+    db: Session, task_id: int
+) -> tuple[Optional[str], Optional[list[dict[str, Any]]]]:
+    from ..models.chat_message import TaskChatMessage
+
+    latest_question = (
+        db.query(TaskChatMessage)
+        .filter(
+            TaskChatMessage.task_id == task_id,
+            TaskChatMessage.role == "assistant",
+            TaskChatMessage.message_type == "question",
+        )
+        .order_by(TaskChatMessage.id.desc())
+        .first()
+    )
+    if not latest_question:
+        return None, None
+
+    interactions = latest_question.interactions
+    return (
+        str(latest_question.content),
+        interactions if isinstance(interactions, list) else None,
+    )
+
+
+def make_agent_v2_outbound_handler(task_id: int) -> Any:
+    """Create a web bridge for agent_v2 agent-to-user messages."""
+
+    async def handle_outbound_message(payload: Dict[str, Any]) -> None:
+        event = create_stream_event(
+            "agent_message",
+            task_id,
+            {
+                "execution_id": payload.get("execution_id"),
+                "message": payload.get("message"),
+                "message_type": payload.get("message_type", "info"),
+                "expect_response": bool(payload.get("expect_response", False)),
+                "metadata": payload.get("metadata") or {},
+                "agent_runtime": "v2",
+            },
+        )
+        await asyncio.to_thread(_persist_agent_v2_outbound_event, task_id, event)
+        await manager.broadcast_to_task(event, task_id)
+
+    return handle_outbound_message
+
+
+def _is_agent_v2_checkpoint_data(data: Any) -> bool:
+    """Return True for internal agent_v2 checkpoint payloads."""
+    if not isinstance(data, dict):
+        return False
+    try:
+        from ...core.agent_v2.checkpoint import CHECKPOINT_TYPE
+    except Exception:
+        CHECKPOINT_TYPE = "agent_v2_execution_checkpoint"
+    return data.get("checkpoint_type") == CHECKPOINT_TYPE or (
+        data.get("type") == "checkpoint"
+        and isinstance(data.get("pattern_state"), dict)
+        and isinstance(data.get("context"), dict)
+    )
 
 
 def convert_to_local_time(utc_dt: Any) -> datetime:
@@ -350,7 +526,48 @@ def _rewrite_file_links_to_file_id(
         replace_legacy_link,
         rewritten_output,
     )
+    rewritten_output = re.sub(
+        r"\((/?(?:input|output|temp)/[^)\s]+|/?(?:user_\d+/)?(?:web_task_\d+|task_\d+)/(?:input|output|temp)/[^)\s]+)\)",
+        replace_legacy_link,
+        rewritten_output,
+    )
     return rewritten_output
+
+
+def _add_file_link_aliases(
+    path_to_file_id: Dict[str, str], relative_path: str, file_id: str
+) -> None:
+    normalized_relative_path = relative_path.lstrip("/")
+    if not normalized_relative_path:
+        return
+
+    path_to_file_id[normalized_relative_path] = file_id
+    path_to_file_id[f"/{normalized_relative_path}"] = file_id
+    path_to_file_id[f"preview/{normalized_relative_path}"] = file_id
+    path_to_file_id[f"/preview/{normalized_relative_path}"] = file_id
+    path_to_file_id[f"uploads/{normalized_relative_path}"] = file_id
+    path_to_file_id[f"/uploads/{normalized_relative_path}"] = file_id
+
+    parts = Path(normalized_relative_path).parts
+    task_local_parts: tuple[str, ...] = ()
+    if (
+        len(parts) >= 3
+        and parts[0].startswith("user_")
+        and (parts[1].startswith("web_task_") or parts[1].startswith("task_"))
+    ):
+        without_user = "/".join(parts[1:])
+        if without_user:
+            _add_file_link_aliases(path_to_file_id, without_user, file_id)
+        task_local_parts = parts[2:]
+    elif len(parts) >= 2 and (
+        parts[0].startswith("web_task_") or parts[0].startswith("task_")
+    ):
+        task_local_parts = parts[1:]
+
+    if task_local_parts and task_local_parts[0] in {"input", "output", "temp"}:
+        task_local_path = "/".join(task_local_parts)
+        path_to_file_id[task_local_path] = file_id
+        path_to_file_id[f"/{task_local_path}"] = file_id
 
 
 def _normalize_file_outputs(
@@ -455,24 +672,7 @@ def _normalize_file_outputs(
             if stripped:
                 path_to_file_id[stripped] = final_file_id
                 path_to_file_id[stripped.lstrip("/")] = final_file_id
-        path_to_file_id[normalized_relative_path] = final_file_id
-        path_to_file_id[f"/{normalized_relative_path}"] = final_file_id
-
-        path_to_file_id[f"preview/{normalized_relative_path}"] = final_file_id
-        path_to_file_id[f"/preview/{normalized_relative_path}"] = final_file_id
-        path_to_file_id[f"uploads/{normalized_relative_path}"] = final_file_id
-        path_to_file_id[f"/uploads/{normalized_relative_path}"] = final_file_id
-
-        normalized_parts = Path(normalized_relative_path).parts
-        if normalized_parts and normalized_parts[0].startswith("user_"):
-            without_user = "/".join(normalized_parts[1:])
-            if without_user:
-                path_to_file_id[without_user] = final_file_id
-                path_to_file_id[f"/{without_user}"] = final_file_id
-                path_to_file_id[f"preview/{without_user}"] = final_file_id
-                path_to_file_id[f"/preview/{without_user}"] = final_file_id
-                path_to_file_id[f"uploads/{without_user}"] = final_file_id
-                path_to_file_id[f"/uploads/{without_user}"] = final_file_id
+        _add_file_link_aliases(path_to_file_id, normalized_relative_path, final_file_id)
 
     if changed:
         db.commit()
@@ -521,6 +721,10 @@ async def execute_task_background(
             agent_service = await agent_manager.get_agent_for_task(
                 task_id, db, user=user
             )
+            if hasattr(agent_service, "set_outbound_message_handler"):
+                agent_service.set_outbound_message_handler(
+                    make_agent_v2_outbound_handler(task_id)
+                )
 
             # Execute task with automatic token tracking
             actual_task_id = None if force_fresh_execution else str(task_id)
@@ -564,16 +768,43 @@ async def execute_task_background(
 
         db_gen = get_db()
         db_new = next(db_gen)
+        waiting_for_control = False
+        final_task_status = task.status.value
         try:
             task_updated = db_new.query(Task).filter(Task.id == task_id).first()
             if task_updated:
                 # If task current status is PAUSED, don't overwrite
-                if task_updated.status != TaskStatus.PAUSED:
+                if result.get("status") == "waiting_for_user":
+                    release_current_runner_task_lease(
+                        db_new, task_id, status=TaskStatus.WAITING_FOR_USER
+                    )
+                    db_new.refresh(task_updated)
+                    waiting_for_control = True
+                    logger.info(
+                        f"Updated task {task_id} status to WAITING_FOR_USER for v2 control state"
+                    )
+                elif result.get("status") == "interrupted":
+                    release_current_runner_task_lease(
+                        db_new, task_id, status=TaskStatus.PAUSED
+                    )
+                    db_new.refresh(task_updated)
+                    waiting_for_control = True
+                    logger.info(
+                        f"Updated task {task_id} status to PAUSED for v2 interrupt state"
+                    )
+                elif task_updated.status not in {
+                    TaskStatus.PAUSED,
+                    TaskStatus.WAITING_FOR_USER,
+                }:
                     if result.get("success", False):
-                        task_updated.status = TaskStatus.COMPLETED
+                        release_current_runner_task_lease(
+                            db_new, task_id, status=TaskStatus.COMPLETED
+                        )
                     else:
-                        task_updated.status = TaskStatus.FAILED
-                    db_new.commit()
+                        release_current_runner_task_lease(
+                            db_new, task_id, status=TaskStatus.FAILED
+                        )
+                    db_new.refresh(task_updated)
                     logger.info(
                         f"Updated task {task_id} status to {task_updated.status.value}"
                     )
@@ -581,27 +812,48 @@ async def execute_task_background(
                     logger.info(
                         f"Task {task_id} is paused, not updating status to {result.get('success')}"
                     )
+                final_task_status = task_updated.status.value
 
-                persist_assistant_message(
-                    db_new,
-                    task_id=task_id,
-                    user_id=int(task.user_id),
-                    content=str(
-                        chat_response.get("message", ai_response)
+                if not waiting_for_control:
+                    persist_assistant_message(
+                        db_new,
+                        task_id=task_id,
+                        user_id=int(task.user_id),
+                        content=str(
+                            chat_response.get("message", ai_response)
+                            if isinstance(chat_response, dict)
+                            else ai_response
+                        ),
+                        message_type="chat_response"
                         if isinstance(chat_response, dict)
-                        else ai_response
-                    ),
-                    message_type="chat_response"
-                    if isinstance(chat_response, dict)
-                    else "final_answer",
-                    interactions=chat_response.get("interactions")
-                    if isinstance(chat_response, dict)
-                    else None,
-                )
+                        else "final_answer",
+                        interactions=chat_response.get("interactions")
+                        if isinstance(chat_response, dict)
+                        else None,
+                    )
         finally:
             db_new.close()
 
         # Note: trace_task_completion is handled by the agent execution logic (e.g., dag_plan_execute.py)
+
+        if waiting_for_control:
+            await manager.broadcast_to_task(
+                create_stream_event(
+                    "task_info",
+                    task_id,
+                    {
+                        "id": task.id,
+                        "title": task.title,
+                        "description": task.description,
+                        "status": final_task_status,
+                        "execution_mode": task.execution_mode,
+                    },
+                    task.updated_at if task.updated_at else None,
+                ),
+                task_id,
+            )
+            logger.info(f"Background task {task_id} paused for v2 control")
+            return
 
         # Send task completion event (includes agent response info)
         await manager.broadcast_to_task(
@@ -610,11 +862,12 @@ async def execute_task_background(
                 "task": {
                     "id": task.id,
                     "title": task.title,
-                    "status": task.status.value,
+                    "status": final_task_status,
                     "description": task.description,
                 },
                 "result": ai_response,
                 "output": ai_response,
+                "file_outputs": normalized_outputs,
                 "success": result.get("success", False),
                 "chat_response": chat_response
                 if isinstance(chat_response, dict)
@@ -712,8 +965,11 @@ async def execute_continuation_background(
         try:
             task_updated = db_new.query(Task).filter(Task.id == task_id).first()
             if task_updated:
-                # If task current status is PAUSED, don't overwrite
-                if task_updated.status != TaskStatus.PAUSED:
+                # If task current status is PAUSED/WAITING_FOR_USER, don't overwrite
+                if task_updated.status not in {
+                    TaskStatus.PAUSED,
+                    TaskStatus.WAITING_FOR_USER,
+                }:
                     if result.get("success", False):
                         task_updated.status = TaskStatus.COMPLETED
                     else:
@@ -783,6 +1039,157 @@ async def execute_continuation_background(
         raise
     finally:
         # Clean up background task records
+        background_task_manager.cleanup_task(task_id)
+
+
+async def execute_v2_resume_background(
+    task_id: int,
+    agent_service: Any,
+    user: Any,
+    task: Any,
+    previous_task: Optional[asyncio.Task] = None,
+) -> None:
+    """Resume an agent_v2 execution after an interrupt/user-message checkpoint."""
+    from ..models.database import get_db
+    from ..models.task import Task, TaskStatus
+
+    lease_stop_event = None
+    lease_heartbeat_task = None
+    try:
+        if previous_task is not None and not previous_task.done():
+            try:
+                await previous_task
+            except Exception as e:
+                logger.warning(
+                    f"Previous v2 background task {task_id} ended before resume: {e}"
+                )
+
+        db_gen = get_db()
+        db_lease = next(db_gen)
+        lease = None
+        try:
+            lease = acquire_task_lease(db_lease, task_id)
+        finally:
+            db_lease.close()
+        if lease is None:
+            logger.info(
+                "Task %s resume skipped; another runner owns the lease", task_id
+            )
+            return
+        lease_stop_event = asyncio.Event()
+        lease_heartbeat_task = asyncio.create_task(
+            run_task_lease_heartbeat(lease, lease_stop_event)
+        )
+
+        user_id = int(user.id) if user else None
+        with UserContext(user_id):
+            result = await agent_service.resume_v2_execution(str(task_id))
+
+        if result is None:
+            logger.warning(f"No resumable v2 execution found for task {task_id}")
+            return
+
+        status = str(result.get("status") or "")
+        success = bool(result.get("success", False))
+        output = str(result.get("output") or result.get("error") or "")
+
+        db_gen = get_db()
+        db_normalize = next(db_gen)
+        try:
+            normalized_outputs, path_to_file_id = _normalize_file_outputs(
+                db_normalize,
+                task_id=int(task_id),
+                task_user_id=int(cast(Any, task.user_id)),
+                file_outputs=result.get("file_outputs", []),
+            )
+            if normalized_outputs:
+                result["file_outputs"] = normalized_outputs
+                output = _rewrite_file_links_to_file_id(output, path_to_file_id)
+        finally:
+            db_normalize.close()
+
+        db_gen = get_db()
+        db_new = next(db_gen)
+        try:
+            task_updated = db_new.query(Task).filter(Task.id == task_id).first()
+            if task_updated:
+                if status == "waiting_for_user":
+                    release_current_runner_task_lease(
+                        db_new, task_id, status=TaskStatus.WAITING_FOR_USER
+                    )
+                    db_new.refresh(task_updated)
+                elif status == "interrupted":
+                    release_current_runner_task_lease(
+                        db_new, task_id, status=TaskStatus.PAUSED
+                    )
+                    db_new.refresh(task_updated)
+                elif success:
+                    release_current_runner_task_lease(
+                        db_new, task_id, status=TaskStatus.COMPLETED
+                    )
+                    db_new.refresh(task_updated)
+                else:
+                    release_current_runner_task_lease(
+                        db_new, task_id, status=TaskStatus.FAILED
+                    )
+                    db_new.refresh(task_updated)
+                final_status = task_updated.status.value
+            else:
+                final_status = task.status.value
+        finally:
+            db_new.close()
+
+        if status in {"interrupted", "waiting_for_user"}:
+            await manager.broadcast_to_task(
+                create_stream_event(
+                    "task_info",
+                    task_id,
+                    {
+                        "id": task.id,
+                        "title": task.title,
+                        "description": task.description,
+                        "status": final_status,
+                        "execution_mode": task.execution_mode,
+                    },
+                ),
+                task_id,
+            )
+            return
+
+        await manager.broadcast_to_task(
+            {
+                "type": "task_completed",
+                "task": {
+                    "id": task.id,
+                    "title": task.title,
+                    "status": final_status,
+                    "description": task.description,
+                },
+                "result": output,
+                "output": output,
+                "file_outputs": normalized_outputs,
+                "success": success,
+                "metadata": result.get("metadata", {}),
+                "timestamp": datetime.now(timezone.utc).timestamp(),
+            },
+            task_id,
+        )
+    except asyncio.CancelledError:
+        logger.info(f"V2 resume background task {task_id} cancelled")
+        raise
+    except Exception as e:
+        logger.error(f"V2 resume background task {task_id} failed: {e}", exc_info=True)
+        await manager.broadcast_to_task(
+            {
+                "type": "task_error",
+                "task_id": task_id,
+                "error": str(e),
+                "timestamp": datetime.now(timezone.utc).timestamp(),
+            },
+            task_id,
+        )
+    finally:
+        await stop_task_lease_heartbeat(lease_heartbeat_task, lease_stop_event)
         background_task_manager.cleanup_task(task_id)
 
 
@@ -883,6 +1290,8 @@ class SharedWebSocketTracer(TraceHandler):
         def serialize_value(value: Any) -> Any:
             if hasattr(value, "model_dump"):
                 return serialize_value(value.model_dump())
+            elif callable(getattr(value, "to_dict", None)):
+                return serialize_value(value.to_dict())
             elif hasattr(value, "dict"):
                 return serialize_value(value.dict())
             elif isinstance(value, datetime):
@@ -1275,6 +1684,9 @@ async def handle_chat_message(
                             title=task_title,
                             description=user_message,
                             status=TaskStatus.PENDING,  # Use PENDING instead of RUNNING
+                            execution_mode=get_default_task_execution_mode(
+                                agent_runtime=get_agent_runtime()
+                            ),
                         )
                         db.add(task)
                         db.commit()
@@ -1359,6 +1771,7 @@ async def handle_chat_message(
                 # Handle file upload if files present
                 uploaded_file_paths = []
                 file_info_list = []
+                uploaded_files_context = ""
                 if files:
                     # Process file upload
                     upload_result = await handle_file_upload_for_task(
@@ -1395,6 +1808,10 @@ async def handle_chat_message(
                                         "agent-builder" in agent_record.skills
                                     )
 
+                        uploaded_files_context = _build_uploaded_files_context(
+                            file_info_list,
+                            is_agent_builder=is_agent_builder,
+                        )
                         file_prompt = (
                             "## UPLOADED FILES\n"
                             f"The user has uploaded {len(file_info_list)} file(s): {file_names}\n\n"
@@ -1424,21 +1841,30 @@ async def handle_chat_message(
                         else:
                             context["system_prompt"] = file_prompt
 
+                user_message_for_llm = _append_uploaded_files_context_to_message(
+                    user_message,
+                    uploaded_files_context,
+                )
+
                 # DAG plan-execute will automatically send user_message trace event
 
                 # Get agent service
                 agent_service = await get_agent_manager().get_agent_for_task(
                     task_id, db, user=user
                 )
+                if hasattr(agent_service, "set_outbound_message_handler"):
+                    agent_service.set_outbound_message_handler(
+                        make_agent_v2_outbound_handler(task_id)
+                    )
 
                 persisted_user_message = persist_user_message(
                     db,
                     task_id=task_id,
                     user_id=int(user.id),
-                    content=user_message,
+                    content=user_message_for_llm,
                 )
 
-                # Check if there's an old task running (PAUSED or RUNNING status)
+                # Check if there's an old task running (PAUSED, WAITING_FOR_USER, or RUNNING status)
                 # If so, use continuation mechanism; otherwise execute normally
                 dag_pattern = (
                     agent_service.get_dag_pattern()
@@ -1446,8 +1872,12 @@ async def handle_chat_message(
                     else None
                 )
 
-                # Only use continuation when task is running (PAUSED or RUNNING) and has old task
-                task_is_running = task.status in [TaskStatus.PAUSED, TaskStatus.RUNNING]
+                # Only use continuation when task is active and has old task
+                task_is_running = task.status in [
+                    TaskStatus.PAUSED,
+                    TaskStatus.WAITING_FOR_USER,
+                    TaskStatus.RUNNING,
+                ]
                 has_continuation = dag_pattern and hasattr(
                     dag_pattern, "request_continuation"
                 )
@@ -1475,12 +1905,22 @@ async def handle_chat_message(
                             trace_data,
                         )
 
-                    dag_pattern.request_continuation(user_message, context)
+                    dag_pattern.request_continuation(user_message_for_llm, context)
 
-                    # If previously PAUSED, update status to RUNNING
-                    if task.status == TaskStatus.PAUSED:
-                        task.status = TaskStatus.RUNNING
-                        db.commit()
+                    # If previously PAUSED/WAITING_FOR_USER, update status to RUNNING
+                    if task.status in {TaskStatus.PAUSED, TaskStatus.WAITING_FOR_USER}:
+                        if acquire_task_lease(db, task_id) is None:
+                            await manager.send_personal_message(
+                                {
+                                    "type": "error",
+                                    "message": (
+                                        "Task is already running on another worker"
+                                    ),
+                                },
+                                websocket,
+                            )
+                            return
+                        db.refresh(task)
 
                         (
                             model_id,
@@ -1521,8 +1961,63 @@ async def handle_chat_message(
 
                     # Continuation will be handled by old task, return directly
                     return
-                if not (task_is_running and has_continuation):
-                    # New task (PENDING/COMPLETED/FAILED) OR running non-DAG agent (new turn)
+                if (
+                    task_is_running
+                    and getattr(agent_service, "supports_v2_control", lambda: False)()
+                ):
+                    logger.info(f"Using agent_v2 message control for task {task_id}")
+                    posted = await agent_service.post_user_message(
+                        str(task_id),
+                        user_message_for_llm,
+                        request_interrupt=task.status == TaskStatus.RUNNING,
+                        reason="new websocket user message",
+                    )
+                    if not posted:
+                        logger.warning(
+                            f"agent_v2 execution {task_id} was not live; attempting resume from checkpoint"
+                        )
+
+                    previous_task = background_task_manager.running_tasks.get(task_id)
+                    if task.status in {TaskStatus.PAUSED, TaskStatus.WAITING_FOR_USER}:
+                        if acquire_task_lease(db, task_id) is None:
+                            await manager.send_personal_message(
+                                {
+                                    "type": "error",
+                                    "message": (
+                                        "Task is already running on another worker"
+                                    ),
+                                },
+                                websocket,
+                            )
+                            return
+                        db.refresh(task)
+                    bg_task = asyncio.create_task(
+                        execute_v2_resume_background(
+                            task_id=task_id,
+                            agent_service=agent_service,
+                            user=user,
+                            task=task,
+                            previous_task=previous_task,
+                        )
+                    )
+                    background_task_manager.register_task(task_id, bg_task)
+
+                    return
+                elif task_is_running and not has_continuation:
+                    # Task is running but doesn't support continuation (shouldn't happen)
+                    logger.error(
+                        f"Task {task_id} is running but does not support continuation"
+                    )
+                    await manager.send_personal_message(
+                        {
+                            "type": "error",
+                            "message": "Task does not support message continuation",
+                        },
+                        websocket,
+                    )
+                    return
+                else:
+                    # New task (PENDING/COMPLETED/FAILED), execute normally
                     logger.info(
                         f"Task {task_id} starting new execution turn (status: {task.status.value})"
                     )
@@ -1558,8 +2053,18 @@ async def handle_chat_message(
 
                     # Update task status to RUNNING
                     if task.status != TaskStatus.RUNNING:
-                        task.status = TaskStatus.RUNNING
-                        db.commit()
+                        if acquire_task_lease(db, task_id) is None:
+                            await manager.send_personal_message(
+                                {
+                                    "type": "error",
+                                    "message": (
+                                        "Task is already running on another worker"
+                                    ),
+                                },
+                                websocket,
+                            )
+                            return
+                        db.refresh(task)
                         logger.info(
                             f"Sending task_info event for existing task {task_id}, status: {task.status.value}"
                         )
@@ -1743,8 +2248,16 @@ async def handle_execute_task(
                 raise Exception(f"Task {task_id} not found or access denied")
 
             # Update task status to running
-            task.status = TaskStatus.RUNNING
-            db.commit()
+            if acquire_task_lease(db, task_id) is None:
+                await manager.send_personal_message(
+                    {
+                        "type": "error",
+                        "message": "Task is already running on another worker",
+                    },
+                    websocket,
+                )
+                return
+            db.refresh(task)
 
             (
                 model_id,
@@ -1793,6 +2306,10 @@ async def handle_execute_task(
             agent_service = await agent_manager.get_agent_for_task(
                 task_id, db, user=user
             )
+            if hasattr(agent_service, "set_outbound_message_handler"):
+                agent_service.set_outbound_message_handler(
+                    make_agent_v2_outbound_handler(task_id)
+                )
             recovery_state = await load_task_execution_recovery_state(db, task_id)
             agent_service.set_execution_context_messages(
                 recovery_state.get("messages", [])
@@ -1823,11 +2340,14 @@ async def handle_execute_task(
 
                 # Update task status
                 if result.get("success", False):
-                    task.status = TaskStatus.COMPLETED
+                    release_current_runner_task_lease(
+                        db, task_id, status=TaskStatus.COMPLETED
+                    )
                 else:
-                    task.status = TaskStatus.FAILED
-
-                db.commit()
+                    release_current_runner_task_lease(
+                        db, task_id, status=TaskStatus.FAILED
+                    )
+                db.refresh(task)
 
                 # Send task completion event (don't duplicate result as trace system already sent)
 
@@ -1906,8 +2426,9 @@ async def send_historical_data_as_stream(
     try:
         # Load historical data directly from database
         from ..models.agent import Agent
+        from ..models.chat_message import TaskChatMessage
         from ..models.database import get_db
-        from ..models.task import Task, TraceEvent
+        from ..models.task import Task, TaskStatus, TraceEvent
 
         db_gen = get_db()
         db = next(db_gen)
@@ -1931,6 +2452,9 @@ async def send_historical_data_as_stream(
                 )
                 return
 
+            if mark_task_paused_if_stale(db, task):
+                db.refresh(task)
+
             # Determine is_dag from agent config if agent_id exists
             is_dag = None
             if task.agent_id:
@@ -1944,6 +2468,12 @@ async def send_historical_data_as_stream(
                 visual_model_id,
                 compact_model_id,
             ) = _resolve_task_llm_ids(task, db)
+            waiting_question = None
+            waiting_interactions = None
+            if task.status == TaskStatus.WAITING_FOR_USER:
+                waiting_question, waiting_interactions = _get_latest_waiting_question(
+                    db, task_id
+                )
 
             # Send task basic info
             task_event = create_stream_event(
@@ -1965,6 +2495,8 @@ async def send_historical_data_as_stream(
                     "execution_mode": task.execution_mode,
                     "agent_id": task.agent_id,
                     "is_dag": is_dag,
+                    "waiting_question": waiting_question,
+                    "waiting_interactions": waiting_interactions,
                     "created_at": safe_timestamp_to_unix(task.created_at)
                     if task.created_at
                     else None,
@@ -1996,11 +2528,12 @@ async def send_historical_data_as_stream(
             # DAG step rebuild code removed, DAG plan-execute now directly sends trace events
 
             # Merge all time-sensitive events and sort by timestamp
-            historical_events = []
+            historical_events: list[dict[str, Any]] = []
 
             historical_path_to_file_id: Dict[str, str] = {}
             normalized_trace_data_by_event_id: Dict[str, Any] = {}
             task_user_id = int(cast(Any, task.user_id))
+            trace_message_keys: set[tuple[str, str]] = set()
 
             for trace_event in trace_events:
                 normalized_event_data = trace_event.data
@@ -2019,11 +2552,22 @@ async def send_historical_data_as_stream(
                 normalized_trace_data_by_event_id[str(trace_event.event_id)] = (
                     normalized_event_data
                 )
+                if isinstance(normalized_event_data, dict):
+                    content = normalized_event_data.get(
+                        "message"
+                    ) or normalized_event_data.get("content")
+                    if isinstance(content, str) and content.strip():
+                        if trace_event.event_type == "user_message":
+                            trace_message_keys.add(("user", content.strip()))
+                        elif trace_event.event_type == "agent_message":
+                            trace_message_keys.add(("assistant", content.strip()))
 
             for trace_event in trace_events:
                 normalized_event_data = normalized_trace_data_by_event_id.get(
                     str(trace_event.event_id), trace_event.data
                 )
+                if _is_agent_v2_checkpoint_data(normalized_event_data):
+                    continue
                 if historical_path_to_file_id and isinstance(
                     normalized_event_data, dict
                 ):
@@ -2047,13 +2591,65 @@ async def send_historical_data_as_stream(
                     }
                 )
 
+            chat_messages = (
+                db.query(TaskChatMessage)
+                .filter(TaskChatMessage.task_id == task_id)
+                .order_by(TaskChatMessage.created_at, TaskChatMessage.id)
+                .all()
+            )
+            for chat_message in chat_messages:
+                role = str(chat_message.role)
+                content = str(chat_message.content or "").strip()
+                if not content:
+                    continue
+                if (role, content) in trace_message_keys:
+                    continue
+
+                if role == "user":
+                    event_type = "user_message"
+                    data: dict[str, Any] = {"message": content, "content": content}
+                elif role == "assistant":
+                    interactions = chat_message.interactions
+                    data = {
+                        "message": content,
+                        "content": content,
+                        "role": "assistant",
+                        # Historical assistant questions are transcript entries.
+                        # The current WAITING_FOR_USER state is reasserted separately
+                        # after replay, so old questions must not flip status back.
+                        "expect_response": False,
+                    }
+                    if isinstance(interactions, list):
+                        data["metadata"] = {"interactions": interactions}
+                    event_type = "agent_message"
+                else:
+                    continue
+
+                historical_events.append(
+                    {
+                        "type": "trace_event",
+                        "data": {
+                            "event_id": f"chat_message_{chat_message.id}",
+                            "event_type": event_type,
+                            "step_id": None,
+                            "parent_event_id": None,
+                            "data": data,
+                        },
+                        "timestamp": chat_message.created_at,
+                    }
+                )
+
             # Sort historical events by timestamp
             min_datetime = datetime.min.replace(tzinfo=timezone.utc)
 
             def sort_key(x: dict[str, Any]) -> datetime:
                 timestamp = x["timestamp"]
                 if isinstance(timestamp, datetime):
+                    if timestamp.tzinfo is None:
+                        return timestamp.replace(tzinfo=timezone.utc)
                     return timestamp
+                if isinstance(timestamp, (int, float)):
+                    return datetime.fromtimestamp(timestamp, timezone.utc)
                 return min_datetime
 
             historical_events.sort(key=sort_key)
@@ -2128,6 +2724,40 @@ async def send_historical_data_as_stream(
                 },
             )
             await manager.send_personal_message(completion_event, websocket)
+
+            # Historical trace replay can end with an in-flight event from before a
+            # crash/restart, such as llm_call_start. Re-assert the current DB task
+            # state after replay so stale running trace events do not keep the UI in
+            # a running state.
+            if task.status in {TaskStatus.PAUSED, TaskStatus.WAITING_FOR_USER}:
+                event_type = (
+                    "task_waiting_for_user"
+                    if task.status == TaskStatus.WAITING_FOR_USER
+                    else "task_paused"
+                )
+                question_message = None
+                question_interactions = None
+                if task.status == TaskStatus.WAITING_FOR_USER:
+                    question_message, question_interactions = (
+                        _get_latest_waiting_question(db, task_id)
+                    )
+
+                message = (
+                    question_message or "Task waiting for user response"
+                    if task.status == TaskStatus.WAITING_FOR_USER
+                    else "Task paused"
+                )
+                status_event = {
+                    "type": event_type,
+                    "task_id": task_id,
+                    "message": message,
+                    "timestamp": datetime.now(timezone.utc).timestamp(),
+                }
+                if question_message:
+                    status_event["question"] = question_message
+                if isinstance(question_interactions, list):
+                    status_event["interactions"] = question_interactions
+                await manager.send_personal_message(status_event, websocket)
 
         except (ValueError, KeyError, TypeError) as e:
             # Data format error
@@ -2313,7 +2943,17 @@ async def handle_pause_task(
         # Check if agent supports pause functionality
         if hasattr(agent_service, "pause_execution"):
             logger.info("Agent supports pause_execution, calling it...")
-            await agent_service.pause_execution()
+            pause_result = await agent_service.pause_execution()
+            if pause_result is False:
+                await manager.send_personal_message(
+                    {
+                        "type": "error",
+                        "message": "No live execution found to pause",
+                    },
+                    websocket,
+                )
+                logger.warning(f"No live execution found to pause for task {task_id}")
+                return
             logger.info("Agent pause_execution completed")
 
             # Update task status in database
@@ -2332,7 +2972,10 @@ async def handle_pause_task(
                         .first()
                     )
                 if task:
-                    task.status = TaskStatus.PAUSED
+                    setattr(task, "status", TaskStatus.PAUSED)
+                    setattr(task, "runner_id", None)
+                    setattr(task, "lease_expires_at", None)
+                    setattr(task, "last_heartbeat_at", datetime.now(timezone.utc))
                     db_update.commit()
                     logger.info(f"Updated task {task_id} status to PAUSED in database")
                 else:
@@ -2402,39 +3045,81 @@ async def handle_resume_task(
         # Get agent service
         from .chat import get_agent_manager
 
-        agent_service = await get_agent_manager().get_agent_for_task(
-            task_id, db, user=user
-        )
+        try:
+            agent_service = await get_agent_manager().get_agent_for_task(
+                task_id, db, user=user
+            )
+        finally:
+            db.close()
+
+        from ..models.task import Task
+
+        task: Any | None = None
+        db_update_gen = get_db()
+        db_update = next(db_update_gen)
+        try:
+            if user.is_admin:
+                task = db_update.query(Task).filter(Task.id == task_id).first()
+            else:
+                task = (
+                    db_update.query(Task)
+                    .filter(Task.id == task_id, Task.user_id == user.id)
+                    .first()
+                )
+            if task:
+                lease = acquire_task_lease(db_update, task_id)
+                if lease is None:
+                    await manager.send_personal_message(
+                        {
+                            "type": "error",
+                            "message": "Task is already running on another worker",
+                        },
+                        websocket,
+                    )
+                    return
+                db_update.refresh(task)
+                logger.info(f"Updated task {task_id} status to RUNNING in database")
+            else:
+                logger.warning(
+                    f"Task {task_id} not found or access denied for user {user.id}"
+                )
+        finally:
+            db_update.close()
+
+        if task is None:
+            await manager.send_personal_message(
+                {"type": "error", "message": "Task not found or access denied"},
+                websocket,
+            )
+            return
+
+        if getattr(agent_service, "supports_v2_control", lambda: False)():
+            await manager.broadcast_to_task(
+                {
+                    "type": "task_resumed",
+                    "task_id": task_id,
+                    "message": "Task resumed",
+                    "timestamp": datetime.now(timezone.utc).timestamp(),
+                },
+                task_id,
+            )
+            previous_task = background_task_manager.running_tasks.get(task_id)
+            bg_task = asyncio.create_task(
+                execute_v2_resume_background(
+                    task_id=task_id,
+                    agent_service=agent_service,
+                    user=user,
+                    task=task,
+                    previous_task=previous_task,
+                )
+            )
+            background_task_manager.register_task(task_id, bg_task)
+            logger.info(f"Task {task_id} v2 resume scheduled")
+            return
 
         # Check if agent supports resume functionality
         if hasattr(agent_service, "resume_execution"):
             await agent_service.resume_execution()
-
-            # Update task status in database
-            from ..models.task import Task, TaskStatus
-
-            db_gen = get_db()
-            db_update = next(db_gen)
-            try:
-                # Admin can resume any task, regular users can only resume their own tasks
-                if user.is_admin:
-                    task = db_update.query(Task).filter(Task.id == task_id).first()
-                else:
-                    task = (
-                        db_update.query(Task)
-                        .filter(Task.id == task_id, Task.user_id == user.id)
-                        .first()
-                    )
-                if task:
-                    task.status = TaskStatus.RUNNING
-                    db_update.commit()
-                    logger.info(f"Updated task {task_id} status to RUNNING in database")
-                else:
-                    logger.warning(
-                        f"Task {task_id} not found or access denied for user {user.id}"
-                    )
-            finally:
-                db.close()
 
             # Send resume confirmation
             await manager.broadcast_to_task(
@@ -3300,11 +3985,8 @@ async def handle_build_preview_execution(
                     f"Preview is for published agent {preview_agent.id} ({preview_agent.name}), will exclude from agent tools"
                 )
 
-        # Determine execution mode and map to pattern
-        # flash -> single_call (quick tasks)
-        # balanced -> react (everyday tasks)
-        # think -> dag_plan_execute (complex tasks)
-        pattern = EXECUTION_MODE_TO_PATTERN.get(execution_mode, "react")
+        # Determine execution mode and map to pattern.
+        pattern = get_agent_pattern_for_execution_mode(execution_mode)
 
         # Build allowed external directories
         allowed_external_dirs = []

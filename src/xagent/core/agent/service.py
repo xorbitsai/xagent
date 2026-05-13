@@ -3,9 +3,9 @@
 import asyncio
 import logging
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional, cast
 
-from ...config import get_uploads_dir
+from ...config import get_agent_runtime, get_uploads_dir
 from ..memory import MemoryStore
 from ..memory.in_memory import InMemoryMemoryStore
 from ..model.chat.basic.base import BaseLLM
@@ -16,6 +16,7 @@ from .pattern import AgentPattern
 from .pattern.dag_plan_execute import DAGPlanExecutePattern
 from .pattern.dag_plan_execute.models import ExecutionPhase
 from .trace import Tracer
+from .transcript import normalize_transcript_messages
 
 logger = logging.getLogger(__name__)
 
@@ -35,7 +36,7 @@ class AgentService:
         llm: Optional[BaseLLM] = None,
         use_dag_pattern: bool | object = _UNSET,  # Deprecated: Use pattern instead
         pattern: str
-        | AgentPattern = "dag_plan_execute",  # New: "single_call", "react", "dag_plan_execute"
+        | AgentPattern = "dag_plan_execute",  # New: "single_call", "react", "dag_plan_execute", "auto"
         tracer: Optional[Tracer] = None,
         id: Optional[str] = None,
         workspace: Optional[TaskWorkspace] = None,
@@ -50,6 +51,7 @@ class AgentService:
         tool_config: Optional[Any] = None,
         agent_type: str = "standard",
         system_prompt: Optional[str] = None,
+        agent_runtime: Optional[str] = None,
         **agent_kwargs: Any,
     ) -> None:
         """Initialize AgentService with configurable components.
@@ -61,7 +63,7 @@ class AgentService:
             tools: Available tools for agent execution (optional, can be combined with tool_config)
             llm: Language model for agent execution (required for DAG pattern)
             use_dag_pattern: Deprecated: Whether to use the DAG plan-execute pattern (use pattern instead)
-            pattern: Agent pattern to use: "single_call", "react", or "dag_plan_execute"
+            pattern: Agent pattern to use: "single_call", "react", "dag_plan_execute", or "auto"
             tracer: Tracer instance for event tracking
             id: Agent identifier for workspace management
             workspace: Pre-existing workspace to bind to
@@ -82,13 +84,24 @@ class AgentService:
         self.fast_llm = fast_llm
         self.vision_llm = vision_llm
         self.compact_llm = compact_llm
+        self.system_prompt = system_prompt
+        self.agent_runtime = (agent_runtime or get_agent_runtime()).strip().lower()
 
         # Debug logging for LLM configuration
         logger = logging.getLogger(__name__)
         logger.info(
-            f"AgentService initialized with llm={llm.model_name if llm else None}, compact_llm={compact_llm.model_name if compact_llm else None}"
+            "AgentService runtime selected: name=%s, agent_runtime=%s, pattern=%s, "
+            "llm=%s, compact_llm=%s",
+            name,
+            self.agent_runtime,
+            pattern,
+            llm.model_name if llm else None,
+            compact_llm.model_name if compact_llm else None,
         )
         self.memory_similarity_threshold = memory_similarity_threshold
+        self.allowed_skills = self._get_allowed_skills_from_config(tool_config)
+        if self.allowed_skills:
+            logger.info(f"Allowed skills configured: {self.allowed_skills}")
 
         # Handle backward compatibility: if use_dag_pattern is explicitly set, override pattern
         if use_dag_pattern is _UNSET:
@@ -150,18 +163,12 @@ class AgentService:
         # Auto-create default tool config if neither tools nor tool_config provided
         if not self.tools and not self.tool_config:
             self.tool_config = self._create_default_tool_config()
+            self.allowed_skills = self._get_allowed_skills_from_config(self.tool_config)
 
         # Set up patterns
         if patterns:
             self.patterns = patterns
         elif llm:
-            # Get allowed_skills from tool_config if available
-            allowed_skills = None
-            if tool_config and hasattr(tool_config, "get_allowed_skills"):
-                allowed_skills = tool_config.get_allowed_skills()
-                if allowed_skills:
-                    logger.info(f"Allowed skills configured: {allowed_skills}")
-
             # Create pattern based on pattern parameter
             if self.pattern == "single_call":
                 # Create SingleCall pattern for flash mode
@@ -195,7 +202,7 @@ class AgentService:
                     workspace=self.workspace if self.enable_workspace else None,
                     task_id=task_id,
                     memory_store=self.memory,
-                    allowed_skills=allowed_skills,
+                    allowed_skills=self.allowed_skills,
                 )
 
                 if self.fast_llm:
@@ -238,6 +245,11 @@ class AgentService:
 
         # Task continuation tracking
         self._current_task_id: Optional[str] = None
+        self._v2_adapter: Optional[Any] = None
+        self._outbound_message_handler: Optional[Callable[[Dict[str, Any]], Any]] = None
+        self._conversation_history: List[Dict[str, Any]] = []
+        self._execution_context_messages: List[Dict[str, str]] = []
+        self._recovered_skill_context: Optional[str] = None
         # Set current task_id if provided
         if task_id:
             self._current_task_id = str(
@@ -309,6 +321,9 @@ class AgentService:
 
         # Ensure tools are initialized before execution
         await self._ensure_tools_initialized()
+
+        if self.agent_runtime == "v2":
+            return await self._execute_v2_task(task, context, task_id)
 
         # Check if agent has any patterns to execute
         if not self.patterns:
@@ -493,11 +508,31 @@ class AgentService:
                 },
             }
 
-    async def pause_execution(self) -> None:
+    async def pause_execution(self) -> bool:
         """Pause the currently executing task."""
         if self._is_paused:
             logger.warning(f"Agent '{self.name}' is already paused")
-            return
+            return True
+
+        if self.supports_v2_control():
+            execution_id = self._current_task_id or self.id
+            paused = self.pause_v2_execution(
+                str(execution_id), reason="paused by websocket"
+            )
+            if paused:
+                self._is_paused = True
+                logger.info(
+                    "Agent '%s' v2 execution %s pause requested",
+                    self.name,
+                    execution_id,
+                )
+                return True
+            logger.warning(
+                "Agent '%s' could not find live v2 execution %s to pause",
+                self.name,
+                execution_id,
+            )
+            return False
 
         # Set pause state
         self._is_paused = True
@@ -517,6 +552,7 @@ class AgentService:
                     logger.error(
                         f"Failed to pause pattern {pattern.__class__.__name__}: {e}"
                     )
+        return True
 
     async def resume_execution(self) -> None:
         """Resume paused task execution."""
@@ -569,6 +605,73 @@ class AgentService:
             logger.warning("No DAG pattern found to handle WebSocket input")
             return False
 
+    def set_outbound_message_handler(
+        self,
+        handler: Optional[Callable[[Dict[str, Any]], Any]],
+    ) -> None:
+        """Set an agent-to-user message handler for agent_v2 executions."""
+        self._outbound_message_handler = handler
+        if self._v2_adapter is not None:
+            self._v2_adapter.config.outbound_message_handler = handler
+
+    def supports_v2_control(self) -> bool:
+        return self.agent_runtime == "v2"
+
+    async def post_user_message(
+        self,
+        execution_id: str,
+        message: str,
+        *,
+        request_interrupt: bool = True,
+        reason: Optional[str] = None,
+    ) -> bool:
+        if self._v2_adapter is None:
+            self._v2_adapter = self._build_v2_adapter()
+        return bool(
+            await self._v2_adapter.post_user_message(
+                execution_id,
+                message,
+                request_interrupt=request_interrupt,
+                reason=reason,
+            )
+        )
+
+    async def resume_v2_execution(
+        self,
+        execution_id: str,
+        **kwargs: Any,
+    ) -> Optional[Dict[str, Any]]:
+        self._is_paused = False
+        if self._pause_event:
+            self._pause_event.set()
+            self._pause_event = None
+        await self._ensure_tools_initialized()
+        if self._v2_adapter is None:
+            self._v2_adapter = self._build_v2_adapter()
+        else:
+            self._v2_adapter.config.tools = self.tools
+        return cast(
+            Optional[Dict[str, Any]],
+            await self._v2_adapter.resume(execution_id, **kwargs),
+        )
+
+    def pause_v2_execution(
+        self,
+        execution_id: str,
+        reason: Optional[str] = None,
+    ) -> bool:
+        if self._v2_adapter is None:
+            return False
+        return bool(self._v2_adapter.pause(execution_id, reason=reason))
+
+    def get_v2_execution_status(
+        self,
+        execution_id: str,
+    ) -> Optional[Dict[str, Any]]:
+        if self._v2_adapter is None:
+            return None
+        return cast(Optional[Dict[str, Any]], self._v2_adapter.get_status(execution_id))
+
     def add_pattern(self, pattern: AgentPattern) -> None:
         """Add a new pattern to the agent.
 
@@ -599,6 +702,7 @@ class AgentService:
         """
         status = {
             "name": self.name,
+            "agent_runtime": self.agent_runtime,
             "patterns_count": len(self.patterns),
             "tools_count": len(self.tools),
             "memory_type": self.memory.__class__.__name__,
@@ -633,18 +737,29 @@ class AgentService:
 
     def set_conversation_history(self, messages: List[Dict[str, Any]]) -> None:
         """Load a persisted transcript into patterns that support top-level chat history."""
+        self._conversation_history = list(messages)
+        if self._v2_adapter is not None:
+            self._v2_adapter.config.conversation_history = self._conversation_history
         for pattern in self.patterns:
             if hasattr(pattern, "set_conversation_history"):
                 pattern.set_conversation_history(messages)
 
     def set_execution_context_messages(self, messages: List[Dict[str, Any]]) -> None:
         """Load persisted execution-state context into patterns that support it."""
+        self._execution_context_messages = normalize_transcript_messages(messages)
+        if self._v2_adapter is not None:
+            self._v2_adapter.config.execution_context_messages = (
+                self._execution_context_messages
+            )
         for pattern in self.patterns:
             if hasattr(pattern, "set_execution_context_messages"):
                 pattern.set_execution_context_messages(messages)
 
     def set_recovered_skill_context(self, skill_context: Optional[str]) -> None:
         """Load recovered skill context into patterns that support it."""
+        self._recovered_skill_context = skill_context
+        if self._v2_adapter is not None:
+            self._v2_adapter.config.recovered_skill_context = skill_context
         for pattern in self.patterns:
             if hasattr(pattern, "set_recovered_skill_context"):
                 pattern.set_recovered_skill_context(skill_context)
@@ -764,6 +879,90 @@ class AgentService:
         # Keep task_id for continuation even if execution fails
         # This allows retrying or continuing failed tasks
         return result
+
+    async def _execute_v2_task(
+        self,
+        task: str,
+        context: Optional[Dict[str, Any]] = None,
+        task_id: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Execute a task through the agent_v2 runtime behind the runtime switch."""
+        if task_id:
+            self._current_task_id = str(task_id)
+        elif self._current_task_id is None:
+            self._current_task_id = self.id
+
+        if self._v2_adapter is None:
+            self._v2_adapter = self._build_v2_adapter()
+        else:
+            self._v2_adapter.config.current_task_id = self._current_task_id
+            self._v2_adapter.config.tools = self.tools
+            self._v2_adapter.config.llm = self.llm
+            self._v2_adapter.config.pattern = str(self.pattern)
+            self._v2_adapter.config.outbound_message_handler = (
+                self._outbound_message_handler
+            )
+            self._v2_adapter.config.conversation_history = self._conversation_history
+            self._v2_adapter.config.execution_context_messages = (
+                self._execution_context_messages
+            )
+            self._v2_adapter.config.recovered_skill_context = (
+                self._recovered_skill_context
+            )
+
+        return cast(
+            Dict[str, Any],
+            await self._v2_adapter.execute(
+                task=task,
+                context=context,
+                task_id=task_id,
+            ),
+        )
+
+    def _build_v2_adapter(self) -> Any:
+        from ..agent_runtime import AgentV2ExecutionAdapter, AgentV2ExecutionConfig
+        from ..agent_v2 import TraceCheckpointStore
+
+        checkpoint_reader_available = any(
+            callable(getattr(handler, "load_latest_checkpoint", None))
+            for handler in getattr(self.tracer, "handlers", [])
+        )
+        tracer = (
+            TraceCheckpointStore(
+                self.tracer,
+                require_persisted=checkpoint_reader_available,
+            )
+            if self.tracer is not None
+            else None
+        )
+        return AgentV2ExecutionAdapter(
+            AgentV2ExecutionConfig(
+                name=self.name,
+                tools=self.tools,
+                llm=self.llm,
+                pattern=str(self.pattern),
+                tracer=tracer,
+                system_prompt=self.system_prompt,
+                workspace_base_dir=self.workspace_base_dir,
+                allowed_external_dirs=self.allowed_external_dirs,
+                current_task_id=self._current_task_id,
+                service_id=self.id,
+                outbound_message_handler=self._outbound_message_handler,
+                conversation_history=self._conversation_history,
+                execution_context_messages=self._execution_context_messages,
+                recovered_skill_context=self._recovered_skill_context,
+                memory_store=self.memory,
+                memory_similarity_threshold=self.memory_similarity_threshold,
+                allowed_skills=self.allowed_skills,
+            )
+        )
+
+    def _get_allowed_skills_from_config(
+        self, tool_config: Optional[Any]
+    ) -> Optional[List[str]]:
+        if tool_config and hasattr(tool_config, "get_allowed_skills"):
+            return cast(Optional[List[str]], tool_config.get_allowed_skills())
+        return None
 
     def get_workspace_files(self) -> Dict[str, Any]:
         """Get all files in the workspace."""

@@ -565,3 +565,45 @@ class TestGeminiLLMSDK:
             await llm.chat(messages)
 
         print("✅ 500 server error correctly caught as retryable")
+
+    @pytest.mark.asyncio
+    async def test_504_deadline_exceeded_error_is_retryable(
+        self, llm: GeminiLLM, mocker: pytest_mock.MockerFixture
+    ) -> None:
+        """Test that Gemini DEADLINE_EXCEEDED errors are retryable."""
+        from google.genai import errors as genai_errors
+
+        from xagent.core.model.chat.exceptions import LLMRetryableError
+
+        mock_response = mocker.MagicMock()
+        mock_response.status_code = 504
+        mock_response.json.return_value = {
+            "error": {
+                "code": 504,
+                "message": "Deadline expired before operation could complete.",
+                "status": "DEADLINE_EXCEEDED",
+            }
+        }
+
+        mock_client = mocker.MagicMock()
+
+        async def mock_generate_content_error(*args, **kwargs):
+            raise genai_errors.ClientError(
+                code=504,
+                response_json={
+                    "error": {
+                        "code": 504,
+                        "message": "Deadline expired before operation could complete.",
+                        "status": "DEADLINE_EXCEEDED",
+                    }
+                },
+                response=mock_response,
+            )
+
+        mock_client.aio.models.generate_content = mock_generate_content_error
+        mocker.patch("google.genai.Client", return_value=mock_client)
+
+        messages = [{"role": "user", "content": "Test"}]
+
+        with pytest.raises(LLMRetryableError, match="code=504"):
+            await llm.chat(messages)

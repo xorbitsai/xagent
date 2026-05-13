@@ -22,6 +22,7 @@ from __future__ import annotations
 import logging
 import os
 from pathlib import Path
+from typing import Literal
 
 logger = logging.getLogger(__name__)
 
@@ -30,6 +31,9 @@ UPLOADS_DIR = "XAGENT_UPLOADS_DIR"
 WEB_DIR = "XAGENT_WEB_DIR"
 EXTERNAL_UPLOAD_DIRS = "XAGENT_EXTERNAL_UPLOAD_DIRS"
 EXTERNAL_SKILLS_LIBRARY_DIRS = "XAGENT_EXTERNAL_SKILLS_LIBRARY_DIRS"
+AGENT_RUNTIME = "XAGENT_AGENT_RUNTIME"
+TASK_LEASE_TTL_SECONDS = "XAGENT_TASK_LEASE_TTL_SECONDS"
+TASK_LEASE_HEARTBEAT_SECONDS = "XAGENT_TASK_LEASE_HEARTBEAT_SECONDS"
 STORAGE_ROOT = "XAGENT_STORAGE_ROOT"
 MAX_UPLOAD_SIZE = "XAGENT_MAX_UPLOAD_SIZE"
 SANDBOX_IMAGE = "SANDBOX_IMAGE"
@@ -47,6 +51,125 @@ TOOL_MAX_RECURSION_DEPTH = "XAGENT_TOOL_MAX_RECURSION_DEPTH"
 TOOL_MAX_FIELD_COUNT = "XAGENT_TOOL_MAX_FIELD_COUNT"
 
 WEB_SEARCH_PROVIDERS = {"auto", "google", "tavily", "exa", "zhipu"}
+
+
+def get_agent_runtime() -> Literal["v1", "v2"]:
+    """Get the agent execution runtime version.
+
+    Priority:
+        1. XAGENT_AGENT_RUNTIME environment variable
+        2. "v1" default for compatibility
+
+    Returns:
+        "v1" or "v2"
+    """
+    runtime = os.getenv(AGENT_RUNTIME, "v1").strip().lower()
+    if runtime == "v1":
+        return "v1"
+    if runtime == "v2":
+        return "v2"
+    logger.warning("Invalid %s=%r; falling back to v1", AGENT_RUNTIME, runtime)
+    return "v1"
+
+
+def get_agent_pattern_for_execution_mode(execution_mode: str | None) -> str:
+    """Map UI execution mode to agent pattern name.
+
+    Supported modes:
+        flash: strict single call
+        balanced: ReAct
+        think: DAG plan-execute
+        auto: LLM-selected final answer / ReAct / DAG
+    """
+    mode = (execution_mode or "").strip().lower()
+    mapping = {
+        "flash": "single_call",
+        "balanced": "react",
+        "think": "dag_plan_execute",
+        "auto": "auto",
+    }
+    return mapping.get(mode, "react")
+
+
+def get_default_task_execution_mode(
+    *,
+    agent_id: object | None = None,
+    agent_runtime: str | None = None,
+) -> str:
+    """Get the default UI execution mode for a newly-created task.
+
+    Standalone v2 tasks default to auto so simple prompts can answer directly
+    while complex prompts can still route into ReAct or DAG. v1 keeps the legacy
+    standalone DAG default for compatibility. Agent Builder tasks keep balanced
+    in both runtimes because the agent's explicit tool/KB setup is usually
+    better served by ReAct.
+    """
+    if agent_id is not None:
+        return "balanced"
+
+    runtime = (agent_runtime or get_agent_runtime()).strip().lower()
+    if runtime == "v2":
+        return "auto"
+    return "think"
+
+
+def get_task_lease_ttl_seconds() -> int:
+    """Get task execution lease TTL in seconds.
+
+    Priority:
+        1. XAGENT_TASK_LEASE_TTL_SECONDS environment variable
+        2. 60 seconds
+    """
+    value = os.getenv(TASK_LEASE_TTL_SECONDS, "60")
+    try:
+        seconds = int(value)
+    except ValueError:
+        logger.warning(
+            "Invalid %s=%r; falling back to 60",
+            TASK_LEASE_TTL_SECONDS,
+            value,
+        )
+        return 60
+    if seconds < 10:
+        logger.warning(
+            "%s=%r is too small; falling back to 60",
+            TASK_LEASE_TTL_SECONDS,
+            value,
+        )
+        return 60
+    return seconds
+
+
+def get_task_lease_heartbeat_seconds() -> int:
+    """Get task execution lease heartbeat interval in seconds.
+
+    Priority:
+        1. XAGENT_TASK_LEASE_HEARTBEAT_SECONDS environment variable
+        2. One third of the lease TTL, at least 5 seconds
+    """
+    default = max(5, get_task_lease_ttl_seconds() // 3)
+    value = os.getenv(TASK_LEASE_HEARTBEAT_SECONDS)
+    if value is None:
+        return default
+    try:
+        seconds = int(value)
+    except ValueError:
+        logger.warning(
+            "Invalid %s=%r; falling back to %s",
+            TASK_LEASE_HEARTBEAT_SECONDS,
+            value,
+            default,
+        )
+        return default
+    if seconds < 1:
+        logger.warning(
+            "%s=%r is too small; falling back to %s",
+            TASK_LEASE_HEARTBEAT_SECONDS,
+            value,
+            default,
+        )
+        return default
+    return min(seconds, max(1, get_task_lease_ttl_seconds() - 1))
 
 
 def get_web_dir() -> Path:

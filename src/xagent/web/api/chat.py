@@ -9,7 +9,13 @@ from typing import Any, Dict, List, Optional, cast
 from fastapi import APIRouter, Depends, HTTPException, Request
 from sqlalchemy.orm import Session
 
-from ...config import get_external_upload_dirs, get_uploads_dir
+from ...config import (
+    get_agent_pattern_for_execution_mode,
+    get_agent_runtime,
+    get_default_task_execution_mode,
+    get_external_upload_dirs,
+    get_uploads_dir,
+)
 from ...core.agent.service import AgentService
 from ...core.agent.trace import Tracer
 from ...core.model.chat.basic.base import BaseLLM
@@ -31,6 +37,13 @@ from ..services.model_service import _get_visible_user_ids
 from ..services.task_execution_context_service import (
     load_task_execution_recovery_state,
 )
+from ..services.task_lease_service import (
+    acquire_task_lease,
+    mark_task_paused_if_stale,
+    release_task_lease,
+    run_task_lease_heartbeat,
+    stop_task_lease_heartbeat,
+)
 from ..tools.config import WebToolConfig
 from ..tracing import create_task_tracer
 from ..user_isolated_memory import UserContext
@@ -38,16 +51,35 @@ from ..utils.db_timezone import format_datetime_for_api, safe_timestamp_to_unix
 
 logger = logging.getLogger(__name__)
 
-# Execution mode to pattern mapping
-# flash -> single_call, balanced -> react, think -> dag_plan_execute
-EXECUTION_MODE_TO_PATTERN = {
-    "flash": "single_call",
-    "balanced": "react",
-    "think": "dag_plan_execute",
-}
-
 # Create router
 chat_router = APIRouter(prefix="/api/chat", tags=["chat"])
+
+
+def _get_latest_waiting_question(
+    db: Session, task_id: int
+) -> tuple[Optional[str], Optional[list[dict[str, Any]]]]:
+    """Return the latest persisted ask_user_question prompt for a waiting task."""
+
+    from ..models.chat_message import TaskChatMessage
+
+    latest_question = (
+        db.query(TaskChatMessage)
+        .filter(
+            TaskChatMessage.task_id == task_id,
+            TaskChatMessage.role == "assistant",
+            TaskChatMessage.message_type == "question",
+        )
+        .order_by(TaskChatMessage.id.desc())
+        .first()
+    )
+    if not latest_question:
+        return None, None
+
+    interactions = latest_question.interactions
+    return (
+        str(latest_question.content),
+        interactions if isinstance(interactions, list) else None,
+    )
 
 
 def create_default_llm() -> Optional[BaseLLM]:
@@ -477,6 +509,120 @@ class AgentServiceManager:
             "tool_categories": agent.tool_categories or [],
         }
 
+    async def _build_tools_for_task(
+        self,
+        *,
+        task_id: int,
+        task: Task,
+        db: Session,
+        user: User,
+        agent_config: Optional[dict],
+        task_llm: Optional[BaseLLM],
+        task_vision_llm: Optional[BaseLLM],
+    ) -> tuple[list[Any], Any]:
+        """Build the tool set configured for a web task."""
+        excluded_agent_id = None
+        if task.agent_id:
+            from ..models.agent import AgentStatus
+
+            current_agent = db.query(Agent).filter(Agent.id == task.agent_id).first()
+            if current_agent and current_agent.status == AgentStatus.PUBLISHED:
+                excluded_agent_id = int(current_agent.id)
+                logger.info(
+                    f"Task {task_id} is associated with published agent "
+                    f"{current_agent.id} ({current_agent.name}), will exclude from "
+                    "agent tools"
+                )
+
+        allowed_tools = None
+        if agent_config and "tool_categories" in agent_config:
+            tool_categories = agent_config["tool_categories"]
+
+            from ...core.tools.adapters.vibe.factory import ToolFactory
+
+            temp_config = WebToolConfig(
+                db=db,
+                request=self.request,
+                llm=task_llm,
+                user_id=int(user.id),
+                is_admin=bool(user.is_admin),
+                workspace_config=None,
+                include_mcp_tools=True,
+                task_id=None,
+                browser_tools_enabled=True,
+                allowed_collections=agent_config.get("knowledge_bases"),
+                allowed_skills=agent_config.get("skills"),
+            )
+            all_tools = await ToolFactory.create_all_tools(temp_config)
+            allowed_tools = []
+
+            for tool in all_tools:
+                if not (
+                    hasattr(tool, "metadata") and hasattr(tool.metadata, "category")
+                ):
+                    continue
+
+                category = str(tool.metadata.category.value)
+                tool_name = getattr(tool, "name", None)
+                if not tool_name:
+                    continue
+
+                if category in tool_categories:
+                    allowed_tools.append(tool_name)
+                    continue
+
+                if category == "mcp":
+                    for tool_category in tool_categories:
+                        if not tool_category.startswith("mcp:"):
+                            continue
+                        server_name = (
+                            tool_category.split(":", 1)[1]
+                            .replace(" ", "_")
+                            .replace("-", "_")
+                        )
+                        if tool_name.lower().startswith(f"mcp_{server_name.lower()}_"):
+                            allowed_tools.append(tool_name)
+                            break
+
+            logger.info(
+                f"Tool categories {tool_categories} mapped to "
+                f"{len(allowed_tools)} tools for task {task_id}"
+            )
+
+        user_id = int(user.id)
+        sandbox = self._sandboxes.get(user_id)
+        if sandbox is None:
+            from ..sandbox_manager import get_sandbox_manager
+
+            sandbox_mgr = get_sandbox_manager()
+            if sandbox_mgr:
+                try:
+                    sandbox = await sandbox_mgr.get_or_create_sandbox(
+                        "user", str(user_id)
+                    )
+                    self._sandboxes[user_id] = sandbox
+                except Exception as e:
+                    logger.warning(
+                        f"Sandbox creation failed for user {user_id}, "
+                        f"falling back to local execution: {e}"
+                    )
+
+        return await create_default_tools(
+            db,
+            request=self.request,
+            user=user,
+            task_id=f"web_task_{task_id}",
+            allowed_collections=agent_config["knowledge_bases"]
+            if agent_config
+            else None,
+            allowed_skills=agent_config["skills"] if agent_config else None,
+            allowed_tools=allowed_tools,
+            excluded_agent_id=excluded_agent_id,
+            vision_model=task_vision_llm,
+            sandbox=sandbox,
+            llm=task_llm,
+        )
+
     async def get_agent_for_task(
         self,
         task_id: int,
@@ -523,6 +669,7 @@ class AgentServiceManager:
                 should_reconstruct = task is not None and task.status in [
                     TaskStatus.RUNNING,
                     TaskStatus.PAUSED,
+                    TaskStatus.WAITING_FOR_USER,
                 ]
                 # Task exists in database, try to reconstruct from history only for active executions
                 if db is not None and should_reconstruct:
@@ -582,12 +729,15 @@ class AgentServiceManager:
                             f"❌ Task {task.id} is not Text2SQL, using standard agent creation"
                         )
 
-                    # Get task's execution_mode and map to pattern
-                    task_execution_mode = (
-                        getattr(task, "execution_mode", None) or "think"
-                    )
-                    task_pattern = EXECUTION_MODE_TO_PATTERN.get(
-                        task_execution_mode, "dag_plan_execute"
+                    # Get task's execution_mode and map to pattern.
+                    task_execution_mode = getattr(task, "execution_mode", None)
+                    if not task_execution_mode:
+                        task_execution_mode = get_default_task_execution_mode(
+                            agent_id=getattr(task, "agent_id", None),
+                            agent_runtime=get_agent_runtime(),
+                        )
+                    task_pattern = get_agent_pattern_for_execution_mode(
+                        task_execution_mode
                     )
                     logger.info(
                         f"Task {task_id} execution_mode={task_execution_mode} -> pattern={task_pattern}"
@@ -623,13 +773,12 @@ class AgentServiceManager:
                                 task_vision_llm,
                                 task_compact_llm,
                             ) = agent_config["llms"]
-                            # Agent Builder execution_mode overrides task pattern
-                            # "flash" -> single_call, "balanced" -> react, "think" -> dag_plan_execute
+                            # Agent Builder execution_mode overrides task pattern.
                             agent_execution_mode = agent_config.get(
                                 "execution_mode", "balanced"
                             )
-                            task_pattern = EXECUTION_MODE_TO_PATTERN.get(
-                                agent_execution_mode, "react"
+                            task_pattern = get_agent_pattern_for_execution_mode(
+                                agent_execution_mode
                             )
                             logger.info(
                                 f"Task {task_id} using Agent Builder execution mode: {agent.execution_mode} -> pattern={task_pattern}"
@@ -1040,7 +1189,22 @@ class AgentServiceManager:
         # Initialize tracker if db_session and task_id are provided
         tracker = None
         tracker_task_id = tracking_task_id or task_id
+        lease = None
+        lease_stop_event = None
+        lease_heartbeat_task = None
+        result: Dict[str, Any] | None = None
         if db_session and tracker_task_id:
+            lease = acquire_task_lease(db_session, int(tracker_task_id))
+            if lease is None:
+                return {
+                    "success": False,
+                    "status": "running_elsewhere",
+                    "error": "Task is already running on another worker.",
+                }
+            lease_stop_event = asyncio.Event()
+            lease_heartbeat_task = asyncio.create_task(
+                run_task_lease_heartbeat(lease, lease_stop_event)
+            )
             try:
                 from ..tracking.task_tracker import TaskTracker
 
@@ -1076,6 +1240,18 @@ class AgentServiceManager:
 
             return result
         finally:
+            await stop_task_lease_heartbeat(lease_heartbeat_task, lease_stop_event)
+            if db_session and lease and result is not None:
+                status = str(result.get("status") or "")
+                if status == "waiting_for_user":
+                    final_status = TaskStatus.WAITING_FOR_USER
+                elif status == "interrupted":
+                    final_status = TaskStatus.PAUSED
+                elif result.get("success", False):
+                    final_status = TaskStatus.COMPLETED
+                else:
+                    final_status = TaskStatus.FAILED
+                release_task_lease(db_session, lease, status=final_status)
             # Complete tracking if it was started
             if tracker:
                 try:
@@ -1364,6 +1540,25 @@ class AgentServiceManager:
                 try:
                     task = db.query(Task).filter(Task.id == task_id).first()
                     if task:
+                        user = (
+                            db.query(User).filter(User.id == task.user_id).first()
+                            if task.user_id
+                            else None
+                        )
+                        if user is None:
+                            raise ValueError(
+                                "User context is required for agent reconstruction"
+                            )
+
+                        task_execution_mode = getattr(task, "execution_mode", None)
+                        if not task_execution_mode:
+                            task_execution_mode = get_default_task_execution_mode(
+                                agent_id=getattr(task, "agent_id", None),
+                                agent_runtime=get_agent_runtime(),
+                            )
+                        task_pattern = get_agent_pattern_for_execution_mode(
+                            task_execution_mode
+                        )
                         llm_ids = self._get_task_llm_ids(task, db)
                         # Use user_id for model resolution if available
                         user_id_for_resolution = (
@@ -1373,21 +1568,54 @@ class AgentServiceManager:
                             resolve_llms_from_names(llm_ids, db, user_id_for_resolution)
                         )
 
+                        agent_config = None
+                        if task.agent_id:
+                            agent = (
+                                db.query(Agent)
+                                .filter(Agent.id == task.agent_id)
+                                .first()
+                            )
+                            if agent:
+                                agent_config = self._load_agent_builder_config(
+                                    agent, db, int(user.id)
+                                )
+                                (
+                                    task_llm,
+                                    task_fast_llm,
+                                    task_vision_llm,
+                                    task_compact_llm,
+                                ) = agent_config["llms"]
+                                agent_execution_mode = agent_config.get(
+                                    "execution_mode", "balanced"
+                                )
+                                task_pattern = get_agent_pattern_for_execution_mode(
+                                    agent_execution_mode
+                                )
+
                         # If no models were resolved, use defaults
                         if not task_llm:
                             task_llm = self._default_llm
+
+                        tools_list, tool_config = await self._build_tools_for_task(
+                            task_id=task_id,
+                            task=task,
+                            db=db,
+                            user=user,
+                            agent_config=agent_config,
+                            task_llm=task_llm,
+                            task_vision_llm=task_vision_llm,
+                        )
                     else:
-                        # Use defaults if no task record
-                        task_llm = self._default_llm
-                        task_fast_llm = None
-                        task_vision_llm = None
-                        task_compact_llm = None
-                except Exception:
-                    # Fallback to defaults
-                    task_llm = self._default_llm
-                    task_fast_llm = None
-                    task_vision_llm = None
-                    task_compact_llm = None
+                        raise ValueError(
+                            f"Task {task_id} not found in database during "
+                            "agent reconstruction"
+                        )
+                except Exception as e:
+                    logger.error(
+                        f"Failed to rebuild runtime configuration for task "
+                        f"{task_id}: {e}"
+                    )
+                    raise
 
                 # Build allowed external directories
                 allowed_external_dirs = _build_allowed_external_dirs(
@@ -1397,6 +1625,27 @@ class AgentServiceManager:
                 # Create agent with basic configuration
                 if user_id is not None:
                     with UserContext(int(user_id)):
+                        from .agents import enhance_system_prompt_with_kb
+
+                        system_prompt = (
+                            agent_config.get("instructions") if agent_config else None
+                        )
+                        kb_list = (
+                            agent_config.get("knowledge_bases")
+                            if agent_config
+                            else None
+                        )
+                        system_prompt = enhance_system_prompt_with_kb(
+                            system_prompt, kb_list
+                        )
+                        memory_similarity_threshold = None
+                        if (
+                            agent_config
+                            and "memory_similarity_threshold" in agent_config
+                        ):
+                            memory_similarity_threshold = agent_config[
+                                "memory_similarity_threshold"
+                            ]
                         self._agents[task_id] = AgentService(
                             name=f"reconstructed_agent_task_{task_id}",
                             id=f"web_task_{task_id}",  # Use task ID only for workspace
@@ -1404,19 +1653,22 @@ class AgentServiceManager:
                             fast_llm=task_fast_llm,
                             vision_llm=task_vision_llm,
                             compact_llm=task_compact_llm,
-                            tools=[]
-                            if db is None
-                            else [],  # Tools loaded separately for reconstructed agents
+                            tools=tools_list,
+                            tool_config=tool_config,
                             memory=get_memory_store(),  # Use dynamic memory store for auto-switching
-                            pattern="react",  # Default to react for reconstructed agents
+                            pattern=task_pattern,
                             tracer=tracer,
+                            agent_type=str(task.agent_type)
+                            if task and task.agent_type
+                            else "standard",
+                            system_prompt=system_prompt,
                             enable_workspace=True,
                             workspace_base_dir=str(
                                 get_uploads_dir() / f"user_{user_id}"
                             ),  # Use user-isolated base directory
                             allowed_external_dirs=allowed_external_dirs,
                             task_id=str(task_id),
-                            memory_similarity_threshold=None,  # Reconstructed agents use default
+                            memory_similarity_threshold=memory_similarity_threshold,
                         )
                 else:
                     raise ValueError(
@@ -1772,7 +2024,10 @@ async def create_task(
 
         task_execution_mode = request.execution_mode
         if not task_execution_mode:
-            task_execution_mode = "balanced" if request.agent_id else "think"
+            task_execution_mode = get_default_task_execution_mode(
+                agent_id=request.agent_id,
+                agent_runtime=get_agent_runtime(),
+            )
 
         # Create task with PENDING status and model configuration
         task_title = request.title if request.title else task_description
@@ -2031,6 +2286,9 @@ async def get_task(
             if not task:
                 raise HTTPException(status_code=404, detail="Task not found")
 
+            mark_task_paused_if_stale(db, task)
+            db.refresh(task)
+
             # Get the raw status value safely
             if hasattr(task, "status") and task.status is not None:
                 if hasattr(task.status, "value"):
@@ -2063,6 +2321,12 @@ async def get_task(
             # from stored provider-facing model_name values.
             llm_ids = get_agent_manager()._get_task_llm_ids(task, db)
             model_id, small_fast_model_id, visual_model_id, compact_model_id = llm_ids
+            waiting_question = None
+            waiting_interactions = None
+            if task.status == TaskStatus.WAITING_FOR_USER:
+                waiting_question, waiting_interactions = _get_latest_waiting_question(
+                    db, task_id
+                )
 
             return {
                 "task_id": task.id,
@@ -2086,6 +2350,8 @@ async def get_task(
                 "llm_calls": task.llm_calls or 0,
                 "channel_id": task.channel_id,
                 "channel_name": task.channel_name,
+                "waiting_question": waiting_question,
+                "waiting_interactions": waiting_interactions,
             }
 
         # Execute in thread pool to avoid blocking
@@ -2129,6 +2395,12 @@ async def get_task_status(
 
             llm_ids = get_agent_manager()._get_task_llm_ids(task, db)
             model_id, small_fast_model_id, visual_model_id, compact_model_id = llm_ids
+            waiting_question = None
+            waiting_interactions = None
+            if task.status == TaskStatus.WAITING_FOR_USER:
+                waiting_question, waiting_interactions = _get_latest_waiting_question(
+                    db, task_id
+                )
 
             return {
                 "task_id": task.id,
@@ -2150,6 +2422,8 @@ async def get_task_status(
                 "llm_calls": task.llm_calls or 0,
                 "channel_id": task.channel_id,
                 "channel_name": task.channel_name,
+                "waiting_question": waiting_question,
+                "waiting_interactions": waiting_interactions,
             }
 
         # Execute in thread pool to avoid blocking

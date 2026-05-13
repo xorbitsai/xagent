@@ -1,8 +1,12 @@
 """Test cases for Claude LLM implementation using Anthropic SDK."""
 
 import pytest
+from jsonschema import Draft202012Validator
 
-from xagent.core.model.chat.basic.claude import ClaudeLLM
+from xagent.core.model.chat.basic.claude import (
+    ClaudeLLM,
+    _fix_pydantic_schema_for_claude,
+)
 
 
 class TestClaudeLLM:
@@ -12,6 +16,29 @@ class TestClaudeLLM:
     def llm(self, claude_llm_config):
         """Fixture providing Claude LLM instance."""
         return ClaudeLLM(**claude_llm_config)
+
+    def test_schema_fix_preserves_property_named_type(self):
+        """Claude schema fixer must not treat properties maps as schema objects."""
+        schema = {
+            "title": "get_workspace_output_filesArgs",
+            "type": "object",
+            "properties": {
+                "type": {},
+                "limit": {"type": "integer", "minimum": 1},
+            },
+        }
+
+        fixed = _fix_pydantic_schema_for_claude(schema)
+
+        Draft202012Validator.check_schema(fixed)
+        assert fixed["type"] == "object"
+        assert fixed["additionalProperties"] is False
+        assert fixed["properties"]["type"] == {
+            "type": "object",
+            "properties": {},
+            "additionalProperties": False,
+        }
+        assert fixed["properties"]["limit"] == {"type": "integer"}
 
     @pytest.mark.asyncio
     async def test_basic_chat_completion(self, llm, mocker):
@@ -171,6 +198,79 @@ class TestClaudeLLM:
         call_args = mock_client.messages.create.call_args
         assert "system" in call_args.kwargs
         assert call_args.kwargs["system"] == "You are a helpful assistant."
+
+    @pytest.mark.asyncio
+    async def test_tool_call_history_is_sent_as_tool_use_and_result(self, llm, mocker):
+        """Claude expects each tool_result to follow a matching tool_use block."""
+        mock_client = mocker.AsyncMock()
+
+        mock_text_block = mocker.Mock()
+        mock_text_block.type = "text"
+        mock_text_block.text = "Final answer"
+
+        mock_usage = mocker.Mock()
+        mock_usage.input_tokens = 10
+        mock_usage.output_tokens = 5
+
+        mock_response = mocker.Mock()
+        mock_response.stop_reason = "stop"
+        mock_response.content = [mock_text_block]
+        mock_response.usage = mock_usage
+
+        mock_client.messages.create.return_value = mock_response
+        mocker.patch(
+            "xagent.core.model.chat.basic.claude.AsyncAnthropic",
+            return_value=mock_client,
+        )
+
+        messages = [
+            {"role": "user", "content": "Search this"},
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [
+                    {
+                        "id": "toolu_1",
+                        "type": "function",
+                        "function": {
+                            "name": "web_search",
+                            "arguments": '{"query":"x"}',
+                        },
+                    }
+                ],
+            },
+            {
+                "role": "tool",
+                "content": "Tool web_search returned: result",
+                "tool_call_id": "toolu_1",
+            },
+        ]
+
+        await llm.chat(messages, tools=[])
+
+        call_args = mock_client.messages.create.call_args
+        anthropic_messages = call_args.kwargs["messages"]
+        assert anthropic_messages[-2] == {
+            "role": "assistant",
+            "content": [
+                {
+                    "type": "tool_use",
+                    "id": "toolu_1",
+                    "name": "web_search",
+                    "input": {"query": "x"},
+                }
+            ],
+        }
+        assert anthropic_messages[-1] == {
+            "role": "user",
+            "content": [
+                {
+                    "type": "tool_result",
+                    "tool_use_id": "toolu_1",
+                    "content": "Tool web_search returned: result",
+                }
+            ],
+        }
 
     @pytest.mark.asyncio
     async def test_context_manager(self, claude_llm_config, mocker):

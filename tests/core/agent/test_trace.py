@@ -227,6 +227,38 @@ class TestTracer(unittest.TestCase):
         self.assertIsNotNone(event_id)  # Should still return an ID
         mock_handler.handle_event.assert_called_once()
 
+    def test_required_persistence_propagates_handler_errors(self):
+        """Test required persistence fails when a handler fails."""
+        mock_handler = MagicMock()
+        mock_handler.handle_event = AsyncMock(side_effect=Exception("Handler error"))
+        self.tracer.add_handler(mock_handler)
+
+        event_type = TraceEventType(
+            TraceScope.TASK, TraceAction.START, TraceCategory.DAG
+        )
+        with self.assertRaises(RuntimeError):
+            asyncio.run(
+                self.tracer.trace_event(
+                    event_type,
+                    task_id="task123",
+                    require_persisted=True,
+                )
+            )
+
+    def test_required_persistence_requires_handler(self):
+        """Test required persistence fails without a handler."""
+        event_type = TraceEventType(
+            TraceScope.TASK, TraceAction.START, TraceCategory.DAG
+        )
+        with self.assertRaises(RuntimeError):
+            asyncio.run(
+                self.tracer.trace_event(
+                    event_type,
+                    task_id="task123",
+                    require_persisted=True,
+                )
+            )
+
 
 class TestConsoleTraceHandler(unittest.TestCase):
     """Test the ConsoleTraceHandler class."""

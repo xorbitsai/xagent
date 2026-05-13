@@ -149,12 +149,10 @@ function ExpandableMessage({ content }: { content: string }) {
     const frameId = window.requestAnimationFrame(updateOverflowState);
     const observer = new ResizeObserver(() => updateOverflowState());
     observer.observe(el);
-    window.addEventListener("resize", updateOverflowState);
 
     return () => {
       window.cancelAnimationFrame(frameId);
       observer.disconnect();
-      window.removeEventListener("resize", updateOverflowState);
     };
   }, [content, isExpanded, updateOverflowState]);
 
@@ -225,7 +223,7 @@ function ExpandableMessage({ content }: { content: string }) {
       <div
         ref={contentRef}
         className={cn(
-          "max-w-full min-w-0 text-sm leading-relaxed whitespace-pre-wrap break-all [overflow-wrap:anywhere] transition-all duration-300 py-[2px]",
+          "max-w-full min-w-0 text-sm leading-relaxed whitespace-pre-wrap break-words [overflow-wrap:anywhere] transition-all duration-300 py-[2px]",
           !isExpanded && "max-h-[240px] overflow-hidden"
         )}
       >

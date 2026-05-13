@@ -728,11 +728,8 @@ function StepActionItem({ action, onViewDetail, onOpenTerminal, onFileClick, onA
     if (fixedMetaRef.current) resizeObserver.observe(fixedMetaRef.current);
     if (summaryMeasureRef.current) resizeObserver.observe(summaryMeasureRef.current);
 
-    window.addEventListener('resize', updateToolSummaryVisibility);
-
     return () => {
       resizeObserver.disconnect();
-      window.removeEventListener('resize', updateToolSummaryVisibility);
     };
   }, [updateToolSummaryVisibility]);
 
@@ -891,7 +888,7 @@ function StepItem({ step, index, onOpenTerminal, onViewDetail, onFileClick, onAg
         )}
 
         <div className="flex-1 min-w-0 flex items-start gap-2">
-          <h3 className="min-w-0 flex-1 text-sm font-medium text-foreground break-all [overflow-wrap:anywhere]">
+          <h3 className="min-w-0 flex-1 text-sm font-medium text-foreground break-words [overflow-wrap:anywhere]">
             {step.description || step.stepName}
           </h3>
           <div className="mt-0.5 shrink-0 opacity-0 group-hover/step:opacity-100 transition-opacity">

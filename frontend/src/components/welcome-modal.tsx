@@ -34,30 +34,30 @@ export function WelcomeModal() {
             <DialogContent
                 showCloseButton={false}
                 onInteractOutside={(e) => e.preventDefault()}
-                className="max-w-[90vw] md:max-w-[900px] lg:max-w-[1000px] p-8 md:p-12 rounded-3xl gap-0"
+                className="max-h-[calc(100vh-1.5rem)] w-[calc(100%-1rem)] max-w-[90vw] overflow-y-auto rounded-2xl p-4 sm:w-full sm:max-w-[90vw] sm:rounded-3xl sm:p-6 md:max-w-[900px] md:p-12 lg:max-w-[1000px] gap-0"
             >
-                <div className="flex flex-col items-center text-center mb-10">
-                    <span className="text-[11px] font-bold text-primary tracking-[0.2em] uppercase mb-4">
+                <div className="mb-6 flex flex-col items-center text-center sm:mb-8 md:mb-10">
+                    <span className="mb-3 text-[11px] font-bold uppercase tracking-[0.2em] text-primary sm:mb-4">
                         {t("dashboard.welcome.title", { appName: branding.appName.toUpperCase() })}
                     </span>
-                    <h2 className="text-3xl md:text-4xl font-extrabold text-foreground mb-3 tracking-tight">
+                    <h2 className="mb-3 text-2xl font-extrabold tracking-tight text-foreground sm:text-3xl md:text-4xl">
                         {t("dashboard.welcome.heading")}
                     </h2>
-                    <p className="text-muted-foreground text-[15px]">
+                    <p className="text-[14px] text-muted-foreground sm:text-[15px]">
                         {t("dashboard.welcome.subtitle")}
                     </p>
                 </div>
 
-                <div className="grid grid-cols-1 md:grid-cols-3 gap-6 mb-10">
+                <div className="mb-6 grid grid-cols-1 gap-4 sm:mb-8 sm:gap-5 md:mb-10 md:grid-cols-3 md:gap-6">
                     {/* Card 1: Presentation Builder */}
                     <button
                         onClick={() => handleCardClick("/task")}
                         className="group flex flex-col text-left bg-card rounded-2xl border border-border/60 hover:border-primary/50 hover:shadow-[0_8px_30px_rgb(0,0,0,0.12)] dark:hover:shadow-[0_8px_30px_rgba(255,255,255,0.05)] transition-all duration-300 overflow-hidden"
                     >
-                        <div className="h-[180px] w-full overflow-hidden">
+                        <div className="h-[150px] w-full overflow-hidden sm:h-[180px]">
                             <img src="/home_create_a_presentation.webp" alt="Presentation Builder" className="w-full h-full object-cover" />
                         </div>
-                        <div className="p-6">
+                        <div className="p-4 sm:p-6">
                             <h3 className="font-bold text-[16px] mb-2 text-foreground group-hover:text-primary transition-colors">
                                 {t("dashboard.welcome.presentationBuilder.title")}
                             </h3>
@@ -72,10 +72,10 @@ export function WelcomeModal() {
                         onClick={() => handleCardClick("/templates")}
                         className="group flex flex-col text-left bg-card rounded-2xl border border-border/60 hover:border-primary/50 hover:shadow-[0_8px_30px_rgb(0,0,0,0.12)] dark:hover:shadow-[0_8px_30px_rgba(255,255,255,0.05)] transition-all duration-300 overflow-hidden"
                     >
-                        <div className="h-[180px] w-full overflow-hidden">
+                        <div className="h-[150px] w-full overflow-hidden sm:h-[180px]">
                             <img src="/home_chat_with_agents.webp" alt="Chat with Agents" className="w-full h-full object-cover" />
                         </div>
-                        <div className="p-6">
+                        <div className="p-4 sm:p-6">
                             <h3 className="font-bold text-[16px] mb-2 text-foreground group-hover:text-primary transition-colors">
                                 {t("dashboard.welcome.buildAgents.title")}
                             </h3>
@@ -90,10 +90,10 @@ export function WelcomeModal() {
                         onClick={() => handleCardClick("/build")}
                         className="group flex flex-col text-left bg-card rounded-2xl border border-border/60 hover:border-primary/50 hover:shadow-[0_8px_30px_rgb(0,0,0,0.12)] dark:hover:shadow-[0_8px_30px_rgba(255,255,255,0.05)] transition-all duration-300 overflow-hidden"
                     >
-                        <div className="h-[180px] w-full overflow-hidden">
+                        <div className="h-[150px] w-full overflow-hidden sm:h-[180px]">
                             <img src="/home_build_your_own_agents.png" alt="Build Your Own Agents" className="w-full h-full object-cover" />
                         </div>
-                        <div className="p-6">
+                        <div className="p-4 sm:p-6">
                             <h3 className="font-bold text-[16px] mb-2 text-foreground group-hover:text-primary transition-colors">
                                 {t("dashboard.welcome.createAgent.title")}
                             </h3>

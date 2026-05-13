@@ -537,6 +537,15 @@ async def test_dag_pattern_executes_independent_ready_steps_concurrently() -> No
     }
 
 
+@pytest.mark.parametrize("max_concurrency", [0, -1])
+def test_dag_pattern_clamps_non_positive_max_concurrency(
+    max_concurrency: int,
+) -> None:
+    pattern = DAGPattern(lambda **_: build_plan(), max_concurrency=max_concurrency)
+
+    assert pattern.max_concurrency == 1
+
+
 @pytest.mark.asyncio
 async def test_dag_pattern_concurrent_interrupt_cancels_sibling_and_replans(
     tmp_path: Path,

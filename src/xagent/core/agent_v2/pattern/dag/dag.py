@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 from dataclasses import dataclass
 from typing import Any
 
@@ -22,6 +23,8 @@ from .plan_generator import (
     PlanStep,
     PlanValidationError,
 )
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -627,11 +630,14 @@ class DAGPattern(AgentPattern):
                         )
                         return None
         except Exception:
-            await self._cancel_pending_steps(
-                pending,
-                step_ids_by_task=tasks,
-                steps_by_id=steps_by_id,
-            )
+            try:
+                await self._cancel_pending_steps(
+                    pending,
+                    step_ids_by_task=tasks,
+                    steps_by_id=steps_by_id,
+                )
+            except Exception:
+                logger.exception("Failed to clean up cancelled DAG sibling steps.")
             raise
         return None
 

@@ -613,6 +613,66 @@ async def test_dag_pattern_concurrent_interrupt_cancels_sibling_and_replans(
 
 
 @pytest.mark.asyncio
+async def test_dag_pattern_concurrent_failure_clears_cancelled_sibling() -> None:
+    class FailingAndSlowLLM:
+        def __init__(self) -> None:
+            self.slow_started = asyncio.Event()
+            self.slow_cancelled = asyncio.Event()
+            self.fail_calls = 0
+            self.slow_calls = 0
+
+        async def chat(self, **kwargs: Any) -> dict[str, Any]:
+            messages = list(kwargs.get("messages", []))
+            task = current_step_task(messages)
+            if task == "Slow task":
+                self.slow_calls += 1
+                self.slow_started.set()
+                try:
+                    await asyncio.Future()
+                except asyncio.CancelledError:
+                    self.slow_cancelled.set()
+                    raise
+            if task == "Fail task":
+                self.fail_calls += 1
+                await self.slow_started.wait()
+                return {"content": "not done", "done": False}
+            return {"content": "done", "done": True}
+
+    llm = FailingAndSlowLLM()
+    runtime = PatternRuntime(execution_id="dag-concurrent-failure")
+    pattern = DAGPattern(
+        lambda **_: build_plan(
+            PlanStep(id="fail", task="Fail task"),
+            PlanStep(id="slow", task="Slow task"),
+        ),
+        react_max_iterations=1,
+    )
+
+    result = await asyncio.wait_for(
+        pattern.run(
+            context=ExecutionContext(execution_id="dag-concurrent-failure"),
+            tools=[],
+            llm=llm,
+            runtime=runtime,
+        ),
+        timeout=1,
+    )
+
+    assert result["success"] is False
+    assert result["status"] == "failed"
+    assert result["failure_reason"] == "step_failed"
+    assert result["failed_step_id"] == "fail"
+    assert llm.fail_calls == 1
+    assert llm.slow_calls == 1
+    assert llm.slow_cancelled.is_set()
+    assert pattern.active_step_ids == []
+    assert {step.id: step.status for step in pattern.plan.steps} == {
+        "fail": "failed",
+        "slow": "pending",
+    }
+
+
+@pytest.mark.asyncio
 async def test_callable_plan_generator_receives_structured_request() -> None:
     seen: list[PlanGenerationRequest] = []
 

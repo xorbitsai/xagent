@@ -560,6 +560,7 @@ class DAGPattern(AgentPattern):
             ): step.id
             for step in steps
         }
+        steps_by_id = {step.id: step for step in steps}
         pending = set(tasks)
         try:
             while pending:
@@ -570,19 +571,67 @@ class DAGPattern(AgentPattern):
                 for task in done:
                     result = task.result()
                     if result is not None:
-                        await self._cancel_pending_steps(pending)
+                        await self._cancel_pending_steps(
+                            pending,
+                            step_ids_by_task=tasks,
+                            steps_by_id=steps_by_id,
+                        )
+                        if pending:
+                            await runtime.checkpoint(
+                                "dag_after_cancelled_siblings",
+                                context=root_context,
+                                pattern=self,
+                                status=self.status,
+                                metadata={
+                                    "active_step_ids": list(self.active_step_ids),
+                                    "cancelled_step_ids": [
+                                        step_id
+                                        for task, step_id in tasks.items()
+                                        if task in pending
+                                    ],
+                                },
+                            )
                         return result
-                    if any(step.status == "failed" for step in steps):
-                        await self._cancel_pending_steps(pending)
-                        return None
+                    failed_step = next(
+                        (step for step in steps if step.status == "failed"),
+                        None,
+                    )
+                    if failed_step is not None:
+                        await self._cancel_pending_steps(
+                            pending,
+                            step_ids_by_task=tasks,
+                            steps_by_id=steps_by_id,
+                        )
+                        return await self._fail(
+                            context=root_context,
+                            runtime=runtime,
+                            error=(
+                                failed_step.error or f"Step {failed_step.id} failed."
+                            ),
+                            failure_reason="step_failed",
+                            checkpoint_label="dag_failed",
+                            failed_step_id=failed_step.id,
+                        )
                     if self._needs_replan(root_context):
-                        await self._cancel_pending_steps(pending)
+                        await self._cancel_pending_steps(
+                            pending,
+                            step_ids_by_task=tasks,
+                            steps_by_id=steps_by_id,
+                        )
                         return None
                     if self.status in {"interrupted", "waiting_for_user"}:
-                        await self._cancel_pending_steps(pending)
+                        await self._cancel_pending_steps(
+                            pending,
+                            step_ids_by_task=tasks,
+                            steps_by_id=steps_by_id,
+                        )
                         return None
         except Exception:
-            await self._cancel_pending_steps(pending)
+            await self._cancel_pending_steps(
+                pending,
+                step_ids_by_task=tasks,
+                steps_by_id=steps_by_id,
+            )
             raise
         return None
 
@@ -1153,11 +1202,26 @@ class DAGPattern(AgentPattern):
             return str(tool.name)
         return str(tool)
 
-    async def _cancel_pending_steps(self, pending: set[asyncio.Task[Any]]) -> None:
+    async def _cancel_pending_steps(
+        self,
+        pending: set[asyncio.Task[Any]],
+        *,
+        step_ids_by_task: dict[asyncio.Task[Any], str] | None = None,
+        steps_by_id: dict[str, PlanStep] | None = None,
+    ) -> None:
+        cancelled_step_ids: list[str] = []
         for task in pending:
+            step_id = step_ids_by_task.get(task) if step_ids_by_task else None
+            if step_id is not None:
+                cancelled_step_ids.append(step_id)
             task.cancel()
         if pending:
             await asyncio.gather(*pending, return_exceptions=True)
+        for step_id in cancelled_step_ids:
+            self._clear_active_step(step_id)
+            step = steps_by_id.get(step_id) if steps_by_id else None
+            if step is not None and step.status == "running":
+                step.status = "pending"
 
     def _mark_step_active(self, step_id: str) -> None:
         if step_id not in self.active_step_ids:

@@ -807,7 +807,11 @@ async def list_collections(
             }
             if metadata_info is not None:
                 collection_kwargs["created_at"] = metadata_info.created_at
-                collection_kwargs["updated_at"] = metadata_info.updated_at
+                collection_kwargs["updated_at"] = (
+                    timestamp_now
+                    if timestamp_now is not None
+                    else metadata_info.updated_at
+                )
                 collection_kwargs["last_accessed_at"] = (
                     timestamp_now
                     if timestamp_now is not None

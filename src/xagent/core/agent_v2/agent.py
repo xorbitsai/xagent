@@ -5,6 +5,7 @@ from datetime import datetime, timezone
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
+    from .pattern import AgentPattern
     from .runner import AgentRunner
 
 
@@ -17,7 +18,7 @@ class Agent:
     """Minimal agent definition for the execution-centric v2 runtime."""
 
     name: str
-    patterns: list[Any]
+    patterns: list["AgentPattern"]
     tools: list[Any] = field(default_factory=list)
     llm: Any | None = None
     system_prompt: str | None = None

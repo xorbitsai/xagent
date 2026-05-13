@@ -61,6 +61,50 @@ class ToolCallRecord:
         )
 
 
+def _normalize_ask_user_interactions(interactions: Any) -> list[dict[str, Any]]:
+    """Normalize common model variants into the frontend interaction contract."""
+
+    if not isinstance(interactions, list):
+        return []
+
+    normalized: list[dict[str, Any]] = []
+    for index, interaction in enumerate(interactions):
+        if not isinstance(interaction, dict):
+            continue
+
+        item = dict(interaction)
+        field = item.get("field") or item.get("id") or item.get("name")
+        if not isinstance(field, str) or not field.strip():
+            field = f"response_{index}"
+        item["field"] = field.strip()
+
+        if "options" not in item and isinstance(item.get("actions"), list):
+            item["options"] = item["actions"]
+
+        options = item.get("options")
+        if isinstance(options, list):
+            item["options"] = [
+                {
+                    key: value
+                    for key, value in {
+                        "label": option.get("label"),
+                        "value": option.get("value"),
+                        "description": option.get("description"),
+                        "action_type": option.get("action_type"),
+                    }.items()
+                    if value is not None
+                }
+                for option in options
+                if isinstance(option, dict)
+                and isinstance(option.get("value"), str)
+                and option.get("value")
+            ]
+
+        normalized.append(item)
+
+    return normalized
+
+
 class ReActPattern(AgentPattern):
     """Minimal ReAct loop for the v2 execution runtime."""
 
@@ -666,7 +710,53 @@ class ReActPattern(AgentPattern):
                             "message": {"type": "string"},
                             "interactions": {
                                 "type": "array",
-                                "items": {"type": "object"},
+                                "items": {
+                                    "type": "object",
+                                    "properties": {
+                                        "type": {
+                                            "type": "string",
+                                            "enum": [
+                                                "select_one",
+                                                "select_multiple",
+                                                "text_input",
+                                                "file_upload",
+                                                "confirm",
+                                                "number_input",
+                                                "action_cards",
+                                            ],
+                                        },
+                                        "field": {"type": "string"},
+                                        "label": {"type": "string"},
+                                        "options": {
+                                            "type": "array",
+                                            "items": {
+                                                "type": "object",
+                                                "properties": {
+                                                    "label": {"type": "string"},
+                                                    "value": {"type": "string"},
+                                                    "description": {"type": "string"},
+                                                    "action_type": {
+                                                        "type": "string",
+                                                        "enum": [
+                                                            "upload",
+                                                            "input_url",
+                                                            "none",
+                                                        ],
+                                                    },
+                                                },
+                                                "required": ["label", "value"],
+                                            },
+                                        },
+                                        "placeholder": {"type": "string"},
+                                        "multiline": {"type": "boolean"},
+                                        "accept": {
+                                            "type": "array",
+                                            "items": {"type": "string"},
+                                        },
+                                        "multiple": {"type": "boolean"},
+                                    },
+                                    "required": ["type", "field", "label"],
+                                },
                             },
                         },
                         "required": ["message", "interactions"],
@@ -771,7 +861,9 @@ class ReActPattern(AgentPattern):
 
         if name == "ask_user_question":
             message = str(args.get("message", ""))
-            interactions = args.get("interactions", [])
+            interactions = _normalize_ask_user_interactions(
+                args.get("interactions", [])
+            )
             await runtime.send_message(
                 message=message,
                 message_type="question",

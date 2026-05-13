@@ -385,6 +385,37 @@ def test_get_messages_for_llm_injects_time_context_without_system_prompt() -> No
     assert result[1] == {"role": "user", "content": "what happened recently?"}
 
 
+def test_get_messages_for_llm_injects_current_request_focus() -> None:
+    ctx = ExecutionContext()
+    ctx.metadata["task"] = "Compare Mistral, OpenAI, and Anthropic ARR."
+    ctx.add_user_message("Any recent Mistral news?")
+    ctx.add_assistant_message("Mistral recently announced updates.")
+    ctx.add_user_message("Compare Mistral, OpenAI, and Anthropic ARR.")
+
+    result = ctx.get_messages_for_llm()
+
+    system_content = result[0]["content"]
+    assert "Current user request:" in system_content
+    assert "Compare Mistral, OpenAI, and Anthropic ARR." in system_content
+    assert "Earlier user and assistant messages are context only" in system_content
+    assert "do not re-answer previous requests" in system_content
+
+
+def test_get_messages_for_llm_omits_current_request_focus_for_dag_step() -> None:
+    ctx = ExecutionContext()
+    ctx.metadata["task"] = "Create two posters."
+    ctx.metadata["dag_step_id"] = "step-1"
+    ctx.metadata["dag_step_name"] = "Extract release notes"
+    ctx.add_user_message("Create two posters.")
+
+    result = ctx.get_messages_for_llm()
+
+    system_content = result[0]["content"]
+    assert "Current user request:" not in system_content
+    assert "DAG step execution scope:" in system_content
+    assert "Only execute the current DAG step" in system_content
+
+
 def test_get_messages_for_llm_coalesces_system_messages() -> None:
     ctx = ExecutionContext(system_prompt="Base prompt.")
     ctx.add_system_message("Recovered system context.")

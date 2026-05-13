@@ -1,3 +1,4 @@
+from .auto import AutoAction, AutoDecision, AutoPattern
 from .base import AgentPattern, PatternResult
 from .dag import (
     CallablePlanGenerator,
@@ -13,15 +14,18 @@ from .react import ReActPattern, ReActReasoningMode, ToolCallRecord
 
 __all__ = [
     "AgentPattern",
+    "AutoAction",
+    "AutoDecision",
+    "AutoPattern",
     "CallablePlanGenerator",
     "DAGPattern",
     "ExecutionPlan",
     "LLMPlanGenerator",
-    "PatternResult",
     "PlanGenerationRequest",
     "PlanGenerator",
-    "PlanStep",
     "PlanValidationError",
+    "PlanStep",
+    "PatternResult",
     "ReActPattern",
     "ReActReasoningMode",
     "ToolCallRecord",

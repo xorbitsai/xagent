@@ -24,6 +24,9 @@ from .context import (
 from .frame import ExecutionFrame, ExecutionSnapshot, ExecutionStatus
 from .pattern import (
     AgentPattern,
+    AutoAction,
+    AutoDecision,
+    AutoPattern,
     CallablePlanGenerator,
     DAGPattern,
     ExecutionPlan,
@@ -35,8 +38,8 @@ from .pattern import (
     PlanValidationError,
     ReActPattern,
     ReActReasoningMode,
+    ToolCallRecord,
 )
-from .pattern.react import ToolCallRecord
 from .registry import ExecutionHandle, ExecutionLifecycleStatus, ExecutionRegistry
 from .runner import AgentRunner
 from .runtime import PatternRuntime, load_pattern_checkpoint
@@ -46,6 +49,9 @@ __all__ = [
     "Agent",
     "AgentPattern",
     "AgentRunner",
+    "AutoAction",
+    "AutoDecision",
+    "AutoPattern",
     "CHECKPOINT_EVENT_TYPE",
     "CHECKPOINT_SCHEMA_VERSION",
     "CHECKPOINT_TYPE",
@@ -79,9 +85,9 @@ __all__ = [
     "PlanValidationError",
     "ReActPattern",
     "ReActReasoningMode",
+    "ToolCallRecord",
     "TraceCheckpointStore",
     "TraceEventCallback",
-    "ToolCallRecord",
     "WorkspaceComponent",
     "clone_component",
     "load_pattern_checkpoint",

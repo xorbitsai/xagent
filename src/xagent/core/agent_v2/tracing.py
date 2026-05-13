@@ -61,11 +61,16 @@ class TraceEventCallback:
 
         if result.get("success"):
             if output:
+                completion_result: dict[str, Any] = {"content": output}
+                file_outputs = result.get("file_outputs")
+                if file_outputs:
+                    completion_result["file_outputs"] = file_outputs
+                    completion_result["output"] = output
                 await trace_ai_message(tracer, execution_id, output, data)
                 await trace_task_completion(
                     tracer,
                     execution_id,
-                    result={"content": output},
+                    result=completion_result,
                     success=True,
                 )
             return

@@ -1,0 +1,894 @@
+from __future__ import annotations
+
+import json
+from pathlib import Path
+from typing import Any
+
+import pytest
+
+from xagent.core.agent_v2 import (
+    Agent,
+    AgentRunner,
+    AutoAction,
+    AutoPattern,
+    DAGPattern,
+    ExecutionContext,
+    LLMPlanGenerator,
+    PatternRuntime,
+    ReActPattern,
+)
+from xagent.core.agent_v2.pattern.auto.auto import DECISION_TOOL_NAME
+
+
+class FakeWorkspace:
+    def __init__(self, task_id: str, tmp_path: Path) -> None:
+        workspace_dir = tmp_path / task_id
+        self.id = task_id
+        self.workspace_dir = workspace_dir
+        self.input_dir = workspace_dir / "input"
+        self.output_dir = workspace_dir / "output"
+        self.temp_dir = workspace_dir / "temp"
+        self.allowed_external_dirs: list[Path] = []
+
+
+class FakeWorkspaceManager:
+    def __init__(self, tmp_path: Path) -> None:
+        self.tmp_path = tmp_path
+
+    def get_or_create_workspace(
+        self,
+        base_dir: str,
+        task_id: str,
+        allowed_external_dirs: list[str] | None = None,
+    ) -> FakeWorkspace:
+        del base_dir, allowed_external_dirs
+        return FakeWorkspace(task_id, self.tmp_path)
+
+
+class FakeLLM:
+    def __init__(self, responses: list[Any]) -> None:
+        self.responses = responses
+        self.calls: list[dict[str, Any]] = []
+
+    async def chat(self, **kwargs: Any) -> Any:
+        self.calls.append(kwargs)
+        return self.responses.pop(0)
+
+
+class TimeoutLLM:
+    def __init__(self) -> None:
+        self.calls: list[dict[str, Any]] = []
+
+    async def chat(self, **kwargs: Any) -> Any:
+        self.calls.append(kwargs)
+        raise TimeoutError("read timed out")
+
+
+class MemoryNote:
+    content = "Answer simple follow-ups using the project memory."
+    keywords = ["follow-up"]
+    metadata = {"source": "test"}
+    category = "react_memory"
+
+
+class FakeMemoryStore:
+    def __init__(self) -> None:
+        self.searches: list[dict[str, Any]] = []
+
+    def search(self, **kwargs: Any) -> list[MemoryNote]:
+        self.searches.append(kwargs)
+        return [MemoryNote()]
+
+
+class FakeSkillManager:
+    async def select_skill(self, **kwargs: Any) -> dict[str, Any]:
+        return {
+            "name": "auto-skill",
+            "description": "Auto skill",
+            "content": "Use the Auto skill instructions.",
+        }
+
+
+class CapturingChildPattern:
+    def __init__(self) -> None:
+        self.kwargs: dict[str, Any] | None = None
+
+    async def run(self, **kwargs: Any) -> dict[str, Any]:
+        self.kwargs = kwargs
+        return {"success": True, "output": "child done"}
+
+    def get_state(self) -> dict[str, Any]:
+        return {"captured": True}
+
+
+def decision_tool_response(
+    action: str,
+    reason: str,
+    answer: str | None = None,
+    requires_current_or_external_facts: bool = False,
+    existing_context_sufficient: bool = True,
+    evidence_basis: str = "current conversation",
+    missing_verification: str = "",
+) -> dict[str, Any]:
+    arguments: dict[str, Any] = {
+        "action": action,
+        "reason": reason,
+        "requires_current_or_external_facts": requires_current_or_external_facts,
+        "existing_context_sufficient": existing_context_sufficient,
+        "evidence_basis": evidence_basis,
+        "missing_verification": missing_verification,
+    }
+    if answer is not None:
+        arguments["answer"] = answer
+    return {
+        "tool_calls": [
+            {
+                "id": f"call_{DECISION_TOOL_NAME}",
+                "type": "function",
+                "function": {
+                    "name": DECISION_TOOL_NAME,
+                    "arguments": json.dumps(arguments),
+                },
+            }
+        ]
+    }
+
+
+@pytest.mark.asyncio
+async def test_auto_decision_sees_memory_and_skill_context() -> None:
+    llm = FakeLLM(
+        responses=[
+            decision_tool_response(
+                AutoAction.FINAL_ANSWER.value,
+                "simple",
+                "Done from context.",
+            )
+        ]
+    )
+    context = ExecutionContext(execution_id="auto-context")
+    context.add_user_message("Answer from context")
+    memory_store = FakeMemoryStore()
+
+    result = await AutoPattern().run(
+        context=context,
+        tools=[],
+        llm=llm,
+        memory_store=memory_store,
+        skill_manager=FakeSkillManager(),
+    )
+
+    assert result["success"] is True
+    assert [search["filters"]["category"] for search in memory_store.searches] == [
+        "react_memory",
+        "general",
+    ]
+    decision_messages = llm.calls[0]["messages"]
+    system_context = next(
+        message["content"]
+        for message in decision_messages
+        if message["role"] == "system"
+    )
+    assert "Answer simple follow-ups using the project memory." in system_context
+    assert "Available Skill: auto-skill" in system_context
+
+
+def plan_tool_response(steps: list[dict[str, Any]]) -> dict[str, Any]:
+    return {
+        "tool_calls": [
+            {
+                "id": "call_generate_execution_plan",
+                "type": "function",
+                "function": {
+                    "name": "generate_execution_plan",
+                    "arguments": json.dumps({"steps": steps}),
+                },
+            }
+        ]
+    }
+
+
+class TracerCheckpointStore:
+    def __init__(self) -> None:
+        self.by_execution_id: dict[str, dict[str, Any]] = {}
+        self.checkpoints: list[dict[str, Any]] = []
+
+    async def checkpoint(self, **payload: Any) -> None:
+        self.by_execution_id[str(payload["execution_id"])] = dict(payload)
+        self.checkpoints.append(dict(payload))
+
+    async def load_latest_checkpoint(self, execution_id: str) -> dict[str, Any] | None:
+        payload = self.by_execution_id.get(execution_id)
+        return dict(payload) if payload is not None else None
+
+
+class RecordingTracer:
+    def __init__(self) -> None:
+        self.events: list[dict[str, Any]] = []
+
+    async def trace_event(
+        self,
+        event_type: Any,
+        *,
+        task_id: str | None = None,
+        step_id: str | None = None,
+        data: dict[str, Any] | None = None,
+    ) -> str:
+        self.events.append(
+            {
+                "event_type": getattr(event_type, "value", str(event_type)),
+                "task_id": task_id,
+                "step_id": step_id,
+                "data": data or {},
+            }
+        )
+        return str(len(self.events))
+
+
+class RecordingRuntime(PatternRuntime):
+    def __init__(self) -> None:
+        super().__init__()
+        self.hooks: list[tuple[str, dict[str, Any]]] = []
+
+    async def on_llm_start(
+        self,
+        *,
+        context: Any,
+        messages: list[dict[str, Any]],
+        tools: list[dict[str, Any]] | None = None,
+        metadata: dict[str, Any] | None = None,
+    ) -> None:
+        del context
+        self.hooks.append(
+            (
+                "llm_start",
+                {
+                    "message_count": len(messages),
+                    "tools_count": len(tools or []),
+                    "metadata": metadata or {},
+                },
+            )
+        )
+
+    async def on_llm_end(
+        self,
+        *,
+        context: Any,
+        response: Any,
+        metadata: dict[str, Any] | None = None,
+    ) -> None:
+        del context
+        self.hooks.append(
+            (
+                "llm_end",
+                {
+                    "response": response,
+                    "metadata": metadata or {},
+                },
+            )
+        )
+
+    async def on_llm_error(
+        self,
+        *,
+        context: Any,
+        error: Exception,
+        metadata: dict[str, Any] | None = None,
+    ) -> None:
+        del context
+        self.hooks.append(
+            (
+                "llm_error",
+                {
+                    "error": str(error),
+                    "metadata": metadata or {},
+                },
+            )
+        )
+
+    async def on_dag_step_start(
+        self,
+        *,
+        context: Any,
+        step_id: str,
+        data: dict[str, Any] | None = None,
+    ) -> None:
+        del context
+        self.hooks.append(("dag_step_start", {"step_id": step_id, "data": data or {}}))
+
+    async def on_dag_step_end(
+        self,
+        *,
+        context: Any,
+        step_id: str,
+        data: dict[str, Any] | None = None,
+    ) -> None:
+        del context
+        self.hooks.append(("dag_step_end", {"step_id": step_id, "data": data or {}}))
+
+    async def on_dag_execution(
+        self,
+        *,
+        context: Any,
+        phase: str,
+        data: dict[str, Any] | None = None,
+    ) -> None:
+        del context
+        self.hooks.append(("dag_execution", {"phase": phase, "data": data or {}}))
+
+
+@pytest.mark.asyncio
+async def test_auto_pattern_final_answer_completes_without_child_pattern() -> None:
+    llm = FakeLLM(
+        [decision_tool_response("final_answer", "Greeting only.", answer="hi")]
+    )
+    pattern = AutoPattern()
+    context = ExecutionContext()
+    context.add_user_message("hi")
+    runtime = PatternRuntime()
+
+    result = await pattern.run(context=context, tools=[], llm=llm, runtime=runtime)
+
+    assert result["success"] is True
+    assert result["status"] == "completed"
+    assert result["output"] == "hi"
+    assert pattern.decision is not None
+    assert pattern.decision.action == AutoAction.FINAL_ANSWER
+    assert context.messages[-1].role == "assistant"
+    assert context.messages[-1].content == "hi"
+    assert len(llm.calls) == 1
+    assert llm.calls[0]["tools"][0]["function"]["name"] == DECISION_TOOL_NAME
+    assert llm.calls[0]["tool_choice"] == "required"
+    assert llm.calls[0]["thinking"] == {"type": "disabled", "enable": False}
+    assert "response_format" not in llm.calls[0]
+    assert [message["role"] for message in llm.calls[0]["messages"]].count(
+        "system"
+    ) == 1
+    decision_prompt = llm.calls[0]["messages"][-1]["content"]
+    assert llm.calls[0]["messages"][-1]["role"] == "user"
+    assert "must include a complete non-empty answer field" in decision_prompt
+    assert (
+        "available retrieved context already provide enough evidence" in decision_prompt
+    )
+    assert "knowledge base or RAG results" in decision_prompt
+    assert "do not choose final_answer" in decision_prompt
+    assert "explicitly asks to call or use an available tool" in decision_prompt
+    assert "pause for user input" in decision_prompt
+    assert "Use react as the default tool-use mode" in decision_prompt
+    assert "For follow-up requests" in decision_prompt
+    assert "Do not choose plan_execute merely because" in decision_prompt
+    assert "user-visible DAG execution" in decision_prompt
+    assert "execution tools are available" in decision_prompt
+    assert "Available tool names" not in decision_prompt
+    tool_schema = llm.calls[0]["tools"][0]["function"]
+    assert "answer argument is mandatory" in tool_schema["description"]
+    answer_schema = tool_schema["parameters"]["properties"]["answer"]
+    assert "Mandatory when action is final_answer" in answer_schema["description"]
+    assert runtime.last_checkpoint is not None
+    assert runtime.last_checkpoint["pattern"] == "AutoPattern"
+
+
+@pytest.mark.asyncio
+async def test_auto_decision_prompt_does_not_expose_execution_tool_names() -> None:
+    llm = FakeLLM([decision_tool_response("react", "Needs an execution tool.")])
+    child = CapturingChildPattern()
+    pattern = AutoPattern(react_pattern=child)  # type: ignore[arg-type]
+    context = ExecutionContext()
+    context.add_user_message("Create an agent from a knowledge base")
+    tools = [
+        {
+            "type": "function",
+            "function": {
+                "name": "list_knowledge_bases",
+                "description": "List knowledge bases",
+                "parameters": {"type": "object", "properties": {}},
+            },
+        }
+    ]
+
+    result = await pattern.run(
+        context=context,
+        tools=tools,
+        llm=llm,
+        runtime=PatternRuntime(),
+    )
+
+    assert result["success"] is True
+    decision_call = llm.calls[0]
+    assert [tool["function"]["name"] for tool in decision_call["tools"]] == [
+        DECISION_TOOL_NAME
+    ]
+    decision_prompt = decision_call["messages"][-1]["content"]
+    assert "1 execution tools are available" in decision_prompt
+    assert "list_knowledge_bases" not in decision_prompt
+
+
+@pytest.mark.asyncio
+async def test_auto_pattern_interrupt_before_decision_skips_llm_call() -> None:
+    llm = FakeLLM(
+        [decision_tool_response("final_answer", "Should not be called.", answer="hi")]
+    )
+    pattern = AutoPattern()
+    context = ExecutionContext()
+    context.add_user_message("hi")
+    runtime = PatternRuntime()
+    runtime.request_interrupt("paused by test")
+
+    result = await pattern.run(context=context, tools=[], llm=llm, runtime=runtime)
+
+    assert result["success"] is False
+    assert result["status"] == "interrupted"
+    assert result["interrupt_reason"] == "paused by test"
+    assert len(llm.calls) == 0
+    assert runtime.last_checkpoint is not None
+    assert runtime.last_checkpoint["label"] == "auto_interrupted"
+    assert runtime.last_checkpoint["metadata"] == {
+        "safe_point": "auto_before_decision",
+        "reason": "paused by test",
+    }
+
+
+@pytest.mark.asyncio
+async def test_auto_pattern_does_not_emit_general_task_start_or_completion() -> None:
+    llm = FakeLLM(
+        [decision_tool_response("final_answer", "Greeting only.", answer="hi")]
+    )
+    tracer = RecordingTracer()
+    pattern = AutoPattern()
+    context = ExecutionContext(execution_id="auto-final")
+    context.add_user_message("hi")
+
+    result = await pattern.run(
+        context=context,
+        tools=[],
+        llm=llm,
+        runtime=PatternRuntime(tracer=tracer),
+    )
+
+    assert result["success"] is True
+    assert {event["event_type"] for event in tracer.events} == {
+        "action_start_llm",
+        "action_end_llm",
+        "task_update_general",
+    }
+
+
+@pytest.mark.asyncio
+async def test_auto_pattern_react_decision_delegates_to_react() -> None:
+    llm = FakeLLM(
+        [
+            decision_tool_response("react", "Ordinary response."),
+            "react done",
+        ]
+    )
+    pattern = AutoPattern()
+    context = ExecutionContext()
+    context.add_user_message("Say done")
+    runtime = RecordingRuntime()
+
+    result = await pattern.run(context=context, tools=[], llm=llm, runtime=runtime)
+
+    assert result["success"] is True
+    assert result["output"] == "react done"
+    assert result["auto_decision"] == {
+        "action": "react",
+        "reason": "Ordinary response.",
+        "requires_current_or_external_facts": False,
+        "existing_context_sufficient": True,
+        "evidence_basis": "current conversation",
+        "missing_verification": "",
+    }
+    assert pattern.selected_pattern == "react"
+    assert pattern.react_state is not None
+    assert runtime.last_checkpoint is not None
+    assert runtime.last_checkpoint["pattern_state"]["selected_pattern"] == "react"
+    assert [hook for hook, _ in runtime.hooks] == [
+        "llm_start",
+        "llm_end",
+        "llm_start",
+        "llm_end",
+    ]
+    assert runtime.hooks[0][1]["metadata"] == {"phase": "auto_decision"}
+
+
+@pytest.mark.asyncio
+async def test_auto_pattern_passes_memory_to_child_pattern() -> None:
+    child = CapturingChildPattern()
+    memory_store = FakeMemoryStore()
+    llm = FakeLLM(
+        [
+            decision_tool_response("react", "Needs child execution."),
+        ]
+    )
+    pattern = AutoPattern(react_pattern=child)  # type: ignore[arg-type]
+    context = ExecutionContext()
+    context.add_user_message("Use context and then execute")
+
+    result = await pattern.run(
+        context=context,
+        tools=[],
+        llm=llm,
+        memory_store=memory_store,
+        memory_similarity_threshold=0.42,
+    )
+
+    assert result["success"] is True
+    assert child.kwargs is not None
+    assert child.kwargs["memory_store"] is memory_store
+    assert child.kwargs["memory_similarity_threshold"] == 0.42
+
+
+@pytest.mark.asyncio
+async def test_auto_pattern_emits_llm_error_for_decision_failure() -> None:
+    llm = TimeoutLLM()
+    pattern = AutoPattern()
+    context = ExecutionContext()
+    context.add_user_message("Use Python")
+    runtime = RecordingRuntime()
+
+    with pytest.raises(TimeoutError):
+        await pattern.run(context=context, tools=[], llm=llm, runtime=runtime)
+
+    assert [hook for hook, _ in runtime.hooks] == ["llm_start", "llm_error"]
+    assert runtime.hooks[0][1]["metadata"] == {"phase": "auto_decision"}
+    assert runtime.hooks[1][1]["metadata"] == {"phase": "auto_decision"}
+    assert "read timed out" in runtime.hooks[1][1]["error"]
+
+
+@pytest.mark.asyncio
+async def test_auto_pattern_plan_execute_decision_delegates_to_dag() -> None:
+    llm = FakeLLM(
+        [
+            decision_tool_response("plan_execute", "Needs a plan."),
+            plan_tool_response([{"id": "answer", "task": "Answer directly"}]),
+            "dag done",
+        ]
+    )
+    pattern = AutoPattern(dag_pattern=DAGPattern(LLMPlanGenerator()))
+    context = ExecutionContext()
+    context.add_user_message("Plan then answer")
+    runtime = RecordingRuntime()
+
+    result = await pattern.run(context=context, tools=[], llm=llm, runtime=runtime)
+
+    assert result["success"] is True
+    assert result["output"] == "dag done"
+    assert result["step_results"] == {"answer": "dag done"}
+    assert result["auto_decision"] == {
+        "action": "plan_execute",
+        "reason": "Needs a plan.",
+        "requires_current_or_external_facts": False,
+        "existing_context_sufficient": True,
+        "evidence_basis": "current conversation",
+        "missing_verification": "",
+    }
+    assert pattern.selected_pattern == "plan_execute"
+    assert pattern.dag_state is not None
+    assert runtime.last_checkpoint is not None
+    assert runtime.last_checkpoint["pattern_state"]["selected_pattern"] == (
+        "plan_execute"
+    )
+    hook_names = [hook for hook, _ in runtime.hooks]
+    assert "dag_execution" in hook_names
+    assert "dag_step_start" in hook_names
+    assert "dag_step_end" in hook_names
+    assert hook_names.count("llm_start") >= 1
+    assert hook_names.count("llm_end") >= 1
+
+
+@pytest.mark.asyncio
+async def test_auto_pattern_resume_reuses_existing_decision() -> None:
+    llm = FakeLLM(["react after resume"])
+    pattern = AutoPattern(react_pattern=ReActPattern())
+    pattern.load_state(
+        {
+            "status": "running",
+            "decision": {"action": "react", "reason": "Already decided."},
+            "selected_pattern": "react",
+        }
+    )
+    context = ExecutionContext()
+    context.add_user_message("Continue")
+
+    result = await pattern.run(
+        context=context,
+        tools=[],
+        llm=llm,
+        runtime=PatternRuntime(),
+    )
+
+    assert result["success"] is True
+    assert result["output"] == "react after resume"
+    assert len(llm.calls) == 1
+    assert llm.calls[0]["tools"] is not None
+
+
+@pytest.mark.asyncio
+async def test_auto_pattern_missing_decision_tool_call_fails() -> None:
+    llm = FakeLLM(["not a tool call"])
+    pattern = AutoPattern()
+    context = ExecutionContext()
+    context.add_user_message("Continue")
+
+    with pytest.raises(ValueError, match=DECISION_TOOL_NAME):
+        await pattern.run(
+            context=context,
+            tools=[],
+            llm=llm,
+            runtime=PatternRuntime(),
+        )
+
+
+@pytest.mark.asyncio
+async def test_auto_pattern_unknown_action_fails() -> None:
+    llm = FakeLLM(
+        [
+            decision_tool_response("unknown", "Bad action."),
+        ]
+    )
+    pattern = AutoPattern()
+    context = ExecutionContext()
+    context.add_user_message("Continue")
+
+    with pytest.raises(ValueError, match="unknown"):
+        await pattern.run(
+            context=context,
+            tools=[],
+            llm=llm,
+            runtime=PatternRuntime(),
+        )
+
+
+@pytest.mark.asyncio
+async def test_auto_pattern_empty_final_answer_falls_back_to_react() -> None:
+    llm = FakeLLM(
+        [
+            decision_tool_response("final_answer", "No answer.", answer="  "),
+            "react fallback",
+        ]
+    )
+    pattern = AutoPattern()
+    context = ExecutionContext()
+    context.add_user_message("Continue")
+    runtime = RecordingRuntime()
+
+    result = await pattern.run(
+        context=context,
+        tools=[],
+        llm=llm,
+        runtime=runtime,
+    )
+
+    assert result["success"] is True
+    assert result["output"] == "react fallback"
+    assert result["auto_decision"] == {
+        "action": "react",
+        "reason": (
+            "AutoPattern selected final_answer without a non-empty answer; "
+            "falling back to react."
+        ),
+        "requires_current_or_external_facts": False,
+        "existing_context_sufficient": True,
+        "evidence_basis": "",
+        "missing_verification": "",
+    }
+    assert pattern.selected_pattern == "react"
+    assert len(llm.calls) == 2
+
+
+@pytest.mark.asyncio
+async def test_auto_pattern_final_answer_requiring_external_facts_falls_back_to_react() -> (
+    None
+):
+    llm = FakeLLM(
+        [
+            decision_tool_response(
+                "final_answer",
+                "Recent public facts can be answered from memory.",
+                answer="Unsupported factual answer.",
+                requires_current_or_external_facts=True,
+                existing_context_sufficient=False,
+                evidence_basis="memory only",
+                missing_verification="Need current public-source verification.",
+            ),
+            "verified through react",
+        ]
+    )
+    pattern = AutoPattern()
+    context = ExecutionContext()
+    context.add_user_message("总结最近 AI 圈子的供应链攻击")
+    runtime = RecordingRuntime()
+
+    result = await pattern.run(
+        context=context,
+        tools=[],
+        llm=llm,
+        runtime=runtime,
+    )
+
+    assert result["success"] is True
+    assert result["output"] == "verified through react"
+    assert result["auto_decision"] == {
+        "action": "react",
+        "reason": (
+            "AutoPattern selected final_answer for a request requiring current or "
+            "external facts without sufficient supporting context; falling back to "
+            "react."
+        ),
+        "requires_current_or_external_facts": True,
+        "existing_context_sufficient": False,
+        "evidence_basis": "memory only",
+        "missing_verification": "Need current public-source verification.",
+    }
+    assert pattern.selected_pattern == "react"
+    assert len(llm.calls) == 2
+
+
+@pytest.mark.asyncio
+async def test_auto_pattern_plan_execute_without_dag_fails() -> None:
+    llm = FakeLLM(
+        [
+            decision_tool_response("plan_execute", "Needs DAG."),
+        ]
+    )
+    pattern = AutoPattern()
+    context = ExecutionContext()
+    context.add_user_message("Continue")
+
+    with pytest.raises(ValueError, match="DAGPattern"):
+        await pattern.run(
+            context=context,
+            tools=[],
+            llm=llm,
+            runtime=PatternRuntime(),
+        )
+
+
+@pytest.mark.asyncio
+async def test_auto_pattern_react_resume_from_tracer_does_not_redecide(
+    tmp_path: Path,
+) -> None:
+    tracer = TracerCheckpointStore()
+    execution_id = "auto-react-restart"
+    first_agent = Agent(
+        name="auto",
+        patterns=[AutoPattern()],
+        llm=None,
+    )
+    first_runner = AgentRunner(
+        agent=first_agent,
+        tracer=tracer,
+        workspace_manager=FakeWorkspaceManager(tmp_path),
+    )
+    first_llm = FakeLLM(
+        responses=[
+            decision_tool_response("react", "Needs ReAct."),
+            {
+                "content": "Need input.",
+                "tool_calls": [
+                    {
+                        "id": "ask",
+                        "function": {
+                            "name": "send_message",
+                            "arguments": (
+                                '{"message":"Need input","expect_response":true}'
+                            ),
+                        },
+                    }
+                ],
+            },
+        ],
+    )
+    first_agent.llm = first_llm
+
+    interrupted = await first_runner.run(
+        task="Answer through auto react",
+        execution_id=execution_id,
+    )
+
+    assert interrupted["status"] == "waiting_for_user"
+    latest = await tracer.load_latest_checkpoint(execution_id)
+    assert latest is not None
+    assert latest["pattern"] == "AutoPattern"
+    assert latest["pattern_state"]["selected_pattern"] == "react"
+
+    resumed_llm = FakeLLM(["resumed react"])
+    resumed_agent = Agent(
+        name="auto",
+        patterns=[AutoPattern()],
+        llm=resumed_llm,
+    )
+    resumed_runner = AgentRunner(
+        agent=resumed_agent,
+        tracer=tracer,
+        workspace_manager=FakeWorkspaceManager(tmp_path),
+    )
+    await resumed_runner.post_user_message(
+        execution_id,
+        "User input",
+        request_interrupt=False,
+    )
+
+    resumed = await resumed_runner.resume(execution_id)
+
+    assert resumed["success"] is True
+    assert resumed["status"] == "completed"
+    assert resumed["output"] == "resumed react"
+    assert resumed["pattern"] == "AutoPattern"
+    assert len(resumed_llm.calls) == 1
+    assert resumed_llm.calls[0]["tools"] is not None
+
+
+@pytest.mark.asyncio
+async def test_auto_pattern_dag_resume_from_tracer_does_not_redecide(
+    tmp_path: Path,
+) -> None:
+    tracer = TracerCheckpointStore()
+    execution_id = "auto-dag-restart"
+    first_agent = Agent(
+        name="auto",
+        patterns=[AutoPattern(dag_pattern=DAGPattern(LLMPlanGenerator()))],
+        llm=None,
+    )
+    first_runner = AgentRunner(
+        agent=first_agent,
+        tracer=tracer,
+        workspace_manager=FakeWorkspaceManager(tmp_path),
+    )
+    first_llm = FakeLLM(
+        responses=[
+            decision_tool_response("plan_execute", "Needs DAG."),
+            plan_tool_response([{"id": "answer", "task": "Answer directly"}]),
+            {
+                "content": "Need input.",
+                "tool_calls": [
+                    {
+                        "id": "ask",
+                        "function": {
+                            "name": "send_message",
+                            "arguments": (
+                                '{"message":"Need input","expect_response":true}'
+                            ),
+                        },
+                    }
+                ],
+            },
+        ],
+    )
+    first_agent.llm = first_llm
+
+    interrupted = await first_runner.run(
+        task="Plan through auto dag",
+        execution_id=execution_id,
+    )
+
+    assert interrupted["status"] == "waiting_for_user"
+    latest = await tracer.load_latest_checkpoint(execution_id)
+    assert latest is not None
+    assert latest["pattern"] == "AutoPattern"
+    assert latest["pattern_state"]["selected_pattern"] == "plan_execute"
+    assert latest["pattern_state"]["dag_state"] is not None
+
+    resumed_llm = FakeLLM(["resumed dag"])
+    resumed_agent = Agent(
+        name="auto",
+        patterns=[AutoPattern(dag_pattern=DAGPattern(LLMPlanGenerator()))],
+        llm=resumed_llm,
+    )
+    resumed_runner = AgentRunner(
+        agent=resumed_agent,
+        tracer=tracer,
+        workspace_manager=FakeWorkspaceManager(tmp_path),
+    )
+    await resumed_runner.post_user_message(
+        execution_id,
+        "User input",
+        request_interrupt=False,
+    )
+
+    resumed = await resumed_runner.resume(execution_id)
+
+    assert resumed["success"] is True
+    assert resumed["status"] == "completed"
+    assert resumed["output"] == "resumed dag"
+    assert resumed["pattern"] == "AutoPattern"
+    assert len(resumed_llm.calls) == 1

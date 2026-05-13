@@ -337,6 +337,18 @@ class ExecutionContext:
     def _system_context(self) -> str:
         parts = [self._current_time_context()]
         dag_step_id = self.metadata.get("dag_step_id")
+        current_task = str(self.metadata.get("task") or "").strip()
+        if current_task and not dag_step_id:
+            parts.append(
+                "Current user request:\n"
+                f"{current_task}\n\n"
+                "Conversation focus rules: answer the current user request above. "
+                "Earlier user and assistant messages are context only; use them to "
+                "resolve references and preserve continuity, but do not re-answer "
+                "previous requests or repeat previous final answers unless the "
+                "current user request explicitly asks to revise, continue, compare, "
+                "or summarize them."
+            )
         if dag_step_id:
             dag_step_name = str(self.metadata.get("dag_step_name") or "").strip()
             dag_step_description = str(

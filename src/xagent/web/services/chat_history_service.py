@@ -86,6 +86,31 @@ def load_task_transcript(
     return normalize_transcript_messages(messages)
 
 
+def get_latest_waiting_question(
+    db: Session, task_id: int
+) -> tuple[Optional[str], Optional[list[dict[str, Any]]]]:
+    """Return the latest persisted ask-user question for a waiting task."""
+
+    latest_question = (
+        db.query(TaskChatMessage)
+        .filter(
+            TaskChatMessage.task_id == task_id,
+            TaskChatMessage.role == "assistant",
+            TaskChatMessage.message_type == "question",
+        )
+        .order_by(TaskChatMessage.id.desc())
+        .first()
+    )
+    if not latest_question:
+        return None, None
+
+    interactions = latest_question.interactions
+    return (
+        str(latest_question.content),
+        interactions if isinstance(interactions, list) else None,
+    )
+
+
 def _persist_message(
     db: Session,
     task_id: int,

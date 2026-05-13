@@ -31,7 +31,10 @@ from ..models.model import Model as DBModel
 from ..models.task import AgentType, Task, TaskStatus
 from ..models.user import User
 from ..schemas.chat import TaskCreateRequest, TaskCreateResponse
-from ..services.chat_history_service import load_task_transcript
+from ..services.chat_history_service import (
+    get_latest_waiting_question,
+    load_task_transcript,
+)
 from ..services.llm_utils import resolve_llms_from_names
 from ..services.model_service import _get_visible_user_ids
 from ..services.task_execution_context_service import (
@@ -53,33 +56,6 @@ logger = logging.getLogger(__name__)
 
 # Create router
 chat_router = APIRouter(prefix="/api/chat", tags=["chat"])
-
-
-def _get_latest_waiting_question(
-    db: Session, task_id: int
-) -> tuple[Optional[str], Optional[list[dict[str, Any]]]]:
-    """Return the latest persisted ask_user_question prompt for a waiting task."""
-
-    from ..models.chat_message import TaskChatMessage
-
-    latest_question = (
-        db.query(TaskChatMessage)
-        .filter(
-            TaskChatMessage.task_id == task_id,
-            TaskChatMessage.role == "assistant",
-            TaskChatMessage.message_type == "question",
-        )
-        .order_by(TaskChatMessage.id.desc())
-        .first()
-    )
-    if not latest_question:
-        return None, None
-
-    interactions = latest_question.interactions
-    return (
-        str(latest_question.content),
-        interactions if isinstance(interactions, list) else None,
-    )
 
 
 def create_default_llm() -> Optional[BaseLLM]:
@@ -2324,7 +2300,7 @@ async def get_task(
             waiting_question = None
             waiting_interactions = None
             if task.status == TaskStatus.WAITING_FOR_USER:
-                waiting_question, waiting_interactions = _get_latest_waiting_question(
+                waiting_question, waiting_interactions = get_latest_waiting_question(
                     db, task_id
                 )
 
@@ -2398,7 +2374,7 @@ async def get_task_status(
             waiting_question = None
             waiting_interactions = None
             if task.status == TaskStatus.WAITING_FOR_USER:
-                waiting_question, waiting_interactions = _get_latest_waiting_question(
+                waiting_question, waiting_interactions = get_latest_waiting_question(
                     db, task_id
                 )
 

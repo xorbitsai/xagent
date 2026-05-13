@@ -7,6 +7,7 @@ from xagent.web.models.database import Base
 from xagent.web.models.task import Task, TaskStatus
 from xagent.web.models.user import User
 from xagent.web.services.chat_history_service import (
+    get_latest_waiting_question,
     load_task_transcript,
     persist_assistant_message,
     persist_user_message,
@@ -115,6 +116,44 @@ def test_persist_assistant_message_formats_interactions_into_transcript():
         assert stored_message.role == "assistant"
         assert "Please answer the following questions:" in stored_message.content
         assert "Repository path: Enter the repository path" in stored_message.content
+    finally:
+        db_session.close()
+
+
+def test_get_latest_waiting_question_returns_latest_question_only():
+    db_session = _create_db_session()
+    try:
+        task = _create_task(db_session)
+
+        persist_assistant_message(
+            db_session,
+            int(task.id),
+            int(task.user_id),
+            "First question",
+            message_type="question",
+            interactions=[{"type": "text_input", "label": "First"}],
+        )
+        persist_assistant_message(
+            db_session,
+            int(task.id),
+            int(task.user_id),
+            "Regular answer",
+            message_type="assistant_message",
+        )
+        persist_assistant_message(
+            db_session,
+            int(task.id),
+            int(task.user_id),
+            "Second question",
+            message_type="question",
+            interactions=[{"type": "text_input", "label": "Second"}],
+        )
+
+        question, interactions = get_latest_waiting_question(db_session, int(task.id))
+
+        assert question is not None
+        assert question.startswith("Second question")
+        assert interactions == [{"type": "text_input", "label": "Second"}]
     finally:
         db_session.close()
 

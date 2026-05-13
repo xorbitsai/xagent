@@ -35,6 +35,7 @@ from ..models.database import get_db
 from ..models.task import Task
 from ..models.uploaded_file import UploadedFile
 from ..models.user import User
+from ..services.chat_history_service import get_latest_waiting_question
 from ..services.task_lease_service import (
     acquire_task_lease,
     mark_task_paused_if_stale,
@@ -239,10 +240,12 @@ def _persist_agent_v2_outbound_event(task_id: int, event: Dict[str, Any]) -> Non
 
         trace_event = DatabaseTraceEvent(
             task_id=task_id,
-            event_id=str(event.get("event_id") or uuid.uuid4()),
-            event_type=str(event.get("event_type") or "agent_message"),
+            event_id=str(data.get("event_id") or event.get("event_id") or uuid.uuid4()),
+            event_type=str(
+                event.get("event_type") or event.get("type") or "agent_message"
+            ),
             timestamp=event_time,
-            step_id=str(event["step_id"]) if event.get("step_id") else None,
+            step_id=str(data["step_id"]) if data.get("step_id") else None,
             parent_event_id=None,
             data=data,
         )
@@ -276,31 +279,6 @@ def _persist_agent_v2_outbound_event(task_id: int, event: Dict[str, Any]) -> Non
         db.close()
 
 
-def _get_latest_waiting_question(
-    db: Session, task_id: int
-) -> tuple[Optional[str], Optional[list[dict[str, Any]]]]:
-    from ..models.chat_message import TaskChatMessage
-
-    latest_question = (
-        db.query(TaskChatMessage)
-        .filter(
-            TaskChatMessage.task_id == task_id,
-            TaskChatMessage.role == "assistant",
-            TaskChatMessage.message_type == "question",
-        )
-        .order_by(TaskChatMessage.id.desc())
-        .first()
-    )
-    if not latest_question:
-        return None, None
-
-    interactions = latest_question.interactions
-    return (
-        str(latest_question.content),
-        interactions if isinstance(interactions, list) else None,
-    )
-
-
 def make_agent_v2_outbound_handler(task_id: int) -> Any:
     """Create a web bridge for agent_v2 agent-to-user messages."""
 
@@ -309,6 +287,8 @@ def make_agent_v2_outbound_handler(task_id: int) -> Any:
             "agent_message",
             task_id,
             {
+                "event_id": payload.get("event_id"),
+                "step_id": payload.get("step_id"),
                 "execution_id": payload.get("execution_id"),
                 "message": payload.get("message"),
                 "message_type": payload.get("message_type", "info"),
@@ -2471,7 +2451,7 @@ async def send_historical_data_as_stream(
             waiting_question = None
             waiting_interactions = None
             if task.status == TaskStatus.WAITING_FOR_USER:
-                waiting_question, waiting_interactions = _get_latest_waiting_question(
+                waiting_question, waiting_interactions = get_latest_waiting_question(
                     db, task_id
                 )
 
@@ -2739,7 +2719,7 @@ async def send_historical_data_as_stream(
                 question_interactions = None
                 if task.status == TaskStatus.WAITING_FOR_USER:
                     question_message, question_interactions = (
-                        _get_latest_waiting_question(db, task_id)
+                        get_latest_waiting_question(db, task_id)
                     )
 
                 message = (

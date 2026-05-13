@@ -40,6 +40,7 @@ from ..services.task_lease_service import (
     acquire_task_lease,
     mark_task_paused_if_stale,
     release_current_runner_task_lease,
+    release_task_lease,
     run_task_lease_heartbeat,
     stop_task_lease_heartbeat,
 )
@@ -254,7 +255,8 @@ def _persist_agent_v2_outbound_event(task_id: int, event: Dict[str, Any]) -> Non
         if bool(data.get("expect_response")):
             task = db.query(DatabaseTask).filter(DatabaseTask.id == task_id).first()
             message = str(data.get("message") or "")
-            if task and message:
+            task_user_id = _task_user_id(task) if task else None
+            if task and task_user_id is not None and message:
                 metadata = data.get("metadata") if isinstance(data, dict) else {}
                 interactions = (
                     metadata.get("interactions")
@@ -265,7 +267,7 @@ def _persist_agent_v2_outbound_event(task_id: int, event: Dict[str, Any]) -> Non
                 persist_assistant_message(
                     db,
                     task_id=task_id,
-                    user_id=int(cast(Any, task.user_id)),
+                    user_id=task_user_id,
                     content=message,
                     message_type="question",
                     interactions=interactions,
@@ -673,6 +675,13 @@ def _rewrite_links_in_payload(payload: Any, path_to_file_id: Dict[str, str]) -> 
     return payload
 
 
+def _task_user_id(task: Any) -> int | None:
+    user_id = getattr(task, "user_id", None)
+    if user_id is None:
+        return None
+    return int(cast(Any, user_id))
+
+
 async def execute_task_background(
     task_id: int,
     user_message: str,
@@ -717,12 +726,16 @@ async def execute_task_background(
                 db_session=db,
             )
 
-        normalized_outputs, path_to_file_id = _normalize_file_outputs(
-            db,
-            task_id=int(task_id),
-            task_user_id=int(cast(Any, task.user_id)),
-            file_outputs=result.get("file_outputs", []),
-        )
+        task_user_id = _task_user_id(task)
+        if task_user_id is not None:
+            normalized_outputs, path_to_file_id = _normalize_file_outputs(
+                db,
+                task_id=int(task_id),
+                task_user_id=task_user_id,
+                file_outputs=result.get("file_outputs", []),
+            )
+        else:
+            normalized_outputs, path_to_file_id = [], {}
         if normalized_outputs:
             result["file_outputs"] = normalized_outputs
 
@@ -913,12 +926,16 @@ async def execute_continuation_background(
             # Call continuation
             result = await dag_pattern.handle_continuation(user_message, context)
 
-        normalized_outputs, path_to_file_id = _normalize_file_outputs(
-            db,
-            task_id=int(task_id),
-            task_user_id=int(cast(Any, task.user_id)),
-            file_outputs=result.get("file_outputs", []),
-        )
+        task_user_id = _task_user_id(task)
+        if task_user_id is not None:
+            normalized_outputs, path_to_file_id = _normalize_file_outputs(
+                db,
+                task_id=int(task_id),
+                task_user_id=task_user_id,
+                file_outputs=result.get("file_outputs", []),
+            )
+        else:
+            normalized_outputs, path_to_file_id = [], {}
         if normalized_outputs:
             result["file_outputs"] = normalized_outputs
 
@@ -1035,6 +1052,13 @@ async def execute_v2_resume_background(
 
     lease_stop_event = None
     lease_heartbeat_task = None
+    lease = None
+    lease_released = False
+    result: Dict[str, Any] | None = None
+    normalized_outputs: list[Dict[str, str]] = []
+    output = ""
+    success = False
+    final_status = getattr(task.status, "value", str(task.status))
     try:
         if previous_task is not None and not previous_task.done():
             try:
@@ -1046,7 +1070,6 @@ async def execute_v2_resume_background(
 
         db_gen = get_db()
         db_lease = next(db_gen)
-        lease = None
         try:
             lease = acquire_task_lease(db_lease, task_id)
         finally:
@@ -1073,20 +1096,22 @@ async def execute_v2_resume_background(
         success = bool(result.get("success", False))
         output = str(result.get("output") or result.get("error") or "")
 
-        db_gen = get_db()
-        db_normalize = next(db_gen)
-        try:
-            normalized_outputs, path_to_file_id = _normalize_file_outputs(
-                db_normalize,
-                task_id=int(task_id),
-                task_user_id=int(cast(Any, task.user_id)),
-                file_outputs=result.get("file_outputs", []),
-            )
-            if normalized_outputs:
-                result["file_outputs"] = normalized_outputs
-                output = _rewrite_file_links_to_file_id(output, path_to_file_id)
-        finally:
-            db_normalize.close()
+        task_user_id = _task_user_id(task)
+        if task_user_id is not None:
+            db_gen = get_db()
+            db_normalize = next(db_gen)
+            try:
+                normalized_outputs, path_to_file_id = _normalize_file_outputs(
+                    db_normalize,
+                    task_id=int(task_id),
+                    task_user_id=task_user_id,
+                    file_outputs=result.get("file_outputs", []),
+                )
+                if normalized_outputs:
+                    result["file_outputs"] = normalized_outputs
+                    output = _rewrite_file_links_to_file_id(output, path_to_file_id)
+            finally:
+                db_normalize.close()
 
         db_gen = get_db()
         db_new = next(db_gen)
@@ -1094,22 +1119,22 @@ async def execute_v2_resume_background(
             task_updated = db_new.query(Task).filter(Task.id == task_id).first()
             if task_updated:
                 if status == "waiting_for_user":
-                    release_current_runner_task_lease(
+                    lease_released = release_current_runner_task_lease(
                         db_new, task_id, status=TaskStatus.WAITING_FOR_USER
                     )
                     db_new.refresh(task_updated)
                 elif status == "interrupted":
-                    release_current_runner_task_lease(
+                    lease_released = release_current_runner_task_lease(
                         db_new, task_id, status=TaskStatus.PAUSED
                     )
                     db_new.refresh(task_updated)
                 elif success:
-                    release_current_runner_task_lease(
+                    lease_released = release_current_runner_task_lease(
                         db_new, task_id, status=TaskStatus.COMPLETED
                     )
                     db_new.refresh(task_updated)
                 else:
-                    release_current_runner_task_lease(
+                    lease_released = release_current_runner_task_lease(
                         db_new, task_id, status=TaskStatus.FAILED
                     )
                     db_new.refresh(task_updated)
@@ -1170,6 +1195,13 @@ async def execute_v2_resume_background(
         )
     finally:
         await stop_task_lease_heartbeat(lease_heartbeat_task, lease_stop_event)
+        if lease is not None and not lease_released:
+            db_gen = get_db()
+            db_cleanup = next(db_gen)
+            try:
+                release_task_lease(db_cleanup, lease, status=TaskStatus.FAILED)
+            finally:
+                db_cleanup.close()
         background_task_manager.cleanup_task(task_id)
 
 
@@ -2336,12 +2368,16 @@ async def handle_execute_task(
             # Note: trace_task_completion is handled by handle_chat_message to avoid duplicates
 
             # Extract file output info
-            file_outputs, path_to_file_id = _normalize_file_outputs(
-                db,
-                task_id=int(task_id),
-                task_user_id=int(cast(Any, task.user_id)),
-                file_outputs=result.get("file_outputs", []),
-            )
+            task_user_id = _task_user_id(task)
+            if task_user_id is not None:
+                file_outputs, path_to_file_id = _normalize_file_outputs(
+                    db,
+                    task_id=int(task_id),
+                    task_user_id=task_user_id,
+                    file_outputs=result.get("file_outputs", []),
+                )
+            else:
+                file_outputs, path_to_file_id = [], {}
             result["output"] = _rewrite_file_links_to_file_id(
                 result.get("output", ""),
                 path_to_file_id,

@@ -1217,16 +1217,19 @@ class AgentServiceManager:
             return result
         finally:
             await stop_task_lease_heartbeat(lease_heartbeat_task, lease_stop_event)
-            if db_session and lease and result is not None:
-                status = str(result.get("status") or "")
-                if status == "waiting_for_user":
-                    final_status = TaskStatus.WAITING_FOR_USER
-                elif status == "interrupted":
-                    final_status = TaskStatus.PAUSED
-                elif result.get("success", False):
-                    final_status = TaskStatus.COMPLETED
-                else:
+            if db_session and lease:
+                if result is None:
                     final_status = TaskStatus.FAILED
+                else:
+                    status = str(result.get("status") or "")
+                    if status == "waiting_for_user":
+                        final_status = TaskStatus.WAITING_FOR_USER
+                    elif status == "interrupted":
+                        final_status = TaskStatus.PAUSED
+                    elif result.get("success", False):
+                        final_status = TaskStatus.COMPLETED
+                    else:
+                        final_status = TaskStatus.FAILED
                 release_task_lease(db_session, lease, status=final_status)
             # Complete tracking if it was started
             if tracker:

@@ -48,7 +48,7 @@ def _handle_union_type(schema: Dict[str, Any], union_key: str) -> Dict[str, Any]
         # Optional[T] — use the non-null type
         for opt in options:
             if isinstance(opt, dict) and opt.get("type") != "null":
-                result = _fix_pydantic_schema_for_claude(opt)
+                result = _fix_claude_schema(opt)
                 schema = (
                     result.copy() if isinstance(result, dict) else {"type": "string"}
                 )
@@ -59,10 +59,10 @@ def _handle_union_type(schema: Dict[str, Any], union_key: str) -> Dict[str, Any]
             schema = {"type": "array", "items": {"type": "string"}}
         else:
             first_option = options[0] if isinstance(options[0], dict) else {}
-            schema = _fix_pydantic_schema_for_claude(first_option)
+            schema = _fix_claude_schema(first_option)
     else:
         first_option = options[0] if isinstance(options[0], dict) else {}
-        schema = _fix_pydantic_schema_for_claude(first_option)
+        schema = _fix_claude_schema(first_option)
 
     schema.pop(union_key, None)
     return schema
@@ -88,7 +88,12 @@ def _fix_pydantic_schema_for_claude(schema: Dict[str, Any]) -> Dict[str, Any]:
     """
     if not isinstance(schema, dict):
         return schema
-    schema = deepcopy(schema)
+    return _fix_claude_schema(deepcopy(schema))
+
+
+def _fix_claude_schema(schema: Dict[str, Any]) -> Dict[str, Any]:
+    if not isinstance(schema, dict):
+        return schema
 
     # Handle empty schema - convert to a concrete type
     if not schema or len(schema) == 0:
@@ -126,21 +131,19 @@ def _fix_pydantic_schema_for_claude(schema: Dict[str, Any]) -> Dict[str, Any]:
         if key in {"properties", "$defs", "definitions", "patternProperties"}:
             if isinstance(value, dict):
                 schema[key] = {
-                    str(prop_name): _fix_pydantic_schema_for_claude(prop_schema)
+                    str(prop_name): _fix_claude_schema(prop_schema)
                     for prop_name, prop_schema in value.items()
                 }
             continue
         if key == "additionalProperties":
             if isinstance(value, dict):
-                schema[key] = _fix_pydantic_schema_for_claude(value)
+                schema[key] = _fix_claude_schema(value)
             continue
         if isinstance(value, dict):
-            schema[key] = _fix_pydantic_schema_for_claude(value)
+            schema[key] = _fix_claude_schema(value)
         elif isinstance(value, list):
             schema[key] = [
-                _fix_pydantic_schema_for_claude(item)
-                if isinstance(item, dict)
-                else item
+                _fix_claude_schema(item) if isinstance(item, dict) else item
                 for item in value
             ]
 

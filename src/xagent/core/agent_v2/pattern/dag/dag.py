@@ -917,16 +917,9 @@ class DAGPattern(AgentPattern):
         for step in self.plan.steps:
             if step.status in {"completed", "failed"}:
                 continue
-            if active_step_ids and step.id not in active_step_ids:
-                continue
-            if (
-                self.active_step_id
-                and step.id != self.active_step_id
-                and step.status == "running"
-            ):
-                continue
-            if self.active_step_id == step.id:
-                ready.append(step)
+            if active_step_ids:
+                if step.id in active_step_ids:
+                    ready.append(step)
                 continue
             if all(dep in self.step_results for dep in step.dependencies):
                 ready.append(step)

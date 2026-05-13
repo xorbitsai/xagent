@@ -1024,6 +1024,19 @@ def test_execution_plan_validate_raises_for_invalid_plan() -> None:
         ExecutionPlan(steps=[]).validate()
 
 
+def test_dag_ready_steps_includes_all_active_concurrent_steps() -> None:
+    pattern = DAGPattern(lambda **_: build_plan())
+    pattern.plan = build_plan(
+        PlanStep(id="step_1", task="Task 1", status="running"),
+        PlanStep(id="step_2", task="Task 2", status="running"),
+        PlanStep(id="step_3", task="Task 3"),
+    )
+    pattern.active_step_ids = ["step_1", "step_2"]
+    pattern.active_step_id = "step_1"
+
+    assert [step.id for step in pattern._ready_steps()] == ["step_1", "step_2"]
+
+
 @pytest.mark.asyncio
 async def test_dag_pattern_resume_restores_active_step_from_root_checkpoint(
     tmp_path: Path,
@@ -1114,6 +1127,69 @@ async def test_dag_pattern_resume_restores_active_step_from_root_checkpoint(
     assert resumed["status"] == "completed"
     assert resumed["step_results"]["calc"] == "The answer is 42."
     assert tool.calls == []
+
+
+@pytest.mark.asyncio
+async def test_dag_pattern_resume_executes_pending_tool_call_from_checkpoint() -> None:
+    first_runtime = PatternRuntime(execution_id="dag-resume-pending-tool")
+    first_runtime.interrupt_checker = lambda: any(
+        checkpoint["label"] == "dag_after_llm"
+        for checkpoint in first_runtime.checkpoints
+    )
+    first_pattern = DAGPattern(
+        lambda **_: build_plan(PlanStep(id="calc", task="Calculate 6*7"))
+    )
+    first_context = ExecutionContext(execution_id="dag-resume-pending-tool")
+    first_context.add_user_message("Root task")
+
+    interrupted = await first_pattern.run(
+        context=first_context,
+        tools=[FakeTool()],
+        llm=SequenceLLM(
+            [
+                {
+                    "content": "Need tool",
+                    "tool_calls": [
+                        {
+                            "id": "dag-call",
+                            "function": {
+                                "name": "calculator",
+                                "arguments": '{"expression":"6*7"}',
+                            },
+                        }
+                    ],
+                    "done": False,
+                }
+            ]
+        ),
+        runtime=first_runtime,
+    )
+    checkpoint = first_runtime.last_checkpoint
+
+    assert interrupted["status"] == "interrupted"
+    assert checkpoint is not None
+    assert checkpoint["label"] == "dag_interrupted"
+    assert checkpoint["pattern_state"]["active_step_pattern_states"]["calc"][
+        "pending_tool_calls"
+    ] == [{"id": "dag-call", "name": "calculator", "args": {"expression": "6*7"}}]
+
+    restored_pattern = DAGPattern(
+        lambda **_: build_plan(PlanStep(id="calc", task="Calculate 6*7"))
+    )
+    restored_pattern.load_state(checkpoint["pattern_state"])
+    restored_context = ExecutionContext.from_dict(checkpoint["context"])
+    restored_tool = FakeTool()
+
+    resumed = await restored_pattern.run(
+        context=restored_context,
+        tools=[restored_tool],
+        llm=SequenceLLM([{"content": "The answer is 42.", "done": True}]),
+    )
+
+    assert resumed["success"] is True
+    assert resumed["status"] == "completed"
+    assert resumed["step_results"]["calc"] == "The answer is 42."
+    assert restored_tool.calls == [{"expression": "6*7"}]
 
 
 @pytest.mark.asyncio

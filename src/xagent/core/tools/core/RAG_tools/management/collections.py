@@ -12,7 +12,7 @@ import os
 import re
 import warnings as py_warnings
 from collections import defaultdict
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Sequence, Set
 
 import pyarrow as pa  # type: ignore
@@ -593,6 +593,7 @@ async def list_collections(
         vector_store = get_vector_index_store()
         metadata_collections: List[CollectionInfo] = []
         metadata_collection_names: Set[str] = set()
+        metadata_collections_by_name: Dict[str, CollectionInfo] = {}
         metadata_stats_by_name: Dict[str, Dict[str, int]] = {}
         metadata_processed_documents_by_name: Dict[str, int] = {}
         try:
@@ -604,6 +605,11 @@ async def list_collections(
             )
             metadata_collection_names = {
                 collection.name
+                for collection in metadata_collections
+                if collection.name
+            }
+            metadata_collections_by_name = {
+                collection.name: collection
                 for collection in metadata_collections
                 if collection.name
             }
@@ -782,8 +788,27 @@ async def list_collections(
             try:
                 metadata_store = get_metadata_store()
                 for collection in collection_keys:
+                    existing_metadata_info = metadata_collections_by_name.get(
+                        collection
+                    )
+                    timestamp_now = datetime.now(timezone.utc).replace(tzinfo=None)
                     info = CollectionInfo(
                         name=collection,
+                        schema_version=(
+                            existing_metadata_info.schema_version
+                            if existing_metadata_info
+                            else "1.0.0"
+                        ),
+                        embedding_model_id=(
+                            existing_metadata_info.embedding_model_id
+                            if existing_metadata_info
+                            else None
+                        ),
+                        embedding_dimension=(
+                            existing_metadata_info.embedding_dimension
+                            if existing_metadata_info
+                            else None
+                        ),
                         documents=stats[collection]["documents"],
                         parses=stats[collection]["parses"],
                         chunks=stats[collection]["chunks"],
@@ -799,8 +824,42 @@ async def list_collections(
                             ),
                         ),
                         owners=sorted(owners.get(collection, set())),
+                        collection_locked=(
+                            existing_metadata_info.collection_locked
+                            if existing_metadata_info
+                            else False
+                        ),
+                        allow_mixed_parse_methods=(
+                            existing_metadata_info.allow_mixed_parse_methods
+                            if existing_metadata_info
+                            else False
+                        ),
+                        skip_config_validation=(
+                            existing_metadata_info.skip_config_validation
+                            if existing_metadata_info
+                            else False
+                        ),
+                        ingestion_config=(
+                            existing_metadata_info.ingestion_config
+                            if existing_metadata_info
+                            else None
+                        ),
+                        created_at=(
+                            existing_metadata_info.created_at
+                            if existing_metadata_info
+                            else timestamp_now
+                        ),
+                        updated_at=timestamp_now,
+                        last_accessed_at=timestamp_now,
+                        extra_metadata=(
+                            dict(existing_metadata_info.extra_metadata)
+                            if existing_metadata_info
+                            else {}
+                        ),
                     )
                     await metadata_store.save_collection(info)
+                    metadata_collections_by_name[collection] = info
+                    metadata_collection_names.add(collection)
             except Exception as exc:
                 logger.debug("Failed to cache collection metadata: %s", exc)
         collection_keys = sorted(
@@ -829,20 +888,28 @@ async def list_collections(
                 if key not in stats[collection]:
                     stats[collection][key] = 0
 
-        collections = [
-            CollectionInfo(
-                name=collection,
-                documents=stats[collection]["documents"],
-                parses=stats[collection]["parses"],
-                chunks=stats[collection]["chunks"],
-                embeddings=stats[collection]["embeddings"],
-                processed_documents=(
+        collections = []
+        for collection in collection_keys:
+            metadata_info = metadata_collections_by_name.get(collection)
+            collection_kwargs: Dict[str, Any] = {
+                "name": collection,
+                "embedding_model_id": (
+                    metadata_info.embedding_model_id if metadata_info else None
+                ),
+                "embedding_dimension": (
+                    metadata_info.embedding_dimension if metadata_info else None
+                ),
+                "documents": stats[collection]["documents"],
+                "parses": stats[collection]["parses"],
+                "chunks": stats[collection]["chunks"],
+                "embeddings": stats[collection]["embeddings"],
+                "processed_documents": (
                     stats[collection]["parses"]
                     if stats[collection]["parses"] > 0
                     else metadata_processed_documents_by_name.get(collection, 0)
                 ),
-                document_names=sorted(document_names[collection]),
-                document_metadata=sorted(
+                "document_names": sorted(document_names[collection]),
+                "document_metadata": sorted(
                     document_metadata[collection],
                     key=lambda item: (
                         item.filename,
@@ -850,11 +917,29 @@ async def list_collections(
                         item.doc_id or "",
                     ),
                 ),
-                ingestion_config=collection_configs.get(collection),
-                owners=sorted(owners.get(collection, set())),
-            )
-            for collection in collection_keys
-        ]
+                "ingestion_config": collection_configs.get(collection),
+                "owners": sorted(owners.get(collection, set())),
+                "schema_version": (
+                    metadata_info.schema_version if metadata_info else "1.0.0"
+                ),
+                "collection_locked": (
+                    metadata_info.collection_locked if metadata_info else False
+                ),
+                "allow_mixed_parse_methods": (
+                    metadata_info.allow_mixed_parse_methods if metadata_info else False
+                ),
+                "skip_config_validation": (
+                    metadata_info.skip_config_validation if metadata_info else False
+                ),
+                "extra_metadata": (
+                    dict(metadata_info.extra_metadata) if metadata_info else {}
+                ),
+            }
+            if metadata_info is not None:
+                collection_kwargs["created_at"] = metadata_info.created_at
+                collection_kwargs["updated_at"] = metadata_info.updated_at
+                collection_kwargs["last_accessed_at"] = metadata_info.last_accessed_at
+            collections.append(CollectionInfo(**collection_kwargs))
 
         message = f"Found {len(collections)} collections"
         logger.info(message)

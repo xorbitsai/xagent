@@ -124,7 +124,6 @@ class LanceDBMetadataStore(MetadataStore):
         await self.ensure_collection_metadata_table()
 
         data = collection.to_storage()
-        data["updated_at"] = datetime.now(timezone.utc).replace(tzinfo=None)
 
         table = conn.open_table("collection_metadata")
         try:

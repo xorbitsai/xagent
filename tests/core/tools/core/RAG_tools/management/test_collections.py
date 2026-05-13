@@ -744,6 +744,44 @@ async def test_list_collections_cache_filled_by_subsequent_call(
 
 
 @pytest.mark.asyncio
+async def test_list_collections_preserves_cached_collection_timestamps(
+    temp_lancedb_dir: str,
+) -> None:
+    """Cached collection timestamps should remain stable across list calls."""
+    collection = "timestamp_cache_test"
+    now = datetime.now(timezone.utc)
+
+    _insert_documents(
+        [
+            {
+                "collection": collection,
+                "doc_id": "doc-1",
+                "source_path": "/path/doc.pdf",
+                "file_type": "pdf",
+                "content_hash": "hash-1",
+                "uploaded_at": now,
+                "title": "Doc",
+                "language": "en",
+            }
+        ]
+    )
+
+    first_result = await list_collections(
+        user_id=None, is_admin=True, force_realtime=True
+    )
+    assert first_result.status == "success"
+    first_info = next(c for c in first_result.collections if c.name == collection)
+
+    second_result = await list_collections(user_id=None, is_admin=True)
+    assert second_result.status == "success"
+    second_info = next(c for c in second_result.collections if c.name == collection)
+
+    assert second_info.created_at == first_info.created_at
+    assert second_info.updated_at == first_info.updated_at
+    assert second_info.last_accessed_at == first_info.last_accessed_at
+
+
+@pytest.mark.asyncio
 async def test_list_collections_cache_miss_uses_realtime(
     temp_lancedb_dir: str,
 ) -> None:

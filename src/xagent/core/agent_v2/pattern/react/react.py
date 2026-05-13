@@ -87,6 +87,7 @@ class ReActPattern(AgentPattern):
         self.tool_ledger: dict[str, ToolCallRecord] = {}
         self.force_final_answer_next = False
         self.waiting_for_user_request: dict[str, Any] | None = None
+        self.task_text: str | None = None
         self._memory_store: Any | None = None
 
     async def run(
@@ -142,7 +143,7 @@ class ReActPattern(AgentPattern):
             return result
 
         try:
-            task_text = latest_user_text(context)
+            task_text = self._task_text(context)
             self._memory_store = kwargs.get("memory_store")
             await enrich_context_with_memory(
                 context=context,
@@ -392,6 +393,7 @@ class ReActPattern(AgentPattern):
             "finalize_after_tool_result": self.finalize_after_tool_result,
             "force_final_answer_next": self.force_final_answer_next,
             "waiting_for_user_request": self.waiting_for_user_request,
+            "task_text": self.task_text,
             "last_response": self.last_response,
             "pending_tool_calls": self.pending_tool_calls,
             "tool_ledger": {
@@ -415,6 +417,8 @@ class ReActPattern(AgentPattern):
         self.waiting_for_user_request = (
             dict(waiting_request) if isinstance(waiting_request, dict) else None
         )
+        stored_task_text = state.get("task_text")
+        self.task_text = str(stored_task_text) if stored_task_text else None
         self.last_response = state.get("last_response")
         self.pending_tool_calls = list(state.get("pending_tool_calls", []))
         self.tool_ledger = {
@@ -456,9 +460,18 @@ class ReActPattern(AgentPattern):
             context=context,
             after_message_count=waiting_message_count,
         )
+        waiting_task = self.waiting_for_user_request.get("task_text")
+        if waiting_task and self.task_text is None:
+            self.task_text = str(waiting_task)
         self.waiting_for_user_request = None
         self.status = "thinking"
         return None
+
+    def _task_text(self, context: Any) -> str:
+        if self.task_text:
+            return self.task_text
+        self.task_text = latest_user_text(context)
+        return self.task_text
 
     def _mark_latest_user_message_as_waiting_response(
         self,
@@ -695,6 +708,11 @@ class ReActPattern(AgentPattern):
                 result={"answer": answer},
             )
             self.status = "completed"
+            context.add_tool_result(
+                tool_name=name,
+                result={"answer": answer},
+                tool_call_id=tool_call.get("id"),
+            )
             if answer:
                 context.add_assistant_message(answer)
             return await self._finalize_success(
@@ -734,6 +752,7 @@ class ReActPattern(AgentPattern):
                     "tool_name": name,
                     "message": message,
                     "message_type": message_type,
+                    "task_text": self.task_text,
                     "message_count": len(getattr(context, "messages", [])),
                 }
                 return {
@@ -785,6 +804,7 @@ class ReActPattern(AgentPattern):
                 "message": message,
                 "message_type": "question",
                 "interactions": interactions,
+                "task_text": self.task_text,
                 "message_count": len(getattr(context, "messages", [])),
             }
             return {
@@ -882,7 +902,7 @@ class ReActPattern(AgentPattern):
         ).to_dict()
         await generate_and_store_react_memory(
             context=context,
-            task=latest_user_text(context),
+            task=self._task_text(context),
             result=result,
             iterations=self.current_iteration + 1,
             llm=llm,
@@ -1076,7 +1096,47 @@ class ReActPattern(AgentPattern):
         args = getattr(tool, "args", None)
         if isinstance(args, dict) and args:
             return {"type": "object", "properties": args}
+        if inspect.isfunction(tool):
+            return self._signature_json_schema(tool)
         return {"type": "object", "properties": {}}
+
+    def _signature_json_schema(self, fn: Any) -> dict[str, Any]:
+        signature = inspect.signature(fn)
+        properties: dict[str, Any] = {}
+        required: list[str] = []
+        for name, parameter in signature.parameters.items():
+            if name in {"self", "cls"}:
+                continue
+            if parameter.kind in {
+                inspect.Parameter.VAR_POSITIONAL,
+                inspect.Parameter.VAR_KEYWORD,
+            }:
+                continue
+            properties[name] = self._annotation_json_schema(parameter.annotation)
+            if parameter.default is inspect.Parameter.empty:
+                required.append(name)
+
+        schema: dict[str, Any] = {"type": "object", "properties": properties}
+        if required:
+            schema["required"] = required
+        return schema
+
+    def _annotation_json_schema(self, annotation: Any) -> dict[str, Any]:
+        if annotation is inspect.Parameter.empty:
+            return {}
+        if annotation is str or annotation == "str":
+            return {"type": "string"}
+        if annotation is int or annotation == "int":
+            return {"type": "integer"}
+        if annotation is float or annotation == "float":
+            return {"type": "number"}
+        if annotation is bool or annotation == "bool":
+            return {"type": "boolean"}
+        if annotation is dict or annotation == "dict":
+            return {"type": "object"}
+        if annotation is list or annotation == "list":
+            return {"type": "array"}
+        return {}
 
     async def _execute_tool(self, tool_call: dict[str, Any], tools: list[Any]) -> Any:
         tool = self._find_tool(tool_call["name"], tools)

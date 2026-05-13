@@ -279,6 +279,9 @@ async def test_react_pattern_supports_plain_function_tools(
         if schema["function"]["name"] == "double_number"
     )
     assert tool_schema["function"]["description"] == "Double a numeric input."
+    parameters = tool_schema["function"]["parameters"]
+    assert parameters["properties"]["value"]["type"] == "integer"
+    assert parameters["required"] == ["value"]
     assert context.messages[2].content == "Tool double_number returned: {'result': 8}"
 
 
@@ -539,6 +542,9 @@ async def test_react_pattern_can_finish_with_final_answer_tool() -> None:
     assert result["success"] is True
     assert result["response"] == "The result is 4."
     assert tool.calls == [{"expression": "2+2"}]
+    assert context.messages[-2].role == "tool"
+    assert context.messages[-2].tool_call_id == "call_final"
+    assert context.messages[-2].metadata["tool_name"] == "final_answer"
     assert context.messages[-1].role == "assistant"
     assert context.messages[-1].content == "The result is 4."
 
@@ -580,8 +586,12 @@ async def test_react_pattern_final_answer_tool_persists_memory(
 
     assert result["success"] is True
     assert result["response"] == "Done."
+    assert context.messages[-2].role == "tool"
+    assert context.messages[-2].tool_call_id == "call_final"
+    assert context.messages[-1].content == "Done."
     assert memory_calls
     assert memory_calls[0]["task"] == "Finish"
+    assert memory_calls[0]["context"].messages[-2].role == "tool"
     assert memory_calls[0]["result"]["response"] == "Done."
     assert memory_calls[0]["iterations"] == 1
 
@@ -916,6 +926,59 @@ async def test_react_pattern_preserves_pending_calls_after_waiting_control_tool(
         "call_calc"
     )
     assert "Tool calculator returned" in resumed_tool_result["content"]
+
+
+@pytest.mark.asyncio
+async def test_react_pattern_resume_uses_original_task_for_memory(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    memory_calls: list[dict[str, Any]] = []
+
+    async def fake_generate_and_store_react_memory(**kwargs: Any) -> None:
+        memory_calls.append(kwargs)
+
+    monkeypatch.setattr(
+        react_module,
+        "generate_and_store_react_memory",
+        fake_generate_and_store_react_memory,
+    )
+    llm = FakeLLM(
+        responses=[
+            {
+                "tool_calls": [
+                    {
+                        "id": "call_question",
+                        "function": {
+                            "name": "send_message",
+                            "arguments": '{"message":"Choose A or B","message_type":"question","expect_response":true}',
+                        },
+                    }
+                ],
+            }
+        ]
+    )
+    pattern = ReActPattern(max_iterations=3)
+    context = ExecutionContext()
+    context.add_user_message("Ask, then calculate")
+
+    first = await pattern.run(context=context, tools=[], llm=llm)
+
+    assert first["status"] == "waiting_for_user"
+    context.add_user_message("B")
+    resumed_pattern = ReActPattern(max_iterations=3)
+    resumed_pattern.load_state(pattern.get_state())
+    resumed_llm = FakeLLM([{"content": "Continuing with B.", "done": True}])
+
+    resumed = await resumed_pattern.run(
+        context=context,
+        tools=[],
+        llm=resumed_llm,
+        memory_store=object(),
+    )
+
+    assert resumed["success"] is True
+    assert memory_calls
+    assert memory_calls[0]["task"] == "Ask, then calculate"
 
 
 @pytest.mark.asyncio
@@ -1330,6 +1393,7 @@ def test_react_pattern_state_roundtrip() -> None:
     pattern = ReActPattern(max_iterations=5)
     pattern.status = "acting"
     pattern.current_iteration = 2
+    pattern.task_text = "Original task"
     pattern.pending_tool_calls = [{"id": "call_1", "name": "calculator", "args": {}}]
     pattern._record_tool_call(
         {"id": "call_1", "name": "calculator", "args": {"expression": "1+1"}},
@@ -1343,6 +1407,7 @@ def test_react_pattern_state_roundtrip() -> None:
     assert restored.status == "acting"
     assert restored.current_iteration == 2
     assert restored.max_iterations == 5
+    assert restored.task_text == "Original task"
     assert restored.reasoning_mode == ReActReasoningMode.TOOL_CALLING
     assert restored.tool_ledger["call_1"].result == {"result": 2}
 

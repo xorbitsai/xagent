@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import re
 from typing import Any
 
 import pytest
@@ -11,6 +12,7 @@ from xagent.core.agent_v2 import (
     PatternRuntime,
     ReActPattern,
     ReActReasoningMode,
+    ToolCallRecord,
 )
 
 
@@ -219,7 +221,8 @@ async def test_react_pattern_runs_tool_call_then_final_answer() -> None:
     assert llm.calls[0]["tools"][0]["function"]["name"] == "calculator"
     system_prompt = llm.calls[0]["messages"][0]["content"]
     assert "latest user message" in system_prompt
-    assert "current date" in system_prompt
+    assert re.search(r"Current date \(UTC\): \d{4}-\d{2}-\d{2}", system_prompt)
+    assert "use this date when forming search queries" in system_prompt
     assert "not supported by the conversation" in system_prompt
     assert "available context is insufficient" in system_prompt
 
@@ -1190,6 +1193,20 @@ def test_react_pattern_state_roundtrip() -> None:
     assert restored.tool_ledger["call_1"].result == {"result": 2}
 
 
+def test_tool_call_record_from_dict_handles_null_args() -> None:
+    record = ToolCallRecord.from_dict(
+        {
+            "tool_call_id": "call_1",
+            "tool_name": "calculator",
+            "args": None,
+        }
+    )
+
+    assert record.args == {}
+    assert record.args_hash == ""
+    assert record.status == "pending"
+
+
 @pytest.mark.asyncio
 async def test_react_pattern_reasoning_action_mode_is_explicit_placeholder() -> None:
     pattern = ReActPattern(reasoning_mode=ReActReasoningMode.REASONING_ACTION)
@@ -1200,7 +1217,9 @@ async def test_react_pattern_reasoning_action_mode_is_explicit_placeholder() -> 
 
     assert result["success"] is False
     assert result["status"] == "failed"
-    assert "not implemented" in result["error"]
+    assert "reserved for a future implementation" in result["error"]
+    assert result["reasoning_mode"] == ReActReasoningMode.REASONING_ACTION.value
+    assert result["error_type"] == "not_implemented"
 
 
 @pytest.mark.asyncio

@@ -3,6 +3,7 @@ from __future__ import annotations
 import inspect
 import json
 from dataclasses import dataclass, replace
+from datetime import datetime, timezone
 from enum import Enum
 from typing import Any, cast
 
@@ -51,7 +52,7 @@ class ToolCallRecord:
         return cls(
             tool_call_id=str(data["tool_call_id"]),
             tool_name=str(data["tool_name"]),
-            args=dict(data.get("args", {})),
+            args=dict(data.get("args") or {}),
             args_hash=str(data.get("args_hash", "")),
             status=str(data.get("status", "pending")),
             result=data.get("result"),
@@ -124,8 +125,15 @@ class ReActPattern(AgentPattern):
             self.status = "failed"
             result = PatternResult(
                 success=False,
-                error="ReActPattern reasoning_action mode is not implemented yet.",
-                metadata={"status": self.status},
+                error=(
+                    "ReActPattern reasoning_action mode is reserved for a future "
+                    "implementation; use tool_calling mode for this release."
+                ),
+                metadata={
+                    "status": self.status,
+                    "reasoning_mode": self.reasoning_mode.value,
+                    "error_type": "not_implemented",
+                },
             ).to_dict()
             await runtime.on_pattern_end(context=context, pattern=self, result=result)
             return result
@@ -327,6 +335,7 @@ class ReActPattern(AgentPattern):
             )
         elif has_tools:
             available_tools = ", ".join(tool_names or []) or "(none)"
+            current_date = datetime.now(timezone.utc).date().isoformat()
             instruction = (
                 "Use available tools when the user asks you to generate, compute, run, "
                 "execute, inspect, read, write, or otherwise produce a concrete result "
@@ -347,9 +356,10 @@ class ReActPattern(AgentPattern):
                 "entities, incidents, dates, sources, or causal explanations "
                 "that are not supported by the conversation, retrieved "
                 "context, or tool results. If available context is insufficient, "
-                "say so or use an appropriate tool to verify. For recent, latest, current, or "
-                "time-sensitive requests, use the current date from the system context "
-                "when forming search queries and judging source relevance. Only call "
+                "say so or use an appropriate tool to verify. "
+                f"Current date (UTC): {current_date}. "
+                "For recent, latest, current, or time-sensitive requests, use this "
+                "date when forming search queries and judging source relevance. Only call "
                 "tools that are present in the current tool schema for this LLM call; "
                 "tool names mentioned in memory, previous tasks, plans, or error "
                 "messages are unavailable unless they are included in the current "

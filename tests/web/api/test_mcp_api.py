@@ -2,9 +2,11 @@
 Test MCP API endpoints and functions
 """
 
+from unittest.mock import MagicMock
+
 import pytest
 
-from xagent.web.api.mcp import get_supported_transports
+from xagent.web.api.mcp import _db_server_to_response, get_supported_transports
 from xagent.web.models.mcp import MCPServer
 
 
@@ -153,6 +155,25 @@ class TestMCPServerModel:
         assert server.restart_policy == "always"
         assert server.auto_start is True
 
+    def test_from_config_encrypts_oauth_access_token(self):
+        """Test from_config encrypts OAuth access tokens at rest."""
+        server = MCPServer.from_config(
+            {
+                "name": "oauth_server",
+                "managed": "external",
+                "transport": "streamable_http",
+                "url": "https://example.com/mcp",
+                "auth": {
+                    "type": "oauth2",
+                    "access_token": "plain-access-token",
+                    "token_type": "Bearer",
+                },
+            }
+        )
+
+        assert server.auth["access_token"] != "plain-access-token"
+        assert server.to_config_dict()["auth"]["access_token"] == "plain-access-token"
+
     def test_transport_display_property(self):
         """Test transport_display property for different transports."""
         stdio_server = MCPServer(
@@ -224,6 +245,38 @@ class TestMCPApiFunctions:
         assert config_fields["args"]["required"] is False
         assert "env" in config_fields
         assert "cwd" in config_fields
+
+    def test_db_server_to_response_masks_oauth_access_token(self):
+        """Test API responses mask OAuth access tokens like other auth secrets."""
+        server = MCPServer.from_config(
+            {
+                "name": "oauth_server",
+                "managed": "external",
+                "transport": "streamable_http",
+                "url": "https://example.com/mcp",
+                "auth": {
+                    "type": "oauth2",
+                    "access_token": "plain-access-token",
+                    "token_type": "Bearer",
+                },
+            }
+        )
+        server.id = 1
+
+        user_mcp = MagicMock()
+        user_mcp.user_id = 1
+        user_mcp.is_active = True
+        user_mcp.is_default = False
+
+        response = _db_server_to_response(
+            server=server,
+            user_mcp=user_mcp,
+            manager=MagicMock(),
+        )
+
+        assert response.config["auth"]["type"] == "oauth2"
+        assert response.config["auth"]["token_type"] == "Bearer"
+        assert response.config["auth"]["access_token"] == "********"
 
 
 class TestMCPApiModels:

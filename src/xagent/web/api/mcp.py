@@ -17,6 +17,7 @@ from sqlalchemy.orm import Session
 
 from ...core.tools.core.mcp.data_config import MCPServerConfig
 from ...core.tools.core.mcp.manager.db import DatabaseMCPServerManager
+from ...core.tools.core.mcp.model import SENSITIVE_AUTH_FIELDS
 from ..auth_dependencies import get_current_user
 from ..mcp_apps import get_all_mcp_apps, get_app_by_name
 from ..models.database import get_db
@@ -306,7 +307,7 @@ def _update_server_from_config(server: MCPServer, config: MCPServerConfig) -> No
                 from xagent.core.utils.encryption import encrypt_value
 
                 encrypted_auth = value.copy()
-                for key in ["bearer_token", "api_key_value", "client_secret"]:
+                for key in SENSITIVE_AUTH_FIELDS:
                     if key in encrypted_auth and encrypted_auth[key]:
                         # If masked, retain the existing encrypted value from the database
                         if encrypted_auth[key] == "********":
@@ -379,7 +380,7 @@ def _db_server_to_response(
     auth_config = config.get("auth")
     if auth_config and isinstance(auth_config, dict):
         masked_auth = auth_config.copy()
-        for key in ["bearer_token", "api_key_value", "client_secret"]:
+        for key in SENSITIVE_AUTH_FIELDS:
             if key in masked_auth and masked_auth[key]:
                 masked_auth[key] = "********"
         config["auth"] = masked_auth

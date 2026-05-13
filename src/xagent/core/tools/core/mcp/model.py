@@ -6,6 +6,13 @@ from typing import Any, Dict, Type
 from sqlalchemy import JSON, Boolean, Column, DateTime, Integer, String, Text
 from sqlalchemy.sql import func
 
+SENSITIVE_AUTH_FIELDS = (
+    "bearer_token",
+    "api_key_value",
+    "client_secret",
+    "access_token",
+)
+
 
 def create_mcp_server_table(Base: Type[Any]) -> Type[Any]:
     """
@@ -74,12 +81,7 @@ def create_mcp_server_table(Base: Type[Any]) -> Type[Any]:
             from xagent.core.utils.encryption import decrypt_value
 
             decrypted_auth = auth_value.copy()
-            for key in (
-                "bearer_token",
-                "api_key_value",
-                "client_secret",
-                "access_token",
-            ):
+            for key in SENSITIVE_AUTH_FIELDS:
                 if key in decrypted_auth and decrypted_auth[key]:
                     decrypted_auth[key] = decrypt_value(decrypted_auth[key])
             return decrypted_auth
@@ -239,30 +241,13 @@ def create_mcp_server_table(Base: Type[Any]) -> Type[Any]:
                 encrypted_auth = auth_config.copy()
                 # Check if it's already encrypted (starts with gAAAAAB...) to avoid double encryption
                 # (Fernet tokens always start with gAAAAAB)
-                if (
-                    "bearer_token" in encrypted_auth
-                    and encrypted_auth["bearer_token"]
-                    and not encrypted_auth["bearer_token"].startswith("gAAAAAB")
-                ):
-                    encrypted_auth["bearer_token"] = encrypt_value(
-                        encrypted_auth["bearer_token"]
-                    )
-                if (
-                    "api_key_value" in encrypted_auth
-                    and encrypted_auth["api_key_value"]
-                    and not encrypted_auth["api_key_value"].startswith("gAAAAAB")
-                ):
-                    encrypted_auth["api_key_value"] = encrypt_value(
-                        encrypted_auth["api_key_value"]
-                    )
-                if (
-                    "client_secret" in encrypted_auth
-                    and encrypted_auth["client_secret"]
-                    and not encrypted_auth["client_secret"].startswith("gAAAAAB")
-                ):
-                    encrypted_auth["client_secret"] = encrypt_value(
-                        encrypted_auth["client_secret"]
-                    )
+                for key in SENSITIVE_AUTH_FIELDS:
+                    if (
+                        key in encrypted_auth
+                        and encrypted_auth[key]
+                        and not encrypted_auth[key].startswith("gAAAAAB")
+                    ):
+                        encrypted_auth[key] = encrypt_value(encrypted_auth[key])
                 auth_config = encrypted_auth
 
             return cls(

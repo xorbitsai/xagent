@@ -757,6 +757,64 @@ async def list_collections(
                     "Metadata cache unavailable, falling back to realtime: %s", exc
                 )
 
+        def _build_collection_info(
+            collection_name: str,
+            *,
+            metadata_info: Optional[CollectionInfo],
+            ingestion_config: Optional[IngestionConfig],
+            processed_documents: int,
+            timestamp_now: Optional[datetime] = None,
+        ) -> CollectionInfo:
+            collection_kwargs: Dict[str, Any] = {
+                "name": collection_name,
+                "embedding_model_id": (
+                    metadata_info.embedding_model_id if metadata_info else None
+                ),
+                "embedding_dimension": (
+                    metadata_info.embedding_dimension if metadata_info else None
+                ),
+                "documents": stats[collection_name]["documents"],
+                "parses": stats[collection_name]["parses"],
+                "chunks": stats[collection_name]["chunks"],
+                "embeddings": stats[collection_name]["embeddings"],
+                "processed_documents": processed_documents,
+                "document_names": sorted(document_names.get(collection_name, set())),
+                "document_metadata": sorted(
+                    document_metadata.get(collection_name, []),
+                    key=lambda item: (
+                        item.filename,
+                        item.file_id or "",
+                        item.doc_id or "",
+                    ),
+                ),
+                "ingestion_config": ingestion_config,
+                "owners": sorted(owners.get(collection_name, set())),
+                "schema_version": (
+                    metadata_info.schema_version if metadata_info else "1.0.0"
+                ),
+                "collection_locked": (
+                    metadata_info.collection_locked if metadata_info else False
+                ),
+                "allow_mixed_parse_methods": (
+                    metadata_info.allow_mixed_parse_methods if metadata_info else False
+                ),
+                "skip_config_validation": (
+                    metadata_info.skip_config_validation if metadata_info else False
+                ),
+                "extra_metadata": (
+                    dict(metadata_info.extra_metadata) if metadata_info else {}
+                ),
+            }
+            if metadata_info is not None:
+                collection_kwargs["created_at"] = metadata_info.created_at
+                collection_kwargs["updated_at"] = metadata_info.updated_at
+                collection_kwargs["last_accessed_at"] = metadata_info.last_accessed_at
+            elif timestamp_now is not None:
+                collection_kwargs["created_at"] = timestamp_now
+                collection_kwargs["updated_at"] = timestamp_now
+                collection_kwargs["last_accessed_at"] = timestamp_now
+            return CollectionInfo(**collection_kwargs)
+
         # Fallback to realtime aggregation for missing collections or cache failure
         used_realtime = False
         if (
@@ -787,75 +845,21 @@ async def list_collections(
         if used_realtime:
             try:
                 metadata_store = get_metadata_store()
+                timestamp_now = datetime.now(timezone.utc).replace(tzinfo=None)
                 for collection in collection_keys:
                     existing_metadata_info = metadata_collections_by_name.get(
                         collection
                     )
-                    timestamp_now = datetime.now(timezone.utc).replace(tzinfo=None)
-                    info = CollectionInfo(
-                        name=collection,
-                        schema_version=(
-                            existing_metadata_info.schema_version
-                            if existing_metadata_info
-                            else "1.0.0"
-                        ),
-                        embedding_model_id=(
-                            existing_metadata_info.embedding_model_id
-                            if existing_metadata_info
-                            else None
-                        ),
-                        embedding_dimension=(
-                            existing_metadata_info.embedding_dimension
-                            if existing_metadata_info
-                            else None
-                        ),
-                        documents=stats[collection]["documents"],
-                        parses=stats[collection]["parses"],
-                        chunks=stats[collection]["chunks"],
-                        embeddings=stats[collection]["embeddings"],
-                        processed_documents=stats[collection]["parses"],
-                        document_names=sorted(document_names.get(collection, set())),
-                        document_metadata=sorted(
-                            document_metadata.get(collection, []),
-                            key=lambda item: (
-                                item.filename,
-                                item.file_id or "",
-                                item.doc_id or "",
-                            ),
-                        ),
-                        owners=sorted(owners.get(collection, set())),
-                        collection_locked=(
-                            existing_metadata_info.collection_locked
-                            if existing_metadata_info
-                            else False
-                        ),
-                        allow_mixed_parse_methods=(
-                            existing_metadata_info.allow_mixed_parse_methods
-                            if existing_metadata_info
-                            else False
-                        ),
-                        skip_config_validation=(
-                            existing_metadata_info.skip_config_validation
-                            if existing_metadata_info
-                            else False
-                        ),
+                    info = _build_collection_info(
+                        collection,
+                        metadata_info=existing_metadata_info,
                         ingestion_config=(
                             existing_metadata_info.ingestion_config
                             if existing_metadata_info
                             else None
                         ),
-                        created_at=(
-                            existing_metadata_info.created_at
-                            if existing_metadata_info
-                            else timestamp_now
-                        ),
-                        updated_at=timestamp_now,
-                        last_accessed_at=timestamp_now,
-                        extra_metadata=(
-                            dict(existing_metadata_info.extra_metadata)
-                            if existing_metadata_info
-                            else {}
-                        ),
+                        processed_documents=stats[collection]["parses"],
+                        timestamp_now=timestamp_now,
                     )
                     await metadata_store.save_collection(info)
                     metadata_collections_by_name[collection] = info
@@ -891,55 +895,18 @@ async def list_collections(
         collections = []
         for collection in collection_keys:
             metadata_info = metadata_collections_by_name.get(collection)
-            collection_kwargs: Dict[str, Any] = {
-                "name": collection,
-                "embedding_model_id": (
-                    metadata_info.embedding_model_id if metadata_info else None
-                ),
-                "embedding_dimension": (
-                    metadata_info.embedding_dimension if metadata_info else None
-                ),
-                "documents": stats[collection]["documents"],
-                "parses": stats[collection]["parses"],
-                "chunks": stats[collection]["chunks"],
-                "embeddings": stats[collection]["embeddings"],
-                "processed_documents": (
-                    stats[collection]["parses"]
-                    if stats[collection]["parses"] > 0
-                    else metadata_processed_documents_by_name.get(collection, 0)
-                ),
-                "document_names": sorted(document_names[collection]),
-                "document_metadata": sorted(
-                    document_metadata[collection],
-                    key=lambda item: (
-                        item.filename,
-                        item.file_id or "",
-                        item.doc_id or "",
+            collections.append(
+                _build_collection_info(
+                    collection,
+                    metadata_info=metadata_info,
+                    ingestion_config=collection_configs.get(collection),
+                    processed_documents=(
+                        stats[collection]["parses"]
+                        if stats[collection]["parses"] > 0
+                        else metadata_processed_documents_by_name.get(collection, 0)
                     ),
-                ),
-                "ingestion_config": collection_configs.get(collection),
-                "owners": sorted(owners.get(collection, set())),
-                "schema_version": (
-                    metadata_info.schema_version if metadata_info else "1.0.0"
-                ),
-                "collection_locked": (
-                    metadata_info.collection_locked if metadata_info else False
-                ),
-                "allow_mixed_parse_methods": (
-                    metadata_info.allow_mixed_parse_methods if metadata_info else False
-                ),
-                "skip_config_validation": (
-                    metadata_info.skip_config_validation if metadata_info else False
-                ),
-                "extra_metadata": (
-                    dict(metadata_info.extra_metadata) if metadata_info else {}
-                ),
-            }
-            if metadata_info is not None:
-                collection_kwargs["created_at"] = metadata_info.created_at
-                collection_kwargs["updated_at"] = metadata_info.updated_at
-                collection_kwargs["last_accessed_at"] = metadata_info.last_accessed_at
-            collections.append(CollectionInfo(**collection_kwargs))
+                )
+            )
 
         message = f"Found {len(collections)} collections"
         logger.info(message)

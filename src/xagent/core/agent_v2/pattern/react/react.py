@@ -96,6 +96,8 @@ def _normalize_ask_user_interactions(interactions: Any) -> list[dict[str, Any]]:
                 }
                 for option in options
                 if isinstance(option, dict)
+                and isinstance(option.get("label"), str)
+                and option.get("label")
                 and isinstance(option.get("value"), str)
                 and option.get("value")
             ]

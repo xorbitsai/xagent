@@ -960,11 +960,3 @@ class AutoPattern(AgentPattern):
             "waiting_for_user": ExecutionStatus.WAITING_FOR_USER,
         }
         return status_map.get(status, ExecutionStatus.RUNNING)
-
-    def _tool_name(self, tool: Any) -> str:
-        metadata = getattr(tool, "metadata", None)
-        if metadata is not None and getattr(metadata, "name", None):
-            return str(metadata.name)
-        if getattr(tool, "name", None):
-            return str(tool.name)
-        return str(tool.__class__.__name__)

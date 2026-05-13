@@ -876,6 +876,48 @@ async def test_react_pattern_ask_user_question_pauses_with_structured_payload() 
 
 
 @pytest.mark.asyncio
+async def test_react_pattern_ask_user_question_drops_invalid_options() -> None:
+    llm = FakeLLM(
+        responses=[
+            {
+                "content": "Need structured input.",
+                "tool_calls": [
+                    {
+                        "id": "call_question_form",
+                        "function": {
+                            "name": "ask_user_question",
+                            "arguments": (
+                                '{"message":"Pick one","interactions":'
+                                '[{"type":"select_one","field":"choice",'
+                                '"label":"Choice","options":['
+                                '{"label":"A","value":"a"},'
+                                '{"label":"","value":"empty-label"},'
+                                '{"value":"missing-label"},'
+                                '{"label":"Missing value"},'
+                                '{"label":"B","value":"b","description":"Bee"}'
+                                "]}]}"
+                            ),
+                        },
+                    }
+                ],
+            }
+        ]
+    )
+    pattern = ReActPattern(max_iterations=2)
+    runtime = PatternRuntime(execution_id="exec-1")
+    context = ExecutionContext()
+    context.add_user_message("Ask")
+
+    result = await pattern.run(context=context, tools=[], llm=llm, runtime=runtime)
+
+    assert result["status"] == "waiting_for_user"
+    assert result["interactions"][0]["options"] == [
+        {"label": "A", "value": "a"},
+        {"label": "B", "value": "b", "description": "Bee"},
+    ]
+
+
+@pytest.mark.asyncio
 async def test_react_pattern_resume_waiting_without_user_response_stays_waiting() -> (
     None
 ):

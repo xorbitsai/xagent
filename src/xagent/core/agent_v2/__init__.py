@@ -22,6 +22,8 @@ from .context import (
     clone_component,
 )
 from .frame import ExecutionFrame, ExecutionSnapshot, ExecutionStatus
+from .pattern import AgentPattern, PatternResult, ReActPattern, ReActReasoningMode
+from .pattern.react import ToolCallRecord
 from .registry import ExecutionHandle, ExecutionLifecycleStatus, ExecutionRegistry
 from .runner import AgentRunner
 from .runtime import PatternRuntime, load_pattern_checkpoint
@@ -29,6 +31,7 @@ from .tracing import TraceEventCallback
 
 __all__ = [
     "Agent",
+    "AgentPattern",
     "AgentRunner",
     "CHECKPOINT_EVENT_TYPE",
     "CHECKPOINT_SCHEMA_VERSION",
@@ -51,9 +54,13 @@ __all__ = [
     "MemoryComponent",
     "MergeStrategy",
     "Message",
+    "PatternResult",
     "PatternRuntime",
+    "ReActPattern",
+    "ReActReasoningMode",
     "TraceCheckpointStore",
     "TraceEventCallback",
+    "ToolCallRecord",
     "WorkspaceComponent",
     "clone_component",
     "load_pattern_checkpoint",

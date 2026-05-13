@@ -645,6 +645,10 @@ function StepActionItem({ action, onViewDetail, onOpenTerminal, onFileClick, onA
   const isRunning = action.status === 'running';
   const isFailed = action.status === 'failed';
   const isCompleted = action.status === 'completed';
+  const summaryMetaRef = useRef<HTMLDivElement>(null);
+  const fixedMetaRef = useRef<HTMLDivElement>(null);
+  const summaryMeasureRef = useRef<HTMLSpanElement>(null);
+  const [hideToolSummary, setHideToolSummary] = useState(false);
 
   const summary = useMemo(() => {
     if (action.type === 'llm') {
@@ -667,20 +671,17 @@ function StepActionItem({ action, onViewDetail, onOpenTerminal, onFileClick, onA
         return `${t('traceEventRenderer.searchPrefix')} ${args.query}`;
       }
 
-      // Prefer showing file path for file operations
       if (args && typeof args === 'object') {
         if ('file_path' in args) return `${t('traceEventRenderer.filePrefix')} ${String(args.file_path)}`;
         if ('query' in args) return `${t('traceEventRenderer.queryPrefix')} ${String(args.query)}`;
         if ('path' in args) return `${t('traceEventRenderer.pathPrefix')} ${String(args.path)}`;
       }
 
-      // Fallback to code snippet
       if (code) {
         const clean = code.replace(/[\n\r\s]+/g, ' ').trim();
         return clean.length > 50 ? clean.slice(0, 50) + '...' : clean;
       }
 
-      // Fallback to generic args string
       if (args) {
         try {
           const str = JSON.stringify(args);
@@ -689,7 +690,51 @@ function StepActionItem({ action, onViewDetail, onOpenTerminal, onFileClick, onA
       }
     }
     return null;
-  }, [action.type, action.data]);
+  }, [action.type, action.data, t]);
+
+  const updateToolSummaryVisibility = useCallback(() => {
+    if (action.type !== 'tool' || !summary) {
+      setHideToolSummary(false);
+      return;
+    }
+
+    if (typeof window !== 'undefined' && window.innerWidth < 640) {
+      setHideToolSummary(true);
+      return;
+    }
+
+    const container = summaryMetaRef.current;
+    const measure = summaryMeasureRef.current;
+    const fixed = fixedMetaRef.current;
+
+    if (!container || !measure) {
+      setHideToolSummary(false);
+      return;
+    }
+
+    const fixedWidth = fixed?.offsetWidth ?? 0;
+    const availableWidth = container.clientWidth - fixedWidth - 8;
+    setHideToolSummary(availableWidth <= 0 || measure.scrollWidth > availableWidth);
+  }, [action.type, summary]);
+
+  useEffect(() => {
+    updateToolSummaryVisibility();
+
+    const resizeObserver = new ResizeObserver(() => {
+      updateToolSummaryVisibility();
+    });
+
+    if (summaryMetaRef.current) resizeObserver.observe(summaryMetaRef.current);
+    if (fixedMetaRef.current) resizeObserver.observe(fixedMetaRef.current);
+    if (summaryMeasureRef.current) resizeObserver.observe(summaryMeasureRef.current);
+
+    window.addEventListener('resize', updateToolSummaryVisibility);
+
+    return () => {
+      resizeObserver.disconnect();
+      window.removeEventListener('resize', updateToolSummaryVisibility);
+    };
+  }, [updateToolSummaryVisibility]);
 
   if (action.type === 'llm') {
     return (
@@ -725,32 +770,43 @@ function StepActionItem({ action, onViewDetail, onOpenTerminal, onFileClick, onA
               "bg-muted/50 border-transparent hover:bg-muted/60 text-muted-foreground/80 hover:text-foreground"
         )}
       >
-        <div className="flex flex-1 items-center gap-2 min-w-0 overflow-hidden">
-          <div className="flex items-center gap-2 min-w-0">
+        <div className="flex flex-1 items-start gap-2 min-w-0">
+          <div className="flex items-start gap-2 min-w-0">
             <span className="flex-shrink-0 flex items-center">
               {action.type === 'tool' && <Wrench className="w-3.5 h-3.5" />}
               {action.type === 'error' && <Info className="w-3.5 h-3.5 text-red-500" />}
               {action.type === 'info' && <Info className="w-3.5 h-3.5" />}
             </span>
 
-            <span className="font-medium whitespace-nowrap truncate">{action.title}</span>
+            <span className="font-medium break-words [overflow-wrap:anywhere]">{action.title}</span>
           </div>
 
-          <div className="flex items-center gap-1 min-w-0 flex-1 overflow-hidden">
-            {action.data.sandboxed && (
-              <span className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded text-[10px] font-medium bg-green-500/10 text-green-600 dark:text-green-400 border border-green-500/20 whitespace-nowrap flex-shrink-0">
-                <Shield className="w-3 h-3" />
-                {t('traceEventRenderer.sandboxedExecution')}
-              </span>
-            )}
+          <div ref={summaryMetaRef} className="relative flex items-center gap-1 min-w-0 flex-1 overflow-hidden">
+            <div ref={fixedMetaRef} className="flex items-center gap-1 shrink-0">
+              {action.data.sandboxed && (
+                <span className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded text-[10px] font-medium bg-green-500/10 text-green-600 dark:text-green-400 border border-green-500/20 whitespace-nowrap flex-shrink-0">
+                  <Shield className="w-3 h-3" />
+                  {t('traceEventRenderer.sandboxedExecution')}
+                </span>
+              )}
 
-            {summary && (
+              {isRunning && <Loader2 className="w-3 h-3 animate-spin ml-1 flex-shrink-0" />}
+            </div>
+
+            {summary && (action.type !== 'tool' || !hideToolSummary) && (
               <span className="text-muted-foreground/50 font-normal ml-1 hidden sm:block min-w-0 truncate">
                 - {summary}
               </span>
             )}
-
-            {isRunning && <Loader2 className="w-3 h-3 animate-spin ml-1 flex-shrink-0" />}
+            {summary && action.type === 'tool' && (
+              <span
+                ref={summaryMeasureRef}
+                aria-hidden="true"
+                className="pointer-events-none absolute invisible whitespace-nowrap"
+              >
+                - {summary}
+              </span>
+            )}
           </div>
         </div>
         <div className="flex items-center gap-2 flex-shrink-0">
@@ -834,11 +890,11 @@ function StepItem({ step, index, onOpenTerminal, onViewDetail, onFileClick, onAg
           <Loader2 className="w-5 h-5 text-primary animate-spin" />
         )}
 
-        <div className="flex-1 min-w-0 flex items-center gap-2">
-          <h3 className="text-sm font-medium text-foreground">
+        <div className="flex-1 min-w-0 flex items-start gap-2">
+          <h3 className="min-w-0 flex-1 text-sm font-medium text-foreground break-all [overflow-wrap:anywhere]">
             {step.description || step.stepName}
           </h3>
-          <div className="opacity-0 group-hover/step:opacity-100 transition-opacity">
+          <div className="mt-0.5 shrink-0 opacity-0 group-hover/step:opacity-100 transition-opacity">
             {isExpanded ? (
               <ChevronDown className="w-4 h-4 text-muted-foreground/50" />
             ) : (

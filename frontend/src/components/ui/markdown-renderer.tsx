@@ -311,7 +311,7 @@ export function MarkdownRenderer({ content, className = '', onFileClick, onAgent
   )
 
   return (
-    <div className={`prose prose-invert max-w-none ${className}`}>
+    <div className={`prose prose-invert max-w-none break-words [overflow-wrap:anywhere] ${className}`}>
       <ReactMarkdown
         remarkPlugins={[remarkGfm, remarkMath]}
         rehypePlugins={[rehypeKatex]}

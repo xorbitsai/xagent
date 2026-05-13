@@ -1,4 +1,4 @@
-import React, { useState, useRef, useEffect } from "react";
+import React, { useState, useRef, useEffect, useCallback } from "react";
 import { Bot, ChevronDown, ChevronUp, Copy, Check } from "lucide-react";
 import { useRouter } from "next/navigation";
 import { cn } from "@/lib/utils";
@@ -136,11 +136,27 @@ function ExpandableMessage({ content }: { content: string }) {
   const { t } = useI18n();
   const { openFilePreview } = useApp();
 
+  const updateOverflowState = useCallback(() => {
+    const el = contentRef.current;
+    if (!el) return;
+    setIsOverflowing(el.scrollHeight > el.clientHeight + 1);
+  }, []);
+
   useEffect(() => {
-    if (contentRef.current) {
-      setIsOverflowing(contentRef.current.scrollHeight > 240);
-    }
-  }, [content]);
+    const el = contentRef.current;
+    if (!el) return;
+
+    const frameId = window.requestAnimationFrame(updateOverflowState);
+    const observer = new ResizeObserver(() => updateOverflowState());
+    observer.observe(el);
+    window.addEventListener("resize", updateOverflowState);
+
+    return () => {
+      window.cancelAnimationFrame(frameId);
+      observer.disconnect();
+      window.removeEventListener("resize", updateOverflowState);
+    };
+  }, [content, isExpanded, updateOverflowState]);
 
   if (!content) return null;
 
@@ -205,11 +221,11 @@ function ExpandableMessage({ content }: { content: string }) {
   }
 
   return (
-    <div className="relative">
+    <div className="relative max-w-full min-w-0">
       <div
         ref={contentRef}
         className={cn(
-          "text-sm leading-relaxed whitespace-pre-wrap break-words transition-all duration-300 py-[2px]",
+          "max-w-full min-w-0 text-sm leading-relaxed whitespace-pre-wrap break-all [overflow-wrap:anywhere] transition-all duration-300 py-[2px]",
           !isExpanded && "max-h-[240px] overflow-hidden"
         )}
       >
@@ -365,13 +381,13 @@ export function ChatMessage({
                 ) : (
                   <MarkdownRenderer
                     content={content}
-                    className="prose-sm pt-2 leading-relaxed"
+                    className="prose-sm pt-2 leading-relaxed break-words [overflow-wrap:anywhere]"
                     onAgentClick={handleAgentClick}
                     onFileClick={handleFileClick}
                   />
                 )
               ) : (
-                <div className="text-sm leading-relaxed">{content}</div>
+                <div className="text-sm leading-relaxed break-words [overflow-wrap:anywhere]">{content}</div>
               )
             ) : (
               !isUser && <GeneratingIndicator latestTitle={latestTitle} taskStatus={taskStatus} errorMessage={errorMessage} />

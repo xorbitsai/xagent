@@ -455,14 +455,14 @@ class DeterministicDagLLM(BaseLLM):
                 }
             }"""
 
-        if kwargs.get("tools"):
-            return '{"type":"tool_call","tool_name":"get_weather","tool_args":{"city":"Singapore"}}'
-
         if "tool result from get_weather" in lowered:
             return (
                 '{"type":"final_answer","reasoning":"Done",'
                 '"answer":"Weather is sunny in Singapore today","success":true,"error":null}'
             )
+
+        if kwargs.get("tools"):
+            return '{"type":"tool_call","tool_name":"get_weather","tool_args":{"city":"Singapore"}}'
 
         if "tool_call" in lowered and "final_answer" in lowered:
             return '{"type":"tool_call","reasoning":"Need weather tool"}'

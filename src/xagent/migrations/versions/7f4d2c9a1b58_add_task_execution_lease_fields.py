@@ -1,7 +1,7 @@
 """Add task execution lease fields
 
 Revision ID: 7f4d2c9a1b58
-Revises: fix_agent_status_case, b2c517a02b3b
+Revises: 20260509_add_delegate_agent_ids_to_tasks
 Create Date: 2026-05-09
 """
 
@@ -11,7 +11,7 @@ from sqlalchemy.engine.reflection import Inspector
 
 # revision identifiers, used by Alembic.
 revision = "7f4d2c9a1b58"
-down_revision = ("fix_agent_status_case", "b2c517a02b3b")
+down_revision = "20260509_add_delegate_agent_ids_to_tasks"
 branch_labels = None
 depends_on = None
 

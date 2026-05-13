@@ -7,6 +7,10 @@ from enum import Enum
 from typing import Any
 
 from ...context.enrichment import (
+    MEMORY_CONTEXT_METADATA_KEY,
+    RETRIEVED_MEMORIES_METADATA_KEY,
+    SELECTED_SKILL_METADATA_KEY,
+    SKILL_CONTEXT_METADATA_KEY,
     enrich_context_with_memory,
     enrich_context_with_skill,
     latest_user_text,
@@ -966,6 +970,19 @@ class AutoPattern(AgentPattern):
         self.selected_pattern = None
         self.last_result = None
         self.status = "idle"
+        self._clear_request_scoped_enrichment(context)
+
+    def _clear_request_scoped_enrichment(self, context: Any) -> None:
+        metadata = getattr(context, "metadata", None)
+        if not isinstance(metadata, dict):
+            return
+        for key in (
+            RETRIEVED_MEMORIES_METADATA_KEY,
+            MEMORY_CONTEXT_METADATA_KEY,
+            SELECTED_SKILL_METADATA_KEY,
+            SKILL_CONTEXT_METADATA_KEY,
+        ):
+            metadata.pop(key, None)
 
     def _user_message_signature(self, context: Any) -> dict[str, Any]:
         user_contents = [

@@ -89,6 +89,39 @@ class FakeSkillManager:
         }
 
 
+class QueryMemoryNote:
+    keywords: list[str] = []
+    metadata = {"source": "test"}
+    category = "react_memory"
+
+    def __init__(self, content: str) -> None:
+        self.content = content
+
+
+class QueryMemoryStore:
+    def __init__(self) -> None:
+        self.searches: list[dict[str, Any]] = []
+
+    def search(self, **kwargs: Any) -> list[QueryMemoryNote]:
+        self.searches.append(kwargs)
+        query = str(kwargs.get("query") or "")
+        return [QueryMemoryNote(f"memory for {query}")]
+
+
+class QuerySkillManager:
+    def __init__(self) -> None:
+        self.tasks: list[str] = []
+
+    async def select_skill(self, **kwargs: Any) -> dict[str, Any]:
+        task = str(kwargs.get("task") or "")
+        self.tasks.append(task)
+        return {
+            "name": f"skill-for-{task}",
+            "description": "Task-specific skill",
+            "content": f"Use guidance for {task}.",
+        }
+
+
 class CapturingChildPattern:
     def __init__(self) -> None:
         self.kwargs: dict[str, Any] | None = None
@@ -651,6 +684,75 @@ async def test_auto_pattern_final_answer_resume_redecides_after_new_user_message
     assert resumed["success"] is True
     assert resumed["output"] == "new"
     assert len(resumed_llm.calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_auto_pattern_final_answer_redecision_refreshes_enrichment() -> None:
+    first_llm = FakeLLM(
+        [decision_tool_response("final_answer", "Original answer.", answer="old")]
+    )
+    first_pattern = AutoPattern()
+    context = ExecutionContext()
+    context.add_user_message("first question")
+    runtime = PatternRuntime()
+    memory_store = QueryMemoryStore()
+    skill_manager = QuerySkillManager()
+
+    def interrupt_after_decision() -> bool:
+        return bool(
+            runtime.last_checkpoint
+            and runtime.last_checkpoint.get("label") == "auto_after_decision"
+        )
+
+    runtime.interrupt_checker = interrupt_after_decision
+
+    interrupted = await first_pattern.run(
+        context=context,
+        tools=[],
+        llm=first_llm,
+        runtime=runtime,
+        memory_store=memory_store,
+        skill_manager=skill_manager,
+    )
+
+    assert interrupted["status"] == "interrupted"
+    assert runtime.last_checkpoint is not None
+
+    resumed_context = ExecutionContext.from_dict(runtime.last_checkpoint["context"])
+    resumed_context.add_user_message("replacement question")
+    resumed_pattern = AutoPattern()
+    resumed_pattern.load_state(runtime.last_checkpoint["pattern_state"])
+    resumed_llm = FakeLLM(
+        [decision_tool_response("final_answer", "Replacement answer.", answer="new")]
+    )
+
+    resumed = await resumed_pattern.run(
+        context=resumed_context,
+        tools=[],
+        llm=resumed_llm,
+        runtime=PatternRuntime(),
+        memory_store=memory_store,
+        skill_manager=skill_manager,
+    )
+
+    assert resumed["success"] is True
+    assert resumed["output"] == "new"
+    assert [search["query"] for search in memory_store.searches] == [
+        "first question",
+        "first question",
+        "replacement question",
+        "replacement question",
+    ]
+    assert skill_manager.tasks == ["first question", "replacement question"]
+    resumed_system_context = next(
+        message["content"]
+        for message in resumed_llm.calls[0]["messages"]
+        if message["role"] == "system"
+    )
+    assert "memory for replacement question" in resumed_system_context
+    assert "skill-for-replacement question" in resumed_system_context
+    assert "memory for first question" not in resumed_system_context
+    assert "skill-for-first question" not in resumed_system_context
 
 
 @pytest.mark.asyncio

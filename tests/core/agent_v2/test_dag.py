@@ -928,6 +928,37 @@ async def test_dag_pattern_checkpoints_failed_step_result() -> None:
 
 
 @pytest.mark.asyncio
+async def test_dag_pattern_marks_step_failed_when_child_raises() -> None:
+    class ExplodingLLM:
+        async def chat(self, **kwargs: Any) -> dict[str, Any]:
+            del kwargs
+            raise RuntimeError("child exploded")
+
+    tracer = TracerCheckpointStore()
+    runtime = PatternRuntime(tracer=tracer, execution_id="dag-step-exception")
+    plan = build_plan(PlanStep(id="bad", task="Raise unexpectedly"))
+    pattern = DAGPattern(lambda **_: plan)
+
+    result = await pattern.run(
+        context=ExecutionContext(execution_id="dag-step-exception"),
+        tools=[],
+        llm=ExplodingLLM(),
+        runtime=runtime,
+    )
+
+    assert result["success"] is False
+    assert result["status"] == "failed"
+    assert result["failure_reason"] == "step_failed"
+    assert result["failed_step_id"] == "bad"
+    assert result["error"] == "child exploded"
+    assert plan.steps[0].status == "failed"
+    assert plan.steps[0].error == "child exploded"
+    assert runtime.last_checkpoint is not None
+    assert runtime.last_checkpoint["label"] == "dag_failed"
+    assert runtime.last_checkpoint["metadata"]["failed_step_id"] == "bad"
+
+
+@pytest.mark.asyncio
 async def test_dag_step_keeps_tools_available_until_final_answer() -> None:
     plan = build_plan(
         PlanStep(

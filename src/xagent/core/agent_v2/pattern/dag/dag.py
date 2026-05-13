@@ -665,16 +665,37 @@ class DAGPattern(AgentPattern):
                 "tool_names": list(step.tool_names),
             },
         )
-        result = await react_pattern.run(
-            context=child_context,
-            tools=tools,
-            llm=llm,
-            runtime=step_runtime,
-            memory_store=memory_store,
-            memory_similarity_threshold=memory_similarity_threshold,
-            skill_manager=skill_manager,
-            allowed_skills=allowed_skills,
-        )
+        try:
+            result = await react_pattern.run(
+                context=child_context,
+                tools=tools,
+                llm=llm,
+                runtime=step_runtime,
+                memory_store=memory_store,
+                memory_similarity_threshold=memory_similarity_threshold,
+                skill_manager=skill_manager,
+                allowed_skills=allowed_skills,
+            )
+        except LLMCallInterrupted:
+            raise
+        except Exception as exc:
+            step.status = "failed"
+            step.error = str(exc)
+            self._clear_active_step(step.id)
+            await runtime.on_dag_step_end(
+                context=root_context,
+                step_id=step.id,
+                data={
+                    "step_id": step.id,
+                    "step_name": step.task,
+                    "description": step.description,
+                    "dependencies": list(step.dependencies),
+                    "tool_names": list(step.tool_names),
+                    "status": "failed",
+                    "error": step.error,
+                },
+            )
+            return None
 
         status = result.get("status")
         if status == "interrupted":

@@ -82,6 +82,31 @@ class FakeAskUserTool:
         return args
 
 
+class LegacySchemaArgs:
+    @classmethod
+    def schema(cls) -> dict[str, Any]:
+        return {
+            "type": "object",
+            "properties": {"value": {"type": "integer"}},
+            "required": ["value"],
+        }
+
+
+class LegacySchemaTool:
+    def __init__(self) -> None:
+        class Metadata:
+            name = "legacy_schema"
+            description = "Legacy schema tool."
+
+        self.metadata = Metadata()
+
+    def args_type(self) -> type[LegacySchemaArgs]:
+        return LegacySchemaArgs
+
+    async def run_json_async(self, args: dict[str, Any]) -> Any:
+        return {"value": args["value"]}
+
+
 class FakeLLM:
     def __init__(self, responses: list[Any]) -> None:
         self.responses = responses
@@ -327,6 +352,26 @@ async def test_react_pattern_uses_langchain_tool_schema() -> None:
     assert context.get_messages_by_role("tool")[-1].content == (
         "Tool add_numbers returned: 5"
     )
+
+
+@pytest.mark.asyncio
+async def test_react_pattern_supports_legacy_args_type_schema() -> None:
+    llm = FakeLLM(responses=[{"content": "Done.", "done": True}])
+    pattern = ReActPattern(max_iterations=1)
+    context = ExecutionContext()
+    context.add_user_message("Inspect schema")
+
+    result = await pattern.run(context=context, tools=[LegacySchemaTool()], llm=llm)
+
+    assert result["success"] is True
+    tool_schema = next(
+        schema
+        for schema in llm.calls[0]["tools"]
+        if schema["function"]["name"] == "legacy_schema"
+    )
+    parameters = tool_schema["function"]["parameters"]
+    assert parameters["properties"]["value"]["type"] == "integer"
+    assert parameters["required"] == ["value"]
 
 
 @pytest.mark.asyncio

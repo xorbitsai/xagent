@@ -1085,6 +1085,8 @@ class ReActPattern(AgentPattern):
             schema_type = args_type()
             if hasattr(schema_type, "model_json_schema"):
                 return cast(dict[str, Any], schema_type.model_json_schema())
+            if hasattr(schema_type, "schema"):
+                return cast(dict[str, Any], schema_type.schema())
         for schema_attr in ("args_schema", "tool_call_schema"):
             schema_type = getattr(tool, schema_attr, None)
             if schema_type is None:

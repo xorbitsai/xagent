@@ -149,11 +149,13 @@ class LanceDBMetadataStore(MetadataStore):
         )
         table = conn.open_table("collection_metadata")
         try:
-            for collection_name in rows_by_name:
-                safe_name = escape_lancedb_string(collection_name)
-                existing = table.search().where(f"name = '{safe_name}'").to_arrow()
-                if len(existing) > 0:
-                    table.delete(f"name = '{safe_name}'")
+            names_to_delete = [
+                escape_lancedb_string(collection_name)
+                for collection_name in rows_by_name
+            ]
+            if names_to_delete:
+                names_str = ", ".join(f"'{name}'" for name in names_to_delete)
+                table.delete(f"name IN ({names_str})")
             table.add(list(rows_by_name.values()))
         finally:
             _safe_close_table(table)

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import inspect
 import json
 from dataclasses import dataclass, replace
@@ -67,6 +68,8 @@ class ReActPattern(AgentPattern):
         self,
         llm: Any | None = None,
         *,
+        # Intentionally high for interactive and long-running agent tasks; callers
+        # can pass a lower value when they need stricter cost or latency bounds.
         max_iterations: int = 200,
         tool_choice: str | dict[str, Any] | None = "auto",
         reasoning_mode: ReActReasoningMode | str = ReActReasoningMode.TOOL_CALLING,
@@ -977,13 +980,19 @@ class ReActPattern(AgentPattern):
             return str(metadata.name)
         if getattr(tool, "name", None):
             return str(tool.name)
+        if getattr(tool, "__name__", None):
+            return str(tool.__name__)
         raise ValueError(f"Tool {tool!r} is missing a name.")
 
     def _tool_description(self, tool: Any) -> str:
         metadata = getattr(tool, "metadata", None)
         if metadata is not None and getattr(metadata, "description", None):
             return str(metadata.description)
-        return str(getattr(tool, "description", "")) or self._tool_name(tool)
+        return (
+            str(getattr(tool, "description", ""))
+            or str(getattr(tool, "__doc__", "")).strip()
+            or self._tool_name(tool)
+        )
 
     def _tool_json_schema(self, tool: Any) -> dict[str, Any]:
         args_type = getattr(tool, "args_type", None)
@@ -1024,7 +1033,9 @@ class ReActPattern(AgentPattern):
         raise ValueError(f"Tool not found: {name}")
 
     async def _invoke_callable(self, fn: Any, **kwargs: Any) -> Any:
-        result = fn(**kwargs)
+        if inspect.iscoroutinefunction(fn):
+            return await fn(**kwargs)
+        result = await asyncio.to_thread(fn, **kwargs)
         if inspect.isawaitable(result):
             return await result
         return result

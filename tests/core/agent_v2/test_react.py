@@ -228,6 +228,57 @@ async def test_react_pattern_runs_tool_call_then_final_answer() -> None:
 
 
 @pytest.mark.asyncio
+async def test_react_pattern_supports_plain_function_tools(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    to_thread_calls: list[dict[str, Any]] = []
+
+    async def fake_to_thread(fn: Any, /, *args: Any, **kwargs: Any) -> Any:
+        to_thread_calls.append({"fn": fn, "args": args, "kwargs": kwargs})
+        return fn(*args, **kwargs)
+
+    def double_number(value: int) -> dict[str, Any]:
+        """Double a numeric input."""
+        return {"result": value * 2}
+
+    monkeypatch.setattr(asyncio, "to_thread", fake_to_thread)
+    llm = FakeLLM(
+        responses=[
+            {
+                "content": "Use the plain function.",
+                "tool_calls": [
+                    {
+                        "id": "call_plain",
+                        "function": {
+                            "name": "double_number",
+                            "arguments": '{"value":4}',
+                        },
+                    }
+                ],
+            },
+            {"content": "The result is 8.", "done": True},
+        ]
+    )
+    pattern = ReActPattern(max_iterations=3)
+    context = ExecutionContext(system_prompt="You are helpful.")
+    context.add_user_message("Double 4")
+
+    result = await pattern.run(context=context, tools=[double_number], llm=llm)
+
+    assert result["success"] is True
+    assert result["response"] == "The result is 8."
+    assert to_thread_calls
+    assert to_thread_calls[0]["kwargs"] == {"value": 4}
+    tool_schema = next(
+        schema
+        for schema in llm.calls[0]["tools"]
+        if schema["function"]["name"] == "double_number"
+    )
+    assert tool_schema["function"]["description"] == "Double a numeric input."
+    assert context.messages[2].content == "Tool double_number returned: {'result': 8}"
+
+
+@pytest.mark.asyncio
 async def test_react_pattern_injects_v1_memory_and_skill_context() -> None:
     llm = FakeLLM(
         responses=[

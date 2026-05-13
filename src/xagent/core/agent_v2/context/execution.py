@@ -336,6 +336,43 @@ class ExecutionContext:
 
     def _system_context(self) -> str:
         parts = [self._current_time_context()]
+        dag_step_id = self.metadata.get("dag_step_id")
+        if dag_step_id:
+            dag_step_name = str(self.metadata.get("dag_step_name") or "").strip()
+            dag_step_description = str(
+                self.metadata.get("dag_step_description") or dag_step_name
+            ).strip()
+            dag_dependencies = self.metadata.get("dag_dependencies")
+            if not isinstance(dag_dependencies, list):
+                dag_dependencies = []
+            dag_tool_names = self.metadata.get("dag_tool_names")
+            if not isinstance(dag_tool_names, list):
+                dag_tool_names = []
+            suggested_tools = (
+                ", ".join(str(name) for name in dag_tool_names if str(name).strip())
+                or "(none)"
+            )
+            original_goal = str(self.metadata.get("dag_original_goal") or "").strip()
+            parts.append(
+                "DAG step execution scope:\n"
+                f"- Overall user goal is background context only: "
+                f"{original_goal or '(not provided)'}\n"
+                f"- Current step id: {dag_step_id}\n"
+                f"- Current step title: {dag_step_name or dag_step_id}\n"
+                f"- Current step description: "
+                f"{dag_step_description or dag_step_name or dag_step_id}\n"
+                f"- Current step dependencies: {dag_dependencies}\n"
+                f"- Suggested tools for this step: {suggested_tools}\n\n"
+                "Only execute the current DAG step. Do not perform sibling, "
+                "downstream, final synthesis, rendering, export, or delivery work "
+                "unless that work is explicitly part of the current step description. "
+                "Use dependency results only as inputs for this step. Treat suggested "
+                "tools as the primary tool scope: prefer them and avoid other tools "
+                "unless this current step cannot be completed or recovered without "
+                "them. If no suggested tools are listed, avoid tool calls unless the "
+                "step clearly cannot be completed from provided context and dependency "
+                "results."
+            )
         memory_context = self.metadata.get(MEMORY_CONTEXT_METADATA_KEY)
         if memory_context:
             parts.append(

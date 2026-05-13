@@ -1,0 +1,1480 @@
+from __future__ import annotations
+
+import asyncio
+import json
+from pathlib import Path
+from typing import Any
+
+import pytest
+
+from xagent.core.agent_v2 import (
+    Agent,
+    AgentRunner,
+    ContextManager,
+    DAGPattern,
+    ExecutionContext,
+    ExecutionPlan,
+    LLMPlanGenerator,
+    PatternRuntime,
+    PlanGenerationRequest,
+    PlanGenerator,
+    PlanStep,
+    PlanValidationError,
+)
+
+
+@pytest.fixture(autouse=True)
+def reset_context_manager() -> None:
+    manager = ContextManager()
+    manager._contexts.clear()  # type: ignore[attr-defined]
+    yield
+    manager._contexts.clear()  # type: ignore[attr-defined]
+
+
+class FakeWorkspace:
+    def __init__(self, task_id: str, tmp_path: Path) -> None:
+        workspace_dir = tmp_path / task_id
+        self.id = task_id
+        self.workspace_dir = workspace_dir
+        self.input_dir = workspace_dir / "input"
+        self.output_dir = workspace_dir / "output"
+        self.temp_dir = workspace_dir / "temp"
+        self.allowed_external_dirs: list[Path] = []
+
+
+class FakeWorkspaceManager:
+    def __init__(self, tmp_path: Path) -> None:
+        self.tmp_path = tmp_path
+
+    def get_or_create_workspace(
+        self,
+        base_dir: str,
+        task_id: str,
+        allowed_external_dirs: list[str] | None = None,
+    ) -> FakeWorkspace:
+        del base_dir, allowed_external_dirs
+        return FakeWorkspace(task_id, self.tmp_path)
+
+
+class FakeTool:
+    def __init__(self) -> None:
+        self.calls: list[dict[str, Any]] = []
+
+        class Metadata:
+            name = "calculator"
+            description = "Evaluate math expressions."
+
+        self.metadata = Metadata()
+
+    def args_type(self) -> type:
+        class Args:
+            @staticmethod
+            def model_json_schema() -> dict[str, Any]:
+                return {
+                    "type": "object",
+                    "properties": {"expression": {"type": "string"}},
+                }
+
+        return Args
+
+    async def run_json_async(self, args: dict[str, Any]) -> Any:
+        self.calls.append(args)
+        return {"result": eval(args["expression"])}  # noqa: S307
+
+
+class SequenceLLM:
+    def __init__(self, responses: list[dict[str, Any]]) -> None:
+        self.responses = responses
+        self.calls = 0
+        self.call_kwargs: list[dict[str, Any]] = []
+        self.seen_messages: list[list[dict[str, Any]]] = []
+
+    async def chat(self, **kwargs: Any) -> dict[str, Any]:
+        self.call_kwargs.append(kwargs)
+        self.seen_messages.append(list(kwargs.get("messages", [])))
+        response = self.responses[self.calls]
+        self.calls += 1
+        return response
+
+
+class TracerCheckpointStore:
+    def __init__(self) -> None:
+        self.by_execution_id: dict[str, dict[str, Any]] = {}
+        self.checkpoints: list[dict[str, Any]] = []
+
+    async def checkpoint(self, **payload: Any) -> None:
+        self.by_execution_id[str(payload["execution_id"])] = dict(payload)
+        self.checkpoints.append(dict(payload))
+
+    async def load_latest_checkpoint(self, execution_id: str) -> dict[str, Any] | None:
+        payload = self.by_execution_id.get(execution_id)
+        return dict(payload) if payload is not None else None
+
+
+class PlanLLM:
+    def __init__(self, response: Any) -> None:
+        self.response = response
+        self.calls: list[dict[str, Any]] = []
+
+    async def chat(self, **kwargs: Any) -> Any:
+        self.calls.append(kwargs)
+        return self.response
+
+
+class MemoryNote:
+    content = "Split this project using the historical DAG pattern."
+    keywords = ["dag"]
+    metadata = {"source": "test"}
+    category = "dag_plan_execute_memory"
+
+
+class FakeMemoryStore:
+    def __init__(self) -> None:
+        self.searches: list[dict[str, Any]] = []
+
+    def search(self, **kwargs: Any) -> list[MemoryNote]:
+        self.searches.append(kwargs)
+        return [MemoryNote()]
+
+
+class FakeSkillManager:
+    async def select_skill(self, **kwargs: Any) -> dict[str, Any]:
+        return {
+            "name": "dag-skill",
+            "description": "DAG skill",
+            "content": "Use the DAG skill instructions.",
+        }
+
+
+def current_step_task(messages: list[dict[str, Any]]) -> str:
+    content = str(messages[-1]["content"])
+    for line in content.splitlines():
+        if line.startswith("Current DAG step title: "):
+            return line.removeprefix("Current DAG step title: ").strip()
+    return content
+
+
+def plan_tool_response(steps: list[dict[str, Any]]) -> dict[str, Any]:
+    return {
+        "tool_calls": [
+            {
+                "id": "call_generate_execution_plan",
+                "type": "function",
+                "function": {
+                    "name": "generate_execution_plan",
+                    "arguments": json.dumps({"steps": steps}),
+                },
+            }
+        ]
+    }
+
+
+class ConcurrentStepLLM:
+    def __init__(self) -> None:
+        self.release = asyncio.Event()
+        self.started_by_task: dict[str, asyncio.Event] = {}
+        self.active_calls = 0
+        self.max_active_calls = 0
+
+    async def chat(self, **kwargs: Any) -> dict[str, Any]:
+        messages = list(kwargs.get("messages", []))
+        task = current_step_task(messages)
+        self.started_by_task.setdefault(task, asyncio.Event()).set()
+        self.active_calls += 1
+        self.max_active_calls = max(self.max_active_calls, self.active_calls)
+        try:
+            await self.release.wait()
+            return {"content": f"{task} done", "done": True}
+        finally:
+            self.active_calls -= 1
+
+    async def wait_started(self, task: str) -> None:
+        await self.started_by_task.setdefault(task, asyncio.Event()).wait()
+
+
+class FailingPlanGenerator(PlanGenerator):
+    def __init__(self, message: str = "planner failed") -> None:
+        self.message = message
+
+    async def generate_plan(
+        self,
+        *,
+        request: PlanGenerationRequest,
+        llm: Any,
+    ) -> ExecutionPlan:
+        del request, llm
+        raise RuntimeError(self.message)
+
+
+def build_plan(*steps: PlanStep) -> ExecutionPlan:
+    return ExecutionPlan(steps=list(steps))
+
+
+async def run_invalid_plan(plan: ExecutionPlan) -> dict[str, Any]:
+    pattern = DAGPattern(lambda **_: plan)
+    return await pattern.run(
+        context=ExecutionContext(execution_id="dag-invalid"),
+        tools=[],
+        llm=SequenceLLM([]),
+    )
+
+
+@pytest.mark.asyncio
+async def test_dag_pattern_interrupt_before_plan_skips_plan_generation() -> None:
+    plan_calls: list[dict[str, Any]] = []
+
+    def generate_plan(**kwargs: Any) -> ExecutionPlan:
+        plan_calls.append(kwargs)
+        return build_plan(PlanStep(id="answer", task="Answer directly"))
+
+    runtime = PatternRuntime()
+    runtime.request_interrupt("paused by test")
+    context = ExecutionContext(execution_id="dag-pause")
+    context.add_user_message("Plan this")
+
+    result = await DAGPattern(generate_plan).run(
+        context=context,
+        tools=[],
+        llm=SequenceLLM([]),
+        runtime=runtime,
+    )
+
+    assert result["success"] is False
+    assert result["status"] == "interrupted"
+    assert result["interrupt_reason"] == "paused by test"
+    assert plan_calls == []
+    assert runtime.last_checkpoint is not None
+    assert runtime.last_checkpoint["label"] == "dag_interrupted"
+    assert runtime.last_checkpoint["metadata"] == {
+        "safe_point": "dag_before_plan",
+        "reason": "paused by test",
+    }
+
+
+class ReplanningPlanGenerator(PlanGenerator):
+    def __init__(self) -> None:
+        self.calls: list[dict[str, Any]] = []
+
+    async def generate_plan(
+        self,
+        *,
+        request: PlanGenerationRequest,
+        llm: Any,
+    ) -> ExecutionPlan:
+        del llm
+        self.calls.append(
+            {
+                "user_messages": [
+                    message.content
+                    for message in request.context.messages
+                    if message.role == "user"
+                ],
+                "request": request.to_dict(),
+            }
+        )
+        if request.replan:
+            return build_plan(
+                PlanStep(id="step_1", task="Original first step"),
+                PlanStep(
+                    id="step_3", task="New replanned step", dependencies=["step_1"]
+                ),
+            )
+        return build_plan(
+            PlanStep(id="step_1", task="Original first step"),
+            PlanStep(id="step_2", task="Original second step", dependencies=["step_1"]),
+        )
+
+
+class FailingReplanGenerator(ReplanningPlanGenerator):
+    async def generate_plan(
+        self,
+        *,
+        request: PlanGenerationRequest,
+        llm: Any,
+    ) -> ExecutionPlan:
+        if request.replan:
+            self.calls.append(
+                {
+                    "user_messages": [
+                        message.content
+                        for message in request.context.messages
+                        if message.role == "user"
+                    ],
+                    "request": request.to_dict(),
+                }
+            )
+            raise RuntimeError("replan exploded")
+        return await super().generate_plan(request=request, llm=llm)
+
+
+class ConcurrentReplanGenerator(PlanGenerator):
+    def __init__(self) -> None:
+        self.calls: list[dict[str, Any]] = []
+
+    async def generate_plan(
+        self,
+        *,
+        request: PlanGenerationRequest,
+        llm: Any,
+    ) -> ExecutionPlan:
+        del llm
+        self.calls.append(request.to_dict())
+        if request.replan:
+            return build_plan(PlanStep(id="replacement", task="Replacement task"))
+        return build_plan(
+            PlanStep(id="interrupt", task="Interrupt task"),
+            PlanStep(id="slow", task="Slow task"),
+        )
+
+
+@pytest.mark.asyncio
+async def test_dag_pattern_executes_steps_in_dependency_order() -> None:
+    llm = SequenceLLM(
+        [
+            {"content": "step one complete", "done": True},
+            {"content": "step two complete", "done": True},
+        ]
+    )
+    plan = build_plan(
+        PlanStep(id="step_1", task="First task"),
+        PlanStep(id="step_2", task="Second task", dependencies=["step_1"]),
+    )
+    pattern = DAGPattern(lambda **_: plan)
+    context = ExecutionContext(execution_id="dag-seq")
+
+    result = await pattern.run(context=context, tools=[], llm=llm)
+
+    assert result["success"] is True
+    assert result["status"] == "completed"
+    assert result["step_results"] == {
+        "step_1": "step one complete",
+        "step_2": "step two complete",
+    }
+    assert [step.status for step in pattern.plan.steps] == ["completed", "completed"]
+
+
+@pytest.mark.asyncio
+async def test_dag_pattern_returns_terminal_step_result_as_output() -> None:
+    llm = SequenceLLM(
+        [
+            {"content": "raw search notes", "done": True},
+            {"content": "final summary", "done": True},
+        ]
+    )
+    plan = build_plan(
+        PlanStep(id="search", task="Search"),
+        PlanStep(id="summarize", task="Summarize", dependencies=["search"]),
+    )
+    pattern = DAGPattern(lambda **_: plan)
+
+    result = await pattern.run(
+        context=ExecutionContext(execution_id="dag-terminal-output"),
+        tools=[],
+        llm=llm,
+    )
+
+    assert result["success"] is True
+    assert result["output"] == "final summary"
+    assert result["step_results"] == {
+        "search": "raw search notes",
+        "summarize": "final summary",
+    }
+
+
+@pytest.mark.asyncio
+async def test_dag_pattern_injects_dependency_summary_into_child_context() -> None:
+    llm = SequenceLLM(
+        [
+            {"content": "42", "done": True},
+            {"content": "done", "done": True},
+        ]
+    )
+    plan = build_plan(
+        PlanStep(id="calc", task="Compute a number"),
+        PlanStep(id="use", task="Use the dependency", dependencies=["calc"]),
+    )
+    pattern = DAGPattern(lambda **_: plan)
+    context = ExecutionContext(execution_id="dag-deps")
+
+    result = await pattern.run(context=context, tools=[], llm=llm)
+
+    assert result["success"] is True
+    second_call_messages = llm.seen_messages[1]
+    assert any(
+        message["role"] == "user"
+        and "Dependency results" in message["content"]
+        and "42" in message["content"]
+        for message in second_call_messages
+    )
+
+
+@pytest.mark.asyncio
+async def test_dag_step_appends_current_step_boundary_after_parent_context() -> None:
+    llm = SequenceLLM([{"content": "release notes only", "done": True}])
+    plan = build_plan(
+        PlanStep(
+            id="extract",
+            task="Extract release highlights",
+            description="Extract version, date, features, bug fixes, and contributors.",
+        )
+    )
+    pattern = DAGPattern(lambda **_: plan)
+    context = ExecutionContext(execution_id="dag-step-boundary")
+    context.add_user_message("Extract highlights and generate two posters.")
+
+    result = await pattern.run(context=context, tools=[], llm=llm)
+
+    assert result["success"] is True
+    messages = llm.seen_messages[0]
+    assert any(
+        message["role"] == "user"
+        and message["content"] == "Extract highlights and generate two posters."
+        for message in messages
+    )
+    assert messages[-1]["role"] == "user"
+    assert "DAG STEP EXECUTION BOUNDARY" in messages[-1]["content"]
+    assert "Current DAG step id: extract" in messages[-1]["content"]
+    assert "Execute only the current DAG step" in messages[-1]["content"]
+    assert "leave that work for later DAG steps" in messages[-1]["content"]
+    assert messages[0]["role"] == "system"
+    assert "DAG step execution scope" in messages[0]["content"]
+    assert "Overall user goal is background context only" in messages[0]["content"]
+    assert "Current step id: extract" in messages[0]["content"]
+    assert "Treat suggested tools as the primary tool scope" in messages[0]["content"]
+
+
+@pytest.mark.asyncio
+async def test_dag_dependency_summary_precedes_current_step_boundary() -> None:
+    llm = SequenceLLM(
+        [
+            {"content": "raw research", "done": True},
+            {"content": "summary", "done": True},
+        ]
+    )
+    plan = build_plan(
+        PlanStep(id="research", task="Research"),
+        PlanStep(id="summarize", task="Summarize", dependencies=["research"]),
+    )
+    pattern = DAGPattern(lambda **_: plan)
+    context = ExecutionContext(execution_id="dag-boundary-deps")
+    context.add_user_message("Research and summarize.")
+
+    result = await pattern.run(context=context, tools=[], llm=llm)
+
+    assert result["success"] is True
+    second_call_messages = llm.seen_messages[1]
+    assert second_call_messages[-2]["role"] == "user"
+    assert "Dependency results" in second_call_messages[-2]["content"]
+    assert second_call_messages[-1]["role"] == "user"
+    assert "DAG STEP EXECUTION BOUNDARY" in second_call_messages[-1]["content"]
+    assert "Current DAG step id: summarize" in second_call_messages[-1]["content"]
+    assert second_call_messages[0]["role"] == "system"
+    assert "Current step id: summarize" in second_call_messages[0]["content"]
+
+
+@pytest.mark.asyncio
+async def test_dag_pattern_executes_independent_ready_steps_concurrently() -> None:
+    tracer = TracerCheckpointStore()
+    llm = ConcurrentStepLLM()
+    pattern = DAGPattern(
+        lambda **_: build_plan(
+            PlanStep(id="step_1", task="Task 1"),
+            PlanStep(id="step_2", task="Task 2"),
+            PlanStep(id="step_3", task="Task 3"),
+            PlanStep(id="step_4", task="Task 4"),
+            PlanStep(id="step_5", task="Task 5"),
+        )
+    )
+    context = ExecutionContext(execution_id="dag-parallel")
+
+    run_task = asyncio.create_task(
+        pattern.run(
+            context=context,
+            tools=[],
+            llm=llm,
+            runtime=PatternRuntime(tracer=tracer, execution_id="dag-parallel"),
+        )
+    )
+    await llm.wait_started("Task 1")
+    await llm.wait_started("Task 2")
+    await llm.wait_started("Task 3")
+    await llm.wait_started("Task 4")
+
+    assert "Task 5" not in llm.started_by_task
+    assert llm.max_active_calls == 4
+    batch_checkpoint = next(
+        checkpoint
+        for checkpoint in tracer.checkpoints
+        if checkpoint["label"] == "dag_before_ready_batch"
+    )
+    assert batch_checkpoint["metadata"]["max_concurrency"] == 4
+    snapshot = batch_checkpoint["execution_snapshot"]
+    assert snapshot["active_frame_ids"] == [
+        "dag-parallel:dag",
+        "dag-parallel:dag_step:step_1",
+        "dag-parallel:dag_step:step_2",
+        "dag-parallel:dag_step:step_3",
+        "dag-parallel:dag_step:step_4",
+    ]
+    assert snapshot["frames"]["dag-parallel:dag"]["children"] == [
+        "dag-parallel:dag_step:step_1",
+        "dag-parallel:dag_step:step_2",
+        "dag-parallel:dag_step:step_3",
+        "dag-parallel:dag_step:step_4",
+    ]
+
+    llm.release.set()
+    result = await run_task
+
+    assert result["success"] is True
+    assert result["status"] == "completed"
+    assert result["step_results"] == {
+        "step_1": "Task 1 done",
+        "step_2": "Task 2 done",
+        "step_3": "Task 3 done",
+        "step_4": "Task 4 done",
+        "step_5": "Task 5 done",
+    }
+
+
+@pytest.mark.asyncio
+async def test_dag_pattern_concurrent_interrupt_cancels_sibling_and_replans(
+    tmp_path: Path,
+) -> None:
+    tracer = TracerCheckpointStore()
+    plan_generator = ConcurrentReplanGenerator()
+    execution_id = "dag-parallel-interrupt"
+    tool = FakeTool()
+    agent = Agent(
+        name="writer",
+        patterns=[DAGPattern(plan_generator)],
+        tools=[tool],
+        llm=None,
+    )
+    runner = AgentRunner(
+        agent=agent,
+        tracer=tracer,
+        workspace_manager=FakeWorkspaceManager(tmp_path),
+    )
+
+    class InterruptAndSlowLLM:
+        def __init__(self) -> None:
+            self.slow_started = asyncio.Event()
+            self.slow_cancelled = asyncio.Event()
+
+        async def chat(self, **kwargs: Any) -> dict[str, Any]:
+            messages = list(kwargs.get("messages", []))
+            task = current_step_task(messages)
+            if task == "Slow task":
+                self.slow_started.set()
+                try:
+                    await asyncio.Future()
+                except asyncio.CancelledError:
+                    self.slow_cancelled.set()
+                    raise
+            if task == "Interrupt task":
+                await self.slow_started.wait()
+                await runner.post_user_message(
+                    execution_id,
+                    "Replace the remaining work.",
+                    request_interrupt=True,
+                    reason="parallel interrupt",
+                )
+                return {
+                    "content": "Stop old branch",
+                    "tool_calls": [
+                        {
+                            "id": "old-tool",
+                            "function": {
+                                "name": "calculator",
+                                "arguments": '{"expression":"1+1"}',
+                            },
+                        }
+                    ],
+                    "done": False,
+                }
+            return {"content": "replacement done", "done": True}
+
+    llm = InterruptAndSlowLLM()
+    agent.llm = llm
+
+    result = await asyncio.wait_for(
+        runner.run(task="Root task", execution_id=execution_id),
+        timeout=1,
+    )
+
+    assert result["success"] is True
+    assert result["status"] == "completed"
+    assert result["step_results"] == {"replacement": "replacement done"}
+    assert tool.calls == []
+    assert llm.slow_cancelled.is_set()
+    assert plan_generator.calls[1]["replan"] is True
+    assert plan_generator.calls[1]["completed_step_results"] == {}
+
+
+@pytest.mark.asyncio
+async def test_callable_plan_generator_receives_structured_request() -> None:
+    seen: list[PlanGenerationRequest] = []
+
+    def build_from_request(**kwargs: Any) -> ExecutionPlan:
+        request = kwargs["request"]
+        seen.append(request)
+        return build_plan(PlanStep(id="single", task="Only task"))
+
+    pattern = DAGPattern(build_from_request)
+    context = ExecutionContext(execution_id="dag-contract")
+
+    result = await pattern.run(
+        context=context,
+        tools=[],
+        llm=SequenceLLM([{"content": "done", "done": True}]),
+    )
+
+    assert result["success"] is True
+    assert len(seen) == 1
+    assert seen[0].execution_id == "dag-contract"
+    assert seen[0].replan is False
+    assert seen[0].completed_step_results == {}
+    assert seen[0].previous_plan is None
+
+
+@pytest.mark.asyncio
+async def test_llm_plan_generator_builds_plan_from_model_json() -> None:
+    generator = LLMPlanGenerator()
+    context = ExecutionContext(execution_id="dag-llm-plan")
+    context.add_user_message("Create a short plan")
+    llm = PlanLLM(
+        plan_tool_response(
+            [
+                {"id": "draft", "task": "Draft answer"},
+                {
+                    "id": "final",
+                    "task": "Finalize answer",
+                    "description": "Write the final answer from the draft.",
+                    "tool_names": ["calculator"],
+                    "dependencies": ["draft"],
+                },
+            ]
+        )
+    )
+
+    plan = await generator.generate_plan(
+        request=PlanGenerationRequest(
+            context=context,
+            execution_id="dag-llm-plan",
+            available_tool_names=["calculator"],
+        ),
+        llm=llm,
+    )
+
+    assert [step.id for step in plan.steps] == ["draft", "final"]
+    assert plan.steps[1].dependencies == ["draft"]
+    assert plan.steps[1].description == "Write the final answer from the draft."
+    assert plan.steps[1].tool_names == ["calculator"]
+    assert llm.calls[0]["tools"][0]["function"]["name"] == "generate_execution_plan"
+    step_schema = llm.calls[0]["tools"][0]["function"]["parameters"]["properties"][
+        "steps"
+    ]["items"]["properties"]
+    assert "description" in step_schema
+    assert "tool_names" in step_schema
+    assert "dependencies" in step_schema
+    step_required = llm.calls[0]["tools"][0]["function"]["parameters"]["properties"][
+        "steps"
+    ]["items"]["required"]
+    assert "dependencies" in step_required
+    assert "tool_names" in step_required
+    system_prompt = llm.calls[0]["messages"][0]["content"]
+    assert "dependencies is required for every step" in system_prompt
+    assert "screenshot or render steps must depend" in system_prompt
+    assert 'tool_names"; "description" is optional' in system_prompt
+    assert "suggested execution tool scope" in system_prompt
+    assert llm.calls[0]["tool_choice"] == "required"
+    assert llm.calls[0]["thinking"] == {"type": "disabled", "enable": False}
+    assert "response_format" not in llm.calls[0]
+
+
+@pytest.mark.asyncio
+async def test_llm_plan_generator_filters_unknown_suggested_tools() -> None:
+    generator = LLMPlanGenerator()
+    context = ExecutionContext(execution_id="dag-llm-plan-filter-tools")
+    context.add_user_message("Create a short plan")
+    llm = PlanLLM(
+        plan_tool_response(
+            [
+                {
+                    "id": "draft",
+                    "task": "Draft answer",
+                    "tool_names": ["calculator", "poster-design", "missing_tool"],
+                },
+            ]
+        )
+    )
+
+    plan = await generator.generate_plan(
+        request=PlanGenerationRequest(
+            context=context,
+            execution_id="dag-llm-plan-filter-tools",
+            available_tool_names=["calculator"],
+        ),
+        llm=llm,
+    )
+
+    assert plan.steps[0].tool_names == ["calculator"]
+
+
+@pytest.mark.asyncio
+async def test_dag_pattern_enriches_plan_prompt_with_memory_and_skill() -> None:
+    generator = LLMPlanGenerator()
+    pattern = DAGPattern(generator)
+    context = ExecutionContext(execution_id="dag-enriched")
+    context.add_user_message("Plan this")
+    memory_store = FakeMemoryStore()
+    skill_manager = FakeSkillManager()
+    llm = SequenceLLM(
+        [
+            plan_tool_response([{"id": "only", "task": "Only step"}]),
+            {"content": "step done", "done": True},
+            {
+                "content": (
+                    '{"should_store": false, "reason": "routine", '
+                    '"core_insight": "", "user_preferences": "", '
+                    '"failure_patterns": "", "success_patterns": ""}'
+                )
+            },
+        ]
+    )
+
+    await pattern.run(
+        context=context,
+        tools=[],
+        llm=llm,
+        memory_store=memory_store,
+        skill_manager=skill_manager,
+    )
+
+    assert [search["filters"]["category"] for search in memory_store.searches] == [
+        "dag_plan_execute_memory",
+        "general",
+        "react_memory",
+        "general",
+    ]
+    prompt_payload = json.loads(llm.call_kwargs[0]["messages"][1]["content"])
+    assert (
+        "Split this project using the historical DAG pattern."
+        in prompt_payload["retrieved_memory_context"]
+    )
+    assert prompt_payload["selected_skill"]["name"] == "dag-skill"
+    assert "Use the DAG skill instructions." in prompt_payload["selected_skill_context"]
+
+
+@pytest.mark.asyncio
+async def test_dag_dependency_summary_does_not_add_extra_system_message() -> None:
+    llm = SequenceLLM(
+        [
+            {"content": "dependency done", "done": True},
+            {"content": "child done", "done": True},
+        ]
+    )
+    plan = build_plan(
+        PlanStep(id="dep", task="Dependency task"),
+        PlanStep(id="child", task="Child task", dependencies=["dep"]),
+    )
+    pattern = DAGPattern(lambda **_: plan)
+    context = ExecutionContext(
+        execution_id="dag-single-system",
+        system_prompt="You are a precise planner.",
+    )
+
+    result = await pattern.run(context=context, tools=[], llm=llm)
+
+    assert result["success"] is True
+    child_messages = llm.seen_messages[1]
+    system_messages = [
+        message for message in child_messages if message["role"] == "system"
+    ]
+    assert len(system_messages) == 1
+    assert system_messages[0]["content"].startswith("You are a precise planner.")
+    assert "Current date and time:" in system_messages[0]["content"]
+    assert any(
+        message["role"] == "user" and "Dependency results" in message["content"]
+        for message in child_messages
+    )
+
+
+@pytest.mark.parametrize(
+    ("plan", "error"),
+    [
+        (ExecutionPlan(steps=[]), "must contain at least one step"),
+        (
+            build_plan(
+                PlanStep(id="dup", task="First"),
+                PlanStep(id="dup", task="Second"),
+            ),
+            "must be unique: dup",
+        ),
+        (
+            build_plan(PlanStep(id="child", task="Child", dependencies=["missing"])),
+            "depends on unknown step missing",
+        ),
+        (
+            build_plan(
+                PlanStep(id="a", task="A", dependencies=["b"]),
+                PlanStep(id="b", task="B", dependencies=["a"]),
+            ),
+            "dependency cycle",
+        ),
+    ],
+)
+@pytest.mark.asyncio
+async def test_dag_pattern_rejects_invalid_plans(
+    plan: ExecutionPlan,
+    error: str,
+) -> None:
+    tracer = TracerCheckpointStore()
+    runtime = PatternRuntime(tracer=tracer, execution_id="dag-invalid")
+    pattern = DAGPattern(lambda **_: plan)
+    result = await pattern.run(
+        context=ExecutionContext(execution_id="dag-invalid"),
+        tools=[],
+        llm=SequenceLLM([]),
+        runtime=runtime,
+    )
+
+    assert result["success"] is False
+    assert result["status"] == "failed"
+    assert result["failure_reason"] == "invalid_plan"
+    assert error in result["error"]
+    assert runtime.last_checkpoint is not None
+    assert runtime.last_checkpoint["label"] == "dag_plan_invalid"
+    assert runtime.last_checkpoint["metadata"]["failure_reason"] == "invalid_plan"
+
+
+@pytest.mark.asyncio
+async def test_dag_pattern_returns_failed_result_for_plan_generator_exception() -> None:
+    tracer = TracerCheckpointStore()
+    runtime = PatternRuntime(tracer=tracer, execution_id="dag-plan-error")
+    pattern = DAGPattern(FailingPlanGenerator("planner exploded"))
+
+    result = await pattern.run(
+        context=ExecutionContext(execution_id="dag-plan-error"),
+        tools=[],
+        llm=SequenceLLM([]),
+        runtime=runtime,
+    )
+
+    assert result["success"] is False
+    assert result["status"] == "failed"
+    assert result["failure_reason"] == "plan_generation_error"
+    assert result["error"] == "planner exploded"
+    assert runtime.last_checkpoint is not None
+    assert runtime.last_checkpoint["label"] == "dag_plan_generation_failed"
+    assert (
+        runtime.last_checkpoint["metadata"]["failure_reason"] == "plan_generation_error"
+    )
+
+
+@pytest.mark.asyncio
+async def test_dag_pattern_checkpoints_no_executable_steps_failure() -> None:
+    tracer = TracerCheckpointStore()
+    runtime = PatternRuntime(tracer=tracer, execution_id="dag-blocked")
+    pattern = DAGPattern(lambda **_: build_plan())
+    pattern.plan = build_plan(
+        PlanStep(id="done", task="Done", status="completed"),
+        PlanStep(id="blocked", task="Blocked", dependencies=["done"]),
+    )
+
+    result = await pattern.run(
+        context=ExecutionContext(execution_id="dag-blocked"),
+        tools=[],
+        llm=SequenceLLM([]),
+        runtime=runtime,
+    )
+
+    assert result["success"] is False
+    assert result["status"] == "failed"
+    assert result["failure_reason"] == "no_executable_steps"
+    assert runtime.last_checkpoint is not None
+    assert runtime.last_checkpoint["label"] == "dag_no_executable_steps"
+    assert (
+        runtime.last_checkpoint["metadata"]["failure_reason"] == "no_executable_steps"
+    )
+
+
+@pytest.mark.asyncio
+async def test_dag_pattern_checkpoints_failed_step_result() -> None:
+    tracer = TracerCheckpointStore()
+    runtime = PatternRuntime(tracer=tracer, execution_id="dag-step-failed")
+    pattern = DAGPattern(
+        lambda **_: build_plan(PlanStep(id="bad", task="Never finishes")),
+        react_max_iterations=1,
+    )
+
+    result = await pattern.run(
+        context=ExecutionContext(execution_id="dag-step-failed"),
+        tools=[],
+        llm=SequenceLLM([{"content": "still working", "done": False}]),
+        runtime=runtime,
+    )
+
+    assert result["success"] is False
+    assert result["status"] == "failed"
+    assert result["failure_reason"] == "step_failed"
+    assert result["failed_step_id"] == "bad"
+    assert "max iterations" in result["error"]
+    assert runtime.last_checkpoint is not None
+    assert runtime.last_checkpoint["label"] == "dag_failed"
+    assert runtime.last_checkpoint["metadata"]["failure_reason"] == "step_failed"
+    assert runtime.last_checkpoint["metadata"]["failed_step_id"] == "bad"
+
+
+@pytest.mark.asyncio
+async def test_dag_step_keeps_tools_available_until_final_answer() -> None:
+    plan = build_plan(
+        PlanStep(
+            id="calc",
+            task="Calculate value",
+            description="Calculate 6*7 and return the result.",
+            tool_names=["calculator"],
+        )
+    )
+    llm = SequenceLLM(
+        [
+            {
+                "content": "Need calculation.",
+                "tool_calls": [
+                    {
+                        "id": "dag-finalize-call",
+                        "function": {
+                            "name": "calculator",
+                            "arguments": '{"expression":"6*7"}',
+                        },
+                    }
+                ],
+                "done": False,
+            },
+            {
+                "content": "",
+                "tool_calls": [
+                    {
+                        "id": "dag-final-answer-call",
+                        "function": {
+                            "name": "final_answer",
+                            "arguments": '{"answer":"The answer is 42."}',
+                        },
+                    }
+                ],
+                "done": False,
+            },
+        ]
+    )
+    tool = FakeTool()
+    pattern = DAGPattern(lambda **_: plan)
+
+    result = await pattern.run(
+        context=ExecutionContext(execution_id="dag-finalize"),
+        tools=[tool],
+        llm=llm,
+    )
+
+    assert result["success"] is True
+    assert result["step_results"]["calc"] == "The answer is 42."
+    assert tool.calls == [{"expression": "6*7"}]
+    assert llm.call_kwargs[0]["tools"][0]["function"]["name"] == "calculator"
+    second_call_tool_names = [
+        schema["function"]["name"] for schema in llm.call_kwargs[1]["tools"]
+    ]
+    assert "calculator" in second_call_tool_names
+    assert "final_answer" in second_call_tool_names
+    assert "Do not call tools again" not in llm.call_kwargs[1]["messages"][0]["content"]
+
+
+def test_execution_plan_validate_raises_for_invalid_plan() -> None:
+    with pytest.raises(PlanValidationError, match="must contain at least one step"):
+        ExecutionPlan(steps=[]).validate()
+
+
+@pytest.mark.asyncio
+async def test_dag_pattern_resume_restores_active_step_from_root_checkpoint(
+    tmp_path: Path,
+) -> None:
+    tracer = TracerCheckpointStore()
+    tool = FakeTool()
+    first_llm = SequenceLLM(
+        [
+            {
+                "content": "Need tool",
+                "tool_calls": [
+                    {
+                        "id": "dag-call",
+                        "function": {
+                            "name": "calculator",
+                            "arguments": '{"expression":"6*7"}',
+                        },
+                    }
+                ],
+                "done": False,
+            }
+        ]
+    )
+    execution_id = "dag-resume"
+    agent = Agent(
+        name="writer",
+        patterns=[
+            DAGPattern(
+                lambda **_: build_plan(PlanStep(id="calc", task="Calculate 6*7"))
+            )
+        ],
+        tools=[tool],
+        llm=first_llm,
+    )
+    runner = AgentRunner(
+        agent=agent,
+        tracer=tracer,
+        workspace_manager=FakeWorkspaceManager(tmp_path),
+    )
+
+    class InterruptingLLM:
+        def __init__(self, base_llm: SequenceLLM, runner: AgentRunner) -> None:
+            self.base_llm = base_llm
+            self.runner = runner
+
+        async def chat(self, **kwargs: Any) -> dict[str, Any]:
+            response = await self.base_llm.chat(**kwargs)
+            self.runner.pause(execution_id, reason="pause before tool")
+            return response
+
+    agent.llm = InterruptingLLM(first_llm, runner)
+    interrupted = await runner.run(task="Root task", execution_id=execution_id)
+
+    assert interrupted["status"] == "interrupted"
+    checkpoint = tracer.by_execution_id[execution_id]
+    assert checkpoint["pattern"] == "DAGPattern"
+    assert checkpoint["metadata"]["active_step_id"] == "calc"
+    snapshot = checkpoint["execution_snapshot"]
+    root_frame_id = f"{execution_id}:dag"
+    child_frame_id = f"{execution_id}:dag_step:calc"
+    assert snapshot["root_execution_id"] == execution_id
+    assert snapshot["active_frame_ids"] == [root_frame_id, child_frame_id]
+    assert snapshot["frames"][root_frame_id]["pattern_type"] == "dag"
+    assert snapshot["frames"][root_frame_id]["active_child_id"] == child_frame_id
+    assert snapshot["frames"][child_frame_id]["pattern_type"] == "react"
+    assert snapshot["frames"][child_frame_id]["parent_frame_id"] == root_frame_id
+    assert snapshot["frames"][child_frame_id]["metadata"]["dag_step_id"] == "calc"
+
+    resumed_agent = Agent(
+        name="writer",
+        patterns=[
+            DAGPattern(
+                lambda **_: build_plan(PlanStep(id="calc", task="Calculate 6*7"))
+            )
+        ],
+        tools=[tool],
+        llm=SequenceLLM([{"content": "The answer is 42.", "done": True}]),
+    )
+    resumed_runner = AgentRunner(
+        agent=resumed_agent,
+        tracer=tracer,
+        workspace_manager=FakeWorkspaceManager(tmp_path),
+    )
+
+    resumed = await resumed_runner.resume(execution_id)
+
+    assert resumed["success"] is True
+    assert resumed["status"] == "completed"
+    assert resumed["step_results"]["calc"] == "The answer is 42."
+    assert tool.calls == []
+
+
+@pytest.mark.asyncio
+async def test_dag_pattern_interrupt_then_append_message_triggers_replan(
+    tmp_path: Path,
+) -> None:
+    tracer = TracerCheckpointStore()
+    plan_generator = ReplanningPlanGenerator()
+    execution_id = "dag-replan"
+    first_llm = SequenceLLM(
+        [
+            {"content": "first step done", "done": True},
+            {
+                "content": "Need tool",
+                "tool_calls": [
+                    {
+                        "id": "replan-call",
+                        "function": {
+                            "name": "calculator",
+                            "arguments": '{"expression":"1+1"}',
+                        },
+                    }
+                ],
+                "done": False,
+            },
+        ]
+    )
+    tool = FakeTool()
+    agent = Agent(
+        name="writer",
+        patterns=[DAGPattern(plan_generator)],
+        tools=[tool],
+        llm=first_llm,
+    )
+    runner = AgentRunner(
+        agent=agent,
+        tracer=tracer,
+        workspace_manager=FakeWorkspaceManager(tmp_path),
+    )
+
+    class InterruptOnSecondCallLLM:
+        def __init__(self, base_llm: SequenceLLM, runner: AgentRunner) -> None:
+            self.base_llm = base_llm
+            self.runner = runner
+
+        async def chat(self, **kwargs: Any) -> dict[str, Any]:
+            response = await self.base_llm.chat(**kwargs)
+            if self.base_llm.calls == 2:
+                self.runner.pause(execution_id, reason="interrupt for replan")
+            return response
+
+    agent.llm = InterruptOnSecondCallLLM(first_llm, runner)
+    interrupted = await runner.run(task="Root task", execution_id=execution_id)
+
+    assert interrupted["status"] == "interrupted"
+    assert interrupted["active_step_id"] == "step_2"
+    await runner.post_user_message(
+        execution_id,
+        "Change direction and do the new task instead.",
+        request_interrupt=False,
+    )
+
+    resumed_agent = Agent(
+        name="writer",
+        patterns=[DAGPattern(plan_generator)],
+        tools=[tool],
+        llm=SequenceLLM([{"content": "replanned step done", "done": True}]),
+    )
+    resumed_runner = AgentRunner(
+        agent=resumed_agent,
+        tracer=tracer,
+        workspace_manager=FakeWorkspaceManager(tmp_path),
+    )
+
+    resumed = await resumed_runner.resume(execution_id)
+
+    assert resumed["success"] is True
+    assert resumed["status"] == "completed"
+    assert resumed["step_results"] == {
+        "step_1": "first step done",
+        "step_3": "replanned step done",
+    }
+    assert "step_2" not in resumed["step_results"]
+    assert plan_generator.calls[1]["request"]["replan"] is True
+    assert plan_generator.calls[1]["request"]["completed_step_results"] == {
+        "step_1": "first step done"
+    }
+    assert (
+        plan_generator.calls[1]["request"]["previous_plan"]["steps"][1]["id"]
+        == "step_2"
+    )
+    assert plan_generator.calls[1]["user_messages"] == [
+        "Root task",
+        "Change direction and do the new task instead.",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_dag_pattern_live_user_message_interrupt_replans_in_same_run(
+    tmp_path: Path,
+) -> None:
+    tracer = TracerCheckpointStore()
+    plan_generator = ReplanningPlanGenerator()
+    execution_id = "dag-live-replan"
+    first_llm = SequenceLLM(
+        [
+            {"content": "first step done", "done": True},
+            {
+                "content": "Old step should stop",
+                "tool_calls": [
+                    {
+                        "id": "live-replan-call",
+                        "function": {
+                            "name": "calculator",
+                            "arguments": '{"expression":"1+1"}',
+                        },
+                    }
+                ],
+                "done": False,
+            },
+            {"content": "live replanned step done", "done": True},
+        ]
+    )
+    tool = FakeTool()
+    agent = Agent(
+        name="writer",
+        patterns=[DAGPattern(plan_generator)],
+        tools=[tool],
+        llm=first_llm,
+    )
+    runner = AgentRunner(
+        agent=agent,
+        tracer=tracer,
+        workspace_manager=FakeWorkspaceManager(tmp_path),
+    )
+
+    class LiveUserMessageLLM:
+        def __init__(self, base_llm: SequenceLLM, runner: AgentRunner) -> None:
+            self.base_llm = base_llm
+            self.runner = runner
+
+        async def chat(self, **kwargs: Any) -> dict[str, Any]:
+            response = await self.base_llm.chat(**kwargs)
+            if self.base_llm.calls == 2:
+                await self.runner.post_user_message(
+                    execution_id,
+                    "Change direction during the active node.",
+                    request_interrupt=True,
+                    reason="new live user message",
+                )
+            return response
+
+    agent.llm = LiveUserMessageLLM(first_llm, runner)
+
+    result = await runner.run(task="Root task", execution_id=execution_id)
+
+    assert result["success"] is True
+    assert result["status"] == "completed"
+    assert result["step_results"] == {
+        "step_1": "first step done",
+        "step_3": "live replanned step done",
+    }
+    assert "step_2" not in result["step_results"]
+    assert tool.calls == []
+    assert plan_generator.calls[1]["request"]["replan"] is True
+    assert plan_generator.calls[1]["request"]["completed_step_results"] == {
+        "step_1": "first step done"
+    }
+    assert plan_generator.calls[1]["user_messages"] == [
+        "Root task",
+        "Change direction during the active node.",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_dag_pattern_returns_failed_result_when_replan_generation_fails(
+    tmp_path: Path,
+) -> None:
+    tracer = TracerCheckpointStore()
+    plan_generator = FailingReplanGenerator()
+    execution_id = "dag-replan-fails"
+    first_llm = SequenceLLM(
+        [
+            {"content": "first step done", "done": True},
+            {
+                "content": "Need tool",
+                "tool_calls": [
+                    {
+                        "id": "replan-fail-call",
+                        "function": {
+                            "name": "calculator",
+                            "arguments": '{"expression":"1+1"}',
+                        },
+                    }
+                ],
+                "done": False,
+            },
+        ]
+    )
+    agent = Agent(
+        name="writer",
+        patterns=[DAGPattern(plan_generator)],
+        tools=[FakeTool()],
+        llm=first_llm,
+    )
+    runner = AgentRunner(
+        agent=agent,
+        tracer=tracer,
+        workspace_manager=FakeWorkspaceManager(tmp_path),
+    )
+
+    class InterruptOnSecondCallLLM:
+        def __init__(self, base_llm: SequenceLLM, runner: AgentRunner) -> None:
+            self.base_llm = base_llm
+            self.runner = runner
+
+        async def chat(self, **kwargs: Any) -> dict[str, Any]:
+            response = await self.base_llm.chat(**kwargs)
+            if self.base_llm.calls == 2:
+                self.runner.pause(execution_id, reason="interrupt for replan")
+            return response
+
+    agent.llm = InterruptOnSecondCallLLM(first_llm, runner)
+    interrupted = await runner.run(task="Root task", execution_id=execution_id)
+
+    assert interrupted["status"] == "interrupted"
+    await runner.post_user_message(
+        execution_id,
+        "Change direction and do the new task instead.",
+        request_interrupt=False,
+    )
+
+    resumed_agent = Agent(
+        name="writer",
+        patterns=[DAGPattern(plan_generator)],
+        tools=[],
+        llm=SequenceLLM([]),
+    )
+    resumed_runner = AgentRunner(
+        agent=resumed_agent,
+        tracer=tracer,
+        workspace_manager=FakeWorkspaceManager(tmp_path),
+    )
+
+    failed = await resumed_runner.resume(execution_id)
+
+    assert failed["success"] is False
+    assert failed["status"] == "failed"
+    assert failed["failure_reason"] == "replan_generation_error"
+    assert failed["error"] == "replan exploded"
+    checkpoint = tracer.by_execution_id[execution_id]
+    assert checkpoint["label"] == "dag_plan_generation_failed"
+    assert checkpoint["metadata"]["failure_reason"] == "replan_generation_error"
+    assert checkpoint["pattern_state"]["step_results"] == {"step_1": "first step done"}
+    assert checkpoint["pattern_state"]["plan"]["steps"][1]["id"] == "step_2"
+    assert plan_generator.calls[1]["request"]["replan"] is True
+
+
+@pytest.mark.asyncio
+async def test_dag_pattern_resume_after_replan_keeps_new_active_step(
+    tmp_path: Path,
+) -> None:
+    tracer = TracerCheckpointStore()
+    plan_generator = ReplanningPlanGenerator()
+    execution_id = "dag-replan-restart"
+    tool = FakeTool()
+    first_llm = SequenceLLM(
+        [
+            {"content": "first step done", "done": True},
+            {
+                "content": "Old plan needs tool",
+                "tool_calls": [
+                    {
+                        "id": "old-call",
+                        "function": {
+                            "name": "calculator",
+                            "arguments": '{"expression":"1+1"}',
+                        },
+                    }
+                ],
+                "done": False,
+            },
+        ]
+    )
+    first_agent = Agent(
+        name="writer",
+        patterns=[DAGPattern(plan_generator)],
+        tools=[tool],
+        llm=first_llm,
+    )
+    first_runner = AgentRunner(
+        agent=first_agent,
+        tracer=tracer,
+        workspace_manager=FakeWorkspaceManager(tmp_path),
+    )
+
+    class InterruptOldStepLLM:
+        def __init__(self, base_llm: SequenceLLM, runner: AgentRunner) -> None:
+            self.base_llm = base_llm
+            self.runner = runner
+
+        async def chat(self, **kwargs: Any) -> dict[str, Any]:
+            response = await self.base_llm.chat(**kwargs)
+            if self.base_llm.calls == 2:
+                self.runner.pause(execution_id, reason="interrupt old step")
+            return response
+
+    first_agent.llm = InterruptOldStepLLM(first_llm, first_runner)
+    first_interrupted = await first_runner.run(
+        task="Root task",
+        execution_id=execution_id,
+    )
+
+    assert first_interrupted["status"] == "interrupted"
+    assert first_interrupted["active_step_id"] == "step_2"
+    await first_runner.post_user_message(
+        execution_id,
+        "Change direction and do the new task instead.",
+        request_interrupt=False,
+    )
+
+    replan_llm = SequenceLLM(
+        [
+            {
+                "content": "New plan needs tool",
+                "tool_calls": [
+                    {
+                        "id": "new-call",
+                        "function": {
+                            "name": "calculator",
+                            "arguments": '{"expression":"3+4"}',
+                        },
+                    }
+                ],
+                "done": False,
+            }
+        ]
+    )
+    replan_agent = Agent(
+        name="writer",
+        patterns=[DAGPattern(plan_generator)],
+        tools=[tool],
+        llm=replan_llm,
+    )
+    replan_runner = AgentRunner(
+        agent=replan_agent,
+        tracer=tracer,
+        workspace_manager=FakeWorkspaceManager(tmp_path),
+    )
+
+    class InterruptNewStepLLM:
+        def __init__(self, base_llm: SequenceLLM, runner: AgentRunner) -> None:
+            self.base_llm = base_llm
+            self.runner = runner
+
+        async def chat(self, **kwargs: Any) -> dict[str, Any]:
+            response = await self.base_llm.chat(**kwargs)
+            self.runner.pause(execution_id, reason="interrupt new step")
+            return response
+
+    replan_agent.llm = InterruptNewStepLLM(replan_llm, replan_runner)
+    second_interrupted = await replan_runner.resume(execution_id)
+
+    assert second_interrupted["status"] == "interrupted"
+    assert second_interrupted["active_step_id"] == "step_3"
+    checkpoint_state = tracer.by_execution_id[execution_id]["pattern_state"]
+    assert checkpoint_state["active_step_id"] == "step_3"
+    assert [step["id"] for step in checkpoint_state["plan"]["steps"]] == [
+        "step_1",
+        "step_3",
+    ]
+    assert checkpoint_state["step_results"] == {"step_1": "first step done"}
+
+    final_agent = Agent(
+        name="writer",
+        patterns=[DAGPattern(plan_generator)],
+        tools=[tool],
+        llm=SequenceLLM([{"content": "new step done", "done": True}]),
+    )
+    final_runner = AgentRunner(
+        agent=final_agent,
+        tracer=tracer,
+        workspace_manager=FakeWorkspaceManager(tmp_path),
+    )
+
+    resumed = await final_runner.resume(execution_id)
+
+    assert resumed["success"] is True
+    assert resumed["status"] == "completed"
+    assert resumed["step_results"] == {
+        "step_1": "first step done",
+        "step_3": "new step done",
+    }
+    assert "step_2" not in resumed["step_results"]
+    assert tool.calls == []

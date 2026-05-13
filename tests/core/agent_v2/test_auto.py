@@ -629,7 +629,7 @@ async def test_auto_pattern_unknown_action_fails() -> None:
     context = ExecutionContext()
     context.add_user_message("Continue")
 
-    with pytest.raises(ValueError, match="unknown"):
+    with pytest.raises(ValueError, match="Invalid AutoPattern action: unknown"):
         await pattern.run(
             context=context,
             tools=[],

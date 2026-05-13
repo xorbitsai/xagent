@@ -60,8 +60,12 @@ class AutoDecision:
         raw_action = payload.get("action") or payload.get("type")
         if raw_action == "dag":
             raw_action = AutoAction.PLAN_EXECUTE.value
+        try:
+            action = AutoAction(str(raw_action))
+        except ValueError as exc:
+            raise ValueError(f"Invalid AutoPattern action: {raw_action}") from exc
         return cls(
-            action=AutoAction(str(raw_action)),
+            action=action,
             reason=str(payload.get("reason", "")),
             answer=payload.get("answer"),
             requires_current_or_external_facts=_coerce_bool(

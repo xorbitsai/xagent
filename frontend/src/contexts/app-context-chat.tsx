@@ -3680,8 +3680,8 @@ export function AppProvider({ children, token }: { children: React.ReactNode; to
           }
         }
 
-        // Add LLM configuration
-        if (llmIds) {
+        // Agent chats should use the published agent's own model configuration.
+        if (llmIds && !config?.agentId) {
           requestBody.llm_ids = llmIds
         }
 
@@ -3693,9 +3693,6 @@ export function AppProvider({ children, token }: { children: React.ReactNode; to
         }
         if (config?.agentId) {
           requestBody.agent_id = config.agentId
-        }
-        if (Array.isArray(config?.delegateAgentIds)) {
-          requestBody.delegate_agent_ids = config.delegateAgentIds
         }
         if (config?.agentType) {
           requestBody.agent_type = config.agentType

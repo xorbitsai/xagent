@@ -125,9 +125,10 @@ function TaskHomePageContent() {
   const handleSend = async (message: string, filesToSend: File[], config?: any) => {
     if (state.isProcessing) return;
 
+    const selectedAgentId = Number(selectedAgents[0]?.id);
     const nextConfig = {
       ...config,
-      delegateAgentIds: selectedAgents.map((agent) => Number(agent.id)).filter((id) => !Number.isNaN(id)),
+      agentId: Number.isNaN(selectedAgentId) ? undefined : selectedAgentId,
     };
 
     // Use sendMessage from AppContext - it will create task and send files via WebSocket

@@ -1890,11 +1890,14 @@ async def handle_chat_message(
                     TaskStatus.WAITING_FOR_USER,
                     TaskStatus.RUNNING,
                 ]
+                supports_v2_control = getattr(
+                    agent_service, "supports_v2_control", lambda: False
+                )()
                 has_continuation = dag_pattern and hasattr(
                     dag_pattern, "request_continuation"
                 )
 
-                if task_is_running and has_continuation:
+                if task_is_running and has_continuation and not supports_v2_control:
                     # Use continuation: old task will handle at appropriate time
                     logger.info(f"Using continuation for running task {task_id}")
                     assert dag_pattern is not None  # for mypy type checking
@@ -1973,10 +1976,7 @@ async def handle_chat_message(
 
                     # Continuation will be handled by old task, return directly
                     return
-                if (
-                    task_is_running
-                    and getattr(agent_service, "supports_v2_control", lambda: False)()
-                ):
+                if task_is_running and supports_v2_control:
                     logger.info(f"Using agent_v2 message control for task {task_id}")
                     posted = await agent_service.post_user_message(
                         str(task_id),

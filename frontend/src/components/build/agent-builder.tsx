@@ -2120,6 +2120,7 @@ export function AgentBuilder({ agentId }: AgentBuilderProps) {
           />}
           middlePanel={LeftPanel}
           rightPanel={RightPanel}
+          initialLeftWidth={20}
           initialMiddleWidth={50}
           initialRightWidth={30}
           minLeftWidth={15}

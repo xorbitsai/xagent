@@ -111,7 +111,7 @@ export function ResizableThreeColumnLayout({
     return (
         <div
             ref={containerRef}
-            className={cn("flex flex-col md:flex-row w-full h-full min-h-0 md:overflow-hidden overflow-y-auto pb-16", className)}
+            className={cn("flex flex-col md:flex-row w-full h-full min-h-0 md:overflow-hidden overflow-y-auto pb-16 lg:pb-0", className)}
         >
             {/* Left Panel */}
             <div

@@ -2066,8 +2066,6 @@ Build when you need.`
       },
       action: "+ Create Your First Agent"
     },
-    table: {
-    },
     stats: {
       total: "Total {count} builds"
     },
@@ -2141,7 +2139,7 @@ Build when you need.`
       stepGuide: {
         title: "Build Your Agent",
         prompt: "Create With Prompt",
-        configure: "Configure Capabilities",
+        configure: "Configure & Connect",
         preview: "Test In Preview",
         completed: "All steps complete - click the Create button to publish your agent.",
       },

@@ -2138,8 +2138,8 @@ Build when you need.`
       aiAssistant: "{appName} 助手",
       stepGuide: {
         title: "构建你的 Agent",
-        prompt: "通过提示词生成",
-        configure: "配置知识库与能力",
+        prompt: "通过提示词创建",
+        configure: "配置与连接",
         preview: "到右侧预览测试",
         completed: "所有步骤已完成，点击 创建按钮即可发布你的 Agent。",
       },

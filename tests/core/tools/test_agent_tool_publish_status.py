@@ -1,17 +1,12 @@
 import tempfile
 
-import pytest
 from sqlalchemy import create_engine
 from sqlalchemy.orm import Session, sessionmaker
 
-from xagent.core.tools.adapters.vibe.agent_tool import (
-    create_agent_tools,
-    get_published_agents_tools,
-)
+from xagent.core.tools.adapters.vibe.agent_tool import get_published_agents_tools
 from xagent.web.models.agent import Agent, AgentStatus
 from xagent.web.models.database import Base
 from xagent.web.models.user import User
-from xagent.web.tools.config import WebToolConfig
 
 
 def _create_session() -> tuple[Session, str]:
@@ -147,42 +142,6 @@ def test_allowed_agent_ids_include_only_selected_published_user_agents() -> None
         assert "call_agent_selected_draft_agent" not in tool_names
         assert "call_agent_unselected_published_agent" not in tool_names
         assert "call_agent_other_users_agent" not in tool_names
-    finally:
-        db.close()
-        try:
-            import os
-
-            os.remove(db_path)
-        except OSError:
-            pass
-
-
-@pytest.mark.asyncio
-async def test_create_agent_tools_treats_empty_delegate_allowlist_as_unrestricted() -> (
-    None
-):
-    db, db_path = _create_session()
-    try:
-        owner = User(username="owner4", password_hash="x", is_admin=False)
-        db.add(owner)
-        db.commit()
-        db.refresh(owner)
-
-        published_agent = Agent(
-            user_id=owner.id,
-            name="Default Published Agent",
-            status=AgentStatus.PUBLISHED,
-        )
-        db.add(published_agent)
-        db.commit()
-
-        config = WebToolConfig(db=db, request=None, user_id=owner.id, user=owner)
-        config._delegate_agent_ids = []
-
-        tools = await create_agent_tools(config)
-        tool_names = {tool.name for tool in tools}
-
-        assert "call_agent_default_published_agent" in tool_names
     finally:
         db.close()
         try:

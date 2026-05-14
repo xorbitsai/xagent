@@ -1555,9 +1555,6 @@ async def create_agent_tools(config: "WebToolConfig") -> list[AbstractBaseTool]:
             return []
 
         excluded_agent_id = config.get_excluded_agent_id() if config else None
-        delegate_agent_ids = config.get_delegate_agent_ids() if config else None
-        if not delegate_agent_ids:
-            delegate_agent_ids = None
 
         return get_published_agents_tools(
             db=db,
@@ -1566,7 +1563,6 @@ async def create_agent_tools(config: "WebToolConfig") -> list[AbstractBaseTool]:
             workspace_base_dir=None,  # Will use get_uploads_dir() default
             excluded_agent_id=excluded_agent_id,
             include_draft=False,  # Only PUBLISHED agents by default
-            allowed_agent_ids=delegate_agent_ids,
         )
     except Exception as e:
         logger.warning(f"Failed to create agent tools: {e}")

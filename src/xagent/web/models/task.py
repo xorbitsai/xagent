@@ -107,7 +107,6 @@ class Task(Base):  # type: ignore
     agent_id = Column(
         Integer, ForeignKey("agents.id"), nullable=True
     )  # Agent Builder agent ID
-    delegate_agent_ids = Column(JSON, nullable=True)  # Delegable agent IDs
     agent_type = Column(
         String(20), default=AgentType.STANDARD.value, nullable=True
     )  # SQLite compatible

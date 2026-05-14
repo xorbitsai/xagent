@@ -95,10 +95,6 @@ class BaseToolConfig(ABC):
         """Whether to include published agents as tools."""
         pass
 
-    def get_delegate_agent_ids(self) -> Optional[List[int]]:
-        """Get explicitly selected delegable agent IDs. None means default behavior."""
-        return None
-
     @abstractmethod
     def get_image_generate_model(self) -> Optional[Any]:
         """Get default image generation model."""

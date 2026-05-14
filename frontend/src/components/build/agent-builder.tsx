@@ -1349,12 +1349,12 @@ export function AgentBuilder({ agentId }: AgentBuilderProps) {
   const LeftPanel = (
     <div className="p-6 space-y-8 min-h-full bg-card/50">
       {/* Header moved to middle panel */}
-      <div className="flex flex-col 2xl:flex-row 2xl:justify-between items-start gap-4">
-        <div className="w-full 2xl:flex-1 min-w-0">
-          <h1 className="text-3xl font-bold mb-1 break-words">{name || t("builds.editor.header.title")}</h1>
+      <div className="flex flex-wrap items-start justify-between gap-4">
+        <div className="min-w-[240px] flex-1">
+          <h1 className="mb-1 text-3xl font-bold break-words">{name || t("builds.editor.header.title")}</h1>
           <p className="text-muted-foreground">{t("builds.editor.header.subtitle")}</p>
         </div>
-        <div className="flex w-full flex-wrap items-center gap-2 2xl:w-auto 2xl:justify-end 2xl:gap-4 shrink-0">
+        <div className="flex max-w-full flex-wrap items-center gap-2 xl:gap-4">
           <Button
             variant="outline"
             className={cn(
@@ -2117,10 +2117,10 @@ export function AgentBuilder({ agentId }: AgentBuilderProps) {
           />}
           middlePanel={LeftPanel}
           rightPanel={RightPanel}
-          initialLeftWidth={20}
-          initialMiddleWidth={45}
+          initialMiddleWidth={50}
+          initialRightWidth={30}
           minLeftWidth={15}
-          minMiddleWidth={35}
+          minMiddleWidth={45}
           minRightWidth={20}
         />
       </div>

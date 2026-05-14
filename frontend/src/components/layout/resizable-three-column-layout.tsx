@@ -8,6 +8,7 @@ interface ResizableThreeColumnLayoutProps {
     rightPanel: React.ReactNode
     initialLeftWidth?: number // Percentage (0-100)
     initialMiddleWidth?: number // Percentage (0-100)
+    initialRightWidth?: number // Percentage (0-100)
     minLeftWidth?: number // Percentage (0-100)
     minMiddleWidth?: number // Percentage (0-100)
     minRightWidth?: number // Percentage (0-100)
@@ -21,6 +22,7 @@ export function ResizableThreeColumnLayout({
     rightPanel,
     initialLeftWidth = 25,
     initialMiddleWidth = 45,
+    initialRightWidth,
     minLeftWidth = 15,
     minMiddleWidth = 30,
     minRightWidth = 20,
@@ -28,7 +30,12 @@ export function ResizableThreeColumnLayout({
     showLeftPanel = true
 }: ResizableThreeColumnLayoutProps) {
     const [leftWidth, setLeftWidth] = useState(initialLeftWidth)
-    const [middleWidth, setMiddleWidth] = useState(initialMiddleWidth)
+    const [middleWidth, setMiddleWidth] = useState(() => {
+        if (typeof initialRightWidth === "number") {
+            return Math.max(0, 100 - initialLeftWidth - initialRightWidth)
+        }
+        return initialMiddleWidth
+    })
     const [isMobile, setIsMobile] = useState(false)
 
     useEffect(() => {
@@ -104,7 +111,7 @@ export function ResizableThreeColumnLayout({
     return (
         <div
             ref={containerRef}
-            className={cn("flex flex-col md:flex-row w-full h-full min-h-0 md:overflow-hidden overflow-y-auto", className)}
+            className={cn("flex flex-col md:flex-row w-full h-full min-h-0 md:overflow-hidden overflow-y-auto pb-16", className)}
         >
             {/* Left Panel */}
             <div

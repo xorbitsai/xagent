@@ -7,6 +7,7 @@ import type { Components } from 'react-markdown'
 import { getApiUrl } from '@/lib/utils'
 import { apiRequest } from '@/lib/api-wrapper'
 import { AgentCard } from '@/components/chat/AgentCard'
+import { useI18n } from '@/contexts/i18n-context'
 
 
 interface AgentInfo {
@@ -106,6 +107,7 @@ function AgentCardContainer({
   agentName: string
   onAgentClick?: (agentId: string, agentName: string) => void
 }) {
+  const { t } = useI18n()
   const { agentInfo, loading, error } = useAgentInfo(agentId)
 
   // Show loading state
@@ -127,7 +129,7 @@ function AgentCardContainer({
       <AgentCard
         agentId={agentId}
         agentName={initialAgentName}
-        description="无法加载 Agent 详情"
+        description={t("markdownRenderer.loadAgentDetailsFailed")}
         status="draft"
       />
     )

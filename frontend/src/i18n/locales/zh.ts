@@ -2032,19 +2032,6 @@ Build when you need.`
     },
   },
   builds: {
-    prerequisites: {
-      title: "配置向导",
-      description: "为了充分发挥该模板的能力，请先完成以下配置：",
-      mcpTitle: "连接必要工具",
-      mcpDesc: "该模板依赖：",
-      connectBtn: "去连接",
-      kbTitle: "上传或选择知识库",
-      kbDesc: "上传或选择该模板可能需要的参考文档、数据。",
-      uploadBtn: "上传新文档",
-      selectKbPlaceholder: "或者选择已有的知识库...",
-      skipBtn: "暂不配置",
-      doneBtn: "我知道了"
-    },
     header: {
       title: "构建历史",
       description: "查看和管理构建历史记录",
@@ -2149,6 +2136,13 @@ Build when you need.`
     },
     editor: {
       aiAssistant: "{appName} 助手",
+      stepGuide: {
+        title: "构建你的 Agent",
+        prompt: "通过提示词生成",
+        configure: "配置知识库与能力",
+        preview: "到右侧预览测试",
+        completed: "所有步骤已完成，点击 创建按钮即可发布你的 Agent。",
+      },
       header: {
         title: "自定义 Agent",
         subtitle: "配置你的 AI Agent 的行为和能力。",
@@ -2342,6 +2336,9 @@ Build when you need.`
         requestFailed: "预览请求失败，请检查网络连接",
       }
     }
+  },
+  markdownRenderer: {
+    loadAgentDetailsFailed: "无法加载 Agent 详情",
   },
   agent: {
     header: {

@@ -51,7 +51,7 @@ export function WelcomeModal() {
                 <div className="mb-6 grid grid-cols-1 gap-4 sm:mb-8 sm:gap-5 md:mb-10 md:grid-cols-3 md:gap-6">
                     {/* Card 1: Presentation Builder */}
                     <button
-                        onClick={() => handleCardClick("/task")}
+                        onClick={() => handleCardClick("/task?starter=presentation")}
                         className="group flex flex-col text-left bg-card rounded-2xl border border-border/60 hover:border-primary/50 hover:shadow-[0_8px_30px_rgb(0,0,0,0.12)] dark:hover:shadow-[0_8px_30px_rgba(255,255,255,0.05)] transition-all duration-300 overflow-hidden"
                     >
                         <div className="h-[150px] w-full overflow-hidden sm:h-[180px]">
@@ -87,7 +87,7 @@ export function WelcomeModal() {
 
                     {/* Card 3: Create Custom Agent */}
                     <button
-                        onClick={() => handleCardClick("/build")}
+                        onClick={() => handleCardClick("/build?create=true")}
                         className="group flex flex-col text-left bg-card rounded-2xl border border-border/60 hover:border-primary/50 hover:shadow-[0_8px_30px_rgb(0,0,0,0.12)] dark:hover:shadow-[0_8px_30px_rgba(255,255,255,0.05)] transition-all duration-300 overflow-hidden"
                     >
                         <div className="h-[150px] w-full overflow-hidden sm:h-[180px]">

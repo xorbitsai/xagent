@@ -1,7 +1,7 @@
 "use client";
 
-import { useState, useEffect } from "react";
-import { Bot, Presentation, BarChart, Image as ImageIcon, Zap, Search, Smartphone, Wand2 } from "lucide-react";
+import { useState, useEffect, useMemo, useRef } from "react";
+import { Bot, Presentation, Search, Smartphone, Wand2 } from "lucide-react";
 import { useI18n } from "@/contexts/i18n-context";
 import { useApp } from "@/contexts/app-context-chat";
 import { ChatStartScreen, AgentCard } from "@/components/chat/ChatStartScreen";
@@ -9,13 +9,29 @@ import { FilePreviewDialog } from "@/components/file/file-preview-dialog";
 import { getBrandingFromEnv } from "@/lib/branding";
 import { apiRequest } from "@/lib/api-wrapper";
 import { getApiUrl } from "@/lib/utils";
+import { useSearchParams } from "next/navigation";
 
 function TaskHomePageContent() {
   const { t } = useI18n();
   const { sendMessage, state, dispatch, closeFilePreview } = useApp();
+  const searchParams = useSearchParams();
+  const starter = searchParams.get("starter");
+  const promptFromQuery = searchParams.get("prompt");
+  const hasAppliedStarterRef = useRef(false);
+
+  const starterPreset = useMemo(() => {
+    if (starter === "presentation") {
+      return {
+        prompt: "Build a N-slide presentation on topic for audience.",
+        highlights: ["N", "topic", "audience"],
+      };
+    }
+    return null;
+  }, [starter]);
+
   const [files, setFiles] = useState<File[]>([]);
-  const [inputValue, setInputValue] = useState("");
-  const [promptHighlightTerms, setPromptHighlightTerms] = useState<string[]>([]);
+  const [inputValue, setInputValue] = useState(() => starterPreset?.prompt || promptFromQuery || "");
+  const [promptHighlightTerms, setPromptHighlightTerms] = useState<string[]>(() => starterPreset?.highlights || []);
   const [agents, setAgents] = useState<AgentCard[]>([]);
   const [selectedAgents, setSelectedAgents] = useState<AgentCard[]>([]);
   const branding = getBrandingFromEnv();
@@ -50,44 +66,67 @@ function TaskHomePageContent() {
     fetchAgents();
   }, []);
 
-  const samplePrompts = [
+  const samplePrompts = useMemo(() => ([
     {
+      id: "research",
       icon: Search,
       title: t("chatPage.cards.research.title"),
       prompt: "Research topic and deliver a structured report with key findings, data points, and sources.",
       promptHighlights: ["topic"],
     },
     {
+      id: "linkedin",
       icon: Smartphone,
       title: t("chatPage.cards.linkedin.title"),
       prompt: "Write a LinkedIn post about topic or achievement. Tone: professional / inspirational.",
       promptHighlights: ["topic or achievement", "professional / inspirational"],
     },
     {
+      id: "poster",
       icon: Wand2,
       title: t("chatPage.cards.poster.title"),
       prompt: "Create a promotional poster for event or product. Style: modern / bold / minimal.",
       promptHighlights: ["event or product", "modern / bold / minimal"],
     },
     {
+      id: "compare",
       icon: Search,
       title: t("chatPage.cards.compare.title"),
       prompt: "Compare product A vs product B across key criteria. Provide a detailed analysis with a recommendation.",
       promptHighlights: ["product A", "product B", "key criteria"],
     },
     {
+      id: "visual",
       icon: Wand2,
       title: t("chatPage.cards.visual.title"),
       prompt: "Create a platform graphic for campaign or brand. Size: square / story / banner. Theme: colour or style.",
       promptHighlights: ["platform", "campaign or brand", "square / story / banner", "colour or style"],
     },
     {
+      id: "presentation",
       icon: Presentation,
       title: t("chatPage.cards.presentation.title"),
       prompt: "Build a N-slide presentation on topic for audience.",
       promptHighlights: ["N", "topic", "audience"],
     }
-  ];
+  ]), [t]);
+
+  useEffect(() => {
+    if (hasAppliedStarterRef.current) return;
+
+    if (starterPreset) {
+      hasAppliedStarterRef.current = true;
+      setInputValue(starterPreset.prompt);
+      setPromptHighlightTerms(starterPreset.highlights || []);
+      return;
+    }
+
+    if (promptFromQuery) {
+      hasAppliedStarterRef.current = true;
+      setInputValue(promptFromQuery);
+      setPromptHighlightTerms([]);
+    }
+  }, [promptFromQuery, starterPreset]);
 
   const handleSend = async (message: string, filesToSend: File[], config?: any) => {
     if (state.isProcessing) return;

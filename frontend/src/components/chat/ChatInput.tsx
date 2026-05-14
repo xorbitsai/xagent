@@ -91,20 +91,18 @@ export function ChatInput({
   const { openFilePreview } = useApp();
 
   useEffect(() => {
-    if (autoFocus && editorRef.current) {
-      // Focus at the end of text if any, or just focus
-      editorRef.current.focus();
-
-      // Try to place cursor at the end
-      if (typeof window !== 'undefined') {
-        const selection = window.getSelection();
-        const range = document.createRange();
-        range.selectNodeContents(editorRef.current);
-        range.collapse(false); // false means collapse to end
-        selection?.removeAllRanges();
-        selection?.addRange(range);
-      }
-    }
+    if (!autoFocus || !editorRef.current) return;
+    const el = editorRef.current;
+    const frameId = window.requestAnimationFrame(() => {
+      el.focus();
+      const selection = window.getSelection();
+      const range = document.createRange();
+      range.selectNodeContents(el);
+      range.collapse(false);
+      selection?.removeAllRanges();
+      selection?.addRange(range);
+    });
+    return () => window.cancelAnimationFrame(frameId);
   }, [autoFocus]);
 
   const escapeHtml = (value: string) =>

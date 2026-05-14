@@ -1,6 +1,6 @@
 "use client"
 
-import React, { useState, useEffect } from "react"
+import React, { useState, useEffect, useRef } from "react"
 import { SearchInput } from "@/components/ui/search-input"
 import { Button } from "@/components/ui/button"
 import { Plus, Bot, Trash2, MessageSquare, Edit, MoreVertical, Globe, Calendar, Clock, Rocket, Sparkles, Settings2, ArrowRight, FileText, Wrench, Database, Plug } from "lucide-react"
@@ -21,6 +21,7 @@ export default function BuildsPage() {
   const { t } = useI18n()
   const router = useRouter()
   const searchParams = useSearchParams()
+  const hasAutoOpenedCreateRef = useRef(false)
   const [searchTerm, setSearchTerm] = useState("")
   const [agents, setAgents] = useState<Agent[]>([])
   const [loading, setLoading] = useState(true)
@@ -36,6 +37,14 @@ export default function BuildsPage() {
       // Redirect to create page with template parameter
       router.replace(`/build/new?template=${templateId}`)
     }
+  }, [searchParams, router])
+
+  useEffect(() => {
+    const shouldOpenCreate = searchParams.get("create") === "true"
+    if (!shouldOpenCreate || hasAutoOpenedCreateRef.current) return
+    hasAutoOpenedCreateRef.current = true
+    setIsCreateModalOpen(true)
+    router.replace("/build")
   }, [searchParams, router])
 
   // Fetch agents on mount

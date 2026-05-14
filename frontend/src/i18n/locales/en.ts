@@ -2032,19 +2032,6 @@ Build when you need.`
     },
   },
   builds: {
-    prerequisites: {
-      title: "Setup Prerequisites",
-      description: "To fully utilize this template's capabilities, please complete the following configurations first:",
-      mcpTitle: "Connect Required Tools",
-      mcpDesc: "This template requires:",
-      connectBtn: "Connect",
-      kbTitle: "Knowledge Base",
-      kbDesc: "Upload or select existing references or documents that this template can utilize.",
-      uploadBtn: "Upload New",
-      selectKbPlaceholder: "Or select existing knowledge bases...",
-      skipBtn: "Skip for now",
-      doneBtn: "Got it"
-    },
     header: {
       title: "Build History",
       description: "View and manage build history",
@@ -2151,6 +2138,13 @@ Build when you need.`
     },
     editor: {
       aiAssistant: "{appName} Assistant",
+      stepGuide: {
+        title: "Build Your Agent",
+        prompt: "Create With Prompt",
+        configure: "Configure Capabilities",
+        preview: "Test In Preview",
+        completed: "All steps complete - click the Create button to publish your agent.",
+      },
       header: {
         title: "Custom Agent",
         subtitle: "Configure your AI agent's behavior and capabilities.",
@@ -2344,6 +2338,9 @@ Build when you need.`
         requestFailed: "Preview request failed, please check network connection",
       }
     }
+  },
+  markdownRenderer: {
+    loadAgentDetailsFailed: "Unable to load agent details",
   },
   agent: {
     header: {

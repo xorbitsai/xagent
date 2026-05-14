@@ -565,6 +565,8 @@ class AgentServiceManager:
                 f"{len(allowed_tools)} tools for task {task_id}"
             )
 
+        delegate_agent_ids = self._get_delegate_agent_ids(task)
+
         user_id = int(user.id)
         sandbox = self._sandboxes.get(user_id)
         if sandbox is None:
@@ -594,9 +596,58 @@ class AgentServiceManager:
             allowed_skills=agent_config["skills"] if agent_config else None,
             allowed_tools=allowed_tools,
             excluded_agent_id=excluded_agent_id,
+            delegate_agent_ids=delegate_agent_ids,
             vision_model=task_vision_llm,
             sandbox=sandbox,
             llm=task_llm,
+        )
+
+    def _get_delegate_agent_ids(self, task: Task | None) -> Optional[List[int]]:
+        if task is None or not isinstance(task.delegate_agent_ids, list):
+            return None
+        delegate_agent_ids = [
+            int(agent_id)
+            for agent_id in task.delegate_agent_ids
+            if isinstance(agent_id, int)
+        ]
+        return delegate_agent_ids or None
+
+    def _apply_delegate_prompt(
+        self,
+        *,
+        db: Session,
+        user: User,
+        system_prompt: Optional[str],
+        delegate_agent_ids: Optional[List[int]],
+    ) -> Optional[str]:
+        if not delegate_agent_ids:
+            return system_prompt
+
+        delegate_agents = (
+            db.query(Agent)
+            .filter(
+                Agent.user_id == int(user.id),
+                Agent.id.in_(delegate_agent_ids),
+            )
+            .all()
+        )
+        if not delegate_agents:
+            return system_prompt
+
+        delegate_lines = [
+            f"- {agent.name}: {agent.description or 'Use this agent when its specialty matches the task.'}"
+            for agent in delegate_agents
+        ]
+        delegate_prompt = (
+            "\n\n[Delegation Instructions]\n"
+            "You can delegate subtasks to the following selected agents.\n"
+            "Use them when their specialization matches the user's request.\n"
+            + "\n".join(delegate_lines)
+        )
+        return (
+            (system_prompt or "") + delegate_prompt
+            if system_prompt
+            else delegate_prompt.lstrip("\n")
         )
 
     async def get_agent_for_task(
@@ -914,15 +965,7 @@ class AgentServiceManager:
                         f"Tool categories {tool_categories} mapped to {len(allowed_tools)} tools for task {task_id}"
                     )
 
-                delegate_agent_ids: Optional[List[int]] = None
-                if task and isinstance(task.delegate_agent_ids, list):
-                    delegate_agent_ids = [
-                        int(agent_id)
-                        for agent_id in task.delegate_agent_ids
-                        if isinstance(agent_id, int)
-                    ]
-                    if not delegate_agent_ids:
-                        delegate_agent_ids = None
+                delegate_agent_ids = self._get_delegate_agent_ids(task)
 
                 # Create tools using ToolFactory
                 tools = await create_default_tools(
@@ -988,31 +1031,12 @@ class AgentServiceManager:
                         system_prompt, kb_list
                     )
 
-                    if delegate_agent_ids:
-                        delegate_agents = (
-                            db.query(Agent)
-                            .filter(
-                                Agent.user_id == int(user.id),
-                                Agent.id.in_(delegate_agent_ids),
-                            )
-                            .all()
-                        )
-                        if delegate_agents:
-                            delegate_lines = [
-                                f"- {agent.name}: {agent.description or 'Use this agent when its specialty matches the task.'}"
-                                for agent in delegate_agents
-                            ]
-                            delegate_prompt = (
-                                "\n\n[Delegation Instructions]\n"
-                                "You can delegate subtasks to the following selected agents.\n"
-                                "Use them when their specialization matches the user's request.\n"
-                                + "\n".join(delegate_lines)
-                            )
-                            system_prompt = (
-                                (system_prompt or "") + delegate_prompt
-                                if system_prompt
-                                else delegate_prompt.lstrip("\n")
-                            )
+                    system_prompt = self._apply_delegate_prompt(
+                        db=db,
+                        user=user,
+                        system_prompt=system_prompt,
+                        delegate_agent_ids=delegate_agent_ids,
+                    )
 
                     # Extract memory similarity threshold from agent config
                     memory_similarity_threshold = None
@@ -1616,6 +1640,12 @@ class AgentServiceManager:
                         )
                         system_prompt = enhance_system_prompt_with_kb(
                             system_prompt, kb_list
+                        )
+                        system_prompt = self._apply_delegate_prompt(
+                            db=db,
+                            user=user,
+                            system_prompt=system_prompt,
+                            delegate_agent_ids=self._get_delegate_agent_ids(task),
                         )
                         memory_similarity_threshold = None
                         if (

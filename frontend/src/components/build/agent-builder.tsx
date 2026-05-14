@@ -1325,6 +1325,7 @@ export function AgentBuilder({ agentId }: AgentBuilderProps) {
     },
   ]
   const allStepsCompleted = buildSteps.every((step) => step.status === "complete")
+  const shouldShowCompletedBanner = allStepsCompleted && !localAgentId
 
   const getStepStatusClasses = (status: "complete" | "current" | "upcoming") =>
     status === "complete"
@@ -1437,7 +1438,7 @@ export function AgentBuilder({ agentId }: AgentBuilderProps) {
         </div>
       </div>
 
-      {allStepsCompleted && (
+      {shouldShowCompletedBanner && (
         <div className="rounded-lg border border-green-200 bg-green-50 px-4 py-3 text-sm text-green-700 dark:border-green-900/40 dark:bg-green-900/20 dark:text-green-400">
           <div className="flex items-center gap-2">
             <Check className="h-4 w-4 shrink-0" />

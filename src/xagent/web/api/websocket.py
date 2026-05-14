@@ -2937,40 +2937,6 @@ async def handle_pause_task(
                 return
             logger.info("Agent pause_execution completed")
 
-            if not getattr(agent_service, "supports_v2_control", lambda: False)():
-                # Update task status in database for legacy in-process agents.
-                # agent_v2 pause is interrupt-request based; the live runner keeps
-                # its lease until it returns an interrupted result.
-                from ..models.task import Task, TaskStatus
-
-                db_gen = get_db()
-                db_update = next(db_gen)
-                try:
-                    # Admin can pause any task, regular users can only pause their own tasks
-                    if user.is_admin:
-                        task = db_update.query(Task).filter(Task.id == task_id).first()
-                    else:
-                        task = (
-                            db_update.query(Task)
-                            .filter(Task.id == task_id, Task.user_id == user.id)
-                            .first()
-                        )
-                    if task:
-                        setattr(task, "status", TaskStatus.PAUSED)
-                        setattr(task, "runner_id", None)
-                        setattr(task, "lease_expires_at", None)
-                        setattr(task, "last_heartbeat_at", datetime.now(timezone.utc))
-                        db_update.commit()
-                        logger.info(
-                            f"Updated task {task_id} status to PAUSED in database"
-                        )
-                    else:
-                        logger.warning(
-                            f"Task {task_id} not found or access denied for user {user.id}"
-                        )
-                finally:
-                    db_update.close()
-
             # Send pause confirmation
             await manager.broadcast_to_task(
                 {
@@ -3092,22 +3058,6 @@ async def handle_resume_task(
 
         # Check if agent supports resume functionality
         if hasattr(agent_service, "resume_execution"):
-            db_update_gen = get_db()
-            db_update = next(db_update_gen)
-            try:
-                lease = acquire_task_lease(db_update, task_id)
-                if lease is None:
-                    await manager.send_personal_message(
-                        {
-                            "type": "error",
-                            "message": "Task is already running on another worker",
-                        },
-                        websocket,
-                    )
-                    return
-            finally:
-                db_update.close()
-
             await agent_service.resume_execution()
 
             # Send resume confirmation

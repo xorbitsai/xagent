@@ -1,6 +1,6 @@
 "use client";
 
-import { useState, useEffect, useMemo, useRef } from "react";
+import { useState, useEffect, useMemo } from "react";
 import { Bot, Presentation, Search, Smartphone, Wand2 } from "lucide-react";
 import { useI18n } from "@/contexts/i18n-context";
 import { useApp } from "@/contexts/app-context-chat";
@@ -17,7 +17,6 @@ function TaskHomePageContent() {
   const searchParams = useSearchParams();
   const starter = searchParams.get("starter");
   const promptFromQuery = searchParams.get("prompt");
-  const hasAppliedStarterRef = useRef(false);
 
   const [files, setFiles] = useState<File[]>([]);
   const [agents, setAgents] = useState<AgentCard[]>([]);
@@ -111,23 +110,6 @@ function TaskHomePageContent() {
 
   const [inputValue, setInputValue] = useState(() => starterPreset?.prompt || promptFromQuery || "");
   const [promptHighlightTerms, setPromptHighlightTerms] = useState<string[]>(() => starterPreset?.highlights || []);
-
-  useEffect(() => {
-    if (hasAppliedStarterRef.current) return;
-
-    if (starterPreset) {
-      hasAppliedStarterRef.current = true;
-      setInputValue(starterPreset.prompt);
-      setPromptHighlightTerms(starterPreset.highlights || []);
-      return;
-    }
-
-    if (promptFromQuery) {
-      hasAppliedStarterRef.current = true;
-      setInputValue(promptFromQuery);
-      setPromptHighlightTerms([]);
-    }
-  }, [promptFromQuery, starterPreset]);
 
   const handleSend = async (message: string, filesToSend: File[], config?: any) => {
     if (state.isProcessing) return;

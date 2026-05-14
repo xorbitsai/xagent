@@ -19,19 +19,7 @@ function TaskHomePageContent() {
   const promptFromQuery = searchParams.get("prompt");
   const hasAppliedStarterRef = useRef(false);
 
-  const starterPreset = useMemo(() => {
-    if (starter === "presentation") {
-      return {
-        prompt: "Build a N-slide presentation on topic for audience.",
-        highlights: ["N", "topic", "audience"],
-      };
-    }
-    return null;
-  }, [starter]);
-
   const [files, setFiles] = useState<File[]>([]);
-  const [inputValue, setInputValue] = useState(() => starterPreset?.prompt || promptFromQuery || "");
-  const [promptHighlightTerms, setPromptHighlightTerms] = useState<string[]>(() => starterPreset?.highlights || []);
   const [agents, setAgents] = useState<AgentCard[]>([]);
   const [selectedAgents, setSelectedAgents] = useState<AgentCard[]>([]);
   const branding = getBrandingFromEnv();
@@ -110,6 +98,19 @@ function TaskHomePageContent() {
       promptHighlights: ["N", "topic", "audience"],
     }
   ]), [t]);
+
+  const starterPreset = useMemo(() => {
+    const found = samplePrompts.find((prompt) => prompt.id === starter);
+    if (!found) return null;
+
+    return {
+      prompt: found.prompt,
+      highlights: found.promptHighlights,
+    };
+  }, [starter, samplePrompts]);
+
+  const [inputValue, setInputValue] = useState(() => starterPreset?.prompt || promptFromQuery || "");
+  const [promptHighlightTerms, setPromptHighlightTerms] = useState<string[]>(() => starterPreset?.highlights || []);
 
   useEffect(() => {
     if (hasAppliedStarterRef.current) return;

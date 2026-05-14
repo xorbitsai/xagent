@@ -285,12 +285,15 @@ export function AgentBuilder({ agentId }: AgentBuilderProps) {
             fragment.appendChild(document.createElement("br"));
           }
         });
+        const lastNode = fragment.lastChild;
         range.insertNode(fragment);
-        selection.removeAllRanges();
-        const endRange = document.createRange();
-        endRange.selectNodeContents(editor);
-        endRange.collapse(false);
-        selection.addRange(endRange);
+        if (lastNode) {
+          const newRange = document.createRange();
+          newRange.setStartAfter(lastNode);
+          newRange.collapse(true);
+          selection.removeAllRanges();
+          selection.addRange(newRange);
+        }
       } else {
         editor.innerHTML += escapeHtml(textToInsert).replace(/\n/g, "<br>");
       }

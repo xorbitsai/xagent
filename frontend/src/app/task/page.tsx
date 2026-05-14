@@ -108,8 +108,19 @@ function TaskHomePageContent() {
     };
   }, [starter, samplePrompts]);
 
-  const [inputValue, setInputValue] = useState(() => starterPreset?.prompt || promptFromQuery || "");
-  const [promptHighlightTerms, setPromptHighlightTerms] = useState<string[]>(() => starterPreset?.highlights || []);
+  const queryInputValue = starterPreset?.prompt || promptFromQuery || "";
+  const queryPromptHighlightTerms = useMemo(
+    () => starterPreset?.highlights || [],
+    [starterPreset]
+  );
+
+  const [inputValue, setInputValue] = useState(() => queryInputValue);
+  const [promptHighlightTerms, setPromptHighlightTerms] = useState<string[]>(() => queryPromptHighlightTerms);
+
+  useEffect(() => {
+    setInputValue(queryInputValue);
+    setPromptHighlightTerms(queryPromptHighlightTerms);
+  }, [queryInputValue, queryPromptHighlightTerms]);
 
   const handleSend = async (message: string, filesToSend: File[], config?: any) => {
     if (state.isProcessing) return;

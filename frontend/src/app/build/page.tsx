@@ -41,7 +41,11 @@ export default function BuildsPage() {
 
   useEffect(() => {
     const shouldOpenCreate = searchParams.get("create") === "true"
-    if (!shouldOpenCreate || hasAutoOpenedCreateRef.current) return
+    if (!shouldOpenCreate) {
+      hasAutoOpenedCreateRef.current = false
+      return
+    }
+    if (hasAutoOpenedCreateRef.current) return
     hasAutoOpenedCreateRef.current = true
     setIsCreateModalOpen(true)
     router.replace("/build")

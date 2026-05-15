@@ -1,7 +1,7 @@
 """drop delegate_agent_ids from tasks
 
 Revision ID: 20260514_drop_delegate_agent_ids_from_tasks
-Revises: 7f4d2c9a1b58
+Revises: 20260514_add_user_template_relations
 Create Date: 2026-05-14 00:00:00.000000
 
 """
@@ -14,7 +14,7 @@ from sqlalchemy.engine.reflection import Inspector
 
 # revision identifiers, used by Alembic.
 revision: str = "20260514_drop_delegate_agent_ids_from_tasks"
-down_revision: Union[str, None] = "7f4d2c9a1b58"
+down_revision: Union[str, None] = "20260514_add_user_template_relations"
 branch_labels: Union[str, Sequence[str], None] = None
 depends_on: Union[str, Sequence[str], None] = None
 

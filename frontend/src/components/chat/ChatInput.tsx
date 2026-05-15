@@ -239,6 +239,12 @@ export function ChatInput({
     memorySimilarityThreshold?: number;
     executionMode?: "flash" | "balanced" | "think";
   }>({ model: "", memorySimilarityThreshold: 1.5 });
+  const [defaultAgentConfig, setDefaultAgentConfig] = useState<{
+    model: string;
+    smallFastModel?: string;
+    visualModel?: string;
+    compactModel?: string;
+  }>({ model: "" });
   const [models, setModels] = useState<any[]>([]);
 
   // State to track files currently being uploaded
@@ -365,12 +371,21 @@ export function ChatInput({
           }
         }
 
+        const newDefaultConfig = {
+          model: defaultModels.general?.model_id || "",
+          smallFastModel: defaultModels.small_fast?.model_id,
+          visualModel: defaultModels.visual?.model_id,
+          compactModel: defaultModels.compact?.model_id
+        };
+
+        setDefaultAgentConfig(newDefaultConfig);
+
         setAgentConfig(prev => ({
           ...prev,
-          model: prev.model || defaultModels.general?.model_id || "",
-          smallFastModel: prev.smallFastModel || defaultModels.small_fast?.model_id,
-          visualModel: prev.visualModel || defaultModels.visual?.model_id,
-          compactModel: prev.compactModel || defaultModels.compact?.model_id
+          model: prev.model || newDefaultConfig.model,
+          smallFastModel: prev.smallFastModel || newDefaultConfig.smallFastModel,
+          visualModel: prev.visualModel || newDefaultConfig.visualModel,
+          compactModel: prev.compactModel || newDefaultConfig.compactModel
         }));
       } catch (error) {
         console.error('Failed to fetch default models:', error);
@@ -391,8 +406,17 @@ export function ChatInput({
         compactModel: taskConfig.compactModel || prev.compactModel,
         executionMode: taskConfig.executionMode
       }));
+    } else if (!readOnlyConfig) {
+      setAgentConfig(prev => ({
+        ...prev,
+        model: defaultAgentConfig.model,
+        smallFastModel: defaultAgentConfig.smallFastModel,
+        visualModel: defaultAgentConfig.visualModel,
+        compactModel: defaultAgentConfig.compactModel,
+        executionMode: undefined
+      }));
     }
-  }, [taskConfig]);
+  }, [taskConfig, readOnlyConfig, defaultAgentConfig]);
 
   const handleConfigChange = (config: {
     model: string;
@@ -715,11 +739,11 @@ export function ChatInput({
                         size="sm"
                         className="h-9 px-3 text-muted-foreground rounded-xl gap-2 cursor-default hover:bg-transparent"
                         disabled={true}
-                        title={models.find(m => m.model_id === agentConfig.model)?.model_name || agentConfig.model || t("chatPage.input.noModel")}
+                        title={models.find(m => String(m.id) === String(agentConfig.model) || String(m.model_id) === String(agentConfig.model))?.model_name || agentConfig.model || t("chatPage.input.noModel")}
                       >
                         <Globe className="h-4 w-4" />
                         <span className="text-xs font-normal max-w-[150px] truncate hidden sm:inline-block">
-                          {models.find(m => m.model_id === agentConfig.model)?.model_name || agentConfig.model || t("chatPage.input.noModel")}
+                          {models.find(m => String(m.id) === String(agentConfig.model) || String(m.model_id) === String(agentConfig.model))?.model_name || agentConfig.model || t("chatPage.input.noModel")}
                         </span>
                       </Button>
                     ) : (
@@ -737,7 +761,7 @@ export function ChatInput({
                           >
                             <Globe className="h-4 w-4" />
                             <span className="text-xs font-normal max-w-[150px] truncate hidden sm:inline-block">
-                              {models.find(m => m.model_id === agentConfig.model)?.model_name || agentConfig.model || t("chatPage.input.noModel")}
+                              {models.find(m => String(m.id) === String(agentConfig.model) || String(m.model_id) === String(agentConfig.model))?.model_name || agentConfig.model || t("chatPage.input.noModel")}
                             </span>
                           </Button>
                         }

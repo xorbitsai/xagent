@@ -1879,22 +1879,28 @@ async def create_task(
                 )
 
         llm_ids_to_use = request.llm_ids
-        if not llm_ids_to_use and selected_agent and selected_agent.models:
-            # Fetch model configuration from agent
-            agent_models = selected_agent.models
-            # Agent Builder stores references that may be DB PKs; normalize to internal
-            # model_id only if the current user has access.
-            llm_ids_to_use = _normalize_llm_refs(
-                [
-                    agent_models.get("general"),
-                    agent_models.get("small_fast"),
-                    agent_models.get("visual"),
-                    agent_models.get("compact"),
-                ]
-            )
-            logger.info(
-                f"Using agent {request.agent_id} model configuration (llm_ids): {llm_ids_to_use}"
-            )
+        if selected_agent:
+            if request.llm_ids:
+                logger.warning(
+                    f"Ignoring caller-supplied llm_ids {request.llm_ids} because agent_id {request.agent_id} is present."
+                )
+            llm_ids_to_use = None
+            if selected_agent.models:
+                # Fetch model configuration from agent
+                agent_models = selected_agent.models
+                # Agent Builder stores references that may be DB PKs; normalize to internal
+                # model_id only if the current user has access.
+                llm_ids_to_use = _normalize_llm_refs(
+                    [
+                        agent_models.get("general"),
+                        agent_models.get("small_fast"),
+                        agent_models.get("visual"),
+                        agent_models.get("compact"),
+                    ]
+                )
+                logger.info(
+                    f"Using agent {request.agent_id} model configuration (llm_ids): {llm_ids_to_use}"
+                )
 
         # Normalize any refs (pk/model_name/model_id) to internal model_id strings,
         # but only if the current user has access to the model.

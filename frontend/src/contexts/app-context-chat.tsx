@@ -2730,6 +2730,9 @@ export function AppProvider({ children, token }: { children: React.ReactNode; to
           }
           // Skill Selection Events
           else if (eventType === "skill_select_start") {
+            dispatch({ type: "UPDATE_TASK_STATUS", payload: { status: "running" } })
+            dispatch({ type: "SET_PROCESSING", payload: true })
+
             const traceEvent: TraceEvent = {
               event_id: generateMessageId("skill-select-start"),
               event_type: eventType,

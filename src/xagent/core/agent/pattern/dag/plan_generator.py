@@ -16,7 +16,7 @@ class PlanValidationError(ValueError):
 
 @dataclass
 class PlanStep:
-    """Serializable DAG step used by the v2 execution runtime."""
+    """Serializable DAG step used by the execution runtime."""
 
     id: str
     task: str

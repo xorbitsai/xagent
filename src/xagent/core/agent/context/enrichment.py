@@ -488,7 +488,7 @@ def _current_user_id() -> Any | None:
 
 
 def lookup_relevant_memories(
-    memory_store: Any,
+    memory_store: Any | None,
     query: str,
     category: str,
     *,
@@ -496,6 +496,9 @@ def lookup_relevant_memories(
     limit: int = 5,
     similarity_threshold: float | None = None,
 ) -> list[dict[str, Any]]:
+    if memory_store is None:
+        return []
+
     filters: dict[str, Any] = {}
     if category:
         filters["category"] = category
@@ -536,13 +539,16 @@ def enhance_goal_with_memory(query: str, memories: list[dict[str, Any]]) -> str:
 
 def store_react_task_memory(
     *,
-    memory_store: Any,
+    memory_store: Any | None,
     task: str,
     result: dict[str, Any],
     tool_usage_insights: str,
     reasoning_strategy: str,
     classification: dict[str, Any],
 ) -> str | None:
+    if memory_store is None:
+        return None
+
     content_parts = [
         f"Task: {task}",
         f"Result: {str(result.get('output') or '')}",

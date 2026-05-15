@@ -118,7 +118,7 @@ class AgentService:
             tools=self.tools,
             patterns=self.patterns,
             llm=self.llm,
-            memory=self.memory,
+            memory_store=self.memory,
         )
 
         logger.info(

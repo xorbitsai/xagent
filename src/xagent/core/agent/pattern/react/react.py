@@ -108,7 +108,7 @@ def _normalize_ask_user_interactions(interactions: Any) -> list[dict[str, Any]]:
 
 
 class ReActPattern(AgentPattern):
-    """Minimal ReAct loop for the v2 execution runtime."""
+    """Minimal ReAct loop for the execution runtime."""
 
     def __init__(
         self,

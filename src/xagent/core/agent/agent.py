@@ -5,6 +5,9 @@ from datetime import datetime, timezone
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
+    from ...skills.manager import SkillManager
+    from ..memory import MemoryStore
+    from ..model.chat.basic.base import BaseLLM
     from .pattern import AgentPattern
     from .runner import AgentRunner
 
@@ -15,17 +18,17 @@ def _utcnow() -> datetime:
 
 @dataclass
 class Agent:
-    """Minimal agent definition for the execution-centric v2 runtime."""
+    """Minimal agent definition for the execution-centric runtime."""
 
     name: str
     patterns: list["AgentPattern"]
     tools: list[Any] = field(default_factory=list)
-    llm: Any | None = None
+    llm: "BaseLLM | None" = None
     system_prompt: str | None = None
     metadata: dict[str, Any] = field(default_factory=dict)
-    memory_store: Any | None = None
+    memory_store: "MemoryStore | None" = None
     memory_similarity_threshold: float | None = None
-    skill_manager: Any | None = None
+    skill_manager: "SkillManager | None" = None
     allowed_skills: list[str] | None = None
     created_at: datetime = field(default_factory=_utcnow)
 

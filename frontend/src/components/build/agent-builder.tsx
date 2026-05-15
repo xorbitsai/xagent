@@ -116,7 +116,6 @@ export function AgentBuilder({ agentId }: AgentBuilderProps) {
   const router = useRouter()
   const searchParams = useSearchParams()
   const templateId = searchParams.get("template")
-  const initialPrompt = searchParams.get("prompt")
   const [localAgentId, setLocalAgentId] = useState<string | undefined>(agentId)
   const isEditMode = !!localAgentId
   const branding = getBrandingFromEnv();
@@ -145,10 +144,11 @@ export function AgentBuilder({ agentId }: AgentBuilderProps) {
   const [originalData, setOriginalData] = useState<any>(null)
   const [isKbModalOpen, setIsKbModalOpen] = useState(false)
   const [isModelConfigOpen, setIsModelConfigOpen] = useState(false)
-  const [showAIAssistant, setShowAIAssistant] = useState(!!initialPrompt)
+  const [showAIAssistant, setShowAIAssistant] = useState(false)
   const [configSynced, setConfigSynced] = useState(false)
   const [notFound, setNotFound] = useState(false)
   const isFirstRender = useRef(true)
+  const modelSectionRef = useRef<HTMLDivElement>(null)
 
   useEffect(() => {
     if (isFirstRender.current) {
@@ -1264,7 +1264,6 @@ export function AgentBuilder({ agentId }: AgentBuilderProps) {
     }
   }
 
-  const isPromptBuildFlow = Boolean(initialPrompt) && !isEditMode
   const isTemplateEntry = Boolean(templateId) && !isEditMode
   const isTemplateRequirementsPending = isTemplateEntry && (!isInitialDataLoaded || loadingAgent || !templateRequirements)
   const isTemplateBuildFlow = isTemplateEntry && !isTemplateRequirementsPending
@@ -1291,7 +1290,7 @@ export function AgentBuilder({ agentId }: AgentBuilderProps) {
   )
   const useTemplateSpecificHighlights =
     templateMissingKb || templateMissingSkills || templateMissingTools || templateMissingMcp
-  const promptStepCompleted = !isPromptBuildFlow || Boolean(name.trim() && instructions.trim())
+  const describeStepCompleted = Boolean(name.trim() && description.trim() && instructions.trim())
   const configStepCompleted = isTemplateRequirementsPending
     ? false
     : isTemplateBuildFlow
@@ -1304,26 +1303,23 @@ export function AgentBuilder({ agentId }: AgentBuilderProps) {
       )
   const previewStepCompleted = messages.some((message) => message.role === "user")
   const shouldHighlightConfigStep = !configStepCompleted
-  const shouldHighlightPreviewStep = promptStepCompleted && configStepCompleted && !previewStepCompleted
   const shouldHighlightKbSection = useTemplateSpecificHighlights ? templateMissingKb : shouldHighlightConfigStep
   const shouldHighlightSkillsSection = useTemplateSpecificHighlights ? templateMissingSkills : shouldHighlightConfigStep
   const shouldHighlightToolsSection = useTemplateSpecificHighlights ? templateMissingTools : shouldHighlightConfigStep
   const shouldHighlightConnectorSection = useTemplateSpecificHighlights ? templateMissingMcp : shouldHighlightConfigStep
 
   const buildSteps = [
-    ...(isPromptBuildFlow
-      ? [{
-        key: "prompt",
-        label: t("builds.editor.stepGuide.prompt"),
-        status: promptStepCompleted ? "complete" : "current" as "complete" | "current" | "upcoming",
-      }]
-      : []),
+    {
+      key: "describe",
+      label: t("builds.editor.stepGuide.describe"),
+      status: describeStepCompleted ? "complete" : "current" as "complete" | "current" | "upcoming",
+    },
     {
       key: "configure",
       label: t("builds.editor.stepGuide.configure"),
       status: configStepCompleted
         ? "complete"
-        : promptStepCompleted
+        : describeStepCompleted
           ? "current"
           : "upcoming" as "complete" | "current" | "upcoming",
     },
@@ -1332,7 +1328,7 @@ export function AgentBuilder({ agentId }: AgentBuilderProps) {
       label: t("builds.editor.stepGuide.preview"),
       status: previewStepCompleted
         ? "complete"
-        : promptStepCompleted && configStepCompleted
+        : describeStepCompleted && configStepCompleted
           ? "current"
           : "upcoming" as "complete" | "current" | "upcoming",
     },
@@ -1362,6 +1358,13 @@ export function AgentBuilder({ agentId }: AgentBuilderProps) {
       "space-y-2 transition-all duration-200",
       highlight && "rounded-xl border border-primary/30 bg-primary/5 p-4 shadow-sm"
     )
+
+  const scrollToModelSection = () => {
+    modelSectionRef.current?.scrollIntoView({
+      behavior: "smooth",
+      block: "start",
+    })
+  }
 
   const LeftPanel = (
     <div className="p-6 space-y-8 min-h-full bg-card/50">
@@ -1429,7 +1432,14 @@ export function AgentBuilder({ agentId }: AgentBuilderProps) {
           <div className="flex min-w-max items-center gap-3">
             {buildSteps.map((step, index) => (
               <React.Fragment key={step.key}>
-                <div className="flex items-center gap-3">
+                <button
+                  type="button"
+                  className={cn(
+                    "flex items-center gap-3 rounded-md transition-colors",
+                    step.key === "configure" && "cursor-pointer hover:bg-primary/5 px-1 py-1"
+                  )}
+                  onClick={step.key === "configure" ? scrollToModelSection : undefined}
+                >
                   <div
                     className={cn(
                       "flex h-7 w-7 shrink-0 items-center justify-center rounded-full border text-xs font-semibold",
@@ -1441,7 +1451,7 @@ export function AgentBuilder({ agentId }: AgentBuilderProps) {
                   <span className={cn("text-sm font-medium whitespace-nowrap", getStepLabelClasses(step.status))}>
                     {step.label}
                   </span>
-                </div>
+                </button>
                 {index < buildSteps.length - 1 && (
                   <div className={cn("h-px min-w-10 flex-1", getStepConnectorClasses(step.status))} />
                 )}
@@ -1627,7 +1637,7 @@ export function AgentBuilder({ agentId }: AgentBuilderProps) {
         </div>
 
         {/* Model Selection */}
-        <div className="space-y-4">
+        <div ref={modelSectionRef} className="space-y-4">
           <div className="flex items-center justify-between">
             <Label>{t("builds.configForm.model.label")}</Label>
             <Button
@@ -2107,7 +2117,6 @@ export function AgentBuilder({ agentId }: AgentBuilderProps) {
         <ResizableThreeColumnLayout
           showLeftPanel={showAIAssistant}
           leftPanel={<AgentBuilderChat
-            initialPrompt={initialPrompt}
             agentConfig={{
               id: localAgentId ? parseInt(localAgentId) : undefined,
               name, description, instructions, executionMode, suggestedPrompts,

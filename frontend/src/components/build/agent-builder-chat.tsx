@@ -64,15 +64,13 @@ interface AgentBuilderChatProps {
   agentConfig: AgentConfig
   onUpdateConfig: (config: Partial<AgentConfig>) => void
   availableOptions?: any
-  initialPrompt?: string | null
   toolCategories?: string[]
 }
 
-export function AgentBuilderChat({ agentConfig, onUpdateConfig, availableOptions, initialPrompt, toolCategories = [] }: AgentBuilderChatProps) {
+export function AgentBuilderChat({ agentConfig, onUpdateConfig, availableOptions, toolCategories = [] }: AgentBuilderChatProps) {
   const { t } = useI18n()
   const { token } = useAuth()
   const [messages, setMessages] = useState<Message[]>([])
-  const [hasSentInitial, setHasSentInitial] = useState(false)
   const branding = getBrandingFromEnv()
 
   // Set initial message on mount to avoid hydration mismatch and get translation
@@ -433,14 +431,6 @@ export function AgentBuilderChat({ agentConfig, onUpdateConfig, availableOptions
       setIsLoading(false)
     }
   }, [messages, isLoading, token, agentConfig, onUpdateConfig])
-
-  // Handle initial prompt from URL
-  useEffect(() => {
-    if (initialPrompt && !hasSentInitial && token && messages.length > 0 && !isLoading) {
-      setHasSentInitial(true)
-      handleSendMessage(initialPrompt)
-    }
-  }, [initialPrompt, hasSentInitial, token, messages.length, isLoading, handleSendMessage])
 
   const handleStop = () => {
     if (wsRef.current) {

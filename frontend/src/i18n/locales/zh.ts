@@ -2119,7 +2119,8 @@ Build when you need.`
         describeTitle: "通过描述创建",
         describeDesc: "告诉我们你的需求 —— {appName} 将为你预填配置",
         placeholder: "例如：一个可以回答产品问题、处理退款请求并将复杂问题升级给人工客服的客服 Agent...",
-        buildBtn: "生成 Agent",
+        buildBtn: "开始任务",
+        startTaskFailed: "创建任务失败，请重试",
         manualTitle: "手动创建",
         manualDesc: "打开空白表单，从头开始配置每个字段",
         manualBtn: "前往创建面板",
@@ -2140,10 +2141,10 @@ Build when you need.`
       aiAssistant: "{appName} 助手",
       stepGuide: {
         title: "构建你的 Agent",
-        prompt: "通过提示词创建",
+        describe: "描述你的 Agent",
         configure: "配置与连接",
         preview: "到右侧预览测试",
-        completed: "所有步骤已完成，点击 创建按钮即可发布你的 Agent。",
+        completed: "所有步骤已完成，点击 创建按钮 即可发布你的 Agent。",
       },
       header: {
         title: "自定义 Agent",

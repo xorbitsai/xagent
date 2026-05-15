@@ -2119,7 +2119,8 @@ Build when you need.`
         describeTitle: "By Describing It",
         describeDesc: "Tell us what you want — {appName} will pre-fill the configuration for you",
         placeholder: "e.g. A customer support agent that answers product questions, handles refund requests, and escalates complex issues to human agents...",
-        buildBtn: "Build Agent",
+        buildBtn: "Start Task",
+        startTaskFailed: "Failed to create task. Please try again.",
         manualTitle: "Manually",
         manualDesc: "Open a blank form and configure each field yourself from scratch",
         manualBtn: "Go to Builder",
@@ -2140,7 +2141,7 @@ Build when you need.`
       aiAssistant: "{appName} Assistant",
       stepGuide: {
         title: "Build Your Agent",
-        prompt: "Create With Prompt",
+        describe: "Describe your agent",
         configure: "Configure & Connect",
         preview: "Test In Preview",
         completed: "All steps complete - click the Create button to publish your agent.",

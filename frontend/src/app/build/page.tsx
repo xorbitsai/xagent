@@ -10,6 +10,7 @@ import { Textarea } from "@/components/ui/textarea"
 import { DeployAgentDialog, Agent } from "@/components/build/deploy-agent-dialog"
 import { FeatureEmptyState } from "@/components/ui/feature-empty-state"
 import { useI18n } from "@/contexts/i18n-context"
+import { useApp } from "@/contexts/app-context-chat"
 import { useRouter, useSearchParams } from "next/navigation"
 import { apiRequest } from "@/lib/api-wrapper"
 import { getApiUrl } from "@/lib/utils"
@@ -17,8 +18,21 @@ import { ConfirmDialog } from "@/components/ui/confirm-dialog"
 import { toast } from "sonner"
 import { getBrandingFromEnv } from "@/lib/branding"
 
+interface LlmModel {
+  model_id: string
+  is_default?: boolean
+}
+
+interface DefaultModelRecord {
+  config_type?: "general" | "small_fast" | "visual" | "compact"
+  model?: {
+    model_id?: string
+  } | null
+}
+
 export default function BuildsPage() {
   const { t } = useI18n()
+  const { dispatch, setTaskId, setPendingMessage } = useApp()
   const router = useRouter()
   const searchParams = useSearchParams()
   const hasAutoOpenedCreateRef = useRef(false)
@@ -135,18 +149,110 @@ export default function BuildsPage() {
 
   const [isCreateModalOpen, setIsCreateModalOpen] = useState(false)
   const [createPrompt, setCreatePrompt] = useState("")
+  const [isStartingTask, setIsStartingTask] = useState(false)
 
   const handleCreate = () => {
     setIsCreateModalOpen(true)
   }
 
-  const handleBuildWithPrompt = () => {
-    if (createPrompt.trim()) {
-      router.push(`/build/new?prompt=${encodeURIComponent(createPrompt.trim())}`)
-    } else {
-      router.push("/build/new")
+  const resolveTaskLlmIds = async (): Promise<[string, string | null, string | null, string | null] | null> => {
+    const apiUrl = getApiUrl()
+    const [modelsResponse, defaultResponse] = await Promise.all([
+      apiRequest(`${apiUrl}/api/models/?category=llm`, { headers: {} }),
+      apiRequest(`${apiUrl}/api/models/user-default`, { headers: {} }),
+    ])
+
+    let allModels: LlmModel[] = []
+    if (modelsResponse.ok) {
+      const modelsData = await modelsResponse.json()
+      if (Array.isArray(modelsData)) {
+        allModels = modelsData as LlmModel[]
+      }
     }
-    setIsCreateModalOpen(false)
+
+    const defaultModels: Record<string, string | undefined> = {}
+    if (defaultResponse.ok) {
+      const defaultsData = await defaultResponse.json()
+      if (Array.isArray(defaultsData)) {
+        defaultsData.forEach((defaultConfig: DefaultModelRecord) => {
+          if (defaultConfig?.config_type && defaultConfig.model?.model_id) {
+            defaultModels[defaultConfig.config_type] = defaultConfig.model.model_id
+          }
+        })
+      }
+    }
+
+    const generalModelId =
+      defaultModels.general ||
+      allModels.find((model) => model.is_default)?.model_id ||
+      allModels[0]?.model_id
+
+    if (!generalModelId) {
+      return null
+    }
+
+    return [
+      generalModelId,
+      defaultModels.small_fast ?? null,
+      defaultModels.visual ?? null,
+      defaultModels.compact ?? null,
+    ]
+  }
+
+  const handleBuildWithPrompt = async () => {
+    const prompt = createPrompt.trim()
+    if (!prompt || isStartingTask) return
+
+    setIsStartingTask(true)
+    try {
+      dispatch({ type: "RESET_STATE" })
+      const llmIds = await resolveTaskLlmIds()
+      if (!llmIds) {
+        toast.error(t("chatPage.input.noModelAlert"))
+        return
+      }
+
+      const taskResponse = await apiRequest(`${getApiUrl()}/api/chat/task/create`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          title: prompt,
+          description: prompt,
+          llm_ids: llmIds,
+        }),
+      })
+
+      if (!taskResponse.ok) {
+        throw new Error("Failed to create task")
+      }
+
+      const taskData = await taskResponse.json()
+      const taskId = taskData.id || taskData.task_id
+      const parsedTaskId = typeof taskId === "string" ? parseInt(taskId, 10) : taskId
+
+      if (!parsedTaskId) {
+        throw new Error("Task ID missing from create response")
+      }
+
+      setPendingMessage({
+        message: prompt,
+        files: [],
+        targetTaskId: parsedTaskId,
+      })
+      dispatch({ type: "TRIGGER_TASK_UPDATE" })
+      setTaskId(parsedTaskId)
+      setIsCreateModalOpen(false)
+      setCreatePrompt("")
+    } catch (error) {
+      console.error("Failed to start task from build modal:", error)
+      toast.error(t("builds.list.createModal.startTaskFailed"))
+      setIsCreateModalOpen(true)
+      setCreatePrompt(prompt)
+    } finally {
+      setIsStartingTask(false)
+    }
   }
 
   const handleManualCreate = () => {
@@ -429,7 +535,7 @@ export default function BuildsPage() {
                   placeholder={t("builds.list.createModal.placeholder")}
                   className="min-h-[100px] flex-1 resize-none border-0 shadow-none focus-visible:ring-0"
                   onKeyDown={(e) => {
-                    if (e.key === "Enter" && !e.shiftKey) {
+                    if (e.key === "Enter" && !e.shiftKey && !isStartingTask) {
                       e.preventDefault()
                       handleBuildWithPrompt()
                     }
@@ -438,11 +544,11 @@ export default function BuildsPage() {
                 <div className="p-2 flex justify-end">
                   <Button
                     onClick={handleBuildWithPrompt}
-                    disabled={!createPrompt.trim()}
+                    disabled={!createPrompt.trim() || isStartingTask}
                     className="bg-indigo-400 hover:bg-indigo-500 text-white shadow-none shrink-0"
                   >
                     <Sparkles className="mr-2 h-4 w-4" />
-                    {t("builds.list.createModal.buildBtn")}
+                    {isStartingTask ? t("common.loading") : t("builds.list.createModal.buildBtn")}
                   </Button>
                 </div>
               </div>

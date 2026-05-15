@@ -810,7 +810,7 @@ function appReducer(state: AppState, action: AppAction): AppState {
 interface AppContextType {
   state: AppState
   dispatch: React.Dispatch<AppAction>
-  sendMessage: (message: string, config?: any, files?: File[]) => void
+  sendMessage: (message: string, config?: any, files?: File[]) => Promise<void>
   executeTask: (description: string) => void
   pauseTask: () => void
   resumeTask: () => void

@@ -30,6 +30,31 @@ interface DefaultModelRecord {
   } | null
 }
 
+interface TaskCreateResponse {
+  task_id: number
+}
+
+const isLlmModel = (value: unknown): value is LlmModel => {
+  if (!value || typeof value !== "object") {
+    return false
+  }
+
+  const candidate = value as Record<string, unknown>
+  return (
+    typeof candidate.model_id === "string" &&
+    (candidate.is_default === undefined || typeof candidate.is_default === "boolean")
+  )
+}
+
+const isTaskCreateResponse = (value: unknown): value is TaskCreateResponse => {
+  if (!value || typeof value !== "object") {
+    return false
+  }
+
+  const candidate = value as Record<string, unknown>
+  return typeof candidate.task_id === "number"
+}
+
 export default function BuildsPage() {
   const { t } = useI18n()
   const { dispatch, setTaskId, setPendingMessage } = useApp()
@@ -166,7 +191,7 @@ export default function BuildsPage() {
     if (modelsResponse.ok) {
       const modelsData = await modelsResponse.json()
       if (Array.isArray(modelsData)) {
-        allModels = modelsData as LlmModel[]
+        allModels = modelsData.filter(isLlmModel)
       }
     }
 
@@ -229,20 +254,17 @@ export default function BuildsPage() {
       }
 
       const taskData = await taskResponse.json()
-      const taskId = taskData.id || taskData.task_id
-      const parsedTaskId = typeof taskId === "string" ? parseInt(taskId, 10) : taskId
-
-      if (!parsedTaskId) {
-        throw new Error("Task ID missing from create response")
+      if (!isTaskCreateResponse(taskData)) {
+        throw new Error("Task create response is missing task_id")
       }
 
       setPendingMessage({
         message: prompt,
         files: [],
-        targetTaskId: parsedTaskId,
+        targetTaskId: taskData.task_id,
       })
       dispatch({ type: "TRIGGER_TASK_UPDATE" })
-      setTaskId(parsedTaskId)
+      setTaskId(taskData.task_id)
       setIsCreateModalOpen(false)
       setCreatePrompt("")
     } catch (error) {

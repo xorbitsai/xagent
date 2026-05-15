@@ -130,7 +130,12 @@ class ExecutionRegistry:
         **run_kwargs: Any,
     ) -> ExecutionHandle:
         run_task = asyncio.create_task(
-            runner.run(task=task, execution_id=execution_id, **run_kwargs)
+            runner.run(
+                task=task,
+                execution_id=execution_id,
+                metadata=metadata,
+                **run_kwargs,
+            )
         )
         return self.register(
             execution_id,

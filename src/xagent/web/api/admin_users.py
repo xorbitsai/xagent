@@ -1,4 +1,5 @@
 from fastapi import APIRouter, Depends, HTTPException, Query
+from sqlalchemy import inspect, text
 from sqlalchemy.orm import Session
 
 from ..auth_dependencies import get_current_user
@@ -8,6 +9,17 @@ from ..models.user import User
 from ..schemas.user import UserListResponse, UserResponse
 
 router = APIRouter(prefix="/api/admin/users", tags=["admin-users"])
+
+
+def _delete_legacy_text2sql_rows(db: Session, user_id: int) -> None:
+    """Delete legacy Text2SQL rows without importing removed ORM models."""
+    inspector = inspect(db.get_bind())
+    if not inspector.has_table("text2sql_databases"):
+        return
+    db.execute(
+        text("DELETE FROM text2sql_databases WHERE user_id = :user_id"),
+        {"user_id": user_id},
+    )
 
 
 @router.get("", response_model=UserListResponse)
@@ -65,6 +77,10 @@ async def delete_user(
 
     # Delete related data in correct order to respect foreign key constraints
     from ..models.mcp import UserMCPServer
+
+    # Existing deployments may still have the removed Text2SQL table. Clean it
+    # up by table name so user deletion keeps working under strict FK checks.
+    _delete_legacy_text2sql_rows(db, user_id)
 
     # Delete user's tasks
     db.query(Task).filter(Task.user_id == user_id).delete()

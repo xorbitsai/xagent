@@ -312,10 +312,12 @@ def _is_agent_checkpoint_data(data: Any) -> bool:
     if not isinstance(data, dict):
         return False
     try:
-        from ...core.agent.checkpoint import CHECKPOINT_TYPE
+        from ...core.agent.checkpoint import READABLE_CHECKPOINT_TYPES
     except Exception:
-        CHECKPOINT_TYPE = "agent_execution_checkpoint"
-    return data.get("checkpoint_type") == CHECKPOINT_TYPE or (
+        READABLE_CHECKPOINT_TYPES = frozenset(
+            {"agent_execution_checkpoint", "agent_v2_execution_checkpoint"}
+        )
+    return data.get("checkpoint_type") in READABLE_CHECKPOINT_TYPES or (
         data.get("type") == "checkpoint"
         and isinstance(data.get("pattern_state"), dict)
         and isinstance(data.get("context"), dict)

@@ -342,6 +342,31 @@ class ExecutionContext:
                 "current user request explicitly asks to revise, continue, compare, "
                 "or summarize them."
             )
+        process_description = str(
+            self.metadata.get("process_description") or ""
+        ).strip()
+        if process_description:
+            parts.append(f"Task process requirements:\n{process_description}")
+        examples = self.metadata.get("examples")
+        if isinstance(examples, list) and examples:
+            formatted_examples: list[str] = []
+            for index, example in enumerate(examples, start=1):
+                if isinstance(example, dict):
+                    example_input = str(example.get("input") or "").strip()
+                    example_output = str(example.get("output") or "").strip()
+                    if example_input or example_output:
+                        formatted_examples.append(
+                            f"{index}. Input: {example_input}\n"
+                            f"   Output: {example_output}"
+                        )
+                else:
+                    value = str(example).strip()
+                    if value:
+                        formatted_examples.append(f"{index}. {value}")
+            if formatted_examples:
+                parts.append(
+                    "Task input/output examples:\n" + "\n".join(formatted_examples)
+                )
         if dag_step_id:
             dag_step_name = str(self.metadata.get("dag_step_name") or "").strip()
             dag_step_description = str(

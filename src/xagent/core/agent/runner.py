@@ -135,69 +135,84 @@ class AgentRunner:
             tools = [*getattr(self.agent, "tools", []), *(extra_tools or [])]
             pattern_errors: list[dict[str, Any]] = []
 
-            for pattern in patterns:
-                load_pattern_checkpoint(pattern, checkpoint)
-                try:
-                    result = await pattern.run(
-                        **self._build_pattern_kwargs(
-                            pattern=pattern,
-                            task=task or "",
-                            context=context,
-                            tools=tools,
-                            runtime=runtime,
-                            streaming_handler=streaming_handler,
+            try:
+                await self._setup_tools(tools, task_id=execution_id)
+                for pattern in patterns:
+                    load_pattern_checkpoint(pattern, checkpoint)
+                    try:
+                        result = await pattern.run(
+                            **self._build_pattern_kwargs(
+                                pattern=pattern,
+                                task=task or "",
+                                context=context,
+                                tools=tools,
+                                runtime=runtime,
+                                streaming_handler=streaming_handler,
+                            )
                         )
+                    except LLMCallInterrupted as exc:
+                        normalized = {
+                            "success": False,
+                            "status": "interrupted",
+                            "error": str(exc),
+                            "execution_id": execution_id,
+                            "context": context,
+                            "pattern": pattern.__class__.__name__,
+                        }
+                        await self._dispatch_callback(
+                            "on_run_end",
+                            runner=self,
+                            context=context,
+                            result=normalized,
+                        )
+                        return normalized
+                    except Exception as exc:  # noqa: BLE001
+                        logger.exception(
+                            "Pattern %s failed", pattern.__class__.__name__
+                        )
+                        pattern_errors.append(
+                            {
+                                "pattern": pattern.__class__.__name__,
+                                "error": str(exc),
+                                "exception_type": exc.__class__.__name__,
+                            }
+                        )
+                        continue
+
+                    normalized = self._normalize_result(
+                        result=result,
+                        pattern=pattern,
+                        context=context,
+                        execution_id=execution_id,
                     )
-                except LLMCallInterrupted as exc:
-                    normalized = {
-                        "success": False,
-                        "status": "interrupted",
-                        "error": str(exc),
-                        "execution_id": execution_id,
-                        "context": context,
-                        "pattern": pattern.__class__.__name__,
-                    }
-                    await self._dispatch_callback(
-                        "on_run_end", runner=self, context=context, result=normalized
-                    )
-                    return normalized
-                except Exception as exc:  # noqa: BLE001
-                    logger.exception("Pattern %s failed", pattern.__class__.__name__)
+                    if normalized.get("success"):
+                        await self._dispatch_callback(
+                            "on_run_end",
+                            runner=self,
+                            context=context,
+                            result=normalized,
+                        )
+                        return normalized
+                    if normalized.get("status") in {"interrupted", "waiting_for_user"}:
+                        await self._dispatch_callback(
+                            "on_run_end",
+                            runner=self,
+                            context=context,
+                            result=normalized,
+                        )
+                        return normalized
+
                     pattern_errors.append(
                         {
                             "pattern": pattern.__class__.__name__,
-                            "error": str(exc),
-                            "exception_type": exc.__class__.__name__,
+                            "error": normalized.get(
+                                "error", "Pattern failed without a detailed error."
+                            ),
+                            "result": normalized,
                         }
                     )
-                    continue
-
-                normalized = self._normalize_result(
-                    result=result,
-                    pattern=pattern,
-                    context=context,
-                    execution_id=execution_id,
-                )
-                if normalized.get("success"):
-                    await self._dispatch_callback(
-                        "on_run_end", runner=self, context=context, result=normalized
-                    )
-                    return normalized
-                if normalized.get("status") in {"interrupted", "waiting_for_user"}:
-                    await self._dispatch_callback(
-                        "on_run_end", runner=self, context=context, result=normalized
-                    )
-                    return normalized
-
-                pattern_errors.append(
-                    {
-                        "pattern": pattern.__class__.__name__,
-                        "error": normalized.get(
-                            "error", "Pattern failed without a detailed error."
-                        ),
-                        "result": normalized,
-                    }
-                )
+            finally:
+                await self._teardown_tools(tools, task_id=execution_id)
 
             if len(pattern_errors) == 1:
                 single_result = pattern_errors[0].get("result")
@@ -353,6 +368,11 @@ class AgentRunner:
             context.metadata.update(metadata)
         if task:
             context.metadata.setdefault("task", task)
+        request_context = (
+            metadata.get("request_context") if isinstance(metadata, dict) else None
+        )
+        if isinstance(request_context, dict):
+            self._apply_request_context(context, request_context)
 
         memory_session = await self._resolve_memory_session(
             execution_id=execution_id,
@@ -364,6 +384,26 @@ class AgentRunner:
             context.attach_memory_session(memory_id, snapshot)
 
         return context
+
+    def _apply_request_context(
+        self,
+        context: ExecutionContext,
+        request_context: dict[str, Any],
+    ) -> None:
+        system_prompt = request_context.get("system_prompt")
+        if isinstance(system_prompt, str) and system_prompt.strip():
+            prompt = system_prompt.strip()
+            if context.system_prompt and context.system_prompt.strip():
+                existing = context.system_prompt.strip()
+                if prompt not in existing:
+                    context.system_prompt = f"{existing}\n\n{prompt}"
+            else:
+                context.system_prompt = prompt
+
+        for key, value in request_context.items():
+            if key == "system_prompt":
+                continue
+            context.metadata[key] = value
 
     def _resolve_task(
         self,
@@ -504,6 +544,29 @@ class AgentRunner:
             skill_manager=getattr(self.agent, "skill_manager", None),
             allowed_skills=getattr(self.agent, "allowed_skills", None),
         )
+
+    async def _setup_tools(self, tools: list[Any], *, task_id: str) -> None:
+        for tool in tools:
+            setup = getattr(tool, "setup", None)
+            if not callable(setup):
+                continue
+            result = setup(task_id=task_id)
+            if inspect.isawaitable(result):
+                await result
+
+    async def _teardown_tools(self, tools: list[Any], *, task_id: str) -> None:
+        for tool in reversed(tools):
+            teardown = getattr(tool, "teardown", None)
+            if not callable(teardown):
+                continue
+            try:
+                result = teardown(task_id=task_id)
+                if inspect.isawaitable(result):
+                    await result
+            except Exception:
+                logger.exception(
+                    "Tool teardown failed for %s", getattr(tool, "name", tool)
+                )
 
     async def _load_latest_checkpoint(
         self,

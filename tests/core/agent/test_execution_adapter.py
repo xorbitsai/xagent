@@ -60,6 +60,8 @@ class RecordingTracer:
 class FakeTool:
     def __init__(self) -> None:
         self.calls: list[dict[str, Any]] = []
+        self.setup_calls: list[str | None] = []
+        self.teardown_calls: list[str | None] = []
 
         class Metadata:
             name = "noop"
@@ -79,6 +81,12 @@ class FakeTool:
     async def run_json_async(self, args: dict[str, Any]) -> dict[str, Any]:
         self.calls.append(args)
         return {"args": args}
+
+    async def setup(self, task_id: str | None = None) -> None:
+        self.setup_calls.append(task_id)
+
+    async def teardown(self, task_id: str | None = None) -> None:
+        self.teardown_calls.append(task_id)
 
 
 class NoSkillManager:
@@ -190,6 +198,68 @@ async def test_execution_adapter_routes_react_to_react() -> None:
     assert result["metadata"]["execution_type"] == "agent_react"
     assert result["agent_result"]["pattern"] == "ReActPattern"
     assert llm.calls[0]["tools"] is not None
+
+
+@pytest.mark.asyncio
+async def test_execution_adapter_propagates_request_context_to_llm() -> None:
+    llm = FakeLLM(["context done"])
+    adapter = AgentExecutionAdapter(
+        AgentExecutionConfig(
+            name="context",
+            pattern="react",
+            llm=llm,
+            tools=[FakeTool()],
+            system_prompt="Base system.",
+            service_id="context-service",
+            skill_manager=NoSkillManager(),
+        )
+    )
+
+    result = await adapter.execute(
+        task="Say done",
+        task_id="context-exec",
+        context={
+            "system_prompt": "Follow request-specific rules.",
+            "process_description": "Use the provided process.",
+            "examples": [{"input": "hello", "output": "world"}],
+        },
+    )
+
+    assert result["success"] is True
+    system_messages = [
+        message["content"]
+        for message in llm.calls[0]["messages"]
+        if message["role"] == "system"
+    ]
+    assert len(system_messages) == 1
+    system_prompt = system_messages[0]
+    assert "Base system." in system_prompt
+    assert "Follow request-specific rules." in system_prompt
+    assert "Use the provided process." in system_prompt
+    assert "Input: hello" in system_prompt
+    assert "Output: world" in system_prompt
+
+
+@pytest.mark.asyncio
+async def test_execution_adapter_runs_tool_lifecycle() -> None:
+    llm = FakeLLM(["done"])
+    tool = FakeTool()
+    adapter = AgentExecutionAdapter(
+        AgentExecutionConfig(
+            name="lifecycle",
+            pattern="react",
+            llm=llm,
+            tools=[tool],
+            service_id="lifecycle-service",
+            skill_manager=NoSkillManager(),
+        )
+    )
+
+    result = await adapter.execute(task="Say done", task_id="lifecycle-exec")
+
+    assert result["success"] is True
+    assert tool.setup_calls == ["lifecycle-exec"]
+    assert tool.teardown_calls == ["lifecycle-exec"]
 
 
 @pytest.mark.asyncio

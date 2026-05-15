@@ -7,6 +7,7 @@ import pytest
 from xagent.core.agent import Agent, AgentRunner
 from xagent.core.agent.checkpoint import (
     CHECKPOINT_TYPE,
+    LEGACY_CHECKPOINT_TYPES,
     CheckpointPersistenceError,
     TraceCheckpointStore,
 )
@@ -78,6 +79,19 @@ class NoneReturningTraceEventBackend:
         return None
 
 
+class LegacyCheckpointBackend:
+    def __init__(self, payload: dict[str, Any]) -> None:
+        self.payload = payload
+
+    async def load_latest_checkpoint(self, execution_id: str) -> dict[str, Any]:
+        legacy_type = next(iter(LEGACY_CHECKPOINT_TYPES))
+        return {
+            "checkpoint_type": legacy_type,
+            "root_execution_id": execution_id,
+            "snapshot": dict(self.payload),
+        }
+
+
 class FakeLLM:
     async def chat(self, **_: Any) -> str:
         return "done"
@@ -116,6 +130,21 @@ async def test_trace_checkpoint_store_persists_full_snapshot_event() -> None:
     assert backend.events[0]["require_persisted"] is True
     assert backend.events[0]["data"]["checkpoint_type"] == CHECKPOINT_TYPE
     assert backend.events[0]["data"]["snapshot"] == payload
+    assert loaded == payload
+
+
+@pytest.mark.asyncio
+async def test_trace_checkpoint_store_reads_legacy_checkpoint_marker() -> None:
+    payload = {
+        "type": "checkpoint",
+        "label": "before_llm",
+        "execution_id": "legacy-exec",
+        "context": {"messages": []},
+    }
+    store = TraceCheckpointStore(LegacyCheckpointBackend(payload))
+
+    loaded = await store.load_latest_checkpoint("legacy-exec")
+
     assert loaded == payload
 
 

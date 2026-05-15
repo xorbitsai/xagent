@@ -8,6 +8,8 @@ from typing import Any
 from .trace import TraceAction, TraceCategory, TraceEventType, TraceScope
 
 CHECKPOINT_TYPE = "agent_execution_checkpoint"
+LEGACY_CHECKPOINT_TYPES = frozenset({"agent_v2_execution_checkpoint"})
+READABLE_CHECKPOINT_TYPES = frozenset({CHECKPOINT_TYPE, *LEGACY_CHECKPOINT_TYPES})
 CHECKPOINT_SCHEMA_VERSION = 1
 
 
@@ -147,11 +149,14 @@ class TraceCheckpointStore:
     def _unwrap_checkpoint_payload(self, payload: Any) -> dict[str, Any] | None:
         if not isinstance(payload, dict):
             return None
-        if payload.get("checkpoint_type") == CHECKPOINT_TYPE:
+        if payload.get("checkpoint_type") in READABLE_CHECKPOINT_TYPES:
             snapshot = payload.get("snapshot")
             return dict(snapshot) if isinstance(snapshot, dict) else None
         data = payload.get("data")
-        if isinstance(data, dict) and data.get("checkpoint_type") == CHECKPOINT_TYPE:
+        if (
+            isinstance(data, dict)
+            and data.get("checkpoint_type") in READABLE_CHECKPOINT_TYPES
+        ):
             snapshot = data.get("snapshot")
             return dict(snapshot) if isinstance(snapshot, dict) else None
         if payload.get("type") == "checkpoint" or "context" in payload:

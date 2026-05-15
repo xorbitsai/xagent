@@ -19,7 +19,7 @@ from ...config import (
     get_task_lease_heartbeat_seconds,
     get_task_lease_ttl_seconds,
 )
-from ...core.agent.checkpoint import CHECKPOINT_TYPE
+from ...core.agent.checkpoint import READABLE_CHECKPOINT_TYPES
 from ..models.database import get_db
 from ..models.task import Task, TaskStatus, TraceEvent
 
@@ -67,7 +67,7 @@ def has_agent_checkpoint(db: Session, task_id: int) -> bool:
         data: dict[str, Any] = (
             cast(dict[str, Any], row.data) if isinstance(row.data, dict) else {}
         )
-        if data.get("checkpoint_type") == CHECKPOINT_TYPE:
+        if data.get("checkpoint_type") in READABLE_CHECKPOINT_TYPES:
             return True
     return False
 

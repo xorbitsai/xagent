@@ -8,6 +8,7 @@ from typing import Any, Dict, Optional
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
+from ...core.agent.checkpoint import CHECKPOINT_TYPE, READABLE_CHECKPOINT_TYPES
 from ...core.agent.trace import BaseTraceHandler
 from ...core.agent.trace import TraceEvent as CoreTraceEvent
 from ...web.models.database import get_db
@@ -98,8 +99,6 @@ class DatabaseTraceHandler(BaseTraceHandler):
         self,
         execution_id: str,
     ) -> Optional[Dict[str, Any]]:
-        from ...core.agent.checkpoint import CHECKPOINT_TYPE
-
         db = next(get_db())
         try:
             rows = (
@@ -117,7 +116,7 @@ class DatabaseTraceHandler(BaseTraceHandler):
             )
             for row in rows:
                 data: Dict[str, Any] = row.data if isinstance(row.data, dict) else {}
-                if data.get("checkpoint_type") != CHECKPOINT_TYPE:
+                if data.get("checkpoint_type") not in READABLE_CHECKPOINT_TYPES:
                     continue
                 if str(
                     data.get("root_execution_id") or data.get("execution_id")
@@ -170,7 +169,7 @@ class DatabaseTraceHandler(BaseTraceHandler):
             if (
                 event_type_str == "system_update_general"
                 and isinstance(data, dict)
-                and data.get("checkpoint_type") == "agent_execution_checkpoint"
+                and data.get("checkpoint_type") == CHECKPOINT_TYPE
             ):
                 task = db.query(Task).filter(Task.id == self.task_id).first()
                 if task:

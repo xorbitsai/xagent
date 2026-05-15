@@ -6,15 +6,15 @@ from typing import Any
 
 import pytest
 
-from xagent.core.agent_v2 import (
+from xagent.core.agent import (
     Agent,
     ContextManager,
     ExecutionContext,
     PatternRuntime,
     TraceEventCallback,
 )
-from xagent.core.agent_v2.runner import AgentRunner
-from xagent.core.agent_v2.runtime import LLMCallInterrupted
+from xagent.core.agent.runner import AgentRunner
+from xagent.core.agent.runtime import LLMCallInterrupted
 
 
 @pytest.fixture(autouse=True)

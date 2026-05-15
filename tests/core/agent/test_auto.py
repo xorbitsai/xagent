@@ -6,7 +6,7 @@ from typing import Any
 
 import pytest
 
-from xagent.core.agent_v2 import (
+from xagent.core.agent import (
     Agent,
     AgentRunner,
     AutoAction,
@@ -17,7 +17,7 @@ from xagent.core.agent_v2 import (
     PatternRuntime,
     ReActPattern,
 )
-from xagent.core.agent_v2.pattern.auto.auto import DECISION_TOOL_NAME
+from xagent.core.agent.pattern.auto.auto import DECISION_TOOL_NAME
 
 
 class FakeWorkspace:

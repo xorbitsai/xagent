@@ -28,7 +28,7 @@ class PatternResult:
 
 
 class AgentPattern(ABC):
-    """Abstract interface for agent_v2 execution patterns."""
+    """Abstract interface for agent execution patterns."""
 
     @abstractmethod
     async def run(

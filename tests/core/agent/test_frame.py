@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import pytest
 
-from xagent.core.agent_v2 import ExecutionFrame, ExecutionSnapshot, ExecutionStatus
+from xagent.core.agent import ExecutionFrame, ExecutionSnapshot, ExecutionStatus
 
 
 def test_execution_snapshot_roundtrip() -> None:

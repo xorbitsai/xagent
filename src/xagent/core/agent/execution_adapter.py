@@ -4,24 +4,17 @@ import logging
 from dataclasses import dataclass, field
 from typing import Any
 
-from ..agent_v2 import Agent as V2Agent
-from ..agent_v2 import AgentRunner as V2AgentRunner
-from ..agent_v2 import AutoPattern as V2AutoPattern
-from ..agent_v2 import DAGPattern as V2DAGPattern
-from ..agent_v2 import (
-    ExecutionRegistry,
-    LLMPlanGenerator,
-)
-from ..agent_v2 import ReActPattern as V2ReActPattern
-from ..agent_v2 import (
-    TraceEventCallback,
-)
+from .agent import Agent
+from .pattern import AutoPattern, DAGPattern, LLMPlanGenerator, ReActPattern
+from .registry import ExecutionRegistry
+from .runner import AgentRunner
+from .tracing import TraceEventCallback
 
 logger = logging.getLogger(__name__)
 
 
 @dataclass
-class AgentV2ExecutionConfig:
+class AgentExecutionConfig:
     name: str
     pattern: str
     llm: Any | None
@@ -44,10 +37,10 @@ class AgentV2ExecutionConfig:
     allowed_skills: list[str] | None = None
 
 
-class AgentV2ExecutionAdapter:
-    """Adapter that routes AgentService executions into agent_v2."""
+class AgentExecutionAdapter:
+    """Adapter that routes AgentService executions into agent."""
 
-    def __init__(self, config: AgentV2ExecutionConfig) -> None:
+    def __init__(self, config: AgentExecutionConfig) -> None:
         self.config = config
         self.registry = config.registry or ExecutionRegistry()
 
@@ -60,8 +53,7 @@ class AgentV2ExecutionAdapter:
     ) -> dict[str, Any]:
         if self.config.llm is None:
             error_msg = (
-                f"Agent '{self.config.name}' has no LLM configured for agent_v2 "
-                "execution."
+                f"Agent '{self.config.name}' has no LLM configured for agent execution."
             )
             logger.error(error_msg)
             return {
@@ -71,8 +63,7 @@ class AgentV2ExecutionAdapter:
                 "error": error_msg,
                 "metadata": {
                     "agent_name": self.config.name,
-                    "agent_runtime": "v2",
-                    "execution_type": "agent_v2_error",
+                    "execution_type": "agent_error",
                 },
             }
 
@@ -85,7 +76,6 @@ class AgentV2ExecutionAdapter:
             execution_id=execution_id,
             task=task,
             metadata={
-                "agent_runtime": "v2",
                 "execution_type": execution_type,
                 "pattern": self.config.pattern,
                 "request_context": dict(context or {}),
@@ -112,8 +102,7 @@ class AgentV2ExecutionAdapter:
     ) -> dict[str, Any]:
         if self.config.llm is None:
             raise ValueError(
-                f"Agent '{self.config.name}' has no LLM configured for agent_v2 "
-                "execution."
+                f"Agent '{self.config.name}' has no LLM configured for agent execution."
             )
         execution_id = str(
             task_id or self.config.current_task_id or self.config.service_id or ""
@@ -124,7 +113,6 @@ class AgentV2ExecutionAdapter:
             execution_id=execution_id,
             task=task,
             metadata={
-                "agent_runtime": "v2",
                 "execution_type": execution_type,
                 "pattern": self.config.pattern,
                 "request_context": dict(context or {}),
@@ -146,7 +134,6 @@ class AgentV2ExecutionAdapter:
                 execution_id,
                 runner,
                 metadata={
-                    "agent_runtime": "v2",
                     "execution_type": execution_type,
                     "pattern": self.config.pattern,
                 },
@@ -179,7 +166,6 @@ class AgentV2ExecutionAdapter:
                 execution_id,
                 runner,
                 metadata={
-                    "agent_runtime": "v2",
                     "execution_type": execution_type,
                     "pattern": self.config.pattern,
                 },
@@ -201,16 +187,16 @@ class AgentV2ExecutionAdapter:
     def list_statuses(self) -> list[dict[str, Any]]:
         return self.registry.list_statuses()
 
-    def _build_runner(self) -> tuple[V2AgentRunner, str]:
-        v2_pattern, execution_type = self._build_pattern()
+    def _build_runner(self) -> tuple[AgentRunner, str]:
+        pattern, execution_type = self._build_pattern()
         skill_manager = self.config.skill_manager
         if skill_manager is None:
             from ...skills.utils import create_skill_manager
 
             skill_manager = create_skill_manager()
-        v2_agent = V2Agent(
+        agent = Agent(
             name=self.config.name,
-            patterns=[v2_pattern],
+            patterns=[pattern],
             tools=self.config.tools,
             llm=self.config.llm,
             system_prompt=self.config.system_prompt,
@@ -221,8 +207,8 @@ class AgentV2ExecutionAdapter:
             allowed_skills=self.config.allowed_skills,
         )
         return (
-            V2AgentRunner(
-                agent=v2_agent,
+            AgentRunner(
+                agent=agent,
                 tracer=self.config.tracer,
                 callbacks=[TraceEventCallback()],
                 workspace_base_dir=self.config.workspace_base_dir,
@@ -234,28 +220,28 @@ class AgentV2ExecutionAdapter:
     def _build_pattern(self) -> tuple[Any, str]:
         if self.config.pattern == "dag_plan_execute":
             return (
-                V2DAGPattern(
+                DAGPattern(
                     LLMPlanGenerator(),
                     max_concurrency=self.config.dag_max_concurrency,
                 ),
-                "agent_v2_dag",
+                "agent_dag",
             )
         if self.config.pattern == "auto":
             return (
-                V2AutoPattern(
-                    dag_pattern=V2DAGPattern(
+                AutoPattern(
+                    dag_pattern=DAGPattern(
                         LLMPlanGenerator(),
                         max_concurrency=self.config.dag_max_concurrency,
                     )
                 ),
-                "agent_v2_auto",
+                "agent_auto",
             )
         if self.config.pattern == "single_call":
             return (
-                V2ReActPattern(max_iterations=2, finalize_after_tool_result=True),
-                "agent_v2_single_call",
+                ReActPattern(max_iterations=2, finalize_after_tool_result=True),
+                "agent_single_call",
             )
-        return V2ReActPattern(), "agent_v2_react"
+        return ReActPattern(), "agent_react"
 
     def _initial_messages(self) -> list[dict[str, Any]]:
         return [
@@ -265,12 +251,12 @@ class AgentV2ExecutionAdapter:
 
     def _execution_type(self) -> str:
         if self.config.pattern == "dag_plan_execute":
-            return "agent_v2_dag"
+            return "agent_dag"
         if self.config.pattern == "auto":
-            return "agent_v2_auto"
+            return "agent_auto"
         if self.config.pattern == "single_call":
-            return "agent_v2_single_call"
-        return "agent_v2_react"
+            return "agent_single_call"
+        return "agent_react"
 
     def _normalize_result(
         self,
@@ -293,12 +279,11 @@ class AgentV2ExecutionAdapter:
             "error": result.get("error"),
             "metadata": {
                 "agent_name": self.config.name,
-                "agent_runtime": "v2",
                 "execution_type": execution_type,
                 "pattern": self.config.pattern,
                 "task_id": execution_id,
             },
-            "agent_v2_result": result,
+            "agent_result": result,
         }
         if status == "waiting_for_user":
             message = str(result.get("message") or output or "")

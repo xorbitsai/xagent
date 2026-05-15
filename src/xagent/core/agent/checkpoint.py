@@ -5,9 +5,9 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any
 
-from ..agent.trace import TraceAction, TraceCategory, TraceEventType, TraceScope
+from .trace import TraceAction, TraceCategory, TraceEventType, TraceScope
 
-CHECKPOINT_TYPE = "agent_v2_execution_checkpoint"
+CHECKPOINT_TYPE = "agent_execution_checkpoint"
 CHECKPOINT_SCHEMA_VERSION = 1
 
 

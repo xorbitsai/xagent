@@ -7,8 +7,8 @@ from typing import Any, cast
 
 import pytest
 
+from xagent.core.agent import AgentExecutionAdapter, AgentExecutionConfig
 from xagent.core.agent.service import AgentService
-from xagent.core.agent_runtime import AgentV2ExecutionAdapter, AgentV2ExecutionConfig
 
 
 class FakeLLM:
@@ -125,7 +125,9 @@ def dag_plan(steps: list[dict[str, Any]]) -> dict[str, Any]:
 
 
 @pytest.mark.asyncio
-async def test_v2_adapter_routes_single_call_to_one_tool_then_final_answer() -> None:
+async def test_execution_adapter_routes_single_call_to_one_tool_then_final_answer() -> (
+    None
+):
     llm = FakeLLM(
         [
             {
@@ -143,8 +145,8 @@ async def test_v2_adapter_routes_single_call_to_one_tool_then_final_answer() -> 
         ]
     )
     tool = FakeTool()
-    adapter = AgentV2ExecutionAdapter(
-        AgentV2ExecutionConfig(
+    adapter = AgentExecutionAdapter(
+        AgentExecutionConfig(
             name="single",
             pattern="single_call",
             llm=llm,
@@ -159,7 +161,7 @@ async def test_v2_adapter_routes_single_call_to_one_tool_then_final_answer() -> 
     assert result["success"] is True
     assert result["status"] == "completed"
     assert result["output"] == "done"
-    assert result["metadata"]["execution_type"] == "agent_v2_single_call"
+    assert result["metadata"]["execution_type"] == "agent_single_call"
     assert tool.calls == [{"value": "from tool"}]
     assert llm.calls[0]["tools"][0]["function"]["name"] == "noop"
     assert llm.calls[0]["tool_choice"] == "auto"
@@ -168,10 +170,10 @@ async def test_v2_adapter_routes_single_call_to_one_tool_then_final_answer() -> 
 
 
 @pytest.mark.asyncio
-async def test_v2_adapter_routes_react_to_v2_react() -> None:
+async def test_execution_adapter_routes_react_to_react() -> None:
     llm = FakeLLM(["react done"])
-    adapter = AgentV2ExecutionAdapter(
-        AgentV2ExecutionConfig(
+    adapter = AgentExecutionAdapter(
+        AgentExecutionConfig(
             name="react",
             pattern="react",
             llm=llm,
@@ -185,13 +187,13 @@ async def test_v2_adapter_routes_react_to_v2_react() -> None:
 
     assert result["success"] is True
     assert result["output"] == "react done"
-    assert result["metadata"]["execution_type"] == "agent_v2_react"
-    assert result["agent_v2_result"]["pattern"] == "ReActPattern"
+    assert result["metadata"]["execution_type"] == "agent_react"
+    assert result["agent_result"]["pattern"] == "ReActPattern"
     assert llm.calls[0]["tools"] is not None
 
 
 @pytest.mark.asyncio
-async def test_v2_adapter_preserves_waiting_for_user_payload() -> None:
+async def test_execution_adapter_preserves_waiting_for_user_payload() -> None:
     interactions = [
         {
             "type": "action_cards",
@@ -226,8 +228,8 @@ async def test_v2_adapter_preserves_waiting_for_user_payload() -> None:
             }
         ]
     )
-    adapter = AgentV2ExecutionAdapter(
-        AgentV2ExecutionConfig(
+    adapter = AgentExecutionAdapter(
+        AgentExecutionConfig(
             name="react",
             pattern="react",
             llm=llm,
@@ -250,10 +252,10 @@ async def test_v2_adapter_preserves_waiting_for_user_payload() -> None:
 
 
 @pytest.mark.asyncio
-async def test_v2_adapter_includes_persisted_conversation_history() -> None:
+async def test_execution_adapter_includes_persisted_conversation_history() -> None:
     llm = FakeLLM(["generated"])
-    adapter = AgentV2ExecutionAdapter(
-        AgentV2ExecutionConfig(
+    adapter = AgentExecutionAdapter(
+        AgentExecutionConfig(
             name="history",
             pattern="react",
             llm=llm,
@@ -285,10 +287,12 @@ async def test_v2_adapter_includes_persisted_conversation_history() -> None:
 
 
 @pytest.mark.asyncio
-async def test_v2_adapter_includes_persisted_execution_context_before_history() -> None:
+async def test_execution_adapter_includes_persisted_execution_context_before_history() -> (
+    None
+):
     llm = FakeLLM(["updated"])
-    adapter = AgentV2ExecutionAdapter(
-        AgentV2ExecutionConfig(
+    adapter = AgentExecutionAdapter(
+        AgentExecutionConfig(
             name="execution-context",
             pattern="react",
             llm=llm,
@@ -327,7 +331,7 @@ async def test_v2_adapter_includes_persisted_execution_context_before_history() 
 
 
 @pytest.mark.asyncio
-async def test_agent_service_passes_conversation_history_to_v2_adapter() -> None:
+async def test_agent_service_passes_conversation_history_to_execution_adapter() -> None:
     llm = FakeLLM(["generated", '{"should_store": false, "reason": "test"}'])
     service = AgentService(
         name="history-service",
@@ -335,7 +339,6 @@ async def test_agent_service_passes_conversation_history_to_v2_adapter() -> None
         pattern="react",
         llm=cast(Any, llm),
         tools=cast(Any, [FakeTool()]),
-        agent_runtime="v2",
         tool_config=None,
     )
     service.allowed_skills = []
@@ -361,7 +364,7 @@ async def test_agent_service_passes_conversation_history_to_v2_adapter() -> None
 
 
 @pytest.mark.asyncio
-async def test_agent_service_passes_execution_context_to_v2_adapter() -> None:
+async def test_agent_service_passes_execution_context_to_execution_adapter() -> None:
     llm = FakeLLM(["updated", '{"should_store": false, "reason": "test"}'])
     service = AgentService(
         name="execution-context-service",
@@ -369,7 +372,6 @@ async def test_agent_service_passes_execution_context_to_v2_adapter() -> None:
         pattern="react",
         llm=cast(Any, llm),
         tools=cast(Any, [FakeTool()]),
-        agent_runtime="v2",
         tool_config=None,
     )
     service.allowed_skills = []
@@ -400,10 +402,10 @@ async def test_agent_service_passes_execution_context_to_v2_adapter() -> None:
 
 
 @pytest.mark.asyncio
-async def test_v2_adapter_emits_visible_trace_events() -> None:
+async def test_execution_adapter_emits_visible_trace_events() -> None:
     tracer = RecordingTracer()
-    adapter = AgentV2ExecutionAdapter(
-        AgentV2ExecutionConfig(
+    adapter = AgentExecutionAdapter(
+        AgentExecutionConfig(
             name="trace",
             pattern="react",
             llm=FakeLLM(["hello"]),
@@ -433,15 +435,15 @@ async def test_v2_adapter_emits_visible_trace_events() -> None:
 
 
 @pytest.mark.asyncio
-async def test_v2_adapter_routes_dag_to_v2_dag() -> None:
+async def test_execution_adapter_routes_dag_to_dag() -> None:
     llm = FakeLLM(
         [
             dag_plan([{"id": "answer", "task": "Answer directly"}]),
             "dag done",
         ]
     )
-    adapter = AgentV2ExecutionAdapter(
-        AgentV2ExecutionConfig(
+    adapter = AgentExecutionAdapter(
+        AgentExecutionConfig(
             name="dag",
             pattern="dag_plan_execute",
             llm=llm,
@@ -455,13 +457,13 @@ async def test_v2_adapter_routes_dag_to_v2_dag() -> None:
 
     assert result["success"] is True
     assert result["output"] == "dag done"
-    assert result["metadata"]["execution_type"] == "agent_v2_dag"
-    assert result["agent_v2_result"]["pattern"] == "DAGPattern"
+    assert result["metadata"]["execution_type"] == "agent_dag"
+    assert result["agent_result"]["pattern"] == "DAGPattern"
 
 
-def test_v2_adapter_passes_dag_max_concurrency_to_pattern() -> None:
-    adapter = AgentV2ExecutionAdapter(
-        AgentV2ExecutionConfig(
+def test_execution_adapter_passes_dag_max_concurrency_to_pattern() -> None:
+    adapter = AgentExecutionAdapter(
+        AgentExecutionConfig(
             name="dag",
             pattern="dag_plan_execute",
             llm=FakeLLM([]),
@@ -472,13 +474,13 @@ def test_v2_adapter_passes_dag_max_concurrency_to_pattern() -> None:
 
     pattern, execution_type = adapter._build_pattern()
 
-    assert execution_type == "agent_v2_dag"
+    assert execution_type == "agent_dag"
     assert pattern.max_concurrency == 2
 
 
-def test_v2_adapter_routes_auto_to_v2_auto() -> None:
-    adapter = AgentV2ExecutionAdapter(
-        AgentV2ExecutionConfig(
+def test_execution_adapter_routes_auto_to_auto() -> None:
+    adapter = AgentExecutionAdapter(
+        AgentExecutionConfig(
             name="auto",
             pattern="auto",
             llm=FakeLLM([]),
@@ -488,18 +490,18 @@ def test_v2_adapter_routes_auto_to_v2_auto() -> None:
 
     pattern, execution_type = adapter._build_pattern()
 
-    assert execution_type == "agent_v2_auto"
+    assert execution_type == "agent_auto"
     assert pattern.__class__.__name__ == "AutoPattern"
     assert pattern.dag_pattern.max_concurrency == 4
 
 
 @pytest.mark.asyncio
-async def test_v2_adapter_executes_auto_final_answer() -> None:
+async def test_execution_adapter_executes_auto_final_answer() -> None:
     llm = FakeLLM(
         [auto_decision("final_answer", answer="hello", reason="Greeting only.")]
     )
-    adapter = AgentV2ExecutionAdapter(
-        AgentV2ExecutionConfig(
+    adapter = AgentExecutionAdapter(
+        AgentExecutionConfig(
             name="auto",
             pattern="auto",
             llm=llm,
@@ -512,20 +514,20 @@ async def test_v2_adapter_executes_auto_final_answer() -> None:
 
     assert result["success"] is True
     assert result["output"] == "hello"
-    assert result["metadata"]["execution_type"] == "agent_v2_auto"
-    assert result["agent_v2_result"]["pattern"] == "AutoPattern"
+    assert result["metadata"]["execution_type"] == "agent_auto"
+    assert result["agent_result"]["pattern"] == "AutoPattern"
 
 
 @pytest.mark.asyncio
-async def test_v2_adapter_executes_auto_react() -> None:
+async def test_execution_adapter_executes_auto_react() -> None:
     llm = FakeLLM(
         [
             auto_decision("react", reason="Needs ReAct."),
             "react done",
         ]
     )
-    adapter = AgentV2ExecutionAdapter(
-        AgentV2ExecutionConfig(
+    adapter = AgentExecutionAdapter(
+        AgentExecutionConfig(
             name="auto",
             pattern="auto",
             llm=llm,
@@ -538,12 +540,12 @@ async def test_v2_adapter_executes_auto_react() -> None:
 
     assert result["success"] is True
     assert result["output"] == "react done"
-    assert result["metadata"]["execution_type"] == "agent_v2_auto"
-    assert result["agent_v2_result"]["auto_decision"]["action"] == "react"
+    assert result["metadata"]["execution_type"] == "agent_auto"
+    assert result["agent_result"]["auto_decision"]["action"] == "react"
 
 
 @pytest.mark.asyncio
-async def test_v2_adapter_executes_auto_plan_execute() -> None:
+async def test_execution_adapter_executes_auto_plan_execute() -> None:
     llm = FakeLLM(
         [
             auto_decision("plan_execute", reason="Needs DAG."),
@@ -551,8 +553,8 @@ async def test_v2_adapter_executes_auto_plan_execute() -> None:
             "dag done",
         ]
     )
-    adapter = AgentV2ExecutionAdapter(
-        AgentV2ExecutionConfig(
+    adapter = AgentExecutionAdapter(
+        AgentExecutionConfig(
             name="auto",
             pattern="auto",
             llm=llm,
@@ -565,12 +567,12 @@ async def test_v2_adapter_executes_auto_plan_execute() -> None:
 
     assert result["success"] is True
     assert result["output"] == "dag done"
-    assert result["metadata"]["execution_type"] == "agent_v2_auto"
-    assert result["agent_v2_result"]["auto_decision"]["action"] == "plan_execute"
+    assert result["metadata"]["execution_type"] == "agent_auto"
+    assert result["agent_result"]["auto_decision"]["action"] == "plan_execute"
 
 
 @pytest.mark.asyncio
-async def test_v2_adapter_exposes_pause_and_message_controls() -> None:
+async def test_execution_adapter_exposes_pause_and_message_controls() -> None:
     llm = BlockingLLM(
         {
             "content": "",
@@ -583,8 +585,8 @@ async def test_v2_adapter_exposes_pause_and_message_controls() -> None:
             ],
         }
     )
-    adapter = AgentV2ExecutionAdapter(
-        AgentV2ExecutionConfig(
+    adapter = AgentExecutionAdapter(
+        AgentExecutionConfig(
             name="control",
             pattern="react",
             llm=llm,
@@ -618,10 +620,10 @@ async def test_v2_adapter_exposes_pause_and_message_controls() -> None:
 
 
 @pytest.mark.asyncio
-async def test_v2_adapter_exposes_cancel_control() -> None:
+async def test_execution_adapter_exposes_cancel_control() -> None:
     llm = BlockingLLM()
-    adapter = AgentV2ExecutionAdapter(
-        AgentV2ExecutionConfig(
+    adapter = AgentExecutionAdapter(
+        AgentExecutionConfig(
             name="cancel",
             pattern="react",
             llm=llm,
@@ -646,7 +648,7 @@ async def test_v2_adapter_exposes_cancel_control() -> None:
 
 
 @pytest.mark.asyncio
-async def test_v2_adapter_forwards_outbound_messages() -> None:
+async def test_execution_adapter_forwards_outbound_messages() -> None:
     sent_messages: list[dict[str, Any]] = []
     llm = FakeLLM(
         [
@@ -667,8 +669,8 @@ async def test_v2_adapter_forwards_outbound_messages() -> None:
             "done",
         ]
     )
-    adapter = AgentV2ExecutionAdapter(
-        AgentV2ExecutionConfig(
+    adapter = AgentExecutionAdapter(
+        AgentExecutionConfig(
             name="outbound",
             pattern="react",
             llm=llm,
@@ -693,9 +695,9 @@ async def test_v2_adapter_forwards_outbound_messages() -> None:
     ]
 
 
-def test_v2_adapter_uses_last_assistant_message_when_output_missing() -> None:
-    adapter = AgentV2ExecutionAdapter(
-        AgentV2ExecutionConfig(
+def test_execution_adapter_uses_last_assistant_message_when_output_missing() -> None:
+    adapter = AgentExecutionAdapter(
+        AgentExecutionConfig(
             name="fallback",
             pattern="react",
             llm=FakeLLM([]),
@@ -711,7 +713,7 @@ def test_v2_adapter_uses_last_assistant_message_when_output_missing() -> None:
 
     result = adapter._normalize_result(
         result={"success": True, "context": context},
-        execution_type="agent_v2_react",
+        execution_type="agent_react",
         execution_id="fallback-exec",
     )
 
@@ -719,7 +721,7 @@ def test_v2_adapter_uses_last_assistant_message_when_output_missing() -> None:
 
 
 @pytest.mark.asyncio
-async def test_v2_adapter_resume_restores_from_tracer_after_restart() -> None:
+async def test_execution_adapter_resume_restores_from_tracer_after_restart() -> None:
     tracer = TracerCheckpointStore()
     first_llm = BlockingLLM(
         {
@@ -733,8 +735,8 @@ async def test_v2_adapter_resume_restores_from_tracer_after_restart() -> None:
             ],
         }
     )
-    first_adapter = AgentV2ExecutionAdapter(
-        AgentV2ExecutionConfig(
+    first_adapter = AgentExecutionAdapter(
+        AgentExecutionConfig(
             name="restart",
             pattern="react",
             llm=first_llm,
@@ -763,8 +765,8 @@ async def test_v2_adapter_resume_restores_from_tracer_after_restart() -> None:
     )
 
     resumed_llm = FakeLLM(["resumed done"])
-    resumed_adapter = AgentV2ExecutionAdapter(
-        AgentV2ExecutionConfig(
+    resumed_adapter = AgentExecutionAdapter(
+        AgentExecutionConfig(
             name="restart",
             pattern="react",
             llm=resumed_llm,
@@ -781,9 +783,9 @@ async def test_v2_adapter_resume_restores_from_tracer_after_restart() -> None:
     assert resumed["success"] is True
     assert resumed["status"] == "completed"
     assert resumed["output"] == "resumed done"
-    assert resumed["metadata"]["execution_type"] == "agent_v2_react"
+    assert resumed["metadata"]["execution_type"] == "agent_react"
     assert resumed_adapter.get_status("restart-exec") is None
-    context_messages = resumed["agent_v2_result"]["context"].messages
+    context_messages = resumed["agent_result"]["context"].messages
     assert any(
         message.role == "user" and message.content == "Resume with concise answer."
         for message in context_messages
@@ -791,7 +793,7 @@ async def test_v2_adapter_resume_restores_from_tracer_after_restart() -> None:
 
 
 @pytest.mark.asyncio
-async def test_v2_adapter_posts_user_message_after_restart() -> None:
+async def test_execution_adapter_posts_user_message_after_restart() -> None:
     tracer = TracerCheckpointStore()
     first_llm = BlockingLLM(
         {
@@ -805,8 +807,8 @@ async def test_v2_adapter_posts_user_message_after_restart() -> None:
             ],
         }
     )
-    first_adapter = AgentV2ExecutionAdapter(
-        AgentV2ExecutionConfig(
+    first_adapter = AgentExecutionAdapter(
+        AgentExecutionConfig(
             name="restart-message",
             pattern="react",
             llm=first_llm,
@@ -826,8 +828,8 @@ async def test_v2_adapter_posts_user_message_after_restart() -> None:
     interrupted = await first_handle.task
     assert interrupted["status"] == "interrupted"
 
-    restarted_adapter = AgentV2ExecutionAdapter(
-        AgentV2ExecutionConfig(
+    restarted_adapter = AgentExecutionAdapter(
+        AgentExecutionConfig(
             name="restart-message",
             pattern="react",
             llm=FakeLLM(["resumed after message"]),
@@ -846,7 +848,7 @@ async def test_v2_adapter_posts_user_message_after_restart() -> None:
 
     assert resumed is not None
     assert resumed["success"] is True
-    context_messages = resumed["agent_v2_result"]["context"].messages
+    context_messages = resumed["agent_result"]["context"].messages
     assert any(
         message.role == "user"
         and message.content == "New message after process restart."

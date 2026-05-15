@@ -5,8 +5,8 @@ from typing import Any
 
 import pytest
 
-from xagent.core.agent_v2 import ExecutionContext, PatternRuntime
-from xagent.core.agent_v2.runtime import LLMCallInterrupted
+from xagent.core.agent import ExecutionContext, PatternRuntime
+from xagent.core.agent.runtime import LLMCallInterrupted
 
 
 class SlowLLM:

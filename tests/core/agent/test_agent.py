@@ -1,7 +1,7 @@
 from __future__ import annotations
 
-from xagent.core.agent_v2 import Agent
-from xagent.core.agent_v2.runner import AgentRunner
+from xagent.core.agent import Agent
+from xagent.core.agent.runner import AgentRunner
 
 
 def test_agent_exposes_runner_and_core_configuration() -> None:

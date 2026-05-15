@@ -7,16 +7,16 @@ from typing import Any
 
 import pytest
 
-from xagent.core.agent_v2 import (
+from xagent.core.agent import (
     Agent,
     ContextManager,
     ExecutionContext,
     ExecutionLifecycleStatus,
     PatternRuntime,
 )
-from xagent.core.agent_v2 import registry as registry_module
-from xagent.core.agent_v2.registry import ExecutionRegistry
-from xagent.core.agent_v2.runner import AgentRunner
+from xagent.core.agent import registry as registry_module
+from xagent.core.agent.registry import ExecutionRegistry
+from xagent.core.agent.runner import AgentRunner
 
 
 @pytest.fixture(autouse=True)

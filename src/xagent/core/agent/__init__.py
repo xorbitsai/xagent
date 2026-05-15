@@ -1,5 +1,28 @@
-"""Agent service facade and shared tracing utilities."""
+"""Agent execution system and service facade."""
 
+from .agent import Agent
+from .checkpoint import (
+    CHECKPOINT_EVENT_TYPE,
+    CHECKPOINT_SCHEMA_VERSION,
+    CHECKPOINT_TYPE,
+    CheckpointPersistenceError,
+    TraceCheckpointStore,
+)
+from .context import (
+    COMPONENT_LOADERS,
+    CompactConfig,
+    CompactResult,
+    ContextManager,
+    ExecutionComponent,
+    ExecutionContext,
+    GenericComponent,
+    LLMCallRecord,
+    MemoryComponent,
+    MergeStrategy,
+    Message,
+    WorkspaceComponent,
+    clone_component,
+)
 from .exceptions import (
     AgentConfigurationError,
     AgentException,
@@ -24,10 +47,82 @@ from .exceptions import (
     ToolNotFoundError,
     create_execution_error,
 )
+from .execution_adapter import AgentExecutionAdapter, AgentExecutionConfig
+from .frame import ExecutionFrame, ExecutionSnapshot, ExecutionStatus
+from .pattern import (
+    AgentPattern,
+    AutoAction,
+    AutoDecision,
+    AutoPattern,
+    CallablePlanGenerator,
+    DAGPattern,
+    ExecutionPlan,
+    LLMPlanGenerator,
+    PatternResult,
+    PlanGenerationRequest,
+    PlanGenerator,
+    PlanStep,
+    PlanValidationError,
+    ReActPattern,
+    ReActReasoningMode,
+    ToolCallRecord,
+)
+from .registry import ExecutionHandle, ExecutionLifecycleStatus, ExecutionRegistry
+from .runner import AgentRunner
+from .runtime import LLMCallInterrupted, PatternRuntime, load_pattern_checkpoint
 from .service import AgentService
+from .tracing import TraceEventCallback
 
 __all__ = [
+    "Agent",
+    "AgentExecutionAdapter",
+    "AgentExecutionConfig",
     "AgentService",
+    "AgentPattern",
+    "AgentRunner",
+    "AutoAction",
+    "AutoDecision",
+    "AutoPattern",
+    "CHECKPOINT_EVENT_TYPE",
+    "CHECKPOINT_SCHEMA_VERSION",
+    "CHECKPOINT_TYPE",
+    "COMPONENT_LOADERS",
+    "CallablePlanGenerator",
+    "CheckpointPersistenceError",
+    "CompactConfig",
+    "CompactResult",
+    "ContextManager",
+    "DAGPattern",
+    "ExecutionComponent",
+    "ExecutionFrame",
+    "ExecutionHandle",
+    "ExecutionLifecycleStatus",
+    "ExecutionPlan",
+    "ExecutionRegistry",
+    "ExecutionSnapshot",
+    "ExecutionStatus",
+    "ExecutionContext",
+    "GenericComponent",
+    "LLMCallInterrupted",
+    "LLMCallRecord",
+    "LLMPlanGenerator",
+    "MemoryComponent",
+    "MergeStrategy",
+    "Message",
+    "PatternResult",
+    "PatternRuntime",
+    "PlanGenerationRequest",
+    "PlanGenerator",
+    "PlanStep",
+    "PlanValidationError",
+    "ReActPattern",
+    "ReActReasoningMode",
+    "ToolCallRecord",
+    "TraceCheckpointStore",
+    "TraceEventCallback",
+    "WorkspaceComponent",
+    "clone_component",
+    "load_pattern_checkpoint",
     "AgentException",
     "AgentConfigurationError",
     "LLMError",

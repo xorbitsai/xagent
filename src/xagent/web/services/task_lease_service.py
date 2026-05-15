@@ -19,7 +19,7 @@ from ...config import (
     get_task_lease_heartbeat_seconds,
     get_task_lease_ttl_seconds,
 )
-from ...core.agent_v2.checkpoint import CHECKPOINT_TYPE
+from ...core.agent.checkpoint import CHECKPOINT_TYPE
 from ..models.database import get_db
 from ..models.task import Task, TaskStatus, TraceEvent
 
@@ -51,8 +51,8 @@ def _expires_at(now: datetime | None = None) -> datetime:
     return (now or utc_now()) + timedelta(seconds=get_task_lease_ttl_seconds())
 
 
-def has_agent_v2_checkpoint(db: Session, task_id: int) -> bool:
-    """Return whether the task has a persisted agent_v2 checkpoint."""
+def has_agent_checkpoint(db: Session, task_id: int) -> bool:
+    """Return whether the task has a persisted agent checkpoint."""
     rows = (
         db.query(TraceEvent)
         .filter(
@@ -198,7 +198,7 @@ def mark_task_paused_if_stale(db: Session, task: Task) -> bool:
         task,
         "status",
         TaskStatus.PAUSED
-        if has_agent_v2_checkpoint(db, int(task.id))
+        if has_agent_checkpoint(db, int(task.id))
         else TaskStatus.FAILED,
     )
     setattr(task, "runner_id", None)

@@ -4,8 +4,8 @@ from typing import Any
 
 import pytest
 
-from xagent.core.agent_v2 import Agent, AgentRunner
-from xagent.core.agent_v2.checkpoint import (
+from xagent.core.agent import Agent, AgentRunner
+from xagent.core.agent.checkpoint import (
     CHECKPOINT_TYPE,
     CheckpointPersistenceError,
     TraceCheckpointStore,

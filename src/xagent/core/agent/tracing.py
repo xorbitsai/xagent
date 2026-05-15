@@ -3,18 +3,18 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any
 
-from ..agent.trace import (
+from .result import extract_assistant_message
+from .trace import (
     trace_ai_message,
     trace_error,
     trace_task_completion,
     trace_user_message,
 )
-from .result import extract_assistant_message
 
 
 @dataclass
 class TraceEventCallback:
-    """Bridge agent_v2 runner callbacks into the existing web trace stream."""
+    """Bridge agent runner callbacks into the existing web trace stream."""
 
     async def on_run_start(
         self,
@@ -36,7 +36,7 @@ class TraceEventCallback:
                 tracer,
                 execution_id,
                 task,
-                {"agent_runtime": "v2", "context": self._context_payload(context)},
+                {"context": self._context_payload(context)},
             )
 
     async def on_run_end(
@@ -52,7 +52,6 @@ class TraceEventCallback:
         status = str(result.get("status") or "")
         output = extract_assistant_message(result)
         data = {
-            "agent_runtime": "v2",
             "execution_id": execution_id,
             "status": status or ("completed" if result.get("success") else "failed"),
             "pattern": result.get("pattern"),
@@ -84,8 +83,8 @@ class TraceEventCallback:
         await trace_error(
             tracer,
             execution_id,
-            error_type="agent_v2_error",
-            error_message=str(result.get("error") or "agent_v2 execution failed"),
+            error_type="agent_error",
+            error_message=str(result.get("error") or "agent execution failed"),
             data=data,
         )
 

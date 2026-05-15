@@ -220,7 +220,7 @@ def create_stream_event(
     }
 
 
-def _persist_agent_v2_outbound_event(task_id: int, event: Dict[str, Any]) -> None:
+def _persist_agent_outbound_event(task_id: int, event: Dict[str, Any]) -> None:
     """Persist v2 agent-to-user messages so waiting prompts survive reloads."""
 
     from ..models.task import Task as DatabaseTask
@@ -277,13 +277,15 @@ def _persist_agent_v2_outbound_event(task_id: int, event: Dict[str, Any]) -> Non
         db.commit()
     except Exception:
         db.rollback()
-        logger.exception("Failed to persist v2 outbound message for task %s", task_id)
+        logger.exception(
+            "Failed to persist agent outbound message for task %s", task_id
+        )
     finally:
         db.close()
 
 
-def make_agent_v2_outbound_handler(task_id: int) -> Any:
-    """Create a web bridge for agent_v2 agent-to-user messages."""
+def make_agent_outbound_handler(task_id: int) -> Any:
+    """Create a web bridge for agent agent-to-user messages."""
 
     async def handle_outbound_message(payload: Dict[str, Any]) -> None:
         event = create_stream_event(
@@ -297,23 +299,22 @@ def make_agent_v2_outbound_handler(task_id: int) -> Any:
                 "message_type": payload.get("message_type", "info"),
                 "expect_response": bool(payload.get("expect_response", False)),
                 "metadata": payload.get("metadata") or {},
-                "agent_runtime": "v2",
             },
         )
-        await asyncio.to_thread(_persist_agent_v2_outbound_event, task_id, event)
+        await asyncio.to_thread(_persist_agent_outbound_event, task_id, event)
         await manager.broadcast_to_task(event, task_id)
 
     return handle_outbound_message
 
 
-def _is_agent_v2_checkpoint_data(data: Any) -> bool:
-    """Return True for internal agent_v2 checkpoint payloads."""
+def _is_agent_checkpoint_data(data: Any) -> bool:
+    """Return True for internal agent checkpoint payloads."""
     if not isinstance(data, dict):
         return False
     try:
-        from ...core.agent_v2.checkpoint import CHECKPOINT_TYPE
+        from ...core.agent.checkpoint import CHECKPOINT_TYPE
     except Exception:
-        CHECKPOINT_TYPE = "agent_v2_execution_checkpoint"
+        CHECKPOINT_TYPE = "agent_execution_checkpoint"
     return data.get("checkpoint_type") == CHECKPOINT_TYPE or (
         data.get("type") == "checkpoint"
         and isinstance(data.get("pattern_state"), dict)
@@ -713,7 +714,7 @@ async def execute_task_background(
             )
             if hasattr(agent_service, "set_outbound_message_handler"):
                 agent_service.set_outbound_message_handler(
-                    make_agent_v2_outbound_handler(task_id)
+                    make_agent_outbound_handler(task_id)
                 )
 
             # Execute task with automatic token tracking
@@ -1040,14 +1041,14 @@ async def execute_continuation_background(
         background_task_manager.cleanup_task(task_id)
 
 
-async def execute_v2_resume_background(
+async def execute_resume_background(
     task_id: int,
     agent_service: Any,
     user: Any,
     task: Any,
     previous_task: Optional[asyncio.Task] = None,
 ) -> None:
-    """Resume an agent_v2 execution after an interrupt/user-message checkpoint."""
+    """Resume an agent execution after an interrupt/user-message checkpoint."""
     from ..models.database import get_db
     from ..models.task import Task, TaskStatus
 
@@ -1066,7 +1067,7 @@ async def execute_v2_resume_background(
                 await previous_task
             except Exception as e:
                 logger.warning(
-                    f"Previous v2 background task {task_id} ended before resume: {e}"
+                    f"Previous background task {task_id} ended before resume: {e}"
                 )
 
         db_gen = get_db()
@@ -1087,10 +1088,10 @@ async def execute_v2_resume_background(
 
         user_id = int(user.id) if user else None
         with UserContext(user_id):
-            result = await agent_service.resume_v2_execution(str(task_id))
+            result = await agent_service.resume_execution_by_id(str(task_id))
 
         if result is None:
-            logger.warning(f"No resumable v2 execution found for task {task_id}")
+            logger.warning(f"No resumable agent execution found for task {task_id}")
             return
 
         status = str(result.get("status") or "")
@@ -1953,7 +1954,7 @@ async def handle_chat_message(
                 )
                 if hasattr(agent_service, "set_outbound_message_handler"):
                     agent_service.set_outbound_message_handler(
-                        make_agent_v2_outbound_handler(task_id)
+                        make_agent_outbound_handler(task_id)
                     )
 
                 persisted_user_message = persist_user_message(
@@ -1977,14 +1978,14 @@ async def handle_chat_message(
                     TaskStatus.WAITING_FOR_USER,
                     TaskStatus.RUNNING,
                 ]
-                supports_v2_control = getattr(
-                    agent_service, "supports_v2_control", lambda: False
+                supports_live_control = getattr(
+                    agent_service, "supports_live_control", lambda: False
                 )()
                 has_continuation = dag_pattern and hasattr(
                     dag_pattern, "request_continuation"
                 )
 
-                if task_is_running and has_continuation and not supports_v2_control:
+                if task_is_running and has_continuation and not supports_live_control:
                     # Use continuation: old task will handle at appropriate time
                     logger.info(f"Using continuation for running task {task_id}")
                     assert dag_pattern is not None  # for mypy type checking
@@ -2063,8 +2064,8 @@ async def handle_chat_message(
 
                     # Continuation will be handled by old task, return directly
                     return
-                if task_is_running and supports_v2_control:
-                    logger.info(f"Using agent_v2 message control for task {task_id}")
+                if task_is_running and supports_live_control:
+                    logger.info(f"Using agent message control for task {task_id}")
                     posted = await agent_service.post_user_message(
                         str(task_id),
                         user_message_for_llm,
@@ -2073,12 +2074,12 @@ async def handle_chat_message(
                     )
                     if not posted:
                         logger.warning(
-                            f"agent_v2 execution {task_id} was not live; attempting resume from checkpoint"
+                            f"agent execution {task_id} was not live; attempting resume from checkpoint"
                         )
 
                     previous_task = background_task_manager.running_tasks.get(task_id)
                     bg_task = asyncio.create_task(
-                        execute_v2_resume_background(
+                        execute_resume_background(
                             task_id=task_id,
                             agent_service=agent_service,
                             user=user,
@@ -2372,7 +2373,7 @@ async def handle_execute_task(
             )
             if hasattr(agent_service, "set_outbound_message_handler"):
                 agent_service.set_outbound_message_handler(
-                    make_agent_v2_outbound_handler(task_id)
+                    make_agent_outbound_handler(task_id)
                 )
             recovery_state = await load_task_execution_recovery_state(db, task_id)
             agent_service.set_execution_context_messages(
@@ -2634,7 +2635,7 @@ async def send_historical_data_as_stream(
                 normalized_event_data = normalized_trace_data_by_event_id.get(
                     str(trace_event.event_id), trace_event.data
                 )
-                if _is_agent_v2_checkpoint_data(normalized_event_data):
+                if _is_agent_checkpoint_data(normalized_event_data):
                     continue
                 if historical_path_to_file_id and isinstance(
                     normalized_event_data, dict
@@ -3119,7 +3120,7 @@ async def handle_resume_task(
             )
             return
 
-        if getattr(agent_service, "supports_v2_control", lambda: False)():
+        if getattr(agent_service, "supports_live_control", lambda: False)():
             await manager.broadcast_to_task(
                 {
                     "type": "task_resumed",
@@ -3131,7 +3132,7 @@ async def handle_resume_task(
             )
             previous_task = background_task_manager.running_tasks.get(task_id)
             bg_task = asyncio.create_task(
-                execute_v2_resume_background(
+                execute_resume_background(
                     task_id=task_id,
                     agent_service=agent_service,
                     user=user,
@@ -3252,8 +3253,8 @@ async def handle_builder_chat(
     """
     import uuid
 
+    from ...core.agent.context.enrichment import build_skill_context
     from ...core.agent.service import AgentService
-    from ...core.agent_v2.context.enrichment import build_skill_context
     from ...core.memory.in_memory import InMemoryMemoryStore
     from ...skills.utils import create_skill_manager
     from ..models.database import get_db
@@ -3358,7 +3359,7 @@ clarification questions as plain assistant text.
 """
 
         async def send_builder_outbound_message(payload: Dict[str, Any]) -> None:
-            """Bridge agent_v2 agent-to-user messages to the builder chat socket."""
+            """Bridge agent agent-to-user messages to the builder chat socket."""
             await websocket.send_text(
                 json.dumps(
                     create_stream_event(
@@ -3374,7 +3375,6 @@ clarification questions as plain assistant text.
                                 payload.get("expect_response", False)
                             ),
                             "metadata": payload.get("metadata") or {},
-                            "agent_runtime": "v2",
                         },
                     )
                 )

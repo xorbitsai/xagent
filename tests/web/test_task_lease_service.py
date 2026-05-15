@@ -4,7 +4,7 @@ from datetime import timedelta
 
 import pytest
 
-from xagent.core.agent_v2.checkpoint import CHECKPOINT_TYPE
+from xagent.core.agent.checkpoint import CHECKPOINT_TYPE
 from xagent.web.models.database import Base, get_db, get_engine, init_db
 from xagent.web.models.task import Task, TaskStatus, TraceEvent
 from xagent.web.models.user import User

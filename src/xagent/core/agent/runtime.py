@@ -205,7 +205,7 @@ class PatternRuntime:
             task_id=self._task_id(context),
             step_id=self._step_id(context),
             data={
-                "error_type": "agent_v2_pattern_error",
+                "error_type": "agent_pattern_error",
                 "error_message": str(error),
                 "pattern": pattern.__class__.__name__,
             },
@@ -293,7 +293,7 @@ class PatternRuntime:
         result: Any | None = None,
     ) -> None:
         data = {
-            "error_type": "agent_v2_tool_error",
+            "error_type": "agent_tool_error",
             "error": str(error),
             "error_message": str(error),
             "tool_name": tool_call.get("name"),
@@ -451,7 +451,7 @@ class PatternRuntime:
             task_id=str(event_metadata.get("task_id") or self._task_id(context)),
             step_id=str(event_metadata.get("step_id") or self._step_id(context)),
             data={
-                "error_type": "agent_v2_llm_error",
+                "error_type": "agent_llm_error",
                 "error": str(error),
                 "error_message": str(error),
                 "success": False,
@@ -476,7 +476,6 @@ class PatternRuntime:
 
         event_metadata = metadata or {}
         compact_data = {
-            "agent_runtime": "v2",
             "compact_type": "execution_context",
             "strategy": getattr(result, "strategy", None),
             "original_count": getattr(result, "original_count", None),
@@ -621,7 +620,6 @@ class PatternRuntime:
             task_id=self._task_id(context),
             step_id=self._step_id(context),
             data={
-                "agent_runtime": "v2",
                 "pattern": pattern.__class__.__name__,
                 **(data or {}),
             },

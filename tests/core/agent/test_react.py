@@ -9,7 +9,7 @@ import pytest
 from langchain_core.tools import tool as langchain_tool
 from pydantic import BaseModel
 
-from xagent.core.agent_v2 import (
+from xagent.core.agent import (
     ExecutionContext,
     PatternRuntime,
     ReActPattern,
@@ -17,7 +17,7 @@ from xagent.core.agent_v2 import (
     ToolCallRecord,
 )
 
-react_module = importlib.import_module("xagent.core.agent_v2.pattern.react.react")
+react_module = importlib.import_module("xagent.core.agent.pattern.react.react")
 
 
 class CalculatorArgs(BaseModel):

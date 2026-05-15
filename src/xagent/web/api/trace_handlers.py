@@ -79,7 +79,7 @@ class DatabaseTraceHandler(BaseTraceHandler):
     async def load_latest_checkpoint(
         self, execution_id: str
     ) -> Optional[Dict[str, Any]]:
-        """Load the latest agent_v2 checkpoint persisted as a trace event."""
+        """Load the latest agent checkpoint persisted as a trace event."""
         try:
             return await asyncio.to_thread(
                 self._sync_load_latest_checkpoint,
@@ -98,7 +98,7 @@ class DatabaseTraceHandler(BaseTraceHandler):
         self,
         execution_id: str,
     ) -> Optional[Dict[str, Any]]:
-        from ...core.agent_v2.checkpoint import CHECKPOINT_TYPE
+        from ...core.agent.checkpoint import CHECKPOINT_TYPE
 
         db = next(get_db())
         try:
@@ -170,7 +170,7 @@ class DatabaseTraceHandler(BaseTraceHandler):
             if (
                 event_type_str == "system_update_general"
                 and isinstance(data, dict)
-                and data.get("checkpoint_type") == "agent_v2_execution_checkpoint"
+                and data.get("checkpoint_type") == "agent_execution_checkpoint"
             ):
                 task = db.query(Task).filter(Task.id == self.task_id).first()
                 if task:

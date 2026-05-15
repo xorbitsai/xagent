@@ -1,4 +1,4 @@
-"""Agent service facade for v2 execution."""
+"""Agent service facade for agent execution."""
 
 from __future__ import annotations
 
@@ -22,7 +22,7 @@ _UNSET = object()
 
 
 class AgentService:
-    """Service facade that executes tasks through agent_v2 only."""
+    """Service facade that executes tasks through agent only."""
 
     def __init__(
         self,
@@ -48,7 +48,6 @@ class AgentService:
         tool_config: Any | None = None,
         agent_type: str = "standard",
         system_prompt: str | None = None,
-        agent_runtime: str | None = None,
         **agent_kwargs: Any,
     ) -> None:
         self.name = name
@@ -59,7 +58,6 @@ class AgentService:
         self.vision_llm = vision_llm
         self.compact_llm = compact_llm
         self.system_prompt = system_prompt
-        self.agent_runtime = "v2"
         self.memory_similarity_threshold = memory_similarity_threshold
         self.memory_enabled = memory_enabled
         self.tool_config = tool_config
@@ -68,7 +66,7 @@ class AgentService:
         self._is_paused = False
         self._pause_event = None
         self._current_runner = None
-        self._v2_adapter: Any | None = None
+        self._execution_adapter: Any | None = None
         self._outbound_message_handler: Callable[[dict[str, Any]], Any] | None = None
         self._conversation_history: list[dict[str, Any]] = []
         self._execution_context_messages: list[dict[str, str]] = []
@@ -124,7 +122,7 @@ class AgentService:
         )
 
         logger.info(
-            "AgentService initialized for v2 execution: name=%s, pattern=%s, "
+            "AgentService initialized for agent execution: name=%s, pattern=%s, "
             "llm=%s, compact_llm=%s",
             name,
             self.pattern,
@@ -145,7 +143,7 @@ class AgentService:
             if not has_files:
                 raise ValueError("Task cannot be empty or whitespace-only")
         await self._ensure_tools_initialized()
-        return await self._execute_v2_task(task, context, task_id)
+        return await self._execute_agent_task(task, context, task_id)
 
     async def pause_execution(self) -> bool:
         if self._is_paused:
@@ -153,19 +151,19 @@ class AgentService:
             return True
 
         execution_id = self._current_task_id or self.id
-        paused = self.pause_v2_execution(
+        paused = self.pause_execution_by_id(
             str(execution_id), reason="paused by websocket"
         )
         if paused:
             self._is_paused = True
             logger.info(
-                "Agent '%s' v2 execution %s pause requested",
+                "Agent '%s' agent execution %s pause requested",
                 self.name,
                 execution_id,
             )
             return True
         logger.warning(
-            "Agent '%s' could not find live v2 execution %s to pause",
+            "Agent '%s' could not find live agent execution %s to pause",
             self.name,
             execution_id,
         )
@@ -182,7 +180,7 @@ class AgentService:
 
     def handle_websocket_input(self, user_input: str) -> bool:
         logger.info(
-            "Synchronous websocket input ignored for v2 service: %s", user_input
+            "Synchronous websocket input ignored for agent service: %s", user_input
         )
         return False
 
@@ -191,15 +189,15 @@ class AgentService:
         handler: Callable[[dict[str, Any]], Any] | None,
     ) -> None:
         self._outbound_message_handler = handler
-        if self._v2_adapter is not None:
-            self._v2_adapter.config.outbound_message_handler = handler
+        if self._execution_adapter is not None:
+            self._execution_adapter.config.outbound_message_handler = handler
 
     def set_allowed_skills(self, allowed_skills: list[str] | None) -> None:
         self.allowed_skills = allowed_skills
-        if self._v2_adapter is not None:
-            self._v2_adapter.config.allowed_skills = allowed_skills
+        if self._execution_adapter is not None:
+            self._execution_adapter.config.allowed_skills = allowed_skills
 
-    def supports_v2_control(self) -> bool:
+    def supports_live_control(self) -> bool:
         return True
 
     async def post_user_message(
@@ -210,10 +208,10 @@ class AgentService:
         request_interrupt: bool = True,
         reason: str | None = None,
     ) -> bool:
-        if self._v2_adapter is None:
-            self._v2_adapter = self._build_v2_adapter()
+        if self._execution_adapter is None:
+            self._execution_adapter = self._build_execution_adapter()
         return bool(
-            await self._v2_adapter.post_user_message(
+            await self._execution_adapter.post_user_message(
                 execution_id,
                 message,
                 request_interrupt=request_interrupt,
@@ -221,30 +219,35 @@ class AgentService:
             )
         )
 
-    async def resume_v2_execution(
+    async def resume_execution_by_id(
         self,
         execution_id: str,
         **kwargs: Any,
     ) -> dict[str, Any] | None:
         self._is_paused = False
         await self._ensure_tools_initialized()
-        if self._v2_adapter is None:
-            self._v2_adapter = self._build_v2_adapter()
+        if self._execution_adapter is None:
+            self._execution_adapter = self._build_execution_adapter()
         else:
-            self._v2_adapter.config.tools = self.tools
+            self._execution_adapter.config.tools = self.tools
         return cast(
-            dict[str, Any] | None, await self._v2_adapter.resume(execution_id, **kwargs)
+            dict[str, Any] | None,
+            await self._execution_adapter.resume(execution_id, **kwargs),
         )
 
-    def pause_v2_execution(self, execution_id: str, reason: str | None = None) -> bool:
-        if self._v2_adapter is None:
+    def pause_execution_by_id(
+        self, execution_id: str, reason: str | None = None
+    ) -> bool:
+        if self._execution_adapter is None:
             return False
-        return bool(self._v2_adapter.pause(execution_id, reason=reason))
+        return bool(self._execution_adapter.pause(execution_id, reason=reason))
 
-    def get_v2_execution_status(self, execution_id: str) -> dict[str, Any] | None:
-        if self._v2_adapter is None:
+    def get_execution_status(self, execution_id: str) -> dict[str, Any] | None:
+        if self._execution_adapter is None:
             return None
-        return cast(dict[str, Any] | None, self._v2_adapter.get_status(execution_id))
+        return cast(
+            dict[str, Any] | None, self._execution_adapter.get_status(execution_id)
+        )
 
     def add_pattern(self, pattern: Any) -> None:
         self.patterns.append(pattern)
@@ -253,13 +256,12 @@ class AgentService:
     def add_tool(self, tool: Tool) -> None:
         self.tools.append(tool)
         self.agent.tools = self.tools
-        if self._v2_adapter is not None:
-            self._v2_adapter.config.tools = self.tools
+        if self._execution_adapter is not None:
+            self._execution_adapter.config.tools = self.tools
 
     def get_status(self) -> dict[str, Any]:
         return {
             "name": self.name,
-            "agent_runtime": "v2",
             "patterns_count": 1 if self.llm else 0,
             "tools_count": len(self.tools),
             "memory_type": self.memory.__class__.__name__,
@@ -278,23 +280,25 @@ class AgentService:
 
     def set_conversation_history(self, messages: list[dict[str, Any]]) -> None:
         self._conversation_history = list(messages)
-        if self._v2_adapter is not None:
-            self._v2_adapter.config.conversation_history = self._conversation_history
+        if self._execution_adapter is not None:
+            self._execution_adapter.config.conversation_history = (
+                self._conversation_history
+            )
 
     def set_execution_context_messages(self, messages: list[dict[str, Any]]) -> None:
         self._execution_context_messages = normalize_transcript_messages(messages)
-        if self._v2_adapter is not None:
-            self._v2_adapter.config.execution_context_messages = (
+        if self._execution_adapter is not None:
+            self._execution_adapter.config.execution_context_messages = (
                 self._execution_context_messages
             )
 
     def set_recovered_skill_context(self, skill_context: str | None) -> None:
         self._recovered_skill_context = skill_context
-        if self._v2_adapter is not None:
-            self._v2_adapter.config.recovered_skill_context = skill_context
+        if self._execution_adapter is not None:
+            self._execution_adapter.config.recovered_skill_context = skill_context
 
     def get_task_info(self) -> dict[str, Any] | None:
-        status = self.get_v2_execution_status(self._current_task_id or self.id)
+        status = self.get_execution_status(self._current_task_id or self.id)
         if not status:
             return None
         metadata = status.get("metadata")
@@ -322,7 +326,7 @@ class AgentService:
             self.workspace.workspace_dir,
         )
 
-    async def _execute_v2_task(
+    async def _execute_agent_task(
         self,
         task: str,
         context: dict[str, Any] | None = None,
@@ -333,40 +337,42 @@ class AgentService:
         elif self._current_task_id is None:
             self._current_task_id = self.id
 
-        if self._v2_adapter is None:
-            self._v2_adapter = self._build_v2_adapter()
+        if self._execution_adapter is None:
+            self._execution_adapter = self._build_execution_adapter()
         else:
-            self._v2_adapter.config.current_task_id = self._current_task_id
-            self._v2_adapter.config.tools = self.tools
-            self._v2_adapter.config.llm = self.llm
-            self._v2_adapter.config.pattern = self.pattern
-            self._v2_adapter.config.outbound_message_handler = (
+            self._execution_adapter.config.current_task_id = self._current_task_id
+            self._execution_adapter.config.tools = self.tools
+            self._execution_adapter.config.llm = self.llm
+            self._execution_adapter.config.pattern = self.pattern
+            self._execution_adapter.config.outbound_message_handler = (
                 self._outbound_message_handler
             )
-            self._v2_adapter.config.conversation_history = self._conversation_history
-            self._v2_adapter.config.execution_context_messages = (
+            self._execution_adapter.config.conversation_history = (
+                self._conversation_history
+            )
+            self._execution_adapter.config.execution_context_messages = (
                 self._execution_context_messages
             )
-            self._v2_adapter.config.recovered_skill_context = (
+            self._execution_adapter.config.recovered_skill_context = (
                 self._recovered_skill_context
             )
-            self._v2_adapter.config.memory_store = (
+            self._execution_adapter.config.memory_store = (
                 self.memory if self.memory_enabled else None
             )
-            self._v2_adapter.config.allowed_skills = self.allowed_skills
+            self._execution_adapter.config.allowed_skills = self.allowed_skills
 
         return cast(
             dict[str, Any],
-            await self._v2_adapter.execute(
+            await self._execution_adapter.execute(
                 task=task,
                 context=context,
                 task_id=task_id,
             ),
         )
 
-    def _build_v2_adapter(self) -> Any:
-        from ..agent_runtime import AgentV2ExecutionAdapter, AgentV2ExecutionConfig
-        from ..agent_v2 import TraceCheckpointStore
+    def _build_execution_adapter(self) -> Any:
+        from .checkpoint import TraceCheckpointStore
+        from .execution_adapter import AgentExecutionAdapter, AgentExecutionConfig
 
         checkpoint_reader_available = any(
             callable(getattr(handler, "load_latest_checkpoint", None))
@@ -380,8 +386,8 @@ class AgentService:
             if self.tracer is not None
             else None
         )
-        return AgentV2ExecutionAdapter(
-            AgentV2ExecutionConfig(
+        return AgentExecutionAdapter(
+            AgentExecutionConfig(
                 name=self.name,
                 tools=self.tools,
                 llm=self.llm,
@@ -441,14 +447,13 @@ class AgentService:
         plan_state: dict[str, Any] | None = None,
     ) -> None:
         self._current_task_id = str(task_id)
-        logger.info("AgentService v2 reconstruction prepared for task %s", task_id)
+        logger.info("AgentService reconstruction prepared for task %s", task_id)
 
     def get_reconstruction_data(self) -> dict[str, Any]:
         return {
             "task_id": self._current_task_id,
             "agent_name": self.name,
             "patterns": 1 if self.llm else 0,
-            "agent_runtime": "v2",
         }
 
     def _create_default_tool_config(self) -> Any:
@@ -559,8 +564,8 @@ class AgentService:
                         ]
 
                 self.agent.tools = self.tools
-                if self._v2_adapter is not None:
-                    self._v2_adapter.config.tools = self.tools
+                if self._execution_adapter is not None:
+                    self._execution_adapter.config.tools = self.tools
                 self._tools_initialized = True
             except Exception as exc:
                 logger.error("Failed to initialize tools from configuration: %s", exc)
@@ -570,9 +575,9 @@ class AgentService:
 
     def _execution_type(self) -> str:
         if self.pattern == "dag_plan_execute":
-            return "agent_v2_dag"
+            return "agent_dag"
         if self.pattern == "auto":
-            return "agent_v2_auto"
+            return "agent_auto"
         if self.pattern == "single_call":
-            return "agent_v2_single_call"
-        return "agent_v2_react"
+            return "agent_single_call"
+        return "agent_react"

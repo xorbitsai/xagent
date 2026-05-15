@@ -5,6 +5,7 @@ from collections.abc import Iterator
 from sqlalchemy import create_engine
 from sqlalchemy.orm import Session, sessionmaker
 
+from xagent.core.agent.checkpoint import CHECKPOINT_EVENT_TYPE, CHECKPOINT_TYPE
 from xagent.core.agent.trace import (
     TraceAction,
     TraceCategory,
@@ -12,10 +13,9 @@ from xagent.core.agent.trace import (
     TraceEventType,
     TraceScope,
 )
-from xagent.core.agent_v2.checkpoint import CHECKPOINT_EVENT_TYPE, CHECKPOINT_TYPE
 from xagent.web.api.websocket import (
-    _is_agent_v2_checkpoint_data,
-    _persist_agent_v2_outbound_event,
+    _is_agent_checkpoint_data,
+    _persist_agent_outbound_event,
     create_stream_event,
 )
 from xagent.web.api.ws_trace_handlers import (
@@ -28,7 +28,7 @@ from xagent.web.models.task import TraceEvent as DatabaseTraceEvent
 from xagent.web.models.user import User
 
 
-def test_agent_v2_checkpoint_is_not_converted_to_websocket_stream_event() -> None:
+def test_agent_checkpoint_is_not_converted_to_websocket_stream_event() -> None:
     event = TraceEvent(
         CHECKPOINT_EVENT_TYPE,
         task_id="365",
@@ -68,15 +68,15 @@ def test_action_llm_error_maps_to_llm_call_failed() -> None:
     assert get_event_type_mapping(event) == "llm_call_failed"
 
 
-def test_historical_stream_identifies_agent_v2_checkpoint_payload() -> None:
-    assert _is_agent_v2_checkpoint_data(
+def test_historical_stream_identifies_agent_checkpoint_payload() -> None:
+    assert _is_agent_checkpoint_data(
         {
             "checkpoint_type": CHECKPOINT_TYPE,
             "execution_id": "365",
             "snapshot": {"label": "dag_before_llm"},
         }
     )
-    assert _is_agent_v2_checkpoint_data(
+    assert _is_agent_checkpoint_data(
         {
             "type": "checkpoint",
             "execution_id": "365",
@@ -84,10 +84,10 @@ def test_historical_stream_identifies_agent_v2_checkpoint_payload() -> None:
             "context": {"messages": []},
         }
     )
-    assert not _is_agent_v2_checkpoint_data({"event": "ai_message"})
+    assert not _is_agent_checkpoint_data({"event": "ai_message"})
 
 
-def test_persist_agent_v2_outbound_event_uses_payload_ids(monkeypatch) -> None:
+def test_persist_agent_outbound_event_uses_payload_ids(monkeypatch) -> None:
     engine = create_engine("sqlite:///:memory:")
     SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
     Base.metadata.create_all(bind=engine)
@@ -129,7 +129,7 @@ def test_persist_agent_v2_outbound_event_uses_payload_ids(monkeypatch) -> None:
         },
     )
 
-    _persist_agent_v2_outbound_event(int(task.id), event)
+    _persist_agent_outbound_event(int(task.id), event)
 
     db = SessionLocal()
     try:

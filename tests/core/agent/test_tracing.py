@@ -5,7 +5,7 @@ from typing import Any
 
 import pytest
 
-from xagent.core.agent_v2 import ExecutionContext, TraceEventCallback
+from xagent.core.agent import ExecutionContext, TraceEventCallback
 
 
 class TraceRecorder:

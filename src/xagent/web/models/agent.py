@@ -25,7 +25,7 @@ class ExecutionMode(enum.Enum):
     FLASH = "flash"  # Simple, quick tasks (single_call pattern)
     BALANCED = "balanced"  # Most everyday tasks (react pattern)
     THINK = "think"  # Complex, multi-step tasks (dag_plan_execute pattern)
-    AUTO = "auto"  # Let agent_v2 choose final answer, ReAct, or DAG
+    AUTO = "auto"  # Let agent choose final answer, ReAct, or DAG
 
 
 class Agent(Base):  # type: ignore

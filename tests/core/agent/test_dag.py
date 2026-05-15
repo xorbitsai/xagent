@@ -7,7 +7,7 @@ from typing import Any
 
 import pytest
 
-from xagent.core.agent_v2 import (
+from xagent.core.agent import (
     Agent,
     AgentRunner,
     ContextManager,

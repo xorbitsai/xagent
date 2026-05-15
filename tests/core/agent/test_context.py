@@ -4,15 +4,15 @@ import json
 
 import pytest
 
-from xagent.core.agent_v2.context import (
+from xagent.core.agent.context import (
     ContextManager,
     ExecutionContext,
     GenericComponent,
     MergeStrategy,
     Message,
 )
-from xagent.core.agent_v2.context import enrichment as enrichment_module
-from xagent.core.agent_v2.context.enrichment import (
+from xagent.core.agent.context import enrichment as enrichment_module
+from xagent.core.agent.context.enrichment import (
     MEMORY_CONTEXT_METADATA_KEY,
     SKILL_CONTEXT_METADATA_KEY,
     _current_user_id,
@@ -23,7 +23,7 @@ from xagent.core.agent_v2.context.enrichment import (
     enrich_context_with_skill,
     generate_and_store_react_memory,
 )
-from xagent.core.agent_v2.runtime import LLMCallInterrupted
+from xagent.core.agent.runtime import LLMCallInterrupted
 from xagent.web.user_isolated_memory import current_user_id
 
 

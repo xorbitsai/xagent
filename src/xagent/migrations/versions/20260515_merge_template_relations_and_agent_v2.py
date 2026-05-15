@@ -9,7 +9,7 @@ from typing import Sequence
 
 # revision identifiers, used by Alembic.
 revision: str = "20260515_merge_template_relations_and_agent_v2"
-down_revision: tuple[str, str] | None = (
+down_revision: str | Sequence[str] | None = (
     "20260514_add_user_template_relations",
     "9f8d7e6c5b4a",
 )

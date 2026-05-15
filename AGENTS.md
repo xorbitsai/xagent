@@ -28,11 +28,25 @@ Xagent has one main entrypoint:
 
 ### Core Components (`src/xagent/core/`)
 
-**Agent System:**
-- `agent.py` - Main Agent class with nested agent support and execution history
-- `pattern/` - Agent execution patterns (ReAct, DAG plan-execute)
-- `runner.py` - Agent execution engine
-- `context.py` - Agent context management
+**Agent System (`src/xagent/core/agent/`):**
+- `service.py` - `AgentService` facade used by web/chat/preview/builder entry points.
+- `agent.py` - Core `Agent` definition for the only supported execution runtime.
+- `execution_adapter.py` - Adapts `AgentService` calls into `AgentRunner` executions.
+- `runner.py` - Execution engine with pause/resume/interruption and checkpoint loading.
+- `runtime.py` - Cross-cutting pattern services: LLM calls, tool calls, tracing, checkpoints, outbound messages, and context compaction.
+- `context/` - Message and execution context management.
+- `pattern/` - Execution patterns: `single_call`, ReAct, DAG plan-execute, and auto routing.
+- `checkpoint.py` - Trace-backed checkpoint persistence for resumable executions.
+
+There is no v1/v2 runtime switch. Do not add new code under `agent_v2` or `agent_runtime`; both concepts have been collapsed into `core.agent`.
+
+Execution mode mapping:
+- `flash` -> `single_call`
+- `balanced` -> ReAct
+- `think` -> DAG plan-execute
+- `auto` -> auto pattern selection between final-answer, ReAct, and DAG
+
+Agent tasks built in the agent builder should default to memory disabled unless a future product change adds an explicit switch. Knowledge base/RAG grounding is separate from memory.
 
 **Graph System:**
 - `graph.py` - Graph workflow execution engine with validation
@@ -167,6 +181,21 @@ GOOGLE_CSE_ID="your-google-cse-id"
 LANGFUSE_PUBLIC_KEY="your-langfuse-public-key"
 LANGFUSE_SECRET_KEY="your-langfuse-secret-key"
 ```
+
+### Local Development Conventions
+
+**Commit and PR titles:**
+- Use a short conventional prefix: `feat:`, `fix:`, `enh:`, or `ref:`.
+- Prefer the same prefix in PR titles so split PRs are easy to scan.
+- Keep branch names meaningful and task-oriented, for example `fix/remove-agent-v1` or `feat/agent-builder-preview`. Avoid generic agent/tool prefixes that do not describe the work.
+
+**Local data locations:**
+- The default storage root is `~/.xagent`, configured by `XAGENT_STORAGE_ROOT`.
+- The default SQLite database is `~/.xagent/xagent.db`, unless `DATABASE_URL` is set.
+- The default KB/RAG LanceDB path is `~/.xagent/data/lancedb`, unless `LANCEDB_PATH`/`LANCEDB_DIR` is set by the specific code path.
+- User memory and knowledge base storage are different concepts. Agent/user memory uses `DynamicMemoryStoreManager`; when a LanceDB memory store is active it defaults to `~/.xagent/memory_store` after checking the legacy project `memory_store/` directory. KB/RAG collections use the RAG storage layer and the LanceDB path above.
+- Uploaded files default to `src/xagent/web/uploads`, unless `XAGENT_UPLOADS_DIR` is set. External upload roots must go through `XAGENT_EXTERNAL_UPLOAD_DIRS`.
+- Do not hardcode these paths in source or tests. Use `src/xagent/config.py` helpers or explicitly override env vars in tests.
 
 ### Optional Dependencies for Presentation Generation
 

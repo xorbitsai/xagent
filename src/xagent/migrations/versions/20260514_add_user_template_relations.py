@@ -1,7 +1,7 @@
 """Add user template relations table
 
 Revision ID: 20260514_add_user_template_relations
-Revises: 7f4d2c9a1b58
+Revises: 9f8d7e6c5b4a
 Create Date: 2026-05-14
 """
 
@@ -12,7 +12,7 @@ from alembic import op
 
 # revision identifiers, used by Alembic.
 revision: str = "20260514_add_user_template_relations"
-down_revision: str | None = "7f4d2c9a1b58"
+down_revision: str | None = "9f8d7e6c5b4a"
 branch_labels: str | Sequence[str] | None = None
 depends_on: str | Sequence[str] | None = None
 

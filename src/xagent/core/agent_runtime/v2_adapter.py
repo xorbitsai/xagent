@@ -45,7 +45,7 @@ class AgentV2ExecutionConfig:
 
 
 class AgentV2ExecutionAdapter:
-    """Adapter that routes legacy AgentService executions into agent_v2."""
+    """Adapter that routes AgentService executions into agent_v2."""
 
     def __init__(self, config: AgentV2ExecutionConfig) -> None:
         self.config = config
@@ -87,7 +87,7 @@ class AgentV2ExecutionAdapter:
             metadata={
                 "agent_runtime": "v2",
                 "execution_type": execution_type,
-                "legacy_pattern": self.config.pattern,
+                "pattern": self.config.pattern,
                 "request_context": dict(context or {}),
                 "selected_skill_context": self.config.recovered_skill_context,
             },
@@ -126,7 +126,7 @@ class AgentV2ExecutionAdapter:
             metadata={
                 "agent_runtime": "v2",
                 "execution_type": execution_type,
-                "legacy_pattern": self.config.pattern,
+                "pattern": self.config.pattern,
                 "request_context": dict(context or {}),
                 "selected_skill_context": self.config.recovered_skill_context,
             },
@@ -148,7 +148,7 @@ class AgentV2ExecutionAdapter:
                 metadata={
                     "agent_runtime": "v2",
                     "execution_type": execution_type,
-                    "legacy_pattern": self.config.pattern,
+                    "pattern": self.config.pattern,
                 },
             )
         else:
@@ -181,7 +181,7 @@ class AgentV2ExecutionAdapter:
                 metadata={
                     "agent_runtime": "v2",
                     "execution_type": execution_type,
-                    "legacy_pattern": self.config.pattern,
+                    "pattern": self.config.pattern,
                 },
             )
         context = await self.registry.post_user_message(
@@ -214,7 +214,7 @@ class AgentV2ExecutionAdapter:
             tools=self.config.tools,
             llm=self.config.llm,
             system_prompt=self.config.system_prompt,
-            metadata={"legacy_pattern": self.config.pattern},
+            metadata={"pattern": self.config.pattern},
             memory_store=self.config.memory_store,
             memory_similarity_threshold=self.config.memory_similarity_threshold,
             skill_manager=skill_manager,
@@ -295,7 +295,7 @@ class AgentV2ExecutionAdapter:
                 "agent_name": self.config.name,
                 "agent_runtime": "v2",
                 "execution_type": execution_type,
-                "legacy_pattern": self.config.pattern,
+                "pattern": self.config.pattern,
                 "task_id": execution_id,
             },
             "agent_v2_result": result,

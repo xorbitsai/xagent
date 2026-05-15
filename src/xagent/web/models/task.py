@@ -62,10 +62,6 @@ class AgentType(enum.Enum):
     """Agent type enumeration"""
 
     STANDARD = "standard"  # Standard purpose agent
-    TEXT2SQL = "text2sql"  # Text2SQL agent
-    # Future agent types can be added here
-    # CODE_ASSISTANT = "code_assistant"
-    # DATA_ANALYSIS = "data_analysis"
 
 
 class Task(Base):  # type: ignore

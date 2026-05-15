@@ -11,13 +11,11 @@ from sqlalchemy.orm import Session
 
 from ...config import (
     get_agent_pattern_for_execution_mode,
-    get_agent_runtime,
     get_default_task_execution_mode,
     get_external_upload_dirs,
     get_uploads_dir,
 )
 from ...core.agent.service import AgentService
-from ...core.agent.trace import Tracer
 from ...core.model.chat.basic.base import BaseLLM
 from ...core.model.chat.basic.deepseek import DeepSeekLLM
 from ...core.model.chat.basic.openai import OpenAILLM
@@ -687,31 +685,11 @@ class AgentServiceManager:
                         f"Task {task_id} record: agent_type={task.agent_type}, model_name={task.model_name}, compact_model_name={task.compact_model_name}"
                     )
 
-                    # Check if this is a Text2SQL task
-                    logger.info(
-                        f"Task {task.id} agent_type: '{task.agent_type}', agent_type_enum: '{task.agent_type_enum}'"
-                    )
-                    if task.agent_type_enum == AgentType.TEXT2SQL:
-                        logger.info(f"🎯 Creating Text2SQL agent for task {task.id}")
-                        if user is not None:
-                            return await self._create_text2sql_agent(
-                                task, db, user, tracer
-                            )
-                        else:
-                            raise ValueError(
-                                "User context is required for Text2SQL agent creation"
-                            )
-                    else:
-                        logger.info(
-                            f"❌ Task {task.id} is not Text2SQL, using standard agent creation"
-                        )
-
                     # Get task's execution_mode and map to pattern.
                     task_execution_mode = getattr(task, "execution_mode", None)
                     if not task_execution_mode:
                         task_execution_mode = get_default_task_execution_mode(
                             agent_id=getattr(task, "agent_id", None),
-                            agent_runtime=get_agent_runtime(),
                         )
                     task_pattern = get_agent_pattern_for_execution_mode(
                         task_execution_mode
@@ -941,35 +919,6 @@ class AgentServiceManager:
                 )
 
                 with UserContext(int(user.id)):
-                    # Extract Text2SQL configuration if this is a Text2SQL task
-                    agent_kwargs = {}
-                    if task and task.agent_type == "text2sql" and task.agent_config:
-                        config: dict[str, Any] = (
-                            task.agent_config
-                            if isinstance(task.agent_config, dict)
-                            else {}
-                        )
-                        logger.info(
-                            f"Extracting Text2SQL config: {list(config.keys())}"
-                        )
-                        agent_kwargs.update(
-                            {
-                                "database_url": config.get("database_url"),
-                                "database_name": config.get("database_name"),
-                                "database_type": config.get("database_type"),
-                                "schema_info": config.get("schema_info"),
-                                "max_iterations": config.get("max_iterations", 3),
-                                "read_only": config.get("read_only", True),
-                                "available_tables": config.get("available_tables"),
-                            }
-                        )
-                        logger.info(
-                            f"Text2SQL kwargs prepared: {list(agent_kwargs.keys())}"
-                        )
-                        logger.info(
-                            f"Database URL: {config.get('database_url', 'NOT FOUND')}"
-                        )
-
                     # Unpack tools and tool_config from create_default_tools
                     tools_list, tool_config = tools
 
@@ -1014,9 +963,6 @@ class AgentServiceManager:
                         memory=get_memory_store(),  # Use dynamic memory store for auto-switching
                         pattern=task_pattern,  # Use pattern instead of use_dag_pattern
                         tracer=tracer,
-                        agent_type=str(task.agent_type)
-                        if task and task.agent_type
-                        else "standard",
                         enable_workspace=True,  # Enable workspace functionality
                         workspace_base_dir=str(
                             get_uploads_dir() / f"user_{user.id}"
@@ -1026,7 +972,6 @@ class AgentServiceManager:
                         memory_similarity_threshold=memory_similarity_threshold,  # Set from task config
                         memory_enabled=agent_builder_memory_enabled,
                         system_prompt=system_prompt,  # Pass agent builder instructions
-                        **agent_kwargs,  # Pass Text2SQL-specific parameters
                     )
 
                     selected_file_ids: list[str] = []
@@ -1041,10 +986,10 @@ class AgentServiceManager:
                                 if isinstance(item, str) and item.strip()
                             ]
 
-                    if selected_file_ids and self._agents[task_id].workspace:
+                    workspace = self._agents[task_id].workspace
+                    if selected_file_ids and workspace is not None:
                         from ..models.uploaded_file import UploadedFile
 
-                        workspace = self._agents[task_id].workspace
                         for selected_file_id in selected_file_ids:
                             uploaded_file = (
                                 db.query(UploadedFile)
@@ -1259,184 +1204,6 @@ class AgentServiceManager:
                 f"No workspace directory found for task {task_id} (user {user_id})"
             )
 
-    async def _create_text2sql_agent(
-        self, task: Task, db: Session, user: User, tracer: Tracer
-    ) -> AgentService:
-        """Create Text2SQL agent service"""
-
-        try:
-            # Extract Text2SQL configuration from task
-            if not task.agent_config:
-                raise ValueError(
-                    "Text2SQL agent requires database configuration but agent_config is empty"
-                )
-
-            if not isinstance(task.agent_config, dict):
-                raise ValueError(
-                    f"Text2SQL agent_config must be a dictionary, got {type(task.agent_config)}"
-                )
-
-            config = task.agent_config
-
-            # Validate required configuration
-            if not config.get("database_url"):
-                raise ValueError(
-                    "Text2SQL agent configuration must include 'database_url'"
-                )
-
-            # Log configuration for debugging
-            logger.info(
-                f"Creating Text2SQL agent for task {task.id} with config: {config}"
-            )
-
-            llm_ids = self._get_task_llm_ids(task, db)
-
-            # Use user_id for model resolution if available
-            user_id_for_resolution = int(user.id) if user else None
-            task_llm, task_fast_llm, task_vision_llm, task_compact_llm = (
-                resolve_llms_from_names(llm_ids, db, user_id_for_resolution)
-            )
-
-            # Use default LLM if no specific LLM configured
-            if not task_llm:
-                logger.warning(
-                    f"Text2SQL task {task.id} has no valid LLM configuration, using default"
-                )
-                task_llm = self._default_llm
-
-            # Create workspace for the Text2SQL agent
-            with UserContext(int(user.id)):
-                # Extract database context information
-                database_url = config["database_url"]  # Required field, no default
-                database_name = config.get("database_name", "Unknown Database")
-                database_type = self._infer_database_type(database_url)
-
-                # Build allowed external directories
-                allowed_external_dirs = _build_allowed_external_dirs(
-                    int(user.id) if user and user.id else None
-                )
-
-                # Create AgentService with Text2SQL agent type
-
-                agent_service = AgentService(
-                    name=f"text2sql_task_{task.id}",
-                    id=f"web_task_{task.id}",  # Required id parameter
-                    agent_type="text2sql",
-                    llm=task_llm,
-                    fast_llm=task_fast_llm,
-                    vision_llm=task_vision_llm,
-                    compact_llm=task_compact_llm,
-                    tracer=tracer,
-                    enable_workspace=True,
-                    task_id=str(task.id),
-                    pattern="react",  # Text2SQL agent provides its own patterns
-                    # Pass Text2SQL-specific configuration
-                    database_url=database_url,
-                    database_name=database_name,
-                    database_type=database_type,
-                    schema_info=config.get("schema_info"),
-                    max_iterations=config.get("max_iterations", 3),
-                    read_only=config.get("read_only", True),
-                    available_tables=config.get("available_tables"),
-                    workspace_base_dir=str(get_uploads_dir() / f"user_{user.id}"),
-                    allowed_external_dirs=allowed_external_dirs,
-                )
-
-                # Use Text2SQLAgent's execute method directly, not AgentService
-                # This ensures our custom pattern and trace system is used
-                if hasattr(agent_service.agent, "execute") and hasattr(
-                    agent_service.agent, "_get_domain_name"
-                ):
-                    # Save original method
-
-                    async def wrapped_execute(task, context=None, task_id=None):
-                        return await self._execute_text2sql_agent_directly(
-                            agent_service.agent,
-                            task,
-                            tracer,
-                            task_id if task_id else str(task.id),
-                        )
-
-                    agent_service.execute_task = wrapped_execute
-
-                # Store in manager
-                self._agents[int(task.id)] = agent_service
-
-                logger.info(
-                    f"Successfully created Text2SQL agent for task {task.id} with database_url={config.get('database_url', 'sqlite:///xagent.db')}"
-                )
-
-                return agent_service
-
-        except Exception as e:
-            logger.error(f"Failed to create Text2SQL agent for task {task.id}: {e}")
-            raise
-
-    def _infer_database_type(self, database_url: str) -> str:
-        """Infer database type from connection URL"""
-        if database_url.startswith("mysql://") or database_url.startswith("mysql2://"):
-            return "MySQL"
-        elif database_url.startswith("postgresql://") or database_url.startswith(
-            "postgres://"
-        ):
-            return "PostgreSQL"
-        elif database_url.startswith("sqlite://"):
-            return "SQLite"
-        elif database_url.startswith("sqlserver://") or database_url.startswith(
-            "mssql://"
-        ):
-            return "SQL Server"
-        else:
-            return "Unknown"
-
-    async def _execute_text2sql_agent_directly(
-        self, agent: Any, task: str, tracer: Any, task_id: str
-    ) -> Dict[str, Any]:
-        """
-        Execute Text2SQL agent directly using its own execute method.
-
-        This bypasses AgentService's standard execution flow and uses the
-        Text2SQL agent's custom patterns and trace system.
-        """
-        try:
-            # Call Text2SQLAgent's execute method directly
-            result = await agent.execute(task=task, task_id=task_id)
-
-            # Normalize return format to match AgentService format
-            return {
-                "status": "completed" if result.get("success") else "failed",
-                "output": result.get(
-                    "output", result.get("error", "No output provided")
-                ),
-                "success": result.get("success", False),
-                "metadata": result.get(
-                    "metadata",
-                    {
-                        "agent_name": getattr(agent, "name", "text2sql-agent"),
-                        "patterns_used": len(agent.patterns),
-                        "tools_available": len(agent.tools),
-                        "execution_type": "text2sql_direct",
-                    },
-                ),
-            }
-
-        except Exception as e:
-            logger.error(f"[TEXT2SQL WEB] Error executing Text2SQL agent directly: {e}")
-            import traceback
-
-            traceback.print_exc()
-
-            return {
-                "status": "failed",
-                "output": f"Text2SQL execution error: {str(e)}",
-                "success": False,
-                "error": str(e),
-                "metadata": {
-                    "agent_name": getattr(agent, "name", "text2sql-agent"),
-                    "execution_type": "text2sql_direct_error",
-                },
-            }
-
     async def _reconstruct_agent_from_history(self, task_id: int, db: Session) -> None:
         """Reconstruct agent from historical data"""
         try:
@@ -1511,7 +1278,6 @@ class AgentServiceManager:
                         if not task_execution_mode:
                             task_execution_mode = get_default_task_execution_mode(
                                 agent_id=getattr(task, "agent_id", None),
-                                agent_runtime=get_agent_runtime(),
                             )
                         task_pattern = get_agent_pattern_for_execution_mode(
                             task_execution_mode
@@ -1621,9 +1387,6 @@ class AgentServiceManager:
                             memory=get_memory_store(),  # Use dynamic memory store for auto-switching
                             pattern=task_pattern,
                             tracer=tracer,
-                            agent_type=str(task.agent_type)
-                            if task and task.agent_type
-                            else "standard",
                             system_prompt=system_prompt,
                             enable_workspace=True,
                             workspace_base_dir=str(
@@ -1971,7 +1734,6 @@ async def create_task(
         if not task_execution_mode:
             task_execution_mode = get_default_task_execution_mode(
                 agent_id=request.agent_id,
-                agent_runtime=get_agent_runtime(),
             )
 
         # Create task with PENDING status and model configuration

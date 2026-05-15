@@ -119,7 +119,6 @@ class TestAgentServiceManagerReconstruction:
             patch("xagent.web.api.chat.AgentService") as mock_agent_service_class,
             patch("xagent.web.api.chat.resolve_llms_from_names") as mock_resolve_llms,
             patch("xagent.web.api.chat.get_memory_store") as mock_get_memory,
-            patch("xagent.web.api.chat.Tracer"),
             patch(
                 "xagent.core.tools.adapters.vibe.factory.ToolFactory"
             ) as mock_tool_factory,
@@ -175,7 +174,6 @@ class TestAgentServiceManagerReconstruction:
             patch("xagent.web.api.chat.AgentService") as mock_agent_service_class,
             patch("xagent.web.api.chat.resolve_llms_from_names") as mock_resolve_llms,
             patch("xagent.web.api.chat.get_memory_store") as mock_get_memory,
-            patch("xagent.web.api.chat.Tracer"),
             patch(
                 "xagent.core.tools.adapters.vibe.factory.ToolFactory"
             ) as mock_tool_factory,
@@ -220,7 +218,6 @@ class TestAgentServiceManagerReconstruction:
             patch("xagent.web.api.chat.AgentService") as mock_agent_service_class,
             patch("xagent.web.api.chat.resolve_llms_from_names") as mock_resolve_llms,
             patch("xagent.web.api.chat.get_memory_store") as mock_get_memory,
-            patch("xagent.web.api.chat.Tracer"),
             patch(
                 "xagent.core.tools.adapters.vibe.factory.ToolFactory"
             ) as mock_tool_factory,

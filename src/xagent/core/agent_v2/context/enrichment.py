@@ -6,11 +6,6 @@ import json
 import logging
 from typing import Any, cast
 
-from ...agent.pattern.memory_utils import (
-    enhance_goal_with_memory,
-    lookup_relevant_memories,
-    store_react_task_memory,
-)
 from ...agent.trace import (
     trace_memory_generate_end,
     trace_memory_generate_start,
@@ -19,6 +14,7 @@ from ...agent.trace import (
     trace_memory_store_end,
     trace_memory_store_start,
 )
+from ...memory.core import MemoryNote
 from ...user_context import current_user_id
 from ..runtime import LLMCallInterrupted
 
@@ -489,3 +485,96 @@ def _lookup_relevant_memories_with_context(
 
 def _current_user_id() -> Any | None:
     return current_user_id.get()
+
+
+def lookup_relevant_memories(
+    memory_store: Any,
+    query: str,
+    category: str,
+    *,
+    include_general: bool = True,
+    limit: int = 5,
+    similarity_threshold: float | None = None,
+) -> list[dict[str, Any]]:
+    filters: dict[str, Any] = {}
+    if category:
+        filters["category"] = category
+    search = getattr(memory_store, "search", None)
+    if not callable(search):
+        return []
+
+    memories = search(
+        query=query,
+        k=limit,
+        filters=filters or None,
+        similarity_threshold=similarity_threshold,
+    )
+    if include_general and category != "general":
+        memories.extend(
+            search(
+                query=query,
+                k=limit,
+                filters={"category": "general"},
+                similarity_threshold=similarity_threshold,
+            )
+        )
+    return [_memory_note_to_dict(memory) for memory in memories[:limit]]
+
+
+def enhance_goal_with_memory(query: str, memories: list[dict[str, Any]]) -> str:
+    if not memories:
+        return query
+    memory_lines = [
+        f"- {str(memory.get('content') or '').strip()}"
+        for memory in memories
+        if str(memory.get("content") or "").strip()
+    ]
+    if not memory_lines:
+        return query
+    return f"{query}\n\nRelevant memory:\n" + "\n".join(memory_lines)
+
+
+def store_react_task_memory(
+    *,
+    memory_store: Any,
+    task: str,
+    result: dict[str, Any],
+    tool_usage_insights: str,
+    reasoning_strategy: str,
+    classification: dict[str, Any],
+) -> str | None:
+    content_parts = [
+        f"Task: {task}",
+        f"Result: {str(result.get('output') or '')}",
+        f"Tool usage: {tool_usage_insights}",
+        f"Reasoning strategy: {reasoning_strategy}",
+        f"Core insight: {classification.get('core_insight') or ''}",
+    ]
+    note = MemoryNote(
+        content="\n".join(part for part in content_parts if part.strip()),
+        category="react_memory",
+        metadata={
+            "task": task,
+            "success": bool(result.get("success", True)),
+            "classification": classification,
+        },
+    )
+    response = memory_store.add(note)
+    return (
+        getattr(response, "memory_id", None)
+        if getattr(response, "success", False)
+        else None
+    )
+
+
+def _memory_note_to_dict(memory: Any) -> dict[str, Any]:
+    if hasattr(memory, "model_dump"):
+        return cast(dict[str, Any], memory.model_dump())
+    if isinstance(memory, dict):
+        return memory
+    return {
+        "id": getattr(memory, "id", None),
+        "content": getattr(memory, "content", ""),
+        "category": getattr(memory, "category", "general"),
+        "metadata": getattr(memory, "metadata", {}),
+    }

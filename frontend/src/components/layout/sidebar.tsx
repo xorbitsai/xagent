@@ -501,7 +501,7 @@ export function Sidebar({ className, allowCollapse = true }: SidebarProps) {
 
     try {
       const searchParam = searchRef.current ? `&search=${encodeURIComponent(searchRef.current)}` : ''
-      const response = await apiRequest(`${getApiUrl()}/api/chat/tasks?exclude_agent_type=text2sql&page=${pageNum}&per_page=10${searchParam}`)
+      const response = await apiRequest(`${getApiUrl()}/api/chat/tasks?page=${pageNum}&per_page=10${searchParam}`)
       if (response.ok) {
         const data = await response.json()
         // Handle new API response format {tasks: [...], pagination: {...}}

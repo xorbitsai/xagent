@@ -10,7 +10,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
 
-from ..config import get_agent_runtime, get_uploads_dir
+from ..config import get_uploads_dir
 from ..core.tracing.langfuse import flush_langfuse, initialize_langfuse
 from .api.admin_mcp import admin_mcp_router
 from .api.admin_users import router as admin_users_router
@@ -30,7 +30,6 @@ from .api.progress_ws import progress_ws_router
 from .api.skills import router as skills_router
 from .api.system import system_router
 from .api.templates import router as templates_router
-from .api.text2sql import text2sql_router
 from .api.tools import tools_router
 from .api.websocket import ws_router
 from .api.widget import widget_router
@@ -157,7 +156,6 @@ app.include_router(progress_ws_router)
 app.include_router(memory_router)
 app.include_router(mcp_router)
 app.include_router(custom_api_router)
-app.include_router(text2sql_router)
 app.include_router(tools_router)
 app.include_router(admin_users_router)
 app.include_router(admin_mcp_router)
@@ -173,7 +171,7 @@ app.include_router(widget_router)
 @app.on_event("startup")
 async def startup_event() -> None:
     global _migration_task
-    logger.info("Agent runtime configured: %s", get_agent_runtime())
+    logger.info("Agent runtime configured: v2")
     logger.info("Initializing database...")
     init_db()
     logger.info("Database initialized successfully")

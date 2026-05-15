@@ -58,7 +58,7 @@ class TaskCreateRequest(BaseModel):
     memory_similarity_threshold: Optional[float] = (
         1.5  # Memory search similarity threshold
     )
-    agent_type: Optional[str] = "standard"  # Agent type: "standard", "text2sql", etc.
+    agent_type: Optional[str] = "standard"
     agent_config: Optional[Dict[str, Any]] = None  # Agent-specific configuration
 
     # Execution mode field

@@ -110,7 +110,6 @@ async def test_handle_builder_chat_basic() -> None:
         assert MockAgentService.called
         call_kwargs = MockAgentService.call_args[1]
         assert call_kwargs["pattern"] == "react"
-        assert call_kwargs["agent_runtime"] == "v2"
         assert call_kwargs["name"] == "builder_chat_agent"
         mock_agent_service.set_allowed_skills.assert_called_once_with(["agent-builder"])
         mock_agent_service.set_recovered_skill_context.assert_called_once()

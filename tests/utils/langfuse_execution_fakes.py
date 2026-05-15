@@ -263,7 +263,6 @@ class DeterministicSingleCallLLM(BaseLLM):
         self._call_count += 1
         if self._call_count == 1:
             return {
-                "type": "tool_call",
                 "tool_calls": [
                     {
                         "function": {
@@ -303,7 +302,6 @@ class DeterministicReActLLM(BaseLLM):
         self._call_count += 1
         if self._call_count == 1:
             return {
-                "type": "tool_call",
                 "tool_calls": [
                     {
                         "function": {
@@ -322,7 +320,7 @@ class DeterministicReActLLM(BaseLLM):
         has_tools = bool(kwargs.get("tools"))
         if has_tools:
             parsed = response if isinstance(response, dict) else json.loads(response)
-            if parsed.get("type") == "tool_call":
+            if parsed.get("tool_calls"):
                 yield StreamChunk(
                     type=ChunkType.TOOL_CALL,
                     tool_calls=parsed["tool_calls"],

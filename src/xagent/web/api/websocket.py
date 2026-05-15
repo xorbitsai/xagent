@@ -26,7 +26,6 @@ from sqlalchemy.orm import Session
 
 from ...config import (
     get_agent_pattern_for_execution_mode,
-    get_agent_runtime,
     get_default_task_execution_mode,
     get_external_upload_dirs,
     get_uploads_dir,
@@ -1786,9 +1785,7 @@ async def handle_chat_message(
                             title=task_title,
                             description=user_message,
                             status=TaskStatus.PENDING,  # Use PENDING instead of RUNNING
-                            execution_mode=get_default_task_execution_mode(
-                                agent_runtime=get_agent_runtime()
-                            ),
+                            execution_mode=get_default_task_execution_mode(),
                         )
                         db.add(task)
                         db.commit()
@@ -3486,7 +3483,6 @@ clarification questions as plain assistant text.
                     create_kb_file_tool,
                 ],
                 pattern="react",
-                agent_runtime="v2",
                 id=builder_task_id,
                 enable_workspace=True,
                 workspace_base_dir=str(get_uploads_dir() / "builder_chat"),

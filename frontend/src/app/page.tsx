@@ -65,7 +65,7 @@ export default function Home() {
       try {
         const [templatesRes, tasksRes] = await Promise.all([
           apiRequest(`${getApiUrl()}/api/templates/?lang=${locale}`),
-          apiRequest(`${getApiUrl()}/api/chat/tasks?exclude_agent_type=text2sql&page=1&per_page=5`)
+          apiRequest(`${getApiUrl()}/api/chat/tasks?page=1&per_page=5`)
         ]);
 
         if (templatesRes.ok) {

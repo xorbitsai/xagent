@@ -7,7 +7,6 @@ import tempfile
 from typing import Any, Dict, List, Optional
 from unittest.mock import MagicMock
 
-from xagent.core.agent.context import AgentContext
 from xagent.core.agent.trace import (
     ACTION_END_LLM,
     ACTION_END_TOOL,
@@ -414,7 +413,6 @@ def create_test_components():
     llm = SharedMockLLM()
     memory = SharedDummyMemoryStore()
     tools = [SharedMockWeatherTool(), SharedMockAnalysisTool()]
-    context = AgentContext()
     tracer = create_test_tracer()
     # Create a temporary workspace for testing
     temp_dir = tempfile.mkdtemp()
@@ -424,7 +422,6 @@ def create_test_components():
         "llm": llm,
         "memory": memory,
         "tools": tools,
-        "context": context,
         "tracer": tracer,
         "workspace": workspace,
         "temp_dir": temp_dir,

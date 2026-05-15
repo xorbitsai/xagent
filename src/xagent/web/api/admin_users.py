@@ -65,13 +65,9 @@ async def delete_user(
 
     # Delete related data in correct order to respect foreign key constraints
     from ..models.mcp import UserMCPServer
-    from ..models.text2sql import Text2SQLDatabase
 
     # Delete user's tasks
     db.query(Task).filter(Task.user_id == user_id).delete()
-
-    # Delete user's Text2SQL databases
-    db.query(Text2SQLDatabase).filter(Text2SQLDatabase.user_id == user_id).delete()
 
     # Delete user's MCP server associations (not the servers themselves)
     db.query(UserMCPServer).filter(UserMCPServer.user_id == user_id).delete()

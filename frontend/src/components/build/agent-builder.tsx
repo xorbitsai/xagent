@@ -425,8 +425,10 @@ export function AgentBuilder({ agentId }: AgentBuilderProps) {
                 timestamp: Date.now()
               }])
             } else if (message.type === 'task_paused') {
+              setIsChatLoading(false)
               setTaskStatus('paused')
             } else if (message.type === 'task_resumed') {
+              setIsChatLoading(true)
               setTaskStatus('running')
             } else if (message.type === 'trace_event') {
               // Collect trace events and steps
@@ -448,6 +450,17 @@ export function AgentBuilder({ agentId }: AgentBuilderProps) {
                 return prev
               })
             } else if (message.type === 'task_completed') {
+              const completionText = typeof message.result === 'string'
+                ? message.result
+                : message.result?.content || ""
+              const interruptedByPause =
+                message.success === false &&
+                completionText === "ReActPattern interrupted."
+
+              if (interruptedByPause) {
+                return
+              }
+
               setIsChatLoading(false)
               setTaskStatus('idle')
               setMessages(prev => {
@@ -456,7 +469,7 @@ export function AgentBuilder({ agentId }: AgentBuilderProps) {
                 if (lastMsg && lastMsg.role === 'assistant') {
                   newMessages[newMessages.length - 1] = {
                     ...lastMsg,
-                    content: message.result || message.output || "Preview completed"
+                    content: completionText || message.output || "Preview completed"
                   }
                   return newMessages
                 }

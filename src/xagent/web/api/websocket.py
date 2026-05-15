@@ -3678,6 +3678,8 @@ async def websocket_build_preview_endpoint(
                     and not websocket.state.preview_task.done()
                 ):
                     websocket.state.preview_task.cancel()
+                websocket.state.preview_pause_requested = False
+                websocket.state.preview_checkpoint_store = {}
 
                 # Run execution in background task to not block message receiving
                 websocket.state.preview_task = asyncio.create_task(
@@ -3691,6 +3693,7 @@ async def websocket_build_preview_endpoint(
                     if hasattr(
                         websocket.state.preview_agent_service, "pause_execution"
                     ):
+                        websocket.state.preview_pause_requested = True
                         await websocket.state.preview_agent_service.pause_execution()
                         await websocket.send_text(
                             json.dumps(
@@ -3715,10 +3718,47 @@ async def websocket_build_preview_endpoint(
                     hasattr(websocket.state, "preview_agent_service")
                     and websocket.state.preview_agent_service
                 ):
-                    if hasattr(
-                        websocket.state.preview_agent_service, "resume_execution"
+                    agent_service = websocket.state.preview_agent_service
+                    execution_id = (
+                        getattr(websocket.state, "preview_execution_id", None)
+                        or getattr(agent_service, "_current_task_id", None)
+                        or getattr(agent_service, "id", None)
+                    )
+                    if (
+                        getattr(agent_service, "supports_v2_control", None)
+                        and agent_service.supports_v2_control()
                     ):
-                        await websocket.state.preview_agent_service.resume_execution()
+                        if not execution_id:
+                            await websocket.send_text(
+                                json.dumps(
+                                    {
+                                        "type": "error",
+                                        "message": "No paused preview execution to resume",
+                                    }
+                                )
+                            )
+                            continue
+                        checkpoint_store = getattr(
+                            websocket.state, "preview_checkpoint_store", {}
+                        )
+                        if not checkpoint_store.get(str(execution_id)):
+                            await websocket.send_text(
+                                json.dumps(
+                                    {
+                                        "type": "error",
+                                        "message": "No resumable preview checkpoint found",
+                                    }
+                                )
+                            )
+                            continue
+                        websocket.state.preview_pause_requested = False
+                        websocket.state.preview_task = asyncio.create_task(
+                            handle_build_preview_resume_execution(
+                                websocket, user, str(execution_id)
+                            )
+                        )
+                    elif hasattr(agent_service, "resume_execution"):
+                        await agent_service.resume_execution()
                         await websocket.send_text(
                             json.dumps(
                                 {
@@ -3742,6 +3782,8 @@ async def websocket_build_preview_endpoint(
                     websocket.state.preview_memory.clear()
                 if hasattr(websocket.state, "preview_history"):
                     websocket.state.preview_history = []
+                if hasattr(websocket.state, "preview_checkpoint_store"):
+                    websocket.state.preview_checkpoint_store = {}
                 await websocket.send_text(
                     json.dumps(
                         {
@@ -3767,6 +3809,95 @@ async def websocket_build_preview_endpoint(
         logger.error(f"Connection error in build preview WebSocket: {e}")
     except Exception as e:
         logger.error(f"Unexpected error in build preview WebSocket: {e}")
+
+
+async def handle_build_preview_resume_execution(
+    websocket: WebSocket,
+    user: User,
+    execution_id: str,
+) -> None:
+    """Resume a paused build preview execution for agent_v2 runtimes."""
+    try:
+        agent_service = getattr(websocket.state, "preview_agent_service", None)
+        if agent_service is None:
+            await websocket.send_text(
+                json.dumps(
+                    {
+                        "type": "error",
+                        "message": "No active agent to resume",
+                    }
+                )
+            )
+            return
+
+        await websocket.send_text(
+            json.dumps(
+                {
+                    "type": "task_resumed",
+                    "timestamp": datetime.now(timezone.utc).timestamp(),
+                }
+            )
+        )
+
+        with UserContext(int(user.id)):
+            result = await agent_service.resume_v2_execution(str(execution_id))
+
+        if result is None:
+            await websocket.send_text(
+                json.dumps(
+                    {
+                        "type": "error",
+                        "message": "No resumable preview execution found",
+                    }
+                )
+            )
+            return
+
+        result_status = str(result.get("status") or "")
+        if result_status == "interrupted":
+            await websocket.send_text(
+                json.dumps(
+                    {
+                        "type": "task_paused",
+                        "timestamp": datetime.now(timezone.utc).timestamp(),
+                    }
+                )
+            )
+            logger.info("Build preview %s paused again during resume", execution_id)
+            return
+
+        assistant_output = result.get("output", "")
+        if hasattr(websocket.state, "preview_history") and assistant_output:
+            websocket.state.preview_history.append(
+                {"role": "assistant", "content": assistant_output}
+            )
+
+        await websocket.send_text(
+            json.dumps(
+                {
+                    "type": "task_completed",
+                    "result": assistant_output,
+                    "success": result.get("success", False),
+                    "chat_response": result.get("chat_response"),
+                    "timestamp": datetime.now(timezone.utc).timestamp(),
+                }
+            )
+        )
+        logger.info("Build preview %s resumed and completed", execution_id)
+    except Exception as e:
+        logger.error(f"Error resuming build preview {execution_id}: {e}", exc_info=True)
+        try:
+            await websocket.send_text(
+                json.dumps(
+                    {
+                        "type": "task_error",
+                        "error": str(e),
+                        "timestamp": datetime.now(timezone.utc).timestamp(),
+                    }
+                )
+            )
+        except Exception:
+            pass
 
 
 async def handle_build_preview_execution(
@@ -3807,12 +3938,14 @@ async def handle_build_preview_execution(
 
     # Generate temporary task_id
     preview_task_id = f"build_preview_{uuid.uuid4().hex[:8]}"
+    websocket.state.preview_execution_id = preview_task_id
 
     preview_tracer = create_ephemeral_tracer(
         task_id=preview_task_id,
         websocket_handler=SharedWebSocketTracer(
             websocket, preview_task_id, is_preview=True
         ),
+        checkpoint_store=getattr(websocket.state, "preview_checkpoint_store", None),
         user=user,
         is_preview=True,
     )
@@ -4231,6 +4364,20 @@ async def handle_build_preview_execution(
                 context=execution_context if execution_context else None,
                 task_id=preview_task_id,
             )
+
+        result_status = str(result.get("status") or "")
+        if result_status == "interrupted":
+            if not getattr(websocket.state, "preview_pause_requested", False):
+                await websocket.send_text(
+                    json.dumps(
+                        {
+                            "type": "task_paused",
+                            "timestamp": datetime.now(timezone.utc).timestamp(),
+                        }
+                    )
+                )
+            logger.info(f"Build preview {preview_task_id} paused")
+            return
 
         # Append the new interaction to the history
         websocket.state.preview_history.append(

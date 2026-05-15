@@ -21,6 +21,10 @@ function TaskHomePageContent() {
   const [files, setFiles] = useState<File[]>([]);
   const [agents, setAgents] = useState<AgentCard[]>([]);
   const [selectedAgents, setSelectedAgents] = useState<AgentCard[]>([]);
+  const [selectedAgentConfig, setSelectedAgentConfig] = useState<{
+    model?: string;
+    executionMode?: "flash" | "balanced" | "think";
+  }>();
   const branding = getBrandingFromEnv();
 
   // Clear state on mount to ensure we are in "new task" mode
@@ -52,6 +56,47 @@ function TaskHomePageContent() {
     };
     fetchAgents();
   }, []);
+
+  useEffect(() => {
+    let cancelled = false;
+
+    const fetchSelectedAgentConfig = async () => {
+      const selectedAgentId = Number(selectedAgents[0]?.id);
+      if (Number.isNaN(selectedAgentId)) {
+        setSelectedAgentConfig(undefined);
+        return;
+      }
+
+      try {
+        const response = await apiRequest(`${getApiUrl()}/api/agents/${selectedAgentId}`);
+        if (!response.ok) {
+          if (!cancelled) {
+            setSelectedAgentConfig(undefined);
+          }
+          return;
+        }
+
+        const data = await response.json();
+        if (!cancelled) {
+          setSelectedAgentConfig({
+            model: data?.models?.general,
+            executionMode: data?.execution_mode,
+          });
+        }
+      } catch (error) {
+        console.error("Failed to fetch selected agent config:", error);
+        if (!cancelled) {
+          setSelectedAgentConfig(undefined);
+        }
+      }
+    };
+
+    fetchSelectedAgentConfig();
+
+    return () => {
+      cancelled = true;
+    };
+  }, [selectedAgents]);
 
   const samplePrompts = useMemo(() => ([
     {
@@ -185,6 +230,8 @@ function TaskHomePageContent() {
             onInputChange={handleInputChange}
             onPromptSelect={handlePromptSelect}
             promptHighlightTerms={promptHighlightTerms}
+            readOnlyConfig={selectedAgents.length > 0}
+            taskConfig={selectedAgents.length > 0 ? selectedAgentConfig : undefined}
             showModeToggle={true}
             autoFocus={true}
             inputMinHeightClass="min-h-[200px]"

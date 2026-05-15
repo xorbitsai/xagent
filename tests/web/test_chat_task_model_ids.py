@@ -333,3 +333,41 @@ def test_task_create_skips_stale_user_default(test_db, user1_headers):
         assert data.get("model_id") == "admin-shared-fallback"
     finally:
         db.close()
+
+
+def test_task_create_rejects_agent_id_from_another_user(
+    test_db, user1_headers, user2_headers
+):
+    from xagent.web.models.agent import Agent, AgentStatus
+    from xagent.web.models.database import get_db
+    from xagent.web.models.user import User
+
+    db = next(get_db())
+    try:
+        user2 = db.query(User).filter(User.username == "user2").first()
+        assert user2 is not None
+
+        agent = Agent(
+            user_id=user2.id,
+            name="user2-private-agent",
+            description="private",
+            status=AgentStatus.DRAFT,
+        )
+        db.add(agent)
+        db.commit()
+        db.refresh(agent)
+
+        resp = client.post(
+            "/api/chat/task/create",
+            json={
+                "title": "agent-ownership-check",
+                "description": "desc",
+                "agent_id": agent.id,
+            },
+            headers=user1_headers,
+        )
+
+        assert resp.status_code == 404
+        assert resp.json()["detail"] == "Agent not found or access denied"
+    finally:
+        db.close()

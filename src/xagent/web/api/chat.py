@@ -498,7 +498,11 @@ class AgentServiceManager:
         if task.agent_id:
             from ..models.agent import AgentStatus
 
-            current_agent = db.query(Agent).filter(Agent.id == task.agent_id).first()
+            current_agent = (
+                db.query(Agent)
+                .filter(Agent.id == task.agent_id, Agent.user_id == task.user_id)
+                .first()
+            )
             if current_agent and current_agent.status == AgentStatus.PUBLISHED:
                 excluded_agent_id = int(current_agent.id)
                 logger.info(
@@ -729,16 +733,20 @@ class AgentServiceManager:
                     )
 
                     # Override with Agent Builder configuration if task.agent_id exists
-                    if task and task.agent_id and user:
+                    if task and task.agent_id:
                         agent = (
-                            db.query(Agent).filter(Agent.id == task.agent_id).first()
+                            db.query(Agent)
+                            .filter(
+                                Agent.id == task.agent_id, Agent.user_id == task.user_id
+                            )
+                            .first()
                         )
                         if agent:
                             logger.info(
                                 f"Task {task_id} using Agent Builder config: {agent.name}"
                             )
                             agent_config = self._load_agent_builder_config(
-                                agent, db, int(user.id)
+                                agent, db, int(task.user_id)
                             )
                             (
                                 task_llm,
@@ -802,7 +810,11 @@ class AgentServiceManager:
                     from ..models.agent import AgentStatus
 
                     current_agent = (
-                        db.query(Agent).filter(Agent.id == task.agent_id).first()
+                        db.query(Agent)
+                        .filter(
+                            Agent.id == task.agent_id, Agent.user_id == task.user_id
+                        )
+                        .first()
                     )
                     if current_agent and current_agent.status == AgentStatus.PUBLISHED:
                         excluded_agent_id = int(current_agent.id)
@@ -1517,7 +1529,10 @@ class AgentServiceManager:
                         if task.agent_id:
                             agent = (
                                 db.query(Agent)
-                                .filter(Agent.id == task.agent_id)
+                                .filter(
+                                    Agent.id == task.agent_id,
+                                    Agent.user_id == task.user_id,
+                                )
                                 .first()
                             )
                             if agent:
@@ -1702,8 +1717,6 @@ async def create_task(
 ) -> TaskCreateResponse:
     """Create new chat task"""
     try:
-        from ..models.agent import Agent as AgentModel
-
         # Build task description with file information
         task_description = request.description or ""
 
@@ -1852,31 +1865,36 @@ async def create_task(
 
             return defaults
 
-        llm_ids_to_use = request.llm_ids
-        if not llm_ids_to_use and request.agent_id:
-            # Fetch model configuration from agent
-            agent_db = (
-                db.query(AgentModel)
-                .filter(
-                    AgentModel.id == request.agent_id, AgentModel.user_id == user.id
-                )
+        selected_agent: Optional[Agent] = None
+        if request.agent_id:
+            selected_agent = (
+                db.query(Agent)
+                .filter(Agent.id == request.agent_id, Agent.user_id == user.id)
                 .first()
             )
-            if agent_db and agent_db.models:
-                agent_models = agent_db.models
-                # Agent Builder stores references that may be DB PKs; normalize to internal
-                # model_id only if the current user has access.
-                llm_ids_to_use = _normalize_llm_refs(
-                    [
-                        agent_models.get("general"),
-                        agent_models.get("small_fast"),
-                        agent_models.get("visual"),
-                        agent_models.get("compact"),
-                    ]
+            if not selected_agent:
+                raise HTTPException(
+                    status_code=404,
+                    detail="Agent not found or access denied",
                 )
-                logger.info(
-                    f"Using agent {request.agent_id} model configuration (llm_ids): {llm_ids_to_use}"
-                )
+
+        llm_ids_to_use = request.llm_ids
+        if not llm_ids_to_use and selected_agent and selected_agent.models:
+            # Fetch model configuration from agent
+            agent_models = selected_agent.models
+            # Agent Builder stores references that may be DB PKs; normalize to internal
+            # model_id only if the current user has access.
+            llm_ids_to_use = _normalize_llm_refs(
+                [
+                    agent_models.get("general"),
+                    agent_models.get("small_fast"),
+                    agent_models.get("visual"),
+                    agent_models.get("compact"),
+                ]
+            )
+            logger.info(
+                f"Using agent {request.agent_id} model configuration (llm_ids): {llm_ids_to_use}"
+            )
 
         # Normalize any refs (pk/model_name/model_id) to internal model_id strings,
         # but only if the current user has access to the model.

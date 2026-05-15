@@ -31,9 +31,13 @@ class EphemeralCheckpointTraceHandler(BaseTraceHandler):
         if data.get("checkpoint_type") != CHECKPOINT_TYPE:
             return
 
-        execution_id = str(
+        raw_id = (
             data.get("root_execution_id") or data.get("execution_id") or event.task_id
         )
+        if raw_id is None:
+            return
+
+        execution_id = str(raw_id)
         snapshot = data.get("snapshot")
         if not execution_id or not isinstance(snapshot, dict):
             return

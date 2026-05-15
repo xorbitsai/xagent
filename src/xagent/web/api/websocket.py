@@ -3719,16 +3719,18 @@ async def websocket_build_preview_endpoint(
                     and websocket.state.preview_agent_service
                 ):
                     agent_service = websocket.state.preview_agent_service
-                    execution_id = (
-                        getattr(websocket.state, "preview_execution_id", None)
-                        or getattr(agent_service, "_current_task_id", None)
-                        or getattr(agent_service, "id", None)
+                    execution_id = getattr(
+                        websocket.state, "preview_execution_id", None
                     )
+                    if execution_id is None:
+                        execution_id = getattr(agent_service, "_current_task_id", None)
+                    if execution_id is None:
+                        execution_id = getattr(agent_service, "id", None)
                     if (
                         getattr(agent_service, "supports_v2_control", None)
                         and agent_service.supports_v2_control()
                     ):
-                        if not execution_id:
+                        if execution_id is None:
                             await websocket.send_text(
                                 json.dumps(
                                     {
@@ -3751,6 +3753,16 @@ async def websocket_build_preview_endpoint(
                                 )
                             )
                             continue
+                        previous_task = getattr(websocket.state, "preview_task", None)
+                        if previous_task is not None and not previous_task.done():
+                            try:
+                                await previous_task
+                            except Exception as e:
+                                logger.warning(
+                                    "Previous preview task %s ended before resume: %s",
+                                    execution_id,
+                                    e,
+                                )
                         websocket.state.preview_pause_requested = False
                         websocket.state.preview_task = asyncio.create_task(
                             handle_build_preview_resume_execution(

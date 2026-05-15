@@ -3724,8 +3724,8 @@ async def websocket_build_preview_endpoint(
                     if execution_id is None:
                         execution_id = getattr(agent_service, "id", None)
                     if (
-                        getattr(agent_service, "supports_v2_control", None)
-                        and agent_service.supports_v2_control()
+                        getattr(agent_service, "supports_live_control", None)
+                        and agent_service.supports_live_control()
                     ):
                         if execution_id is None:
                             await websocket.send_text(
@@ -3827,7 +3827,7 @@ async def handle_build_preview_resume_execution(
     user: User,
     execution_id: str,
 ) -> None:
-    """Resume a paused build preview execution for agent_v2 runtimes."""
+    """Resume a paused build preview execution from its latest checkpoint."""
     try:
         agent_service = getattr(websocket.state, "preview_agent_service", None)
         if agent_service is None:
@@ -3851,7 +3851,7 @@ async def handle_build_preview_resume_execution(
         )
 
         with UserContext(int(user.id)):
-            result = await agent_service.resume_v2_execution(str(execution_id))
+            result = await agent_service.resume_execution_by_id(str(execution_id))
 
         if result is None:
             await websocket.send_text(

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from typing import Any, Optional
 
+from ..core.agent.checkpoint import CHECKPOINT_TYPE
 from ..core.agent.trace import (
     BaseTraceHandler,
     ConsoleTraceHandler,
@@ -13,7 +14,6 @@ from ..core.agent.trace import (
     TraceHandler,
     Tracer,
 )
-from ..core.agent_v2.checkpoint import CHECKPOINT_TYPE
 from ..core.tracing import create_agent_tracer
 from .api.trace_handlers import DatabaseTraceHandler
 from .models.user import User

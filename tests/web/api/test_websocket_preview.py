@@ -152,7 +152,7 @@ async def test_websocket_build_preview_endpoint_pause_resume():
     mock_websocket.state = MagicMock()
 
     mock_agent_service = AsyncMock()
-    mock_agent_service.supports_v2_control = MagicMock(return_value=False)
+    mock_agent_service.supports_live_control = MagicMock(return_value=False)
     mock_websocket.state.preview_agent_service = mock_agent_service
 
     mock_user = MagicMock(spec=User)

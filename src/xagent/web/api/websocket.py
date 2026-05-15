@@ -3680,6 +3680,7 @@ async def websocket_build_preview_endpoint(
                     websocket.state.preview_task.cancel()
                 websocket.state.preview_pause_requested = False
                 websocket.state.preview_checkpoint_store = {}
+                websocket.state.preview_pending_user_message = None
 
                 # Run execution in background task to not block message receiving
                 websocket.state.preview_task = asyncio.create_task(
@@ -3796,6 +3797,8 @@ async def websocket_build_preview_endpoint(
                     websocket.state.preview_history = []
                 if hasattr(websocket.state, "preview_checkpoint_store"):
                     websocket.state.preview_checkpoint_store = {}
+                if hasattr(websocket.state, "preview_pending_user_message"):
+                    websocket.state.preview_pending_user_message = None
                 await websocket.send_text(
                     json.dumps(
                         {
@@ -3879,10 +3882,16 @@ async def handle_build_preview_resume_execution(
             return
 
         assistant_output = result.get("output", "")
+        pending_user_message = getattr(
+            websocket.state, "preview_pending_user_message", None
+        )
+        if pending_user_message:
+            _append_preview_user_turn_if_needed(websocket, pending_user_message)
         if hasattr(websocket.state, "preview_history") and assistant_output:
             websocket.state.preview_history.append(
                 {"role": "assistant", "content": assistant_output}
             )
+        websocket.state.preview_pending_user_message = None
 
         await websocket.send_text(
             json.dumps(
@@ -3910,6 +3919,25 @@ async def handle_build_preview_resume_execution(
             )
         except Exception:
             pass
+
+
+def _append_preview_user_turn_if_needed(
+    websocket: WebSocket, user_message: str
+) -> None:
+    if not user_message:
+        return
+    if not hasattr(websocket.state, "preview_history"):
+        websocket.state.preview_history = []
+
+    history = websocket.state.preview_history
+    if (
+        history
+        and history[-1].get("role") == "user"
+        and history[-1].get("content") == user_message
+    ):
+        return
+
+    history.append({"role": "user", "content": user_message})
 
 
 async def handle_build_preview_execution(
@@ -4360,6 +4388,7 @@ async def handle_build_preview_execution(
                 user_message = f"{user_message}\n\n{file_prompt}"
             else:
                 user_message = file_prompt
+        websocket.state.preview_pending_user_message = user_message
 
         if uploaded_files:
             execution_context["uploaded_files"] = uploaded_files
@@ -4379,6 +4408,7 @@ async def handle_build_preview_execution(
 
         result_status = str(result.get("status") or "")
         if result_status == "interrupted":
+            _append_preview_user_turn_if_needed(websocket, user_message)
             if not getattr(websocket.state, "preview_pause_requested", False):
                 await websocket.send_text(
                     json.dumps(
@@ -4392,13 +4422,12 @@ async def handle_build_preview_execution(
             return
 
         # Append the new interaction to the history
-        websocket.state.preview_history.append(
-            {"role": "user", "content": user_message}
-        )
+        _append_preview_user_turn_if_needed(websocket, user_message)
         assistant_output = result.get("output", "")
         websocket.state.preview_history.append(
             {"role": "assistant", "content": assistant_output}
         )
+        websocket.state.preview_pending_user_message = None
 
         # Send preview completion event
         await websocket.send_text(

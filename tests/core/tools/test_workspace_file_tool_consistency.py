@@ -45,6 +45,15 @@ class TestWorkspaceFileToolConsistency:
         write_result = tools.write_file(test_filename, test_content)
         assert write_result["success"] is True
         assert isinstance(write_result.get("file_id"), str)
+        assert write_result["filename"] == test_filename
+        assert write_result["mime_type"] == "text/plain"
+        assert write_result["size"] == len(test_content)
+        assert write_result["preview_url"].endswith(write_result["file_id"])
+        assert write_result["download_url"].endswith(write_result["file_id"])
+        assert write_result["public_preview_url"].endswith(write_result["file_id"])
+        assert write_result["markdown_link"] == (
+            f"[{test_filename}](file:{write_result['file_id']})"
+        )
 
         # Verify file exists in output directory
         output_file = workspace.output_dir / test_filename
@@ -197,6 +206,66 @@ class TestWorkspaceFileToolConsistency:
 
         read_content = tools.read_file(f"file:{file_id}")
         assert read_content == test_content
+
+    @pytest.mark.usefixtures("mock_workspace_db")
+    def test_prepare_html_asset_copies_file_id_to_output_assets(self, tmp_path):
+        """Test that file_id assets get copied into the output HTML bundle."""
+        workspace = TaskWorkspace("test_task", str(tmp_path))
+        tools = WorkspaceFileTools(workspace)
+
+        source = tools.write_file("input/logo.png", "fake image")
+        result = tools.prepare_html_asset(source["file_id"])
+
+        assert result["success"] is True
+        assert result["source_file_id"] == source["file_id"]
+        assert isinstance(result["asset_file_id"], str)
+        assert result["html_src"] == "assets/logo.png"
+        assert result["filename"] == "logo.png"
+        assert result["mime_type"] == "image/png"
+        assert result["relative_path"] == "output/assets/logo.png"
+        assert (workspace.output_dir / "assets" / "logo.png").read_text() == (
+            "fake image"
+        )
+        assert tools.read_file(f"file:{result['asset_file_id']}") == "fake image"
+
+    @pytest.mark.usefixtures("mock_workspace_db")
+    def test_prepare_html_asset_accepts_file_link_prefix(self, tmp_path):
+        """Test that file:file_id references are accepted for HTML assets."""
+        workspace = TaskWorkspace("test_task", str(tmp_path))
+        tools = WorkspaceFileTools(workspace)
+
+        source = tools.write_file("input/photo.jpg", "fake jpg")
+        result = tools.prepare_html_asset(f"file:{source['file_id']}")
+
+        assert result["success"] is True
+        assert result["html_src"] == "assets/photo.jpg"
+        assert (workspace.output_dir / "assets" / "photo.jpg").exists()
+
+    @pytest.mark.usefixtures("mock_workspace_db")
+    def test_prepare_html_asset_sanitizes_alias(self, tmp_path):
+        """Test that aliases cannot escape the assets directory."""
+        workspace = TaskWorkspace("test_task", str(tmp_path))
+        tools = WorkspaceFileTools(workspace)
+
+        source = tools.write_file("input/logo.png", "fake image")
+        result = tools.prepare_html_asset(source["file_id"], alias="../../safe.png")
+
+        assert result["html_src"] == "assets/safe.png"
+        assert result["relative_path"] == "output/assets/safe.png"
+        assert (workspace.output_dir / "assets" / "safe.png").exists()
+        assert not (workspace.output_dir.parent / "safe.png").exists()
+
+    @pytest.mark.usefixtures("mock_workspace_db")
+    @pytest.mark.parametrize("assets_dir", ["/assets", "../assets", "assets/../../x"])
+    def test_prepare_html_asset_rejects_unsafe_assets_dir(self, tmp_path, assets_dir):
+        """Test that the assets directory must stay inside output."""
+        workspace = TaskWorkspace("test_task", str(tmp_path))
+        tools = WorkspaceFileTools(workspace)
+
+        source = tools.write_file("input/logo.png", "fake image")
+
+        with pytest.raises(ValueError, match="assets_dir must be a relative path"):
+            tools.prepare_html_asset(source["file_id"], assets_dir=assets_dir)
 
 
 if __name__ == "__main__":

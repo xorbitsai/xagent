@@ -32,6 +32,7 @@ from ...config import (
     get_uploads_dir,
 )
 from ...core.agent.trace import TraceEvent, TraceHandler
+from ...core.file_ref import FILE_REF_MODEL_INSTRUCTIONS, build_file_ref
 from ..auth_dependencies import get_user_from_websocket_token
 from ..models.database import get_db
 from ..models.task import Task, TaskStatus
@@ -170,6 +171,8 @@ def _build_uploaded_files_context(
         "## UPLOADED FILES",
         "The user has uploaded file(s) for this turn. Use these exact file_id values:",
         *file_summaries,
+        "",
+        FILE_REF_MODEL_INSTRUCTIONS,
     ]
     if is_agent_builder:
         joined_file_ids = ", ".join(f'"{file_id}"' for file_id in file_ids)
@@ -643,7 +646,7 @@ def _normalize_file_outputs(
     task_id: int,
     task_user_id: int,
     file_outputs: Any,
-) -> tuple[list[Dict[str, str]], Dict[str, str]]:
+) -> tuple[list[Dict[str, Any]], Dict[str, str]]:
     from ..models.uploaded_file import UploadedFile
 
     if isinstance(file_outputs, str):
@@ -651,7 +654,7 @@ def _normalize_file_outputs(
     if not isinstance(file_outputs, list):
         return [], {}
 
-    normalized_outputs: list[Dict[str, str]] = []
+    normalized_outputs: list[Dict[str, Any]] = []
     path_to_file_id: Dict[str, str] = {}
     changed = False
 
@@ -683,10 +686,10 @@ def _normalize_file_outputs(
         if resolved_info is None:
             if item_file_id:
                 normalized_outputs.append(
-                    {
-                        "file_id": item_file_id,
-                        "filename": item_filename or "output",
-                    }
+                    build_file_ref(
+                        file_id=item_file_id,
+                        filename=item_filename or "output",
+                    )
                 )
             continue
 
@@ -729,10 +732,12 @@ def _normalize_file_outputs(
             path_to_file_id[item_file_id] = final_file_id
 
         normalized_outputs.append(
-            {
-                "file_id": final_file_id,
-                "filename": final_filename,
-            }
+            build_file_ref(
+                file_id=final_file_id,
+                filename=final_filename,
+                mime_type=getattr(file_record, "mime_type", None),
+                size=getattr(file_record, "file_size", None),
+            )
         )
 
         for raw_path in raw_paths:
@@ -2042,6 +2047,7 @@ async def handle_chat_message(
                         file_prompt = (
                             "## UPLOADED FILES\n"
                             f"The user has uploaded {len(file_info_list)} file(s): {file_names}\n\n"
+                            f"{FILE_REF_MODEL_INSTRUCTIONS}\n\n"
                         )
 
                         if is_agent_builder:
@@ -3446,6 +3452,7 @@ async def handle_builder_chat(
             if file_ids:
                 user_message += (
                     f"\n\n[Uploaded file_ids: {file_ids}. "
+                    "Use file_id as the canonical file handle and do not guess storage paths. "
                     "Please call `create_knowledge_base_from_file` with these file_ids immediately, "
                     "then create or update the agent with the resulting collection_name.]"
                 )

@@ -61,6 +61,15 @@ class WorkspaceFileTools(WorkspaceFileOperations):
             raise ValueError("content is required")
         return self.inner.write_file(file_path, content, encoding, create_dirs)
 
+    def prepare_html_asset(
+        self,
+        file_id: str,
+        alias: str | None = None,
+        assets_dir: str = "assets",
+    ) -> Dict[str, Any]:
+        """Copy a file_id-referenced asset into the current output bundle."""
+        return self.inner.prepare_html_asset(file_id, alias, assets_dir)
+
     def append_file(
         self,
         file_path: str,
@@ -162,7 +171,12 @@ class WorkspaceFileTools(WorkspaceFileOperations):
             FileTool(
                 self.write_file,
                 name="write_file",
-                description="Write file content in workspace. Use relative paths (e.g., 'filename.txt'), not absolute paths.\n\nImportant: For HTML files, when referencing resources in the same directory (CSS, JS, images), only use filenames (e.g., '1.png'), not absolute paths (e.g., '/uploads/xxx/1.png'). All files are in the workspace, and browsers will automatically resolve relative paths.",
+                description="Write file content in workspace. Use relative paths (e.g., 'filename.txt'), not absolute paths. Returns a FileRef with file_id, preview_url, download_url, and markdown_link.\n\nImportant: For HTML files, do not guess paths to uploaded files or files from other tasks. First call prepare_html_asset(file_id, alias) for every external image/CSS/JS asset, then use the returned html_src in the HTML.",
+            ),
+            FileTool(
+                self.prepare_html_asset,
+                name="prepare_html_asset",
+                description="Prepare an uploaded or registered file for use inside an HTML artifact. Pass the source file_id and an optional alias such as 'logo.png'. The tool copies the asset into the current output/assets bundle and returns html_src (for example 'assets/logo.png'). Use html_src in <img src>, <link href>, <script src>, or CSS url(). Do not compute ../ paths yourself.",
             ),
             FileTool(
                 self.append_file,

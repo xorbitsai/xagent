@@ -7,6 +7,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from typing import Any, Dict, List, Optional
 
+from ...file_ref import FILE_REF_MODEL_INSTRUCTIONS
 from ...model.chat.basic.base import BaseLLM
 from ..trace import Tracer, trace_compact_end, trace_compact_start
 from .compact import CompactConfig, CompactUtils
@@ -127,7 +128,11 @@ class ContextBuilder:
             file_list_str = "\n".join(file_list_lines)
 
             # Build content message that supports both generic file processing and KB creation
-            content_msg = f"## UPLOADED FILES: {len(file_info)} files available for processing:\n{file_list_str}\n\n"
+            content_msg = (
+                f"## UPLOADED FILES: {len(file_info)} files available for processing:\n"
+                f"{file_list_str}\n\n"
+                f"{FILE_REF_MODEL_INSTRUCTIONS}\n\n"
+            )
 
             if is_builder_context:
                 content_msg += (

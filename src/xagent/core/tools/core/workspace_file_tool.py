@@ -8,12 +8,14 @@ It focuses on pure file operations without tool framework dependencies.
 import asyncio
 import csv
 import logging
+import shutil
 import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Union
 
 from pydantic import BaseModel
 
+from ...file_ref import build_file_ref, safe_asset_filename
 from ...workspace import TaskWorkspace
 from .document_parser import DocumentCapabilities, DocumentParseArgs, parse_document
 from .file_tool import EditOperation, EditResult, get_image_metadata
@@ -310,13 +312,86 @@ class WorkspaceFileOperations:
         # Use resolved workspace_dir so relative_to works on macOS where
         # /var can be symlink to /private/var (resolved_path has /private, raw dir may not).
         workspace_root = self.workspace.workspace_dir.resolve()
+        file_ref = build_file_ref(
+            file_id=file_id,
+            filename=resolved_path.name,
+            size=resolved_path.stat().st_size,
+        )
         return {
             "success": True,
-            "file_id": file_id,
-            "filename": resolved_path.name,
+            **file_ref,
             "relative_path": str(resolved_path.relative_to(workspace_root)),
             "file_path": str(resolved_path),
         }
+
+    def prepare_html_asset(
+        self,
+        file_id: str,
+        alias: str | None = None,
+        assets_dir: str = "assets",
+    ) -> Dict[str, Any]:
+        """Copy an existing file into output/assets and return the HTML src."""
+        source_ref = self._normalize_file_ref(file_id)
+        source_path = self.workspace.resolve_path_with_search(source_ref)
+        if not source_path.exists() or not source_path.is_file():
+            raise FileNotFoundError(f"File not found: {file_id}")
+
+        assets_path = Path(assets_dir)
+        if assets_path.is_absolute() or ".." in assets_path.parts:
+            raise ValueError("assets_dir must be a relative path inside output")
+
+        asset_name = safe_asset_filename(alias or source_path.name)
+        target_dir = self._resolve_path(str(assets_path), "output")
+        target_dir.mkdir(parents=True, exist_ok=True)
+        target_path = self._build_unique_asset_path(target_dir / asset_name)
+
+        with self.workspace.auto_register_files():
+            shutil.copy2(source_path, target_path)
+
+        asset_file_id = self.workspace.get_file_id_from_path(str(target_path))
+        if not asset_file_id:
+            asset_file_id = self.workspace.register_file(str(target_path))
+
+        output_root = self.workspace.output_dir.resolve()
+        workspace_root = self.workspace.workspace_dir.resolve()
+        html_src = target_path.resolve().relative_to(output_root).as_posix()
+        file_ref = build_file_ref(
+            file_id=asset_file_id,
+            filename=target_path.name,
+            size=target_path.stat().st_size,
+        )
+        return {
+            "success": True,
+            "source_file_id": source_ref,
+            "asset_file_id": asset_file_id,
+            "html_src": html_src,
+            **file_ref,
+            "relative_path": str(target_path.resolve().relative_to(workspace_root)),
+            "file_path": str(target_path.resolve()),
+        }
+
+    @staticmethod
+    def _normalize_file_ref(file_ref: str) -> str:
+        value = str(file_ref).strip()
+        if value.startswith("file://"):
+            return value[7:]
+        if value.startswith("file:"):
+            return value[5:]
+        return value
+
+    @staticmethod
+    def _build_unique_asset_path(path: Path) -> Path:
+        if not path.exists():
+            return path
+        stem = path.stem
+        suffix = path.suffix
+        parent = path.parent
+        index = 1
+        while True:
+            candidate = parent / f"{stem}_{index}{suffix}"
+            if not candidate.exists():
+                return candidate
+            index += 1
 
     def append_file(
         self,

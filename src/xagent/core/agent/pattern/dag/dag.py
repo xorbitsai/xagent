@@ -12,6 +12,7 @@ from ...context.enrichment import (
     latest_user_text,
 )
 from ...frame import ExecutionFrame, ExecutionSnapshot, ExecutionStatus
+from ...result import unwrap_final_answer_content
 from ...runtime import LLMCallInterrupted, PatternRuntime
 from ..base import AgentPattern, PatternResult
 from ..react import ReActPattern, ReActReasoningMode
@@ -719,16 +720,22 @@ class DAGPattern(AgentPattern):
                 metadata={
                     "kind": "dag_step_instruction",
                     "dag_step_id": step.id,
+                    "dag_completion_evidence": step.completion_evidence or "",
                 },
             )
 
+        finalize_after_tool_result = bool(
+            step.completion_evidence and len(step.tool_names) == 1
+        )
         react_pattern = ReActPattern(
             max_iterations=self.react_max_iterations,
             reasoning_mode=self.react_reasoning_mode,
+            finalize_after_tool_result=finalize_after_tool_result,
         )
         active_pattern_state = self.active_step_pattern_states.get(step.id)
         if active_pattern_state is not None:
             react_pattern.load_state(active_pattern_state)
+            react_pattern.finalize_after_tool_result = finalize_after_tool_result
 
         step_runtime = _DAGStepRuntime(
             parent=runtime,
@@ -1051,7 +1058,7 @@ class DAGPattern(AgentPattern):
 
     def _display_output(self, result: Any) -> str:
         if isinstance(result, str):
-            return result
+            return unwrap_final_answer_content(result)
         return json.dumps(result, ensure_ascii=False, indent=2, default=str)
 
     def _terminal_steps(self) -> list[PlanStep]:
@@ -1085,6 +1092,7 @@ class DAGPattern(AgentPattern):
             step.termination_condition
             or "Return final_answer when the current step description is satisfied."
         )
+        completion_evidence = step.completion_evidence or "(none)"
         return (
             "DAG STEP EXECUTION BOUNDARY\n"
             "The overall user goal is background context only. Do not execute it "
@@ -1098,6 +1106,7 @@ class DAGPattern(AgentPattern):
             f"Suggested tools for this step: {suggested_tools}\n\n"
             "TERMINATION CONDITION - AUTHORITATIVE STOP RULE\n"
             f"{termination_condition}\n"
+            f"Completion evidence: {completion_evidence}\n"
             "Treat this termination condition as authoritative for this step. "
             "Once it is satisfied, your next action must be final_answer for this "
             "step. Do not inspect, verify, revise, optimize, regenerate, or perform "

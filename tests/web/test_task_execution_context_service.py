@@ -10,6 +10,7 @@ from xagent.web.models.user import User
 from xagent.web.services.task_execution_context_service import (
     load_task_execution_context_messages,
     load_task_execution_recovery_state,
+    summarize_execution_failure_event,
     summarize_tool_event,
 )
 
@@ -93,6 +94,95 @@ def test_summarize_tool_event_uses_generic_fallback_for_unknown_tools():
     assert summary is not None
     assert summary.startswith("- Tool web_search previously returned: ")
     assert "top_result" in summary
+
+
+def test_summarize_tool_event_omits_binary_payloads():
+    summary = summarize_tool_event(
+        {
+            "tool_name": "read_file",
+            "success": True,
+            "tool_params": {"file_path": "logo.png"},
+            "result": "\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR" + ("\x80" * 100),
+        }
+    )
+
+    assert summary is not None
+    assert "non-text payload omitted" in summary
+    assert "logo.png" in summary
+    assert "PNG" not in summary
+    assert "IHDR" not in summary
+
+
+def test_summarize_tool_event_compacts_nested_large_strings():
+    summary = summarize_tool_event(
+        {
+            "tool_name": "write_file",
+            "success": True,
+            "result": {
+                "success": True,
+                "file_path": "/tmp/report.html",
+                "content": "<html>" + ("a" * 300) + "</html>",
+            },
+        }
+    )
+
+    assert summary is not None
+    assert "/tmp/report.html" in summary
+    assert "a" * 200 not in summary
+
+
+def test_summarize_execution_failure_event_includes_step_anchor():
+    summary = summarize_execution_failure_event(
+        {
+            "status": "failed",
+            "result": {
+                "success": False,
+                "error": "Gemini SDK API error: connection reset by peer",
+                "failure_reason": "step_failed",
+                "failed_step_id": "write_html",
+            },
+        }
+    )
+
+    assert summary is not None
+    assert "step=write_html" in summary
+    assert "reason=step_failed" in summary
+    assert "connection reset" in summary
+
+
+def test_load_task_execution_context_messages_includes_latest_failure_anchor():
+    db_session = _create_db_session()
+    try:
+        task = _create_task(db_session)
+        db_session.add(
+            TraceEvent(
+                task_id=int(task.id),
+                build_id=None,
+                event_id="failure-event-1",
+                event_type="dag_execute_end",
+                timestamp=datetime.now(timezone.utc),
+                step_id=str(task.id),
+                parent_event_id=None,
+                data={
+                    "status": "failed",
+                    "result": {
+                        "success": False,
+                        "error": "network reset",
+                        "failure_reason": "step_failed",
+                        "failed_step_id": "render_poster",
+                    },
+                },
+            )
+        )
+        db_session.commit()
+
+        messages = load_task_execution_context_messages(db_session, int(task.id))
+
+        assert len(messages) == 1
+        assert "Previous execution failed" in messages[0]["content"]
+        assert "step=render_poster" in messages[0]["content"]
+    finally:
+        db_session.close()
 
 
 @pytest.mark.asyncio

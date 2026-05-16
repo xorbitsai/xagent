@@ -677,3 +677,39 @@ async def test_trace_callback_does_not_emit_completion_for_interrupted_run(
     event_types = [event["event_type"] for event in tracer.events]
     assert event_types == ["task_start_message"]
     assert "task_end_general" not in event_types
+
+
+@pytest.mark.asyncio
+async def test_trace_callback_unwraps_final_answer_and_omits_success_context(
+    tmp_path: Path,
+) -> None:
+    tracer = RecordingTraceEventTracer()
+    agent = Agent(
+        name="writer",
+        patterns=[
+            FakePattern(
+                {
+                    "success": True,
+                    "output": (
+                        '```json\n{"action":"final_answer",'
+                        '"action_input":"Done cleanly."}\n```'
+                    ),
+                }
+            )
+        ],
+    )
+    runner = AgentRunner(
+        agent=agent,
+        tracer=tracer,
+        callbacks=[TraceEventCallback()],
+        workspace_manager=FakeWorkspaceManager(tmp_path),
+    )
+
+    result = await runner.run(task="Finish", execution_id="exec-success")
+
+    assert result["output"] == "Done cleanly."
+    ai_event = next(
+        event for event in tracer.events if event["event_type"] == "task_end_message"
+    )
+    assert ai_event["data"]["content"] == "Done cleanly."
+    assert "context" not in ai_event["data"]

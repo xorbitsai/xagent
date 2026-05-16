@@ -230,6 +230,9 @@ def test_plan_step_serializes_termination_condition() -> None:
         termination_condition=(
             "Stop after output/poster.html has been successfully written once."
         ),
+        completion_evidence=(
+            "The writer returned success=true for the requested output path."
+        ),
         tool_names=["write_file"],
     )
 
@@ -239,6 +242,10 @@ def test_plan_step_serializes_termination_condition() -> None:
         "Stop after output/poster.html has been successfully written once."
     )
     assert restored.to_dict()["termination_condition"] == restored.termination_condition
+    assert restored.completion_evidence == (
+        "The writer returned success=true for the requested output path."
+    )
+    assert restored.to_dict()["completion_evidence"] == restored.completion_evidence
 
 
 @pytest.mark.asyncio
@@ -845,13 +852,23 @@ async def test_llm_plan_generator_builds_plan_from_model_json() -> None:
     llm = PlanLLM(
         plan_tool_response(
             [
-                {"id": "draft", "task": "Draft answer"},
+                {
+                    "id": "draft",
+                    "task": "Draft answer",
+                    "dependencies": [],
+                    "termination_condition": "Stop after the draft is written.",
+                    "completion_evidence": "The draft has been returned in final_answer.",
+                    "tool_names": [],
+                },
                 {
                     "id": "final",
                     "task": "Finalize answer",
                     "description": "Write the final answer from the draft.",
                     "termination_condition": (
                         "Stop after the final answer has been written once."
+                    ),
+                    "completion_evidence": (
+                        "The final answer has been returned successfully."
                     ),
                     "tool_names": ["calculator"],
                     "dependencies": ["draft"],
@@ -883,6 +900,7 @@ async def test_llm_plan_generator_builds_plan_from_model_json() -> None:
     ]["items"]["properties"]
     assert "description" in step_schema
     assert "termination_condition" in step_schema
+    assert "completion_evidence" in step_schema
     assert "tool_names" in step_schema
     assert "dependencies" in step_schema
     step_required = llm.calls[0]["tools"][0]["function"]["parameters"]["properties"][
@@ -890,11 +908,14 @@ async def test_llm_plan_generator_builds_plan_from_model_json() -> None:
     ]["items"]["required"]
     assert "dependencies" in step_required
     assert "termination_condition" in step_required
+    assert "completion_evidence" in step_required
     assert "tool_names" in step_required
     system_prompt = llm.calls[0]["messages"][0]["content"]
     assert "dependencies is required for every step" in system_prompt
     assert "screenshot or render steps must depend" in system_prompt
     assert '"termination_condition"' in system_prompt
+    assert '"completion_evidence"' in system_prompt
+    assert "Few-shot examples" in system_prompt
     assert "must be concrete and action-specific" in system_prompt
     assert "suggested execution tool scope" in system_prompt
     assert llm.calls[0]["tool_choice"] == "required"

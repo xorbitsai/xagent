@@ -24,6 +24,11 @@ class CalculatorArgs(BaseModel):
     expression: str
 
 
+class WriteFileArgs(BaseModel):
+    file_path: str
+    content: str
+
+
 class FakeTool:
     def __init__(self) -> None:
         self.calls: list[dict[str, Any]] = []
@@ -41,6 +46,30 @@ class FakeTool:
         self.calls.append(args)
         expression = args["expression"]
         return {"result": eval(expression), "expression": expression}  # noqa: S307
+
+
+class FakeWriteFileTool:
+    def __init__(self) -> None:
+        self.calls: list[dict[str, Any]] = []
+
+        class Metadata:
+            name = "write_file"
+            description = "Write file content in workspace."
+
+        self.metadata = Metadata()
+
+    def args_type(self) -> type[BaseModel]:
+        return WriteFileArgs
+
+    async def run_json_async(self, args: dict[str, Any]) -> Any:
+        self.calls.append(args)
+        path = args["file_path"]
+        return {
+            "success": True,
+            "filename": path.split("/")[-1],
+            "relative_path": f"output/{path.split('/')[-1]}",
+            "file_path": f"/workspace/output/{path.split('/')[-1]}",
+        }
 
 
 class BrokenTool:
@@ -266,6 +295,72 @@ async def test_react_pattern_runs_tool_call_then_final_answer() -> None:
     assert "use this date when forming search queries" in system_prompt
     assert "not supported by the conversation" in system_prompt
     assert "available context is insufficient" in system_prompt
+
+
+@pytest.mark.asyncio
+async def test_react_pattern_unwraps_textual_final_answer_json() -> None:
+    llm = FakeLLM(
+        responses=[
+            '```json\n{"action":"final_answer","action_input":"Done cleanly."}\n```'
+        ]
+    )
+    pattern = ReActPattern(max_iterations=1)
+    context = ExecutionContext()
+    context.add_user_message("Finish")
+
+    result = await pattern.run(context=context, tools=[], llm=llm)
+
+    assert result["success"] is True
+    assert result["response"] == "Done cleanly."
+    assert context.messages[-1].content == "Done cleanly."
+    assert "action_input" not in context.messages[-1].content
+
+
+@pytest.mark.asyncio
+async def test_react_pattern_finalizes_with_completion_evidence() -> None:
+    llm = FakeLLM(
+        responses=[
+            {
+                "content": "",
+                "tool_calls": [
+                    {
+                        "id": "call_write",
+                        "function": {
+                            "name": "write_file",
+                            "arguments": (
+                                '{"file_path":"en_poster.html","content":"<html></html>"}'
+                            ),
+                        },
+                    }
+                ],
+                "done": False,
+            },
+            {"content": "Created output/en_poster.html."},
+        ]
+    )
+    pattern = ReActPattern(max_iterations=3, finalize_after_tool_result=True)
+    tool = FakeWriteFileTool()
+    context = ExecutionContext(system_prompt="You are helpful.")
+    context.add_user_message(
+        "Create the English poster HTML.",
+        metadata={
+            "dag_completion_evidence": (
+                "The writer returned success=true for the requested output path."
+            )
+        },
+    )
+
+    result = await pattern.run(context=context, tools=[tool], llm=llm)
+
+    assert result["success"] is True
+    assert result["response"] == "Created output/en_poster.html."
+    assert tool.calls == [{"file_path": "en_poster.html", "content": "<html></html>"}]
+    assert llm.calls[1]["tools"] is None
+    assert (
+        "Step completion evidence: The writer returned success=true"
+        in (llm.calls[1]["messages"][0]["content"])
+    )
+    assert "Do not repeat the same work" in llm.calls[1]["messages"][0]["content"]
 
 
 @pytest.mark.asyncio

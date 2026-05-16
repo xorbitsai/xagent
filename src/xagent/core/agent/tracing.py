@@ -51,11 +51,10 @@ class TraceEventCallback:
         )
         status = str(result.get("status") or "")
         output = extract_assistant_message(result)
-        data = {
+        data: dict[str, Any] = {
             "execution_id": execution_id,
             "status": status or ("completed" if result.get("success") else "failed"),
             "pattern": result.get("pattern"),
-            "context": self._context_payload(context),
         }
 
         if result.get("success"):
@@ -85,7 +84,7 @@ class TraceEventCallback:
             execution_id,
             error_type="agent_error",
             error_message=str(result.get("error") or "agent execution failed"),
-            data=data,
+            data={**data, "context": self._context_payload(context)},
         )
 
     def _context_payload(self, context: Any) -> dict[str, Any] | None:

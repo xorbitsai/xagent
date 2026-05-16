@@ -14,6 +14,7 @@ from ...context.enrichment import (
     generate_and_store_react_memory,
     latest_user_text,
 )
+from ...result import unwrap_final_answer_content
 from ...runtime import LLMCallInterrupted, PatternRuntime
 from ..base import AgentPattern, PatternResult
 
@@ -260,7 +261,12 @@ class ReActPattern(AgentPattern):
                 self.status = "thinking"
                 continue
 
-            tool_schemas = [] if self.force_final_answer_next else base_tool_schemas
+            force_final_answer_now = self.force_final_answer_next or (
+                self.finalize_after_tool_result
+                and not self.pending_tool_calls
+                and self._latest_tool_result_success(context)
+            )
+            tool_schemas = [] if force_final_answer_now else base_tool_schemas
             interrupted = await self._interrupt_if_requested(
                 runtime=runtime,
                 context=context,
@@ -278,7 +284,7 @@ class ReActPattern(AgentPattern):
             messages = self._messages_for_llm(
                 context,
                 has_tools=bool(tool_schemas),
-                force_final_answer=self.force_final_answer_next,
+                force_final_answer=force_final_answer_now,
                 tool_names=self._schema_tool_names(tool_schemas),
             )
             await runtime.checkpoint("before_llm", context=context, pattern=self)
@@ -311,7 +317,7 @@ class ReActPattern(AgentPattern):
             )
             self.last_response = response
             normalized = self._normalize_llm_response(response)
-            if self.force_final_answer_next and not normalized.get("tool_calls"):
+            if force_final_answer_now and not normalized.get("tool_calls"):
                 normalized["done"] = True
 
             assistant_content = normalized.get("content")
@@ -411,6 +417,9 @@ class ReActPattern(AgentPattern):
             )
         else:
             return messages
+        completion_instruction = self._completion_evidence_instruction(context)
+        if completion_instruction:
+            instruction = f"{instruction}\n\n{completion_instruction}"
         if messages and messages[0].get("role") == "system":
             return [
                 {
@@ -549,32 +558,35 @@ class ReActPattern(AgentPattern):
 
     def _normalize_llm_response(self, response: Any) -> dict[str, Any]:
         if isinstance(response, str):
+            content = unwrap_final_answer_content(response)
             return {
-                "content": response,
+                "content": content,
                 "tool_calls": [],
                 "done": True,
                 "raw": response,
             }
 
         if not isinstance(response, dict):
-            text = str(response)
+            text = unwrap_final_answer_content(str(response))
             return {"content": text, "tool_calls": [], "done": True, "raw": response}
 
         tool_calls = self._normalize_tool_calls(response.get("tool_calls", []))
-        content = response.get("content")
-        if content is None:
-            content = (
+        content_value: Any = response.get("content")
+        if content_value is None:
+            content_value = (
                 response.get("answer")
                 or response.get("output")
                 or response.get("message")
             )
+        if isinstance(content_value, str):
+            content_value = unwrap_final_answer_content(content_value)
 
         done = response.get("done")
         if done is None:
             done = not tool_calls
 
         return {
-            "content": content,
+            "content": content_value,
             "tool_calls": tool_calls,
             "raw_tool_calls": response.get("tool_calls", []),
             "done": bool(done),
@@ -1068,6 +1080,32 @@ class ReActPattern(AgentPattern):
             return False
         status = result.get("status")
         return not (isinstance(status, str) and status.lower() == "error")
+
+    def _latest_tool_result_success(self, context: Any) -> bool:
+        for message in reversed(getattr(context, "messages", [])):
+            if getattr(message, "role", None) != "tool":
+                continue
+            metadata = getattr(message, "metadata", {}) or {}
+            return self._tool_result_success(metadata.get("raw_result"))
+        return False
+
+    def _completion_evidence_instruction(self, context: Any) -> str:
+        for message in reversed(getattr(context, "messages", [])):
+            metadata = getattr(message, "metadata", {}) or {}
+            evidence = metadata.get("dag_completion_evidence")
+            if not isinstance(evidence, str):
+                continue
+            evidence = evidence.strip()
+            if evidence:
+                return (
+                    "Step completion evidence: "
+                    f"{evidence} "
+                    "When the latest tool result or response satisfies this evidence "
+                    "and the termination condition, call final_answer for this step. "
+                    "Do not repeat the same work for a nicer variant unless the result "
+                    "failed or the user explicitly requested a revision."
+                )
+        return ""
 
     async def _interrupt_if_requested(
         self,

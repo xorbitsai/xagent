@@ -22,6 +22,7 @@ import { useAuth } from "@/contexts/auth-context"
 import { getApiUrl, getUploadApiUrl } from "@/lib/utils"
 import { apiRequest, getUploadErrorMessage, isJsonRecord, parseApiResponse, UPLOAD_ERROR_MESSAGES } from "@/lib/api-wrapper"
 import { useI18n } from "@/contexts/i18n-context"
+import { unwrapFinalAnswerContent } from "@/lib/final-answer"
 
 // Unique ID generator for messages
 let messageIdCounter = 0
@@ -1738,7 +1739,11 @@ export function AppProvider({ children, token }: { children: React.ReactNode; to
               && (resultData as any).content
               && !(resultData as any).output
             ) {
-              resultData = { ...resultData, output: (resultData as any).content }
+              const content = (resultData as any).content
+              resultData = {
+                ...resultData,
+                output: typeof content === "string" ? unwrapFinalAnswerContent(content) : content,
+              }
             }
 
             // 1. Output meta info (exclude output, file_outputs and history)
@@ -2081,7 +2086,10 @@ export function AppProvider({ children, token }: { children: React.ReactNode; to
               payload: {
                 id: generateMessageId("msg-ai"),
                 role: "assistant",
-                content: eventData.content || "",
+                content:
+                  typeof eventData.content === "string"
+                    ? unwrapFinalAnswerContent(eventData.content)
+                    : eventData.content || "",
                 timestamp: message.timestamp,
                 status: "completed",
               }

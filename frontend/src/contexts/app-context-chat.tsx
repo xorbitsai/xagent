@@ -39,6 +39,7 @@ import { getApiUrl, getUploadApiUrl } from "@/lib/utils"
 import { apiRequest, getUploadErrorMessage, isJsonRecord, parseApiResponse, UPLOAD_ERROR_MESSAGES } from "@/lib/api-wrapper"
 import { useI18n } from "@/contexts/i18n-context"
 import { normalizeTimestampMs } from "@/lib/time-utils"
+import { unwrapFinalAnswerContent } from "@/lib/final-answer"
 
 // Unique ID generator for messages
 let messageIdCounter = 0
@@ -1229,7 +1230,11 @@ export function AppProvider({ children, token }: { children: React.ReactNode; to
 
           // Agent-to-user messages, including ask_user_question prompts.
           else if (eventType === "agent_message" || eventType === "ai_message") {
-            const messageContent = eventData.message || eventData.content || ""
+            const rawMessageContent = eventData.message || eventData.content || ""
+            const messageContent =
+              typeof rawMessageContent === "string"
+                ? unwrapFinalAnswerContent(rawMessageContent)
+                : rawMessageContent
             if (!messageContent) {
               return
             }
@@ -2166,7 +2171,11 @@ export function AppProvider({ children, token }: { children: React.ReactNode; to
               && (resultData as any).content
               && !(resultData as any).output
             ) {
-              resultData = { ...resultData, output: (resultData as any).content }
+              const content = (resultData as any).content
+              resultData = {
+                ...resultData,
+                output: typeof content === "string" ? unwrapFinalAnswerContent(content) : content,
+              }
             }
 
             // 1. Output meta info (excluding output, file_outputs, and history)

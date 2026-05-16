@@ -23,6 +23,7 @@ class PlanStep:
     dependencies: list[str] = field(default_factory=list)
     description: str | None = None
     termination_condition: str | None = None
+    completion_evidence: str | None = None
     tool_names: list[str] = field(default_factory=list)
     status: str = "pending"
     result: Any = None
@@ -35,6 +36,7 @@ class PlanStep:
             "dependencies": list(self.dependencies),
             "description": self.description,
             "termination_condition": self.termination_condition,
+            "completion_evidence": self.completion_evidence,
             "tool_names": list(self.tool_names),
             "status": self.status,
             "result": self.result,
@@ -58,6 +60,7 @@ class PlanStep:
                 if data.get("termination_condition") is not None
                 else None
             ),
+            completion_evidence=normalize_completion_evidence(data),
             tool_names=tool_names,
             status=str(data.get("status", "pending")),
             result=data.get("result"),
@@ -206,8 +209,8 @@ class LLMPlanGenerator(PlanGenerator):
                         "Generate a DAG execution plan by calling the "
                         f"{self.PLAN_TOOL_NAME} tool exactly once. Each step requires "
                         '"id", "task", "dependencies", "termination_condition", '
-                        'and "tool_names"; "description" is optional but strongly '
-                        "recommended. "
+                        '"completion_evidence", and "tool_names"; "description" is '
+                        "optional but strongly recommended. "
                         "dependencies is required for every step; "
                         "use an empty array only for true entry steps that do not "
                         "need any prior output. If a step uses data, files, decisions, "
@@ -223,12 +226,26 @@ class LLMPlanGenerator(PlanGenerator):
                         "step executor when this step is done and what it must report. "
                         "The termination_condition must be concrete and action-specific; "
                         "do not use vague wording such as 'when complete' or 'when the "
-                        "task is done'. For artifact-producing steps, name the exact "
-                        "artifact or path and state that the step must call final_answer "
-                        "after the artifact is successfully produced. Put review, "
+                        "task is done'. For artifact-producing steps, name an exact path "
+                        "only when the user requires that path or the tool accepts it as "
+                        "an argument; otherwise refer to the artifact returned by the "
+                        "tool. State that the step must call final_answer after the "
+                        "condition is satisfied. Put review, "
                         "verification, rendering, optimization, and final synthesis in "
                         "separate dependent steps unless this step explicitly owns that "
-                        "work. tool_names "
+                        "work. Use completion_evidence for a short natural-language "
+                        "proof that this specific step is done, usually naming the "
+                        "successful tool result fields to check. Do not use global "
+                        "effect labels or invented fixed filenames. For auto-named "
+                        "outputs, say that the tool returned a usable path. Keep "
+                        "completion_evidence under 160 characters. If a workflow needs "
+                        "several tool actions and only the last one proves completion, "
+                        "split those actions into dependent steps. Few-shot examples: "
+                        "auto-named output evidence: 'The generator returned success=true "
+                        "and a non-empty path or URL for the created asset.' explicit "
+                        "path evidence: 'The writer returned success=true for the "
+                        "requested output path.' non-file evidence: 'The tool returned "
+                        "the requested answer data successfully.' tool_names "
                         "must only contain exact names from available_tool_names. "
                         "Include the best matching available tools for every step "
                         "that needs tool use. Leave tool_names empty only for pure "
@@ -333,12 +350,24 @@ class LLMPlanGenerator(PlanGenerator):
                                             "be completed without tools."
                                         ),
                                     },
+                                    "completion_evidence": {
+                                        "type": "string",
+                                        "description": (
+                                            "Short natural-language proof that this "
+                                            "step is finished. Do not use global effect "
+                                            "labels. For tool steps, describe the "
+                                            "successful tool result fields that prove "
+                                            "completion; avoid invented fixed filenames "
+                                            "for auto-named outputs."
+                                        ),
+                                    },
                                 },
                                 "required": [
                                     "id",
                                     "task",
                                     "dependencies",
                                     "termination_condition",
+                                    "completion_evidence",
                                     "tool_names",
                                 ],
                                 "additionalProperties": False,
@@ -452,6 +481,23 @@ def normalize_tool_names(data: dict[str, Any]) -> list[str]:
             seen.add(stripped)
             names.append(stripped)
     return names
+
+
+def normalize_completion_evidence(data: dict[str, Any]) -> str | None:
+    raw_evidence = data.get("completion_evidence")
+    if raw_evidence is not None:
+        evidence = str(raw_evidence).strip()
+        return evidence or None
+
+    legacy_effects = data.get("expected_effects")
+    if isinstance(legacy_effects, str):
+        evidence = legacy_effects.strip()
+        return evidence or None
+    if isinstance(legacy_effects, list):
+        parts = [item.strip() for item in legacy_effects if isinstance(item, str)]
+        evidence = "; ".join(part for part in parts if part)
+        return evidence or None
+    return None
 
 
 def coerce_execution_plan(payload: Any) -> ExecutionPlan:

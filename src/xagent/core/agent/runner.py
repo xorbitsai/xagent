@@ -649,6 +649,11 @@ class AgentRunner:
         normalized.setdefault("pattern", pattern.__class__.__name__)
 
         assistant_message = extract_assistant_message(normalized)
+        if assistant_message:
+            for key in ("response", "answer", "output", "content", "message"):
+                if isinstance(normalized.get(key), str):
+                    normalized[key] = assistant_message
+                    break
         if assistant_message and not self._has_assistant_message(
             context, assistant_message
         ):

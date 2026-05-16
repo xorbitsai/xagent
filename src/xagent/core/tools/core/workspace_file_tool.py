@@ -378,7 +378,9 @@ class WorkspaceFileOperations:
         }
 
     @staticmethod
-    def _normalize_file_ref(file_ref: str) -> str:
+    def _normalize_file_ref(file_ref: str | None) -> str:
+        if file_ref is None:
+            return ""
         value = str(file_ref).strip()
         if value.startswith("file://"):
             return value[7:]

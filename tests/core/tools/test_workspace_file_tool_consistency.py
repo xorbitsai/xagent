@@ -270,6 +270,15 @@ class TestWorkspaceFileToolConsistency:
         with pytest.raises(ValueError, match="assets_dir must"):
             tools.prepare_html_asset(source["file_id"], assets_dir=assets_dir)
 
+    @pytest.mark.usefixtures("mock_workspace_db")
+    def test_prepare_html_asset_rejects_missing_file_ref(self, tmp_path):
+        """Test that None file refs are not coerced into a filename."""
+        workspace = TaskWorkspace("test_task", str(tmp_path))
+        tools = WorkspaceFileTools(workspace)
+
+        with pytest.raises(FileNotFoundError, match="File not found"):
+            tools.prepare_html_asset(None)  # type: ignore[arg-type]
+
 
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])

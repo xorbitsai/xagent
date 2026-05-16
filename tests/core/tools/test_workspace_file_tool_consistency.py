@@ -256,7 +256,10 @@ class TestWorkspaceFileToolConsistency:
         assert not (workspace.output_dir.parent / "safe.png").exists()
 
     @pytest.mark.usefixtures("mock_workspace_db")
-    @pytest.mark.parametrize("assets_dir", ["/assets", "../assets", "assets/../../x"])
+    @pytest.mark.parametrize(
+        "assets_dir",
+        ["/assets", "../assets", "assets/../../x", "input/assets", "temp/assets"],
+    )
     def test_prepare_html_asset_rejects_unsafe_assets_dir(self, tmp_path, assets_dir):
         """Test that the assets directory must stay inside output."""
         workspace = TaskWorkspace("test_task", str(tmp_path))
@@ -264,7 +267,7 @@ class TestWorkspaceFileToolConsistency:
 
         source = tools.write_file("input/logo.png", "fake image")
 
-        with pytest.raises(ValueError, match="assets_dir must be a relative path"):
+        with pytest.raises(ValueError, match="assets_dir must"):
             tools.prepare_html_asset(source["file_id"], assets_dir=assets_dir)
 
 

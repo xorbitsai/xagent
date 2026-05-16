@@ -342,6 +342,14 @@ class WorkspaceFileOperations:
 
         asset_name = safe_asset_filename(alias or source_path.name)
         target_dir = self._resolve_path(str(assets_path), "output")
+        output_root = self.workspace.output_dir.resolve()
+        resolved_target_dir = target_dir.resolve()
+        if (
+            resolved_target_dir != output_root
+            and not resolved_target_dir.is_relative_to(output_root)
+        ):
+            raise ValueError("assets_dir must resolve inside output")
+
         target_dir.mkdir(parents=True, exist_ok=True)
         target_path = self._build_unique_asset_path(target_dir / asset_name)
 
@@ -352,7 +360,6 @@ class WorkspaceFileOperations:
         if not asset_file_id:
             asset_file_id = self.workspace.register_file(str(target_path))
 
-        output_root = self.workspace.output_dir.resolve()
         workspace_root = self.workspace.workspace_dir.resolve()
         html_src = target_path.resolve().relative_to(output_root).as_posix()
         file_ref = build_file_ref(

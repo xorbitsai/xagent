@@ -4,7 +4,21 @@ import inspect
 
 import pytest
 
-from xagent.core.tools.adapters.vibe.browser_use import create_browser_tools
+from xagent.core.tools.adapters.vibe.browser_use import (
+    BrowserTaskSessionMixin,
+    create_browser_tools,
+)
+
+
+@pytest.mark.asyncio
+async def test_browser_task_session_mixin_defaults_to_no_task() -> None:
+    tool = BrowserTaskSessionMixin()
+
+    assert tool._task_id is None
+
+    await tool.setup(task_id=None)
+
+    assert tool._task_id is None
 
 
 @pytest.mark.asyncio

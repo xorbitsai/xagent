@@ -34,7 +34,7 @@ logger = logging.getLogger(__name__)
 class BrowserTaskSessionMixin:
     """Keeps browser tool default sessions aligned during task setup."""
 
-    _task_id: Optional[str]
+    _task_id: Optional[str] = None
 
     async def setup(self, task_id: Optional[str] = None) -> None:
         if task_id:

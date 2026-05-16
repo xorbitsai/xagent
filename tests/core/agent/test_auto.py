@@ -204,6 +204,43 @@ def malformed_empty_missing_verification_decision_tool_response() -> dict[str, A
     }
 
 
+def truncated_final_answer_decision_tool_response() -> dict[str, Any]:
+    return {
+        "tool_calls": [
+            {
+                "id": f"call_{DECISION_TOOL_NAME}",
+                "type": "function",
+                "function": {
+                    "name": DECISION_TOOL_NAME,
+                    "arguments": (
+                        '{"action":"final_answer","reason":"simple reply",'
+                        '"requires_current_or_external_facts":false,'
+                        '"existing_context_sufficient":true,'
+                        '"evidence_basis":"current conversation",'
+                        '"missing_verification":"",'
+                        '"answer":"Recovered answer'
+                    ),
+                },
+            }
+        ]
+    }
+
+
+def unrepairable_decision_tool_response() -> dict[str, Any]:
+    return {
+        "tool_calls": [
+            {
+                "id": f"call_{DECISION_TOOL_NAME}",
+                "type": "function",
+                "function": {
+                    "name": DECISION_TOOL_NAME,
+                    "arguments": "not json at all",
+                },
+            }
+        ]
+    }
+
+
 @pytest.mark.asyncio
 async def test_auto_decision_sees_memory_and_skill_context() -> None:
     llm = FakeLLM(
@@ -663,6 +700,59 @@ async def test_auto_pattern_repairs_empty_missing_verification_argument() -> Non
     assert result["success"] is True
     assert result["auto_decision"]["action"] == "plan_execute"
     assert result["auto_decision"]["missing_verification"] == ""
+
+
+@pytest.mark.asyncio
+async def test_auto_pattern_repairs_truncated_final_answer_arguments() -> None:
+    llm = FakeLLM([truncated_final_answer_decision_tool_response()])
+    pattern = AutoPattern()
+    context = ExecutionContext()
+    context.add_user_message("Continue")
+
+    result = await pattern.run(context=context, tools=[], llm=llm)
+
+    assert result["success"] is True
+    assert result["output"] == "Recovered answer"
+    assert result["auto_decision"]["action"] == "final_answer"
+    assert len(llm.calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_auto_pattern_retries_unrepairable_decision_arguments() -> None:
+    llm = FakeLLM(
+        [
+            unrepairable_decision_tool_response(),
+            decision_tool_response(
+                "final_answer",
+                "Retry produced valid arguments.",
+                answer="after retry",
+            ),
+        ]
+    )
+    pattern = AutoPattern()
+    context = ExecutionContext()
+    context.add_user_message("Continue")
+    runtime = RecordingRuntime()
+
+    result = await pattern.run(context=context, tools=[], llm=llm, runtime=runtime)
+
+    assert result["success"] is True
+    assert result["output"] == "after retry"
+    assert len(llm.calls) == 2
+    retry_messages = llm.calls[1]["messages"]
+    assert "invalid JSON" in retry_messages[-1]["content"]
+    assert "not json at all" in retry_messages[-1]["content"]
+    llm_start_metadata = [
+        hook[1]["metadata"] for hook in runtime.hooks if hook[0] == "llm_start"
+    ]
+    assert llm_start_metadata == [
+        {"phase": "auto_decision"},
+        {"phase": "auto_decision", "attempt": 2},
+    ]
+    assert any(
+        checkpoint["label"] == "auto_decision_retry"
+        for checkpoint in runtime.checkpoints
+    )
 
 
 @pytest.mark.asyncio

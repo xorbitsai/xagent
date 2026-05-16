@@ -2,10 +2,11 @@ from __future__ import annotations
 
 import json
 import logging
-import re
 from dataclasses import dataclass
 from enum import Enum
 from typing import Any
+
+from json_repair import loads as repair_json_loads
 
 from ...context.enrichment import (
     MEMORY_CONTEXT_METADATA_KEY,
@@ -85,6 +86,15 @@ class AutoDecision:
 
 
 DECISION_TOOL_NAME = "select_execution_pattern"
+MAX_DECISION_PARSE_ATTEMPTS = 2
+
+
+class AutoDecisionArgumentsError(ValueError):
+    """Raised when the routing tool call arguments cannot be parsed."""
+
+    def __init__(self, message: str, *, arguments: str | None = None) -> None:
+        super().__init__(message)
+        self.arguments = arguments
 
 
 def _coerce_bool(value: Any, *, default: bool) -> bool:
@@ -590,30 +600,84 @@ class AutoPattern(AgentPattern):
             metadata={"phase": "auto_decision"},
         )
 
-        messages = context.get_messages_for_llm()
+        base_messages = context.get_messages_for_llm()
         decision_prompt = self._decision_prompt(tools)
-        messages.append({"role": "user", "content": decision_prompt})
         decision_tools = [self._decision_tool_schema()]
-        metadata = {"phase": "auto_decision"}
-        await runtime.on_llm_start(
-            context=context,
-            messages=messages,
-            tools=decision_tools,
-            metadata=metadata,
-        )
-        try:
-            response = await runtime.run_llm_call(
-                llm,
+        retry_feedback: str | None = None
+        for attempt in range(MAX_DECISION_PARSE_ATTEMPTS):
+            messages = list(base_messages)
+            messages.append({"role": "user", "content": decision_prompt})
+            if retry_feedback:
+                messages.append({"role": "user", "content": retry_feedback})
+            metadata: dict[str, Any] = {"phase": "auto_decision"}
+            if attempt:
+                metadata["attempt"] = attempt + 1
+            await runtime.on_llm_start(
+                context=context,
                 messages=messages,
                 tools=decision_tools,
-                tool_choice="required",
-                thinking={"type": "disabled", "enable": False},
+                metadata=metadata,
             )
-        except Exception as exc:
-            await runtime.on_llm_error(context=context, error=exc, metadata=metadata)
-            raise
-        await runtime.on_llm_end(context=context, response=response, metadata=metadata)
-        return self._parse_decision(response)
+            try:
+                response = await runtime.run_llm_call(
+                    llm,
+                    messages=messages,
+                    tools=decision_tools,
+                    tool_choice="required",
+                    thinking={"type": "disabled", "enable": False},
+                )
+            except Exception as exc:
+                await runtime.on_llm_error(
+                    context=context, error=exc, metadata=metadata
+                )
+                raise
+            await runtime.on_llm_end(
+                context=context, response=response, metadata=metadata
+            )
+            try:
+                return self._parse_decision(response)
+            except AutoDecisionArgumentsError as exc:
+                if attempt + 1 >= MAX_DECISION_PARSE_ATTEMPTS:
+                    raise
+                retry_feedback = self._decision_retry_feedback(exc)
+                logger.warning(
+                    "AutoPattern decision arguments were invalid JSON; retrying "
+                    "decision parse. execution_id=%s error=%s",
+                    getattr(context, "execution_id", None),
+                    exc,
+                )
+                await runtime.checkpoint(
+                    "auto_decision_retry",
+                    context=context,
+                    pattern=self,
+                    metadata={
+                        "attempt": attempt + 1,
+                        "error": str(exc),
+                    },
+                )
+        raise RuntimeError("AutoPattern decision retry loop exited unexpectedly.")
+
+    def _decision_retry_feedback(self, error: AutoDecisionArgumentsError) -> str:
+        argument_preview = self._truncate_retry_preview(error.arguments or "")
+        return (
+            f"The previous {DECISION_TOOL_NAME} tool call could not be used "
+            f"because its arguments were invalid JSON: {error}. Call "
+            f"{DECISION_TOOL_NAME} again exactly once. The tool arguments must be "
+            "one complete valid JSON object. Do not truncate string values. If "
+            "action is final_answer, include the complete non-empty answer field "
+            "inside the same tool call."
+            + (
+                f"\nInvalid arguments preview:\n```json\n{argument_preview}\n```"
+                if argument_preview
+                else ""
+            )
+        )
+
+    def _truncate_retry_preview(self, value: str, *, limit: int = 1200) -> str:
+        stripped = value.strip()
+        if len(stripped) <= limit:
+            return stripped
+        return f"{stripped[:limit]}... [truncated]"
 
     def _decision_prompt(self, tools: list[Any]) -> str:
         tool_count = len(tools)
@@ -796,28 +860,30 @@ class AutoPattern(AgentPattern):
         try:
             payload = json.loads(arguments)
         except json.JSONDecodeError as exc:
-            repaired_arguments = self._repair_empty_string_arguments(arguments)
-            if repaired_arguments == arguments:
-                raise ValueError("Tool call arguments must be valid JSON.") from exc
-            try:
-                payload = json.loads(repaired_arguments)
-            except json.JSONDecodeError:
-                raise ValueError("Tool call arguments must be valid JSON.") from exc
+            payload = self._repair_json_arguments(
+                arguments=arguments,
+                original_error=exc,
+            )
         if not isinstance(payload, dict):
-            raise TypeError("Tool call arguments must decode to an object.")
+            raise AutoDecisionArgumentsError(
+                "Tool call arguments must decode to an object.",
+                arguments=arguments,
+            )
         return payload
 
-    def _repair_empty_string_arguments(self, arguments: str) -> str:
-        """Repair common model omission of an empty string value in tool JSON."""
-        empty_string_fields = ("missing_verification",)
-        repaired = arguments
-        for field in empty_string_fields:
-            repaired = re.sub(
-                rf'("{re.escape(field)}"\s*:\s*)(?=[,}}])',
-                r'\1""',
-                repaired,
-            )
-        return repaired
+    def _repair_json_arguments(
+        self,
+        *,
+        arguments: str,
+        original_error: json.JSONDecodeError,
+    ) -> Any:
+        try:
+            return repair_json_loads(arguments, logging=False)
+        except Exception as exc:
+            raise AutoDecisionArgumentsError(
+                "Tool call arguments must be valid JSON.",
+                arguments=arguments,
+            ) from original_error or exc
 
     def _selected_child(self) -> AgentPattern:
         if self.decision is None:

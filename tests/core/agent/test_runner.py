@@ -694,6 +694,10 @@ async def test_trace_callback_unwraps_final_answer_and_omits_success_context(
                         '```json\n{"action":"final_answer",'
                         '"action_input":"Done cleanly."}\n```'
                     ),
+                    "message": (
+                        '```json\n{"action":"final_answer",'
+                        '"action_input":"Done cleanly."}\n```'
+                    ),
                 }
             )
         ],
@@ -708,6 +712,7 @@ async def test_trace_callback_unwraps_final_answer_and_omits_success_context(
     result = await runner.run(task="Finish", execution_id="exec-success")
 
     assert result["output"] == "Done cleanly."
+    assert result["message"] == "Done cleanly."
     ai_event = next(
         event for event in tracer.events if event["event_type"] == "task_end_message"
     )

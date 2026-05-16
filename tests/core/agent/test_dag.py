@@ -674,6 +674,61 @@ async def test_dag_pattern_schedules_newly_ready_step_before_sibling_finishes() 
     }
 
 
+@pytest.mark.asyncio
+async def test_dag_pattern_catches_dynamically_scheduled_step_failure() -> None:
+    class DynamicFailureLLM:
+        def __init__(self) -> None:
+            self.started_by_task: dict[str, asyncio.Event] = {}
+            self.cancelled_tasks: list[str] = []
+
+        async def chat(self, **kwargs: Any) -> dict[str, Any]:
+            messages = list(kwargs.get("messages", []))
+            task = current_step_task(messages)
+            self.started_by_task.setdefault(task, asyncio.Event()).set()
+            if task == "Create English HTML":
+                try:
+                    await asyncio.Future()
+                except asyncio.CancelledError:
+                    self.cancelled_tasks.append(task)
+                    raise
+            if task == "Render Chinese poster":
+                await self.wait_started("Create English HTML")
+                raise RuntimeError("render failed")
+            return {"content": f"{task} done", "done": True}
+
+        async def wait_started(self, task: str) -> None:
+            await asyncio.wait_for(
+                self.started_by_task.setdefault(task, asyncio.Event()).wait(),
+                timeout=1,
+            )
+
+    llm = DynamicFailureLLM()
+    pattern = DAGPattern(
+        lambda **_: build_plan(
+            PlanStep(id="zh", task="Create Chinese HTML"),
+            PlanStep(id="en", task="Create English HTML"),
+            PlanStep(id="render_zh", task="Render Chinese poster", dependencies=["zh"]),
+            PlanStep(id="render_en", task="Render English poster", dependencies=["en"]),
+        ),
+        max_concurrency=2,
+    )
+
+    result = await asyncio.wait_for(
+        pattern.run(
+            context=ExecutionContext(execution_id="dag-dynamic-failure"),
+            tools=[],
+            llm=llm,
+        ),
+        timeout=1,
+    )
+
+    assert result["success"] is False
+    assert result["status"] == "failed"
+    assert result["failure_reason"] == "step_failed"
+    assert result["failed_step_id"] == "render_zh"
+    assert "Create English HTML" in llm.cancelled_tasks
+
+
 @pytest.mark.parametrize("max_concurrency", [0, -1])
 def test_dag_pattern_clamps_non_positive_max_concurrency(
     max_concurrency: int,

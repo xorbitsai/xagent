@@ -631,7 +631,11 @@ class DAGPattern(AgentPattern):
                             )
                         return result
                     failed_step = next(
-                        (step for step in steps if step.status == "failed"),
+                        (
+                            step
+                            for step in steps_by_id.values()
+                            if step.status == "failed"
+                        ),
                         None,
                     )
                     if failed_step is not None:

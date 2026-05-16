@@ -743,18 +743,15 @@ class DAGPattern(AgentPattern):
                 },
             )
 
-        finalize_after_tool_result = bool(
-            step.completion_evidence and len(step.tool_names) == 1
-        )
         react_pattern = ReActPattern(
             max_iterations=self.react_max_iterations,
             reasoning_mode=self.react_reasoning_mode,
-            finalize_after_tool_result=finalize_after_tool_result,
+            finalize_after_tool_result=False,
         )
         active_pattern_state = self.active_step_pattern_states.get(step.id)
         if active_pattern_state is not None:
             react_pattern.load_state(active_pattern_state)
-            react_pattern.finalize_after_tool_result = finalize_after_tool_result
+            react_pattern.finalize_after_tool_result = False
 
         step_runtime = _DAGStepRuntime(
             parent=runtime,

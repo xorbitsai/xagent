@@ -84,6 +84,38 @@ class FakeTool:
         return {"result": eval(args["expression"])}  # noqa: S307
 
 
+class FakeWriteFileTool:
+    def __init__(self) -> None:
+        self.calls: list[dict[str, Any]] = []
+        self.metadata = type(
+            "Metadata",
+            (),
+            {
+                "name": "write_file",
+                "description": "Write file content in the workspace.",
+            },
+        )()
+
+    def args_type(self) -> type:
+        class Args:
+            @staticmethod
+            def model_json_schema() -> dict[str, Any]:
+                return {
+                    "type": "object",
+                    "properties": {
+                        "file_path": {"type": "string"},
+                        "content": {"type": "string"},
+                    },
+                    "required": ["file_path", "content"],
+                }
+
+        return Args
+
+    async def run_json_async(self, args: dict[str, Any]) -> Any:
+        self.calls.append(args)
+        return {"success": True, "file_path": args["file_path"]}
+
+
 class SequenceLLM:
     def __init__(self, responses: list[dict[str, Any]]) -> None:
         self.responses = responses
@@ -808,6 +840,91 @@ async def test_dag_pattern_single_step_failure_stops_independent_steps() -> None
     assert llm.tasks == ["Fail task"]
     assert runtime.last_checkpoint is not None
     assert runtime.last_checkpoint["label"] == "dag_failed"
+
+
+@pytest.mark.asyncio
+async def test_dag_completion_evidence_keeps_tools_for_multi_call_step() -> None:
+    class MultiWriteLLM:
+        def __init__(self) -> None:
+            self.calls: list[dict[str, Any]] = []
+
+        async def chat(self, **kwargs: Any) -> dict[str, Any]:
+            self.calls.append(kwargs)
+            tools = kwargs.get("tools") or []
+            tool_names = {
+                schema.get("function", {}).get("name")
+                for schema in tools
+                if isinstance(schema, dict)
+            }
+            if len(self.calls) == 1:
+                assert "write_file" in tool_names
+                return {
+                    "content": "",
+                    "tool_calls": [
+                        {
+                            "id": "write-index",
+                            "function": {
+                                "name": "write_file",
+                                "arguments": json.dumps(
+                                    {
+                                        "file_path": "index.html",
+                                        "content": "<html></html>",
+                                    }
+                                ),
+                            },
+                        }
+                    ],
+                    "done": False,
+                }
+            if len(self.calls) == 2:
+                assert "write_file" in tool_names
+                return {
+                    "content": "",
+                    "tool_calls": [
+                        {
+                            "id": "write-style",
+                            "function": {
+                                "name": "write_file",
+                                "arguments": json.dumps(
+                                    {
+                                        "file_path": "style.css",
+                                        "content": "body { color: black; }",
+                                    }
+                                ),
+                            },
+                        }
+                    ],
+                    "done": False,
+                }
+            return {"content": "Both files were written.", "done": True}
+
+    llm = MultiWriteLLM()
+    tool = FakeWriteFileTool()
+    pattern = DAGPattern(
+        lambda **_: build_plan(
+            PlanStep(
+                id="write_files",
+                task="Write landing page files",
+                termination_condition=(
+                    "Stop after both index.html and style.css have been written."
+                ),
+                completion_evidence="Both file writes returned success=true.",
+                tool_names=["write_file"],
+            )
+        ),
+        react_max_iterations=4,
+    )
+
+    result = await pattern.run(
+        context=ExecutionContext(execution_id="dag-multi-write"),
+        tools=[tool],
+        llm=llm,
+    )
+
+    assert result["success"] is True
+    assert result["step_results"]["write_files"] == "Both files were written."
+    assert [call["file_path"] for call in tool.calls] == ["index.html", "style.css"]
+    assert len(llm.calls) == 3
 
 
 @pytest.mark.parametrize("max_concurrency", [0, -1])

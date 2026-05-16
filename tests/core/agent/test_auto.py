@@ -703,18 +703,35 @@ async def test_auto_pattern_repairs_empty_missing_verification_argument() -> Non
 
 
 @pytest.mark.asyncio
-async def test_auto_pattern_repairs_truncated_final_answer_arguments() -> None:
-    llm = FakeLLM([truncated_final_answer_decision_tool_response()])
+async def test_auto_pattern_retries_truncated_final_answer_arguments() -> None:
+    llm = FakeLLM(
+        [
+            truncated_final_answer_decision_tool_response(),
+            decision_tool_response(
+                "final_answer",
+                "Retry produced the full answer.",
+                answer="Complete answer after retry.",
+            ),
+        ]
+    )
     pattern = AutoPattern()
     context = ExecutionContext()
     context.add_user_message("Continue")
+    runtime = RecordingRuntime()
 
-    result = await pattern.run(context=context, tools=[], llm=llm)
+    result = await pattern.run(context=context, tools=[], llm=llm, runtime=runtime)
 
     assert result["success"] is True
-    assert result["output"] == "Recovered answer"
+    assert result["output"] == "Complete answer after retry."
     assert result["auto_decision"]["action"] == "final_answer"
-    assert len(llm.calls) == 1
+    assert len(llm.calls) == 2
+    retry_messages = llm.calls[1]["messages"]
+    assert "truncated" in retry_messages[-1]["content"]
+    assert "Recovered answer" in retry_messages[-1]["content"]
+    assert any(
+        checkpoint["label"] == "auto_decision_retry"
+        for checkpoint in runtime.checkpoints
+    )
 
 
 @pytest.mark.asyncio

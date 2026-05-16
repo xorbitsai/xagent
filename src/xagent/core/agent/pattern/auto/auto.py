@@ -877,6 +877,11 @@ class AutoPattern(AgentPattern):
         arguments: str,
         original_error: json.JSONDecodeError,
     ) -> Any:
+        if not self._is_structurally_complete_json_object(arguments):
+            raise AutoDecisionArgumentsError(
+                "Tool call arguments appear truncated and must be retried.",
+                arguments=arguments,
+            ) from original_error
         try:
             return repair_json_loads(arguments, logging=False)
         except Exception as exc:
@@ -884,6 +889,35 @@ class AutoPattern(AgentPattern):
                 "Tool call arguments must be valid JSON.",
                 arguments=arguments,
             ) from original_error or exc
+
+    def _is_structurally_complete_json_object(self, arguments: str) -> bool:
+        stripped = arguments.strip()
+        if not stripped.startswith("{") or not stripped.endswith("}"):
+            return False
+
+        pairs = {"}": "{", "]": "["}
+        stack: list[str] = []
+        in_string = False
+        escaped = False
+        for char in stripped:
+            if in_string:
+                if escaped:
+                    escaped = False
+                elif char == "\\":
+                    escaped = True
+                elif char == '"':
+                    in_string = False
+                continue
+
+            if char == '"':
+                in_string = True
+            elif char in "{[":
+                stack.append(char)
+            elif char in pairs:
+                if not stack or stack.pop() != pairs[char]:
+                    return False
+
+        return not in_string and not escaped and not stack
 
     def _selected_child(self) -> AgentPattern:
         if self.decision is None:

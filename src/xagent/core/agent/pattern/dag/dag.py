@@ -522,7 +522,8 @@ class DAGPattern(AgentPattern):
         if not steps:
             return None
         if len(steps) == 1:
-            return await self._execute_step(
+            step = steps[0]
+            result = await self._execute_step(
                 step=steps[0],
                 root_context=root_context,
                 tools=tools,
@@ -533,6 +534,18 @@ class DAGPattern(AgentPattern):
                 skill_manager=skill_manager,
                 allowed_skills=allowed_skills,
             )
+            if result is not None:
+                return result
+            if step.status == "failed":
+                return await self._fail(
+                    context=root_context,
+                    runtime=runtime,
+                    error=step.error or f"Step {step.id} failed.",
+                    failure_reason="step_failed",
+                    checkpoint_label="dag_failed",
+                    failed_step_id=step.id,
+                )
+            return None
 
         self.status = "running"
         for step in steps:
@@ -560,7 +573,8 @@ class DAGPattern(AgentPattern):
                     memory_similarity_threshold=memory_similarity_threshold,
                     skill_manager=skill_manager,
                     allowed_skills=allowed_skills,
-                )
+                ),
+                name=f"dag_step_{step.id}",
             ): step.id
             for step in steps
         }
@@ -590,7 +604,8 @@ class DAGPattern(AgentPattern):
                         memory_similarity_threshold=memory_similarity_threshold,
                         skill_manager=skill_manager,
                         allowed_skills=allowed_skills,
-                    )
+                    ),
+                    name=f"dag_step_{ready_step.id}",
                 )
                 tasks[task] = ready_step.id
                 steps_by_id[ready_step.id] = ready_step

@@ -619,6 +619,46 @@ async def test_dag_pattern_executes_independent_ready_steps_concurrently() -> No
 
 
 @pytest.mark.asyncio
+async def test_dag_pattern_names_concurrent_step_tasks(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    created_task_names: list[str | None] = []
+    real_create_task = asyncio.create_task
+
+    def record_create_task(coro: Any, *, name: str | None = None) -> asyncio.Task[Any]:
+        created_task_names.append(name)
+        return real_create_task(coro, name=name)
+
+    monkeypatch.setattr(asyncio, "create_task", record_create_task)
+
+    pattern = DAGPattern(
+        lambda **_: build_plan(
+            PlanStep(id="first", task="First task"),
+            PlanStep(id="second", task="Second task", dependencies=["first"]),
+            PlanStep(id="slow", task="Slow task"),
+        ),
+        max_concurrency=2,
+    )
+
+    result = await pattern.run(
+        context=ExecutionContext(execution_id="dag-task-names"),
+        tools=[],
+        llm=SequenceLLM(
+            [
+                "first done",
+                "slow done",
+                "second done",
+            ]
+        ),
+    )
+
+    assert result["success"] is True
+    assert "dag_step_first" in created_task_names
+    assert "dag_step_slow" in created_task_names
+    assert "dag_step_second" in created_task_names
+
+
+@pytest.mark.asyncio
 async def test_dag_pattern_schedules_newly_ready_step_before_sibling_finishes() -> None:
     class PartialBlockingLLM:
         def __init__(self) -> None:
@@ -727,6 +767,47 @@ async def test_dag_pattern_catches_dynamically_scheduled_step_failure() -> None:
     assert result["failure_reason"] == "step_failed"
     assert result["failed_step_id"] == "render_zh"
     assert "Create English HTML" in llm.cancelled_tasks
+
+
+@pytest.mark.asyncio
+async def test_dag_pattern_single_step_failure_stops_independent_steps() -> None:
+    class FailThenRecordLLM:
+        def __init__(self) -> None:
+            self.tasks: list[str] = []
+
+        async def chat(self, **kwargs: Any) -> dict[str, Any]:
+            messages = list(kwargs.get("messages", []))
+            task = current_step_task(messages)
+            self.tasks.append(task)
+            if task == "Fail task":
+                return {"content": "not done", "done": False}
+            return {"content": f"{task} done", "done": True}
+
+    llm = FailThenRecordLLM()
+    runtime = PatternRuntime(execution_id="dag-single-failure")
+    pattern = DAGPattern(
+        lambda **_: build_plan(
+            PlanStep(id="fail", task="Fail task"),
+            PlanStep(id="next", task="Should not run"),
+        ),
+        max_concurrency=1,
+        react_max_iterations=1,
+    )
+
+    result = await pattern.run(
+        context=ExecutionContext(execution_id="dag-single-failure"),
+        tools=[],
+        llm=llm,
+        runtime=runtime,
+    )
+
+    assert result["success"] is False
+    assert result["status"] == "failed"
+    assert result["failure_reason"] == "step_failed"
+    assert result["failed_step_id"] == "fail"
+    assert llm.tasks == ["Fail task"]
+    assert runtime.last_checkpoint is not None
+    assert runtime.last_checkpoint["label"] == "dag_failed"
 
 
 @pytest.mark.parametrize("max_concurrency", [0, -1])

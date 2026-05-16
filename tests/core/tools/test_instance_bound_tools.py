@@ -147,12 +147,13 @@ async def test_tool_creation_function():
 
         # Test that tools are created and bound correctly
         assert (
-            len(file_tools) == 16
-        )  # Should have 16 file tools (13 original + 2 new editing tools + 1 translate_json tool)
+            len(file_tools) == 17
+        )  # Should have 17 file tools, including prepare_html_asset.
 
         # Test tool functionality
         write_tool = next(tool for tool in file_tools if tool.name == "write_file")
         read_tool = next(tool for tool in file_tools if tool.name == "read_file")
+        assert any(tool.name == "prepare_html_asset" for tool in file_tools)
 
         # Use the tools
         write_tool.func("function_test.txt", "Test content")
@@ -171,9 +172,9 @@ async def test_tool_creation_function():
         assert "fetch_skill_file" in skill_tool_names
         print("✅ Skill tools creation test passed!")
 
-        # Total tools: 16 file + 3 skill = 19
+        # Total tools: 17 file + 3 skill = 20
         all_tools = file_tools + skill_tools
-        assert len(all_tools) == 19
+        assert len(all_tools) == 20
 
         print("✅ Tool creation function test passed!")
 

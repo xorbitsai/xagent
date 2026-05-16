@@ -132,6 +132,9 @@ class _AutoChildRuntime:
     async def should_interrupt(self) -> bool:
         return await self.parent.should_interrupt()
 
+    def clear_interrupt(self) -> None:
+        self.parent.clear_interrupt()
+
     async def run_llm_call(self, llm: Any, **kwargs: Any) -> Any:
         return await self.parent.run_llm_call(llm, **kwargs)
 

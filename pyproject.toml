@@ -178,6 +178,7 @@ source = "vcs"
 addopts = "-ra -q"
 testpaths = ["tests"]
 asyncio_mode = "auto"
+pythonpath = ["tests/_stubs"]
 markers = [
   "integration: marks tests as integration tests",
   "slow: marks tests as slow running tests",

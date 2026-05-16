@@ -221,6 +221,26 @@ async def run_invalid_plan(plan: ExecutionPlan) -> dict[str, Any]:
     )
 
 
+def test_plan_step_serializes_termination_condition() -> None:
+    step = PlanStep(
+        id="write_html",
+        task="Write HTML",
+        dependencies=["extract"],
+        description="Create the poster HTML file.",
+        termination_condition=(
+            "Stop after output/poster.html has been successfully written once."
+        ),
+        tool_names=["write_file"],
+    )
+
+    restored = PlanStep.from_dict(step.to_dict())
+
+    assert restored.termination_condition == (
+        "Stop after output/poster.html has been successfully written once."
+    )
+    assert restored.to_dict()["termination_condition"] == restored.termination_condition
+
+
 @pytest.mark.asyncio
 async def test_dag_pattern_interrupt_before_plan_skips_plan_generation() -> None:
     plan_calls: list[dict[str, Any]] = []
@@ -418,6 +438,9 @@ async def test_dag_step_appends_current_step_boundary_after_parent_context() -> 
             id="extract",
             task="Extract release highlights",
             description="Extract version, date, features, bug fixes, and contributors.",
+            termination_condition=(
+                "Stop after the release highlights have been extracted and reported."
+            ),
         )
     )
     pattern = DAGPattern(lambda **_: plan)
@@ -437,6 +460,12 @@ async def test_dag_step_appends_current_step_boundary_after_parent_context() -> 
     assert "DAG STEP EXECUTION BOUNDARY" in messages[-1]["content"]
     assert "Current DAG step id: extract" in messages[-1]["content"]
     assert "CURRENT STEP - ONLY EXECUTABLE GOAL" in messages[-1]["content"]
+    assert "TERMINATION CONDITION - AUTHORITATIVE STOP RULE" in messages[-1]["content"]
+    assert (
+        "Stop after the release highlights have been extracted and reported."
+        in messages[-1]["content"]
+    )
+    assert "your next action must be final_answer" in messages[-1]["content"]
     assert "Execute only the current DAG step" in messages[-1]["content"]
     assert (
         "Do not infer extra work from the overall user goal" in messages[-1]["content"]
@@ -579,6 +608,62 @@ async def test_dag_pattern_executes_independent_ready_steps_concurrently() -> No
         "step_3": "Task 3 done",
         "step_4": "Task 4 done",
         "step_5": "Task 5 done",
+    }
+
+
+@pytest.mark.asyncio
+async def test_dag_pattern_schedules_newly_ready_step_before_sibling_finishes() -> None:
+    class PartialBlockingLLM:
+        def __init__(self) -> None:
+            self.release_slow = asyncio.Event()
+            self.started_by_task: dict[str, asyncio.Event] = {}
+
+        async def chat(self, **kwargs: Any) -> dict[str, Any]:
+            messages = list(kwargs.get("messages", []))
+            task = current_step_task(messages)
+            self.started_by_task.setdefault(task, asyncio.Event()).set()
+            if task == "Create English HTML":
+                await self.release_slow.wait()
+            return {"content": f"{task} done", "done": True}
+
+        async def wait_started(self, task: str) -> None:
+            await asyncio.wait_for(
+                self.started_by_task.setdefault(task, asyncio.Event()).wait(),
+                timeout=1,
+            )
+
+    llm = PartialBlockingLLM()
+    pattern = DAGPattern(
+        lambda **_: build_plan(
+            PlanStep(id="zh", task="Create Chinese HTML"),
+            PlanStep(id="en", task="Create English HTML"),
+            PlanStep(id="render_zh", task="Render Chinese poster", dependencies=["zh"]),
+            PlanStep(id="render_en", task="Render English poster", dependencies=["en"]),
+        ),
+        max_concurrency=2,
+    )
+
+    run_task = asyncio.create_task(
+        pattern.run(
+            context=ExecutionContext(execution_id="dag-dynamic-ready"),
+            tools=[],
+            llm=llm,
+        )
+    )
+
+    await llm.wait_started("Create English HTML")
+    await llm.wait_started("Render Chinese poster")
+    assert "Render English poster" not in llm.started_by_task
+
+    llm.release_slow.set()
+    result = await asyncio.wait_for(run_task, timeout=1)
+
+    assert result["success"] is True
+    assert result["step_results"] == {
+        "zh": "Create Chinese HTML done",
+        "en": "Create English HTML done",
+        "render_zh": "Render Chinese poster done",
+        "render_en": "Render English poster done",
     }
 
 
@@ -765,6 +850,9 @@ async def test_llm_plan_generator_builds_plan_from_model_json() -> None:
                     "id": "final",
                     "task": "Finalize answer",
                     "description": "Write the final answer from the draft.",
+                    "termination_condition": (
+                        "Stop after the final answer has been written once."
+                    ),
                     "tool_names": ["calculator"],
                     "dependencies": ["draft"],
                 },
@@ -784,23 +872,30 @@ async def test_llm_plan_generator_builds_plan_from_model_json() -> None:
     assert [step.id for step in plan.steps] == ["draft", "final"]
     assert plan.steps[1].dependencies == ["draft"]
     assert plan.steps[1].description == "Write the final answer from the draft."
+    assert (
+        plan.steps[1].termination_condition
+        == "Stop after the final answer has been written once."
+    )
     assert plan.steps[1].tool_names == ["calculator"]
     assert llm.calls[0]["tools"][0]["function"]["name"] == "generate_execution_plan"
     step_schema = llm.calls[0]["tools"][0]["function"]["parameters"]["properties"][
         "steps"
     ]["items"]["properties"]
     assert "description" in step_schema
+    assert "termination_condition" in step_schema
     assert "tool_names" in step_schema
     assert "dependencies" in step_schema
     step_required = llm.calls[0]["tools"][0]["function"]["parameters"]["properties"][
         "steps"
     ]["items"]["required"]
     assert "dependencies" in step_required
+    assert "termination_condition" in step_required
     assert "tool_names" in step_required
     system_prompt = llm.calls[0]["messages"][0]["content"]
     assert "dependencies is required for every step" in system_prompt
     assert "screenshot or render steps must depend" in system_prompt
-    assert 'tool_names"; "description" is optional' in system_prompt
+    assert '"termination_condition"' in system_prompt
+    assert "must be concrete and action-specific" in system_prompt
     assert "suggested execution tool scope" in system_prompt
     assert llm.calls[0]["tool_choice"] == "required"
     assert llm.calls[0]["thinking"] == {"type": "disabled", "enable": False}

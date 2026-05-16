@@ -22,6 +22,7 @@ class PlanStep:
     task: str
     dependencies: list[str] = field(default_factory=list)
     description: str | None = None
+    termination_condition: str | None = None
     tool_names: list[str] = field(default_factory=list)
     status: str = "pending"
     result: Any = None
@@ -33,6 +34,7 @@ class PlanStep:
             "task": self.task,
             "dependencies": list(self.dependencies),
             "description": self.description,
+            "termination_condition": self.termination_condition,
             "tool_names": list(self.tool_names),
             "status": self.status,
             "result": self.result,
@@ -49,6 +51,11 @@ class PlanStep:
             description=(
                 str(data["description"])
                 if data.get("description") is not None
+                else None
+            ),
+            termination_condition=(
+                str(data["termination_condition"])
+                if data.get("termination_condition") is not None
                 else None
             ),
             tool_names=tool_names,
@@ -198,8 +205,9 @@ class LLMPlanGenerator(PlanGenerator):
                     "content": (
                         "Generate a DAG execution plan by calling the "
                         f"{self.PLAN_TOOL_NAME} tool exactly once. Each step requires "
-                        '"id", "task", "dependencies", and "tool_names"; '
-                        '"description" is optional but strongly recommended. '
+                        '"id", "task", "dependencies", "termination_condition", '
+                        'and "tool_names"; "description" is optional but strongly '
+                        "recommended. "
                         "dependencies is required for every step; "
                         "use an empty array only for true entry steps that do not "
                         "need any prior output. If a step uses data, files, decisions, "
@@ -210,7 +218,17 @@ class LLMPlanGenerator(PlanGenerator):
                         "on the research or build steps they summarize. Use task as "
                         "the short node title, "
                         "description for the concrete work to perform, and tool_names "
-                        "for the step's suggested execution tool scope. tool_names "
+                        "for the step's suggested execution tool scope. Use "
+                        "termination_condition for the exact stop rule that tells the "
+                        "step executor when this step is done and what it must report. "
+                        "The termination_condition must be concrete and action-specific; "
+                        "do not use vague wording such as 'when complete' or 'when the "
+                        "task is done'. For artifact-producing steps, name the exact "
+                        "artifact or path and state that the step must call final_answer "
+                        "after the artifact is successfully produced. Put review, "
+                        "verification, rendering, optimization, and final synthesis in "
+                        "separate dependent steps unless this step explicitly owns that "
+                        "work. tool_names "
                         "must only contain exact names from available_tool_names. "
                         "Include the best matching available tools for every step "
                         "that needs tool use. Leave tool_names empty only for pure "
@@ -294,6 +312,16 @@ class LLMPlanGenerator(PlanGenerator):
                                             "execution plan."
                                         ),
                                     },
+                                    "termination_condition": {
+                                        "type": "string",
+                                        "description": (
+                                            "Concrete stop rule for this step. It must "
+                                            "state the exact condition that means this "
+                                            "step is finished and what final_answer "
+                                            "should report. Avoid vague conditions such "
+                                            "as 'when complete'."
+                                        ),
+                                    },
                                     "tool_names": {
                                         "type": "array",
                                         "items": {"type": "string"},
@@ -310,6 +338,7 @@ class LLMPlanGenerator(PlanGenerator):
                                     "id",
                                     "task",
                                     "dependencies",
+                                    "termination_condition",
                                     "tool_names",
                                 ],
                                 "additionalProperties": False,

@@ -399,7 +399,15 @@ async def browser_navigate(**kwargs: Any) -> Dict[str, Any]:
             "session_id": session_id,
             "url": url,
             "title": title,
-            "message": f"Navigated to {url}. IMPORTANT: Session ID is '{session_id}'. You MUST use this exact session_id='{session_id}' in all subsequent browser calls (browser_click, browser_extract_text, etc.) to continue using this browser.",
+            "message": (
+                f"Navigation complete: opened {url}. This only confirms the page "
+                "loaded; it does not inspect content, validate visual rendering, "
+                "or create an image export. Do not call browser_navigate again for "
+                "this same URL unless navigation failed or the target URL changed. "
+                "Use browser_screenshot for visual inspection/rendered output, "
+                "or browser_extract_text for page text. "
+                f"Session ID: '{session_id}'."
+            ),
         }
     except Exception as e:
         import logging

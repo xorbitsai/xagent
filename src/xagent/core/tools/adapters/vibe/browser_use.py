@@ -257,6 +257,14 @@ class BrowserNavigateTool(AbstractBaseTool):
     def description(self) -> str:
         return """Navigate to URL. Browser session auto-created.
 
+        This tool only opens a page and reports navigation success. It does not inspect
+        page content, validate visual rendering, take screenshots, export images, or
+        prove that a page meets the user's request. After a successful navigation to the
+        intended URL, do not call browser_navigate again for the same URL unless the
+        previous navigation failed or the URL changed. Use browser_screenshot when visual
+        inspection or rendered output is required, and use browser_extract_text when page
+        text is required.
+
         Workspace files: Use filename (e.g., "poster.html") - auto-searches input/output/temp dirs.
 
         Default: headless=False (shows browser window for debugging/interaction).

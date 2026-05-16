@@ -17,7 +17,7 @@ from xagent.core.agent import (
     PatternRuntime,
     ReActPattern,
 )
-from xagent.core.agent.pattern.auto.auto import DECISION_TOOL_NAME
+from xagent.core.agent.pattern.auto.auto import DECISION_TOOL_NAME, _AutoChildRuntime
 
 
 class FakeWorkspace:
@@ -132,6 +132,22 @@ class CapturingChildPattern:
 
     def get_state(self) -> dict[str, Any]:
         return {"captured": True}
+
+
+def test_auto_child_runtime_forwards_clear_interrupt() -> None:
+    parent_runtime = PatternRuntime()
+    parent_runtime.request_interrupt("resume with user guidance")
+
+    child_runtime = _AutoChildRuntime(
+        parent=parent_runtime,
+        auto_pattern=AutoPattern(),
+        root_context=ExecutionContext(execution_id="auto-clear-interrupt"),
+    )
+
+    child_runtime.clear_interrupt()
+
+    assert parent_runtime._interrupt_requested is False
+    assert parent_runtime.interrupt_reason is None
 
 
 def decision_tool_response(

@@ -429,11 +429,14 @@ export function ChatInput({
     setAgentConfig(config);
   };
 
+  const allowsInterruptedInput = taskStatus === 'paused' || taskStatus === 'waiting_for_user';
+  const isInputBusy = !!isLoading && !allowsInterruptedInput;
+
   const canSubmit = () => {
     const hasText = message.trim().length > 0;
     const hasFiles = files.length > 0;
     const isUploadingFiles = uploadingFiles.size > 0;
-    return (hasText || hasFiles) && !isLoading && !isUploadingFiles;
+    return (hasText || hasFiles) && !isInputBusy && !isUploadingFiles;
   };
   const canPauseTask =
     taskStatus === 'running' ||
@@ -690,7 +693,7 @@ export function ChatInput({
               className={cn(
                 "w-full rounded-md border-0 bg-transparent text-[15px] outline-none placeholder:text-muted-foreground/60 overflow-y-auto resize-none focus-visible:ring-0 focus-visible:ring-offset-0 whitespace-pre-wrap break-words text-left",
                 compact ? "min-h-[44px] px-3 py-3 pr-12 max-h-[150px]" : cn(minHeightClass, "px-4 py-3 pb-16 max-h-[400px]"),
-                isLoading ? "opacity-50 pointer-events-none" : ""
+                isInputBusy ? "opacity-50 pointer-events-none" : ""
               )}
               onInput={handleInput}
               onKeyDown={handleKeyDown}
@@ -719,7 +722,7 @@ export function ChatInput({
                   !canSubmit() && "bg-muted text-muted-foreground/50"
                 )}
               >
-                {isLoading ? (
+                {isInputBusy ? (
                   <Sparkles className="h-4 w-4 animate-pulse" />
                 ) : (
                   <ArrowUp className="h-4 w-4" />
@@ -756,7 +759,7 @@ export function ChatInput({
                             variant="ghost"
                             size="sm"
                             className="h-9 px-3 text-muted-foreground hover:text-foreground hover:bg-secondary/80 rounded-xl gap-2"
-                            disabled={isLoading}
+                            disabled={isInputBusy}
                             title={t('agent.input.actions.config')}
                           >
                             <Globe className="h-4 w-4" />
@@ -786,7 +789,7 @@ export function ChatInput({
                       size="sm"
                       className="h-9 w-9 p-0 text-muted-foreground hover:text-foreground hover:bg-secondary/80 rounded-full"
                       onClick={() => fileInputRef.current?.click()}
-                      disabled={isLoading}
+                      disabled={isInputBusy}
                       title={t("chatPage.input.actions.upload")}
                     >
                       <Paperclip className="h-4 w-4" />
@@ -805,15 +808,6 @@ export function ChatInput({
                   >
                     <Pause className="h-4 w-4" />
                   </Button>
-                ) : taskStatus === 'paused' ? (
-                  <Button
-                    type="button"
-                    size="icon"
-                    onClick={onResume}
-                    className="h-8 w-8 rounded-full transition-all duration-300 bg-green-500 hover:bg-green-600 text-white"
-                  >
-                    <Play className="h-4 w-4" />
-                  </Button>
                 ) : (
                   <div className="flex items-center gap-2">
                     <span className="text-[13px] font-medium text-muted-foreground/50 select-none mr-1">
@@ -828,12 +822,23 @@ export function ChatInput({
                         !canSubmit() && "bg-muted text-muted-foreground/50"
                       )}
                     >
-                      {isLoading ? (
+                      {isInputBusy ? (
                         <Sparkles className="h-4 w-4 animate-pulse" />
                       ) : (
                         <ArrowUp className="h-4 w-4" />
                       )}
                     </Button>
+                    {taskStatus === 'paused' && onResume && (
+                      <Button
+                        type="button"
+                        size="icon"
+                        onClick={onResume}
+                        className="h-8 w-8 rounded-full transition-all duration-300 bg-green-500 hover:bg-green-600 text-white"
+                        title={t('agent.input.actions.resumeTask')}
+                      >
+                        <Play className="h-4 w-4" />
+                      </Button>
+                    )}
                   </div>
                 )}
               </div>

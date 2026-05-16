@@ -565,6 +565,40 @@ class DAGPattern(AgentPattern):
         }
         steps_by_id = {step.id: step for step in steps}
         pending = set(tasks)
+        scheduled_step_ids = set(steps_by_id)
+
+        def schedule_ready_steps() -> None:
+            if self.plan is None:
+                return
+            available_slots = self.max_concurrency - len(pending)
+            if available_slots <= 0:
+                return
+            for ready_step in self._pending_ready_steps():
+                if ready_step.id in scheduled_step_ids:
+                    continue
+                self._mark_step_active(ready_step.id)
+                ready_step.status = "running"
+                task = asyncio.create_task(
+                    self._execute_step(
+                        step=ready_step,
+                        root_context=root_context,
+                        tools=tools,
+                        llm=llm,
+                        runtime=runtime,
+                        memory_store=memory_store,
+                        memory_similarity_threshold=memory_similarity_threshold,
+                        skill_manager=skill_manager,
+                        allowed_skills=allowed_skills,
+                    )
+                )
+                tasks[task] = ready_step.id
+                steps_by_id[ready_step.id] = ready_step
+                pending.add(task)
+                scheduled_step_ids.add(ready_step.id)
+                available_slots -= 1
+                if available_slots <= 0:
+                    break
+
         try:
             while pending:
                 done, pending = await asyncio.wait(
@@ -629,6 +663,7 @@ class DAGPattern(AgentPattern):
                             steps_by_id=steps_by_id,
                         )
                         return None
+                schedule_ready_steps()
         except Exception:
             try:
                 await self._cancel_pending_steps(
@@ -980,6 +1015,16 @@ class DAGPattern(AgentPattern):
                 ready.append(step)
         return ready
 
+    def _pending_ready_steps(self) -> list[PlanStep]:
+        if self.plan is None:
+            return []
+        return [
+            step
+            for step in self.plan.steps
+            if step.status == "pending"
+            and all(dep in self.step_results for dep in step.dependencies)
+        ]
+
     def _all_steps_completed(self) -> bool:
         return self.plan is not None and all(
             step.status == "completed" for step in self.plan.steps
@@ -1036,6 +1081,10 @@ class DAGPattern(AgentPattern):
             else "This step has no dependencies."
         )
         suggested_tools = ", ".join(step.tool_names) if step.tool_names else "(none)"
+        termination_condition = (
+            step.termination_condition
+            or "Return final_answer when the current step description is satisfied."
+        )
         return (
             "DAG STEP EXECUTION BOUNDARY\n"
             "The overall user goal is background context only. Do not execute it "
@@ -1047,9 +1096,17 @@ class DAGPattern(AgentPattern):
             f"Current DAG step description: {step.description or step.task}\n"
             f"Current DAG step dependencies: {list(step.dependencies)}\n"
             f"Suggested tools for this step: {suggested_tools}\n\n"
+            "TERMINATION CONDITION - AUTHORITATIVE STOP RULE\n"
+            f"{termination_condition}\n"
+            "Treat this termination condition as authoritative for this step. "
+            "Once it is satisfied, your next action must be final_answer for this "
+            "step. Do not inspect, verify, revise, optimize, regenerate, or perform "
+            "downstream work unless the termination condition explicitly requires "
+            "that work.\n\n"
             f"{dependency_note}\n\n"
             "Execute only the current DAG step. The current step title and "
-            "description define the entire actionable goal for this ReAct run. "
+            "description plus the termination condition define the entire "
+            "actionable goal for this ReAct run. "
             "Do not infer extra work from the overall user goal. Do not complete "
             "downstream, sibling, final synthesis, rendering, screenshots, visual "
             "inspection, export, or delivery work unless that work is explicitly "

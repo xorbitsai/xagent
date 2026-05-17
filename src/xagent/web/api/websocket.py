@@ -641,6 +641,44 @@ def _add_file_link_aliases(
         path_to_file_id[f"/{task_local_path}"] = file_id
 
 
+def _uploaded_file_record_in_task_scope(
+    file_record: Any, task_id: int, task_user_id: int
+) -> bool:
+    try:
+        record_user_id = int(getattr(file_record, "user_id"))
+    except (TypeError, ValueError):
+        return False
+
+    if record_user_id != int(task_user_id):
+        return False
+
+    record_task_id = getattr(file_record, "task_id", None)
+    if record_task_id is None:
+        return True
+
+    try:
+        return int(record_task_id) == int(task_id)
+    except (TypeError, ValueError):
+        return False
+
+
+def _output_path_in_current_task_scope(
+    relative_path: str, task_id: int, task_user_id: int
+) -> bool:
+    parts = Path(relative_path.lstrip("/")).parts
+    task_dirs = {f"web_task_{task_id}", f"task_{task_id}"}
+
+    if (
+        len(parts) >= 4
+        and parts[0] == f"user_{task_user_id}"
+        and parts[1] in task_dirs
+        and parts[2] == "output"
+    ):
+        return True
+
+    return len(parts) >= 3 and parts[0] in task_dirs and parts[1] == "output"
+
+
 def _normalize_file_outputs(
     db: Session,
     task_id: int,
@@ -715,6 +753,15 @@ def _normalize_file_outputs(
 
         resolved_path, relative_path = resolved_info
         normalized_relative_path = relative_path.lstrip("/")
+        if not _output_path_in_current_task_scope(
+            normalized_relative_path, task_id, task_user_id
+        ):
+            logger.warning(
+                "Skipping file output outside current task output scope: %s",
+                relative_path,
+            )
+            continue
+
         expected_file_id = item_file_id or _build_output_file_id(
             normalized_relative_path
         )
@@ -724,6 +771,15 @@ def _normalize_file_outputs(
             .filter(UploadedFile.storage_path == str(resolved_path))
             .first()
         )
+        if file_record is not None and not _uploaded_file_record_in_task_scope(
+            file_record, task_id, task_user_id
+        ):
+            logger.warning(
+                "Skipping file output record outside task/user scope: %s",
+                getattr(file_record, "file_id", str(resolved_path)),
+            )
+            continue
+
         if file_record is None and item_file_id:
             file_record = (
                 db.query(UploadedFile)

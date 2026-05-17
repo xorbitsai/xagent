@@ -10,6 +10,7 @@ from xagent.web.api.websocket import (
     _append_uploaded_files_context_to_message,
     _build_uploaded_files_context,
     _display_message_for_user,
+    _normalize_file_outputs,
     _selected_file_refs_from_task,
     handle_file_upload_for_task,
 )
@@ -242,6 +243,98 @@ def test_selected_file_refs_from_task_ignores_missing_config(db_session):
     task = _create_task(db_session, task_id=10, user_id=1)
 
     assert _selected_file_refs_from_task(task, db_session) == []
+
+
+def test_normalize_file_outputs_rejects_foreign_storage_path_record(
+    db_session,
+    tmp_path,
+    monkeypatch,
+):
+    uploads_dir = tmp_path / "uploads"
+    monkeypatch.setenv("XAGENT_UPLOADS_DIR", str(uploads_dir))
+    _create_user(db_session, 1, "owner")
+    _create_user(db_session, 2, "other")
+    _create_task(db_session, task_id=20, user_id=1)
+    _create_task(db_session, task_id=10, user_id=2)
+    foreign_path = uploads_dir / "user_2" / "web_task_10" / "output" / "secret.txt"
+    foreign_path.parent.mkdir(parents=True)
+    foreign_path.write_text("secret")
+    db_session.add(
+        UploadedFile(
+            file_id="foreign-output",
+            user_id=2,
+            task_id=10,
+            filename="secret.txt",
+            storage_path=str(foreign_path),
+            mime_type="text/plain",
+            file_size=len("secret"),
+        )
+    )
+    db_session.flush()
+
+    normalized_outputs, path_to_file_id = _normalize_file_outputs(
+        db_session,
+        task_id=20,
+        task_user_id=1,
+        file_outputs=[{"path": str(foreign_path)}],
+    )
+
+    assert normalized_outputs == []
+    assert path_to_file_id == {}
+
+
+def test_normalize_file_outputs_rejects_foreign_untracked_storage_path(
+    db_session,
+    tmp_path,
+    monkeypatch,
+):
+    uploads_dir = tmp_path / "uploads"
+    monkeypatch.setenv("XAGENT_UPLOADS_DIR", str(uploads_dir))
+    _create_user(db_session, 1, "owner")
+    _create_task(db_session, task_id=20, user_id=1)
+    foreign_path = uploads_dir / "user_2" / "web_task_10" / "output" / "secret.txt"
+    foreign_path.parent.mkdir(parents=True)
+    foreign_path.write_text("secret")
+
+    normalized_outputs, path_to_file_id = _normalize_file_outputs(
+        db_session,
+        task_id=20,
+        task_user_id=1,
+        file_outputs=[{"path": str(foreign_path)}],
+    )
+
+    assert normalized_outputs == []
+    assert path_to_file_id == {}
+    assert db_session.query(UploadedFile).count() == 0
+
+
+def test_normalize_file_outputs_registers_current_task_output_path(
+    db_session,
+    tmp_path,
+    monkeypatch,
+):
+    uploads_dir = tmp_path / "uploads"
+    monkeypatch.setenv("XAGENT_UPLOADS_DIR", str(uploads_dir))
+    _create_user(db_session, 1, "owner")
+    _create_task(db_session, task_id=20, user_id=1)
+    output_path = uploads_dir / "user_1" / "web_task_20" / "output" / "report.txt"
+    output_path.parent.mkdir(parents=True)
+    output_path.write_text("report")
+
+    normalized_outputs, path_to_file_id = _normalize_file_outputs(
+        db_session,
+        task_id=20,
+        task_user_id=1,
+        file_outputs=[{"path": str(output_path), "filename": "report.txt"}],
+    )
+
+    assert len(normalized_outputs) == 1
+    assert normalized_outputs[0]["filename"] == "report.txt"
+    assert path_to_file_id[str(output_path)] == normalized_outputs[0]["file_id"]
+    file_record = db_session.query(UploadedFile).one()
+    assert file_record.user_id == 1
+    assert file_record.task_id == 20
+    assert file_record.storage_path == str(output_path)
 
 
 @pytest.mark.asyncio

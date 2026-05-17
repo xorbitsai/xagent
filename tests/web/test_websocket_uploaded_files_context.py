@@ -5,6 +5,7 @@ from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 
 from xagent.core.agent.trace import get_display_user_message
+from xagent.web.api import websocket as websocket_api
 from xagent.web.api.chat import _build_task_agent_config
 from xagent.web.api.websocket import (
     _append_uploaded_files_context_to_message,
@@ -12,9 +13,11 @@ from xagent.web.api.websocket import (
     _display_message_for_user,
     _normalize_file_outputs,
     _selected_file_refs_from_task,
+    execute_task_background,
     handle_file_upload_for_task,
 )
 from xagent.web.models import Base
+from xagent.web.models import database as database_models
 from xagent.web.models.task import Task, TaskStatus
 from xagent.web.models.uploaded_file import UploadedFile
 from xagent.web.models.user import User
@@ -50,13 +53,14 @@ def _create_task(
     task_id: int,
     user_id: int,
     selected_file_ids: list[str] | None = None,
+    status: TaskStatus = TaskStatus.PENDING,
 ) -> Task:
     task = Task(
         id=task_id,
         user_id=user_id,
         title=f"task-{task_id}",
         description="task",
-        status=TaskStatus.PENDING,
+        status=status,
         agent_config=(
             {"selected_file_ids": selected_file_ids}
             if selected_file_ids is not None
@@ -91,6 +95,103 @@ def _create_uploaded_file(
     db.add(file_record)
     db.flush()
     return file_record
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "terminal_status",
+    [TaskStatus.COMPLETED, TaskStatus.FAILED],
+)
+async def test_execute_task_background_reuses_task_id_for_terminal_tasks(
+    db_session,
+    monkeypatch,
+    terminal_status,
+):
+    user = _create_user(db_session, 1, "owner")
+    _create_task(
+        db_session,
+        task_id=10,
+        user_id=1,
+        status=terminal_status,
+    )
+    captured: dict[str, object] = {}
+
+    class BackgroundTaskManager:
+        async def wait_for_previous(self, task_id):
+            captured["waited_for"] = task_id
+
+        def cleanup_task(self, task_id):
+            captured["cleaned_up"] = task_id
+
+    class BroadcastManager:
+        async def broadcast_to_task(self, event, task_id):
+            captured["broadcast_task_id"] = task_id
+
+    class AgentService:
+        def set_conversation_history(self, history):
+            captured["conversation_history"] = history
+
+        def set_execution_context_messages(self, messages):
+            captured["execution_context_messages"] = messages
+
+        def set_recovered_skill_context(self, skill_context):
+            captured["skill_context"] = skill_context
+
+    class AgentManager:
+        async def get_agent_for_task(self, task_id, db, user=None):
+            captured["agent_db"] = db
+            return AgentService()
+
+        async def execute_task(
+            self,
+            *,
+            agent_service,
+            task,
+            context,
+            task_id,
+            tracking_task_id,
+            db_session,
+        ):
+            captured["agent_task"] = task
+            captured["agent_task_id"] = task_id
+            captured["tracking_task_id"] = tracking_task_id
+            return {"success": True, "output": "ok", "file_outputs": []}
+
+    def fake_get_db():
+        yield db_session
+
+    def fake_release_current_runner_task_lease(db, task_id, *, status):
+        return True
+
+    monkeypatch.setattr(
+        websocket_api,
+        "background_task_manager",
+        BackgroundTaskManager(),
+    )
+    monkeypatch.setattr(websocket_api, "manager", BroadcastManager())
+    monkeypatch.setattr(
+        websocket_api,
+        "release_current_runner_task_lease",
+        fake_release_current_runner_task_lease,
+    )
+    monkeypatch.setattr(database_models, "get_db", fake_get_db)
+    monkeypatch.setattr(
+        "xagent.web.services.chat_history_service.persist_assistant_message",
+        lambda *args, **kwargs: None,
+    )
+
+    await execute_task_background(
+        task_id=10,
+        user_message="重试",
+        context={},
+        agent_manager=AgentManager(),
+        user_id=int(user.id),
+        llm_user_message="重试",
+    )
+
+    assert captured["agent_task_id"] == "10"
+    assert captured["tracking_task_id"] == "10"
+    assert captured["agent_task"] == "重试"
 
 
 def test_build_uploaded_files_context_includes_agent_builder_kb_instruction():

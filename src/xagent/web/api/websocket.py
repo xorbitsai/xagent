@@ -860,26 +860,43 @@ async def execute_task_background(
     user_message: str,
     context: Dict[str, Any],
     agent_manager: Any,
-    user: Any,
-    task: Any,
-    db: Session,
-    force_fresh_execution: bool = False,
+    user_id: int | None,
+    before_message_id: int | None = None,
     llm_user_message: Optional[str] = None,
 ) -> None:
     """Execute task in background without blocking WebSocket message loop"""
+    from ..models.database import get_db
     from ..models.task import Task, TaskStatus
-    from ..services.chat_history_service import persist_assistant_message
+    from ..models.user import User
+    from ..services.chat_history_service import (
+        load_task_transcript,
+        persist_assistant_message,
+    )
+    from ..services.task_execution_context_service import (
+        load_task_execution_recovery_state,
+    )
 
     # Wait for previous background task to complete
     await background_task_manager.wait_for_previous(task_id)
 
+    db_gen = get_db()
     try:
+        db = next(db_gen)
         logger.info(f"Background task execution started for task {task_id}")
 
-        # Set up user context
-        user_id = int(user.id) if user else None
+        task = db.query(Task).filter(Task.id == task_id).first()
+        if task is None:
+            raise ValueError(f"Task {task_id} not found")
 
-        with UserContext(user_id):
+        task_user_id = _task_user_id(task)
+        effective_user_id = user_id if user_id is not None else task_user_id
+        user = (
+            db.query(User).filter(User.id == effective_user_id).first()
+            if effective_user_id is not None
+            else None
+        )
+
+        with UserContext(effective_user_id):
             # Get agent service
             agent_service = await agent_manager.get_agent_for_task(
                 task_id, db, user=user
@@ -888,9 +905,22 @@ async def execute_task_background(
                 agent_service.set_outbound_message_handler(
                     make_agent_outbound_handler(task_id)
                 )
+            if before_message_id is not None:
+                conversation_history = load_task_transcript(
+                    db,
+                    task_id,
+                    before_message_id=before_message_id,
+                )
+                agent_service.set_conversation_history(conversation_history)
+            recovery_state = await load_task_execution_recovery_state(db, task_id)
+            execution_context_messages = recovery_state.get("messages", [])
+            agent_service.set_execution_context_messages(execution_context_messages)
+            agent_service.set_recovered_skill_context(
+                recovery_state.get("skill_context")
+            )
 
-            # Execute task with automatic token tracking
-            actual_task_id = None if force_fresh_execution else str(task_id)
+            # Execute the next turn under the same task/thread id.
+            actual_task_id = str(task_id)
             task_for_agent = llm_user_message or user_message
             result = await agent_manager.execute_task(
                 agent_service=agent_service,
@@ -901,7 +931,6 @@ async def execute_task_background(
                 db_session=db,
             )
 
-        task_user_id = _task_user_id(task)
         if task_user_id is not None:
             normalized_outputs, path_to_file_id = _normalize_file_outputs(
                 db,
@@ -931,14 +960,11 @@ async def execute_task_background(
 
         # Task execution result is logged by ConsoleTraceHandler, no need for duplicate logs
 
-        # Update task status (get new session to avoid expiration)
-        from ..models.database import get_db
-
-        db_gen = get_db()
-        db_new = next(db_gen)
-        waiting_for_control = False
-        final_task_status = task.status.value
+        db_new_gen = get_db()
         try:
+            db_new = next(db_new_gen)
+            waiting_for_control = False
+            final_task_status = task.status.value
             task_updated = db_new.query(Task).filter(Task.id == task_id).first()
             if task_updated:
                 # Caller is responsible for the lease lifecycle (acquire +
@@ -1004,7 +1030,10 @@ async def execute_task_background(
                         else None,
                     )
         finally:
-            db_new.close()
+            try:
+                next(db_new_gen)
+            except StopIteration:
+                pass
 
         # Note: trace_task_completion is handled by the agent execution logic (e.g., dag_plan_execute.py)
 
@@ -1071,6 +1100,10 @@ async def execute_task_background(
     finally:
         # Clean up background task record
         background_task_manager.cleanup_task(task_id)
+        try:
+            next(db_gen)
+        except StopIteration:
+            pass
 
 
 async def execute_continuation_background(
@@ -1932,12 +1965,6 @@ async def handle_chat_message(
 
         # Call Agent to handle - use same agent manager as chat API
         try:
-            from ..services.chat_history_service import (
-                load_task_transcript,
-            )
-            from ..services.task_execution_context_service import (
-                load_task_execution_recovery_state,
-            )
             from .chat import get_agent_manager
 
             # Get database session
@@ -2170,47 +2197,41 @@ async def handle_chat_message(
 
                 # DAG plan-execute will automatically send user_message trace event
 
-                # Get agent service
-                agent_service = await get_agent_manager().get_agent_for_task(
-                    task_id, db, user=user
-                )
-                if hasattr(agent_service, "set_outbound_message_handler"):
-                    agent_service.set_outbound_message_handler(
-                        make_agent_outbound_handler(task_id)
-                    )
-
-                # NOTE: the user message is persisted inside
-                # ``TaskTurnOrchestrator.begin_turn`` below as part of
-                # the atomic transition (claim + persist + schedule
-                # commit together). We previously persisted it inline
-                # here and had to best-effort-delete on schedule
-                # rejection; that's now handled by begin_turn's
-                # transactional rollback. ``persisted_user_message`` is
-                # populated after begin_turn returns by reading back
-                # the latest user-role message — needed for the
-                # transcript-history slice below.
-                persisted_user_message = None
+                # The user message is persisted inside
+                # ``TaskTurnOrchestrator.begin_turn`` as part of the atomic
+                # transition (claim + persist + schedule commit together).
 
                 # Check if there's an old task running (PAUSED, WAITING_FOR_USER, or RUNNING status)
                 # If so, use continuation mechanism; otherwise execute normally
-                dag_pattern = (
-                    agent_service.get_dag_pattern()
-                    if hasattr(agent_service, "get_dag_pattern")
-                    else None
-                )
-
                 # Only use continuation when task is active and has old task
                 task_is_running = task.status in [
                     TaskStatus.PAUSED,
                     TaskStatus.WAITING_FOR_USER,
                     TaskStatus.RUNNING,
                 ]
-                supports_live_control = getattr(
-                    agent_service, "supports_live_control", lambda: False
-                )()
-                has_continuation = dag_pattern and hasattr(
-                    dag_pattern, "request_continuation"
-                )
+                agent_service = None
+                dag_pattern = None
+                supports_live_control = False
+                has_continuation = False
+                if task_is_running:
+                    agent_service = await get_agent_manager().get_agent_for_task(
+                        task_id, db, user=user
+                    )
+                    if hasattr(agent_service, "set_outbound_message_handler"):
+                        agent_service.set_outbound_message_handler(
+                            make_agent_outbound_handler(task_id)
+                        )
+                    dag_pattern = (
+                        agent_service.get_dag_pattern()
+                        if hasattr(agent_service, "get_dag_pattern")
+                        else None
+                    )
+                    supports_live_control = getattr(
+                        agent_service, "supports_live_control", lambda: False
+                    )()
+                    has_continuation = bool(
+                        dag_pattern and hasattr(dag_pattern, "request_continuation")
+                    )
 
                 if task_is_running and has_continuation and not supports_live_control:
                     # Use continuation: old task will handle at appropriate time
@@ -2293,6 +2314,7 @@ async def handle_chat_message(
                     return
                 if task_is_running and supports_live_control:
                     logger.info(f"Using agent message control for task {task_id}")
+                    assert agent_service is not None
                     posted = await agent_service.post_user_message(
                         str(task_id),
                         user_message_for_llm,
@@ -2335,35 +2357,6 @@ async def handle_chat_message(
                     logger.info(
                         f"Task {task_id} starting new execution turn (status: {task.status.value})"
                     )
-
-                    if persisted_user_message is not None:
-                        conversation_history = load_task_transcript(
-                            db,
-                            task_id,
-                            before_message_id=int(persisted_user_message.id),
-                        )
-                        agent_service.set_conversation_history(conversation_history)
-                    recovery_state = await load_task_execution_recovery_state(
-                        db, task_id
-                    )
-                    execution_context_messages = recovery_state.get("messages", [])
-                    agent_service.set_execution_context_messages(
-                        execution_context_messages
-                    )
-                    agent_service.set_recovered_skill_context(
-                        recovery_state.get("skill_context")
-                    )
-
-                    # IMPORTANT: Check if task was completed/failed BEFORE updating status
-                    # This is needed to force fresh execution instead of continuation
-                    was_completed_or_failed = task.status in [
-                        TaskStatus.COMPLETED,
-                        TaskStatus.FAILED,
-                    ]
-                    if was_completed_or_failed:
-                        logger.info(
-                            f"🔄 Task {task_id} was {task.status.value}, will force fresh execution"
-                        )
 
                     # The execution wrapper acquires the lease just before it
                     # starts running. Avoid acquiring it during setup so setup
@@ -2436,14 +2429,6 @@ async def handle_chat_message(
                     if hasattr(task, "examples") and task.examples:
                         context["examples"] = task.examples
 
-                    # For completed/failed tasks, we need to force a fresh execution
-                    # by not passing task_id to agent.execute_task
-                    force_fresh_execution = was_completed_or_failed
-                    if force_fresh_execution:
-                        logger.info(
-                            f"Confirmed: Task {task_id} was completed/failed, forcing fresh execution"
-                        )
-
                     # WS builds the display/execution payload here and
                     # delegates the full new-turn transition to the
                     # shared orchestrator. ``begin_turn`` owns the
@@ -2452,7 +2437,6 @@ async def handle_chat_message(
                     # single-commit transaction, and the lease-aware bg
                     # schedule -- so WS and /v1 SDK use one turn-
                     # lifecycle state machine.
-                    from ..models.chat_message import TaskChatMessage
                     from ..services.task_orchestrator import (
                         TaskTurnError,
                         TaskTurnOrchestrator,
@@ -2465,8 +2449,8 @@ async def handle_chat_message(
                         execution_message=user_message_for_llm,
                     )
                     # WS path only has two legal entries into begin_turn:
-                    #   PENDING                  → CREATE, no force_fresh
-                    #   COMPLETED / FAILED       → APPEND, force_fresh=True
+                    #   PENDING                  → CREATE
+                    #   COMPLETED / FAILED       → APPEND
                     # PAUSED / WAITING_FOR_USER / RUNNING should have been
                     # intercepted by the continuation path above. Reaching
                     # this branch with any of them is an upstream-dispatch
@@ -2480,7 +2464,7 @@ async def handle_chat_message(
                         TaskStatus.FAILED,
                     ):
                         turn_kind = TurnKind.APPEND
-                        turn_force_fresh = True  # WS always re-engages fresh
+                        turn_force_fresh = False
                     else:
                         logger.error(
                             f"WS schedule reached for task {task_id} with "
@@ -2509,17 +2493,6 @@ async def handle_chat_message(
                             context=context,
                         )
                         logger.info(f"Task {task_id} started in background")
-                        # Fetch the message begin_turn just persisted so the
-                        # transcript-history slice below can use its id.
-                        persisted_user_message = (
-                            db.query(TaskChatMessage)
-                            .filter(
-                                TaskChatMessage.task_id == task_id,
-                                TaskChatMessage.role == "user",
-                            )
-                            .order_by(TaskChatMessage.id.desc())
-                            .first()
-                        )
                     except TaskTurnError as busy_err:
                         # begin_turn's atomic transaction rolls back on
                         # bg_inflight / busy — neither the status flip

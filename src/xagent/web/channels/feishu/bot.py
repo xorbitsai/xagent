@@ -220,7 +220,6 @@ class FeishuBotInstance:
                     .first()
                 )
 
-            was_completed_or_failed = False
             if not task:
                 is_new_task = True
 
@@ -243,10 +242,6 @@ class FeishuBotInstance:
                 self._save_active_tasks()
             else:
                 is_new_task = False
-                was_completed_or_failed = task.status in [
-                    TaskStatus.COMPLETED,
-                    TaskStatus.FAILED,
-                ]
                 task.status = TaskStatus.PENDING
                 db.commit()
 
@@ -308,8 +303,7 @@ class FeishuBotInstance:
 
             from ...user_isolated_memory import UserContext
 
-            force_fresh_execution = not is_new_task and was_completed_or_failed
-            actual_task_id = None if force_fresh_execution else str(task.id)
+            actual_task_id = str(task.id)
 
             with UserContext(int(user.id)):
                 result = await agent_manager.execute_task(

@@ -287,12 +287,17 @@ class TaskTurnOrchestrator:
 
             from .chat_history_service import persist_user_message_no_commit
 
-            persist_user_message_no_commit(
+            persisted_message = persist_user_message_no_commit(
                 db=db,
                 task_id=task_id,
                 user_id=int(user.id),
                 content=payload.transcript_message,
             )
+            if persisted_message is not None:
+                db.flush()
+                before_message_id = int(persisted_message.id)
+            else:
+                before_message_id = None
             db.commit()
         except TaskTurnError:
             raise
@@ -309,6 +314,7 @@ class TaskTurnOrchestrator:
             payload=payload,
             force_fresh=force_fresh,
             context=context,
+            before_message_id=before_message_id,
         )
 
 
@@ -494,6 +500,7 @@ async def _schedule_bg(
     payload: TaskTurnPayload,
     force_fresh: bool,
     context: Optional[Dict[str, Any]],
+    before_message_id: Optional[int] = None,
 ) -> "asyncio.Task[None]":
     """Lease-aware bg scheduler.
 
@@ -557,10 +564,8 @@ async def _schedule_bg(
                     user_message=payload.transcript_message,
                     context=context or {},
                     agent_manager=_get_agent_manager(),
-                    user=bg_user_row,
-                    task=bg_task_row,
-                    db=bg_db,
-                    force_fresh_execution=force_fresh,
+                    user_id=int(bg_user_row.id),
+                    before_message_id=before_message_id,
                     llm_user_message=payload.execution_message,
                 )
                 try:

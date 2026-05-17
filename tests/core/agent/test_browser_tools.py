@@ -42,3 +42,31 @@ async def test_browser_tools_share_runtime_task_session_after_setup() -> None:
 
     assert session_tools
     assert {tool._task_id for tool in session_tools} == {"runtime-task"}
+
+
+def test_browser_task_session_mixin_defaults_to_step_scoped_session() -> None:
+    tool = BrowserTaskSessionMixin()
+    tool._task_id = "task-412"
+
+    args = tool._with_default_session(
+        {"url": "poster.html", "_xagent_step_id": "render english"}
+    )
+
+    assert args["session_id"] == "task-412:render_english"
+    assert "_xagent_step_id" not in args
+
+
+def test_browser_task_session_mixin_keeps_explicit_session() -> None:
+    tool = BrowserTaskSessionMixin()
+    tool._task_id = "task-412"
+
+    args = tool._with_default_session(
+        {
+            "url": "poster.html",
+            "session_id": "custom-session",
+            "_xagent_step_id": "render_english",
+        }
+    )
+
+    assert args["session_id"] == "custom-session"
+    assert "_xagent_step_id" not in args

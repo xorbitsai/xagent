@@ -72,6 +72,27 @@ class FakeWriteFileTool:
         }
 
 
+class FakeBrowserNavigateTool:
+    def __init__(self) -> None:
+        self.calls: list[dict[str, Any]] = []
+
+        class Metadata:
+            name = "browser_navigate"
+            description = "Navigate a browser page."
+
+        self.metadata = Metadata()
+
+    async def run_json_async(self, args: dict[str, Any]) -> Any:
+        self.calls.append(args)
+        return {
+            "success": True,
+            "session_id": args.get("session_id", ""),
+            "url": args["url"],
+            "title": "",
+            "message": "ok",
+        }
+
+
 class BrokenTool:
     def __init__(self) -> None:
         class Metadata:
@@ -295,6 +316,32 @@ async def test_react_pattern_runs_tool_call_then_final_answer() -> None:
     assert "use this date when forming search queries" in system_prompt
     assert "not supported by the conversation" in system_prompt
     assert "available context is insufficient" in system_prompt
+
+
+@pytest.mark.asyncio
+async def test_react_passes_runtime_step_to_browser_tool_call() -> None:
+    pattern = ReActPattern()
+    runtime = PatternRuntime()
+    runtime.active_react_step_id = "render_english_poster"
+    tool = FakeBrowserNavigateTool()
+
+    result = await pattern._execute_tool_safely(
+        {
+            "id": "call-browser",
+            "name": "browser_navigate",
+            "args": {"url": "poster_en.html"},
+        },
+        [tool],
+        runtime,
+    )
+
+    assert result["success"] is True
+    assert tool.calls == [
+        {
+            "url": "poster_en.html",
+            "_xagent_step_id": "render_english_poster",
+        }
+    ]
 
 
 @pytest.mark.asyncio

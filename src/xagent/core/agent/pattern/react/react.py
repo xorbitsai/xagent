@@ -1139,6 +1139,7 @@ class ReActPattern(AgentPattern):
         tools: list[Any],
         runtime: PatternRuntime,
     ) -> Any:
+        tool_call = self._with_runtime_step(tool_call, runtime)
         self._record_tool_call(tool_call, status="running")
         await runtime.on_tool_start(tool_call=tool_call)
         try:
@@ -1178,6 +1179,22 @@ class ReActPattern(AgentPattern):
         self._record_tool_call(tool_call, status="completed", result=result)
         await runtime.on_tool_end(tool_call=tool_call, result=result)
         return result
+
+    def _with_runtime_step(
+        self, tool_call: dict[str, Any], runtime: PatternRuntime
+    ) -> dict[str, Any]:
+        if tool_call.get("step_id") or tool_call.get("dag_step_id"):
+            return tool_call
+
+        step_id = getattr(runtime, "active_react_step_id", None)
+        if not step_id:
+            return tool_call
+
+        return {
+            **tool_call,
+            "step_id": str(step_id),
+            "dag_step_id": str(step_id),
+        }
 
     def _record_tool_call(
         self,
@@ -1289,7 +1306,7 @@ class ReActPattern(AgentPattern):
 
     async def _execute_tool(self, tool_call: dict[str, Any], tools: list[Any]) -> Any:
         tool = self._find_tool(tool_call["name"], tools)
-        args = tool_call.get("args", {})
+        args = self._tool_args_for_execution(tool_call, tool)
 
         execute = getattr(tool, "execute", None)
         if callable(execute):
@@ -1310,6 +1327,19 @@ class ReActPattern(AgentPattern):
         raise ValueError(
             f"Tool {tool_call['name']} does not expose a supported executor."
         )
+
+    def _tool_args_for_execution(
+        self, tool_call: dict[str, Any], tool: Any
+    ) -> dict[str, Any]:
+        args = dict(tool_call.get("args", {}))
+        tool_name = self._tool_name(tool)
+        if not tool_name.startswith("browser_"):
+            return args
+
+        step_id = tool_call.get("dag_step_id") or tool_call.get("step_id")
+        if step_id and not args.get("session_id"):
+            args.setdefault("_xagent_step_id", str(step_id))
+        return args
 
     def _find_tool(self, name: str, tools: list[Any]) -> Any:
         for tool in tools:

@@ -30,6 +30,8 @@ from .base import AbstractBaseTool, ToolCategory, ToolVisibility
 
 logger = logging.getLogger(__name__)
 
+_STEP_SESSION_ARG = "_xagent_step_id"
+
 
 class BrowserTaskSessionMixin:
     """Keeps browser tool default sessions aligned during task setup."""
@@ -39,6 +41,63 @@ class BrowserTaskSessionMixin:
     async def setup(self, task_id: Optional[str] = None) -> None:
         if task_id:
             self._task_id = task_id
+
+    async def teardown(self, task_id: Optional[str] = None) -> None:
+        await self._close_task_sessions(task_id)
+
+    def _with_default_session(self, args: Mapping[str, Any]) -> dict[str, Any]:
+        updated = dict(args)
+        step_id = updated.pop(_STEP_SESSION_ARG, None)
+        if not updated.get("session_id") and self._task_id:
+            updated["session_id"] = self._default_session_id(step_id)
+        return updated
+
+    def _default_session_id(self, step_id: Any = None) -> str:
+        task_id = str(self._task_id or "").strip()
+        step_part = self._safe_session_part(step_id)
+        if step_part:
+            return f"{task_id}:{step_part}"
+        return task_id
+
+    @staticmethod
+    def _safe_session_part(value: Any = None) -> str:
+        if value is None:
+            return ""
+        safe = "".join(
+            char if char.isalnum() or char in {"-", "_", "."} else "_"
+            for char in str(value).strip()
+        ).strip("_")
+        return safe
+
+    async def _close_task_sessions(self, task_id: Optional[str] = None) -> None:
+        target_task_id = str(task_id or self._task_id or "").strip()
+        if not target_task_id:
+            return
+
+        try:
+            manager = get_browser_manager()
+            async with manager._lock:
+                session_ids = [
+                    session_id
+                    for session_id in manager._sessions
+                    if session_id == target_task_id
+                    or session_id.startswith(f"{target_task_id}:")
+                ]
+                for session_id in session_ids:
+                    await manager._sessions[session_id].close()
+                    del manager._sessions[session_id]
+            logger.info(
+                "Cleaned up %d browser session(s) for task %s",
+                len(session_ids),
+                target_task_id,
+            )
+        except Exception as e:
+            logger.error(
+                "Failed to cleanup browser sessions for task %s: %s",
+                target_task_id,
+                e,
+                exc_info=True,
+            )
 
 
 # ============== Input/Output Schemas ==============
@@ -307,10 +366,7 @@ class BrowserNavigateTool(BrowserTaskSessionMixin, AbstractBaseTool):
         )
 
     async def run_json_async(self, args: Mapping[str, Any]) -> Any:
-        # Use task_id as default session_id if not provided
-        if not args.get("session_id") and self._task_id:
-            args = dict(args)  # Make a mutable copy
-            args["session_id"] = self._task_id
+        args = self._with_default_session(args)
 
         # Convert workspace-relative paths to file:// URLs
         url = args.get("url", "")
@@ -415,22 +471,7 @@ class BrowserNavigateTool(BrowserTaskSessionMixin, AbstractBaseTool):
 
     async def teardown(self, task_id: Optional[str] = None) -> None:
         """Cleanup browser sessions when task completes."""
-        if self._task_id or task_id:
-            target_task_id = self._task_id or task_id
-            if target_task_id:  # Type guard for mypy
-                try:
-                    manager = get_browser_manager()
-                    # Close the session associated with this task
-                    # Session ID is typically the same as task_id in our pattern
-                    await manager.close(target_task_id)
-                    logger.info(
-                        f"Cleaned up browser session for task {target_task_id} via teardown"
-                    )
-                except Exception as e:
-                    logger.error(
-                        f"Failed to cleanup browser session for task {target_task_id}: {e}",
-                        exc_info=True,
-                    )
+        await self._close_task_sessions(task_id)
 
 
 class BrowserClickTool(BrowserTaskSessionMixin, AbstractBaseTool):
@@ -475,10 +516,7 @@ class BrowserClickTool(BrowserTaskSessionMixin, AbstractBaseTool):
         )
 
     async def run_json_async(self, args: Mapping[str, Any]) -> Any:
-        # Use task_id as default session_id if not provided
-        if not args.get("session_id") and self._task_id:
-            args = dict(args)  # Make a mutable copy
-            args["session_id"] = self._task_id
+        args = self._with_default_session(args)
 
         result = await browser_click(**args)
         return BrowserClickResult(**result).model_dump()
@@ -526,10 +564,7 @@ class BrowserFillTool(BrowserTaskSessionMixin, AbstractBaseTool):
         )
 
     async def run_json_async(self, args: Mapping[str, Any]) -> Any:
-        # Use task_id as default session_id if not provided
-        if not args.get("session_id") and self._task_id:
-            args = dict(args)  # Make a mutable copy
-            args["session_id"] = self._task_id
+        args = self._with_default_session(args)
 
         result = await browser_fill(**args)
         return BrowserFillResult(**result).model_dump()
@@ -583,10 +618,7 @@ class BrowserScreenshotTool(BrowserTaskSessionMixin, AbstractBaseTool):
         )
 
     async def run_json_async(self, args: Mapping[str, Any]) -> Any:
-        # Use task_id as default session_id if not provided
-        if not args.get("session_id") and self._task_id:
-            args = dict(args)  # Make a mutable copy
-            args["session_id"] = self._task_id
+        args = self._with_default_session(args)
 
         # Call async version directly
         import traceback
@@ -689,10 +721,7 @@ class BrowserExtractTextTool(BrowserTaskSessionMixin, AbstractBaseTool):
         )
 
     async def run_json_async(self, args: Mapping[str, Any]) -> Any:
-        # Use task_id as default session_id if not provided
-        if not args.get("session_id") and self._task_id:
-            args = dict(args)  # Make a mutable copy
-            args["session_id"] = self._task_id
+        args = self._with_default_session(args)
 
         result = await browser_extract_text(**args)
         return BrowserExtractTextResult(**result).model_dump()
@@ -749,10 +778,7 @@ class BrowserEvaluateTool(BrowserTaskSessionMixin, AbstractBaseTool):
         )
 
     async def run_json_async(self, args: Mapping[str, Any]) -> Any:
-        # Use task_id as default session_id if not provided
-        if not args.get("session_id") and self._task_id:
-            args = dict(args)  # Make a mutable copy
-            args["session_id"] = self._task_id
+        args = self._with_default_session(args)
 
         result = await browser_evaluate(**args)
         return BrowserEvaluateResult(**result).model_dump()
@@ -851,10 +877,7 @@ class BrowserSelectOptionTool(BrowserTaskSessionMixin, AbstractBaseTool):
         )
 
     async def run_json_async(self, args: Mapping[str, Any]) -> Any:
-        # Use task_id as default session_id if not provided
-        if not args.get("session_id") and self._task_id:
-            args = dict(args)  # Make a mutable copy
-            args["session_id"] = self._task_id
+        args = self._with_default_session(args)
 
         result = await browser_select_option(**args)
         return BrowserSelectOptionResult(**result).model_dump()
@@ -902,10 +925,7 @@ class BrowserWaitForSelectorTool(BrowserTaskSessionMixin, AbstractBaseTool):
         )
 
     async def run_json_async(self, args: Mapping[str, Any]) -> Any:
-        # Use task_id as default session_id if not provided
-        if not args.get("session_id") and self._task_id:
-            args = dict(args)  # Make a mutable copy
-            args["session_id"] = self._task_id
+        args = self._with_default_session(args)
 
         result = await browser_wait_for_selector(**args)
         return BrowserWaitForSelectorResult(**result).model_dump()
@@ -948,10 +968,7 @@ class BrowserCloseTool(BrowserTaskSessionMixin, AbstractBaseTool):
         )
 
     async def run_json_async(self, args: Mapping[str, Any]) -> Any:
-        # Use task_id as default session_id if not provided
-        if not args.get("session_id") and self._task_id:
-            args = dict(args)  # Make a mutable copy
-            args["session_id"] = self._task_id
+        args = self._with_default_session(args)
 
         result = await browser_close(**args)
         return BrowserCloseResult(**result).model_dump()
@@ -1009,10 +1026,7 @@ class BrowserPdfTool(BrowserTaskSessionMixin, AbstractBaseTool):
         )
 
     async def run_json_async(self, args: Mapping[str, Any]) -> Any:
-        # Use task_id as default session_id if not provided
-        if not args.get("session_id") and self._task_id:
-            args = dict(args)  # Make a mutable copy
-            args["session_id"] = self._task_id
+        args = self._with_default_session(args)
 
         # Call core function to get PDF data (base64 encoded)
         result = await browser_pdf(**args)

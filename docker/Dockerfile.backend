@@ -22,11 +22,13 @@ RUN if [ -n "$APT_MIRROR" ]; then \
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
     build-essential \
+    ca-certificates \
     gcc \
     git \
     pkg-config \
     python3-dev \
     curl \
+    openssl \
     libssl-dev \
     libffi-dev \
     libgl1 \
@@ -47,10 +49,11 @@ COPY .git .git
 
 # Create venv and install build tools
 RUN python -m venv /opt/venv \
+    && /opt/venv/bin/python -c "import ssl; print(ssl.OPENSSL_VERSION)" \
     && /opt/venv/bin/pip install --no-cache-dir ${PYPI_INDEX_URL:+--index-url $PYPI_INDEX_URL} --upgrade pip
 
 # Install torch CPU version first (to avoid CUDA version from docling dependency)
-RUN /opt/venv/bin/pip install --no-cache-dir --extra-index-url https://download.pytorch.org/whl/cpu torch
+RUN /opt/venv/bin/pip install --no-cache-dir ${PYPI_INDEX_URL:+--index-url $PYPI_INDEX_URL} --extra-index-url https://download.pytorch.org/whl/cpu torch
 
 # Copy source code (changes frequently)
 COPY src ./src
@@ -87,9 +90,11 @@ RUN if [ -n "$APT_MIRROR" ]; then \
 
 # System deps + Node.js + LibreOffice + Xvfb (for headless browser/screenshots)
 RUN apt-get update && apt-get install -y --no-install-recommends \
+    ca-certificates \
     curl \
     docker.io \
     gnupg \
+    openssl \
     libreoffice \
     libglib2.0-0 \
     libsm6 \

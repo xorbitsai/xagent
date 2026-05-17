@@ -61,6 +61,8 @@ class TaskWorkspace:
         self.db_session = None  # Optional database session for file registration
         self._recently_registered_files: Dict[str, str] = {}  # path -> file_id mapping
         self._file_id_to_path: Dict[str, Path] = {}  # file_id -> path reverse mapping
+        self.owner_user_id: Optional[int] = None
+        self.current_task_id: Optional[int] = self._parse_task_id_from_workspace_id(id)
 
         # Create workspace directory
         self.workspace_dir = self.base_dir / id
@@ -238,6 +240,36 @@ class TaskWorkspace:
         except Exception:
             return None
 
+    @staticmethod
+    def _parse_task_id_from_workspace_id(workspace_id: str) -> Optional[int]:
+        try:
+            return int(str(workspace_id).split("_")[-1])
+        except (TypeError, ValueError, IndexError):
+            return None
+
+    def _file_record_allowed_for_workspace(self, record: Any, path: Path) -> bool:
+        workspace_abs = self.workspace_dir.resolve()
+        resolved_path = path.resolve()
+        if resolved_path == workspace_abs or resolved_path.is_relative_to(
+            workspace_abs
+        ):
+            return True
+
+        owner_user_id = self.owner_user_id
+        if owner_user_id is None:
+            return True
+
+        record_user_id = getattr(record, "user_id", None)
+        if record_user_id != owner_user_id:
+            return False
+
+        record_task_id = getattr(record, "task_id", None)
+        if record_task_id is None:
+            return True
+        return (
+            self.current_task_id is not None and record_task_id == self.current_task_id
+        )
+
     def resolve_file_id(self, file_id: str) -> Optional[Path]:
         file_id = str(file_id).strip()
         if not file_id:
@@ -274,6 +306,14 @@ class TaskWorkspace:
                 if record and record.storage_path:
                     resolved_path = Path(record.storage_path)
                     if resolved_path.exists() and resolved_path.is_file():
+                        if not self._file_record_allowed_for_workspace(
+                            record, resolved_path
+                        ):
+                            logger.warning(
+                                "Rejected file_id outside workspace scope: %s",
+                                file_id,
+                            )
+                            return None
                         return resolved_path
                 return None
             finally:

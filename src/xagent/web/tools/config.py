@@ -156,6 +156,8 @@ class WebToolConfig(BaseToolConfig):
         # Ensure base_dir is in workspace_config (required by ToolFactory._create_workspace)
         if "base_dir" not in workspace_config:
             workspace_config["base_dir"] = workspace_base_dir
+        if self._user_id is not None and "user_id" not in workspace_config:
+            workspace_config["user_id"] = self._user_id
         self._workspace_config = workspace_config
         self._explicit_vision_model = vision_model
         self._explicit_llm = llm

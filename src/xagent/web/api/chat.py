@@ -228,6 +228,7 @@ async def create_default_tools(
         workspace_config={
             "base_dir": str(get_uploads_dir() / f"user_{owner_id}"),
             "task_id": task_id,
+            "user_id": owner_id,
             "allowed_external_dirs": allowed_external_dirs,
         },
         include_mcp_tools=bool(

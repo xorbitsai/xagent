@@ -11,7 +11,7 @@ Files are referenced by FileRef objects. Treat file_id as the canonical file han
 Rules:
 - Use file_id when reading files or passing files to tools.
 - Do not guess storage paths such as /uploads/... or user_id/... paths.
-- For HTML assets, call prepare_html_asset(file_id, alias) first.
+- For HTML assets, call prepare_html_asset(file_id, html_path, alias) first.
 - Use the returned html_src inside HTML, CSS, script, or image references.
 - For user-visible output links, use markdown_link or file:{file_id}."""
 
@@ -44,7 +44,6 @@ def build_file_ref(
             {
                 "preview_url": f"/api/files/preview/{encoded_file_id}",
                 "download_url": f"/api/files/download/{encoded_file_id}",
-                "public_preview_url": f"/api/files/public/preview/{encoded_file_id}",
                 "markdown_link": f"[{filename}](file:{file_id})",
             }
         )
@@ -53,7 +52,6 @@ def build_file_ref(
             {
                 "preview_url": None,
                 "download_url": None,
-                "public_preview_url": None,
                 "markdown_link": None,
             }
         )

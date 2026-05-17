@@ -685,10 +685,30 @@ def _normalize_file_outputs(
 
         if resolved_info is None:
             if item_file_id:
+                file_record = (
+                    db.query(UploadedFile)
+                    .filter(
+                        UploadedFile.file_id == item_file_id,
+                        UploadedFile.user_id == task_user_id,
+                        or_(
+                            UploadedFile.task_id == task_id,
+                            UploadedFile.task_id.is_(None),
+                        ),
+                    )
+                    .first()
+                )
+                if file_record is None:
+                    logger.warning(
+                        "Skipping file output outside task/user scope: %s",
+                        item_file_id,
+                    )
+                    continue
                 normalized_outputs.append(
                     build_file_ref(
-                        file_id=item_file_id,
-                        filename=item_filename or "output",
+                        file_id=str(file_record.file_id),
+                        filename=item_filename or str(file_record.filename),
+                        mime_type=getattr(file_record, "mime_type", None),
+                        size=getattr(file_record, "file_size", None),
                     )
                 )
             continue
@@ -707,7 +727,13 @@ def _normalize_file_outputs(
         if file_record is None and item_file_id:
             file_record = (
                 db.query(UploadedFile)
-                .filter(UploadedFile.file_id == item_file_id)
+                .filter(
+                    UploadedFile.file_id == item_file_id,
+                    UploadedFile.user_id == task_user_id,
+                    or_(
+                        UploadedFile.task_id == task_id, UploadedFile.task_id.is_(None)
+                    ),
+                )
                 .first()
             )
 

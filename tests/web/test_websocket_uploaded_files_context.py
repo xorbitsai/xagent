@@ -107,7 +107,7 @@ def test_build_uploaded_files_context_includes_agent_builder_kb_instruction():
     assert "FAQ.docx: file_id=file-123" in context
     assert "## FILE REFERENCES" in context
     assert "Treat file_id as the canonical file handle" in context
-    assert "call prepare_html_asset(file_id, alias) first" in context
+    assert "call prepare_html_asset(file_id, html_path, alias) first" in context
     assert "create_knowledge_base_from_file" in context
     assert 'file_ids = ["file-123"]' in context
     assert "Do NOT ask the user to upload again" in context

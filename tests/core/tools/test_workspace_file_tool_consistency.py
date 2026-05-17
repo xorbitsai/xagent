@@ -2,6 +2,8 @@
 Tests for workspace file tool consistency between write and read operations.
 """
 
+from types import SimpleNamespace
+
 import pytest
 
 from xagent.core.tools.adapters.vibe.workspace_file_tool import WorkspaceFileTools
@@ -50,7 +52,6 @@ class TestWorkspaceFileToolConsistency:
         assert write_result["size"] == len(test_content)
         assert write_result["preview_url"].endswith(write_result["file_id"])
         assert write_result["download_url"].endswith(write_result["file_id"])
-        assert write_result["public_preview_url"].endswith(write_result["file_id"])
         assert write_result["markdown_link"] == (
             f"[{test_filename}](file:{write_result['file_id']})"
         )
@@ -214,7 +215,7 @@ class TestWorkspaceFileToolConsistency:
         tools = WorkspaceFileTools(workspace)
 
         source = tools.write_file("input/logo.png", "fake image")
-        result = tools.prepare_html_asset(source["file_id"])
+        result = tools.prepare_html_asset(source["file_id"], "index.html")
 
         assert result["success"] is True
         assert result["source_file_id"] == source["file_id"]
@@ -235,7 +236,7 @@ class TestWorkspaceFileToolConsistency:
         tools = WorkspaceFileTools(workspace)
 
         source = tools.write_file("input/photo.jpg", "fake jpg")
-        result = tools.prepare_html_asset(f"file:{source['file_id']}")
+        result = tools.prepare_html_asset(f"file:{source['file_id']}", "index.html")
 
         assert result["success"] is True
         assert result["html_src"] == "assets/photo.jpg"
@@ -248,7 +249,9 @@ class TestWorkspaceFileToolConsistency:
         tools = WorkspaceFileTools(workspace)
 
         source = tools.write_file("input/logo.png", "fake image")
-        result = tools.prepare_html_asset(source["file_id"], alias="../../safe.png")
+        result = tools.prepare_html_asset(
+            source["file_id"], "index.html", alias="../../safe.png"
+        )
 
         assert result["html_src"] == "assets/safe.png"
         assert result["relative_path"] == "output/assets/safe.png"
@@ -257,18 +260,51 @@ class TestWorkspaceFileToolConsistency:
 
     @pytest.mark.usefixtures("mock_workspace_db")
     @pytest.mark.parametrize(
-        "assets_dir",
-        ["/assets", "../assets", "assets/../../x", "input/assets", "temp/assets"],
+        "assets_subdir",
+        ["/assets", "../assets", "assets/../../x"],
     )
-    def test_prepare_html_asset_rejects_unsafe_assets_dir(self, tmp_path, assets_dir):
+    def test_prepare_html_asset_rejects_unsafe_assets_subdir(
+        self, tmp_path, assets_subdir
+    ):
         """Test that the assets directory must stay inside output."""
         workspace = TaskWorkspace("test_task", str(tmp_path))
         tools = WorkspaceFileTools(workspace)
 
         source = tools.write_file("input/logo.png", "fake image")
 
-        with pytest.raises(ValueError, match="assets_dir must"):
-            tools.prepare_html_asset(source["file_id"], assets_dir=assets_dir)
+        with pytest.raises(ValueError, match="assets_subdir must"):
+            tools.prepare_html_asset(
+                source["file_id"], "index.html", assets_subdir=assets_subdir
+            )
+
+    @pytest.mark.usefixtures("mock_workspace_db")
+    def test_prepare_html_asset_uses_html_path_for_relative_src(self, tmp_path):
+        """Test that nested HTML outputs get local relative asset paths."""
+        workspace = TaskWorkspace("test_task", str(tmp_path))
+        tools = WorkspaceFileTools(workspace)
+
+        source = tools.write_file("input/logo.png", "fake image")
+        result = tools.prepare_html_asset(
+            source["file_id"], "reports/index.html", alias="logo.png"
+        )
+
+        assert result["html_src"] == "assets/logo.png"
+        assert result["relative_path"] == "output/reports/assets/logo.png"
+        assert (workspace.output_dir / "reports" / "assets" / "logo.png").exists()
+
+    @pytest.mark.usefixtures("mock_workspace_db")
+    @pytest.mark.parametrize(
+        "html_path", ["/index.html", "../index.html", "input/x.html"]
+    )
+    def test_prepare_html_asset_rejects_unsafe_html_path(self, tmp_path, html_path):
+        """Test that HTML target paths must stay inside output."""
+        workspace = TaskWorkspace("test_task", str(tmp_path))
+        tools = WorkspaceFileTools(workspace)
+
+        source = tools.write_file("input/logo.png", "fake image")
+
+        with pytest.raises(ValueError, match="html_path must"):
+            tools.prepare_html_asset(source["file_id"], html_path)
 
     @pytest.mark.usefixtures("mock_workspace_db")
     def test_prepare_html_asset_rejects_missing_file_ref(self, tmp_path):
@@ -277,7 +313,40 @@ class TestWorkspaceFileToolConsistency:
         tools = WorkspaceFileTools(workspace)
 
         with pytest.raises(FileNotFoundError, match="File not found"):
-            tools.prepare_html_asset(None)  # type: ignore[arg-type]
+            tools.prepare_html_asset(None, "index.html")  # type: ignore[arg-type]
+
+    def test_resolve_file_id_rejects_other_user_records(self, tmp_path, mocker):
+        """Test that DB file_id lookup is scoped to the workspace owner."""
+        external_file = tmp_path / "other-user.txt"
+        external_file.write_text("private")
+        workspace = TaskWorkspace("web_task_10", str(tmp_path))
+        workspace.owner_user_id = 1
+
+        class FakeQuery:
+            def filter(self, *_args):
+                return self
+
+            def first(self):
+                return SimpleNamespace(
+                    file_id="foreign-file",
+                    user_id=2,
+                    task_id=None,
+                    storage_path=str(external_file),
+                )
+
+        class FakeSession:
+            def query(self, *_args):
+                return FakeQuery()
+
+            def close(self):
+                pass
+
+        mocker.patch(
+            "xagent.core.storage.manager.create_db_session",
+            return_value=FakeSession(),
+        )
+
+        assert workspace.resolve_file_id("foreign-file") is None
 
 
 if __name__ == "__main__":

@@ -64,11 +64,12 @@ class WorkspaceFileTools(WorkspaceFileOperations):
     def prepare_html_asset(
         self,
         file_id: str,
+        html_path: str,
         alias: str | None = None,
-        assets_dir: str = "assets",
+        assets_subdir: str = "assets",
     ) -> Dict[str, Any]:
         """Copy a file_id-referenced asset into the current output bundle."""
-        return self.inner.prepare_html_asset(file_id, alias, assets_dir)
+        return self.inner.prepare_html_asset(file_id, html_path, alias, assets_subdir)
 
     def append_file(
         self,
@@ -171,12 +172,12 @@ class WorkspaceFileTools(WorkspaceFileOperations):
             FileTool(
                 self.write_file,
                 name="write_file",
-                description="Write file content in workspace. Use relative paths (e.g., 'filename.txt'), not absolute paths. Returns a FileRef with file_id, preview_url, download_url, and markdown_link.\n\nImportant: For HTML files, do not guess paths to uploaded files or files from other tasks. First call prepare_html_asset(file_id, alias) for every external image/CSS/JS asset, then use the returned html_src in the HTML.",
+                description="Write file content in workspace. Use relative paths (e.g., 'filename.txt'), not absolute paths. Returns a FileRef with file_id, preview_url, download_url, and markdown_link.\n\nImportant: For HTML files, do not guess paths to uploaded files or files from other tasks. First call prepare_html_asset(file_id, html_path, alias) for every external image/CSS/JS asset, then use the returned html_src in the HTML.",
             ),
             FileTool(
                 self.prepare_html_asset,
                 name="prepare_html_asset",
-                description="Prepare an uploaded or registered file for use inside an HTML artifact. Pass the source file_id and an optional alias such as 'logo.png'. The tool copies the asset into the current output/assets bundle and returns html_src (for example 'assets/logo.png'). Use html_src in <img src>, <link href>, <script src>, or CSS url(). Do not compute ../ paths yourself.",
+                description="Prepare an uploaded or registered file for use inside an HTML artifact. Pass the source file_id, the target HTML output path such as 'index.html' or 'reports/index.html', and an optional alias such as 'logo.png'. The tool copies the asset next to that HTML file under assets_subdir and returns html_src relative to the HTML file. Use html_src in <img src>, <link href>, <script src>, or CSS url(). Do not compute ../ paths yourself.",
             ),
             FileTool(
                 self.append_file,

@@ -341,6 +341,9 @@ class ToolFactory:
                 task_id or "default",
                 allowed_external_dirs=workspace_config.get("allowed_external_dirs"),
             )
+            user_id = workspace_config.get("user_id")
+            if isinstance(user_id, int):
+                workspace.owner_user_id = user_id
             return workspace
         except Exception as e:
             logger.warning(f"Failed to create workspace: {e}")

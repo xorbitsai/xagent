@@ -9,6 +9,7 @@ from typing import TYPE_CHECKING, Any, List, Optional, Union
 
 from xagent.core.workspace import TaskWorkspace
 
+from ....file_ref import build_workspace_file_ref
 from ....model.chat.basic.base import BaseLLM
 from ...core.vision_tool import DetectObjectsResult, UnderstandImagesResult, VisionCore
 from .base import ToolCategory
@@ -229,6 +230,26 @@ class VisionTool:
                 temperature,
                 max_tokens,
             )
+
+        if (
+            mark_objects
+            and self.workspace
+            and result.success
+            and result.marked_image_path
+        ):
+            try:
+                file_ref = build_workspace_file_ref(
+                    workspace=self.workspace,
+                    file_path=result.marked_image_path,
+                )
+                result = result.model_copy(
+                    update={
+                        "file_id": file_ref["file_id"],
+                        "file_ref": file_ref,
+                    }
+                )
+            except Exception as e:
+                logger.warning("Failed to build marked image FileRef: %s", e)
 
         return result
 

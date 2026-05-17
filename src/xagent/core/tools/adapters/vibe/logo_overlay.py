@@ -11,6 +11,7 @@ from typing import Any, Mapping, Optional, Type
 from pydantic import BaseModel, Field
 
 from .....config import get_uploads_dir
+from ....file_ref import build_workspace_file_ref
 from ....workspace import TaskWorkspace
 from ...core.logo_overlay import LogoOverlayCore
 from .base import AbstractBaseTool, ToolCategory, ToolVisibility
@@ -51,6 +52,10 @@ class LogoOverlayResult(BaseModel):
     output_path: str = Field(description="Path to the output image")
     message: str = Field(description="Operation message")
     error: Optional[str] = Field(description="Error message if any")
+    file_id: Optional[str] = Field(default=None, description="Registered file ID")
+    file_ref: Optional[dict[str, Any]] = Field(
+        default=None, description="Registered FileRef for the output image"
+    )
 
 
 class LogoOverlayTool(AbstractBaseTool):
@@ -127,6 +132,18 @@ class LogoOverlayTool(AbstractBaseTool):
                 padding=overlay_args.padding,
                 output_filename=overlay_args.output_filename,
             )
+
+        if self._workspace and result.get("success") and result.get("output_path"):
+            try:
+                file_ref = build_workspace_file_ref(
+                    workspace=self._workspace,
+                    file_path=result["output_path"],
+                )
+                result["file_id"] = file_ref["file_id"]
+                result["file_ref"] = file_ref
+            except Exception as e:
+                logger.warning("Failed to build logo overlay FileRef: %s", e)
+                result["file_ref_warning"] = str(e)
 
         return LogoOverlayResult(**result).model_dump()
 

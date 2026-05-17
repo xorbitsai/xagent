@@ -13,6 +13,8 @@ from typing import Any, Dict, List, Optional
 from tqdm import tqdm as tqdm_std  # type: ignore[import-untyped]
 from tqdm.asyncio import tqdm as tqdm_async  # type: ignore[import-untyped]
 
+from ...file_ref import build_workspace_file_ref
+
 logger = logging.getLogger(__name__)
 
 
@@ -427,6 +429,7 @@ Translations:"""
 
         # Save translation to JSON file if workspace is available
         file_id: Optional[str] = None
+        file_ref: Optional[dict[str, Any]] = None
         translation_path = None
         saved_to_workspace = False
 
@@ -464,7 +467,11 @@ Translations:"""
 
                 # Get file ID from workspace after registration
                 if translation_path:
-                    file_id = self._workspace.get_file_id_from_path(translation_path)
+                    file_ref = build_workspace_file_ref(
+                        workspace=self._workspace,
+                        file_path=translation_path,
+                    )
+                    file_id = file_ref["file_id"]
                     saved_to_workspace = True
 
             except Exception as e:
@@ -477,6 +484,7 @@ Translations:"""
             "fields_translated": len(translated_texts),
             "target_lang": target_lang,
             "file_id": file_id,
+            "file_ref": file_ref,
             "translation_path": translation_path,
             "saved_to_workspace": saved_to_workspace,
         }

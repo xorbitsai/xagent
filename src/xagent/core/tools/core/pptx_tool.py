@@ -21,6 +21,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Union
 from xml.etree import ElementTree as ET
 
+from ...file_ref import build_workspace_file_ref
 from ...workspace import TaskWorkspace
 
 # PPTX namespaces
@@ -1922,9 +1923,16 @@ def generate_pptx(
             if result.get("success"):
                 output_file_str = result.get("output")
                 if output_file_str:
-                    file_id = workspace.get_file_id_from_path(output_file_str)
-                    if file_id:
-                        result["file_id"] = file_id
+                    try:
+                        file_ref = build_workspace_file_ref(
+                            workspace=workspace,
+                            file_path=output_file_str,
+                        )
+                        result["file_id"] = file_ref["file_id"]
+                        result["file_ref"] = file_ref
+                    except Exception as e:
+                        logger.warning("Failed to build generated PPTX FileRef: %s", e)
+                        result["file_ref_warning"] = str(e)
             return result
     else:
         return gen.generate(
@@ -1986,9 +1994,16 @@ def pack_pptx(
             if result.get("success"):
                 output_path_str = result.get("output_path")
                 if output_path_str:
-                    file_id = workspace.get_file_id_from_path(output_path_str)
-                    if file_id:
-                        result["file_id"] = file_id
+                    try:
+                        file_ref = build_workspace_file_ref(
+                            workspace=workspace,
+                            file_path=output_path_str,
+                        )
+                        result["file_id"] = file_ref["file_id"]
+                        result["file_ref"] = file_ref
+                    except Exception as e:
+                        logger.warning("Failed to build packed PPTX FileRef: %s", e)
+                        result["file_ref_warning"] = str(e)
             return result
     else:
         return reader.pack(str(output_file), validate=validate)

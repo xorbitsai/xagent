@@ -16,6 +16,7 @@ from urllib import parse
 
 import aiohttp
 
+from ...file_ref import build_workspace_file_ref
 from ...model.image.base import BaseImageModel
 from ...workspace import TaskWorkspace
 
@@ -537,6 +538,7 @@ Images are automatically saved to workspace.
             image_url = result.get("image_url")
             image_path = None
             image_file_id: Optional[str] = None
+            file_ref: Optional[dict[str, Any]] = None
 
             # Download image to workspace if workspace is available
             if image_url and self._workspace:
@@ -544,9 +546,19 @@ Images are automatically saved to workspace.
                     with self._workspace.auto_register_files():
                         image_path = await self._download_image(image_url)
                     if image_path:
-                        image_file_id = self._workspace.get_file_id_from_path(
-                            image_path
-                        )
+                        try:
+                            file_ref = build_workspace_file_ref(
+                                workspace=self._workspace,
+                                file_path=image_path,
+                            )
+                            image_file_id = file_ref["file_id"]
+                        except Exception as e:
+                            logger.warning(
+                                "Failed to build generated image FileRef: %s", e
+                            )
+                            image_file_id = self._workspace.get_file_id_from_path(
+                                image_path
+                            )
                 except Exception as e:
                     logger.warning(f"Failed to download image to workspace: {e}")
                     # Continue execution even if download fails
@@ -558,6 +570,7 @@ Images are automatically saved to workspace.
                 "image_path": image_path,
                 "file_id": image_file_id,
                 "artifacts": self._build_image_artifacts(image_path, image_file_id),
+                "file_ref": file_ref,
                 "usage": result.get("usage", {}),
                 "task_metric": result.get("task_metric", {}),
                 "request_id": result.get("request_id"),
@@ -661,6 +674,7 @@ Images are automatically saved to workspace.
             edited_image_url = result.get("image_url")
             image_path = None
             image_file_id: Optional[str] = None
+            file_ref: Optional[dict[str, Any]] = None
 
             # Download image to workspace if workspace is available
             if edited_image_url and self._workspace:
@@ -672,9 +686,19 @@ Images are automatically saved to workspace.
                             edited_image_url, filename
                         )
                     if image_path:
-                        image_file_id = self._workspace.get_file_id_from_path(
-                            image_path
-                        )
+                        try:
+                            file_ref = build_workspace_file_ref(
+                                workspace=self._workspace,
+                                file_path=image_path,
+                            )
+                            image_file_id = file_ref["file_id"]
+                        except Exception as e:
+                            logger.warning(
+                                "Failed to build edited image FileRef: %s", e
+                            )
+                            image_file_id = self._workspace.get_file_id_from_path(
+                                image_path
+                            )
                 except Exception as e:
                     logger.warning(f"Failed to download edited image to workspace: {e}")
                     # Continue execution even if download fails
@@ -686,6 +710,7 @@ Images are automatically saved to workspace.
                 "image_path": image_path,
                 "file_id": image_file_id,
                 "artifacts": self._build_image_artifacts(image_path, image_file_id),
+                "file_ref": file_ref,
                 "usage": result.get("usage", {}),
                 "task_metric": result.get("task_metric", {}),
                 "request_id": result.get("request_id"),

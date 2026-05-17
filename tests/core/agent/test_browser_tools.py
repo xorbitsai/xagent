@@ -5,9 +5,11 @@ import inspect
 import pytest
 
 from xagent.core.tools.adapters.vibe.browser_use import (
+    BrowserScreenshotTool,
     BrowserTaskSessionMixin,
     create_browser_tools,
 )
+from xagent.core.workspace import TaskWorkspace
 
 
 @pytest.mark.asyncio
@@ -70,3 +72,56 @@ def test_browser_task_session_mixin_keeps_explicit_session() -> None:
 
     assert args["session_id"] == "custom-session"
     assert "_xagent_step_id" not in args
+
+
+@pytest.mark.asyncio
+async def test_browser_screenshot_returns_registered_file_ref(
+    tmp_path, monkeypatch
+) -> None:
+    def mock_create_record(self, file_id, file_path, db_session=None):
+        path_str = str(file_path)
+        resolved_str = str(file_path.resolve())
+        self._recently_registered_files[path_str] = file_id
+        self._recently_registered_files[resolved_str] = file_id
+        self._file_id_to_path[file_id] = file_path
+
+    monkeypatch.setattr(TaskWorkspace, "_create_file_record", mock_create_record)
+
+    async def fake_browser_screenshot(**kwargs):
+        return {
+            "success": True,
+            "session_id": kwargs["session_id"],
+            "screenshot": (
+                "data:image/png;base64,"
+                "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAA"
+                "DElEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg=="
+            ),
+            "format": "png",
+            "full_page": True,
+            "wait_for_lazy_load": False,
+            "message": "ok",
+            "error": "",
+        }
+
+    monkeypatch.setattr(
+        "xagent.core.tools.adapters.vibe.browser_use.browser_screenshot",
+        fake_browser_screenshot,
+    )
+
+    workspace = TaskWorkspace("test_task", str(tmp_path))
+    tool = BrowserScreenshotTool(task_id="task-412", workspace=workspace)
+
+    result = await tool.run_json_async(
+        {
+            "full_page": True,
+            "output_filename": "poster_en.png",
+            "_xagent_step_id": "render_english",
+        }
+    )
+
+    assert result["success"] is True
+    assert result["screenshot"] == "output/poster_en.png"
+    assert result["file_id"]
+    assert result["file_ref"]["file_id"] == result["file_id"]
+    assert result["file_ref"]["relative_path"] == "output/poster_en.png"
+    assert result["markdown_link"] == (f"[poster_en.png](file:{result['file_id']})")

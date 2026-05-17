@@ -55,6 +55,8 @@ class TestWorkspaceFileToolConsistency:
         assert write_result["markdown_link"] == (
             f"[{test_filename}](file:{write_result['file_id']})"
         )
+        assert write_result["file_ref"]["file_id"] == write_result["file_id"]
+        assert write_result["file_ref"]["relative_path"] == "output/test_file.txt"
 
         # Verify file exists in output directory
         output_file = workspace.output_dir / test_filename

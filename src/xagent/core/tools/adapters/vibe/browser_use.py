@@ -11,6 +11,7 @@ from typing import Any, Mapping, Optional, Type
 
 from pydantic import BaseModel, Field
 
+from ....file_ref import build_workspace_file_ref
 from ....tools.core.browser_use import (
     browser_click,
     browser_close,
@@ -190,6 +191,13 @@ class BrowserScreenshotResult(BaseModel):
     wait_for_lazy_load: bool = Field(description="Whether lazy loading was enabled")
     message: str = Field(description="Result message")
     error: str = Field(default="", description="Error message if failed")
+    file_id: Optional[str] = Field(default=None, description="Registered file ID")
+    file_ref: Optional[dict[str, Any]] = Field(
+        default=None, description="Registered FileRef for the saved screenshot"
+    )
+    preview_url: Optional[str] = Field(default=None, description="Preview URL")
+    download_url: Optional[str] = Field(default=None, description="Download URL")
+    markdown_link: Optional[str] = Field(default=None, description="Markdown file link")
 
 
 class BrowserExtractTextArgs(BaseModel):
@@ -302,6 +310,13 @@ class BrowserPdfResult(BaseModel):
     size: int = Field(default=0, description="PDF file size in bytes")
     message: str = Field(description="Result message")
     error: str = Field(default="", description="Error message if failed")
+    file_id: Optional[str] = Field(default=None, description="Registered file ID")
+    file_ref: Optional[dict[str, Any]] = Field(
+        default=None, description="Registered FileRef for the saved PDF"
+    )
+    preview_url: Optional[str] = Field(default=None, description="Preview URL")
+    download_url: Optional[str] = Field(default=None, description="Download URL")
+    markdown_link: Optional[str] = Field(default=None, description="Markdown file link")
 
 
 # ============== Tool Implementations ==============
@@ -666,8 +681,18 @@ class BrowserScreenshotTool(BrowserTaskSessionMixin, AbstractBaseTool):
                 relative_path = str(
                     file_path.relative_to(self._workspace.workspace_dir)
                 )
+                file_ref = build_workspace_file_ref(
+                    workspace=self._workspace,
+                    file_path=file_path,
+                    mime_type="image/png",
+                )
                 result["screenshot"] = relative_path
                 result["format"] = "file"
+                result["file_id"] = file_ref["file_id"]
+                result["file_ref"] = file_ref
+                result["preview_url"] = file_ref["preview_url"]
+                result["download_url"] = file_ref["download_url"]
+                result["markdown_link"] = file_ref["markdown_link"]
                 result["message"] = f"Screenshot saved to {relative_path}"
             except Exception as e:
                 logger.error(
@@ -1067,8 +1092,18 @@ class BrowserPdfTool(BrowserTaskSessionMixin, AbstractBaseTool):
                 relative_path = str(
                     file_path.relative_to(self._workspace.workspace_dir)
                 )
+                file_ref = build_workspace_file_ref(
+                    workspace=self._workspace,
+                    file_path=file_path,
+                    mime_type="application/pdf",
+                )
                 result["output_path"] = relative_path
                 result["format"] = "file"
+                result["file_id"] = file_ref["file_id"]
+                result["file_ref"] = file_ref
+                result["preview_url"] = file_ref["preview_url"]
+                result["download_url"] = file_ref["download_url"]
+                result["markdown_link"] = file_ref["markdown_link"]
                 result["message"] = f"PDF saved to {relative_path}"
             except Exception as e:
                 logger.error(f"Failed to save PDF to workspace: {e}", exc_info=True)

@@ -46,6 +46,8 @@ class DetectObjectsResult(BaseModel):
     confidence_threshold: float = 0.5
     prompt_sent: Optional[str] = None
     marked_image_path: Optional[str] = None
+    file_id: Optional[str] = None
+    file_ref: Optional[Dict[str, Any]] = None
     box_color: Optional[str] = None
     raw_response: Optional[str] = None
     parsing_method: Optional[str] = None

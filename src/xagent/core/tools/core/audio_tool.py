@@ -14,6 +14,7 @@ import uuid
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
+from ...file_ref import build_workspace_file_ref
 from ...model.asr.base import ASRResult, BaseASR
 from ...model.tts.base import BaseTTS, TTSResult
 from ...workspace import TaskWorkspace
@@ -370,6 +371,7 @@ class AudioToolCore:
 
             # Save transcription to JSON file if workspace is available
             file_id: Optional[str] = None
+            file_ref: Optional[dict[str, Any]] = None
             transcription_path = None
 
             if text and self._workspace:
@@ -406,9 +408,11 @@ class AudioToolCore:
 
                     # Get file ID from workspace after registration
                     if transcription_path:
-                        file_id = self._workspace.get_file_id_from_path(
-                            transcription_path
+                        file_ref = build_workspace_file_ref(
+                            workspace=self._workspace,
+                            file_path=transcription_path,
                         )
+                        file_id = file_ref["file_id"]
 
                 except Exception as e:
                     logger.warning(f"Failed to save transcription to workspace: {e}")
@@ -420,6 +424,7 @@ class AudioToolCore:
             return {
                 "success": True,
                 "file_id": file_id,
+                "file_ref": file_ref,
                 "transcription_path": transcription_path,
                 "segments": segments,
                 "language": language_detected,
@@ -517,6 +522,7 @@ class AudioToolCore:
             # Save audio file to workspace if available
             audio_path = None
             audio_file_id: Optional[str] = None
+            file_ref: Optional[dict[str, Any]] = None
 
             if audio_data and self._workspace:
                 try:
@@ -536,9 +542,11 @@ class AudioToolCore:
 
                     # Get file ID from workspace after registration
                     if audio_path:
-                        audio_file_id = self._workspace.get_file_id_from_path(
-                            audio_path
+                        file_ref = build_workspace_file_ref(
+                            workspace=self._workspace,
+                            file_path=audio_path,
                         )
+                        audio_file_id = file_ref["file_id"]
 
                 except Exception as e:
                     logger.warning(f"Failed to save audio to workspace: {e}")
@@ -550,6 +558,7 @@ class AudioToolCore:
                 "success": True,
                 "audio_path": audio_path,
                 "file_id": audio_file_id,
+                "file_ref": file_ref,
                 "format": result_audio_format,
                 "sample_rate": sample_rate,
                 "language": language_detected,
@@ -1084,6 +1093,7 @@ class AudioToolCore:
             # Save to workspace if available
             audio_path = None
             audio_file_id = None
+            file_ref: Optional[dict[str, Any]] = None
 
             if self._workspace:
                 try:
@@ -1100,9 +1110,11 @@ class AudioToolCore:
 
                     # Get file ID
                     if audio_path:
-                        audio_file_id = self._workspace.get_file_id_from_path(
-                            audio_path
+                        file_ref = build_workspace_file_ref(
+                            workspace=self._workspace,
+                            file_path=audio_path,
                         )
+                        audio_file_id = file_ref["file_id"]
 
                 except Exception as e:
                     logger.warning(f"Failed to save audio to workspace: {e}")
@@ -1114,6 +1126,7 @@ class AudioToolCore:
                 "voice": voice,
                 "audio_path": audio_path,
                 "file_id": audio_file_id,
+                "file_ref": file_ref,
                 "format": audio_format,
                 "saved_to_workspace": audio_path is not None,
             }

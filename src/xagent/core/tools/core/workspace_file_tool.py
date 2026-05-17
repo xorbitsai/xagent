@@ -16,7 +16,7 @@ from typing import Any, Dict, List, Optional, Union
 
 from pydantic import BaseModel
 
-from ...file_ref import build_file_ref, safe_asset_filename
+from ...file_ref import build_workspace_file_ref, safe_asset_filename
 from ...workspace import TaskWorkspace
 from .document_parser import DocumentCapabilities, DocumentParseArgs, parse_document
 from .file_tool import EditOperation, EditResult, get_image_metadata
@@ -305,24 +305,20 @@ class WorkspaceFileOperations:
             with open(resolved_path, "w", encoding=encoding) as f:
                 f.write(content)
 
-        file_id = self.workspace.get_file_id_from_path(str(resolved_path))
+        file_ref = build_workspace_file_ref(
+            workspace=self.workspace,
+            file_path=resolved_path,
+        )
 
         logger.debug(
-            "Successfully wrote file: %s with file_id: %s", resolved_path, file_id
-        )
-        # Use resolved workspace_dir so relative_to works on macOS where
-        # /var can be symlink to /private/var (resolved_path has /private, raw dir may not).
-        workspace_root = self.workspace.workspace_dir.resolve()
-        file_ref = build_file_ref(
-            file_id=file_id,
-            filename=resolved_path.name,
-            size=resolved_path.stat().st_size,
+            "Successfully wrote file: %s with file_id: %s",
+            resolved_path,
+            file_ref["file_id"],
         )
         return {
             "success": True,
             **file_ref,
-            "relative_path": str(resolved_path.relative_to(workspace_root)),
-            "file_path": str(resolved_path),
+            "file_ref": file_ref,
         }
 
     def prepare_html_asset(
@@ -359,27 +355,20 @@ class WorkspaceFileOperations:
         with self.workspace.auto_register_files():
             shutil.copy2(source_path, target_path)
 
-        asset_file_id = self.workspace.get_file_id_from_path(str(target_path))
-        if not asset_file_id:
-            asset_file_id = self.workspace.register_file(str(target_path))
-
-        workspace_root = self.workspace.workspace_dir.resolve()
         html_src = Path(
             os.path.relpath(target_path.resolve(), start=html_output_path.parent)
         ).as_posix()
-        file_ref = build_file_ref(
-            file_id=asset_file_id,
-            filename=target_path.name,
-            size=target_path.stat().st_size,
+        file_ref = build_workspace_file_ref(
+            workspace=self.workspace,
+            file_path=target_path,
         )
         return {
             "success": True,
             "source_file_id": source_ref,
-            "asset_file_id": asset_file_id,
+            "asset_file_id": file_ref["file_id"],
             "html_src": html_src,
             **file_ref,
-            "relative_path": str(target_path.resolve().relative_to(workspace_root)),
-            "file_path": str(target_path.resolve()),
+            "file_ref": file_ref,
         }
 
     def _resolve_html_output_path(self, html_path: str) -> Path:

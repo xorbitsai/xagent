@@ -58,6 +58,43 @@ def build_file_ref(
     return result
 
 
+def build_workspace_file_ref(
+    *,
+    workspace: Any,
+    file_path: str | Path,
+    file_id: str | None = None,
+    mime_type: str | None = None,
+) -> dict[str, Any]:
+    """Register a workspace file and build the model/API-facing FileRef."""
+    resolved_path = Path(file_path).resolve()
+    if not resolved_path.exists() or not resolved_path.is_file():
+        raise FileNotFoundError(f"File not found for FileRef: {file_path}")
+    if not hasattr(workspace, "workspace_dir"):
+        raise ValueError("Workspace does not expose workspace_dir")
+
+    final_file_id = file_id or workspace.get_file_id_from_path(str(resolved_path))
+    if not final_file_id:
+        final_file_id = workspace.register_file(str(resolved_path))
+
+    workspace_root = workspace.workspace_dir.resolve()
+    file_ref = build_file_ref(
+        file_id=final_file_id,
+        filename=resolved_path.name,
+        mime_type=mime_type,
+        size=resolved_path.stat().st_size,
+    )
+    try:
+        relative_path = str(resolved_path.relative_to(workspace_root))
+    except ValueError:
+        relative_path = str(resolved_path)
+
+    return {
+        **file_ref,
+        "relative_path": relative_path,
+        "file_path": str(resolved_path),
+    }
+
+
 def safe_asset_filename(filename: str) -> str:
     """Return a browser-safe basename for HTML bundle assets."""
     name = Path(filename).name.strip()

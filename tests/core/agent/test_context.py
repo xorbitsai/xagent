@@ -23,6 +23,7 @@ from xagent.core.agent.context.enrichment import (
     enrich_context_with_skill,
     generate_and_store_react_memory,
 )
+from xagent.core.agent.language import response_language_rules
 from xagent.core.agent.runtime import LLMCallInterrupted
 from xagent.web.user_isolated_memory import current_user_id
 
@@ -125,6 +126,14 @@ def test_system_context_preserves_current_request_language_over_memory() -> None
     assert "Response language rules" in system_message
     assert "Use the same natural language as the current user request" in system_message
     assert "Do not let retrieved memories" in system_message
+
+
+def test_response_language_rules_uses_custom_subject_throughout() -> None:
+    rules = response_language_rules(subject="current DAG step")
+
+    assert "If the current DAG step explicitly asks" in rules
+    assert "unless the current DAG step explicitly asks" in rules
+    assert "unless the current user request explicitly asks" not in rules
 
 
 def test_dag_step_system_context_preserves_step_language_for_final_answer() -> None:

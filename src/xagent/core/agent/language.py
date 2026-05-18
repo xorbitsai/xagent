@@ -13,7 +13,7 @@ def response_language_rules(*, subject: str = "current user request") -> str:
         "to translate, rewrite, or answer in another language, use that requested "
         "target language. Do not let retrieved memories, tool results, source "
         "documents, examples, or earlier turns change the response language unless "
-        "the current user request explicitly asks for that language change."
+        f"the {subject} explicitly asks for that language change."
     )
 
 
@@ -27,8 +27,8 @@ def plan_language_rules() -> str:
         "use that requested target language for those fields. Any final synthesis "
         "or final result produced from the plan must use that same language. "
         "Do not let retrieved memories, tool results, source documents, examples, "
-        "or earlier turns change the plan language unless the current user request "
-        "explicitly asks for that language change."
+        "completed step results, or earlier turns change the plan language unless "
+        "the current user request explicitly asks for that language change."
     )
 
 

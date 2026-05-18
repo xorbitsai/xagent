@@ -1178,6 +1178,7 @@ async def test_llm_plan_generator_builds_plan_from_model_json() -> None:
         "user request"
     ) in system_prompt
     assert "Any final synthesis or final result produced from the plan" in system_prompt
+    assert "completed step results" in system_prompt
     assert llm.calls[0]["tool_choice"] == "required"
     assert llm.calls[0]["thinking"] == {"type": "disabled", "enable": False}
     assert "response_format" not in llm.calls[0]

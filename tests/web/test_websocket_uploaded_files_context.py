@@ -12,6 +12,7 @@ from xagent.web.api.websocket import (
     _build_uploaded_files_context,
     _display_message_for_user,
     _normalize_file_outputs,
+    _register_uploaded_files_for_agent,
     _selected_file_refs_from_task,
     execute_task_background,
     handle_file_upload_for_task,
@@ -473,23 +474,13 @@ async def test_handle_file_upload_for_task_rejects_unowned_and_wrong_task_files(
         filename="other-task.txt",
     )
 
-    class Workspace:
-        def __init__(self):
-            self.input_dir = str(tmp_path / "workspace" / "input")
-            self.registered_files = []
-
-        def register_file(self, path, file_id, db_session=None):
-            self.registered_files.append((path, file_id, db_session))
-
-    workspace = Workspace()
-
-    class Manager:
-        async def get_agent_for_task(self, task_id, db, user=None):
-            return SimpleNamespace(workspace=workspace)
-
     import xagent.web.api.chat as chat_api
 
-    monkeypatch.setattr(chat_api, "get_agent_manager", lambda: Manager())
+    monkeypatch.setattr(
+        chat_api,
+        "get_agent_manager",
+        lambda: pytest.fail("file staging must not create an AgentService"),
+    )
 
     result = await handle_file_upload_for_task(
         10,
@@ -504,9 +495,48 @@ async def test_handle_file_upload_for_task_rejects_unowned_and_wrong_task_files(
     )
 
     assert [item["file_id"] for item in result["file_info_list"]] == ["valid-file"]
-    assert [item[1] for item in workspace.registered_files] == ["valid-file"]
     db_session.refresh(valid_file)
     assert valid_file.task_id == 10
+
+
+def test_register_uploaded_files_for_agent_uses_execution_db_session(
+    db_session,
+    tmp_path,
+):
+    upload = _create_uploaded_file(
+        db_session,
+        tmp_path,
+        file_id="valid-file",
+        user_id=1,
+        task_id=10,
+        filename="valid file.txt",
+    )
+
+    class Workspace:
+        def __init__(self):
+            self.input_dir = str(tmp_path / "workspace" / "input")
+            self.registered_files = []
+
+        def register_file(self, path, file_id, db_session=None):
+            self.registered_files.append((path, file_id, db_session))
+
+    workspace = Workspace()
+    file_info = {
+        "file_id": "valid-file",
+        "name": "valid_file.txt",
+        "path": str(upload.storage_path),
+        "workspace_path": None,
+    }
+
+    _register_uploaded_files_for_agent(
+        SimpleNamespace(workspace=workspace),
+        [file_info],
+        db_session,
+    )
+
+    assert [item[1] for item in workspace.registered_files] == ["valid-file"]
+    assert workspace.registered_files[0][2] is db_session
+    assert file_info["workspace_path"]
 
 
 def test_get_display_user_message_reads_agent_context_state():

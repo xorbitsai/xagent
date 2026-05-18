@@ -918,6 +918,11 @@ async def execute_task_background(
             agent_service.set_recovered_skill_context(
                 recovery_state.get("skill_context")
             )
+            _register_uploaded_files_for_agent(
+                agent_service,
+                context.get("file_info", []),
+                db,
+            )
 
             # Execute the next turn under the same task/thread id.
             actual_task_id = str(task_id)
@@ -1707,10 +1712,7 @@ async def handle_file_upload_for_task(
 ) -> dict:
     """Handle file upload for task"""
     try:
-        from pathlib import Path
-
         from ..models.uploaded_file import UploadedFile
-        from .chat import get_agent_manager
 
         uploaded_files = []
         file_info_list = []
@@ -1726,12 +1728,6 @@ async def handle_file_upload_for_task(
                 task_id,
             )
             return {"uploaded_files": [], "file_info_list": []}
-
-        # Get agent
-        agent_service = await get_agent_manager().get_agent_for_task(
-            task_id, db, user=user
-        )
-        logger.info(f"🤖 Got agent service for task {task_id}")
 
         for file_info in files:
             file_id = file_info.get("file_id")
@@ -1769,9 +1765,6 @@ async def handle_file_upload_for_task(
                 continue
 
             try:
-                # Add file to workspace, use original filename
-                from pathlib import Path
-
                 # Use normalized filename instead of original
                 original_file_name = Path(file_name).name
                 normalized_file_name = normalize_filename(original_file_name)
@@ -1785,60 +1778,10 @@ async def handle_file_upload_for_task(
                 target_path = source_path
                 uploaded_files.append(str(target_path))
 
-                workspace_link_path: Path | None = None
-                if agent_service.workspace:
-                    try:
-                        input_dir = Path(agent_service.workspace.input_dir)
-                        input_dir.mkdir(parents=True, exist_ok=True)
-                        candidate = input_dir / normalized_file_name
-                        # If something with the same name already exists in
-                        # input/, give the link a unique numeric suffix.
-                        suffix_idx = 1
-                        stem, ext = candidate.stem, candidate.suffix
-                        while candidate.exists() or candidate.is_symlink():
-                            try:
-                                if candidate.resolve() == source_path.resolve():
-                                    break  # already pointing at the right file
-                            except OSError:
-                                pass
-                            candidate = input_dir / f"{stem}_{suffix_idx}{ext}"
-                            suffix_idx += 1
-                        if not (candidate.exists() or candidate.is_symlink()):
-                            try:
-                                candidate.symlink_to(source_path.resolve())
-                                workspace_link_path = candidate
-                            except OSError as link_err:
-                                # Fall back to copy when symlinks aren't
-                                # supported (e.g. some Windows configs).
-                                logger.warning(
-                                    f"symlink failed ({link_err}); copying "
-                                    f"{source_path.name} into workspace"
-                                )
-
-                                shutil.copy2(source_path, candidate)
-                                workspace_link_path = candidate
-                        else:
-                            workspace_link_path = candidate
-                    except Exception as link_err:  # noqa: BLE001
-                        logger.warning(
-                            f"Could not expose {source_path.name} in task "
-                            f"workspace input/: {link_err}"
-                        )
-
                 if file_record.task_id is None:
                     file_record.task_id = task_id
 
                 db.flush()
-
-                if agent_service.workspace:
-                    # Pass absolute path so resolve_path() in register_file
-                    # doesn't mistake a CWD-relative storage_path for a
-                    # workspace-relative one (looking under output/...).
-                    agent_service.workspace.register_file(
-                        str(target_path.resolve()),
-                        file_id=str(file_record.file_id),
-                        db_session=db,
-                    )
 
                 # Build file info using normalized filename
                 file_info_list.append(
@@ -1849,15 +1792,12 @@ async def handle_file_upload_for_task(
                         "size": file_size,
                         "type": file_type,
                         "path": str(target_path),
-                        "workspace_path": (
-                            str(workspace_link_path) if workspace_link_path else None
-                        ),
+                        "workspace_path": None,
                     }
                 )
 
                 logger.info(
-                    f"File registered: storage={target_path} "
-                    f"input_link={workspace_link_path} "
+                    f"File staged: storage={target_path} "
                     f"(original={original_file_name} normalized={normalized_file_name})"
                 )
 
@@ -1872,6 +1812,73 @@ async def handle_file_upload_for_task(
     except Exception as e:
         logger.error(f"Error handling file upload for task {task_id}: {e}")
         raise
+
+
+def _register_uploaded_files_for_agent(
+    agent_service: Any,
+    file_info_list: List[Dict[str, Any]],
+    db: Session,
+) -> None:
+    """Expose staged upload records to the agent workspace under its DB session."""
+    workspace = getattr(agent_service, "workspace", None)
+    if not workspace:
+        return
+
+    input_dir = Path(workspace.input_dir)
+    input_dir.mkdir(parents=True, exist_ok=True)
+
+    for file_info in file_info_list:
+        file_id = str(file_info.get("file_id") or "")
+        source_path = Path(str(file_info.get("path") or ""))
+        if not file_id or not source_path.exists():
+            logger.warning(
+                "Skipping unavailable uploaded file for workspace: %s", file_info
+            )
+            continue
+
+        normalized_file_name = normalize_filename(
+            Path(str(file_info.get("name") or source_path.name)).name
+        )
+        candidate = input_dir / normalized_file_name
+        suffix_idx = 1
+        stem, ext = candidate.stem, candidate.suffix
+        while candidate.exists() or candidate.is_symlink():
+            try:
+                if candidate.resolve() == source_path.resolve():
+                    break
+            except OSError:
+                pass
+            candidate = input_dir / f"{stem}_{suffix_idx}{ext}"
+            suffix_idx += 1
+
+        workspace_link_path: Path | None
+        if candidate.exists() or candidate.is_symlink():
+            workspace_link_path = candidate
+        else:
+            try:
+                candidate.symlink_to(source_path.resolve())
+                workspace_link_path = candidate
+            except OSError as link_err:
+                logger.warning(
+                    f"symlink failed ({link_err}); copying "
+                    f"{source_path.name} into workspace"
+                )
+                shutil.copy2(source_path, candidate)
+                workspace_link_path = candidate
+
+        # Pass absolute path so resolve_path() in register_file doesn't mistake
+        # a CWD-relative storage_path for a workspace-relative one.
+        workspace.register_file(
+            str(source_path.resolve()),
+            file_id=file_id,
+            db_session=db,
+        )
+        file_info["workspace_path"] = str(workspace_link_path)
+        logger.info(
+            "File registered for agent workspace: storage=%s input_link=%s",
+            source_path,
+            workspace_link_path,
+        )
 
 
 async def get_authenticated_user(

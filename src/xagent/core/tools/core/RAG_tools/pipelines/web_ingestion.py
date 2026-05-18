@@ -339,29 +339,41 @@ async def run_web_ingestion(
     # "Web ingestion completed: ..." even on error, which produced the
     # "red error toast + green-toned 'completed' text" UX in the frontend
     # whenever every crawl attempt got blocked. On error/partial we now
-    # surface the first failing URL and its reason so the user sees
-    # something actionable.
-    if status == "error" and failed_urls:
+    # check all failures for anti-bot/WAF signals and otherwise surface
+    # the first failing URL and its reason so the user sees something
+    # actionable.
+    if (status == "error" or status == "partial") and failed_urls:
         first_url, first_err = next(iter(failed_urls.items()))
-        if _looks_like_crawler_block(first_err):
-            message = _CRAWLER_BLOCK_MESSAGE
+        blocking_entry = next(
+            (
+                (url, err)
+                for url, err in failed_urls.items()
+                if _looks_like_crawler_block(err)
+            ),
+            None,
+        )
+
+        if status == "error":
+            if blocking_entry:
+                message = _CRAWLER_BLOCK_MESSAGE
+            else:
+                message = f"Web ingestion failed: {first_url} returned {first_err}"
         else:
-            message = f"Web ingestion failed: {first_url} returned {first_err}"
-    elif status == "partial" and failed_urls:
-        first_url, first_err = next(iter(failed_urls.items()))
-        if _looks_like_crawler_block(first_err):
-            message = (
-                f"Web ingestion partial: {documents_created} documents from "
-                f"{pages_crawled} pages, {len(failed_urls)} failed. "
-                "Some target pages are blocking access to automated crawlers. "
-                "Please use a different method to create your KB for those pages."
-            )
-        else:
-            message = (
-                f"Web ingestion partial: {documents_created} documents from "
-                f"{pages_crawled} pages, {len(failed_urls)} failed "
-                f"(first: {first_url} returned {first_err})"
-            )
+            if blocking_entry:
+                blocking_url, _ = blocking_entry
+                message = (
+                    f"Web ingestion partial: {documents_created} documents from "
+                    f"{pages_crawled} pages, {len(failed_urls)} failed. "
+                    f"Some pages (e.g. {blocking_url}) are blocking access to "
+                    "automated crawlers. Please use a different method to "
+                    "create your KB for those pages."
+                )
+            else:
+                message = (
+                    f"Web ingestion partial: {documents_created} documents from "
+                    f"{pages_crawled} pages, {len(failed_urls)} failed "
+                    f"(first: {first_url} returned {first_err})"
+                )
     else:
         message = (
             f"Web ingestion completed: {documents_created} documents, "

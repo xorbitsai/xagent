@@ -149,7 +149,7 @@ const LOCAL_PROVIDER_CONFIGS: Record<string, Partial<ProviderConfig>> = {
   },
   dashscope: {
     icon: <img src="/dashscope.png" alt="DashScope" className="w-6 h-6" />,
-    category: ["embedding", "image"],
+    category: ["llm", "embedding", "image"],
     defaultBaseUrl: "https://dashscope.aliyuncs.com/compatible-mode/v1",
     categoryBaseUrls: {
       embedding: "https://dashscope.aliyuncs.com/api/v1/services/embeddings/text-embedding/text-embedding",

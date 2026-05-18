@@ -431,7 +431,8 @@ export function ChatInput({
 
   const allowsInterruptedInput = taskStatus === 'waiting_for_user';
   const isPaused = taskStatus === 'paused';
-  const isInputDisabled = isPaused || (!!isLoading && !allowsInterruptedInput);
+  const isInputBusy = !!isLoading && !allowsInterruptedInput;
+  const isInputDisabled = isPaused || isInputBusy;
 
   const canSubmit = () => {
     const hasText = message.trim().length > 0;
@@ -723,7 +724,7 @@ export function ChatInput({
                   !canSubmit() && "bg-muted text-muted-foreground/50"
                 )}
               >
-                {isInputDisabled ? (
+                {isInputBusy ? (
                   <Sparkles className="h-4 w-4 animate-pulse" />
                 ) : (
                   <ArrowUp className="h-4 w-4" />
@@ -823,7 +824,7 @@ export function ChatInput({
                         !canSubmit() && "bg-muted text-muted-foreground/50"
                       )}
                     >
-                      {isInputDisabled ? (
+                      {isInputBusy ? (
                         <Sparkles className="h-4 w-4 animate-pulse" />
                       ) : (
                         <ArrowUp className="h-4 w-4" />

@@ -29,6 +29,25 @@ from .document_ingestion import run_document_ingestion
 logger = logging.getLogger(__name__)
 
 
+_CRAWLER_BLOCK_ERROR_MARKERS: tuple[str, ...] = (
+    "http 403",
+    "403 forbidden",
+    "http 429",
+    "429 too many requests",
+    "checking your browser",
+    "cf-challenge",
+    "just a moment",
+    "security review",
+    "access denied",
+    "blocked",
+)
+
+_CRAWLER_BLOCK_MESSAGE = (
+    "Web ingestion failed. The target website is blocking access to "
+    "automated crawlers. Please use a different method to create your KB."
+)
+
+
 class FileHandlerResult(TypedDict):
     """Return type for file_handler callback.
 
@@ -39,6 +58,12 @@ class FileHandlerResult(TypedDict):
 
     file_path: str
     file_id: Optional[str]
+
+
+def _looks_like_crawler_block(error: str) -> bool:
+    """Heuristically detect WAF / anti-bot blocks from a crawl failure string."""
+    normalized_error = error.lower()
+    return any(marker in normalized_error for marker in _CRAWLER_BLOCK_ERROR_MARKERS)
 
 
 async def run_web_ingestion(
@@ -318,14 +343,25 @@ async def run_web_ingestion(
     # something actionable.
     if status == "error" and failed_urls:
         first_url, first_err = next(iter(failed_urls.items()))
-        message = f"Web ingestion failed: {first_url} returned {first_err}"
+        if _looks_like_crawler_block(first_err):
+            message = _CRAWLER_BLOCK_MESSAGE
+        else:
+            message = f"Web ingestion failed: {first_url} returned {first_err}"
     elif status == "partial" and failed_urls:
         first_url, first_err = next(iter(failed_urls.items()))
-        message = (
-            f"Web ingestion partial: {documents_created} documents from "
-            f"{pages_crawled} pages, {len(failed_urls)} failed "
-            f"(first: {first_url} returned {first_err})"
-        )
+        if _looks_like_crawler_block(first_err):
+            message = (
+                f"Web ingestion partial: {documents_created} documents from "
+                f"{pages_crawled} pages, {len(failed_urls)} failed. "
+                "Some target pages are blocking access to automated crawlers. "
+                "Please use a different method to create your KB for those pages."
+            )
+        else:
+            message = (
+                f"Web ingestion partial: {documents_created} documents from "
+                f"{pages_crawled} pages, {len(failed_urls)} failed "
+                f"(first: {first_url} returned {first_err})"
+            )
     else:
         message = (
             f"Web ingestion completed: {documents_created} documents, "

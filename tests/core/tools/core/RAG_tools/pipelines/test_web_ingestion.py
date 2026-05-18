@@ -344,6 +344,82 @@ class TestWebIngestionPipeline:
         )
 
     @pytest.mark.asyncio
+    async def test_partial_message_does_not_treat_ingestion_429_as_crawler_block(
+        self, crawl_config, ingestion_config
+    ):
+        """Downstream ingestion failures must not be labeled as site anti-bot blocks."""
+        mock_crawl_results = [
+            MagicMock(
+                url="https://example.com/page1",
+                title="Page 1",
+                content_markdown="# Page 1\n\nContent",
+                status="success",
+                depth=0,
+                timestamp=datetime(2025, 1, 1, 12, 0, 0),
+                content_length=30,
+            ),
+            MagicMock(
+                url="https://example.com/page2",
+                title="Page 2",
+                content_markdown="# Page 2\n\nContent",
+                status="success",
+                depth=0,
+                timestamp=datetime(2025, 1, 1, 12, 0, 0),
+                content_length=30,
+            ),
+        ]
+
+        success_result = IngestionResult(
+            status="success",
+            doc_id="doc1",
+            parse_hash="hash1",
+            chunk_count=5,
+            embedding_count=5,
+            vector_count=5,
+            completed_steps=[],
+            failed_step=None,
+            message="Success",
+            warnings=[],
+        )
+
+        error_result = IngestionResult(
+            status="error",
+            doc_id="doc2",
+            parse_hash="hash2",
+            chunk_count=0,
+            embedding_count=0,
+            vector_count=0,
+            completed_steps=[],
+            failed_step="embed",
+            message="HTTP 429 from embedding API",
+            warnings=[],
+        )
+
+        with patch(
+            "xagent.core.tools.core.RAG_tools.pipelines.web_ingestion.WebCrawler"
+        ) as mock_crawler_class:
+            mock_crawler = MagicMock()
+            mock_crawler.crawl = AsyncMock(return_value=mock_crawl_results)
+            mock_crawler.total_urls_found = 2
+            mock_crawler.failed_urls = {}
+            mock_crawler_class.return_value = mock_crawler
+
+            with patch(
+                "xagent.core.tools.core.RAG_tools.pipelines.web_ingestion.run_document_ingestion",
+                side_effect=[success_result, error_result],
+            ):
+                result = await run_web_ingestion(
+                    collection="test_collection",
+                    crawl_config=crawl_config,
+                    ingestion_config=ingestion_config,
+                )
+
+        assert result.status == "partial"
+        assert "automated crawlers" not in result.message
+        assert "https://example.com/page2" in result.message
+        assert "HTTP 429 from embedding API" in result.message
+
+    @pytest.mark.asyncio
     async def test_empty_crawl_results(self, crawl_config, ingestion_config):
         """Test handling of empty crawl results."""
         with patch(

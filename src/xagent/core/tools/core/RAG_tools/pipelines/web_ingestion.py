@@ -40,6 +40,7 @@ _CRAWLER_BLOCK_ERROR_MARKERS: tuple[str, ...] = (
     "security review",
     "access denied",
     "blocked",
+    "challenge page",
 )
 
 _CRAWLER_BLOCK_MESSAGE = (
@@ -347,7 +348,7 @@ async def run_web_ingestion(
         blocking_entry = next(
             (
                 (url, err)
-                for url, err in failed_urls.items()
+                for url, err in crawler.failed_urls.items()
                 if _looks_like_crawler_block(err)
             ),
             None,

@@ -1,5 +1,13 @@
 import html
 import re
+from dataclasses import dataclass
+from urllib.parse import unquote, urlparse
+
+
+@dataclass(frozen=True)
+class TelegramImageRef:
+    file_id: str
+    alt_text: str
 
 
 def markdown_to_tg_html(text: str) -> str:
@@ -67,3 +75,42 @@ def markdown_to_tg_html(text: str) -> str:
     text = re.sub(r"\[([^\]\n]+)\]\(([^)\n]+)\)", r'<a href="\2">\1</a>', text)
 
     return text
+
+
+_MARKDOWN_IMAGE_RE = re.compile(r"!\[([^\]\n]*)\]\(([^)\n]+)\)")
+
+
+def strip_telegram_image_refs(text: str) -> tuple[str, list[TelegramImageRef]]:
+    """Remove local image refs from text and return refs Telegram should upload."""
+    if not text:
+        return "", []
+
+    image_refs: list[TelegramImageRef] = []
+
+    def replace_image(match: re.Match[str]) -> str:
+        alt_text = match.group(1).strip()
+        target = html.unescape(match.group(2).strip())
+        file_id = _extract_local_file_id(target)
+        if not file_id:
+            return match.group(0)
+        image_refs.append(TelegramImageRef(file_id=file_id, alt_text=alt_text))
+        return ""
+
+    cleaned = _MARKDOWN_IMAGE_RE.sub(replace_image, text)
+    cleaned = re.sub(r"[ \t]+\n", "\n", cleaned)
+    cleaned = re.sub(r"\n{3,}", "\n\n", cleaned)
+    return cleaned.strip(), image_refs
+
+
+def _extract_local_file_id(target: str) -> str | None:
+    parsed = urlparse(target)
+    path = parsed.path
+    if parsed.scheme == "file":
+        file_id = f"{parsed.netloc}{path}".lstrip("/")
+        return unquote(file_id) or None
+
+    for prefix in ("/api/files/preview/", "/api/files/download/"):
+        if path.startswith(prefix):
+            return unquote(path[len(prefix) :].strip("/")) or None
+
+    return None

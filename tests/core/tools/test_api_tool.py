@@ -2,17 +2,74 @@
 Tests for API Tool
 """
 
+import json
+from typing import Any
+from urllib.parse import parse_qs, urlparse
+
 import pytest
 
 from xagent.core.tools.adapters.vibe.api_tool import APICallArgs, APITool
 from xagent.core.tools.core.api_tool import APIClientCore, call_api
 
 
+def _single_value_query_args(url: str) -> dict[str, str]:
+    return {key: values[-1] for key, values in parse_qs(urlparse(url).query).items()}
+
+
+@pytest.fixture
+def mock_httpbin(monkeypatch: pytest.MonkeyPatch) -> None:
+    async def mock_make_request(
+        self: APIClientCore,
+        *,
+        url: str,
+        method: str,
+        headers: dict[str, str],
+        params: dict[str, Any] | None,
+        data: str | bytes | None,
+        timeout: int,
+        proxy_url: str | None,
+        allow_redirects: bool,
+    ) -> dict[str, Any]:
+        parsed = urlparse(url)
+        path = parsed.path
+        body: dict[str, Any]
+        status_code = 200
+
+        if path == "/get":
+            body = {"args": _single_value_query_args(url)}
+        elif path == "/post":
+            parsed_data = json.loads(
+                data.decode() if isinstance(data, bytes) else data or "{}"
+            )
+            body = {"json": parsed_data}
+        elif path == "/bearer":
+            token = headers.get("Authorization", "").removeprefix("Bearer ")
+            body = {"authenticated": bool(token), "token": token}
+        elif path == "/headers":
+            body = {"headers": headers}
+        elif path == "/status/404":
+            status_code = 404
+            body = {}
+        else:
+            status_code = 404
+            body = {}
+
+        return {
+            "success": 200 <= status_code < 300,
+            "status_code": status_code,
+            "headers": {"content-type": "application/json"},
+            "body": body,
+            "error": None if 200 <= status_code < 300 else f"HTTP {status_code}",
+        }
+
+    monkeypatch.setattr(APIClientCore, "_make_request", mock_make_request)
+
+
 class TestAPIClientCore:
     """Test core API client functionality"""
 
     @pytest.mark.asyncio
-    async def test_get_request(self):
+    async def test_get_request(self, mock_httpbin: None):
         """Test basic GET request"""
         client = APIClientCore()
         result = await client.call_api(
@@ -27,7 +84,7 @@ class TestAPIClientCore:
         assert result["body"]["args"]["test"] == "value"
 
     @pytest.mark.asyncio
-    async def test_post_json_request(self):
+    async def test_post_json_request(self, mock_httpbin: None):
         """Test POST request with JSON body"""
         client = APIClientCore()
         result = await client.call_api(
@@ -42,7 +99,7 @@ class TestAPIClientCore:
         assert result["body"]["json"]["value"] == 123
 
     @pytest.mark.asyncio
-    async def test_bearer_auth(self):
+    async def test_bearer_auth(self, mock_httpbin: None):
         """Test Bearer token authentication"""
         client = APIClientCore()
         result = await client.call_api(
@@ -58,7 +115,7 @@ class TestAPIClientCore:
         assert result["body"]["token"] == "test-token-123"
 
     @pytest.mark.asyncio
-    async def test_api_key_query_auth(self):
+    async def test_api_key_query_auth(self, mock_httpbin: None):
         """Test API key in query parameters using convenience function"""
         result = await call_api(
             url="https://httpbin.org/get",
@@ -73,7 +130,7 @@ class TestAPIClientCore:
         assert result["body"]["args"]["api_key"] == "test-key-123"
 
     @pytest.mark.asyncio
-    async def test_api_key_query_custom_param(self):
+    async def test_api_key_query_custom_param(self, mock_httpbin: None):
         """Test API key in custom query parameter"""
         result = await call_api(
             url="https://httpbin.org/get",
@@ -89,7 +146,7 @@ class TestAPIClientCore:
         assert result["body"]["args"]["token"] == "test-key-123"
 
     @pytest.mark.asyncio
-    async def test_custom_headers(self):
+    async def test_custom_headers(self, mock_httpbin: None):
         """Test custom headers"""
         client = APIClientCore()
         result = await client.call_api(
@@ -112,7 +169,7 @@ class TestAPIClientCore:
         assert "error" in result
 
     @pytest.mark.asyncio
-    async def test_retry_mechanism(self):
+    async def test_retry_mechanism(self, mock_httpbin: None):
         """Test retry mechanism on failure"""
         client = APIClientCore(default_retry_count=2)
         # This will fail with 404
@@ -306,7 +363,7 @@ class TestConvenienceFunctions:
     """Test convenience functions"""
 
     @pytest.mark.asyncio
-    async def test_call_api_function(self):
+    async def test_call_api_function(self, mock_httpbin: None):
         """Test convenience call_api function"""
         result = await call_api(
             url="https://httpbin.org/get",

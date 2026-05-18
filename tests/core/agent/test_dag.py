@@ -1171,6 +1171,13 @@ async def test_llm_plan_generator_builds_plan_from_model_json() -> None:
     assert "Few-shot examples" in system_prompt
     assert "must be concrete and action-specific" in system_prompt
     assert "suggested execution tool scope" in system_prompt
+    assert "Plan language rules" in system_prompt
+    assert (
+        "Write every plan step task, description, termination_condition, "
+        "and completion_evidence in the same natural language as the current "
+        "user request"
+    ) in system_prompt
+    assert "Any final synthesis or final result produced from the plan" in system_prompt
     assert llm.calls[0]["tool_choice"] == "required"
     assert llm.calls[0]["thinking"] == {"type": "disabled", "enable": False}
     assert "response_format" not in llm.calls[0]
@@ -1282,6 +1289,27 @@ async def test_dag_dependency_summary_does_not_add_extra_system_message() -> Non
         message["role"] == "user" and "Dependency results" in message["content"]
         for message in child_messages
     )
+
+
+def test_dag_step_instruction_preserves_step_language_for_final_answer() -> None:
+    pattern = DAGPattern(lambda **_: build_plan(PlanStep(id="unused", task="unused")))
+    instruction = pattern._step_instruction(
+        root_context=ExecutionContext(execution_id="dag-language"),
+        step=PlanStep(
+            id="research",
+            task="Research best practices",
+            description="Find lessons from the repository",
+            termination_condition="Stop after the lessons are summarized.",
+            completion_evidence="The summary has been returned.",
+        ),
+    )
+
+    assert "Step language rules" in instruction
+    assert (
+        "Use the same natural language as the current DAG step title and "
+        "description for all user-facing prose and for this step's final_answer"
+    ) in instruction
+    assert "Do not switch languages because dependency results" in instruction
 
 
 @pytest.mark.parametrize(

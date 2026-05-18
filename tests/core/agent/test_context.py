@@ -109,6 +109,24 @@ def test_format_tool_result_uses_shared_image_artifact_observation() -> None:
     assert "/api/files/public/preview/" not in content
 
 
+def test_system_context_preserves_current_request_language_over_memory() -> None:
+    ctx = ExecutionContext(execution_id="exec-language")
+    ctx.metadata["task"] = "Can you analyze this GitHub project?"
+    ctx.metadata[MEMORY_CONTEXT_METADATA_KEY] = (
+        "Relevant memory:\n- Task: 怎么样进入 github trending？\n"
+        "Result: 使用中文总结增长策略。"
+    )
+    ctx.add_user_message("Can you analyze this GitHub project?")
+
+    system_message = ctx.get_messages_for_llm()[0]["content"]
+
+    assert "Current user request:" in system_message
+    assert "Can you analyze this GitHub project?" in system_message
+    assert "Response language rules" in system_message
+    assert "Use the same natural language as the current user request" in system_message
+    assert "Do not let retrieved memories" in system_message
+
+
 def test_memory_enrichment_uses_web_user_context(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

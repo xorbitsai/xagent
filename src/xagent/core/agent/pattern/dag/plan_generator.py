@@ -7,6 +7,8 @@ from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from typing import Any, Callable
 
+from ...language import plan_language_rules
+
 logger = logging.getLogger(__name__)
 
 
@@ -256,6 +258,7 @@ class LLMPlanGenerator(PlanGenerator):
                         "limits, but they define the expected tool scope for the "
                         "step executor; choose them carefully so the executor does "
                         "not need to perform sibling or downstream step work. "
+                        f"{plan_language_rules()} "
                         "Keep ids stable "
                         "across replans when a completed step can be reused."
                     ),

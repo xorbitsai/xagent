@@ -337,10 +337,19 @@ class ExecutionContext:
             "latest, yesterday, and tomorrow."
         )
 
+    def _current_user_request_text(self) -> str:
+        for message in reversed(self.messages):
+            if message.hidden or message.role != "user":
+                continue
+            content = str(message.content or "").strip()
+            if content:
+                return content
+        return str(self.metadata.get("task") or "").strip()
+
     def _system_context(self) -> str:
         parts = [self._current_time_context()]
         dag_step_id = self.metadata.get("dag_step_id")
-        current_task = str(self.metadata.get("task") or "").strip()
+        current_task = self._current_user_request_text()
         if current_task and not dag_step_id:
             parts.append(
                 "Current user request:\n"

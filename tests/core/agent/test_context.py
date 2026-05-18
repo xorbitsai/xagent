@@ -136,6 +136,21 @@ def test_response_language_rules_uses_custom_subject_throughout() -> None:
     assert "unless the current user request explicitly asks" not in rules
 
 
+def test_system_context_uses_latest_user_message_as_current_request() -> None:
+    ctx = ExecutionContext(execution_id="exec-follow-up-language")
+    ctx.metadata["task"] = "Can you analyze this GitHub project?"
+    ctx.add_user_message("Can you analyze this GitHub project?")
+    ctx.add_assistant_message("Sure, here is the analysis.")
+    ctx.add_user_message("请继续用中文总结")
+
+    system_message = ctx.get_messages_for_llm()[0]["content"]
+
+    assert "Current user request:\n请继续用中文总结" in system_message
+    assert "Current user request:\nCan you analyze this GitHub project?" not in (
+        system_message
+    )
+
+
 def test_dag_step_system_context_preserves_step_language_for_final_answer() -> None:
     ctx = ExecutionContext(
         execution_id="exec-dag-language",

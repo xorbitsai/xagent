@@ -429,14 +429,15 @@ export function ChatInput({
     setAgentConfig(config);
   };
 
-  const allowsInterruptedInput = taskStatus === 'paused' || taskStatus === 'waiting_for_user';
-  const isInputBusy = !!isLoading && !allowsInterruptedInput;
+  const allowsInterruptedInput = taskStatus === 'waiting_for_user';
+  const isPaused = taskStatus === 'paused';
+  const isInputDisabled = isPaused || (!!isLoading && !allowsInterruptedInput);
 
   const canSubmit = () => {
     const hasText = message.trim().length > 0;
     const hasFiles = files.length > 0;
     const isUploadingFiles = uploadingFiles.size > 0;
-    return (hasText || hasFiles) && !isInputBusy && !isUploadingFiles;
+    return (hasText || hasFiles) && !isInputDisabled && !isUploadingFiles;
   };
   const canPauseTask =
     taskStatus === 'running' ||
@@ -689,11 +690,11 @@ export function ChatInput({
           <div className="relative flex-1">
             <div
               ref={editorRef}
-              contentEditable
+              contentEditable={!isInputDisabled}
               className={cn(
                 "w-full rounded-md border-0 bg-transparent text-[15px] outline-none placeholder:text-muted-foreground/60 overflow-y-auto resize-none focus-visible:ring-0 focus-visible:ring-offset-0 whitespace-pre-wrap break-words text-left",
                 compact ? "min-h-[44px] px-3 py-3 pr-12 max-h-[150px]" : cn(minHeightClass, "px-4 py-3 pb-16 max-h-[400px]"),
-                isInputBusy ? "opacity-50 pointer-events-none" : ""
+                isInputDisabled ? "opacity-50 pointer-events-none" : ""
               )}
               onInput={handleInput}
               onKeyDown={handleKeyDown}
@@ -722,7 +723,7 @@ export function ChatInput({
                   !canSubmit() && "bg-muted text-muted-foreground/50"
                 )}
               >
-                {isInputBusy ? (
+                {isInputDisabled ? (
                   <Sparkles className="h-4 w-4 animate-pulse" />
                 ) : (
                   <ArrowUp className="h-4 w-4" />
@@ -759,7 +760,7 @@ export function ChatInput({
                             variant="ghost"
                             size="sm"
                             className="h-9 px-3 text-muted-foreground hover:text-foreground hover:bg-secondary/80 rounded-xl gap-2"
-                            disabled={isInputBusy}
+                            disabled={isInputDisabled}
                             title={t('agent.input.actions.config')}
                           >
                             <Globe className="h-4 w-4" />
@@ -789,7 +790,7 @@ export function ChatInput({
                       size="sm"
                       className="h-9 w-9 p-0 text-muted-foreground hover:text-foreground hover:bg-secondary/80 rounded-full"
                       onClick={() => fileInputRef.current?.click()}
-                      disabled={isInputBusy}
+                      disabled={isInputDisabled}
                       title={t("chatPage.input.actions.upload")}
                     >
                       <Paperclip className="h-4 w-4" />
@@ -822,7 +823,7 @@ export function ChatInput({
                         !canSubmit() && "bg-muted text-muted-foreground/50"
                       )}
                     >
-                      {isInputBusy ? (
+                      {isInputDisabled ? (
                         <Sparkles className="h-4 w-4 animate-pulse" />
                       ) : (
                         <ArrowUp className="h-4 w-4" />

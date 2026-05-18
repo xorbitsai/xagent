@@ -127,6 +127,27 @@ def test_system_context_preserves_current_request_language_over_memory() -> None
     assert "Do not let retrieved memories" in system_message
 
 
+def test_dag_step_system_context_preserves_step_language_for_final_answer() -> None:
+    ctx = ExecutionContext(
+        execution_id="exec-dag-language",
+        metadata={
+            "dag_step_id": "research",
+            "dag_step_name": "Research best practices",
+            "dag_step_description": "Find lessons from the repository",
+        },
+    )
+    ctx.add_user_message("Dependency results: {'prior': '中文内容'}")
+
+    system_message = ctx.get_messages_for_llm()[0]["content"]
+
+    assert "Step language rules" in system_message
+    assert (
+        "Use the same natural language as the current DAG step title and "
+        "description for all user-facing prose and for this step's final_answer"
+    ) in system_message
+    assert "Do not let dependency results, tool results" in system_message
+
+
 def test_memory_enrichment_uses_web_user_context(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

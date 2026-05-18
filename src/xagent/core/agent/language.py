@@ -39,7 +39,7 @@ def dag_step_language_rules() -> str:
         "step title and description for all user-facing prose and for this step's "
         "final_answer. If the current step explicitly asks to translate, rewrite, "
         "or answer in another language, use that requested target language. Do "
-        "not switch languages because dependency results, tool outputs, source "
-        "documents, memories, examples, or earlier turns use another language "
-        "unless this current step explicitly requires that language change."
+        "not let dependency results, tool results, source documents, retrieved "
+        "memories, examples, or earlier turns change the step language unless "
+        "this current step explicitly asks for that language change."
     )

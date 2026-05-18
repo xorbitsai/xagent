@@ -12,7 +12,6 @@ from ...context.enrichment import (
     latest_user_text,
 )
 from ...frame import ExecutionFrame, ExecutionSnapshot, ExecutionStatus
-from ...language import dag_step_language_rules
 from ...result import unwrap_final_answer_content
 from ...runtime import LLMCallInterrupted, PatternRuntime
 from ..base import AgentPattern, PatternResult
@@ -1129,7 +1128,6 @@ class DAGPattern(AgentPattern):
             "step. Do not inspect, verify, revise, optimize, regenerate, or perform "
             "downstream work unless the termination condition explicitly requires "
             "that work.\n\n"
-            f"{dag_step_language_rules()}\n\n"
             f"{dependency_note}\n\n"
             "Execute only the current DAG step. The current step title and "
             "description plus the termination condition define the entire "

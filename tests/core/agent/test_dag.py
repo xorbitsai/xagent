@@ -1291,27 +1291,6 @@ async def test_dag_dependency_summary_does_not_add_extra_system_message() -> Non
     )
 
 
-def test_dag_step_instruction_preserves_step_language_for_final_answer() -> None:
-    pattern = DAGPattern(lambda **_: build_plan(PlanStep(id="unused", task="unused")))
-    instruction = pattern._step_instruction(
-        root_context=ExecutionContext(execution_id="dag-language"),
-        step=PlanStep(
-            id="research",
-            task="Research best practices",
-            description="Find lessons from the repository",
-            termination_condition="Stop after the lessons are summarized.",
-            completion_evidence="The summary has been returned.",
-        ),
-    )
-
-    assert "Step language rules" in instruction
-    assert (
-        "Use the same natural language as the current DAG step title and "
-        "description for all user-facing prose and for this step's final_answer"
-    ) in instruction
-    assert "Do not switch languages because dependency results" in instruction
-
-
 @pytest.mark.parametrize(
     ("plan", "error"),
     [

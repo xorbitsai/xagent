@@ -28,6 +28,9 @@ class TelegramTraceHandler(TraceHandler):
 
     async def handle_event(self, event: TraceEvent) -> None:
         try:
+            if not self._matches_task(event):
+                return
+
             # We only care about assistant messages and coarse tool activity for Telegram.
             if (
                 event.event_type.category == TraceCategory.MESSAGE
@@ -56,6 +59,11 @@ class TelegramTraceHandler(TraceHandler):
 
         except Exception as e:
             logger.warning(f"TelegramTraceHandler error for task {self.task_id}: {e}")
+
+    def _matches_task(self, event: TraceEvent) -> bool:
+        if event.task_id is None:
+            return True
+        return str(event.task_id) == str(self.task_id)
 
     async def _handle_tool_event(self, event: TraceEvent) -> None:
         tool_name = self._extract_tool_name(event)

@@ -1,7 +1,13 @@
 import html
 import re
 from dataclasses import dataclass
+from typing import TYPE_CHECKING, Any
 from urllib.parse import unquote, urlparse
+
+if TYPE_CHECKING:
+    from sqlalchemy.orm import Session
+
+    from ....core.agent.service import AgentService
 
 
 @dataclass(frozen=True)
@@ -30,19 +36,7 @@ def markdown_to_tg_html(text: str) -> str:
     text = re.sub(r"```(.*?)\n(.*?)\n```", replace_code_block, text, flags=re.DOTALL)
     text = re.sub(r"```(.*?)```", r"<pre>\1</pre>", text, flags=re.DOTALL)
 
-    # Replace tables
-    table_pattern = re.compile(r"(?:^.*\|.*(?:\n|$))+", re.MULTILINE)
-
-    def replace_table(match: re.Match) -> str:
-        table_content = str(match.group(0)).strip()
-        # Verify it has a separator line (e.g., |---| or ---|---)
-        if re.search(
-            r"^[ \t]*\|?[\s\-:]*[-]+[\s\-:]*\|[\s\-:|]*$", table_content, re.MULTILINE
-        ):
-            return f"\n<pre>{table_content}</pre>\n\n"
-        return str(match.group(0))
-
-    text = table_pattern.sub(replace_table, text)
+    text = _format_markdown_tables_for_telegram(text)
 
     # Replace inline code: `code`
     text = re.sub(r"`([^`\n]+)`", r"<code>\1</code>", text)
@@ -77,6 +71,80 @@ def markdown_to_tg_html(text: str) -> str:
     return text
 
 
+def _format_markdown_tables_for_telegram(text: str) -> str:
+    """Render Markdown tables as wrapped Telegram-friendly lists."""
+    lines = text.splitlines()
+    rendered_lines: list[str] = []
+    index = 0
+
+    while index < len(lines):
+        if _is_markdown_table_start(lines, index):
+            table_lines = [lines[index], lines[index + 1]]
+            index += 2
+            while index < len(lines) and "|" in lines[index].strip():
+                table_lines.append(lines[index])
+                index += 1
+            rendered_lines.extend(_render_markdown_table_as_list(table_lines))
+            continue
+
+        rendered_lines.append(lines[index])
+        index += 1
+
+    return "\n".join(rendered_lines)
+
+
+def _is_markdown_table_start(lines: list[str], index: int) -> bool:
+    return (
+        index + 1 < len(lines)
+        and "|" in lines[index]
+        and _is_markdown_table_separator(lines[index + 1])
+    )
+
+
+def _is_markdown_table_separator(line: str) -> bool:
+    cells = _split_markdown_table_row(line)
+    return bool(cells) and all(re.fullmatch(r":?-+:?", cell) for cell in cells)
+
+
+def _split_markdown_table_row(line: str) -> list[str]:
+    stripped = line.strip()
+    if stripped.startswith("|"):
+        stripped = stripped[1:]
+    if stripped.endswith("|"):
+        stripped = stripped[:-1]
+    return [cell.strip() for cell in stripped.split("|")]
+
+
+def _render_markdown_table_as_list(table_lines: list[str]) -> list[str]:
+    headers = _split_markdown_table_row(table_lines[0])
+    rows = [
+        _split_markdown_table_row(line)
+        for line in table_lines[2:]
+        if line.strip() and "|" in line
+    ]
+    if not headers or not rows:
+        return table_lines
+
+    rendered: list[str] = []
+    for row in rows:
+        padded_row = row + [""] * max(0, len(headers) - len(row))
+        if len(headers) == 2:
+            title = padded_row[0] or headers[0]
+            detail = padded_row[1]
+            rendered.append(
+                f"• <b>{title}</b>: {detail}" if detail else f"• <b>{title}</b>"
+            )
+            continue
+
+        title = next((cell for cell in padded_row if cell), "Row")
+        rendered.append(f"• <b>{title}</b>")
+        for header, cell in zip(headers, padded_row):
+            if cell and cell != title:
+                rendered.append(f"  {header}: {cell}")
+
+    return rendered
+
+
 _MARKDOWN_IMAGE_RE = re.compile(r"!\[([^\]\n]*)\]\(([^)\n]+)\)")
 
 
@@ -100,6 +168,51 @@ def strip_telegram_image_refs(text: str) -> tuple[str, list[TelegramImageRef]]:
     cleaned = re.sub(r"[ \t]+\n", "\n", cleaned)
     cleaned = re.sub(r"\n{3,}", "\n\n", cleaned)
     return cleaned.strip(), image_refs
+
+
+async def restore_telegram_task_context(
+    agent_service: "AgentService",
+    db: "Session",
+    task_id: int,
+) -> None:
+    """Restore prior chat transcript and execution context for a Telegram turn."""
+    from ...services.chat_history_service import load_task_transcript
+    from ...services.task_execution_context_service import (
+        load_task_execution_recovery_state,
+    )
+
+    agent_service.set_conversation_history(load_task_transcript(db, task_id))
+
+    recovery_state: dict[str, Any] = await load_task_execution_recovery_state(
+        db, task_id
+    )
+    agent_service.set_execution_context_messages(recovery_state.get("messages", []))
+    agent_service.set_recovered_skill_context(recovery_state.get("skill_context"))
+
+
+def persist_telegram_assistant_turn(
+    db: "Session",
+    task_id: int,
+    user_id: int,
+    content: str,
+    interactions: list[dict[str, Any]] | None = None,
+    message_type: str = "assistant_message",
+) -> None:
+    """Persist a Telegram assistant turn when it has text or structured prompts."""
+    from ...services.chat_history_service import persist_assistant_message
+
+    normalized_interactions = interactions or []
+    if not content.strip() and not normalized_interactions:
+        return
+
+    persist_assistant_message(
+        db=db,
+        task_id=task_id,
+        user_id=user_id,
+        content=content,
+        interactions=normalized_interactions,
+        message_type=message_type,
+    )
 
 
 def _extract_local_file_id(target: str) -> str | None:

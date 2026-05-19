@@ -17,6 +17,7 @@ from ...models.database import get_db
 from ...models.task import Task, TaskStatus
 from ...models.user import User
 from ...models.user_channel import UserChannel
+from ...services.execution_result_projection import project_execution_result_for_channel
 from .trace_handler import FeishuTraceHandler
 
 logger = logging.getLogger(__name__)
@@ -315,44 +316,11 @@ class FeishuBotInstance:
                     db_session=db,
                 )
 
-            task.status = (
-                TaskStatus.COMPLETED
-                if result.get("success", False)
-                else TaskStatus.FAILED
-            )
+            projection = project_execution_result_for_channel(result)
+            task.status = projection.task_status
             db.commit()
 
-            output = result.get("output", "")
-
-            chat_response = result.get("chat_response")
-            if isinstance(chat_response, dict):
-                interactions = chat_response.get("interactions", [])
-                if interactions:
-                    interaction_texts = []
-                    for interaction in interactions:
-                        label = interaction.get("label") or interaction.get(
-                            "field", "Input"
-                        )
-                        options = interaction.get("options", [])
-                        if options:
-                            opts = []
-                            for opt in options:
-                                if isinstance(opt, dict):
-                                    opts.append(
-                                        str(opt.get("label", opt.get("value", "")))
-                                    )
-                                else:
-                                    opts.append(str(opt))
-                            interaction_texts.append(
-                                f"• {label}\n  Options: {', '.join(opts)}"
-                            )
-                        else:
-                            interaction_texts.append(f"• {label}")
-                    if interaction_texts:
-                        output += "\n\n" + "\n".join(interaction_texts)
-
-            if not output or not str(output).strip():
-                output = "Task completed, but no output was generated."
+            output = projection.visible_text
 
             max_len = 4000
             text_chunks = [

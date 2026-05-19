@@ -21,8 +21,16 @@ from ...models.database import get_db
 from ...models.task import Task, TaskStatus
 from ...models.uploaded_file import UploadedFile
 from ...models.user import User
+from ...services.chat_history_service import persist_user_message
+from ...services.execution_result_projection import project_execution_result_for_channel
 from .handler import TelegramTraceHandler
-from .utils import TelegramImageRef, markdown_to_tg_html, strip_telegram_image_refs
+from .utils import (
+    TelegramImageRef,
+    markdown_to_tg_html,
+    persist_telegram_assistant_turn,
+    restore_telegram_task_context,
+    strip_telegram_image_refs,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -368,19 +376,7 @@ class TelegramBotInstance:
                     user=user,  # type: ignore
                 )
 
-                from ...services.task_execution_context_service import (
-                    load_task_execution_recovery_state,
-                )
-
-                recovery_state = await load_task_execution_recovery_state(
-                    db, int(task.id)
-                )  # type: ignore
-                agent_service.set_execution_context_messages(
-                    recovery_state.get("messages", [])
-                )
-                agent_service.set_recovered_skill_context(
-                    recovery_state.get("skill_context")
-                )
+                await restore_telegram_task_context(agent_service, db, int(task.id))
 
                 context: dict = {}
 
@@ -413,6 +409,13 @@ class TelegramBotInstance:
                         context["state"] = context.get("state", {})
                         context["state"]["file_info"] = uploaded_info
 
+                persist_user_message(
+                    db=db,
+                    task_id=int(task.id),  # type: ignore
+                    user_id=int(user.id),  # type: ignore
+                    content=text,
+                )
+
                 loading_msg = await last_message.answer(
                     "Got it, I'm working on this now.\n"
                     "<i>I'll update this message as I make progress.</i>",
@@ -431,56 +434,34 @@ class TelegramBotInstance:
 
                 actual_task_id = str(task.id)
 
-                with UserContext(int(user.id)):  # type: ignore
-                    result = await agent_manager.execute_task(
-                        agent_service=agent_service,
-                        task=text,
-                        context=context,
-                        task_id=actual_task_id,
-                        tracking_task_id=str(task.id),
-                        db_session=db,
-                    )
+                try:
+                    with UserContext(int(user.id)):  # type: ignore
+                        result = await agent_manager.execute_task(
+                            agent_service=agent_service,
+                            task=text,
+                            context=context,
+                            task_id=actual_task_id,
+                            tracking_task_id=str(task.id),
+                            db_session=db,
+                        )
+                finally:
+                    if tg_handler in agent_service.tracer.handlers:
+                        agent_service.tracer.handlers.remove(tg_handler)
 
-                task.status = (
-                    TaskStatus.COMPLETED
-                    if result.get("success", False)
-                    else TaskStatus.FAILED
-                )
+                projection = project_execution_result_for_channel(result)
+                task.status = projection.task_status
                 db.commit()
 
-                output = result.get("output", "")
+                persist_telegram_assistant_turn(
+                    db=db,
+                    task_id=int(task.id),  # type: ignore
+                    user_id=int(user.id),  # type: ignore
+                    content=projection.transcript_content,
+                    interactions=projection.interactions,
+                    message_type=projection.message_type,
+                )
 
-                chat_response = result.get("chat_response")
-                if isinstance(chat_response, dict):
-                    interactions = chat_response.get("interactions", [])
-                    if interactions:
-                        interaction_texts = []
-                        for interaction in interactions:
-                            label = interaction.get("label") or interaction.get(
-                                "field", "Input"
-                            )
-                            options = interaction.get("options", [])
-                            if options:
-                                opts = []
-                                for opt in options:
-                                    if isinstance(opt, dict):
-                                        opts.append(
-                                            str(opt.get("label", opt.get("value", "")))
-                                        )
-                                    else:
-                                        opts.append(str(opt))
-                                interaction_texts.append(
-                                    f"• {label}\n  Options: {', '.join(opts)}"
-                                )
-                            else:
-                                interaction_texts.append(f"• {label}")
-                        if interaction_texts:
-                            output += "\n\n" + "\n".join(interaction_texts)
-
-                if not output or not str(output).strip():
-                    output = "Task completed, but no output was generated."
-
-                output = str(output)
+                output = projection.visible_text
                 output, image_refs = strip_telegram_image_refs(output)
                 if not output and image_refs:
                     output = "Task completed."

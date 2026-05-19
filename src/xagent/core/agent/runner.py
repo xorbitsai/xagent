@@ -97,7 +97,10 @@ class AgentRunner:
                 if role and content:
                     context.add_message(role, content)
             if task:
-                context.add_user_message(task)
+                context.add_user_message(
+                    task,
+                    metadata=self._initial_user_message_metadata(context),
+                )
 
         runtime = runtime or PatternRuntime(
             tracer=self.tracer,
@@ -412,6 +415,46 @@ class AgentRunner:
             context.attach_memory_session(memory_id, snapshot)
 
         return context
+
+    def _initial_user_message_metadata(
+        self, context: ExecutionContext
+    ) -> dict[str, Any]:
+        metadata: dict[str, Any] = {}
+        context_metadata = (
+            context.metadata if isinstance(context.metadata, dict) else {}
+        )
+        request_context = context_metadata.get("request_context")
+
+        candidates = []
+        if isinstance(request_context, dict):
+            candidates.append(request_context)
+        candidates.append(context_metadata)
+
+        for candidate in candidates:
+            if "display_message" in candidate:
+                display_message = candidate.get("display_message")
+                metadata["display_message"] = (
+                    display_message if isinstance(display_message, str) else ""
+                )
+                break
+            if "display_user_message" in candidate:
+                display_message = candidate.get("display_user_message")
+                metadata["display_message"] = (
+                    display_message if isinstance(display_message, str) else ""
+                )
+                break
+
+        for candidate in candidates:
+            files = candidate.get("files")
+            if isinstance(files, list):
+                metadata["files"] = files
+                break
+            attachments = candidate.get("attachments")
+            if isinstance(attachments, list):
+                metadata["files"] = attachments
+                break
+
+        return metadata
 
     def _apply_request_context(
         self,

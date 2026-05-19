@@ -701,6 +701,42 @@ async def test_runner_post_user_message_preserves_display_and_execution_contract
 
 
 @pytest.mark.asyncio
+async def test_runner_initial_user_message_preserves_display_metadata(
+    tmp_path: Path,
+) -> None:
+    tracer = RecordingTraceEventTracer()
+    agent = Agent(
+        name="writer",
+        patterns=[FakePattern({"success": True, "response": "Done"})],
+    )
+    runner = AgentRunner(
+        agent=agent,
+        tracer=tracer,
+        callbacks=[TraceEventCallback()],
+        workspace_manager=FakeWorkspaceManager(tmp_path),
+    )
+
+    execution_message = "Read file\n\n## UPLOADED FILES\nfile_id=file-123"
+    files = [{"file_id": "file-123", "name": "notes.txt"}]
+    result = await runner.run(
+        task=execution_message,
+        execution_id="exec-initial-display",
+        metadata={"request_context": {"display_message": "Read file", "files": files}},
+    )
+
+    first_user = next(
+        message for message in result["context"].messages if message.role == "user"
+    )
+    assert first_user.content == execution_message
+    assert first_user.metadata["display_message"] == "Read file"
+    assert first_user.metadata["files"] == files
+    user_event = next(
+        event for event in tracer.events if event["event_type"] == "task_start_message"
+    )
+    assert user_event["data"]["message"] == "Read file"
+
+
+@pytest.mark.asyncio
 async def test_runner_post_user_message_rejects_execution_without_display(
     tmp_path: Path,
 ) -> None:

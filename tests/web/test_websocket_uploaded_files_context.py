@@ -10,6 +10,7 @@ from xagent.web.api.chat import _build_task_agent_config
 from xagent.web.api.websocket import (
     _append_uploaded_files_context_to_message,
     _build_uploaded_files_context,
+    _display_file_refs_from_file_info,
     _display_message_for_user,
     _normalize_file_outputs,
     _register_uploaded_files_for_agent,
@@ -619,3 +620,29 @@ def test_display_message_for_file_only_turn_uses_placeholder():
         _display_message_for_user("Summarize this document", has_files=True)
         == "Summarize this document"
     )
+
+
+def test_display_file_refs_from_file_info_omits_runtime_paths():
+    refs = _display_file_refs_from_file_info(
+        [
+            {
+                "file_id": 123,
+                "name": "notes.txt",
+                "size": 42,
+                "type": "text/plain",
+                "path": "/internal/uploads/notes.txt",
+                "workspace_path": "/workspace/input/notes.txt",
+            }
+        ]
+    )
+
+    assert refs == [
+        {
+            "file_id": "123",
+            "name": "notes.txt",
+            "size": 42,
+            "type": "text/plain",
+        }
+    ]
+    assert "path" not in refs[0]
+    assert "workspace_path" not in refs[0]

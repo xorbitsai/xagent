@@ -10,7 +10,7 @@ from .claude import ClaudeLLM
 from .deepseek import DeepSeekLLM
 from .gemini import GeminiLLM
 from .openai import OpenAILLM
-from .litellm import LiteLLMChat
+from .litellm import LiteLLM
 from .xinference import XinferenceLLM
 from .zhipu import ZhipuLLM
 
@@ -88,7 +88,7 @@ def create_base_llm(model: ModelConfig) -> BaseLLM:
             abilities=model.abilities,
         )
     elif provider == "litellm":
-        llm = LiteLLMChat(
+        llm = LiteLLM(
             model_name=model.model_name,
             api_key=model.api_key,
             api_base=model.base_url,

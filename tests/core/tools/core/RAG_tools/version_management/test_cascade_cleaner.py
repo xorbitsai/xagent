@@ -1177,3 +1177,49 @@ def test_cascade_delete_confirm_deletion_order_is_stable(
         "ingestion_runs",
         "documents",
     ]
+
+
+@patch(
+    "xagent.core.tools.core.RAG_tools.version_management.cascade_cleaner._plan_by_predicates"
+)
+@patch(
+    "xagent.core.tools.core.RAG_tools.version_management.cascade_cleaner._build_collection_filter"
+)
+@patch(
+    "xagent.core.tools.core.RAG_tools.version_management.cascade_cleaner.get_vector_store_raw_connection"
+)
+def test_cascade_delete_builds_distinct_embeddings_predicates_per_table(
+    mock_get_conn: MagicMock,
+    mock_build_collection_filter: MagicMock,
+    mock_plan: MagicMock,
+) -> None:
+    """Each embeddings_* table must get its own predicate (schema may differ during migration)."""
+    mock_build_collection_filter.side_effect = (
+        lambda *, table_name, **_: f"expr:{table_name}"
+    )
+    mock_plan.return_value = {}
+
+    conn = MagicMock(spec=["table_names"])
+    conn.table_names.return_value = ["embeddings_m1", "embeddings_m2"]
+    mock_get_conn.return_value = conn
+
+    cascade_delete(
+        target="collection",
+        collection="kb",
+        user_id=1,
+        is_admin=False,
+        preview_only=True,
+        confirm=False,
+    )
+
+    predicates = mock_plan.call_args[0][1]
+    assert predicates["embeddings_m1"] == "expr:embeddings_m1"
+    assert predicates["embeddings_m2"] == "expr:embeddings_m2"
+    assert predicates["embeddings_m1"] != predicates["embeddings_m2"]
+
+    embeddings_calls = [
+        call.kwargs["table_name"]
+        for call in mock_build_collection_filter.call_args_list
+        if str(call.kwargs["table_name"]).startswith("embeddings_")
+    ]
+    assert sorted(embeddings_calls) == ["embeddings_m1", "embeddings_m2"]

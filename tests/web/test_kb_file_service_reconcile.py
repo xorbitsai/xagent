@@ -17,6 +17,7 @@ from xagent.core.tools.core.RAG_tools.LanceDB.schema_manager import (
     ensure_documents_table,
 )
 from xagent.core.tools.core.RAG_tools.management.status import write_ingestion_status
+from xagent.core.tools.core.RAG_tools.storage.factory import reset_rag_storage_for_tests
 from xagent.providers.vector_store.lancedb import get_connection_from_env
 from xagent.web.models.database import Base
 from xagent.web.models.uploaded_file import UploadedFile
@@ -35,6 +36,7 @@ def reconcile_env(monkeypatch: pytest.MonkeyPatch):
     ):
         monkeypatch.setenv("LANCEDB_DIR", lancedb_dir)
         monkeypatch.setenv("XAGENT_UPLOADS_DIR", uploads_dir)
+        reset_rag_storage_for_tests()
 
         conn = lancedb.connect(lancedb_dir)
         ensure_documents_table(conn)
@@ -44,6 +46,8 @@ def reconcile_env(monkeypatch: pytest.MonkeyPatch):
         Base.metadata.create_all(engine)
         SessionLocal = sessionmaker(bind=engine)
         yield docs_table, SessionLocal, Path(uploads_dir)
+
+        reset_rag_storage_for_tests()
 
 
 def _create_user(session_local: sessionmaker, user_id: int = 1) -> None:
@@ -192,7 +196,7 @@ def test_aggregate_uploaded_file_statuses_treats_legacy_indexed_file_as_success(
 
 
 def test_indexed_status_fallback_skips_embeddings_after_chunks_cover_candidates(
-    reconcile_env, monkeypatch: pytest.MonkeyPatch
+    reconcile_env,
 ):
     """Chunks are sufficient to prove legacy documents are searchable."""
     _docs_table, _session_local, _uploads_dir = reconcile_env
@@ -220,28 +224,30 @@ def test_indexed_status_fallback_skips_embeddings_after_chunks_cover_candidates(
             }
         ]
     )
-    monkeypatch.setattr(
-        kb_file_service,
-        "list_embeddings_table_names",
-        lambda _conn: ["embeddings_should_not_open"],
-    )
 
-    opened_tables: list[str] = []
+    from xagent.core.tools.core.RAG_tools.storage.factory import get_vector_index_store
 
-    class RecordingConnection:
-        def open_table(self, table_name: str):
-            opened_tables.append(table_name)
-            return conn.open_table(table_name)
+    store = get_vector_index_store()
+
+    aggregated_tables: list[str] = []
+    original_aggregate = store.aggregate_document_counts
+
+    def _tracking_aggregate(table_name, *args, **kwargs):
+        aggregated_tables.append(table_name)
+        return original_aggregate(table_name, *args, **kwargs)
+
+    store.aggregate_document_counts = _tracking_aggregate  # type: ignore[method-assign]
 
     refs = kb_file_service._load_indexed_doc_refs(
-        RecordingConnection(),
-        collections=["kb"],
-        doc_refs_by_file_id={"file-1": [("kb", "doc-legacy")]},
-        user_filter="user_id == 1",
+        store,
+        doc_ids_by_collection={"kb": {"doc-legacy"}},
+        user_id=1,
+        is_admin=False,
     )
 
     assert refs == {("kb", "doc-legacy")}
-    assert opened_tables == ["chunks"]
+    assert "chunks" in aggregated_tables
+    assert not any(t.startswith("embeddings_") for t in aggregated_tables)
 
 
 def test_reconcile_uploaded_files_deletes_only_stale_failed_by_default(reconcile_env):
@@ -419,7 +425,7 @@ def test_reconcile_uploaded_files_does_not_commit_caller_session(
     db.close()
 
 
-def test_reconcile_uploaded_files_records_cleanup_error_when_documents_delete_fails(
+def test_reconcile_uploaded_files_records_cleanup_error_when_cascade_delete_fails(
     reconcile_env, monkeypatch: pytest.MonkeyPatch
 ):
     docs_table, session_local, uploads_dir = reconcile_env
@@ -463,37 +469,9 @@ def test_reconcile_uploaded_files_records_cleanup_error_when_documents_delete_fa
         user_id=1,
     )
 
-    real_conn = get_connection_from_env()
-    real_table = real_conn.open_table("documents")
-
-    class _DeleteFailingTable:
-        def delete(self, where: str) -> None:
-            if failed_file.file_id in where:
-                raise RuntimeError("delete failed")
-            real_table.delete(where)
-
-        def __getattr__(self, item: str):
-            return getattr(real_table, item)
-
-    class _DeleteFailingConn:
-        def open_table(self, name: str):
-            if name == "documents":
-                return _DeleteFailingTable()
-            return real_conn.open_table(name)
-
-    # Mock kb_file_service's connection (used for querying documents)
     monkeypatch.setattr(
-        "xagent.web.services.kb_file_service.get_connection_from_env",
-        lambda: _DeleteFailingConn(),
-    )
-    monkeypatch.setattr(
-        "xagent.web.services.kb_file_service.ensure_documents_table",
-        lambda _conn: None,
-    )
-    # Mock cascade_cleaner's connection (used by cascade_delete)
-    monkeypatch.setattr(
-        "xagent.core.tools.core.RAG_tools.version_management.cascade_cleaner.get_vector_store_raw_connection",
-        lambda: _DeleteFailingConn(),
+        "xagent.web.services.kb_file_service.cascade_delete",
+        lambda **kwargs: (_ for _ in ()).throw(RuntimeError("cascade delete failed")),
     )
 
     result = reconcile_uploaded_files(

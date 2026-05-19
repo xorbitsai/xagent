@@ -8,31 +8,21 @@ import time
 from collections import OrderedDict
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Union
+from typing import Any, Dict, List, Optional, Sequence, Union
 
 from sqlalchemy.orm import Session
 
 from ...config import get_uploads_dir
-from ...core.tools.core.RAG_tools.LanceDB.schema_manager import (
-    _safe_close_table,
-    ensure_documents_table,
-)
 from ...core.tools.core.RAG_tools.management.status import load_ingestion_status
-from ...core.tools.core.RAG_tools.storage.contracts import DocumentRecord
-from ...core.tools.core.RAG_tools.utils.lancedb_query_utils import (
-    list_embeddings_table_names,
-    query_to_list,
+from ...core.tools.core.RAG_tools.storage.contracts import (
+    DocumentRecord,
+    VectorIndexStore,
 )
-from ...core.tools.core.RAG_tools.utils.string_utils import (
-    build_lancedb_filter_expression,
-    escape_lancedb_string,
-)
-from ...core.tools.core.RAG_tools.utils.user_permissions import UserPermissions
+from ...core.tools.core.RAG_tools.storage.factory import get_vector_index_store
 from ...core.tools.core.RAG_tools.utils.user_scope import resolve_user_scope
 from ...core.tools.core.RAG_tools.version_management.cascade_cleaner import (
     cascade_delete,
 )
-from ...providers.vector_store.lancedb import get_connection_from_env
 from ..models.uploaded_file import UploadedFile
 
 logger = logging.getLogger(__name__)
@@ -46,7 +36,7 @@ class _FileStatusCache:
     """Simple TTL cache for file status aggregation results.
 
     Caches status maps keyed by (user_id, file_ids_tuple) to avoid
-    repeated LanceDB queries for the same set of files within a short window.
+    repeated vector store queries for the same set of files within a short window.
     """
 
     def __init__(self, ttl_seconds: int = 5, maxsize: int = 1024) -> None:
@@ -89,6 +79,33 @@ class _FileStatusCache:
 
 # Global cache instance
 _file_status_cache = _FileStatusCache(ttl_seconds=5)
+
+
+def _list_document_records_for_file_ids(
+    store: VectorIndexStore,
+    *,
+    file_ids: Sequence[str],
+    user_id: int,
+    is_admin: bool,
+) -> List[DocumentRecord]:
+    """Load document rows for many file IDs without scan-limit truncation."""
+    unique_ids = sorted({file_id for file_id in file_ids if file_id})
+    if not unique_ids:
+        return []
+
+    records: List[DocumentRecord] = []
+    for offset in range(0, len(unique_ids), _FILE_STATUS_BATCH_SIZE):
+        batch = unique_ids[offset : offset + _FILE_STATUS_BATCH_SIZE]
+        records.extend(
+            store.list_document_records(
+                collection_name=None,
+                user_id=user_id,
+                is_admin=is_admin,
+                file_ids=batch,
+                max_results=-1,
+            )
+        )
+    return records
 
 
 def upsert_uploaded_file_record(
@@ -144,32 +161,27 @@ def list_documents_for_user(
     collection_name: Optional[str] = None,
 ) -> List[Dict[str, Any]]:
     """Load KB document metadata rows for a user."""
-    conn = get_connection_from_env()
-    ensure_documents_table(conn)
-    table = None
-    try:
-        table = conn.open_table("documents")
+    records = get_vector_index_store().list_document_records(
+        collection_name=collection_name,
+        user_id=user_id,
+        is_admin=is_admin,
+        max_results=10000,
+    )
+    return [_document_record_to_dict(record) for record in records]
 
-        base_filter = ""
-        if collection_name:
-            base_filter = build_lancedb_filter_expression(
-                {"collection": collection_name}
-            )
-        scope = resolve_user_scope(user_id=user_id, is_admin=is_admin)
-        user_filter = UserPermissions.get_user_filter(
-            scope.user_id, is_admin=scope.is_admin
-        )
-        combined_filter = (
-            f"({base_filter}) and ({user_filter})"
-            if user_filter and base_filter
-            else (user_filter or base_filter)
-        )
-        query = table.search()
-        if combined_filter:
-            query = query.where(combined_filter)
-        return query_to_list(query.limit(10000))
-    finally:
-        _safe_close_table(table)
+
+def _document_record_to_dict(
+    record: Union[Dict[str, Any], DocumentRecord],
+) -> Dict[str, Any]:
+    """Convert a document record projection to the legacy dict shape."""
+    if isinstance(record, dict):
+        return dict(record)
+    return {
+        "collection": record.collection,
+        "doc_id": record.doc_id,
+        "file_id": record.file_id,
+        "source_path": record.source_path,
+    }
 
 
 def build_uploaded_filename_map(
@@ -306,105 +318,57 @@ def delete_uploaded_file_if_orphaned(
     return True
 
 
-def _build_file_id_in_filter(file_ids: List[str]) -> str:
-    escaped_ids = [f"'{escape_lancedb_string(file_id)}'" for file_id in file_ids]
-    return f"file_id IN ({', '.join(escaped_ids)})"
-
-
-def _build_doc_id_in_filter(doc_ids: List[str]) -> str:
-    escaped_ids = [f"'{escape_lancedb_string(doc_id)}'" for doc_id in doc_ids]
-    return f"doc_id IN ({', '.join(escaped_ids)})"
-
-
-def _combine_lancedb_filters(
-    base_filter: Optional[str], user_filter: Optional[str]
-) -> Optional[str]:
-    if base_filter and user_filter:
-        return f"({base_filter}) and ({user_filter})"
-    return base_filter or user_filter
-
-
 def _load_indexed_doc_refs(
-    conn: Any,
+    store: VectorIndexStore,
     *,
-    collections: List[str],
-    doc_refs_by_file_id: Dict[str, List[tuple[str, str]]],
-    user_filter: Optional[str],
+    doc_ids_by_collection: Dict[str, set[str]],
+    user_id: Optional[int],
+    is_admin: bool,
 ) -> set[tuple[str, str]]:
-    """Return document refs that have searchable artifacts in LanceDB.
+    """Return document refs that have searchable artifacts in the vector store.
 
     Legacy deployments may not have ingestion status rows. If chunks or
     embeddings exist for a document, the file was already indexed enough to be
     user-visible and should be treated as successful for file-list status.
     """
-    indexed_refs: set[tuple[str, str]] = set()
-    doc_ids_by_collection: Dict[str, set[str]] = {
-        collection: set() for collection in collections
-    }
-    for doc_refs in doc_refs_by_file_id.values():
-        for collection, doc_id in doc_refs:
-            if collection in doc_ids_by_collection:
-                doc_ids_by_collection[collection].add(doc_id)
-
     candidate_refs = {
         (collection, doc_id)
         for collection, doc_ids in doc_ids_by_collection.items()
         for doc_id in doc_ids
     }
     if not candidate_refs:
-        return indexed_refs
+        return set()
 
-    candidate_tables = ["chunks", *list_embeddings_table_names(conn)]
+    indexed_refs: set[tuple[str, str]] = set()
+    candidate_tables = ["chunks"] + [
+        t for t in store.list_table_names() if t.startswith("embeddings_")
+    ]
+
     for table_name in candidate_tables:
         if indexed_refs.issuperset(candidate_refs):
             return indexed_refs
-        table = None
-        try:
-            table = conn.open_table(table_name)
-        except Exception as exc:  # noqa: BLE001
-            logger.debug(
-                "Skipping indexed status fallback table '%s': %s", table_name, exc
-            )
-            continue
-
-        try:
-            for collection, doc_ids in doc_ids_by_collection.items():
-                pending_doc_ids = {
-                    doc_id
-                    for doc_id in doc_ids
-                    if (collection, doc_id) not in indexed_refs
-                }
-                if not pending_doc_ids:
-                    continue
-                collection_filter = build_lancedb_filter_expression(
-                    {"collection": collection},
-                    skip_user_filter=True,
+        for collection, doc_ids in doc_ids_by_collection.items():
+            pending = doc_ids - {d for c, d in indexed_refs if c == collection}
+            if not pending:
+                continue
+            try:
+                counts = store.aggregate_document_counts(
+                    table_name,
+                    "doc_id",
+                    collection,
+                    user_id=user_id,
+                    is_admin=is_admin,
                 )
-                doc_filter = _build_doc_id_in_filter(sorted(pending_doc_ids))
-                combined_filter = _combine_lancedb_filters(
-                    f"({collection_filter}) and ({doc_filter})", user_filter
+            except Exception:  # noqa: BLE001
+                logger.debug(
+                    "Skipping indexed status fallback table '%s' for collection '%s'",
+                    table_name,
+                    collection,
                 )
-                try:
-                    query = table.search().where(combined_filter)
-                    rows = query_to_list(
-                        query.select(["collection", "doc_id"]).limit(-1)
-                    )
-                except Exception as exc:  # noqa: BLE001
-                    logger.debug(
-                        "Failed indexed status fallback query on '%s' for collection '%s': %s",
-                        table_name,
-                        collection,
-                        exc,
-                    )
-                    continue
-
-                for row in rows:
-                    row_collection = str(row.get("collection") or "").strip()
-                    row_doc_id = str(row.get("doc_id") or "").strip()
-                    if row_collection and row_doc_id:
-                        indexed_refs.add((row_collection, row_doc_id))
-        finally:
-            _safe_close_table(table)
+                continue
+            for doc_id, count in counts.items():
+                if count > 0 and doc_id in pending:
+                    indexed_refs.add((collection, doc_id))
 
     return indexed_refs
 
@@ -437,36 +401,24 @@ def aggregate_uploaded_file_statuses(
         if cached_result is not None:
             return cached_result
 
-    # Cache miss - compute from database
-    conn = get_connection_from_env()
-    ensure_documents_table(conn)
-    user_filter = UserPermissions.get_user_filter(user_id, is_admin=is_admin)
+    # Cache miss - compute from database via abstraction layer
+    store = get_vector_index_store()
+    records = _list_document_records_for_file_ids(
+        store,
+        file_ids=normalized_file_ids,
+        user_id=user_id,
+        is_admin=is_admin,
+    )
 
     doc_refs_by_file_id: Dict[str, List[tuple[str, str]]] = {
         file_id: [] for file_id in normalized_file_ids
     }
-    documents_table = None
-    try:
-        documents_table = conn.open_table("documents")
-        for offset in range(0, len(normalized_file_ids), _FILE_STATUS_BATCH_SIZE):
-            batch = normalized_file_ids[offset : offset + _FILE_STATUS_BATCH_SIZE]
-            base_filter = _build_file_id_in_filter(batch)
-            combined_filter = _combine_lancedb_filters(base_filter, user_filter)
-
-            query = documents_table.search()
-            if combined_filter:
-                query = query.where(combined_filter)
-            rows = query_to_list(
-                query.select(["file_id", "collection", "doc_id"]).limit(-1)
-            )
-            for row in rows:
-                file_id = str(row.get("file_id") or "").strip()
-                collection = str(row.get("collection") or "").strip()
-                doc_id = str(row.get("doc_id") or "").strip()
-                if file_id and collection and doc_id and file_id in doc_refs_by_file_id:
-                    doc_refs_by_file_id[file_id].append((collection, doc_id))
-    finally:
-        _safe_close_table(documents_table)
+    for record in records:
+        file_id = (record.file_id or "").strip()
+        collection = (record.collection or "").strip()
+        doc_id = record.doc_id.strip()
+        if file_id and collection and doc_id and file_id in doc_refs_by_file_id:
+            doc_refs_by_file_id[file_id].append((collection, doc_id))
 
     collections = sorted(
         {
@@ -487,11 +439,16 @@ def aggregate_uploaded_file_statuses(
             if doc_id and status:
                 status_by_doc[(collection, doc_id)] = status
 
+    doc_ids_by_collection: Dict[str, set[str]] = {}
+    for doc_refs in doc_refs_by_file_id.values():
+        for collection, doc_id in doc_refs:
+            doc_ids_by_collection.setdefault(collection, set()).add(doc_id)
+
     indexed_doc_refs = _load_indexed_doc_refs(
-        conn,
-        collections=collections,
-        doc_refs_by_file_id=doc_refs_by_file_id,
-        user_filter=user_filter,
+        store,
+        doc_ids_by_collection=doc_ids_by_collection,
+        user_id=user_id,
+        is_admin=is_admin,
     )
 
     status_map: Dict[str, str] = {}
@@ -574,8 +531,7 @@ def reconcile_uploaded_files(
             else _DEFAULT_DELETABLE_STALE_STATUSES
         )
     }
-    conn = get_connection_from_env()
-    ensure_documents_table(conn)
+    store = get_vector_index_store()
     for record in uploaded_files:
         scanned += 1
         file_id = str(record.file_id)
@@ -589,7 +545,6 @@ def reconcile_uploaded_files(
         if created_at is not None and created_at > cutoff:
             continue
 
-        # Log warning for RUNNING files as they may indicate crashed ingestion
         if status == "RUNNING":
             logger.warning(
                 "Found stale RUNNING file (possible crashed ingestion): file_id=%s, created_at=%s",
@@ -610,16 +565,12 @@ def reconcile_uploaded_files(
             )
             continue
 
-        safe_file_id = escape_lancedb_string(file_id)
-        # Query documents table to get (collection, doc_id) pairs for cascade deletion
-        documents_table = None
         try:
-            documents_table = conn.open_table("documents")
-            doc_rows = query_to_list(
-                documents_table.search()
-                .where(f"file_id = '{safe_file_id}'")
-                .select(["collection", "doc_id"])
-                .limit(-1)
+            doc_records = store.list_document_records(
+                collection_name=None,
+                user_id=user_id,
+                is_admin=is_admin,
+                file_ids=[file_id],
             )
         except Exception as exc:  # noqa: BLE001
             cleanup_errors += 1
@@ -629,17 +580,12 @@ def reconcile_uploaded_files(
                 exc,
             )
             continue
-        finally:
-            _safe_close_table(documents_table)
 
-        # Cascade delete all related data for each (collection, doc_id) pair
-        # Note: We use cascade_delete for complete cleanup across all tables
-        # (parses, chunks, embeddings_*, main_pointers, ingestion_runs, documents)
         cascade_deleted = 0
         cascade_error = False
-        for row in doc_rows:
-            collection = str(row.get("collection") or "").strip()
-            doc_id = str(row.get("doc_id") or "").strip()
+        for doc_rec in doc_records:
+            collection = (doc_rec.collection or "").strip()
+            doc_id = doc_rec.doc_id.strip()
             if not collection or not doc_id:
                 continue
 

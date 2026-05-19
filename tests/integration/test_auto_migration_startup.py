@@ -694,7 +694,7 @@ def test_phase2_ensures_tables_exist(temp_lancedb_dir):
 async def test_startup_event_skips_when_auto_migrate_disabled(
     monkeypatch: pytest.MonkeyPatch, temp_lancedb_dir
 ):
-    """Startup should not create migration task when auto migration is disabled."""
+    """Startup runs compatibility checks but does not backfill when auto migrate is off."""
     import importlib
 
     _patch_channel_modules_disabled(monkeypatch)
@@ -791,7 +791,8 @@ async def test_startup_event_skips_when_auto_migrate_disabled(
     if created_tasks:
         await asyncio.gather(*created_tasks)
 
-    assert created_tasks == []
+    # One task: schema compatibility checks only (no reconcile when auto_migrate=false).
+    assert len(created_tasks) == 1
     assert migration_called["value"] is False
 
 
@@ -905,7 +906,7 @@ async def test_startup_event_triggers_background_auto_migration(
 async def test_startup_event_no_task_when_no_table_needs_migration(
     monkeypatch: pytest.MonkeyPatch, temp_lancedb_dir
 ):
-    """Startup should not create migration task when no table needs migration."""
+    """Startup should still create task to run documents backfill checks."""
     import importlib
 
     _patch_channel_modules_disabled(monkeypatch)
@@ -1002,6 +1003,6 @@ async def test_startup_event_no_task_when_no_table_needs_migration(
     if created_tasks:
         await asyncio.gather(*created_tasks)
 
-    # We expect 1 task: uploaded files reconcile (even without migration needs)
-    assert len(created_tasks) == 1
+    # 2 tasks: migration service (always starts when auto_migrate=true) + reconcile
+    assert len(created_tasks) == 2
     assert migration_called["value"] is False

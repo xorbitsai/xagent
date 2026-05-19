@@ -190,6 +190,8 @@ def test_document_search_end_to_end(
     search_result = document_search.search_documents(
         collection=collection,
         query_text=query_text,
+        user_id=1,
+        is_admin=True,
         config=SearchConfig(
             search_type=SearchType.SPARSE,
             top_k=3,

@@ -11,10 +11,7 @@ from typing import Any, Dict, List, Optional, Union
 
 from ..core.exceptions import DatabaseOperationError, VersionManagementError
 from ..core.schemas import StepType
-from ..LanceDB.schema_manager import _safe_close_table
-from ..storage.factory import get_vector_store_raw_connection
-from ..utils.lancedb_query_utils import list_table_names, query_to_list
-from ..utils.string_utils import build_lancedb_filter_expression
+from ..storage.factory import get_vector_index_store
 
 
 def _resolve_step_type(step_type_input: Union[StepType, str]) -> StepType:
@@ -45,37 +42,6 @@ def _resolve_step_type(step_type_input: Union[StepType, str]) -> StepType:
         raise VersionManagementError(
             f"Unsupported step_type type: {type(step_type_input)}. Expected StepType or str."
         )
-
-
-def _query_table(
-    connection: Any,
-    table_name: str,
-    filters: Dict[str, Any],
-) -> List[Dict[str, Any]]:
-    """Run a where query on a table with given filters and return List[Dict].
-
-    This small helper unifies filter building and querying across candidate getters.
-    It safely escapes filter values to prevent injection attacks.
-    Uses unified query_to_list() with three-tier fallback for maximum compatibility.
-
-    Args:
-        connection: LanceDB connection
-        table_name: Name of the table to query
-        filters: Dictionary of filters for the table
-
-    Returns:
-        List of dictionaries representing query results. Empty list if table doesn't exist or no results.
-    """
-    if table_name not in list_table_names(connection):
-        return []
-    table = None
-    try:
-        table = connection.open_table(table_name)
-
-        filter_expr = build_lancedb_filter_expression(filters)
-        return query_to_list(table.search().where(filter_expr))
-    finally:
-        _safe_close_table(table)
 
 
 def _generate_semantic_id(
@@ -110,8 +76,7 @@ def _generate_semantic_id(
 
 
 def _get_parse_candidates(
-    connection: Any,
-    filters: Dict[str, Any],
+    rows: List[Dict[str, Any]],
 ) -> List[Dict[str, Any]]:
     """Get parse candidates from the database.
 
@@ -122,11 +87,10 @@ def _get_parse_candidates(
     Returns:
         List of parse candidate dictionaries
     """
-    result = _query_table(connection, "parses", filters)
-    if not result:
+    if not rows:
         return []
     parse_candidates: List[Dict[str, Any]] = []
-    for row in result:
+    for row in rows:
         params = {
             "parse_method": row.get("parse_method", "unknown"),
             "parser": row.get("parser", "unknown"),
@@ -155,8 +119,7 @@ def _get_parse_candidates(
 
 
 def _get_chunk_candidates(
-    connection: Any,
-    filters: Dict[str, Any],
+    rows: List[Dict[str, Any]],
 ) -> List[Dict[str, Any]]:
     """Get chunk candidates from the database.
 
@@ -167,11 +130,10 @@ def _get_chunk_candidates(
     Returns:
         List of chunk candidate dictionaries
     """
-    result = _query_table(connection, "chunks", filters)
-    if not result:
+    if not rows:
         return []
     chunk_configs: Dict[str, Dict[str, Any]] = {}
-    for row in result:
+    for row in rows:
         parse_hash = row["parse_hash"]
         if parse_hash not in chunk_configs:
             chunk_configs[parse_hash] = {
@@ -213,8 +175,7 @@ def _get_chunk_candidates(
 
 
 def _get_embed_candidates(
-    connection: Any,
-    filters: Dict[str, Any],
+    rows: List[Dict[str, Any]],
     model_tag: str,
 ) -> List[Dict[str, Any]]:
     """Get embedding candidates from the database.
@@ -227,96 +188,80 @@ def _get_embed_candidates(
     Returns:
         List of embedding candidate dictionaries
     """
-    table_names = list_table_names(connection)
-    embed_tables = [name for name in table_names if name.startswith("embeddings_")]
-    if not embed_tables:
+    if not rows:
         return []
     embed_candidates: List[Dict[str, Any]] = []
-    for table_name in embed_tables:
-        table_model_tag = table_name.replace("embeddings_", "")
-        if model_tag != table_model_tag:
-            continue
-        result = _query_table(connection, table_name, filters)
-        if not result:
-            continue
-        embed_configs: Dict[tuple[str, str], Dict[str, Any]] = {}
-        for row in result:
-            model = row.get("model", "unknown")
-            parse_hash = row.get("parse_hash", "unknown")
-            key = (model, parse_hash)
-            if key not in embed_configs:
-                embed_configs[key] = {
-                    "vector_count": 0,
-                    "vector_dim": 0,
-                    "created_at": row.get(
-                        "created_at", datetime.now(timezone.utc).replace(tzinfo=None)
-                    ),
-                }
-            embed_configs[key]["vector_count"] += 1
-            vector = row.get("vector", [])
-            if vector and embed_configs[key]["vector_dim"] == 0:
-                embed_configs[key]["vector_dim"] = len(vector)
-
-        for (model, parse_hash), cfg in embed_configs.items():
-            semantic_id = _generate_semantic_id(
-                StepType.EMBED,
-                parse_hash,
-                {"model": model, "model_tag": model_tag},
-            )
-            stats = {
-                "upsert_count": cfg["vector_count"],
-                "vector_dim": cfg["vector_dim"],
-                "model": model,
-                "model_tag": model_tag,
-                "parse_hash": parse_hash,
+    embed_configs: Dict[tuple[str, str], Dict[str, Any]] = {}
+    for row in rows:
+        model = row.get("model", "unknown")
+        parse_hash = row.get("parse_hash", "unknown")
+        key = (model, parse_hash)
+        if key not in embed_configs:
+            embed_configs[key] = {
+                "vector_count": 0,
+                "vector_dim": 0,
+                "created_at": row.get(
+                    "created_at", datetime.now(timezone.utc).replace(tzinfo=None)
+                ),
             }
-            embed_candidates.append(
-                {
-                    "semantic_id": semantic_id,
-                    "technical_id": parse_hash,
-                    "params_brief": {
-                        "model": model,
-                        "model_tag": model_tag,
-                    },
-                    "stats": stats,
-                    "state": "candidate",
-                    "created_at": cfg["created_at"],
-                    "operator": "unknown",
-                }
-            )
+        embed_configs[key]["vector_count"] += 1
+        vector = row.get("vector", [])
+        if vector and embed_configs[key]["vector_dim"] == 0:
+            embed_configs[key]["vector_dim"] = len(vector)
+
+    for (model, parse_hash), cfg in embed_configs.items():
+        semantic_id = _generate_semantic_id(
+            StepType.EMBED,
+            parse_hash,
+            {"model": model, "model_tag": model_tag},
+        )
+        stats = {
+            "upsert_count": cfg["vector_count"],
+            "vector_dim": cfg["vector_dim"],
+            "model": model,
+            "model_tag": model_tag,
+            "parse_hash": parse_hash,
+        }
+        embed_candidates.append(
+            {
+                "semantic_id": semantic_id,
+                "technical_id": parse_hash,
+                "params_brief": {
+                    "model": model,
+                    "model_tag": model_tag,
+                },
+                "stats": stats,
+                "state": "candidate",
+                "created_at": cfg["created_at"],
+                "operator": "unknown",
+            }
+        )
     return embed_candidates
 
 
 def _get_candidates(
-    connection: Any,
+    rows: List[Dict[str, Any]],
     step_type: StepType,
-    collection: str,
-    doc_id: str,
     model_tag: Optional[str] = None,
 ) -> List[Dict[str, Any]]:
     """Unified candidate getter by step_type.
 
     Internally applies minimal branching and reuses common helpers.
     """
-    try:
-        filters = {"collection": collection, "doc_id": doc_id}
+    if step_type == StepType.PARSE:
+        return _get_parse_candidates(rows)
 
-        if step_type == StepType.PARSE:
-            return _get_parse_candidates(connection, filters)
+    if step_type == StepType.CHUNK:
+        return _get_chunk_candidates(rows)
 
-        if step_type == StepType.CHUNK:
-            return _get_chunk_candidates(connection, filters)
+    if step_type == StepType.EMBED:
+        if not model_tag:
+            raise VersionManagementError("model_tag is required for embed step")
+        return _get_embed_candidates(rows, model_tag)
 
-        if step_type == StepType.EMBED:
-            if not model_tag:
-                raise VersionManagementError("model_tag is required for embed step")
-            return _get_embed_candidates(connection, filters, model_tag)
-
-        # Handle invalid step_type
-        step_type_str = step_type.value
-        raise VersionManagementError(f"Unknown step_type: {step_type_str}")
-    except Exception as e:
-        raise DatabaseOperationError(f"Failed to get candidates: {e}") from e
+    # Handle invalid step_type
+    step_type_str = step_type.value
+    raise VersionManagementError(f"Unknown step_type: {step_type_str}")
 
 
 def list_candidates(
@@ -343,20 +288,25 @@ def list_candidates(
         Dictionary containing candidates list and metadata
 
     Raises:
-        DatabaseOperationError: If database connection or operation fails
-        VersionManagementError: If there's a version management logic error
+        DatabaseOperationError: If backend candidate query fails.
+        VersionManagementError: If step/model input is invalid.
     """
     resolved_step_type = _resolve_step_type(step_type)
     try:
-        # Get LanceDB connection from environment (uses default path if LANCEDB_DIR not set)
-        connection = get_vector_store_raw_connection()
+        vector_store = get_vector_index_store()
+        try:
+            rows = vector_store.list_version_candidates(
+                collection=collection,
+                doc_id=doc_id,
+                step_type=resolved_step_type.value,
+                model_tag=model_tag,
+            )
+        except Exception as e:
+            raise DatabaseOperationError(f"Failed to get candidates: {e}") from e
 
-        # Get candidates based on step_type
         candidates = _get_candidates(
-            connection=connection,
+            rows=rows,
             step_type=resolved_step_type,
-            collection=collection,
-            doc_id=doc_id,
             model_tag=model_tag,
         )
 

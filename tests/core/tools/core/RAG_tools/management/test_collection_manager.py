@@ -1,6 +1,6 @@
 """Tests for collection manager functionality."""
 
-from unittest.mock import Mock, patch
+from unittest.mock import AsyncMock, Mock, patch
 
 import pytest
 
@@ -38,6 +38,18 @@ class TestCollectionManager:
         """Create a CollectionManager instance with real storage."""
         # The isolate_rag_storage fixture in conftest.py already handles directory isolation
         return CollectionManager()
+
+    @pytest.mark.asyncio
+    async def test_ensure_metadata_table_delegates_to_metadata_store(self) -> None:
+        """Collection manager should delegate metadata DDL ownership to MetadataStore."""
+        manager = CollectionManager()
+        mock_store = Mock()
+        mock_store.ensure_collection_metadata_table = AsyncMock()
+
+        with patch.object(manager, "_get_metadata_store", return_value=mock_store):
+            await manager._ensure_metadata_table()
+
+        mock_store.ensure_collection_metadata_table.assert_awaited_once_with()
 
     @pytest.mark.asyncio
     async def test_get_collection_success(self, manager):

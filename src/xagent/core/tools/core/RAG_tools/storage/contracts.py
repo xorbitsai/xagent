@@ -24,9 +24,26 @@ from typing import (
 )
 
 from ..core.config import DEFAULT_VECTOR_STORE_SCAN_LIMIT, IndexPolicy
+from ..core.exceptions import DatabaseOperationError
 from ..core.schemas import CollectionInfo, IndexResult
 
 logger = logging.getLogger(__name__)
+
+
+def _release_embeddings_table_probe(table: Any) -> None:
+    """Close a table handle opened only to resolve embeddings table name.
+
+    ``open_embeddings_table`` returns ``(table, name)``; by-model helpers then
+    delegate to ``search_*`` methods that open their own handles by name. The
+    probe handle must not be left open (LanceDB native tables support
+    ``close()``).
+    """
+    if table is not None and hasattr(table, "close"):
+        try:
+            table.close()
+        except Exception:
+            pass
+
 
 # Field name whitelist for filter validation
 # Derived from all LanceDB table schemas in schema_manager.py
@@ -221,12 +238,15 @@ class DocumentRecord:
     """Lightweight document projection for metadata/control operations.
 
     Attributes:
+        collection: Optional collection identifier for callers that need to
+            preserve collection context when listing documents across collections.
         doc_id: Document identifier.
         file_id: Optional file identifier for uploaded file tracking.
         source_path: Original source path if available.
     """
 
     doc_id: str
+    collection: Optional[str] = None
     file_id: Optional[str] = None
     source_path: Optional[str] = None
 
@@ -408,6 +428,7 @@ class VectorIndexStore(ABC):
         user_id: Optional[int],
         is_admin: bool,
         max_results: int = DEFAULT_VECTOR_STORE_SCAN_LIMIT,
+        file_ids: Optional[List[str]] = None,
     ) -> List[DocumentRecord]:
         """List document records from vector index side.
 
@@ -416,6 +437,9 @@ class VectorIndexStore(ABC):
             user_id: User ID for multi-tenancy filtering.
             is_admin: Whether the user has admin privileges.
             max_results: Maximum records to return.
+            file_ids: Optional list of file IDs to filter by. When provided,
+                only documents whose ``file_id`` matches one of the given
+                values are returned.
         """
 
     @abstractmethod
@@ -533,8 +557,44 @@ class VectorIndexStore(ABC):
         """
 
     @abstractmethod
+    def list_version_candidates(
+        self,
+        *,
+        collection: str,
+        doc_id: str,
+        step_type: str,
+        model_tag: Optional[str] = None,
+    ) -> List[Dict[str, Any]]:
+        """List raw candidate rows for version-management step.
+
+        Args:
+            collection: Collection name.
+            doc_id: Document ID.
+            step_type: One of "parse", "chunk", "embed".
+            model_tag: Required for "embed" step.
+        """
+
+    @abstractmethod
     def list_table_names(self) -> Sequence[str]:
         """List backend table names."""
+
+    @abstractmethod
+    def plan_vector_plane_cascade(
+        self,
+        table_to_filter: Dict[str, str],
+        *,
+        model_tag: Optional[str] = None,
+    ) -> Dict[str, int]:
+        """Preview row counts per table for vector-plane cascade predicates."""
+
+    @abstractmethod
+    def execute_vector_plane_cascade(
+        self,
+        table_to_filter: Dict[str, str],
+        *,
+        model_tag: Optional[str] = None,
+    ) -> Dict[str, int]:
+        """Execute vector-plane cascade deletes for prepared backend filter strings."""
 
     @abstractmethod
     def get_vector_dimension(self, table_name: str) -> Optional[int]:
@@ -642,8 +702,6 @@ class VectorIndexStore(ABC):
         Returns:
             Row count, or 0 if table doesn't exist or count fails.
         """
-        from ..core.exceptions import DatabaseOperationError
-
         try:
             return self.count_rows(table_name, filters, user_id, is_admin)
         except DatabaseOperationError as e:
@@ -771,6 +829,41 @@ class VectorIndexStore(ABC):
             - metadata: Additional metadata
         """
 
+    @abstractmethod
+    def search_fts(
+        self,
+        table_name: str,
+        query_text: str,
+        *,
+        top_k: int,
+        filters: Optional[FilterExpression] = None,
+        text_column_name: str = "text",
+        user_id: Optional[int] = None,
+        is_admin: bool = False,
+    ) -> List[Dict[str, Any]]:
+        """Execute full-text search (sync).
+
+        Args:
+            table_name: Name of embeddings/table to search (must have FTS index).
+            query_text: Query text for full-text search.
+            top_k: Number of top results to return.
+            filters: Optional abstract filter expression.
+            text_column_name: Name of text column with FTS index (default "text").
+            user_id: Optional user ID for multi-tenancy filtering.
+            is_admin: Whether the user has admin privileges.
+
+        Returns:
+            List of search result dictionaries with keys:
+            - doc_id: Document ID
+            - chunk_id: Chunk ID
+            - text: Chunk text
+            - _score: TF-IDF score (higher is better)
+            - metadata: Additional metadata
+
+        Raises:
+            DatabaseOperationError: If FTS index is not configured or search fails.
+        """
+
     def search_vectors_by_model(
         self,
         model_tag: str,
@@ -805,15 +898,60 @@ class VectorIndexStore(ABC):
             - metadata: Additional metadata
         """
         _table, table_name = self.open_embeddings_table(model_tag)
-        return self.search_vectors(
-            table_name=table_name,
-            query_vector=query_vector,
-            top_k=top_k,
-            filters=filters,
-            vector_column_name=vector_column_name,
-            user_id=user_id,
-            is_admin=is_admin,
-        )
+        try:
+            return self.search_vectors(
+                table_name=table_name,
+                query_vector=query_vector,
+                top_k=top_k,
+                filters=filters,
+                vector_column_name=vector_column_name,
+                user_id=user_id,
+                is_admin=is_admin,
+            )
+        finally:
+            _release_embeddings_table_probe(_table)
+
+    def search_fts_by_model(
+        self,
+        model_tag: str,
+        query_text: str,
+        *,
+        top_k: int,
+        filters: Optional[FilterExpression] = None,
+        text_column_name: str = "text",
+        user_id: Optional[int] = None,
+        is_admin: bool = False,
+    ) -> List[Dict[str, Any]]:
+        """Convenience method: sync FTS search by model_tag with automatic table resolution.
+
+        This method combines open_embeddings_table() + search_fts() for callers that
+        only know model_tag.
+
+        Args:
+            model_tag: Model tag for the embeddings table.
+            query_text: Query text for full-text search.
+            top_k: Number of top results to return.
+            filters: Optional abstract filter expression.
+            text_column_name: Name of text column with FTS index (default "text").
+            user_id: Optional user ID for multi-tenancy filtering.
+            is_admin: Whether the user has admin privileges.
+
+        Returns:
+            List of search result dictionaries (see search_fts).
+        """
+        _table, table_name = self.open_embeddings_table(model_tag)
+        try:
+            return self.search_fts(
+                table_name=table_name,
+                query_text=query_text,
+                top_k=top_k,
+                filters=filters,
+                text_column_name=text_column_name,
+                user_id=user_id,
+                is_admin=is_admin,
+            )
+        finally:
+            _release_embeddings_table_probe(_table)
 
     # --- Async variants (Phase 1A Option C: Hybrid approach) ---
 
@@ -826,6 +964,8 @@ class VectorIndexStore(ABC):
         top_k: int,
         filters: Optional[FilterExpression] = None,
         vector_column_name: str = "vector",
+        user_id: Optional[int] = None,
+        is_admin: bool = False,
     ) -> List[Dict[str, Any]]:
         """Execute vector search (async).
 
@@ -835,6 +975,8 @@ class VectorIndexStore(ABC):
             top_k: Number of top results to return.
             filters: Optional abstract filter expression.
             vector_column_name: Name of vector column (default "vector").
+            user_id: Optional user ID for multi-tenancy filtering.
+            is_admin: Whether the user has admin privileges.
 
         Returns:
             List of search result dictionaries with keys:
@@ -879,13 +1021,18 @@ class VectorIndexStore(ABC):
             - metadata: Additional metadata
         """
         _table, table_name = self.open_embeddings_table(model_tag)
-        return await self.search_vectors_async(
-            table_name=table_name,
-            query_vector=query_vector,
-            top_k=top_k,
-            filters=filters,
-            vector_column_name=vector_column_name,
-        )
+        try:
+            return await self.search_vectors_async(
+                table_name=table_name,
+                query_vector=query_vector,
+                top_k=top_k,
+                filters=filters,
+                vector_column_name=vector_column_name,
+                user_id=user_id,
+                is_admin=is_admin,
+            )
+        finally:
+            _release_embeddings_table_probe(_table)
 
     @abstractmethod
     async def search_fts_async(
@@ -896,6 +1043,8 @@ class VectorIndexStore(ABC):
         top_k: int,
         filters: Optional[FilterExpression] = None,
         text_column_name: str = "text",
+        user_id: Optional[int] = None,
+        is_admin: bool = False,
     ) -> List[Dict[str, Any]]:
         """Execute full-text search (async).
 
@@ -905,6 +1054,8 @@ class VectorIndexStore(ABC):
             top_k: Number of top results to return.
             filters: Optional abstract filter expression.
             text_column_name: Name of text column with FTS index (default "text").
+            user_id: Optional user ID for multi-tenancy filtering.
+            is_admin: Whether the user has admin privileges.
 
         Returns:
             List of search result dictionaries with keys:
@@ -926,6 +1077,8 @@ class VectorIndexStore(ABC):
         top_k: int,
         filters: Optional[FilterExpression] = None,
         text_column_name: str = "text",
+        user_id: Optional[int] = None,
+        is_admin: bool = False,
     ) -> List[Dict[str, Any]]:
         """Convenience method: search FTS by model_tag with automatic table resolution.
 
@@ -938,6 +1091,8 @@ class VectorIndexStore(ABC):
             top_k: Number of top results to return.
             filters: Optional abstract filter expression.
             text_column_name: Name of text column with FTS index (default "text").
+            user_id: Optional user ID for multi-tenancy filtering.
+            is_admin: Whether the user has admin privileges.
 
         Returns:
             List of search result dictionaries with keys:
@@ -951,13 +1106,18 @@ class VectorIndexStore(ABC):
             DatabaseOperationError: If FTS index is not configured or search fails.
         """
         _table, table_name = self.open_embeddings_table(model_tag)
-        return await self.search_fts_async(
-            table_name=table_name,
-            query_text=query_text,
-            top_k=top_k,
-            filters=filters,
-            text_column_name=text_column_name,
-        )
+        try:
+            return await self.search_fts_async(
+                table_name=table_name,
+                query_text=query_text,
+                top_k=top_k,
+                filters=filters,
+                text_column_name=text_column_name,
+                user_id=user_id,
+                is_admin=is_admin,
+            )
+        finally:
+            _release_embeddings_table_probe(_table)
 
     @abstractmethod
     async def iter_batches_async(

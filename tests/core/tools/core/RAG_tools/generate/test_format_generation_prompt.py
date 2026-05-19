@@ -8,6 +8,7 @@ from xagent.core.tools.core.RAG_tools.generate.format_generation_prompt import (
 )
 
 logger = logging.getLogger(__name__)
+PROMPT_LOGGER = "xagent.core.tools.core.RAG_tools.generate.format_generation_prompt"
 
 
 @pytest.fixture
@@ -78,7 +79,7 @@ class TestFormatGenerationPrompt:
         caplog: pytest.LogCaptureFixture,
     ) -> None:
         """Test that empty formatted contexts produce a warning but still format."""
-        with caplog.at_level(logging.WARNING):
+        with caplog.at_level(logging.WARNING, logger=PROMPT_LOGGER):
             result = format_generation_prompt(
                 prompt_template=sample_prompt_template_plain,
                 formatted_contexts="",

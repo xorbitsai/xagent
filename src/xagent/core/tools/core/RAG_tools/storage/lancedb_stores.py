@@ -41,6 +41,20 @@ from .logging_utils import log_audit, log_performance
 logger = logging.getLogger(__name__)
 
 
+def _arrow_table_to_dicts(results_table: Any) -> List[Dict[str, Any]]:
+    """Convert Arrow table batches to list-of-dicts rows."""
+    results: List[Dict[str, Any]] = []
+    for batch in results_table.to_batches():
+        for i in range(batch.num_rows):
+            row: Dict[str, Any] = {}
+            for j in range(batch.num_columns):
+                col_name = batch.schema.names[j]
+                col_array = batch.column(j)
+                row[col_name] = col_array[i].as_py()
+            results.append(row)
+    return results
+
+
 class LanceDBMetadataStore(MetadataStore):
     """LanceDB implementation for control-plane metadata operations."""
 
@@ -512,6 +526,7 @@ class LanceDBVectorIndexStore(VectorIndexStore):
         user_id: Optional[int],
         is_admin: bool,
         max_results: int = DEFAULT_VECTOR_STORE_SCAN_LIMIT,
+        file_ids: Optional[List[str]] = None,
     ) -> List[DocumentRecord]:
         # Audit log for data access
         log_audit(
@@ -523,12 +538,22 @@ class LanceDBVectorIndexStore(VectorIndexStore):
             max_results=max_results,
         )
 
-        # Build filter expression using common function (includes validation)
-        filters = {}
+        conditions: list[FilterCondition] = []
         if collection_name is not None:
-            filters["collection"] = collection_name
+            conditions.append(
+                FilterCondition("collection", FilterOperator.EQ, collection_name)
+            )
+        if file_ids:
+            conditions.append(
+                FilterCondition("file_id", FilterOperator.IN, list(file_ids))
+            )
 
-        filter_expr_obj = build_filter_from_dict(filters)
+        filter_expr_obj: Optional[FilterExpression] = None
+        if len(conditions) == 1:
+            filter_expr_obj = conditions[0]
+        elif len(conditions) > 1:
+            filter_expr_obj = tuple(conditions)
+
         combined_filter = self.build_filter_expression(
             filters=filter_expr_obj,
             user_id=user_id,
@@ -555,6 +580,9 @@ class LanceDBVectorIndexStore(VectorIndexStore):
                 records.append(
                     DocumentRecord(
                         doc_id=str(raw_doc_id),
+                        collection=(
+                            str(item["collection"]) if item.get("collection") else None
+                        ),
                         file_id=str(item["file_id"]) if item.get("file_id") else None,
                         source_path=(
                             str(item["source_path"])
@@ -776,6 +804,71 @@ class LanceDBVectorIndexStore(VectorIndexStore):
         # Ensure subsequent reads don't observe stale cached table handles.
         self.invalidate_table_cache()
         return counts
+
+    def list_version_candidates(
+        self,
+        *,
+        collection: str,
+        doc_id: str,
+        step_type: str,
+        model_tag: Optional[str] = None,
+    ) -> List[Dict[str, Any]]:
+        """List raw candidate rows for version-management steps."""
+        from ..LanceDB.schema_manager import _safe_close_table
+
+        conn = self._get_connection()
+        filter_expr = build_lancedb_filter_expression(
+            {"collection": collection, "doc_id": doc_id}
+        )
+        table_names = set(self.list_table_names())
+
+        def _query(table_name: str) -> List[Dict[str, Any]]:
+            if table_name not in table_names:
+                return []
+            table = None
+            try:
+                table = conn.open_table(table_name)
+                return query_to_list(table.search().where(filter_expr))
+            finally:
+                _safe_close_table(table)
+
+        if step_type == "parse":
+            return _query("parses")
+        if step_type == "chunk":
+            return _query("chunks")
+        if step_type == "embed":
+            if not model_tag:
+                return []
+            return _query(f"embeddings_{model_tag}")
+        return []
+
+    def plan_vector_plane_cascade(
+        self,
+        table_to_filter: Dict[str, str],
+        *,
+        model_tag: Optional[str] = None,
+    ) -> Dict[str, int]:
+        """Preview LanceDB cascade counts (adapter-owned)."""
+        from . import lancedb_cascade_vector_plane as lcv
+
+        return lcv.plan_by_predicates(
+            self._get_connection(), dict(table_to_filter), model_tag=model_tag
+        )
+
+    def execute_vector_plane_cascade(
+        self,
+        table_to_filter: Dict[str, str],
+        *,
+        model_tag: Optional[str] = None,
+    ) -> Dict[str, int]:
+        """Execute LanceDB cascade deletes (adapter-owned)."""
+        from . import lancedb_cascade_vector_plane as lcv
+
+        result = lcv.delete_by_predicates(
+            self._get_connection(), dict(table_to_filter), model_tag=model_tag
+        )
+        self.invalidate_table_cache()
+        return result
 
     def _count_collections_fast(
         self,
@@ -1206,6 +1299,7 @@ class LanceDBVectorIndexStore(VectorIndexStore):
         Yields backend-specific batch objects (e.g., PyArrow RecordBatch).
         """
         from ..LanceDB.schema_manager import (
+            _safe_close_table,
             ensure_chunks_table,
             ensure_documents_table,
             ensure_parses_table,
@@ -1221,10 +1315,9 @@ class LanceDBVectorIndexStore(VectorIndexStore):
         elif table_name == "chunks":
             ensure_chunks_table(conn)
 
-        from ..LanceDB.schema_manager import _safe_close_table
-
         table = None
         try:
+            # High-frequency scan path: bypass table cache to avoid FD buildup.
             table = self._get_table(table_name, use_cache=False)
         except Exception as exc:
             logger.debug("Unable to open table '%s': %s", table_name, exc)
@@ -1501,7 +1594,7 @@ class LanceDBVectorIndexStore(VectorIndexStore):
         """
         from ..LanceDB.model_tag_utils import to_model_tag
         from ..LanceDB.schema_manager import ensure_embeddings_table
-        from ..vector_storage.vector_manager import _is_non_recoverable_merge_error
+        from ..vector_storage.vector_manager import is_non_recoverable_merge_error
 
         if not records:
             return
@@ -1527,7 +1620,7 @@ class LanceDBVectorIndexStore(VectorIndexStore):
                 ["collection", "doc_id", "chunk_id"]
             ).when_matched_update_all().when_not_matched_insert_all().execute(records)
         except Exception as merge_error:
-            if _is_non_recoverable_merge_error(merge_error):
+            if is_non_recoverable_merge_error(merge_error):
                 # Log critical error and re-raise without fallback
                 logger.error(
                     "merge_insert failed with non-recoverable error (error_type=%s): %s. "
@@ -1635,6 +1728,69 @@ class LanceDBVectorIndexStore(VectorIndexStore):
         finally:
             _safe_close_table(table)
 
+    def search_fts(
+        self,
+        table_name: str,
+        query_text: str,
+        *,
+        top_k: int,
+        filters: Optional[FilterExpression] = None,
+        text_column_name: str = "text",
+        user_id: Optional[int] = None,
+        is_admin: bool = False,
+    ) -> List[Dict[str, Any]]:
+        """Execute full-text search using sync LanceDB FTS API."""
+        log_performance(
+            "search_fts_start",
+            top_k=top_k,
+            table_name=table_name,
+            has_filters=filters is not None,
+        )
+
+        from ..LanceDB.schema_manager import _safe_close_table
+
+        conn = self._get_connection()
+
+        try:
+            table = conn.open_table(table_name)
+        except Exception as exc:
+            logger.debug("Unable to open table '%s' for FTS: %s", table_name, exc)
+            return []
+
+        try:
+            backend_filter = self.build_filter_expression(
+                filters, user_id=user_id, is_admin=is_admin
+            )
+
+            search_query = table.search(
+                query_text,
+                query_type="fts",
+            )
+
+            if backend_filter:
+                search_query = search_query.where(backend_filter)
+
+            search_query = search_query.limit(top_k)
+
+            try:
+                raw_results = query_to_list(search_query)
+                log_performance(
+                    "search_fts_complete",
+                    result_count=len(raw_results),
+                    table_name=table_name,
+                )
+                return raw_results
+            except Exception as exc:
+                logger.warning(
+                    "Sync FTS search failed for table='%s', query='%s': %s",
+                    table_name,
+                    query_text[:100],
+                    exc,
+                )
+                return []
+        finally:
+            _safe_close_table(table)
+
     # --- Async method implementations (Phase 1A Option C) ---
 
     async def search_vectors_async(
@@ -1645,6 +1801,8 @@ class LanceDBVectorIndexStore(VectorIndexStore):
         top_k: int,
         filters: Optional[FilterExpression] = None,
         vector_column_name: str = "vector",
+        user_id: Optional[int] = None,
+        is_admin: bool = False,
     ) -> List[Dict[str, Any]]:
         """Execute vector search using async LanceDB API.
 
@@ -1668,7 +1826,7 @@ class LanceDBVectorIndexStore(VectorIndexStore):
 
             # Build filter expression
             backend_filter = self.build_filter_expression(
-                filters, user_id=None, is_admin=False
+                filters, user_id=user_id, is_admin=is_admin
             )
 
             # Build search query
@@ -1686,16 +1844,7 @@ class LanceDBVectorIndexStore(VectorIndexStore):
             results_table = await search_query.to_arrow()
 
             # Convert Arrow to list of dicts
-            results = []
-            for batch in results_table.to_batches():
-                for i in range(batch.num_rows):
-                    row = {}
-                    for j in range(batch.num_columns):
-                        col_name = batch.schema.names[j]
-                        col_array = batch.column(j)
-                        value = col_array[i].as_py()
-                        row[col_name] = value
-                    results.append(row)
+            results = _arrow_table_to_dicts(results_table)
 
             # Log performance metric
             log_performance(
@@ -1718,6 +1867,8 @@ class LanceDBVectorIndexStore(VectorIndexStore):
         top_k: int,
         filters: Optional[FilterExpression] = None,
         text_column_name: str = "text",
+        user_id: Optional[int] = None,
+        is_admin: bool = False,
     ) -> List[Dict[str, Any]]:
         """Execute full-text search using async LanceDB FTS API.
 
@@ -1732,7 +1883,7 @@ class LanceDBVectorIndexStore(VectorIndexStore):
 
             # Build filter expression
             backend_filter = self.build_filter_expression(
-                filters, user_id=None, is_admin=False
+                filters, user_id=user_id, is_admin=is_admin
             )
 
             # Build FTS search query
@@ -1751,20 +1902,16 @@ class LanceDBVectorIndexStore(VectorIndexStore):
             results_table = await search_query.to_arrow()
 
             # Convert Arrow to list of dicts
-            results = []
-            for batch in results_table.to_batches():
-                for i in range(batch.num_rows):
-                    row = {}
-                    for j in range(batch.num_columns):
-                        col_name = batch.schema.names[j]
-                        col_array = batch.column(j)
-                        value = col_array[i].as_py()
-                        row[col_name] = value
-                    results.append(row)
+            results = _arrow_table_to_dicts(results_table)
             return results
 
         except Exception as exc:
-            logger.error("Async FTS search failed: %s", exc)
+            logger.warning(
+                "Async FTS search failed for table='%s', query='%s': %s",
+                table_name,
+                query_text[:100],
+                exc,
+            )
             return []
         finally:
             _safe_close_table(table)

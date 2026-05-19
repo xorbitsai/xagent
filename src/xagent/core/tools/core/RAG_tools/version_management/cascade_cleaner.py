@@ -21,7 +21,7 @@ from ..LanceDB.schema_manager import (
     ensure_parses_table,
 )
 from ..storage.factory import get_vector_store_raw_connection
-from ..utils.lancedb_query_utils import _safe_count_rows, list_table_names
+from ..utils.lancedb_query_utils import list_table_names
 from ..utils.string_utils import (
     build_lancedb_filter_expression,
     build_user_id_filter_for_table,
@@ -175,178 +175,19 @@ def _get_table_names(conn: Any) -> list[str]:
 def _plan_by_predicates(
     conn: Any, table_to_filter: Dict[str, str], model_tag: Optional[str] = None
 ) -> Dict[str, int]:
-    """Count rows that match each table predicate without deleting.
+    """Count rows that match each table predicate without deleting."""
+    from ..storage import lancedb_cascade_vector_plane as lcv
 
-    Args:
-        conn: LanceDB connection
-        table_to_filter: Mapping of table name -> filter expression
-        model_tag: Optional model tag to filter embeddings tables. If specified,
-                   only the embeddings table matching this model will be counted.
-
-    Returns:
-        Mapping of table name -> matched row count
-    """
-    counts: Dict[str, int] = {}
-    table_names = _get_table_names(conn)
-
-    # If predicates explicitly include embeddings tables, plan them first.
-    for t in table_names:
-        if t.startswith("embeddings_") and t in table_to_filter:
-            table = None
-            try:
-                table = conn.open_table(t)
-                counts[t] = _safe_count_rows(table, table_to_filter[t])
-            finally:
-                _safe_close_table(table)
-
-    for table_name, filt in table_to_filter.items():
-        # Special fan-out handling for embeddings preview like deleter
-        if table_name == "__embeddings__":
-            total = 0
-            all_embed_tables = [t for t in table_names if t.startswith("embeddings_")]
-            # Apply model_tag filter if specified (must match _delete_by_predicates logic)
-            if model_tag:
-                all_embed_tables = [
-                    t for t in all_embed_tables if t == f"embeddings_{model_tag}"
-                ]
-            for t in all_embed_tables:
-                table = None
-                try:
-                    table = conn.open_table(t)
-                    count = _safe_count_rows(table, filt)
-                    total += count
-                finally:
-                    _safe_close_table(table)
-            counts[table_name] = total
-            continue
-
-        if table_name not in table_names:
-            counts[table_name] = 0
-            continue
-        table = None
-        try:
-            table = conn.open_table(table_name)
-            count = _safe_count_rows(table, filt)
-            counts[table_name] = count
-        finally:
-            _safe_close_table(table)
-    return counts
+    return lcv.plan_by_predicates(conn, dict(table_to_filter), model_tag=model_tag)
 
 
 def _delete_by_predicates(
     conn: Any, table_to_filter: Dict[str, str], model_tag: Optional[str] = None
 ) -> Dict[str, int]:
-    """Delete rows by table predicates in a fixed, safe order.
+    """Delete rows by table predicates in adapter-owned order."""
+    from ..storage import lancedb_cascade_vector_plane as lcv
 
-    Order: embeddings_* -> chunks -> parses -> main_pointers -> documents
-    Unknown tables are executed after the known order, in given insertion order.
-
-    Args:
-        conn: LanceDB connection
-        table_to_filter: Dictionary mapping table names to filter expressions
-        model_tag: Optional model tag to filter embeddings tables. If specified,
-                   only the embeddings table matching this model will be processed.
-    """
-    deleted: Dict[str, int] = {}
-    table_names = _get_table_names(conn)
-
-    # If predicates explicitly include embeddings tables, delete them first.
-    for t in table_names:
-        if not t.startswith("embeddings_") or t not in table_to_filter:
-            continue
-        filt = table_to_filter[t]
-        table = None
-        try:
-            table = conn.open_table(t)
-            cnt = _safe_count_rows(table, filt)
-            if cnt > 0:
-                table.delete(filt)
-                logger.info("Cascade cleanup: deleted %s rows from %s", cnt, t)
-            deleted[t] = cnt
-        finally:
-            _safe_close_table(table)
-
-    order = [
-        # embeddings handled specially below (fan-out across many tables)
-        "__embeddings__",
-        "chunks",
-        "parses",
-        "main_pointers",
-        "ingestion_runs",
-        "documents",
-    ]
-
-    # First handle embeddings fan-out
-    if "__embeddings__" in table_to_filter:
-        filt = table_to_filter["__embeddings__"]
-        total = 0
-
-        # Filter embeddings tables based on model_tag if specified
-        all_embed_tables = [t for t in table_names if t.startswith("embeddings_")]
-        if model_tag is not None:
-            target_tables = [
-                t for t in all_embed_tables if t == f"embeddings_{model_tag}"
-            ]
-        else:
-            target_tables = all_embed_tables
-
-        for t in target_tables:
-            table = None
-            try:
-                table = conn.open_table(t)
-                cnt = _safe_count_rows(table, filt)
-                if cnt > 0:
-                    table.delete(filt)
-                total += cnt
-            finally:
-                _safe_close_table(table)
-        deleted["embeddings"] = total
-        if total > 0:
-            logger.info(
-                "Cascade cleanup: deleted %s rows from embeddings tables", total
-            )
-
-    # Then handle known tables
-    for name in order[1:]:
-        if name in table_to_filter and name in table_names:
-            filt = table_to_filter[name]
-            table = None
-            try:
-                table = conn.open_table(name)
-                cnt = _safe_count_rows(table, filt)
-                if cnt > 0:
-                    table.delete(filt)
-                    logger.info("Cascade cleanup: deleted %s rows from %s", cnt, name)
-                deleted[name] = cnt
-            finally:
-                _safe_close_table(table)
-
-    # Finally, handle any remaining custom tables once
-    for name, filt in table_to_filter.items():
-        if name in (
-            "__embeddings__",
-            "chunks",
-            "parses",
-            "main_pointers",
-            "ingestion_runs",
-            "documents",
-        ) or name.startswith("embeddings_"):
-            continue
-        if name not in table_names:
-            deleted[name] = 0
-            continue
-        table = None
-        try:
-            table = conn.open_table(name)
-            cnt = _safe_count_rows(table, filt)
-            if cnt > 0:
-                table.delete(filt)
-                logger.info("Cascade cleanup: deleted %s rows from %s", cnt, name)
-            deleted[name] = cnt
-        finally:
-            _safe_close_table(table)
-
-    return deleted
+    return lcv.delete_by_predicates(conn, dict(table_to_filter), model_tag=model_tag)
 
 
 def cascade_delete(
@@ -420,12 +261,15 @@ def cascade_delete(
                 is_admin=is_admin,
             )
 
-    # Embeddings tables: expand explicitly so we can safely include user_id filter
-    for t in table_names:
-        if not t.startswith("embeddings_"):
-            continue
-        if model_tag is not None and t != f"embeddings_{model_tag}":
-            continue
+    # Embeddings predicates: keep per-table keys for compatibility, but avoid
+    # opening every embeddings_* table during predicate construction.
+    target_embeddings_tables = [
+        t
+        for t in table_names
+        if t.startswith("embeddings_")
+        and (model_tag is None or t == f"embeddings_{model_tag}")
+    ]
+    for t in target_embeddings_tables:
         if target == "collection":
             predicates[t] = _build_collection_filter(
                 conn=conn,
@@ -445,9 +289,9 @@ def cascade_delete(
             )
 
     if preview_only and not confirm:
-        return _plan_by_predicates(conn, predicates, model_tag=None)
+        return _plan_by_predicates(conn, predicates, model_tag=model_tag)
 
-    return _delete_by_predicates(conn, predicates, model_tag=None)
+    return _delete_by_predicates(conn, predicates, model_tag=model_tag)
 
 
 def cleanup_cascade(

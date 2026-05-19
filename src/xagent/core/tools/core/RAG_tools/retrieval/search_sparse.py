@@ -2,11 +2,7 @@ from __future__ import annotations
 
 import logging
 from collections.abc import AsyncIterator
-from typing import Any, Dict, Iterable, List, Optional, Set, cast
-
-import pandas as pd
-import pyarrow as pa  # type: ignore
-from pyarrow import Table as PyArrowTable
+from typing import Any, Dict, List, Optional, cast
 
 from ..core.schemas import (
     SearchFallbackAction,
@@ -15,7 +11,7 @@ from ..core.schemas import (
     SparseSearchResponse,
 )
 from ..LanceDB.schema_manager import _safe_close_table
-from ..storage.contracts import FilterExpression
+from ..storage.contracts import FilterCondition, FilterExpression, FilterOperator
 from ..storage.factory import (
     get_vector_index_store,
 )
@@ -53,13 +49,8 @@ def search_sparse(
             )
         )
 
-    table = None
     try:
         vector_store = get_vector_index_store()
-
-        # Open embeddings table with legacy fallback (handled by abstraction layer)
-        # open_embeddings_table will handle adding the "embeddings_" prefix
-        table, actual_table_name = vector_store.open_embeddings_table(model_tag)
 
         # Use storage abstraction for index management
         index_result_obj = vector_store.create_index(model_tag, readonly)
@@ -77,8 +68,6 @@ def search_sparse(
                 )
             )
 
-        search_query = table.search(query_text, query_type="fts").limit(top_k)
-
         # Convert legacy dict format to FilterExpression if needed
         filter_expr: Optional[FilterExpression] = None
         if collection or filters:
@@ -87,8 +76,6 @@ def search_sparse(
 
             # Add collection filter
             if collection:
-                from ..storage.contracts import FilterCondition, FilterOperator
-
                 conditions.append(
                     FilterCondition(
                         field="collection", operator=FilterOperator.EQ, value=collection
@@ -127,27 +114,26 @@ def search_sparse(
         if filter_expr is not None:
             validate_filter_depth(filter_expr)
 
-        # Use abstract filter builder to get backend-specific syntax
-        if filter_expr:
-            backend_filter = vector_store.build_filter_expression(
-                filters=filter_expr,
-                user_id=user_id,
-                is_admin=is_admin,
-            )
-            if backend_filter:
-                search_query = search_query.where(backend_filter)
+        raw_rows = vector_store.search_fts_by_model(
+            model_tag=model_tag,
+            query_text=query_text,
+            top_k=top_k,
+            filters=filter_expr,
+            text_column_name="text",
+            user_id=user_id,
+            is_admin=is_admin,
+        )
 
-        # LanceDB's search().to_pandas() returns Any due to missing type stubs
-        raw_results_df = pd.DataFrame(search_query.to_pandas())
-
-        if not raw_results_df.empty:
+        if raw_rows:
             search_results: List[SearchResult] = []
-            for _, row in raw_results_df.iterrows():
+            for row in raw_rows:
                 # LanceDB FTS returns TF-IDF score (higher is better),
                 # normalize to similarity score (0-1) similar to dense search
                 # Using score/(1+score) formula to convert TF-IDF to normalized similarity
                 raw_score_value = row.get("_score")
-                raw_score = float(raw_score_value) if pd.notna(raw_score_value) else 0.0
+                raw_score = (
+                    float(raw_score_value) if raw_score_value is not None else 0.0
+                )
                 # Normalize TF-IDF score to [0, 1) range using x/(1+x) formula
                 score = raw_score / (1.0 + raw_score)
                 # Deserialize metadata from JSON string to dictionary
@@ -158,9 +144,9 @@ def search_sparse(
                         chunk_id=row["chunk_id"],
                         text=row["text"],
                         score=score,
-                        parse_hash=row["parse_hash"],
+                        parse_hash=row.get("parse_hash"),
                         model_tag=model_tag,
-                        created_at=row["created_at"],
+                        created_at=row.get("created_at"),
                         metadata=metadata,
                     )
                 )
@@ -177,13 +163,14 @@ def search_sparse(
             query_text,
         )
         fallback_results = _substring_fallback(
-            table=table,
+            model_tag=model_tag,
             collection=collection,
             query_text=query_text,
-            model_tag=model_tag,
             top_k=top_k,
             filters=filters,
             current_warnings=current_warnings,
+            user_id=user_id,
+            is_admin=is_admin,
         )
 
         return _build_sparse_response(
@@ -212,111 +199,110 @@ def search_sparse(
             query_text=query_text,
             status="failed",
         )
-    finally:
-        _safe_close_table(table)
+
+
+def _build_substring_scan_filters(
+    *,
+    collection: str,
+    filters: Optional[Dict[str, Any]],
+) -> Dict[str, Any]:
+    """Build iter_batches filters with a non-overridable route collection."""
+    scan_filters: Dict[str, Any] = dict(filters) if filters else {}
+    scan_filters.pop("collection", None)
+    scan_filters["collection"] = collection
+    return scan_filters
 
 
 def _substring_fallback(
     *,
-    table: Any,
+    model_tag: str,
     collection: str,
     query_text: str,
-    model_tag: str,
     top_k: int,
     filters: Optional[Dict[str, Any]],
     current_warnings: List[SearchWarning],
+    user_id: Optional[int] = None,
+    is_admin: bool = False,
     batch_size: int = 2048,
 ) -> List[SearchResult]:
-    """Perform a memory-friendly substring scan across the table when FTS misses."""
+    """Perform substring scan via VectorIndexStore.iter_batches when FTS misses."""
 
-    desired_columns: Set[str] = {
-        "collection",
-        "doc_id",
-        "chunk_id",
-        "text",
-        "parse_hash",
-        "created_at",
-        "metadata",
-    }
-    if filters:
-        desired_columns.update(filters.keys())
-
+    vector_store = get_vector_index_store()
     results: List[SearchResult] = []
 
+    query_filters = _build_substring_scan_filters(
+        collection=collection, filters=filters
+    )
+
+    _table = None
     try:
-        if hasattr(table, "to_batches"):
-            batch_iter: Iterable[Any] = table.to_batches(
-                columns=list(desired_columns), batch_size=batch_size
+        # Resolve embeddings table name with legacy fallback support.
+        _table, table_name = vector_store.open_embeddings_table(model_tag)
+
+        for batch in vector_store.iter_batches(
+            table_name=table_name,
+            columns=[
+                "doc_id",
+                "chunk_id",
+                "text",
+                "parse_hash",
+                "created_at",
+                "metadata",
+            ],
+            batch_size=batch_size,
+            filters=query_filters,
+            user_id=user_id,
+            is_admin=is_admin,
+        ):
+            batch_df = batch.to_pandas()
+
+            text_mask = (
+                batch_df["text"]
+                .astype(str)
+                .str.contains(query_text, na=False, regex=False)
             )
-        else:
-            if pa is None:  # pragma: no cover - Safety guard when pyarrow missing
-                raise ImportError(
-                    "pyarrow is required for substring fallback when LanceDB table does not expose to_batches()."
-                )
-            arrow_table: PyArrowTable = table.to_arrow()  # type: ignore
-            arrow_table = arrow_table.select(list(desired_columns))
-            batch_iter = arrow_table.to_batches(max_chunksize=batch_size)
-    except Exception as exc:  # noqa: BLE001
-        logger.error("Substring fallback failed to read batches: %s", exc)
-        return results
+            matching_rows = batch_df[text_mask]
 
-    for batch in batch_iter:
-        batch_df = batch.to_pandas()
-
-        mask = batch_df["collection"] == collection
-        if filters:
-            for key, value in filters.items():
-                if key not in batch_df.columns:
-                    continue
-                if isinstance(value, (list, tuple, set)):
-                    mask &= batch_df[key].isin(list(value))
-                else:
-                    mask &= batch_df[key] == value
-
-        if not mask.any():
-            continue
-
-        text_mask = (
-            batch_df["text"].astype(str).str.contains(query_text, na=False, regex=False)
-        )
-        mask &= text_mask
-
-        if not mask.any():
-            continue
-
-        for _, row in batch_df.loc[mask].iterrows():
-            # Deserialize metadata from JSON string to dictionary
-            metadata = deserialize_metadata(row.get("metadata"))
-            results.append(
-                SearchResult(
-                    doc_id=row["doc_id"],
-                    chunk_id=row["chunk_id"],
-                    text=row["text"],
-                    score=1.0,
-                    parse_hash=row["parse_hash"],
-                    model_tag=model_tag,
-                    created_at=row["created_at"],
-                    metadata=metadata,
-                )
-            )
             if len(results) >= top_k:
                 break
 
-        if len(results) >= top_k:
-            break
+            for _, row in matching_rows.iterrows():
+                metadata = deserialize_metadata(row.get("metadata"))
+                results.append(
+                    SearchResult(
+                        doc_id=row["doc_id"],
+                        chunk_id=row["chunk_id"],
+                        text=row["text"],
+                        score=1.0,
+                        parse_hash=row["parse_hash"],
+                        model_tag=model_tag,
+                        created_at=row["created_at"],
+                        metadata=metadata,
+                    )
+                )
+                if len(results) >= top_k:
+                    break
 
-    if results:
-        current_warnings.append(
-            SearchWarning(
-                code="FTS_FALLBACK",
-                message=(
-                    "Full-text index returned no matches; used substring search fallback. "
-                    "Check FTS tokenizer configuration or update LanceDB to ensure proper tokenisation for query language."
-                ),
-                fallback_action=SearchFallbackAction.BRUTE_FORCE,
-                affected_models=[model_tag],
+            if len(results) >= top_k:
+                break
+
+        if results:
+            current_warnings.append(
+                SearchWarning(
+                    code="FTS_FALLBACK",
+                    message=(
+                        "Full-text index returned no matches; used substring search fallback. "
+                        "Check FTS tokenizer configuration or update LanceDB to ensure proper tokenisation for query language."
+                    ),
+                    fallback_action=SearchFallbackAction.BRUTE_FORCE,
+                    affected_models=[model_tag],
+                )
             )
-        )
+
+    except Exception as exc:
+        logger.error("Substring fallback failed: %s", exc)
+    finally:
+        _safe_close_table(_table)
 
     return results
 
@@ -402,8 +388,6 @@ async def search_sparse_async(
             conditions: List[FilterExpression] = []
 
             if collection:
-                from ..storage.contracts import FilterCondition, FilterOperator
-
                 conditions.append(
                     FilterCondition(
                         field="collection", operator=FilterOperator.EQ, value=collection
@@ -441,6 +425,8 @@ async def search_sparse_async(
             top_k=top_k,
             filters=filter_expr,
             text_column_name="text",
+            user_id=user_id,
+            is_admin=is_admin,
         )
 
         if not raw_results:
@@ -540,10 +526,9 @@ async def _substring_fallback_async(
     vector_store = get_vector_index_store()
     results: List[SearchResult] = []
 
-    # Build query filters
-    query_filters: Dict[str, Any] = {"collection": collection}
-    if filters:
-        query_filters.update(filters)
+    query_filters = _build_substring_scan_filters(
+        collection=collection, filters=filters
+    )
 
     _table = None
     try:

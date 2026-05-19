@@ -46,7 +46,7 @@ from ..utils.metadata_utils import deserialize_metadata, serialize_metadata
 logger = logging.getLogger(__name__)
 
 
-def _is_non_recoverable_merge_error(error: Exception) -> bool:
+def is_non_recoverable_merge_error(error: Exception) -> bool:
     """Classify merge_insert failures as recoverable or non-recoverable.
 
     Non-recoverable errors (schema/type/dimension issues) should re-raise
@@ -504,7 +504,7 @@ def _process_batch(
         method_used = "merge_insert"
     except Exception as merge_error:  # noqa: BLE001
         error_type = type(merge_error).__name__
-        if _is_non_recoverable_merge_error(merge_error):
+        if is_non_recoverable_merge_error(merge_error):
             # Log critical error and re-raise without fallback
             logger.error(
                 "merge_insert failed with non-recoverable error for batch %d/%d "

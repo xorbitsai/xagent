@@ -52,6 +52,10 @@ SANDBOX_VOLUMES = "SANDBOX_VOLUMES"
 BOXLITE_HOME_DIR = "BOXLITE_HOME_DIR"
 WEB_SEARCH_PROVIDER = "XAGENT_WEB_SEARCH_PROVIDER"
 WEB_CRAWL_TLS_IMPERSONATE = "XAGENT_WEB_CRAWL_TLS_IMPERSONATE"
+REDIS_URL = "XAGENT_REDIS_URL"
+HOT_PATH_CACHE_ENABLED = "XAGENT_HOT_PATH_CACHE_ENABLED"
+HOT_PATH_CACHE_TTL_SECONDS = "XAGENT_HOT_PATH_CACHE_TTL_SECONDS"
+HOT_PATH_TASK_CACHE_TTL_SECONDS = "XAGENT_HOT_PATH_TASK_CACHE_TTL_SECONDS"
 
 TOOL_MAX_OUTPUT_LENGTH = "XAGENT_TOOL_MAX_OUTPUT_LENGTH"
 TOOL_MAX_RECURSION_DEPTH = "XAGENT_TOOL_MAX_RECURSION_DEPTH"
@@ -182,6 +186,51 @@ def get_task_lease_heartbeat_seconds() -> int:
         )
         return default
     return min(seconds, max(1, get_task_lease_ttl_seconds() - 1))
+
+
+def _get_positive_int_env(env_var: str, default: int, *, minimum: int = 1) -> int:
+    value = os.getenv(env_var)
+    if value is None:
+        return default
+    try:
+        parsed = int(value)
+    except ValueError:
+        logger.warning("Invalid %s=%r; falling back to %s", env_var, value, default)
+        return default
+    if parsed < minimum:
+        logger.warning("Invalid %s=%r; falling back to %s", env_var, value, default)
+        return default
+    return parsed
+
+
+def get_redis_url() -> str | None:
+    """Return the optional Redis URL used by hot-path cache backends."""
+    value = os.getenv(REDIS_URL)
+    if value is None:
+        return None
+    value = value.strip()
+    return value or None
+
+
+def get_hot_path_cache_enabled() -> bool:
+    """Return whether optional hot-path caching is enabled.
+
+    Caching is inert unless ``XAGENT_REDIS_URL`` is configured or tests install
+    an explicit cache backend. This flag gives operators a kill switch without
+    changing the Redis URL.
+    """
+    value = os.getenv(HOT_PATH_CACHE_ENABLED, "true").strip().lower()
+    return value in {"1", "true", "yes", "on"}
+
+
+def get_hot_path_cache_ttl_seconds() -> int:
+    """Default TTL for agent/model hot-path response caches."""
+    return _get_positive_int_env(HOT_PATH_CACHE_TTL_SECONDS, 30)
+
+
+def get_hot_path_task_cache_ttl_seconds() -> int:
+    """Default TTL for task polling response caches."""
+    return _get_positive_int_env(HOT_PATH_TASK_CACHE_TTL_SECONDS, 30)
 
 
 def get_web_dir() -> Path:

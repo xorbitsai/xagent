@@ -7,7 +7,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, cast
 
 from fastapi import APIRouter, Depends, HTTPException, Request
-from sqlalchemy import or_
+from sqlalchemy import func, or_
 from sqlalchemy.orm import Session
 
 from ...config import (
@@ -25,14 +25,24 @@ from ...core.model.providers import is_placeholder_api_key
 from ..auth_dependencies import get_current_user
 from ..dynamic_memory_store import get_memory_store
 from ..models.agent import Agent
+from ..models.chat_message import TaskChatMessage
 from ..models.database import get_db
 from ..models.model import Model as DBModel
-from ..models.task import AgentType, Task, TaskStatus
+from ..models.task import AgentType, Task, TaskStatus, TraceEvent
 from ..models.user import User
 from ..schemas.chat import TaskCreateRequest, TaskCreateResponse
 from ..services.chat_history_service import (
     get_latest_waiting_question,
     load_task_transcript,
+)
+from ..services.hot_path_cache import (
+    cache_get,
+    cache_set,
+    cache_version_token,
+    invalidate_task_cache,
+    task_cache_ttl_seconds,
+    web_task_detail_key,
+    web_task_status_key,
 )
 from ..services.llm_utils import resolve_llms_from_names
 from ..services.managed_file_ref import ensure_uploaded_file_local_path
@@ -57,6 +67,8 @@ logger = logging.getLogger(__name__)
 # Create router
 chat_router = APIRouter(prefix="/api/chat", tags=["chat"])
 
+_TERMINAL_CACHE_STATUSES = {TaskStatus.COMPLETED, TaskStatus.FAILED}
+
 
 def _build_task_agent_config(
     request_agent_config: Optional[Dict[str, Any]],
@@ -70,6 +82,25 @@ def _build_task_agent_config(
     if selected_file_ids:
         task_agent_config["selected_file_ids"] = selected_file_ids
     return task_agent_config or None
+
+
+def _get_task_activity_ids(db: Session, task_id: int) -> tuple[int, int]:
+    max_trace_event_id = (
+        db.query(func.max(TraceEvent.id))
+        .filter(
+            TraceEvent.task_id == task_id,
+            TraceEvent.build_id.is_(None),
+        )
+        .scalar()
+        or 0
+    )
+    max_chat_message_id = (
+        db.query(func.max(TaskChatMessage.id))
+        .filter(TaskChatMessage.task_id == task_id)
+        .scalar()
+        or 0
+    )
+    return int(max_trace_event_id), int(max_chat_message_id)
 
 
 def create_default_llm() -> Optional[BaseLLM]:
@@ -2194,6 +2225,9 @@ async def get_task(
             mark_task_paused_if_stale(db, task)
             db.refresh(task)
 
+            cache_key = web_task_detail_key(task_id)
+            task_updated_at = cache_version_token(task.updated_at)
+
             # Get the raw status value safely
             if hasattr(task, "status") and task.status is not None:
                 if hasattr(task.status, "value"):
@@ -2210,6 +2244,27 @@ async def get_task(
             dag_execution = (
                 db.query(DAGExecution).filter(DAGExecution.task_id == task_id).first()
             )
+            dag_updated_at = (
+                cache_version_token(dag_execution.updated_at) if dag_execution else None
+            )
+            activity_ids: tuple[int, int] | None = None
+            cached = cache_get(cache_key)
+            if (
+                isinstance(cached, dict)
+                and cached.get("updated_at") == task_updated_at
+                and cached.get("dag_updated_at") == dag_updated_at
+            ):
+                if task.status in _TERMINAL_CACHE_STATUSES:
+                    return cast(Dict[str, Any], cached["response"])
+                activity_ids = _get_task_activity_ids(db, task_id)
+                if cached.get("max_trace_event_id") == int(
+                    activity_ids[0]
+                ) and cached.get("max_chat_message_id") == int(activity_ids[1]):
+                    return cast(Dict[str, Any], cached["response"])
+
+            if task.status not in _TERMINAL_CACHE_STATUSES and activity_ids is None:
+                activity_ids = _get_task_activity_ids(db, task_id)
+
             if dag_execution:
                 dag_data = {
                     "phase": dag_execution.phase.value if dag_execution.phase else None,
@@ -2233,7 +2288,7 @@ async def get_task(
                     db, task_id
                 )
 
-            return {
+            response = {
                 "task_id": task.id,
                 "title": task.title,
                 "description": task.description,
@@ -2258,6 +2313,22 @@ async def get_task(
                 "waiting_question": waiting_question,
                 "waiting_interactions": waiting_interactions,
             }
+            cache_set(
+                cache_key,
+                {
+                    "updated_at": task_updated_at,
+                    "dag_updated_at": dag_updated_at,
+                    "max_trace_event_id": (
+                        activity_ids[0] if activity_ids is not None else None
+                    ),
+                    "max_chat_message_id": (
+                        activity_ids[1] if activity_ids is not None else None
+                    ),
+                    "response": response,
+                },
+                ttl_seconds=task_cache_ttl_seconds(),
+            )
+            return response
 
         # Execute in thread pool to avoid blocking
         return await asyncio.to_thread(_get_task_sync)
@@ -2289,6 +2360,22 @@ async def get_task_status(
             if not task:
                 raise HTTPException(status_code=404, detail="Task not found")
 
+            cache_key = web_task_status_key(task_id)
+            task_updated_at = cache_version_token(task.updated_at)
+            activity_ids: tuple[int, int] | None = None
+            cached = cache_get(cache_key)
+            if isinstance(cached, dict) and cached.get("updated_at") == task_updated_at:
+                if task.status in _TERMINAL_CACHE_STATUSES:
+                    return cast(Dict[str, Any], cached["response"])
+                activity_ids = _get_task_activity_ids(db, task_id)
+                if cached.get("max_trace_event_id") == int(
+                    activity_ids[0]
+                ) and cached.get("max_chat_message_id") == int(activity_ids[1]):
+                    return cast(Dict[str, Any], cached["response"])
+
+            if task.status not in _TERMINAL_CACHE_STATUSES and activity_ids is None:
+                activity_ids = _get_task_activity_ids(db, task_id)
+
             # Get the raw status value safely
             if hasattr(task, "status") and task.status is not None:
                 if hasattr(task.status, "value"):
@@ -2307,7 +2394,7 @@ async def get_task_status(
                     db, task_id
                 )
 
-            return {
+            response = {
                 "task_id": task.id,
                 "title": task.title,
                 "status": status_value,
@@ -2330,6 +2417,21 @@ async def get_task_status(
                 "waiting_question": waiting_question,
                 "waiting_interactions": waiting_interactions,
             }
+            cache_set(
+                cache_key,
+                {
+                    "updated_at": task_updated_at,
+                    "max_trace_event_id": (
+                        activity_ids[0] if activity_ids is not None else None
+                    ),
+                    "max_chat_message_id": (
+                        activity_ids[1] if activity_ids is not None else None
+                    ),
+                    "response": response,
+                },
+                ttl_seconds=task_cache_ttl_seconds(),
+            )
+            return response
 
         # Execute in thread pool to avoid blocking
         return await asyncio.to_thread(_get_task_status_sync)
@@ -2371,6 +2473,7 @@ async def update_task(
 
         task.title = title
         db.commit()
+        invalidate_task_cache(task_id)
 
         return {"status": "success", "message": "Task updated successfully"}
     except HTTPException:
@@ -2435,6 +2538,7 @@ async def delete_task(
 
         # Execute database operations in thread pool to avoid blocking
         task = await asyncio.to_thread(_delete_task_sync)
+        invalidate_task_cache(task_id)
 
         # Remove agent from manager if it exists
         get_agent_manager(request).remove_agent(task_id, int(user.id))

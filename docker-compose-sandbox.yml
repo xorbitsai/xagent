@@ -45,12 +45,16 @@ services:
       - SANDBOX_CPUS=1
       - SANDBOX_MEMORY=512
       - BOXLITE_HOME_DIR=/root/.xagent/boxlite
+      - XAGENT_REDIS_URL=redis://redis:6379/0
+      - XAGENT_HOT_PATH_CACHE_ENABLED=${XAGENT_HOT_PATH_CACHE_ENABLED:-true}
     env_file:
       - .env
     volumes:
       - xagent_data:/root/.xagent
     depends_on:
       postgres:
+        condition: service_healthy
+      redis:
         condition: service_healthy
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
@@ -78,6 +82,20 @@ services:
       - postgres_data:/var/lib/postgresql/data
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U xagent -d xagent"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - xagent_network
+
+  # Redis cache for hot-path API reads
+  redis:
+    image: redis:7-alpine
+    container_name: xagent_redis
+    restart: unless-stopped
+    command: ["redis-server", "--appendonly", "no"]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
       interval: 10s
       timeout: 5s
       retries: 5

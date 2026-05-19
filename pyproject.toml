@@ -40,6 +40,7 @@ dependencies = [
   "python-dotenv >= 1.0.1",
   "mcp>=1.12.4",
   "requests >= 2.32.0",
+  "redis>=5.0.0",
   "pillow >= 10.0.0",
   "lancedb>=0.13.0",
   "pyarrow>=16.1.0",

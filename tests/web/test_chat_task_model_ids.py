@@ -456,6 +456,55 @@ def test_standalone_task_create_defaults_to_auto(test_db, user1_headers):
     assert resp.json()["execution_mode"] == "auto"
 
 
+def test_web_task_detail_cache_reuses_response_until_task_changes(
+    test_db, user1_headers, monkeypatch
+):
+    from xagent.web.services.hot_path_cache import (
+        InMemoryTTLCache,
+        set_cache_backend_for_testing,
+    )
+
+    set_cache_backend_for_testing(InMemoryTTLCache())
+    try:
+        create_resp = client.post(
+            "/api/chat/task/create",
+            json={"title": "cache-test", "description": "desc"},
+            headers=user1_headers,
+        )
+        assert create_resp.status_code == 200
+        task_id = create_resp.json()["task_id"]
+
+        first = client.get(f"/api/chat/task/{task_id}", headers=user1_headers)
+        assert first.status_code == 200
+        assert first.json()["title"] == "cache-test"
+
+        def fail_if_uncached(*args, **kwargs):
+            raise AssertionError("cache miss reached model id resolution")
+
+        monkeypatch.setattr(
+            AgentServiceManager,
+            "_get_task_llm_ids",
+            fail_if_uncached,
+        )
+        cached = client.get(f"/api/chat/task/{task_id}", headers=user1_headers)
+        assert cached.status_code == 200
+        assert cached.json()["title"] == "cache-test"
+
+        monkeypatch.undo()
+        update = client.put(
+            f"/api/chat/task/{task_id}",
+            json={"title": "cache-test-updated"},
+            headers=user1_headers,
+        )
+        assert update.status_code == 200
+
+        refreshed = client.get(f"/api/chat/task/{task_id}", headers=user1_headers)
+        assert refreshed.status_code == 200
+        assert refreshed.json()["title"] == "cache-test-updated"
+    finally:
+        set_cache_backend_for_testing(None)
+
+
 def test_get_task_llm_ids_preserves_stored_id_when_model_missing(test_db):
     ensure_system_initialized()
     from xagent.web.models.task import Task, TaskStatus

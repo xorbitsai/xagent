@@ -52,9 +52,14 @@ class TestCreateAgentTool:
             mock_llm = Mock()
             mock_llm.model_id = "gpt-4"
 
-            with patch(
-                "xagent.web.services.llm_utils.UserAwareModelStorage"
-            ) as mock_storage_class:
+            with (
+                patch(
+                    "xagent.web.services.llm_utils.UserAwareModelStorage"
+                ) as mock_storage_class,
+                patch(
+                    "xagent.core.tools.adapters.vibe.agent_tool.invalidate_agent_cache"
+                ) as mock_invalidate_agent_cache,
+            ):
                 mock_storage = Mock()
                 mock_storage.get_configured_defaults.return_value = (
                     mock_llm,
@@ -83,6 +88,9 @@ class TestCreateAgentTool:
                 assert result["tool_name"] == "call_agent_test_agent"
                 assert "test_agent" in result["markdown_link"]
                 assert "agent://" in result["markdown_link"]
+                mock_invalidate_agent_cache.assert_called_once_with(
+                    user.id, result["agent_id"]
+                )
 
                 # Verify agent was created in database
                 agent = (
@@ -417,16 +425,22 @@ class TestUpdateAgentTool:
             db.commit()
             db.refresh(existing_agent)
 
-            tool = UpdateAgentTool(db=db, user_id=user.id, task_id="test_task")
+            with patch(
+                "xagent.core.tools.adapters.vibe.agent_tool.invalidate_agent_cache"
+            ) as mock_invalidate_agent_cache:
+                tool = UpdateAgentTool(db=db, user_id=user.id, task_id="test_task")
 
-            result = await tool.run_json_async(
-                {
-                    "agent_id": existing_agent.id,
-                    "name": "updated_name",
-                    "description": "Updated description",
-                    "instructions": "Updated instructions",
-                }
-            )
+                result = await tool.run_json_async(
+                    {
+                        "agent_id": existing_agent.id,
+                        "name": "updated_name",
+                        "description": "Updated description",
+                        "instructions": "Updated instructions",
+                    }
+                )
+                mock_invalidate_agent_cache.assert_called_once_with(
+                    user.id, existing_agent.id
+                )
 
             # Verify result
             assert result["status"] == "success"

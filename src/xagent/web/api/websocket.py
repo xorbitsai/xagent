@@ -22,7 +22,7 @@ from fastapi import (
     WebSocketDisconnect,
 )
 from fastapi.responses import RedirectResponse
-from sqlalchemy import or_
+from sqlalchemy import func, or_
 from sqlalchemy.orm import Session
 
 from ...config import (
@@ -39,6 +39,13 @@ from ..models.task import Task, TaskStatus
 from ..models.uploaded_file import UploadedFile
 from ..models.user import User
 from ..services.chat_history_service import get_latest_waiting_question
+from ..services.hot_path_cache import (
+    cache_get,
+    cache_set,
+    cache_version_token,
+    task_cache_ttl_seconds,
+    web_task_history_key,
+)
 from ..services.managed_file_ref import (
     DurableStorageOperationError,
     build_task_output_storage_key,
@@ -2789,6 +2796,38 @@ async def send_historical_data_as_stream(
             if mark_task_paused_if_stale(db, task):
                 db.refresh(task)
 
+            max_trace_event_id = (
+                db.query(func.max(TraceEvent.id))
+                .filter(
+                    TraceEvent.task_id == task_id,
+                    TraceEvent.build_id.is_(None),
+                )
+                .scalar()
+                or 0
+            )
+            max_chat_message_id = (
+                db.query(func.max(TaskChatMessage.id))
+                .filter(TaskChatMessage.task_id == task_id)
+                .scalar()
+                or 0
+            )
+            cache_key = web_task_history_key(task_id)
+            task_updated_at = cache_version_token(task.updated_at)
+            cached = cache_get(cache_key)
+            if (
+                isinstance(cached, dict)
+                and cached.get("updated_at") == task_updated_at
+                and cached.get("max_trace_event_id") == int(max_trace_event_id)
+                and cached.get("max_chat_message_id") == int(max_chat_message_id)
+                and isinstance(cached.get("events"), list)
+            ):
+                for cached_event in cached["events"]:
+                    if isinstance(cached_event, dict):
+                        await manager.send_personal_message(cached_event, websocket)
+                return
+
+            cached_stream_events: list[dict[str, Any]] = []
+
             # Determine is_dag from agent config if agent_id exists
             is_dag = None
             if task.agent_id:
@@ -2841,6 +2880,7 @@ async def send_historical_data_as_stream(
                 task.created_at if task.created_at else None,
             )
             await manager.send_personal_message(task_event, websocket)
+            cached_stream_events.append(task_event)
 
             # Get unified trace events (only VIBE phase, exclude BUILD phase)
             trace_events = (
@@ -3036,6 +3076,7 @@ async def send_historical_data_as_stream(
                     if event_data.get("step_id"):
                         stream_event["step_id"] = str(event_data["step_id"])
                     await manager.send_personal_message(stream_event, websocket)
+                    cached_stream_events.append(stream_event)
                 else:
                     # For other events, use original format
                     event_data = event["data"]
@@ -3047,6 +3088,7 @@ async def send_historical_data_as_stream(
                             event["timestamp"],
                         )
                         await manager.send_personal_message(event_obj, websocket)
+                        cached_stream_events.append(event_obj)
 
             # Send historical data completion marker
             completion_event = create_stream_event(
@@ -3058,6 +3100,7 @@ async def send_historical_data_as_stream(
                 },
             )
             await manager.send_personal_message(completion_event, websocket)
+            cached_stream_events.append(completion_event)
 
             # Historical trace replay can end with an in-flight event from before a
             # crash/restart, such as llm_call_start. Re-assert the current DB task
@@ -3092,6 +3135,18 @@ async def send_historical_data_as_stream(
                 if isinstance(question_interactions, list):
                     status_event["interactions"] = question_interactions
                 await manager.send_personal_message(status_event, websocket)
+                cached_stream_events.append(status_event)
+
+            cache_set(
+                cache_key,
+                {
+                    "updated_at": task_updated_at,
+                    "max_trace_event_id": int(max_trace_event_id),
+                    "max_chat_message_id": int(max_chat_message_id),
+                    "events": cached_stream_events,
+                },
+                ttl_seconds=task_cache_ttl_seconds(),
+            )
 
         except (ValueError, KeyError, TypeError) as e:
             # Data format error

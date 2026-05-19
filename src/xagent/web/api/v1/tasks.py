@@ -17,6 +17,7 @@ by the WebSocket UI path so both transports share one state machine.
 from typing import Tuple
 
 from fastapi import APIRouter, Depends
+from sqlalchemy import func
 from sqlalchemy.orm import Session
 
 from ...models.agent import Agent
@@ -31,6 +32,14 @@ from ...schemas.v1 import (
     PublicStep,
     StepsResponse,
     TaskInfoResponse,
+)
+from ...services.hot_path_cache import (
+    cache_get,
+    cache_set,
+    cache_version_token,
+    task_cache_ttl_seconds,
+    task_snapshot_key,
+    task_steps_key,
 )
 from ...services.task_orchestrator import (
     TaskTurnError,
@@ -352,8 +361,13 @@ async def get_chat_task(
     # don't mis-interpret an in-flight task's last write timestamp as
     # a completion time.
     completed_at = task.updated_at if task.status in _TERMINAL_STATUSES else None
+    cache_key = task_snapshot_key(task_id)
+    task_updated_at = cache_version_token(task.updated_at)
+    cached = cache_get(cache_key)
+    if isinstance(cached, dict) and cached.get("updated_at") == task_updated_at:
+        return TaskInfoResponse.model_validate(cached["response"])
 
-    return TaskInfoResponse(
+    response = TaskInfoResponse(
         task_id=int(task.id),
         agent_id=int(task.agent_id),
         status=task.status.value,
@@ -363,6 +377,15 @@ async def get_chat_task(
         created_at=task.created_at,
         completed_at=completed_at,
     )
+    cache_set(
+        cache_key,
+        {
+            "updated_at": task_updated_at,
+            "response": response.model_dump(mode="json"),
+        },
+        ttl_seconds=task_cache_ttl_seconds(),
+    )
+    return response
 
 
 @router.get("/chat/tasks/{task_id}/steps", response_model=StepsResponse)
@@ -404,6 +427,15 @@ async def get_chat_task_steps(
     agent, _key = authed
     task = _resolve_task_or_404(task_id, agent, db)
 
+    max_event_id = (
+        db.query(func.max(TraceEvent.id)).filter(TraceEvent.task_id == task_id).scalar()
+        or 0
+    )
+    cache_key = task_steps_key(task_id)
+    cached = cache_get(cache_key)
+    if isinstance(cached, dict) and cached.get("max_event_id") == int(max_event_id):
+        return StepsResponse.model_validate(cached["response"])
+
     # Ordered ASC by ``id`` -- the trace_events PK is monotonically
     # increasing per write, so ordering by it gives us the same
     # temporal ordering as ``timestamp`` but without depending on
@@ -420,8 +452,17 @@ async def get_chat_task_steps(
     # FastAPI app or DB session.
     public_steps_data = map_trace_events_to_public_steps(events)
 
-    return StepsResponse(
+    response = StepsResponse(
         task_id=int(task.id),
         agent_id=int(task.agent_id),
         steps=[PublicStep(**step) for step in public_steps_data],
     )
+    cache_set(
+        cache_key,
+        {
+            "max_event_id": int(max_event_id),
+            "response": response.model_dump(mode="json"),
+        },
+        ttl_seconds=task_cache_ttl_seconds(),
+    )
+    return response

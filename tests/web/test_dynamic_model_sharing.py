@@ -20,6 +20,10 @@ from fastapi.testclient import TestClient
 from xagent.web.api.auth import auth_router
 from xagent.web.api.model import _can_user_share, model_router, set_can_share_hook
 from xagent.web.models.database import Base, get_db, get_engine
+from xagent.web.services.hot_path_cache import (
+    InMemoryTTLCache,
+    set_cache_backend_for_testing,
+)
 from xagent.web.services.model_service import (
     _get_visible_user_ids,
     set_visible_user_ids_hook,
@@ -66,9 +70,11 @@ def _reset_hooks():
     """Ensure hooks are reset between tests."""
     set_visible_user_ids_hook(None)
     set_can_share_hook(None)
+    set_cache_backend_for_testing(None)
     yield
     set_visible_user_ids_hook(None)
     set_can_share_hook(None)
+    set_cache_backend_for_testing(None)
 
 
 @pytest.fixture(scope="function")
@@ -1200,6 +1206,46 @@ class TestLegacyDataCompatibility:
 
 class TestGetUserDefaultModelsStaleSkip:
     """Tests for stale UserDefaultModel visibility."""
+
+    def test_shared_fallback_default_delete_invalidates_other_user_cache(
+        self, test_db, admin_headers, regular_headers, sample_model_data
+    ):
+        sample_model_data["share_with_users"] = True
+        create_response = client.post(
+            "/api/models/", json=sample_model_data, headers=admin_headers
+        )
+        assert create_response.status_code == 200
+        model_db_id = create_response.json()["id"]
+
+        default_response = client.post(
+            "/api/models/user-default",
+            json={"model_id": model_db_id, "config_type": "general"},
+            headers=admin_headers,
+        )
+        assert default_response.status_code == 200
+
+        set_cache_backend_for_testing(InMemoryTTLCache())
+        defaults_before = client.get(
+            "/api/models/user-default", headers=regular_headers
+        )
+        assert defaults_before.status_code == 200
+        general_before = [
+            d for d in defaults_before.json() if d.get("config_type") == "general"
+        ]
+        assert len(general_before) == 1
+        assert general_before[0]["model"]["model_id"] == sample_model_data["model_id"]
+
+        delete_response = client.delete(
+            "/api/models/user-default/general", headers=admin_headers
+        )
+        assert delete_response.status_code == 200
+
+        defaults_after = client.get("/api/models/user-default", headers=regular_headers)
+        assert defaults_after.status_code == 200
+        general_after = [
+            d for d in defaults_after.json() if d.get("config_type") == "general"
+        ]
+        assert general_after == []
 
     def test_skips_stale_user_default_and_falls_back(
         self, test_db, admin_headers, regular_headers, sample_model_data

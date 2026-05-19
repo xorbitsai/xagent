@@ -36,6 +36,14 @@ from ..schemas.model import (
     UserDefaultModelCreate,
     UserDefaultModelResponse,
 )
+from ..services.hot_path_cache import (
+    cache_get,
+    cache_set,
+    invalidate_model_cache,
+    model_list_key,
+    user_default_model_key,
+    user_default_models_key,
+)
 from ..services.llm_utils import CoreStorage
 from ..user_isolated_memory import UserContext
 
@@ -66,6 +74,15 @@ def _can_user_share(user: User) -> bool:
 
 # Create router
 model_router = APIRouter(prefix="/api/models", tags=["models"])
+
+
+def _model_has_shared_visibility(db: Session, model_id: int) -> bool:
+    return (
+        db.query(UserModel.id)
+        .filter(UserModel.model_id == model_id, UserModel.is_shared.is_(True))
+        .first()
+        is not None
+    )
 
 
 def _decode_model_identifier(model_id: str) -> str:
@@ -392,6 +409,7 @@ async def create_model(
     )
     db.add(user_model)
     db.commit()
+    invalidate_model_cache(None if is_share else int(user.id))
 
     # No pre-creation for other users — dynamic discovery handles visibility.
 
@@ -433,6 +451,18 @@ async def list_models(
     user: User = Depends(get_current_user),
 ) -> List[ModelWithAccessInfo]:
     """List all model configurations accessible to the current user"""
+    current_user_id = int(user.id)
+    cache_key = model_list_key(
+        current_user_id,
+        skip=skip,
+        limit=limit,
+        model_provider=model_provider,
+        category=category,
+        is_active=is_active,
+    )
+    cached = cache_get(cache_key)
+    if isinstance(cached, list):
+        return [ModelWithAccessInfo.model_validate(item) for item in cached]
 
     from ..services.model_service import (
         _get_visible_user_ids,
@@ -440,7 +470,7 @@ async def list_models(
     )
 
     # Get models that user has access to (owned or shared from visible users)
-    visible_ids = _get_visible_user_ids(db, int(user.id))
+    visible_ids = _get_visible_user_ids(db, current_user_id)
 
     # Correlated subquery: for each DBModel, pick exactly one UserModel row,
     # preferring the user's own row (deduplicates legacy shared data).
@@ -448,7 +478,7 @@ async def list_models(
         db.query(UserModel.id)
         .filter(
             UserModel.model_id == DBModel.id,
-            build_user_model_visibility_filter(int(user.id), visible_ids),
+            build_user_model_visibility_filter(current_user_id, visible_ids),
         )
         .order_by(
             (UserModel.user_id == user.id).desc(),
@@ -503,6 +533,7 @@ async def list_models(
         }
         result.append(ModelWithAccessInfo.model_validate(model_data))
 
+    cache_set(cache_key, [item.model_dump(mode="json") for item in result])
     return result
 
 
@@ -511,6 +542,11 @@ async def get_user_default_models(
     db: Session = Depends(get_db), user: User = Depends(get_current_user)
 ) -> list:
     """Get all user's default model configurations with per-type admin fallback"""
+    current_user_id = int(user.id)
+    cache_key = user_default_models_key(current_user_id)
+    cached = cache_get(cache_key)
+    if isinstance(cached, list):
+        return cached
 
     try:
         from ..services.model_service import (
@@ -545,7 +581,7 @@ async def get_user_default_models(
             user_defaults_by_type[str(ud.config_type)] = ud
 
         result = []
-        visible_ids = _get_visible_user_ids(db, int(user.id))
+        visible_ids = _get_visible_user_ids(db, current_user_id)
 
         # Process each config type
         for config_type in all_config_types:
@@ -559,7 +595,9 @@ async def get_user_default_models(
                     db.query(UserModel)
                     .filter(
                         UserModel.model_id == ud.model_id,
-                        build_user_model_visibility_filter(int(user.id), visible_ids),
+                        build_user_model_visibility_filter(
+                            current_user_id, visible_ids
+                        ),
                     )
                     .first()
                 )
@@ -661,6 +699,7 @@ async def get_user_default_models(
                     }
                     result.append(model_data)
 
+        cache_set(cache_key, result)
         return result
     except Exception as e:
         logger.error(f"Error getting user default models: {e}")
@@ -1596,11 +1635,23 @@ async def set_user_default_model(
             ),
         )
 
+    existing_default = (
+        db.query(UserDefaultModel)
+        .filter(
+            UserDefaultModel.user_id == user.id,
+            UserDefaultModel.config_type == config_type,
+        )
+        .first()
+    )
+    old_default_was_shared = bool(
+        existing_default
+        and _model_has_shared_visibility(db, int(existing_default.model_id))
+    )
+    new_default_is_shared = bool(user_model.is_shared)
+
     # Remove existing configuration for this config_type
-    db.query(UserDefaultModel).filter(
-        UserDefaultModel.user_id == user.id,
-        UserDefaultModel.config_type == config_type,
-    ).delete()
+    if existing_default:
+        db.delete(existing_default)
 
     # Create new default configuration
     user_default = UserDefaultModel(
@@ -1610,6 +1661,9 @@ async def set_user_default_model(
     db.add(user_default)
     db.commit()
     db.refresh(user_default)
+    invalidate_model_cache(
+        None if old_default_was_shared or new_default_is_shared else int(user.id)
+    )
 
     # If this is an embedding model configuration, trigger memory store check
     if config.config_type == "embedding":
@@ -1639,6 +1693,10 @@ async def get_user_default_model(
     user: User = Depends(get_current_user),
 ) -> Optional[UserDefaultModelResponse]:
     """Get a user's default model configuration for a specific type"""
+    cache_key = user_default_model_key(int(user.id), config_type)
+    cached = cache_get(cache_key)
+    if isinstance(cached, dict):
+        return UserDefaultModelResponse.model_validate(cached)
 
     user_default = (
         db.query(UserDefaultModel)
@@ -1654,7 +1712,9 @@ async def get_user_default_model(
     if not user_default:
         return None
 
-    return UserDefaultModelResponse.model_validate(user_default)
+    response = UserDefaultModelResponse.model_validate(user_default)
+    cache_set(cache_key, response.model_dump(mode="json"))
+    return response
 
 
 @model_router.delete("/user-default/{config_type}")
@@ -1677,8 +1737,11 @@ async def delete_user_default_model(
     if not user_default:
         raise HTTPException(status_code=404, detail="Default configuration not found")
 
+    default_was_shared = _model_has_shared_visibility(db, int(user_default.model_id))
+
     db.delete(user_default)
     db.commit()
+    invalidate_model_cache(None if default_was_shared else int(user.id))
 
     return {"message": "Default configuration deleted successfully"}
 
@@ -1817,6 +1880,9 @@ async def update_model(
     # Commit database changes
     db.commit()
     db.refresh(db_model)
+    invalidate_model_cache(
+        None if is_shared or model_update.share_with_users is not None else int(user.id)
+    )
 
     # Return updated model with access info
     return ModelWithAccessInfo.model_validate(
@@ -1864,6 +1930,7 @@ async def delete_model(
 
     # Delete the model using CoreStorage
     model_storage.delete(user_model.model.model_id)
+    invalidate_model_cache(None)
 
     return {"message": "Model deleted successfully"}
 

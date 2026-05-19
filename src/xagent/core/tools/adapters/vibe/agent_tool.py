@@ -9,6 +9,7 @@ from uuid import uuid4
 from pydantic import BaseModel, Field, field_validator
 
 from .....config import get_uploads_dir
+from .....web.services.hot_path_cache import invalidate_agent_cache
 from .....web.services.model_service import (
     _get_visible_user_ids,
     _is_model_visible_to_user,
@@ -597,6 +598,7 @@ class CreateAgentTool(AbstractBaseTool):
             self._db.add(agent)
             self._db.commit()
             self._db.refresh(agent)
+            invalidate_agent_cache(self._user_id, int(agent.id))
 
             # Generate the tool name and markdown link
             tool_name = gen_agent_tool_name(agent_name)
@@ -904,6 +906,7 @@ class UpdateAgentTool(AbstractBaseTool):
             # Commit changes to database
             self._db.commit()
             self._db.refresh(agent)
+            invalidate_agent_cache(self._user_id, int(agent.id))
 
             # Generate the tool name and markdown link
             tool_name = gen_agent_tool_name(agent.name)

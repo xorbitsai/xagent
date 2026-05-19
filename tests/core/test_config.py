@@ -16,9 +16,13 @@ from xagent.config import (
     FILE_STORAGE_OPTIONS,
     FILE_STORAGE_STARTUP_SYNC_ENABLED,
     FILE_STORAGE_URI,
+    HOT_PATH_CACHE_ENABLED,
+    HOT_PATH_CACHE_TTL_SECONDS,
+    HOT_PATH_TASK_CACHE_TTL_SECONDS,
     LANCEDB_PATH,
     MAX_TRACE_PAYLOAD_BYTES,
     MAX_UPLOAD_SIZE,
+    REDIS_URL,
     SANDBOX_CPUS,
     SANDBOX_ENV,
     SANDBOX_IMAGE,
@@ -42,9 +46,13 @@ from xagent.config import (
     get_file_storage_options,
     get_file_storage_startup_sync_enabled,
     get_file_storage_uri,
+    get_hot_path_cache_enabled,
+    get_hot_path_cache_ttl_seconds,
+    get_hot_path_task_cache_ttl_seconds,
     get_lancedb_path,
     get_max_trace_payload_bytes,
     get_max_upload_size_bytes,
+    get_redis_url,
     get_sandbox_cpus,
     get_sandbox_env,
     get_sandbox_image,
@@ -111,6 +119,47 @@ class TestEnvironmentVariableConstants:
             FILE_STORAGE_STARTUP_SYNC_ENABLED
             == "XAGENT_FILE_STORAGE_STARTUP_SYNC_ENABLED"
         )
+
+    def test_redis_url_constant(self):
+        assert REDIS_URL == "XAGENT_REDIS_URL"
+
+    def test_hot_path_cache_constants(self):
+        assert HOT_PATH_CACHE_ENABLED == "XAGENT_HOT_PATH_CACHE_ENABLED"
+        assert HOT_PATH_CACHE_TTL_SECONDS == "XAGENT_HOT_PATH_CACHE_TTL_SECONDS"
+        assert (
+            HOT_PATH_TASK_CACHE_TTL_SECONDS == "XAGENT_HOT_PATH_TASK_CACHE_TTL_SECONDS"
+        )
+
+
+class TestHotPathCacheConfig:
+    def test_redis_url_empty_is_none(self, monkeypatch):
+        monkeypatch.delenv(REDIS_URL, raising=False)
+        assert get_redis_url() is None
+        monkeypatch.setenv(REDIS_URL, "  ")
+        assert get_redis_url() is None
+
+    def test_redis_url_strips_value(self, monkeypatch):
+        monkeypatch.setenv(REDIS_URL, " redis://localhost:6379/0 ")
+        assert get_redis_url() == "redis://localhost:6379/0"
+
+    def test_hot_path_cache_enabled_defaults_true(self, monkeypatch):
+        monkeypatch.delenv(HOT_PATH_CACHE_ENABLED, raising=False)
+        assert get_hot_path_cache_enabled() is True
+
+    def test_hot_path_cache_enabled_false(self, monkeypatch):
+        monkeypatch.setenv(HOT_PATH_CACHE_ENABLED, "false")
+        assert get_hot_path_cache_enabled() is False
+
+    def test_hot_path_ttls(self, monkeypatch):
+        monkeypatch.delenv(HOT_PATH_CACHE_TTL_SECONDS, raising=False)
+        monkeypatch.delenv(HOT_PATH_TASK_CACHE_TTL_SECONDS, raising=False)
+        assert get_hot_path_cache_ttl_seconds() == 30
+        assert get_hot_path_task_cache_ttl_seconds() == 30
+
+        monkeypatch.setenv(HOT_PATH_CACHE_TTL_SECONDS, "45")
+        monkeypatch.setenv(HOT_PATH_TASK_CACHE_TTL_SECONDS, "3")
+        assert get_hot_path_cache_ttl_seconds() == 45
+        assert get_hot_path_task_cache_ttl_seconds() == 3
 
 
 class TestGetWebSearchProvider:

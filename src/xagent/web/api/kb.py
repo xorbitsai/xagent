@@ -13,6 +13,7 @@ import time
 import uuid
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, TypedDict, TypeVar, cast
+from urllib.parse import urlparse
 
 from fastapi import (
     APIRouter,
@@ -137,6 +138,23 @@ def _like_contains_pattern(value: str) -> str:
         .replace("_", f"{_SQL_LIKE_ESCAPE}_")
     )
     return f"%{escaped}%"
+
+
+def _validate_web_start_url(start_url: str) -> str:
+    """Reject malformed web-ingestion start URLs before crawling starts."""
+    normalized = start_url.strip()
+    parsed = urlparse(normalized)
+    if parsed.scheme not in {"http", "https"}:
+        raise HTTPException(
+            status_code=422,
+            detail="Invalid start_url: URL must start with http:// or https://",
+        )
+    if not parsed.netloc:
+        raise HTTPException(
+            status_code=422,
+            detail="Invalid start_url: URL must include a hostname",
+        )
+    return normalized
 
 
 def _normalize_parse_method_for_filename(
@@ -2324,6 +2342,8 @@ async def ingest_web(
             raise HTTPException(
                 status_code=422, detail=f"Invalid collection name: {str(e)}"
             ) from e
+
+        start_url = _validate_web_start_url(start_url)
 
         await _ensure_collection_access(safe_collection, _user, allow_create=True)
 

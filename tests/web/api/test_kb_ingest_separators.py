@@ -578,6 +578,26 @@ def test_ingest_web_separators_invalid_json_request_succeeds(app_with_kb):
     assert captured_config[0].separators is None
 
 
+def test_ingest_web_missing_protocol_returns_422(app_with_kb):
+    """POST ingest-web rejects start_url values without an explicit HTTP(S) scheme."""
+    with patch("xagent.web.api.kb.run_web_ingestion") as mock_run_web_ingestion:
+        client = TestClient(app_with_kb)
+        response = client.post(
+            "/api/kb/ingest-web",
+            data={
+                "collection": "web_coll",
+                "start_url": "www.example.com",
+            },
+        )
+
+    assert response.status_code == 422
+    assert (
+        response.json()["detail"]
+        == "Invalid start_url: URL must start with http:// or https://"
+    )
+    mock_run_web_ingestion.assert_not_called()
+
+
 def test_ingest_web_error_cleans_new_collection_config(app_with_kb):
     """POST ingest-web should clean saved config when a new collection fails before any docs are created."""
     metadata_store = MagicMock()

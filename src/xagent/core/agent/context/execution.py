@@ -341,6 +341,8 @@ class ExecutionContext:
         for message in reversed(self.messages):
             if message.hidden or message.role != "user":
                 continue
+            if message.metadata.get("response_to_waiting_for_user"):
+                continue
             content = str(message.content or "").strip()
             if content:
                 return content

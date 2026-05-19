@@ -151,6 +151,30 @@ def test_system_context_uses_latest_user_message_as_current_request() -> None:
     )
 
 
+def test_system_context_ignores_waiting_for_user_answer_as_current_request() -> None:
+    ctx = ExecutionContext(execution_id="exec-waiting-for-user-language")
+    ctx.metadata["task"] = "Book a trip"
+    ctx.add_user_message("Book a trip")
+    ctx.add_assistant_message("What city?")
+    ctx.add_user_message(
+        "北京",
+        metadata={
+            "response_to_waiting_for_user": {
+                "question": "What city?",
+            },
+        },
+    )
+
+    messages = ctx.get_messages_for_llm()
+    system_message = messages[0]["content"]
+    waiting_answer_message = messages[-1]["content"]
+
+    assert "Current user request:\nBook a trip" in system_message
+    assert "Current user request:\n北京" not in system_message
+    assert "answer to a pending agent question" in waiting_answer_message
+    assert "User answer: 北京" in waiting_answer_message
+
+
 def test_dag_step_system_context_preserves_step_language_for_final_answer() -> None:
     ctx = ExecutionContext(
         execution_id="exec-dag-language",

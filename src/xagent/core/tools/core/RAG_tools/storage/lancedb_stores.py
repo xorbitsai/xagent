@@ -80,15 +80,62 @@ class LanceDBMetadataStore(MetadataStore):
         except Exception as exc:
             logger.debug("Failed to delete collection metadata: %s", exc)
 
-    async def rename_collection(self, old_name: str, new_name: str) -> None:
-        """Rename ``collection_config`` and ``collection_metadata`` keys.
-
-        See :meth:`MetadataStore.rename_collection`.
-        """
+    async def count_users_with_collection_config(self, collection_name: str) -> int:
+        """Count distinct ``user_id`` rows in ``collection_config`` for a collection name."""
         from ..LanceDB.schema_manager import (
             _safe_close_table,
             ensure_collection_config_table,
         )
+
+        conn = await self._get_connection()
+        ensure_collection_config_table(conn)
+
+        safe_collection = escape_lancedb_string(collection_name)
+        config_table = None
+        try:
+            config_table = conn.open_table("collection_config")
+            rows = (
+                config_table.search()
+                .where(f"collection = '{safe_collection}'")
+                .to_arrow()
+                .to_pylist()
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.debug(
+                "Failed to count collection config occupants for %s: %s",
+                collection_name,
+                exc,
+            )
+            return 0
+        finally:
+            _safe_close_table(config_table)
+
+        occupant_ids = {
+            int(row["user_id"]) for row in rows if row.get("user_id") is not None
+        }
+        return len(occupant_ids)
+
+    async def rename_collection(
+        self,
+        old_name: str,
+        new_name: str,
+        *,
+        user_id: int,
+        is_admin: bool = False,
+    ) -> None:
+        """Rename control-plane keys for a single user's collection scope.
+
+        See :meth:`MetadataStore.rename_collection`.
+        """
+        from ..core.schemas import CollectionInfo
+        from ..LanceDB.schema_manager import (
+            _safe_close_table,
+            ensure_collection_config_table,
+        )
+
+        del (
+            is_admin
+        )  # Scope is always limited to ``user_id``; flag is for callers only.
 
         conn = await self._get_connection()
         await self.ensure_collection_metadata_table()
@@ -96,26 +143,31 @@ class LanceDBMetadataStore(MetadataStore):
 
         safe_old = escape_lancedb_string(old_name)
         now = datetime.now(timezone.utc).replace(tzinfo=None)
+        occupant_count = await self.count_users_with_collection_config(old_name)
 
         config_table = None
         try:
             config_table = conn.open_table("collection_config")
             config_table.update(
-                f"collection = '{safe_old}'",
+                f"collection = '{safe_old}' AND user_id = {int(user_id)}",
                 {"collection": new_name, "updated_at": now},
             )
         finally:
             _safe_close_table(config_table)
 
-        meta_table = None
-        try:
-            meta_table = conn.open_table("collection_metadata")
-            meta_table.update(
-                f"name = '{safe_old}'",
-                {"name": new_name, "updated_at": now},
-            )
-        finally:
-            _safe_close_table(meta_table)
+        if occupant_count <= 1:
+            meta_table = None
+            try:
+                meta_table = conn.open_table("collection_metadata")
+                meta_table.update(
+                    f"name = '{safe_old}'",
+                    {"name": new_name, "updated_at": now},
+                )
+            finally:
+                _safe_close_table(meta_table)
+            return
+
+        await self.save_collection(CollectionInfo(name=new_name))
 
     async def save_collection(self, collection: CollectionInfo) -> None:
         from ..LanceDB.schema_manager import _safe_close_table
@@ -612,11 +664,20 @@ class LanceDBVectorIndexStore(VectorIndexStore):
         self,
         collection_name: str,
         new_name: str,
+        user_id: Optional[int],
+        is_admin: bool,
     ) -> List[str]:
         from ..LanceDB.schema_manager import _safe_close_table
 
         warnings: List[str] = []
-        safe_old_name = escape_lancedb_string(collection_name)
+        filter_expr = self.build_filter_expression(
+            build_filter_from_dict({"collection": collection_name}),
+            user_id=user_id,
+            is_admin=is_admin,
+        )
+        if not filter_expr:
+            return warnings
+
         conn = self._get_connection()
         for table_name in self.list_table_names():
             if table_name not in {
@@ -629,7 +690,7 @@ class LanceDBVectorIndexStore(VectorIndexStore):
             try:
                 table = conn.open_table(table_name)
                 table.update(
-                    f"collection = '{safe_old_name}'",
+                    filter_expr,
                     {"collection": new_name},
                 )
             except Exception as exc:  # noqa: BLE001

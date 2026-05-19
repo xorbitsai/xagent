@@ -718,6 +718,12 @@ async def shutdown_event() -> None:
     if sandbox_mgr:
         await sandbox_mgr.cleanup()
 
+    # Shutdown shared ingestion executor
+    from .api.kb import shutdown_ingest_executor
+
+    shutdown_ingest_executor()
+    logger.info("Ingestion executor shutdown completed")
+
 
 # Frontend is now served by Next.js at http://localhost:3000
 # This backend only provides API endpoints

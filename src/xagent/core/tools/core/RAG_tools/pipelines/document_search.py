@@ -5,6 +5,7 @@ from __future__ import annotations
 import logging
 import numbers
 import os
+import time
 from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple, Union, cast
 
 import requests
@@ -515,6 +516,8 @@ def search_documents(
     user_id = scope.user_id
     is_admin = scope.is_admin
 
+    search_start = time.time()
+
     cfg = (
         config
         if isinstance(config, SearchConfig)
@@ -583,11 +586,27 @@ def search_documents(
         message = "Search completed successfully"
 
         if requested_type == SearchType.SPARSE:
+            logger.info(
+                "Executing SPARSE search: UserID=%s, Collection=%s, TopK=%d, ModelTag=%s",
+                user_id,
+                collection,
+                fetch_top_k,
+                embedding_model_id,
+            )
+            sparse_start = time.time()
             with progress_tracker.track_step("sparse_search"):
                 pass
             current_step = "search_sparse"
             results, status, sparse_warnings, message = _execute_sparse_search(
                 collection, query_text, cfg, embedding_model_id, user_id, is_admin
+            )
+            sparse_elapsed = int((time.time() - sparse_start) * 1000)
+            logger.info(
+                "SPARSE search completed: Found %d results, Status=%s, Elapsed=%dms, UserID=%s",
+                len(results),
+                status,
+                sparse_elapsed,
+                user_id,
             )
             warnings.extend(sparse_warnings)
         else:
@@ -596,7 +615,15 @@ def search_documents(
                 with progress_tracker.track_step("encode_query"):
                     pass
                 current_step = "encode_query_vector"
+                encode_start = time.time()
                 query_vector = _encode_query_vector(embedding_adapter, query_text)
+                encode_elapsed = int((time.time() - encode_start) * 1000)
+                logger.info(
+                    "Query vector encoded: Dimension=%d, Elapsed=%dms, UserID=%s",
+                    len(query_vector),
+                    encode_elapsed,
+                    user_id,
+                )
             except VectorValidationError:
                 if requested_type == SearchType.HYBRID and cfg.fallback_to_sparse:
                     current_step = "search_sparse_fallback"
@@ -620,6 +647,17 @@ def search_documents(
                     raise
             else:
                 if requested_type == SearchType.DENSE:
+                    logger.info(
+                        "Executing DENSE search: UserID=%s, Collection=%s, TopK=%d, ModelTag=%s, "
+                        "NProbes=%s, RefineFactor=%s",
+                        user_id,
+                        collection,
+                        fetch_top_k,
+                        embedding_model_id,
+                        cfg.nprobes,
+                        cfg.refine_factor,
+                    )
+                    dense_start = time.time()
                     with progress_tracker.track_step("dense_search"):
                         pass
                     dense_response: DenseSearchResponse = search_dense(
@@ -641,7 +679,28 @@ def search_documents(
                     message = (
                         advice if advice else "Dense search completed successfully"
                     )
+                    dense_elapsed = int((time.time() - dense_start) * 1000)
+                    logger.info(
+                        "DENSE search completed: Found %d results, Status=%s, Elapsed=%dms, "
+                        "IndexAdvice=%s, UserID=%s",
+                        len(results),
+                        status,
+                        dense_elapsed,
+                        advice or "None",
+                        user_id,
+                    )
                 else:  # HYBRID
+                    logger.info(
+                        "Executing HYBRID search: UserID=%s, Collection=%s, TopK=%d, ModelTag=%s, "
+                        "FusionConfig=%s, FallbackToSparse=%s",
+                        user_id,
+                        collection,
+                        fetch_top_k,
+                        embedding_model_id,
+                        cfg.fusion_config,
+                        cfg.fallback_to_sparse,
+                    )
+                    hybrid_start = time.time()
                     try:
                         with progress_tracker.track_step("hybrid_search"):
                             pass
@@ -684,6 +743,7 @@ def search_documents(
                             current_step = "search_hybrid"
                             raise
                     else:
+                        hybrid_elapsed = int((time.time() - hybrid_start) * 1000)
                         warnings.extend(_serialize_warnings(hybrid_response.warnings))
                         results = list(hybrid_response.results)
                         status = hybrid_response.status or "success"
@@ -692,13 +752,65 @@ def search_documents(
                             if status == "success"
                             else "Hybrid search completed with warnings"
                         )
+                        logger.info(
+                            "HYBRID search completed: Found %d results, Status=%s, Elapsed=%dms, UserID=%s",
+                            len(results),
+                            status,
+                            hybrid_elapsed,
+                            user_id,
+                        )
 
         # Apply optional rerank
         current_step = "apply_rerank"
+        rerank_start = time.time()
         results, used_rerank, rerank_warnings = _apply_rerank_if_needed(
             results, query_text, cfg
         )
+        rerank_elapsed = int((time.time() - rerank_start) * 1000)
         warnings.extend(rerank_warnings)
+
+        if used_rerank:
+            logger.info(
+                "Rerank applied: Input results=%d, Output results=%d, Elapsed=%dms",
+                len(results) + len(rerank_warnings),
+                len(results),
+                rerank_elapsed,
+            )
+        else:
+            logger.debug("Rerank skipped: Not configured or no results to rerank")
+
+        total_elapsed = int((time.time() - search_start) * 1000)
+        logger.info(
+            "Document search COMPLETED: UserID=%s, Collection=%s, Status=%s, SearchType=%s, "
+            "Results=%d, TopK=%d, TotalElapsed=%dms, UsedRerank=%s, Warnings=%d, "
+            "Model=%s",
+            user_id,
+            collection,
+            status.upper(),
+            actual_type.value,
+            len(results),
+            cfg.top_k,
+            total_elapsed,
+            used_rerank,
+            len(warnings),
+            embedding_model_id,
+        )
+        if status == "success":
+            logger.info(
+                "Search SUCCESS: UserID=%s, Found %d results in %dms using %s search with model %s",
+                user_id,
+                len(results),
+                total_elapsed,
+                actual_type.value,
+                embedding_model_id,
+            )
+        elif status != "success":
+            logger.warning(
+                "Search completed with status '%s': Found %d results, Warnings: %d",
+                status,
+                len(results),
+                len(warnings),
+            )
 
         return _build_pipeline_result(
             status=status,

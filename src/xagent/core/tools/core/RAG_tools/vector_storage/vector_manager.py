@@ -39,6 +39,7 @@ from ..core.schemas import (
 )
 from ..LanceDB.model_tag_utils import to_model_tag
 from ..LanceDB.schema_manager import _safe_close_table, ensure_embeddings_table
+from ..storage.contracts import VectorIndexStore
 from ..storage.factory import get_vector_index_store
 from ..utils.lancedb_query_utils import list_table_names
 from ..utils.metadata_utils import deserialize_metadata, serialize_metadata
@@ -184,6 +185,53 @@ def _safe_int_conversion(value: Any, default: int = 0) -> int:
         return default
 
 
+def _maybe_log_chunks_hidden_by_user_filter(
+    vector_store: VectorIndexStore,
+    query_filters: Dict[str, Any],
+    *,
+    user_id: Optional[int],
+    is_admin: bool,
+) -> None:
+    """If DEBUG logging is enabled, detect chunks matching scope filters but excluded by user_id filter.
+
+    Non-admin callers filter rows by ``user_id``; admins effectively omit that predicate.
+    When the scoped count is zero but an admin-equivalent count is positive, rows likely
+    exist under another ``user_id`` or legacy NULL ``user_id`` — typical symptom of a
+    permission or ingestion ownership mismatch.
+
+    Args:
+        vector_store: Vector index abstraction bound to the active backend.
+        query_filters: Column equality filters (collection, doc_id, parse_hash, ...).
+        user_id: Authenticated user id passed into the read path.
+        is_admin: Whether the caller is treated as admin for tenancy filtering.
+    """
+    if is_admin or user_id is None:
+        return
+    if not logger.isEnabledFor(logging.DEBUG):
+        return
+    try:
+        count_without_user_scope = vector_store.count_rows_or_zero(
+            table_name="chunks",
+            filters=query_filters,
+            user_id=user_id,
+            is_admin=True,
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("Skipped chunks user-filter diagnostic count: %s", exc)
+        return
+
+    if count_without_user_scope > 0:
+        logger.error(
+            "Chunks exist for doc/collection scope but user filter excluded them "
+            "(possible user_id mismatch, legacy NULL user_id row, or permission bug). "
+            "caller_user_id=%s is_admin=%s unscoped_count=%s filters=%s",
+            user_id,
+            is_admin,
+            count_without_user_scope,
+            query_filters,
+        )
+
+
 def _safe_str_value(value: Any) -> Optional[str]:
     """Extract string value, returning None for NaN/None values.
 
@@ -251,6 +299,12 @@ def read_chunks_for_embedding(
             is_admin=is_admin,
         )
         if total_count == 0:
+            _maybe_log_chunks_hidden_by_user_filter(
+                vector_store,
+                query_filters,
+                user_id=user_id,
+                is_admin=is_admin,
+            )
             logger.info("No chunks found for the given criteria")
             return EmbeddingReadResponse(chunks=[], total_count=0, pending_count=0)
 

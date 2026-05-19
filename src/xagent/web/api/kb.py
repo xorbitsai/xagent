@@ -1,6 +1,8 @@
 """Knowledge base API route handlers"""
 
 import asyncio
+import concurrent.futures
+import contextvars
 import functools
 import hashlib
 import json
@@ -75,7 +77,10 @@ from ...core.tools.core.RAG_tools.pipelines.web_ingestion import (
 )
 from ...core.tools.core.RAG_tools.progress import get_progress_manager
 from ...core.tools.core.RAG_tools.storage.contracts import DocumentRecord
-from ...core.tools.core.RAG_tools.storage.factory import get_vector_index_store
+from ...core.tools.core.RAG_tools.storage.factory import (
+    get_metadata_store,
+    get_vector_index_store,
+)
 from ...core.tools.core.RAG_tools.utils.string_utils import (
     generate_deterministic_doc_id,
 )
@@ -891,6 +896,47 @@ def with_kb_user_scope(func: T) -> T:
 # Create router
 kb_router = APIRouter(prefix="/api/kb", tags=["kb"])
 
+# Shared executor for ingestion tasks to prevent global thread pool exhaustion
+_ingest_executor = concurrent.futures.ThreadPoolExecutor(
+    max_workers=10, thread_name_prefix="ingest_worker_"
+)
+
+
+def shutdown_ingest_executor() -> None:
+    """Shutdown the shared ingestion executor gracefully.
+
+    Called during application shutdown to ensure pending tasks complete
+    and resources are properly released. Uses a timeout to prevent blocking
+    application shutdown indefinitely.
+    """
+    logger.info("Shutting down ingestion executor...")
+    try:
+        import threading
+
+        shutdown_complete = threading.Event()
+
+        def wait_for_shutdown() -> None:
+            _ingest_executor.shutdown(wait=True)
+            shutdown_complete.set()
+
+        shutdown_thread = threading.Thread(target=wait_for_shutdown, daemon=True)
+        shutdown_thread.start()
+
+        if shutdown_complete.wait(timeout=30):
+            logger.info("Ingestion executor shutdown complete")
+        else:
+            logger.warning(
+                "Executor shutdown timed out after 30s; forcing shutdown. "
+                "Some ingestion tasks may be incomplete."
+            )
+            _ingest_executor.shutdown(wait=False)
+    except Exception as e:
+        logger.error("Error during executor shutdown: %s", e)
+        try:
+            _ingest_executor.shutdown(wait=False)
+        except Exception:
+            pass
+
 
 class CloudFile(BaseModel):
     provider: str
@@ -1408,8 +1454,12 @@ async def ingest(
                 file_id=str(file_record.file_id),
             )
 
+        ingest_ctx = contextvars.copy_context()
         loop = asyncio.get_running_loop()
-        result: IngestionResult = await loop.run_in_executor(None, _run_ingestion)
+        result: IngestionResult = await loop.run_in_executor(
+            _ingest_executor,
+            lambda: ingest_ctx.run(_run_ingestion),
+        )
 
         if result.status in {"error", "partial"}:
             await _rollback_failed_ingestion(
@@ -1675,15 +1725,22 @@ async def ingest_cloud(
                         file_config = config.model_copy(
                             update={"parse_method": normalized_parse_method}
                         )
-                        result = await asyncio.to_thread(
-                            run_document_ingestion,
-                            collection=safe_collection,
-                            source_path=str(file_path),
-                            ingestion_config=file_config,
-                            progress_manager=progress_manager,
-                            user_id=int(_user.id),
-                            is_admin=bool(_user.is_admin),
-                            file_id=str(file_record.file_id),
+
+                        def _run_cloud_ingestion() -> IngestionResult:
+                            return run_document_ingestion(
+                                collection=safe_collection,
+                                source_path=str(file_path),
+                                ingestion_config=file_config,
+                                progress_manager=progress_manager,
+                                user_id=int(_user.id),
+                                is_admin=bool(_user.is_admin),
+                                file_id=str(file_record.file_id),
+                            )
+
+                        cloud_ctx = contextvars.copy_context()
+                        result = await asyncio.get_running_loop().run_in_executor(
+                            _ingest_executor,
+                            lambda: cloud_ctx.run(_run_cloud_ingestion),
                         )
                         if result.status in {"error", "partial"}:
                             await _rollback_failed_cloud_ingestion(
@@ -2632,9 +2689,8 @@ async def ingest_web(
             finally:
                 db_session.close()
 
-        result = await asyncio.get_event_loop().run_in_executor(
-            None,
-            lambda: asyncio.run(
+        def _run_web_ingestion_blocking() -> WebIngestionResult:
+            return asyncio.run(
                 run_web_ingestion(
                     collection=safe_collection,
                     crawl_config=crawl_config,
@@ -2643,7 +2699,12 @@ async def ingest_web(
                     is_admin=bool(_user.is_admin),
                     file_handler=_file_handler_with_db,
                 )
-            ),
+            )
+
+        web_ctx = contextvars.copy_context()
+        result = await asyncio.get_running_loop().run_in_executor(
+            _ingest_executor,
+            lambda: web_ctx.run(_run_web_ingestion_blocking),
         )
 
         if result.status == "error":
@@ -3858,6 +3919,10 @@ async def delete_document_api(
 async def rename_collection_api(
     collection_name: str,
     new_name: str = Form(..., description="New collection name"),
+    target_user_id: Optional[int] = Form(
+        None,
+        description="Admin only: user whose collection scope to rename",
+    ),
     _user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ) -> dict:
@@ -3866,6 +3931,7 @@ async def rename_collection_api(
     Args:
         collection_name: Current collection name
         new_name: New collection name
+        target_user_id: Required for admins; scopes rename to that user's data only
 
     Returns:
         Success message
@@ -3875,12 +3941,19 @@ async def rename_collection_api(
         load_ingestion_status,
         write_ingestion_status,
     )
-    from ...core.tools.core.RAG_tools.storage.factory import (
-        get_metadata_store,
-        get_vector_index_store,
-    )
 
+    metadata_store = get_metadata_store()
     vector_store = get_vector_index_store()
+
+    if bool(_user.is_admin):
+        if target_user_id is None:
+            raise HTTPException(
+                status_code=422,
+                detail="Admin rename requires target_user_id form field",
+            )
+        scope_user_id = int(target_user_id)
+    else:
+        scope_user_id = int(_user.id)
 
     if not new_name or not new_name.strip():
         raise HTTPException(
@@ -3903,12 +3976,40 @@ async def rename_collection_api(
     if safe_new_collection == safe_old_collection:
         return {"status": "success", "message": "Collection name unchanged"}
 
+    is_admin_rename = bool(_user.is_admin)
+    if not is_admin_rename:
+        occupant_count = await metadata_store.count_users_with_collection_config(
+            safe_old_collection
+        )
+        if occupant_count > 1:
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    "Collection name is shared by multiple users; "
+                    "rename is not allowed. Contact an administrator."
+                ),
+            )
+
     # Access control check
-    await _ensure_collection_access(safe_old_collection, _user, hide_missing=False)
+    if is_admin_rename:
+        visible_for_scope = await _list_collections_with_retry(
+            user_id=scope_user_id,
+            is_admin=False,
+            stage="rename_list_visible_collections_for_target_user",
+        )
+        if not any(
+            c.name == safe_old_collection for c in visible_for_scope.collections
+        ):
+            raise HTTPException(
+                status_code=404,
+                detail=f"Collection not found for user: {safe_old_collection}",
+            )
+    else:
+        await _ensure_collection_access(safe_old_collection, _user, hide_missing=False)
 
     # Validate that target collection doesn't exist or user has access
     visible_for_user = await _list_collections_with_retry(
-        user_id=int(_user.id),
+        user_id=scope_user_id,
         is_admin=False,
         stage="rename_list_visible_collections",
     )
@@ -3935,8 +4036,8 @@ async def rename_collection_api(
     new_collection_dir: Optional[Path] = None
     collection_records = vector_store.list_document_records(
         collection_name=safe_old_collection,
-        user_id=int(_user.id),
-        is_admin=bool(_user.is_admin),
+        user_id=scope_user_id,
+        is_admin=False,
     )
     collection_file_ids = {
         file_id
@@ -3948,7 +4049,7 @@ async def rename_collection_api(
 
     physical_rename = rename_collection_storage(
         db,
-        user_id=int(_user.id),
+        user_id=scope_user_id,
         old_collection_name=safe_old_collection,
         new_collection_name=safe_new_collection,
         collection_file_ids=collection_file_ids,
@@ -3973,20 +4074,21 @@ async def rename_collection_api(
         )
 
     # Step 2: Update collection name in all tables (documents, parses, chunks, embeddings)
-    # Use storage abstraction layer which handles all tables including embeddings
-    vector_store = get_vector_index_store()
     warnings.extend(
         vector_store.rename_collection_data(
             collection_name=safe_old_collection,
             new_name=safe_new_collection,
+            user_id=scope_user_id,
+            is_admin=False,
         )
     )
 
     try:
-        metadata_store = get_metadata_store()
         await metadata_store.rename_collection(
             old_name=safe_old_collection,
             new_name=safe_new_collection,
+            user_id=scope_user_id,
+            is_admin=is_admin_rename,
         )
     except Exception as e:
         logger.warning("Failed to rename metadata store keys: %s", e)
@@ -3994,7 +4096,11 @@ async def rename_collection_api(
 
     # Migrate ingestion status from old collection name to new
     try:
-        status_entries = load_ingestion_status(collection=safe_old_collection)
+        status_entries = load_ingestion_status(
+            collection=safe_old_collection,
+            user_id=scope_user_id,
+            is_admin=False,
+        )
         for entry in status_entries:
             doc_id = entry.get("doc_id")
             if doc_id:
@@ -4004,8 +4110,14 @@ async def rename_collection_api(
                     status=entry.get("status", "pending"),
                     message=entry.get("message", ""),
                     parse_hash=entry.get("parse_hash", ""),
+                    user_id=scope_user_id,
                 )
-                clear_ingestion_status(safe_old_collection, doc_id)
+                clear_ingestion_status(
+                    safe_old_collection,
+                    doc_id,
+                    user_id=scope_user_id,
+                    is_admin=False,
+                )
     except Exception as e:
         logger.warning("Failed to update ingestion status: %s", e)
         warnings.append(f"Failed to update ingestion status: {e}")

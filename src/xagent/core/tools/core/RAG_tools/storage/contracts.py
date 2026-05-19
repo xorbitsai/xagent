@@ -334,16 +334,36 @@ class MetadataStore(ABC):
         """Delete persisted metadata/config rows for a collection."""
 
     @abstractmethod
-    async def rename_collection(self, old_name: str, new_name: str) -> None:
-        """Rename persisted control-plane keys after a data-plane collection rename.
+    async def count_users_with_collection_config(self, collection_name: str) -> int:
+        """Count distinct users with a ``collection_config`` row for ``collection_name``.
 
-        Updates rows that gate :meth:`list_collections` visibility (for example
-        per-tenant config rows and aggregate metadata) so they stay aligned with
-        vector tables when the ``collection`` / ``name`` fields change.
+        Args:
+            collection_name: Collection name (sanitized by the caller).
+
+        Returns:
+            Number of distinct ``user_id`` values occupying the name.
+        """
+
+    @abstractmethod
+    async def rename_collection(
+        self,
+        old_name: str,
+        new_name: str,
+        *,
+        user_id: int,
+        is_admin: bool = False,
+    ) -> None:
+        """Rename persisted control-plane keys for one user's collection scope.
+
+        Updates the caller's ``collection_config`` row. Global ``collection_metadata``
+        is renamed only when this user is the sole config occupant of ``old_name``.
 
         Args:
             old_name: Previous collection name (sanitized by the caller).
             new_name: Target collection name (sanitized by the caller).
+            user_id: User whose config (and optionally metadata) should be renamed.
+            is_admin: Whether the operation is performed by an admin on behalf of
+                ``user_id`` (does not broaden vector/config scope beyond ``user_id``).
         """
 
     @abstractmethod
@@ -445,8 +465,22 @@ class VectorIndexStore(ABC):
         self,
         collection_name: str,
         new_name: str,
+        user_id: Optional[int],
+        is_admin: bool,
     ) -> List[str]:
         """Rename collection key across vector-side tables.
+
+        Applies the same multi-tenancy filter semantics as
+        :meth:`delete_collection_data`: non-admin callers only rename rows they
+        can see (``user_id`` match; legacy NULL ``user_id`` is admin-only).
+        Admins omit the user predicate and rename all rows for the old collection
+        name.
+
+        Args:
+            collection_name: Current collection name stored in vector tables.
+            new_name: Target collection name after rename.
+            user_id: User ID for multi-tenancy filtering.
+            is_admin: Whether the caller has admin privileges.
 
         Returns:
             Warning messages generated during best-effort updates.

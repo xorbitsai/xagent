@@ -1288,14 +1288,12 @@ def test_kb_delete_returns_physical_cleanup_status(test_env, temp_uploads):
         data = response.json()
 
         # Should include physical cleanup information in warnings
-        assert "warnings" in data or "message" in data
-        if "warnings" in data:
-            # Check that warnings include physical cleanup status
-            warnings_text = " ".join(data["warnings"]).lower()
-            assert any(
-                keyword in warnings_text
-                for keyword in ["physical", "directory", "cleanup", "removed"]
-            )
+        assert "warnings" in data
+        warnings_text = " ".join(data["warnings"]).lower()
+        assert any(
+            keyword in warnings_text
+            for keyword in ["physical", "directory", "cleanup", "removed"]
+        )
 
 
 def test_kb_delete_skips_uploaded_file_cleanup_when_logical_delete_fails(

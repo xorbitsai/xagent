@@ -38,9 +38,12 @@ import { CloudConnectDialog, CloudFile } from "./cloud-connect-dialog"
 interface IngestionResult {
   collection: string
   document_count: number
-  chunks_count: number
+  chunk_count: number
+  embedding_count?: number
+  vector_count?: number
   status: string
   message: string
+  warnings?: string[]
   failed_step?: string
 }
 
@@ -357,16 +360,29 @@ export function KnowledgeBaseCreationDialog({ open, onOpenChange, onSuccess }: K
           }))
         }
 
-        const result = isJsonRecord(parsed.data) ? parsed.data as unknown as IngestionResult : null
+        const result = isJsonRecord(parsed.data)
+          ? (parsed.data as unknown as IngestionResult)
+          : null
         if (!result) {
           throw new Error(t("kb.errors.uploadFailedFile", { name: file.name }))
         }
-        setIngestionResults(prev => [...prev, result])
 
-        if (result.status === "partial" && result.failed_step) {
-          throw new Error(result.message || t("kb.errors.failedAtStep", { step: result.failed_step }))
+        if (result.status === "error") {
+          throw new Error(result.message || t("kb.errors.uploadFailedFile", { name: file.name }))
+        }
+        if (result.status === "partial") {
+          toast.warning(
+            result.message + (result.warnings?.length ? ` Warnings: ${result.warnings.join(", ")}` : "")
+          )
+        }
+        if (result.status === "success" && (result.embedding_count ?? 0) === 0 && (result.chunk_count ?? 0) > 0) {
+          toast.error(
+            "文档上传成功，但 embedding 生成失败（" + result.chunk_count + " 个 chunks 未生成 embedding）。文档无法被搜索。请检查 embedding 模型配置和 API 状态。" +
+            (result.warnings?.length ? ` 警告: ${result.warnings.join(", ")}` : "")
+          )
         }
 
+        setIngestionResults(prev => [...prev, result])
         successfulCollections.push(collectionName)
         setCompletedUploadCount(i + 1)
         setUploadProgress(((i + 1) / selectedFiles.length) * 100)
@@ -457,6 +473,16 @@ export function KnowledgeBaseCreationDialog({ open, onOpenChange, onSuccess }: K
       if (!result) {
         throw new Error(t("kb.errors.webIngestFailed"))
       }
+
+      if (result.status === "error") {
+        throw new Error(result.message || t("kb.errors.webIngestFailed"))
+      }
+      if (result.status === "partial") {
+        toast.warning(
+          result.message + (result.warnings?.length ? ` Warnings: ${result.warnings.join(", ")}` : "")
+        )
+      }
+
       setWebIngestionResult(result)
       setWebIngestionProgress(100)
 
@@ -1011,7 +1037,7 @@ export function KnowledgeBaseCreationDialog({ open, onOpenChange, onSuccess }: K
                                       {result.document_count} {t("kb.dialog.fileUpload.processResult.createDocuments")}
                                     </Badge>
                                     <Badge variant="secondary" className="text-xs font-normal">
-                                      {result.chunks_count} {t("kb.dialog.fileUpload.processResult.textChunks")}
+                                      {result.chunk_count} {t("kb.dialog.fileUpload.processResult.textChunks")}
                                     </Badge>
                                   </>
                                 )}

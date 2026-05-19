@@ -152,9 +152,23 @@ async def search_knowledge_base(
         RuntimeError: If search fails
     """
     try:
+        logger.debug(
+            "Listing collections for search: UserID=%s, IsAdmin=%s, Query='%s'",
+            user_id,
+            is_admin,
+            tool_args.query[:100] + ("..." if len(tool_args.query) > 100 else ""),
+        )
         # List all collections
         collections_result = await list_collections(user_id=user_id, is_admin=is_admin)
 
+        logger.debug(
+            "Found %d collections: %s",
+            len(collections_result.collections),
+            [
+                (c.name, c.documents, c.chunks, c.embeddings)
+                for c in collections_result.collections
+            ],
+        )
         if not collections_result.collections:
             return KnowledgeSearchResult(
                 results=[],
@@ -165,13 +179,13 @@ async def search_knowledge_base(
         available_names = {c.name for c in collections_result.collections}
 
         # Debug: Log available collections for troubleshooting
-        logger.info(
+        logger.debug(
             f"📚 Available knowledge base collections: {sorted(available_names)}"
         )
         if tool_args.collections:
-            logger.info(f"   - Requested collections: {tool_args.collections}")
+            logger.debug(f"   - Requested collections: {tool_args.collections}")
         if tool_args.allowed_collections:
-            logger.info(f"   - Allowed collections: {tool_args.allowed_collections}")
+            logger.debug(f"   - Allowed collections: {tool_args.allowed_collections}")
 
         if tool_args.collections:
             # User specified collections - validate against allowed_collections
@@ -205,7 +219,7 @@ async def search_knowledge_base(
             collections_to_iterate = [
                 c for c in collections_result.collections if c.name in collections_set
             ]
-            logger.info(f"Searching specific collections: {sorted(collections_set)}")
+            logger.debug(f"Searching specific collections: {sorted(collections_set)}")
         elif tool_args.allowed_collections is not None:
             # Use allowed_collections as default
             allowed_set = set(tool_args.allowed_collections)
@@ -228,10 +242,10 @@ async def search_knowledge_base(
             collections_to_iterate = [
                 c for c in collections_result.collections if c.name in valid_collections
             ]
-            logger.info(f"Searching allowed collections: {sorted(valid_collections)}")
+            logger.debug(f"Searching allowed collections: {sorted(valid_collections)}")
         else:
             collections_to_iterate = collections_result.collections
-            logger.info("Searching all collections")
+            logger.debug("Searching all collections")
 
         # Build search config
         search_config = {
@@ -250,6 +264,11 @@ async def search_knowledge_base(
         collection_warnings: list[str] = []
         total_searched = 0
 
+        logger.debug(
+            "Starting search across %d collections: %s",
+            len(collections_to_iterate),
+            [c.name for c in collections_to_iterate],
+        )
         for collection_info in collections_to_iterate:
             collection_name = collection_info.name
 
@@ -261,7 +280,7 @@ async def search_knowledge_base(
                 continue
 
             try:
-                logger.info(
+                logger.debug(
                     f"Searching collection '{collection_name}' for: {tool_args.query}"
                 )
 

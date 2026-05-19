@@ -1067,3 +1067,57 @@ def test_delete_collection_removes_metadata_table_entry(temp_lancedb_dir: str) -
     after_table = conn.open_table("collection_metadata")
     after = after_table.search().where(f"name = '{collection}'").to_list()
     assert after == []
+
+
+@pytest.mark.asyncio
+async def test_metadata_rename_collection_preserves_other_users_config_when_shared(
+    temp_lancedb_dir: str,
+) -> None:
+    """Tenant-scoped metadata rename must not retarget another user's config row."""
+    from src.xagent.core.tools.core.RAG_tools.core.schemas import CollectionInfo
+
+    collection = "shared_rename"
+    store = get_metadata_store()
+    await store.save_collection(CollectionInfo(name=collection))
+    await store.save_collection_config(collection, "{}", user_id=1)
+    await store.save_collection_config(collection, "{}", user_id=2)
+
+    await store.rename_collection(
+        collection,
+        "user1_new",
+        user_id=1,
+        is_admin=False,
+    )
+
+    assert await store.get_collection_config("user1_new", user_id=1) == "{}"
+    assert await store.get_collection_config(collection, user_id=2) == "{}"
+    assert await store.get_collection_config("user1_new", user_id=2) is None
+
+    listed = await list_collections(user_id=None, is_admin=True)
+    names = {info.name for info in listed.collections}
+    assert collection in names
+    assert "user1_new" in names
+
+
+@pytest.mark.asyncio
+async def test_metadata_rename_collection_admin_scopes_to_target_user_only(
+    temp_lancedb_dir: str,
+) -> None:
+    """Admin rename for one user must leave other occupants on the old name."""
+    from src.xagent.core.tools.core.RAG_tools.core.schemas import CollectionInfo
+
+    collection = "shared_admin_rename"
+    store = get_metadata_store()
+    await store.save_collection(CollectionInfo(name=collection))
+    await store.save_collection_config(collection, "{}", user_id=10)
+    await store.save_collection_config(collection, "{}", user_id=20)
+
+    await store.rename_collection(
+        collection,
+        "user10_new",
+        user_id=10,
+        is_admin=True,
+    )
+
+    assert await store.get_collection_config("user10_new", user_id=10) == "{}"
+    assert await store.get_collection_config(collection, user_id=20) == "{}"

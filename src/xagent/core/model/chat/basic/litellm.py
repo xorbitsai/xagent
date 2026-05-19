@@ -10,7 +10,7 @@ from .base import BaseLLM
 logger = logging.getLogger(__name__)
 
 
-class LiteLLMLLM(BaseLLM):
+class LiteLLMChat(BaseLLM):
     """
     LiteLLM client providing access to 100+ LLM providers through a unified interface.
     Uses provider-prefixed model names (e.g. openai/gpt-4o, anthropic/claude-sonnet-4-6).

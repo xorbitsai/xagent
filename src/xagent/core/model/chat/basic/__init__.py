@@ -4,7 +4,7 @@ from .base import BaseLLM
 from .claude import ClaudeLLM
 from .deepseek import DeepSeekLLM
 from .gemini import GeminiLLM
-from .litellm import LiteLLMLLM
+from .litellm import LiteLLMChat
 from .openai import OpenAILLM
 from .zhipu import ZhipuLLM
 
@@ -16,6 +16,6 @@ __all__ = [
     "ZhipuLLM",
     "GeminiLLM",
     "ClaudeLLM",
-    "LiteLLMLLM",
+    "LiteLLMChat",
     "create_base_llm",
 ]

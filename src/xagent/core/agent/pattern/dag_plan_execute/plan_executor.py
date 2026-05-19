@@ -812,6 +812,21 @@ class PlanExecutor:
             )
             self.step_execution_results[step.id] = step_execution_result
 
+            # Respect the step's self-reported success: when ReAct's final_answer
+            # was emitted with `success: false` (or a tool bubbled `success: false`
+            # up without the LLM overriding it), the step is a failure even though
+            # the agent loop returned normally. Marking it COMPLETED would let
+            # result_analyzer's summary treat the failure as a success and the
+            # final-answer LLM would never see the error.
+            step_reported_success = not (
+                isinstance(result, dict) and result.get("success") is False
+            )
+            step_reported_error = ""
+            if not step_reported_success and isinstance(result, dict):
+                step_reported_error = str(
+                    result.get("error") or "Step reported success=false"
+                )
+
             # Trace step completion with detailed execution information
             step_trace_data = {
                 "step_id": step.id,
@@ -820,12 +835,18 @@ class PlanExecutor:
                 "result": result,
                 # Add execution details for better trace visibility
                 "tool_names": step.tool_names,
-                "status": StepStatus.COMPLETED.value,
+                "status": (
+                    StepStatus.COMPLETED.value
+                    if step_reported_success
+                    else StepStatus.FAILED.value
+                ),
                 "start_time": step.started_at.isoformat() if step.started_at else None,
                 "end_time": step.completed_at.isoformat()
                 if step.completed_at
                 else None,
             }
+            if not step_reported_success:
+                step_trace_data["error"] = step_reported_error
 
             # Extract meaningful execution details from result if available
             if isinstance(result, dict):
@@ -935,11 +956,19 @@ class PlanExecutor:
                             message=error_msg,
                         )
 
-            step.status = StepStatus.COMPLETED
-
-            logger.info(
-                f"Step {step.id} completed in {(step.completed_at - step.started_at).total_seconds():.2f}s"
-            )
+            if step_reported_success:
+                step.status = StepStatus.COMPLETED
+                logger.info(
+                    f"Step {step.id} completed in {(step.completed_at - step.started_at).total_seconds():.2f}s"
+                )
+            else:
+                step.status = StepStatus.FAILED
+                step.error = step_reported_error
+                step.error_type = "StepReportedFailure"
+                logger.warning(
+                    f"Step {step.id} marked FAILED — result reported success=false: "
+                    f"{step_reported_error[:200]}"
+                )
 
             return result
 

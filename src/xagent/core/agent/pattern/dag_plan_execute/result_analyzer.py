@@ -519,6 +519,25 @@ STORAGE THRESHOLD: Be extremely conservative. Default to should_store = false un
                             # Include full content for goal checking
                             iteration_summary += f"- {step_name}: {content}\n"
 
+                # Surface failed-step errors so the goal-check LLM sees them. An
+                # earlier version of the summary only listed successful steps,
+                # so a step whose tool returned success=false but whose stdout
+                # was empty disappeared from the LLM's view entirely.
+                if failed > 0:
+                    iteration_summary += "\nFailed Step Results:\n"
+                    for result in results:
+                        if result.get("status") == "failed":
+                            step_name = result.get("step_name", "Unknown")
+                            step_result = result.get("result", {})
+                            error = result.get("error") or (
+                                step_result.get("error", "")
+                                if isinstance(step_result, dict)
+                                else ""
+                            )
+                            iteration_summary += (
+                                f"- {step_name}: FAILED — {error or 'unknown error'}\n"
+                            )
+
             summary_parts.append(iteration_summary)
 
         return "\n".join(summary_parts) if summary_parts else "No execution history"
@@ -698,6 +717,15 @@ STORAGE THRESHOLD: Be extremely conservative. Default to should_store = false un
         if not isinstance(result, dict):
             return str(result)
 
+        # Prepend the error message when present. The content keys below can
+        # all be empty even when the step raised (e.g. a JS executor that
+        # aborts before any console.log produces empty stdout but a populated
+        # `error`), so without this the summarizer would see nothing.
+        error_msg = result.get("error")
+        error_prefix = ""
+        if isinstance(error_msg, str) and error_msg.strip():
+            error_prefix = f"[error: {error_msg.strip()}] "
+
         # Try common content keys in priority order
         content_keys = [
             "output",
@@ -716,10 +744,12 @@ STORAGE THRESHOLD: Be extremely conservative. Default to should_store = false un
                     # If it's a dict, try nested keys
                     for nested_key in ["output", "content", "text"]:
                         if nested_key in content:
-                            return str(content[nested_key])
-                return str(content)
+                            return error_prefix + str(content[nested_key])
+                return error_prefix + str(content)
 
-        # If no specific content found, return string representation
+        # If no specific content found, return error (if any) + string repr
+        if error_prefix:
+            return error_prefix.rstrip()
         return str(result)
 
     def _generate_fallback_summary(self, history: List[Dict[str, Any]]) -> str:

@@ -201,6 +201,27 @@ class SandboxedToolWrapper(AbstractBaseTool):
     def state_type(self) -> Optional[Type[BaseModel]]:
         return self._target.state_type()
 
+    def _get_target_workspace(self) -> Optional[TaskWorkspace]:
+        """Return the target tool's bound workspace, if any.
+
+        Sandboxed executor tools (JS/Python/command) hold a TaskWorkspace on
+        ``_workspace``; for FunctionTool wrappers we check the bound method's
+        owner instance instead. Returns None when there is no usable workspace.
+        """
+        candidates: list[Any] = [self._target]
+        if isinstance(self._target, FunctionTool):
+            method_target = extract_bound_method_target(self._target)
+            if method_target is not None:
+                candidates.append(method_target[0])
+
+        for candidate in candidates:
+            workspace = getattr(candidate, "_workspace", None) or getattr(
+                candidate, "workspace", None
+            )
+            if isinstance(workspace, TaskWorkspace):
+                return workspace
+        return None
+
     def _build_execution_env(self) -> dict[str, str]:
         """Build per-exec environment variables (scoped to this process, not the sandbox)."""
         env = {"PYTHONPATH": _SANDBOX_SRC_ROOT}
@@ -359,9 +380,22 @@ class SandboxedToolWrapper(AbstractBaseTool):
             # Execute script in sandbox
             logger.debug(f"Executing tool {self._target.name} in sandbox")
             command = self._build_execution_command(args, result_file)
-            result = await self._sandbox.exec(
-                command[0], *command[1:], env=self._build_execution_env()
-            )
+
+            # Files written by the sandbox process appear on the host via the
+            # mounted workspace volume, but the sandbox cannot reach the host
+            # database, so file registration done inside the sandbox is silently
+            # dropped. Wrap the exec on the host side so new workspace files get
+            # registered with valid file_ids.
+            workspace = self._get_target_workspace()
+            if workspace is not None:
+                with workspace.auto_register_files():
+                    result = await self._sandbox.exec(
+                        command[0], *command[1:], env=self._build_execution_env()
+                    )
+            else:
+                result = await self._sandbox.exec(
+                    command[0], *command[1:], env=self._build_execution_env()
+                )
 
             # Check execution result
             if result.exit_code != 0:

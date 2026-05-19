@@ -219,6 +219,8 @@ async def test_registry_emits_lifecycle_and_message_events(
     assert all(event["execution_id"] == execution_id for event in events)
     assert events[1]["handle"]["status"] == "interrupted"
     assert events[2]["message"] == "Reply with only the number."
+    assert events[2]["display_message"] == "Reply with only the number."
+    assert events[2]["execution_message"] == "Reply with only the number."
     assert registry.unsubscribe(subscription_id) is True
     assert registry.unsubscribe(subscription_id) is False
 

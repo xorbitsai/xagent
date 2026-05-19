@@ -11,11 +11,37 @@ from uuid import uuid4
 
 logger = logging.getLogger(__name__)
 
+DISPLAY_MESSAGE_KEY = "display_message"
 DISPLAY_USER_MESSAGE_KEY = "display_user_message"
+
+
+def _display_message_from_metadata(metadata: Any) -> str | None:
+    if not isinstance(metadata, dict):
+        return None
+    for key in (DISPLAY_MESSAGE_KEY, DISPLAY_USER_MESSAGE_KEY):
+        display_message = metadata.get(key)
+        if isinstance(display_message, str) and display_message.strip():
+            return display_message
+    return None
 
 
 def get_display_user_message(context: Any, fallback: str) -> str:
     """Return the user-visible message for trace/UI events."""
+    messages = getattr(context, "messages", None)
+    if isinstance(messages, list):
+        for message in reversed(messages):
+            if getattr(message, "role", None) != "user":
+                continue
+            display_message = _display_message_from_metadata(
+                getattr(message, "metadata", None)
+            )
+            if display_message:
+                return display_message
+            content = getattr(message, "content", None)
+            if isinstance(content, str) and content.strip():
+                return content
+            break
+
     candidates: list[dict[str, Any]] = []
     if isinstance(context, dict):
         candidates.append(context)
@@ -32,8 +58,8 @@ def get_display_user_message(context: Any, fallback: str) -> str:
         candidates.append(metadata)
 
     for candidate in candidates:
-        display_message = candidate.get(DISPLAY_USER_MESSAGE_KEY)
-        if isinstance(display_message, str) and display_message.strip():
+        display_message = _display_message_from_metadata(candidate)
+        if display_message:
             return display_message
 
     return fallback
@@ -1349,7 +1375,11 @@ async def trace_visualization_update(
 async def trace_user_message(
     tracer: Tracer, task_id: str, message: str, data: Optional[Dict[str, Any]] = None
 ) -> str:
-    """Trace user message event."""
+    """Trace a user-visible message event.
+
+    ``message`` is display text for transcript/UI surfaces. Runtime prompts and
+    internal execution context belong in LLM/runtime trace events instead.
+    """
     event_data = {"message": message}
     if data:
         event_data.update(data)

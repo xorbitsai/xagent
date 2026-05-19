@@ -155,8 +155,11 @@ class AgentExecutionAdapter:
     async def post_user_message(
         self,
         execution_id: str,
-        message: str,
+        message: str | None = None,
         *,
+        execution_message: str | None = None,
+        display_message: str | None = None,
+        files: list[dict[str, Any]] | None = None,
         request_interrupt: bool = True,
         reason: str | None = None,
     ) -> bool:
@@ -173,6 +176,9 @@ class AgentExecutionAdapter:
         context = await self.registry.post_user_message(
             execution_id,
             message,
+            execution_message=execution_message,
+            display_message=display_message,
+            files=files,
             request_interrupt=request_interrupt,
             reason=reason,
         )

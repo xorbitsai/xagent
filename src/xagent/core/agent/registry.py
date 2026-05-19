@@ -204,8 +204,11 @@ class ExecutionRegistry:
     async def inject_user_message(
         self,
         execution_id: str,
-        message: str,
+        message: str | None = None,
         *,
+        execution_message: str | None = None,
+        display_message: str | None = None,
+        files: list[dict[str, Any]] | None = None,
         request_interrupt: bool = True,
         reason: str | None = None,
     ) -> ExecutionContext | None:
@@ -216,6 +219,9 @@ class ExecutionRegistry:
         return await handle.runner.inject_user_message(
             execution_id,
             message,
+            execution_message=execution_message,
+            display_message=display_message,
+            files=files,
             request_interrupt=request_interrupt,
             reason=reason,
         )
@@ -223,23 +229,43 @@ class ExecutionRegistry:
     async def post_user_message(
         self,
         execution_id: str,
-        message: str,
+        message: str | None = None,
         *,
+        execution_message: str | None = None,
+        display_message: str | None = None,
+        files: list[dict[str, Any]] | None = None,
         request_interrupt: bool = True,
         reason: str | None = None,
     ) -> ExecutionContext | None:
         context = await self.inject_user_message(
             execution_id,
             message,
+            execution_message=execution_message,
+            display_message=display_message,
+            files=files,
             request_interrupt=request_interrupt,
             reason=reason,
         )
         handle = self.get(execution_id)
         if handle is not None and context is not None:
+            resolved_execution_message = (
+                execution_message if execution_message is not None else message
+            )
+            resolved_display_message = (
+                display_message
+                if display_message is not None
+                else resolved_execution_message
+            )
             self._emit_event(
                 "execution.message_posted",
                 handle,
-                {"message": message, "request_interrupt": request_interrupt},
+                {
+                    "message": resolved_display_message,
+                    "display_message": resolved_display_message,
+                    "execution_message": resolved_execution_message,
+                    "files": files,
+                    "request_interrupt": request_interrupt,
+                },
             )
         return context
 

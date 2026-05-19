@@ -2056,6 +2056,8 @@ async def handle_chat_message(
                     user_message,
                     bool(file_info_list),
                 )
+                context["display_message"] = display_user_message
+                context["display_user_message"] = display_user_message
 
                 # DAG plan-execute will automatically send user_message trace event
 
@@ -2179,13 +2181,29 @@ async def handle_chat_message(
                     assert agent_service is not None
                     posted = await agent_service.post_user_message(
                         str(task_id),
-                        user_message_for_llm,
+                        execution_message=user_message_for_llm,
+                        display_message=display_user_message,
+                        files=file_info_list,
                         request_interrupt=task.status == TaskStatus.RUNNING,
                         reason="new websocket user message",
                     )
                     if not posted:
                         logger.warning(
                             f"agent execution {task_id} was not live; attempting resume from checkpoint"
+                        )
+                    else:
+                        from ...core.agent.trace import trace_user_message
+
+                        await trace_user_message(
+                            agent_service.tracer,
+                            str(task_id),
+                            display_user_message,
+                            {
+                                "context": context,
+                                "pattern": "Agent Live Control",
+                                "continuation": "true",
+                                "files": file_info_list,
+                            },
                         )
 
                     previous_task = background_task_manager.running_tasks.get(task_id)
@@ -2280,7 +2298,6 @@ async def handle_chat_message(
                         logger.info(f"task_info event sent for existing task {task_id}")
 
                     # Build context with vibe mode information if available
-                    context["display_user_message"] = display_user_message
                     if hasattr(task, "execution_mode") and task.execution_mode:
                         context["execution_mode"] = task.execution_mode
                     if (

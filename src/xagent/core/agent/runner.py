@@ -289,8 +289,11 @@ class AgentRunner:
     async def inject_user_message(
         self,
         execution_id: str,
-        message: str,
+        message: str | None = None,
         *,
+        execution_message: str | None = None,
+        display_message: str | None = None,
+        files: list[dict[str, Any]] | None = None,
         request_interrupt: bool = True,
         reason: str | None = None,
     ) -> ExecutionContext | None:
@@ -305,7 +308,23 @@ class AgentRunner:
             context = ExecutionContext.from_dict(checkpoint["context"])
             self.context_manager.set_context(context)
 
-        context.add_user_message(message)
+        resolved_execution_message = (
+            execution_message if execution_message is not None else message
+        )
+        if resolved_execution_message is None:
+            raise ValueError(
+                "inject_user_message requires message or execution_message"
+            )
+        resolved_display_message = (
+            display_message
+            if display_message is not None
+            else resolved_execution_message
+        )
+        metadata: dict[str, Any] = {"display_message": resolved_display_message}
+        if files is not None:
+            metadata["files"] = files
+
+        context.add_user_message(resolved_execution_message, metadata=metadata)
         await self._persist_injected_context(
             execution_id=execution_id,
             context=context,
@@ -318,8 +337,11 @@ class AgentRunner:
     async def post_user_message(
         self,
         execution_id: str,
-        message: str,
+        message: str | None = None,
         *,
+        execution_message: str | None = None,
+        display_message: str | None = None,
+        files: list[dict[str, Any]] | None = None,
         request_interrupt: bool = True,
         reason: str | None = None,
     ) -> ExecutionContext | None:
@@ -331,6 +353,9 @@ class AgentRunner:
         return await self.inject_user_message(
             execution_id,
             message,
+            execution_message=execution_message,
+            display_message=display_message,
+            files=files,
             request_interrupt=request_interrupt,
             reason=reason,
         )

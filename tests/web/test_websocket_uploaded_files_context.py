@@ -555,6 +555,50 @@ def test_get_display_user_message_reads_agent_context_state():
     )
 
 
+def test_get_display_user_message_prefers_latest_message_metadata():
+    context = SimpleNamespace(
+        metadata={
+            "display_user_message": "First turn",
+        },
+        messages=[
+            SimpleNamespace(
+                role="user",
+                content="First turn",
+                metadata={"display_message": "First turn"},
+            ),
+            SimpleNamespace(
+                role="user",
+                content="Second turn\n\n## UPLOADED FILES\nfile_id=file-123",
+                metadata={"display_message": "Second turn"},
+            ),
+        ],
+    )
+
+    assert get_display_user_message(context, "fallback") == "Second turn"
+
+
+def test_get_display_user_message_does_not_reuse_stale_context_display():
+    context = SimpleNamespace(
+        metadata={
+            "display_user_message": "First turn",
+        },
+        messages=[
+            SimpleNamespace(
+                role="user",
+                content="First turn",
+                metadata={"display_message": "First turn"},
+            ),
+            SimpleNamespace(
+                role="user",
+                content="Second turn",
+                metadata={},
+            ),
+        ],
+    )
+
+    assert get_display_user_message(context, "fallback") == "Second turn"
+
+
 def test_display_message_for_file_only_turn_uses_placeholder():
     assert _display_message_for_user("", has_files=True) == "Uploaded file(s)"
     assert (

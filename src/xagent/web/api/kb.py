@@ -144,7 +144,7 @@ def _validate_web_start_url(start_url: str) -> str:
     """Reject malformed web-ingestion start URLs before crawling starts."""
     normalized = start_url.strip()
     parsed = urlparse(normalized)
-    if parsed.scheme not in {"http", "https"}:
+    if parsed.scheme.lower() not in {"http", "https"}:
         raise HTTPException(
             status_code=422,
             detail="Invalid start_url: URL must start with http:// or https://",

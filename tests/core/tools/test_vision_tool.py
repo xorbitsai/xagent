@@ -325,6 +325,42 @@ class TestVisionToolUnderstandImages:
         assert call_args.kwargs.get("max_tokens") == 200
 
     @pytest.mark.asyncio
+    async def test_understand_coerces_string_numeric_parameters(
+        self, vision_tool_without_workspace, mock_vision_model
+    ):
+        """Tool calls may pass optional numeric arguments as strings."""
+        result = await vision_tool_without_workspace.understand_images(
+            "data:image/jpeg;base64,ZmFrZV9pbWFnZV9kYXRh",
+            "What is in this image?",
+            temperature="0.7",
+            max_tokens="200",
+        )
+
+        assert result.success is True
+
+        call_args = mock_vision_model.vision_chat.call_args
+        assert call_args.kwargs.get("temperature") == 0.7
+        assert call_args.kwargs.get("max_tokens") == 200
+
+    @pytest.mark.asyncio
+    async def test_understand_ignores_blank_optional_numeric_parameters(
+        self, vision_tool_without_workspace, mock_vision_model
+    ):
+        """Blank optional values should not be sent to OpenAI as strings."""
+        result = await vision_tool_without_workspace.understand_images(
+            "data:image/jpeg;base64,ZmFrZV9pbWFnZV9kYXRh",
+            "What is in this image?",
+            temperature="",
+            max_tokens="",
+        )
+
+        assert result.success is True
+
+        call_args = mock_vision_model.vision_chat.call_args
+        assert call_args.kwargs.get("temperature") is None
+        assert call_args.kwargs.get("max_tokens") is None
+
+    @pytest.mark.asyncio
     async def test_understand_file_not_found_with_workspace(
         self, vision_tool_with_workspace, mock_workspace
     ):
@@ -475,6 +511,23 @@ class TestVisionToolDetectObjects:
         messages = call_kwargs["messages"]
         prompt = messages[0]["content"][0]["text"]  # User message text
         assert "0.9" in prompt
+
+    @pytest.mark.asyncio
+    async def test_detect_objects_preserves_zero_temperature(
+        self, mock_vision_model_with_detection
+    ):
+        """A valid zero temperature should not be replaced by the detection default."""
+        vision_tool = VisionTool(mock_vision_model_with_detection)
+        result = await vision_tool.detect_objects(
+            "data:image/jpeg;base64,ZmFrZV9pbWFnZV9kYXRh",
+            task="Detect objects",
+            temperature=0.0,
+        )
+
+        assert result.success is True
+
+        call_kwargs = mock_vision_model_with_detection.vision_chat.call_args.kwargs
+        assert call_kwargs["temperature"] == 0.0
 
     @pytest.mark.asyncio
     async def test_detect_objects_unstructured_response(

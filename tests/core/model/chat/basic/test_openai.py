@@ -254,6 +254,43 @@ class TestOpenAILLM:
         assert call_args.kwargs["max_tokens"] == 50
 
     @pytest.mark.asyncio
+    async def test_vision_chat_preserves_zero_temperature(
+        self, openai_llm_config, mock_chat_completion, mocker
+    ):
+        """Vision calls should preserve explicit 0.0 instead of using defaults."""
+        mock_client = mocker.AsyncMock()
+        mock_client.chat.completions.create.return_value = mock_chat_completion
+        mocker.patch(
+            "xagent.core.model.chat.basic.openai.AsyncOpenAI",
+            return_value=mock_client,
+        )
+
+        llm = OpenAILLM(**openai_llm_config, abilities=["chat", "vision"])
+        messages = [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "Describe this image."},
+                    {
+                        "type": "image_url",
+                        "image_url": {
+                            "url": "data:image/jpeg;base64,ZmFrZV9pbWFnZV9kYXRh"
+                        },
+                    },
+                ],
+            }
+        ]
+
+        response = await llm.vision_chat(messages, temperature=0.0)
+
+        assert isinstance(response, dict)
+        assert response.get("type") == "text"
+
+        call_args = mock_client.chat.completions.create.call_args
+        assert call_args.kwargs["temperature"] == 0.0
+        assert call_args.kwargs["max_tokens"] == 1024
+
+    @pytest.mark.asyncio
     async def test_cleanup(self, openai_llm_config, mock_chat_completion, mocker):
         """Test that client cleanup works properly."""
         # Setup mock

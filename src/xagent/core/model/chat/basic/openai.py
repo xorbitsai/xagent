@@ -458,10 +458,18 @@ class OpenAILLM(BaseLLM):
         completion_params = {
             "model": self._model_name,
             "messages": self._sanitize_unicode_content(messages),
-            "temperature": temperature or self.default_temperature,
-            "max_tokens": max_tokens or self.default_max_tokens,
             **kwargs,
         }
+
+        if max_tokens is not None:
+            completion_params["max_tokens"] = max_tokens
+        elif self.default_max_tokens is not None:
+            completion_params["max_tokens"] = self.default_max_tokens
+
+        if temperature is not None:
+            completion_params["temperature"] = temperature
+        elif self.default_temperature is not None:
+            completion_params["temperature"] = self.default_temperature
 
         # Add optional parameters
         if tools:

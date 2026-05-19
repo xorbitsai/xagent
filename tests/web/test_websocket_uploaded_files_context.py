@@ -599,6 +599,20 @@ def test_get_display_user_message_does_not_reuse_stale_context_display():
     assert get_display_user_message(context, "fallback") == "Second turn"
 
 
+def test_get_display_user_message_respects_empty_display_metadata():
+    context = SimpleNamespace(
+        messages=[
+            SimpleNamespace(
+                role="user",
+                content="Internal prompt\n\n## UPLOADED FILES\nfile_id=file-123",
+                metadata={"display_message": ""},
+            ),
+        ],
+    )
+
+    assert get_display_user_message(context, "fallback") == ""
+
+
 def test_display_message_for_file_only_turn_uses_placeholder():
     assert _display_message_for_user("", has_files=True) == "Uploaded file(s)"
     assert (

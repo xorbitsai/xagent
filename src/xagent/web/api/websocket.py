@@ -31,7 +31,7 @@ from ...config import (
     get_external_upload_dirs,
     get_uploads_dir,
 )
-from ...core.agent.trace import TraceEvent, TraceHandler
+from ...core.agent.trace import TraceEvent, TraceHandler, trace_user_message
 from ...core.file_ref import FILE_REF_MODEL_INSTRUCTIONS, build_file_ref
 from ..auth_dependencies import get_user_from_websocket_token
 from ..models.database import get_db
@@ -2057,7 +2057,6 @@ async def handle_chat_message(
                     bool(file_info_list),
                 )
                 context["display_message"] = display_user_message
-                context["display_user_message"] = display_user_message
 
                 # DAG plan-execute will automatically send user_message trace event
 
@@ -2106,8 +2105,6 @@ async def handle_chat_message(
                     if hasattr(dag_pattern, "tracer") and hasattr(
                         dag_pattern, "task_id"
                     ):
-                        from ...core.agent.trace import trace_user_message
-
                         trace_data = {
                             "context": context,
                             "pattern": "DAG Plan-Execute Continuation",
@@ -2192,8 +2189,6 @@ async def handle_chat_message(
                             f"agent execution {task_id} was not live; attempting resume from checkpoint"
                         )
                     else:
-                        from ...core.agent.trace import trace_user_message
-
                         await trace_user_message(
                             agent_service.tracer,
                             str(task_id),

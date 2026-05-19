@@ -252,9 +252,7 @@ class ExecutionRegistry:
                 execution_message if execution_message is not None else message
             )
             resolved_display_message = (
-                display_message
-                if display_message is not None
-                else resolved_execution_message
+                display_message if display_message is not None else message
             )
             self._emit_event(
                 "execution.message_posted",

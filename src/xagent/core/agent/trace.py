@@ -19,9 +19,9 @@ def _display_message_from_metadata(metadata: Any) -> str | None:
     if not isinstance(metadata, dict):
         return None
     for key in (DISPLAY_MESSAGE_KEY, DISPLAY_USER_MESSAGE_KEY):
-        display_message = metadata.get(key)
-        if isinstance(display_message, str) and display_message.strip():
-            return display_message
+        if key in metadata:
+            display_message = metadata.get(key)
+            return display_message if isinstance(display_message, str) else ""
     return None
 
 
@@ -35,7 +35,7 @@ def get_display_user_message(context: Any, fallback: str) -> str:
             display_message = _display_message_from_metadata(
                 getattr(message, "metadata", None)
             )
-            if display_message:
+            if display_message is not None:
                 return display_message
             content = getattr(message, "content", None)
             if isinstance(content, str) and content.strip():
@@ -59,7 +59,7 @@ def get_display_user_message(context: Any, fallback: str) -> str:
 
     for candidate in candidates:
         display_message = _display_message_from_metadata(candidate)
-        if display_message:
+        if display_message is not None:
             return display_message
 
     return fallback

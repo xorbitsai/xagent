@@ -315,10 +315,13 @@ class AgentRunner:
             raise ValueError(
                 "inject_user_message requires message or execution_message"
             )
+        if display_message is None and message is None:
+            raise ValueError(
+                "inject_user_message requires display_message when "
+                "execution_message is provided without legacy message"
+            )
         resolved_display_message = (
-            display_message
-            if display_message is not None
-            else resolved_execution_message
+            display_message if display_message is not None else message
         )
         metadata: dict[str, Any] = {"display_message": resolved_display_message}
         if files is not None:

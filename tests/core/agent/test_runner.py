@@ -701,6 +701,38 @@ async def test_runner_post_user_message_preserves_display_and_execution_contract
 
 
 @pytest.mark.asyncio
+async def test_runner_post_user_message_rejects_execution_without_display(
+    tmp_path: Path,
+) -> None:
+    tracer = TracerCheckpointStore()
+    agent = Agent(name="writer", patterns=[FakePattern({"success": True})])
+    runner = AgentRunner(
+        agent=agent,
+        tracer=tracer,
+        workspace_manager=FakeWorkspaceManager(tmp_path),
+    )
+    checkpoint_context = ExecutionContext(execution_id="exec-display-required")
+    checkpoint_context.add_user_message("Original task")
+    await tracer.checkpoint(
+        type="checkpoint",
+        execution_id="exec-display-required",
+        pattern="FakePattern",
+        label="before_llm",
+        status="interrupted",
+        context=checkpoint_context.to_dict(),
+        pattern_state={},
+        metadata={},
+    )
+
+    with pytest.raises(ValueError, match="requires display_message"):
+        await runner.post_user_message(
+            "exec-display-required",
+            execution_message="Read file\n\n## UPLOADED FILES\nfile_id=file-123",
+            request_interrupt=False,
+        )
+
+
+@pytest.mark.asyncio
 async def test_trace_callback_does_not_emit_completion_for_interrupted_run(
     tmp_path: Path,
 ) -> None:

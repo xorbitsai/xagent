@@ -62,73 +62,81 @@ def _make_tool_map() -> Dict[str, Any]:
     return {"execute_javascript_code": tool}
 
 
-@pytest.mark.asyncio
-async def test_step_marked_failed_when_react_reports_success_false(monkeypatch):
-    """ReAct returning success=False ⇒ step.status = FAILED with the error attached."""
-    executor = _make_executor()
-    step = _make_step()
+def _patch_react_with_result(monkeypatch, result: Dict[str, Any]) -> None:
+    """Make every ReAct step return `result` immediately."""
 
-    react_result: Dict[str, Any] = {
-        "type": "final_answer",
-        "content": "I tried to write a pptx but addTable rejected the rows.",
-        "success": False,
-        "error": "addTable: 'rows' should be an array of cells!",
-    }
-
-    async def fake_react(*args: Any, **kwargs: Any) -> Dict[str, Any]:
-        step.started_at = datetime.now()
-        return react_result
+    async def fake_run(*args: Any, **kwargs: Any) -> Dict[str, Any]:
+        return result
 
     fake_pattern = MagicMock()
     fake_pattern.set_step_context = MagicMock()
-    fake_pattern.run_with_context = AsyncMock(side_effect=fake_react)
+    fake_pattern.run_with_context = AsyncMock(side_effect=fake_run)
 
     monkeypatch.setattr(
         "xagent.core.agent.pattern.react.ReActPattern",
         lambda *a, **k: fake_pattern,
     )
 
+
+@pytest.mark.asyncio
+async def test_execute_plan_marks_step_failed_when_react_reports_success_false(
+    monkeypatch,
+):
+    """End-to-end: a ReAct step returning success=False ⇒ plan.step is FAILED.
+
+    Goes through `execute_plan` rather than the internal method directly so
+    the unconditional `step.status = COMPLETED` at the call site is exercised
+    — the fix raises DAGStepError before that assignment runs.
+    """
+    executor = _make_executor()
+    step = _make_step()
     plan = ExecutionPlan(id="p1", goal="g", steps=[step], created_at=datetime.now())
-    executor.current_plan = plan
 
-    result = await executor._execute_step_with_react_agent(step, _make_tool_map())
+    _patch_react_with_result(
+        monkeypatch,
+        {
+            "type": "final_answer",
+            "content": "I tried to write a pptx but addTable rejected the rows.",
+            "success": False,
+            "error": "addTable: 'rows' should be an array of cells!",
+        },
+    )
 
-    assert result is react_result
+    execution_results = await executor.execute_plan(plan, _make_tool_map())
+
     assert step.status == StepStatus.FAILED
     assert "addTable" in (step.error or "")
-    assert step.error_type == "StepReportedFailure"
+    # The exception path records the failure in execution_results so the
+    # result_analyzer's summarizer sees the FAILED status downstream.
+    failed_entries = [r for r in execution_results if r.get("status") == "failed"]
+    assert failed_entries, "execute_plan must record the failure in execution_results"
+    assert "addTable" in str(failed_entries[0])
 
 
 @pytest.mark.asyncio
-async def test_step_marked_completed_when_react_reports_success_true(monkeypatch):
-    """Sanity: the existing success path is unchanged."""
+async def test_execute_plan_keeps_step_completed_when_react_reports_success_true(
+    monkeypatch,
+):
+    """Sanity: existing success path through execute_plan unchanged."""
     executor = _make_executor()
     step = _make_step()
+    plan = ExecutionPlan(id="p1", goal="g", steps=[step], created_at=datetime.now())
 
-    async def fake_react(*args: Any, **kwargs: Any) -> Dict[str, Any]:
-        step.started_at = datetime.now()
-        return {
+    _patch_react_with_result(
+        monkeypatch,
+        {
             "type": "final_answer",
             "content": "done",
             "success": True,
             "error": None,
-        }
-
-    fake_pattern = MagicMock()
-    fake_pattern.set_step_context = MagicMock()
-    fake_pattern.run_with_context = AsyncMock(side_effect=fake_react)
-
-    monkeypatch.setattr(
-        "xagent.core.agent.pattern.react.ReActPattern",
-        lambda *a, **k: fake_pattern,
+        },
     )
 
-    plan = ExecutionPlan(id="p1", goal="g", steps=[step], created_at=datetime.now())
-    executor.current_plan = plan
-
-    await executor._execute_step_with_react_agent(step, _make_tool_map())
+    execution_results = await executor.execute_plan(plan, _make_tool_map())
 
     assert step.status == StepStatus.COMPLETED
+    completed_entries = [r for r in execution_results if r.get("status") == "completed"]
+    assert len(completed_entries) == 1
 
 
 def test_summary_surfaces_failed_steps_with_error():

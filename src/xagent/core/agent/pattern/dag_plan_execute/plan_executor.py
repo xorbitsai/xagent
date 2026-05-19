@@ -178,6 +178,22 @@ class PlanExecutor:
                         step, tool_map, execution_results, skill_context
                     )
 
+                # A ReAct step can return normally but still report
+                # `success: false` (typically when a tool inside the step
+                # failed and the LLM forwarded that signal). Raise so the
+                # regular failure path below records the failure, traces it,
+                # and unblocks dependents that tolerate FAILED deps —
+                # otherwise the COMPLETED assignment on the next line erases
+                # the failure entirely.
+                if isinstance(result, dict) and result.get("success") is False:
+                    raise DAGStepError(
+                        step_id=step.id,
+                        step_name=step.name,
+                        message=str(
+                            result.get("error") or "Step reported success=false"
+                        ),
+                    )
+
                 # Handle successful completion
                 step.status = StepStatus.COMPLETED
                 step.result = result if isinstance(result, dict) else {"value": result}
@@ -812,20 +828,16 @@ class PlanExecutor:
             )
             self.step_execution_results[step.id] = step_execution_result
 
-            # Respect the step's self-reported success: when ReAct's final_answer
-            # was emitted with `success: false` (or a tool bubbled `success: false`
-            # up without the LLM overriding it), the step is a failure even though
-            # the agent loop returned normally. Marking it COMPLETED would let
-            # result_analyzer's summary treat the failure as a success and the
-            # final-answer LLM would never see the error.
+            # Honor result["success"] when computing the traced status: a
+            # ReAct step can return normally but still report `success: false`
+            # (a tool inside the step failed and the LLM forwarded that
+            # signal). The final step.status will be decided by the caller —
+            # which raises DAGStepError on `success: false` so the regular
+            # failure path runs — but the trace event for this step still
+            # needs to record the right outcome.
             step_reported_success = not (
                 isinstance(result, dict) and result.get("success") is False
             )
-            step_reported_error = ""
-            if not step_reported_success and isinstance(result, dict):
-                step_reported_error = str(
-                    result.get("error") or "Step reported success=false"
-                )
 
             # Trace step completion with detailed execution information
             step_trace_data = {
@@ -846,7 +858,10 @@ class PlanExecutor:
                 else None,
             }
             if not step_reported_success:
-                step_trace_data["error"] = step_reported_error
+                # result must be a dict here (success=False check above implies it)
+                step_trace_data["error"] = str(
+                    result.get("error") or "Step reported success=false"
+                )
 
             # Extract meaningful execution details from result if available
             if isinstance(result, dict):
@@ -956,19 +971,15 @@ class PlanExecutor:
                             message=error_msg,
                         )
 
-            if step_reported_success:
-                step.status = StepStatus.COMPLETED
-                logger.info(
-                    f"Step {step.id} completed in {(step.completed_at - step.started_at).total_seconds():.2f}s"
-                )
-            else:
-                step.status = StepStatus.FAILED
-                step.error = step_reported_error
-                step.error_type = "StepReportedFailure"
-                logger.warning(
-                    f"Step {step.id} marked FAILED — result reported success=false: "
-                    f"{step_reported_error[:200]}"
-                )
+            # NOTE: the caller (`execute_step_with_completion`) sets the final
+            # step.status — assigning here would be overwritten. The caller
+            # converts `result["success"] is False` into a DAGStepError so the
+            # regular failure path records and surfaces it.
+            step.status = StepStatus.COMPLETED
+
+            logger.info(
+                f"Step {step.id} completed in {(step.completed_at - step.started_at).total_seconds():.2f}s"
+            )
 
             return result
 

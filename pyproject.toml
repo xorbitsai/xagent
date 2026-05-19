@@ -66,6 +66,8 @@ dependencies = [
   "filelock>=3.0.0",
   "cloudpickle>=3.0.0",
   "exa-py>=2.0.0",
+  # Process isolation for tool execution
+  "xoscar>=0.9.0",
   # Data science libraries (core for RAG and analysis)
   "pandas>=1.3.0",
   # Special handling - AI-enhanced document processing
@@ -232,6 +234,9 @@ module = [
   "lark_oapi.*",
   "exa_py",
   "exa_py.*",
+  "xoscar",
+  "xoscar.*",
+  "xagent.core.sandbox_manager",
 ]
 ignore_missing_imports = true
 
@@ -252,6 +257,8 @@ module = [
   "xagent.core.model.tts.xinference",
   "xagent.web.channels.telegram.bot",
   "xagent.web.channels.telegram.handler",
+  "xagent.core.execution.actors.base_executor_actor",
+  "xagent.core.tools.adapters.vibe.process_isolated.integration",
 ]
 disallow_any_unimported = false
 warn_unused_ignores = false

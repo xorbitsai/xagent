@@ -221,6 +221,10 @@ class ToolFactory:
 
                 await create_workspace_in_sandbox(sandbox, workspace)
             tools = await ToolFactory._wrap_sandbox_tools(tools, sandbox)
+        else:
+            from .process_isolated import wrap_tools
+
+            tools = wrap_tools(tools)
 
         # Apply output filtering to all tools
         tools = ToolFactory._apply_output_filters(tools, config)

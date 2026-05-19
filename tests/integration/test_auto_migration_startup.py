@@ -733,6 +733,7 @@ async def test_startup_event_skips_when_auto_migrate_disabled(
     original_create_task = asyncio.create_task
 
     monkeypatch.setenv("LANCEDB_AUTO_MIGRATE", "false")
+    monkeypatch.setenv("XAGENT_PROCESS_ISOLATION_ENABLED", "false")
     monkeypatch.setattr(web_app_module, "init_db", lambda: None)
     monkeypatch.setattr(web_app_module, "_migration_task", None)
     monkeypatch.setattr(
@@ -838,6 +839,7 @@ async def test_startup_event_triggers_background_auto_migration(
     original_create_task = asyncio.create_task
 
     monkeypatch.setenv("LANCEDB_AUTO_MIGRATE", "true")
+    monkeypatch.setenv("XAGENT_PROCESS_ISOLATION_ENABLED", "false")
     monkeypatch.setattr(web_app_module, "init_db", lambda: None)
     monkeypatch.setattr(web_app_module, "_migration_task", None)
     monkeypatch.setattr(
@@ -944,6 +946,7 @@ async def test_startup_event_no_task_when_no_table_needs_migration(
     original_create_task = asyncio.create_task
 
     monkeypatch.setenv("LANCEDB_AUTO_MIGRATE", "true")
+    monkeypatch.setenv("XAGENT_PROCESS_ISOLATION_ENABLED", "false")
     monkeypatch.setattr(web_app_module, "init_db", lambda: None)
     monkeypatch.setattr(web_app_module, "_migration_task", None)
     monkeypatch.setattr(

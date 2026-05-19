@@ -11,7 +11,12 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
 
-from ..config import get_uploads_dir
+from ..config import (
+    get_process_isolation_address,
+    get_process_isolation_enabled,
+    get_process_isolation_workers,
+    get_uploads_dir,
+)
 from ..core.tracing.langfuse import flush_langfuse, initialize_langfuse
 from .api.admin_mcp import admin_mcp_router
 from .api.admin_users import router as admin_users_router
@@ -28,6 +33,7 @@ from .api.memory import MemoryManagementRouter
 from .api.model import model_router
 from .api.monitor import monitor_router
 from .api.progress_ws import progress_ws_router
+from .api.services import router as process_services_router
 from .api.skills import router as skills_router
 from .api.system import system_router
 from .api.templates import router as templates_router
@@ -230,6 +236,7 @@ app.include_router(tools_router)
 app.include_router(admin_users_router)
 app.include_router(admin_mcp_router)
 app.include_router(skills_router)
+app.include_router(process_services_router)
 app.include_router(system_router)
 app.include_router(templates_router)
 app.include_router(agents_router)
@@ -250,6 +257,20 @@ async def startup_event() -> None:
     logger.info("Database initialized successfully")
 
     initialize_langfuse()
+
+    if get_process_isolation_enabled():
+        from ..core.execution.service import ProcessService, set_process_service
+
+        process_service = ProcessService(
+            address=get_process_isolation_address(),
+            n_workers=get_process_isolation_workers(),
+        )
+        await process_service.start()
+        set_process_service(process_service)
+        app.state.process_service = process_service
+        logger.info("Process isolation service initialized")
+    else:
+        logger.info("Process isolation service disabled")
 
     # Initialize skill manager
     from ..skills.utils import create_skill_manager
@@ -717,6 +738,14 @@ async def shutdown_event() -> None:
     sandbox_mgr = get_sandbox_manager()
     if sandbox_mgr:
         await sandbox_mgr.cleanup()
+
+    process_service = getattr(app.state, "process_service", None)
+    if process_service is not None:
+        from ..core.execution.service import clear_process_service
+
+        await process_service.stop()
+        clear_process_service()
+        app.state.process_service = None
 
 
 # Frontend is now served by Next.js at http://localhost:3000

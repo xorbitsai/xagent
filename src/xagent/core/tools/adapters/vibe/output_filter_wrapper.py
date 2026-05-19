@@ -53,6 +53,14 @@ class OutputFilteredToolWrapper(AbstractBaseTool):
         return getattr(self._target, "is_sandboxed", False)
 
     @property
+    def is_isolated(self) -> bool:
+        return getattr(self._target, "is_isolated", False)
+
+    @property
+    def supports_process_isolation(self) -> bool:
+        return getattr(self._target, "supports_process_isolation", False)
+
+    @property
     def name(self) -> str:
         return self._target.name
 

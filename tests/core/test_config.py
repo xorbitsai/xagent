@@ -13,6 +13,9 @@ from xagent.config import (
     LANCEDB_PATH,
     MAX_TRACE_PAYLOAD_BYTES,
     MAX_UPLOAD_SIZE,
+    PROCESS_ISOLATION_ADDRESS,
+    PROCESS_ISOLATION_ENABLED,
+    PROCESS_ISOLATION_WORKERS,
     SANDBOX_CPUS,
     SANDBOX_ENV,
     SANDBOX_IMAGE,
@@ -33,6 +36,9 @@ from xagent.config import (
     get_lancedb_path,
     get_max_trace_payload_bytes,
     get_max_upload_size_bytes,
+    get_process_isolation_address,
+    get_process_isolation_enabled,
+    get_process_isolation_workers,
     get_sandbox_cpus,
     get_sandbox_env,
     get_sandbox_image,
@@ -77,6 +83,49 @@ class TestEnvironmentVariableConstants:
 
     def test_web_search_provider_constant(self):
         assert WEB_SEARCH_PROVIDER == "XAGENT_WEB_SEARCH_PROVIDER"
+
+    def test_process_isolation_constants(self):
+        assert PROCESS_ISOLATION_ENABLED == "XAGENT_PROCESS_ISOLATION_ENABLED"
+        assert PROCESS_ISOLATION_ADDRESS == "XAGENT_PROCESS_ISOLATION_ADDRESS"
+        assert PROCESS_ISOLATION_WORKERS == "XAGENT_PROCESS_ISOLATION_WORKERS"
+
+
+class TestProcessIsolationConfig:
+    """Test process isolation configuration."""
+
+    def test_process_isolation_enabled_by_default(self, monkeypatch):
+        monkeypatch.delenv(PROCESS_ISOLATION_ENABLED, raising=False)
+        assert get_process_isolation_enabled() is True
+
+    @pytest.mark.parametrize("value", ["1", "true", "yes", "on", " TRUE "])
+    def test_process_isolation_enabled_values(self, monkeypatch, value):
+        monkeypatch.setenv(PROCESS_ISOLATION_ENABLED, value)
+        assert get_process_isolation_enabled() is True
+
+    @pytest.mark.parametrize("value", ["0", "false", "no", "off", ""])
+    def test_process_isolation_disabled_values(self, monkeypatch, value):
+        monkeypatch.setenv(PROCESS_ISOLATION_ENABLED, value)
+        assert get_process_isolation_enabled() is False
+
+    def test_process_isolation_address_default_and_override(self, monkeypatch):
+        monkeypatch.delenv(PROCESS_ISOLATION_ADDRESS, raising=False)
+        assert get_process_isolation_address() == "localhost:12345"
+
+        monkeypatch.setenv(PROCESS_ISOLATION_ADDRESS, "localhost:22345")
+        assert get_process_isolation_address() == "localhost:22345"
+
+    def test_process_isolation_workers_default_and_override(self, monkeypatch):
+        monkeypatch.delenv(PROCESS_ISOLATION_WORKERS, raising=False)
+        assert get_process_isolation_workers() == 0
+
+        monkeypatch.setenv(PROCESS_ISOLATION_WORKERS, "3")
+        assert get_process_isolation_workers() == 3
+
+        monkeypatch.setenv(PROCESS_ISOLATION_WORKERS, "bad")
+        assert get_process_isolation_workers() == 0
+
+        monkeypatch.setenv(PROCESS_ISOLATION_WORKERS, "-1")
+        assert get_process_isolation_workers() == 0
 
 
 class TestGetWebSearchProvider:

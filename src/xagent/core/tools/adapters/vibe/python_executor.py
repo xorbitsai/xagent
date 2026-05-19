@@ -40,6 +40,8 @@ class PythonExecutorResult(BaseModel):
 class PythonExecutorTool(AbstractBaseTool):
     """Framework wrapper for the pure Python executor tool"""
 
+    supports_process_isolation = True
+
     def __init__(self, workspace: Optional[TaskWorkspace] = None) -> None:
         self._visibility = ToolVisibility.PUBLIC
         self._workspace = workspace

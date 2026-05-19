@@ -10,6 +10,7 @@ from .claude import ClaudeLLM
 from .deepseek import DeepSeekLLM
 from .gemini import GeminiLLM
 from .openai import OpenAILLM
+from .litellm import LiteLLMLLM
 from .xinference import XinferenceLLM
 from .zhipu import ZhipuLLM
 
@@ -81,6 +82,16 @@ def create_base_llm(model: ModelConfig) -> BaseLLM:
             model_name=model.model_name,
             api_key=model.api_key,
             base_url=model.base_url,
+            default_temperature=model.default_temperature,
+            default_max_tokens=model.default_max_tokens,
+            timeout=model.timeout,
+            abilities=model.abilities,
+        )
+    elif provider == "litellm":
+        llm = LiteLLMLLM(
+            model_name=model.model_name,
+            api_key=model.api_key,
+            api_base=model.base_url,
             default_temperature=model.default_temperature,
             default_max_tokens=model.default_max_tokens,
             timeout=model.timeout,

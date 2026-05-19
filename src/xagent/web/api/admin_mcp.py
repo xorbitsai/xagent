@@ -69,6 +69,7 @@ class PublicMCPAppBase(BaseModel):
     provider_name: Optional[str] = None
     category: Optional[str] = None
     oauth_scopes: Optional[List[str]] = None
+    is_visible_in_connector: bool = True
     launch_config: Optional[Dict[str, Any]] = None
 
 

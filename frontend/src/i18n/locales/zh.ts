@@ -2939,7 +2939,15 @@ Build when you need.`
       columns: {
         appId: "应用 ID",
         provider: "供应商",
-        transport: "传输协议"
+        transport: "传输协议",
+        connectorVisibility: "连接器展示"
+      },
+      visibility: {
+        visible: "显示",
+        hidden: "隐藏",
+        showSuccess: "应用已显示在连接器弹窗中",
+        hideSuccess: "应用已从连接器弹窗中隐藏",
+        updateFailed: "更新连接器展示状态失败"
       },
       form: {
         appId: "应用 ID (例如 gmail)",
@@ -2948,6 +2956,8 @@ Build when you need.`
         iconUrl: "图标 URL",
         category: "分类",
         transport: "传输协议",
+        visibleInConnector: "在连接器弹窗中显示",
+        visibleInConnectorDescription: "关闭后，该公共应用会从连接器弹窗中完全隐藏，任何用户都无法再看到它。",
         oauthScopes: "OAuth 权限范围 (逗号分隔)",
         launchConfig: "启动配置 (JSON)",
         invalidJson: "launch_config 中存在无效的 JSON"

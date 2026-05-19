@@ -2939,7 +2939,15 @@ Build when you need.`
       columns: {
         appId: "APP ID",
         provider: "PROVIDER",
-        transport: "TRANSPORT"
+        transport: "TRANSPORT",
+        connectorVisibility: "CONNECTOR VISIBILITY"
+      },
+      visibility: {
+        visible: "Visible",
+        hidden: "Hidden",
+        showSuccess: "App is now visible in the connector dialog",
+        hideSuccess: "App is now hidden from the connector dialog",
+        updateFailed: "Failed to update connector visibility"
       },
       form: {
         appId: "App ID (e.g. gmail)",
@@ -2948,6 +2956,8 @@ Build when you need.`
         iconUrl: "Icon URL",
         category: "Category",
         transport: "Transport",
+        visibleInConnector: "Show in connector dialog",
+        visibleInConnectorDescription: "When disabled, this public app is completely hidden from the connector dialog for all users.",
         oauthScopes: "OAuth Scopes (comma separated)",
         launchConfig: "Launch Config (JSON)",
         invalidJson: "Invalid JSON in launch_config"

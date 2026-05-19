@@ -470,11 +470,22 @@ def list_mcp_apps(
 
     if location in ["remote", "all"]:
         for app in library_apps:
+            is_connected = (
+                app["name"].lower() in connected_apps
+                or app["id"].lower() in connected_apps
+            )
+            is_visible_in_connector = app.get("is_visible_in_connector", True)
+
+            # Strong hide mode: hidden public apps are removed from the
+            # connector catalog for everyone, including already connected users.
+            if not is_visible_in_connector:
+                continue
+
             if search:
                 search_lower = search.lower()
                 if (
                     search_lower not in app["name"].lower()
-                    and search_lower not in app.get("description", "").lower()
+                    and search_lower not in (app.get("description") or "").lower()
                 ):
                     continue
 
@@ -483,10 +494,6 @@ def list_mcp_apps(
                     continue
 
             app_copy = app.copy()
-            is_connected = (
-                app["name"].lower() in connected_apps
-                or app["id"].lower() in connected_apps
-            )
             app_copy["is_connected"] = is_connected
 
             if is_connected:

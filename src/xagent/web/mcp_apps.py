@@ -21,6 +21,7 @@ def _app_to_dict(app: PublicMCPApp) -> Dict[str, Any]:
         "provider": app.provider_name,
         "category": app.category,
         "oauth_scopes": app.oauth_scopes or [],
+        "is_visible_in_connector": bool(app.is_visible_in_connector),
         "launch_config": app.launch_config or {},
     }
 

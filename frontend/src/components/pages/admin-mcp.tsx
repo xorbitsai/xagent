@@ -19,6 +19,7 @@ import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card"
 import { Badge } from "@/components/ui/badge"
 import { Stepper } from "@/components/ui/stepper"
+import { Switch } from "@/components/ui/switch"
 
 interface OAuthProvider {
   id: number
@@ -45,6 +46,7 @@ interface PublicMCPApp {
   provider_name: string | null
   category: string | null
   oauth_scopes: string[] | null
+  is_visible_in_connector: boolean
   launch_config: any | null
 }
 
@@ -54,6 +56,7 @@ export default function AdminMcpPage() {
   const [providers, setProviders] = useState<OAuthProvider[]>([])
   const [apps, setApps] = useState<PublicMCPApp[]>([])
   const [loading, setLoading] = useState(true)
+  const [togglingAppId, setTogglingAppId] = useState<number | null>(null)
   const [appSearchQuery, setAppSearchQuery] = useState("")
 
   // Modals state
@@ -77,7 +80,7 @@ export default function AdminMcpPage() {
   // New App Form
   const [newApp, setNewApp] = useState<Partial<PublicMCPApp>>({
     app_id: "", name: "", description: "", icon: "", transport: "oauth",
-    category: "Communication", oauth_scopes: [], launch_config: "{}"
+    category: "Communication", oauth_scopes: [], is_visible_in_connector: true, launch_config: "{}"
   })
 
   useEffect(() => {
@@ -171,6 +174,44 @@ export default function AdminMcpPage() {
       }
     } catch (err) {
       toast.error(t("adminMcp.apps.deleteFailed"))
+    }
+  }
+
+  const handleToggleAppVisibility = async (app: PublicMCPApp, checked: boolean) => {
+    setTogglingAppId(app.id)
+    try {
+      const payload = {
+        ...app,
+        is_visible_in_connector: checked,
+        launch_config: app.launch_config || {},
+        oauth_scopes: app.oauth_scopes || [],
+      }
+      const res = await apiRequest(`${getApiUrl()}/api/admin/mcp/apps/${app.id}`, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload)
+      })
+
+      if (res.ok) {
+        setApps((prev) =>
+          prev.map((item) =>
+            item.id === app.id
+              ? { ...item, is_visible_in_connector: checked }
+              : item
+          )
+        )
+        toast.success(
+          checked
+            ? t("adminMcp.apps.visibility.showSuccess")
+            : t("adminMcp.apps.visibility.hideSuccess")
+        )
+      } else {
+        toast.error(t("adminMcp.apps.visibility.updateFailed"))
+      }
+    } catch (err) {
+      toast.error(t("adminMcp.apps.visibility.updateFailed"))
+    } finally {
+      setTogglingAppId(null)
     }
   }
 
@@ -285,7 +326,7 @@ export default function AdminMcpPage() {
         setEditingAppId(null)
         setIsCreatingProvider(false)
         setNewProvider({ provider_name: "", name: "", client_id: "", client_secret: "", auth_url: "", token_url: "", redirect_uri: "", userinfo_url: "", user_id_path: "id", email_path: "email", default_scopes: [] })
-        setNewApp({ app_id: "", name: "", description: "", icon: "", transport: "oauth", category: "Communication", oauth_scopes: [], launch_config: "{}" })
+        setNewApp({ app_id: "", name: "", description: "", icon: "", transport: "oauth", category: "Communication", oauth_scopes: [], is_visible_in_connector: true, launch_config: "{}" })
       }, 300)
       return () => window.clearTimeout(timeoutId)
     }
@@ -388,6 +429,7 @@ export default function AdminMcpPage() {
                     <TableHead className="text-xs font-semibold text-muted-foreground">{t("adminMcp.apps.columns.appId")}</TableHead>
                     <TableHead className="text-xs font-semibold text-muted-foreground">{t("adminMcp.apps.columns.provider")}</TableHead>
                     <TableHead className="text-xs font-semibold text-muted-foreground">{t("adminMcp.apps.columns.transport")}</TableHead>
+                      <TableHead className="text-xs font-semibold text-muted-foreground">{t("adminMcp.apps.columns.connectorVisibility")}</TableHead>
                     <TableHead className="w-[100px]"></TableHead>
                   </TableRow>
                 </TableHeader>
@@ -400,6 +442,21 @@ export default function AdminMcpPage() {
                       </TableCell>
                       <TableCell>
                         <Badge variant="secondary" className="bg-blue-50 text-blue-500 font-normal hover:bg-blue-50">{a.transport}</Badge>
+                      </TableCell>
+                      <TableCell>
+                        <div className="flex items-center gap-3">
+                          <Switch
+                            checked={a.is_visible_in_connector}
+                            disabled={togglingAppId === a.id}
+                            onCheckedChange={(checked) => handleToggleAppVisibility(a, checked)}
+                            aria-label={t("adminMcp.apps.form.visibleInConnector")}
+                          />
+                          <span className="text-xs text-muted-foreground">
+                            {a.is_visible_in_connector
+                              ? t("adminMcp.apps.visibility.visible")
+                              : t("adminMcp.apps.visibility.hidden")}
+                          </span>
+                        </div>
                       </TableCell>
                       <TableCell className="text-right">
                         <div className="flex justify-end opacity-0 group-hover:opacity-100 transition-opacity">
@@ -415,7 +472,7 @@ export default function AdminMcpPage() {
                   ))}
                   {filteredApps.length === 0 && !loading && (
                     <TableRow>
-                      <TableCell colSpan={4} className="text-center text-muted-foreground h-32">{t("adminMcp.apps.noData")}</TableCell>
+                      <TableCell colSpan={5} className="text-center text-muted-foreground h-32">{t("adminMcp.apps.noData")}</TableCell>
                     </TableRow>
                   )}
                 </TableBody>
@@ -685,6 +742,18 @@ export default function AdminMcpPage() {
                             <SelectItem value="sse">SSE</SelectItem>
                           </SelectContent>
                         </Select>
+                      </div>
+                      <div className="flex items-center justify-between rounded-lg border px-3 py-3">
+                        <div className="space-y-1">
+                          <Label>{t("adminMcp.apps.form.visibleInConnector")}</Label>
+                          <p className="text-xs text-muted-foreground">
+                            {t("adminMcp.apps.form.visibleInConnectorDescription")}
+                          </p>
+                        </div>
+                        <Switch
+                          checked={newApp.is_visible_in_connector ?? true}
+                          onCheckedChange={(checked) => setNewApp({ ...newApp, is_visible_in_connector: checked })}
+                        />
                       </div>
                       {newApp.transport === "oauth" && (
                         <div className="space-y-2">

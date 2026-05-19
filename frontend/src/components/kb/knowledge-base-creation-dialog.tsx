@@ -105,6 +105,7 @@ export function KnowledgeBaseCreationDialog({ open, onOpenChange, onSuccess }: K
     request_delay: 1.0,
     timeout: 30,
     respect_robots_txt: true,
+    render_js: false,
   })
 
   // Cloud connect state
@@ -298,6 +299,7 @@ export function KnowledgeBaseCreationDialog({ open, onOpenChange, onSuccess }: K
       request_delay: 1.0,
       timeout: 30,
       respect_robots_txt: true,
+      render_js: false,
     })
     setCurrentStep(1)
   }
@@ -425,6 +427,7 @@ export function KnowledgeBaseCreationDialog({ open, onOpenChange, onSuccess }: K
       formData.append("request_delay", webIngestionConfig.request_delay.toString())
       formData.append("timeout", webIngestionConfig.timeout.toString())
       formData.append("respect_robots_txt", webIngestionConfig.respect_robots_txt.toString())
+      formData.append("render_js", webIngestionConfig.render_js.toString())
 
       appendIngestionConfigToFormData(formData, ingestionConfig)
 
@@ -840,6 +843,16 @@ export function KnowledgeBaseCreationDialog({ open, onOpenChange, onSuccess }: K
                           className="mt-1.5"
                         />
                       </div>
+                    </div>
+                    <div className="flex items-center gap-2">
+                      <input
+                        type="checkbox"
+                        id="create-render-js"
+                        checked={webIngestionConfig.render_js}
+                        onChange={(e) => setWebIngestionConfig(prev => ({ ...prev, render_js: e.target.checked }))}
+                        className="w-4 h-4"
+                      />
+                      <Label htmlFor="create-render-js" className="cursor-pointer">{t("kb.dialog.webImport.advanced.renderJs")}</Label>
                     </div>
                   </div>
                 )}

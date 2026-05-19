@@ -115,6 +115,7 @@ def test_ingest_separators_valid_json_passed_to_config(app_with_kb, mock_user):
         user_id,
         progress_manager=None,
         is_admin=False,
+        **_: object,
     ):
         captured_config.append(ingestion_config)
         return IngestionResult(
@@ -319,6 +320,7 @@ def test_ingest_separators_missing_uses_none(app_with_kb, mock_user):
         user_id,
         progress_manager=None,
         is_admin=False,
+        **_: object,
     ):
         captured_config.append(ingestion_config)
         return IngestionResult(
@@ -389,6 +391,7 @@ def test_ingest_separators_invalid_json_request_succeeds_uses_default(
         user_id,
         progress_manager=None,
         is_admin=False,
+        **_: object,
     ):
         captured_config.append(ingestion_config)
         return IngestionResult(
@@ -441,6 +444,7 @@ def test_ingest_separators_empty_array_uses_none(app_with_kb, mock_user):
         user_id,
         progress_manager=None,
         is_admin=False,
+        **_: object,
     ):
         captured_config.append(ingestion_config)
         return IngestionResult(
@@ -508,6 +512,7 @@ async def _fake_run_web_ingestion(
     user_id,
     is_admin=False,
     file_handler=None,
+    **_: object,
 ):
     """Async fake that captures ingestion_config and returns WebIngestionResult."""
     captured_config: list = _fake_run_web_ingestion.captured  # type: ignore[attr-defined]

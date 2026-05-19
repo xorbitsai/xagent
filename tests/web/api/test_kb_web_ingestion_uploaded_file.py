@@ -535,6 +535,7 @@ class TestIngestWebHandleWebFile:
             user_id: int,
             is_admin: bool,
             file_handler,
+            **_: object,
         ):
             temp_md = tmp_path / "temp.md"
             temp_md.write_text("# Title\n\nBody", encoding="utf-8")
@@ -633,6 +634,7 @@ class TestIngestWebHandleWebFile:
             user_id: int,
             is_admin: bool,
             file_handler,
+            **_: object,
         ):
             temp_md = tmp_path / "temp.md"
             temp_md.write_text("# Title\n\nBody", encoding="utf-8")

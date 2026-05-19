@@ -76,6 +76,7 @@ async def run_web_ingestion(
     user_id: Optional[int] = None,
     is_admin: Optional[bool] = None,
     file_handler: Optional[Callable[[Path, str, str, str], FileHandlerResult]] = None,
+    trace_id: Optional[str] = None,
 ) -> WebIngestionResult:
     """Crawl a website and ingest all pages into the knowledge base.
 
@@ -117,14 +118,42 @@ async def run_web_ingestion(
     ing_cfg = coerce_ingestion_config(ingestion_config)
 
     logger.info(
-        "Starting web ingestion: collection=%s, start_url=%s",
-        collection,
-        crawl_config.start_url,
+        "Starting web ingestion",
+        extra={
+            "trace_id": trace_id,
+            "collection": collection,
+            "start_url": crawl_config.start_url,
+            "user_id": user_id,
+            "is_admin": is_admin,
+            "max_pages": crawl_config.max_pages,
+            "max_depth": crawl_config.max_depth,
+            "same_domain_only": crawl_config.same_domain_only,
+            "url_patterns": crawl_config.url_patterns,
+            "exclude_patterns": crawl_config.exclude_patterns,
+            "content_selector": crawl_config.content_selector,
+            "remove_selectors": crawl_config.remove_selectors,
+            "concurrent_requests": crawl_config.concurrent_requests,
+            "request_delay": crawl_config.request_delay,
+            "timeout": crawl_config.timeout,
+            "respect_robots_txt": crawl_config.respect_robots_txt,
+            "render_js": crawl_config.render_js,
+            "render_wait_until": crawl_config.render_wait_until,
+            "render_timeout_ms": crawl_config.render_timeout_ms,
+            "ingestion_parse_method": str(ing_cfg.parse_method),
+            "ingestion_chunk_strategy": str(ing_cfg.chunk_strategy),
+            "ingestion_chunk_size": ing_cfg.chunk_size,
+            "ingestion_chunk_overlap": ing_cfg.chunk_overlap,
+            "ingestion_separators": ing_cfg.separators,
+            "embedding_model_id": ing_cfg.embedding_model_id,
+            "embedding_batch_size": ing_cfg.embedding_batch_size,
+            "embedding_use_async": ing_cfg.embedding_use_async,
+            "embedding_concurrent": ing_cfg.embedding_concurrent,
+        },
     )
 
     # Step 1: Crawl the website
     logger.info("Step 1: Crawling website")
-    crawler = WebCrawler(crawl_config, progress_callback)
+    crawler = WebCrawler(crawl_config, progress_callback, trace_id=trace_id)
 
     try:
         crawl_results: list[CrawlResult] = await crawler.crawl()
@@ -144,7 +173,14 @@ async def run_web_ingestion(
             embeddings_created=0,
             crawled_urls=[],
             failed_urls={},
-            message=f"Website crawling failed: {str(e)}",
+            message=(
+                "Website crawling failed: "
+                + (
+                    "Playwright browsers are not installed. Run: playwright install chromium"
+                    if "Playwright browsers are not installed" in str(e)
+                    else str(e)
+                )
+            ),
             warnings=[],
             elapsed_time_ms=elapsed_ms,
         )
@@ -159,8 +195,57 @@ async def run_web_ingestion(
     pages_failed = len(failed_urls)
 
     logger.info(
-        "Crawling completed: %s successful, %s failed", pages_crawled, pages_failed
+        "Crawling completed",
+        extra={
+            "trace_id": trace_id,
+            "collection": collection,
+            "start_url": crawl_config.start_url,
+            "successful_pages": pages_crawled,
+            "failed_pages": pages_failed,
+            "total_urls_found": crawler.total_urls_found,
+            "results_count": len(crawl_results),
+        },
     )
+
+    # Fail fast: crawling produced no successful pages but has concrete failure reasons.
+    # This avoids continuing into ingestion and makes debugging much easier.
+    if pages_crawled == 0 and pages_failed > 0:
+        elapsed_ms = int(
+            (datetime.now(timezone.utc) - start_time).total_seconds() * 1000
+        )
+        blocking_entry = next(
+            (
+                (url, err)
+                for url, err in failed_urls.items()
+                if _looks_like_crawler_block(err)
+            ),
+            None,
+        )
+        if blocking_entry is not None:
+            fail_fast_message = _CRAWLER_BLOCK_MESSAGE
+        else:
+            reasons: list[str] = []
+            for url, reason in list(failed_urls.items())[:3]:
+                reasons.append(f"{url}: {reason}")
+            reason_suffix = "; ".join(reasons)
+            fail_fast_message = "Website crawling failed: no valid pages extracted." + (
+                f" Reasons: {reason_suffix}" if reason_suffix else ""
+            )
+        return WebIngestionResult(
+            status="error",
+            collection=collection,
+            total_urls_found=crawler.total_urls_found,
+            pages_crawled=0,
+            pages_failed=pages_failed,
+            documents_created=0,
+            chunks_created=0,
+            embeddings_created=0,
+            crawled_urls=[],
+            failed_urls=failed_urls,
+            message=fail_fast_message,
+            warnings=warnings,
+            elapsed_time_ms=elapsed_ms,
+        )
 
     # Step 2: Ingest each crawled page
     logger.info("Step 2: Ingesting crawled pages")
@@ -190,6 +275,19 @@ async def run_web_ingestion(
                 )
 
             try:
+                logger.debug(
+                    "Ingesting crawled page",
+                    extra={
+                        "trace_id": trace_id,
+                        "collection": collection,
+                        "url": crawl_result.url,
+                        "title": crawl_result.title,
+                        "depth": crawl_result.depth,
+                        "content_length": crawl_result.content_length,
+                        "index": i + 1,
+                        "total": len(crawl_results),
+                    },
+                )
                 # Save crawled content to temporary markdown file
                 filename = sanitize_for_doc_id(crawl_result.title or f"page_{i + 1}")
                 temp_file = Path(temp_dir) / f"{filename}.md"
@@ -239,7 +337,6 @@ async def run_web_ingestion(
                         continue
 
                 try:
-                    # Ingest the file
                     progress_manager = get_progress_manager()
 
                     def _ingest_file() -> IngestionResult:
@@ -251,49 +348,56 @@ async def run_web_ingestion(
                             progress_manager=progress_manager,
                             user_id=user_id,
                             is_admin=is_admin,
+                            trace_id=trace_id,
                         )
 
-                    # Run ingestion in thread pool while preserving ContextVar user scope
-                    # NOTE: request_context was copied before the loop to avoid repeated copying.
-                    # Modifications made in the thread pool won't propagate back to the main request context.
-                    # This is acceptable for user scope (read-only) but observability systems should
-                    # be aware that child span updates may be lost.
                     with concurrent.futures.ThreadPoolExecutor() as executor:
                         ingest_result: IngestionResult = await loop.run_in_executor(
                             executor, lambda: request_context.run(_ingest_file)
                         )
 
-                    # Track statistics
                     if ingest_result.status == "success":
                         documents_created += 1
                         total_chunks += ingest_result.chunk_count
                         total_embeddings += ingest_result.embedding_count
-                        logger.info(
-                            "Ingested %s: %s chunks, %s embeddings",
-                            crawl_result.url,
-                            ingest_result.chunk_count,
-                            ingest_result.embedding_count,
+                        logger.debug(
+                            "Ingested crawled page successfully",
+                            extra={
+                                "trace_id": trace_id,
+                                "collection": collection,
+                                "url": crawl_result.url,
+                                "doc_id": ingest_result.doc_id,
+                                "parse_hash": ingest_result.parse_hash,
+                                "chunk_count": ingest_result.chunk_count,
+                                "embedding_count": ingest_result.embedding_count,
+                                "vector_count": ingest_result.vector_count,
+                            },
                         )
-                        # Only clear temp file reference on success
                         copied_persistent_file = None
                     else:
-                        # Non-success ingestion (e.g., embedding failed) without exception.
-                        # Keep file and DB record for potential retry scenarios.
-                        # Note: This accumulates files on persistent failures.
-                        # TODO: Add periodic cleanup for orphaned files from persistent failures.
                         failed_urls[crawl_result.url] = ingest_result.message
                         msg = (
                             f"Partial ingestion for {crawl_result.url}: "
                             f"{ingest_result.message}"
                         )
                         warnings.append(msg)
+                        logger.debug(
+                            "Ingested crawled page failed",
+                            extra={
+                                "trace_id": trace_id,
+                                "collection": collection,
+                                "url": crawl_result.url,
+                                "status": ingest_result.status,
+                                "failed_step": ingest_result.failed_step,
+                                "ingest_message": ingest_result.message,
+                            },
+                        )
 
                 except Exception as e:
                     logger.exception("Failed to ingest %s", crawl_result.url)
                     failed_urls[crawl_result.url] = str(e)
                     warnings.append(f"Failed to ingest {crawl_result.url}: {str(e)}")
 
-                    # Clean up copied persistent file on ingestion failure
                     if copied_persistent_file and copied_persistent_file.exists():
                         try:
                             copied_persistent_file.unlink()
@@ -398,10 +502,22 @@ async def run_web_ingestion(
     )
 
     logger.info(
-        "Web ingestion completed: %s, %s documents, %sms",
-        result.status,
-        documents_created,
-        elapsed_ms,
+        "Web ingestion completed",
+        extra={
+            "trace_id": trace_id,
+            "collection": collection,
+            "start_url": crawl_config.start_url,
+            "status": result.status,
+            "total_urls_found": crawler.total_urls_found,
+            "pages_crawled": pages_crawled,
+            "pages_failed": pages_failed,
+            "documents_created": documents_created,
+            "chunks_created": total_chunks,
+            "embeddings_created": total_embeddings,
+            "failed_urls_count": len(failed_urls),
+            "warnings_count": len(warnings),
+            "elapsed_time_ms": elapsed_ms,
+        },
     )
 
     return result

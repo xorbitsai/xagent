@@ -200,18 +200,25 @@ class LanceDBConnectionManager:
             KeyError: If environment variable (other than LANCEDB_DIR) is not set
         """
         db_dir = os.getenv(env_var)
+        source = "env"
 
         if db_dir is None:
             if env_var == "LANCEDB_DIR":
                 # Use default path only for the standard LANCEDB_DIR environment variable
                 db_dir = self.get_default_lancedb_dir()
-                logger.info(f"Using default LanceDB directory: {db_dir}")
+                source = "default"
             else:
                 # For other environment variables, raise KeyError as before
                 raise KeyError(f"Environment variable {env_var} is not set")
         elif db_dir.strip() == "":
             raise ValueError(f"Environment variable {env_var} is empty")
 
+        logger.info(
+            "Using LanceDB directory: %s (source=%s, env_var=%s)",
+            db_dir,
+            source,
+            env_var,
+        )
         return self.get_connection(db_dir)
 
 

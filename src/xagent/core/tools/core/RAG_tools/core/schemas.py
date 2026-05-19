@@ -1769,6 +1769,24 @@ class WebCrawlConfig(BaseModel):
         description="Whether to respect robots.txt rules",
     )
 
+    # JavaScript rendering (Playwright)
+    render_js: bool = Field(
+        default=False,
+        description=(
+            "Whether to render pages with a real browser (Playwright) to support SPA/JS-heavy sites. "
+            "When enabled, crawling fetches the post-rendered DOM instead of raw HTML."
+        ),
+    )
+    render_wait_until: Literal["load", "domcontentloaded", "networkidle"] = Field(
+        default="networkidle",
+        description="Playwright navigation wait strategy when render_js=True",
+    )
+    render_timeout_ms: int = Field(
+        default=30000,
+        ge=1,
+        description="Playwright navigation timeout in milliseconds when render_js=True",
+    )
+
 
 class CrawlResult(BaseModel):
     """Result of crawling a single page."""

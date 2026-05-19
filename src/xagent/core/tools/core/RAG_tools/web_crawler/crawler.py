@@ -153,6 +153,8 @@ class WebCrawler:
         self,
         config: WebCrawlConfig,
         progress_callback: Optional[Callable[[str, int, int], None]] = None,
+        *,
+        trace_id: Optional[str] = None,
     ):
         """Initialize web crawler.
 
@@ -163,6 +165,7 @@ class WebCrawler:
         """
         self.config = config
         self.progress_callback = progress_callback
+        self.trace_id = trace_id
 
         # Initialize components
         self.url_filter = URLFilter(
@@ -175,6 +178,7 @@ class WebCrawler:
         self.content_cleaner = ContentCleaner(
             content_selector=config.content_selector,
             remove_selectors=config.remove_selectors,
+            trace_id=trace_id,
         )
         self.link_extractor = LinkExtractor(config.start_url)
 
@@ -200,13 +204,6 @@ class WebCrawler:
             self._tls_chain = (config.tls_impersonate,)
 
         # Effective User-Agent for policy decisions (robots.txt, etc.).
-        # When tls_impersonate is None we send config.user_agent on the
-        # wire, so policy must reason about that string. When tls_impersonate
-        # is set, curl_cffi controls the UA based on the impersonate spec --
-        # config.user_agent is intentionally ignored in that path to keep
-        # TLS fingerprint and HTTP UA consistent. For policy we use the
-        # mapped UA of the *first* fingerprint in the chain, falling back
-        # to "*" if the spec is unknown to us.
         if config.tls_impersonate is None:
             self._policy_user_agent: str = config.user_agent or _DEFAULT_USER_AGENT
         else:
@@ -214,6 +211,11 @@ class WebCrawler:
             self._policy_user_agent = (
                 _IMPERSONATE_TO_UA.get(first_fp, "*") if first_fp else "*"
             )
+
+        # Playwright runtime (optional, used when render_js=True)
+        self._playwright: Any | None = None
+        self._browser: Any | None = None
+        self._browser_context: Any | None = None
 
     async def crawl(self) -> List[CrawlResult]:
         """Start crawling from the configured start URL.
@@ -227,43 +229,91 @@ class WebCrawler:
         start_url_normalized = self.url_filter.normalize_url(self.config.start_url)
         if start_url_normalized:
             self.pending_urls.append((start_url_normalized, 0))  # (url, depth)
+        else:
+            self.failed_urls[self.config.start_url] = (
+                "Invalid start_url: must start with http:// or https://"
+            )
+            logger.error(
+                "Start URL normalization failed; crawl will not run",
+                extra={
+                    "trace_id": self.trace_id,
+                    "start_url": self.config.start_url,
+                    "base_domain": getattr(self.url_filter, "base_domain", None),
+                    "same_domain_only": self.config.same_domain_only,
+                },
+            )
+            # Fail fast: without a valid start URL, the crawl loop would do nothing.
+            # We record the failure in failed_urls so upstream can surface an error.
+            self.start_time = self.start_time or time.time()
+            return []
 
-        logger.info("Starting crawl from %s", self.config.start_url)
+        logger.info(
+            "Starting crawl",
+            extra={
+                "trace_id": self.trace_id,
+                "start_url": self.config.start_url,
+                "start_url_normalized": start_url_normalized,
+                "max_pages": self.config.max_pages,
+                "max_depth": self.config.max_depth,
+                "same_domain_only": self.config.same_domain_only,
+                "url_patterns": self.config.url_patterns,
+                "exclude_patterns": self.config.exclude_patterns,
+                "respect_robots_txt": self.config.respect_robots_txt,
+                "content_selector": self.config.content_selector,
+                "remove_selectors": self.config.remove_selectors,
+                "concurrent_requests": self.config.concurrent_requests,
+                "request_delay": self.config.request_delay,
+                "timeout": self.config.timeout,
+                "user_agent": self.config.user_agent,
+                "tls_impersonate": self.config.tls_impersonate,
+                "render_js": self.config.render_js,
+            },
+        )
 
-        # When tls_impersonate is None we use plain httpx; in that path we
-        # need to manually compose a browser-like header set so the request
-        # doesn't look obviously bot-shaped. When tls_impersonate is set,
-        # curl_cffi owns headers (matching its TLS impersonation), and we
-        # MUST NOT inject our own UA/headers -- doing so creates a TLS-vs-
-        # HTTP-fingerprint mismatch which is exactly what WAFs catch.
-        httpx_headers: Optional[Dict[str, str]] = None
-        if None in self._tls_chain:
-            user_agent = self.config.user_agent or _DEFAULT_USER_AGENT
-            httpx_headers = {
-                "User-Agent": user_agent,
-                "Accept": (
-                    "text/html,application/xhtml+xml,application/xml;q=0.9,"
-                    "image/avif,image/webp,*/*;q=0.8"
-                ),
-                "Accept-Language": "en-US,en;q=0.9",
-                "Accept-Encoding": "gzip, deflate, br",
-                "Sec-Fetch-Dest": "document",
-                "Sec-Fetch-Mode": "navigate",
-                "Sec-Fetch-Site": "none",
-                "Sec-Fetch-User": "?1",
-                "Upgrade-Insecure-Requests": "1",
-                "DNT": "1",
-            }
+        try:
+            if self.config.render_js:
+                ua = self.config.user_agent or _DEFAULT_USER_AGENT
+                await self._start_playwright(user_agent=ua)
+                await self._crawl_loop({})
+            else:
+                httpx_headers: Optional[Dict[str, str]] = None
+                if None in self._tls_chain:
+                    user_agent = self.config.user_agent or _DEFAULT_USER_AGENT
+                    httpx_headers = {
+                        "User-Agent": user_agent,
+                        "Accept": (
+                            "text/html,application/xhtml+xml,application/xml;q=0.9,"
+                            "image/avif,image/webp,*/*;q=0.8"
+                        ),
+                        "Accept-Language": "en-US,en;q=0.9",
+                        "Accept-Encoding": "gzip, deflate, br",
+                        "Sec-Fetch-Dest": "document",
+                        "Sec-Fetch-Mode": "navigate",
+                        "Sec-Fetch-Site": "none",
+                        "Sec-Fetch-User": "?1",
+                        "Upgrade-Insecure-Requests": "1",
+                        "DNT": "1",
+                    }
 
-        async with self._open_sessions(httpx_headers) as sessions:
-            await self._crawl_loop(sessions)
+                async with self._open_sessions(httpx_headers) as sessions:
+                    await self._crawl_loop(sessions)
+        finally:
+            if self.config.render_js:
+                await self._stop_playwright()
 
         elapsed = time.time() - self.start_time
         logger.info(
-            "Crawl completed: %s pages, %s failed, %.2fs",
-            len(self.crawl_results),
-            len(self.failed_urls),
-            elapsed,
+            "Crawl completed",
+            extra={
+                "trace_id": self.trace_id,
+                "start_url": self.config.start_url,
+                "pages": len(self.crawl_results),
+                "failed": len(self.failed_urls),
+                "visited_urls": len(self.visited_urls),
+                "pending_urls": len(self.pending_urls),
+                "total_urls_found": self.total_urls_found,
+                "elapsed_sec": round(elapsed, 3),
+            },
         )
 
         return self.crawl_results
@@ -520,32 +570,46 @@ class WebCrawler:
             try:
                 logger.debug("Crawling %s (depth: %s)", url, depth)
 
-                # Fetch page (with TLS fingerprint fallback chain)
-                response, fingerprint_used = await self._fetch_with_fallback(
-                    sessions, url
-                )
-                if response is None:
-                    error_msg = "All TLS fingerprints raised exceptions"
-                    logger.error("Failed to crawl %s: %s", url, error_msg)
-                    self.failed_urls[url] = error_msg
-                    return None, set()
+                # Fetch page — Playwright (JS rendered) or TLS fallback chain
+                if self.config.render_js:
+                    try:
+                        html, _meta = await self._fetch_html_rendered(url)
+                    except RuntimeError as e:
+                        error_msg = str(e)
+                        logger.error("Failed to crawl %s: %s", url, error_msg)
+                        self.failed_urls[url] = error_msg
+                        return None, set()
 
-                if fingerprint_used is None and 200 <= response.status_code < 300:
-                    error_msg = "TLS fallback exhausted with challenge page"
-                    logger.error("Failed to crawl %s: %s", url, error_msg)
-                    self.failed_urls[url] = error_msg
-                    return None, set()
+                    raw_status = _meta.get("status_code")
+                    if raw_status is not None and isinstance(raw_status, int):
+                        if not (200 <= raw_status < 300):
+                            error_msg = f"HTTP {raw_status}"
+                            logger.error("Failed to crawl %s: %s", url, error_msg)
+                            self.failed_urls[url] = error_msg
+                            return None, set()
+                else:
+                    response, fingerprint_used = await self._fetch_with_fallback(
+                        sessions, url
+                    )
+                    if response is None:
+                        error_msg = "All TLS fingerprints raised exceptions"
+                        logger.error("Failed to crawl %s: %s", url, error_msg)
+                        self.failed_urls[url] = error_msg
+                        return None, set()
 
-                # Explicit status check is library-agnostic (works for both
-                # httpx and curl_cffi response objects, which raise different
-                # exception types from raise_for_status()).
-                if not 200 <= response.status_code < 300:
-                    error_msg = f"HTTP {response.status_code}"
-                    logger.error("Failed to crawl %s: %s", url, error_msg)
-                    self.failed_urls[url] = error_msg
-                    return None, set()
+                    if fingerprint_used is None and 200 <= response.status_code < 300:
+                        error_msg = "TLS fallback exhausted with challenge page"
+                        logger.error("Failed to crawl %s: %s", url, error_msg)
+                        self.failed_urls[url] = error_msg
+                        return None, set()
 
-                html = response.text
+                    if not 200 <= response.status_code < 300:
+                        error_msg = f"HTTP {response.status_code}"
+                        logger.error("Failed to crawl %s: %s", url, error_msg)
+                        self.failed_urls[url] = error_msg
+                        return None, set()
+
+                    html = response.text
 
                 # Clean and convert content
                 cleaned = self.content_cleaner.clean_and_convert(html, url)
@@ -553,7 +617,23 @@ class WebCrawler:
                 # Validate content
                 content = cleaned["content_markdown"]
                 if not self.content_cleaner.is_valid_content(content, min_length=10):
-                    logger.warning("Insufficient content at %s", url)
+                    logger.warning(
+                        "Insufficient content at %s (content_length=%s, title=%s)",
+                        url,
+                        cleaned.get("content_length"),
+                        cleaned.get("title"),
+                        extra={"trace_id": self.trace_id},
+                    )
+                    if logger.isEnabledFor(logging.DEBUG):
+                        snippet = (content or "").replace("\n", "\\n")
+                        if len(snippet) > 400:
+                            snippet = snippet[:400] + "...(truncated)"
+                        logger.debug(
+                            "Insufficient content snippet at %s (snippet=%s)",
+                            url,
+                            snippet,
+                            extra={"trace_id": self.trace_id},
+                        )
                     self.failed_urls[url] = "Insufficient content"
                     return None, set()
 
@@ -620,6 +700,144 @@ class WebCrawler:
             # Only add if not visited and not already pending
             if link not in self.visited_urls and link not in pending_urls_set:
                 self.pending_urls.append((link, next_depth))
+
+    async def _fetch_html_rendered(self, url: str) -> Tuple[str, Dict[str, object]]:
+        # Lazy import to keep Playwright optional at runtime.
+        try:
+            from playwright.async_api import Error as PlaywrightError
+            from playwright.async_api import TimeoutError as PlaywrightTimeoutError
+        except Exception as exc:  # noqa: BLE001
+            raise RuntimeError(
+                "Playwright is not available. Install with: pip install playwright "
+                "and then download browsers: playwright install chromium"
+            ) from exc
+
+        if self._browser_context is None:
+            raise RuntimeError("Playwright browser context is not initialized")
+
+        context = self._browser_context
+        page = await context.new_page()
+        try:
+            resp = await page.goto(
+                url,
+                wait_until=self.config.render_wait_until,
+                timeout=self.config.render_timeout_ms,
+            )
+            status_code: object = None
+            if resp is not None:
+                status_attr = getattr(resp, "status", None)
+                # Playwright Response.status is an int property (not a method).
+                status_code = status_attr() if callable(status_attr) else status_attr
+            content_type = None
+            try:
+                headers = getattr(resp, "headers", None)
+                if isinstance(headers, dict):
+                    content_type = headers.get("content-type")
+            except Exception:  # noqa: BLE001
+                content_type = None
+
+            html = await page.content()
+            self._log_fetched_page(
+                requested_url=url,
+                final_url=page.url,
+                status_code=status_code,
+                content_type=content_type,
+                html=html or "",
+                mode="rendered",
+            )
+            return html or "", {
+                "mode": "rendered",
+                "final_url": getattr(page, "url", url),
+                "status_code": status_code,
+            }
+        except (PlaywrightTimeoutError, PlaywrightError) as exc:
+            raise RuntimeError(f"Playwright navigation failed: {exc}") from exc
+        finally:
+            await page.close()
+
+    def _log_fetched_page(
+        self,
+        *,
+        requested_url: str,
+        final_url: str,
+        status_code: object,
+        content_type: object,
+        html: str,
+        mode: str,
+    ) -> None:
+        logger.info(
+            "Fetched page [%s] (requested_url=%s, final_url=%s, status_code=%s, content_type=%s, html_length=%s)",
+            mode,
+            requested_url,
+            final_url,
+            status_code,
+            content_type,
+            len(html or ""),
+            extra={"trace_id": self.trace_id},
+        )
+        if logger.isEnabledFor(logging.DEBUG):
+            html_snippet = (html or "").replace("\n", "\\n")
+            if len(html_snippet) > 400:
+                html_snippet = html_snippet[:400] + "...(truncated)"
+            logger.debug(
+                "Fetched page snippet [%s] (requested_url=%s, html_snippet=%s)",
+                mode,
+                requested_url,
+                html_snippet,
+                extra={"trace_id": self.trace_id},
+            )
+
+    async def _start_playwright(self, *, user_agent: str) -> None:
+        try:
+            from playwright.async_api import Error as PlaywrightError
+            from playwright.async_api import async_playwright
+        except Exception as exc:  # noqa: BLE001
+            raise RuntimeError(
+                "Playwright is not installed. Install with: pip install playwright. "
+                "Then download browsers: playwright install chromium"
+            ) from exc
+
+        self._playwright = await async_playwright().start()
+        chromium = getattr(self._playwright, "chromium", None)
+        if chromium is None:
+            await self._playwright.stop()
+            self._playwright = None
+            raise RuntimeError("Playwright chromium is unavailable")
+        try:
+            self._browser = await chromium.launch(headless=True)
+            self._browser_context = await self._browser.new_context(
+                user_agent=user_agent
+            )
+        except PlaywrightError as exc:
+            await self._stop_playwright()
+            msg = str(exc)
+            if "Executable doesn't exist" in msg or "playwright install" in msg:
+                raise RuntimeError(
+                    "Playwright browsers are not installed. "
+                    "If running locally, run: playwright install chromium. "
+                    "If running in Docker, update/rebuild the backend image (or run: docker compose exec backend playwright install chromium)."
+                ) from exc
+            raise RuntimeError(f"Playwright launch failed: {msg}") from exc
+
+    async def _stop_playwright(self) -> None:
+        try:
+            if self._browser_context is not None:
+                await self._browser_context.close()
+        except Exception:  # noqa: BLE001
+            pass
+        try:
+            if self._browser is not None:
+                await self._browser.close()
+        except Exception:  # noqa: BLE001
+            pass
+        try:
+            if self._playwright is not None:
+                await self._playwright.stop()
+        except Exception:  # noqa: BLE001
+            pass
+        self._browser_context = None
+        self._browser = None
+        self._playwright = None
 
     def get_statistics(self) -> dict:
         """Get crawl statistics.

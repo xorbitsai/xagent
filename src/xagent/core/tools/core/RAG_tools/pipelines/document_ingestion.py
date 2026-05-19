@@ -191,6 +191,7 @@ def run_document_ingestion(
     user_id: Optional[int] = None,
     is_admin: Optional[bool] = None,
     file_id: Optional[str] = None,
+    trace_id: Optional[str] = None,
 ) -> IngestionResult:
     """Public entrypoint for LangGraph-compatible ingestion tooling.
 
@@ -224,6 +225,7 @@ def run_document_ingestion(
         user_id=user_id,
         is_admin=is_admin,
         file_id=file_id,
+        trace_id=trace_id,
     )
 
 
@@ -445,10 +447,14 @@ def _handle_ingestion_error(
     vector_count: int,
     warnings: List[str],
     user_id: Optional[int] = None,
+    trace_id: Optional[str] = None,
 ) -> IngestionResult:
     """Unify error handling for the ingestion pipeline."""
     logger.exception(
-        "Document ingestion pipeline failed at step '%s': %s", current_step, exc
+        "Document ingestion pipeline failed at step '%s': %s",
+        current_step,
+        exc,
+        extra={"trace_id": trace_id, "collection": collection, "doc_id": doc_id},
     )
 
     status = "partial" if completed_steps else "error"
@@ -484,6 +490,7 @@ def process_document(
     user_id: Optional[int] = None,
     is_admin: bool = False,
     file_id: Optional[str] = None,
+    trace_id: Optional[str] = None,
 ) -> IngestionResult:
     """Execute the full ingestion pipeline for a document.
 
@@ -558,7 +565,11 @@ def process_document(
         # Step 0: Initialize/validate collection embedding configuration
         logger.info(
             "Step initialize_collection started",
-            extra={"collection": collection, "source_path": source_path},
+            extra={
+                "trace_id": trace_id,
+                "collection": collection,
+                "source_path": source_path,
+            },
         )
         init_start = time.time()
 
@@ -610,6 +621,7 @@ def process_document(
         logger.info(
             "Step initialize_collection completed",
             extra={
+                "trace_id": trace_id,
                 "collection": collection,
                 "embedding_model_id": selected_model_id,
                 "elapsed_ms": init_elapsed,
@@ -1292,4 +1304,5 @@ def process_document(
             vector_count=vector_count,
             warnings=warnings,
             user_id=user_id,
+            trace_id=trace_id,
         )

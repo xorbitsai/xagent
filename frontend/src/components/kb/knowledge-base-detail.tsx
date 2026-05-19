@@ -176,6 +176,7 @@ export function KnowledgeBaseDetailContent({ collectionName }: { collectionName:
     request_delay: 1.0,
     timeout: 30,
     respect_robots_txt: true,
+    render_js: false,
   })
 
   // Embedding models state
@@ -482,6 +483,7 @@ export function KnowledgeBaseDetailContent({ collectionName }: { collectionName:
       formData.append("request_delay", webIngestionConfig.request_delay.toString())
       formData.append("timeout", webIngestionConfig.timeout.toString())
       formData.append("respect_robots_txt", webIngestionConfig.respect_robots_txt.toString())
+      formData.append("render_js", webIngestionConfig.render_js.toString())
 
       // Add ingestion configuration
       appendIngestionConfigToFormData(formData, ingestionConfig)
@@ -538,6 +540,7 @@ export function KnowledgeBaseDetailContent({ collectionName }: { collectionName:
         request_delay: 1.0,
         timeout: 30,
         respect_robots_txt: true,
+        render_js: false,
       })
 
     } catch (err) {
@@ -1295,6 +1298,23 @@ export function KnowledgeBaseDetailContent({ collectionName }: { collectionName:
                               className="mt-1"
                             />
                           </div>
+                        </div>
+                        <div className="flex items-center gap-2">
+                          <input
+                            type="checkbox"
+                            id="dialog-render-js"
+                            checked={webIngestionConfig.render_js}
+                            onChange={(e) =>
+                              setWebIngestionConfig((prev) => ({
+                                ...prev,
+                                render_js: e.target.checked,
+                              }))
+                            }
+                            className="w-4 h-4"
+                          />
+                          <Label htmlFor="dialog-render-js" className="cursor-pointer">
+                            {t("kb.dialog.webImport.advanced.renderJs")}
+                          </Label>
                         </div>
                       </div>
                     </details>

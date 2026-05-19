@@ -33,3 +33,27 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 - **LanceDB user_id migration hardening**
   Startup and migration logic now include cross-process file locking, legacy `-1` orphan marker remapping to reserved int64 sentinel values, zero-progress loop protection, and shared embeddings-table listing utilities to avoid API-compat drift.
+
+### Added
+
+- **Knowledge Base web ingestion: JS-rendered crawling (Playwright)**
+  Web ingestion now supports an optional **JS-rendered** mode for SPA/JavaScript-heavy websites (e.g. pages where the initial HTML contains mostly `<head>` metadata and the real content is rendered by JavaScript).
+
+  If you enable the **"Render JS (Playwright)"** option in the Knowledge Base web ingestion UI:
+
+  - **Docker (recommended)**: the official backend image installs Chromium during build (see `docker/Dockerfile.backend`). If you see an error about missing Playwright browsers, you are likely using an older image tag. Fix by updating/rebuilding the backend image:
+
+    ```bash
+    docker compose pull backend
+    docker compose up -d backend
+    ```
+
+  - **Local (non-Docker)**: install Playwright browsers once:
+
+    ```bash
+    cd xagent
+    source .venv/bin/activate
+    playwright install chromium
+    ```
+
+  If browsers are missing, the backend returns an error like **"Playwright browsers are not installed"** with the command to run.

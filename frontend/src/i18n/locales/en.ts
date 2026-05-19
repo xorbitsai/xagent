@@ -1709,6 +1709,7 @@ Build when you need.`
           timeoutSeconds: "Request Timeout (seconds)",
           sameDomainOnly: "Same Domain Only",
           respectRobotsTxt: "Respect robots.txt",
+          renderJs: "Enable JS rendering (Playwright)",
           hintMultiple: "Separate multiple patterns with commas",
           hintContentSelector: "CSS selector for main content",
         },

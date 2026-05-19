@@ -1709,6 +1709,7 @@ Build when you need.`
           timeoutSeconds: "超时时间（秒）",
           sameDomainOnly: "仅同域名",
           respectRobotsTxt: "遵守 robots.txt",
+          renderJs: "启用 JS 渲染（Playwright）",
           hintMultiple: "多个模式用逗号分隔",
           hintContentSelector: "CSS 选择器，用于提取主内容",
         },

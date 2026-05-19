@@ -13,6 +13,8 @@ import time
 import uuid
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, TypedDict, TypeVar, cast
+from urllib.parse import urlparse
+from uuid import uuid4
 
 from fastapi import (
     APIRouter,
@@ -1207,6 +1209,7 @@ async def ingest(
         max_retries: Maximum retry attempts for failures.
         retry_delay: Delay between retry attempts in seconds.
     """
+    trace_id = uuid4().hex
     if not file.filename or not file.filename.strip():
         raise HTTPException(status_code=422, detail="No filename provided")
 
@@ -1227,6 +1230,18 @@ async def ingest(
     if not collection or not collection.strip():
         collection = Path(safe_filename).stem
         logger.info("Using file name as collection: %s", collection)
+
+    logger.info(
+        "KB ingest request received",
+        extra={
+            "trace_id": trace_id,
+            "collection": collection,
+            "filename": safe_filename,
+            "content_type": getattr(file, "content_type", None),
+            "user_id": getattr(_user, "id", None),
+            "is_admin": bool(getattr(_user, "is_admin", False)),
+        },
+    )
 
     try:
         # SECURITY: Validate collection name at API boundary
@@ -1373,6 +1388,23 @@ async def ingest(
         else 1.0,
     )
 
+    logger.info(
+        "KB ingest ingestion_config built",
+        extra={
+            "trace_id": trace_id,
+            "collection": collection,
+            "parse_method": str(config.parse_method),
+            "chunk_strategy": str(config.chunk_strategy),
+            "chunk_size": config.chunk_size,
+            "chunk_overlap": config.chunk_overlap,
+            "separators": config.separators,
+            "embedding_model_id": config.embedding_model_id,
+            "embedding_batch_size": config.embedding_batch_size,
+            "max_retries": config.max_retries,
+            "retry_delay": config.retry_delay,
+        },
+    )
+
     progress_manager = get_progress_manager()
 
     try:
@@ -1449,6 +1481,21 @@ async def ingest(
             except OSError:
                 logger.warning("Failed to remove ingest backup %s", file_backup_path)
 
+        logger.info(
+            "KB ingest result returned",
+            extra={
+                "trace_id": trace_id,
+                "collection": collection,
+                "doc_id": result.doc_id,
+                "parse_hash": result.parse_hash,
+                "status": result.status,
+                "failed_step": result.failed_step,
+                "chunk_count": result.chunk_count,
+                "embedding_count": result.embedding_count,
+                "vector_count": result.vector_count,
+            },
+        )
+
         return JSONResponse(
             status_code=200,
             content={**result.model_dump(), "file_id": file_record.file_id},
@@ -1510,7 +1557,6 @@ async def ingest_cloud(
 
     results = []
 
-    # Common configuration setup
     final_chunk_size = (
         request.chunk_size if request.chunk_size and request.chunk_size > 0 else 1000
     )
@@ -1556,7 +1602,6 @@ async def ingest_cloud(
     except Exception as e:
         logger.warning("Failed to save collection config during ingest_cloud: %s", e)
 
-    # Concurrency limit for cloud ingestion to avoid overloading
     semaphore = asyncio.Semaphore(5)
 
     async def process_file(file_info: CloudFile) -> IngestionResult:
@@ -1585,7 +1630,6 @@ async def ingest_cloud(
                 )
             try:
                 if file_info.provider == "google-drive":
-                    # Get credentials (run in thread to avoid blocking)
                     try:
                         creds = await asyncio.to_thread(
                             get_google_credentials, int(_user.id), db
@@ -1597,12 +1641,10 @@ async def ingest_cloud(
                             doc_id=file_info.fileName,
                         )
 
-                    # Build service (blocking)
                     service = await asyncio.to_thread(
                         build, "drive", "v3", credentials=creds, cache_discovery=False
                     )
 
-                    # Save to local path
                     had_existing_file = file_path.exists()
                     if had_existing_file:
                         file_backup_path = file_path.with_name(
@@ -1610,7 +1652,6 @@ async def ingest_cloud(
                         )
                         shutil.copy2(file_path, file_backup_path)
 
-                    # Download file directly to disk
                     try:
 
                         def _download_file() -> None:
@@ -1666,7 +1707,6 @@ async def ingest_cloud(
                         file_size=int(file_path.stat().st_size),
                     )
 
-                    # Run ingestion (blocking)
                     try:
                         normalized_parse_method = _normalize_parse_method_for_filename(
                             request.parse_method,
@@ -1776,7 +1816,6 @@ async def ingest_cloud(
                     doc_id=file_info.fileName,
                 )
 
-    # Run all file processings concurrently
     results = await asyncio.gather(*[process_file(f) for f in request.files])
 
     if not collection_existed_before and not any(
@@ -2243,6 +2282,19 @@ async def ingest_web(
         True,
         description="Respect robots.txt (default: True)",
     ),
+    render_js: Optional[bool] = Form(
+        False,
+        description="Render pages with a real browser (Playwright) for JS-heavy sites (default: False)",
+    ),
+    render_wait_until: Optional[str] = Form(
+        "networkidle",
+        description="Playwright wait_until: load|domcontentloaded|networkidle (default: networkidle)",
+    ),
+    render_timeout_ms: Optional[int] = Form(
+        30000,
+        ge=1,
+        description="Playwright navigation timeout in ms (default: 30000)",
+    ),
     # IngestionConfig parameters
     parse_method: Optional[ParseMethod] = Form(
         None,
@@ -2316,6 +2368,64 @@ async def ingest_web(
         max_retries: Maximum retry attempts
         retry_delay: Delay between retries
     """
+    trace_id = uuid4().hex
+    start_url = start_url.strip()
+    parsed_start = urlparse(start_url)
+    if parsed_start.scheme not in ("http", "https") or not parsed_start.netloc:
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                "Invalid start_url. It must be an absolute URL starting with "
+                "'http://' or 'https://', e.g. 'https://example.com'."
+            ),
+        )
+
+    effective_render_wait_until = render_wait_until or "networkidle"
+    if effective_render_wait_until not in ("load", "domcontentloaded", "networkidle"):
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                "Invalid render_wait_until. Must be one of: "
+                "load, domcontentloaded, networkidle"
+            ),
+        )
+
+    logger.info(
+        "KB web ingest request received",
+        extra={
+            "trace_id": trace_id,
+            "collection": collection,
+            "start_url": start_url,
+            "user_id": int(_user.id),
+            "is_admin": bool(_user.is_admin),
+            "max_pages": max_pages,
+            "max_depth": max_depth,
+            "same_domain_only": same_domain_only,
+            "url_patterns": url_patterns,
+            "exclude_patterns": exclude_patterns,
+            "content_selector": content_selector,
+            "remove_selectors": remove_selectors,
+            "concurrent_requests": concurrent_requests,
+            "request_delay": request_delay,
+            "timeout": timeout,
+            "respect_robots_txt": respect_robots_txt,
+            "render_js": render_js,
+            "render_wait_until": render_wait_until,
+            "render_timeout_ms": render_timeout_ms,
+            "parse_method": str(parse_method) if parse_method is not None else None,
+            "chunk_strategy": str(chunk_strategy)
+            if chunk_strategy is not None
+            else None,
+            "chunk_size": chunk_size,
+            "chunk_overlap": chunk_overlap,
+            "separators": separators,
+            "embedding_model_id": embedding_model_id,
+            "embedding_batch_size": embedding_batch_size,
+            "max_retries": max_retries,
+            "retry_delay": retry_delay,
+        },
+    )
+
     try:
         try:
             safe_collection = sanitize_path_component(collection, "collection")
@@ -2358,6 +2468,9 @@ async def ingest_web(
             respect_robots_txt=(
                 respect_robots_txt if respect_robots_txt is not None else True
             ),
+            render_js=bool(render_js),
+            render_wait_until=effective_render_wait_until,
+            render_timeout_ms=render_timeout_ms or 30000,
         )
 
         final_chunk_size = (
@@ -2642,8 +2755,28 @@ async def ingest_web(
                     user_id=int(_user.id),
                     is_admin=bool(_user.is_admin),
                     file_handler=_file_handler_with_db,
+                    trace_id=trace_id,
                 )
             ),
+        )
+
+        logger.info(
+            "KB web ingest result returned",
+            extra={
+                "trace_id": trace_id,
+                "collection": collection,
+                "start_url": start_url,
+                "status": getattr(result, "status", None),
+                "total_urls_found": getattr(result, "total_urls_found", None),
+                "pages_crawled": getattr(result, "pages_crawled", None),
+                "pages_failed": getattr(result, "pages_failed", None),
+                "documents_created": getattr(result, "documents_created", None),
+                "chunks_created": getattr(result, "chunks_created", None),
+                "embeddings_created": getattr(result, "embeddings_created", None),
+                "failed_urls_count": len(getattr(result, "failed_urls", {}) or {}),
+                "warnings_count": len(getattr(result, "warnings", []) or []),
+                "elapsed_time_ms": getattr(result, "elapsed_time_ms", None),
+            },
         )
 
         if result.status == "error":

@@ -16,6 +16,8 @@ class ContentCleaner:
         self,
         content_selector: Optional[str] = None,
         remove_selectors: Optional[list[str]] = None,
+        *,
+        trace_id: Optional[str] = None,
     ):
         """Initialize content cleaner.
 
@@ -25,6 +27,7 @@ class ContentCleaner:
         """
         self.content_selector = content_selector
         self.remove_selectors = remove_selectors or []
+        self.trace_id = trace_id
 
     def clean_and_convert(self, html: str, url: str) -> dict:
         """Clean HTML and convert to markdown.
@@ -81,8 +84,21 @@ class ContentCleaner:
                 "content_length": len(markdown),
             }
 
-        except Exception as e:
-            logger.error("Failed to clean content from %s: %s", url, e)
+        except Exception:
+            html_snippet = (html or "").replace("\n", "\\n")
+            if len(html_snippet) > 400:
+                html_snippet = html_snippet[:400] + "...(truncated)"
+            logger.exception(
+                "Failed to clean content",
+                extra={
+                    "trace_id": self.trace_id,
+                    "url": url,
+                    "html_length": len(html or ""),
+                    "html_snippet": html_snippet,
+                    "content_selector": self.content_selector,
+                    "remove_selectors": self.remove_selectors,
+                },
+            )
             return {
                 "title": None,
                 "content_markdown": "",
@@ -207,8 +223,26 @@ class ContentCleaner:
             True if valid, False otherwise
         """
         if not content or len(content) < min_length:
+            logger.debug(
+                "Content rejected by min_length",
+                extra={
+                    "trace_id": self.trace_id,
+                    "content_length": len(content or ""),
+                    "min_length": min_length,
+                },
+            )
             return False
 
         # Check if content has actual text (not just empty lines/spaces)
         lines = [line.strip() for line in content.split("\n") if line.strip()]
-        return len(lines) > 0
+        if len(lines) == 0:
+            logger.debug(
+                "Content rejected: no non-empty lines",
+                extra={
+                    "trace_id": self.trace_id,
+                    "content_length": len(content),
+                    "min_length": min_length,
+                },
+            )
+            return False
+        return True

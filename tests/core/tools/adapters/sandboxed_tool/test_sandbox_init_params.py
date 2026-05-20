@@ -246,20 +246,54 @@ class TestBuildExecutionEnv:
         env = wrapper._build_execution_env()
         assert env["MY_API_KEY"] == "secret"
 
-    def test_missing_env_var_warns(self, monkeypatch, caplog):
+    def test_missing_env_var_warns(self, monkeypatch):
         monkeypatch.delenv("NONEXISTENT_VAR", raising=False)
         wrapper = _create_test_wrapper(_FakeToolNoParams())
         wrapper._env_vars = ["NONEXISTENT_VAR"]
         import logging
 
-        # Bind caplog to the specific logger so a prior test (or an
-        # import-time ``logging.basicConfig(...)`` in one of the MCP
-        # tool modules) cannot leave the handler chain in a state where
-        # WARNING records are silently dropped. pytest 8+ stopped
-        # aggressively overriding handler levels from ``caplog.at_level``,
-        # so the context-manager form alone is fragile under the
-        # CI's pytest-xdist worker test ordering.
-        with caplog.at_level(logging.WARNING, logger=SandboxedToolWrapper.__module__):
+        # Bypass ``caplog`` entirely. Under pytest 8/9 + xdist on
+        # Python 3.12, the caplog handler can be left in a state where
+        # WARNING records are silently dropped between tests on the
+        # same worker (pytest-dev/pytest#11886). Both the plain
+        # ``caplog.at_level()`` and the logger-bound form proved
+        # unreliable for this test in CI. Attach our own list-collecting
+        # handler directly to the target logger so we don't depend on
+        # the caplog chain at all, and reset every piece of process-wide
+        # logging state that a prior test could have flipped.
+        target_logger = logging.getLogger(SandboxedToolWrapper.__module__)
+        records: list[logging.LogRecord] = []
+
+        class _ListHandler(logging.Handler):
+            def emit(self, record: logging.LogRecord) -> None:
+                records.append(record)
+
+        list_handler = _ListHandler(level=logging.WARNING)
+
+        original_level = target_logger.level
+        original_disabled = target_logger.disabled
+        original_propagate = target_logger.propagate
+        # ``logging.disable(level)`` is a process-wide threshold that
+        # short-circuits Logger.isEnabledFor; reset to NOTSET for the
+        # duration of this test so a prior test's ``logging.disable``
+        # call cannot suppress our WARNING.
+        previous_disable_level = logging.root.manager.disable
+        target_logger.addHandler(list_handler)
+        target_logger.setLevel(logging.WARNING)
+        target_logger.disabled = False
+        target_logger.propagate = True
+        logging.disable(logging.NOTSET)
+        try:
             env = wrapper._build_execution_env()
+        finally:
+            target_logger.removeHandler(list_handler)
+            target_logger.setLevel(original_level)
+            target_logger.disabled = original_disabled
+            target_logger.propagate = original_propagate
+            logging.disable(previous_disable_level)
+
         assert "NONEXISTENT_VAR" not in env
-        assert "NONEXISTENT_VAR" in caplog.text
+        messages = [record.getMessage() for record in records]
+        assert any("NONEXISTENT_VAR" in m for m in messages), (
+            f"expected a warning mentioning NONEXISTENT_VAR; got {messages!r}"
+        )

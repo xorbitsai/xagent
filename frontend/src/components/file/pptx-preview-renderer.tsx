@@ -46,16 +46,36 @@ export function PptxPreviewRenderer({ base64Content }: PptxPreviewRendererProps)
 
   // Size the canvas backing store to the container before each render.
   // pptxviewjs uses the canvas's pixel dimensions to lay out slides in
-  // 'fit' mode, so we need to keep them in sync with the visible area.
+  // 'fit' mode, so we keep them in sync with the visible area. We also
+  // multiply by devicePixelRatio so text is rendered at full Retina
+  // resolution — without this, glyphs (especially small CJK text) look
+  // washed out because the bundle ignores `scale`/`quality` render
+  // options at runtime and draws directly into canvas pixels.
   const syncCanvasSize = useCallback(() => {
     const container = containerRef.current
     const canvas = canvasRef.current
     if (!container || !canvas) return false
-    const w = Math.max(1, Math.floor(container.clientWidth))
-    const h = Math.max(1, Math.floor(container.clientHeight))
-    if (canvas.width === w && canvas.height === h) return false
-    canvas.width = w
-    canvas.height = h
+    const cssW = Math.max(1, Math.floor(container.clientWidth))
+    const cssH = Math.max(1, Math.floor(container.clientHeight))
+    const rawDpr = typeof window !== "undefined" ? window.devicePixelRatio || 1 : 1
+    // Clamp to 3 to avoid blowing memory on rare 4x displays.
+    const dpr = Math.max(1, Math.min(3, rawDpr))
+    const physW = Math.max(1, Math.floor(cssW * dpr))
+    const physH = Math.max(1, Math.floor(cssH * dpr))
+    const styleW = `${cssW}px`
+    const styleH = `${cssH}px`
+    if (
+      canvas.width === physW &&
+      canvas.height === physH &&
+      canvas.style.width === styleW &&
+      canvas.style.height === styleH
+    ) {
+      return false
+    }
+    canvas.width = physW
+    canvas.height = physH
+    canvas.style.width = styleW
+    canvas.style.height = styleH
     return true
   }, [])
 
@@ -180,11 +200,11 @@ export function PptxPreviewRenderer({ base64Content }: PptxPreviewRendererProps)
         ref={containerRef}
         className="flex-1 relative overflow-hidden flex items-center justify-center"
       >
-        <canvas
-          ref={canvasRef}
-          className="block max-w-full max-h-full"
-          style={{ width: "100%", height: "100%" }}
-        />
+        {/*
+          Canvas is sized in JS by syncCanvasSize (physical = cssSize *
+          devicePixelRatio). Don't override width/height here.
+        */}
+        <canvas ref={canvasRef} className="block" />
         {isLoading && (
           <div className="absolute inset-0 flex items-center justify-center pointer-events-none bg-background/40">
             <Loader2 className="h-6 w-6 animate-spin text-primary" />

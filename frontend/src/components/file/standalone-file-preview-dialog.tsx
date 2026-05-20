@@ -37,7 +37,10 @@ export function StandaloneFilePreviewDialog({
         setError(null)
 
         try {
-          const isPptxFile = fileName.toLowerCase().endsWith('.pptx') || fileName.toLowerCase().endsWith('.ppt')
+          // Only .pptx is rendered by the in-browser viewer; legacy .ppt
+          // (97-2003 binary) is not supported by pptxviewjs and falls
+          // through to a plain download.
+          const isPptxFile = fileName.toLowerCase().endsWith('.pptx')
           const url = isPptxFile
             ? `${getApiUrl()}/api/files/preview/${encodeURIComponent(fileId)}`
             : `${getApiUrl()}/api/files/download/${encodeURIComponent(fileId)}`

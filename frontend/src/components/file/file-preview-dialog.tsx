@@ -35,9 +35,9 @@ export function FilePreviewDialog({ open, onOpenChange }: FilePreviewDialogProps
           const apiUrl = getApiUrl()
 
           // .pptx is routed through /preview (raw bytes for PptxPreviewRenderer
-          // to render in-browser); everything else streams via /download.
-          const isPptxFile = filePreview.fileName.toLowerCase().endsWith('.pptx') ||
-            filePreview.fileName.toLowerCase().endsWith('.ppt')
+          // to render in-browser); everything else (including legacy .ppt, which
+          // pptxviewjs does not support) streams via /download.
+          const isPptxFile = filePreview.fileName.toLowerCase().endsWith('.pptx')
 
           let url: string
           if (isPptxFile) {
@@ -143,9 +143,10 @@ export function FilePreviewDialog({ open, onOpenChange }: FilePreviewDialogProps
 
   const handleOpenInNewWindow = () => {
     if (filePreview.fileId) {
-      // Check if this is a PPTX file
-      const isPptxFile = filePreview.fileName.toLowerCase().endsWith('.pptx') ||
-        filePreview.fileName.toLowerCase().endsWith('.ppt')
+      // .pptx is routed through /preview so the browser receives the raw
+      // bytes (mirroring the in-app viewer). Legacy .ppt and everything
+      // else falls back to the public preview URL.
+      const isPptxFile = filePreview.fileName.toLowerCase().endsWith('.pptx')
 
       let fileUrl: string
       const apiUrl = getApiUrl()

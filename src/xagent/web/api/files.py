@@ -44,6 +44,14 @@ from .legacy_file import (
 
 # Optional import for python-pptx (used for upload-time text preview).
 pptx: ModuleType | None = None
+# Kept around as a defensive placeholder so future call sites can raise a
+# helpful error if python-pptx is missing instead of failing with
+# AttributeError. Currently unused — _pptx_text_preview just no-ops when
+# pptx is None.
+pptx_not_installed_exception = RuntimeError(
+    "python-pptx is not installed. "
+    "Install with: pip install 'xagent[document-processing]'"
+)
 try:
     import pptx
 except ImportError:

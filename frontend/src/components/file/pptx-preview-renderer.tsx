@@ -85,7 +85,13 @@ export function PptxPreviewRenderer({ base64Content }: PptxPreviewRendererProps)
     let createdViewer: PPTXViewerHandle | null = null
 
     const load = async () => {
-      if (!base64Content || !canvasRef.current) return
+      // Empty payload: nothing to render. Drop the loading spinner so we
+      // don't hang the UI in an infinite loading state.
+      if (!base64Content) {
+        setIsLoading(false)
+        return
+      }
+      if (!canvasRef.current) return
       setIsLoading(true)
       setError(null)
 

@@ -131,6 +131,12 @@ _PDF_ONLY_PARSE_METHODS = {
 # lock_key -> (lock, active waiter/holder count)
 _WEB_FILE_LOCKS: Dict[str, tuple[threading.Lock, int]] = {}
 _WEB_FILE_LOCKS_GUARD = threading.Lock()
+_WEB_FILENAME_HASH_LENGTH = 16
+_WEB_FILENAME_SUFFIX = ".md"
+_MAX_FILESYSTEM_FILENAME_BYTES = 255
+_MAX_WEB_TITLE_FILENAME_BYTES = _MAX_FILESYSTEM_FILENAME_BYTES - len(
+    f"{'0' * _WEB_FILENAME_HASH_LENGTH}_{_WEB_FILENAME_SUFFIX}".encode("utf-8")
+)
 
 
 def _like_contains_pattern(value: str) -> str:
@@ -167,14 +173,16 @@ def _normalize_web_title_for_filename(title: str) -> str:
     # Replace separators and punctuation-heavy runs with underscores so
     # ordinary article titles ("How to edit a completed job?") remain usable.
     normalized = normalized.replace("/", " ").replace("\\", " ")
-    normalized = re.sub(r"\s+", "_", normalized)
     normalized = re.sub(r"[^\w.-]", "_", normalized)
     normalized = re.sub(r"_+", "_", normalized).strip("._-")
 
     if not normalized:
         return "untitled"
 
-    trimmed = normalized[:MAX_COLLECTION_NAME_LENGTH].rstrip("._-")
+    trimmed = normalized[:MAX_COLLECTION_NAME_LENGTH]
+    while trimmed and len(trimmed.encode("utf-8")) > _MAX_WEB_TITLE_FILENAME_BYTES:
+        trimmed = trimmed[:-1]
+    trimmed = trimmed.rstrip("._-")
     return trimmed or "untitled"
 
 

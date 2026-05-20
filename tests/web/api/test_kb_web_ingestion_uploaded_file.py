@@ -43,6 +43,20 @@ from xagent.web.models.uploaded_file import UploadedFile
 from xagent.web.models.user import User
 
 
+class TestNormalizeWebTitleForFilename:
+    """Unit tests for web-title filename normalization."""
+
+    def test_truncates_multibyte_titles_to_safe_filename_budget(self) -> None:
+        title = "你" * 120
+
+        normalized = _normalize_web_title_for_filename(title)
+        filename = f"{'0' * 16}_{normalized}.md"
+
+        assert normalized != "untitled"
+        assert len(normalized.encode("utf-8")) <= 235
+        assert len(filename.encode("utf-8")) <= 255
+
+
 @pytest.fixture
 def db_session():
     """Create a test database session."""

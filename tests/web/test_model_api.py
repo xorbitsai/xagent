@@ -181,6 +181,21 @@ def sample_speech_model_data():
     }
 
 
+@pytest.fixture(scope="function")
+def sample_image_model_data():
+    return {
+        "model_id": "test-image-model",
+        "category": "image",
+        "model_provider": "dashscope",
+        "model_name": "qwen-image",
+        "api_key": "test-api-key",
+        "base_url": "https://dashscope.aliyuncs.com/api/v1/services/aigc/multimodal-generation/generation",
+        "abilities": ["generate"],
+        "description": "Test image model",
+        "share_with_users": False,
+    }
+
+
 class TestModelAPI:
     """Test model management API endpoints"""
 
@@ -666,6 +681,55 @@ class TestModelAPI:
         }
         assert defaults["asr"] == sample_speech_model_data["model_id"]
         assert defaults["tts"] == sample_speech_model_data["model_id"]
+
+    def test_reject_asr_only_speech_model_as_tts_default(
+        self,
+        test_db,
+        regular_user,
+        regular_headers,
+        sample_speech_model_data,
+    ):
+        sample_speech_model_data["abilities"] = ["asr"]
+        create_response = client.post(
+            "/api/models/",
+            json=sample_speech_model_data,
+            headers=regular_headers,
+        )
+        assert create_response.status_code == 200
+        speech_model_id = create_response.json()["id"]
+
+        default_response = client.post(
+            "/api/models/user-default",
+            json={"model_id": speech_model_id, "config_type": "tts"},
+            headers=regular_headers,
+        )
+
+        assert default_response.status_code == 400
+        assert "incompatible" in default_response.json()["detail"]
+
+    def test_reject_generate_only_image_model_as_image_edit_default(
+        self,
+        test_db,
+        regular_user,
+        regular_headers,
+        sample_image_model_data,
+    ):
+        create_response = client.post(
+            "/api/models/",
+            json=sample_image_model_data,
+            headers=regular_headers,
+        )
+        assert create_response.status_code == 200
+        image_model_id = create_response.json()["id"]
+
+        default_response = client.post(
+            "/api/models/user-default",
+            json={"model_id": image_model_id, "config_type": "image_edit"},
+            headers=regular_headers,
+        )
+
+        assert default_response.status_code == 400
+        assert "incompatible" in default_response.json()["detail"]
 
     def test_list_supported_providers_includes_deepseek(
         self, test_db, regular_user, regular_headers

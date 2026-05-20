@@ -263,7 +263,27 @@ def _is_default_config_type_compatible(model: Any, config_type: str) -> bool:
     if expected_category is None:
         return False
     current_category = str(getattr(model, "category", ""))
-    return current_category == expected_category
+    if current_category != expected_category:
+        return False
+
+    abilities = getattr(model, "abilities", None) or []
+    if not isinstance(abilities, list):
+        abilities = []
+
+    required_abilities_by_config_type = {
+        "visual": {"vision"},
+        "image_edit": {"edit"},
+        "asr": {"asr"},
+        "tts": {"tts"},
+        "speech": {"asr", "tts"},
+    }
+
+    required_abilities = required_abilities_by_config_type.get(config_type)
+    if not required_abilities:
+        return True
+
+    current_abilities = {str(ability) for ability in abilities}
+    return required_abilities.issubset(current_abilities)
 
 
 @model_router.post("/", response_model=ModelWithAccessInfo)

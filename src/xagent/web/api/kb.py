@@ -7,9 +7,11 @@ import json
 import logging
 import mimetypes
 import os
+import re
 import shutil
 import threading
 import time
+import unicodedata
 import uuid
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, TypedDict, TypeVar, cast
@@ -82,6 +84,7 @@ from ...core.tools.core.RAG_tools.utils.string_utils import (
 from ...core.tools.core.RAG_tools.utils.user_scope import user_scope_context
 from ..auth_dependencies import get_current_user
 from ..config import (
+    MAX_COLLECTION_NAME_LENGTH,
     MAX_FILE_SIZE,
     MAX_FILE_SIZE_LABEL,
     get_upload_path,
@@ -153,6 +156,26 @@ def _normalize_parse_method_for_filename(
         )
         return ParseMethod.DEFAULT
     return normalized
+
+
+def _normalize_web_title_for_filename(title: str) -> str:
+    """Convert arbitrary web page titles into filesystem-safe filename parts."""
+    normalized = unicodedata.normalize("NFKC", title).strip()
+    if not normalized:
+        return "untitled"
+
+    # Replace separators and punctuation-heavy runs with underscores so
+    # ordinary article titles ("How to edit a completed job?") remain usable.
+    normalized = normalized.replace("/", " ").replace("\\", " ")
+    normalized = re.sub(r"\s+", "_", normalized)
+    normalized = re.sub(r"[^\w.-]", "_", normalized)
+    normalized = re.sub(r"_+", "_", normalized).strip("._-")
+
+    if not normalized:
+        return "untitled"
+
+    trimmed = normalized[:MAX_COLLECTION_NAME_LENGTH].rstrip("._-")
+    return trimmed or "untitled"
 
 
 def _validate_parser_for_file(
@@ -2468,9 +2491,7 @@ async def ingest_web(
             url_hash = hashlib.sha256(f"{collection_name}:{url}".encode()).hexdigest()[
                 :16
             ]
-            safe_title = (
-                sanitize_path_component(title, "filename") if title else "untitled"
-            )
+            safe_title = _normalize_web_title_for_filename(title)
             filename = f"{url_hash}_{safe_title}.md"
             lock_key = f"{int(_user.id)}:{url_hash}"
 

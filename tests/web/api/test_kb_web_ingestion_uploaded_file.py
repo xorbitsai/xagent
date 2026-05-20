@@ -33,6 +33,7 @@ from xagent.web.api.kb import (
     _atomic_replace_file,
     _get_file_sha256,
     _mark_uploaded_file_for_reindex,
+    _normalize_web_title_for_filename,
     _upsert_uploaded_file_record,
     _WebFileLock,
     kb_router,
@@ -539,7 +540,7 @@ class TestIngestWebHandleWebFile:
             temp_md = tmp_path / "temp.md"
             temp_md.write_text("# Title\n\nBody", encoding="utf-8")
             url = "https://example.com/page"
-            title = "My Page"
+            title = "How to edit a completed job?"
 
             # Call file handler twice with the same URL; second call must dedup.
             r1 = file_handler(temp_md, title, collection, url)
@@ -569,7 +570,6 @@ class TestIngestWebHandleWebFile:
             patch(
                 "xagent.web.api.kb.get_upload_path", side_effect=patched_get_upload_path
             ),
-            patch("xagent.web.api.kb.sanitize_path_component", return_value="my_page"),
             patch(
                 "xagent.web.api.kb.get_session_local", return_value=TestingSessionLocal
             ),
@@ -611,8 +611,9 @@ class TestIngestWebHandleWebFile:
 
         url = "https://example.com/page"
         collection = "c1"
+        title = "How to edit a completed job?"
         url_hash = hashlib.sha256(f"{collection}:{url}".encode()).hexdigest()[:16]
-        filename = f"{url_hash}_my_page.md"
+        filename = f"{url_hash}_{_normalize_web_title_for_filename(title)}.md"
         expected_persistent = uploads_root / f"user_{user.id}" / collection / filename
 
         def patched_get_upload_path(
@@ -636,7 +637,7 @@ class TestIngestWebHandleWebFile:
         ):
             temp_md = tmp_path / "temp.md"
             temp_md.write_text("# Title\n\nBody", encoding="utf-8")
-            file_handler(temp_md, "My Page", collection, url)
+            file_handler(temp_md, title, collection, url)
 
             from xagent.core.tools.core.RAG_tools.core.schemas import WebIngestionResult
 
@@ -649,7 +650,6 @@ class TestIngestWebHandleWebFile:
             patch(
                 "xagent.web.api.kb.get_upload_path", side_effect=patched_get_upload_path
             ),
-            patch("xagent.web.api.kb.sanitize_path_component", return_value="my_page"),
             patch(
                 "xagent.web.api.kb.get_session_local", return_value=TestingSessionLocal
             ),

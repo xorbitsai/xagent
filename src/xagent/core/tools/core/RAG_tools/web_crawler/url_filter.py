@@ -9,6 +9,8 @@ from typing import Optional
 from urllib.parse import urlparse
 from urllib.robotparser import RobotFileParser
 
+from ..core.web_url_utils import normalize_web_url
+
 logger = logging.getLogger(__name__)
 
 
@@ -36,7 +38,8 @@ class URLFilter:
             exclude_patterns: Regex patterns for excluded URLs
             respect_robots_txt: Whether to check robots.txt
         """
-        self.base_domain = urlparse(base_url).netloc
+        normalized_base_url = normalize_web_url(base_url)
+        self.base_domain = urlparse(normalized_base_url or base_url).netloc.lower()
         self.same_domain_only = same_domain_only
         self.url_patterns = [re.compile(p) for p in (url_patterns or [])]
         self.exclude_patterns = [re.compile(p) for p in (exclude_patterns or [])]
@@ -47,9 +50,7 @@ class URLFilter:
         self.robots_url: Optional[str] = None
         if respect_robots_txt:
             try:
-                self.robots_url = (
-                    f"{urlparse(base_url).scheme}://{self.base_domain}/robots.txt"
-                )
+                self.robots_url = f"{urlparse(normalized_base_url or base_url).scheme}://{self.base_domain}/robots.txt"
                 self.robots_parser = RobotFileParser()
                 self.robots_parser.set_url(self.robots_url)
                 self._fetch_robots_txt()
@@ -102,7 +103,7 @@ class URLFilter:
         """
         try:
             parsed = urlparse(url)
-            return parsed.netloc == self.base_domain
+            return parsed.netloc.lower() == self.base_domain
         except Exception as e:
             logger.debug("Error checking domain for %s: %s", url, e)
             return False
@@ -181,36 +182,7 @@ class URLFilter:
         Returns:
             Normalized absolute URL, or None if invalid
         """
-        from urllib.parse import urljoin, urlunparse
-
-        try:
-            # Handle relative URLs - use base_url if provided, otherwise try to resolve
-            if base_url:
-                url = urljoin(base_url, url)
-            elif not url.startswith(("http://", "https://")):
-                # If no base_url and not absolute, can't normalize
-                return None
-
-            parsed = urlparse(url)
-
-            # Remove fragment and normalize
-            normalized = urlunparse(
-                (
-                    parsed.scheme or "https",
-                    parsed.netloc,
-                    parsed.path,
-                    parsed.params,
-                    parsed.query,
-                    "",  # Remove fragment
-                )
-            )
-
-            # Only allow http/https
-            if parsed.scheme not in ("http", "https"):
-                return None
-
-            return normalized
-
-        except Exception as e:
-            logger.warning("Failed to normalize URL %s: %s", url, e)
-            return None
+        normalized = normalize_web_url(url, base_url=base_url)
+        if normalized is None:
+            logger.debug("Failed to normalize URL %s", url)
+        return normalized

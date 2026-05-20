@@ -598,6 +598,61 @@ def test_ingest_web_missing_protocol_returns_422(app_with_kb):
     mock_run_web_ingestion.assert_not_called()
 
 
+def test_ingest_web_uppercase_scheme_is_normalized(app_with_kb):
+    """POST ingest-web should accept uppercase schemes via shared URL normalization."""
+    captured_config = []
+
+    async def capture_web_ingestion(*, crawl_config, **kwargs):
+        captured_config.append(crawl_config)
+        return WebIngestionResult(
+            status="success",
+            collection=kwargs["collection"],
+            total_urls_found=1,
+            pages_crawled=1,
+            pages_failed=0,
+            documents_created=1,
+            chunks_created=1,
+            embeddings_created=1,
+            crawled_urls=[crawl_config.start_url],
+            failed_urls={},
+            message="ok",
+            warnings=[],
+            elapsed_time_ms=1,
+        )
+
+    with patch(
+        "xagent.web.api.kb.run_web_ingestion",
+        new=AsyncMock(side_effect=capture_web_ingestion),
+    ):
+        client = TestClient(app_with_kb)
+        response = client.post(
+            "/api/kb/ingest-web",
+            data={
+                "collection": "web_coll",
+                "start_url": "HTTP://Example.com/docs#intro",
+            },
+        )
+
+    assert response.status_code == 200
+    assert len(captured_config) == 1
+    assert captured_config[0].start_url == "http://example.com/docs"
+
+
+@pytest.mark.parametrize("start_url", ["http://@", "http://:80"])
+def test_ingest_web_hostless_url_returns_422(app_with_kb, start_url):
+    """POST ingest-web should reject hostless HTTP(S) URLs at validation time."""
+    with patch("xagent.web.api.kb.run_web_ingestion") as mock_run_web_ingestion:
+        client = TestClient(app_with_kb)
+        response = client.post(
+            "/api/kb/ingest-web",
+            data={"collection": "web_coll", "start_url": start_url},
+        )
+
+    assert response.status_code == 422
+    assert response.json()["detail"] == "Invalid start_url: URL must include a hostname"
+    mock_run_web_ingestion.assert_not_called()
+
+
 def test_ingest_web_error_cleans_new_collection_config(app_with_kb):
     """POST ingest-web should clean saved config when a new collection fails before any docs are created."""
     metadata_store = MagicMock()

@@ -11,7 +11,9 @@ from enum import Enum
 from typing import Annotated, Any, Dict, List, Literal, Optional, Union
 from uuid import uuid4
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
+
+from .web_url_utils import validate_and_normalize_web_url
 
 # Default configurable values (avoid scattering literals)
 DEFAULT_SEARCH_TOP_K: int = 5
@@ -1768,6 +1770,12 @@ class WebCrawlConfig(BaseModel):
         default=True,
         description="Whether to respect robots.txt rules",
     )
+
+    @field_validator("start_url", mode="before")
+    @classmethod
+    def validate_start_url(cls, value: Any) -> str:
+        """Normalize the crawl entrypoint once at the shared config boundary."""
+        return validate_and_normalize_web_url(value)
 
 
 class CrawlResult(BaseModel):

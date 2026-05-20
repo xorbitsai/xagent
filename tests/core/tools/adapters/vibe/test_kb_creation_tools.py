@@ -187,6 +187,30 @@ async def test_create_kb_from_url_returns_error_when_shared_service_fails():
 
 
 @pytest.mark.asyncio
+async def test_create_kb_from_url_rejects_invalid_start_url():
+    service = MagicMock()
+    service.prepare_collection = AsyncMock()
+    service.refresh_collection_metadata = AsyncMock()
+
+    with patch(
+        "xagent.core.tools.adapters.vibe.agent_kb_service.AgentKnowledgeBaseService",
+        return_value=service,
+    ):
+        tool = CreateKnowledgeBaseFromUrlTool(user_id=71, is_admin=False)
+        result = await tool.run_json_async(
+            {"url": "www.example.com", "collection_name": "agent_url_kb"}
+        )
+
+    assert result["success"] is False
+    assert (
+        result["message"]
+        == "Invalid start_url: URL must start with http:// or https://"
+    )
+    service.prepare_collection.assert_not_awaited()
+    service.refresh_collection_metadata.assert_not_awaited()
+
+
+@pytest.mark.asyncio
 async def test_create_kb_from_file_uses_shared_service(tmp_path):
     source_file = tmp_path / "notes.txt"
     source_file.write_text("hello", encoding="utf-8")

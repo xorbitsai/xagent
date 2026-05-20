@@ -1,7 +1,7 @@
 import logging
 from typing import Any, Mapping, Optional, Type
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, ValidationError
 
 from .....web.tools.config import WebToolConfig
 from .base import AbstractBaseTool, ToolCategory, ToolVisibility
@@ -140,11 +140,26 @@ class CreateKnowledgeBaseFromUrlTool(AbstractBaseTool):
                 message=f"Successfully imported website {tool_args.url} into knowledge base '{collection_name}'",
                 pages_crawled=result.pages_crawled,
             ).model_dump()
+        except ValidationError as e:
+            errors = e.errors()
+            message = errors[0]["msg"] if errors else str(e)
+            if isinstance(message, str) and message.startswith("Value error, "):
+                message = message.removeprefix("Value error, ")
+            logger.warning("Invalid URL for knowledge base creation: %s", message)
+            return CreateKnowledgeBaseFromUrlResult(
+                success=False,
+                collection_name="",
+                message=message,
+                pages_crawled=0,
+            ).model_dump()
 
         except Exception as e:
             logger.exception(f"Error creating knowledge base from URL: {e}")
             return CreateKnowledgeBaseFromUrlResult(
-                success=False, collection_name="", message=str(e), pages_crawled=0
+                success=False,
+                collection_name="",
+                message=str(e),
+                pages_crawled=0,
             ).model_dump()
 
 

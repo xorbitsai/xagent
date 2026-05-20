@@ -1,5 +1,9 @@
 """Unit tests for URL filter."""
 
+import pytest
+from pydantic import ValidationError
+
+from xagent.core.tools.core.RAG_tools.core.schemas import WebCrawlConfig
 from xagent.core.tools.core.RAG_tools.web_crawler.url_filter import URLFilter
 
 
@@ -39,6 +43,22 @@ class TestURLFilter:
 
         # Invalid scheme
         assert filter.normalize_url("ftp://example.com/file") is None
+
+    def test_normalize_url_accepts_uppercase_scheme(self):
+        """Normalization should be case-insensitive for HTTP(S) schemes."""
+        filter = URLFilter("https://example.com")
+
+        assert (
+            filter.normalize_url("HTTP://Example.com/Test#section")
+            == "http://example.com/Test"
+        )
+
+    def test_normalize_url_rejects_hostless_http_urls(self):
+        """Hostless HTTP(S) inputs should fail before crawl-time errors."""
+        filter = URLFilter("https://example.com")
+
+        assert filter.normalize_url("http://@") is None
+        assert filter.normalize_url("http://:80") is None
 
     def test_should_crawl_same_domain_only(self):
         """Test crawling with same domain restriction."""
@@ -121,3 +141,25 @@ class TestURLFilter:
         # Should allow all same-domain URLs when no patterns specified
         assert filter.should_crawl("https://example.com/any-page") is True
         assert filter.should_crawl("https://example.com/admin") is True
+
+
+def test_web_crawl_config_normalizes_start_url():
+    """WebCrawlConfig should normalize its shared crawl entrypoint."""
+    config = WebCrawlConfig(start_url=" HTTP://Example.com/docs#intro ")
+
+    assert config.start_url == "http://example.com/docs"
+
+
+def test_web_crawl_config_rejects_invalid_start_urls():
+    """WebCrawlConfig should enforce the shared web URL validation boundary."""
+    with pytest.raises(
+        ValidationError,
+        match="Invalid start_url: URL must start with http:// or https://",
+    ):
+        WebCrawlConfig(start_url="www.example.com")
+
+    with pytest.raises(
+        ValidationError,
+        match="Invalid start_url: URL must include a hostname",
+    ):
+        WebCrawlConfig(start_url="http://@")

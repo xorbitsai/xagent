@@ -12,6 +12,10 @@ def _build_normalized_netloc(parsed: ParseResult) -> str:
     if hostname is None:
         raise ValueError("Invalid start_url: URL must include a hostname")
 
+    normalized_host = hostname.lower()
+    if ":" in normalized_host:
+        normalized_host = f"[{normalized_host}]"
+
     userinfo = ""
     if parsed.username is not None:
         userinfo = parsed.username
@@ -23,7 +27,7 @@ def _build_normalized_netloc(parsed: ParseResult) -> str:
     if parsed.port is not None:
         port = f":{parsed.port}"
 
-    return f"{userinfo}{hostname.lower()}{port}"
+    return f"{userinfo}{normalized_host}{port}"
 
 
 def validate_and_normalize_web_url(url: str, *, base_url: Optional[str] = None) -> str:

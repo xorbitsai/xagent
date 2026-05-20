@@ -150,6 +150,13 @@ def test_web_crawl_config_normalizes_start_url():
     assert config.start_url == "http://example.com/docs"
 
 
+def test_web_crawl_config_preserves_ipv6_literal_brackets():
+    """WebCrawlConfig should keep IPv6 literals bracketed when normalizing."""
+    config = WebCrawlConfig(start_url="http://[::1]:8000/docs#frag")
+
+    assert config.start_url == "http://[::1]:8000/docs"
+
+
 def test_web_crawl_config_rejects_invalid_start_urls():
     """WebCrawlConfig should enforce the shared web URL validation boundary."""
     with pytest.raises(

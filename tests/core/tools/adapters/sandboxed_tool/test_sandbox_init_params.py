@@ -259,10 +259,7 @@ class TestBuildExecutionEnv:
         # aggressively overriding handler levels from ``caplog.at_level``,
         # so the context-manager form alone is fragile under the
         # CI's pytest-xdist worker test ordering.
-        with caplog.at_level(
-            logging.WARNING,
-            logger="xagent.core.tools.adapters.vibe.sandboxed_tool.sandboxed_tool_wrapper",
-        ):
+        with caplog.at_level(logging.WARNING, logger=SandboxedToolWrapper.__module__):
             env = wrapper._build_execution_env()
         assert "NONEXISTENT_VAR" not in env
         assert "NONEXISTENT_VAR" in caplog.text

@@ -451,18 +451,26 @@ export function ModelManagementDialog({
       setLoading(true)
 
       const currentDefaults = getModelDefaultTypes(model.id)
+      const failWithResponse = async (response: Response) => {
+        if (response.ok) return
 
-      for (const configType of currentDefaults) {
-        if (!nextDefaultTypes.includes(configType)) {
-          await apiRequest(`${getApiUrl()}/api/models/user-default/${configType}`, {
+        const errorData = await response.json().catch(() => ({}))
+        throw new Error(errorData.detail || t('models.errors.setDefaultFailed'))
+      }
+
+      const deleteRequests = currentDefaults
+        .filter(configType => !nextDefaultTypes.includes(configType))
+        .map(async (configType) => {
+          const response = await apiRequest(`${getApiUrl()}/api/models/user-default/${configType}`, {
             method: 'DELETE',
             headers: {}
           })
-        }
-      }
+          await failWithResponse(response)
+        })
 
-      for (const configType of nextDefaultTypes) {
-        if (!currentDefaults.includes(configType)) {
+      const addRequests = nextDefaultTypes
+        .filter(configType => !currentDefaults.includes(configType))
+        .map(async (configType) => {
           const response = await apiRequest(`${getApiUrl()}/api/models/user-default`, {
             method: 'POST',
             headers: {
@@ -474,12 +482,10 @@ export function ModelManagementDialog({
             })
           })
 
-          if (!response.ok) {
-            const errorData = await response.json().catch(() => ({}))
-            throw new Error(errorData.detail || t('models.errors.setDefaultFailed'))
-          }
-        }
-      }
+          await failWithResponse(response)
+        })
+
+      await Promise.all([...deleteRequests, ...addRequests])
 
       await onSuccess()
       setDefaultTargetModel(null)

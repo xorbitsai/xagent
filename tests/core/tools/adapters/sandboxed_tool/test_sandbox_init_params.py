@@ -4,6 +4,7 @@ Test init params extraction, serialization, and script generation for sandbox to
 
 import base64
 import json
+import logging
 import threading
 from typing import Any, Optional
 from unittest.mock import AsyncMock, MagicMock
@@ -250,7 +251,6 @@ class TestBuildExecutionEnv:
         monkeypatch.delenv("NONEXISTENT_VAR", raising=False)
         wrapper = _create_test_wrapper(_FakeToolNoParams())
         wrapper._env_vars = ["NONEXISTENT_VAR"]
-        import logging
 
         # Bypass ``caplog`` entirely. Under pytest 8/9 + xdist on
         # Python 3.12, the caplog handler can be left in a state where
@@ -281,7 +281,11 @@ class TestBuildExecutionEnv:
         target_logger.addHandler(list_handler)
         target_logger.setLevel(logging.WARNING)
         target_logger.disabled = False
-        target_logger.propagate = True
+        # The list_handler is attached directly to ``target_logger``,
+        # so propagation to the root logger is unnecessary — and harmful:
+        # it would leak this test's warning to whatever stream/file
+        # handler the root logger has hooked up (CI console output).
+        target_logger.propagate = False
         logging.disable(logging.NOTSET)
         try:
             env = wrapper._build_execution_env()

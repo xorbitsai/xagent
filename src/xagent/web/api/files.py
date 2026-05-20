@@ -1,5 +1,4 @@
 import asyncio
-import html
 import logging
 from pathlib import Path
 from types import ModuleType
@@ -7,17 +6,14 @@ from typing import Any, Dict, Optional, Tuple, cast
 from uuid import uuid4
 
 from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, UploadFile
-from fastapi.responses import FileResponse, HTMLResponse, StreamingResponse
+from fastapi.responses import FileResponse
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from ...config import get_uploads_dir
 from ...core.file_storage.factory import get_file_storage
 from ...core.tools.adapters.vibe.file_tool import read_file
-from ...core.tools.core.file_analysis import (
-    collect_pptx_slide_blocks,
-    iter_pptx_shapes,
-)
+from ...core.tools.core.file_analysis import collect_pptx_slide_blocks
 from ..auth_dependencies import get_current_user
 from ..config import (
     BINARY_EXTENSIONS,
@@ -46,15 +42,12 @@ from .legacy_file import (
     resolve_legacy_file_path_cross_user,
 )
 
-# Optional import for openpyxl
+# Optional import for python-pptx (used for upload-time text preview).
 pptx: ModuleType | None = None
 try:
     import pptx
 except ImportError:
-    pptx_not_installed_exception = RuntimeError(
-        "python-pptx is not installed. "
-        "Install with: pip install 'xagent[document-processing]'"
-    )
+    pptx = None
 
 logger = logging.getLogger(__name__)
 
@@ -433,45 +426,6 @@ def _check_file_access(file_record: UploadedFile, user: User) -> None:
         raise HTTPException(status_code=403, detail="Access denied")
 
 
-async def _try_convert_pptx_to_pdf(path: Path) -> Optional[StreamingResponse]:
-    if path.suffix.lower() != ".pptx":
-        return None
-    import tempfile
-
-    try:
-        with tempfile.TemporaryDirectory() as temp_dir:
-            proc = await asyncio.create_subprocess_exec(
-                "soffice",
-                "--headless",
-                "--convert-to",
-                "pdf",
-                "--outdir",
-                temp_dir,
-                str(path),
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-            )
-            try:
-                _, _ = await asyncio.wait_for(proc.communicate(), timeout=30)
-            except asyncio.TimeoutError:
-                proc.kill()
-                await proc.wait()
-                return None
-            if proc.returncode != 0:
-                return None
-            pdf_files = list(Path(temp_dir).glob("*.pdf"))
-            if not pdf_files:
-                return None
-            pdf_content = pdf_files[0].read_bytes()
-            return StreamingResponse(
-                iter([pdf_content]),
-                media_type="application/pdf",
-                headers={"Content-Disposition": f'inline; filename="{path.stem}.pdf"'},
-            )
-    except Exception:
-        return None
-
-
 def _pptx_text_preview(path: Path) -> str:
     """Extract a plain-text preview from a .pptx file for upload responses.
 
@@ -489,64 +443,6 @@ def _pptx_text_preview(path: Path) -> str:
 
     blocks, _stats = collect_pptx_slide_blocks(prs)
     return "\n\n".join(blocks)
-
-
-def _pptx_fallback_html(path: Path) -> HTMLResponse:
-    if not pptx:
-        raise pptx_not_installed_exception
-
-    prs = pptx.Presentation(str(path))
-    html_content = """
-    <!DOCTYPE html>
-    <html>
-    <head>
-        <meta charset="UTF-8">
-        <style>
-            body { font-family: Arial, sans-serif; margin: 40px; line-height: 1.6; }
-            h1 { color: #333; border-bottom: 2px solid #4CAF50; padding-bottom: 10px; }
-            h2 { color: #555; margin-top: 30px; }
-            .slide { border: 1px solid #ddd; padding: 20px; margin: 20px 0; background: #f9f9f9; border-radius: 8px; }
-            .slide-number { color: #999; font-size: 12px; margin-top: 10px; }
-            .text-content { white-space: pre-wrap; }
-            .notes { color: #666; font-style: italic; margin-top: 10px; }
-        </style>
-    </head>
-    <body>
-    """
-    html_content += f"<h1>📊 {html.escape(path.name)}</h1>"
-    total_slides = len(prs.slides)
-    for slide_num, slide in enumerate(prs.slides, 1):
-        slide_text: list[str] = []
-        for shape in iter_pptx_shapes(slide.shapes):
-            shape_text = getattr(shape, "text", None)
-            if shape_text:
-                txt = str(shape_text).strip()
-                if txt:
-                    slide_text.append(html.escape(txt))
-            elif getattr(shape, "has_table", False):
-                for row in shape.table.rows:
-                    for cell in row.cells:
-                        cell_text = cell.text_frame.text.strip()
-                        if cell_text:
-                            slide_text.append(html.escape(cell_text))
-        notes_html = ""
-        if getattr(slide, "has_notes_slide", False):
-            notes_frame = getattr(slide.notes_slide, "notes_text_frame", None)
-            notes = getattr(notes_frame, "text", "").strip() if notes_frame else ""
-            if notes:
-                notes_html = f'<div class="notes">[Notes] {html.escape(notes)}</div>'
-        if slide_text or notes_html:
-            body_html = "<br>".join(slide_text)
-            html_content += f"""
-            <div class=\"slide\">
-                <h2>Slide {slide_num}</h2>
-                <div class=\"text-content\">{body_html}</div>
-                {notes_html}
-                <div class=\"slide-number\">Slide {slide_num} of {total_slides}</div>
-            </div>
-            """
-    html_content += "</body></html>"
-    return HTMLResponse(content=html_content)
 
 
 @file_router.post("/upload")
@@ -909,16 +805,6 @@ async def preview_file(
                 raise _durable_storage_unavailable() from exc
             except DurableObjectMissingError:
                 materialized_path = file_ref.local_path
-            converted_pdf = await _try_convert_pptx_to_pdf(materialized_path)
-            if converted_pdf is not None:
-                return converted_pdf
-
-            if materialized_path.suffix.lower() == ".pptx":
-                try:
-                    return _pptx_fallback_html(materialized_path)
-                except Exception:
-                    pass
-
             return FileResponse(
                 path=str(materialized_path),
                 filename=file_name,
@@ -936,16 +822,6 @@ async def preview_file(
 
     if not full_path.exists():
         raise HTTPException(status_code=404, detail="File not found")
-
-    converted_pdf = await _try_convert_pptx_to_pdf(full_path)
-    if converted_pdf is not None:
-        return converted_pdf
-
-    if full_path.suffix.lower() == ".pptx":
-        try:
-            return _pptx_fallback_html(full_path)
-        except Exception:
-            pass
 
     return FileResponse(
         path=str(full_path),
@@ -986,16 +862,6 @@ async def public_preview_file(
                 raise _durable_storage_unavailable() from exc
             except DurableObjectMissingError:
                 target_path = file_ref.local_path
-            converted_pdf = await _try_convert_pptx_to_pdf(target_path)
-            if converted_pdf is not None:
-                return converted_pdf
-
-            if target_path.suffix.lower() == ".pptx":
-                try:
-                    return _pptx_fallback_html(target_path)
-                except Exception:
-                    pass
-
             return FileResponse(
                 path=str(target_path),
                 filename=str(file_record.filename),
@@ -1041,16 +907,6 @@ async def public_preview_file(
 
     if not target_path.exists() or not target_path.is_file():
         raise HTTPException(status_code=404, detail="File not found")
-
-    converted_pdf = await _try_convert_pptx_to_pdf(target_path)
-    if converted_pdf is not None:
-        return converted_pdf
-
-    if target_path.suffix.lower() == ".pptx":
-        try:
-            return _pptx_fallback_html(target_path)
-        except Exception:
-            pass
 
     return FileResponse(
         path=str(target_path),

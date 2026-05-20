@@ -2,6 +2,7 @@ import React from "react"
 import { Loader2, XIcon } from "lucide-react"
 import { DocxPreviewRenderer } from "@/components/file/docx-preview-renderer"
 import { ExcelPreviewRenderer } from "@/components/file/excel-preview-renderer"
+import { PptxPreviewRenderer } from "@/components/file/pptx-preview-renderer"
 import { MarkdownRenderer } from "@/components/ui/markdown-renderer"
 import { useI18n } from "@/contexts/i18n-context"
 import {
@@ -80,13 +81,8 @@ export function FileViewer({
 
   return (
     <div className="flex-1 overflow-auto bg-muted/30 rounded border h-full">
-      {(fileName.toLowerCase().endsWith('.pptx') || fileName.toLowerCase().endsWith('.ppt')) && mimeType !== 'application/pdf' ? (
-        <iframe
-          srcDoc={content || ''}
-          className="w-full h-full border-0"
-          sandbox="allow-same-origin allow-scripts"
-          title={fileName}
-        />
+      {fileName.toLowerCase().endsWith('.pptx') ? (
+        <PptxPreviewRenderer base64Content={content || ''} />
       ) : mimeType?.startsWith('image/') || fileName.match(/\.(jpg|jpeg|png|gif|webp|svg)$/i) ? (
         <div className="flex items-center justify-center h-full p-4">
           <img

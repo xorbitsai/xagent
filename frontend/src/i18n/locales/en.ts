@@ -1080,6 +1080,7 @@ Build when you need.`
         loadFailed: "Failed to load file",
         docxRenderFailed: "Failed to render DOCX preview",
         excelRenderFailed: "Failed to render Excel preview",
+        pptxRenderFailed: "Failed to render PowerPoint preview",
         cors: "CORS error: Unable to access the file. This might be a browser cache issue, please try refreshing the page.",
         networkErrorWithMsg: "Network error: {msg}",
       },

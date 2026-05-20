@@ -23,11 +23,10 @@ export function FilePreviewContent({ open }: FilePreviewContentProps) {
         try {
           const apiUrl = getApiUrl()
 
-          // PPTX files are converted to PDF by backend, treat as PDF
-          const isPptx = filePreview.fileName.match(/\.pptx$/i)
-          const isPdf = isPptx || filePreview.fileName.match(/\.pdf$/i)
-          const isDocx = filePreview.fileName.match(/\.docx$/i)
-
+          // The backend's preview endpoint returns raw bytes (including for
+          // .pptx, which is rendered in the browser by PptxPreviewRenderer).
+          // We only need to base64-encode binary responses for the
+          // downstream viewers.
           const url = `${apiUrl}/api/files/preview/${filePreview.fileId}`
 
           const response = await apiRequest(url, {

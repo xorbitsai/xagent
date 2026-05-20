@@ -34,10 +34,10 @@ export function FilePreviewDialog({ open, onOpenChange }: FilePreviewDialogProps
         try {
           const apiUrl = getApiUrl()
 
-          // Check if this is a PPTX file that needs preview conversion
+          // .pptx is routed through /preview (raw bytes for PptxPreviewRenderer
+          // to render in-browser); everything else streams via /download.
           const isPptxFile = filePreview.fileName.toLowerCase().endsWith('.pptx') ||
             filePreview.fileName.toLowerCase().endsWith('.ppt')
-          const isDocxFile = filePreview.fileName.toLowerCase().endsWith('.docx')
 
           let url: string
           if (isPptxFile) {

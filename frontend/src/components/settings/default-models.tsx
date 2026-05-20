@@ -78,28 +78,20 @@ const modelTypeConfig = {
 const defaultModelTypes = Object.keys(modelTypeConfig) as DefaultModelType[]
 
 const getModelCategory = (model: Model): string => {
-  const record = model as unknown as Record<string, unknown>
-  const category = record.category
-  return typeof category === 'string' ? category : ''
+  return model.category || ''
 }
 
 const getModelAbilities = (model: Model): string[] => {
-  const record = model as unknown as Record<string, unknown>
-  const abilities = record.abilities
-  return Array.isArray(abilities) ? abilities.filter((ability): ability is string => typeof ability === 'string') : []
+  return model.abilities || []
 }
 
 const getModelDisplayName = (model: Model): string => {
-  const record = model as unknown as Record<string, unknown>
-  const name = record.model_name
-  if (typeof name === 'string' && name) return name
+  if (model.model_name) return model.model_name
   return model.name
 }
 
 const getModelProviderLabel = (model: Model): string => {
-  const record = model as unknown as Record<string, unknown>
-  const provider = record.model_provider
-  if (typeof provider === 'string' && provider) return provider
+  if (model.model_provider) return model.model_provider
   return model.provider
 }
 
@@ -278,7 +270,7 @@ export function DefaultModelsSettings() {
                               {getModelProviderLabel(currentDefault.model)}
                             </Badge>
                             <Badge variant="outline" className="text-xs">
-                              {getModelCategory(currentDefault.model)}
+                              {t(`models.tabs.${getModelCategory(currentDefault.model)}`)}
                             </Badge>
                           </div>
                         </div>

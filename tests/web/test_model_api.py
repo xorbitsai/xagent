@@ -166,6 +166,21 @@ def sample_embedding_model_data():
     }
 
 
+@pytest.fixture(scope="function")
+def sample_speech_model_data():
+    return {
+        "model_id": "test-speech-model",
+        "category": "speech",
+        "model_provider": "xinference",
+        "model_name": "speech-dual-model",
+        "api_key": "test-api-key",
+        "base_url": "http://localhost:9997",
+        "abilities": ["asr", "tts"],
+        "description": "Test speech model",
+        "share_with_users": False,
+    }
+
+
 class TestModelAPI:
     """Test model management API endpoints"""
 
@@ -609,6 +624,48 @@ class TestModelAPI:
 
         assert default_response.status_code == 200
         assert default_response.json()["config_type"] == "embedding"
+
+    def test_allow_dual_speech_model_for_individual_asr_and_tts_defaults(
+        self,
+        test_db,
+        regular_user,
+        regular_headers,
+        sample_speech_model_data,
+    ):
+        create_response = client.post(
+            "/api/models/",
+            json=sample_speech_model_data,
+            headers=regular_headers,
+        )
+        assert create_response.status_code == 200
+        speech_model_id = create_response.json()["id"]
+
+        asr_response = client.post(
+            "/api/models/user-default",
+            json={"model_id": speech_model_id, "config_type": "asr"},
+            headers=regular_headers,
+        )
+        assert asr_response.status_code == 200
+        assert asr_response.json()["config_type"] == "asr"
+
+        tts_response = client.post(
+            "/api/models/user-default",
+            json={"model_id": speech_model_id, "config_type": "tts"},
+            headers=regular_headers,
+        )
+        assert tts_response.status_code == 200
+        assert tts_response.json()["config_type"] == "tts"
+
+        defaults_response = client.get(
+            "/api/models/user-default", headers=regular_headers
+        )
+        assert defaults_response.status_code == 200
+        defaults = {
+            item["config_type"]: item["model"]["model_id"]
+            for item in defaults_response.json()
+        }
+        assert defaults["asr"] == sample_speech_model_data["model_id"]
+        assert defaults["tts"] == sample_speech_model_data["model_id"]
 
     def test_list_supported_providers_includes_deepseek(
         self, test_db, regular_user, regular_headers

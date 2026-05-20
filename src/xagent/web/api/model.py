@@ -1563,19 +1563,9 @@ async def set_user_default_model(
     if not model:
         raise HTTPException(status_code=404, detail="Model not found")
 
-    # For speech models, automatically determine config_type based on actual abilities
-    # This prevents ASR and TTS models from conflicting with each other
-    if model.category == "speech" and model.abilities:
-        if "asr" in model.abilities and "tts" not in model.abilities:
-            config_type = "asr"  # Only ASR ability
-        elif "tts" in model.abilities and "asr" not in model.abilities:
-            config_type = "tts"  # Only TTS ability
-        elif "asr" in model.abilities and "tts" in model.abilities:
-            config_type = "speech"  # Both abilities
-        else:
-            config_type = config.config_type  # Fallback to user-specified
-    else:
-        config_type = config.config_type
+    # Respect the config_type selected by the client so users can choose
+    # distinct defaults for multi-capability speech models.
+    config_type = config.config_type
 
     if not _is_default_config_type_compatible(model, config_type):
         raise HTTPException(

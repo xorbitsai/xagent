@@ -13,6 +13,9 @@ import {
   Eye,
   FileText,
   Search,
+  Image as ImageIcon,
+  Mic,
+  Volume2,
   Loader2,
   CheckCircle,
   AlertCircle,
@@ -23,6 +26,7 @@ import {
   setUserDefaultModel,
   removeUserDefaultModel,
   DefaultModelConfig,
+  DefaultModelType,
   Model,
 } from "@/lib/models"
 import { useAuth } from "@/contexts/auth-context"
@@ -49,7 +53,29 @@ const modelTypeConfig = {
     icon: Search,
     color: "bg-red-500",
   },
+  image: {
+    icon: ImageIcon,
+    color: "bg-pink-500",
+  },
+  image_edit: {
+    icon: ImageIcon,
+    color: "bg-fuchsia-500",
+  },
+  asr: {
+    icon: Mic,
+    color: "bg-cyan-500",
+  },
+  tts: {
+    icon: Volume2,
+    color: "bg-teal-500",
+  },
+  speech: {
+    icon: Volume2,
+    color: "bg-sky-500",
+  },
 }
+
+const defaultModelTypes = Object.keys(modelTypeConfig) as DefaultModelType[]
 
 const getModelCategory = (model: Model): string => {
   const record = model as unknown as Record<string, unknown>
@@ -57,9 +83,47 @@ const getModelCategory = (model: Model): string => {
   return typeof category === 'string' ? category : ''
 }
 
-const getCompatibleModels = (models: Model[], configType: keyof typeof modelTypeConfig): Model[] => {
+const getModelAbilities = (model: Model): string[] => {
+  const record = model as unknown as Record<string, unknown>
+  const abilities = record.abilities
+  return Array.isArray(abilities) ? abilities.filter((ability): ability is string => typeof ability === 'string') : []
+}
+
+const getModelDisplayName = (model: Model): string => {
+  const record = model as unknown as Record<string, unknown>
+  const name = record.model_name
+  if (typeof name === 'string' && name) return name
+  return model.name
+}
+
+const getModelProviderLabel = (model: Model): string => {
+  const record = model as unknown as Record<string, unknown>
+  const provider = record.model_provider
+  if (typeof provider === 'string' && provider) return provider
+  return model.provider
+}
+
+const getCompatibleModels = (models: Model[], configType: DefaultModelType): Model[] => {
   if (configType === 'embedding') {
     return models.filter((model) => getModelCategory(model) === 'embedding')
+  }
+  if (configType === 'image') {
+    return models.filter((model) => getModelCategory(model) === 'image')
+  }
+  if (configType === 'image_edit') {
+    return models.filter((model) => getModelCategory(model) === 'image' && getModelAbilities(model).includes('edit'))
+  }
+  if (configType === 'asr') {
+    return models.filter((model) => getModelCategory(model) === 'speech' && getModelAbilities(model).includes('asr'))
+  }
+  if (configType === 'tts') {
+    return models.filter((model) => getModelCategory(model) === 'speech' && getModelAbilities(model).includes('tts'))
+  }
+  if (configType === 'speech') {
+    return models.filter((model) => {
+      const abilities = getModelAbilities(model)
+      return getModelCategory(model) === 'speech' && abilities.includes('asr') && abilities.includes('tts')
+    })
   }
   return models.filter((model) => getModelCategory(model) === 'llm')
 }
@@ -95,7 +159,7 @@ export function DefaultModelsSettings() {
     }
   }
 
-  const handleSetDefault = async (configType: keyof typeof modelTypeConfig, modelId: number) => {
+  const handleSetDefault = async (configType: DefaultModelType, modelId: number) => {
     if (!token) return
 
     try {
@@ -117,7 +181,7 @@ export function DefaultModelsSettings() {
     }
   }
 
-  const handleRemoveDefault = async (configType: keyof typeof modelTypeConfig) => {
+  const handleRemoveDefault = async (configType: DefaultModelType) => {
     if (!token) return
 
     try {
@@ -137,10 +201,6 @@ export function DefaultModelsSettings() {
     } finally {
       setSaving(null)
     }
-  }
-
-  const getModelById = (modelId: number) => {
-    return models.find(model => model.id === modelId)
   }
 
   if (loading) {
@@ -180,14 +240,12 @@ export function DefaultModelsSettings() {
         )}
 
         <div className="grid gap-6 md:grid-cols-2 xl:grid-cols-3">
-          {Object.entries(modelTypeConfig).map(([configType, config]) => {
-            const currentDefault = defaultModels[configType as keyof typeof modelTypeConfig]
+          {defaultModelTypes.map((configType) => {
+            const config = modelTypeConfig[configType]
+            const currentDefault = defaultModels[configType]
             const Icon = config.icon
             const isSaving = saving === configType
-            const compatibleModels = getCompatibleModels(
-              models,
-              configType as keyof typeof modelTypeConfig,
-            )
+            const compatibleModels = getCompatibleModels(models, configType)
 
             return (
               <Card key={configType} className="relative">
@@ -213,14 +271,14 @@ export function DefaultModelsSettings() {
                       <div className="flex items-center justify-between">
                         <div className="flex-1 min-w-0">
                           <p className="text-sm font-medium truncate">
-                            {currentDefault.model.name}
+                            {getModelDisplayName(currentDefault.model)}
                           </p>
                           <div className="flex items-center gap-1 mt-1">
                             <Badge variant="secondary" className="text-xs">
-                              {currentDefault.model.provider}
+                              {getModelProviderLabel(currentDefault.model)}
                             </Badge>
                             <Badge variant="outline" className="text-xs">
-                              {currentDefault.model.model_provider}
+                              {getModelCategory(currentDefault.model)}
                             </Badge>
                           </div>
                         </div>
@@ -228,7 +286,7 @@ export function DefaultModelsSettings() {
                       <Button
                         variant="outline"
                         size="sm"
-                        onClick={() => handleRemoveDefault(configType as keyof typeof modelTypeConfig)}
+                        onClick={() => handleRemoveDefault(configType)}
                         disabled={isSaving}
                         className="w-full"
                       >
@@ -244,11 +302,11 @@ export function DefaultModelsSettings() {
                       <Select
                         value=""
                         onValueChange={(value) =>
-                          handleSetDefault(configType as keyof typeof modelTypeConfig, parseInt(value))
+                          handleSetDefault(configType, parseInt(value))
                         }
                         options={compatibleModels.map((model) => ({
                           value: model.id.toString(),
-                          label: `${model.name} (${model.provider})`,
+                          label: `${getModelDisplayName(model)} (${getModelProviderLabel(model)})`,
                         }))}
                         placeholder={t('settings.defaultModels.labels.selectModel')}
                       />

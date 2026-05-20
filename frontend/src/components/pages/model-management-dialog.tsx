@@ -235,6 +235,12 @@ export function ModelManagementDialog({
     onOpenChange(false)
   }
 
+  const handleCancelDefaultsView = () => {
+    setDefaultTargetModel(null)
+    setSelectedDefaultConfigTypes([])
+    setViewMode('list')
+  }
+
   const handleEdit = (model: Model) => {
     setDefaultTargetModel(null)
     setEditingModel(model)
@@ -488,9 +494,7 @@ export function ModelManagementDialog({
       await Promise.all([...deleteRequests, ...addRequests])
 
       await onSuccess()
-      setDefaultTargetModel(null)
-      setSelectedDefaultConfigTypes([])
-      setViewMode('list')
+      handleCancelDefaultsView()
     } catch (err) {
       toast.error(err instanceof Error ? err.message : t('models.errors.setDefaultFailed'))
     } finally {
@@ -1025,11 +1029,7 @@ export function ModelManagementDialog({
                     variant="ghost"
                     size="icon"
                     className="-ml-2 h-8 w-8"
-                    onClick={() => {
-                      setDefaultTargetModel(null)
-                      setSelectedDefaultConfigTypes([])
-                      setViewMode('list')
-                    }}
+                    onClick={handleCancelDefaultsView}
                   >
                     <ArrowLeft className="w-4 h-4" />
                   </Button>
@@ -1110,14 +1110,7 @@ export function ModelManagementDialog({
                 </div>
 
                 <div className="flex justify-end gap-2 mt-6">
-                  <Button
-                    variant="outline"
-                    onClick={() => {
-                      setDefaultTargetModel(null)
-                      setSelectedDefaultConfigTypes([])
-                      setViewMode('list')
-                    }}
-                  >
+                  <Button variant="outline" onClick={handleCancelDefaultsView}>
                     {t('models.dialog.cancel')}
                   </Button>
                   <Button

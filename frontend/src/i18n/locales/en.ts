@@ -275,6 +275,11 @@ Build when you need.`
         visual: { title: "Vision Model", description: "Understands and processes images" },
         compact: { title: "Long Context Model", description: "Handles long contexts and compression" },
         embedding: { title: "Embedding Model", description: "Generates vector embeddings" },
+        image: { title: "Image Generation Model", description: "Used for image generation tasks" },
+        image_edit: { title: "Image Edit Model", description: "Used for image editing and refinement" },
+        asr: { title: "Speech Recognition Model", description: "Used for speech-to-text tasks" },
+        tts: { title: "Text-to-Speech Model", description: "Used for text-to-speech tasks" },
+        speech: { title: "Speech Model", description: "Supports both recognition and synthesis" },
       },
       actions: {
         clearDefault: "Clear Default",

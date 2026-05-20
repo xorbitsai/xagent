@@ -275,6 +275,11 @@ Build when you need.`
         visual: { title: "视觉模型", description: "理解并处理图像" },
         compact: { title: "长上下文模型", description: "处理长上下文与压缩" },
         embedding: { title: "嵌入模型", description: "生成向量嵌入" },
+        image: { title: "图像生成模型", description: "用于图片生成任务" },
+        image_edit: { title: "图像编辑模型", description: "用于图片编辑与修改" },
+        asr: { title: "语音识别模型", description: "用于语音转文本任务" },
+        tts: { title: "文本转语音模型", description: "用于文本转语音任务" },
+        speech: { title: "语音模型", description: "同时支持语音识别与合成" },
       },
       actions: {
         clearDefault: "清除默认",

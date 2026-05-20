@@ -5,6 +5,18 @@
 import { getApiUrl } from './utils';
 import { apiRequest } from './api-wrapper';
 
+export type DefaultModelType =
+  | 'general'
+  | 'small_fast'
+  | 'visual'
+  | 'compact'
+  | 'embedding'
+  | 'image'
+  | 'image_edit'
+  | 'asr'
+  | 'tts'
+  | 'speech';
+
 export interface Model {
   id: number;
   name: string;
@@ -24,7 +36,7 @@ export interface Model {
 export interface UserDefaultModel {
   id: number;
   user_id: number;
-  config_type: 'general' | 'small_fast' | 'visual' | 'compact' | 'embedding';
+  config_type: DefaultModelType;
   model_id: number;
   created_at: string;
   updated_at: string;
@@ -41,6 +53,11 @@ export interface DefaultModelConfig {
   visual?: ModelConfig;
   compact?: ModelConfig;
   embedding?: ModelConfig;
+  image?: ModelConfig;
+  image_edit?: ModelConfig;
+  asr?: ModelConfig;
+  tts?: ModelConfig;
+  speech?: ModelConfig;
 }
 
 /**
@@ -76,7 +93,7 @@ export async function getUserDefaultModels(token: string): Promise<DefaultModelC
  */
 export async function setUserDefaultModel(
   token: string,
-  configType: 'general' | 'small_fast' | 'visual' | 'compact' | 'embedding',
+  configType: DefaultModelType,
   modelId: number
 ): Promise<void> {
   const apiUrl = getApiUrl()
@@ -101,7 +118,7 @@ export async function setUserDefaultModel(
  */
 export async function removeUserDefaultModel(
   token: string,
-  configType: 'general' | 'small_fast' | 'visual' | 'compact' | 'embedding'
+  configType: DefaultModelType
 ): Promise<void> {
   const apiUrl = getApiUrl()
   const response = await apiRequest(`${apiUrl}/api/models/user-default/${configType}`, {

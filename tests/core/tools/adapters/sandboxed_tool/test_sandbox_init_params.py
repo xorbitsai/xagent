@@ -252,7 +252,17 @@ class TestBuildExecutionEnv:
         wrapper._env_vars = ["NONEXISTENT_VAR"]
         import logging
 
-        with caplog.at_level(logging.WARNING):
+        # Bind caplog to the specific logger so a prior test (or an
+        # import-time ``logging.basicConfig(...)`` in one of the MCP
+        # tool modules) cannot leave the handler chain in a state where
+        # WARNING records are silently dropped. pytest 8+ stopped
+        # aggressively overriding handler levels from ``caplog.at_level``,
+        # so the context-manager form alone is fragile under the
+        # CI's pytest-xdist worker test ordering.
+        with caplog.at_level(
+            logging.WARNING,
+            logger="xagent.core.tools.adapters.vibe.sandboxed_tool.sandboxed_tool_wrapper",
+        ):
             env = wrapper._build_execution_env()
         assert "NONEXISTENT_VAR" not in env
         assert "NONEXISTENT_VAR" in caplog.text

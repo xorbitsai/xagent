@@ -1,4 +1,4 @@
-from sqlalchemy import JSON, Boolean, Column, Integer, String, Text
+from sqlalchemy import JSON, Boolean, Column, Integer, String, Text, true
 
 from .database import Base
 
@@ -20,7 +20,9 @@ class PublicMCPApp(Base):  # type: ignore[no-any-unimported]
 
     category = Column(String(100), nullable=True)
     oauth_scopes = Column(JSON, nullable=True)  # List[str]
-    is_visible_in_connector = Column(Boolean, default=True, nullable=False)
+    is_visible_in_connector = Column(
+        Boolean, default=True, server_default=true(), nullable=False
+    )
     launch_config = Column(
         JSON, nullable=True
     )  # Dict e.g., {"command": "npx", "args": ["..."]}

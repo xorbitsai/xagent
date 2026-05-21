@@ -38,6 +38,13 @@ def _build_post_body(author_urn: str, text: str) -> dict:
     }
 
 
+def _sanitize_post_text(text: str) -> str:
+    # LinkedIn's API/feed rendering can truncate posts at the first ASCII
+    # parenthesis when content is published via automation. Converting to the
+    # fullwidth forms preserves readability while avoiding the buggy path.
+    return text.replace("(", "（").replace(")", "）")
+
+
 def _get_author_urn(headers: dict, proxies: dict | None) -> str:
     r = requests.get(USERINFO_URL, headers=headers, proxies=proxies)
     r.raise_for_status()
@@ -228,7 +235,7 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
             return [TextContent(type="text", text=r.text)]
 
         elif name == "create_post":
-            text = str(arguments.get("text") or "")
+            text = _sanitize_post_text(str(arguments.get("text") or ""))
             image_path = (arguments.get("image_path") or "").strip()
             alt_text = str(arguments.get("altText") or "")
             author_urn = _get_author_urn(headers, proxies)
@@ -257,7 +264,7 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
             ]
 
         elif name == "create_article_post":
-            text = str(arguments.get("text") or "")
+            text = _sanitize_post_text(str(arguments.get("text") or ""))
             author_urn = _get_author_urn(headers, proxies)
             body = _build_post_body(author_urn, text)
             body["content"] = {

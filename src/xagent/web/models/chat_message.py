@@ -21,6 +21,11 @@ class TaskChatMessage(Base):  # type: ignore
     content = Column(Text, nullable=False)
     message_type = Column(String(64), nullable=False)
     interactions = Column(JSON, nullable=True)
+    # Per-message attachments (uploaded files). For user messages this is the
+    # list of files the user attached when sending this turn. Stored as JSON so
+    # the original file metadata (file_id, name, size, type) is available for
+    # historical replay without having to re-derive it from the message body.
+    attachments = Column(JSON, nullable=True)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
 
     task = relationship("Task", back_populates="chat_messages")

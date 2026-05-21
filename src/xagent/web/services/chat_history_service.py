@@ -21,6 +21,8 @@ def persist_user_message(
     task_id: int,
     user_id: int,
     content: str,
+    *,
+    attachments: Optional[List[Dict[str, Any]]] = None,
 ) -> Optional[TaskChatMessage]:
     return _persist_message(
         db=db,
@@ -29,6 +31,7 @@ def persist_user_message(
         role="user",
         content=content,
         message_type="user_message",
+        attachments=attachments,
     )
 
 
@@ -37,6 +40,8 @@ def persist_user_message_no_commit(
     task_id: int,
     user_id: int,
     content: str,
+    *,
+    attachments: Optional[List[Dict[str, Any]]] = None,
 ) -> Optional[TaskChatMessage]:
     """``persist_user_message`` variant that stages the row but does NOT commit.
 
@@ -46,11 +51,12 @@ def persist_user_message_no_commit(
     responsible for calling ``db.commit()`` (or ``db.rollback()`` on
     failure).
 
-    Returns ``None`` when content is whitespace-only, same as the
-    regular ``persist_user_message``.
+    Returns ``None`` when content is whitespace-only AND no attachments
+    are provided. A row with empty content but non-empty attachments is
+    still persisted (the user uploaded files but didn't type anything).
     """
     normalized_content = content.strip()
-    if not normalized_content:
+    if not normalized_content and not attachments:
         return None
     message = TaskChatMessage(
         task_id=task_id,
@@ -59,6 +65,11 @@ def persist_user_message_no_commit(
         content=normalized_content,
         message_type="user_message",
         interactions=None,
+        # Pass through ``attachments`` directly so an explicit empty list
+        # round-trips as ``[]`` rather than being coerced to ``NULL`` —
+        # callers may want to distinguish "no attachments specified" from
+        # "attachments key was set, just empty".
+        attachments=attachments,
     )
     db.add(message)
     return message
@@ -151,9 +162,10 @@ def _persist_message(
     content: str,
     message_type: str,
     interactions: Optional[List[Dict[str, Any]]] = None,
+    attachments: Optional[List[Dict[str, Any]]] = None,
 ) -> Optional[TaskChatMessage]:
     normalized_content = content.strip()
-    if not normalized_content:
+    if not normalized_content and not attachments:
         return None
 
     message = TaskChatMessage(
@@ -163,6 +175,9 @@ def _persist_message(
         content=normalized_content,
         message_type=message_type,
         interactions=interactions,
+        # Pass through ``attachments`` directly so an explicit empty list
+        # round-trips as ``[]`` rather than being coerced to ``NULL``.
+        attachments=attachments,
     )
     db.add(message)
     db.commit()

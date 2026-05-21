@@ -49,7 +49,7 @@ import enum
 import logging
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
 from ..models.task import Task, TaskStatus
 from ..models.user import User
@@ -93,6 +93,12 @@ class TaskTurnPayload:
 
     transcript_message: str
     execution_message: Optional[str] = None
+    # Per-turn uploaded-file metadata persisted alongside the transcript
+    # row so historical replay can render the same clickable chips the
+    # user saw live. Each entry is the minimal chip shape (file_id,
+    # name, size, type) — already path-stripped by the websocket layer
+    # before reaching here.
+    attachments: Optional[List[Dict[str, Any]]] = None
 
     @property
     def for_agent(self) -> str:
@@ -292,6 +298,7 @@ class TaskTurnOrchestrator:
                 task_id=task_id,
                 user_id=int(user.id),
                 content=payload.transcript_message,
+                attachments=payload.attachments,
             )
             if persisted_message is not None:
                 db.flush()

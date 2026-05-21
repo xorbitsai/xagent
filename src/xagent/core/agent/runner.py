@@ -311,6 +311,10 @@ class AgentRunner:
             context = ExecutionContext.from_dict(checkpoint["context"])
             self.context_manager.set_context(context)
 
+        # Display-vs-execution split: ``execution_message`` is the prompt
+        # the agent runtime sees (may be enriched with file refs / system
+        # context); ``display_message`` is what the chat bubble should
+        # show. Both fall back to ``message`` for legacy callers.
         resolved_execution_message = (
             execution_message if execution_message is not None else message
         )
@@ -326,19 +330,62 @@ class AgentRunner:
         resolved_display_message = (
             display_message if display_message is not None else message
         )
+        # Attach files + display text to the new Message so they survive
+        # checkpoint round-trips: Message.metadata is serialized by
+        # ExecutionContext. The on_user_message_posted callback reads
+        # display_message back from metadata so the chat bubble shows the
+        # user-typed text rather than the LLM-augmented prompt.
         metadata: dict[str, Any] = {"display_message": resolved_display_message}
         if files is not None:
             metadata["files"] = files
 
-        context.add_user_message(resolved_execution_message, metadata=metadata)
+        added = context.add_user_message(resolved_execution_message, metadata=metadata)
+        # Persist BEFORE emitting the trace so the message is durable even
+        # if the trace dispatch fails — the resume path's catch-up logic
+        # in TraceEventCallback.on_run_start will replay any missed events.
         await self._persist_injected_context(
             execution_id=execution_id,
             context=context,
             label="user_message_injected",
         )
+        # Snapshot the watermark BEFORE the callback so we can detect a
+        # change (see comment below) and persist it.
+        watermark_before = self._read_trace_watermark(context)
+        await self._dispatch_callback(
+            "on_user_message_posted",
+            runner=self,
+            context=context,
+            message=added,
+            files=files,
+        )
+        # Re-persist when the trace callback advanced the watermark —
+        # without this a worker crash between trace emission and the next
+        # checkpoint would let the resume path replay the same user_message
+        # event because the watermark was still living only in memory.
+        watermark_after = self._read_trace_watermark(context)
+        if watermark_after and watermark_after != watermark_before:
+            await self._persist_injected_context(
+                execution_id=execution_id,
+                context=context,
+                label="user_message_trace_watermark",
+            )
         if request_interrupt:
             self.pause(execution_id, reason=reason or "new user message")
         return context
+
+    @staticmethod
+    def _read_trace_watermark(context: ExecutionContext) -> str | None:
+        """Read the user-message trace watermark off context metadata, if any.
+
+        Kept in-runner so we don't import the tracing module (which would
+        create a cycle) — the key is a stable contract spelled out in
+        ``core.agent.tracing.TRACE_WATERMARK_KEY``.
+        """
+        metadata = getattr(context, "metadata", None)
+        if not isinstance(metadata, dict):
+            return None
+        value = metadata.get("_user_message_trace_watermark")
+        return value if isinstance(value, str) and value else None
 
     async def post_user_message(
         self,

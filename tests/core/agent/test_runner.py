@@ -611,6 +611,57 @@ async def test_runner_resume_restores_from_latest_checkpoint_after_restart(
 
 
 @pytest.mark.asyncio
+async def test_runner_inject_user_message_with_files_dispatches_trace_callback(
+    tmp_path: Path,
+) -> None:
+    """End-to-end coverage of the continuation chip path: a websocket-style
+    ``post_user_message`` call with attachments must (a) attach the files to
+    the new Message so they survive checkpoints and (b) fire the trace
+    callback so the chip is broadcast live (instead of only appearing after
+    a page reload via historical replay)."""
+    tracer = RecordingTraceEventTracer()
+    agent = Agent(name="writer", patterns=[FakePattern({"success": True})])
+    runner = AgentRunner(
+        agent=agent,
+        tracer=tracer,
+        callbacks=[TraceEventCallback()],
+        workspace_manager=FakeWorkspaceManager(tmp_path),
+    )
+    await runner.run(task="Original task", execution_id="exec-cont-files")
+
+    files = [
+        {
+            "file_id": "fid-cont",
+            "name": "follow-up.pdf",
+            "size": 2048,
+            "type": "application/pdf",
+        }
+    ]
+    context = await runner.post_user_message(
+        "exec-cont-files",
+        "Use the attached PDF.",
+        request_interrupt=False,
+        files=files,
+    )
+
+    assert context is not None
+    new_user_message = next(
+        msg for msg in reversed(context.messages) if msg.role == "user"
+    )
+    assert new_user_message.metadata.get("files") == files
+
+    user_message_events = [
+        event
+        for event in tracer.events
+        if event["event_type"] == "task_start_message"
+        and event["data"].get("message") == "Use the attached PDF."
+    ]
+    assert len(user_message_events) == 1
+    assert user_message_events[0]["data"]["files"] == files
+    assert user_message_events[0]["data"]["attachments"] == files
+
+
+@pytest.mark.asyncio
 async def test_runner_post_user_message_alias_matches_inject_behavior(
     tmp_path: Path,
 ) -> None:

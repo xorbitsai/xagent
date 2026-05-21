@@ -307,6 +307,43 @@ def _selected_file_refs_from_task(task: Any, db: Session) -> list[dict[str, Any]
     return refs
 
 
+def _normalize_attachments_for_persistence(
+    file_info_list: Optional[List[Dict[str, Any]]],
+) -> List[Dict[str, Any]]:
+    """Project file_info_list to the minimal shape we persist on chat rows.
+
+    Thin wrapper around the shared
+    ``core.agent.attachments.project_file_info_to_chip`` so the trace
+    callback and the persistence path can't drift on what fields the
+    browser sees (paths must never leak — the attachments column and the
+    user_message trace events both reach the UI).
+    """
+    from ...core.agent.attachments import project_file_info_to_chip
+
+    return project_file_info_to_chip(file_info_list)
+
+
+def _attachment_fingerprint(attachments: Any) -> str:
+    """Order-independent fingerprint of a chip-shaped attachment list.
+
+    Used by the replay dedup key so two user turns with the same typed
+    text but different uploaded files don't collapse into one. We
+    fingerprint on ``file_id`` only — the field is stable across the
+    trace event payload and the persisted ``TaskChatMessage.attachments``
+    column, and the order of items isn't meaningful for identity.
+    """
+    if not isinstance(attachments, list):
+        return ""
+    file_ids: list[str] = []
+    for item in attachments:
+        if not isinstance(item, dict):
+            continue
+        file_id = item.get("file_id")
+        if isinstance(file_id, str) and file_id.strip():
+            file_ids.append(file_id.strip())
+    return "|".join(sorted(file_ids))
+
+
 def create_stream_event(
     event_type: str,
     task_id: Union[int, str],
@@ -2213,12 +2250,21 @@ async def handle_chat_message(
                     if hasattr(dag_pattern, "tracer") and hasattr(
                         dag_pattern, "task_id"
                     ):
-                        trace_data = {
+                        trace_data: Dict[str, Any] = {
                             "context": context,
                             "pattern": "DAG Plan-Execute Continuation",
                             "continuation": "true",
                             "files": display_file_refs,
                         }
+                        # Surface uploaded files at the top level so the
+                        # frontend user-message renderer can show clickable
+                        # file chips alongside the continuation bubble
+                        # (matches what historical replay shows on reload).
+                        # ``files`` is already populated above via #455's
+                        # display_file_refs; mirror it under ``attachments``
+                        # for the historical-replay client contract.
+                        if display_file_refs:
+                            trace_data["attachments"] = display_file_refs
                         await trace_user_message(
                             dag_pattern.tracer,
                             str(dag_pattern.task_id),
@@ -2285,6 +2331,12 @@ async def handle_chat_message(
                 if task_is_running and supports_live_control:
                     logger.info(f"Using agent message control for task {task_id}")
                     assert agent_service is not None
+                    # Pass the user-typed bubble text + display-safe file refs
+                    # alongside the LLM-augmented execution text. The runner
+                    # persists them onto Message.metadata so its tracing
+                    # callback can emit the bubble with the typed content +
+                    # file chips rather than the inflated prompt; matches what
+                    # historical replay shows on reload.
                     posted = await agent_service.post_user_message(
                         str(task_id),
                         execution_message=user_message_for_llm,
@@ -2427,9 +2479,16 @@ async def handle_chat_message(
                         TurnKind,
                     )
 
+                    # Strip absolute filesystem paths before the row hits
+                    # disk — the attachments column is exposed to historical-
+                    # replay clients, so paths must not leak.
+                    persisted_attachments = _normalize_attachments_for_persistence(
+                        file_info_list
+                    )
                     payload = TaskTurnPayload(
                         transcript_message=display_user_message,
                         execution_message=user_message_for_llm,
+                        attachments=persisted_attachments or None,
                     )
                     # WS path only has two legal entries into begin_turn:
                     #   PENDING                  → CREATE
@@ -2867,7 +2926,12 @@ async def send_historical_data_as_stream(
             historical_path_to_file_id: Dict[str, str] = {}
             normalized_trace_data_by_event_id: Dict[str, Any] = {}
             task_user_id = int(cast(Any, task.user_id))
-            trace_message_keys: set[tuple[str, str]] = set()
+            # Dedup key for "is this chat_messages row already covered by a
+            # trace event?". Includes an attachment fingerprint so two
+            # user turns with the same typed text but different uploaded
+            # files no longer collapse into one — the second row used to
+            # be dropped and its file chips disappeared on reload.
+            trace_message_keys: set[tuple[str, str, str]] = set()
 
             for trace_event in trace_events:
                 normalized_event_data = trace_event.data
@@ -2891,10 +2955,18 @@ async def send_historical_data_as_stream(
                         "message"
                     ) or normalized_event_data.get("content")
                     if isinstance(content, str) and content.strip():
+                        event_attachments = normalized_event_data.get(
+                            "files"
+                        ) or normalized_event_data.get("attachments")
+                        attachment_key = _attachment_fingerprint(event_attachments)
                         if trace_event.event_type == "user_message":
-                            trace_message_keys.add(("user", content.strip()))
+                            trace_message_keys.add(
+                                ("user", content.strip(), attachment_key)
+                            )
                         elif trace_event.event_type in {"agent_message", "ai_message"}:
-                            trace_message_keys.add(("assistant", content.strip()))
+                            trace_message_keys.add(
+                                ("assistant", content.strip(), attachment_key)
+                            )
 
             for trace_event in trace_events:
                 normalized_event_data = normalized_trace_data_by_event_id.get(
@@ -2934,14 +3006,37 @@ async def send_historical_data_as_stream(
             for chat_message in chat_messages:
                 role = str(chat_message.role)
                 content = str(chat_message.content or "").strip()
-                if not content:
+                # Read attachments off the row so file-only turns (empty
+                # content + non-empty attachments) survive replay and so the
+                # chip metadata reaches the synthesized user_message event.
+                _attachments_raw = chat_message.attachments
+                row_attachments: Optional[list] = (
+                    _attachments_raw
+                    if isinstance(_attachments_raw, list) and _attachments_raw
+                    else None
+                )
+                # Drop only when there's nothing to render — empty text *and*
+                # no attachments. A row with attachments but no text is a real
+                # turn (user uploaded files without typing) and must be kept.
+                if not content and not row_attachments:
                     continue
-                if (role, content) in trace_message_keys:
+                if (
+                    content
+                    and (role, content, _attachment_fingerprint(row_attachments))
+                    in trace_message_keys
+                ):
                     continue
 
                 if role == "user":
                     event_type = "user_message"
                     data: dict[str, Any] = {"message": content, "content": content}
+                    if row_attachments:
+                        # Surface the persisted chip payload at the top level
+                        # so the frontend user-message renderer can show
+                        # clickable file chips on reload, matching the live
+                        # event shape emitted by the agent tracing callback.
+                        data["files"] = row_attachments
+                        data["attachments"] = row_attachments
                 elif role == "assistant":
                     interactions = chat_message.interactions
                     data = {

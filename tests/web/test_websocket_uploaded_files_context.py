@@ -12,6 +12,7 @@ from xagent.web.api.websocket import (
     _build_uploaded_files_context,
     _display_file_refs_from_file_info,
     _display_message_for_user,
+    _normalize_attachments_for_persistence,
     _normalize_file_outputs,
     _register_uploaded_files_for_agent,
     _selected_file_refs_from_task,
@@ -646,3 +647,44 @@ def test_display_file_refs_from_file_info_omits_runtime_paths():
     ]
     assert "path" not in refs[0]
     assert "workspace_path" not in refs[0]
+
+
+def test_normalize_attachments_keeps_chip_fields_and_strips_paths():
+    """Only chip-relevant fields persist; absolute paths must not leak
+    into chat history (which is exposed to historical-replay clients)."""
+    raw = [
+        {
+            "file_id": "uuid-1",
+            "name": "normalized.xlsx",
+            "original_name": "Q1 Report.xlsx",
+            "size": 12345,
+            "type": (
+                "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+            ),
+            "path": "/abs/leak/should/be/stripped.xlsx",
+        }
+    ]
+    assert _normalize_attachments_for_persistence(raw) == [
+        {
+            "file_id": "uuid-1",
+            "name": "Q1 Report.xlsx",  # original_name preferred over name
+            "size": 12345,
+            "type": (
+                "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+            ),
+        }
+    ]
+
+
+def test_normalize_attachments_drops_entries_without_file_id():
+    assert _normalize_attachments_for_persistence(
+        [
+            {"name": "no-id.txt", "size": 1},
+            {"file_id": "keep", "name": "keep.txt"},
+        ]
+    ) == [{"file_id": "keep", "name": "keep.txt", "size": None, "type": None}]
+
+
+def test_normalize_attachments_handles_empty():
+    assert _normalize_attachments_for_persistence([]) == []
+    assert _normalize_attachments_for_persistence(None) == []

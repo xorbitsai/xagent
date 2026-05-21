@@ -36,15 +36,8 @@ from ..schemas.model import (
     UserDefaultModelCreate,
     UserDefaultModelResponse,
 )
-from ..services.hot_path_cache import (
-    cache_get,
-    cache_set,
-    invalidate_model_cache,
-    model_list_key,
-    user_default_model_key,
-    user_default_models_key,
-)
 from ..services.llm_utils import CoreStorage
+from ..services.model_store import ModelSharingConflictError, ModelStore
 from ..user_isolated_memory import UserContext
 
 logger = logging.getLogger(__name__)
@@ -72,17 +65,7 @@ def _can_user_share(user: User) -> bool:
     return bool(user.is_admin)
 
 
-# Create router
 model_router = APIRouter(prefix="/api/models", tags=["models"])
-
-
-def _model_has_shared_visibility(db: Session, model_id: int) -> bool:
-    return (
-        db.query(UserModel.id)
-        .filter(UserModel.model_id == model_id, UserModel.is_shared.is_(True))
-        .first()
-        is not None
-    )
 
 
 def _decode_model_identifier(model_id: str) -> str:
@@ -137,38 +120,6 @@ def _resolve_accessible_model(
         return model_storage, db_model, shared
 
     raise HTTPException(status_code=404, detail="Model not found or access denied")
-
-
-def _serialize_model_with_access(
-    db_model: DBModel, user_model: UserModel, requesting_user_id: Optional[int] = None
-) -> dict[str, Any]:
-    """Build a model response payload with user access info."""
-
-    is_owner = (
-        user_model.is_owner and user_model.user_id == requesting_user_id
-        if requesting_user_id is not None
-        else user_model.is_owner
-    )
-
-    return {
-        "id": db_model.id,
-        "model_id": db_model.model_id,
-        "category": db_model.category,
-        "model_provider": db_model.model_provider,
-        "model_name": db_model.model_name,
-        "base_url": db_model.base_url,
-        "temperature": db_model.temperature,
-        "dimension": db_model.dimension,
-        "abilities": db_model.abilities,
-        "description": db_model.description,
-        "created_at": db_model.created_at.isoformat() if db_model.created_at else None,
-        "updated_at": db_model.updated_at.isoformat() if db_model.updated_at else None,
-        "is_active": db_model.is_active,
-        "is_owner": is_owner,
-        "can_edit": is_owner and user_model.can_edit,
-        "can_delete": is_owner and user_model.can_delete,
-        "is_shared": user_model.is_shared,
-    }
 
 
 def _normalize_provider_model_id(model_id: str) -> str:
@@ -399,17 +350,11 @@ async def create_model(
 
     # Create user model relationship
     is_share: bool = model.share_with_users and _can_user_share(user)
-    user_model = UserModel(
-        user_id=user.id,
-        model_id=db_model.id,
-        is_owner=True,
-        can_edit=True,
-        can_delete=True,
+    ModelStore(db).create_user_model_link(
+        user_id=int(user.id),
+        model_id=int(db_model.id),
         is_shared=is_share,
     )
-    db.add(user_model)
-    db.commit()
-    invalidate_model_cache(None if is_share else int(user.id))
 
     # No pre-creation for other users — dynamic discovery handles visibility.
 
@@ -451,90 +396,14 @@ async def list_models(
     user: User = Depends(get_current_user),
 ) -> List[ModelWithAccessInfo]:
     """List all model configurations accessible to the current user"""
-    current_user_id = int(user.id)
-    cache_key = model_list_key(
-        current_user_id,
+    return ModelStore(db).list_models(
+        user_id=int(user.id),
         skip=skip,
         limit=limit,
         model_provider=model_provider,
         category=category,
         is_active=is_active,
     )
-    cached = cache_get(cache_key)
-    if isinstance(cached, list):
-        return [ModelWithAccessInfo.model_validate(item) for item in cached]
-
-    from ..services.model_service import (
-        _get_visible_user_ids,
-        build_user_model_visibility_filter,
-    )
-
-    # Get models that user has access to (owned or shared from visible users)
-    visible_ids = _get_visible_user_ids(db, current_user_id)
-
-    # Correlated subquery: for each DBModel, pick exactly one UserModel row,
-    # preferring the user's own row (deduplicates legacy shared data).
-    best_user_model_id = (
-        db.query(UserModel.id)
-        .filter(
-            UserModel.model_id == DBModel.id,
-            build_user_model_visibility_filter(current_user_id, visible_ids),
-        )
-        .order_by(
-            (UserModel.user_id == user.id).desc(),
-            UserModel.is_owner.desc(),
-        )
-        .limit(1)
-        .correlate(DBModel)
-        .scalar_subquery()
-    )
-
-    query = (
-        db.query(DBModel, UserModel)
-        .join(UserModel, DBModel.id == UserModel.model_id)
-        .filter(UserModel.id == best_user_model_id)
-    )
-    if model_provider:
-        query = query.filter(DBModel.model_provider == model_provider)
-
-    if category:
-        query = query.filter(DBModel.category == category)
-
-    if is_active is not None:
-        query = query.filter(DBModel.is_active == is_active)
-
-    models = query.offset(skip).limit(limit).all()
-
-    result = []
-    for db_model, user_model in models:
-        is_owner = user_model.is_owner and user_model.user_id == user.id
-        model_data = {
-            "id": db_model.id,
-            "model_id": db_model.model_id,
-            "category": db_model.category,
-            "model_provider": db_model.model_provider,
-            "model_name": db_model.model_name,
-            "base_url": db_model.base_url,
-            "temperature": db_model.temperature,
-            "dimension": db_model.dimension,
-            "abilities": db_model.abilities,
-            "description": db_model.description,
-            "created_at": db_model.created_at.isoformat()
-            if db_model.created_at
-            else None,
-            "updated_at": db_model.updated_at.isoformat()
-            if db_model.updated_at
-            else None,
-            "is_active": db_model.is_active,
-            "is_owner": is_owner,
-            "can_edit": is_owner and user_model.can_edit,
-            "can_delete": is_owner and user_model.can_delete,
-            "is_shared": user_model.is_shared,
-        }
-        result.append(ModelWithAccessInfo.model_validate(model_data))
-
-    cache_set(cache_key, [item.model_dump(mode="json") for item in result])
-    return result
 
 
 @model_router.get("/user-default")
@@ -542,165 +411,8 @@ async def get_user_default_models(
     db: Session = Depends(get_db), user: User = Depends(get_current_user)
 ) -> list:
     """Get all user's default model configurations with per-type admin fallback"""
-    current_user_id = int(user.id)
-    cache_key = user_default_models_key(current_user_id)
-    cached = cache_get(cache_key)
-    if isinstance(cached, list):
-        return cached
-
     try:
-        from ..services.model_service import (
-            _get_visible_user_ids,
-            build_user_model_visibility_filter,
-        )
-
-        # Get all possible config types
-        all_config_types = [
-            "general",
-            "small_fast",
-            "visual",
-            "compact",
-            "embedding",
-            "image",
-            "image_edit",
-            "asr",
-            "tts",
-        ]
-
-        # Get user's own defaults
-        user_defaults_by_type: dict[str, UserDefaultModel] = {}
-        user_defaults = (
-            db.query(UserDefaultModel)
-            .join(DBModel, UserDefaultModel.model_id == DBModel.id)
-            .filter(UserDefaultModel.user_id == user.id, DBModel.is_active)
-            .all()
-        )
-
-        # Organize user defaults by config type
-        for ud in user_defaults:
-            user_defaults_by_type[str(ud.config_type)] = ud
-
-        result = []
-        visible_ids = _get_visible_user_ids(db, current_user_id)
-
-        # Process each config type
-        for config_type in all_config_types:
-            user_model = None
-            if config_type in user_defaults_by_type:
-                # User has their own default for this type
-                ud = user_defaults_by_type[config_type]
-
-                # Get user model relationship for access info (two-step: own or shared)
-                user_model = (
-                    db.query(UserModel)
-                    .filter(
-                        UserModel.model_id == ud.model_id,
-                        build_user_model_visibility_filter(
-                            current_user_id, visible_ids
-                        ),
-                    )
-                    .first()
-                )
-
-                if user_model:
-                    is_owner = user_model.is_owner and user_model.user_id == user.id
-                    model_data = {
-                        "id": ud.id,
-                        "user_id": ud.user_id,
-                        "model_id": ud.model_id,
-                        "config_type": ud.config_type,
-                        "created_at": ud.created_at.isoformat()
-                        if ud.created_at
-                        else None,
-                        "updated_at": ud.updated_at.isoformat()
-                        if ud.updated_at
-                        else None,
-                        "model": {
-                            "id": user_model.model.id,
-                            "model_id": user_model.model.model_id,
-                            "category": user_model.model.category,
-                            "model_provider": user_model.model.model_provider,
-                            "model_name": user_model.model.model_name,
-                            "base_url": user_model.model.base_url,
-                            "temperature": user_model.model.temperature,
-                            "dimension": user_model.model.dimension,
-                            "abilities": user_model.model.abilities,
-                            "description": user_model.model.description,
-                            "created_at": user_model.model.created_at.isoformat()
-                            if user_model.model.created_at
-                            else None,
-                            "updated_at": user_model.model.updated_at.isoformat()
-                            if user_model.model.updated_at
-                            else None,
-                            "is_active": user_model.model.is_active,
-                            "is_owner": is_owner,
-                            "can_edit": is_owner and user_model.can_edit,
-                            "can_delete": is_owner and user_model.can_delete,
-                            "is_shared": user_model.is_shared,
-                        },
-                    }
-                    result.append(model_data)
-                    continue
-
-            if not user_model:
-                # User has no default for this type (or it's stale), try visible users' shared defaults
-                admin_default = (
-                    db.query(UserDefaultModel)
-                    .join(DBModel, UserDefaultModel.model_id == DBModel.id)
-                    .join(UserModel, UserDefaultModel.model_id == UserModel.model_id)
-                    .filter(
-                        UserDefaultModel.user_id.in_(visible_ids),
-                        UserDefaultModel.config_type == config_type,
-                        DBModel.is_active,
-                        UserModel.is_shared.is_(True),
-                    )
-                    .first()
-                )
-
-                if admin_default:
-                    logger.info(
-                        f"User {user.username} has no {config_type} default, using visible user default for display"
-                    )
-
-                    model_data = {
-                        "id": admin_default.id,
-                        "user_id": admin_default.user_id,
-                        "model_id": admin_default.model_id,
-                        "config_type": admin_default.config_type,
-                        "created_at": admin_default.created_at.isoformat()
-                        if admin_default.created_at
-                        else None,
-                        "updated_at": admin_default.updated_at.isoformat()
-                        if admin_default.updated_at
-                        else None,
-                        "model": {
-                            "id": admin_default.model.id,
-                            "model_id": admin_default.model.model_id,
-                            "category": admin_default.model.category,
-                            "model_provider": admin_default.model.model_provider,
-                            "model_name": admin_default.model.model_name,
-                            "base_url": admin_default.model.base_url,
-                            "temperature": admin_default.model.temperature,
-                            "dimension": admin_default.model.dimension,
-                            "abilities": admin_default.model.abilities,
-                            "description": admin_default.model.description,
-                            "created_at": admin_default.model.created_at.isoformat()
-                            if admin_default.model.created_at
-                            else None,
-                            "updated_at": admin_default.model.updated_at.isoformat()
-                            if admin_default.model.updated_at
-                            else None,
-                            "is_active": admin_default.model.is_active,
-                            "is_owner": False,
-                            "can_edit": False,
-                            "can_delete": False,
-                            "is_shared": True,
-                        },
-                    }
-                    result.append(model_data)
-
-        cache_set(cache_key, result)
-        return result
+        return ModelStore(db).get_user_default_models(user)
     except Exception as e:
         logger.error(f"Error getting user default models: {e}")
         # Return an empty list even if an error occurs, instead of 404
@@ -715,7 +427,7 @@ async def get_model_by_path(
 
     _, db_model, user_model = _resolve_accessible_model(db, user, model_id)
     return ModelWithAccessInfo.model_validate(
-        _serialize_model_with_access(
+        ModelStore(db).serialize_model_with_access(
             db_model, user_model, requesting_user_id=int(user.id)
         )
     )
@@ -1635,34 +1347,11 @@ async def set_user_default_model(
             ),
         )
 
-    existing_default = (
-        db.query(UserDefaultModel)
-        .filter(
-            UserDefaultModel.user_id == user.id,
-            UserDefaultModel.config_type == config_type,
-        )
-        .first()
-    )
-    old_default_was_shared = bool(
-        existing_default
-        and _model_has_shared_visibility(db, int(existing_default.model_id))
-    )
-    new_default_is_shared = bool(user_model.is_shared)
-
-    # Remove existing configuration for this config_type
-    if existing_default:
-        db.delete(existing_default)
-
-    # Create new default configuration
-    user_default = UserDefaultModel(
-        user_id=user.id, model_id=config.model_id, config_type=config_type
-    )
-
-    db.add(user_default)
-    db.commit()
-    db.refresh(user_default)
-    invalidate_model_cache(
-        None if old_default_was_shared or new_default_is_shared else int(user.id)
+    user_default = ModelStore(db).set_user_default_model(
+        user_id=int(user.id),
+        model_id=int(config.model_id),
+        config_type=config_type,
+        user_model=user_model,
     )
 
     # If this is an embedding model configuration, trigger memory store check
@@ -1693,28 +1382,7 @@ async def get_user_default_model(
     user: User = Depends(get_current_user),
 ) -> Optional[UserDefaultModelResponse]:
     """Get a user's default model configuration for a specific type"""
-    cache_key = user_default_model_key(int(user.id), config_type)
-    cached = cache_get(cache_key)
-    if isinstance(cached, dict):
-        return UserDefaultModelResponse.model_validate(cached)
-
-    user_default = (
-        db.query(UserDefaultModel)
-        .join(DBModel, UserDefaultModel.model_id == DBModel.id)
-        .filter(
-            UserDefaultModel.user_id == user.id,
-            UserDefaultModel.config_type == config_type,
-            DBModel.is_active,
-        )
-        .first()
-    )
-
-    if not user_default:
-        return None
-
-    response = UserDefaultModelResponse.model_validate(user_default)
-    cache_set(cache_key, response.model_dump(mode="json"))
-    return response
+    return ModelStore(db).get_user_default_model(int(user.id), config_type)
 
 
 @model_router.delete("/user-default/{config_type}")
@@ -1725,23 +1393,12 @@ async def delete_user_default_model(
 ) -> dict:
     """Delete a user's default model configuration"""
 
-    user_default = (
-        db.query(UserDefaultModel)
-        .filter(
-            UserDefaultModel.user_id == user.id,
-            UserDefaultModel.config_type == config_type,
-        )
-        .first()
+    user_default = ModelStore(db).delete_user_default_model(
+        user_id=int(user.id), config_type=config_type
     )
 
     if not user_default:
         raise HTTPException(status_code=404, detail="Default configuration not found")
-
-    default_was_shared = _model_has_shared_visibility(db, int(user_default.model_id))
-
-    db.delete(user_default)
-    db.commit()
-    invalidate_model_cache(None if default_was_shared else int(user.id))
 
     return {"message": "Default configuration deleted successfully"}
 
@@ -1759,7 +1416,7 @@ async def get_model(
     """Get a specific model configuration"""
     _, db_model, user_model = _resolve_accessible_model(db, user, model_id)
     return ModelWithAccessInfo.model_validate(
-        _serialize_model_with_access(
+        ModelStore(db).serialize_model_with_access(
             db_model, user_model, requesting_user_id=int(user.id)
         )
     )
@@ -1782,15 +1439,10 @@ async def update_model(
     # Get the database model
     db_model = user_model.model
 
+    model_store = ModelStore(db)
+
     # Constraint 2: shared models cannot change category or abilities
-    is_shared = (
-        db.query(UserModel)
-        .filter(
-            UserModel.model_id == db_model.id,
-            UserModel.is_shared.is_(True) == True,  # noqa: E712
-        )
-        .first()
-    )
+    is_shared = model_store.model_has_shared_visibility(int(db_model.id))
     if is_shared:
         locked = []
         if (
@@ -1808,53 +1460,11 @@ async def update_model(
                 detail=f"Cannot change {' and '.join(locked)} of a shared model. Un-share first.",
             )
 
-    # Handle sharing updates
-    if model_update.share_with_users is not None:
-        # Only check sharing permission when enabling sharing
-        if model_update.share_with_users and not _can_user_share(user):
-            raise HTTPException(
-                status_code=403, detail="Only administrators can enable global sharing"
-            )
-
-        # Update sharing status
-        if model_update.share_with_users:
-            # Enable sharing: just update owner's record to shared=True
-            db.query(UserModel).filter(
-                UserModel.model_id == db_model.id,
-                UserModel.user_id == user.id,
-            ).update({"is_shared": True})
-        else:
-            # `share_with_users=false` on an already-unshared model is a no-op
-            if is_shared:
-                # Constraint 1: owner cannot un-share own default model
-                owner_defaults = (
-                    db.query(UserDefaultModel)
-                    .filter(
-                        UserDefaultModel.model_id == db_model.id,
-                        UserDefaultModel.user_id == user.id,
-                    )
-                    .count()
-                )
-                if owner_defaults > 0:
-                    raise HTTPException(
-                        409,
-                        detail="Cannot un-share: you have this model as your default. Change default first.",
-                    )
-
-                # Disable sharing:
-                # 1. Update owner's record to shared=False
-                user_model.is_shared = False  # type: ignore[assignment]
-
-                # 2. Delete all non-owner UserModel records
-                db.query(UserModel).filter(
-                    UserModel.model_id == db_model.id, UserModel.is_owner.is_(False)
-                ).delete()
-
-                # 3. Clean up non-owner UserDefaultModel records
-                db.query(UserDefaultModel).filter(
-                    UserDefaultModel.model_id == db_model.id,
-                    UserDefaultModel.user_id != user.id,
-                ).delete()
+    share_with_users = model_update.share_with_users
+    if share_with_users and not _can_user_share(user):
+        raise HTTPException(
+            status_code=403, detail="Only administrators can enable global sharing"
+        )
 
     # Update model configuration in-place
     update_data = model_update.model_dump(exclude_unset=True)
@@ -1877,16 +1487,26 @@ async def update_model(
         if hasattr(db_model, field):
             setattr(db_model, field, value)
 
-    # Commit database changes
-    db.commit()
-    db.refresh(db_model)
-    invalidate_model_cache(
-        None if is_shared or model_update.share_with_users is not None else int(user.id)
-    )
+    if share_with_users is not None:
+        try:
+            model_store.set_model_sharing(
+                user_id=int(user.id),
+                db_model=db_model,
+                user_model=user_model,
+                share_with_users=share_with_users,
+            )
+        except ModelSharingConflictError as exc:
+            raise HTTPException(409, detail=str(exc)) from exc
+    else:
+        model_store.commit_model_update(
+            user_id=int(user.id),
+            db_model=db_model,
+            invalidate_globally=is_shared,
+        )
 
     # Return updated model with access info
     return ModelWithAccessInfo.model_validate(
-        _serialize_model_with_access(
+        model_store.serialize_model_with_access(
             db_model, user_model, requesting_user_id=int(user.id)
         )
     )
@@ -1920,17 +1540,7 @@ async def delete_model(
             detail="Cannot delete: you have this model as your default. Change default first.",
         )
 
-    # Delete all user model relationships
-    db.query(UserModel).filter(UserModel.model_id == user_model.model.id).delete()
-
-    # Delete all user default model configurations
-    db.query(UserDefaultModel).filter(
-        UserDefaultModel.model_id == user_model.model.id
-    ).delete()
-
-    # Delete the model using CoreStorage
-    model_storage.delete(user_model.model.model_id)
-    invalidate_model_cache(None)
+    ModelStore(db).delete_model(model_storage=model_storage, user_model=user_model)
 
     return {"message": "Model deleted successfully"}
 

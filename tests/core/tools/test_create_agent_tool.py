@@ -57,7 +57,7 @@ class TestCreateAgentTool:
                     "xagent.web.services.llm_utils.UserAwareModelStorage"
                 ) as mock_storage_class,
                 patch(
-                    "xagent.core.tools.adapters.vibe.agent_tool.invalidate_agent_cache"
+                    "xagent.web.services.agent_store.invalidate_agent_cache"
                 ) as mock_invalidate_agent_cache,
             ):
                 mock_storage = Mock()
@@ -426,7 +426,7 @@ class TestUpdateAgentTool:
             db.refresh(existing_agent)
 
             with patch(
-                "xagent.core.tools.adapters.vibe.agent_tool.invalidate_agent_cache"
+                "xagent.web.services.agent_store.invalidate_agent_cache"
             ) as mock_invalidate_agent_cache:
                 tool = UpdateAgentTool(db=db, user_id=user.id, task_id="test_task")
 

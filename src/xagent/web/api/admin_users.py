@@ -7,7 +7,7 @@ from ..models.database import get_db
 from ..models.task import Task
 from ..models.user import User
 from ..schemas.user import UserListResponse, UserResponse
-from ..services.hot_path_cache import invalidate_model_cache
+from ..services.model_store import ModelStore
 
 router = APIRouter(prefix="/api/admin/users", tags=["admin-users"])
 
@@ -92,6 +92,6 @@ async def delete_user(
     # Delete the user (UserModel and UserDefaultModel have cascade delete)
     db.delete(user)
     db.commit()
-    invalidate_model_cache(None)
+    ModelStore(db).invalidate_after_user_delete()
 
     return {"message": "User deleted successfully"}

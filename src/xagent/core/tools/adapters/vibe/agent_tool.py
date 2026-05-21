@@ -9,7 +9,7 @@ from uuid import uuid4
 from pydantic import BaseModel, Field, field_validator
 
 from .....config import get_uploads_dir
-from .....web.services.hot_path_cache import invalidate_agent_cache
+from .....web.services.agent_store import AgentStore
 from .....web.services.model_service import (
     _get_visible_user_ids,
     _is_model_visible_to_user,
@@ -460,7 +460,7 @@ class CreateAgentTool(AbstractBaseTool):
 
     async def run_json_async(self, args: Mapping[str, Any]) -> Any:
         """Create a new agent with the given configuration."""
-        from .....web.models.agent import Agent, AgentStatus
+        from .....web.models.agent import AgentStatus
         from .....web.models.user import UserDefaultModel, UserModel
 
         try:
@@ -580,8 +580,7 @@ class CreateAgentTool(AbstractBaseTool):
                     ),
                 ).model_dump()
 
-            # Create the agent in DRAFT status
-            agent = Agent(
+            agent = AgentStore(self._db).create_agent(
                 user_id=self._user_id,
                 name=agent_name,
                 description=agent_description,
@@ -591,14 +590,9 @@ class CreateAgentTool(AbstractBaseTool):
                 knowledge_bases=knowledge_bases,
                 skills=ensure_list(args.get("skills")),
                 tool_categories=ensure_list(args.get("tool_categories")),
-                suggested_prompts=[],
                 status=AgentStatus.DRAFT,  # Create as DRAFT, not PUBLISHED
+                suggested_prompts=[],
             )
-
-            self._db.add(agent)
-            self._db.commit()
-            self._db.refresh(agent)
-            invalidate_agent_cache(self._user_id, int(agent.id))
 
             # Generate the tool name and markdown link
             tool_name = gen_agent_tool_name(agent_name)
@@ -807,6 +801,7 @@ class UpdateAgentTool(AbstractBaseTool):
 
             # Track changes
             changes = []
+            updates: dict[str, Any] = {}
 
             # Update name if provided
             new_name = args.get("name", "").strip() if args.get("name") else None
@@ -830,7 +825,7 @@ class UpdateAgentTool(AbstractBaseTool):
                         status="error",
                         message=f"Error: Agent with name '{new_name}' already exists",
                     ).model_dump()
-                agent.name = new_name
+                updates["name"] = new_name
                 changes.append(f"name → '{new_name}'")
 
             # Update description if provided
@@ -838,7 +833,7 @@ class UpdateAgentTool(AbstractBaseTool):
                 args.get("description", "").strip() if args.get("description") else None
             )
             if new_description:
-                agent.description = new_description
+                updates["description"] = new_description
                 changes.append("description updated")
 
             # Update instructions if provided
@@ -848,13 +843,13 @@ class UpdateAgentTool(AbstractBaseTool):
                 else None
             )
             if new_instructions:
-                agent.instructions = new_instructions
+                updates["instructions"] = new_instructions
                 changes.append("instructions updated")
 
             # Update tool_categories if provided
             new_tool_categories = ensure_list(args.get("tool_categories"))
             if new_tool_categories is not None:
-                agent.tool_categories = new_tool_categories
+                updates["tool_categories"] = new_tool_categories
                 changes.append(f"tool_categories → {new_tool_categories}")
 
             # Update knowledge_bases if provided
@@ -875,19 +870,19 @@ class UpdateAgentTool(AbstractBaseTool):
                             + ", ".join(missing_kbs)
                         ),
                     ).model_dump()
-                agent.knowledge_bases = new_knowledge_bases
+                updates["knowledge_bases"] = new_knowledge_bases
                 changes.append(f"knowledge_bases → {new_knowledge_bases}")
 
             # Update skills if provided
             new_skills = ensure_list(args.get("skills"))
             if new_skills is not None:
-                agent.skills = new_skills
+                updates["skills"] = new_skills
                 changes.append(f"skills → {new_skills}")
 
             # Update execution_mode if provided
             new_execution_mode = args.get("execution_mode")
             if new_execution_mode in ["flash", "balanced", "think", "auto"]:
-                agent.execution_mode = new_execution_mode
+                updates["execution_mode"] = new_execution_mode
                 changes.append(f"execution_mode → {new_execution_mode}")
 
             # Check if there were any changes
@@ -903,22 +898,25 @@ class UpdateAgentTool(AbstractBaseTool):
                     f"All fields were the same or no values were provided.",
                 ).model_dump()
 
-            # Commit changes to database
-            self._db.commit()
-            self._db.refresh(agent)
-            invalidate_agent_cache(self._user_id, int(agent.id))
+            agent = (
+                AgentStore(self._db).update_agent_fields(
+                    self._user_id, agent_id, updates
+                )
+                or agent
+            )
 
             # Generate the tool name and markdown link
-            tool_name = gen_agent_tool_name(agent.name)
-            markdown_link = f"[{agent.name}](agent://{agent.id})"
+            agent_name = str(agent.name)
+            tool_name = gen_agent_tool_name(agent_name)
+            markdown_link = f"[{agent_name}](agent://{agent.id})"
 
             logger.info(
-                f"Updated {agent.status.value.upper()} agent '{agent.name}' (ID: {agent.id}) for user {self._user_id}: {', '.join(changes)}"
+                f"Updated {agent.status.value.upper()} agent '{agent_name}' (ID: {agent.id}) for user {self._user_id}: {', '.join(changes)}"
             )
 
             return UpdateAgentToolResult(
                 agent_id=agent.id,
-                agent_name=agent.name,
+                agent_name=agent_name,
                 tool_name=tool_name,
                 markdown_link=markdown_link,
                 status="success",

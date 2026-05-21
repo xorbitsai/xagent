@@ -39,10 +39,9 @@ def _build_post_body(author_urn: str, text: str) -> dict:
 
 
 def _sanitize_post_text(text: str) -> str:
-    # LinkedIn's API/feed rendering can truncate posts at the first ASCII
-    # parenthesis when content is published via automation. Converting to the
-    # fullwidth forms preserves readability while avoiding the buggy path.
-    return text.replace("(", "（").replace(")", "）")
+    # Escape ASCII parentheses before publishing to avoid LinkedIn truncating
+    # automated posts at the first bracket in some publishing flows.
+    return text.replace("\\", "\\\\").replace("(", "\\(").replace(")", "\\)")
 
 
 def _get_author_urn(headers: dict, proxies: dict | None) -> str:

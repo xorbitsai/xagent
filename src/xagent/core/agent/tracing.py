@@ -171,13 +171,35 @@ class TraceEventCallback:
         message: str,
         files: list[dict[str, Any]],
     ) -> None:
-        trace_data: dict[str, Any] = {"context": self._context_payload(context)}
-        if files:
+        """Emit a user-message trace event with a browser-safe payload.
+
+        Browser-safety contract (rogercloud review): a user-message trace
+        event reaches the chat UI / historical-replay client and must not
+        carry raw filesystem paths.
+
+        1. We deliberately do NOT attach ``ExecutionContext.to_dict()`` to
+           the trace payload. The context dict can contain raw paths under
+           ``metadata.request_context.file_info`` and
+           ``messages[].metadata.files`` that were not stripped at ingest
+           (e.g. when a caller passes raw ``file_info`` straight into
+           ``Message.metadata['files']``). Anything internal that needs the
+           full context lives in the checkpoint, not the user-facing trace.
+
+        2. ``files`` is funnelled through ``project_file_info_to_chip``
+           regardless of how it arrived. This is defence in depth — even
+           if a future caller passes raw ``file_info`` with absolute paths
+           to ``on_user_message_posted(files=...)``, the projector strips
+           anything outside the chip schema (``file_id`` / ``name`` /
+           ``size`` / ``type``).
+        """
+        safe_files = project_file_info_to_chip(files)
+        trace_data: dict[str, Any] = {}
+        if safe_files:
             # Surface uploaded files at the top level of trace_data so the
             # frontend user-message renderer (which reads ``eventData.files``)
             # can show clickable file chips alongside the user's message.
-            trace_data["files"] = files
-            trace_data["attachments"] = files
+            trace_data["files"] = safe_files
+            trace_data["attachments"] = safe_files
         execution_id = str(getattr(context, "execution_id", "") or "")
         await trace_user_message(tracer, execution_id, message, trace_data)
 

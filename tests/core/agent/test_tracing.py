@@ -341,7 +341,60 @@ async def test_on_user_message_posted_emits_for_file_only_continuation() -> None
     assert len(tracer.events) == 1
     data = tracer.events[0]["data"]
     assert data["message"] == ""
-    assert data["files"] == files
+    # The trace funnels files through ``project_file_info_to_chip`` for
+    # browser-safety (see _emit_user_message_trace); ``size``/``type`` are
+    # filled with ``None`` when missing so the chip schema stays uniform.
+    assert data["files"] == [
+        {"file_id": "fid-only", "name": "x.pdf", "size": None, "type": None}
+    ]
+
+
+@pytest.mark.asyncio
+async def test_emit_user_message_trace_strips_absolute_paths_from_files() -> None:
+    """Browser-safety contract: even if a caller hands the callback raw
+    ``file_info`` (with absolute ``path`` keys), the emitted trace payload
+    must not contain that path. The trace event reaches the chat UI /
+    historical-replay client, which is not allowed to see runtime paths.
+    """
+    tracer = TraceRecorder()
+    callback = TraceEventCallback()
+    runner = SimpleNamespace(tracer=tracer)
+    context = ExecutionContext(execution_id="exec-path-leak")
+    raw_files = [
+        {
+            "file_id": "fid-1",
+            "name": "doc.pdf",
+            "size": 2048,
+            "type": "application/pdf",
+            "path": "/abs/secret/doc.pdf",
+            "workspace_path": "/workspace/input/doc.pdf",
+        }
+    ]
+    new_msg = context.add_user_message("hello", metadata={"files": raw_files})
+
+    await callback.on_user_message_posted(
+        runner=runner, context=context, message=new_msg, files=raw_files
+    )
+
+    assert len(tracer.events) == 1
+    data = tracer.events[0]["data"]
+    # No raw context payload — the full ExecutionContext.to_dict() can
+    # also carry path-bearing metadata, so we don't include it.
+    assert "context" not in data
+    # Files at the top level are projected to the chip schema (no
+    # ``path``/``workspace_path``).
+    for chip in data["files"]:
+        assert "path" not in chip
+        assert "workspace_path" not in chip
+    assert data["files"] == [
+        {
+            "file_id": "fid-1",
+            "name": "doc.pdf",
+            "size": 2048,
+            "type": "application/pdf",
+        }
+    ]
+    assert data["attachments"] == data["files"]
 
 
 @pytest.mark.asyncio

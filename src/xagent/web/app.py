@@ -27,6 +27,7 @@ from .api.chat import chat_router
 from .api.cloud_storage import cloud_router
 from .api.custom_api import custom_api_router
 from .api.files import file_router
+from .api.jobs import jobs_router
 from .api.kb import kb_router
 from .api.mcp import mcp_router
 from .api.memory import MemoryManagementRouter
@@ -439,6 +440,7 @@ app.include_router(auth_router)
 app.include_router(chat_router)
 app.include_router(cloud_router)
 app.include_router(file_router)
+app.include_router(jobs_router)
 app.include_router(kb_router)
 app.include_router(model_router)
 app.include_router(ws_router)

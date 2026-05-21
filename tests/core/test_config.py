@@ -8,7 +8,12 @@ import pytest
 
 from xagent.config import (
     AGENT_RUNTIME,
+    BACKGROUND_JOB_MAX_RETRIES,
+    BACKGROUND_JOB_VISIBILITY_TIMEOUT_SECONDS,
     BOXLITE_HOME_DIR,
+    CELERY_BROKER_URL,
+    CELERY_ENABLED,
+    CELERY_RESULT_BACKEND,
     DATABASE_URL,
     EXTERNAL_SKILLS_LIBRARY_DIRS,
     EXTERNAL_UPLOAD_DIRS,
@@ -43,7 +48,12 @@ from xagent.config import (
     format_file_size,
     get_agent_pattern_for_execution_mode,
     get_agent_runtime,
+    get_background_job_max_retries,
+    get_background_job_visibility_timeout_seconds,
     get_boxlite_home_dir,
+    get_celery_broker_url,
+    get_celery_enabled,
+    get_celery_result_backend,
     get_database_url,
     get_default_sqlite_db_path,
     get_default_task_execution_mode,
@@ -163,6 +173,16 @@ class TestEnvironmentVariableConstants:
             HOT_PATH_TASK_CACHE_TTL_SECONDS == "XAGENT_HOT_PATH_TASK_CACHE_TTL_SECONDS"
         )
 
+    def test_celery_background_job_constants(self):
+        assert CELERY_ENABLED == "XAGENT_CELERY_ENABLED"
+        assert CELERY_BROKER_URL == "XAGENT_CELERY_BROKER_URL"
+        assert CELERY_RESULT_BACKEND == "XAGENT_CELERY_RESULT_BACKEND"
+        assert (
+            BACKGROUND_JOB_VISIBILITY_TIMEOUT_SECONDS
+            == "XAGENT_BACKGROUND_JOB_VISIBILITY_TIMEOUT_SECONDS"
+        )
+        assert BACKGROUND_JOB_MAX_RETRIES == "XAGENT_BACKGROUND_JOB_MAX_RETRIES"
+
 
 class TestHotPathCacheConfig:
     def test_redis_url_empty_is_none(self, monkeypatch):
@@ -193,6 +213,43 @@ class TestHotPathCacheConfig:
         monkeypatch.setenv(HOT_PATH_TASK_CACHE_TTL_SECONDS, "3")
         assert get_hot_path_cache_ttl_seconds() == 45
         assert get_hot_path_task_cache_ttl_seconds() == 3
+
+
+class TestCeleryBackgroundJobConfig:
+    def test_celery_disabled_by_default(self, monkeypatch):
+        monkeypatch.delenv(CELERY_ENABLED, raising=False)
+        assert get_celery_enabled() is False
+
+    def test_celery_enabled_true_values(self, monkeypatch):
+        monkeypatch.setenv(CELERY_ENABLED, "yes")
+        assert get_celery_enabled() is True
+
+    def test_celery_broker_explicit(self, monkeypatch):
+        monkeypatch.setenv(CELERY_BROKER_URL, " redis://localhost:6379/7 ")
+        monkeypatch.setenv(REDIS_URL, "redis://localhost:6379/0")
+        assert get_celery_broker_url() == "redis://localhost:6379/7"
+
+    def test_celery_broker_derives_from_redis_url_db1(self, monkeypatch):
+        monkeypatch.delenv(CELERY_BROKER_URL, raising=False)
+        monkeypatch.setenv(REDIS_URL, "redis://localhost:6379/0")
+        assert get_celery_broker_url() == "redis://localhost:6379/1"
+
+    def test_celery_broker_none_without_redis(self, monkeypatch):
+        monkeypatch.delenv(CELERY_BROKER_URL, raising=False)
+        monkeypatch.delenv(REDIS_URL, raising=False)
+        assert get_celery_broker_url() is None
+
+    def test_celery_result_backend_optional(self, monkeypatch):
+        monkeypatch.delenv(CELERY_RESULT_BACKEND, raising=False)
+        assert get_celery_result_backend() is None
+        monkeypatch.setenv(CELERY_RESULT_BACKEND, " redis://localhost:6379/2 ")
+        assert get_celery_result_backend() == "redis://localhost:6379/2"
+
+    def test_background_job_tuning_defaults(self, monkeypatch):
+        monkeypatch.delenv(BACKGROUND_JOB_VISIBILITY_TIMEOUT_SECONDS, raising=False)
+        monkeypatch.delenv(BACKGROUND_JOB_MAX_RETRIES, raising=False)
+        assert get_background_job_visibility_timeout_seconds() == 3600
+        assert get_background_job_max_retries() == 3
 
 
 class TestGetWebSearchProvider:

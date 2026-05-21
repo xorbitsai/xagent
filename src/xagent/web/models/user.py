@@ -63,6 +63,9 @@ class User(Base):  # type: ignore
     channels = relationship(
         "UserChannel", back_populates="user", cascade="all, delete-orphan"
     )
+    background_jobs = relationship(
+        "BackgroundJob", back_populates="user", cascade="all, delete-orphan"
+    )
     tool_configs = relationship(
         "UserToolConfig", back_populates="user", cascade="all, delete-orphan"
     )

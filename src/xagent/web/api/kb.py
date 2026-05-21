@@ -107,9 +107,12 @@ from ..config import (
     is_allowed_file,
     sanitize_path_component,
 )
+from ..models.background_job import BackgroundJobType
 from ..models.database import get_db, get_session_local
 from ..models.uploaded_file import UploadedFile
 from ..models.user import User
+from ..schemas.background_job import BackgroundJobResponse
+from ..services.background_jobs import create_background_job, enqueue_background_job
 from ..services.kb_collection_service import (
     delete_collection_physical_dir,
     delete_collection_uploaded_files,
@@ -1711,6 +1714,150 @@ async def ingest(
         raise
 
 
+@kb_router.post(
+    "/ingest/jobs",
+    response_model=BackgroundJobResponse,
+    status_code=202,
+)
+@with_kb_user_scope
+@handle_kb_exceptions
+async def create_ingest_job(
+    collection: str = Form(None),
+    file: UploadFile = File(...),
+    *,
+    parse_method: Optional[ParseMethod] = Form(None),
+    chunk_strategy: Optional[ChunkStrategy] = Form(None),
+    chunk_size: Optional[int] = Form(None, gt=0),
+    chunk_overlap: Optional[int] = Form(None, ge=0),
+    separators: Optional[str] = Form(None),
+    embedding_model_id: str = Form("text-embedding-v4"),
+    embedding_batch_size: Optional[int] = Form(None, gt=0),
+    max_retries: Optional[int] = Form(None, ge=0),
+    retry_delay: Optional[float] = Form(None, ge=0.0),
+    _user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> Any:
+    """Upload a document and enqueue durable KB ingestion."""
+    if not file.filename or not file.filename.strip():
+        raise HTTPException(status_code=422, detail="No filename provided")
+
+    safe_filename = Path(file.filename).name
+    if not is_allowed_file(safe_filename, "general"):
+        raise HTTPException(
+            status_code=422,
+            detail=f"File type {Path(safe_filename).suffix.lower()} not supported",
+        )
+    _validate_parser_for_file(
+        safe_filename, parse_method, user_id=getattr(_user, "id", None)
+    )
+
+    if not collection or not collection.strip():
+        collection = Path(safe_filename).stem
+
+    try:
+        safe_collection = sanitize_path_component(collection, "collection")
+        file_path = Path(
+            get_upload_path(
+                safe_filename,
+                user_id=int(_user.id),
+                collection=safe_collection,
+                collection_is_sanitized=True,
+            )
+        )
+    except ValueError as e:
+        raise HTTPException(
+            status_code=422, detail=f"Invalid collection name: {str(e)}"
+        ) from e
+
+    await _ensure_collection_access(safe_collection, _user, allow_create=True)
+
+    total_size = 0
+    file_read_buffer_size = 1024 * 1024
+    with open(file_path, "wb") as buffer:
+        while True:
+            chunk = await file.read(file_read_buffer_size)
+            if not chunk:
+                break
+            total_size += len(chunk)
+            if total_size > MAX_FILE_SIZE:
+                file_path.unlink(missing_ok=True)
+                raise HTTPException(
+                    status_code=413,
+                    detail=f"File size exceeds maximum limit of {MAX_FILE_SIZE_LABEL}",
+                )
+            buffer.write(chunk)
+
+    mime_type = (
+        getattr(file, "content_type", None)
+        or mimetypes.guess_type(safe_filename)[0]
+        or "application/octet-stream"
+    )
+    file_record = _upsert_uploaded_file_record(
+        db,
+        user_id=int(_user.id),
+        filename=safe_filename,
+        storage_path=file_path,
+        mime_type=mime_type,
+        file_size=int(total_size),
+    )
+
+    final_chunk_size = chunk_size if chunk_size is not None and chunk_size > 0 else 1000
+    final_chunk_overlap = (
+        chunk_overlap if chunk_overlap is not None and chunk_overlap >= 0 else 200
+    )
+    if final_chunk_overlap >= final_chunk_size:
+        final_chunk_overlap = min(int(final_chunk_size * 0.2), final_chunk_size - 1)
+
+    parsed_separators = _parse_separators(separators)
+    final_strategy = (
+        chunk_strategy if chunk_strategy is not None else ChunkStrategy.RECURSIVE
+    )
+    normalized_parse_method = _normalize_parse_method_for_filename(
+        parse_method, safe_filename
+    )
+    config = IngestionConfig(
+        parse_method=normalized_parse_method,
+        chunk_strategy=final_strategy,
+        chunk_size=final_chunk_size,
+        chunk_overlap=final_chunk_overlap,
+        separators=parsed_separators,
+        embedding_model_id=embedding_model_id,
+        embedding_batch_size=embedding_batch_size
+        if embedding_batch_size is not None and embedding_batch_size > 0
+        else 10,
+        max_retries=max_retries if max_retries is not None and max_retries >= 0 else 3,
+        retry_delay=retry_delay
+        if retry_delay is not None and retry_delay >= 0
+        else 1.0,
+    )
+
+    try:
+        metadata_store = get_metadata_store()
+        await metadata_store.save_collection_config(
+            collection=safe_collection,
+            config_json=config.model_dump_json(exclude_unset=True),
+            user_id=int(_user.id),
+        )
+    except Exception as e:
+        logger.warning("Failed to save collection config during async ingest: %s", e)
+
+    job = create_background_job(
+        db,
+        user_id=int(_user.id),
+        job_type=BackgroundJobType.KB_INGEST_DOCUMENT,
+        payload={
+            "collection": safe_collection,
+            "source_path": str(file_path),
+            "file_id": str(file_record.file_id),
+            "filename": safe_filename,
+            "user_id": int(_user.id),
+            "is_admin": bool(_user.is_admin),
+            "ingestion_config": config.model_dump(mode="json"),
+        },
+    )
+    return enqueue_background_job(db, job)
+
+
 @kb_router.post("/ingest-cloud", response_model=List[IngestionResult])
 @handle_kb_exceptions
 async def ingest_cloud(
@@ -2916,6 +3063,137 @@ async def ingest_web(
             status_code=500,
             detail=f"Server internal error: {str(e)}",
         ) from e
+
+
+@kb_router.post(
+    "/ingest-web/jobs",
+    response_model=BackgroundJobResponse,
+    status_code=202,
+)
+@with_kb_user_scope
+@handle_kb_exceptions
+async def create_ingest_web_job(
+    collection: str = Form(..., description="Target collection name"),
+    start_url: str = Form(..., description="Starting URL for crawling"),
+    max_pages: Optional[int] = Form(100),
+    max_depth: Optional[int] = Form(3),
+    url_patterns: Optional[str] = Form(None),
+    exclude_patterns: Optional[str] = Form(None),
+    same_domain_only: Optional[bool] = Form(True),
+    content_selector: Optional[str] = Form(None),
+    remove_selectors: Optional[str] = Form(None),
+    concurrent_requests: Optional[int] = Form(3, ge=1, le=10),
+    request_delay: Optional[float] = Form(1.0, ge=0),
+    timeout: Optional[int] = Form(30, ge=1),
+    respect_robots_txt: Optional[bool] = Form(True),
+    parse_method: Optional[ParseMethod] = Form(None),
+    chunk_strategy: Optional[ChunkStrategy] = Form(None),
+    chunk_size: Optional[int] = Form(None, gt=0),
+    chunk_overlap: Optional[int] = Form(None, ge=0),
+    separators: Optional[str] = Form(None),
+    embedding_model_id: str = Form("text-embedding-v4"),
+    embedding_batch_size: Optional[int] = Form(None, gt=0),
+    max_retries: Optional[int] = Form(None, ge=0),
+    retry_delay: Optional[float] = Form(None, ge=0.0),
+    _user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> Any:
+    """Enqueue durable website ingestion into the knowledge base."""
+    try:
+        safe_collection = sanitize_path_component(collection, "collection")
+    except ValueError as e:
+        raise HTTPException(
+            status_code=422, detail=f"Invalid collection name: {str(e)}"
+        ) from e
+
+    await _ensure_collection_access(safe_collection, _user, allow_create=True)
+
+    url_patterns_list = (
+        [p.strip() for p in url_patterns.split(",")] if url_patterns else None
+    )
+    exclude_patterns_list = (
+        [p.strip() for p in exclude_patterns.split(",")] if exclude_patterns else None
+    )
+    remove_selectors_list = (
+        [s.strip() for s in remove_selectors.split(",")] if remove_selectors else None
+    )
+
+    try:
+        crawl_config = WebCrawlConfig(
+            start_url=start_url,
+            max_pages=max_pages or 100,
+            max_depth=max_depth or 3,
+            url_patterns=url_patterns_list,
+            exclude_patterns=exclude_patterns_list,
+            same_domain_only=same_domain_only if same_domain_only is not None else True,
+            content_selector=content_selector,
+            remove_selectors=remove_selectors_list,
+            concurrent_requests=concurrent_requests or 3,
+            request_delay=request_delay or 1.0,
+            timeout=timeout or 30,
+            respect_robots_txt=(
+                respect_robots_txt if respect_robots_txt is not None else True
+            ),
+        )
+    except ValidationError as exc:
+        errors = exc.errors()
+        detail = errors[0]["msg"] if errors else "Invalid start_url"
+        if isinstance(detail, str) and detail.startswith("Value error, "):
+            detail = detail.removeprefix("Value error, ")
+        raise HTTPException(status_code=422, detail=detail) from exc
+
+    final_chunk_size = chunk_size if chunk_size is not None and chunk_size > 0 else 1000
+    final_chunk_overlap = (
+        chunk_overlap if chunk_overlap is not None and chunk_overlap >= 0 else 200
+    )
+    if final_chunk_overlap >= final_chunk_size:
+        final_chunk_overlap = min(int(final_chunk_size * 0.2), final_chunk_size - 1)
+
+    web_parsed_separators = _parse_separators(separators)
+    web_final_strategy = (
+        chunk_strategy if chunk_strategy is not None else ChunkStrategy.RECURSIVE
+    )
+    ingestion_config = IngestionConfig(
+        parse_method=parse_method if parse_method is not None else ParseMethod.DEFAULT,
+        chunk_strategy=web_final_strategy,
+        chunk_size=final_chunk_size,
+        chunk_overlap=final_chunk_overlap,
+        separators=web_parsed_separators,
+        embedding_model_id=embedding_model_id,
+        embedding_batch_size=embedding_batch_size
+        if embedding_batch_size is not None and embedding_batch_size > 0
+        else 10,
+        max_retries=max_retries if max_retries is not None and max_retries >= 0 else 3,
+        retry_delay=retry_delay
+        if retry_delay is not None and retry_delay >= 0
+        else 1.0,
+    )
+
+    try:
+        metadata_store = get_metadata_store()
+        await metadata_store.save_collection_config(
+            collection=safe_collection,
+            config_json=ingestion_config.model_dump_json(exclude_unset=True),
+            user_id=int(_user.id),
+        )
+    except Exception as e:
+        logger.warning(
+            "Failed to save collection config during async web ingest: %s", e
+        )
+
+    job = create_background_job(
+        db,
+        user_id=int(_user.id),
+        job_type=BackgroundJobType.KB_INGEST_WEB,
+        payload={
+            "collection": safe_collection,
+            "crawl_config": crawl_config.model_dump(mode="json"),
+            "ingestion_config": ingestion_config.model_dump(mode="json"),
+            "user_id": int(_user.id),
+            "is_admin": bool(_user.is_admin),
+        },
+    )
+    return enqueue_background_job(db, job)
 
 
 class BatchDeleteCollectionsRequest(BaseModel):

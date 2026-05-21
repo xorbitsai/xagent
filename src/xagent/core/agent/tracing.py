@@ -22,6 +22,17 @@ from .trace import (
 # ``ExecutionContext.to_dict``.
 TRACE_WATERMARK_KEY = "_user_message_trace_watermark"
 
+# Stamped on ``context.metadata`` by ``runner.inject_user_message`` just
+# before persisting a freshly-injected user message, and cleared when the
+# follow-up persist records the advanced watermark. Carries the injected
+# message's ISO-UTC timestamp.
+#
+# The catch-up loop on resume uses this to disambiguate three cases:
+# - both absent  -> old/pre-PR checkpoint, do nothing (don't replay history)
+# - pending only -> crashed between persist and trace emit, replay that turn
+# - watermark    -> normal "trace already emitted" path, fast-skip
+PENDING_MARKER_KEY = "_pending_user_message_trace_timestamp"
+
 
 @dataclass
 class TraceEventCallback:
@@ -205,6 +216,18 @@ class TraceEventCallback:
 
     async def _emit_untraced_user_messages(self, *, tracer: Any, context: Any) -> None:
         watermark = self._watermark(context)
+        pending = self._pending_marker(context)
+        # Disambiguate old/pre-PR checkpoints from genuinely-pending turns:
+        # a checkpoint that has neither marker is from before this PR (or
+        # from a code path that doesn't go through the runner's
+        # inject_user_message). Treating it as "everything is untraced"
+        # would re-emit every historical user message on resume. The
+        # crash-window for newly-injected messages is covered by the
+        # pending marker below; long-term per-turn idempotency is tracked
+        # in #454.
+        if watermark is None and pending is None:
+            return
+
         messages = list(getattr(context, "messages", []) or [])
         # Resolve once outside the loop — every miss inside would otherwise
         # rescan the full message list (O(N^2) in the worst case where many
@@ -219,6 +242,13 @@ class TraceEventCallback:
             bubble_text = self._display_message_from(message) or content
             ts = self._message_timestamp_iso(message)
             if watermark and ts and ts <= watermark:
+                continue
+            # Pending marker present without watermark advance: only replay
+            # the matching turn. Any other historical turn at this point
+            # was already visible to the client on the prior run; skip it
+            # so we don't spam re-emissions for everything older than the
+            # crash point.
+            if pending is not None and ts != pending:
                 continue
             files = self._files_from_message(message)
             # For the chronologically first user message we additionally fall
@@ -246,6 +276,13 @@ class TraceEventCallback:
         if not isinstance(metadata, dict):
             return None
         value = metadata.get(TRACE_WATERMARK_KEY)
+        return value if isinstance(value, str) and value else None
+
+    def _pending_marker(self, context: Any) -> str | None:
+        metadata = getattr(context, "metadata", None)
+        if not isinstance(metadata, dict):
+            return None
+        value = metadata.get(PENDING_MARKER_KEY)
         return value if isinstance(value, str) and value else None
 
     def _mark_traced(self, context: Any, message: Any) -> None:

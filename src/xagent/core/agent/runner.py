@@ -340,9 +340,18 @@ class AgentRunner:
             metadata["files"] = files
 
         added = context.add_user_message(resolved_execution_message, metadata=metadata)
+        # Set a "this turn is waiting to be traced" pending marker before
+        # we persist. The resume catch-up logic uses this to disambiguate
+        # an old checkpoint that pre-dates this PR (no watermark, no
+        # pending marker — should NOT replay history) from a checkpoint
+        # that crashed mid-emit (pending marker present — replay this
+        # specific turn). Without this, ``_emit_untraced_user_messages``
+        # would treat any missing-watermark checkpoint as "everything
+        # untraced" and re-render historical user messages on resume.
+        self._set_pending_user_message_marker(context, added)
         # Persist BEFORE emitting the trace so the message is durable even
         # if the trace dispatch fails — the resume path's catch-up logic
-        # in TraceEventCallback.on_run_start will replay any missed events.
+        # in TraceEventCallback.on_run_start will replay the marked turn.
         await self._persist_injected_context(
             execution_id=execution_id,
             context=context,
@@ -362,8 +371,12 @@ class AgentRunner:
         # without this a worker crash between trace emission and the next
         # checkpoint would let the resume path replay the same user_message
         # event because the watermark was still living only in memory.
+        # The same persist also clears the pending marker since the trace
+        # has now been emitted; doing both in one persist keeps the
+        # invariant {pending => never traced yet} on every durable state.
         watermark_after = self._read_trace_watermark(context)
         if watermark_after and watermark_after != watermark_before:
+            self._clear_pending_user_message_marker(context)
             await self._persist_injected_context(
                 execution_id=execution_id,
                 context=context,
@@ -386,6 +399,45 @@ class AgentRunner:
             return None
         value = metadata.get("_user_message_trace_watermark")
         return value if isinstance(value, str) and value else None
+
+    @staticmethod
+    def _set_pending_user_message_marker(
+        context: ExecutionContext, message: Any
+    ) -> None:
+        """Stamp ``_pending_user_message_trace_timestamp`` on context.metadata.
+
+        Mirrored in ``core.agent.tracing.PENDING_MARKER_KEY``; kept in-runner
+        to avoid an import cycle. The timestamp is the just-added message's
+        normalized ISO-UTC timestamp so the catch-up loop can replay this
+        specific turn rather than scanning history.
+        """
+        ts = AgentRunner._message_iso_timestamp(message)
+        if ts is None:
+            return
+        metadata = getattr(context, "metadata", None)
+        if isinstance(metadata, dict):
+            metadata["_pending_user_message_trace_timestamp"] = ts
+
+    @staticmethod
+    def _clear_pending_user_message_marker(context: ExecutionContext) -> None:
+        metadata = getattr(context, "metadata", None)
+        if isinstance(metadata, dict):
+            metadata.pop("_pending_user_message_trace_timestamp", None)
+
+    @staticmethod
+    def _message_iso_timestamp(message: Any) -> str | None:
+        """ISO-UTC string of ``message.timestamp`` — same normalization the
+        tracing module uses for its watermark, kept here to avoid a cycle.
+        """
+        from datetime import datetime, timezone
+
+        ts = getattr(message, "timestamp", None)
+        if isinstance(ts, datetime):
+            aware = ts.replace(tzinfo=timezone.utc) if ts.tzinfo is None else ts
+            return aware.astimezone(timezone.utc).isoformat()
+        if isinstance(ts, str) and ts:
+            return ts
+        return None
 
     async def post_user_message(
         self,

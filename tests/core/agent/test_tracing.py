@@ -6,6 +6,25 @@ from typing import Any
 import pytest
 
 from xagent.core.agent import ExecutionContext, TraceEventCallback
+from xagent.core.agent.tracing import PENDING_MARKER_KEY
+
+
+def _stamp_pending(context: ExecutionContext) -> None:
+    """Mark the most-recently added user message as 'pending trace emit'.
+
+    Mirrors what ``runner.inject_user_message`` does just before it
+    persists the injected-message checkpoint. The catch-up loop on
+    resume requires either a watermark or this marker before it will
+    replay anything — otherwise it would re-emit history on pre-PR
+    checkpoints. See ``tracing.PENDING_MARKER_KEY`` for the contract.
+    """
+    callback = TraceEventCallback()
+    latest = callback._latest_user_message(context)
+    if latest is None:
+        return
+    ts = callback._message_timestamp_iso(latest)
+    if ts:
+        context.metadata[PENDING_MARKER_KEY] = ts
 
 
 class TraceRecorder:
@@ -257,6 +276,10 @@ async def test_on_run_start_resume_emits_untraced_user_message() -> None:
         }
     ]
     context.add_user_message("Continue from here.", metadata={"files": files})
+    # Simulate the runner: pending marker stamped just before the
+    # crashed checkpoint. Catch-up will only replay turns whose ts
+    # matches this marker, not all history.
+    _stamp_pending(context)
 
     await callback.on_run_start(
         runner=runner,
@@ -269,6 +292,65 @@ async def test_on_run_start_resume_emits_untraced_user_message() -> None:
     data = tracer.events[0]["data"]
     assert data["message"] == "Continue from here."
     assert data["files"] == files
+
+
+@pytest.mark.asyncio
+async def test_on_run_start_resume_skips_pre_pr_checkpoint_history() -> None:
+    """Pre-PR checkpoints (created before the chip-attachments PR landed)
+    have neither the trace watermark nor the pending marker on
+    ``context.metadata``. Resume catch-up must NOT replay every historical
+    user message in that case — otherwise it would re-render bubbles the
+    client already saw on the prior worker.
+    """
+    tracer = TraceRecorder()
+    callback = TraceEventCallback()
+    runner = SimpleNamespace(tracer=tracer)
+    context = ExecutionContext(execution_id="exec-pre-pr")
+    context.metadata["task"] = "Old task"
+    context.add_user_message("First historical turn.")
+    context.add_user_message("Second historical turn.")
+    # Crucially: no _user_message_trace_watermark, no
+    # _pending_user_message_trace_timestamp — this is what an
+    # already-running task looks like on first resume after upgrade.
+
+    await callback.on_run_start(runner=runner, context=context, resume=True)
+    await callback.on_run_start(
+        runner=runner, context=context, checkpoint={"context": context.to_dict()}
+    )
+
+    assert tracer.events == []
+
+
+@pytest.mark.asyncio
+async def test_on_run_start_resume_with_pending_marker_replays_only_pending_turn() -> (
+    None
+):
+    """When a checkpoint carries a pending marker but no watermark advance
+    (the runner persisted the injected user message and then crashed
+    before the trace was emitted), catch-up should fire exactly once for
+    the matching turn — not for any older history that lacks the marker.
+    """
+    tracer = TraceRecorder()
+    callback = TraceEventCallback()
+    runner = SimpleNamespace(tracer=tracer)
+    context = ExecutionContext(execution_id="exec-pending-replay")
+    context.metadata["task"] = "Original task"
+    context.add_user_message("Earlier historical turn.")
+    pending_msg = context.add_user_message(
+        "The turn that crashed mid-emit.",
+        metadata={"files": [{"file_id": "fid-crash", "name": "c.txt"}]},
+    )
+    # Pending marker points at the second message — only it should replay.
+    pending_ts = callback._message_timestamp_iso(pending_msg)
+    assert pending_ts is not None
+    context.metadata[PENDING_MARKER_KEY] = pending_ts
+
+    await callback.on_run_start(runner=runner, context=context, resume=True)
+
+    assert len(tracer.events) == 1
+    data = tracer.events[0]["data"]
+    assert data["message"] == "The turn that crashed mid-emit."
+    assert data["files"][0]["file_id"] == "fid-crash"
 
 
 @pytest.mark.asyncio
@@ -522,6 +604,9 @@ async def test_on_run_start_resume_falls_back_to_request_context_for_initial_fil
         ]
     }
     context.add_user_message("Initial task")
+    # Same crash-recovery framing: stamp the pending marker so catch-up
+    # knows this is the turn to replay.
+    _stamp_pending(context)
 
     await callback.on_run_start(runner=runner, context=context, resume=True)
 

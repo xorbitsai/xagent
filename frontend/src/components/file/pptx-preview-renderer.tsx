@@ -14,7 +14,10 @@ interface PptxPreviewRendererProps {
 // useEffect to stay SSR-safe under Next.js.
 type PPTXViewerHandle = {
   loadFile(input: ArrayBuffer | Uint8Array | File): Promise<unknown>
-  render(canvas?: HTMLCanvasElement | null): Promise<unknown>
+  render(
+    canvas?: HTMLCanvasElement | null,
+    options?: { slideIndex?: number },
+  ): Promise<unknown>
   nextSlide(): Promise<unknown>
   previousSlide(): Promise<unknown>
   goToSlide(index: number): Promise<unknown>
@@ -125,10 +128,22 @@ export function PptxPreviewRenderer({ base64Content }: PptxPreviewRendererProps)
           if (typeof idx === "number") setCurrentSlide(idx)
         })
 
-        // loadFile() triggers an automatic render of the first slide
-        // (autoRenderFirstSlide defaults to true), so we don't call
-        // render() again here.
+        // pptxviewjs@1.1.9: ``loadFile()`` parses the deck and emits
+        // ``loadComplete`` but does NOT render a slide — the
+        // ``autoRenderFirstSlide`` constructor option is accepted but
+        // never read inside the bundle. Without an explicit render here
+        // the canvas stays blank until something else (the
+        // ResizeObserver below, prev/next click) triggers one. Fresh
+        // opens where the container was already the right size show no
+        // ResizeObserver fire and the user sees an empty canvas.
+        // Explicitly render slide 0 right after the load, then clear
+        // isLoading.
         await viewer.loadFile(bytes)
+        if (cancelled) {
+          viewer.destroy()
+          return
+        }
+        await viewer.render(canvasRef.current, { slideIndex: 0 })
         if (cancelled) {
           viewer.destroy()
           return

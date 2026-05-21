@@ -27,6 +27,34 @@ from sqlalchemy.exc import SQLAlchemyError
 project_root = Path(__file__).parent.parent.parent
 
 
+def _revision_reached(
+    script_dir: ScriptDirectory, target_revision: str, current_revisions: set[str]
+) -> bool:
+    """Return whether target_revision is present in or behind current heads."""
+    pending = list(current_revisions)
+    visited: set[str] = set()
+
+    while pending:
+        revision_id = pending.pop()
+        if revision_id == target_revision:
+            return True
+        if revision_id in visited:
+            continue
+
+        visited.add(revision_id)
+        revision = script_dir.get_revision(revision_id)
+
+        down_revisions = revision.down_revision
+        if down_revisions is None:
+            continue
+        if isinstance(down_revisions, str):
+            pending.append(down_revisions)
+        else:
+            pending.extend(down_revisions)
+
+    return False
+
+
 class MigrationTester:
     """Helper class to test database migrations."""
 
@@ -121,6 +149,12 @@ class MigrationTester:
                 # We want index 1 (name)
                 result = conn.execute(text(f"PRAGMA table_info({table_name})"))
                 return [row[1] for row in result]
+
+    def get_alembic_versions(self) -> set[str]:
+        """Get current Alembic version rows."""
+        with self.engine.begin() as conn:
+            result = conn.execute(text("SELECT version_num FROM alembic_version"))
+            return {row[0] for row in result}
 
 
 class TestMigrations:
@@ -332,6 +366,7 @@ class TestMigrations:
         # Get all migrations from START_REVISION to head
         script_dir = ScriptDirectory.from_config(sqlite_tester.alembic_cfg)
         revisions = list(script_dir.walk_revisions(START_REVISION, "heads"))
+        assert revisions, "Expected migrations from START_REVISION to heads"
         revisions.reverse()  # START_REVISION to head
 
         # Upgrade one revision at a time
@@ -339,10 +374,13 @@ class TestMigrations:
             command.upgrade(sqlite_tester.alembic_cfg, revision.revision)
 
             # Verify version
-            with sqlite_tester.engine.begin() as conn:
-                result = conn.execute(text("SELECT version_num FROM alembic_version"))
-                version = result.scalar()
-                assert version == revision.revision
+            current_revisions = sqlite_tester.get_alembic_versions()
+            assert _revision_reached(
+                script_dir, revision.revision, current_revisions
+            ), (
+                f"{revision.revision} should be present in or behind current "
+                f"Alembic heads {sorted(current_revisions)}"
+            )
 
         # After all upgrades, verify that migrations actually added their columns
         # This tests that migrations work, not just that they're idempotent
@@ -388,6 +426,7 @@ class TestMigrations:
         # Get all migrations from START_REVISION to head
         script_dir = ScriptDirectory.from_config(postgresql_tester.alembic_cfg)
         revisions = list(script_dir.walk_revisions(START_REVISION, "heads"))
+        assert revisions, "Expected migrations from START_REVISION to heads"
         revisions.reverse()  # START_REVISION to head
 
         # Upgrade one revision at a time
@@ -395,10 +434,13 @@ class TestMigrations:
             command.upgrade(postgresql_tester.alembic_cfg, revision.revision)
 
             # Verify version
-            with postgresql_tester.engine.begin() as conn:
-                result = conn.execute(text("SELECT version_num FROM alembic_version"))
-                version = result.scalar()
-                assert version == revision.revision
+            current_revisions = postgresql_tester.get_alembic_versions()
+            assert _revision_reached(
+                script_dir, revision.revision, current_revisions
+            ), (
+                f"{revision.revision} should be present in or behind current "
+                f"Alembic heads {sorted(current_revisions)}"
+            )
 
         # After all upgrades, verify that migrations actually added their columns
         agents_columns = postgresql_tester.get_column_names("agents")

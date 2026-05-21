@@ -2337,6 +2337,14 @@ async def handle_chat_message(
                     # callback can emit the bubble with the typed content +
                     # file chips rather than the inflated prompt; matches what
                     # historical replay shows on reload.
+                    # ``post_user_message`` routes into ``AgentRunner.inject_user_message``,
+                    # which dispatches ``on_user_message_posted`` — that callback
+                    # is the single emission point for the live-control
+                    # continuation user-message trace. Do not emit a second
+                    # ``trace_user_message`` here; doing so would render the
+                    # bubble twice in the live UI. The DAG Plan-Execute
+                    # continuation path above is a separate code path and
+                    # keeps its own immediate trace.
                     posted = await agent_service.post_user_message(
                         str(task_id),
                         execution_message=user_message_for_llm,
@@ -2348,18 +2356,6 @@ async def handle_chat_message(
                     if not posted:
                         logger.warning(
                             f"agent execution {task_id} was not live; attempting resume from checkpoint"
-                        )
-                    else:
-                        await trace_user_message(
-                            agent_service.tracer,
-                            str(task_id),
-                            display_user_message,
-                            {
-                                "context": context,
-                                "pattern": "Agent Live Control",
-                                "continuation": "true",
-                                "files": display_file_refs,
-                            },
                         )
 
                     previous_task = background_task_manager.running_tasks.get(task_id)

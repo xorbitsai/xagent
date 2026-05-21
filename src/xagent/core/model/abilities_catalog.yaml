@@ -1,0 +1,373 @@
+# Curated catalog of LLM abilities for common models.
+#
+# Format
+# ------
+# rules:
+#   - pattern: "<provider>/<model_name_glob>"
+#     abilities: [chat, vision, tool_calling, thinking_mode]
+#
+# - <provider> is the provider id used in xagent (openai, claude, gemini,
+#   zhipu, dashscope, alibaba-coding-plan, alibaba-coding-plan-cn,
+#   zai-coding-plan, zhipuai-coding-plan, minimax-coding-plan,
+#   minimax-cn-coding-plan, kimi-for-coding, xinference, ...).
+#   Use "*" to match any provider, useful for OpenAI-compatible endpoints
+#   that expose third-party models (e.g. DeepSeek through any base_url).
+# - <model_name_glob> uses fnmatch-style wildcards (* and ?). Matching is
+#   case-insensitive.
+# - Rules are evaluated in three tiers; within each tier the YAML order is
+#   preserved, so put the most specific patterns first:
+#     Tier 1: exact provider + specific model (model != "*")
+#     Tier 2: wildcard provider + specific model
+#     Tier 3: exact provider + "*" (provider fallback)
+# - Abilities are restricted to the LLM category and must be drawn from
+#   {chat, vision, tool_calling, thinking_mode}.
+#
+# Maintenance: when a new model ships, add a rule and bump the catalog
+# version comment below. The backend reloads on process restart; tests use
+# `model_catalog.reload_catalog()` to pick up edits.
+
+# Catalog version: 2026-05-07 (rev2 — added GPT-5 / Claude 4.5 / Gemini 3 / DeepSeek V4 series)
+
+rules:
+  # ============================================================
+  # OpenAI
+  # ============================================================
+  # GPT-5 family (2025 H2 / 2026)
+  - pattern: "openai/gpt-5.5*"
+    abilities: [chat, vision, tool_calling, thinking_mode]
+  - pattern: "openai/gpt-5-nano*"
+    abilities: [chat, vision, tool_calling]
+  - pattern: "openai/gpt-5-mini*"
+    abilities: [chat, vision, tool_calling, thinking_mode]
+  - pattern: "openai/gpt-5*"
+    abilities: [chat, vision, tool_calling, thinking_mode]
+  # Reasoning / "o" series
+  - pattern: "openai/o3-mini*"
+    abilities: [chat, tool_calling, thinking_mode]
+  - pattern: "openai/o3*"
+    abilities: [chat, vision, tool_calling, thinking_mode]
+  - pattern: "openai/o4-mini*"
+    abilities: [chat, vision, tool_calling, thinking_mode]
+  - pattern: "openai/o1-mini*"
+    abilities: [chat, thinking_mode]
+  - pattern: "openai/o1*"
+    abilities: [chat, vision, thinking_mode]
+  # GPT-4 family
+  - pattern: "openai/gpt-4o-mini*"
+    abilities: [chat, vision, tool_calling]
+  - pattern: "openai/gpt-4o*"
+    abilities: [chat, vision, tool_calling]
+  - pattern: "openai/gpt-4-turbo*"
+    abilities: [chat, vision, tool_calling]
+  - pattern: "openai/gpt-4-vision*"
+    abilities: [chat, vision]
+  - pattern: "openai/gpt-4*"
+    abilities: [chat, tool_calling]
+  - pattern: "openai/gpt-3.5*"
+    abilities: [chat, tool_calling]
+  # Provider fallback
+  - pattern: "openai/*"
+    abilities: [chat, tool_calling]
+
+  # ============================================================
+  # Anthropic Claude
+  # NOTE: claude-5 family is not yet announced as of 2026-05-07. Latest
+  # released is Claude Opus 4.7 (2026-04-16), which is matched by the
+  # claude-opus-4* rule below. Add claude-5* rules only after public
+  # announcement.
+  # ============================================================
+  # Claude 4.5 (refresh, all support thinking)
+  - pattern: "claude/claude-opus-4.5*"
+    abilities: [chat, vision, tool_calling, thinking_mode]
+  - pattern: "claude/claude-sonnet-4.5*"
+    abilities: [chat, vision, tool_calling, thinking_mode]
+  - pattern: "claude/claude-haiku-4.5*"
+    abilities: [chat, vision, tool_calling, thinking_mode]
+  # Claude 4 (extended thinking on Opus / Sonnet)
+  - pattern: "claude/claude-opus-4*"
+    abilities: [chat, vision, tool_calling, thinking_mode]
+  - pattern: "claude/claude-sonnet-4*"
+    abilities: [chat, vision, tool_calling, thinking_mode]
+  - pattern: "claude/claude-haiku-4*"
+    abilities: [chat, vision, tool_calling]
+  # Claude 3.7 (extended thinking)
+  - pattern: "claude/claude-3-7*"
+    abilities: [chat, vision, tool_calling, thinking_mode]
+  # Claude 3.5
+  - pattern: "claude/claude-3-5-sonnet*"
+    abilities: [chat, vision, tool_calling]
+  - pattern: "claude/claude-3-5-haiku*"
+    abilities: [chat, tool_calling]
+  # Claude 3
+  - pattern: "claude/claude-3-opus*"
+    abilities: [chat, vision, tool_calling]
+  - pattern: "claude/claude-3-sonnet*"
+    abilities: [chat, vision, tool_calling]
+  - pattern: "claude/claude-3-haiku*"
+    abilities: [chat, vision, tool_calling]
+  # Provider fallback
+  - pattern: "claude/*"
+    abilities: [chat, tool_calling]
+
+  # ============================================================
+  # Google Gemini
+  # ============================================================
+  # Gemini 3 (2026)
+  - pattern: "gemini/gemini-3-pro*"
+    abilities: [chat, vision, tool_calling, thinking_mode]
+  - pattern: "gemini/gemini-3-flash*"
+    abilities: [chat, vision, tool_calling, thinking_mode]
+  - pattern: "gemini/gemini-3*"
+    abilities: [chat, vision, tool_calling, thinking_mode]
+  - pattern: "gemini/gemini-2.5-pro*"
+    abilities: [chat, vision, tool_calling, thinking_mode]
+  - pattern: "gemini/gemini-2.5-flash*"
+    abilities: [chat, vision, tool_calling, thinking_mode]
+  - pattern: "gemini/gemini-2.0-flash-thinking*"
+    abilities: [chat, vision, thinking_mode]
+  - pattern: "gemini/gemini-2.0-flash*"
+    abilities: [chat, vision, tool_calling]
+  - pattern: "gemini/gemini-2.0-pro*"
+    abilities: [chat, vision, tool_calling]
+  - pattern: "gemini/gemini-1.5-pro*"
+    abilities: [chat, vision, tool_calling]
+  - pattern: "gemini/gemini-1.5-flash*"
+    abilities: [chat, vision, tool_calling]
+  - pattern: "gemini/*"
+    abilities: [chat, vision, tool_calling]
+
+  # ============================================================
+  # Zhipu AI (GLM, direct API)
+  # NOTE: glm-4.5v is the multimodal variant of 4.5 (image/video input +
+  # thinking mode); it must be matched before glm-4.5* otherwise it loses
+  # vision.
+  # ============================================================
+  - pattern: "zhipu/glm-4.5v*"
+    abilities: [chat, vision, tool_calling, thinking_mode]
+  - pattern: "zhipu/glm-4.5*"
+    abilities: [chat, tool_calling, thinking_mode]
+  - pattern: "zhipu/glm-4v*"
+    abilities: [chat, vision]
+  - pattern: "zhipu/glm-4-plus*"
+    abilities: [chat, tool_calling]
+  - pattern: "zhipu/glm-4*"
+    abilities: [chat, tool_calling]
+  - pattern: "zhipu/glm-zero*"
+    abilities: [chat, thinking_mode]
+  - pattern: "zhipu/*"
+    abilities: [chat]
+
+  # ============================================================
+  # DashScope (Qwen via Alibaba public endpoint)
+  # ============================================================
+  - pattern: "dashscope/qwen*-vl*"
+    abilities: [chat, vision, tool_calling]
+  - pattern: "dashscope/qwq*"
+    abilities: [chat, thinking_mode]
+  - pattern: "dashscope/qwen3*"
+    abilities: [chat, tool_calling, thinking_mode]
+  - pattern: "dashscope/qwen2.5-vl*"
+    abilities: [chat, vision, tool_calling]
+  - pattern: "dashscope/qwen2.5*"
+    abilities: [chat, tool_calling]
+  - pattern: "dashscope/*"
+    abilities: [chat, tool_calling]
+
+  # ============================================================
+  # Alibaba Bailian Coding Plan (international + China)
+  # Curated models per providers.py: glm-4.7, glm-5, qwen3-coder-next/plus,
+  # qwen3-max-2026-01-23, qwen3.5-plus
+  # NOTE: -vl rule must come before generic qwen3.5*/qwen3-max* etc.,
+  # otherwise vision variants get matched as text-only.
+  # ============================================================
+  - pattern: "alibaba-coding-plan/qwen*-vl*"
+    abilities: [chat, vision, tool_calling]
+  - pattern: "alibaba-coding-plan/glm-4v*"
+    abilities: [chat, vision]
+  - pattern: "alibaba-coding-plan/glm-5*"
+    abilities: [chat, tool_calling, thinking_mode]
+  - pattern: "alibaba-coding-plan/glm-4.7*"
+    abilities: [chat, tool_calling, thinking_mode]
+  - pattern: "alibaba-coding-plan/qwen3-coder*"
+    abilities: [chat, tool_calling]
+  - pattern: "alibaba-coding-plan/qwen3-max*"
+    abilities: [chat, tool_calling, thinking_mode]
+  - pattern: "alibaba-coding-plan/qwen3.5*"
+    abilities: [chat, tool_calling, thinking_mode]
+  - pattern: "alibaba-coding-plan/*"
+    abilities: [chat, tool_calling]
+
+  - pattern: "alibaba-coding-plan-cn/qwen*-vl*"
+    abilities: [chat, vision, tool_calling]
+  - pattern: "alibaba-coding-plan-cn/glm-4v*"
+    abilities: [chat, vision]
+  - pattern: "alibaba-coding-plan-cn/glm-5*"
+    abilities: [chat, tool_calling, thinking_mode]
+  - pattern: "alibaba-coding-plan-cn/glm-4.7*"
+    abilities: [chat, tool_calling, thinking_mode]
+  - pattern: "alibaba-coding-plan-cn/qwen3-coder*"
+    abilities: [chat, tool_calling]
+  - pattern: "alibaba-coding-plan-cn/qwen3-max*"
+    abilities: [chat, tool_calling, thinking_mode]
+  - pattern: "alibaba-coding-plan-cn/qwen3.5*"
+    abilities: [chat, tool_calling, thinking_mode]
+  - pattern: "alibaba-coding-plan-cn/*"
+    abilities: [chat, tool_calling]
+
+  # ============================================================
+  # Z.AI Coding Plan / Zhipu AI Coding Plan (GLM via dedicated endpoints)
+  # NOTE: glm-4v* rule must come before generic glm-4*, otherwise the
+  # vision variant gets matched as text-only.
+  # ============================================================
+  - pattern: "zai-coding-plan/glm-4.5v*"
+    abilities: [chat, vision, tool_calling, thinking_mode]
+  - pattern: "zai-coding-plan/glm-4v*"
+    abilities: [chat, vision]
+  - pattern: "zai-coding-plan/glm-4.5*"
+    abilities: [chat, tool_calling, thinking_mode]
+  - pattern: "zai-coding-plan/glm-4*"
+    abilities: [chat, tool_calling]
+  - pattern: "zai-coding-plan/glm-coder*"
+    abilities: [chat, tool_calling]
+  - pattern: "zai-coding-plan/*"
+    abilities: [chat, tool_calling]
+
+  - pattern: "zhipuai-coding-plan/glm-4.5v*"
+    abilities: [chat, vision, tool_calling, thinking_mode]
+  - pattern: "zhipuai-coding-plan/glm-4v*"
+    abilities: [chat, vision]
+  - pattern: "zhipuai-coding-plan/glm-4.5*"
+    abilities: [chat, tool_calling, thinking_mode]
+  - pattern: "zhipuai-coding-plan/glm-4*"
+    abilities: [chat, tool_calling]
+  - pattern: "zhipuai-coding-plan/glm-coder*"
+    abilities: [chat, tool_calling]
+  - pattern: "zhipuai-coding-plan/*"
+    abilities: [chat, tool_calling]
+
+  # ============================================================
+  # MiniMax Coding Plan (international + China)
+  # Curated: MiniMax-M2, MiniMax-M2.1, MiniMax-M2.5
+  # ============================================================
+  - pattern: "minimax-coding-plan/minimax-m2.5*"
+    abilities: [chat, tool_calling, thinking_mode]
+  - pattern: "minimax-coding-plan/minimax-m2.1*"
+    abilities: [chat, tool_calling]
+  - pattern: "minimax-coding-plan/minimax-m2*"
+    abilities: [chat, tool_calling]
+  - pattern: "minimax-coding-plan/*"
+    abilities: [chat, tool_calling]
+
+  - pattern: "minimax-cn-coding-plan/minimax-m2.5*"
+    abilities: [chat, tool_calling, thinking_mode]
+  - pattern: "minimax-cn-coding-plan/minimax-m2.1*"
+    abilities: [chat, tool_calling]
+  - pattern: "minimax-cn-coding-plan/minimax-m2*"
+    abilities: [chat, tool_calling]
+  - pattern: "minimax-cn-coding-plan/*"
+    abilities: [chat, tool_calling]
+
+  # ============================================================
+  # Kimi for Coding (Moonshot)
+  # NOTE: K2.5 / K2.6 are native multimodal models with thinking mode;
+  # they must be matched before the generic kimi-k2* rule, otherwise
+  # they lose vision and thinking_mode.
+  # ============================================================
+  - pattern: "kimi-for-coding/kimi-k2.6*"
+    abilities: [chat, vision, tool_calling, thinking_mode]
+  - pattern: "kimi-for-coding/kimi-k2.5*"
+    abilities: [chat, vision, tool_calling, thinking_mode]
+  - pattern: "kimi-for-coding/kimi-k2*"
+    abilities: [chat, tool_calling]
+  - pattern: "kimi-for-coding/kimi-latest*"
+    abilities: [chat, vision, tool_calling]
+  - pattern: "kimi-for-coding/moonshot-v1*-vision*"
+    abilities: [chat, vision, tool_calling]
+  - pattern: "kimi-for-coding/moonshot-v1*"
+    abilities: [chat, tool_calling]
+  - pattern: "kimi-for-coding/*"
+    abilities: [chat, tool_calling]
+
+  # ============================================================
+  # Xinference (self-hosted; model name is user-defined, fall through to
+  # cross-provider rules below or to provider fallback)
+  # ============================================================
+  - pattern: "xinference/*"
+    abilities: [chat]
+
+  # ============================================================
+  # Cross-provider fallbacks (model name only)
+  # Catches models exposed through OpenAI-compatible endpoints under any
+  # provider id (DeepSeek via openai, Qwen via xinference, etc.)
+  # ============================================================
+  # DeepSeek
+  - pattern: "*/deepseek-r2*"
+    abilities: [chat, thinking_mode]
+  - pattern: "*/deepseek-reasoner*"
+    abilities: [chat, thinking_mode]
+  - pattern: "*/deepseek-r1*"
+    abilities: [chat, thinking_mode]
+  # NOTE: DeepSeek V4 (released 2026-04-24) is text-only. Multimodal is on
+  # the roadmap but not yet shipped — do NOT add vision here.
+  - pattern: "*/deepseek-v4*"
+    abilities: [chat, tool_calling, thinking_mode]
+  - pattern: "*/deepseek-v3.5*"
+    abilities: [chat, tool_calling, thinking_mode]
+  - pattern: "*/deepseek-chat*"
+    abilities: [chat, tool_calling]
+  - pattern: "*/deepseek-coder*"
+    abilities: [chat, tool_calling]
+  - pattern: "*/deepseek-v3*"
+    abilities: [chat, tool_calling]
+  - pattern: "*/deepseek*"
+    abilities: [chat]
+  # Qwen via openai-compat
+  - pattern: "*/qwen*-vl*"
+    abilities: [chat, vision, tool_calling]
+  - pattern: "*/qwq*"
+    abilities: [chat, thinking_mode]
+  - pattern: "*/qwen3*"
+    abilities: [chat, tool_calling, thinking_mode]
+  - pattern: "*/qwen2.5*"
+    abilities: [chat, tool_calling]
+  - pattern: "*/qwen*"
+    abilities: [chat, tool_calling]
+  # GLM via openai-compat (4.5v is multimodal — must come before 4.5*)
+  - pattern: "*/glm-4.5v*"
+    abilities: [chat, vision, tool_calling, thinking_mode]
+  - pattern: "*/glm-4.5*"
+    abilities: [chat, tool_calling, thinking_mode]
+  - pattern: "*/glm-4v*"
+    abilities: [chat, vision]
+  - pattern: "*/glm-4*"
+    abilities: [chat, tool_calling]
+  # MiniMax via openai-compat
+  - pattern: "*/minimax-m2.5*"
+    abilities: [chat, tool_calling, thinking_mode]
+  - pattern: "*/minimax-m2*"
+    abilities: [chat, tool_calling]
+  # Kimi / Moonshot via openai-compat
+  # K2.5 / K2.6 are native multimodal with thinking; must match before */kimi-k2*
+  - pattern: "*/kimi-k2.6*"
+    abilities: [chat, vision, tool_calling, thinking_mode]
+  - pattern: "*/kimi-k2.5*"
+    abilities: [chat, vision, tool_calling, thinking_mode]
+  - pattern: "*/kimi-k2*"
+    abilities: [chat, tool_calling]
+  - pattern: "*/moonshot-v1*-vision*"
+    abilities: [chat, vision, tool_calling]
+  - pattern: "*/moonshot-v1*"
+    abilities: [chat, tool_calling]
+  # Llama / open-source common families on Xinference
+  - pattern: "*/llama-4*-vision*"
+    abilities: [chat, vision, tool_calling]
+  - pattern: "*/llama-4*"
+    abilities: [chat, vision, tool_calling]
+  - pattern: "*/llama-3*-vision*"
+    abilities: [chat, vision]
+  - pattern: "*/llama-3*"
+    abilities: [chat, tool_calling]
+  - pattern: "*/mistral-large*"
+    abilities: [chat, tool_calling]
+  - pattern: "*/mistral*"
+    abilities: [chat, tool_calling]

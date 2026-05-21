@@ -1,5 +1,5 @@
 from datetime import datetime
-from typing import Any, List, Optional, Set
+from typing import Any, List, Literal, Optional, Set
 
 from pydantic import BaseModel, field_validator
 
@@ -372,3 +372,21 @@ class SupportedProvidersResponse(BaseModel):
     """Response schema for supported providers."""
 
     providers: List[ProviderInfo]
+
+
+class AbilitySuggestionResponse(BaseModel):
+    """Suggested abilities for a (provider, model_name) pair, derived from the
+    static ability catalog at ``src/xagent/core/model/abilities_catalog.yaml``.
+
+    ``source`` indicates how the suggestion was derived so the frontend can
+    decide whether to auto-fill silently or surface a hint:
+      - ``exact``: matched a provider-specific rule.
+      - ``wildcard_provider``: matched a cross-provider rule (e.g. DeepSeek
+        served via an OpenAI-compatible endpoint).
+      - ``none``: no rule matched. ``abilities`` will be empty and the
+        frontend should keep current values.
+    """
+
+    abilities: List[str]
+    matched_pattern: Optional[str] = None
+    source: Literal["exact", "wildcard_provider", "none"]

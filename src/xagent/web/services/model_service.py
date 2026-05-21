@@ -878,12 +878,20 @@ def _get_models_by_category(
             ):
                 continue
 
-            api_key = cast(Optional[str], getattr(db_model, "api_key", None))
-            if not api_key:
-                raise ValueError(f"{model_type} model API key cannot be empty")
+            # api_key may be empty for self-hosted Xinference (no auth);
+            # the adapter handles that gracefully so we don't pre-validate
+            # it here. Skip the model only when base_url is missing —
+            # without that there's no way to reach the service. Raising
+            # here would abort loading ALL models of this category in one
+            # go (the outer try/except returns {}), so any per-model issue
+            # is downgraded to a per-model warning + skip.
             base_url = cast(Optional[str], getattr(db_model, "base_url", None))
             if not base_url:
-                raise ValueError(f"{model_type} model base URL cannot be empty")
+                logger.warning(
+                    f"Skipping {model_type} model {db_model.model_name}: "
+                    "base_url is empty"
+                )
+                continue
 
             model_provider = str(db_model.model_provider).strip().lower()
             try:

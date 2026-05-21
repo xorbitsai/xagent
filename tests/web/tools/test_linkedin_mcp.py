@@ -20,6 +20,15 @@ class MockResponse:
             raise RuntimeError(self.text or f"HTTP {self.status_code}")
 
 
+def test_sanitize_post_text_escapes_ascii_parentheses():
+    text = "🤖 Claude (Anthropic) — Prompt-to-prototype thinking"
+
+    assert (
+        linkedin._sanitize_post_text(text)
+        == "🤖 Claude \\(Anthropic\\) — Prompt-to-prototype thinking"
+    )
+
+
 @pytest.mark.asyncio
 async def test_create_post_schema_accepts_optional_image_path():
     tools = await linkedin.list_tools()
@@ -57,6 +66,45 @@ async def test_create_post_without_image_keeps_text_only_flow(monkeypatch):
     post_body = mock_post.call_args.kwargs["json"]
     assert post_body["commentary"] == "hello"
     assert "content" not in post_body
+
+
+@pytest.mark.asyncio
+async def test_create_article_post_escapes_parentheses_in_all_user_facing_fields(
+    monkeypatch,
+):
+    monkeypatch.setenv("LINKEDIN_ACCESS_TOKEN", "token")
+    mock_get = Mock(
+        return_value=MockResponse(
+            json_data={"sub": "person-1"}, text='{"sub":"person-1"}'
+        )
+    )
+    mock_post = Mock(
+        return_value=MockResponse(headers={"x-restli-id": "urn:li:share:post-1"})
+    )
+
+    monkeypatch.setattr(linkedin.requests, "get", mock_get)
+    monkeypatch.setattr(linkedin.requests, "post", mock_post)
+
+    result = await linkedin.call_tool(
+        "create_article_post",
+        {
+            "text": "Launch (recap)",
+            "articleUrl": "https://example.com/post",
+            "articleTitle": "Claude (Anthropic)",
+            "articleDescription": "Notes (draft)",
+        },
+    )
+
+    assert (
+        result[0].text == "Article post created successfully! URN: urn:li:share:post-1"
+    )
+    post_body = mock_post.call_args.kwargs["json"]
+    assert post_body["commentary"] == "Launch \\(recap\\)"
+    assert post_body["content"]["article"] == {
+        "source": "https://example.com/post",
+        "title": "Claude \\(Anthropic\\)",
+        "description": "Notes \\(draft\\)",
+    }
 
 
 @pytest.mark.asyncio
@@ -160,3 +208,29 @@ async def test_create_post_rejects_image_outside_allowed_dirs(monkeypatch, tmp_p
 
     assert "outside allowed directories" in result[0].text
     mock_put.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_create_comment_escapes_parentheses_before_publishing(monkeypatch):
+    monkeypatch.setenv("LINKEDIN_ACCESS_TOKEN", "token")
+    mock_get = Mock(
+        return_value=MockResponse(
+            json_data={"sub": "person-1"}, text='{"sub":"person-1"}'
+        )
+    )
+    mock_post = Mock(return_value=MockResponse(headers={"x-restli-id": "comment-1"}))
+
+    monkeypatch.setattr(linkedin.requests, "get", mock_get)
+    monkeypatch.setattr(linkedin.requests, "post", mock_post)
+
+    result = await linkedin.call_tool(
+        "create_comment",
+        {
+            "post_urn": "urn:li:share:post-1",
+            "text": "Nice work (team)!",
+        },
+    )
+
+    assert result[0].text == "Comment created successfully! ID: comment-1"
+    comment_body = mock_post.call_args.kwargs["json"]
+    assert comment_body["message"]["text"] == "Nice work \\(team\\)!"

@@ -269,8 +269,12 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
             body["content"] = {
                 "article": {
                     "source": arguments.get("articleUrl"),
-                    "title": arguments.get("articleTitle"),
-                    "description": arguments.get("articleDescription", ""),
+                    "title": _sanitize_post_text(
+                        str(arguments.get("articleTitle") or "")
+                    ),
+                    "description": _sanitize_post_text(
+                        str(arguments.get("articleDescription") or "")
+                    ),
                 }
             }
             r2 = requests.post(
@@ -303,7 +307,7 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
 
         elif name == "create_comment":
             post_urn = arguments.get("post_urn")
-            text = str(arguments.get("text") or "")
+            text = _sanitize_post_text(str(arguments.get("text") or ""))
             r = requests.get(USERINFO_URL, headers=headers, proxies=proxies)
             r.raise_for_status()
             sub = r.json().get("sub", "")

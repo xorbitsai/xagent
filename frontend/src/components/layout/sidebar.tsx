@@ -389,7 +389,9 @@ export function Sidebar({ className, allowCollapse = true }: SidebarProps) {
   const [isLoadingMore, setIsLoadingMore] = useState(false)
   const navRef = useRef<HTMLElement | null>(null)
   const pathnameRef = useRef(pathname)
+  const pageRef = useRef(page)
   pathnameRef.current = pathname // Synchronous update during render
+  pageRef.current = page
   const displayVersion = versionInfo?.display_version || "unknown"
 
   // Search state
@@ -554,8 +556,19 @@ export function Sidebar({ className, allowCollapse = true }: SidebarProps) {
 
         // Update pagination status
         const totalPages = data.pagination?.total_pages || 1
-        setHasMore(pageNum < totalPages)
-        setPage(pageNum)
+
+        if (isPolling) {
+          // Polling always refreshes page 1, so keep the user's loaded page state intact.
+          const loadedPage = Math.min(pageRef.current, totalPages)
+          setHasMore(loadedPage < totalPages)
+
+          if (loadedPage !== pageRef.current) {
+            setPage(loadedPage)
+          }
+        } else {
+          setHasMore(pageNum < totalPages)
+          setPage(pageNum)
+        }
       }
     } catch (error) {
       console.error('Failed to load tasks:', error)

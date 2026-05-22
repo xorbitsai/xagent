@@ -797,11 +797,11 @@ export function Sidebar({ className, allowCollapse = true }: SidebarProps) {
       </div>
 
       {/* Navigation */}
-      <div className="flex-1 flex flex-col min-h-0 px-3 pb-4">
+      <div className="flex-1 min-h-0 overflow-y-auto px-3 [&::-webkit-scrollbar]:hidden [-ms-overflow-style:'none'] [scrollbar-width:'none']">
         {/* Sticky Navigation Groups */}
         <nav
           ref={navRef}
-          className="z-10 bg-transparent -mx-3 px-3 py-2 overflow-y-auto [&::-webkit-scrollbar]:hidden [-ms-overflow-style:'none'] [scrollbar-width:'none']"
+          className="z-10 bg-transparent -mx-3 px-3 py-2"
         >
           {/* Groups */}
           {navigationGroups.map((group, groupIndex) => (
@@ -891,7 +891,7 @@ export function Sidebar({ className, allowCollapse = true }: SidebarProps) {
         </nav>
 
         {/* History Section */}
-        <div className="mt-auto flex flex-col overflow-hidden shrink-0">
+        <div className="flex flex-col overflow-hidden shrink-0 border-t border-border/40 pt-2 pb-4">
           <div
             className="px-4 py-2 text-xs font-bold text-slate-400 uppercase tracking-wider mb-1 flex items-center justify-between transition-colors group h-8 shrink-0"
           >

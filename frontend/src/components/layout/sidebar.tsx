@@ -543,6 +543,9 @@ export function Sidebar({ className, allowCollapse = true }: SidebarProps) {
           })
         }
 
+        const totalPages = data.pagination?.total_pages || 1
+        const loadedPage = isPolling ? Math.min(pageRef.current, totalPages) : pageNum
+
         if (isPolling) {
           setTasks(prev => {
             const newTaskIds = new Set(newTasks.map((t: Task) => String(t.task_id)))
@@ -550,8 +553,9 @@ export function Sidebar({ className, allowCollapse = true }: SidebarProps) {
               .slice(Math.min(TASKS_PER_PAGE, prev.length))
               .filter(t => !newTaskIds.has(String(t.task_id)))
 
-            // Polling only refreshes page 1, so replace that slice and keep later pages as-is.
-            return [...newTasks, ...remainingTasks]
+            // Polling only refreshes page 1, so replace that slice and trim retained pages
+            // to the current loaded page when the server reports fewer total pages.
+            return [...newTasks, ...remainingTasks].slice(0, loadedPage * TASKS_PER_PAGE)
           })
         } else if (isAppending) {
           setTasks(prev => [...prev, ...newTasks])
@@ -560,11 +564,8 @@ export function Sidebar({ className, allowCollapse = true }: SidebarProps) {
         }
 
         // Update pagination status
-        const totalPages = data.pagination?.total_pages || 1
-
         if (isPolling) {
           // Polling always refreshes page 1, so keep the user's loaded page state intact.
-          const loadedPage = Math.min(pageRef.current, totalPages)
           setHasMore(loadedPage < totalPages)
 
           if (loadedPage !== pageRef.current) {

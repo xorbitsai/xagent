@@ -851,7 +851,7 @@ export function KnowledgeBaseDetailContent({ collectionName }: { collectionName:
                       const documentCount = result.document_count ?? 0
                       const chunkCount = result.chunks_count ?? 0
                       const parseCount = result.parses_completed ?? 0
-                      const vectorCount = result.vector_count ?? result.embeddings_created ?? result.embedding_count ?? 0
+                      const vectorCount = result.vector_count
                       const errorMessage = result.error || result.message
 
                       return (
@@ -873,7 +873,7 @@ export function KnowledgeBaseDetailContent({ collectionName }: { collectionName:
                             <div>{t("kb.detail.process.labels.vector")}: {vectorCount}</div>
                           </div>
                           {result.status !== "success" && errorMessage && (
-                            <div className="mt-2 text-sm text-red-600 break-all">
+                            <div className="mt-2 text-sm text-destructive break-all">
                               {t("kb.detail.process.labels.error")}: {errorMessage}
                             </div>
                           )}

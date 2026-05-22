@@ -48,6 +48,7 @@ export function normalizeKnowledgeBaseIngestionResult(
     | "message"
     | "parses_completed"
     | "file_name"
+    | "vector_count"
   >
 > &
   Pick<
@@ -55,7 +56,6 @@ export function normalizeKnowledgeBaseIngestionResult(
     | "failed_step"
     | "doc_id"
     | "embedding_count"
-    | "vector_count"
     | "embeddings_created"
     | "error"
   > {
@@ -68,6 +68,10 @@ export function normalizeKnowledgeBaseIngestionResult(
     ?? result.chunk_count
     ?? 0
   const parseCount = result.parses_completed ?? (result.doc_id ? 1 : 0)
+  const vectorCount = result.vector_count
+    ?? result.embeddings_created
+    ?? result.embedding_count
+    ?? 0
 
   return {
     collection: result.collection ?? options.collection,
@@ -80,7 +84,7 @@ export function normalizeKnowledgeBaseIngestionResult(
     parses_completed: parseCount,
     doc_id: result.doc_id,
     embedding_count: result.embedding_count,
-    vector_count: result.vector_count,
+    vector_count: vectorCount,
     embeddings_created: result.embeddings_created,
     error: result.error ?? (result.status === "success" ? undefined : result.message),
   }

@@ -1067,7 +1067,7 @@ def handle_kb_exceptions(func: T) -> T:
             raise HTTPException(status_code=500, detail=str(e))
         except (ValueError, KeyError, TypeError) as e:
             logger.error("Data format error in %s: %s", func.__name__, e)
-            raise HTTPException(status_code=400, detail=f"数据格式错误: {str(e)}")
+            raise HTTPException(status_code=400, detail=f"Data format error: {str(e)}")
         except (PermissionError, OSError) as e:
             logger.error("File system error in %s: %s", func.__name__, e)
             raise HTTPException(status_code=403, detail=f"File system error: {str(e)}")

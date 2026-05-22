@@ -104,4 +104,29 @@ describe("normalizeKnowledgeBaseIngestionResult", () => {
       error: undefined,
     })
   })
+
+  it("falls back to embedding-derived counts when vector_count is absent", () => {
+    expect(
+      normalizeKnowledgeBaseIngestionResult(
+        {
+          status: "success",
+          message: "done",
+          doc_id: "doc-456",
+          chunk_count: 3,
+          embeddings_created: 5,
+        },
+        {
+          collection: "demo",
+          fileName: "report.pdf",
+        }
+      )
+    ).toMatchObject({
+      collection: "demo",
+      document_count: 1,
+      chunks_count: 3,
+      parses_completed: 1,
+      file_name: "report.pdf",
+      vector_count: 5,
+    })
+  })
 })

@@ -31,9 +31,9 @@ async def test_handle_kb_exceptions_passthrough_http_exception() -> None:
 @pytest.mark.parametrize(
     ("exc", "expected_status", "expected_prefix"),
     [
-        (ValueError("bad"), 400, "数据格式错误:"),
-        (KeyError("missing"), 400, "数据格式错误:"),
-        (TypeError("wrong type"), 400, "数据格式错误:"),
+        (ValueError("bad"), 400, "Data format error:"),
+        (KeyError("missing"), 400, "Data format error:"),
+        (TypeError("wrong type"), 400, "Data format error:"),
     ],
 )
 async def test_handle_kb_exceptions_maps_data_errors_to_400(

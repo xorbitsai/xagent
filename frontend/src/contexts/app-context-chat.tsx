@@ -85,6 +85,26 @@ const getAutoOpenGeneratedPreviewIndex = (files: GeneratedPreviewFile[]): number
   return files.findIndex((file) => shouldAutoOpenTaskPreview(file.fileName))
 }
 
+const dispatchAutoOpenPreview = (
+  files: Array<string | any> | undefined,
+  dispatch: React.Dispatch<any>,
+) => {
+  const previewFiles = normalizeGeneratedPreviewFiles(files)
+  const autoOpenIndex = getAutoOpenGeneratedPreviewIndex(previewFiles)
+  if (autoOpenIndex < 0) return
+
+  const autoOpenFile = previewFiles[autoOpenIndex]
+  dispatch({
+    type: "OPEN_FILE_PREVIEW",
+    payload: {
+      fileId: autoOpenFile.fileId,
+      fileName: autoOpenFile.fileName,
+      files: previewFiles,
+      index: autoOpenIndex,
+    }
+  })
+}
+
 // Function to clear duplicate message cache
 const clearDuplicateMessageCache = () => {
   recentMessages.clear()
@@ -2403,20 +2423,7 @@ export function AppProvider({ children, token }: { children: React.ReactNode; to
                 })
               }
 
-              const previewFiles = normalizeGeneratedPreviewFiles(fileOutputsData)
-              const autoOpenIndex = getAutoOpenGeneratedPreviewIndex(previewFiles)
-              if (autoOpenIndex >= 0) {
-                const autoOpenFile = previewFiles[autoOpenIndex]
-                dispatch({
-                  type: "OPEN_FILE_PREVIEW",
-                  payload: {
-                    fileId: autoOpenFile.fileId,
-                    fileName: autoOpenFile.fileName,
-                    files: previewFiles,
-                    index: autoOpenIndex,
-                  }
-                })
-              }
+              dispatchAutoOpenPreview(fileOutputsData, dispatch)
             }
 
             // Update task status and trigger sidebar update
@@ -3464,20 +3471,7 @@ export function AppProvider({ children, token }: { children: React.ReactNode; to
             })
           }
 
-          const previewFiles = normalizeGeneratedPreviewFiles(taskData.file_outputs)
-          const autoOpenIndex = getAutoOpenGeneratedPreviewIndex(previewFiles)
-          if (autoOpenIndex >= 0) {
-            const autoOpenFile = previewFiles[autoOpenIndex]
-            dispatch({
-              type: "OPEN_FILE_PREVIEW",
-              payload: {
-                fileId: autoOpenFile.fileId,
-                fileName: autoOpenFile.fileName,
-                files: previewFiles,
-                index: autoOpenIndex,
-              }
-            })
-          }
+          dispatchAutoOpenPreview(taskData.file_outputs, dispatch)
         }
 
         dispatch({ type: "SET_PROCESSING", payload: false })

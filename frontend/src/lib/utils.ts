@@ -187,9 +187,8 @@ export function shouldAutoOpenTaskPreview(fileName: string): boolean {
     || lowerName.endsWith('.pptx')
     || lowerName.endsWith('.docx')
     || lowerName.endsWith('.xlsx')
-    || lowerName.endsWith('.csv')
-    || lowerName.endsWith('.html')
-    || lowerName.endsWith('.htm')
+    || isCsvFile(lowerName)
+    || isHtmlFile(lowerName)
   )
 }
 

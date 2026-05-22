@@ -106,12 +106,10 @@ function InlineImagePreview({
 function InlineOfficeContent({
   kind,
   previewUrl,
-  filename,
   loadErrorText,
 }: {
   kind: 'presentation' | 'document' | 'spreadsheet'
   previewUrl: string
-  filename: string
   loadErrorText: string
 }) {
   const [base64Content, setBase64Content] = useState('')
@@ -299,7 +297,6 @@ export function InlineFilePreview({
         <InlineOfficeContent
           kind={kind}
           previewUrl={previewUrl}
-          filename={filename}
           loadErrorText={loadErrorText}
         />
       </div>

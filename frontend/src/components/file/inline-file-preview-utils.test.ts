@@ -29,6 +29,33 @@ describe('inline-file-preview-utils', () => {
     expect(getInlineFilePreviewKind({ filename: 'chart.png' })).toBe('image')
   })
 
+  it('classifies .pptx (OOXML) as inline-previewable presentation', () => {
+    // PptxPreviewRenderer (pptxviewjs) renders .pptx in-browser, so the
+    // shared classifier flags it as 'presentation'.
+    expect(getInlineFilePreviewKind({ filename: 'deck.pptx' })).toBe('presentation')
+    expect(
+      getInlineFilePreviewKind({
+        filename: 'unknown',
+        mimeType:
+          'application/vnd.openxmlformats-officedocument.presentationml.presentation',
+      })
+    ).toBe('presentation')
+  })
+
+  it('classifies legacy .ppt as a non-previewable file', () => {
+    // pptxviewjs only supports OOXML .pptx; the legacy binary .ppt
+    // (mime ``application/vnd.ms-powerpoint``) must NOT reach the
+    // PptxPreviewRenderer mount path. The shared classifier returns
+    // 'file' so callers render a download/file link instead.
+    expect(getInlineFilePreviewKind({ filename: 'old-deck.ppt' })).toBe('file')
+    expect(
+      getInlineFilePreviewKind({
+        filename: 'unknown',
+        mimeType: 'application/vnd.ms-powerpoint',
+      })
+    ).toBe('file')
+  })
+
   it('builds public preview URLs from file ids and preserves absolute preview URLs', () => {
     expect(
       getInlineFilePreviewUrl(

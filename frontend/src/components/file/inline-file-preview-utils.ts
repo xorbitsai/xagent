@@ -30,8 +30,12 @@ const PREVIEWABLE_KINDS = new Set<PreviewableInlineFileKind>([
   'spreadsheet',
 ])
 
+// Only OOXML presentations are browser-previewable: PptxPreviewRenderer
+// uses pptxviewjs, which only supports .pptx. Legacy binary .ppt (mime
+// ``application/vnd.ms-powerpoint``) is intentionally NOT in this set —
+// it falls through to ``'file'`` so callers render a download link
+// instead of mounting an unsupported renderer.
 const PRESENTATION_MIME_TYPES = new Set<string>([
-  'application/vnd.ms-powerpoint',
   'application/vnd.openxmlformats-officedocument.presentationml.presentation',
 ])
 
@@ -68,7 +72,9 @@ export const getInlineFilePreviewKind = (
   }
 
   if (/\.(jpg|jpeg|png|gif|webp|svg)$/.test(filename)) return 'image'
-  if (/\.(ppt|pptx)$/.test(filename)) return 'presentation'
+  // Only OOXML .pptx is previewable inline — see PRESENTATION_MIME_TYPES
+  // comment. Legacy .ppt falls through to the generic 'file' kind.
+  if (filename.endsWith('.pptx')) return 'presentation'
   if (filename.endsWith('.docx')) return 'document'
   if (/\.(csv|xls|xlsx)$/.test(filename)) return 'spreadsheet'
 

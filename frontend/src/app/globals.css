@@ -71,18 +71,8 @@ body .hover\:text-\[\#E6EDF3\]:hover {
   color: hsl(var(--accent-foreground)) !important;
 }
 
-/* Override all possible hardcoded color combinations */
-body [class*="bg-["][class*="#"] {
-  background-color: hsl(var(--background)) !important;
-}
-
-body [class*="text-["][class*="#"] {
-  color: hsl(var(--foreground)) !important;
-}
-
-body [class*="border-["][class*="#"] {
-  border-color: hsl(var(--border)) !important;
-}
+/* Keep explicit legacy mappings above, but allow arbitrary Tailwind colors
+   like text-[#3B5AF6] / bg-[#EEF2FF] / border-[#E7EAF3] to render normally. */
 
 /* Preserve specific interaction effects */
 body .hover\:\bg-\[\#1F2937\]:hover {

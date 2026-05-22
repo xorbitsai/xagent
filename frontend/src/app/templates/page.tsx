@@ -1,19 +1,50 @@
 "use client";
 
 import { useI18n } from "@/contexts/i18n-context";
-import { Play, Heart, Loader2, Clock, ChevronRight, Search } from "lucide-react";
-import { useState, useEffect } from "react";
-import { cn, getApiUrl } from "@/lib/utils";
+import { Loader2, Search, Star } from "lucide-react";
+import { useState, useEffect, useMemo } from "react";
+import { getApiUrl } from "@/lib/utils";
 import { useRouter } from "next/navigation";
 import { apiRequest } from "@/lib/api-wrapper";
 import type { Template } from "@/types/template";
+import { FeaturedTemplateCard } from "@/components/templates/featured-template-card";
+import { LibraryTemplateCard } from "@/components/templates/library-template-card";
+import { SegmentedTabs } from "@/components/ui/segmented-tabs";
 
 interface CategorySection {
   id: string;
   title: string;
   templates: Template[];
-  isFeatured?: boolean;
 }
+
+const CATEGORY_LABEL_KEYS: Record<string, string> = {
+  sales: "templates.categoryTitles.sales",
+  marketing: "templates.categoryTitles.marketing",
+  support: "templates.categoryTitles.support",
+  research: "templates.sections.knowledge",
+  productivity: "templates.categoryTitles.general_productivity",
+  healthcare_fitness: "templates.categoryTitles.healthcare_fitness",
+  general_productivity: "templates.categoryTitles.general_productivity",
+  customer_service: "templates.categoryTitles.customer_service",
+  finance_lms_ops: "templates.categoryTitles.finance_lms_ops",
+  security: "templates.categoryTitles.security",
+};
+
+const CATEGORY_ACCENTS: Record<string, { border: string; text: string; hex: string }> = {
+  support: { border: "bg-[#3B5AF6]", text: "text-[#3B5AF6]", hex: "#3B5AF6" },
+  sales: { border: "bg-[#15A34A]", text: "text-[#15A34A]", hex: "#15A34A" },
+  marketing: { border: "bg-[#EC4899]", text: "text-[#EC4899]", hex: "#EC4899" },
+  research: { border: "bg-[#7C3AED]", text: "text-[#7C3AED]", hex: "#7C3AED" },
+  productivity: { border: "bg-[#F59E0B]", text: "text-[#F59E0B]", hex: "#F59E0B" },
+};
+
+const normalizeCategoryKey = (category: string) =>
+  category.toLowerCase().replace(/\s*&\s*/g, "_").replace(/\s+/g, "_");
+
+const formatFallbackLabel = (category: string) =>
+  category
+    .replace(/_/g, " ")
+    .replace(/\b\w/g, (char) => char.toUpperCase());
 
 export default function TemplatesPage() {
   const { t, locale } = useI18n();
@@ -22,20 +53,6 @@ export default function TemplatesPage() {
   const [searchQuery, setSearchQuery] = useState("");
   const [templates, setTemplates] = useState<Template[]>([]);
   const [loading, setLoading] = useState(true);
-
-  const categories = [
-    { id: "All", label: t("templates.categoryTitles.all") },
-    { id: "Sales", label: t("templates.categoryTitles.sales") },
-    { id: "Marketing", label: t("templates.categoryTitles.marketing") },
-    { id: "Support", label: t("templates.categoryTitles.support") },
-  ];
-
-  const categoryConfig: Record<string, string> = {
-    Featured: t("templates.categoryTitles.featured"),
-    Sales: t("templates.categoryTitles.sales"),
-    Marketing: t("templates.categoryTitles.marketing"),
-    Support: t("templates.categoryTitles.support"),
-  };
 
   useEffect(() => {
     const fetchTemplates = async () => {
@@ -55,54 +72,91 @@ export default function TemplatesPage() {
     fetchTemplates();
   }, [locale]);
 
-  const filteredTemplates = templates.filter((template) => {
-    const matchesCategory =
-      selectedCategory === "All" ||
-      template.category === selectedCategory;
-    const matchesSearch =
-      !searchQuery ||
-      template.name.toLowerCase().includes(searchQuery.toLowerCase()) ||
-      template.description.toLowerCase().includes(searchQuery.toLowerCase());
-    return matchesCategory && matchesSearch;
-  });
+  const categoryLabel = (category: string) => {
+    const key = CATEGORY_LABEL_KEYS[normalizeCategoryKey(category)];
+    return key ? t(key) : formatFallbackLabel(category);
+  };
 
-  const buildSections = (): CategorySection[] => {
-    const sections: CategorySection[] = [];
+  const categoryAccent = (category: string) =>
+    CATEGORY_ACCENTS[normalizeCategoryKey(category)] || {
+      border: "bg-[#94A3B8]",
+      text: "text-[#94A3B8]",
+      hex: "#94A3B8",
+    };
 
-    const featuredTemplates = filteredTemplates.filter((t) => t.featured);
-    if (featuredTemplates.length > 0 && selectedCategory === "All" && !searchQuery) {
-      sections.push({ id: "featured", title: t("templates.categoryTitles.featured") || "Featured", templates: featuredTemplates, isFeatured: true });
-    }
+  const categories = useMemo(() => {
+    const preferred = ["Sales", "Marketing", "Support", "Research", "Productivity"];
+    const dynamic = Array.from(new Set(templates.map((template) => template.category).filter(Boolean)));
+    const orderedDynamic = [
+      ...preferred.filter((category) => dynamic.includes(category)),
+      ...dynamic.filter((category) => !preferred.includes(category)),
+    ];
 
+    return [
+      { id: "All", label: t("templates.categoryTitles.all") },
+      ...orderedDynamic.map((category) => ({
+        id: category,
+        label: categoryLabel(category),
+      })),
+    ];
+  }, [t, templates]);
+
+  const featuredTemplates = useMemo(
+    () => [...templates].sort((a, b) => (b.used_count || 0) - (a.used_count || 0)).slice(0, 3),
+    [templates]
+  );
+
+  const filteredTemplates = useMemo(
+    () =>
+      templates.filter((template) => {
+        const matchesCategory = selectedCategory === "All" || template.category === selectedCategory;
+        const matchesSearch =
+          !searchQuery ||
+          template.name.toLowerCase().includes(searchQuery.toLowerCase()) ||
+          template.description.toLowerCase().includes(searchQuery.toLowerCase());
+        return matchesCategory && matchesSearch;
+      }),
+    [searchQuery, selectedCategory, templates]
+  );
+
+  const sections = useMemo(() => {
     const grouped: Record<string, Template[]> = {};
+    const featuredIds = new Set(featuredTemplates.map((template) => template.id));
+    const shouldHideFeaturedFromSections = selectedCategory === "All" && !searchQuery;
+
     filteredTemplates.forEach((template) => {
-      const cat = template.category || "Others";
-      if (!grouped[cat]) grouped[cat] = [];
-      grouped[cat].push(template);
+      if (shouldHideFeaturedFromSections && featuredIds.has(template.id)) {
+        return;
+      }
+      const category = template.category || "Others";
+      if (!grouped[category]) grouped[category] = [];
+      grouped[category].push(template);
     });
 
-    const orderedCats = ["Sales", "Marketing", "Support", "IT", "Others"];
-    orderedCats.forEach((cat) => {
-      if (grouped[cat]?.length) {
-        sections.push({
-          id: cat.toLowerCase(),
-          title: categoryConfig[cat] || cat,
-          templates: grouped[cat],
-          isFeatured: false,
+    const orderedCategories = categories
+      .map((category) => category.id)
+      .filter((category) => category !== "All");
+
+    const orderedSections: CategorySection[] = orderedCategories
+      .filter((category) => grouped[category]?.length)
+      .map((category) => ({
+        id: normalizeCategoryKey(category),
+        title: categoryLabel(category),
+        templates: grouped[category],
+      }));
+
+    Object.keys(grouped).forEach((category) => {
+      if (!orderedCategories.includes(category)) {
+        orderedSections.push({
+          id: normalizeCategoryKey(category),
+          title: categoryLabel(category),
+          templates: grouped[category],
         });
       }
     });
 
-    Object.keys(grouped).forEach((cat) => {
-      if (!orderedCats.includes(cat) && grouped[cat]?.length) {
-        sections.push({ id: cat.toLowerCase(), title: categoryConfig[cat] || cat, templates: grouped[cat], isFeatured: false });
-      }
-    });
-
-    return sections;
-  };
-
-  const sections = buildSections();
+    return orderedSections;
+  }, [categories, featuredTemplates, filteredTemplates, searchQuery, selectedCategory]);
 
   const handleUseTemplate = async (templateId: string) => {
     try {
@@ -123,222 +177,99 @@ export default function TemplatesPage() {
   };
 
   return (
-    <div className="flex flex-col h-full bg-background overflow-y-auto">
-      {/* Top Hero */}
-      <div className="w-full bg-background border-b border-border/60 pt-10 pb-8">
-        <div className="max-w-4xl mx-auto px-6 flex flex-col items-center text-center">
-          <h1 className="text-3xl font-bold mb-2 text-foreground tracking-tight">
-            {t("templates.title")}
-          </h1>
-          <p className="text-[15px] text-muted-foreground mb-6">
-            {t("templates.subtitle")}
-          </p>
-          <div className="w-full max-w-xl relative">
-            <Search className="absolute left-4 top-1/2 -translate-y-1/2 w-4 h-4 text-muted-foreground pointer-events-none" />
+    <div className="flex h-full flex-col overflow-y-auto bg-[#F6F7FB] dark:bg-background">
+      <div className="mx-auto w-full p-6">
+        <div className="mb-[22px] max-w-[600px]">
+          <h1 className="text-[34px] font-bold tracking-tight text-foreground">{t("templates.title")}</h1>
+          <p className="mt-1 text-[13.5px] leading-[1.55] text-muted-foreground">{t("templates.subtitle")}</p>
+        </div>
+
+        <div className="mb-[22px] flex flex-wrap items-center gap-3">
+          <div className="relative w-full max-w-[320px]">
+            <Search className="pointer-events-none absolute left-3 top-1/2 h-[14px] w-[14px] -translate-y-1/2 text-muted-foreground" />
             <input
               type="text"
               value={searchQuery}
               onChange={(e) => setSearchQuery(e.target.value)}
               placeholder={t("templates.searchPlaceholder")}
-              className="w-full pl-11 pr-4 py-2.5 rounded-full border border-border bg-card text-[14px] placeholder:text-muted-foreground focus:outline-none focus:border-primary/50 focus:ring-2 focus:ring-primary/10 transition-all"
+              className="h-[38px] w-full rounded-[8px] border border-[#E7EAF3] bg-white pl-9 pr-4 text-[13px] placeholder:text-muted-foreground shadow-sm focus:outline-none focus:ring-2 focus:ring-primary/10"
             />
           </div>
-        </div>
-      </div>
 
-      {/* Category Tabs + Count */}
-      <div className="sticky top-0 mt-6 z-10 bg-background/95 backdrop-blur border-b border-border/40">
-        <div className="relative mx-auto px-4 sm:px-16 py-3">
-          <div className="-mx-4 overflow-x-auto px-4 sm:mx-0 sm:px-0">
-            <div className="flex min-w-max items-center justify-center gap-1.5 sm:min-w-0 sm:flex-wrap">
-            {categories.map((cat) => (
-              <button
-                key={cat.id}
-                onClick={() => setSelectedCategory(cat.id)}
-                className={cn(
-                  "px-4 py-1.5 rounded-full text-[13px] font-medium transition-all whitespace-nowrap",
-                  selectedCategory === cat.id
-                    ? "bg-primary text-primary-foreground shadow-sm"
-                    : "text-muted-foreground hover:text-foreground hover:bg-muted"
-                )}
-              >
-                {cat.label}
-              </button>
-            ))}
-            </div>
-          </div>
-          <div className="mt-3 flex justify-center sm:hidden">
-            <span className="text-[13px] font-medium text-primary bg-primary/10 border border-primary/20 px-3 py-1 rounded-full whitespace-nowrap shrink-0">
-              {filteredTemplates.length === 1
-                ? t("templates.countOne", { count: filteredTemplates.length })
-                : t("templates.countOther", { count: filteredTemplates.length })}
-            </span>
-          </div>
-          <span className="hidden sm:inline-flex absolute right-16 top-1/2 -translate-y-1/2 text-[13px] font-medium text-primary bg-primary/10 border border-primary/20 px-3 py-1 rounded-full whitespace-nowrap shrink-0">
+          <SegmentedTabs
+            items={categories}
+            value={selectedCategory}
+            onValueChange={setSelectedCategory}
+            className="shrink-0"
+          />
+
+          <div className="flex-1" />
+
+          <div className="shrink-0 rounded-full bg-[#EEF2FF] px-[10px] py-[5px] text-[12px] font-semibold text-[#3B5AF6]">
             {filteredTemplates.length === 1
               ? t("templates.countOne", { count: filteredTemplates.length })
               : t("templates.countOther", { count: filteredTemplates.length })}
-          </span>
+          </div>
         </div>
-      </div>
 
-      {/* Content */}
-      <div className="flex-1">
         {loading ? (
-          <div className="flex items-center justify-center h-64">
-            <Loader2 className="w-8 h-8 animate-spin text-muted-foreground" />
+          <div className="flex h-64 items-center justify-center">
+            <Loader2 className="h-8 w-8 animate-spin text-muted-foreground" />
           </div>
         ) : (
-          <div className="mx-auto px-16 py-8 space-y-12">
+          <div className="space-y-7">
+            {selectedCategory === "All" && !searchQuery && featuredTemplates.length > 0 ? (
+              <section className="space-y-3">
+                <div className="flex items-center gap-[6px] text-[11.5px] font-bold uppercase tracking-[0.06em] text-[#64748B]">
+                  <Star className="h-[13px] w-[13px] text-yellow-500" />
+                  <span>{t("templates.categoryTitles.featured")}</span>
+                </div>
+                <div className="grid grid-cols-1 gap-[14px] xl:grid-cols-3">
+                  {featuredTemplates.map((template) => (
+                    <FeaturedTemplateCard
+                      key={template.id}
+                      template={template}
+                      categoryLabel={categoryLabel(template.category)}
+                      popularLabel={t("templates.popular")}
+                      runsLabel={t("templates.runs")}
+                      onUse={handleUseTemplate}
+                      onLike={handleLikeTemplate}
+                    />
+                  ))}
+                </div>
+              </section>
+            ) : null}
+
             {sections.map((section) => (
-              <div key={section.id}>
-                <h2 className="text-[11px] font-bold tracking-widest text-muted-foreground uppercase mb-5">
-                  {section.title}
-                </h2>
-
-                {section.isFeatured ? (
-                  /* Featured: horizontal wide cards, 3-col */
-                  <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-5">
-                    {section.templates.slice(0, 3).map((template) => (
-                      <div
-                        key={template.id}
-                        className="flex flex-col bg-slate-50 dark:bg-slate-900/40 rounded-xl border border-border/50 shadow-sm hover:shadow-md transition-all cursor-pointer group overflow-hidden"
-                        onClick={() => handleUseTemplate(template.id)}
-                      >
-                        <div
-                          className="h-[3px] w-full shrink-0"
-                          style={{ background: "linear-gradient(to right, #4338ca, #7c3aed, #9333ea, #c026d3)" }}
-                        />
-                        <div className="flex flex-col flex-1 p-5">
-                          <div className="mb-3">
-                            <span className="text-[10px] font-bold tracking-widest text-primary uppercase">
-                              {categoryConfig[template.category] || template.category}
-                            </span>
-                          </div>
-                          <h3 className="font-bold text-[17px] mb-2 text-foreground group-hover:text-primary transition-colors">
-                            {template.name}
-                          </h3>
-                          <p className="text-[13px] text-muted-foreground leading-relaxed flex-1 mb-4 line-clamp-2">
-                            {template.description}
-                          </p>
-                          <div className="flex items-center gap-4 text-[12px] text-muted-foreground mt-auto pt-3 border-t border-border/50">
-                            <div className="flex items-center gap-1">
-                              <Play className="w-3 h-3 fill-current text-primary/60" />
-                              <span className="font-semibold text-foreground/70">
-                                {template.used_count ?? 0} {t("templates.runs")}
-                              </span>
-                            </div>
-                            <button
-                              onClick={(e) => handleLikeTemplate(template.id, e)}
-                              className={`flex items-center gap-1 transition-colors ${
-                                template.is_liked ? "text-pink-500" : "hover:text-pink-500"
-                              }`}
-                            >
-                              <Heart
-                                className={`w-3 h-3 fill-current ${
-                                  template.is_liked ? "text-rose-500" : "text-rose-400/70"
-                                }`}
-                              />
-                              <span className="font-semibold text-foreground/70">{template.likes ?? 0}</span>
-                            </button>
-                          </div>
-                        </div>
-                      </div>
-                    ))}
-                  </div>
-                ) : (
-                  /* Category: standard cards, 4-col */
-                  <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 2xl:grid-cols-4 gap-5">
-                    {section.templates.map((template) => (
-                      <div
-                        key={template.id}
-                        className="flex flex-col bg-blue-50/60 dark:bg-blue-950/20 rounded-xl border border-blue-200/60 dark:border-blue-800/40 border-t-4 border-t-blue-500 shadow-sm hover:shadow-md transition-all p-5 group"
-                      >
-                        <div className="flex items-center justify-between mb-3">
-                          <span className="text-[10px] font-bold tracking-widest text-blue-600 dark:text-blue-400 uppercase">
-                            {categoryConfig[template.category] || template.category}
-                          </span>
-                          <div className="flex items-center gap-1 text-[11px] text-muted-foreground">
-                            <Clock className="w-3 h-3" />
-                            <span>{template.setup_time || t("templates.defaultSetupTime")}</span>
-                          </div>
-                        </div>
-
-                        <h3 className="font-bold text-[15px] mb-3 text-foreground group-hover:text-primary transition-colors line-clamp-1">
-                          {template.name}
-                        </h3>
-
-                        <div className="flex-1 space-y-1.5 mb-5">
-                          {(template.features && template.features.length > 0)
-                            ? template.features.slice(0, 3).map((feature, idx) => (
-                              <div key={idx} className="flex items-start gap-1.5 text-[12px] text-muted-foreground">
-                                <ChevronRight className="w-3.5 h-3.5 text-primary shrink-0 mt-px" />
-                                <span className="line-clamp-2 leading-snug">{feature}</span>
-                              </div>
-                            ))
-                            : (
-                              <div className="flex items-start gap-1.5 text-[12px] text-muted-foreground">
-                                <ChevronRight className="w-3.5 h-3.5 text-primary shrink-0 mt-px" />
-                                <span className="line-clamp-3 leading-snug">{template.description}</span>
-                              </div>
-                            )
-                          }
-                        </div>
-
-                        <div className="h-px bg-blue-200/60 dark:bg-blue-800/30 mb-4" />
-
-                        <div className="flex items-center justify-between mb-4">
-                          <div className="flex items-center gap-1">
-                            {template.connections?.slice(0, 4).map((conn, idx) => (
-                              <div key={idx} className="w-7 h-7 rounded-lg bg-white dark:bg-slate-900 border border-blue-200/60 dark:border-blue-800/40 flex items-center justify-center overflow-hidden">
-                                {conn.logo
-                                  ? <img src={conn.logo} alt={conn.name} className="w-4 h-4 object-contain" />
-                                  : <span className="text-[9px] font-bold text-primary/70">{conn.name.substring(0, 2).toUpperCase()}</span>
-                                }
-                              </div>
-                            ))}
-                            {(template.connections?.length ?? 0) > 4 && (
-                              <div className="w-7 h-7 rounded-lg bg-muted border border-border flex items-center justify-center">
-                                <span className="text-[9px] font-medium text-muted-foreground">+{(template.connections?.length ?? 0) - 4}</span>
-                              </div>
-                            )}
-                          </div>
-                          <div className="flex items-center gap-3 text-[12px] text-muted-foreground">
-                            <div className="flex items-center gap-1">
-                              <Play className="w-3 h-3 fill-current text-primary/60" />
-                              <span className="font-semibold">{template.used_count ?? 0}</span>
-                            </div>
-                            <button
-                              onClick={(e) => handleLikeTemplate(template.id, e)}
-                              className={`flex items-center gap-1 transition-colors ${
-                                template.is_liked ? "text-pink-500" : "hover:text-pink-500"
-                              }`}
-                            >
-                              <Heart
-                                className={`w-3 h-3 fill-current ${
-                                  template.is_liked ? "text-rose-500" : "text-rose-400/70"
-                                }`}
-                              />
-                              <span className="font-semibold">{template.likes ?? 0}</span>
-                            </button>
-                          </div>
-                        </div>
-
-                        <button
-                          onClick={() => handleUseTemplate(template.id)}
-                          className="w-full py-2 text-blue-600 dark:text-blue-400 text-[12px] font-bold uppercase tracking-widest rounded-lg border border-blue-300/60 dark:border-blue-700/50 bg-white/60 dark:bg-blue-950/30 hover:bg-blue-500 hover:text-white hover:border-blue-500 transition-all"
-                        >
-                          {t("templates.useTemplate")}
-                        </button>
-                      </div>
-                    ))}
-                  </div>
-                )}
-              </div>
+              <section key={section.id} className="space-y-3">
+                <div className="flex items-center gap-[6px] text-[11.5px] font-bold uppercase tracking-[0.06em] text-[#64748B]">
+                  <span
+                    className="h-[5px] w-[5px] rounded-full"
+                    style={{ background: categoryAccent(section.templates[0]?.category || section.title).hex }}
+                  />
+                  <span>{section.title}</span>
+                </div>
+                <div className="grid grid-cols-1 gap-[14px] xl:grid-cols-3">
+                  {section.templates.map((template) => (
+                    <LibraryTemplateCard
+                      key={template.id}
+                      template={template}
+                      categoryLabel={categoryLabel(template.category)}
+                      useLabel={t("templates.useTemplate")}
+                      defaultSetupTime={t("templates.defaultSetupTime")}
+                      accentColorClassName={categoryAccent(template.category).border}
+                      accentSoftClassName={categoryAccent(template.category).text}
+                      accentHex={categoryAccent(template.category).hex}
+                      onUse={handleUseTemplate}
+                      onLike={handleLikeTemplate}
+                    />
+                  ))}
+                </div>
+              </section>
             ))}
 
             {sections.length === 0 && (
-              <div className="text-center py-24 text-muted-foreground">
+              <div className="rounded-2xl border border-dashed border-border bg-white px-6 py-20 text-center text-muted-foreground">
                 <p className="text-[15px]">{t("templates.noResults")}</p>
               </div>
             )}

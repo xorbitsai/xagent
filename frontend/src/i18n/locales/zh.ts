@@ -38,6 +38,7 @@ const zh = {
     },
   },
   nav: {
+    home: "首页",
     settings: "系统设置",
     dashboard: "仪表盘",
     vibe: "Vibe",
@@ -74,6 +75,28 @@ const zh = {
       subtitle: "无需编写代码即可构建、部署并扩展属于你的智能体。",
       searchPlaceholder: "你想做点什么？",
     },
+    revamp: {
+      greeting: "你好",
+      greetingMorning: "早上好",
+      greetingAfternoon: "下午好",
+      greetingEvening: "晚上好",
+      goalTitle: "这次想达成什么目标？",
+      start: "开始",
+      running: "{count} 个任务进行中",
+      liveView: "查看",
+      askPlaceholder: "你可以提问、调研、写作、生成、分析……",
+      followupTitle: "希望它以后能反复自动执行？",
+      followupDescription: "把这次流程沉淀成可复用 Agent，下次一句话就能调用。",
+      buildAgent: "构建一个 Agent",
+    },
+    agents: {
+      title: "你的 Agents",
+      subtitle: "点击聊天 — 这些是你可以直接运行、继续打磨和复用的工作助手。",
+      manageAll: "管理全部",
+      empty: "还没有 Agent，先创建一个把工作流沉淀下来。",
+      newAgent: "新建 Agent",
+      buildTime: "几分钟内即可搭建完成",
+    },
     getStarted: {
       title: "开始使用",
       video: {
@@ -94,13 +117,17 @@ const zh = {
       }
     },
     templates: {
-      title: "使用模板构建智能体",
+      title: "模板",
       viewAll: "查看全部",
       setupTime: "{time} 配置",
+      subtitle: "跳过空白页面，快速克隆预构建的智能体。",
+      browseLibrary: "浏览模板库",
       useTemplate: "使用模板"
     },
     recent: {
       title: "最近活动",
+      subtitle: "继续处理最近的任务，或查看最新执行结果。",
+      viewTask: "查看任务",
       untitledTask: "未命名任务",
       defaultAgent: "智能体"
     }
@@ -1207,6 +1234,7 @@ Build when you need.`
     title: "模板中心",
     subtitle: "使用预构建的智能体快速启动工作流。",
     searchPlaceholder: "搜索模板...",
+    popular: "热门",
     useTemplate: "使用模板",
     countOne: "{count} 个模板",
     countOther: "{count} 个模板",

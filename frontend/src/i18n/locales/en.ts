@@ -38,6 +38,7 @@ const en = {
     },
   },
   nav: {
+    home: "Home",
     settings: "Settings",
     dashboard: "Dashboard",
     vibe: "Vibe",
@@ -74,6 +75,28 @@ const en = {
       subtitle: "Build, deploy, and scale intelligent agents that work for you — no code required.",
       searchPlaceholder: "What would you like to do?",
     },
+    revamp: {
+      greeting: "Hello",
+      greetingMorning: "Good morning",
+      greetingAfternoon: "Good afternoon",
+      greetingEvening: "Good evening",
+      goalTitle: "What's the goal?",
+      start: "Start",
+      running: "{count} task running",
+      liveView: "View",
+      askPlaceholder: "Ask anything — research, write, generate, analyze...",
+      followupTitle: "Need it to run again and again?",
+      followupDescription: "Turn this workflow into a reusable agent you can call any time.",
+      buildAgent: "Build an agent",
+    },
+    agents: {
+      title: "Your agents",
+      subtitle: "Click to chat — these are your published, ready-to-run workers",
+      manageAll: "Manage all",
+      empty: "No agents yet. Create one to turn repeat work into a reusable workflow.",
+      newAgent: "New agent",
+      buildTime: "Build in minutes",
+    },
     getStarted: {
       title: "Get started",
       video: {
@@ -94,13 +117,17 @@ const en = {
       }
     },
     templates: {
-      title: "Build agents with templates",
+      title: "Templates",
       viewAll: "View all",
       setupTime: "{time} setup",
+      subtitle: "Skip the blank page — pre-built agents you can clone in 5 minutes",
+      browseLibrary: "Browse library",
       useTemplate: "Use Template"
     },
     recent: {
       title: "Recent",
+      subtitle: "Jump back into recent tasks and pick up where you left off.",
+      viewTask: "Open task",
       untitledTask: "Untitled Task",
       defaultAgent: "Agent"
     }
@@ -1207,6 +1234,7 @@ Build when you need.`
     title: "Templates",
     subtitle: "Jumpstart your workflow with pre-built agents.",
     searchPlaceholder: "Search templates...",
+    popular: "Popular",
     useTemplate: "Use Template",
     countOne: "{count} template",
     countOther: "{count} templates",

@@ -665,7 +665,6 @@ class AutoPattern(AgentPattern):
             answer_emitter = FinalAnswerStreamSession(
                 runtime,
                 enabled=True,
-                buffer_deltas=True,
             )
             answer_streamer = ToolCallStringFieldStreamer(
                 runtime=runtime,

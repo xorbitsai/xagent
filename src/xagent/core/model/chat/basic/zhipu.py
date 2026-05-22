@@ -21,6 +21,27 @@ from .base import BaseLLM
 logger = logging.getLogger(__name__)
 
 
+def _zhipu_stream_tool_calls(
+    accumulated_tool_calls: Dict[str, Dict],
+) -> List[Dict[str, Any]]:
+    tool_calls_list: List[Dict[str, Any]] = []
+    for tool_call in accumulated_tool_calls.values():
+        function_payload: Dict[str, Any] = {
+            "name": tool_call.get("name", ""),
+            "arguments": tool_call.get("arguments", ""),
+        }
+        item: Dict[str, Any] = {
+            "id": tool_call.get("id", ""),
+            "type": "function",
+            "function": function_payload,
+        }
+        index = tool_call.get("index")
+        if isinstance(index, int):
+            item["index"] = index
+        tool_calls_list.append(item)
+    return tool_calls_list
+
+
 class ZhipuLLM(BaseLLM):
     """
     Zhipu AI LLM client using the official Zhipu SDK.
@@ -440,10 +461,10 @@ class ZhipuLLM(BaseLLM):
                 Consume the synchronous Zhipu stream and put chunks into the queue.
                 This runs in a separate thread to avoid blocking the event loop.
                 """
-                if self._client is None:
-                    raise RuntimeError("Zhipu client is not initialized")
-
                 try:
+                    if self._client is None:
+                        raise RuntimeError("Zhipu client is not initialized")
+
                     stream = self._client.chat.completions.create(**completion_params)
 
                     for chunk in stream:
@@ -467,6 +488,9 @@ class ZhipuLLM(BaseLLM):
                                         tool_call_dict: Dict[str, Any] = {
                                             "id": getattr(tool_call, "id", None),
                                         }
+                                        index = getattr(tool_call, "index", None)
+                                        if isinstance(index, int):
+                                            tool_call_dict["index"] = index
 
                                         if hasattr(tool_call, "function"):
                                             func = tool_call.function
@@ -527,7 +551,7 @@ class ZhipuLLM(BaseLLM):
                         loop.call_soon_threadsafe(put_exception)
 
             # Start the producer thread
-            await loop.run_in_executor(None, stream_producer)
+            producer_task = loop.run_in_executor(None, stream_producer)
 
             # Consume chunks from the queue as they arrive (true streaming)
             while True:
@@ -582,19 +606,35 @@ class ZhipuLLM(BaseLLM):
 
                         # Check for tool calls
                         if delta.get("tool_calls"):
+                            saw_tool_call_delta = False
                             for tool_call in delta["tool_calls"]:
                                 tool_id = tool_call.get("id")
+                                index = tool_call.get("index")
 
                                 # Initialize tool call if not exists
+                                if not tool_id and isinstance(index, int):
+                                    for (
+                                        existing_id,
+                                        existing_tool_call,
+                                    ) in accumulated_tool_calls.items():
+                                        if existing_tool_call.get("index") == index:
+                                            tool_id = existing_id
+                                            break
+                                if not tool_id and len(accumulated_tool_calls) == 1:
+                                    tool_id = next(iter(accumulated_tool_calls.keys()))
                                 if tool_id and tool_id not in accumulated_tool_calls:
                                     accumulated_tool_calls[tool_id] = {
                                         "id": tool_id,
+                                        "index": index
+                                        if isinstance(index, int)
+                                        else None,
                                         "name": "",
                                         "arguments": "",
                                     }
 
                                 # Update tool call info
                                 if tool_id:
+                                    saw_tool_call_delta = True
                                     func = tool_call.get("function")
                                     if func:
                                         if func.get("name"):
@@ -605,28 +645,28 @@ class ZhipuLLM(BaseLLM):
                                             accumulated_tool_calls[tool_id][
                                                 "arguments"
                                             ] += func["arguments"]
+                                    if isinstance(index, int):
+                                        accumulated_tool_calls[tool_id]["index"] = index
+
+                            if saw_tool_call_delta:
+                                yield StreamChunk(
+                                    type=ChunkType.TOOL_CALL,
+                                    tool_calls=_zhipu_stream_tool_calls(
+                                        accumulated_tool_calls
+                                    ),
+                                    raw=chunk_dict,
+                                )
 
                     # Check for finish reason
                     finish_reason = choice.get("finish_reason")
                     if finish_reason:
                         # Yield tool calls if accumulated
                         if accumulated_tool_calls:
-                            tool_calls_list = []
-                            for tool_call in accumulated_tool_calls.values():
-                                tool_calls_list.append(
-                                    {
-                                        "id": tool_call["id"],
-                                        "type": "function",
-                                        "function": {
-                                            "name": tool_call["name"],
-                                            "arguments": tool_call["arguments"],
-                                        },
-                                    }
-                                )
-
                             yield StreamChunk(
                                 type=ChunkType.TOOL_CALL,
-                                tool_calls=tool_calls_list,
+                                tool_calls=_zhipu_stream_tool_calls(
+                                    accumulated_tool_calls
+                                ),
                                 finish_reason=finish_reason,
                                 raw=chunk_dict,
                             )
@@ -662,6 +702,8 @@ class ZhipuLLM(BaseLLM):
                         usage=usage_dict,
                         raw=chunk_dict,
                     )
+
+            await producer_task
 
         except LLMTimeoutError:
             # Re-raise timeout errors for retry

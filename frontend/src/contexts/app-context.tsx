@@ -26,8 +26,10 @@ import { unwrapFinalAnswerContent } from "@/lib/final-answer"
 import {
   getFinalAnswerStreamActionPayload,
   getFinalAnswerStreamMessageId,
+  getWebSocketEventType,
   isFinalAnswerStreamEventType,
   isStreamingFinalAnswerMessage,
+  shouldBufferMessageForHistoricalReplay,
 } from "@/lib/streaming-final-answer"
 
 // Unique ID generator for messages
@@ -804,15 +806,22 @@ export function AppProvider({ children, token }: { children: React.ReactNode; to
 
   const handleMessage = useCallback((message: WebSocketMessage, dispatch: React.Dispatch<AppAction>, currentState: AppState) => {
     // If we're in replay mode, don't process immediately - collect for delayed playback
-    if (currentState.isReplaying) {
+    if (
+      shouldBufferMessageForHistoricalReplay({
+        isReplaying: currentState.isReplaying,
+        isHistoryLoading: isHistoricalDataLoading,
+        message,
+      })
+    ) {
       // Add to replay cache
       dispatch({ type: "ADD_TO_REPLAY_CACHE", payload: message })
 
       // If this is historical_data_complete, start the delayed playback
-      const isHistoricalComplete = message.type === "historical_data_complete" ||
-        (message.type === "trace_event" && (message as any).event_type === "historical_data_complete")
+      const isHistoricalComplete =
+        getWebSocketEventType(message) === "historical_data_complete"
 
       if (isHistoricalComplete) {
+        isHistoricalDataLoading = false
         // Add a small delay to ensure all events are collected before starting playback
         setTimeout(() => {
           startDelayedPlayback()

@@ -3,7 +3,9 @@ import { describe, expect, it } from "vitest"
 import {
   getFinalAnswerStreamActionPayload,
   getFinalAnswerStreamMessageId,
+  getWebSocketEventType,
   mergeTraceEventsById,
+  shouldBufferMessageForHistoricalReplay,
 } from "@/lib/streaming-final-answer"
 
 describe("streaming final answer events", () => {
@@ -72,5 +74,51 @@ describe("streaming final answer events", () => {
         stream_message_id: "final_answer_2",
       }),
     ).toBe("final_answer_2")
+  })
+
+  it("does not replay-buffer live final answer stream events", () => {
+    expect(
+      shouldBufferMessageForHistoricalReplay({
+        isReplaying: true,
+        isHistoryLoading: true,
+        message: { type: "final_answer_delta" },
+      }),
+    ).toBe(false)
+  })
+
+  it("only buffers non-stream events while historical replay is loading", () => {
+    expect(
+      shouldBufferMessageForHistoricalReplay({
+        isReplaying: true,
+        isHistoryLoading: true,
+        message: {
+          type: "trace_event",
+          event_type: "tool_execution_start",
+        },
+      }),
+    ).toBe(true)
+    expect(
+      shouldBufferMessageForHistoricalReplay({
+        isReplaying: true,
+        isHistoryLoading: false,
+        message: {
+          type: "trace_event",
+          event_type: "tool_execution_start",
+        },
+      }),
+    ).toBe(false)
+  })
+
+  it("keeps historical completion as the replay flush marker", () => {
+    expect(getWebSocketEventType({ type: "historical_data_complete" })).toBe(
+      "historical_data_complete",
+    )
+    expect(
+      shouldBufferMessageForHistoricalReplay({
+        isReplaying: true,
+        isHistoryLoading: false,
+        message: { type: "historical_data_complete" },
+      }),
+    ).toBe(true)
   })
 })

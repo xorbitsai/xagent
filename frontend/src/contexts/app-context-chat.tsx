@@ -43,9 +43,11 @@ import { unwrapFinalAnswerContent } from "@/lib/final-answer"
 import {
   getFinalAnswerStreamActionPayload,
   getFinalAnswerStreamMessageId,
+  getWebSocketEventType,
   isFinalAnswerStreamEventType,
   isStreamingFinalAnswerMessage,
   mergeTraceEventsById,
+  shouldBufferMessageForHistoricalReplay,
 } from "@/lib/streaming-final-answer"
 
 // Unique ID generator for messages
@@ -472,7 +474,14 @@ type AppAction =
   | { type: "SET_TRACE_EVENTS"; payload: TraceEvent[] }
   | { type: "SELECT_STEP"; payload: string | null }
   | { type: "SET_PROCESSING"; payload: boolean }
-  | { type: "CLEAR_MESSAGES"; payload?: { keepMessageId?: string | null } }
+  | {
+      type: "CLEAR_MESSAGES";
+      payload?: {
+        keepMessageId?: string | null;
+        preserveUserMessages?: boolean;
+        preserveStreamingFinalAnswers?: boolean;
+      };
+    }
   | { type: "RESET_STATE" }
   | { type: "OPEN_FILE_PREVIEW"; payload: { fileId: string; fileName: string; files?: Array<{ fileId: string; fileName: string }>; index?: number } }
   | { type: "CLOSE_FILE_PREVIEW" }
@@ -742,11 +751,25 @@ function appReducer(state: AppState, action: AppAction): AppState {
       return { ...state, isProcessing: action.payload }
 
     case "CLEAR_MESSAGES":
-      if (action.payload?.keepMessageId) {
-        return {
-          ...state,
-          messages: state.messages.filter(m => m.id === action.payload?.keepMessageId)
-        }
+      if (action.payload) {
+        const {
+          keepMessageId,
+          preserveUserMessages,
+          preserveStreamingFinalAnswers,
+        } = action.payload
+        const messagesToKeep = state.messages.filter(message => {
+          if (keepMessageId && message.id === keepMessageId) {
+            return true
+          }
+          if (preserveUserMessages && message.role === "user") {
+            return true
+          }
+          return (
+            preserveStreamingFinalAnswers &&
+            isStreamingFinalAnswerMessage(message)
+          )
+        })
+        return { ...state, messages: messagesToKeep }
       }
       return { ...state, messages: [] }
 
@@ -980,7 +1003,14 @@ export function AppProvider({ children, token }: { children: React.ReactNode; to
       const keepMessageId = pendingOptimisticMessageId.current
       pendingOptimisticMessageId.current = null
 
-      dispatch({ type: "CLEAR_MESSAGES", payload: { keepMessageId } })
+      dispatch({
+        type: "CLEAR_MESSAGES",
+        payload: {
+          keepMessageId,
+          preserveUserMessages: true,
+          preserveStreamingFinalAnswers: true,
+        },
+      })
       dispatch({ type: "SET_TRACE_EVENTS", payload: [] })
       dispatch({ type: "SET_STEPS", payload: [] })
     } else {
@@ -989,6 +1019,7 @@ export function AppProvider({ children, token }: { children: React.ReactNode; to
     }
 
     // Set history loading state
+    isHistoricalDataLoading = true
     dispatch({ type: "SET_HISTORY_LOADING", payload: true })
 
     // Safety timeout: if no history arrives within 2 seconds, assume empty or done
@@ -1108,15 +1139,24 @@ export function AppProvider({ children, token }: { children: React.ReactNode; to
 
   const handleMessage = useCallback((message: WebSocketMessage, dispatch: React.Dispatch<AppAction>, currentState: AppState) => {
     // If we're in replay mode, don't process immediately - collect for delayed playback
-    if (currentState.isReplaying) {
+    if (
+      shouldBufferMessageForHistoricalReplay({
+        isReplaying: currentState.isReplaying,
+        isHistoryLoading: currentState.isHistoryLoading || isHistoricalDataLoading,
+        message,
+      })
+    ) {
       // Add to replay cache
       dispatch({ type: "ADD_TO_REPLAY_CACHE", payload: message })
 
       // If this is historical_data_complete, start the delayed playback
-      const isHistoricalComplete = message.type === "historical_data_complete" ||
-        (message.type === "trace_event" && (message as any).event_type === "historical_data_complete")
+      const isHistoricalComplete =
+        getWebSocketEventType(message) === "historical_data_complete"
 
       if (isHistoricalComplete) {
+        isHistoricalDataLoading = false
+        dispatch({ type: "SET_HISTORY_LOADING", payload: false })
+        dispatch({ type: "SYNC_PROCESSING_STATUS" })
         // Add a small delay to ensure all events are collected before starting playback
         setTimeout(() => {
           startDelayedPlayback()
@@ -4098,6 +4138,7 @@ export function AppProvider({ children, token }: { children: React.ReactNode; to
     dispatch({ type: "SET_TASK_ID", payload: taskId })
     // Set history loading state immediately when switching tasks to prevent empty state flash
     if (taskId) {
+      isHistoricalDataLoading = true
       dispatch({ type: "SET_HISTORY_LOADING", payload: true })
     }
   }, [router])

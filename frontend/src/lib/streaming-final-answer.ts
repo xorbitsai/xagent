@@ -10,6 +10,12 @@ type TraceEventLike = {
   event_id?: string
 }
 
+type WebSocketEventLike = {
+  type?: unknown
+  event_type?: unknown
+  data?: unknown
+}
+
 export type FinalAnswerStreamEventType =
   | "final_answer_start"
   | "final_answer_delta"
@@ -41,6 +47,48 @@ export const isFinalAnswerStreamEventType = (
     value === "final_answer_end" ||
     value === "final_answer_error"
   )
+}
+
+export const getWebSocketEventType = (
+  message: WebSocketEventLike,
+): string | undefined => {
+  if (typeof message.type !== "string") {
+    return undefined
+  }
+  if (message.type !== "trace_event") {
+    return message.type
+  }
+
+  if (typeof message.event_type === "string") {
+    return message.event_type
+  }
+
+  const data =
+    message.data && typeof message.data === "object"
+      ? (message.data as Record<string, unknown>)
+      : {}
+  return typeof data.event_type === "string" ? data.event_type : message.type
+}
+
+export const shouldBufferMessageForHistoricalReplay = ({
+  isReplaying,
+  isHistoryLoading,
+  message,
+}: {
+  isReplaying: boolean
+  isHistoryLoading: boolean
+  message: WebSocketEventLike
+}): boolean => {
+  if (!isReplaying) {
+    return false
+  }
+
+  const eventType = getWebSocketEventType(message)
+  if (isFinalAnswerStreamEventType(eventType)) {
+    return false
+  }
+
+  return isHistoryLoading || eventType === "historical_data_complete"
 }
 
 export const getFinalAnswerStreamMessageId = (

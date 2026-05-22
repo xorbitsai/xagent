@@ -1,5 +1,7 @@
 """Test cases for Claude LLM implementation using Anthropic SDK."""
 
+from types import SimpleNamespace
+
 import pytest
 from jsonschema import Draft202012Validator
 
@@ -7,6 +9,21 @@ from xagent.core.model.chat.basic.claude import (
     ClaudeLLM,
     _fix_pydantic_schema_for_claude,
 )
+from xagent.core.model.chat.types import ChunkType
+
+
+class _AsyncEventStream:
+    def __init__(self, events):
+        self._events = iter(events)
+
+    def __aiter__(self):
+        return self
+
+    async def __anext__(self):
+        try:
+            return next(self._events)
+        except StopIteration as exc:
+            raise StopAsyncIteration from exc
 
 
 class TestClaudeLLM:
@@ -39,6 +56,74 @@ class TestClaudeLLM:
             "additionalProperties": False,
         }
         assert fixed["properties"]["limit"] == {"type": "integer"}
+
+    @pytest.mark.asyncio
+    async def test_stream_chat_yields_tool_call_argument_deltas(self, llm, mocker):
+        """Claude input_json_delta events should surface before message stop."""
+        mock_client = mocker.AsyncMock()
+        events = [
+            SimpleNamespace(
+                type="content_block_start",
+                index=0,
+                content_block=SimpleNamespace(
+                    type="tool_use",
+                    id="toolu_1",
+                    name="final_answer",
+                ),
+            ),
+            SimpleNamespace(
+                type="content_block_delta",
+                index=0,
+                delta=SimpleNamespace(
+                    type="input_json_delta",
+                    partial_json='{"answer":"Hel',
+                ),
+            ),
+            SimpleNamespace(
+                type="content_block_delta",
+                index=0,
+                delta=SimpleNamespace(
+                    type="input_json_delta",
+                    partial_json='lo"}',
+                ),
+            ),
+            SimpleNamespace(
+                type="message_delta",
+                delta=SimpleNamespace(stop_reason="tool_use"),
+            ),
+        ]
+        mock_client.messages.create.return_value = _AsyncEventStream(events)
+        mocker.patch(
+            "xagent.core.model.chat.basic.claude.AsyncAnthropic",
+            return_value=mock_client,
+        )
+
+        chunks = [
+            chunk
+            async for chunk in llm.stream_chat(
+                [{"role": "user", "content": "answer"}],
+                tools=[
+                    {
+                        "type": "function",
+                        "function": {
+                            "name": "final_answer",
+                            "description": "Return final answer",
+                            "parameters": {
+                                "type": "object",
+                                "properties": {"answer": {"type": "string"}},
+                                "required": ["answer"],
+                            },
+                        },
+                    }
+                ],
+            )
+        ]
+
+        tool_chunks = [chunk for chunk in chunks if chunk.type == ChunkType.TOOL_CALL]
+        assert [
+            chunk.tool_calls[0]["function"]["arguments"] for chunk in tool_chunks
+        ] == ['{"answer":"Hel', '{"answer":"Hello"}', '{"answer":"Hello"}']
+        assert tool_chunks[-1].finish_reason == "tool_use"
 
     @pytest.mark.asyncio
     async def test_basic_chat_completion(self, llm, mocker):

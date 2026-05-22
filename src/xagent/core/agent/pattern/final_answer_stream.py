@@ -22,11 +22,9 @@ class FinalAnswerStreamSession:
         runtime: PatternRuntime,
         *,
         enabled: bool = True,
-        buffer_deltas: bool = False,
     ) -> None:
         self.runtime = runtime
         self.enabled = enabled
-        self.buffer_deltas = buffer_deltas
         self.message_id: str | None = None
         self._content = ""
         self._closed = False
@@ -48,9 +46,6 @@ class FinalAnswerStreamSession:
     async def emit_delta(self, delta: str) -> None:
         if not self.enabled or not delta or self._closed:
             return
-        if self.buffer_deltas:
-            self._content += delta
-            return
         if await self.start() is None:
             return
         self._content += delta
@@ -60,31 +55,16 @@ class FinalAnswerStreamSession:
     async def emit_prefix(self, content: str) -> None:
         if len(content) <= len(self._content):
             return
-        if self.buffer_deltas:
-            self._content = content
-            return
         await self.emit_delta(content[len(self._content) :])
 
     async def finish(self, content: str) -> None:
         if not self.enabled or self._closed:
             return
         final_content = content or self._content
-        if self.buffer_deltas:
-            if not final_content:
-                return
-            self._content = final_content
-            message_id = await self.start()
-            if message_id is None:
-                return
-            await self.runtime.emit_final_answer_delta(
-                message_id,
-                final_content,
-            )
-        else:
-            await self.emit_prefix(final_content)
-            message_id = self.message_id
-            if message_id is None:
-                return
+        await self.emit_prefix(final_content)
+        message_id = self.message_id
+        if message_id is None:
+            return
         await self.runtime.end_final_answer_stream(message_id, final_content)
         self._closed = True
 
@@ -98,14 +78,7 @@ class FinalAnswerStreamEmitter(FinalAnswerStreamSession):
     """Lazy final-answer UI stream emitter."""
 
     def __init__(self, runtime: PatternRuntime, *, enabled: bool = True) -> None:
-        super().__init__(runtime, enabled=enabled, buffer_deltas=False)
-
-
-class BufferedFinalAnswerStreamEmitter(FinalAnswerStreamSession):
-    """Collect a candidate answer and flush it only after validation succeeds."""
-
-    def __init__(self, runtime: PatternRuntime, *, enabled: bool = True) -> None:
-        super().__init__(runtime, enabled=enabled, buffer_deltas=True)
+        super().__init__(runtime, enabled=enabled)
 
 
 class ToolCallStringFieldStreamer:
@@ -182,11 +155,7 @@ class ReActFinalAnswerStreamer:
     """Streams ReAct final answers from final_answer control-tool args."""
 
     def __init__(self, runtime: PatternRuntime, *, enabled: bool = True) -> None:
-        self.emitter = FinalAnswerStreamSession(
-            runtime,
-            enabled=enabled,
-            buffer_deltas=True,
-        )
+        self.emitter = FinalAnswerStreamSession(runtime, enabled=enabled)
         self._tool_answer_streamer = ToolCallStringFieldStreamer(
             runtime=runtime,
             tool_name="final_answer",
@@ -194,12 +163,19 @@ class ReActFinalAnswerStreamer:
             emitter=self.emitter,
             enabled=enabled,
         )
+        self._disabled = not enabled
 
     @property
     def started(self) -> bool:
         return self._tool_answer_streamer.has_candidate
 
     async def handle_chunk(self, chunk: Any) -> None:
+        if self._disabled:
+            return
+        tool_names = _tool_call_names(chunk)
+        if tool_names and any(name != "final_answer" for name in tool_names):
+            self._disabled = True
+            return
         await self._tool_answer_streamer.handle_chunk(chunk)
 
     async def finish(self, final_content: str) -> None:
@@ -233,6 +209,17 @@ def _tool_call_arguments(chunk: Any, tool_name: str) -> str | None:
         arguments = function_payload.get("arguments")
         return arguments if isinstance(arguments, str) else None
     return None
+
+
+def _tool_call_names(chunk: Any) -> list[str]:
+    if not _is_tool_call_chunk(chunk):
+        return []
+    names: list[str] = []
+    for tool_call in list(getattr(chunk, "tool_calls", None) or []):
+        name = _function_payload(tool_call).get("name")
+        if isinstance(name, str) and name:
+            names.append(name)
+    return names
 
 
 def _merge_json_arguments_fragment(existing: str, fragment: str) -> str:

@@ -548,9 +548,15 @@ async def test_react_pattern_streams_final_answer_control_tool() -> None:
     assert [event["type"] for event in outbound.events] == [
         "final_answer_start",
         "final_answer_delta",
+        "final_answer_delta",
+        "final_answer_delta",
         "final_answer_end",
     ]
-    assert outbound.events[1]["delta"] == "Hi there."
+    assert [event["delta"] for event in outbound.events[1:-1]] == [
+        "Hi",
+        " there",
+        ".",
+    ]
     assert outbound.events[-1]["content"] == "Hi there."
 
 

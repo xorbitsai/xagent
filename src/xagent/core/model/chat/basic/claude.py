@@ -25,6 +25,25 @@ from .base import BaseLLM
 logger = logging.getLogger(__name__)
 
 
+def _anthropic_stream_tool_calls(
+    accumulated_tool_calls: Dict[str, Dict],
+) -> List[Dict[str, Any]]:
+    tool_calls_list: List[Dict[str, Any]] = []
+    for tool_call in accumulated_tool_calls.values():
+        arguments = tool_call.get("arguments") or "{}"
+        tool_calls_list.append(
+            {
+                "id": tool_call.get("id", ""),
+                "type": "function",
+                "function": {
+                    "name": tool_call.get("name", ""),
+                    "arguments": arguments,
+                },
+            }
+        )
+    return tool_calls_list
+
+
 def _handle_union_type(schema: Dict[str, Any], union_key: str) -> Dict[str, Any]:
     """Simplify anyOf/oneOf for Claude API compatibility.
 
@@ -752,6 +771,7 @@ class ClaudeLLM(BaseLLM):
 
         # Tool call accumulation
         accumulated_tool_calls: Dict[str, Dict] = {}
+        tool_id_by_content_block_index: Dict[int, str] = {}
         current_content = ""
 
         try:
@@ -905,11 +925,14 @@ class ClaudeLLM(BaseLLM):
                             # Initialize tool call
                             tool_id = block.id if hasattr(block, "id") else ""
                             tool_name = block.name if hasattr(block, "name") else ""
+                            block_index = getattr(event, "index", None)
                             accumulated_tool_calls[tool_id] = {
                                 "id": tool_id,
                                 "name": tool_name,
                                 "arguments": "",
                             }
+                            if isinstance(block_index, int):
+                                tool_id_by_content_block_index[block_index] = tool_id
 
                 elif event.type == "content_block_delta":
                     # Incremental content update
@@ -930,11 +953,19 @@ class ClaudeLLM(BaseLLM):
                             # IMPORTANT: event.index is an INTEGER (content block position 0, 1, 2, ...)
                             # NOT the tool_id string (like "toolu_01GK595WLP7ewvoLiMRV6sG4")
                             # We must use event.index to look up the correct tool_id
-                            if hasattr(event, "index") and accumulated_tool_calls:
+                            event_index = getattr(event, "index", None)
+                            if (
+                                isinstance(event_index, int)
+                                and event_index in tool_id_by_content_block_index
+                            ):
+                                tool_id = tool_id_by_content_block_index[event_index]
+                            elif (
+                                isinstance(event_index, int) and accumulated_tool_calls
+                            ):
                                 # Get tool_id by index (event.index is the position in content blocks)
                                 tool_ids = list(accumulated_tool_calls.keys())
-                                if 0 <= event.index < len(tool_ids):
-                                    tool_id = tool_ids[event.index]
+                                if 0 <= event_index < len(tool_ids):
+                                    tool_id = tool_ids[event_index]
                                 else:
                                     # Fallback to first tool if index is out of range
                                     logger.warning(
@@ -959,6 +990,14 @@ class ClaudeLLM(BaseLLM):
                                     else ""
                                 )
                                 accumulated_tool_calls[tool_id]["arguments"] += args
+                                if args:
+                                    yield StreamChunk(
+                                        type=ChunkType.TOOL_CALL,
+                                        tool_calls=_anthropic_stream_tool_calls(
+                                            accumulated_tool_calls
+                                        ),
+                                        raw=event,
+                                    )
                             else:
                                 logger.warning(
                                     f"tool_id {tool_id} not found in accumulated_tool_calls"
@@ -1014,27 +1053,11 @@ class ClaudeLLM(BaseLLM):
                         if stop_reason:
                             # Yield tool calls if accumulated
                             if accumulated_tool_calls:
-                                tool_calls_list = []
-                                for tool_call in accumulated_tool_calls.values():
-                                    # Ensure arguments is valid JSON
-                                    arguments = tool_call["arguments"]
-                                    if not arguments or arguments == "":
-                                        arguments = "{}"
-
-                                    tool_calls_list.append(
-                                        {
-                                            "id": tool_call["id"],
-                                            "type": "function",
-                                            "function": {
-                                                "name": tool_call["name"],
-                                                "arguments": arguments,
-                                            },
-                                        }
-                                    )
-
                                 yield StreamChunk(
                                     type=ChunkType.TOOL_CALL,
-                                    tool_calls=tool_calls_list,
+                                    tool_calls=_anthropic_stream_tool_calls(
+                                        accumulated_tool_calls
+                                    ),
                                     finish_reason=stop_reason,
                                     raw=event,
                                 )

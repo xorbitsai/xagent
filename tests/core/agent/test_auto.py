@@ -562,9 +562,7 @@ async def test_auto_pattern_final_answer_completes_without_child_pattern() -> No
 
 
 @pytest.mark.asyncio
-async def test_auto_pattern_buffers_direct_final_answer_until_decision_is_validated() -> (
-    None
-):
+async def test_auto_pattern_streams_direct_final_answer_as_tool_args_arrive() -> None:
     prefix = (
         '{"action":"final_answer","reason":"simple",'
         '"requires_current_or_external_facts":false,'
@@ -597,9 +595,15 @@ async def test_auto_pattern_buffers_direct_final_answer_until_decision_is_valida
     assert [event["type"] for event in collector.events] == [
         "final_answer_start",
         "final_answer_delta",
+        "final_answer_delta",
+        "final_answer_delta",
         "final_answer_end",
     ]
-    assert collector.events[1]["delta"] == "Hi there."
+    assert [event["delta"] for event in collector.events[1:-1]] == [
+        "Hi",
+        " there",
+        ".",
+    ]
     assert collector.events[-1]["content"] == "Hi there."
     assert len({event["message_id"] for event in collector.events}) == 1
     assert len(llm.calls) == 1

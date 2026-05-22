@@ -1221,10 +1221,7 @@ class DAGPattern(AgentPattern):
             tools=tools,
             metadata={"phase": "dag_completion_assessment"},
         )
-        final_answer_stream = FinalAnswerStreamSession(
-            runtime,
-            buffer_deltas=True,
-        )
+        final_answer_stream = FinalAnswerStreamSession(runtime)
         streamer = ToolCallStringFieldStreamer(
             runtime=runtime,
             tool_name=DAG_COMPLETION_TOOL_NAME,

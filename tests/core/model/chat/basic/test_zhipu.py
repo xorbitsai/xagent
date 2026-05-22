@@ -1,10 +1,12 @@
 """Test cases for Zhipu LLM implementation."""
 
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import pytest
 
 from xagent.core.model.chat.basic.zhipu import ZhipuLLM
+from xagent.core.model.chat.types import ChunkType
 
 
 class TestZhipuLLM:
@@ -134,6 +136,92 @@ class TestZhipuLLM:
         assert result["type"] == "tool_call"
         assert len(result["tool_calls"]) == 1
         assert result["tool_calls"][0]["function"]["name"] == "calculator"
+
+    @pytest.mark.asyncio
+    async def test_stream_chat_yields_tool_call_argument_deltas(
+        self, zhipu_llm, mock_zhipu_client
+    ):
+        """Zhipu stream_chat should consume the producer queue while it streams."""
+        mock_zhipu_client.chat.completions.create.return_value = [
+            SimpleNamespace(
+                choices=[
+                    SimpleNamespace(
+                        delta=SimpleNamespace(
+                            content=None,
+                            tool_calls=[
+                                SimpleNamespace(
+                                    id="call_1",
+                                    index=0,
+                                    function=SimpleNamespace(
+                                        name="final_answer",
+                                        arguments='{"answer":"Hel',
+                                    ),
+                                )
+                            ],
+                        ),
+                        finish_reason=None,
+                    )
+                ],
+                usage=None,
+            ),
+            SimpleNamespace(
+                choices=[
+                    SimpleNamespace(
+                        delta=SimpleNamespace(
+                            content=None,
+                            tool_calls=[
+                                SimpleNamespace(
+                                    id=None,
+                                    index=0,
+                                    function=SimpleNamespace(
+                                        name=None,
+                                        arguments='lo"}',
+                                    ),
+                                )
+                            ],
+                        ),
+                        finish_reason=None,
+                    )
+                ],
+                usage=None,
+            ),
+            SimpleNamespace(
+                choices=[
+                    SimpleNamespace(
+                        delta=SimpleNamespace(content=None, tool_calls=None),
+                        finish_reason="tool_calls",
+                    )
+                ],
+                usage=None,
+            ),
+        ]
+
+        chunks = [
+            chunk
+            async for chunk in zhipu_llm.stream_chat(
+                [{"role": "user", "content": "answer"}],
+                tools=[
+                    {
+                        "type": "function",
+                        "function": {
+                            "name": "final_answer",
+                            "description": "Return final answer",
+                            "parameters": {
+                                "type": "object",
+                                "properties": {"answer": {"type": "string"}},
+                                "required": ["answer"],
+                            },
+                        },
+                    }
+                ],
+            )
+        ]
+
+        tool_chunks = [chunk for chunk in chunks if chunk.type == ChunkType.TOOL_CALL]
+        assert [
+            chunk.tool_calls[0]["function"]["arguments"] for chunk in tool_chunks
+        ] == ['{"answer":"Hel', '{"answer":"Hello"}', '{"answer":"Hello"}']
+        assert tool_chunks[-1].finish_reason == "tool_calls"
 
     @pytest.mark.asyncio
     async def test_none_api_response(self, zhipu_llm, mock_zhipu_client):

@@ -115,9 +115,11 @@ describe("TraceEventRenderer", () => {
   })
 
   it("renders pptx artifacts inline through PptxPreviewRenderer", async () => {
+    // Arbitrary sentinel bytes; base64 encodes to "AQI=". See
+    // inline-file-preview.test.tsx for why we avoid "PK" here.
     apiRequestMock.mockResolvedValue({
       ok: true,
-      arrayBuffer: async () => new Uint8Array([0x50, 0x4b]).buffer,
+      arrayBuffer: async () => new Uint8Array([0x01, 0x02]).buffer,
     })
 
     render(
@@ -166,7 +168,7 @@ describe("TraceEventRenderer", () => {
     // /api/files/public/preview endpoint now returns the raw bytes, so
     // we mirror the docx/xlsx path: fetch + base64 + canvas render
     // via pptxviewjs.
-    expect(await screen.findByTestId("pptx-preview")).toHaveTextContent("UEs=")
+    expect(await screen.findByTestId("pptx-preview")).toHaveTextContent("AQI=")
     expect(apiRequestMock).toHaveBeenCalledWith(
       "http://api.local/api/files/public/preview/slides-file-id",
       expect.objectContaining({ cache: "no-cache" }),

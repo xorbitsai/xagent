@@ -99,9 +99,11 @@ describe('MarkdownRenderer', () => {
   })
 
   it('renders pptx file links as inline previews', async () => {
+    // Arbitrary sentinel bytes; base64 encodes to "AQI=". See
+    // inline-file-preview.test.tsx for why we avoid "PK" here.
     apiRequestMock.mockResolvedValue({
       ok: true,
-      arrayBuffer: async () => new Uint8Array([0x50, 0x4b]).buffer,
+      arrayBuffer: async () => new Uint8Array([0x01, 0x02]).buffer,
     })
 
     const content = '[example_presentation.pptx](file:99fb81ab-b995-4976-be18-21b02f748768)'
@@ -111,7 +113,7 @@ describe('MarkdownRenderer', () => {
     // /api/files/public/preview endpoint now returns the raw bytes, so
     // pptx inline previews are funnelled through PptxPreviewRenderer
     // (canvas-based, pptxviewjs) — same fetch+base64 pattern as docx/xlsx.
-    expect(await screen.findByTestId('pptx-preview')).toHaveTextContent('UEs=')
+    expect(await screen.findByTestId('pptx-preview')).toHaveTextContent('AQI=')
     expect(apiRequestMock).toHaveBeenCalledWith(
       'http://api.local/api/files/public/preview/99fb81ab-b995-4976-be18-21b02f748768',
       expect.objectContaining({ cache: 'no-cache' })

@@ -185,7 +185,7 @@ LANGFUSE_SECRET_KEY="your-langfuse-secret-key"
 ### Local Development Conventions
 
 **Commit and PR titles:**
-- Use a short conventional prefix: `feat:`, `fix:`, `enh:`, or `ref:`.
+- Use a short conventional prefix: `feat:`, `fix:`, `enh:`, `ref:`, or `chore:`.
 - Prefer the same prefix in PR titles so split PRs are easy to scan.
 - Keep branch names meaningful and task-oriented, for example `fix/remove-agent-v1` or `feat/agent-builder-preview`. Avoid generic agent/tool prefixes that do not describe the work.
 
@@ -307,6 +307,20 @@ npm run start  # Production mode
 
 **Development Mode:**
 Run both backend and frontend in separate terminals for full-stack development.
+
+### Docker Release Image Bumps
+
+When bumping Docker release image tags, update all fixed Xagent images together:
+- All fixed Xagent service images present in `docker-compose.yml`
+- `docker/docker-compose.sandbox.boxlite.yml` `SANDBOX_IMAGE`
+- `docker/docker-compose.sandbox.docker.yml` `SANDBOX_IMAGE`
+
+Validate both the base compose file and sandbox overlays:
+```bash
+docker compose config --quiet
+docker compose -f docker-compose.yml -f docker/docker-compose.sandbox.boxlite.yml config --quiet
+docker compose -f docker-compose.yml -f docker/docker-compose.sandbox.docker.yml config --quiet
+```
 
 ## Skills Configuration
 

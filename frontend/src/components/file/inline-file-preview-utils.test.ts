@@ -7,12 +7,13 @@ import {
 } from './inline-file-preview-utils'
 
 describe('inline-file-preview-utils', () => {
-  it('prefers explicit artifact type when resolving preview kind', () => {
+  it('prefers explicit artifact type when filename/mime agree', () => {
     expect(
       getInlineFilePreviewKind({
         type: 'presentation',
         filename: 'unknown.bin',
-        mimeType: 'application/octet-stream',
+        mimeType:
+          'application/vnd.openxmlformats-officedocument.presentationml.presentation',
       })
     ).toBe('presentation')
   })
@@ -54,6 +55,40 @@ describe('inline-file-preview-utils', () => {
         mimeType: 'application/vnd.ms-powerpoint',
       })
     ).toBe('file')
+  })
+
+  it('does not bypass the .pptx-only boundary via explicit type', () => {
+    // Producer-emitted ``type: 'presentation'`` is no longer an
+    // unconditional pass — the classifier still cross-checks
+    // filename/mime to confirm the payload is OOXML .pptx. A legacy
+    // .ppt arriving with ``type: 'presentation'`` (which the old
+    // backend-side ``artifact_type_for_filename`` produced) must fall
+    // through to 'file' so PptxPreviewRenderer never tries to render
+    // a format pptxviewjs cannot parse.
+    expect(
+      getInlineFilePreviewKind({
+        type: 'presentation',
+        filename: 'old-deck.ppt',
+      })
+    ).toBe('file')
+    expect(
+      getInlineFilePreviewKind({
+        type: 'presentation',
+        mimeType: 'application/vnd.ms-powerpoint',
+      })
+    ).toBe('file')
+    // But a matching ``type: 'presentation'`` + .pptx artifact still
+    // resolves to the previewable kind.
+    expect(
+      getInlineFilePreviewKind({
+        type: 'presentation',
+        filename: 'deck.pptx',
+      })
+    ).toBe('presentation')
+    // No filename/mime hint: keep the historical lenient behavior so
+    // existing callers that only set ``type`` (and assume .pptx) keep
+    // working.
+    expect(getInlineFilePreviewKind({ type: 'presentation' })).toBe('presentation')
   })
 
   it('builds public preview URLs from file ids and preserves absolute preview URLs', () => {

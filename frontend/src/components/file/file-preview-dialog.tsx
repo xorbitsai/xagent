@@ -143,15 +143,21 @@ export function FilePreviewDialog({ open, onOpenChange }: FilePreviewDialogProps
 
   const handleOpenInNewWindow = () => {
     if (filePreview.fileId) {
-      // All file kinds (including .pptx) go through the public preview
-      // URL. We deliberately do NOT route .pptx to /api/files/preview/<id>
-      // here: that endpoint returns the raw OOXML package, which a
-      // standalone browser tab cannot render — it would just trigger a
-      // download or show raw bytes, contradicting the "open/preview"
-      // affordance. Browser-rendered presentation previews live inside
-      // PptxPreviewRenderer (canvas-based), not in a standalone tab.
+      // Browser-renderable kinds (images, PDFs, plain text, …) go
+      // through the public preview URL so a standalone tab can display
+      // them inline. .pptx is intentionally routed to /download
+      // instead: the public-preview URL would return the raw OOXML
+      // package with ``Content-Disposition: inline``, which a browser
+      // tab cannot render. By using /download we make the affordance
+      // explicit — the user gets the .pptx file, not a "preview" of
+      // raw bytes pretending to be one. Browser-rendered .pptx
+      // previews live inside PptxPreviewRenderer (canvas-based),
+      // mounted by the in-app dialog rather than a standalone tab.
       const apiUrl = getApiUrl()
-      const fileUrl = getFilePublicPreviewUrl(filePreview.fileId, apiUrl)
+      const isPptx = filePreview.fileName.toLowerCase().endsWith('.pptx')
+      const fileUrl = isPptx
+        ? `${apiUrl}/api/files/download/${encodeURIComponent(filePreview.fileId)}`
+        : getFilePublicPreviewUrl(filePreview.fileId, apiUrl)
 
       // Open in new window/tab
       window.open(fileUrl, '_blank')

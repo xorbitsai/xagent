@@ -189,3 +189,16 @@ def test_snapshot_generated_artifact_files_allows_hidden_root_ancestor(tmp_path)
 
     assert report in snapshot
     assert hidden_descendant not in snapshot
+
+
+def test_artifact_type_for_filename_pptx_vs_ppt_boundary():
+    """Only OOXML .pptx is emitted as ``presentation``; legacy binary
+    .ppt must fall through to ``file`` so it doesn't reach the frontend
+    ``PptxPreviewRenderer`` (pptxviewjs supports only .pptx).
+    """
+    from xagent.core.tools.artifacts import artifact_type_for_filename
+
+    assert artifact_type_for_filename("deck.pptx") == "presentation"
+    assert artifact_type_for_filename("DECK.PPTX") == "presentation"  # case-insensitive
+    assert artifact_type_for_filename("legacy.ppt") == "file"
+    assert artifact_type_for_filename("LEGACY.PPT") == "file"

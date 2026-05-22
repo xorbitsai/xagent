@@ -58,7 +58,31 @@ export const getInlineFilePreviewKind = (
   const mimeType = source.mimeType?.toLowerCase() || ''
 
   if (type === 'image') return 'image'
-  if (type === 'presentation') return 'presentation'
+  if (type === 'presentation') {
+    // An explicit ``type: 'presentation'`` artifact must still be
+    // cross-checked: pptxviewjs only supports OOXML .pptx, so a
+    // producer that emits ``type: 'presentation'`` for a legacy .ppt
+    // (or any non-OOXML payload) must NOT reach PptxPreviewRenderer.
+    // If the filename/mime contradicts the type — or simply isn't
+    // identifiably .pptx — fall through to the generic 'file' kind so
+    // the UI renders a download link instead. The .pptx-only
+    // contract is now enforced here, regardless of caller.
+    const looksLikePptx =
+      mimeType ===
+        'application/vnd.openxmlformats-officedocument.presentationml.presentation' ||
+      mimeType.includes('presentationml') ||
+      filename.endsWith('.pptx')
+    const looksLikeLegacyPpt =
+      mimeType === 'application/vnd.ms-powerpoint' ||
+      (filename.endsWith('.ppt') && !filename.endsWith('.pptx'))
+    if (looksLikeLegacyPpt) return 'file'
+    if (looksLikePptx) return 'presentation'
+    // No filename / mime info to verify either way: assume .pptx (this
+    // was the historical behavior for ``type: 'presentation'`` and
+    // matches what producers emit for previewable artifacts).
+    if (!filename && !mimeType) return 'presentation'
+    return 'file'
+  }
   if (type === 'document') return 'document'
   if (type === 'spreadsheet') return 'spreadsheet'
 

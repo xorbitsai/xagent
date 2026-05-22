@@ -51,7 +51,13 @@ def artifact_type_for_filename(filename: str) -> str:
     suffix = Path(filename).suffix.lower()
     if suffix in {".jpg", ".jpeg", ".png", ".gif", ".webp", ".svg"}:
         return "image"
-    if suffix in {".ppt", ".pptx"}:
+    # Only OOXML .pptx maps to ``presentation`` — the frontend's inline
+    # ``PptxPreviewRenderer`` (pptxviewjs) cannot render legacy binary
+    # .ppt, so emitting ``presentation`` for .ppt would let an artifact
+    # bypass the supported-format boundary on the consumer side. Legacy
+    # .ppt falls through to the generic ``file`` kind, which renders as
+    # a download link.
+    if suffix == ".pptx":
         return "presentation"
     if suffix == ".docx":
         return "document"

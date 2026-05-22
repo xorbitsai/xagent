@@ -28,6 +28,12 @@ vi.mock('@/components/file/excel-preview-renderer', () => ({
   ),
 }))
 
+vi.mock('@/components/file/pptx-preview-renderer', () => ({
+  PptxPreviewRenderer: ({ base64Content }: { base64Content: string }) => (
+    <div data-testid="pptx-preview">{base64Content}</div>
+  ),
+}))
+
 vi.mock('@/contexts/i18n-context', () => ({
   useI18n: () => ({
     t: (key: string) => {
@@ -92,14 +98,23 @@ describe('MarkdownRenderer', () => {
     expect(handleFileClick).toHaveBeenCalledWith('/tmp/test.txt', 'open file')
   })
 
-  it('renders pptx file links as inline previews', () => {
+  it('renders pptx file links as inline previews', async () => {
+    apiRequestMock.mockResolvedValue({
+      ok: true,
+      arrayBuffer: async () => new Uint8Array([0x50, 0x4b]).buffer,
+    })
+
     const content = '[example_presentation.pptx](file:99fb81ab-b995-4976-be18-21b02f748768)'
     render(<MarkdownRenderer content={content} />)
 
-    const frame = screen.getByTitle('example_presentation.pptx')
-    expect(frame).toHaveAttribute(
-      'src',
-      'http://api.local/api/files/public/preview/99fb81ab-b995-4976-be18-21b02f748768'
+    // Browsers can't render raw .pptx in an iframe, and the backend's
+    // /api/files/public/preview endpoint now returns the raw bytes, so
+    // pptx inline previews are funnelled through PptxPreviewRenderer
+    // (canvas-based, pptxviewjs) — same fetch+base64 pattern as docx/xlsx.
+    expect(await screen.findByTestId('pptx-preview')).toHaveTextContent('UEs=')
+    expect(apiRequestMock).toHaveBeenCalledWith(
+      'http://api.local/api/files/public/preview/99fb81ab-b995-4976-be18-21b02f748768',
+      expect.objectContaining({ cache: 'no-cache' })
     )
     expect(screen.queryByText('example_presentation.pptx')?.tagName.toLowerCase()).not.toBe('a')
   })

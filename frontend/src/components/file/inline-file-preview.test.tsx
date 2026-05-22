@@ -28,6 +28,12 @@ vi.mock('@/components/file/excel-preview-renderer', () => ({
   ),
 }))
 
+vi.mock('@/components/file/pptx-preview-renderer', () => ({
+  PptxPreviewRenderer: ({ base64Content }: { base64Content: string }) => (
+    <div data-testid="pptx-preview">{base64Content}</div>
+  ),
+}))
+
 import { InlineFilePreview } from './inline-file-preview'
 
 describe('InlineFilePreview', () => {
@@ -52,7 +58,12 @@ describe('InlineFilePreview', () => {
     )
   })
 
-  it('renders presentation previews in an iframe', () => {
+  it('renders presentation previews through PptxPreviewRenderer with fetched bytes', async () => {
+    apiRequestMock.mockResolvedValue({
+      ok: true,
+      arrayBuffer: async () => new Uint8Array([0x50, 0x4b]).buffer,
+    })
+
     render(
       <InlineFilePreview
         source={{
@@ -63,11 +74,15 @@ describe('InlineFilePreview', () => {
       />
     )
 
-    expect(screen.getByTitle('slides.pptx')).toHaveAttribute(
-      'src',
-      'http://api.local/api/files/public/preview/slides-file-id'
+    // Browsers can't render raw .pptx in an iframe, and the backend's
+    // /api/files/public/preview endpoint now returns the raw bytes, so
+    // we mirror the document/spreadsheet path: fetch the bytes, base64
+    // them, hand to PptxPreviewRenderer (canvas-based, pptxviewjs).
+    expect(await screen.findByTestId('pptx-preview')).toHaveTextContent('UEs=')
+    expect(apiRequestMock).toHaveBeenCalledWith(
+      'http://api.local/api/files/public/preview/slides-file-id',
+      expect.objectContaining({ cache: 'no-cache' })
     )
-    expect(screen.getByTitle('slides.pptx')).toHaveAttribute('sandbox', '')
   })
 
   it('opens inline previews through the file preview callback when available', () => {

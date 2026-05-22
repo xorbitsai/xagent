@@ -3,6 +3,7 @@ import { FileText, Loader2 } from 'lucide-react'
 
 import { DocxPreviewRenderer } from '@/components/file/docx-preview-renderer'
 import { ExcelPreviewRenderer } from '@/components/file/excel-preview-renderer'
+import { PptxPreviewRenderer } from '@/components/file/pptx-preview-renderer'
 import { apiRequest } from '@/lib/api-wrapper'
 import { cn, getApiUrl } from '@/lib/utils'
 import {
@@ -117,7 +118,7 @@ function InlineOfficeContent({
   const [error, setError] = useState(false)
 
   useEffect(() => {
-    if (!previewUrl || kind === 'presentation') return
+    if (!previewUrl) return
 
     let isCancelled = false
 
@@ -151,18 +152,7 @@ function InlineOfficeContent({
     return () => {
       isCancelled = true
     }
-  }, [kind, previewUrl])
-
-  if (kind === 'presentation') {
-    return (
-      <iframe
-        src={previewUrl}
-        title={filename}
-        sandbox=""
-        className="h-[360px] w-full border-0 bg-background"
-      />
-    )
-  }
+  }, [previewUrl])
 
   if (error) {
     return <div className="p-3 text-xs text-muted-foreground">{loadErrorText}</div>
@@ -174,6 +164,14 @@ function InlineOfficeContent({
         <Loader2 className="h-4 w-4 animate-spin" />
       </div>
     )
+  }
+
+  // Presentation now goes through PptxPreviewRenderer (canvas-based,
+  // pptxviewjs) instead of an iframe — browsers can't render raw .pptx
+  // bytes in an iframe, and the backend's /api/files/public/preview
+  // endpoint now returns those raw bytes (rogercloud review on #465).
+  if (kind === 'presentation') {
+    return <PptxPreviewRenderer base64Content={base64Content} />
   }
 
   if (kind === 'document') {

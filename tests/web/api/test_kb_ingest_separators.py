@@ -1199,3 +1199,60 @@ def test_ingest_web_error_cleans_new_collection_config(app_with_kb):
         is_admin=False,
         delete_orphaned_metadata=True,
     )
+
+
+def test_ingest_web_surfaces_embedding_configuration_fix_guidance(app_with_kb):
+    """POST ingest-web should explain how to fix embedding configuration errors."""
+    metadata_store = MagicMock()
+    metadata_store.save_collection_config = AsyncMock()
+    metadata_store.delete_collection_metadata = AsyncMock(
+        return_value={"metadata_rows": 0, "config_rows": 1}
+    )
+
+    with (
+        patch(
+            "xagent.core.tools.core.RAG_tools.storage.factory.get_metadata_store",
+            return_value=metadata_store,
+        ),
+        patch(
+            "xagent.web.api.kb.get_collection_sync", side_effect=ValueError("missing")
+        ),
+        patch(
+            "xagent.web.api.kb.run_web_ingestion",
+            return_value=WebIngestionResult(
+                status="error",
+                collection="web_embedding_error",
+                total_urls_found=1,
+                pages_crawled=0,
+                pages_failed=1,
+                documents_created=0,
+                chunks_created=0,
+                embeddings_created=0,
+                crawled_urls=[],
+                failed_urls={"https://example.com": "embedding failed"},
+                message=(
+                    "Model 'text-embedding-v4' not found in hub and no "
+                    "environment configuration available for embedding."
+                ),
+                warnings=[],
+                elapsed_time_ms=0,
+            ),
+        ),
+    ):
+        client = TestClient(app_with_kb)
+        response = client.post(
+            "/api/kb/ingest-web",
+            data={
+                "collection": "web_embedding_error",
+                "start_url": "https://example.com",
+            },
+        )
+
+    assert response.status_code == 500
+    message = response.json()["message"]
+    assert (
+        "Cause: knowledge-base ingestion requires a resolvable embedding model"
+        in message
+    )
+    assert "Current embedding_model_id: 'text-embedding-v4'." in message
+    assert "How to fix:" in message

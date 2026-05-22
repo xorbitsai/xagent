@@ -17,6 +17,12 @@ import { apiRequest, getUploadErrorMessage, isJsonRecord, parseApiResponse, UPLO
 import { getApiUrl } from "@/lib/utils"
 import { appendIngestionConfigToFormData, normalizeIngestionConfigForFilename } from "@/lib/ingestion-form"
 import { findMatchingIngestionTask, getKBTaskProgressDetail, getKBTaskProgressPercent, KBProgressTask } from "@/lib/kb-progress"
+import {
+  buildKnowledgeBaseErrorResult,
+  getKnowledgeBaseErrorToastContent,
+  KnowledgeBaseIngestionResultLike,
+  normalizeKnowledgeBaseIngestionResult,
+} from "@/lib/kb-ingest-feedback"
 import { parseSeparatorsInput, formatSeparatorsOutput } from "@/lib/separators"
 import { useI18n } from "@/contexts/i18n-context"
 import { toast } from "sonner"
@@ -60,12 +66,25 @@ interface SearchConfig {
   rerank_model_id: string
 }
 
-interface IngestionResult {
-  collection: string
-  document_count: number
-  chunks_count: number
-  status: string
-  message: string
+type IngestionResult = ReturnType<typeof normalizeKnowledgeBaseIngestionResult>
+
+function getKnowledgeBaseToastCopy(
+  t: ReturnType<typeof useI18n>["t"],
+  genericTitle: string
+) {
+  return {
+    genericTitle,
+    embeddingTitle: t("kb.errors.embeddingModelUnavailable"),
+    embeddingDescription: t("kb.errors.embeddingModelUnavailableHint"),
+    rollbackTitle: t("kb.errors.rollbackFailed"),
+    rollbackDescription: t("kb.errors.rollbackFailedHint"),
+  }
+}
+
+function getStatusIcon(status: string) {
+  return status === "success"
+    ? <CheckCircle className="h-4 w-4 text-green-500" />
+    : <XCircle className="h-4 w-4 text-red-500" />
 }
 
 /** KB search API returns ``SearchPipelineResult`` (HTTP 200 even on pipeline failure). */
@@ -91,6 +110,27 @@ interface WebIngestionResult {
   elapsed_time_ms: number
 }
 
+function buildWebIngestionErrorResult(
+  collection: string,
+  message: string
+): WebIngestionResult {
+  return {
+    status: "error",
+    collection,
+    total_urls_found: 0,
+    pages_crawled: 0,
+    pages_failed: 0,
+    documents_created: 0,
+    chunks_created: 0,
+    embeddings_created: 0,
+    crawled_urls: [],
+    failed_urls: {},
+    message,
+    warnings: [],
+    elapsed_time_ms: 0,
+  }
+}
+
 export function KnowledgeBaseDetailContent({ collectionName }: { collectionName: string }) {
   const { t } = useI18n()
   const fileInputRef = useRef<HTMLInputElement>(null)
@@ -108,7 +148,7 @@ export function KnowledgeBaseDetailContent({ collectionName }: { collectionName:
   const [isUploading, setIsUploading] = useState(false)
   const [uploadProgress, setUploadProgress] = useState(0)
   const [uploadProgressDetail, setUploadProgressDetail] = useState<string | null>(null)
-  const [ingestionResults, setIngestionResults] = useState<any[]>([])
+  const [ingestionResults, setIngestionResults] = useState<IngestionResult[]>([])
   const [currentUploadFileName, setCurrentUploadFileName] = useState<string | null>(null)
   const [completedUploadCount, setCompletedUploadCount] = useState(0)
   const [isAddSourceOpen, setIsAddSourceOpen] = useState(false)
@@ -365,20 +405,42 @@ export function KnowledgeBaseDetailContent({ collectionName }: { collectionName:
         if (!response.ok) {
           const errorData = isJsonRecord(parsed.data) ? parsed.data : {}
           if (errorData.status === 'error') {
-            setIngestionResults(prev => [...prev, errorData as unknown as IngestionResult])
+            setIngestionResults(prev => [
+              ...prev,
+              normalizeKnowledgeBaseIngestionResult(
+                errorData as unknown as KnowledgeBaseIngestionResultLike,
+                { collection: collectionName, fileName: file.name }
+              ),
+            ])
             throw new Error((typeof errorData.message === 'string' && errorData.message) || t("kb.errors.uploadFailedFile", { name: file.name }))
           }
-          throw new Error(getUploadErrorMessage(response, parsed, {
+          const errorMessage = getUploadErrorMessage(response, parsed, {
             generic: t("kb.detail.errors.uploadFailedWithName", { name: file.name }) || `Failed to upload file: ${file.name}`,
             ...UPLOAD_ERROR_MESSAGES,
-          }))
+          })
+          setIngestionResults(prev => [
+            ...prev,
+            normalizeKnowledgeBaseIngestionResult(
+              buildKnowledgeBaseErrorResult(collectionName, errorMessage, undefined, file.name),
+              { collection: collectionName, fileName: file.name }
+            ),
+          ])
+          throw new Error(errorMessage)
         }
 
-        const result = isJsonRecord(parsed.data) ? parsed.data as unknown as IngestionResult : null
+        const result = isJsonRecord(parsed.data)
+          ? parsed.data as unknown as KnowledgeBaseIngestionResultLike
+          : null
         if (!result) {
           throw new Error(t("kb.detail.errors.uploadFailedWithName", { name: file.name }))
         }
-        setIngestionResults(prev => [...prev, result])
+        setIngestionResults(prev => [
+          ...prev,
+          normalizeKnowledgeBaseIngestionResult(
+            result as unknown as KnowledgeBaseIngestionResultLike,
+            { collection: collectionName, fileName: file.name }
+          ),
+        ])
         setCompletedUploadCount(i + 1)
         setUploadProgress(((i + 1) / selectedFiles.length) * 100)
       }
@@ -389,7 +451,16 @@ export function KnowledgeBaseDetailContent({ collectionName }: { collectionName:
       setIsAddSourceOpen(false)
       closeReuploadDialog()
     } catch (err) {
-      toast.error(err instanceof Error ? err.message : t("kb.detail.errors.uploadFailedGeneric"))
+      const rawMessage = err instanceof Error
+        ? err.message
+        : t("kb.detail.errors.uploadFailedGeneric")
+      const toastContent = getKnowledgeBaseErrorToastContent(
+        rawMessage,
+        getKnowledgeBaseToastCopy(t, t("kb.detail.errors.uploadFailedGeneric"))
+      )
+      toast.error(toastContent.title, {
+        description: toastContent.description,
+      })
     } finally {
       setIsUploading(false)
       setCurrentUploadFileName(null)
@@ -503,10 +574,12 @@ export function KnowledgeBaseDetailContent({ collectionName }: { collectionName:
           setWebIngestionResult(errorData as unknown as WebIngestionResult)
           throw new Error((typeof errorData.message === 'string' && errorData.message) || t("kb.errors.webIngestFailed"))
         }
-        throw new Error(getUploadErrorMessage(response, parsed, {
+        const errorMessage = getUploadErrorMessage(response, parsed, {
           generic: t("kb.detail.errors.webImportFailed") || "Website import failed",
           ...UPLOAD_ERROR_MESSAGES,
-        }))
+        })
+        setWebIngestionResult(buildWebIngestionErrorResult(collectionName, errorMessage))
+        throw new Error(errorMessage)
       }
 
       const result: WebIngestionResult | null = isJsonRecord(parsed.data)
@@ -541,7 +614,16 @@ export function KnowledgeBaseDetailContent({ collectionName }: { collectionName:
       })
 
     } catch (err) {
-      toast.error(err instanceof Error ? err.message : t("kb.detail.errors.webImportFailed"))
+      const rawMessage = err instanceof Error
+        ? err.message
+        : t("kb.detail.errors.webImportFailed")
+      const toastContent = getKnowledgeBaseErrorToastContent(
+        rawMessage,
+        getKnowledgeBaseToastCopy(t, t("kb.detail.errors.webImportFailed"))
+      )
+      toast.error(toastContent.title, {
+        description: toastContent.description,
+      })
     } finally {
       setIsWebIngesting(false)
       setWebIngestionProgress(0)
@@ -765,29 +847,39 @@ export function KnowledgeBaseDetailContent({ collectionName }: { collectionName:
                 <h3 className="text-lg font-semibold mb-4">{t("kb.detail.process.title")}</h3>
                 <ScrollArea className="h-96">
                   <div className="space-y-4">
-                    {ingestionResults.map((result, index) => (
-                      <div key={index} className="p-4 border rounded-lg">
-                        <div className="flex items-center gap-2 mb-2">
-                          {result.status === "success" ? (
-                            <CheckCircle className="h-4 w-4 text-green-500" />
-                          ) : (
-                            <XCircle className="h-4 w-4 text-red-500" />
-                          )}
-                          <span className="font-medium">{result.file_name || `${t("kb.detail.process.labels.file")} ${index + 1}`}</span>
-                        </div>
-                        <div className="grid grid-cols-2 gap-2 text-sm text-muted-foreground">
-                          <div>{t("kb.detail.process.labels.document")}: {result.documents_processed || 0}</div>
-                          <div>{t("kb.detail.process.labels.chunk")}: {result.chunks_created || 0}</div>
-                          <div>{t("kb.detail.process.labels.parse")}: {result.parses_completed || 0}</div>
-                          <div>{t("kb.detail.process.labels.vector")}: {result.embeddings_created || 0}</div>
-                        </div>
-                        {result.error && (
-                          <div className="mt-2 text-sm text-red-600">
-                            {t("kb.detail.process.labels.error")}: {result.error}
+                    {ingestionResults.map((result, index) => {
+                      const documentCount = result.document_count ?? 0
+                      const chunkCount = result.chunks_count ?? 0
+                      const parseCount = result.parses_completed ?? 0
+                      const vectorCount = result.vector_count ?? result.embeddings_created ?? result.embedding_count ?? 0
+                      const errorMessage = result.error || result.message
+
+                      return (
+                        <div key={index} className="p-4 border rounded-lg">
+                          <div className="flex items-center gap-2 mb-2">
+                            {result.status === "success" ? (
+                              <CheckCircle className="h-4 w-4 text-green-500" />
+                            ) : (
+                              <XCircle className="h-4 w-4 text-red-500" />
+                            )}
+                            <span className="font-medium">
+                              {result.file_name || result.collection || `${t("kb.detail.process.labels.file")} ${index + 1}`}
+                            </span>
                           </div>
-                        )}
-                      </div>
-                    ))}
+                          <div className="grid grid-cols-2 gap-2 text-sm text-muted-foreground">
+                            <div>{t("kb.detail.process.labels.document")}: {documentCount}</div>
+                            <div>{t("kb.detail.process.labels.chunk")}: {chunkCount}</div>
+                            <div>{t("kb.detail.process.labels.parse")}: {parseCount}</div>
+                            <div>{t("kb.detail.process.labels.vector")}: {vectorCount}</div>
+                          </div>
+                          {result.status !== "success" && errorMessage && (
+                            <div className="mt-2 text-sm text-red-600 break-all">
+                              {t("kb.detail.process.labels.error")}: {errorMessage}
+                            </div>
+                          )}
+                        </div>
+                      )
+                    })}
                   </div>
                 </ScrollArea>
               </Card>
@@ -1307,12 +1399,25 @@ export function KnowledgeBaseDetailContent({ collectionName }: { collectionName:
                       {isWebIngesting ? (
                          <div className="flex items-center gap-2">
                             <Loader2 className="h-4 w-4 animate-spin" />
-                            {t("kb.dialog.webImport.status.crawling")}
+                            {t("kb.dialog.webImport.status.crawling")} ({Math.round(webIngestionProgress)}%)
                          </div>
                       ) : (
                          t("kb.index.startImport")
                       )}
                     </Button>
+                    {webIngestionResult && (
+                      <Card className="p-4">
+                        <div className="space-y-2">
+                          <div className="flex items-center gap-2">
+                            {getStatusIcon(webIngestionResult.status)}
+                            <span className="font-medium">
+                              {t(webIngestionResult.status === "success" ? "kb.dialog.webImport.status.success" : "kb.dialog.webImport.status.done")}
+                            </span>
+                          </div>
+                          <p className="text-sm text-muted-foreground break-all">{webIngestionResult.message}</p>
+                        </div>
+                      </Card>
+                    )}
                  </div>
               </div>
             )}

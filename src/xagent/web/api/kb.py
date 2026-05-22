@@ -303,6 +303,69 @@ def _ensure_cleanup_succeeded(operation_name: str, result_obj: Any) -> None:
     raise RuntimeError(f"{operation_name} failed: {message}")
 
 
+def _extract_embedding_model_id_from_error(message: str) -> Optional[str]:
+    match = re.search(r"Model '([^']+)' not found in hub", message)
+    if match:
+        return match.group(1).strip() or None
+    return None
+
+
+def _is_embedding_configuration_error(message: str) -> bool:
+    normalized = message.lower()
+    return (
+        "no embedding model available" in normalized
+        or (
+            "not found in hub" in normalized
+            and "environment configuration available for embedding" in normalized
+        )
+        or ("no environment configuration" in normalized and "embedding" in normalized)
+    )
+
+
+def _build_user_actionable_ingestion_message(
+    message: str,
+    *,
+    embedding_model_id: Optional[str] = None,
+) -> str:
+    normalized = str(message).strip() or "Unknown ingestion failure"
+    if "How to fix:" in normalized:
+        return normalized
+    if not _is_embedding_configuration_error(normalized):
+        return normalized
+
+    resolved_model_id = embedding_model_id or _extract_embedding_model_id_from_error(
+        normalized
+    )
+    current_model_hint = (
+        f" Current embedding_model_id: '{resolved_model_id}'."
+        if resolved_model_id
+        else ""
+    )
+    return (
+        f"{normalized} Cause: knowledge-base ingestion requires a resolvable "
+        f"embedding model, but the current model configuration could not be loaded."
+        f"{current_model_hint} How to fix: configure a visible default embedding "
+        "model in the model settings, or pass a valid embedding_model_id in the "
+        "ingest request. If you rely on environment variables, set "
+        "DASHSCOPE_EMBEDDING_MODEL and DASHSCOPE_EMBEDDING_API_KEY "
+        "(or DASHSCOPE_API_KEY)."
+    )
+
+
+def _with_user_actionable_ingestion_message(
+    result: IngestionResult,
+    *,
+    embedding_model_id: Optional[str] = None,
+) -> IngestionResult:
+    updated_message = _build_user_actionable_ingestion_message(
+        result.message,
+        embedding_model_id=embedding_model_id,
+    )
+    if updated_message == result.message:
+        return result
+    return result.model_copy(update={"message": updated_message})
+
+
 async def _cleanup_failed_new_collection_metadata(
     *,
     collection_name: str,
@@ -337,8 +400,10 @@ async def _rollback_failed_ingestion(
     uploaded_file_existed_before: bool,
     file_backup_path: Optional[Path],
     had_existing_file: bool,
+    embedding_model_id: Optional[str] = None,
 ) -> None:
     user_id = int(user.id)
+    file_record_id = str(file_record.file_id)
     vector_store = get_vector_index_store()
     register_metadata = _get_completed_step_metadata(result, "register_document") or {}
     register_created = bool(register_metadata.get("created"))
@@ -402,9 +467,11 @@ async def _rollback_failed_ingestion(
                 collection_dir=physical_cleanup.collection_dir,
             )
             if not uploaded_file_existed_before:
+                # The collection cleanup above may already delete+commit the UploadedFile
+                # row, so reuse the stable file_id instead of touching a deleted ORM instance.
                 refreshed_file_record = (
                     db.query(UploadedFile)
-                    .filter(UploadedFile.file_id == file_record.file_id)
+                    .filter(UploadedFile.file_id == file_record_id)
                     .first()
                 )
                 if refreshed_file_record is not None:
@@ -448,7 +515,7 @@ async def _rollback_failed_ingestion(
             }
             _delete_uploaded_file_if_orphaned(
                 db,
-                file_id=str(file_record.file_id),
+                file_id=file_record_id,
                 user_id=user_id,
                 remaining_file_ids=remaining_file_ids,
             )
@@ -488,6 +555,12 @@ async def _rollback_failed_ingestion(
             exc,
         )
         message = f"Failed to fully roll back ingest for {collection_name}/{file_path.name}: {exc}"
+        original_error_message = _build_user_actionable_ingestion_message(
+            result.message,
+            embedding_model_id=embedding_model_id,
+        )
+        if original_error_message:
+            message = f"{message}. Original ingestion error: {original_error_message}"
         if restore_error is not None:
             message = f"{message}; backup restore also failed: {restore_error}"
         raise RollbackFailureError(message) from exc
@@ -505,8 +578,10 @@ async def _rollback_failed_cloud_ingestion(
     uploaded_file_existed_before: bool,
     file_backup_path: Optional[Path],
     had_existing_file: bool,
+    embedding_model_id: Optional[str] = None,
 ) -> None:
     user_id = int(user.id)
+    file_record_id = str(file_record.file_id) if file_record is not None else None
     vector_store = get_vector_index_store()
     register_metadata = _get_completed_step_metadata(result, "register_document") or {}
     register_created = bool(register_metadata.get("created"))
@@ -545,10 +620,10 @@ async def _rollback_failed_cloud_ingestion(
             if current_file_id
         }
 
-        if file_record is not None:
+        if file_record_id is not None:
             _delete_uploaded_file_if_orphaned(
                 db,
-                file_id=str(file_record.file_id),
+                file_id=file_record_id,
                 user_id=user_id,
                 remaining_file_ids=remaining_file_ids,
             )
@@ -605,6 +680,12 @@ async def _rollback_failed_cloud_ingestion(
             "Failed to fully roll back cloud ingest for "
             f"{collection_name}/{file_path.name}: {exc}"
         )
+        original_error_message = _build_user_actionable_ingestion_message(
+            result.message,
+            embedding_model_id=embedding_model_id,
+        )
+        if original_error_message:
+            message = f"{message}. Original ingestion error: {original_error_message}"
         if restore_error is not None:
             message = f"{message}; backup restore also failed: {restore_error}"
         raise RollbackFailureError(message) from exc
@@ -981,6 +1062,9 @@ def handle_kb_exceptions(func: T) -> T:
             return await func(*args, **kwargs)
         except HTTPException:
             raise
+        except RollbackFailureError as e:
+            logger.error("KB rollback failure in %s: %s", func.__name__, e)
+            raise HTTPException(status_code=500, detail=str(e))
         except (ValueError, KeyError, TypeError) as e:
             logger.error("Data format error in %s: %s", func.__name__, e)
             raise HTTPException(status_code=400, detail=f"数据格式错误: {str(e)}")
@@ -1538,6 +1622,10 @@ async def ingest(
 
         loop = asyncio.get_running_loop()
         result: IngestionResult = await loop.run_in_executor(None, _run_ingestion)
+        result = _with_user_actionable_ingestion_message(
+            result,
+            embedding_model_id=embedding_model_id,
+        )
 
         if result.status in {"error", "partial"}:
             await _rollback_failed_ingestion(
@@ -1551,6 +1639,7 @@ async def ingest(
                 uploaded_file_existed_before=uploaded_file_existed_before,
                 file_backup_path=file_backup_path,
                 had_existing_file=had_existing_file,
+                embedding_model_id=embedding_model_id,
             )
 
         if result.status == "error":
@@ -1601,6 +1690,7 @@ async def ingest(
                 uploaded_file_existed_before=uploaded_file_existed_before,
                 file_backup_path=file_backup_path,
                 had_existing_file=had_existing_file,
+                embedding_model_id=embedding_model_id,
             )
         elif not collection_existed_before:
             _restore_ingest_file_backup(
@@ -1813,6 +1903,10 @@ async def ingest_cloud(
                             is_admin=bool(_user.is_admin),
                             file_id=str(file_record.file_id),
                         )
+                        result = _with_user_actionable_ingestion_message(
+                            result,
+                            embedding_model_id=request.embedding_model_id,
+                        )
                         if result.status in {"error", "partial"}:
                             await _rollback_failed_cloud_ingestion(
                                 db=db,
@@ -1825,6 +1919,7 @@ async def ingest_cloud(
                                 uploaded_file_existed_before=uploaded_file_existed_before,
                                 file_backup_path=file_backup_path,
                                 had_existing_file=had_existing_file,
+                                embedding_model_id=request.embedding_model_id,
                             )
                         elif file_backup_path is not None:
                             try:
@@ -1855,6 +1950,7 @@ async def ingest_cloud(
                             uploaded_file_existed_before=uploaded_file_existed_before,
                             file_backup_path=file_backup_path,
                             had_existing_file=had_existing_file,
+                            embedding_model_id=request.embedding_model_id,
                         )
                         return IngestionResult(
                             status="error",
@@ -2772,6 +2868,12 @@ async def ingest_web(
                 )
             ),
         )
+        web_updated_message = _build_user_actionable_ingestion_message(
+            result.message,
+            embedding_model_id=embedding_model_id,
+        )
+        if web_updated_message != result.message:
+            result = result.model_copy(update={"message": web_updated_message})
 
         if result.status == "error":
             if not collection_existed_before:

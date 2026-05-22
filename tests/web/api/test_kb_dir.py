@@ -274,25 +274,18 @@ def test_kb_ingest_rolls_back_new_collection_on_partial_failure(test_env, temp_u
     filename = "failed.xlsx"
 
     with patch("xagent.web.api.kb.run_document_ingestion") as mock_ingest:
-        from xagent.core.tools.core.RAG_tools.core.schemas import (
-            IngestionResult,
-            IngestionStepResult,
-        )
+        from xagent.core.tools.core.RAG_tools.core.schemas import IngestionResult
 
         mock_ingest.return_value = IngestionResult(
-            status="partial",
-            doc_id="doc-failed",
-            parse_hash="parse-failed",
-            completed_steps=[
-                IngestionStepResult(name="initialize_collection"),
-                IngestionStepResult(name="resolve_embedding_adapter"),
-                IngestionStepResult(
-                    name="register_document",
-                    metadata={"doc_id": "doc-failed", "created": True},
-                ),
-            ],
-            failed_step="compute_embeddings",
-            message="embedding failed",
+            status="error",
+            doc_id=None,
+            parse_hash=None,
+            completed_steps=[],
+            failed_step="resolve_embedding_adapter",
+            message=(
+                "Model 'text-embedding-v4' not found in hub and no "
+                "environment configuration available for embedding."
+            ),
         )
 
         response = client.post(
@@ -395,7 +388,6 @@ def test_kb_ingest_returns_explicit_error_when_rollback_fails(test_env, temp_upl
     from xagent.core.tools.core.RAG_tools.core.schemas import (
         CollectionOperationResult,
         IngestionResult,
-        IngestionStepResult,
     )
 
     with (
@@ -410,19 +402,15 @@ def test_kb_ingest_returns_explicit_error_when_rollback_fails(test_env, temp_upl
             deleted_counts={},
         )
         mock_ingest.return_value = IngestionResult(
-            status="partial",
-            doc_id="doc-failed",
-            parse_hash="parse-failed",
-            completed_steps=[
-                IngestionStepResult(name="initialize_collection"),
-                IngestionStepResult(name="resolve_embedding_adapter"),
-                IngestionStepResult(
-                    name="register_document",
-                    metadata={"doc_id": "doc-failed", "created": True},
-                ),
-            ],
-            failed_step="compute_embeddings",
-            message="embedding failed",
+            status="error",
+            doc_id=None,
+            parse_hash=None,
+            completed_steps=[],
+            failed_step="resolve_embedding_adapter",
+            message=(
+                "Model 'text-embedding-v4' not found in hub and no "
+                "environment configuration available for embedding."
+            ),
         )
 
         response = client.post(
@@ -434,6 +422,8 @@ def test_kb_ingest_returns_explicit_error_when_rollback_fails(test_env, temp_upl
 
     assert response.status_code == 500
     assert "Failed to fully roll back ingest" in response.json()["detail"]
+    assert "Original ingestion error:" in response.json()["detail"]
+    assert "How to fix:" in response.json()["detail"]
 
 
 def test_kb_ingest_returns_explicit_error_when_physical_rollback_fails(
@@ -498,6 +488,169 @@ def test_kb_ingest_returns_explicit_error_when_physical_rollback_fails(
         "delete collection physical directory during rollback failed"
         in response.json()["detail"]
     )
+
+
+def test_kb_ingest_surfaces_embedding_configuration_fix_guidance(
+    test_env, temp_uploads
+):
+    """Direct ingest should explain why embedding resolution failed and how to fix it."""
+
+    app, headers, _user, _ = test_env
+    client = TestClient(app)
+
+    from xagent.core.tools.core.RAG_tools.core.schemas import IngestionResult
+
+    with (
+        patch(
+            "xagent.web.api.kb.run_document_ingestion",
+            return_value=IngestionResult(
+                status="error",
+                doc_id=None,
+                parse_hash=None,
+                completed_steps=[],
+                failed_step="resolve_embedding_adapter",
+                message=(
+                    "Model 'text-embedding-v4' not found in hub and no "
+                    "environment configuration available for embedding."
+                ),
+            ),
+        ),
+        patch(
+            "xagent.web.api.kb._rollback_failed_ingestion",
+            new=AsyncMock(return_value=None),
+        ),
+    ):
+        response = client.post(
+            "/api/kb/ingest",
+            files={"file": ("failed.xlsx", b"new content", "application/vnd.ms-excel")},
+            data={"collection": "embedding_config_missing"},
+            headers=headers,
+        )
+
+    assert response.status_code == 500
+    message = response.json()["message"]
+    assert (
+        "Cause: knowledge-base ingestion requires a resolvable embedding model"
+        in message
+    )
+    assert "Current embedding_model_id: 'text-embedding-v4'." in message
+    assert "How to fix:" in message
+    assert "DASHSCOPE_EMBEDDING_MODEL" in message
+
+
+@pytest.mark.asyncio
+async def test_rollback_failed_ingestion_uses_cached_file_id_after_row_delete(
+    test_env, temp_uploads
+) -> None:
+    """Rollback should not touch ORM attributes after UploadedFile cleanup deletes the row."""
+
+    _, _, user, TestingSessionLocal = test_env
+
+    from xagent.core.tools.core.RAG_tools.core.schemas import (
+        CollectionOperationResult,
+        IngestionResult,
+        IngestionStepResult,
+    )
+    from xagent.web.api import kb as kb_module
+    from xagent.web.services.kb_collection_service import CollectionPhysicalDeleteResult
+
+    collection_name = "rollback_deleted_uploaded_file"
+    file_path = temp_uploads / f"user_{user.id}" / collection_name / "failed.txt"
+    file_path.parent.mkdir(parents=True, exist_ok=True)
+    file_path.write_text("new content")
+
+    db = TestingSessionLocal()
+    try:
+        file_record = UploadedFile(
+            file_id="file-rollback-1",
+            user_id=user.id,
+            filename=file_path.name,
+            storage_path=str(file_path),
+            mime_type="text/plain",
+            file_size=file_path.stat().st_size,
+        )
+        db.add(file_record)
+        db.commit()
+        db.refresh(file_record)
+        file_id = str(file_record.file_id)
+
+        result = IngestionResult(
+            status="partial",
+            doc_id="doc-failed",
+            parse_hash="parse-failed",
+            completed_steps=[
+                IngestionStepResult(
+                    name="register_document",
+                    metadata={"doc_id": "doc-failed", "created": True},
+                )
+            ],
+            failed_step="compute_embeddings",
+            message=(
+                "Model 'text-embedding-v4' not found in hub and no environment "
+                "configuration available for embedding."
+            ),
+        )
+        mock_store = MagicMock()
+        mock_store.list_document_records.side_effect = [
+            [
+                DocumentRecord(
+                    doc_id="doc-failed",
+                    file_id=file_id,
+                    source_path=str(file_path),
+                )
+            ],
+            [],
+        ]
+        mock_cleanup_metadata = AsyncMock()
+
+        with (
+            patch("xagent.web.api.kb.get_vector_index_store", return_value=mock_store),
+            patch(
+                "xagent.web.api.kb.delete_collection",
+                return_value=CollectionOperationResult(
+                    status="success",
+                    collection=collection_name,
+                    message="deleted",
+                    affected_documents=[],
+                    deleted_counts={},
+                ),
+            ),
+            patch(
+                "xagent.web.api.kb.delete_collection_physical_dir",
+                return_value=CollectionPhysicalDeleteResult(
+                    status="success",
+                    collection_dir=file_path.parent,
+                ),
+            ),
+            patch(
+                "xagent.web.api.kb._cleanup_failed_new_collection_metadata",
+                new=mock_cleanup_metadata,
+            ),
+        ):
+            await kb_module._rollback_failed_ingestion(
+                db=db,
+                user=user,
+                collection_name=collection_name,
+                result=result,
+                file_path=file_path,
+                file_record=file_record,
+                collection_existed_before=False,
+                uploaded_file_existed_before=False,
+                file_backup_path=None,
+                had_existing_file=False,
+            )
+
+        remaining = (
+            db.query(UploadedFile).filter(UploadedFile.file_id == file_id).first()
+        )
+        assert remaining is None
+        assert not file_path.exists()
+        mock_cleanup_metadata.assert_awaited_once_with(
+            collection_name=collection_name,
+            user=user,
+        )
+    finally:
+        db.close()
 
 
 def test_kb_ingest_surfaces_restore_failure_on_upload_abort(test_env, temp_uploads):

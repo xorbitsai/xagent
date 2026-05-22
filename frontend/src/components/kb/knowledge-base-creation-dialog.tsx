@@ -13,6 +13,12 @@ import { Select } from "@/components/ui/select"
 import { getApiUrl } from "@/lib/utils"
 import { appendIngestionConfigToFormData, normalizeIngestionConfigForFilename } from "@/lib/ingestion-form"
 import { findMatchingIngestionTask, getKBTaskProgressDetail, getKBTaskProgressPercent, KBProgressTask } from "@/lib/kb-progress"
+import {
+  buildKnowledgeBaseErrorResult,
+  getKnowledgeBaseErrorToastContent,
+  KnowledgeBaseIngestionResultLike,
+  normalizeKnowledgeBaseIngestionResult,
+} from "@/lib/kb-ingest-feedback"
 import { useI18n } from "@/contexts/i18n-context"
 import { apiRequest, getUploadErrorMessage, isJsonRecord, parseApiResponse, UPLOAD_ERROR_MESSAGES } from "@/lib/api-wrapper"
 import { Model } from "@/lib/models"
@@ -35,13 +41,19 @@ import {
 import { toast } from "sonner"
 import { CloudConnectDialog, CloudFile } from "./cloud-connect-dialog"
 
-interface IngestionResult {
-  collection: string
-  document_count: number
-  chunks_count: number
-  status: string
-  message: string
-  failed_step?: string
+type IngestionResult = ReturnType<typeof normalizeKnowledgeBaseIngestionResult>
+
+function getKnowledgeBaseToastCopy(
+  t: ReturnType<typeof useI18n>["t"],
+  genericTitle: string
+) {
+  return {
+    genericTitle,
+    embeddingTitle: t("kb.errors.embeddingModelUnavailable"),
+    embeddingDescription: t("kb.errors.embeddingModelUnavailableHint"),
+    rollbackTitle: t("kb.errors.rollbackFailed"),
+    rollbackDescription: t("kb.errors.rollbackFailedHint"),
+  }
 }
 
 interface WebIngestionResult {
@@ -58,6 +70,27 @@ interface WebIngestionResult {
   message: string
   warnings: string[]
   elapsed_time_ms: number
+}
+
+function buildWebIngestionErrorResult(
+  collection: string,
+  message: string
+): WebIngestionResult {
+  return {
+    status: "error",
+    collection,
+    total_urls_found: 0,
+    pages_crawled: 0,
+    pages_failed: 0,
+    documents_created: 0,
+    chunks_created: 0,
+    embeddings_created: 0,
+    crawled_urls: [],
+    failed_urls: {},
+    message,
+    warnings: [],
+    elapsed_time_ms: 0,
+  }
 }
 
 interface KnowledgeBaseCreationDialogProps {
@@ -348,23 +381,43 @@ export function KnowledgeBaseCreationDialog({ open, onOpenChange, onSuccess }: K
         if (!response.ok) {
           const errorData = isJsonRecord(parsed.data) ? parsed.data : {}
           if (errorData.status === 'error') {
-            setIngestionResults(prev => [...prev, errorData as unknown as IngestionResult])
+            setIngestionResults(prev => [
+              ...prev,
+              normalizeKnowledgeBaseIngestionResult(
+                errorData as unknown as KnowledgeBaseIngestionResultLike,
+                { collection: collectionName, fileName: file.name }
+              ),
+            ])
             throw new Error((typeof errorData.message === 'string' && errorData.message) || t("kb.errors.uploadFailedFile", { name: file.name }))
           }
-          throw new Error(getUploadErrorMessage(response, parsed, {
+          const errorMessage = getUploadErrorMessage(response, parsed, {
             generic: t("kb.errors.uploadFailedFile", { name: file.name }) || `Failed to upload file: ${file.name}`,
             ...UPLOAD_ERROR_MESSAGES,
-          }))
+          })
+          setIngestionResults(prev => [
+            ...prev,
+            normalizeKnowledgeBaseIngestionResult(
+              buildKnowledgeBaseErrorResult(collectionName, errorMessage, undefined, file.name),
+              { collection: collectionName, fileName: file.name }
+            ),
+          ])
+          throw new Error(errorMessage)
         }
 
-        const result = isJsonRecord(parsed.data) ? parsed.data as unknown as IngestionResult : null
+        const result = isJsonRecord(parsed.data)
+          ? parsed.data as unknown as KnowledgeBaseIngestionResultLike
+          : null
         if (!result) {
           throw new Error(t("kb.errors.uploadFailedFile", { name: file.name }))
         }
-        setIngestionResults(prev => [...prev, result])
+        const normalizedResult = normalizeKnowledgeBaseIngestionResult(
+          result as unknown as KnowledgeBaseIngestionResultLike,
+          { collection: collectionName, fileName: file.name }
+        )
+        setIngestionResults(prev => [...prev, normalizedResult])
 
-        if (result.status === "partial" && result.failed_step) {
-          throw new Error(result.message || t("kb.errors.failedAtStep", { step: result.failed_step }))
+        if (normalizedResult.status === "partial" && normalizedResult.failed_step) {
+          throw new Error(normalizedResult.message || t("kb.errors.failedAtStep", { step: normalizedResult.failed_step }))
         }
 
         successfulCollections.push(collectionName)
@@ -377,7 +430,14 @@ export function KnowledgeBaseCreationDialog({ open, onOpenChange, onSuccess }: K
       onSuccess?.(successfulCollections)
 
     } catch (err) {
-      toast.error(err instanceof Error ? err.message : t("kb.errors.uploadFailed"))
+      const rawMessage = err instanceof Error ? err.message : t("kb.errors.uploadFailed")
+      const toastContent = getKnowledgeBaseErrorToastContent(
+        rawMessage,
+        getKnowledgeBaseToastCopy(t, t("kb.errors.uploadFailed"))
+      )
+      toast.error(toastContent.title, {
+        description: toastContent.description,
+      })
       if (successfulCollections.length > 0) {
         onSuccess?.(successfulCollections)
       }
@@ -445,10 +505,12 @@ export function KnowledgeBaseCreationDialog({ open, onOpenChange, onSuccess }: K
           setWebIngestionResult(errorData as unknown as WebIngestionResult)
           throw new Error((typeof errorData.message === 'string' && errorData.message) || t("kb.errors.webIngestFailed"))
         }
-        throw new Error(getUploadErrorMessage(response, parsed, {
+        const errorMessage = getUploadErrorMessage(response, parsed, {
           generic: t("kb.errors.webIngestFailed") || "Website import failed",
           ...UPLOAD_ERROR_MESSAGES,
-        }))
+        })
+        setWebIngestionResult(buildWebIngestionErrorResult(collectionName, errorMessage))
+        throw new Error(errorMessage)
       }
 
       const result: WebIngestionResult | null = isJsonRecord(parsed.data)
@@ -465,7 +527,14 @@ export function KnowledgeBaseCreationDialog({ open, onOpenChange, onSuccess }: K
       onSuccess?.([collectionName])
 
     } catch (err) {
-      toast.error(err instanceof Error ? err.message : t("kb.errors.webIngestFailed"))
+      const rawMessage = err instanceof Error ? err.message : t("kb.errors.webIngestFailed")
+      const toastContent = getKnowledgeBaseErrorToastContent(
+        rawMessage,
+        getKnowledgeBaseToastCopy(t, t("kb.errors.webIngestFailed"))
+      )
+      toast.error(toastContent.title, {
+        description: toastContent.description,
+      })
     } finally {
       setIsWebIngesting(false)
       setWebIngestionProgress(0)
@@ -535,14 +604,34 @@ export function KnowledgeBaseCreationDialog({ open, onOpenChange, onSuccess }: K
       const parsed = await parseApiResponse(response)
 
       if (!response.ok) {
-        throw new Error(getUploadErrorMessage(response, parsed, {
+        const errorMessage = getUploadErrorMessage(response, parsed, {
           generic: t("kb.errors.cloudIngestFailed") || "Cloud ingest failed",
           ...UPLOAD_ERROR_MESSAGES,
-        }))
+        })
+        setIngestionResults([
+          normalizeKnowledgeBaseIngestionResult(
+            buildKnowledgeBaseErrorResult(
+              collectionName,
+              errorMessage,
+              undefined,
+              filesToIngest.length === 1 ? filesToIngest[0].fileName : undefined
+            ),
+            {
+              collection: collectionName,
+              fileName: filesToIngest.length === 1 ? filesToIngest[0].fileName : undefined,
+            }
+          ),
+        ])
+        throw new Error(errorMessage)
       }
 
       const results: IngestionResult[] = Array.isArray(parsed.data)
-        ? (parsed.data as unknown as IngestionResult[])
+        ? (parsed.data as unknown as KnowledgeBaseIngestionResultLike[]).map((result, index) =>
+            normalizeKnowledgeBaseIngestionResult(result, {
+              collection: collectionName,
+              fileName: filesToIngest[index]?.fileName,
+            })
+          )
         : []
       setIngestionResults(results)
 
@@ -561,7 +650,19 @@ export function KnowledgeBaseCreationDialog({ open, onOpenChange, onSuccess }: K
       }
     } catch (error) {
       console.error("Cloud ingest error:", error)
-      toast.error(error instanceof Error ? error.message : t("kb.dialog.fileUpload.processFailed"))
+      const rawMessage = error instanceof Error
+        ? error.message
+        : t("kb.dialog.fileUpload.processFailed")
+      const toastContent = getKnowledgeBaseErrorToastContent(
+        rawMessage,
+        getKnowledgeBaseToastCopy(
+          t,
+          t("kb.errors.cloudIngestFailed")
+        )
+      )
+      toast.error(toastContent.title, {
+        description: toastContent.description,
+      })
     } finally {
       setIsCloudConnecting(false)
     }
@@ -1004,7 +1105,7 @@ export function KnowledgeBaseCreationDialog({ open, onOpenChange, onSuccess }: K
                             <div key={index} className="flex flex-col gap-1 p-2 bg-slate-50 rounded border">
                               <div className="flex items-center gap-2">
                                 {getStatusIcon(result.status)}
-                                <span className="text-sm font-medium">{result.collection}</span>
+                                <span className="text-sm font-medium">{result.file_name || result.collection}</span>
                                 {result.status === 'success' && (
                                   <>
                                     <Badge variant="secondary" className="text-xs font-normal">

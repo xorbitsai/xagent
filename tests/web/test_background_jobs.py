@@ -29,7 +29,7 @@ def _create_user(db, username: str = "background-job-test") -> User:
 
 
 def test_enqueue_background_job_disabled_stays_pending(tmp_path, monkeypatch):
-    monkeypatch.delenv(CELERY_ENABLED, raising=False)
+    monkeypatch.setenv(CELERY_ENABLED, "false")
     monkeypatch.delenv(CELERY_BROKER_URL, raising=False)
 
     SessionLocal = _init_test_db(tmp_path / "jobs-disabled.db")
@@ -90,7 +90,7 @@ def test_trigger_event_job_runs_with_eager_celery(tmp_path, monkeypatch):
 
 
 def test_background_job_progress_manager_mirrors_rag_progress(tmp_path, monkeypatch):
-    monkeypatch.delenv(CELERY_ENABLED, raising=False)
+    monkeypatch.setenv(CELERY_ENABLED, "false")
     monkeypatch.delenv(CELERY_BROKER_URL, raising=False)
 
     from xagent.web.jobs.progress import BackgroundJobProgressManager
@@ -156,7 +156,7 @@ def test_background_job_progress_manager_mirrors_rag_progress(tmp_path, monkeypa
 
 
 def test_requeue_stale_background_jobs_marks_old_running_pending(tmp_path, monkeypatch):
-    monkeypatch.delenv(CELERY_ENABLED, raising=False)
+    monkeypatch.setenv(CELERY_ENABLED, "false")
     monkeypatch.delenv(CELERY_BROKER_URL, raising=False)
 
     SessionLocal = _init_test_db(tmp_path / "jobs-stale.db")

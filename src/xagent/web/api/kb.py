@@ -1489,7 +1489,7 @@ async def ingest(
         file_backup_path = file_path.with_name(
             f"{file_path.name}.rollback-{uuid.uuid4().hex}"
         )
-        shutil.copy2(file_path, file_backup_path)
+        await asyncio.to_thread(shutil.copy2, file_path, file_backup_path)
 
     try:
         total_size = 0
@@ -1508,7 +1508,7 @@ async def ingest(
                             f"File size exceeds maximum limit of {MAX_FILE_SIZE_LABEL}"
                         ),
                     )
-                buffer.write(chunk)
+                await asyncio.to_thread(buffer.write, chunk)
         logger.info(
             "File uploaded: %s -> %s (user: %s, collection: %s)",
             safe_filename,

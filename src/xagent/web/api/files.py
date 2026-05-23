@@ -3,14 +3,25 @@ import logging
 from pathlib import Path
 from types import ModuleType
 from typing import Any, Dict, Optional, Tuple, cast
+from urllib.parse import quote
 from uuid import uuid4
 
 from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, UploadFile
-from fastapi.responses import FileResponse
+from fastapi.responses import (
+    FileResponse,
+    RedirectResponse,
+    Response,
+)
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
-from ...config import get_uploads_dir
+from ...config import (
+    get_file_delivery_accel_redirect_enabled,
+    get_file_delivery_accel_redirect_prefix,
+    get_file_delivery_redirect_enabled,
+    get_file_delivery_signed_url_ttl_seconds,
+    get_uploads_dir,
+)
 from ...core.file_storage.factory import get_file_storage
 from ...core.tools.adapters.vibe.file_tool import read_file
 from ...core.tools.core.file_analysis import collect_pptx_slide_blocks
@@ -73,6 +84,84 @@ def _file_integrity_failed() -> HTTPException:
     return HTTPException(
         status_code=409,
         detail=FILE_INTEGRITY_REUPLOAD_MESSAGE,
+    )
+
+
+def _content_disposition_header(disposition: str, filename: str) -> str:
+    safe_name = Path(filename).name or "file"
+    return f'{disposition}; filename="{safe_name}"'
+
+
+def _inline_download_disposition(media_type: str) -> str:
+    return (
+        "inline"
+        if media_type.startswith(("image/", "video/", "audio/", "text/"))
+        else "attachment"
+    )
+
+
+def _preview_can_redirect(path: Path, media_type: str) -> bool:
+    if path.suffix.lower() in {".pptx", ".ppt"}:
+        return False
+    return media_type not in {"text/html", "application/xhtml+xml", "image/svg+xml"}
+
+
+def _durable_redirect_response(
+    file_ref: ManagedFileRef,
+    *,
+    filename: str,
+    media_type: str,
+    disposition: str,
+) -> RedirectResponse | None:
+    if not get_file_delivery_redirect_enabled():
+        return None
+
+    try:
+        signed_url = file_ref.signed_access_url(
+            expires=get_file_delivery_signed_url_ttl_seconds(),
+            content_type=media_type,
+            content_disposition=_content_disposition_header(disposition, filename),
+        )
+    except DurableStorageOperationError as exc:
+        raise _durable_storage_unavailable() from exc
+
+    if not signed_url:
+        return None
+
+    return RedirectResponse(url=signed_url, status_code=307)
+
+
+def _accel_redirect_response(
+    path: Path,
+    *,
+    owner_user_id: int,
+    filename: str,
+    media_type: str,
+    disposition: str,
+) -> Response | None:
+    if not get_file_delivery_accel_redirect_enabled():
+        return None
+    if not path.exists() or not path.is_file():
+        return None
+
+    _ensure_under_uploads(path, owner_user_id)
+    uploads_root = get_uploads_dir().resolve()
+    try:
+        relative_path = path.resolve().relative_to(uploads_root)
+    except ValueError as exc:
+        raise HTTPException(status_code=403, detail="Access denied") from exc
+
+    internal_prefix = get_file_delivery_accel_redirect_prefix()
+    internal_uri = (
+        internal_prefix.rstrip("/") + "/" + quote(relative_path.as_posix(), safe="/")
+    )
+    return Response(
+        status_code=200,
+        media_type=media_type,
+        headers={
+            "X-Accel-Redirect": internal_uri,
+            "Content-Disposition": _content_disposition_header(disposition, filename),
+        },
     )
 
 
@@ -723,34 +812,55 @@ async def download_file(
         file_name = str(file_record.filename)
         media_type = guess_media_type(file_name)
         _ensure_under_uploads(full_path, owner_user_id)
+        content_disposition = _inline_download_disposition(media_type)
+        redirect_response = _durable_redirect_response(
+            file_ref,
+            filename=file_name,
+            media_type=media_type,
+            disposition=content_disposition,
+        )
+        if redirect_response is not None:
+            return redirect_response
         if full_path.exists() and full_path.is_file():
-            content_disposition = (
-                "inline"
-                if media_type.startswith(("image/", "video/", "audio/", "text/"))
-                else "attachment"
+            accel_response = _accel_redirect_response(
+                full_path,
+                owner_user_id=owner_user_id,
+                filename=file_name,
+                media_type=media_type,
+                disposition=content_disposition,
             )
+            if accel_response is not None:
+                return accel_response
             return FileResponse(
                 path=str(full_path),
                 filename=file_name,
                 media_type=media_type,
                 headers={
-                    "Content-Disposition": f'{content_disposition}; filename="{file_name}"'
+                    "Content-Disposition": _content_disposition_header(
+                        content_disposition, file_name
+                    )
                 },
             )
         if file_ref.has_durable_object:
-            content_disposition = (
-                "inline"
-                if media_type.startswith(("image/", "video/", "audio/", "text/"))
-                else "attachment"
-            )
             try:
                 restored_path = file_ref.ensure_local()
+                accel_response = _accel_redirect_response(
+                    restored_path,
+                    owner_user_id=owner_user_id,
+                    filename=file_name,
+                    media_type=media_type,
+                    disposition=content_disposition,
+                )
+                if accel_response is not None:
+                    return accel_response
                 return FileResponse(
                     path=str(restored_path),
                     filename=file_name,
                     media_type=media_type,
                     headers={
-                        "Content-Disposition": f'{content_disposition}; filename="{file_name}"'
+                        "Content-Disposition": _content_disposition_header(
+                            content_disposition, file_name
+                        )
                     },
                 )
             except DurableObjectIntegrityError as exc:
@@ -771,18 +881,26 @@ async def download_file(
 
     # For images and other viewable content, set Content-Disposition to inline
     # to allow browser to display the file instead of downloading it
-    content_disposition = (
-        "inline"
-        if media_type.startswith(("image/", "video/", "audio/", "text/"))
-        else "attachment"
+    content_disposition = _inline_download_disposition(media_type)
+
+    accel_response = _accel_redirect_response(
+        full_path,
+        owner_user_id=owner_user_id,
+        filename=file_name,
+        media_type=media_type,
+        disposition=content_disposition,
     )
+    if accel_response is not None:
+        return accel_response
 
     return FileResponse(
         path=str(full_path),
         filename=file_name,
         media_type=media_type,
         headers={
-            "Content-Disposition": f'{content_disposition}; filename="{file_name}"'
+            "Content-Disposition": _content_disposition_header(
+                content_disposition, file_name
+            )
         },
     )
 
@@ -804,6 +922,24 @@ async def preview_file(
         file_name = str(file_record.filename)
         media_type = guess_media_type(file_name)
         _ensure_under_uploads(full_path, owner_user_id)
+        if _preview_can_redirect(full_path, media_type):
+            redirect_response = _durable_redirect_response(
+                file_ref,
+                filename=file_name,
+                media_type=media_type,
+                disposition="inline",
+            )
+            if redirect_response is not None:
+                return redirect_response
+            accel_response = _accel_redirect_response(
+                full_path,
+                owner_user_id=owner_user_id,
+                filename=file_name,
+                media_type=media_type,
+                disposition="inline",
+            )
+            if accel_response is not None:
+                return accel_response
         if file_ref.has_durable_object:
             try:
                 materialized_path = file_ref.materialize()
@@ -830,6 +966,17 @@ async def preview_file(
 
     if not full_path.exists():
         raise HTTPException(status_code=404, detail="File not found")
+
+    if _preview_can_redirect(full_path, media_type):
+        accel_response = _accel_redirect_response(
+            full_path,
+            owner_user_id=owner_user_id,
+            filename=file_name,
+            media_type=media_type,
+            disposition="inline",
+        )
+        if accel_response is not None:
+            return accel_response
 
     return FileResponse(
         path=str(full_path),

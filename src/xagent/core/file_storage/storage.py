@@ -76,6 +76,30 @@ class FsspecFileStorage:
     def stat(self, key: str) -> StoredObject:
         return self._stored_object(self._normalize_key(key))
 
+    def signed_url(
+        self,
+        key: str,
+        *,
+        expires: int,
+        content_type: str | None = None,
+        content_disposition: str | None = None,
+    ) -> str | None:
+        """Return a temporary direct-access URL when the backend supports it."""
+        if self._backend != "s3" or not hasattr(self._fs, "url"):
+            return None
+
+        url_kwargs: dict[str, str] = {}
+        if content_type:
+            url_kwargs["ResponseContentType"] = content_type
+        if content_disposition:
+            url_kwargs["ResponseContentDisposition"] = content_disposition
+
+        full_path = self._full_path(self._normalize_key(key))
+        try:
+            return str(self._fs.url(full_path, expires=expires, **url_kwargs))
+        except TypeError:
+            return str(self._fs.url(full_path, expires=expires))
+
     def content_hash(self, key: str) -> str:
         normalized_key = self._normalize_key(key)
         if self._backend == "file":

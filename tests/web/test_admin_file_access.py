@@ -223,6 +223,67 @@ class TestAdminFileAccess:
 
         assert response.status_code == 403
 
+    def test_regular_user_cannot_get_signed_redirect_for_other_user_file(
+        self, test_db, temp_uploads_dir, monkeypatch
+    ):
+        from xagent.web.services.managed_file_ref import ManagedFileRef
+
+        monkeypatch.setenv("XAGENT_FILE_DELIVERY_REDIRECT_ENABLED", "true")
+        admin_user, regular_user, test_app, session = test_db
+        del admin_user
+        another_user = User(
+            username="signed-other",
+            password_hash=hash_password("signed-other"),
+            is_admin=False,
+        )
+        session.add(another_user)
+        session.commit()
+
+        another_user_id = int(cast(Any, another_user.id))
+        task = Task(
+            id=801,
+            user_id=another_user_id,
+            title="Signed redirect denied",
+            description="other user's file",
+        )
+        session.add(task)
+        session.commit()
+
+        uploaded_file = create_uploaded_file(
+            session,
+            temp_uploads_dir,
+            another_user_id,
+            int(cast(Any, task.id)),
+            "signed-secret.txt",
+            "secret content",
+        )
+        uploaded_file.storage_status = "available"
+        uploaded_file.storage_key = (
+            f"users/{another_user_id}/uploads/{uploaded_file.file_id}/signed-secret.txt"
+        )
+        uploaded_file.storage_backend = "s3"
+        session.commit()
+
+        def fail_signed_access_url(self, **kwargs):
+            del self, kwargs
+            raise AssertionError("access check must happen before signing")
+
+        monkeypatch.setattr(ManagedFileRef, "signed_access_url", fail_signed_access_url)
+
+        client = TestClient(test_app)
+        user_headers = create_auth_headers(regular_user)
+
+        for path in [
+            f"/api/files/download/{uploaded_file.file_id}",
+            f"/api/files/preview/{uploaded_file.file_id}",
+        ]:
+            response = client.get(
+                path,
+                headers=user_headers,
+                follow_redirects=False,
+            )
+            assert response.status_code == 403
+
     def test_missing_file_id_returns_404(self, test_db, temp_uploads_dir):
         admin_user, regular_user, test_app, session = test_db
         del regular_user, session, temp_uploads_dir

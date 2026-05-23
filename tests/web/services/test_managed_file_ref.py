@@ -204,6 +204,48 @@ def test_open_read_prefers_existing_local_file_over_durable(monkeypatch, tmp_pat
         assert handle.read() == b"current local content"
 
 
+def test_signed_access_url_returns_none_without_durable_object(tmp_path):
+    record = _record(tmp_path / "uploads" / "local.txt")
+
+    assert ManagedFileRef(record).signed_access_url(expires=300) is None
+
+
+def test_signed_access_url_delegates_to_storage(tmp_path):
+    class SigningStorage:
+        def __init__(self):
+            self.calls = []
+
+        def signed_url(
+            self,
+            key,
+            *,
+            expires,
+            content_type=None,
+            content_disposition=None,
+        ):
+            self.calls.append((key, expires, content_type, content_disposition))
+            return "https://cdn.example.com/signed"
+
+    storage = SigningStorage()
+    record = _record(
+        tmp_path / "uploads" / "object.txt",
+        storage_backend="s3",
+        storage_key="users/7/uploads/file-123/object.txt",
+        storage_status="available",
+    )
+
+    signed_url = ManagedFileRef(record, storage=storage).signed_access_url(
+        expires=60,
+        content_type="text/plain",
+        content_disposition="inline",
+    )
+
+    assert signed_url == "https://cdn.example.com/signed"
+    assert storage.calls == [
+        ("users/7/uploads/file-123/object.txt", 60, "text/plain", "inline")
+    ]
+
+
 def test_sync_to_durable_uploads_local_file_and_updates_record(monkeypatch, tmp_path):
     _configure_storage(monkeypatch, tmp_path)
     source = tmp_path / "uploads" / "sync.txt"

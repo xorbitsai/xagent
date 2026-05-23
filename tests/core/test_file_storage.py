@@ -155,6 +155,81 @@ def test_object_uri_quotes_key_without_backend_branch(monkeypatch, tmp_path):
     assert stored.uri.endswith("/uploads/file%20with%20spaces.txt")
 
 
+def test_local_file_storage_does_not_return_signed_url(monkeypatch, tmp_path):
+    monkeypatch.setenv("XAGENT_FILE_STORAGE_URI", (tmp_path / "objects").as_uri())
+    get_file_storage.cache_clear()
+
+    storage = get_file_storage()
+
+    assert storage.signed_url("uploads/data.txt", expires=300) is None
+
+
+def test_s3_signed_url_includes_response_headers(tmp_path):
+    class S3UrlStorage:
+        def __init__(self):
+            self.calls = []
+
+        def url(self, path, **kwargs):
+            self.calls.append((path, kwargs))
+            return "https://cdn.example.com/signed"
+
+    backend = S3UrlStorage()
+    storage = FsspecFileStorage(
+        fs=backend,
+        root="bucket/root",
+        backend="s3",
+        base_uri="s3://bucket/root",
+        materialize_dir=tmp_path,
+    )
+
+    signed_url = storage.signed_url(
+        "uploads/data.txt",
+        expires=120,
+        content_type="text/plain",
+        content_disposition="inline; filename*=UTF-8''data.txt",
+    )
+
+    assert signed_url == "https://cdn.example.com/signed"
+    assert backend.calls == [
+        (
+            "bucket/root/uploads/data.txt",
+            {
+                "expires": 120,
+                "ResponseContentType": "text/plain",
+                "ResponseContentDisposition": "inline; filename*=UTF-8''data.txt",
+            },
+        )
+    ]
+
+
+def test_s3_signed_url_falls_back_for_basic_fsspec_url_signature(tmp_path):
+    class BasicUrlStorage:
+        def __init__(self):
+            self.calls = []
+
+        def url(self, path, *, expires):
+            self.calls.append((path, expires))
+            return "https://cdn.example.com/basic"
+
+    backend = BasicUrlStorage()
+    storage = FsspecFileStorage(
+        fs=backend,
+        root="bucket/root",
+        backend="s3",
+        base_uri="s3://bucket/root",
+        materialize_dir=tmp_path,
+    )
+
+    signed_url = storage.signed_url(
+        "uploads/data.txt",
+        expires=120,
+        content_type="text/plain",
+    )
+
+    assert signed_url == "https://cdn.example.com/basic"
+    assert backend.calls == [("bucket/root/uploads/data.txt", 120)]
+
+
 def test_list_uses_detailed_find_metadata_without_per_object_info(tmp_path):
     class DetailedFindStorage:
         def exists(self, path):

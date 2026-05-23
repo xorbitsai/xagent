@@ -43,6 +43,10 @@ FILE_STORAGE_OPTIONS = "XAGENT_FILE_STORAGE_OPTIONS"
 FILE_MATERIALIZE_DIR = "XAGENT_FILE_MATERIALIZE_DIR"
 PREVIEW_TMP_DIR = "XAGENT_PREVIEW_TMP_DIR"
 FILE_STORAGE_STARTUP_SYNC_ENABLED = "XAGENT_FILE_STORAGE_STARTUP_SYNC_ENABLED"
+FILE_DELIVERY_REDIRECT_ENABLED = "XAGENT_FILE_DELIVERY_REDIRECT_ENABLED"
+FILE_DELIVERY_SIGNED_URL_TTL_SECONDS = "XAGENT_FILE_DELIVERY_SIGNED_URL_TTL_SECONDS"
+FILE_DELIVERY_ACCEL_REDIRECT_ENABLED = "XAGENT_FILE_DELIVERY_ACCEL_REDIRECT_ENABLED"
+FILE_DELIVERY_ACCEL_REDIRECT_PREFIX = "XAGENT_FILE_DELIVERY_ACCEL_REDIRECT_PREFIX"
 SANDBOX_IMAGE = "SANDBOX_IMAGE"
 LANCEDB_PATH = "LANCEDB_PATH"
 DATABASE_URL = "DATABASE_URL"
@@ -418,6 +422,82 @@ def get_file_storage_startup_sync_enabled() -> bool:
         f"Invalid {FILE_STORAGE_STARTUP_SYNC_ENABLED} value: {env_value!r}. "
         "Expected a boolean value."
     )
+
+
+def get_file_delivery_redirect_enabled() -> bool:
+    """Return whether private file endpoints may redirect to durable object URLs."""
+    env_value = os.getenv(FILE_DELIVERY_REDIRECT_ENABLED)
+    if env_value is None or not env_value.strip():
+        return False
+
+    normalized = env_value.strip().lower()
+    if normalized in {"1", "true", "yes", "on"}:
+        return True
+    if normalized in {"0", "false", "no", "off"}:
+        return False
+
+    raise ValueError(
+        f"Invalid {FILE_DELIVERY_REDIRECT_ENABLED} value: {env_value!r}. "
+        "Expected a boolean value."
+    )
+
+
+def get_file_delivery_signed_url_ttl_seconds() -> int:
+    """Get signed durable-object URL lifetime for private file delivery redirects."""
+    env_value = os.getenv(FILE_DELIVERY_SIGNED_URL_TTL_SECONDS)
+    if env_value is None or not env_value.strip():
+        return 300
+
+    try:
+        ttl = int(env_value)
+    except ValueError as exc:
+        raise ValueError(
+            f"Invalid {FILE_DELIVERY_SIGNED_URL_TTL_SECONDS} value: {env_value!r}."
+        ) from exc
+
+    if ttl <= 0:
+        raise ValueError(
+            f"Invalid {FILE_DELIVERY_SIGNED_URL_TTL_SECONDS} value: {env_value!r}. "
+            "Value must be positive."
+        )
+
+    return ttl
+
+
+def get_file_delivery_accel_redirect_enabled() -> bool:
+    """Return whether private file endpoints may use nginx X-Accel-Redirect."""
+    env_value = os.getenv(FILE_DELIVERY_ACCEL_REDIRECT_ENABLED)
+    if env_value is None or not env_value.strip():
+        return False
+
+    normalized = env_value.strip().lower()
+    if normalized in {"1", "true", "yes", "on"}:
+        return True
+    if normalized in {"0", "false", "no", "off"}:
+        return False
+
+    raise ValueError(
+        f"Invalid {FILE_DELIVERY_ACCEL_REDIRECT_ENABLED} value: {env_value!r}. "
+        "Expected a boolean value."
+    )
+
+
+def get_file_delivery_accel_redirect_prefix() -> str:
+    """Get the internal nginx URI prefix used for X-Accel-Redirect."""
+    env_value = os.getenv(FILE_DELIVERY_ACCEL_REDIRECT_PREFIX)
+    prefix = (
+        env_value.strip()
+        if env_value is not None and env_value.strip()
+        else "/_xagent_internal_files/"
+    )
+    if not prefix.startswith("/"):
+        raise ValueError(
+            f"Invalid {FILE_DELIVERY_ACCEL_REDIRECT_PREFIX} value: {env_value!r}. "
+            "Value must start with '/'."
+        )
+    if not prefix.endswith("/"):
+        prefix += "/"
+    return prefix
 
 
 def format_file_size(size_bytes: int) -> str:

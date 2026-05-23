@@ -179,6 +179,27 @@ class ManagedFileRef:
     def open_read(self) -> BinaryIO:
         return self.ensure_local().open("rb")
 
+    def signed_access_url(
+        self,
+        *,
+        expires: int,
+        content_type: str | None = None,
+        content_disposition: str | None = None,
+    ) -> str | None:
+        if not self.has_durable_object:
+            return None
+        try:
+            return self.storage.signed_url(
+                self.storage_key,
+                expires=expires,
+                content_type=content_type,
+                content_disposition=content_disposition,
+            )
+        except Exception as exc:
+            raise DurableStorageOperationError(
+                f"Failed to sign durable object URL: {self.storage_key}"
+            ) from exc
+
     def sync_to_durable(
         self,
         *,

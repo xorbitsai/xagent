@@ -12,6 +12,10 @@ from xagent.config import (
     DATABASE_URL,
     EXTERNAL_SKILLS_LIBRARY_DIRS,
     EXTERNAL_UPLOAD_DIRS,
+    FILE_DELIVERY_ACCEL_REDIRECT_ENABLED,
+    FILE_DELIVERY_ACCEL_REDIRECT_PREFIX,
+    FILE_DELIVERY_REDIRECT_ENABLED,
+    FILE_DELIVERY_SIGNED_URL_TTL_SECONDS,
     FILE_MATERIALIZE_DIR,
     FILE_STORAGE_OPTIONS,
     FILE_STORAGE_STARTUP_SYNC_ENABLED,
@@ -45,6 +49,10 @@ from xagent.config import (
     get_default_task_execution_mode,
     get_external_skills_dirs,
     get_external_upload_dirs,
+    get_file_delivery_accel_redirect_enabled,
+    get_file_delivery_accel_redirect_prefix,
+    get_file_delivery_redirect_enabled,
+    get_file_delivery_signed_url_ttl_seconds,
     get_file_materialize_dir,
     get_file_storage_options,
     get_file_storage_startup_sync_enabled,
@@ -133,6 +141,16 @@ class TestEnvironmentVariableConstants:
         assert (
             FILE_STORAGE_STARTUP_SYNC_ENABLED
             == "XAGENT_FILE_STORAGE_STARTUP_SYNC_ENABLED"
+        )
+
+    def test_file_delivery_accel_redirect_constants(self):
+        assert (
+            FILE_DELIVERY_ACCEL_REDIRECT_ENABLED
+            == "XAGENT_FILE_DELIVERY_ACCEL_REDIRECT_ENABLED"
+        )
+        assert (
+            FILE_DELIVERY_ACCEL_REDIRECT_PREFIX
+            == "XAGENT_FILE_DELIVERY_ACCEL_REDIRECT_PREFIX"
         )
 
     def test_redis_url_constant(self):
@@ -354,6 +372,113 @@ class TestFileStorageConfig:
             ValueError, match="XAGENT_FILE_STORAGE_STARTUP_SYNC_ENABLED"
         ):
             get_file_storage_startup_sync_enabled()
+
+    def test_file_delivery_redirect_enabled_defaults_false(self, monkeypatch):
+        monkeypatch.delenv(FILE_DELIVERY_REDIRECT_ENABLED, raising=False)
+
+        assert get_file_delivery_redirect_enabled() is False
+
+    @pytest.mark.parametrize(
+        "value,expected",
+        [
+            ("true", True),
+            ("1", True),
+            ("yes", True),
+            ("on", True),
+            ("false", False),
+            ("0", False),
+            ("no", False),
+            ("off", False),
+        ],
+    )
+    def test_file_delivery_redirect_enabled_parses_bool(
+        self, monkeypatch, value, expected
+    ):
+        monkeypatch.setenv(FILE_DELIVERY_REDIRECT_ENABLED, value)
+
+        assert get_file_delivery_redirect_enabled() is expected
+
+    def test_file_delivery_redirect_enabled_rejects_invalid(self, monkeypatch):
+        monkeypatch.setenv(FILE_DELIVERY_REDIRECT_ENABLED, "maybe")
+
+        with pytest.raises(ValueError, match="XAGENT_FILE_DELIVERY_REDIRECT_ENABLED"):
+            get_file_delivery_redirect_enabled()
+
+    def test_file_delivery_signed_url_ttl_defaults_to_300(self, monkeypatch):
+        monkeypatch.delenv(FILE_DELIVERY_SIGNED_URL_TTL_SECONDS, raising=False)
+
+        assert get_file_delivery_signed_url_ttl_seconds() == 300
+
+    def test_file_delivery_signed_url_ttl_with_env_var(self, monkeypatch):
+        monkeypatch.setenv(FILE_DELIVERY_SIGNED_URL_TTL_SECONDS, "60")
+
+        assert get_file_delivery_signed_url_ttl_seconds() == 60
+
+    @pytest.mark.parametrize("value", ["0", "-1", "abc"])
+    def test_file_delivery_signed_url_ttl_rejects_invalid(self, monkeypatch, value):
+        monkeypatch.setenv(FILE_DELIVERY_SIGNED_URL_TTL_SECONDS, value)
+
+        with pytest.raises(
+            ValueError, match="XAGENT_FILE_DELIVERY_SIGNED_URL_TTL_SECONDS"
+        ):
+            get_file_delivery_signed_url_ttl_seconds()
+
+    def test_file_delivery_accel_redirect_enabled_defaults_false(self, monkeypatch):
+        monkeypatch.delenv(FILE_DELIVERY_ACCEL_REDIRECT_ENABLED, raising=False)
+
+        assert get_file_delivery_accel_redirect_enabled() is False
+
+    @pytest.mark.parametrize(
+        "value,expected",
+        [
+            ("true", True),
+            ("1", True),
+            ("yes", True),
+            ("on", True),
+            ("false", False),
+            ("0", False),
+            ("no", False),
+            ("off", False),
+        ],
+    )
+    def test_file_delivery_accel_redirect_enabled_parses_bool(
+        self, monkeypatch, value, expected
+    ):
+        monkeypatch.setenv(FILE_DELIVERY_ACCEL_REDIRECT_ENABLED, value)
+
+        assert get_file_delivery_accel_redirect_enabled() is expected
+
+    def test_file_delivery_accel_redirect_enabled_rejects_invalid(self, monkeypatch):
+        monkeypatch.setenv(FILE_DELIVERY_ACCEL_REDIRECT_ENABLED, "maybe")
+
+        with pytest.raises(
+            ValueError, match="XAGENT_FILE_DELIVERY_ACCEL_REDIRECT_ENABLED"
+        ):
+            get_file_delivery_accel_redirect_enabled()
+
+    def test_file_delivery_accel_redirect_prefix_defaults_to_internal_uri(
+        self, monkeypatch
+    ):
+        monkeypatch.delenv(FILE_DELIVERY_ACCEL_REDIRECT_PREFIX, raising=False)
+
+        assert get_file_delivery_accel_redirect_prefix() == "/_xagent_internal_files/"
+
+    def test_file_delivery_accel_redirect_prefix_normalizes_trailing_slash(
+        self, monkeypatch
+    ):
+        monkeypatch.setenv(FILE_DELIVERY_ACCEL_REDIRECT_PREFIX, "/private-files")
+
+        assert get_file_delivery_accel_redirect_prefix() == "/private-files/"
+
+    def test_file_delivery_accel_redirect_prefix_requires_absolute_uri(
+        self, monkeypatch
+    ):
+        monkeypatch.setenv(FILE_DELIVERY_ACCEL_REDIRECT_PREFIX, "private-files")
+
+        with pytest.raises(
+            ValueError, match="XAGENT_FILE_DELIVERY_ACCEL_REDIRECT_PREFIX"
+        ):
+            get_file_delivery_accel_redirect_prefix()
 
 
 class TestGetUploadsDir:

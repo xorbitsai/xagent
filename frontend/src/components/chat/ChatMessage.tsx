@@ -317,6 +317,8 @@ export function ChatMessage({
     !!showProcessView &&
     Array.isArray(traceEvents) &&
     traceEvents.length > 0;
+  const isProcessOnlyMessage =
+    shouldShowProcess && !isUser && !content && showEmptyStatus === false;
 
   // Map event/action to i18n key
   const getEventTitle = (e: TraceEvent | undefined) => {
@@ -362,63 +364,65 @@ export function ChatMessage({
         </div>
       )}
 
-      <div
-        className={cn(
-          "flex w-full",
-          isUser ? "justify-end" : "justify-start"
-        )}
-      >
+      {!isProcessOnlyMessage && (
         <div
           className={cn(
-            "flex gap-4 transition-all duration-300",
-            isUser
-              ? "max-w-[85%] bg-secondary text-secondary-foreground p-3 rounded-2xl flex-row-reverse items-center"
-              : "bg-transparent p-0 w-full max-w-full"
+            "flex w-full",
+            isUser ? "justify-end" : "justify-start"
           )}
         >
-          {/* Avatar */}
-          {!isUser && (
-            <div
-              className={cn(
-                "flex-shrink-0 w-10 h-10 rounded-xl flex items-center justify-center shadow-md bg-transparent"
-              )}
-            >
-              <Bot className="w-5 h-5 text-muted-foreground" />
-            </div>
-          )}
-
-          {/* Message content */}
-          <div className={cn("flex-1 min-w-0")}>
-            {!isUser && taskStatus === "failed" ? (
-              <div className="py-3 text-sm leading-relaxed text-red-500 break-words [overflow-wrap:anywhere]">
-                {failedMessageText}
+          <div
+            className={cn(
+              "flex gap-4 transition-all duration-300",
+              isUser
+                ? "max-w-[85%] bg-secondary text-secondary-foreground p-3 rounded-2xl flex-row-reverse items-center"
+                : "bg-transparent p-0 w-full max-w-full"
+            )}
+          >
+            {/* Avatar */}
+            {!isUser && (
+              <div
+                className={cn(
+                  "flex-shrink-0 w-10 h-10 rounded-xl flex items-center justify-center shadow-md bg-transparent"
+                )}
+              >
+                <Bot className="w-5 h-5 text-muted-foreground" />
               </div>
-            ) : content ? (
-              typeof content === "string" ? (
-                isUser ? (
-                  <ExpandableMessage content={content} />
+            )}
+
+            {/* Message content */}
+            <div className={cn("flex-1 min-w-0")}>
+              {!isUser && taskStatus === "failed" ? (
+                <div className="py-3 text-sm leading-relaxed text-red-500 break-words [overflow-wrap:anywhere]">
+                  {failedMessageText}
+                </div>
+              ) : content ? (
+                typeof content === "string" ? (
+                  isUser ? (
+                    <ExpandableMessage content={content} />
+                  ) : (
+                    <MarkdownRenderer
+                      content={content}
+                      className="prose-sm pt-2 leading-relaxed break-words [overflow-wrap:anywhere]"
+                      onAgentClick={handleAgentClick}
+                      onFileClick={handleFileClick}
+                    />
+                  )
                 ) : (
-                  <MarkdownRenderer
-                    content={content}
-                    className="prose-sm pt-2 leading-relaxed break-words [overflow-wrap:anywhere]"
-                    onAgentClick={handleAgentClick}
-                    onFileClick={handleFileClick}
-                  />
+                  <div className="text-sm leading-relaxed break-words [overflow-wrap:anywhere]">{content}</div>
                 )
               ) : (
-                <div className="text-sm leading-relaxed break-words [overflow-wrap:anywhere]">{content}</div>
-              )
-            ) : (
-              !isUser && showEmptyStatus && <GeneratingIndicator latestTitle={latestTitle} taskStatus={taskStatus} errorMessage={errorMessage} />
-            )}
-            {!isUser && interactions && interactions.length > 0 && (
-              <div className="mt-4 border-t pt-4">
-                <ClarificationForm interactions={interactions} active={interactionsActive} onSend={onSendInteraction} />
-              </div>
-            )}
+                !isUser && showEmptyStatus && <GeneratingIndicator latestTitle={latestTitle} taskStatus={taskStatus} errorMessage={errorMessage} />
+              )}
+              {!isUser && interactions && interactions.length > 0 && (
+                <div className="mt-4 border-t pt-4">
+                  <ClarificationForm interactions={interactions} active={interactionsActive} onSend={onSendInteraction} />
+                </div>
+              )}
+            </div>
           </div>
         </div>
-      </div>
+      )}
 
       {/* Action Row */}
       {copyableContent && (

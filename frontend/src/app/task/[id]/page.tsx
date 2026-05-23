@@ -20,6 +20,31 @@ import dagre from "dagre"
 import { CenterPanel } from "@/components/layout/center-panel"
 import { FilePreviewActionButtons } from "@/components/file/file-preview-action-buttons"
 
+const toTimelineTime = (ts: unknown): number => {
+  let time: number;
+  if (typeof ts === 'number') {
+    time = ts;
+  } else {
+    const n = Number(ts);
+    if (!isNaN(n)) {
+      time = n;
+    } else if (typeof ts === 'string' || ts instanceof Date) {
+      time = new Date(ts).getTime();
+    } else {
+      time = Number.NaN;
+    }
+  }
+
+  if (!Number.isFinite(time)) {
+    return 0;
+  }
+
+  if (time < 100000000000) {
+    return time * 1000;
+  }
+  return time;
+};
+
 function TaskDetailContent() {
   const { state, sendMessage, setTaskId, openFilePreview, closeFilePreview, requestStatus, dispatch, pauseTask, resumeTask } = useApp();
   const { t } = useI18n();
@@ -165,37 +190,19 @@ function TaskDetailContent() {
     isStreamingFinalAnswer?: boolean;
     traceEvents?: any[];
     interactions?: any[];
+    showEmptyStatus?: boolean;
   };
-  const combinedItems: CombinedItem[] = useMemo(() => {
-    const toTime = (ts: any): number => {
-      let time: number;
-      if (typeof ts === 'number') {
-        time = ts;
-      } else {
-        const n = Number(ts);
-        if (!isNaN(n)) {
-          time = n;
-        } else {
-          time = new Date(ts).getTime();
-        }
-      }
-
-      if (time < 100000000000) {
-        return time * 1000;
-      }
-      return time;
-    };
-
-    const msgItems: CombinedItem[] = state.messages
+  const messageItems: CombinedItem[] = useMemo(() => {
+    const items: CombinedItem[] = state.messages
       .filter((m) => m.role === 'user' || m.isResult)
       .map((m) => {
-        const id = m.id || `${m.role}-${toTime(m.timestamp)}`;
+        const id = m.id || `${m.role}-${toTimelineTime(m.timestamp)}`;
         return {
           id,
           role: m.role,
           content: m.content,
           rawContent: m.rawContent,
-          timestamp: toTime(m.timestamp),
+          timestamp: toTimelineTime(m.timestamp),
           status: m.status,
           isStreamingFinalAnswer: isStreamingFinalAnswerMessage({
             id,
@@ -207,10 +214,117 @@ function TaskDetailContent() {
         };
       });
 
-    const merged = msgItems;
-    merged.sort((a, b) => a.timestamp - b.timestamp);
-    return merged;
+    items.sort((a, b) => a.timestamp - b.timestamp);
+    return items;
   }, [state.messages]);
+
+  const lastMessageItem = messageItems[messageItems.length - 1];
+  const hasFinalAssistantMessage =
+    !!lastMessageItem &&
+    lastMessageItem.role === "assistant" &&
+    !(
+      lastMessageItem.isStreamingFinalAnswer &&
+      lastMessageItem.status === "failed"
+    );
+
+  const timelineItems: CombinedItem[] = useMemo(() => {
+    const items: CombinedItem[] = messageItems.map((item) => ({
+      ...item,
+      traceEvents: undefined,
+    }));
+    type TimelineProcessEvent = {
+      event_id?: string;
+      event_type?: string;
+      timestamp?: unknown;
+      [key: string]: unknown;
+    };
+    const processEventsById = new Map<string, TimelineProcessEvent>();
+    const addProcessEvent = (event: unknown, fallbackKey: string) => {
+      if (!event || typeof event !== 'object') {
+        return;
+      }
+      const processEvent = event as TimelineProcessEvent;
+      const eventKey =
+        typeof processEvent.event_id === 'string' && processEvent.event_id
+          ? processEvent.event_id
+          : fallbackKey;
+      if (!processEventsById.has(eventKey)) {
+        processEventsById.set(eventKey, processEvent);
+      }
+    };
+
+    if (Array.isArray(state.traceEvents)) {
+      state.traceEvents.forEach((event, index) => {
+        addProcessEvent(event, `state-${index}`);
+      });
+    }
+    messageItems.forEach((item) => {
+      item.traceEvents?.forEach((event, index) => {
+        addProcessEvent(event, `${item.id}-${index}`);
+      });
+    });
+
+    const processEvents = Array.from(processEventsById.values());
+    if (processEvents.length === 0) {
+      return items;
+    }
+
+    const sortedMessages = [...messageItems].sort((a, b) => a.timestamp - b.timestamp);
+    const processGroups = new Map<number, TimelineProcessEvent[]>();
+
+    processEvents.forEach((event) => {
+      const eventTime = toTimelineTime(event?.timestamp);
+      let groupIndex = 0;
+      while (
+        groupIndex < sortedMessages.length &&
+        sortedMessages[groupIndex].timestamp <= eventTime
+      ) {
+        groupIndex += 1;
+      }
+
+      const group = processGroups.get(groupIndex) || [];
+      group.push(event);
+      processGroups.set(groupIndex, group);
+    });
+
+    const groupEntries = Array.from(processGroups.entries()).sort((a, b) => a[0] - b[0]);
+    const latestGroupIndex = groupEntries.length > 0
+      ? groupEntries[groupEntries.length - 1][0]
+      : -1;
+
+    groupEntries.forEach(([groupIndex, events]) => {
+      if (events.length === 0) {
+        return;
+      }
+
+      const groupTimestamp = Math.min(
+        ...events.map((event) => toTimelineTime(event?.timestamp))
+      );
+      const firstEvent = events[0];
+      const shouldShowEmptyStatus =
+        !hasFinalAssistantMessage &&
+        groupIndex === latestGroupIndex &&
+        groupIndex >= sortedMessages.length;
+
+      items.push({
+        id: `process-${groupIndex}-${firstEvent?.event_id || groupTimestamp}`,
+        role: "assistant",
+        content: null,
+        timestamp: groupTimestamp,
+        traceEvents: events,
+        showEmptyStatus: shouldShowEmptyStatus,
+      });
+    });
+
+    items.sort((a, b) => a.timestamp - b.timestamp);
+    return items;
+  }, [
+    hasFinalAssistantMessage,
+    messageItems,
+    state.currentTask?.status,
+    state.isProcessing,
+    state.traceEvents,
+  ]);
 
   const waitingPrompt = useMemo(() => {
     if (state.currentTask?.status !== 'waiting_for_user') {
@@ -281,8 +395,8 @@ function TaskDetailContent() {
 
     if (waitingPrompt) {
       const normalizedPrompt = waitingPrompt.trim();
-      for (let i = combinedItems.length - 1; i >= 0; i--) {
-        const item = combinedItems[i];
+      for (let i = messageItems.length - 1; i >= 0; i--) {
+        const item = messageItems[i];
         if (
           item.role === 'assistant' &&
           typeof item.content === 'string' &&
@@ -293,15 +407,15 @@ function TaskDetailContent() {
       }
     }
 
-    for (let i = combinedItems.length - 1; i >= 0; i--) {
-      const item = combinedItems[i];
+    for (let i = messageItems.length - 1; i >= 0; i--) {
+      const item = messageItems[i];
       if (item.role === 'assistant' && item.interactions && item.interactions.length > 0) {
         return item.id;
       }
     }
 
     return null;
-  }, [combinedItems, state.currentTask?.status, waitingPrompt]);
+  }, [messageItems, state.currentTask?.status, waitingPrompt]);
 
   // DAG node and edge calculation
   const dagreGraph = new dagre.graphlib.Graph();
@@ -414,15 +528,6 @@ function TaskDetailContent() {
     });
   }
 
-  const lastCombinedItem = combinedItems[combinedItems.length - 1];
-  const hasFinalAssistantMessage =
-    !!lastCombinedItem &&
-    lastCombinedItem.role === "assistant" &&
-    !(
-      lastCombinedItem.isStreamingFinalAnswer &&
-      lastCombinedItem.status === "failed"
-    );
-
   const isPlanning = dagNodes.length === 0 && state.dagExecution?.phase === "planning";
   const hasError = dagNodes.length === 0 && (state.dagExecution?.phase === "failed" || state.currentTask?.status === "failed");
 
@@ -462,7 +567,7 @@ function TaskDetailContent() {
         <div className="flex-1 overflow-y-auto">
           <main className={`container max-w-4xl mx-auto px-4 py-8 relative z-0 transition-all`}>
             <div className="space-y-6 pb-4">
-              {state.isHistoryLoading && combinedItems.length === 0 ? (
+              {state.isHistoryLoading && timelineItems.length === 0 ? (
                 <div className="flex flex-col items-center justify-center min-h-[60vh] py-16 text-center">
                   <div className="relative mb-6">
                     <div className="w-16 h-16 rounded-2xl bg-muted/30 flex items-center justify-center animate-pulse">
@@ -475,7 +580,7 @@ function TaskDetailContent() {
                 </div>
               ) : (
                 <>
-                  {combinedItems.map((item) => {
+                  {timelineItems.map((item) => {
                     const isFailedFinalAnswerStream =
                       item.isStreamingFinalAnswer && item.status === "failed";
                     return (
@@ -492,11 +597,12 @@ function TaskDetailContent() {
                         timestamp={item.timestamp}
                         interactions={item.interactions}
                         interactionsActive={item.id === activeWaitingMessageId}
+                        showEmptyStatus={item.showEmptyStatus}
                       />
                     );
                   })}
 
-                  {(state.isProcessing || (state.traceEvents?.length || 0) > 0 || state.currentTask?.status === 'paused' || state.currentTask?.status === 'waiting_for_user' || state.currentTask?.status === 'failed') && !hasFinalAssistantMessage && (
+                  {(state.isProcessing || state.currentTask?.status === 'paused' || state.currentTask?.status === 'waiting_for_user' || state.currentTask?.status === 'failed') && !hasFinalAssistantMessage && !timelineItems.some((item) => item.showEmptyStatus) && (
                     <ChatMessage
                       role="assistant"
                       content={

@@ -70,6 +70,7 @@ export interface ChatMessageProps {
   timestamp?: number | string;
   interactions?: any[];
   interactionsActive?: boolean;
+  showEmptyStatus?: boolean;
   onSendInteraction?: (message: string, files?: File[], metadata?: any) => Promise<void> | void;
 }
 
@@ -275,6 +276,7 @@ export function ChatMessage({
   timestamp,
   interactions,
   interactionsActive = true,
+  showEmptyStatus = true,
   onSendInteraction,
 }: ChatMessageProps) {
   const { t } = useI18n();
@@ -407,7 +409,7 @@ export function ChatMessage({
                 <div className="text-sm leading-relaxed break-words [overflow-wrap:anywhere]">{content}</div>
               )
             ) : (
-              !isUser && <GeneratingIndicator latestTitle={latestTitle} taskStatus={taskStatus} errorMessage={errorMessage} />
+              !isUser && showEmptyStatus && <GeneratingIndicator latestTitle={latestTitle} taskStatus={taskStatus} errorMessage={errorMessage} />
             )}
             {!isUser && interactions && interactions.length > 0 && (
               <div className="mt-4 border-t pt-4">

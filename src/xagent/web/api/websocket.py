@@ -31,6 +31,7 @@ from ...config import (
     get_external_upload_dirs,
     get_uploads_dir,
 )
+from ...core.agent.checkpoint import CHECKPOINT_EVENT_TYPE
 from ...core.agent.trace import TraceEvent, TraceHandler, trace_user_message
 from ...core.file_ref import FILE_REF_MODEL_INSTRUCTIONS, build_file_ref
 from ..auth_dependencies import get_user_from_websocket_token
@@ -66,6 +67,14 @@ from ..user_isolated_memory import UserContext
 from ..utils.db_timezone import safe_timestamp_to_unix
 
 logger = logging.getLogger(__name__)
+
+CHECKPOINT_EVENT_TYPE_NAME = str(CHECKPOINT_EVENT_TYPE)
+
+
+def _task_status_uses_live_control(status: TaskStatus) -> bool:
+    """Return True when a user message should be delivered to an active run."""
+
+    return status in {TaskStatus.WAITING_FOR_USER, TaskStatus.RUNNING}
 
 
 def _resolve_task_llm_ids(
@@ -2310,19 +2319,16 @@ async def handle_chat_message(
                 # ``TaskTurnOrchestrator.begin_turn`` as part of the atomic
                 # transition (claim + persist + schedule commit together).
 
-                # Check if there's an old task running (PAUSED, WAITING_FOR_USER, or RUNNING status)
-                # If so, use continuation mechanism; otherwise execute normally
-                # Only use continuation when task is active and has old task
-                task_is_running = task.status in [
-                    TaskStatus.PAUSED,
-                    TaskStatus.WAITING_FOR_USER,
-                    TaskStatus.RUNNING,
-                ]
+                # Messages to an actively executing task are control-plane
+                # input. A PAUSED task plus a fresh user message is a new
+                # turn on the same task/thread; only an explicit resume event
+                # should continue the paused checkpoint.
+                task_uses_live_control = _task_status_uses_live_control(task.status)
                 agent_service = None
                 dag_pattern = None
                 supports_live_control = False
                 has_continuation = False
-                if task_is_running:
+                if task_uses_live_control:
                     agent_service = await get_agent_manager().get_agent_for_task(
                         task_id, db, user=user
                     )
@@ -2342,7 +2348,11 @@ async def handle_chat_message(
                         dag_pattern and hasattr(dag_pattern, "request_continuation")
                     )
 
-                if task_is_running and has_continuation and not supports_live_control:
+                if (
+                    task_uses_live_control
+                    and has_continuation
+                    and not supports_live_control
+                ):
                     # Use continuation: old task will handle at appropriate time
                     logger.info(f"Using continuation for running task {task_id}")
                     assert dag_pattern is not None  # for mypy type checking
@@ -2429,7 +2439,7 @@ async def handle_chat_message(
 
                     # Continuation will be handled by old task, return directly
                     return
-                if task_is_running and supports_live_control:
+                if task_uses_live_control and supports_live_control:
                     logger.info(f"Using agent message control for task {task_id}")
                     assert agent_service is not None
                     # Pass the user-typed bubble text + display-safe file refs
@@ -2472,7 +2482,7 @@ async def handle_chat_message(
                     background_task_manager.register_task(task_id, bg_task)
 
                     return
-                elif task_is_running and not has_continuation:
+                elif task_uses_live_control and not has_continuation:
                     # Task is running but doesn't support continuation (shouldn't happen)
                     logger.error(
                         f"Task {task_id} is running but does not support continuation"
@@ -2486,7 +2496,7 @@ async def handle_chat_message(
                     )
                     return
                 else:
-                    # New task (PENDING/COMPLETED/FAILED), execute normally
+                    # New task/turn (PENDING/COMPLETED/FAILED/PAUSED), execute normally
                     logger.info(
                         f"Task {task_id} starting new execution turn (status: {task.status.value})"
                     )
@@ -2587,14 +2597,15 @@ async def handle_chat_message(
                         execution_message=user_message_for_llm,
                         attachments=persisted_attachments or None,
                     )
-                    # WS path only has two legal entries into begin_turn:
+                    # WS path has these legal entries into begin_turn:
                     #   PENDING                  → CREATE
                     #   COMPLETED / FAILED       → APPEND
-                    # PAUSED / WAITING_FOR_USER / RUNNING should have been
-                    # intercepted by the continuation path above. Reaching
-                    # this branch with any of them is an upstream-dispatch
-                    # bug; surface it as an agent_error rather than
-                    # silently letting begin_turn 409 on the wrong status.
+                    #   PAUSED + user message    → APPEND (new turn)
+                    # WAITING_FOR_USER / RUNNING should have been intercepted
+                    # by the live-control path above. Reaching this branch
+                    # with either is an upstream-dispatch bug; surface it as
+                    # an agent_error rather than silently letting begin_turn
+                    # 409 on the wrong status.
                     if task.status == TaskStatus.PENDING:
                         turn_kind = TurnKind.CREATE
                         turn_force_fresh = False
@@ -2604,12 +2615,15 @@ async def handle_chat_message(
                     ):
                         turn_kind = TurnKind.APPEND
                         turn_force_fresh = False
+                    elif task.status == TaskStatus.PAUSED:
+                        turn_kind = TurnKind.APPEND
+                        turn_force_fresh = False
                     else:
                         logger.error(
                             f"WS schedule reached for task {task_id} with "
                             f"unexpected status={task.status}; expected "
-                            "PENDING or terminal. Continuation path should "
-                            "have intercepted."
+                            "PENDING, PAUSED, or terminal. Live-control path "
+                            "should have intercepted."
                         )
                         await manager.broadcast_to_task(
                             {
@@ -3037,6 +3051,11 @@ async def send_historical_data_as_stream(
                 .filter(
                     TraceEvent.task_id == task_id,
                     TraceEvent.build_id.is_(None),  # ← Only get VIBE events
+                    # Agent checkpoints are persisted as trace rows for
+                    # resume/recovery, but they are internal snapshots and can
+                    # be megabytes each. Filtering them in SQL avoids loading
+                    # hundreds of large JSON blobs just to discard them below.
+                    TraceEvent.event_type != CHECKPOINT_EVENT_TYPE_NAME,
                 )
                 .order_by(TraceEvent.timestamp)
                 .all()

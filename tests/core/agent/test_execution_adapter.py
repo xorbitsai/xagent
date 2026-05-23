@@ -89,6 +89,22 @@ class FakeTool:
         self.teardown_calls.append(task_id)
 
 
+class StartHandle:
+    task = None
+
+    def to_dict(self) -> dict[str, Any]:
+        return {"status": "running"}
+
+
+class RecordingRegistry:
+    def __init__(self) -> None:
+        self.start_kwargs: dict[str, Any] | None = None
+
+    def start(self, *args: Any, **kwargs: Any) -> StartHandle:
+        self.start_kwargs = dict(kwargs)
+        return StartHandle()
+
+
 class NoSkillManager:
     async def select_skill(self, **_: Any) -> None:
         return None
@@ -152,6 +168,26 @@ def dag_completion(answer: str = "dag done") -> dict[str, Any]:
             }
         ]
     }
+
+
+def test_execution_adapter_uses_service_id_as_runner_workspace_id() -> None:
+    registry = RecordingRegistry()
+    adapter = AgentExecutionAdapter(
+        AgentExecutionConfig(
+            name="web-task",
+            pattern="react",
+            llm=FakeLLM(["unused"]),
+            service_id="web_task_458",
+            registry=cast(Any, registry),
+            skill_manager=NoSkillManager(),
+        )
+    )
+
+    adapter.start(task="Generate a file", task_id="458")
+
+    assert registry.start_kwargs is not None
+    assert registry.start_kwargs["execution_id"] == "458"
+    assert registry.start_kwargs["workspace_id"] == "web_task_458"
 
 
 @pytest.mark.asyncio

@@ -230,6 +230,49 @@ async def test_begin_turn_append_clears_stale_error_message(
 
 
 @pytest.mark.asyncio
+async def test_begin_turn_append_accepts_paused_task_as_new_turn(
+    db_session,
+    mock_schedule_bg,
+) -> None:
+    """A message sent after pause starts the next turn, not a checkpoint resume."""
+    user = _create_user(db_session)
+    task = _create_task(
+        db_session,
+        user.id,
+        status=TaskStatus.PAUSED,
+        input_="previous request",
+        output="stale partial output",
+        error_message="stale pause detail",
+    )
+
+    payload = TaskTurnPayload("new request after pause")
+    await TaskTurnOrchestrator.begin_turn(
+        task=task,
+        payload=payload,
+        user=user,
+        db=db_session,
+        kind=TurnKind.APPEND,
+        force_fresh=False,
+    )
+
+    db_session.refresh(task)
+    assert task.status == TaskStatus.RUNNING
+    assert task.input == "new request after pause"
+    assert task.output is None
+    assert task.error_message is None
+
+    persisted = (
+        db_session.query(TaskChatMessage)
+        .filter(TaskChatMessage.task_id == int(task.id), TaskChatMessage.role == "user")
+        .one()
+    )
+    assert persisted.content == "new request after pause"
+    assert persisted.turn_id == payload.turn_id
+
+    mock_schedule_bg.assert_awaited_once()
+
+
+@pytest.mark.asyncio
 async def test_begin_turn_passes_force_fresh_through_to_schedule_bg(
     db_session,
     mock_schedule_bg,

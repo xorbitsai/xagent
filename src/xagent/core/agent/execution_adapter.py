@@ -81,6 +81,7 @@ class AgentExecutionAdapter:
                 "request_context": dict(context or {}),
                 "selected_skill_context": self.config.recovered_skill_context,
             },
+            workspace_id=self._workspace_id(execution_id),
             allowed_external_dirs=self.config.allowed_external_dirs,
             initial_messages=self._initial_messages(),
         )
@@ -118,6 +119,7 @@ class AgentExecutionAdapter:
                 "request_context": dict(context or {}),
                 "selected_skill_context": self.config.recovered_skill_context,
             },
+            workspace_id=self._workspace_id(execution_id),
             allowed_external_dirs=self.config.allowed_external_dirs,
             initial_messages=self._initial_messages(),
         )
@@ -127,6 +129,7 @@ class AgentExecutionAdapter:
         return self.registry.pause(execution_id, reason=reason)
 
     async def resume(self, execution_id: str, **kwargs: Any) -> dict[str, Any] | None:
+        kwargs.setdefault("workspace_id", self._workspace_id(execution_id))
         handle = self.registry.get(execution_id)
         if handle is None:
             runner, execution_type = self._build_runner()
@@ -192,6 +195,11 @@ class AgentExecutionAdapter:
 
     def list_statuses(self) -> list[dict[str, Any]]:
         return self.registry.list_statuses()
+
+    def _workspace_id(self, execution_id: str) -> str:
+        return str(
+            self.config.service_id or self.config.current_task_id or execution_id
+        )
 
     def _build_runner(self) -> tuple[AgentRunner, str]:
         pattern, execution_type = self._build_pattern()

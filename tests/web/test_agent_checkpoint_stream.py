@@ -520,6 +520,78 @@ async def test_historical_replay_skips_audit_only_trace_events(monkeypatch) -> N
 
 
 @pytest.mark.asyncio
+async def test_historical_replay_skips_checkpoint_rows_before_streaming(
+    monkeypatch,
+) -> None:
+    SessionLocal, db, task = _create_trace_handler_test_task("checkpoint-history")
+    try:
+        task_id = int(task.id)
+        user_id = int(task.user_id)
+        base_time = datetime(2026, 5, 22, tzinfo=timezone.utc)
+        db.add_all(
+            [
+                DatabaseTraceEvent(
+                    task_id=task_id,
+                    event_id="checkpoint-row",
+                    event_type=str(CHECKPOINT_EVENT_TYPE),
+                    timestamp=base_time + timedelta(seconds=1),
+                    data={
+                        "checkpoint_type": CHECKPOINT_TYPE,
+                        "execution_id": str(task_id),
+                        "snapshot": {"context": {"messages": ["large"]}},
+                    },
+                ),
+                DatabaseTraceEvent(
+                    task_id=task_id,
+                    event_id="llm-row",
+                    event_type="llm_call_start",
+                    timestamp=base_time + timedelta(seconds=2),
+                    data={"model_name": "test-model"},
+                ),
+            ]
+        )
+        db.commit()
+    finally:
+        db.close()
+
+    def get_test_db() -> Iterator[Session]:
+        session = SessionLocal()
+        try:
+            yield session
+        finally:
+            session.close()
+
+    sent_events: list[dict] = []
+
+    async def send_personal_message(event: dict, websocket: object) -> None:
+        sent_events.append(event)
+
+    monkeypatch.setattr("xagent.web.models.database.get_db", get_test_db)
+    monkeypatch.setattr("xagent.web.api.websocket.cache_get", lambda *args: None)
+    monkeypatch.setattr(
+        "xagent.web.api.websocket.cache_set", lambda *args, **kwargs: None
+    )
+    monkeypatch.setattr(
+        "xagent.web.api.websocket.manager.send_personal_message",
+        send_personal_message,
+    )
+
+    await send_historical_data_as_stream(
+        websocket=object(),
+        task_id=task_id,
+        user=SimpleNamespace(id=user_id, is_admin=False),
+    )
+
+    streamed_event_ids = {
+        event.get("event_id")
+        for event in sent_events
+        if event.get("type") == "trace_event"
+    }
+    assert "checkpoint-row" not in streamed_event_ids
+    assert "llm-row" in streamed_event_ids
+
+
+@pytest.mark.asyncio
 async def test_historical_replay_uses_turn_id_before_legacy_content_dedupe(
     monkeypatch,
 ) -> None:

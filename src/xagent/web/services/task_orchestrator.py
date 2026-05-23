@@ -65,12 +65,15 @@ from .task_lease_service import (
 logger = logging.getLogger(__name__)
 
 
-# Terminal statuses for the "is the previous turn finished?" check. A
-# task in any of these is eligible for ``TurnKind.APPEND``. PENDING and
-# RUNNING both signal "previous turn not done yet" → 409 busy. PAUSED
-# is intentionally excluded for now (semantics unclear; revisit when
-# pause/resume becomes a first-class SDK feature).
-_TERMINAL_STATUSES = (TaskStatus.COMPLETED, TaskStatus.FAILED)
+# Statuses for the "can a user message start the next turn?" check. A
+# task in any of these is eligible for ``TurnKind.APPEND``. PENDING is
+# claimed by ``CREATE``; RUNNING is still busy; WAITING_FOR_USER is an
+# answer to an explicit pending agent question and resumes that execution.
+_APPENDABLE_STATUSES = (
+    TaskStatus.COMPLETED,
+    TaskStatus.FAILED,
+    TaskStatus.PAUSED,
+)
 
 
 @dataclass(frozen=True)
@@ -130,7 +133,7 @@ class TurnKind(str, enum.Enum):
     """
 
     CREATE = "create"  # PENDING → RUNNING; new task's first turn
-    APPEND = "append"  # TERMINAL → RUNNING; new turn on an existing task
+    APPEND = "append"  # APPENDABLE → RUNNING; new turn on an existing task
 
 
 class TaskTurnError(Exception):
@@ -186,7 +189,7 @@ class TaskTurnOrchestrator:
              with filter:
 
              - ``kind == CREATE`` → ``status == PENDING``
-             - ``kind == APPEND`` → ``status IN TERMINAL_STATUSES``
+             - ``kind == APPEND`` → ``status IN APPENDABLE_STATUSES``
 
              rowcount 0 → ``TaskTurnError("busy")``.
           3. ``persist_user_message(payload.transcript_message)`` in the
@@ -278,7 +281,7 @@ class TaskTurnOrchestrator:
             if kind == TurnKind.CREATE:
                 status_filter = Task.status == TaskStatus.PENDING
             else:  # APPEND
-                status_filter = Task.status.in_(_TERMINAL_STATUSES)
+                status_filter = Task.status.in_(_APPENDABLE_STATUSES)
 
             claimed = (
                 db.query(Task)

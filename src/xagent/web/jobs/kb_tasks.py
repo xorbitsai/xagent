@@ -11,6 +11,7 @@ from sqlalchemy.orm import Session
 
 from ...core.tools.core.RAG_tools.core.schemas import (
     IngestionConfig,
+    IngestionResult,
     WebCrawlConfig,
 )
 from ...core.tools.core.RAG_tools.pipelines.document_ingestion import (
@@ -20,14 +21,15 @@ from ...core.tools.core.RAG_tools.pipelines.web_ingestion import (
     FileHandlerResult,
     run_web_ingestion,
 )
-from ...core.tools.core.RAG_tools.progress import get_progress_manager
 from ...core.tools.core.RAG_tools.utils.user_scope import user_scope_context
 from ..config import get_upload_path
 from ..models.background_job import BackgroundJob
 from ..models.database import get_session_local
 from ..models.uploaded_file import UploadedFile
+from ..models.user import User
 from ..services.background_jobs import update_job_progress
 from .exceptions import BackgroundJobHandlerError
+from .progress import BackgroundJobProgressManager
 
 logger = logging.getLogger(__name__)
 
@@ -36,6 +38,7 @@ def handle_kb_ingest_document(db: Session, job: BackgroundJob) -> dict[str, Any]
     payload = dict(job.payload or {})
     ingestion_config = IngestionConfig.model_validate(payload["ingestion_config"])
     file_id = payload.get("file_id")
+    progress_manager = BackgroundJobProgressManager(db, job)
 
     update_job_progress(db, job, message="Ingesting document")
     with user_scope_context(
@@ -46,7 +49,7 @@ def handle_kb_ingest_document(db: Session, job: BackgroundJob) -> dict[str, Any]
             collection=str(payload["collection"]),
             source_path=str(payload["source_path"]),
             ingestion_config=ingestion_config,
-            progress_manager=get_progress_manager(),
+            progress_manager=progress_manager,
             user_id=int(payload["user_id"]),
             is_admin=bool(payload.get("is_admin", False)),
             file_id=str(file_id) if file_id else None,
@@ -55,8 +58,14 @@ def handle_kb_ingest_document(db: Session, job: BackgroundJob) -> dict[str, Any]
     result_payload = result.model_dump(mode="json")
     if file_id:
         result_payload["file_id"] = file_id
-    if result.status == "error":
-        raise BackgroundJobHandlerError(result.message, result=result_payload)
+    if result.status in {"error", "partial"}:
+        _rollback_failed_document_ingestion(db, payload, result)
+        raise BackgroundJobHandlerError(
+            result.message,
+            result=result_payload,
+            retryable=False,
+        )
+    _discard_ingest_backup(payload)
     return result_payload
 
 
@@ -76,6 +85,7 @@ def handle_kb_ingest_web(db: Session, job: BackgroundJob) -> dict[str, Any]:
             message=message,
             completed=completed,
             total=total,
+            extra={"source": "web_ingestion"},
         )
 
     def _file_handler_with_db(
@@ -232,3 +242,79 @@ def _handle_web_file(
                         persistent_file,
                     )
             raise
+
+
+def _rollback_failed_document_ingestion(
+    db: Session,
+    payload: dict[str, Any],
+    result: IngestionResult,
+) -> None:
+    from ..api.kb import RollbackFailureError, _rollback_failed_ingestion
+
+    user_id = int(payload["user_id"])
+    user = db.query(User).filter(User.id == user_id).first()
+    if user is None:
+        raise BackgroundJobHandlerError(
+            f"Cannot roll back KB ingestion for missing user {user_id}",
+            result=result.model_dump(mode="json"),
+            retryable=False,
+        )
+
+    file_record = None
+    file_id = payload.get("file_id")
+    if file_id:
+        file_record = (
+            db.query(UploadedFile).filter(UploadedFile.file_id == str(file_id)).first()
+        )
+    if file_record is None:
+        file_record = (
+            db.query(UploadedFile)
+            .filter(UploadedFile.storage_path == str(payload["source_path"]))
+            .first()
+        )
+    if file_record is None:
+        raise BackgroundJobHandlerError(
+            f"Cannot roll back KB ingestion for missing file {payload.get('file_id')}",
+            result=result.model_dump(mode="json"),
+            retryable=False,
+        )
+
+    backup_path = payload.get("file_backup_path")
+    try:
+        asyncio.run(
+            _rollback_failed_ingestion(
+                db=db,
+                user=user,
+                collection_name=str(payload["collection"]),
+                result=result,
+                file_path=Path(str(payload["source_path"])),
+                file_record=file_record,
+                collection_existed_before=bool(
+                    payload.get("collection_existed_before", True)
+                ),
+                uploaded_file_existed_before=bool(
+                    payload.get("uploaded_file_existed_before", True)
+                ),
+                file_backup_path=Path(str(backup_path)) if backup_path else None,
+                had_existing_file=bool(payload.get("had_existing_file", True)),
+            )
+        )
+    except RollbackFailureError as exc:
+        raise BackgroundJobHandlerError(
+            str(exc),
+            result=result.model_dump(mode="json"),
+            retryable=False,
+        ) from exc
+
+
+def _discard_ingest_backup(payload: dict[str, Any]) -> None:
+    backup_path = payload.get("file_backup_path")
+    if not backup_path:
+        return
+    backup = Path(str(backup_path))
+    if not backup.exists():
+        return
+    try:
+        backup.unlink()
+    except OSError:
+        logger.warning("Failed to remove ingest backup %s", backup)

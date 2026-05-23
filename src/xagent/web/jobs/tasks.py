@@ -76,7 +76,7 @@ def execute_background_job(self: Any, job_id: str) -> dict[str, Any]:
             result = _execute_job_handler(db, job)
         except BackgroundJobHandlerError as exc:
             db.refresh(job)
-            if int(job.attempts or 0) < int(job.max_attempts or 1):
+            if exc.retryable and int(job.attempts or 0) < int(job.max_attempts or 1):
                 setattr(job, "status", BackgroundJobStatus.ENQUEUED.value)
                 setattr(job, "error_message", str(exc))
                 setattr(job, "result", exc.result)

@@ -107,7 +107,7 @@ from ..config import (
     is_allowed_file,
     sanitize_path_component,
 )
-from ..models.background_job import BackgroundJobType
+from ..models.background_job import BackgroundJob, BackgroundJobType
 from ..models.database import get_db, get_session_local
 from ..models.uploaded_file import UploadedFile
 from ..models.user import User
@@ -770,6 +770,13 @@ def _get_file_sha256(file_path: Path) -> str:
                 break
             hash_obj.update(chunk)
     return hash_obj.hexdigest()
+
+
+def _background_job_idempotency_key(namespace: str, payload: Dict[str, Any]) -> str:
+    """Build a bounded idempotency key from stable request payload fields."""
+    encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"), default=str)
+    digest = hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+    return f"{namespace}:{digest}"
 
 
 def _atomic_replace_file(source_path: Path, target_path: Path) -> None:
@@ -1771,34 +1778,74 @@ async def create_ingest_job(
 
     await _ensure_collection_access(safe_collection, _user, allow_create=True)
 
-    total_size = 0
-    file_read_buffer_size = 1024 * 1024
-    with open(file_path, "wb") as buffer:
-        while True:
-            chunk = await file.read(file_read_buffer_size)
-            if not chunk:
-                break
-            total_size += len(chunk)
-            if total_size > MAX_FILE_SIZE:
-                file_path.unlink(missing_ok=True)
-                raise HTTPException(
-                    status_code=413,
-                    detail=f"File size exceeds maximum limit of {MAX_FILE_SIZE_LABEL}",
-                )
-            buffer.write(chunk)
+    try:
+        get_collection_sync(safe_collection)
+        collection_existed_before = True
+    except ValueError:
+        collection_existed_before = False
+
+    existing_file_record = (
+        db.query(UploadedFile)
+        .filter(UploadedFile.storage_path == str(file_path))
+        .first()
+    )
+    uploaded_file_existed_before = existing_file_record is not None
+    had_existing_file = file_path.exists()
+    file_backup_path: Optional[Path] = None
+    if had_existing_file:
+        file_backup_path = file_path.with_name(
+            f"{file_path.name}.rollback-{uuid.uuid4().hex}"
+        )
+        shutil.copy2(file_path, file_backup_path)
+
+    try:
+        total_size = 0
+        file_read_buffer_size = 1024 * 1024
+        with open(file_path, "wb") as buffer:
+            while True:
+                chunk = await file.read(file_read_buffer_size)
+                if not chunk:
+                    break
+                total_size += len(chunk)
+                if total_size > MAX_FILE_SIZE:
+                    raise HTTPException(
+                        status_code=413,
+                        detail=(
+                            f"File size exceeds maximum limit of {MAX_FILE_SIZE_LABEL}"
+                        ),
+                    )
+                buffer.write(chunk)
+    except HTTPException:
+        try:
+            _restore_ingest_file_backup(
+                file_path=file_path,
+                backup_path=file_backup_path,
+                had_existing_file=had_existing_file,
+            )
+        except Exception as restore_exc:  # noqa: BLE001
+            raise RollbackFailureError(
+                "Failed to restore ingest file after async upload abort for "
+                f"{collection}/{file_path.name}: {restore_exc}"
+            ) from restore_exc
+        raise
+    except Exception as upload_exc:
+        try:
+            _restore_ingest_file_backup(
+                file_path=file_path,
+                backup_path=file_backup_path,
+                had_existing_file=had_existing_file,
+            )
+        except Exception as restore_exc:  # noqa: BLE001
+            raise RollbackFailureError(
+                "Failed to restore ingest file after async upload error for "
+                f"{collection}/{file_path.name}: {restore_exc}"
+            ) from restore_exc
+        raise upload_exc
 
     mime_type = (
         getattr(file, "content_type", None)
         or mimetypes.guess_type(safe_filename)[0]
         or "application/octet-stream"
-    )
-    file_record = _upsert_uploaded_file_record(
-        db,
-        user_id=int(_user.id),
-        filename=safe_filename,
-        storage_path=file_path,
-        mime_type=mime_type,
-        file_size=int(total_size),
     )
 
     final_chunk_size = chunk_size if chunk_size is not None and chunk_size > 0 else 1000
@@ -1831,6 +1878,30 @@ async def create_ingest_job(
         else 1.0,
     )
 
+    file_sha256 = _get_file_sha256(file_path)
+    idempotency_key = _background_job_idempotency_key(
+        "kb.ingest.document",
+        {
+            "collection": safe_collection,
+            "filename": safe_filename,
+            "file_sha256": file_sha256,
+            "ingestion_config": config.model_dump(mode="json"),
+            "user_id": int(_user.id),
+        },
+    )
+    existing_job = (
+        db.query(BackgroundJob)
+        .filter(BackgroundJob.idempotency_key == idempotency_key)
+        .first()
+    )
+    if existing_job is not None:
+        if file_backup_path is not None and file_backup_path.exists():
+            try:
+                file_backup_path.unlink()
+            except OSError:
+                logger.warning("Failed to remove ingest backup %s", file_backup_path)
+        return existing_job
+
     try:
         metadata_store = get_metadata_store()
         await metadata_store.save_collection_config(
@@ -1841,20 +1912,58 @@ async def create_ingest_job(
     except Exception as e:
         logger.warning("Failed to save collection config during async ingest: %s", e)
 
-    job = create_background_job(
-        db,
-        user_id=int(_user.id),
-        job_type=BackgroundJobType.KB_INGEST_DOCUMENT,
-        payload={
-            "collection": safe_collection,
-            "source_path": str(file_path),
-            "file_id": str(file_record.file_id),
-            "filename": safe_filename,
-            "user_id": int(_user.id),
-            "is_admin": bool(_user.is_admin),
-            "ingestion_config": config.model_dump(mode="json"),
-        },
-    )
+    file_record: Optional[UploadedFile] = None
+    try:
+        file_record = _upsert_uploaded_file_record(
+            db,
+            user_id=int(_user.id),
+            filename=safe_filename,
+            storage_path=file_path,
+            mime_type=mime_type,
+            file_size=int(total_size),
+        )
+
+        job = create_background_job(
+            db,
+            user_id=int(_user.id),
+            job_type=BackgroundJobType.KB_INGEST_DOCUMENT,
+            payload={
+                "collection": safe_collection,
+                "source_path": str(file_path),
+                "file_id": str(file_record.file_id),
+                "filename": safe_filename,
+                "user_id": int(_user.id),
+                "is_admin": bool(_user.is_admin),
+                "ingestion_config": config.model_dump(mode="json"),
+                "collection_existed_before": collection_existed_before,
+                "uploaded_file_existed_before": uploaded_file_existed_before,
+                "had_existing_file": had_existing_file,
+                "file_backup_path": str(file_backup_path)
+                if file_backup_path is not None
+                else None,
+            },
+            idempotency_key=idempotency_key,
+        )
+    except Exception:
+        if file_record is not None:
+            db.rollback()
+        try:
+            _restore_ingest_file_backup(
+                file_path=file_path,
+                backup_path=file_backup_path,
+                had_existing_file=had_existing_file,
+            )
+        except Exception as restore_exc:  # noqa: BLE001
+            raise RollbackFailureError(
+                "Failed to restore ingest file after async job setup error for "
+                f"{collection}/{file_path.name}: {restore_exc}"
+            ) from restore_exc
+        if not collection_existed_before:
+            await _cleanup_failed_new_collection_metadata(
+                collection_name=safe_collection,
+                user=_user,
+            )
+        raise
     return enqueue_background_job(db, job)
 
 
@@ -3169,6 +3278,23 @@ async def create_ingest_web_job(
         else 1.0,
     )
 
+    idempotency_key = _background_job_idempotency_key(
+        "kb.ingest.web",
+        {
+            "collection": safe_collection,
+            "crawl_config": crawl_config.model_dump(mode="json"),
+            "ingestion_config": ingestion_config.model_dump(mode="json"),
+            "user_id": int(_user.id),
+        },
+    )
+    existing_job = (
+        db.query(BackgroundJob)
+        .filter(BackgroundJob.idempotency_key == idempotency_key)
+        .first()
+    )
+    if existing_job is not None:
+        return existing_job
+
     try:
         metadata_store = get_metadata_store()
         await metadata_store.save_collection_config(
@@ -3192,6 +3318,7 @@ async def create_ingest_web_job(
             "user_id": int(_user.id),
             "is_admin": bool(_user.is_admin),
         },
+        idempotency_key=idempotency_key,
     )
     return enqueue_background_job(db, job)
 

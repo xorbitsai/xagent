@@ -9,6 +9,8 @@ import pytest
 from xagent.config import (
     AGENT_RUNTIME,
     BACKGROUND_JOB_MAX_RETRIES,
+    BACKGROUND_JOB_STALE_SECONDS,
+    BACKGROUND_JOB_SWEEP_INTERVAL_SECONDS,
     BACKGROUND_JOB_VISIBILITY_TIMEOUT_SECONDS,
     BOXLITE_HOME_DIR,
     CELERY_BROKER_URL,
@@ -49,6 +51,8 @@ from xagent.config import (
     get_agent_pattern_for_execution_mode,
     get_agent_runtime,
     get_background_job_max_retries,
+    get_background_job_stale_seconds,
+    get_background_job_sweep_interval_seconds,
     get_background_job_visibility_timeout_seconds,
     get_boxlite_home_dir,
     get_celery_broker_url,
@@ -182,6 +186,11 @@ class TestEnvironmentVariableConstants:
             == "XAGENT_BACKGROUND_JOB_VISIBILITY_TIMEOUT_SECONDS"
         )
         assert BACKGROUND_JOB_MAX_RETRIES == "XAGENT_BACKGROUND_JOB_MAX_RETRIES"
+        assert BACKGROUND_JOB_STALE_SECONDS == "XAGENT_BACKGROUND_JOB_STALE_SECONDS"
+        assert (
+            BACKGROUND_JOB_SWEEP_INTERVAL_SECONDS
+            == "XAGENT_BACKGROUND_JOB_SWEEP_INTERVAL_SECONDS"
+        )
 
 
 class TestHotPathCacheConfig:
@@ -248,8 +257,12 @@ class TestCeleryBackgroundJobConfig:
     def test_background_job_tuning_defaults(self, monkeypatch):
         monkeypatch.delenv(BACKGROUND_JOB_VISIBILITY_TIMEOUT_SECONDS, raising=False)
         monkeypatch.delenv(BACKGROUND_JOB_MAX_RETRIES, raising=False)
+        monkeypatch.delenv(BACKGROUND_JOB_STALE_SECONDS, raising=False)
+        monkeypatch.delenv(BACKGROUND_JOB_SWEEP_INTERVAL_SECONDS, raising=False)
         assert get_background_job_visibility_timeout_seconds() == 3600
         assert get_background_job_max_retries() == 3
+        assert get_background_job_stale_seconds() == 7200
+        assert get_background_job_sweep_interval_seconds() == 300
 
 
 class TestGetWebSearchProvider:

@@ -1,13 +1,15 @@
 from __future__ import annotations
 
 import logging
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
+from sqlalchemy import and_, or_
 from sqlalchemy.orm import Session
 
 from ...config import (
     get_background_job_max_retries,
+    get_background_job_stale_seconds,
     get_celery_broker_url,
     get_celery_enabled,
 )
@@ -160,6 +162,88 @@ def update_job_progress(
     db.commit()
     db.refresh(job)
     return job
+
+
+def requeue_stale_background_jobs(
+    db: Session,
+    *,
+    stale_after_seconds: int | None = None,
+    limit: int = 100,
+) -> list[BackgroundJob]:
+    """Requeue non-terminal jobs whose durable DB state is stale.
+
+    Redis/Celery can lose in-flight delivery state during broker loss or worker
+    crashes. The database row remains authoritative, so the scheduler can safely
+    put old pending/enqueued/running jobs back on the broker.
+    """
+    stale_seconds = stale_after_seconds or get_background_job_stale_seconds()
+    cutoff = datetime.now(timezone.utc) - timedelta(seconds=stale_seconds)
+    requeue_statuses = {
+        BackgroundJobStatus.PENDING.value,
+        BackgroundJobStatus.ENQUEUED.value,
+        BackgroundJobStatus.RUNNING.value,
+    }
+
+    stale_jobs = (
+        db.query(BackgroundJob)
+        .filter(BackgroundJob.status.in_(requeue_statuses))
+        .filter(
+            or_(
+                and_(
+                    BackgroundJob.status == BackgroundJobStatus.RUNNING.value,
+                    BackgroundJob.started_at.is_not(None),
+                    BackgroundJob.started_at <= cutoff,
+                ),
+                and_(
+                    BackgroundJob.status != BackgroundJobStatus.RUNNING.value,
+                    BackgroundJob.updated_at.is_not(None),
+                    BackgroundJob.updated_at <= cutoff,
+                ),
+                and_(
+                    BackgroundJob.updated_at.is_(None),
+                    BackgroundJob.created_at.is_not(None),
+                    BackgroundJob.created_at <= cutoff,
+                ),
+            )
+        )
+        .order_by(BackgroundJob.created_at.asc())
+        .limit(max(1, min(limit, 500)))
+        .all()
+    )
+
+    requeued: list[BackgroundJob] = []
+    for job in stale_jobs:
+        logger.warning(
+            "Requeueing stale background job %s type=%s status=%s",
+            job.id,
+            job.job_type,
+            job.status,
+        )
+        setattr(job, "status", BackgroundJobStatus.PENDING.value)
+        setattr(job, "celery_task_id", None)
+        setattr(job, "started_at", None)
+        setattr(job, "error_message", "Requeued stale background job")
+        setattr(
+            job,
+            "progress",
+            {"message": "Requeued stale background job", "completed": 0, "total": 1},
+        )
+        db.add(job)
+        db.commit()
+        db.refresh(job)
+
+        try:
+            requeued.append(enqueue_background_job(db, job))
+        except Exception as exc:  # noqa: BLE001
+            logger.exception("Failed to requeue stale background job %s", job.id)
+            setattr(job, "status", BackgroundJobStatus.PENDING.value)
+            setattr(job, "error_message", f"Failed to requeue stale job: {exc}")
+            db.add(job)
+            db.commit()
+            db.refresh(job)
+            requeued.append(job)
+
+    return requeued
 
 
 def mark_job_succeeded(

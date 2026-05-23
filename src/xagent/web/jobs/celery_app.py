@@ -5,6 +5,7 @@ from typing import Any
 from celery import Celery
 
 from ...config import (
+    get_background_job_sweep_interval_seconds,
     get_background_job_visibility_timeout_seconds,
     get_celery_broker_url,
     get_celery_result_backend,
@@ -20,6 +21,7 @@ def create_celery_app() -> Any:
 
     result_backend = get_celery_result_backend()
     visibility_timeout = get_background_job_visibility_timeout_seconds()
+    sweep_interval = get_background_job_sweep_interval_seconds()
     app = Celery("xagent", broker=broker_url, backend=result_backend)
     app.conf.update(
         broker_connection_retry_on_startup=True,
@@ -37,9 +39,9 @@ def create_celery_app() -> Any:
             },
         },
         beat_schedule={
-            "scan-due-triggers-every-minute": {
+            "scan-due-triggers-and-stale-jobs": {
                 "task": "xagent.web.jobs.trigger_tasks.scan_due_triggers",
-                "schedule": 60.0,
+                "schedule": float(sweep_interval),
             },
         },
         task_serializer="json",

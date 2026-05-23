@@ -71,6 +71,8 @@ BACKGROUND_JOB_VISIBILITY_TIMEOUT_SECONDS = (
     "XAGENT_BACKGROUND_JOB_VISIBILITY_TIMEOUT_SECONDS"
 )
 BACKGROUND_JOB_MAX_RETRIES = "XAGENT_BACKGROUND_JOB_MAX_RETRIES"
+BACKGROUND_JOB_STALE_SECONDS = "XAGENT_BACKGROUND_JOB_STALE_SECONDS"
+BACKGROUND_JOB_SWEEP_INTERVAL_SECONDS = "XAGENT_BACKGROUND_JOB_SWEEP_INTERVAL_SECONDS"
 
 TOOL_MAX_OUTPUT_LENGTH = "XAGENT_TOOL_MAX_OUTPUT_LENGTH"
 TOOL_MAX_RECURSION_DEPTH = "XAGENT_TOOL_MAX_RECURSION_DEPTH"
@@ -310,6 +312,20 @@ def get_background_job_visibility_timeout_seconds() -> int:
 def get_background_job_max_retries() -> int:
     """Return the default max attempts for durable background jobs."""
     return _get_positive_int_env(BACKGROUND_JOB_MAX_RETRIES, 3)
+
+
+def get_background_job_stale_seconds() -> int:
+    """Return the age after which non-terminal jobs should be requeued."""
+    return _get_positive_int_env(BACKGROUND_JOB_STALE_SECONDS, 7200, minimum=60)
+
+
+def get_background_job_sweep_interval_seconds() -> int:
+    """Return how often the scheduler scans for stale background jobs."""
+    return _get_positive_int_env(
+        BACKGROUND_JOB_SWEEP_INTERVAL_SECONDS,
+        300,
+        minimum=30,
+    )
 
 
 def get_web_dir() -> Path:

@@ -52,6 +52,7 @@ from ..utils.embedding_utils import (
     normalize_raw_embedding_to_vectors,
     normalize_single_embedding,
 )
+from ..utils.generation_lock import generation_ingestion_lock
 from ..utils.model_resolver import resolve_embedding_adapter
 from ..utils.token_utils import get_token_counter
 from ..utils.user_scope import resolve_user_scope
@@ -521,7 +522,31 @@ def process_document(
           inputs will reuse existing records when possible.
         - Downstream API layers should surface `result.failed_step` and
           `result.warnings` to callers for better observability.
+        - A per-generation lock (collection, doc_id, parse_hash, user scope)
+          serialises chunk replacement through embedding writes (PR #202).
     """
+    return _process_document_impl(
+        collection,
+        source_path,
+        config=config,
+        progress_manager=progress_manager,
+        user_id=user_id,
+        is_admin=is_admin,
+        file_id=file_id,
+    )
+
+
+def _process_document_impl(
+    collection: str,
+    source_path: str,
+    *,
+    config: Optional[IngestionConfig] = None,
+    progress_manager: Optional[ProgressManager] = None,
+    user_id: Optional[int] = None,
+    is_admin: bool = False,
+    file_id: Optional[str] = None,
+) -> IngestionResult:
+    """Internal implementation of process_document."""
     cfg = _apply_spreadsheet_ingestion_safeguards(
         coerce_ingestion_config(config),
         source_path,
@@ -785,445 +810,479 @@ def process_document(
             },
         )
 
-        # Step 3: Chunk document
-        with progress_tracker.track_step("chunk_document"):
-            pass  # Step marked
-        current_step = "chunk_document"
-        logger.info(
-            "Step chunk_document started",
-            extra={
-                "collection": collection,
-                "doc_id": doc_id,
-                "parse_hash": parse_hash,
-                "strategy": str(cfg.chunk_strategy),
-                "chunk_size": cfg.chunk_size,
-                "chunk_overlap": cfg.chunk_overlap,
-            },
-        )
-        chunk_start = time.time()
-        chunk_response = chunk_document(
-            collection=collection,
-            doc_id=doc_id,
-            parse_hash=parse_hash,
-            chunk_strategy=cfg.chunk_strategy,
-            chunk_size=cfg.chunk_size,
-            chunk_overlap=cfg.chunk_overlap,
-            headers_to_split_on=getattr(cfg, "headers_to_split_on", None),
-            separators=getattr(cfg, "separators", None),
-            use_token_count=getattr(cfg, "use_token_count", False),
-            tiktoken_encoding=getattr(
-                cfg, "tiktoken_encoding", DEFAULT_TIKTOKEN_ENCODING
-            ),
-            enable_protected_content=getattr(cfg, "enable_protected_content", True),
-            protected_patterns=getattr(cfg, "protected_patterns", None),
-            table_context_size=getattr(
-                cfg, "table_context_size", DEFAULT_TABLE_CONTEXT_SIZE
-            ),
-            image_context_size=getattr(
-                cfg, "image_context_size", DEFAULT_IMAGE_CONTEXT_SIZE
-            ),
-            user_id=user_id,
-        )
-        chunk_count = int(chunk_response.get("chunk_count", 0))
-        chunk_elapsed = int((time.time() - chunk_start) * 1000)
-        completed_steps.append(
-            IngestionStepResult(
-                name="chunk_document",
-                metadata={
+        last_write_response: Optional[EmbeddingWriteResponse] = None
+        generation_early_result: Optional[IngestionResult] = None
+
+        def _run_chunk_and_embedding_steps() -> None:
+            nonlocal current_step, chunk_count, embedding_count, vector_count
+            nonlocal \
+                completed_steps, \
+                warnings, \
+                last_write_response, \
+                generation_early_result
+
+            # Step 3: Chunk document
+            with progress_tracker.track_step("chunk_document"):
+                pass  # Step marked
+            current_step = "chunk_document"
+            logger.info(
+                "Step chunk_document started",
+                extra={
+                    "collection": collection,
+                    "doc_id": doc_id,
+                    "parse_hash": parse_hash,
+                    "strategy": str(cfg.chunk_strategy),
+                    "chunk_size": cfg.chunk_size,
+                    "chunk_overlap": cfg.chunk_overlap,
+                },
+            )
+            chunk_start = time.time()
+            chunk_response = chunk_document(
+                collection=collection,
+                doc_id=doc_id,
+                parse_hash=parse_hash,
+                chunk_strategy=cfg.chunk_strategy,
+                chunk_size=cfg.chunk_size,
+                chunk_overlap=cfg.chunk_overlap,
+                headers_to_split_on=getattr(cfg, "headers_to_split_on", None),
+                separators=getattr(cfg, "separators", None),
+                use_token_count=getattr(cfg, "use_token_count", False),
+                tiktoken_encoding=getattr(
+                    cfg, "tiktoken_encoding", DEFAULT_TIKTOKEN_ENCODING
+                ),
+                enable_protected_content=getattr(cfg, "enable_protected_content", True),
+                protected_patterns=getattr(cfg, "protected_patterns", None),
+                table_context_size=getattr(
+                    cfg, "table_context_size", DEFAULT_TABLE_CONTEXT_SIZE
+                ),
+                image_context_size=getattr(
+                    cfg, "image_context_size", DEFAULT_IMAGE_CONTEXT_SIZE
+                ),
+                user_id=user_id,
+            )
+            chunk_count = int(chunk_response.get("chunk_count", 0))
+            chunk_elapsed = int((time.time() - chunk_start) * 1000)
+            completed_steps.append(
+                IngestionStepResult(
+                    name="chunk_document",
+                    metadata={
+                        "chunk_count": chunk_count,
+                        "created": chunk_response.get("created"),
+                        "elapsed_ms": chunk_elapsed,
+                    },
+                )
+            )
+            logger.info(
+                "[RAG][chunk] step=chunk_document completed doc_id=%s chunk_count=%s "
+                "stats=%s config_hash_fields chunk_size=%s overlap=%s use_token_count=%s "
+                "protected=%s",
+                doc_id,
+                chunk_count,
+                chunk_response.get("stats"),
+                cfg.chunk_size,
+                cfg.chunk_overlap,
+                getattr(cfg, "use_token_count", False),
+                getattr(cfg, "enable_protected_content", True),
+            )
+            logger.info(
+                "Step chunk_document completed",
+                extra={
+                    "collection": collection,
+                    "doc_id": doc_id,
+                    "parse_hash": parse_hash,
                     "chunk_count": chunk_count,
-                    "created": chunk_response.get("created"),
                     "elapsed_ms": chunk_elapsed,
                 },
             )
-        )
-        logger.info(
-            "[RAG][chunk] step=chunk_document completed doc_id=%s chunk_count=%s "
-            "stats=%s config_hash_fields chunk_size=%s overlap=%s use_token_count=%s "
-            "protected=%s",
-            doc_id,
-            chunk_count,
-            chunk_response.get("stats"),
-            cfg.chunk_size,
-            cfg.chunk_overlap,
-            getattr(cfg, "use_token_count", False),
-            getattr(cfg, "enable_protected_content", True),
-        )
-        logger.info(
-            "Step chunk_document completed",
-            extra={
-                "collection": collection,
-                "doc_id": doc_id,
-                "parse_hash": parse_hash,
-                "chunk_count": chunk_count,
-                "elapsed_ms": chunk_elapsed,
-            },
-        )
 
-        # Step 4: Read chunks for embedding
-        with progress_tracker.track_step("read_chunks_for_embedding"):
-            pass  # Step marked
-        current_step = "read_chunks_for_embedding"
-        logger.info(
-            "Step read_chunks_for_embedding started",
-            extra={
-                "collection": collection,
-                "doc_id": doc_id,
-                "parse_hash": parse_hash,
-                "embedding_model": embedding_config.id,
-            },
-        )
-        read_start = time.time()
-        embedding_read_response = read_chunks_for_embedding(
-            collection=collection,
-            doc_id=doc_id,
-            parse_hash=parse_hash,
-            # IMPORTANT: Use Hub model ID as the single source of truth,
-            # matching the write path (embedding writes use embedding_config.id).
-            model=embedding_config.id,
-            user_id=user_id,
-            is_admin=is_admin,
-        )
-        read_model = (
-            embedding_read_response
-            if isinstance(embedding_read_response, EmbeddingReadResponse)
-            else EmbeddingReadResponse.model_validate(embedding_read_response)
-        )
-        chunks: List[ChunkForEmbedding] = read_model.chunks
-        pending_count = read_model.pending_count
-        if _is_spreadsheet_source(source_path):
-            _validate_spreadsheet_chunk_token_budget(
-                chunks,
-                encoding_name=cfg.tiktoken_encoding or DEFAULT_TIKTOKEN_ENCODING,
+            # Step 4: Read chunks for embedding
+            with progress_tracker.track_step("read_chunks_for_embedding"):
+                pass  # Step marked
+            current_step = "read_chunks_for_embedding"
+            logger.info(
+                "Step read_chunks_for_embedding started",
+                extra={
+                    "collection": collection,
+                    "doc_id": doc_id,
+                    "parse_hash": parse_hash,
+                    "embedding_model": embedding_config.id,
+                },
             )
-        read_elapsed = int((time.time() - read_start) * 1000)
+            read_start = time.time()
+            embedding_read_response = read_chunks_for_embedding(
+                collection=collection,
+                doc_id=doc_id,
+                parse_hash=parse_hash,
+                # IMPORTANT: Use Hub model ID as the single source of truth,
+                # matching the write path (embedding writes use embedding_config.id).
+                model=embedding_config.id,
+                user_id=user_id,
+                is_admin=is_admin,
+            )
+            read_model = (
+                embedding_read_response
+                if isinstance(embedding_read_response, EmbeddingReadResponse)
+                else EmbeddingReadResponse.model_validate(embedding_read_response)
+            )
+            chunks: List[ChunkForEmbedding] = read_model.chunks
+            pending_count = read_model.pending_count
+            if _is_spreadsheet_source(source_path):
+                _validate_spreadsheet_chunk_token_budget(
+                    chunks,
+                    encoding_name=cfg.tiktoken_encoding or DEFAULT_TIKTOKEN_ENCODING,
+                )
+            read_elapsed = int((time.time() - read_start) * 1000)
 
-        completed_steps.append(
-            IngestionStepResult(
-                name="read_chunks_for_embedding",
-                metadata={
+            completed_steps.append(
+                IngestionStepResult(
+                    name="read_chunks_for_embedding",
+                    metadata={
+                        "total_count": len(chunks),
+                        "pending_count": pending_count,
+                        "elapsed_ms": read_elapsed,
+                    },
+                )
+            )
+            logger.info(
+                "Step read_chunks_for_embedding completed",
+                extra={
+                    "collection": collection,
+                    "doc_id": doc_id,
                     "total_count": len(chunks),
                     "pending_count": pending_count,
                     "elapsed_ms": read_elapsed,
                 },
             )
-        )
-        logger.info(
-            "Step read_chunks_for_embedding completed",
-            extra={
-                "collection": collection,
-                "doc_id": doc_id,
-                "total_count": len(chunks),
-                "pending_count": pending_count,
-                "elapsed_ms": read_elapsed,
-            },
-        )
-        _log_pending_chunks_text_stats(
-            f"read_chunks_for_embedding doc_id={doc_id}", chunks
-        )
-
-        if pending_count == 0:
-            logger.info(
-                "No pending chunks for embedding; returning early",
-                extra={"collection": collection, "doc_id": doc_id},
-            )
-            _record_ingestion_status(
-                collection,
-                doc_id,
-                status=DocumentProcessingStatus.SUCCESS,
-                message="Document ingestion completed with no pending embeddings.",
-                parse_hash=parse_hash,
-                user_id=user_id,
-            )
-            return IngestionResult(
-                status="success",
-                doc_id=doc_id,
-                parse_hash=parse_hash,
-                chunk_count=chunk_count,
-                embedding_count=0,
-                vector_count=0,
-                completed_steps=completed_steps,
-                failed_step=None,
-                message="Document ingestion completed with no pending embeddings",
-                warnings=[],
+            _log_pending_chunks_text_stats(
+                f"read_chunks_for_embedding doc_id={doc_id}", chunks
             )
 
-        # Step 5: Compute embeddings and write
-        # Note: Some models (e.g., DashScope text-embedding-v4) do not support batch processing.
-        # When embedding_use_async is True, we use async concurrent processing instead of batch API calls.
-        # This wraps individual encode() calls with asyncio.to_thread for concurrent execution.
-        with progress_tracker.track_step(
-            "compute_embeddings",
-            total_count=pending_count,
-            message="Embedding chunks...",
-        ) as embedding_step_tracker:
-            current_step = "compute_embeddings"
+            if pending_count == 0:
+                logger.info(
+                    "No pending chunks for embedding; returning early",
+                    extra={"collection": collection, "doc_id": doc_id},
+                )
+                _record_ingestion_status(
+                    collection,
+                    doc_id,
+                    status=DocumentProcessingStatus.SUCCESS,
+                    message="Document ingestion completed with no pending embeddings.",
+                    parse_hash=parse_hash,
+                    user_id=user_id,
+                )
+                generation_early_result = IngestionResult(
+                    status="success",
+                    doc_id=doc_id,
+                    parse_hash=parse_hash,
+                    chunk_count=chunk_count,
+                    embedding_count=0,
+                    vector_count=0,
+                    completed_steps=completed_steps,
+                    failed_step=None,
+                    message="Document ingestion completed with no pending embeddings",
+                    warnings=[],
+                )
+                return
+
+            # Step 5: Compute embeddings and write
+            # Note: Some models (e.g., DashScope text-embedding-v4) do not support batch processing.
+            # When embedding_use_async is True, we use async concurrent processing instead of batch API calls.
+            # This wraps individual encode() calls with asyncio.to_thread for concurrent execution.
+            with progress_tracker.track_step(
+                "compute_embeddings",
+                total_count=pending_count,
+                message="Embedding chunks...",
+            ) as embedding_step_tracker:
+                current_step = "compute_embeddings"
+                logger.info(
+                    "Step compute_embeddings started",
+                    extra={
+                        "collection": collection,
+                        "doc_id": doc_id,
+                        "pending_count": pending_count,
+                        "use_async": cfg.embedding_use_async,
+                        "batch_size": cfg.embedding_batch_size
+                        if not cfg.embedding_use_async
+                        else None,
+                        "concurrent": cfg.embedding_concurrent
+                        if cfg.embedding_use_async
+                        else None,
+                    },
+                )
+                embedding_start = time.time()
+                total_embedding_count = 0
+                total_vector_count = 0
+                write_elapsed_total = 0.0
+
+                def _update_embedding_progress(current: int, total: int) -> None:
+                    embedding_step_tracker.update(
+                        current_count=current,
+                        total_count=total,
+                        message=f"Embedding {current}/{total}",
+                        completed_count=current,
+                        remaining_count=max(total - current, 0),
+                    )
+
+                if cfg.embedding_use_async:
+                    logger.info(
+                        "Using async concurrent embedding computation (model does not support batch processing)"
+                    )
+                    embeddings_list = asyncio.run(
+                        _compute_embeddings_async(
+                            chunks=chunks,
+                            embedding_adapter=embedding_adapter,
+                            embedding_config=embedding_config,
+                            max_concurrent=cfg.embedding_concurrent,
+                            max_retries=cfg.max_retries,
+                            retry_delay=cfg.retry_delay,
+                            progress_callback=_update_embedding_progress,
+                        )
+                    )
+                    total_embedding_count = len(embeddings_list)
+
+                    with progress_tracker.track_step(
+                        "write_vectors_to_db",
+                        total_count=len(embeddings_list),
+                        message="Writing vectors...",
+                    ) as write_step_tracker:
+                        for batch_start in range(
+                            0, len(embeddings_list), cfg.embedding_batch_size
+                        ):
+                            embeddings_batch_async = embeddings_list[
+                                batch_start : batch_start + cfg.embedding_batch_size
+                            ]
+
+                            if not embeddings_batch_async:
+                                continue
+
+                            write_batch_start = time.time()
+                            current_step = "write_vectors_to_db"
+                            try:
+                                write_response = write_vectors_to_db(
+                                    collection=collection,
+                                    embeddings=embeddings_batch_async,
+                                    create_index=(
+                                        batch_start + cfg.embedding_batch_size
+                                        >= len(embeddings_list)
+                                    ),
+                                    user_id=user_id,
+                                )
+                                last_write_response = (
+                                    write_response
+                                    if isinstance(
+                                        write_response, EmbeddingWriteResponse
+                                    )
+                                    else EmbeddingWriteResponse.model_validate(
+                                        write_response
+                                    )
+                                )
+                                current_step = "compute_embeddings"
+                            except Exception as exc:  # noqa: BLE001
+                                embedding_count = total_embedding_count
+                                raise DatabaseOperationError(
+                                    "Failed to write embedding batch to vector store",
+                                    details={
+                                        "batch_start": batch_start,
+                                        "batch_size": len(embeddings_batch_async),
+                                        "error": str(exc),
+                                    },
+                                ) from exc
+                            write_elapsed_total += time.time() - write_batch_start
+                            total_vector_count += last_write_response.upsert_count
+                            written_count = min(
+                                batch_start + len(embeddings_batch_async),
+                                len(embeddings_list),
+                            )
+                            write_step_tracker.update(
+                                current_count=written_count,
+                                total_count=len(embeddings_list),
+                                message=f"Writing vectors {written_count}/{len(embeddings_list)}",
+                                written_count=written_count,
+                                remaining_count=max(
+                                    len(embeddings_list) - written_count, 0
+                                ),
+                            )
+
+                else:
+                    processed_batches = 0
+                    with progress_tracker.track_step(
+                        "write_vectors_to_db",
+                        total_count=len(chunks),
+                        message="Writing vectors...",
+                    ) as write_step_tracker:
+                        for batch_start in range(
+                            0, len(chunks), cfg.embedding_batch_size
+                        ):
+                            batch_chunks = chunks[
+                                batch_start : batch_start + cfg.embedding_batch_size
+                            ]
+                            batch_texts = [chunk.text for chunk in batch_chunks]
+                            _log_embedding_text_batch_stats(
+                                f"compute_embeddings(batch) doc_id={doc_id}",
+                                batch_texts,
+                                batch_index=processed_batches,
+                            )
+                            raw_vectors = embedding_adapter.encode(batch_texts)
+                            vectors = normalize_raw_embedding_to_vectors(raw_vectors)
+
+                            if len(vectors) != len(batch_chunks):
+                                raise VectorValidationError(
+                                    "Embedding provider returned mismatched batch size",
+                                    details={
+                                        "batch_index": processed_batches,
+                                        "expected": len(batch_chunks),
+                                        "actual": len(vectors),
+                                    },
+                                )
+
+                            embeddings_batch: List[ChunkEmbeddingData] = [
+                                ChunkEmbeddingData(
+                                    doc_id=chunk.doc_id,
+                                    chunk_id=chunk.chunk_id,
+                                    parse_hash=chunk.parse_hash,
+                                    model=embedding_config.id,
+                                    vector=vector,
+                                    text=chunk.text,
+                                    chunk_hash=chunk.chunk_hash,
+                                    metadata=chunk.metadata,
+                                )
+                                for chunk, vector in zip(batch_chunks, vectors)
+                            ]
+                            total_embedding_count += len(embeddings_batch)
+                            processed_batches += 1
+                            _update_embedding_progress(
+                                total_embedding_count, len(chunks)
+                            )
+
+                            if not embeddings_batch:
+                                continue
+
+                            write_batch_start = time.time()
+                            current_step = "write_vectors_to_db"
+                            try:
+                                write_response = write_vectors_to_db(
+                                    collection=collection,
+                                    embeddings=embeddings_batch,
+                                    create_index=(
+                                        batch_start + cfg.embedding_batch_size
+                                        >= len(chunks)
+                                    ),
+                                    user_id=user_id,
+                                )
+                                last_write_response = (
+                                    write_response
+                                    if isinstance(
+                                        write_response, EmbeddingWriteResponse
+                                    )
+                                    else EmbeddingWriteResponse.model_validate(
+                                        write_response
+                                    )
+                                )
+                                current_step = "compute_embeddings"
+                            except Exception as exc:  # noqa: BLE001
+                                embedding_count = total_embedding_count
+                                raise DatabaseOperationError(
+                                    "Failed to write embedding batch to vector store",
+                                    details={
+                                        "batch_index": processed_batches - 1,
+                                        "batch_size": len(embeddings_batch),
+                                        "error": str(exc),
+                                    },
+                                ) from exc
+                            write_elapsed_total += time.time() - write_batch_start
+                            total_vector_count += last_write_response.upsert_count
+                            write_step_tracker.update(
+                                current_count=total_vector_count,
+                                total_count=len(chunks),
+                                message=f"Writing vectors {total_vector_count}/{len(chunks)}",
+                                written_count=total_vector_count,
+                                remaining_count=max(
+                                    len(chunks) - total_vector_count, 0
+                                ),
+                            )
+
+            embedding_count = total_embedding_count
+            embedding_elapsed = int((time.time() - embedding_start) * 1000)
+
+            # Check if embedding generation failed completely
+            if chunk_count > 0 and embedding_count == 0:
+                raise EmbeddingAdapterError(
+                    "Failed to generate any embeddings",
+                    details={
+                        "chunk_count": chunk_count,
+                        "use_async": cfg.embedding_use_async,
+                        "embedding_model": embedding_config.model_name
+                        if embedding_config
+                        else None,
+                    },
+                )
+
+            completed_steps.append(
+                IngestionStepResult(
+                    name="compute_embeddings",
+                    metadata={
+                        "embedding_count": embedding_count,
+                        "use_async": cfg.embedding_use_async,
+                        "batch_size": cfg.embedding_batch_size
+                        if not cfg.embedding_use_async
+                        else None,
+                        "concurrent": cfg.embedding_concurrent
+                        if cfg.embedding_use_async
+                        else None,
+                        "elapsed_ms": embedding_elapsed,
+                    },
+                )
+            )
             logger.info(
-                "Step compute_embeddings started",
+                "Step compute_embeddings completed",
                 extra={
                     "collection": collection,
                     "doc_id": doc_id,
-                    "pending_count": pending_count,
-                    "use_async": cfg.embedding_use_async,
-                    "batch_size": cfg.embedding_batch_size
-                    if not cfg.embedding_use_async
-                    else None,
-                    "concurrent": cfg.embedding_concurrent
-                    if cfg.embedding_use_async
-                    else None,
-                },
-            )
-            embedding_start = time.time()
-            total_embedding_count = 0
-            total_vector_count = 0
-            write_elapsed_total = 0.0
-            last_write_response: Optional[EmbeddingWriteResponse] = None
-
-            def _update_embedding_progress(current: int, total: int) -> None:
-                embedding_step_tracker.update(
-                    current_count=current,
-                    total_count=total,
-                    message=f"Embedding {current}/{total}",
-                    completed_count=current,
-                    remaining_count=max(total - current, 0),
-                )
-
-            if cfg.embedding_use_async:
-                logger.info(
-                    "Using async concurrent embedding computation (model does not support batch processing)"
-                )
-                embeddings_list = asyncio.run(
-                    _compute_embeddings_async(
-                        chunks=chunks,
-                        embedding_adapter=embedding_adapter,
-                        embedding_config=embedding_config,
-                        max_concurrent=cfg.embedding_concurrent,
-                        max_retries=cfg.max_retries,
-                        retry_delay=cfg.retry_delay,
-                        progress_callback=_update_embedding_progress,
-                    )
-                )
-                total_embedding_count = len(embeddings_list)
-
-                with progress_tracker.track_step(
-                    "write_vectors_to_db",
-                    total_count=len(embeddings_list),
-                    message="Writing vectors...",
-                ) as write_step_tracker:
-                    for batch_start in range(
-                        0, len(embeddings_list), cfg.embedding_batch_size
-                    ):
-                        embeddings_batch_async = embeddings_list[
-                            batch_start : batch_start + cfg.embedding_batch_size
-                        ]
-
-                        if not embeddings_batch_async:
-                            continue
-
-                        write_batch_start = time.time()
-                        current_step = "write_vectors_to_db"
-                        try:
-                            write_response = write_vectors_to_db(
-                                collection=collection,
-                                embeddings=embeddings_batch_async,
-                                create_index=(
-                                    batch_start + cfg.embedding_batch_size
-                                    >= len(embeddings_list)
-                                ),
-                                user_id=user_id,
-                            )
-                            last_write_response = (
-                                write_response
-                                if isinstance(write_response, EmbeddingWriteResponse)
-                                else EmbeddingWriteResponse.model_validate(
-                                    write_response
-                                )
-                            )
-                            current_step = "compute_embeddings"
-                        except Exception as exc:  # noqa: BLE001
-                            embedding_count = total_embedding_count
-                            raise DatabaseOperationError(
-                                "Failed to write embedding batch to vector store",
-                                details={
-                                    "batch_start": batch_start,
-                                    "batch_size": len(embeddings_batch_async),
-                                    "error": str(exc),
-                                },
-                            ) from exc
-                        write_elapsed_total += time.time() - write_batch_start
-                        total_vector_count += last_write_response.upsert_count
-                        written_count = min(
-                            batch_start + len(embeddings_batch_async),
-                            len(embeddings_list),
-                        )
-                        write_step_tracker.update(
-                            current_count=written_count,
-                            total_count=len(embeddings_list),
-                            message=f"Writing vectors {written_count}/{len(embeddings_list)}",
-                            written_count=written_count,
-                            remaining_count=max(
-                                len(embeddings_list) - written_count, 0
-                            ),
-                        )
-
-            else:
-                processed_batches = 0
-                with progress_tracker.track_step(
-                    "write_vectors_to_db",
-                    total_count=len(chunks),
-                    message="Writing vectors...",
-                ) as write_step_tracker:
-                    for batch_start in range(0, len(chunks), cfg.embedding_batch_size):
-                        batch_chunks = chunks[
-                            batch_start : batch_start + cfg.embedding_batch_size
-                        ]
-                        batch_texts = [chunk.text for chunk in batch_chunks]
-                        _log_embedding_text_batch_stats(
-                            f"compute_embeddings(batch) doc_id={doc_id}",
-                            batch_texts,
-                            batch_index=processed_batches,
-                        )
-                        raw_vectors = embedding_adapter.encode(batch_texts)
-                        vectors = normalize_raw_embedding_to_vectors(raw_vectors)
-
-                        if len(vectors) != len(batch_chunks):
-                            raise VectorValidationError(
-                                "Embedding provider returned mismatched batch size",
-                                details={
-                                    "batch_index": processed_batches,
-                                    "expected": len(batch_chunks),
-                                    "actual": len(vectors),
-                                },
-                            )
-
-                        embeddings_batch: List[ChunkEmbeddingData] = [
-                            ChunkEmbeddingData(
-                                doc_id=chunk.doc_id,
-                                chunk_id=chunk.chunk_id,
-                                parse_hash=chunk.parse_hash,
-                                model=embedding_config.id,
-                                vector=vector,
-                                text=chunk.text,
-                                chunk_hash=chunk.chunk_hash,
-                                metadata=chunk.metadata,
-                            )
-                            for chunk, vector in zip(batch_chunks, vectors)
-                        ]
-                        total_embedding_count += len(embeddings_batch)
-                        processed_batches += 1
-                        _update_embedding_progress(total_embedding_count, len(chunks))
-
-                        if not embeddings_batch:
-                            continue
-
-                        write_batch_start = time.time()
-                        current_step = "write_vectors_to_db"
-                        try:
-                            write_response = write_vectors_to_db(
-                                collection=collection,
-                                embeddings=embeddings_batch,
-                                create_index=(
-                                    batch_start + cfg.embedding_batch_size
-                                    >= len(chunks)
-                                ),
-                                user_id=user_id,
-                            )
-                            last_write_response = (
-                                write_response
-                                if isinstance(write_response, EmbeddingWriteResponse)
-                                else EmbeddingWriteResponse.model_validate(
-                                    write_response
-                                )
-                            )
-                            current_step = "compute_embeddings"
-                        except Exception as exc:  # noqa: BLE001
-                            embedding_count = total_embedding_count
-                            raise DatabaseOperationError(
-                                "Failed to write embedding batch to vector store",
-                                details={
-                                    "batch_index": processed_batches - 1,
-                                    "batch_size": len(embeddings_batch),
-                                    "error": str(exc),
-                                },
-                            ) from exc
-                        write_elapsed_total += time.time() - write_batch_start
-                        total_vector_count += last_write_response.upsert_count
-                        write_step_tracker.update(
-                            current_count=total_vector_count,
-                            total_count=len(chunks),
-                            message=f"Writing vectors {total_vector_count}/{len(chunks)}",
-                            written_count=total_vector_count,
-                            remaining_count=max(len(chunks) - total_vector_count, 0),
-                        )
-
-        embedding_count = total_embedding_count
-        embedding_elapsed = int((time.time() - embedding_start) * 1000)
-
-        # Check if embedding generation failed completely
-        if chunk_count > 0 and embedding_count == 0:
-            raise EmbeddingAdapterError(
-                "Failed to generate any embeddings",
-                details={
-                    "chunk_count": chunk_count,
-                    "use_async": cfg.embedding_use_async,
-                    "embedding_model": embedding_config.model_name
-                    if embedding_config
-                    else None,
-                },
-            )
-
-        completed_steps.append(
-            IngestionStepResult(
-                name="compute_embeddings",
-                metadata={
                     "embedding_count": embedding_count,
                     "use_async": cfg.embedding_use_async,
-                    "batch_size": cfg.embedding_batch_size
-                    if not cfg.embedding_use_async
-                    else None,
-                    "concurrent": cfg.embedding_concurrent
-                    if cfg.embedding_use_async
-                    else None,
                     "elapsed_ms": embedding_elapsed,
                 },
             )
-        )
-        logger.info(
-            "Step compute_embeddings completed",
-            extra={
-                "collection": collection,
-                "doc_id": doc_id,
-                "embedding_count": embedding_count,
-                "use_async": cfg.embedding_use_async,
-                "elapsed_ms": embedding_elapsed,
-            },
-        )
 
-        vector_count = total_vector_count
-        write_elapsed_ms = int(write_elapsed_total * 1000)
-        current_step = "write_vectors_to_db"
-        completed_steps.append(
-            IngestionStepResult(
-                name="write_vectors_to_db",
-                metadata={
+            vector_count = total_vector_count
+            write_elapsed_ms = int(write_elapsed_total * 1000)
+            current_step = "write_vectors_to_db"
+            completed_steps.append(
+                IngestionStepResult(
+                    name="write_vectors_to_db",
+                    metadata={
+                        "vector_count": vector_count,
+                        "elapsed_ms": write_elapsed_ms,
+                    },
+                )
+            )
+            logger.info(
+                "Step write_vectors_to_db completed",
+                extra={
+                    "collection": collection,
+                    "doc_id": doc_id,
                     "vector_count": vector_count,
+                    "index_status": (
+                        last_write_response.index_status
+                        if last_write_response is not None
+                        else "skipped"
+                    ),
                     "elapsed_ms": write_elapsed_ms,
                 },
             )
-        )
-        logger.info(
-            "Step write_vectors_to_db completed",
-            extra={
-                "collection": collection,
-                "doc_id": doc_id,
-                "vector_count": vector_count,
-                "index_status": (
-                    last_write_response.index_status
-                    if last_write_response is not None
-                    else "skipped"
-                ),
-                "elapsed_ms": write_elapsed_ms,
-            },
-        )
+
+        with generation_ingestion_lock(
+            collection=collection,
+            doc_id=doc_id,
+            parse_hash=parse_hash,
+            user_id=user_id,
+            is_admin=is_admin,
+        ):
+            _run_chunk_and_embedding_steps()
+
+        if generation_early_result is not None:
+            progress_manager.complete_task(task_id, success=True)
+            return generation_early_result
 
         # Update collection statistics
         try:

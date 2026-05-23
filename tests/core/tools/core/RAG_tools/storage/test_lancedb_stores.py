@@ -1763,6 +1763,273 @@ def test_upsert_chunks_basic(mock_get_connection: Mock) -> None:
 
 
 # ============================================================================
+# replace_chunks Tests
+# ============================================================================
+
+
+@patch(
+    "xagent.core.tools.core.RAG_tools.storage.lancedb_stores.get_connection_from_env"
+)
+def test_replace_chunks_inserts_then_deletes_old(mock_get_connection: Mock) -> None:
+    """replace_chunks should merge_insert new records first, then delete old generation rows."""
+    mock_conn = Mock()
+    mock_get_connection.return_value = mock_conn
+    mock_conn.list_tables.return_value = []
+
+    mock_table = Mock()
+    mock_table.schema = Mock(names=["collection", "doc_id", "chunk_id"])
+    mock_conn.open_table.return_value = mock_table
+
+    store = LanceDBVectorIndexStore()
+
+    records = [
+        {
+            "collection": "col1",
+            "doc_id": "doc1",
+            "parse_hash": "hash1",
+            "chunk_id": "chunk_new_1",
+            "text": "new content",
+        }
+    ]
+    replace_scope = {
+        "collection": "col1",
+        "doc_id": "doc1",
+        "parse_hash": "hash1",
+    }
+
+    store.replace_chunks(
+        records, replace_scope=replace_scope, user_id=1, is_admin=False
+    )
+
+    # Verify merge_insert was called (idempotent upsert)
+    mock_table.merge_insert.assert_called_once_with(
+        ["collection", "doc_id", "parse_hash", "chunk_id"]
+    )
+
+    # Verify delete was called with scope filter + user filter + NOT IN exclusion
+    mock_table.delete.assert_called()
+    delete_expr = mock_table.delete.call_args_list[0][0][0]
+    assert "col1" in delete_expr
+    assert "doc1" in delete_expr
+    assert "hash1" in delete_expr
+    assert "user_id" in delete_expr
+    assert "chunk_new_1" in delete_expr
+    assert "NOT IN" in delete_expr
+
+
+@patch(
+    "xagent.core.tools.core.RAG_tools.storage.lancedb_stores.get_connection_from_env"
+)
+def test_replace_chunks_empty_records_only_deletes(mock_get_connection: Mock) -> None:
+    """replace_chunks with empty records should only delete, not insert."""
+    mock_conn = Mock()
+    mock_get_connection.return_value = mock_conn
+    mock_conn.list_tables.return_value = []
+
+    mock_table = Mock()
+    mock_table.schema = Mock(names=["collection", "doc_id", "chunk_id"])
+    mock_conn.open_table.return_value = mock_table
+
+    store = LanceDBVectorIndexStore()
+
+    replace_scope = {
+        "collection": "col1",
+        "doc_id": "doc1",
+        "parse_hash": "hash1",
+    }
+
+    store.replace_chunks([], replace_scope=replace_scope, user_id=1, is_admin=False)
+
+    # Should delete scope without NOT IN clause (no new ids to exclude)
+    mock_table.delete.assert_called_once()
+    delete_expr = mock_table.delete.call_args[0][0]
+    assert "NOT IN" not in delete_expr
+    mock_table.merge_insert.assert_not_called()
+
+
+@patch(
+    "xagent.core.tools.core.RAG_tools.storage.lancedb_stores.get_connection_from_env"
+)
+def test_replace_chunks_admin_skips_user_filter(mock_get_connection: Mock) -> None:
+    """replace_chunks with is_admin=True should not include user_id filter."""
+    mock_conn = Mock()
+    mock_get_connection.return_value = mock_conn
+    mock_conn.list_tables.return_value = []
+
+    mock_table = Mock()
+    mock_table.schema = Mock(names=["collection", "doc_id", "chunk_id"])
+    mock_conn.open_table.return_value = mock_table
+
+    store = LanceDBVectorIndexStore()
+
+    records = [
+        {
+            "collection": "col1",
+            "doc_id": "doc1",
+            "parse_hash": "hash1",
+            "chunk_id": "c1",
+            "text": "txt",
+        }
+    ]
+    replace_scope = {
+        "collection": "col1",
+        "doc_id": "doc1",
+        "parse_hash": "hash1",
+    }
+
+    store.replace_chunks(
+        records, replace_scope=replace_scope, user_id=99, is_admin=True
+    )
+
+    delete_expr = mock_table.delete.call_args[0][0]
+    assert "user_id" not in delete_expr
+
+
+@patch(
+    "xagent.core.tools.core.RAG_tools.storage.lancedb_stores.get_connection_from_env"
+)
+def test_replace_chunks_raises_when_embedding_cascade_delete_fails(
+    mock_get_connection: Mock,
+) -> None:
+    """Cascade embedding delete failures must surface as DatabaseOperationError."""
+    from xagent.core.tools.core.RAG_tools.core.exceptions import DatabaseOperationError
+
+    mock_conn = Mock()
+    mock_get_connection.return_value = mock_conn
+    mock_conn.list_tables.return_value = ["embeddings_model_a"]
+
+    mock_chunks = Mock()
+    mock_chunks.schema = Mock(names=["collection", "doc_id", "chunk_id"])
+
+    mock_embeddings = Mock()
+    mock_embeddings.delete.side_effect = RuntimeError("delete failed")
+
+    def _open_table(name: str) -> Mock:
+        if name == "chunks":
+            return mock_chunks
+        return mock_embeddings
+
+    mock_conn.open_table.side_effect = _open_table
+
+    store = LanceDBVectorIndexStore()
+    store.list_table_names = Mock(return_value=["embeddings_model_a"])  # type: ignore[method-assign]
+
+    records = [
+        {
+            "collection": "col1",
+            "doc_id": "doc1",
+            "parse_hash": "hash1",
+            "chunk_id": "c1",
+            "text": "t",
+        }
+    ]
+    replace_scope = {
+        "collection": "col1",
+        "doc_id": "doc1",
+        "parse_hash": "hash1",
+    }
+
+    with pytest.raises(DatabaseOperationError, match="cascade-delete stale embeddings"):
+        store.replace_chunks(
+            records, replace_scope=replace_scope, user_id=1, is_admin=False
+        )
+
+
+def test_replace_chunks_rejects_empty_scope() -> None:
+    """Empty replace_scope must not trigger unbounded delete (PR #202 review)."""
+    store = LanceDBVectorIndexStore()
+
+    with pytest.raises(ValueError, match="replace_scope must not be empty"):
+        store.replace_chunks(
+            [{"chunk_id": "c1"}],
+            replace_scope={},
+            user_id=1,
+            is_admin=False,
+        )
+
+
+@patch(
+    "xagent.core.tools.core.RAG_tools.storage.lancedb_stores.get_connection_from_env"
+)
+def test_replace_chunks_reports_all_failed_embedding_tables(
+    mock_get_connection: Mock,
+) -> None:
+    """When some embeddings_* deletes fail, all failed table names are reported."""
+    from xagent.core.tools.core.RAG_tools.core.exceptions import DatabaseOperationError
+
+    mock_conn = Mock()
+    mock_get_connection.return_value = mock_conn
+
+    mock_chunks = Mock()
+    mock_chunks.schema = Mock(names=["collection", "doc_id", "chunk_id"])
+
+    mock_embeddings_ok = Mock()
+    mock_embeddings_fail = Mock()
+    mock_embeddings_fail.delete.side_effect = RuntimeError("delete failed")
+
+    def _open_table(name: str) -> Mock:
+        if name == "chunks":
+            return mock_chunks
+        if name == "embeddings_model_a":
+            return mock_embeddings_ok
+        return mock_embeddings_fail
+
+    mock_conn.open_table.side_effect = _open_table
+
+    store = LanceDBVectorIndexStore()
+    store.list_table_names = Mock(  # type: ignore[method-assign]
+        return_value=["embeddings_model_a", "embeddings_model_b"]
+    )
+
+    replace_scope = {
+        "collection": "col1",
+        "doc_id": "doc1",
+        "parse_hash": "hash1",
+    }
+
+    with pytest.raises(DatabaseOperationError) as exc_info:
+        store.replace_chunks(
+            [
+                {
+                    "collection": "col1",
+                    "doc_id": "doc1",
+                    "parse_hash": "hash1",
+                    "chunk_id": "c1",
+                    "text": "t",
+                }
+            ],
+            replace_scope=replace_scope,
+            user_id=1,
+            is_admin=False,
+        )
+
+    failed = exc_info.value.details.get("failed_tables", [])
+    assert "embeddings_model_b" in failed
+    mock_embeddings_ok.delete.assert_called_once()
+
+
+@patch(
+    "xagent.core.tools.core.RAG_tools.storage.lancedb_stores.get_connection_from_env"
+)
+def test_replace_chunks_rejects_invalid_scope_key(mock_get_connection: Mock) -> None:
+    """replace_chunks should reject scope keys not in the allowed whitelist."""
+    mock_conn = Mock()
+    mock_get_connection.return_value = mock_conn
+    mock_conn.list_tables.return_value = []
+
+    mock_table = Mock()
+    mock_conn.open_table.return_value = mock_table
+
+    store = LanceDBVectorIndexStore()
+
+    with pytest.raises(ValueError, match="Invalid replace_scope column"):
+        store.replace_chunks(
+            [{"chunk_id": "c1"}],
+            replace_scope={"collection": "col1", "malicious_key": "payload"},
+        )
+
+
+# ============================================================================
 # Error Handling Tests
 # ============================================================================
 

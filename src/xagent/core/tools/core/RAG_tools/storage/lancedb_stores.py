@@ -16,8 +16,10 @@ from lancedb.db import DBConnection
 from xagent.providers.vector_store.lancedb import get_connection_from_env
 
 from ..core.config import DEFAULT_VECTOR_STORE_SCAN_LIMIT, IndexPolicy
+from ..core.exceptions import DatabaseOperationError
 from ..core.schemas import CollectionInfo, IndexResult
 from ..LanceDB.schema_manager import ensure_documents_table
+from ..utils.generation_lock import generation_ingestion_lock
 from ..utils.lancedb_query_utils import list_table_names, query_to_list
 from ..utils.string_utils import build_lancedb_filter_expression, escape_lancedb_string
 from ..utils.user_permissions import UserPermissions
@@ -1568,6 +1570,169 @@ class LanceDBVectorIndexStore(VectorIndexStore):
         finally:
             _safe_close_table(table)
         self.invalidate_table_cache("chunks")
+
+    _REPLACE_CHUNKS_ALLOWED_KEYS: frozenset = frozenset(
+        {"collection", "doc_id", "parse_hash"}
+    )
+
+    def replace_chunks(
+        self,
+        records: List[Dict[str, Any]],
+        *,
+        replace_scope: Dict[str, Any],
+        user_id: Optional[int] = None,
+        is_admin: bool = False,
+    ) -> None:
+        """Replace chunk records within a scope (insert new, then delete old).
+
+        Inserts *records* first via idempotent merge_insert, then deletes rows
+        matching *replace_scope* that do not belong to the new generation.
+        This insert-before-delete order avoids data loss if the process crashes
+        between the two operations (worst case: brief duplicate data, not zero
+        data).         Also cascade-deletes orphaned embedding rows from all
+        ``embeddings_*`` tables.
+
+        Raises:
+            DatabaseOperationError: If cascade deletion from any embeddings table
+                fails (stale embeddings would remain searchable).
+        """
+
+        if not replace_scope:
+            raise ValueError("replace_scope must not be empty")
+
+        for key in replace_scope:
+            if key not in self._REPLACE_CHUNKS_ALLOWED_KEYS:
+                raise ValueError(f"Invalid replace_scope column: {key}")
+
+        collection = str(replace_scope["collection"])
+        doc_id = str(replace_scope["doc_id"])
+        parse_hash = str(replace_scope["parse_hash"])
+
+        if records:
+            missing = [i for i, r in enumerate(records) if "chunk_id" not in r]
+            if missing:
+                raise ValueError(
+                    f"records at index {missing} missing required 'chunk_id' field"
+                )
+
+        with generation_ingestion_lock(
+            collection=collection,
+            doc_id=doc_id,
+            parse_hash=parse_hash,
+            user_id=user_id,
+            is_admin=is_admin,
+        ):
+            self._replace_chunks_locked(
+                records,
+                replace_scope=replace_scope,
+                user_id=user_id,
+                is_admin=is_admin,
+            )
+
+    def _replace_chunks_locked(
+        self,
+        records: List[Dict[str, Any]],
+        *,
+        replace_scope: Dict[str, Any],
+        user_id: Optional[int] = None,
+        is_admin: bool = False,
+    ) -> None:
+        """Internal replace_chunks body (caller must hold generation lock)."""
+        from ..LanceDB.schema_manager import _safe_close_table, ensure_chunks_table
+
+        conn = self._get_connection()
+        ensure_chunks_table(conn)
+        table = conn.open_table("chunks")
+        try:
+            # Step 1: Upsert new records (merge_insert is idempotent on retry)
+            if records:
+                table.merge_insert(
+                    ["collection", "doc_id", "parse_hash", "chunk_id"]
+                ).when_matched_update_all().when_not_matched_insert_all().execute(
+                    records
+                )
+
+            # Step 2: Build delete filter targeting old generations
+            scope_parts = [
+                f"{k} == '{escape_lancedb_string(str(v))}'"
+                for k, v in replace_scope.items()
+            ]
+            base_filter = " AND ".join(scope_parts)
+
+            user_filter = UserPermissions.get_user_filter(user_id, is_admin)
+            if base_filter and user_filter:
+                delete_expr = f"({base_filter}) AND ({user_filter})"
+            elif user_filter:
+                delete_expr = user_filter
+            else:
+                delete_expr = base_filter
+
+            # Exclude newly inserted chunk_ids from deletion
+            if records and delete_expr:
+                new_ids = [r["chunk_id"] for r in records]
+                id_list = ", ".join(
+                    f"'{escape_lancedb_string(cid)}'" for cid in new_ids
+                )
+                delete_expr = f"({delete_expr}) AND chunk_id NOT IN ({id_list})"
+
+            if delete_expr:
+                table.delete(delete_expr)
+        finally:
+            _safe_close_table(table)
+        self.invalidate_table_cache("chunks")
+
+        # Step 3: Cascade-delete orphaned embeddings for the same scope.
+        # After chunk replacement, old chunk_ids no longer exist in the chunks
+        # table but their embedding rows would still be searchable.
+        embed_scope_parts = [
+            f"{k} == '{escape_lancedb_string(str(v))}'"
+            for k, v in replace_scope.items()
+            if k in ("collection", "doc_id", "parse_hash")
+        ]
+        if not embed_scope_parts:
+            return
+
+        embed_base = " AND ".join(embed_scope_parts)
+        embed_user = UserPermissions.get_user_filter(user_id, is_admin)
+        if embed_base and embed_user:
+            embed_filter = f"({embed_base}) AND ({embed_user})"
+        elif embed_user:
+            embed_filter = embed_user
+        else:
+            embed_filter = embed_base
+
+        if records:
+            new_ids = [r["chunk_id"] for r in records]
+            id_list = ", ".join(f"'{escape_lancedb_string(cid)}'" for cid in new_ids)
+            embed_filter = f"({embed_filter}) AND chunk_id NOT IN ({id_list})"
+
+        failed_tables: List[str] = []
+        for tname in self.list_table_names():
+            if not tname.startswith("embeddings_"):
+                continue
+            try:
+                etable = conn.open_table(tname)
+                try:
+                    etable.delete(embed_filter)
+                finally:
+                    _safe_close_table(etable)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(
+                    "Failed to cascade-delete embeddings from %s: %s",
+                    tname,
+                    exc,
+                    exc_info=True,
+                )
+                failed_tables.append(tname)
+        self.invalidate_table_cache()
+        if failed_tables:
+            raise DatabaseOperationError(
+                "Failed to cascade-delete stale embeddings after chunk replacement",
+                details={
+                    "failed_tables": failed_tables,
+                    "replace_scope": replace_scope,
+                },
+            )
 
     def upsert_embeddings(self, model_tag: str, records: List[Dict[str, Any]]) -> None:
         """Upsert embedding records to LanceDB with fallback pattern.

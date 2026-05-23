@@ -810,7 +810,7 @@ class TestChunkDocument:
     def test_chunk_separators_create_new_version(
         self, temp_lancedb_dir, test_collection, test_doc_id
     ):
-        """Test that different separators create new version."""
+        """Re-chunking with different separators replaces prior rows (single config_hash)."""
         # Step 1: Register and parse document
         txt_path = "tests/resources/test_files/test.txt"
         register_document(
@@ -852,11 +852,9 @@ class TestChunkDocument:
             user_id=1,
         )
 
-        # Both should write (different versions)
         assert chunk_result1["created"] is True
         assert chunk_result2["created"] is True
 
-        # Verify database has two different config_hash versions
         from xagent.core.tools.core.RAG_tools.storage.factory import (
             get_vector_store_raw_connection,
         )
@@ -871,14 +869,11 @@ class TestChunkDocument:
             .to_pandas()
         )
 
-        # Should have two different config_hash values
+        # Only the latest chunking generation is kept for this parse (issue #199).
         config_hashes = df["config_hash"].unique()
-        assert len(config_hashes) == 2
-
-        # Each version should have > 0 rows
-        for config_hash in config_hashes:
-            version_rows = df[df["config_hash"] == config_hash]
-            assert len(version_rows) > 0
+        assert len(config_hashes) == 1
+        assert len(df) == chunk_result2["chunk_count"]
+        assert len(df) > 0
 
     def test_chunk_recursive_custom_separators_integration(
         self, temp_lancedb_dir, test_collection, test_doc_id
@@ -934,13 +929,19 @@ class TestChunkDocument:
         )
 
     def test_chunk_recursive_custom_separators_vs_default_different_result(
-        self, temp_lancedb_dir, test_collection, test_doc_id
+        self, temp_lancedb_dir, test_collection, test_doc_id, tmp_path
     ):
-        """Integration: custom separators produce different chunk count or config than default."""
-        txt_path = "tests/resources/test_files/test.txt"
+        """Integration: default then custom separators; DB keeps only the last generation."""
+        # Generate deterministic long text to guarantee different chunk counts
+        lines = [
+            f"Line {i}: The quick brown fox jumps over the lazy dog." for i in range(20)
+        ]
+        long_doc = tmp_path / "long_doc.txt"
+        long_doc.write_text("\n".join(lines), encoding="utf-8")
+
         register_document(
             collection=test_collection,
-            source_path=txt_path,
+            source_path=str(long_doc),
             doc_id=test_doc_id,
             user_id=1,
         )
@@ -953,13 +954,14 @@ class TestChunkDocument:
         )
         parse_hash = parse_result["parse_hash"]
 
+        # Large chunk_size → few chunks; small chunk_size with newline separator → many chunks.
         chunk_default = chunk_document(
             collection=test_collection,
             doc_id=test_doc_id,
             parse_hash=parse_hash,
             chunk_strategy=ChunkStrategy.RECURSIVE,
-            chunk_size=50,
-            chunk_overlap=10,
+            chunk_size=500,
+            chunk_overlap=0,
             separators=None,
             user_id=1,
         )
@@ -968,14 +970,16 @@ class TestChunkDocument:
             doc_id=test_doc_id,
             parse_hash=parse_hash,
             chunk_strategy=ChunkStrategy.RECURSIVE,
-            chunk_size=50,
-            chunk_overlap=10,
-            separators=["。", "\n"],
+            chunk_size=25,
+            chunk_overlap=5,
+            separators=["\n"],
             user_id=1,
         )
         assert chunk_default["created"] is True
         assert chunk_custom["created"] is True
-        # Different separators must yield different config_hash (hence different version)
+        assert chunk_default["chunk_count"] != chunk_custom["chunk_count"], (
+            "Expected distinct chunking outcomes so the replacement semantics are observable"
+        )
         from xagent.core.tools.core.RAG_tools.storage.factory import (
             get_vector_store_raw_connection,
         )
@@ -990,9 +994,8 @@ class TestChunkDocument:
             .to_pandas()
         )
         config_hashes = df["config_hash"].unique()
-        assert len(config_hashes) == 2, (
-            "Default and custom separators should produce two distinct chunk versions"
-        )
+        assert len(config_hashes) == 1
+        assert len(df) == chunk_custom["chunk_count"]
 
     def test_chunk_row_level_hash_uniqueness(
         self, temp_lancedb_dir, test_collection, test_doc_id

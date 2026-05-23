@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import threading
+import time
 from typing import Dict, List, Union
 
 import pytest
@@ -972,3 +974,41 @@ def test_process_document_rejects_absolute_paths_outside_allowed_dir(
             or "permission" in message_lower
             or "denied" in message_lower
         ), f"Unexpected error message for {abs_path}: {result.message}"
+
+
+# ---------------------------------------------------------------------------
+# Generation-scope lock integration (PR #202)
+# ---------------------------------------------------------------------------
+
+
+def test_same_generation_scope_serialises_different_source_paths(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Same doc_id/parse_hash must serialise even when source_path differs (file_id path)."""
+    chunk_log: List[str] = []
+
+    def _slow_chunk(**_: object) -> Dict[str, object]:
+        chunk_log.append("enter")
+        time.sleep(0.15)
+        chunk_log.append("exit")
+        return {"chunk_count": 2, "created": True}
+
+    _patch_pipeline_dependencies(monkeypatch)
+    monkeypatch.setattr(document_ingestion, "chunk_document", _slow_chunk)
+
+    def _run(source_path: str) -> None:
+        document_ingestion.process_document(
+            collection="demo",
+            source_path=source_path,
+            config=IngestionConfig(),
+            user_id=1,
+        )
+
+    t1 = threading.Thread(target=_run, args=("/uploads/a/doc.pdf",))
+    t2 = threading.Thread(target=_run, args=("/uploads/b/doc.pdf",))
+    t1.start()
+    t2.start()
+    t1.join(timeout=15)
+    t2.join(timeout=15)
+
+    assert chunk_log == ["enter", "exit", "enter", "exit"]

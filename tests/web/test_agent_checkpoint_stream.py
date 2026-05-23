@@ -592,6 +592,91 @@ async def test_historical_replay_skips_checkpoint_rows_before_streaming(
 
 
 @pytest.mark.asyncio
+async def test_historical_replay_orders_equal_timestamps_by_id(
+    monkeypatch,
+) -> None:
+    engine = create_engine("sqlite:///:memory:")
+    SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+    Base.metadata.create_all(bind=engine)
+    db = SessionLocal()
+    try:
+        user = User(username="tester", password_hash="hashed_password", is_admin=False)
+        db.add(user)
+        db.commit()
+        db.refresh(user)
+        task = Task(
+            user_id=int(user.id),
+            title="Chat task",
+            description="Chat task",
+            status=TaskStatus.COMPLETED,
+        )
+        db.add(task)
+        db.commit()
+        db.refresh(task)
+
+        task_id = int(task.id)
+        user_id = int(user.id)
+        timestamp = datetime(2026, 5, 22, tzinfo=timezone.utc)
+        db.add_all(
+            [
+                DatabaseTraceEvent(
+                    task_id=task_id,
+                    event_id="first-row",
+                    event_type="llm_call_start",
+                    timestamp=timestamp,
+                    data={"model_name": "first-model"},
+                ),
+                DatabaseTraceEvent(
+                    task_id=task_id,
+                    event_id="second-row",
+                    event_type="llm_call_end",
+                    timestamp=timestamp,
+                    data={"response": "done"},
+                ),
+            ]
+        )
+        db.commit()
+    finally:
+        db.close()
+
+    def get_test_db() -> Iterator[Session]:
+        session = SessionLocal()
+        try:
+            yield session
+        finally:
+            session.close()
+
+    sent_events: list[dict] = []
+
+    async def send_personal_message(event: dict, websocket: object) -> None:
+        sent_events.append(event)
+
+    monkeypatch.setattr("xagent.web.models.database.get_db", get_test_db)
+    monkeypatch.setattr("xagent.web.api.websocket.cache_get", lambda *args: None)
+    monkeypatch.setattr(
+        "xagent.web.api.websocket.cache_set", lambda *args, **kwargs: None
+    )
+    monkeypatch.setattr(
+        "xagent.web.api.websocket.manager.send_personal_message",
+        send_personal_message,
+    )
+
+    await send_historical_data_as_stream(
+        websocket=object(),
+        task_id=task_id,
+        user=SimpleNamespace(id=user_id, is_admin=False),
+    )
+
+    streamed_event_ids = [
+        event.get("event_id")
+        for event in sent_events
+        if event.get("type") == "trace_event"
+        and event.get("event_id") in {"first-row", "second-row"}
+    ]
+    assert streamed_event_ids == ["first-row", "second-row"]
+
+
+@pytest.mark.asyncio
 async def test_historical_replay_uses_turn_id_before_legacy_content_dedupe(
     monkeypatch,
 ) -> None:

@@ -3057,7 +3057,7 @@ async def send_historical_data_as_stream(
                     # hundreds of large JSON blobs just to discard them below.
                     TraceEvent.event_type != CHECKPOINT_EVENT_TYPE_NAME,
                 )
-                .order_by(TraceEvent.timestamp)
+                .order_by(TraceEvent.timestamp, TraceEvent.id)
                 .all()
             )
 

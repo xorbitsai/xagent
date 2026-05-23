@@ -277,7 +277,7 @@ function TaskDetailContent() {
       let groupIndex = 0;
       while (
         groupIndex < sortedMessages.length &&
-        sortedMessages[groupIndex].timestamp <= eventTime
+        sortedMessages[groupIndex].timestamp < eventTime
       ) {
         groupIndex += 1;
       }

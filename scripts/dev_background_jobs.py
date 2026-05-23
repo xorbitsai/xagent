@@ -23,25 +23,24 @@ DEFAULT_CELERY_RESULT_BACKEND = "redis://localhost:6379/2"
 
 def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description=("Start xagent backend plus Celery worker for local development.")
+        description=(
+            "Start xagent backend, Celery worker, and scheduler for local development."
+        )
     )
     parser.add_argument(
-        "--with-scheduler",
-        "--with-beat",
+        "--no-scheduler",
+        "--no-beat",
         action="store_true",
-        help="Also start Celery beat for scheduled trigger scans and stale job recovery.",
+        help="Do not start Celery beat.",
     )
     parser.add_argument(
         "--no-reload",
         action="store_true",
         help="Do not pass --reload to the FastAPI backend.",
     )
-    parser.add_argument(
-        "backend_args",
-        nargs=argparse.REMAINDER,
-        help="Extra args for python -m xagent.web.__main__; prefix with --.",
-    )
-    return parser.parse_args()
+    args, backend_args = parser.parse_known_args()
+    args.backend_args = backend_args
+    return args
 
 
 def _safe_url(url: str | None) -> str | None:
@@ -172,7 +171,7 @@ def main() -> int:
                 ),
             )
         )
-        if args.with_scheduler:
+        if not args.no_scheduler:
             processes.append(
                 (
                     "celery beat",

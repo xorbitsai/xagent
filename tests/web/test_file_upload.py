@@ -13,7 +13,7 @@ from sqlalchemy.orm import sessionmaker
 
 from xagent.core.file_storage.factory import get_file_storage
 from xagent.web.api.auth import hash_password
-from xagent.web.api.files import file_router
+from xagent.web.api.files import _content_disposition_header, file_router
 from xagent.web.auth_config import JWT_ALGORITHM, JWT_SECRET_KEY
 from xagent.web.models.database import Base, get_db
 from xagent.web.models.uploaded_file import UploadedFile
@@ -158,6 +158,12 @@ def _corrupt_durable_copy_and_remove_local(
 class TestFileUpload:
     """Test file upload functionality"""
 
+    def test_content_disposition_header_escapes_filename_and_adds_utf8_parameter(self):
+        assert _content_disposition_header("attachment", 'quo"te\\文\r\n.txt') == (
+            'attachment; filename="quo\\"te\\\\___.txt"; '
+            "filename*=UTF-8''quo%22te%5C%E6%96%87%0D%0A.txt"
+        )
+
     def test_upload_text_file_success(
         self, client, test_db, sample_files, temp_uploads_dir, auth_headers
     ):
@@ -262,7 +268,10 @@ class TestFileUpload:
         assert storage_key.endswith(f"/{file_id}/redirect.txt")
         assert expires == 42
         assert content_type == "text/plain"
-        assert content_disposition == 'inline; filename="redirect.txt"'
+        assert (
+            content_disposition
+            == "inline; filename=\"redirect.txt\"; filename*=UTF-8''redirect.txt"
+        )
 
     def test_preview_redirects_to_signed_durable_url_when_enabled(
         self, client, temp_uploads_dir, auth_headers, monkeypatch
@@ -341,7 +350,8 @@ class TestFileUpload:
         assert download.headers["content-type"].startswith("text/plain")
         assert (
             download.headers["content-disposition"]
-            == 'inline; filename="local accel.txt"'
+            == 'inline; filename="local accel.txt"; '
+            "filename*=UTF-8''local%20accel.txt"
         )
 
     def test_preview_uses_accel_redirect_for_local_text_when_enabled(
@@ -369,7 +379,8 @@ class TestFileUpload:
         assert preview.headers["x-accel-redirect"].endswith("/user_1/preview-accel.txt")
         assert (
             preview.headers["content-disposition"]
-            == 'inline; filename="preview-accel.txt"'
+            == 'inline; filename="preview-accel.txt"; '
+            "filename*=UTF-8''preview-accel.txt"
         )
 
     def test_preview_does_not_accel_redirect_html(

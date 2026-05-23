@@ -89,7 +89,14 @@ def _file_integrity_failed() -> HTTPException:
 
 def _content_disposition_header(disposition: str, filename: str) -> str:
     safe_name = Path(filename).name or "file"
-    return f'{disposition}; filename="{safe_name}"'
+    fallback_name = "".join(
+        character if 0x20 <= ord(character) <= 0x7E else "_" for character in safe_name
+    )
+    escaped_name = fallback_name.replace("\\", "\\\\").replace('"', '\\"')
+    encoded_name = quote(safe_name, safe="")
+    return (
+        f"{disposition}; filename=\"{escaped_name}\"; filename*=UTF-8''{encoded_name}"
+    )
 
 
 def _inline_download_disposition(media_type: str) -> str:

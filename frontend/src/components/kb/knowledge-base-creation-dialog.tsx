@@ -635,19 +635,17 @@ export function KnowledgeBaseCreationDialog({ open, onOpenChange, onSuccess }: K
         : []
       setIngestionResults(results)
 
-      // Check for errors
-      const errors = results.filter(r => r.status === 'error')
-      if (errors.length > 0) {
-        toast.error(t("kb.errors.someFilesFailed"))
-        // Don't close dialog so user can see errors
-      } else {
-        toast.success(t("kb.dialog.fileUpload.processSuccess"))
-
-        // Reset and close
-        resetState()
-        onOpenChange(false)
-        onSuccess?.()
+      const failedResults = results.filter(result => result.status !== "success")
+      if (failedResults.length > 0) {
+        throw new Error(failedResults[0].message || t("kb.errors.cloudIngestFailed"))
       }
+
+      toast.success(t("kb.dialog.fileUpload.processSuccess"))
+
+      // Reset and close
+      resetState()
+      onOpenChange(false)
+      onSuccess?.()
     } catch (error) {
       console.error("Cloud ingest error:", error)
       const rawMessage = error instanceof Error
@@ -1117,7 +1115,7 @@ export function KnowledgeBaseCreationDialog({ open, onOpenChange, onSuccess }: K
                                   </>
                                 )}
                               </div>
-                              {result.status === 'error' && result.message && (
+                              {result.status !== 'success' && result.message && (
                                 <p className="text-xs text-destructive ml-6 break-all">{result.message}</p>
                               )}
                             </div>

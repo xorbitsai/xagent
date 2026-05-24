@@ -4,13 +4,27 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest"
 
 const apiRequestMock = vi.hoisted(() => vi.fn())
 const toastErrorMock = vi.hoisted(() => vi.fn())
+const toastSuccessMock = vi.hoisted(() => vi.fn())
 
 vi.mock("@/lib/api-wrapper", () => ({
   apiRequest: apiRequestMock,
+  parseApiResponse: async (response: { json: () => Promise<unknown> }) => ({
+    data: await response.json(),
+    text: null,
+    isHtml: false,
+  }),
+  getUploadErrorMessage: (
+    _response: unknown,
+    parsed: { data?: { message?: string } | null },
+    messages: { generic: string }
+  ) => parsed?.data?.message || messages.generic,
+  isJsonRecord: (value: unknown) => typeof value === "object" && value !== null && !Array.isArray(value),
+  UPLOAD_ERROR_MESSAGES: {},
 }))
 
 vi.mock("@/lib/utils", () => ({
   getApiUrl: () => "http://api.local",
+  cn: (...classes: Array<string | false | null | undefined>) => classes.filter(Boolean).join(" "),
 }))
 
 vi.mock("@/contexts/i18n-context", () => ({
@@ -22,7 +36,7 @@ vi.mock("@/contexts/i18n-context", () => ({
 vi.mock("sonner", () => ({
   toast: {
     error: toastErrorMock,
-    success: vi.fn(),
+    success: toastSuccessMock,
     warning: vi.fn(),
   },
 }))
@@ -39,6 +53,11 @@ vi.mock("lucide-react", () => {
     AlertCircle: Icon,
     FileText: Icon,
     Cloud: Icon,
+    Database: Icon,
+    ChevronDown: Icon,
+    ChevronUp: Icon,
+    ArrowRight: Icon,
+    ArrowLeft: Icon,
   }
 })
 
@@ -59,7 +78,10 @@ vi.mock("@/components/ui/badge", () => ({
 }))
 
 vi.mock("@/components/ui/card", () => ({
-  Card: ({ children }: { children: React.ReactNode }) => <div>{children}</div>,
+  Card: ({
+    children,
+    ...props
+  }: React.HTMLAttributes<HTMLDivElement> & { children: React.ReactNode }) => <div {...props}>{children}</div>,
 }))
 
 vi.mock("@/components/ui/dialog", () => ({
@@ -93,8 +115,29 @@ vi.mock("@/components/ui/select", () => ({
   Select: () => <div />,
 }))
 
+vi.mock("@/components/ui/stepper", () => ({
+  Stepper: () => <div />,
+}))
+
 vi.mock("./cloud-connect-dialog", () => ({
-  CloudConnectDialog: () => null,
+  CloudConnectDialog: ({
+    open,
+    provider,
+    onConfirm,
+  }: {
+    open: boolean
+    provider: { id: string } | null
+    onConfirm: (files: Array<{ id: string; name: string; size?: string }>) => void
+  }) => (
+    open && provider ? (
+      <button
+        data-testid="mock-cloud-confirm"
+        onClick={() => onConfirm([{ id: `${provider.id}-file-1`, name: "alpha.pdf", size: "1 KB" }])}
+      >
+        mock cloud confirm
+      </button>
+    ) : null
+  ),
 }))
 
 import { KnowledgeBaseCreationDialog } from "./knowledge-base-creation-dialog"
@@ -135,6 +178,7 @@ describe("KnowledgeBaseCreationDialog multi-file naming", () => {
   beforeEach(() => {
     apiRequestMock.mockReset()
     toastErrorMock.mockReset()
+    toastSuccessMock.mockReset()
     installApiMocks()
   })
 
@@ -147,6 +191,8 @@ describe("KnowledgeBaseCreationDialog multi-file naming", () => {
       <KnowledgeBaseCreationDialog open={true} onOpenChange={vi.fn()} onSuccess={vi.fn()} />
     )
 
+    fireEvent.click(screen.getByText("common.next"))
+
     const fileInput = container.querySelector("#file-upload") as HTMLInputElement
     fireEvent.change(fileInput, {
       target: {
@@ -157,16 +203,15 @@ describe("KnowledgeBaseCreationDialog multi-file naming", () => {
       },
     })
 
-    const submitButton = screen.getByText("kb.index.startImport")
-    expect(submitButton).toBeDisabled()
-    expect(screen.getByText("kb.dialog.basicInfo.multiFileRequiredHint")).toBeInTheDocument()
-
-    fireEvent.click(submitButton)
+    fireEvent.click(screen.getByText("common.next"))
+    fireEvent.click(screen.getByText("kb.dialog.createButton"))
 
     await waitFor(() => {
-      expect(apiRequestMock).toHaveBeenCalledTimes(2)
+      expect(toastErrorMock).toHaveBeenCalledWith("kb.errors.multiFileNameRequired")
     })
-    expect(toastErrorMock).not.toHaveBeenCalled()
+
+    const ingestCalls = apiRequestMock.mock.calls.filter(([url]) => url === "http://api.local/api/kb/ingest")
+    expect(ingestCalls).toHaveLength(0)
   })
 
   it("uses the same explicit collection name for each uploaded file", async () => {
@@ -175,9 +220,11 @@ describe("KnowledgeBaseCreationDialog multi-file naming", () => {
       <KnowledgeBaseCreationDialog open={true} onOpenChange={vi.fn()} onSuccess={onSuccess} />
     )
 
-    fireEvent.change(screen.getByLabelText("kb.dialog.basicInfo.nameLabel"), {
+    fireEvent.change(container.querySelector("#collection_name") as HTMLInputElement, {
       target: { value: "team-docs" },
     })
+
+    fireEvent.click(screen.getByText("common.next"))
 
     const fileInput = container.querySelector("#file-upload") as HTMLInputElement
     fireEvent.change(fileInput, {
@@ -189,7 +236,8 @@ describe("KnowledgeBaseCreationDialog multi-file naming", () => {
       },
     })
 
-    fireEvent.click(screen.getByText("kb.index.startImport"))
+    fireEvent.click(screen.getByText("common.next"))
+    fireEvent.click(screen.getByText("kb.dialog.createButton"))
 
     await waitFor(() => {
       const ingestCalls = apiRequestMock.mock.calls.filter(([url]) => url === "http://api.local/api/kb/ingest")
@@ -202,5 +250,71 @@ describe("KnowledgeBaseCreationDialog multi-file naming", () => {
     await waitFor(() => {
       expect(onSuccess).toHaveBeenCalledWith(["team-docs", "team-docs"])
     })
+  })
+
+  it("keeps the dialog open for cloud partial failures and surfaces the failure message", async () => {
+    const onOpenChange = vi.fn()
+    const onSuccess = vi.fn()
+    const consoleErrorSpy = vi.spyOn(console, "error").mockImplementation(() => {})
+
+    apiRequestMock.mockImplementation((url: string) => {
+      if (url === "http://api.local/api/models/?category=embedding") {
+        return Promise.resolve(createJsonResponse([]))
+      }
+      if (url === "http://api.local/api/models/user-default") {
+        return Promise.resolve(createJsonResponse({}))
+      }
+      if (url === "http://api.local/api/kb/ingest-cloud") {
+        return Promise.resolve(
+          createJsonResponse([
+            {
+              status: "partial",
+              message: "Cloud import partially failed",
+              doc_id: "doc-1",
+              chunk_count: 2,
+              embedding_count: 0,
+              completed_steps: [{ name: "register_document" }],
+              failed_step: "compute_embeddings",
+            },
+          ])
+        )
+      }
+
+      throw new Error(`Unhandled apiRequest: ${url}`)
+    })
+
+    try {
+      render(
+        <KnowledgeBaseCreationDialog open={true} onOpenChange={onOpenChange} onSuccess={onSuccess} />
+      )
+
+      fireEvent.click(screen.getByText("common.next"))
+      fireEvent.click(screen.getByText("kb.dialog.tabs.cloud"))
+      fireEvent.click(screen.getByText("kb.dialog.cloudConnect.googleDrive"))
+      fireEvent.click(await screen.findByTestId("mock-cloud-confirm"))
+
+      await waitFor(() => {
+        expect(screen.getByText("alpha.pdf")).toBeInTheDocument()
+      })
+
+      fireEvent.click(screen.getByText("common.next"))
+      fireEvent.click(screen.getByText("kb.dialog.createButton"))
+
+      await waitFor(() => {
+        expect(toastErrorMock).toHaveBeenCalledWith(
+          "kb.errors.cloudIngestFailed",
+          expect.objectContaining({
+            description: "Cloud import partially failed",
+          })
+        )
+      })
+
+      expect(toastSuccessMock).not.toHaveBeenCalled()
+      expect(onOpenChange).not.toHaveBeenCalledWith(false)
+      expect(onSuccess).not.toHaveBeenCalled()
+      expect(await screen.findByText("Cloud import partially failed")).toBeInTheDocument()
+    } finally {
+      consoleErrorSpy.mockRestore()
+    }
   })
 })

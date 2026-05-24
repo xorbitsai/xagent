@@ -57,6 +57,7 @@ from ..services.task_lease_service import (
     run_task_lease_heartbeat,
     stop_task_lease_heartbeat,
 )
+from ..services.trace_message_storage import decode_trace_events_data
 from ..tools.config import WebToolConfig
 from ..tracing import create_task_tracer
 from ..user_isolated_memory import UserContext
@@ -1498,7 +1499,13 @@ class AgentServiceManager:
                 )
                 .all()
             )
-            for event in trace_events:
+            decoded_event_data = decode_trace_events_data(
+                db,
+                task_id=task_id,
+                data_items=[event.data for event in trace_events],
+                strict=False,
+            )
+            for event, event_data in zip(trace_events, decoded_event_data):
                 tracer_events.append(
                     {
                         "id": event.event_id,
@@ -1508,7 +1515,7 @@ class AgentServiceManager:
                         "timestamp": event.timestamp.timestamp()
                         if event.timestamp
                         else None,
-                        "data": event.data,
+                        "data": event_data,
                         "parent_id": event.parent_event_id,
                     }
                 )

@@ -11,6 +11,7 @@ from sqlalchemy import (
     Integer,
     String,
     Text,
+    UniqueConstraint,
 )
 from sqlalchemy.orm import relationship
 from sqlalchemy.sql import func
@@ -267,3 +268,66 @@ class TraceEvent(Base):  # type: ignore
 
     def __repr__(self) -> str:
         return f"<TraceEvent(id={self.id}, event_type='{self.event_type}', task_id={self.task_id})>"
+
+
+class TraceMessageBlob(Base):  # type: ignore
+    """Deduplicated message payload referenced by checkpoint trace events."""
+
+    __tablename__ = "trace_message_blobs"
+    __table_args__ = (
+        UniqueConstraint(
+            "task_id",
+            "message_hash",
+            name="uq_trace_message_blobs_task_hash",
+        ),
+    )
+
+    id = Column(Integer, primary_key=True, index=True)
+    task_id = Column(Integer, ForeignKey("tasks.id"), nullable=False, index=True)
+    execution_id = Column(String(255), nullable=False, index=True)
+    message_hash = Column(String(80), nullable=False)
+    message_data = Column(JSON, nullable=False)
+    message_bytes = Column(Integer, nullable=False)
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+
+    task = relationship("Task")
+
+    def __repr__(self) -> str:
+        return (
+            "<TraceMessageBlob("
+            f"id={self.id}, task_id={self.task_id}, message_hash='{self.message_hash}'"
+            ")>"
+        )
+
+
+class TraceCheckpointBlob(Base):  # type: ignore
+    """Deduplicated checkpoint field payload referenced by trace events."""
+
+    __tablename__ = "trace_checkpoint_blobs"
+    __table_args__ = (
+        UniqueConstraint(
+            "task_id",
+            "blob_kind",
+            "blob_hash",
+            name="uq_trace_checkpoint_blobs_task_kind_hash",
+        ),
+    )
+
+    id = Column(Integer, primary_key=True, index=True)
+    task_id = Column(Integer, ForeignKey("tasks.id"), nullable=False, index=True)
+    execution_id = Column(String(255), nullable=False, index=True)
+    blob_kind = Column(String(255), nullable=False, index=True)
+    blob_hash = Column(String(80), nullable=False)
+    blob_data = Column(JSON, nullable=False)
+    blob_bytes = Column(Integer, nullable=False)
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+
+    task = relationship("Task")
+
+    def __repr__(self) -> str:
+        return (
+            "<TraceCheckpointBlob("
+            f"id={self.id}, task_id={self.task_id}, "
+            f"blob_kind='{self.blob_kind}', blob_hash='{self.blob_hash}'"
+            ")>"
+        )

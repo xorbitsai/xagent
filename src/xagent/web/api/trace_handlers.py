@@ -15,6 +15,11 @@ from ...web.models.database import get_db
 from ...web.models.task import Task
 from ...web.models.task import TraceEvent as DatabaseTraceEvent
 from ...web.models.tool_config import ToolUsage
+from ...web.services.trace_message_storage import (
+    CheckpointMessageDecodeError,
+    decode_trace_event_data,
+    encode_checkpoint_data_for_storage,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -126,6 +131,21 @@ class DatabaseTraceHandler(BaseTraceHandler):
                     data.get("root_execution_id") or data.get("execution_id")
                 ) != str(execution_id):
                     continue
+                try:
+                    data = decode_trace_event_data(
+                        db,
+                        task_id=self.task_id,
+                        data=data,
+                        strict=True,
+                    )
+                except CheckpointMessageDecodeError as exc:
+                    logger.warning(
+                        "Skipping unreadable checkpoint trace event %s for task %s: %s",
+                        row.event_id,
+                        self.task_id,
+                        exc,
+                    )
+                    continue
                 snapshot = data.get("snapshot")
                 return dict(snapshot) if isinstance(snapshot, dict) else None
             return None
@@ -162,6 +182,16 @@ class DatabaseTraceHandler(BaseTraceHandler):
                     self.task_id,
                 )
                 return
+            if (
+                event_type_str == "system_update_general"
+                and isinstance(data, dict)
+                and data.get("checkpoint_type") == CHECKPOINT_TYPE
+            ):
+                data = encode_checkpoint_data_for_storage(
+                    db,
+                    task_id=self.task_id,
+                    data=data,
+                )
 
             # Create trace event record
             trace_event = DatabaseTraceEvent(

@@ -110,6 +110,16 @@ class NoSkillManager:
         return None
 
 
+class ReusedExecutionAdapter:
+    def __init__(self, config: SimpleNamespace) -> None:
+        self.config = config
+        self.execute_kwargs: dict[str, Any] | None = None
+
+    async def execute(self, **kwargs: Any) -> dict[str, Any]:
+        self.execute_kwargs = dict(kwargs)
+        return {"success": True}
+
+
 def auto_decision(
     action: str, *, answer: str = "", reason: str = "test"
 ) -> dict[str, Any]:
@@ -528,6 +538,53 @@ async def test_agent_service_passes_execution_context_to_execution_adapter() -> 
         and "Previous tool result: output/index_zh.html exists." in message["content"]
         for message in messages
     )
+
+
+@pytest.mark.asyncio
+async def test_agent_service_refreshes_compact_llm_on_reused_execution_adapter() -> (
+    None
+):
+    initial_llm = FakeLLM(["initial"])
+    updated_llm = FakeLLM(["updated"])
+    initial_compact_llm = FakeLLM(["initial compact"])
+    updated_compact_llm = FakeLLM(["updated compact"])
+    adapter = ReusedExecutionAdapter(
+        SimpleNamespace(
+            current_task_id=None,
+            tools=[],
+            llm=initial_llm,
+            compact_llm=initial_compact_llm,
+            pattern="react",
+            outbound_message_handler=None,
+            conversation_history=[],
+            execution_context_messages=[],
+            recovered_skill_context=None,
+            memory_store=None,
+            allowed_skills=None,
+        )
+    )
+    service = AgentService(
+        name="compact-refresh-service",
+        id="compact-refresh-service",
+        pattern="react",
+        llm=cast(Any, initial_llm),
+        compact_llm=cast(Any, initial_compact_llm),
+        tools=[],
+        tool_config=None,
+    )
+    service._execution_adapter = cast(Any, adapter)
+
+    service.llm = cast(Any, updated_llm)
+    service.compact_llm = cast(Any, updated_compact_llm)
+
+    result = await service._execute_agent_task(
+        "continue", task_id="task-compact-refresh"
+    )
+
+    assert result["success"] is True
+    assert adapter.config.current_task_id == "task-compact-refresh"
+    assert adapter.config.llm is updated_llm
+    assert adapter.config.compact_llm is updated_compact_llm
 
 
 @pytest.mark.asyncio

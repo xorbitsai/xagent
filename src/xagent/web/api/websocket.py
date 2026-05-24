@@ -3962,12 +3962,16 @@ async def handle_builder_chat(
                 )
 
         # Build current_config back from top-level keys
+        models = message_data.get("models")
+        if not isinstance(models, dict):
+            models = {}
         current_config = {
             "id": message_data.get("id"),
             "name": message_data.get("name", ""),
             "description": message_data.get("description", ""),
             "instructions": message_data.get("instructions", ""),
-            "model": message_data.get("models", {}).get("general"),
+            "model": models.get("general"),
+            "compact_model": models.get("compact"),
             "tool_categories": message_data.get("tool_categories", []),
             "skills": message_data.get("selectedSkills", []),
             "knowledge_bases": message_data.get("selectedKbs", []),
@@ -4026,8 +4030,10 @@ clarification questions as plain assistant text.
 
         # Get LLM configuration
         model_name = current_config.get("model")
+        compact_model_name = current_config.get("compact_model")
         resolver = UserAwareModelStorage(db)
         llm = None
+        compact_llm = None
 
         if model_name:
             llm = resolver.get_llm_by_name_with_access(
@@ -4035,13 +4041,22 @@ clarification questions as plain assistant text.
                 user_id=user.id,  # type: ignore[arg-type]
             )
 
-        if not llm:
-            default_llm, fast_llm, vision_llm, compact_llm = (
+        if compact_model_name:
+            compact_llm = resolver.get_llm_by_name_with_access(
+                compact_model_name,
+                user_id=user.id,  # type: ignore[arg-type]
+            )
+
+        if not llm or compact_llm is None:
+            default_llm, _fast_llm, _vision_llm, default_compact_llm = (
                 resolver.get_configured_defaults(
                     user_id=user.id  # type: ignore[arg-type]
                 )
             )
-            llm = default_llm
+            if not llm:
+                llm = default_llm
+            if compact_llm is None:
+                compact_llm = default_compact_llm
 
         if not llm:
             await websocket.send_text(
@@ -4115,7 +4130,7 @@ clarification questions as plain assistant text.
                 llm=llm,
                 fast_llm=None,  # No fast llm for builder chat
                 vision_llm=None,
-                compact_llm=None,
+                compact_llm=compact_llm,
                 memory=memory,
                 tools=[
                     create_agent_tool,

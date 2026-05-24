@@ -837,6 +837,28 @@ async def test_auto_pattern_react_decision_delegates_to_react() -> None:
 
 
 @pytest.mark.asyncio
+async def test_auto_pattern_does_not_use_main_llm_for_compaction() -> None:
+    llm = FakeLLM(
+        [
+            decision_tool_response("react", "Ordinary response."),
+            "react done",
+        ]
+    )
+    pattern = AutoPattern()
+    context = ExecutionContext()
+    context.compact_config.threshold = 1
+    context.add_user_message("Say done " + "x" * 200)
+    runtime = RecordingRuntime()
+
+    result = await pattern.run(context=context, tools=[], llm=llm, runtime=runtime)
+
+    assert result["success"] is True
+    assert result["output"] == "react done"
+    assert len(llm.calls) == 2
+    assert has_tool(llm.calls[0], DECISION_TOOL_NAME)
+
+
+@pytest.mark.asyncio
 async def test_auto_pattern_passes_memory_to_child_pattern() -> None:
     child = CapturingChildPattern()
     memory_store = FakeMemoryStore()

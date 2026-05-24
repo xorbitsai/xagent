@@ -784,11 +784,69 @@ class PatternRuntime:
         llm: Any = None,
         metadata: dict[str, Any] | None = None,
     ) -> Any:
+        llm_compact_request_if_needed = getattr(
+            context, "build_llm_compact_request_if_needed", None
+        )
+        compact_with_llm_response = getattr(context, "compact_with_llm_response", None)
         compact_if_needed = getattr(context, "compact_if_needed", None)
-        if not callable(compact_if_needed):
-            return None
+        result = None
+        if (
+            llm is not None
+            and callable(getattr(llm, "chat", None))
+            and callable(llm_compact_request_if_needed)
+            and callable(compact_with_llm_response)
+        ):
+            request = llm_compact_request_if_needed()
+            if request is not None:
+                request_metadata = request.get("metadata") or {}
+                llm_metadata = {**request_metadata, "purpose": "context_compaction"}
+                try:
+                    await self.on_llm_start(
+                        context=context,
+                        messages=request["messages"],
+                        metadata=llm_metadata,
+                    )
+                    response = await self.run_llm_call(
+                        llm,
+                        messages=request["messages"],
+                        max_tokens=request["max_tokens"],
+                    )
+                    await self.on_llm_end(
+                        context=context,
+                        response=response,
+                        metadata=llm_metadata,
+                    )
+                    result = compact_with_llm_response(
+                        response,
+                        llm=llm,
+                        original_tokens=request.get("original_tokens"),
+                    )
+                    for key, value in request_metadata.items():
+                        result.metadata.setdefault(key, value)
+                except LLMCallInterrupted:
+                    raise
+                except Exception as exc:  # noqa: BLE001
+                    await self.on_llm_error(
+                        context=context,
+                        error=exc,
+                        metadata=llm_metadata,
+                    )
+                    if not callable(compact_if_needed):
+                        raise
+                    result = compact_if_needed()
+                    result.metadata["llm_compact_error"] = str(exc)
+                    result.metadata["fallback_strategy"] = result.strategy
+                    result.metadata.update(request_metadata)
 
-        result = compact_if_needed(llm)
+        if result is None or not getattr(result, "compacted", False):
+            if not callable(compact_if_needed):
+                return result
+            result = compact_if_needed(llm)
+
+        if result is None:
+            return None
+        if inspect.isawaitable(result):
+            result = await result
         if not getattr(result, "compacted", False):
             return result
 

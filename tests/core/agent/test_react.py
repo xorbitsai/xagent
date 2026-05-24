@@ -1772,6 +1772,65 @@ async def test_react_pattern_traces_context_compaction() -> None:
 
 
 @pytest.mark.asyncio
+async def test_react_pattern_uses_compact_llm_for_context_compaction() -> None:
+    tracer = TraceEventRecorder()
+    runtime = PatternRuntime(tracer=tracer)
+    context = ExecutionContext(execution_id="compact-react-llm")
+    context.compact_config.threshold = 1
+    context.add_user_message("current request")
+    context.add_assistant_message(
+        "",
+        tool_calls=[
+            {"id": "call-1", "type": "function", "function": {"name": "read_file"}},
+        ],
+    )
+    context.add_tool_result("read_file", {"output": "x" * 200}, tool_call_id="call-1")
+    llm = FakeLLM([{"content": "done"}])
+    compact_llm = FakeLLM(
+        [
+            {
+                "content": "summarized tool result",
+                "usage": {"prompt_tokens": 10, "completion_tokens": 5},
+            }
+        ]
+    )
+
+    result = await ReActPattern(max_iterations=1).run(
+        context=context,
+        tools=[],
+        llm=llm,
+        compact_llm=compact_llm,
+        runtime=runtime,
+    )
+
+    assert result["success"] is True
+    assert len(compact_llm.calls) == 1
+    assert compact_llm.calls[0]["max_tokens"] == 256
+    assert "Preserve the language" in compact_llm.calls[0]["messages"][0]["content"]
+    assert len(llm.calls) == 1
+    assert any(
+        "summarized tool result" in message["content"]
+        for message in llm.calls[0]["messages"]
+    )
+    compact_end = next(
+        event for event in tracer.events if event["event_type"] == "action_end_compact"
+    )
+    assert compact_end["data"]["strategy"] == "llm_summary"
+    compact_llm_events = [
+        event
+        for event in tracer.events
+        if event["event_type"] in {"action_start_llm", "action_end_llm"}
+        and event["data"].get("purpose") == "context_compaction"
+    ]
+    assert [event["event_type"] for event in compact_llm_events] == [
+        "action_start_llm",
+        "action_end_llm",
+    ]
+    assert compact_llm_events[1]["data"]["input_tokens"] == 10
+    assert context.get_total_token_usage()["total"] == 15
+
+
+@pytest.mark.asyncio
 async def test_react_pattern_emits_runtime_checkpoints() -> None:
     llm = FakeLLM(
         responses=[

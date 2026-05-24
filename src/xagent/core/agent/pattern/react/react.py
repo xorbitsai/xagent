@@ -156,6 +156,7 @@ class ReActPattern(AgentPattern):
             setattr(runtime, "execution_id", getattr(context, "execution_id", None))
 
         active_llm = llm or self.llm
+        compact_llm = kwargs.get("compact_llm")
         if active_llm is None:
             return PatternResult(
                 success=False,
@@ -215,6 +216,7 @@ class ReActPattern(AgentPattern):
                 context=context,
                 tools=tools,
                 llm=active_llm,
+                compact_llm=compact_llm,
                 runtime=runtime,
             )
         except LLMCallInterrupted:
@@ -239,6 +241,7 @@ class ReActPattern(AgentPattern):
         context: Any,
         tools: list[Any],
         llm: Any,
+        compact_llm: Any | None,
         runtime: PatternRuntime,
     ) -> dict[str, Any]:
         self.status = "thinking"
@@ -280,7 +283,7 @@ class ReActPattern(AgentPattern):
 
             await runtime.compact_context_if_needed(
                 context=context,
-                llm=llm,
+                llm=compact_llm,
                 metadata={"iteration": iteration},
             )
 

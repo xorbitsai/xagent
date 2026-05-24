@@ -755,6 +755,10 @@ def test_get_messages_for_llm_can_skip_system_time_context() -> None:
     assert result == [{"role": "user", "content": "hello"}]
 
 
+def test_compact_default_threshold_matches_long_context_budget() -> None:
+    assert ExecutionContext().compact_config.threshold == 32000
+
+
 def test_compact_truncate() -> None:
     ctx = ExecutionContext()
     ctx.compact_config.threshold = 1
@@ -808,6 +812,83 @@ def test_compact_truncate_preserves_tool_call_pair_boundary() -> None:
     assert ctx.messages[1].tool_call_id == "call-1"
     assert ctx.messages[2].role == "tool"
     assert ctx.messages[2].tool_call_id == "call-2"
+
+
+def test_compact_with_llm_summarizes_history_and_preserves_current_user() -> None:
+    class CompactLLM:
+        model_name = "compact-test"
+
+    ctx = ExecutionContext()
+    ctx.compact_config.threshold = 1
+    ctx.add_user_message("current request")
+    ctx.add_assistant_message(
+        "",
+        tool_calls=[
+            {"id": "call-1", "type": "function", "function": {"name": "read_file"}},
+        ],
+    )
+    ctx.add_tool_result("read_file", {"output": "x" * 200}, tool_call_id="call-1")
+    llm = CompactLLM()
+
+    request = ctx.build_llm_compact_request_if_needed()
+    assert request is not None
+    assert request["max_tokens"] == 256
+    prompt = request["messages"]
+    assert "Preserve the language" in prompt[0]["content"]
+    prompt_text = prompt[1]["content"]
+    assert "Tool read_file returned" in str(prompt_text)
+
+    result = ctx.compact_with_llm_response(
+        {
+            "content": "Verbose model response.",
+            "summary": "Used read_file and found the relevant details.",
+        },
+        llm=llm,
+        original_tokens=request["original_tokens"],
+    )
+
+    assert result.compacted
+    assert result.strategy == "llm_summary"
+    assert result.metadata["compact_model"] == "compact-test"
+    assert result.metadata["compacted_tokens"] > 0
+    assert str(result.metadata["compression_ratio"]).endswith("%")
+    assert len(ctx.messages) == 2
+    assert ctx.messages[0].role == "system"
+    assert "Used read_file" in ctx.messages[0].content
+    assert ctx.messages[1].role == "user"
+    assert ctx.messages[1].content == "current request"
+
+
+def test_compact_with_llm_preserves_waiting_for_user_response() -> None:
+    ctx = ExecutionContext()
+    ctx.compact_config.threshold = 1
+    ctx.add_user_message("Book a trip")
+    ctx.add_assistant_message("Choose A or B")
+    ctx.add_user_message(
+        "B",
+        metadata={
+            "response_to_waiting_for_user": {
+                "question": "Choose A or B",
+            },
+        },
+    )
+
+    request = ctx.build_llm_compact_request_if_needed()
+    assert request is not None
+
+    result = ctx.compact_with_llm_response(
+        {"content": "The agent asked the user to choose an option."},
+        original_tokens=request["original_tokens"],
+    )
+
+    assert result.compacted
+    assert len(ctx.messages) == 2
+    assert ctx.messages[0].role == "system"
+    assert ctx.messages[1].role == "user"
+    assert ctx.messages[1].content == "B"
+    assert ctx.messages[1].metadata == {
+        "response_to_waiting_for_user": {"question": "Choose A or B"}
+    }
 
 
 def test_get_messages_for_llm_drops_orphan_tool_messages() -> None:

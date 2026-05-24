@@ -24,6 +24,7 @@ class Agent:
     patterns: list["AgentPattern"]
     tools: list[Any] = field(default_factory=list)
     llm: "BaseLLM | None" = None
+    compact_llm: "BaseLLM | None" = None
     system_prompt: str | None = None
     metadata: dict[str, Any] = field(default_factory=dict)
     memory_store: "MemoryStore | None" = None

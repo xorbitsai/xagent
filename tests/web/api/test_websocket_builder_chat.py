@@ -71,13 +71,14 @@ async def test_handle_builder_chat_basic() -> None:
         # Setup mocks
         mock_storage_instance = MockStorage.return_value
         mock_llm = AsyncMock()
+        mock_compact_llm = AsyncMock()
         mock_llm.stream_chat = AsyncMock()
         mock_storage_instance.get_llm_by_name_with_access.return_value = mock_llm
         mock_storage_instance.get_configured_defaults.return_value = (
             mock_llm,
             None,
             None,
-            None,
+            mock_compact_llm,
         )
 
         # Mock agent service
@@ -111,6 +112,7 @@ async def test_handle_builder_chat_basic() -> None:
         call_kwargs = MockAgentService.call_args[1]
         assert call_kwargs["pattern"] == "react"
         assert call_kwargs["name"] == "builder_chat_agent"
+        assert call_kwargs["compact_llm"] is mock_compact_llm
         mock_agent_service.set_allowed_skills.assert_called_once_with(["agent-builder"])
         mock_agent_service.set_recovered_skill_context.assert_called_once()
         mock_agent_service.set_outbound_message_handler.assert_called_once()
@@ -123,6 +125,81 @@ async def test_handle_builder_chat_basic() -> None:
 
         # Verify agent service execute_task was called
         mock_agent_service.execute_task.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_handle_builder_chat_uses_payload_compact_model() -> None:
+    mock_websocket = AsyncMock()
+    mock_user = MagicMock(spec=User)
+    mock_user.id = 1
+    mock_user.is_admin = False
+
+    message_data = {
+        "messages": [
+            {
+                "role": "user",
+                "content": "Create an agent for data analysis",
+            }
+        ],
+        "models": {"general": 10, "compact": 20},
+        "selectedSkills": [],
+        "selectedKbs": [],
+        "tool_categories": [],
+        "executionMode": "balanced",
+    }
+    mock_db = MagicMock(spec=Session)
+
+    with (
+        patch("xagent.web.models.database.get_db", return_value=iter([mock_db])),
+        patch("xagent.web.services.llm_utils.UserAwareModelStorage") as MockStorage,
+        patch("xagent.core.agent.service.AgentService") as MockAgentService,
+        patch("xagent.core.memory.in_memory.InMemoryMemoryStore"),
+        patch("xagent.web.user_isolated_memory.UserContext"),
+        patch("xagent.core.tools.adapters.vibe.agent_tool.CreateAgentTool"),
+        patch("xagent.core.tools.adapters.vibe.agent_tool.UpdateAgentTool"),
+    ):
+        mock_storage_instance = MockStorage.return_value
+        mock_llm = AsyncMock()
+        mock_compact_llm = AsyncMock()
+        mock_default_llm = AsyncMock()
+        mock_default_compact_llm = AsyncMock()
+
+        def get_llm_by_name_with_access(
+            model_name: object, *, user_id: int | None = None
+        ) -> object | None:
+            assert user_id == 1
+            return {
+                10: mock_llm,
+                20: mock_compact_llm,
+            }.get(model_name)
+
+        mock_storage_instance.get_llm_by_name_with_access.side_effect = (
+            get_llm_by_name_with_access
+        )
+        mock_storage_instance.get_configured_defaults.return_value = (
+            mock_default_llm,
+            None,
+            None,
+            mock_default_compact_llm,
+        )
+
+        mock_agent_service = MockAgentService.return_value
+        mock_agent_service.execute_task = AsyncMock(
+            return_value={"output": "Agent created successfully", "status": "completed"}
+        )
+
+        mock_websocket.state = MagicMock()
+        mock_websocket.state.builder_memory = MagicMock()
+        del mock_websocket.state.builder_task_id
+        del mock_websocket.state.builder_agent_service
+
+        await handle_builder_chat(mock_websocket, message_data, mock_user)
+
+    call_kwargs = MockAgentService.call_args[1]
+    assert call_kwargs["llm"] is mock_llm
+    assert call_kwargs["compact_llm"] is mock_compact_llm
+    mock_storage_instance.get_configured_defaults.assert_not_called()
+    assert mock_storage_instance.get_llm_by_name_with_access.call_count == 2
 
 
 @pytest.mark.asyncio

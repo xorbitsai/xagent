@@ -18,6 +18,7 @@ class AgentExecutionConfig:
     name: str
     pattern: str
     llm: Any | None
+    compact_llm: Any | None = None
     tools: list[Any] = field(default_factory=list)
     tracer: Any | None = None
     system_prompt: str | None = None
@@ -213,6 +214,7 @@ class AgentExecutionAdapter:
             patterns=[pattern],
             tools=self.config.tools,
             llm=self.config.llm,
+            compact_llm=self.config.compact_llm,
             system_prompt=self.config.system_prompt,
             metadata={"pattern": self.config.pattern},
             memory_store=self.config.memory_store,

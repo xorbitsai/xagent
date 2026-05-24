@@ -403,6 +403,7 @@ class AutoPattern(AgentPattern):
                 allowed_skills=kwargs.get("allowed_skills"),
                 memory_store=kwargs.get("memory_store"),
                 memory_similarity_threshold=kwargs.get("memory_similarity_threshold"),
+                compact_llm=kwargs.get("compact_llm"),
             )
         except Exception as exc:
             self.status = "failed"
@@ -422,6 +423,7 @@ class AutoPattern(AgentPattern):
         memory_similarity_threshold: float | None = None,
         skill_manager: Any | None = None,
         allowed_skills: list[str] | None = None,
+        compact_llm: Any | None = None,
         **kwargs: Any,
     ) -> dict[str, Any]:
         self._invalidate_stale_final_answer_decision(context)
@@ -467,7 +469,11 @@ class AutoPattern(AgentPattern):
             )
             try:
                 decision_result = await self._decide(
-                    context=context, tools=tools, llm=llm, runtime=runtime
+                    context=context,
+                    tools=tools,
+                    llm=llm,
+                    compact_llm=compact_llm,
+                    runtime=runtime,
                 )
                 self.decision = decision_result.decision
                 final_answer_stream = decision_result.final_answer_stream
@@ -548,6 +554,7 @@ class AutoPattern(AgentPattern):
             memory_similarity_threshold=memory_similarity_threshold,
             skill_manager=skill_manager,
             allowed_skills=allowed_skills,
+            compact_llm=compact_llm,
             **kwargs,
         )
         self._attach_decision_metadata(result)
@@ -676,7 +683,13 @@ class AutoPattern(AgentPattern):
             metadata.setdefault("auto_decision", self.decision.to_dict())
 
     async def _decide(
-        self, *, context: Any, tools: list[Any], llm: Any, runtime: PatternRuntime
+        self,
+        *,
+        context: Any,
+        tools: list[Any],
+        llm: Any,
+        compact_llm: Any | None,
+        runtime: PatternRuntime,
     ) -> AutoDecisionResult:
         if llm is None:
             raise RuntimeError("AutoPattern requires an LLM with tool calling support.")
@@ -686,7 +699,7 @@ class AutoPattern(AgentPattern):
         self._clear_response_language(context)
         await runtime.compact_context_if_needed(
             context=context,
-            llm=llm,
+            llm=compact_llm,
             metadata={"phase": "auto_decision"},
         )
 

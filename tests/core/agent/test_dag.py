@@ -654,6 +654,32 @@ async def test_dag_pattern_returns_terminal_step_result_as_output() -> None:
 
 
 @pytest.mark.asyncio
+async def test_dag_pattern_passes_compact_llm_to_step_react_compaction() -> None:
+    llm = SequenceLLM([{"content": "step done", "done": True}])
+    compact_llm = SequenceLLM([{"content": "compacted dag step context"}])
+    plan = build_plan(PlanStep(id="answer", task="Answer with DAG"))
+    pattern = DAGPattern(lambda **_: plan)
+    context = ExecutionContext(execution_id="dag-step-compact-llm")
+    context.compact_config.threshold = 1
+    context.add_user_message("Answer from a long parent context. " + "x" * 200)
+
+    result = await pattern.run(
+        context=context,
+        tools=[],
+        llm=llm,
+        compact_llm=compact_llm,
+    )
+
+    assert result["success"] is True
+    assert compact_llm.calls == 1
+    assert compact_llm.call_kwargs[0]["max_tokens"] == 256
+    assert any(
+        "compacted dag step context" in message["content"]
+        for message in llm.seen_messages[0]
+    )
+
+
+@pytest.mark.asyncio
 async def test_dag_pattern_injects_dependency_summary_into_child_context() -> None:
     llm = SequenceLLM(
         [

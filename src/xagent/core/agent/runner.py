@@ -745,6 +745,7 @@ class AgentRunner:
             task=task,
             context=context,
             llm=getattr(self.agent, "llm", None),
+            compact_llm=getattr(self.agent, "compact_llm", None),
             tools=tools,
             tracer=self.tracer,
             runtime=runtime,

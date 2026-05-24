@@ -355,6 +355,7 @@ class AgentService:
             self._execution_adapter.config.current_task_id = self._current_task_id
             self._execution_adapter.config.tools = self.tools
             self._execution_adapter.config.llm = self.llm
+            self._execution_adapter.config.compact_llm = self.compact_llm
             self._execution_adapter.config.pattern = self.pattern
             self._execution_adapter.config.outbound_message_handler = (
                 self._outbound_message_handler
@@ -403,6 +404,7 @@ class AgentService:
                 name=self.name,
                 tools=self.tools,
                 llm=self.llm,
+                compact_llm=self.compact_llm,
                 pattern=self.pattern,
                 tracer=tracer,
                 system_prompt=self.system_prompt,

@@ -4,7 +4,7 @@ import json
 import logging
 import os
 from pathlib import Path
-from typing import TYPE_CHECKING, Dict, Optional, cast
+from typing import TYPE_CHECKING, Any, Coroutine, Dict, Optional, cast
 from uuid import uuid4
 
 if TYPE_CHECKING:
@@ -59,6 +59,8 @@ class TelegramBotInstance:
         self.user_message_queues: Dict[int, list] = {}
         self.user_message_tasks: Dict[int, asyncio.Task] = {}
         self.user_active_executions: Dict[int, tuple[int, object]] = {}
+        self.user_preparing_executions: set[int] = set()
+        self.user_stop_events: Dict[int, asyncio.Event] = {}
 
         # Load active tasks state
         self.active_tasks_file = Path(f"data/telegram_active_tasks_{instance_id}.json")
@@ -190,8 +192,7 @@ class TelegramBotInstance:
         )
 
     def _start_new_conversation(self, user_id: int) -> bool:
-        self.user_message_queues.pop(user_id, None)
-        stopped = self._stop_user_active_execution(
+        stopped = self._request_current_conversation_stop(
             user_id, reason="new Telegram conversation requested"
         )
         self.active_tasks[user_id] = -1
@@ -199,11 +200,17 @@ class TelegramBotInstance:
         return stopped
 
     def _stop_current_conversation(self, user_id: int) -> bool:
-        queued_messages = self.user_message_queues.pop(user_id, None)
-        stopped = self._stop_user_active_execution(
+        return self._request_current_conversation_stop(
             user_id, reason="Telegram stop requested"
         )
-        return bool(queued_messages) or stopped
+
+    def _request_current_conversation_stop(self, user_id: int, *, reason: str) -> bool:
+        queued_messages = self.user_message_queues.pop(user_id, None)
+        stopped = self._stop_user_active_execution(user_id, reason=reason)
+        preparing = user_id in self.user_preparing_executions
+        if preparing and not stopped:
+            self._request_user_stop(user_id)
+        return bool(queued_messages) or stopped or preparing
 
     def _stop_user_active_execution(self, user_id: int, *, reason: str) -> bool:
         active_execution = self.user_active_executions.get(user_id)
@@ -230,6 +237,62 @@ class TelegramBotInstance:
                 e,
             )
             return False
+
+    def _get_user_stop_event(self, user_id: int) -> asyncio.Event:
+        event = self.user_stop_events.get(user_id)
+        if event is None:
+            event = asyncio.Event()
+            self.user_stop_events[user_id] = event
+        return event
+
+    def _request_user_stop(self, user_id: int) -> None:
+        self._get_user_stop_event(user_id).set()
+
+    def _consume_user_stop_request(self, user_id: int) -> bool:
+        event = self.user_stop_events.get(user_id)
+        if event is None or not event.is_set():
+            return False
+        event.clear()
+        return True
+
+    def _clear_user_stop_request(self, user_id: int) -> None:
+        event = self.user_stop_events.get(user_id)
+        if event is not None:
+            event.clear()
+
+    async def _await_execution_with_stop_monitor(
+        self,
+        user_id: int,
+        execution: Coroutine[Any, Any, dict[str, Any]],
+        *,
+        reason: str,
+    ) -> dict[str, Any]:
+        execution_task: asyncio.Task[dict[str, Any]] = asyncio.create_task(execution)
+        stop_event = self._get_user_stop_event(user_id)
+
+        try:
+            while True:
+                if execution_task.done():
+                    return await execution_task
+
+                if stop_event.is_set():
+                    while not execution_task.done():
+                        if self._stop_user_active_execution(user_id, reason=reason):
+                            stop_event.clear()
+                            break
+                        await asyncio.sleep(0.05)
+                    continue
+
+                done, _ = await asyncio.wait(
+                    {execution_task},
+                    timeout=0.05,
+                    return_when=asyncio.FIRST_COMPLETED,
+                )
+                if execution_task in done:
+                    return await execution_task
+        finally:
+            if not execution_task.done():
+                execution_task.cancel()
 
     def _is_stop_request_text(self, text: str) -> bool:
         normalized = text.strip().lower()
@@ -397,6 +460,8 @@ class TelegramBotInstance:
         if not text and not files:
             return
 
+        self.user_preparing_executions.add(user_id)
+        self._clear_user_stop_request(user_id)
         try:
             db_gen = get_db()
             db = next(db_gen)
@@ -425,6 +490,9 @@ class TelegramBotInstance:
                     await last_message.answer(
                         "Configuration error: Cannot find the owner of this bot."
                     )
+                    return
+
+                if self._consume_user_stop_request(user_id):
                     return
 
                 active_task_id = self.active_tasks.get(user_id)
@@ -475,6 +543,11 @@ class TelegramBotInstance:
                 message_turn_id = str(uuid4())
                 context: dict = {"turn_id": message_turn_id}
 
+                if self._consume_user_stop_request(user_id):
+                    task.status = TaskStatus.PAUSED
+                    db.commit()
+                    return
+
                 if files:
                     uploaded_info = await self._download_and_register_files(
                         files=files,
@@ -503,6 +576,11 @@ class TelegramBotInstance:
 
                         context["state"] = context.get("state", {})
                         context["state"]["file_info"] = uploaded_info
+
+                if self._consume_user_stop_request(user_id):
+                    task.status = TaskStatus.PAUSED
+                    db.commit()
+                    return
 
                 persist_user_message(
                     db=db,
@@ -533,14 +611,23 @@ class TelegramBotInstance:
                 self.user_active_executions[user_id] = active_execution
 
                 try:
+                    if self._consume_user_stop_request(user_id):
+                        task.status = TaskStatus.PAUSED
+                        db.commit()
+                        return
+
                     with UserContext(int(user.id)):  # type: ignore
-                        result = await agent_manager.execute_task(
-                            agent_service=agent_service,
-                            task=text,
-                            context=context,
-                            task_id=actual_task_id,
-                            tracking_task_id=str(task.id),
-                            db_session=db,
+                        result = await self._await_execution_with_stop_monitor(
+                            user_id,
+                            agent_manager.execute_task(
+                                agent_service=agent_service,
+                                task=text,
+                                context=context,
+                                task_id=actual_task_id,
+                                tracking_task_id=str(task.id),
+                                db_session=db,
+                            ),
+                            reason="Telegram stop requested",
                         )
                 finally:
                     if self.user_active_executions.get(user_id) == active_execution:
@@ -627,6 +714,9 @@ class TelegramBotInstance:
             await last_message.answer(
                 "Sorry, an error occurred while processing your request."
             )
+        finally:
+            self.user_preparing_executions.discard(user_id)
+            self._clear_user_stop_request(user_id)
 
     async def _send_output_images(
         self,

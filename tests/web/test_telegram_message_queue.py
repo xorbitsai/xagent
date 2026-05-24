@@ -5,12 +5,21 @@ import pytest
 from xagent.web.channels.telegram.bot import TelegramBotInstance
 
 
+def make_bot() -> TelegramBotInstance:
+    bot = object.__new__(TelegramBotInstance)
+    bot.user_message_queues = {}
+    bot.user_message_tasks = {}
+    bot.user_active_executions = {}
+    bot.user_preparing_executions = set()
+    bot.user_stop_events = {}
+    return bot
+
+
 @pytest.mark.asyncio
 async def test_process_user_queue_drains_messages_added_while_batch_runs() -> None:
-    bot = object.__new__(TelegramBotInstance)
+    bot = make_bot()
     bot.queue_flush_delay_seconds = 0
     bot.user_message_queues = {123: ["first"]}
-    bot.user_message_tasks = {}
 
     processed_batches: list[list[str]] = []
 
@@ -33,7 +42,7 @@ async def test_process_user_queue_drains_messages_added_while_batch_runs() -> No
 
 @pytest.mark.asyncio
 async def test_process_user_queue_drains_message_added_while_unregistering() -> None:
-    bot = object.__new__(TelegramBotInstance)
+    bot = make_bot()
     bot.queue_flush_delay_seconds = 0
     bot.user_message_queues = {123: ["first"]}
 
@@ -69,7 +78,7 @@ async def test_process_user_queue_drains_message_added_while_unregistering() -> 
 
 
 def test_start_new_conversation_clears_queue_and_pauses_active_execution() -> None:
-    bot = object.__new__(TelegramBotInstance)
+    bot = make_bot()
     bot.user_message_queues = {123: ["old queued message"]}
     bot.active_tasks = {123: 456}
     bot.saved = False
@@ -100,7 +109,7 @@ def test_start_new_conversation_clears_queue_and_pauses_active_execution() -> No
 
 
 def test_stop_current_conversation_preserves_active_task() -> None:
-    bot = object.__new__(TelegramBotInstance)
+    bot = make_bot()
     bot.user_message_queues = {123: ["old queued message"]}
     bot.active_tasks = {123: 456}
     bot.saved = False
@@ -131,14 +140,56 @@ def test_stop_current_conversation_preserves_active_task() -> None:
 
 
 def test_stop_current_conversation_clears_pending_queue_without_active_run() -> None:
-    bot = object.__new__(TelegramBotInstance)
+    bot = make_bot()
     bot.user_message_queues = {123: ["queued before execution"]}
-    bot.user_active_executions = {}
     bot.active_tasks = {123: 456}
 
     assert bot._stop_current_conversation(123) is True
     assert bot.user_message_queues == {}
     assert bot.active_tasks[123] == 456
+
+
+def test_stop_current_conversation_records_stop_during_preparation() -> None:
+    bot = make_bot()
+    bot.active_tasks = {123: 456}
+    bot.user_preparing_executions.add(123)
+
+    assert bot._stop_current_conversation(123) is True
+    assert bot.user_stop_events[123].is_set()
+    assert bot.active_tasks[123] == 456
+
+
+@pytest.mark.asyncio
+async def test_await_execution_with_stop_monitor_pauses_pending_stop() -> None:
+    bot = make_bot()
+
+    class FakeAgentService:
+        def __init__(self) -> None:
+            self.pause_calls: list[tuple[str, str | None]] = []
+
+        def pause_execution_by_id(
+            self, execution_id: str, reason: str | None = None
+        ) -> bool:
+            self.pause_calls.append((execution_id, reason))
+            return True
+
+    agent_service = FakeAgentService()
+    bot.user_active_executions = {123: (456, agent_service)}
+    bot._request_user_stop(123)
+
+    async def fake_execution() -> dict:
+        await asyncio.sleep(0)
+        return {"status": "interrupted"}
+
+    result = await bot._await_execution_with_stop_monitor(
+        123,
+        fake_execution(),
+        reason="Telegram stop requested",
+    )
+
+    assert result == {"status": "interrupted"}
+    assert agent_service.pause_calls == [("456", "Telegram stop requested")]
+    assert not bot.user_stop_events[123].is_set()
 
 
 @pytest.mark.parametrize(
@@ -155,6 +206,6 @@ def test_stop_current_conversation_clears_pending_queue_without_active_run() -> 
     ],
 )
 def test_stop_request_text_aliases(text: str, expected: bool) -> None:
-    bot = object.__new__(TelegramBotInstance)
+    bot = make_bot()
 
     assert bot._is_stop_request_text(text) is expected

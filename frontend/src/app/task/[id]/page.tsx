@@ -186,11 +186,12 @@ function TaskDetailContent() {
     content: string | React.ReactNode;
     rawContent?: string;
     timestamp: number;
-    status?: "pending" | "running" | "completed" | "failed";
+    status?: string;
     isStreamingFinalAnswer?: boolean;
     traceEvents?: any[];
     interactions?: any[];
     showEmptyStatus?: boolean;
+    timelineOrder?: number;
   };
   const messageItems: CombinedItem[] = useMemo(() => {
     const items: CombinedItem[] = state.messages
@@ -228,10 +229,15 @@ function TaskDetailContent() {
     );
 
   const timelineItems: CombinedItem[] = useMemo(() => {
-    const items: CombinedItem[] = messageItems.map((item) => ({
-      ...item,
-      traceEvents: undefined,
-    }));
+    const sortedMessages = [...messageItems].sort((a, b) => a.timestamp - b.timestamp);
+    const items: CombinedItem[] = sortedMessages.map((item, index) => {
+      const timelineOrder = index * 2 + 1;
+      return {
+        ...item,
+        traceEvents: undefined,
+        timelineOrder,
+      };
+    });
     type TimelineProcessEvent = {
       event_id?: string;
       event_type?: string;
@@ -269,7 +275,6 @@ function TaskDetailContent() {
       return items;
     }
 
-    const sortedMessages = [...messageItems].sort((a, b) => a.timestamp - b.timestamp);
     const processGroups = new Map<number, TimelineProcessEvent[]>();
 
     processEvents.forEach((event) => {
@@ -311,12 +316,19 @@ function TaskDetailContent() {
         role: "assistant",
         content: null,
         timestamp: groupTimestamp,
+        status: shouldShowEmptyStatus ? state.currentTask?.status : undefined,
         traceEvents: events,
         showEmptyStatus: shouldShowEmptyStatus,
+        timelineOrder: groupIndex * 2,
       });
     });
 
-    items.sort((a, b) => a.timestamp - b.timestamp);
+    items.sort(
+      (a, b) =>
+        a.timestamp - b.timestamp ||
+        (a.timelineOrder ?? Number.MAX_SAFE_INTEGER) -
+          (b.timelineOrder ?? Number.MAX_SAFE_INTEGER)
+    );
     return items;
   }, [
     hasFinalAssistantMessage,
@@ -592,7 +604,11 @@ function TaskDetailContent() {
                         traceEvents={item.traceEvents as any || []}
                         showProcessView={true}
                         taskStatus={
-                          isFailedFinalAnswerStream ? "failed" : undefined
+                          isFailedFinalAnswerStream
+                            ? "failed"
+                            : item.showEmptyStatus
+                              ? item.status
+                              : undefined
                         }
                         timestamp={item.timestamp}
                         interactions={item.interactions}

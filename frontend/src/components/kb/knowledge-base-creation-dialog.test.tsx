@@ -317,4 +317,73 @@ describe("KnowledgeBaseCreationDialog multi-file naming", () => {
       consoleErrorSpy.mockRestore()
     }
   })
+
+  it("keeps the dialog open for web partial failures and surfaces the failure message", async () => {
+    const onOpenChange = vi.fn()
+    const onSuccess = vi.fn()
+    const consoleErrorSpy = vi.spyOn(console, "error").mockImplementation(() => {})
+
+    apiRequestMock.mockImplementation((url: string) => {
+      if (url === "http://api.local/api/models/?category=embedding") {
+        return Promise.resolve(createJsonResponse([]))
+      }
+      if (url === "http://api.local/api/models/user-default") {
+        return Promise.resolve(createJsonResponse({}))
+      }
+      if (url === "http://api.local/api/kb/ingest-web") {
+        return Promise.resolve(
+          createJsonResponse({
+            status: "partial",
+            collection: "web_collection",
+            total_urls_found: 1,
+            pages_crawled: 1,
+            pages_failed: 1,
+            documents_created: 0,
+            chunks_created: 0,
+            embeddings_created: 0,
+            crawled_urls: [],
+            failed_urls: {
+              "https://example.com/docs": "embedding missing",
+            },
+            message: "Web import partially failed",
+            warnings: [],
+            elapsed_time_ms: 0,
+          })
+        )
+      }
+
+      throw new Error(`Unhandled apiRequest: ${url}`)
+    })
+
+    try {
+      const { container } = render(
+        <KnowledgeBaseCreationDialog open={true} onOpenChange={onOpenChange} onSuccess={onSuccess} />
+      )
+
+      fireEvent.click(screen.getByText("common.next"))
+      fireEvent.click(screen.getByText("kb.dialog.tabs.web"))
+      fireEvent.change(container.querySelector("#start_url") as HTMLInputElement, {
+        target: { value: "https://example.com/docs" },
+      })
+      fireEvent.click(screen.getByText("common.next"))
+      fireEvent.click(screen.getByText("kb.dialog.createButton"))
+
+      await waitFor(() => {
+        expect(toastErrorMock).toHaveBeenCalledWith(
+          "kb.errors.webIngestFailed",
+          expect.objectContaining({
+            description: "Web import partially failed",
+          })
+        )
+      })
+
+      expect(toastSuccessMock).not.toHaveBeenCalled()
+      expect(onOpenChange).not.toHaveBeenCalledWith(false)
+      expect(onSuccess).not.toHaveBeenCalled()
+      expect(await screen.findByText("kb.dialog.webImport.status.failed")).toBeInTheDocument()
+      expect(await screen.findByText("Web import partially failed")).toBeInTheDocument()
+    } finally {
+      consoleErrorSpy.mockRestore()
+    }
+  })
 })

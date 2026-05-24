@@ -1,6 +1,6 @@
 "use client"
 
-import { useState, useEffect, useRef } from "react"
+import React, { useState, useEffect, useRef } from "react"
 import * as TabsPrimitive from "@radix-ui/react-tabs"
 import { ArrowLeft, HardDrive, Search, Upload, Plus, Trash2, FileIcon, CheckCircle, XCircle, AlertCircle, Globe, Loader2 } from "lucide-react"
 import { Button } from "@/components/ui/button"
@@ -590,6 +590,9 @@ export function KnowledgeBaseDetailContent({ collectionName }: { collectionName:
       }
       setWebIngestionResult(result)
       setWebIngestionProgress(100)
+      if (result.status !== "success") {
+        throw new Error(result.message || t("kb.detail.errors.webImportFailed"))
+      }
 
       // Refresh info after successful import
       await fetchCollectionInfo()
@@ -1411,7 +1414,7 @@ export function KnowledgeBaseDetailContent({ collectionName }: { collectionName:
                           <div className="flex items-center gap-2">
                             {getStatusIcon(webIngestionResult.status)}
                             <span className="font-medium">
-                              {t(webIngestionResult.status === "success" ? "kb.dialog.webImport.status.success" : "kb.dialog.webImport.status.done")}
+                              {t(webIngestionResult.status === "success" ? "kb.dialog.webImport.status.success" : "kb.dialog.webImport.status.failed")}
                             </span>
                           </div>
                           <p className="text-sm text-muted-foreground break-all">{webIngestionResult.message}</p>

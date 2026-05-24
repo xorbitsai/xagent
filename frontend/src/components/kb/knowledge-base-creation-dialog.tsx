@@ -521,6 +521,9 @@ export function KnowledgeBaseCreationDialog({ open, onOpenChange, onSuccess }: K
       }
       setWebIngestionResult(result)
       setWebIngestionProgress(100)
+      if (result.status !== "success") {
+        throw new Error(result.message || t("kb.errors.webIngestFailed"))
+      }
 
       resetState()
       onOpenChange(false)
@@ -1132,7 +1135,7 @@ export function KnowledgeBaseCreationDialog({ open, onOpenChange, onSuccess }: K
                         <div className="space-y-2">
                           <div className="flex items-center gap-2">
                             {getStatusIcon(webIngestionResult.status)}
-                            <span className="font-medium">{t(webIngestionResult.status === "success" ? "kb.dialog.webImport.status.success" : "kb.dialog.webImport.status.done")}</span>
+                            <span className="font-medium">{t(webIngestionResult.status === "success" ? "kb.dialog.webImport.status.success" : "kb.dialog.webImport.status.failed")}</span>
                           </div>
                           <p className="text-sm text-muted-foreground">{webIngestionResult.message}</p>
                           <div className="grid grid-cols-2 md:grid-cols-4 gap-4 mt-4">

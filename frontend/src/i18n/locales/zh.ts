@@ -1728,6 +1728,7 @@ Build when you need.`
           crawling: "正在爬取网站，这可能需要几分钟...",
           success: "爬取成功",
           done: "爬取完成",
+          failed: "爬取失败",
         },
         result: {
           pages: "爬取页面",

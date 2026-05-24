@@ -1728,6 +1728,7 @@ Build when you need.`
           crawling: "Crawling website, this may take a few minutes...",
           success: "Crawl Successful",
           done: "Crawl Completed",
+          failed: "Crawl Failed",
         },
         result: {
           pages: "Crawled Pages",

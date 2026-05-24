@@ -16,6 +16,12 @@ class TelegramImageRef:
     alt_text: str
 
 
+@dataclass(frozen=True)
+class TelegramFileRef:
+    file_id: str
+    label: str
+
+
 def markdown_to_tg_html(text: str) -> str:
     """Convert basic Markdown to Telegram-supported HTML."""
     if not text:
@@ -146,6 +152,7 @@ def _render_markdown_table_as_list(table_lines: list[str]) -> list[str]:
 
 
 _MARKDOWN_IMAGE_RE = re.compile(r"!\[([^\]\n]*)\]\(([^)\n]+)\)")
+_MARKDOWN_FILE_LINK_RE = re.compile(r"(?<!!)\[([^\]\n]+)\]\(([^)\n]+)\)")
 
 
 def strip_telegram_image_refs(text: str) -> tuple[str, list[TelegramImageRef]]:
@@ -165,9 +172,34 @@ def strip_telegram_image_refs(text: str) -> tuple[str, list[TelegramImageRef]]:
         return ""
 
     cleaned = _MARKDOWN_IMAGE_RE.sub(replace_image, text)
-    cleaned = re.sub(r"[ \t]+\n", "\n", cleaned)
-    cleaned = re.sub(r"\n{3,}", "\n\n", cleaned)
-    return cleaned.strip(), image_refs
+    return _clean_stripped_markdown_refs(cleaned), image_refs
+
+
+def strip_telegram_file_refs(text: str) -> tuple[str, list[TelegramFileRef]]:
+    """Remove local file links from text and return refs Telegram should upload."""
+    if not text:
+        return "", []
+
+    file_refs: list[TelegramFileRef] = []
+
+    def replace_file_link(match: re.Match[str]) -> str:
+        label = match.group(1).strip()
+        target = html.unescape(match.group(2).strip())
+        file_id = _extract_local_file_id(target)
+        if not file_id:
+            return match.group(0)
+        file_refs.append(TelegramFileRef(file_id=file_id, label=label))
+        return ""
+
+    cleaned = _MARKDOWN_FILE_LINK_RE.sub(replace_file_link, text)
+    return _clean_stripped_markdown_refs(cleaned), file_refs
+
+
+def _clean_stripped_markdown_refs(text: str) -> str:
+    text = re.sub(r"(?m)^[ \t]*[-*•][ \t]*(?:\n|$)", "", text)
+    text = re.sub(r"[ \t]+\n", "\n", text)
+    text = re.sub(r"\n{3,}", "\n\n", text)
+    return text.strip()
 
 
 async def restore_telegram_task_context(

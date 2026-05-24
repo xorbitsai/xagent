@@ -10,11 +10,14 @@ from xagent.core.agent.trace import (
     TraceScope,
 )
 from xagent.web.channels.telegram import handler as telegram_handler
+from xagent.web.channels.telegram.bot import TelegramBotInstance
 from xagent.web.channels.telegram.handler import TelegramTraceHandler
 from xagent.web.channels.telegram.utils import (
+    TelegramFileRef,
     markdown_to_tg_html,
     persist_telegram_assistant_turn,
     restore_telegram_task_context,
+    strip_telegram_file_refs,
     strip_telegram_image_refs,
 )
 
@@ -43,6 +46,34 @@ def test_strip_telegram_image_refs_supports_file_urls_and_api_urls() -> None:
     assert [ref.file_id for ref in refs] == ["abc 1", "def 2", "ghi 3"]
 
 
+def test_strip_telegram_file_refs_extracts_local_file_links() -> None:
+    text = (
+        "Generated files:\n"
+        "- [report.csv](file://file-1)\n"
+        "- [poster](https://example.com/poster.html)\n"
+        "![preview](file://image-1)"
+    )
+
+    cleaned, refs = strip_telegram_file_refs(text)
+
+    assert cleaned == (
+        "Generated files:\n"
+        "- [poster](https://example.com/poster.html)\n"
+        "![preview](file://image-1)"
+    )
+    assert [(ref.file_id, ref.label) for ref in refs] == [("file-1", "report.csv")]
+
+
+def test_strip_telegram_file_refs_supports_api_download_urls() -> None:
+    cleaned, refs = strip_telegram_file_refs(
+        "[a](/api/files/download/abc%201) "
+        "[b](https://example.com/api/files/preview/def%202?token=ignored)"
+    )
+
+    assert cleaned == ""
+    assert [ref.file_id for ref in refs] == ["abc 1", "def 2"]
+
+
 def test_telegram_trace_handler_uses_plural_image_placeholder() -> None:
     handler = TelegramTraceHandler(
         task_id=421,
@@ -53,6 +84,50 @@ def test_telegram_trace_handler_uses_plural_image_placeholder() -> None:
 
     assert handler._image_placeholder_text(1) == "Image generated."
     assert handler._image_placeholder_text(2) == "Images generated."
+
+
+@pytest.mark.asyncio
+async def test_send_output_files_uploads_documents(tmp_path) -> None:
+    output_path = tmp_path / "report.csv"
+    output_path.write_text("a,b\n1,2\n")
+
+    class FakeRecord:
+        file_id = "file-1"
+        storage_path = str(output_path)
+        filename = "report.csv"
+
+    class FakeQuery:
+        def filter(self, *args):
+            return self
+
+        def all(self):
+            return [FakeRecord()]
+
+    class FakeDB:
+        def query(self, *args):
+            return FakeQuery()
+
+    class FakeReply:
+        def __init__(self) -> None:
+            self.documents = []
+
+        async def answer_document(self, document, caption=None):
+            self.documents.append((document, caption))
+
+    bot = object.__new__(TelegramBotInstance)
+    reply = FakeReply()
+
+    failed_refs = await bot._send_output_files(
+        file_refs=[TelegramFileRef(file_id="file-1", label="report.csv")],
+        user_id=7,
+        task_id=423,
+        db=FakeDB(),  # type: ignore[arg-type]
+        reply_to=reply,  # type: ignore[arg-type]
+    )
+
+    assert failed_refs == []
+    assert len(reply.documents) == 1
+    assert reply.documents[0][1] == "report.csv"
 
 
 @pytest.mark.asyncio

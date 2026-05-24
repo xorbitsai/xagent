@@ -15,6 +15,7 @@ import { TaskFileManager } from "@/components/file/task-file-manager";
 import { getApiUrl } from "@/lib/utils";
 import { apiRequest } from "@/lib/api-wrapper";
 import { isStreamingFinalAnswerMessage } from "@/lib/streaming-final-answer";
+import { getProcessGroupIndex } from "@/lib/task-timeline";
 import type React from "react";
 import dagre from "dagre"
 import { CenterPanel } from "@/components/layout/center-panel"
@@ -279,13 +280,7 @@ function TaskDetailContent() {
 
     processEvents.forEach((event) => {
       const eventTime = toTimelineTime(event?.timestamp);
-      let groupIndex = 0;
-      while (
-        groupIndex < sortedMessages.length &&
-        sortedMessages[groupIndex].timestamp < eventTime
-      ) {
-        groupIndex += 1;
-      }
+      const groupIndex = getProcessGroupIndex(sortedMessages, eventTime);
 
       const group = processGroups.get(groupIndex) || [];
       group.push(event);

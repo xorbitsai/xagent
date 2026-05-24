@@ -70,10 +70,28 @@ logger = logging.getLogger(__name__)
 
 CHECKPOINT_EVENT_TYPE_NAME = str(CHECKPOINT_EVENT_TYPE)
 
+_pause_accepted_task_ids: set[int] = set()
 
-def _task_status_uses_live_control(status: TaskStatus) -> bool:
+
+def _mark_task_pause_accepted(task_id: int) -> None:
+    _pause_accepted_task_ids.add(int(task_id))
+
+
+def _clear_task_pause_accepted(task_id: int) -> None:
+    _pause_accepted_task_ids.discard(int(task_id))
+
+
+def _is_task_pause_accepted(task_id: int) -> bool:
+    return int(task_id) in _pause_accepted_task_ids
+
+
+def _task_status_uses_live_control(
+    status: TaskStatus, *, pause_accepted: bool = False
+) -> bool:
     """Return True when a user message should be delivered to an active run."""
 
+    if pause_accepted:
+        return False
     return status in {TaskStatus.WAITING_FOR_USER, TaskStatus.RUNNING}
 
 
@@ -1352,6 +1370,7 @@ async def execute_task_background(
         raise
     finally:
         # Clean up background task record
+        _clear_task_pause_accepted(task_id)
         background_task_manager.cleanup_task(task_id)
         try:
             next(db_gen)
@@ -1522,6 +1541,7 @@ async def execute_resume_background(
                 release_task_lease(db_cleanup, lease, status=TaskStatus.FAILED)
             finally:
                 db_cleanup.close()
+        _clear_task_pause_accepted(task_id)
         background_task_manager.cleanup_task(task_id)
 
 
@@ -2323,7 +2343,11 @@ async def handle_chat_message(
                 # input. A PAUSED task plus a fresh user message is a new
                 # turn on the same task/thread; only an explicit resume event
                 # should continue the paused checkpoint.
-                task_uses_live_control = _task_status_uses_live_control(task.status)
+                pause_accepted = _is_task_pause_accepted(task_id)
+                task_uses_live_control = _task_status_uses_live_control(
+                    task.status,
+                    pause_accepted=pause_accepted,
+                )
                 agent_service = None
                 dag_pattern = None
                 supports_live_control = False
@@ -2497,6 +2521,36 @@ async def handle_chat_message(
                     return
                 else:
                     # New task/turn (PENDING/COMPLETED/FAILED/PAUSED), execute normally
+                    if pause_accepted and task.status in {
+                        TaskStatus.RUNNING,
+                        TaskStatus.WAITING_FOR_USER,
+                    }:
+                        logger.info(
+                            "Task %s has an accepted pause request; waiting for "
+                            "the active run to persist its control state before "
+                            "routing the follow-up message",
+                            task_id,
+                        )
+                        await background_task_manager.wait_for_previous(task_id)
+                        db.refresh(task)
+                        if task.status in {
+                            TaskStatus.RUNNING,
+                            TaskStatus.WAITING_FOR_USER,
+                        }:
+                            await manager.broadcast_to_task(
+                                {
+                                    "type": "agent_error",
+                                    "message": (
+                                        "Task pause is still being applied; "
+                                        "please retry shortly."
+                                    ),
+                                    "timestamp": datetime.now(timezone.utc).timestamp(),
+                                },
+                                task_id,
+                            )
+                            return
+                        _clear_task_pause_accepted(task_id)
+
                     logger.info(
                         f"Task {task_id} starting new execution turn (status: {task.status.value})"
                     )
@@ -3590,6 +3644,7 @@ async def handle_pause_task(
                 logger.warning(f"No live execution found to pause for task {task_id}")
                 return
             logger.info("Agent pause_execution completed")
+            _mark_task_pause_accepted(task_id)
 
             # Send pause confirmation
             await manager.broadcast_to_task(

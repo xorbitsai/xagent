@@ -4,7 +4,7 @@ import json
 import logging
 import os
 from pathlib import Path
-from typing import TYPE_CHECKING, Dict, Optional
+from typing import TYPE_CHECKING, Dict, Optional, cast
 from uuid import uuid4
 
 if TYPE_CHECKING:
@@ -238,18 +238,23 @@ class TelegramBotInstance:
         return normalized in self.stop_text_aliases
 
     async def _process_user_queue(self, user_id: int) -> None:
-        try:
-            while True:
-                await asyncio.sleep(self.queue_flush_delay_seconds)
-                messages = self.user_message_queues.pop(user_id, [])
-                if messages:
-                    await self._process_user_messages_batch(user_id, messages)
+        while True:
+            await asyncio.sleep(self.queue_flush_delay_seconds)
+            messages = self.user_message_queues.pop(user_id, [])
+            if messages:
+                await self._process_user_messages_batch(user_id, messages)
 
-                if not self.user_message_queues.get(user_id):
-                    return
-        finally:
-            if self.user_message_tasks.get(user_id) is asyncio.current_task():
+            if self.user_message_queues.get(user_id):
+                continue
+
+            current_task = cast(asyncio.Task, asyncio.current_task())
+            if self.user_message_tasks.get(user_id) is current_task:
                 self.user_message_tasks.pop(user_id, None)
+
+            if not self.user_message_queues.get(user_id):
+                return
+
+            self.user_message_tasks[user_id] = current_task
 
     async def _extract_message_content(
         self, message: types.Message

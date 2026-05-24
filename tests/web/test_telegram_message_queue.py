@@ -31,6 +31,43 @@ async def test_process_user_queue_drains_messages_added_while_batch_runs() -> No
     assert bot.user_message_queues == {}
 
 
+@pytest.mark.asyncio
+async def test_process_user_queue_drains_message_added_while_unregistering() -> None:
+    bot = object.__new__(TelegramBotInstance)
+    bot.queue_flush_delay_seconds = 0
+    bot.user_message_queues = {123: ["first"]}
+
+    class RaceTaskDict(dict):
+        def __init__(self, user_id: int) -> None:
+            super().__init__()
+            self.user_id = user_id
+            self.injected = False
+
+        def pop(self, key, default=None):  # type: ignore[no-untyped-def]
+            value = super().pop(key, default)
+            if key == self.user_id and not self.injected:
+                self.injected = True
+                bot.user_message_queues.setdefault(key, []).append("second")
+            return value
+
+    bot.user_message_tasks = RaceTaskDict(123)
+    processed_batches: list[list[str]] = []
+
+    async def fake_process_batch(user_id: int, messages: list[str]) -> None:
+        processed_batches.append(list(messages))
+
+    bot._process_user_messages_batch = fake_process_batch
+
+    queue_task = asyncio.create_task(bot._process_user_queue(123))
+    bot.user_message_tasks[123] = queue_task
+
+    await queue_task
+
+    assert processed_batches == [["first"], ["second"]]
+    assert bot.user_message_tasks == {}
+    assert bot.user_message_queues == {}
+
+
 def test_start_new_conversation_clears_queue_and_pauses_active_execution() -> None:
     bot = object.__new__(TelegramBotInstance)
     bot.user_message_queues = {123: ["old queued message"]}

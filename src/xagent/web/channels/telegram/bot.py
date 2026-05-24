@@ -651,6 +651,13 @@ class TelegramBotInstance:
                 output = projection.visible_text
                 output, image_refs = strip_telegram_image_refs(output)
                 output, file_refs = strip_telegram_file_refs(output)
+                output_image_refs, output_file_refs = (
+                    self._telegram_refs_from_file_outputs(result.get("file_outputs"))
+                )
+                image_refs, file_refs = self._dedupe_telegram_output_refs(
+                    [*image_refs, *output_image_refs],
+                    [*file_refs, *output_file_refs],
+                )
                 if not output and (image_refs or file_refs):
                     output = "Task completed."
 
@@ -795,6 +802,86 @@ class TelegramBotInstance:
                 failed_refs.append(image_ref)
 
         return failed_refs
+
+    def _telegram_refs_from_file_outputs(
+        self, file_outputs: Any
+    ) -> tuple[list[TelegramImageRef], list[TelegramFileRef]]:
+        """Convert structured execution file outputs into Telegram attachments."""
+        if isinstance(file_outputs, dict):
+            file_outputs = [file_outputs]
+        if not isinstance(file_outputs, list):
+            return [], []
+
+        image_refs: list[TelegramImageRef] = []
+        file_refs: list[TelegramFileRef] = []
+        for item in file_outputs:
+            if not isinstance(item, dict):
+                continue
+            raw_file_id = item.get("file_id")
+            file_id = str(raw_file_id).strip() if raw_file_id is not None else ""
+            if not file_id:
+                continue
+
+            label = self._file_output_label(item)
+            if self._file_output_is_image(item, label):
+                image_refs.append(TelegramImageRef(file_id=file_id, alt_text=label))
+            else:
+                file_refs.append(TelegramFileRef(file_id=file_id, label=label))
+
+        return image_refs, file_refs
+
+    def _file_output_label(self, file_output: dict[str, Any]) -> str:
+        for key in ("filename", "name", "relative_path", "path", "file_path"):
+            raw_value = file_output.get(key)
+            if isinstance(raw_value, str) and raw_value.strip():
+                label = Path(raw_value).name.strip()
+                if label:
+                    return label
+        return "file"
+
+    def _file_output_is_image(self, file_output: dict[str, Any], label: str) -> bool:
+        raw_mime_type = file_output.get("mime_type") or file_output.get("type")
+        mime_type = str(raw_mime_type or "").lower()
+        if mime_type.startswith("image/"):
+            return True
+
+        extension = str(file_output.get("extension") or Path(label).suffix).lower()
+        return extension in {
+            ".apng",
+            ".bmp",
+            ".gif",
+            ".heic",
+            ".heif",
+            ".jpeg",
+            ".jpg",
+            ".png",
+            ".tif",
+            ".tiff",
+            ".webp",
+        }
+
+    def _dedupe_telegram_output_refs(
+        self,
+        image_refs: list[TelegramImageRef],
+        file_refs: list[TelegramFileRef],
+    ) -> tuple[list[TelegramImageRef], list[TelegramFileRef]]:
+        deduped_images: list[TelegramImageRef] = []
+        image_file_ids: set[str] = set()
+        for image_ref in image_refs:
+            if image_ref.file_id in image_file_ids:
+                continue
+            image_file_ids.add(image_ref.file_id)
+            deduped_images.append(image_ref)
+
+        deduped_files: list[TelegramFileRef] = []
+        file_ids: set[str] = set()
+        for file_ref in file_refs:
+            if file_ref.file_id in image_file_ids or file_ref.file_id in file_ids:
+                continue
+            file_ids.add(file_ref.file_id)
+            deduped_files.append(file_ref)
+
+        return deduped_images, deduped_files
 
     async def _send_image_fallback_message(
         self, *, image_refs: list[TelegramImageRef], reply_to: types.Message

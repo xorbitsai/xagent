@@ -14,6 +14,7 @@ from xagent.web.channels.telegram.bot import TelegramBotInstance
 from xagent.web.channels.telegram.handler import TelegramTraceHandler
 from xagent.web.channels.telegram.utils import (
     TelegramFileRef,
+    TelegramImageRef,
     markdown_to_tg_html,
     persist_telegram_assistant_turn,
     restore_telegram_task_context,
@@ -128,6 +129,52 @@ async def test_send_output_files_uploads_documents(tmp_path) -> None:
     assert failed_refs == []
     assert len(reply.documents) == 1
     assert reply.documents[0][1] == "report.csv"
+
+
+def test_telegram_refs_from_file_outputs_classifies_structured_outputs() -> None:
+    bot = object.__new__(TelegramBotInstance)
+
+    image_refs, file_refs = bot._telegram_refs_from_file_outputs(
+        [
+            {
+                "file_id": "image-1",
+                "filename": "plot.png",
+                "mime_type": "image/png",
+            },
+            {
+                "file_id": "file-1",
+                "filename": "report.csv",
+                "mime_type": "text/csv",
+            },
+            {"file_id": "", "filename": "ignored.txt"},
+        ]
+    )
+
+    assert [(ref.file_id, ref.alt_text) for ref in image_refs] == [
+        ("image-1", "plot.png")
+    ]
+    assert [(ref.file_id, ref.label) for ref in file_refs] == [("file-1", "report.csv")]
+
+
+def test_dedupe_telegram_output_refs_prefers_images_over_documents() -> None:
+    bot = object.__new__(TelegramBotInstance)
+
+    image_refs, file_refs = bot._dedupe_telegram_output_refs(
+        [
+            TelegramImageRef(file_id="image-1", alt_text="inline image"),
+            TelegramImageRef(file_id="image-1", alt_text="structured image"),
+        ],
+        [
+            TelegramFileRef(file_id="image-1", label="plot.png"),
+            TelegramFileRef(file_id="file-1", label="report.csv"),
+            TelegramFileRef(file_id="file-1", label="report duplicate.csv"),
+        ],
+    )
+
+    assert [(ref.file_id, ref.alt_text) for ref in image_refs] == [
+        ("image-1", "inline image")
+    ]
+    assert [(ref.file_id, ref.label) for ref in file_refs] == [("file-1", "report.csv")]
 
 
 @pytest.mark.asyncio

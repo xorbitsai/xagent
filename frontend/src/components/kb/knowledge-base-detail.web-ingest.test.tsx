@@ -127,6 +127,22 @@ function createJsonResponse(body: unknown, ok = true) {
   }
 }
 
+function createSucceededJob(result: Record<string, unknown>) {
+  return {
+    id: "job-1",
+    user_id: 1,
+    job_type: "kb.ingest.web",
+    queue: "kb",
+    status: "succeeded",
+    progress: { message: "Completed", completed: 1, total: 1 },
+    result,
+    error_message: null,
+    celery_task_id: "task-1",
+    attempts: 1,
+    max_attempts: 3,
+  }
+}
+
 describe("KnowledgeBaseDetailContent web ingest", () => {
   beforeEach(() => {
     apiRequestMock.mockReset()
@@ -155,25 +171,30 @@ describe("KnowledgeBaseDetailContent web ingest", () => {
       if (url === "http://api.local/api/models/user-default") {
         return Promise.resolve(createJsonResponse({}))
       }
-      if (url === "http://api.local/api/kb/ingest-web") {
+      if (url === "http://api.local/api/jobs/capabilities") {
+        return Promise.resolve(createJsonResponse({ kb_ingest_mode: "celery" }))
+      }
+      if (url === "http://api.local/api/kb/ingest-web/jobs") {
         return Promise.resolve(
-          createJsonResponse({
-            status: "partial",
-            collection: "demo",
-            total_urls_found: 1,
-            pages_crawled: 1,
-            pages_failed: 1,
-            documents_created: 0,
-            chunks_created: 0,
-            embeddings_created: 0,
-            crawled_urls: [],
-            failed_urls: {
-              "https://example.com/docs": "embedding missing",
-            },
-            message: "Web import partially failed",
-            warnings: [],
-            elapsed_time_ms: 0,
-          })
+          createJsonResponse(
+            createSucceededJob({
+              status: "partial",
+              collection: "demo",
+              total_urls_found: 1,
+              pages_crawled: 1,
+              pages_failed: 1,
+              documents_created: 0,
+              chunks_created: 0,
+              embeddings_created: 0,
+              crawled_urls: [],
+              failed_urls: {
+                "https://example.com/docs": "embedding missing",
+              },
+              message: "Web import partially failed",
+              warnings: [],
+              elapsed_time_ms: 0,
+            })
+          )
         )
       }
 

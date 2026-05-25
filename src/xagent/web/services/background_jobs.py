@@ -3,6 +3,7 @@ from __future__ import annotations
 import logging
 from datetime import datetime, timedelta, timezone
 from typing import Any
+from urllib.parse import urlsplit
 
 from sqlalchemy import and_, or_
 from sqlalchemy.orm import Session
@@ -39,6 +40,55 @@ TERMINAL_JOB_STATUSES = frozenset(
         BackgroundJobStatus.CANCELLED.value,
     }
 )
+
+
+def _is_redis_broker_reachable(broker_url: str) -> bool:
+    try:
+        import redis  # type: ignore[import-not-found]
+    except ImportError:
+        logger.warning("Redis Celery broker configured but redis package is missing")
+        return False
+
+    try:
+        client = redis.Redis.from_url(
+            broker_url,
+            socket_connect_timeout=1,
+            socket_timeout=1,
+        )
+        client.ping()
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Celery Redis broker is unreachable: %s", exc)
+        return False
+    return True
+
+
+def is_background_job_enqueue_available(*, check_worker: bool = False) -> bool:
+    """Return whether a new durable job can be sent to Celery now."""
+    if not get_celery_enabled():
+        return False
+
+    broker_url = get_celery_broker_url()
+    if broker_url is None:
+        return False
+
+    broker_scheme = urlsplit(broker_url).scheme
+    if broker_scheme in {"redis", "rediss"} and not _is_redis_broker_reachable(
+        broker_url
+    ):
+        return False
+
+    if not check_worker:
+        return True
+
+    try:
+        from ..jobs.celery_app import celery_app
+
+        if celery_app.conf.task_always_eager:
+            return True
+        return bool(celery_app.control.ping(timeout=0.5))
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Celery worker health check failed: %s", exc)
+        return False
 
 
 def queue_for_job_type(job_type: str) -> str:

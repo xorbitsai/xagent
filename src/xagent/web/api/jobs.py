@@ -1,14 +1,21 @@
 from __future__ import annotations
 
+from typing import Any
+
 from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy.orm import Session
 
+from ...config import get_celery_broker_url, get_celery_enabled
 from ..auth_dependencies import get_current_user
 from ..models.background_job import BackgroundJob
 from ..models.database import get_db
 from ..models.user import User
 from ..schemas.background_job import BackgroundJobResponse
-from ..services.background_jobs import get_background_job, list_background_jobs
+from ..services.background_jobs import (
+    get_background_job,
+    is_background_job_enqueue_available,
+    list_background_jobs,
+)
 
 jobs_router = APIRouter(prefix="/api/jobs", tags=["jobs"])
 
@@ -37,6 +44,22 @@ def list_jobs(
         job_type=job_type,
         limit=limit,
     )
+
+
+@jobs_router.get("/capabilities")
+def get_job_capabilities(
+    _user: User = Depends(get_current_user),
+) -> dict[str, Any]:
+    """Return how clients should submit background-capable work."""
+    celery_enabled = get_celery_enabled()
+    broker_configured = get_celery_broker_url() is not None
+    enqueue_available = is_background_job_enqueue_available()
+    return {
+        "kb_ingest_mode": "celery" if enqueue_available else "sync",
+        "celery_enabled": celery_enabled,
+        "broker_configured": broker_configured,
+        "broker_reachable": enqueue_available,
+    }
 
 
 @jobs_router.get("/{job_id}", response_model=BackgroundJobResponse)

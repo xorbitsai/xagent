@@ -150,6 +150,22 @@ function createJsonResponse(body: unknown, ok = true) {
   }
 }
 
+function createSucceededJob(result: Record<string, unknown>) {
+  return {
+    id: "job-1",
+    user_id: 1,
+    job_type: "kb.ingest.document",
+    queue: "kb",
+    status: "succeeded",
+    progress: { message: "Completed", completed: 1, total: 1 },
+    result,
+    error_message: null,
+    celery_task_id: "task-1",
+    attempts: 1,
+    max_attempts: 3,
+  }
+}
+
 function installApiMocks() {
   apiRequestMock.mockImplementation((url: string, options?: RequestInit) => {
     if (url === "http://api.local/api/models/?category=embedding") {
@@ -158,15 +174,20 @@ function installApiMocks() {
     if (url === "http://api.local/api/models/user-default") {
       return Promise.resolve(createJsonResponse({}))
     }
-    if (url === "http://api.local/api/kb/ingest") {
+    if (url === "http://api.local/api/jobs/capabilities") {
+      return Promise.resolve(createJsonResponse({ kb_ingest_mode: "celery" }))
+    }
+    if (url === "http://api.local/api/kb/ingest/jobs") {
       return Promise.resolve(
-        createJsonResponse({
-          status: "success",
-          collection: (options?.body as FormData).get("collection"),
-          document_count: 1,
-          chunks_count: 1,
-          message: "ok",
-        })
+        createJsonResponse(
+          createSucceededJob({
+            status: "success",
+            collection: (options?.body as FormData).get("collection"),
+            document_count: 1,
+            chunks_count: 1,
+            message: "ok",
+          })
+        )
       )
     }
 
@@ -210,7 +231,7 @@ describe("KnowledgeBaseCreationDialog multi-file naming", () => {
       expect(toastErrorMock).toHaveBeenCalledWith("kb.errors.multiFileNameRequired")
     })
 
-    const ingestCalls = apiRequestMock.mock.calls.filter(([url]) => url === "http://api.local/api/kb/ingest")
+    const ingestCalls = apiRequestMock.mock.calls.filter(([url]) => url === "http://api.local/api/kb/ingest/jobs")
     expect(ingestCalls).toHaveLength(0)
   })
 
@@ -240,7 +261,7 @@ describe("KnowledgeBaseCreationDialog multi-file naming", () => {
     fireEvent.click(screen.getByText("kb.dialog.createButton"))
 
     await waitFor(() => {
-      const ingestCalls = apiRequestMock.mock.calls.filter(([url]) => url === "http://api.local/api/kb/ingest")
+      const ingestCalls = apiRequestMock.mock.calls.filter(([url]) => url === "http://api.local/api/kb/ingest/jobs")
       expect(ingestCalls).toHaveLength(2)
       for (const [, options] of ingestCalls) {
         expect((options?.body as FormData).get("collection")).toBe("team-docs")
@@ -249,6 +270,61 @@ describe("KnowledgeBaseCreationDialog multi-file naming", () => {
 
     await waitFor(() => {
       expect(onSuccess).toHaveBeenCalledWith(["team-docs", "team-docs"])
+    })
+  })
+
+  it("uses the sync ingest endpoint when background jobs are unavailable", async () => {
+    const onSuccess = vi.fn()
+    apiRequestMock.mockImplementation((url: string, options?: RequestInit) => {
+      if (url === "http://api.local/api/models/?category=embedding") {
+        return Promise.resolve(createJsonResponse([]))
+      }
+      if (url === "http://api.local/api/models/user-default") {
+        return Promise.resolve(createJsonResponse({}))
+      }
+      if (url === "http://api.local/api/jobs/capabilities") {
+        return Promise.resolve(createJsonResponse({ kb_ingest_mode: "sync" }))
+      }
+      if (url === "http://api.local/api/kb/ingest") {
+        return Promise.resolve(
+          createJsonResponse({
+            status: "success",
+            collection: (options?.body as FormData).get("collection"),
+            document_count: 1,
+            chunks_count: 1,
+            message: "ok",
+          })
+        )
+      }
+
+      throw new Error(`Unhandled apiRequest: ${url}`)
+    })
+
+    const { container } = render(
+      <KnowledgeBaseCreationDialog open={true} onOpenChange={vi.fn()} onSuccess={onSuccess} />
+    )
+
+    fireEvent.click(screen.getByText("common.next"))
+
+    const fileInput = container.querySelector("#file-upload") as HTMLInputElement
+    fireEvent.change(fileInput, {
+      target: {
+        files: [new File(["a"], "alpha.txt", { type: "text/plain" })],
+      },
+    })
+
+    fireEvent.click(screen.getByText("common.next"))
+    fireEvent.click(screen.getByText("kb.dialog.createButton"))
+
+    await waitFor(() => {
+      const syncCalls = apiRequestMock.mock.calls.filter(([url]) => url === "http://api.local/api/kb/ingest")
+      const jobCalls = apiRequestMock.mock.calls.filter(([url]) => url === "http://api.local/api/kb/ingest/jobs")
+      expect(syncCalls).toHaveLength(1)
+      expect(jobCalls).toHaveLength(0)
+    })
+
+    await waitFor(() => {
+      expect(onSuccess).toHaveBeenCalledWith(["alpha"])
     })
   })
 
@@ -263,6 +339,9 @@ describe("KnowledgeBaseCreationDialog multi-file naming", () => {
       }
       if (url === "http://api.local/api/models/user-default") {
         return Promise.resolve(createJsonResponse({}))
+      }
+      if (url === "http://api.local/api/jobs/capabilities") {
+        return Promise.resolve(createJsonResponse({ kb_ingest_mode: "celery" }))
       }
       if (url === "http://api.local/api/kb/ingest-cloud") {
         return Promise.resolve(
@@ -330,25 +409,30 @@ describe("KnowledgeBaseCreationDialog multi-file naming", () => {
       if (url === "http://api.local/api/models/user-default") {
         return Promise.resolve(createJsonResponse({}))
       }
-      if (url === "http://api.local/api/kb/ingest-web") {
+      if (url === "http://api.local/api/jobs/capabilities") {
+        return Promise.resolve(createJsonResponse({ kb_ingest_mode: "celery" }))
+      }
+      if (url === "http://api.local/api/kb/ingest-web/jobs") {
         return Promise.resolve(
-          createJsonResponse({
-            status: "partial",
-            collection: "web_collection",
-            total_urls_found: 1,
-            pages_crawled: 1,
-            pages_failed: 1,
-            documents_created: 0,
-            chunks_created: 0,
-            embeddings_created: 0,
-            crawled_urls: [],
-            failed_urls: {
-              "https://example.com/docs": "embedding missing",
-            },
-            message: "Web import partially failed",
-            warnings: [],
-            elapsed_time_ms: 0,
-          })
+          createJsonResponse(
+            createSucceededJob({
+              status: "partial",
+              collection: "web_collection",
+              total_urls_found: 1,
+              pages_crawled: 1,
+              pages_failed: 1,
+              documents_created: 0,
+              chunks_created: 0,
+              embeddings_created: 0,
+              crawled_urls: [],
+              failed_urls: {
+                "https://example.com/docs": "embedding missing",
+              },
+              message: "Web import partially failed",
+              warnings: [],
+              elapsed_time_ms: 0,
+            })
+          )
         )
       }
 

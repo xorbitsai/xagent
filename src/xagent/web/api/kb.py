@@ -107,7 +107,7 @@ from ..config import (
     is_allowed_file,
     sanitize_path_component,
 )
-from ..models.background_job import BackgroundJobType
+from ..models.background_job import BackgroundJob, BackgroundJobType
 from ..models.database import get_db, get_session_local
 from ..models.uploaded_file import UploadedFile
 from ..models.user import User
@@ -116,6 +116,8 @@ from ..services.background_jobs import (
     create_background_job,
     enqueue_background_job,
     get_non_terminal_background_job_by_idempotency_key,
+    is_background_job_enqueue_available,
+    mark_job_failed,
 )
 from ..services.kb_collection_service import (
     delete_collection_physical_dir,
@@ -781,6 +783,43 @@ def _background_job_idempotency_key(namespace: str, payload: Dict[str, Any]) -> 
     encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"), default=str)
     digest = hashlib.sha256(encoded.encode("utf-8")).hexdigest()
     return f"{namespace}:{digest}"
+
+
+def _enqueue_background_job_or_503(
+    db: Session,
+    job: BackgroundJob,
+) -> BackgroundJob:
+    """Enqueue a job or fail clearly so callers can use the sync endpoint."""
+    if not is_background_job_enqueue_available():
+        mark_job_failed(
+            db,
+            job,
+            error_message="Background job queue is unavailable",
+        )
+        raise HTTPException(
+            status_code=503,
+            detail="Background job queue is unavailable",
+        )
+    try:
+        return enqueue_background_job(db, job)
+    except Exception as exc:  # noqa: BLE001
+        mark_job_failed(
+            db,
+            job,
+            error_message=f"Background job queue is unavailable: {exc}",
+        )
+        raise HTTPException(
+            status_code=503,
+            detail=f"Background job queue is unavailable: {exc}",
+        ) from exc
+
+
+def _ensure_background_job_queue_available() -> None:
+    if not is_background_job_enqueue_available():
+        raise HTTPException(
+            status_code=503,
+            detail="Background job queue is unavailable",
+        )
 
 
 def _atomic_replace_file(source_path: Path, target_path: Path) -> None:
@@ -1781,6 +1820,7 @@ async def create_ingest_job(
         ) from e
 
     await _ensure_collection_access(safe_collection, _user, allow_create=True)
+    _ensure_background_job_queue_available()
 
     try:
         get_collection_sync(safe_collection)
@@ -1968,7 +2008,7 @@ async def create_ingest_job(
                 user=_user,
             )
         raise
-    return enqueue_background_job(db, job)
+    return _enqueue_background_job_or_503(db, job)
 
 
 @kb_router.post("/ingest-cloud", response_model=List[IngestionResult])
@@ -3254,6 +3294,7 @@ async def create_ingest_web_job(
         if isinstance(detail, str) and detail.startswith("Value error, "):
             detail = detail.removeprefix("Value error, ")
         raise HTTPException(status_code=422, detail=detail) from exc
+    _ensure_background_job_queue_available()
 
     final_chunk_size = chunk_size if chunk_size is not None and chunk_size > 0 else 1000
     final_chunk_overlap = (
@@ -3324,7 +3365,7 @@ async def create_ingest_web_job(
         idempotency_key=idempotency_key,
         reuse_terminal_idempotency_key=False,
     )
-    return enqueue_background_job(db, job)
+    return _enqueue_background_job_or_503(db, job)
 
 
 class BatchDeleteCollectionsRequest(BaseModel):

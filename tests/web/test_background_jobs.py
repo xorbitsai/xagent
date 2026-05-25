@@ -13,6 +13,7 @@ from xagent.web.models.user import User
 from xagent.web.services.background_jobs import (
     create_background_job,
     enqueue_background_job,
+    is_background_job_enqueue_available,
     requeue_stale_background_jobs,
 )
 from xagent.web.services.triggers import enqueue_trigger_event_job
@@ -52,6 +53,14 @@ def test_enqueue_background_job_disabled_stays_pending(tmp_path, monkeypatch):
         assert enqueued.celery_task_id is None
     finally:
         db.close()
+
+
+def test_background_job_enqueue_unavailable_without_worker(monkeypatch):
+    monkeypatch.setenv(CELERY_ENABLED, "true")
+    monkeypatch.setenv(CELERY_BROKER_URL, "memory://")
+
+    assert is_background_job_enqueue_available(check_worker=False) is True
+    assert is_background_job_enqueue_available(check_worker=True) is False
 
 
 def test_celery_worker_app_import_registers_tasks():

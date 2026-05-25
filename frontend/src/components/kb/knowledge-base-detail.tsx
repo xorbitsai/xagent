@@ -15,6 +15,15 @@ import { Badge } from "@/components/ui/badge"
 import { ConfirmDialog } from "@/components/ui/confirm-dialog"
 import { apiRequest, getUploadErrorMessage, isJsonRecord, parseApiResponse, UPLOAD_ERROR_MESSAGES } from "@/lib/api-wrapper"
 import { getApiUrl } from "@/lib/utils"
+import {
+  getBackgroundJobFailureMessage,
+  getBackgroundJobProgressMessage,
+  getBackgroundJobProgressPercent,
+  getBackgroundJobResult,
+  isBackgroundJobResponse,
+  shouldUseBackgroundJobs,
+  waitForBackgroundJob,
+} from "@/lib/background-jobs"
 import { appendIngestionConfigToFormData, normalizeIngestionConfigForFilename } from "@/lib/ingestion-form"
 import { findMatchingIngestionTask, getKBTaskProgressDetail, getKBTaskProgressPercent, KBProgressTask } from "@/lib/kb-progress"
 import {
@@ -382,6 +391,8 @@ export function KnowledgeBaseDetailContent({ collectionName }: { collectionName:
     setCompletedUploadCount(0)
 
     try {
+      const apiUrl = getApiUrl()
+      const useBackgroundJobs = await shouldUseBackgroundJobs(apiUrl)
       for (let i = 0; i < selectedFiles.length; i++) {
         const file = selectedFiles[i]
         const formData = new FormData()
@@ -395,10 +406,13 @@ export function KnowledgeBaseDetailContent({ collectionName }: { collectionName:
           normalizeIngestionConfigForFilename(ingestionConfig, file.name)
         )
 
-        const response = await apiRequest(`${getApiUrl()}/api/kb/ingest`, {
-          method: "POST",
-          body: formData
-        })
+        const response = await apiRequest(
+          `${apiUrl}/api/kb/ingest${useBackgroundJobs ? "/jobs" : ""}`,
+          {
+            method: "POST",
+            body: formData
+          }
+        )
 
         const parsed = await parseApiResponse(response)
 
@@ -428,16 +442,48 @@ export function KnowledgeBaseDetailContent({ collectionName }: { collectionName:
           throw new Error(errorMessage)
         }
 
-        const result = isJsonRecord(parsed.data)
-          ? parsed.data as unknown as KnowledgeBaseIngestionResultLike
+        const job = useBackgroundJobs && isBackgroundJobResponse(parsed.data)
+          ? await waitForBackgroundJob(apiUrl, parsed.data, (updatedJob) => {
+              const detail = getBackgroundJobProgressMessage(updatedJob)
+              const taskPercent = getBackgroundJobProgressPercent(updatedJob)
+              if (detail) setUploadProgressDetail(detail)
+              if (typeof taskPercent === "number") {
+                const overall = ((i + taskPercent / 100) / Math.max(selectedFiles.length, 1)) * 100
+                setUploadProgress(Math.max(0, Math.min(100, overall)))
+              }
+            })
           : null
-        if (!result) {
+        const result = job
+          ? getBackgroundJobResult(job)
+          : isJsonRecord(parsed.data)
+            ? parsed.data as unknown as KnowledgeBaseIngestionResultLike
+            : null
+        if (job?.status === "failed" || job?.status === "cancelled") {
+          const errorMessage = getBackgroundJobFailureMessage(
+            job,
+            t("kb.detail.errors.uploadFailedWithName", { name: file.name })
+          )
+          setIngestionResults(prev => [
+            ...prev,
+            normalizeKnowledgeBaseIngestionResult(
+              isJsonRecord(result)
+                ? result as unknown as KnowledgeBaseIngestionResultLike
+                : buildKnowledgeBaseErrorResult(collectionName, errorMessage, undefined, file.name),
+              { collection: collectionName, fileName: file.name }
+            ),
+          ])
+          throw new Error(errorMessage)
+        }
+        const ingestionResult = isJsonRecord(result)
+          ? result as unknown as KnowledgeBaseIngestionResultLike
+          : null
+        if (!ingestionResult) {
           throw new Error(t("kb.detail.errors.uploadFailedWithName", { name: file.name }))
         }
         setIngestionResults(prev => [
           ...prev,
           normalizeKnowledgeBaseIngestionResult(
-            result as unknown as KnowledgeBaseIngestionResultLike,
+            ingestionResult,
             { collection: collectionName, fileName: file.name }
           ),
         ])
@@ -530,6 +576,8 @@ export function KnowledgeBaseDetailContent({ collectionName }: { collectionName:
     setWebIngestionResult(null)
 
     try {
+      const apiUrl = getApiUrl()
+      const useBackgroundJobs = await shouldUseBackgroundJobs(apiUrl)
       const formData = new FormData()
 
       formData.append("collection", collectionName)
@@ -559,10 +607,13 @@ export function KnowledgeBaseDetailContent({ collectionName }: { collectionName:
 
       setWebIngestionProgress(10)
 
-      const response = await apiRequest(`${getApiUrl()}/api/kb/ingest-web`, {
-        method: "POST",
-        body: formData
-      })
+      const response = await apiRequest(
+        `${apiUrl}/api/kb/ingest-web${useBackgroundJobs ? "/jobs" : ""}`,
+        {
+          method: "POST",
+          body: formData
+        }
+      )
 
       const parsed = await parseApiResponse(response)
 
@@ -582,8 +633,33 @@ export function KnowledgeBaseDetailContent({ collectionName }: { collectionName:
         throw new Error(errorMessage)
       }
 
-      const result: WebIngestionResult | null = isJsonRecord(parsed.data)
-        ? (parsed.data as unknown as WebIngestionResult)
+      const job = useBackgroundJobs && isBackgroundJobResponse(parsed.data)
+        ? await waitForBackgroundJob(apiUrl, parsed.data, (updatedJob) => {
+            const taskPercent = getBackgroundJobProgressPercent(updatedJob)
+            if (typeof taskPercent === "number") {
+              setWebIngestionProgress(Math.max(10, Math.min(100, taskPercent)))
+            }
+          })
+        : null
+      const resultData = job
+        ? getBackgroundJobResult(job)
+        : isJsonRecord(parsed.data)
+          ? parsed.data
+          : null
+      if (job?.status === "failed" || job?.status === "cancelled") {
+        const errorMessage = getBackgroundJobFailureMessage(
+          job,
+          t("kb.detail.errors.webImportFailed")
+        )
+        setWebIngestionResult(
+          isJsonRecord(resultData)
+            ? resultData as unknown as WebIngestionResult
+            : buildWebIngestionErrorResult(collectionName, errorMessage)
+        )
+        throw new Error(errorMessage)
+      }
+      const result: WebIngestionResult | null = isJsonRecord(resultData)
+        ? (resultData as unknown as WebIngestionResult)
         : null
       if (!result) {
         throw new Error(t("kb.detail.errors.webImportFailed"))

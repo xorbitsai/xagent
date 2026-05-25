@@ -63,6 +63,16 @@ vi.mock("@/components/chat/ChatInput", () => ({
       >
         attach-chat-input-file
       </button>
+      <button
+        type="button"
+        onClick={() => {
+          const file = new File(["chat-input"], "chat-input.txt", { type: "text/plain" }) as File & { file_id?: string }
+          file.file_id = "existing-file-id"
+          onFilesChange?.([...files, file])
+        }}
+      >
+        attach-preuploaded-chat-input-file
+      </button>
       <button type="button" onClick={() => onSend?.("chat input message")}>
         send-chat-input
       </button>
@@ -71,20 +81,34 @@ vi.mock("@/components/chat/ChatInput", () => ({
 }))
 
 vi.mock("@/components/chat/ChatMessage", () => ({
-  ChatMessage: ({ onSendInteraction }: { onSendInteraction?: (text: string, files?: File[]) => void }) => (
-    onSendInteraction ? (
-      <button
-        type="button"
-        onClick={() => onSendInteraction("upload this", [
-          new File(["data"], "data.txt", { type: "text/plain" }),
-        ])}
-      >
-        send-file-interaction
-      </button>
-    ) : (
-      <div>message</div>
+  ChatMessage: ({ onSendInteraction }: { onSendInteraction?: (text: string, files?: File[]) => Promise<void> | void }) => {
+    const [status, setStatus] = React.useState("idle")
+
+    if (!onSendInteraction) {
+      return <div>message</div>
+    }
+
+    return (
+      <div>
+        <button
+          type="button"
+          onClick={async () => {
+            try {
+              await onSendInteraction("upload this", [
+                new File(["data"], "data.txt", { type: "text/plain" }),
+              ])
+              setStatus("resolved")
+            } catch {
+              setStatus("rejected")
+            }
+          }}
+        >
+          send-file-interaction
+        </button>
+        <span>{status}</span>
+      </div>
     )
-  ),
+  },
 }))
 
 vi.mock("@/components/ui/scroll-area", () => ({
@@ -107,6 +131,39 @@ vi.mock("lucide-react", () => ({
 
 import { AgentBuilderChat, type AgentConfig } from "./agent-builder-chat"
 
+class MockWebSocket {
+  static OPEN = 1
+  static CONNECTING = 0
+  static instances: MockWebSocket[] = []
+
+  readyState = MockWebSocket.CONNECTING
+  sentMessages: string[] = []
+  onopen: (() => void) | null = null
+  onmessage: ((event: { data: string }) => void) | null = null
+  onerror: ((event?: unknown) => void) | null = null
+  onclose: (() => void) | null = null
+
+  constructor(_url: string) {
+    MockWebSocket.instances.push(this)
+  }
+
+  send(message: string) {
+    this.sentMessages.push(message)
+  }
+
+  close() {
+    this.readyState = 3
+    this.onclose?.()
+  }
+
+  open() {
+    this.readyState = MockWebSocket.OPEN
+    this.onopen?.()
+  }
+}
+
+const originalWebSocket = globalThis.WebSocket
+
 const agentConfig: AgentConfig = {
   name: "Demo",
   description: "Demo",
@@ -126,10 +183,13 @@ describe("AgentBuilderChat", () => {
   beforeEach(() => {
     apiRequestMock.mockReset()
     toastErrorMock.mockReset()
+    MockWebSocket.instances = []
+    globalThis.WebSocket = MockWebSocket as unknown as typeof WebSocket
   })
 
   afterEach(() => {
     cleanup()
+    globalThis.WebSocket = originalWebSocket
   })
 
   it("shows backend upload error details when file upload is unavailable", async () => {
@@ -155,5 +215,39 @@ describe("AgentBuilderChat", () => {
         "Startup file storage sync failed"
       )
     })
+
+    await waitFor(() => {
+      expect(screen.getByText("rejected")).toBeInTheDocument()
+    })
+  })
+
+  it("reuses pre-uploaded file ids from compact chat input instead of uploading again", async () => {
+    render(
+      <AgentBuilderChat
+        agentConfig={agentConfig}
+        onUpdateConfig={vi.fn()}
+      />
+    )
+
+    fireEvent.click(screen.getByText("attach-preuploaded-chat-input-file"))
+    fireEvent.click(screen.getByText("send-chat-input"))
+
+    expect(MockWebSocket.instances).toHaveLength(1)
+    MockWebSocket.instances[0].open()
+
+    await waitFor(() => {
+      expect(MockWebSocket.instances[0].sentMessages).toHaveLength(1)
+    })
+
+    const payload = JSON.parse(MockWebSocket.instances[0].sentMessages[0])
+    expect(payload.files).toEqual([
+      {
+        file_id: "existing-file-id",
+        name: "chat-input.txt",
+        size: 10,
+        type: "text/plain",
+      },
+    ])
+    expect(apiRequestMock).not.toHaveBeenCalled()
   })
 })

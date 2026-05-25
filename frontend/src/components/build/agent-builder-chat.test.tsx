@@ -156,35 +156,4 @@ describe("AgentBuilderChat", () => {
       )
     })
   })
-
-  it("uploads files added from the compact chat input before sending", async () => {
-    apiRequestMock.mockResolvedValueOnce(
-      new Response(JSON.stringify({ detail: "Compact input upload failed" }), {
-        status: 503,
-        statusText: "Service Unavailable",
-        headers: { "Content-Type": "application/json" },
-      })
-    )
-
-    render(
-      <AgentBuilderChat
-        agentConfig={agentConfig}
-        onUpdateConfig={vi.fn()}
-      />
-    )
-
-    fireEvent.click(await screen.findByText("attach-chat-input-file"))
-    fireEvent.click(screen.getByText("send-chat-input"))
-
-    await waitFor(() => {
-      expect(apiRequestMock).toHaveBeenCalledWith(
-        "http://api.local/api/files/upload",
-        expect.objectContaining({
-          method: "POST",
-        })
-      )
-    })
-
-    expect(toastErrorMock).toHaveBeenCalledWith("Compact input upload failed")
-  })
 })

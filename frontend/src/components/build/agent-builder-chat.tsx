@@ -487,7 +487,6 @@ export function AgentBuilderChat({ agentConfig, onUpdateConfig, availableOptions
           }}
           isLoading={isLoading}
           hideConfig={true}
-          hideFileUpload={true}
           compact={true}
           files={files}
           onFilesChange={setFiles}

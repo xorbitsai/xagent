@@ -8,6 +8,7 @@ import { apiRequest } from '@/lib/api-wrapper'
 import { cn, getApiUrl } from '@/lib/utils'
 import {
   arrayBufferToBase64,
+  getInlineFileDownloadUrl,
   getInlineFilePreviewKind,
   getInlineFilePreviewUrl,
   getPreviewUrlTrust,
@@ -221,6 +222,7 @@ export function InlineFilePreview({
   const apiUrl = getApiUrl()
   const kind = getInlineFilePreviewKind(source)
   const previewUrl = getInlineFilePreviewUrl(source, apiUrl)
+  const downloadUrl = getInlineFileDownloadUrl(source, apiUrl)
   const previewUrlTrust = getPreviewUrlTrust(source, apiUrl)
   const filename = fileNameFromSource(source)
   const canOpenFilePreview = Boolean(onFileClick && source.fileId)
@@ -260,7 +262,7 @@ export function InlineFilePreview({
   if (!isPreviewableInlineFileKind(kind)) {
     return (
       <a
-        href={previewUrl}
+        href={downloadUrl}
         target={canOpenFilePreview ? undefined : '_blank'}
         rel={canOpenFilePreview ? undefined : 'noreferrer'}
         onClick={canOpenFilePreview ? handleOpenPreview : undefined}
@@ -284,7 +286,7 @@ export function InlineFilePreview({
         <FileText className="h-4 w-4 shrink-0" />
         <span className="min-w-0 flex-1 truncate">{filename}</span>
         <a
-          href={previewUrl}
+          href={downloadUrl}
           target={canOpenFilePreview ? undefined : '_blank'}
           rel={canOpenFilePreview ? undefined : 'noreferrer'}
           onClick={canOpenFilePreview ? handleOpenPreview : undefined}

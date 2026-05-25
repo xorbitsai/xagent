@@ -107,7 +107,13 @@ describe('InlineFilePreview', () => {
     expect(handleFileClick).toHaveBeenCalledWith('slides-file-id', 'slides.pptx')
   })
 
-  it('uses the preview URL as the inline preview open link href', () => {
+  it('uses the download URL as the inline preview open link href', () => {
+    // The "Open" link must route through /api/files/download, not
+    // /api/files/public/preview: preview is for inline rendering (and on
+    // some deployments returns a derived payload), while the download
+    // endpoint serves the source bytes with a ``Content-Disposition:
+    // attachment; filename=...`` header so a save lands as the real
+    // filename rather than the bare file id.
     const handleFileClick = vi.fn()
 
     render(
@@ -124,7 +130,7 @@ describe('InlineFilePreview', () => {
     const openLink = screen.getByRole('link', { name: 'Open' })
     expect(openLink).toHaveAttribute(
       'href',
-      'http://api.local/api/files/public/preview/slides-file-id'
+      'http://api.local/api/files/download/slides-file-id'
     )
 
     fireEvent.click(openLink)
@@ -182,7 +188,11 @@ describe('InlineFilePreview', () => {
     expect(screen.queryByText('Localized load failure')).not.toBeInTheDocument()
   })
 
-  it('uses the preview URL as the non-previewable file link href', () => {
+  it('uses the download URL as the non-previewable file link href', () => {
+    // Non-previewable artifacts (zip, etc.) collapse the file card into
+    // a single download link — same reasoning as the inline-preview Open
+    // link: route through /api/files/download so the save filename is
+    // the source name, not the file id.
     const handleFileClick = vi.fn()
 
     render(
@@ -195,7 +205,7 @@ describe('InlineFilePreview', () => {
     const link = screen.getByRole('link', { name: 'archive.zip' })
     expect(link).toHaveAttribute(
       'href',
-      'http://api.local/api/files/public/preview/archive-file-id'
+      'http://api.local/api/files/download/archive-file-id'
     )
 
     fireEvent.click(link)

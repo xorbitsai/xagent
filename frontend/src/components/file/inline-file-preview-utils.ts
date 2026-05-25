@@ -117,6 +117,25 @@ export const getInlineFilePreviewUrl = (
   return ''
 }
 
+// The "Open" affordance must hand the user the *original* artifact —
+// /api/files/public/preview is intended for inline rendering (e.g. the
+// PptxPreviewRenderer feeds raw bytes into pptxviewjs) and on some
+// deployments returns a derived preview payload instead of the source
+// file. Routing the open link through /api/files/download guarantees the
+// original bytes plus a ``Content-Disposition: attachment; filename=...``
+// header, so the browser saves the file under its real name instead of a
+// bare file id. External (cross-origin) sources fall back to the source's
+// previewUrl since there's no managed download endpoint for them.
+export const getInlineFileDownloadUrl = (
+  source: InlineFilePreviewSource,
+  apiUrl: string
+): string => {
+  if (source.fileId) {
+    return `${apiUrl}/api/files/download/${encodeURIComponent(source.fileId)}`
+  }
+  return getInlineFilePreviewUrl(source, apiUrl)
+}
+
 export const getPreviewUrlTrust = (
   source: InlineFilePreviewSource,
   apiUrl: string

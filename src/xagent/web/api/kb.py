@@ -809,8 +809,9 @@ def _copy_upload_file_to_path(
     file: UploadFile,
     file_path: Path,
     *,
-    max_size: int = MAX_FILE_SIZE,
+    max_size: int | None = None,
 ) -> int:
+    effective_max_size = MAX_FILE_SIZE if max_size is None else max_size
     total_size = 0
     file_read_buffer_size = 1024 * 1024
     file.file.seek(0)
@@ -820,7 +821,7 @@ def _copy_upload_file_to_path(
             if not chunk:
                 break
             total_size += len(chunk)
-            if total_size > max_size:
+            if total_size > effective_max_size:
                 raise HTTPException(
                     status_code=413,
                     detail=f"File size exceeds maximum limit of {MAX_FILE_SIZE_LABEL}",

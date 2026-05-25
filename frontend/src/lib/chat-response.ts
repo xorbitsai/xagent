@@ -8,8 +8,10 @@ export interface ParsedChatResponse {
     interactions?: unknown[]
 }
 
-const stripJsonBlocks = (value: string): string =>
-    value.replace(/```json[\s\S]*?(```|$)/gi, "").trim()
+const stripJsonBlocks = (value: string): string => {
+    const stripped = value.replace(/```json[\s\S]*?(```|$)/gi, "").trim()
+    return stripped || value.trim()
+}
 
 const readChatPayload = (value: unknown): ParsedChatPayload | null => {
     if (!value || typeof value !== "object") return null

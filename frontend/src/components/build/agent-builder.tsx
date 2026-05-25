@@ -469,7 +469,7 @@ export function AgentBuilder({ agentId }: AgentBuilderProps) {
                 if (lastMsg && lastMsg.role === 'assistant') {
                   newMessages[newMessages.length - 1] = {
                     ...lastMsg,
-                    content: completionText || message.output || "Preview completed",
+                    content: completionText || "Preview completed",
                     interactions: interactions ?? lastMsg.interactions,
                   }
                   return newMessages

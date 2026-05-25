@@ -41,6 +41,7 @@ import { KnowledgeBaseCreationDialog } from "@/components/kb/knowledge-base-crea
 import { toast } from "sonner"
 import { cn } from "@/lib/utils"
 import { getBrandingFromEnv } from "@/lib/branding"
+import { extractBuildPreviewResponse } from "@/lib/chat-response"
 
 interface KnowledgeBase {
   name: string
@@ -95,6 +96,7 @@ interface Message {
   content: string | React.ReactNode
   traceEvents?: any[]
   timestamp?: number
+  interactions?: any[]
 }
 
 interface AgentBuilderProps {
@@ -450,9 +452,7 @@ export function AgentBuilder({ agentId }: AgentBuilderProps) {
                 return prev
               })
             } else if (message.type === 'task_completed') {
-              const completionText = typeof message.result === 'string'
-                ? message.result
-                : message.result?.content || ""
+              const { message: completionText, interactions } = extractBuildPreviewResponse(message)
               const interruptedByPause =
                 message.success === false &&
                 completionText === "ReActPattern interrupted."
@@ -469,7 +469,8 @@ export function AgentBuilder({ agentId }: AgentBuilderProps) {
                 if (lastMsg && lastMsg.role === 'assistant') {
                   newMessages[newMessages.length - 1] = {
                     ...lastMsg,
-                    content: completionText || message.output || "Preview completed"
+                    content: completionText || message.output || "Preview completed",
+                    interactions: interactions ?? lastMsg.interactions,
                   }
                   return newMessages
                 }
@@ -2072,6 +2073,8 @@ export function AgentBuilder({ agentId }: AgentBuilderProps) {
                 showProcessView={true}
                 timestamp={msg.timestamp}
                 taskStatus={index === messages.length - 1 && msg.role === 'assistant' ? taskStatus : undefined}
+                interactions={msg.interactions}
+                onSendInteraction={handleSendMessage}
               />
             ))}
           </div>

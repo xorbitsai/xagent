@@ -49,6 +49,7 @@ import {
   mergeTraceEventsById,
   shouldBufferMessageForHistoricalReplay,
 } from "@/lib/streaming-final-answer"
+import { extractSharedChatResponse } from "@/lib/chat-response"
 
 // Unique ID generator for messages
 let messageIdCounter = 0
@@ -249,57 +250,18 @@ const normalizeInteractions = (value: unknown): Interaction[] => {
     .filter(Boolean) as Interaction[]
 }
 
-const extractClarificationMessage = (raw: unknown): { interactions: Interaction[] } | null => {
-  let asObject = raw && typeof raw === "object" ? (raw as any) : null
+const extractClarificationMessage = (raw: unknown): { message?: string; interactions: Interaction[] } | null => {
+  const sharedResponse = extractSharedChatResponse(raw)
+  const interactions = normalizeInteractions(sharedResponse?.interactions)
 
-  if (typeof raw === 'string') {
-    try {
-      asObject = JSON.parse(raw)
-    } catch (e) {
-      // ignore
-    }
+  if (interactions.length === 0) {
+    return null
   }
 
-  const directInteractions = normalizeInteractions(asObject?.interactions)
-  if (directInteractions.length > 0) {
-    return {
-      interactions: directInteractions,
-    }
+  return {
+    message: sharedResponse?.message,
+    interactions,
   }
-
-  const chatResponse = asObject?.chat_response
-  if (chatResponse && typeof chatResponse === "object") {
-    const chatInteractions = normalizeInteractions((chatResponse as any).interactions)
-    if (chatInteractions.length > 0) {
-      return {
-        interactions: chatInteractions,
-      }
-    }
-  }
-
-  const resultValue = asObject?.result
-  // Try to parse result if it's a string
-  let parsedResult = resultValue
-  if (typeof resultValue === 'string') {
-    try {
-      parsedResult = JSON.parse(resultValue)
-    } catch (e) {
-      // ignore
-    }
-  }
-
-  if (parsedResult && typeof parsedResult === "object") {
-    const nested = extractClarificationMessage(parsedResult)
-    if (nested) return nested
-  }
-
-  const metadataValue = asObject?.metadata
-  if (metadataValue && typeof metadataValue === "object") {
-    const nested = extractClarificationMessage(metadataValue)
-    if (nested) return nested
-  }
-
-  return null
 }
 
 
@@ -475,13 +437,13 @@ type AppAction =
   | { type: "SELECT_STEP"; payload: string | null }
   | { type: "SET_PROCESSING"; payload: boolean }
   | {
-      type: "CLEAR_MESSAGES";
-      payload?: {
-        keepMessageId?: string | null;
-        preserveUserMessages?: boolean;
-        preserveStreamingFinalAnswers?: boolean;
-      };
-    }
+    type: "CLEAR_MESSAGES";
+    payload?: {
+      keepMessageId?: string | null;
+      preserveUserMessages?: boolean;
+      preserveStreamingFinalAnswers?: boolean;
+    };
+  }
   | { type: "RESET_STATE" }
   | { type: "OPEN_FILE_PREVIEW"; payload: { fileId: string; fileName: string; files?: Array<{ fileId: string; fileName: string }>; index?: number } }
   | { type: "CLOSE_FILE_PREVIEW" }
@@ -581,12 +543,12 @@ function appReducer(state: AppState, action: AppAction): AppState {
           const updatedMessages = state.messages.map((message, index) =>
             index === targetIndex
               ? {
-                  ...message,
-                  ...messageToAdd,
-                  id: message.id,
-                  status: newMessage.status || "completed",
-                  traceEvents: mergeTraceEventsById(message.traceEvents, messageToAdd.traceEvents),
-                }
+                ...message,
+                ...messageToAdd,
+                id: message.id,
+                status: newMessage.status || "completed",
+                traceEvents: mergeTraceEventsById(message.traceEvents, messageToAdd.traceEvents),
+              }
               : message
           )
           return { ...state, messages: updatedMessages, traceEvents: newTraceEvents }
@@ -2318,6 +2280,9 @@ export function AppProvider({ children, token }: { children: React.ReactNode; to
             // Check for clarification request in task completion
             const clarification = extractClarificationMessage(eventData)
             if (clarification) {
+              const clarificationMessage =
+                clarification.message
+                || (typeof result?.content === "string" ? result.content : "")
               const msgId = generateMessageId("msg-clarification")
               dispatch({
                 type: "ADD_MESSAGE",
@@ -2325,7 +2290,7 @@ export function AppProvider({ children, token }: { children: React.ReactNode; to
                   id: msgId,
                   role: "assistant",
                   content: <div className="space-y-2">
-                    <MarkdownRenderer content={result.content || ""} />
+                    <MarkdownRenderer content={clarificationMessage} />
                     <ClarificationForm
                       interactions={clarification.interactions}
                       messageId={msgId}

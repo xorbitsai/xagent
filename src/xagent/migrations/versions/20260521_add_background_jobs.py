@@ -1,7 +1,7 @@
 """add durable background jobs
 
 Revision ID: 20260521_add_background_jobs
-Revises: 20260523_add_workforce_core_tables
+Revises: 20260525_add_trace_checkpoint_blobs
 Create Date: 2026-05-21 00:00:00.000000
 
 """
@@ -13,7 +13,7 @@ from alembic import op
 
 # revision identifiers, used by Alembic.
 revision: str = "20260521_add_background_jobs"
-down_revision: Union[str, tuple[str, str], None] = "20260523_add_workforce_core_tables"
+down_revision: Union[str, tuple[str, str], None] = "20260525_add_trace_checkpoint_blobs"
 branch_labels: Union[str, Sequence[str], None] = None
 depends_on: Union[str, Sequence[str], None] = None
 

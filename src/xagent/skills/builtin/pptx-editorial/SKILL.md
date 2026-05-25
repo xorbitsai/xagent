@@ -15,24 +15,17 @@ description: |
   signals that visual quality matters beyond a generic deck.
   Use `html-deck-editorial` instead only when the user explicitly wants HTML
   output (more visual freedom but not Office-compatible).
-triggers:
-  - "pptx"
-  - "powerpoint"
-  - "ppt"
-  - "native slides"
-  - "editorial pptx"
-  - "pitch deck"
-  - "投资人路演"
-  - "路演 ppt"
-  - "路演ppt"
-  - "美观 ppt"
-  - "美观ppt"
-  - "powerpoint deck"
-  - "indigo porcelain"
-  - "monocle"
-  - "forest ink"
-  - "kraft paper"
-  - "dune"
+when_to_use: |
+  When the user wants a polished native .pptx deliverable (pitch deck, 路演 PPT,
+  board review, executive memo) where visual quality matters and the file must
+  open in PowerPoint / Keynote / Google Slides. Use `html-deck-editorial`
+  instead when the user explicitly wants HTML output.
+tags:
+  - presentation
+  - pptx
+  - powerpoint
+  - deck
+  - editorial
 ---
 
 # Editorial PPTX Deck
@@ -264,7 +257,9 @@ pass `packages: "pptxgenjs"` (string) so the executor `npm install`s it
 before running. Without it the script crashes with `Cannot find module
 'pptxgenjs'`.
 
-(`javascript_executor` runs this in a Node env with pptxgenjs preinstalled.)
+pptxgenjs is **not** preinstalled in the sandbox — supplying it via
+`packages` is what makes it available for the run. Always pass it
+through `packages`, even on repeated runs in the same task.
 
 ## 📝 Output checklist (verify before running)
 
@@ -301,11 +296,14 @@ before running. Without it the script crashes with `Cannot find module
       (not in code fences, not as "file_id: UUID" text). Otherwise the
       chip won't render — the user can't click anything.
 
-Write the JS, run via `javascript_executor`, then:
+Run via `execute_javascript_code` (with `packages: "pptxgenjs"`), then:
 
-1. Call `get_file_info("editorial-deck.pptx")` (or whatever filename
-   you used) to retrieve the registered `file_id` (UUID).
-2. In your final answer, **the first line MUST be the chip link itself**
+1. **Read the tool's response.** When the JS run succeeds and produces a
+   .pptx in the workspace, the tool result includes a `markdown_link`
+   field (e.g. when there's one output file) or a `file_refs` array
+   whose entries each carry `file_id` + `filename` + `markdown_link`.
+   Use the returned `markdown_link` string verbatim.
+2. In your final answer, **the first line MUST be that chip link**
    (literal markdown syntax, NOT wrapped in backticks, NOT presented as
    "here's the UUID"):
 
@@ -314,7 +312,8 @@ Write the JS, run via `javascript_executor`, then:
    [editorial-deck.pptx](file:20fae785-3823-4906-b385-d0e8a7807dc8)
    ```
    That is, the message body literally starts with `[filename](file:UUID)`
-   on its own line — NOT inside ``` code fences.
+   on its own line — NOT inside ``` code fences. The exact UUID comes
+   from the tool response; never fabricate one.
 
    ❌ **WRONG — common failure mode that renders as plain text**:
    ```
@@ -332,6 +331,11 @@ Write the JS, run via `javascript_executor`, then:
    ```
    </pre>
    Code blocks suppress markdown — the link won't render as a chip.
+
+   ❌ **ALSO WRONG**: calling `get_file_info(...)` to "fetch" the
+   file_id — its `FileInfo` return shape does not include `file_id`.
+   The chip reference is in the executor's own response, not a
+   separate metadata call.
 
 3. After the chip link line, report:
    - Palette chosen

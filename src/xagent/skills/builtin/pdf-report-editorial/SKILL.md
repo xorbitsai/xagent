@@ -9,14 +9,16 @@ description: |
   where visual quality matters and the format must be portable / printable.
   Use `pptx-editorial` or `html-deck-editorial` instead if the user
   actually wants slides; this skill is for read-as-document, not as-slides.
-triggers:
-  - "pdf report"
-  - "whitepaper"
-  - "executive brief"
-  - "research report"
-  - "case study pdf"
-  - "美观 pdf"
-  - "editorial pdf"
+when_to_use: |
+  When the user wants a polished read-as-document deliverable (whitepaper,
+  research brief, executive memo, case study) as a PDF where typography and
+  layout matter. Not for slides — use `pptx-editorial` or `html-deck-editorial`
+  for slide-style decks.
+tags:
+  - pdf
+  - report
+  - whitepaper
+  - editorial
 ---
 
 # Editorial PDF Report
@@ -25,10 +27,12 @@ You will generate one `.pdf` file via a two-step pipeline:
 
 1. Write a self-contained HTML file to the workspace using
    `workspace_file_tool` (or `file_tool`).
-2. Open it in the browser via `browser_use` (action `navigate` to the
-   file's `file://` URL), then call `browser_use` action `pdf` (or
-   the equivalent PDF export action) with `format: A4`, `printBackground: true`,
-   `margin: { top: 12mm, bottom: 16mm, left: 14mm, right: 14mm }`.
+2. Call **`browser_navigate`** on the workspace-relative path (or the
+   file's `file://` URL), then call **`browser_pdf`** with
+   `output_filename="report.pdf"`, `format="A4"`,
+   `print_background=true`. Page margins are controlled by CSS
+   `@page` rules in the HTML (see "@media print" section below) —
+   `browser_pdf` does not accept a `margin` object.
 3. Report both the .html path (for editing) and the .pdf path (final).
 
 ## ⚠️ Hard rules — NO exceptions
@@ -59,7 +63,9 @@ You will generate one `.pdf` file via a two-step pipeline:
    - `@page { size: A4; margin: 0; }`
    - `@media print` rules for page breaks (no orphan/widow titles)
    - `page-break-inside: avoid` on figures, callouts, tables
-   - `page-break-before: always` on H1 chapter titles (optional)
+   - `page-break-before: always` on `section.chapter` wrappers or on
+     the H2 section-divider rule (the cover is the only H1 — see the
+     "Document structure" section and the output checklist).
 
 ## 🎨 Palettes — pick ONE
 
@@ -81,8 +87,8 @@ Each: `ink` (text + rules), `paper` (page bg), `paper-tint` (callout box bg),
 
 | Role | Family | Size | Line-height | Weight |
 |---|---|---|---|---|
-| H1 chapter title | Display | 48pt | 1.1 | 400 |
-| H2 section | Display | 28pt | 1.2 | 400 |
+| H1 (cover title only — used once) | Display | 48pt | 1.1 | 400 |
+| H2 section / chapter divider | Display | 28pt | 1.2 | 400 |
 | H3 subsection | Body | 14pt | 1.3 | 600 |
 | Body paragraph | Body | 11pt | 1.55 | 400 |
 | Pull quote | Display italic | 22pt | 1.3 | 400 |
@@ -191,26 +197,37 @@ figcaption { font-size: 9pt; font-style: italic; color: var(--ink-tint); margin-
 
 ```
 1. Write HTML to workspace as `report.html`.
-2. Use browser_use to navigate to file://<absolute-path>/report.html.
-3. Use browser_use PDF action with: format=A4, printBackground=true,
-   margin top/bottom 12mm/16mm, left/right 14mm.
-4. Save the resulting PDF (decode base64 if returned that way) to
-   workspace as `report.pdf`.
+2. Call `browser_navigate` with the workspace path (or
+   `file://<absolute-path>/report.html`).
+3. Call `browser_pdf` with `output_filename="report.pdf"`,
+   `format="A4"`, `print_background=true`. The page margins are set
+   in CSS `@page { margin: 12mm 14mm 16mm 14mm }` inside the HTML —
+   `browser_pdf` writes the file directly to the workspace and the
+   `markdown_link` for it is in the tool's response (do not manually
+   decode base64 unless the response explicitly indicates the
+   workspace write failed).
 ```
 
 ### 📎 Deliver as a clickable chip in chat
 
-After both files exist, call `get_file_info` on each to get the registered
-`file_id` UUID, then start your final answer with **bare markdown chip
-links** as the first two lines (NO backticks around them, NOT presented as
-"file_id: UUID"):
+The browser tools (`browser_navigate`, `browser_pdf`) and the workspace
+file-writing tools return a `markdown_link` field — or a `file_refs[]`
+array of entries each carrying `file_id` / `filename` / `markdown_link` —
+for every workspace file they registered. **Read each tool's response**
+and copy the returned `markdown_link` strings verbatim. Start your final
+answer with those chip lines (bare markdown, no backticks, not phrased
+as "file_id: UUID"):
 
 ✅ **CORRECT** (chat renders these as clickable chips):
 
-    [report.pdf](file:UUID-FROM-get_file_info)
-    [report.html](file:UUID-FROM-get_file_info)
+    [report.pdf](file:1f9c5a40-...)
+    [report.html](file:9bd5f1aa-...)
 
-❌ **WRONG**: ``` file_id: `UUID` ```, or wrapping the chip link inside
-code fences. Both render as inert text and the user cannot click.
+The UUIDs come from the tools' own responses; do not fabricate them.
+
+❌ **WRONG**: ``` file_id: `UUID` ```, wrapping the chip link inside
+code fences, or calling `get_file_info(...)` to "fetch" the file_id
+(its `FileInfo` shape does not include `file_id` — the chip reference
+is already on the producing tool's result).
 
 After the chip lines, briefly note: palette chosen, page count, section count.

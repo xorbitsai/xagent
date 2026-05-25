@@ -6,31 +6,48 @@ description: |
   "financial report", "KPI dashboard", "monthly report", ".xlsx", or
   similar tabular deliverable where the output must look professional
   (not just raw data). Output is a single .xlsx file produced via
-  `openpyxl` through the `python_executor` tool. Output opens cleanly
+  `openpyxl` through the `execute_python_code` tool. Output opens cleanly
   in Excel / Google Sheets / Numbers.
   Do NOT use this skill for ad-hoc data exploration or raw CSV dumps —
   use the regular `excel` tool for those.
-triggers:
-  - "xlsx"
-  - "excel report"
-  - "financial report"
-  - "kpi dashboard"
-  - "monthly report"
-  - "财报"
-  - "美观 excel"
+when_to_use: |
+  When the user wants a polished financial / KPI / dashboard Excel deliverable
+  (xlsx) where the file is meant to be opened and skimmed — not raw data dumps.
+  Use the regular `excel` tool instead for ad-hoc exploration / CSV-style output.
+tags:
+  - xlsx
+  - excel
+  - financial
+  - report
+  - dashboard
 ---
 
 # Editorial Financial Report (.xlsx)
 
 You will generate one `.xlsx` file via openpyxl by writing a Python
-program and running it through the `python_executor` tool. Save to the
-workspace, then report the path + a 1-line content summary.
+program and running it through the `execute_python_code` tool. Save to
+the workspace, then report the path + a 1-line content summary.
+
+## 📦 Required runtime packages
+
+The sandboxed `execute_python_code` ships with `pandas`, `numpy`, and
+`matplotlib` only — **openpyxl is NOT preinstalled**. Always pass it
+explicitly through the executor's `packages` argument so the sandbox
+installs it before running:
+
+```python
+# When invoking the tool:
+packages=["openpyxl>=3.1.0"]
+```
+
+Without this the very first line of your script (`import openpyxl`) will
+fail with `ModuleNotFoundError`, and the report won't be produced.
 
 ## 💾 How to save the file
 
-`python_executor` already runs with the task's output directory as the
-current working directory. Save the workbook with a **plain filename**
-(no path), e.g.:
+`execute_python_code` already runs with the task's output directory as
+the current working directory. Save the workbook with a **plain
+filename** (no path), e.g.:
 
 ```python
 wb.save("xagent_metrics_dashboard.xlsx")   # ✅ correct
@@ -47,15 +64,18 @@ if your saved file is under 1 KB it's broken or empty.
 
 ### 🔗 Make it clickable in chat — REQUIRED
 
-After saving, call `get_file_info("xagent_metrics_dashboard.xlsx")` to
-get the registered `file_id` (UUID). Then in your final answer, render
-the file as a **markdown chip link** so the user can click it. The
-**first line of your final answer MUST be the bare chip link itself**
-(NOT inside backticks, NOT presented as "file_id: UUID"):
+The Python executor returns a `markdown_link` field in its response for
+every workspace file it generated (or a `file_refs[]` array with one
+entry per file). **Read the tool's response** and use the returned
+`markdown_link` string verbatim. In your final answer, the **first line
+MUST be that chip link itself** — bare markdown, NOT inside backticks,
+NOT presented as "file_id: UUID":
 
 ✅ **CORRECT** (renders as clickable chip — chat UI looks for this exact pattern):
 
     [xagent_metrics_dashboard.xlsx](file:20fae785-3823-4906-b385-d0e8a7807dc8)
+
+The UUID comes from the executor response. Do not fabricate one.
 
 ❌ **WRONG — common failure that renders as plain text**:
 
@@ -65,6 +85,10 @@ the file as a **markdown chip link** so the user can click it. The
 
 ❌ **ALSO WRONG — chip link inside a code fence**: ` ```[name](file:UUID)``` `
    suppresses markdown so the link won't render as a chip.
+
+❌ **ALSO WRONG — calling `get_file_info(...)` to "fetch" the file_id**.
+   Its `FileInfo` return shape does not include `file_id`; the chip
+   reference is already on the executor result.
 
 Plain-text mention of the filename is not clickable — the user must navigate
 to File Management to find it. Always lead with the bare `[name](file:UUID)`
@@ -79,7 +103,14 @@ line, then describe the contents.
    YYYY-MM-DD`. Numbers and date formats stay locale-neutral.
 
 1. **One accent color only.** Pick one of the 5 palettes below; use only
-   the 3 hex values (`ink`, `paper`, `accent`). No other colors anywhere.
+   its **4 hex values** (`ink`, `paper`, `paper_tint`, `accent`).
+   `paper_tint` is the alternating-row band shade — without it you can
+   only do flat one-color rows. No other colors anywhere.
+   In code, define a ``palette = {"ink": "...", "paper": "...",
+   "paper_tint": "...", "accent": "..."}`` dict ONCE at the top of the
+   script and reference `palette["ink"]` / `palette["accent"]` /
+   `palette["paper_tint"]` / `palette["paper"]` everywhere — do not
+   copy literal hex values into individual styling calls.
 2. **Two fonts only.** Headers / titles = `Cambria` (serif, Office native).
    Body / data = `Calibri` (sans, Office default).
 3. **Forbidden:**
@@ -97,7 +128,7 @@ line, then describe the contents.
 5. **Always include**: title row, frozen header pane, alternating row
    bands using `paper-tint`, summary KPI block at top.
 6. **Failure honesty — NEVER fake the deliverable.**
-   - If `python_executor` raises after multiple retries, STOP and report
+   - If `execute_python_code` raises after multiple retries, STOP and report
      the actual error to the user. Do not write a stub file like
      `write_file("report.xlsx", "placeholder")` to make the chip appear.
    - The final answer must reflect what was actually written. Do not
@@ -212,6 +243,18 @@ ONLY the kwargs shown. Most common mistakes:
 
 ### ✅ Tested line-chart snippet (openpyxl 3.x — copy as-is)
 
+> **Before the snippet:** define your chosen palette once. Example for
+> Indigo Sheet:
+>
+> ```python
+> palette = {"ink": "0F172A", "paper": "FFFFFF",
+>            "paper_tint": "F1F5F9", "accent": "4F46E5"}
+> ```
+>
+> Reference `palette["ink"]` / `palette["accent"]` / `palette["paper_tint"]`
+> in the styling code below instead of copying hex literals.
+
+
 ```python
 from openpyxl.chart import LineChart, Reference
 from openpyxl.chart.label import DataLabelList
@@ -234,24 +277,26 @@ ch.set_categories(cats)
 # Series styling — kwarg is `ln=`, not `line=`. `w` is in EMU (12700 EMU = 1pt).
 s = ch.series[0]
 s.graphicalProperties = GraphicalProperties(
-    ln=LineProperties(solidFill="0F172A", w=25000)  # ink, ~2pt
+    ln=LineProperties(solidFill=palette["ink"], w=25000)  # ~2pt
 )
 s.marker = Marker(symbol="circle", size=7)
-s.marker.graphicalProperties = GraphicalProperties(solidFill="4F46E5")  # accent
+s.marker.graphicalProperties = GraphicalProperties(solidFill=palette["accent"])
 
 # Data labels (optional)
 s.dLbls = DataLabelList(showVal=True)
 s.dLbls.numFmt = '#,##0'
 
-# Value-axis gridlines — must wrap in ChartLines(spPr=...)
+# Value-axis gridlines — must wrap in ChartLines(spPr=...). The
+# gridline tint comes from the palette's paper_tint, not a hard-coded
+# grey.
 ch.y_axis.majorGridlines = ChartLines(
-    spPr=GraphicalProperties(ln=LineProperties(solidFill="E5E7EB", w=6350))
+    spPr=GraphicalProperties(ln=LineProperties(solidFill=palette["paper_tint"], w=6350))
 )
 # No category-axis gridlines
 ch.x_axis.majorGridlines = None
 
 # Backgrounds (optional — paper is usually already default)
-ch.plot_area.graphicalProperties = GraphicalProperties(solidFill="FFFFFF")
+ch.plot_area.graphicalProperties = GraphicalProperties(solidFill=palette["paper"])
 
 ws.add_chart(ch, "A22")
 ```
@@ -272,8 +317,8 @@ ch.legend = None
 ch.add_data(Reference(ws, min_col=3, min_row=11, max_row=20), titles_from_data=False)
 ch.set_categories(Reference(ws, min_col=2, min_row=11, max_row=20))
 
-# Fill the bars with `ink`
-ch.series[0].graphicalProperties = GraphicalProperties(solidFill="0F172A")
+# Fill the bars with `ink` (from your palette dict)
+ch.series[0].graphicalProperties = GraphicalProperties(solidFill=palette["ink"])
 
 ws.add_chart(ch, "F22")
 ```
@@ -286,7 +331,8 @@ ws.freeze_panes = 'A12'  # header at row 11 stays visible
 # Alternating row bands (apply via conditional formatting MOD)
 from openpyxl.formatting.rule import FormulaRule
 from openpyxl.styles import PatternFill
-band = PatternFill(start_color='F7F7F5', end_color='F7F7F5', fill_type='solid')
+band = PatternFill(start_color=palette["paper_tint"],
+                   end_color=palette["paper_tint"], fill_type='solid')
 ws.conditional_formatting.add(
     f'A12:Z{last_row}',
     FormulaRule(formula=['MOD(ROW(),2)=0'], fill=band),
@@ -296,7 +342,7 @@ ws.conditional_formatting.add(
 from openpyxl.formatting.rule import DataBarRule
 ws.conditional_formatting.add(
     'D12:D' + str(last_row),
-    DataBarRule(start_type='min', end_type='max', color='1A1A1A'),  # ink at low opacity is fine
+    DataBarRule(start_type='min', end_type='max', color=palette["ink"]),
 )
 ```
 

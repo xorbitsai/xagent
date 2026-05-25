@@ -2,19 +2,22 @@
 name: html-deck-editorial
 description: |
   Generate a single-file HTML presentation deck with magazine-grade editorial
-  styling. Use whenever the user asks for "slides", "deck", "presentation",
-  "PPT", or a slide-style visual deliverable AND a beautiful, designer-looking
+  styling. Use whenever the user asks for an "html deck", "editorial slides",
+  "magazine style presentation", "beautiful slides", "美观 PPT", or "网页版幻灯片"
+  — i.e. a slide-style visual deliverable AND a beautiful, designer-looking
   result is expected. Output is one self-contained .html file (inline CSS + JS,
   no build, no npm), printable to PDF via the browser, with keyboard navigation.
   Prefer this over native .pptx when the user wants visual quality over Office
   compatibility.
-triggers:
-  - "html deck"
-  - "editorial slides"
-  - "magazine style presentation"
-  - "beautiful slides"
-  - "美观 ppt"
-  - "网页版幻灯片"
+when_to_use: |
+  When the user wants a slide-style HTML deliverable with editorial polish —
+  pitch decks, talks, internal review decks — and visual quality matters more
+  than Office compatibility. Prefer over `pptx-editorial` for HTML output.
+tags:
+  - presentation
+  - html
+  - deck
+  - editorial
 ---
 
 # HTML Editorial Deck
@@ -32,8 +35,11 @@ the available file-writing tool (e.g. `file_tool` write_file or
    a Chinese deck — translate them (`研究简报` / `下一个范式`). Same applies
    to other languages.
 
-1. **One file only.** All CSS + JS inline. No external `<link>`, no `<script src=>`,
+1. **One file only.** All custom CSS + JS inline. No external `<script src=>`,
    no images you don't generate inline (use CSS color blocks or SVG).
+   **One exception:** a single Google Fonts `<link rel="stylesheet" href="https://fonts.googleapis.com/...">`
+   is allowed (and required) for the two typography families below — there
+   is no other external resource permitted.
 2. **Pick exactly ONE palette** from the 5 below. **Never mix hex values across
    palettes.** Never invent new hex values.
 3. **Use only the 2 font families per palette.** No custom fonts.
@@ -122,16 +128,22 @@ Then write the file to the workspace, name it `deck.html` (or
 
 ### 📎 Deliver as a clickable chip in chat
 
-Call `get_file_info("deck.html")` to retrieve the registered `file_id` UUID.
-Start your final answer with the **bare markdown chip link** as the first
-line (NO backticks around it, NOT presented as "file_id: UUID"):
+File-producing tools return the registered file reference directly. After
+writing the file, **read the tool's response** for the `markdown_link`
+field (or for `file_refs[].markdown_link` when there are multiple files)
+and use that string verbatim as the first line of your final answer.
 
-✅ **CORRECT** (chat renders this as a clickable chip):
+✅ **CORRECT** (chat renders the returned `markdown_link` as a clickable chip):
 
-    [deck.html](file:UUID-FROM-get_file_info)
+    [deck.html](file:3a22d32b-36c8-4aa6-8ea4-57a5f6e87181)
 
-❌ **WRONG**: ``` file_id: `UUID` ```, or wrapping the link in a code fence.
-Both render as inert text — user cannot click.
+The exact UUID comes from the tool's response — do not fabricate one.
+
+❌ **WRONG**: guessing a UUID, calling `get_file_info` to "fetch" the file_id
+(its `FileInfo` return shape does not include a `file_id` — workspace
+helpers return file metadata, not the registered chip reference), or
+wrapping the chip in a code fence (renders as inert text — user cannot
+click).
 
 After the chip line, report: number of slides, palette chosen, and a 1-line
 summary of layout choices (e.g. `L01 cover → L02 divider → 3× L03 stats → …`).

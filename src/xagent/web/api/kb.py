@@ -1800,7 +1800,7 @@ async def create_ingest_job(
         file_backup_path = file_path.with_name(
             f"{file_path.name}.rollback-{uuid.uuid4().hex}"
         )
-        shutil.copy2(file_path, file_backup_path)
+        await asyncio.to_thread(shutil.copy2, file_path, file_backup_path)
 
     try:
         total_size = 0
@@ -1818,7 +1818,7 @@ async def create_ingest_job(
                             f"File size exceeds maximum limit of {MAX_FILE_SIZE_LABEL}"
                         ),
                     )
-                buffer.write(chunk)
+                await asyncio.to_thread(buffer.write, chunk)
     except HTTPException:
         try:
             _restore_ingest_file_backup(

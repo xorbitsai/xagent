@@ -7,6 +7,22 @@ from sqlalchemy.orm import Session
 from ..models.background_job import BackgroundJob, BackgroundJobType
 from .background_jobs import create_background_job, enqueue_background_job
 
+_TRIGGER_SCOPE_PAYLOAD_KEYS = (
+    "integration_id",
+    "account_id",
+    "mailbox_id",
+    "channel_id",
+    "tenant_id",
+)
+
+
+def _trigger_idempotency_scope(event_payload: dict[str, Any]) -> str:
+    for key in _TRIGGER_SCOPE_PAYLOAD_KEYS:
+        value = event_payload.get(key)
+        if value is not None:
+            return f"{key}:{value}"
+    return "default"
+
 
 def enqueue_trigger_event_job(
     db: Session,
@@ -19,7 +35,10 @@ def enqueue_trigger_event_job(
 ) -> BackgroundJob:
     """Persist and enqueue a trigger event without running the agent in Celery."""
     idempotency_key = (
-        f"trigger:{source_type}:{source_event_id}" if source_event_id else None
+        f"trigger:{user_id}:{source_type}:"
+        f"{_trigger_idempotency_scope(event_payload)}:{source_event_id}"
+        if source_event_id
+        else None
     )
     job = create_background_job(
         db,

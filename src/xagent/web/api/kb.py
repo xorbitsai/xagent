@@ -107,12 +107,16 @@ from ..config import (
     is_allowed_file,
     sanitize_path_component,
 )
-from ..models.background_job import BackgroundJob, BackgroundJobType
+from ..models.background_job import BackgroundJobType
 from ..models.database import get_db, get_session_local
 from ..models.uploaded_file import UploadedFile
 from ..models.user import User
 from ..schemas.background_job import BackgroundJobResponse
-from ..services.background_jobs import create_background_job, enqueue_background_job
+from ..services.background_jobs import (
+    create_background_job,
+    enqueue_background_job,
+    get_non_terminal_background_job_by_idempotency_key,
+)
 from ..services.kb_collection_service import (
     delete_collection_physical_dir,
     delete_collection_uploaded_files,
@@ -1889,10 +1893,9 @@ async def create_ingest_job(
             "user_id": int(_user.id),
         },
     )
-    existing_job = (
-        db.query(BackgroundJob)
-        .filter(BackgroundJob.idempotency_key == idempotency_key)
-        .first()
+    existing_job = get_non_terminal_background_job_by_idempotency_key(
+        db,
+        idempotency_key,
     )
     if existing_job is not None:
         if file_backup_path is not None and file_backup_path.exists():
@@ -1943,6 +1946,7 @@ async def create_ingest_job(
                 else None,
             },
             idempotency_key=idempotency_key,
+            reuse_terminal_idempotency_key=False,
         )
     except Exception:
         if file_record is not None:
@@ -3287,10 +3291,9 @@ async def create_ingest_web_job(
             "user_id": int(_user.id),
         },
     )
-    existing_job = (
-        db.query(BackgroundJob)
-        .filter(BackgroundJob.idempotency_key == idempotency_key)
-        .first()
+    existing_job = get_non_terminal_background_job_by_idempotency_key(
+        db,
+        idempotency_key,
     )
     if existing_job is not None:
         return existing_job
@@ -3319,6 +3322,7 @@ async def create_ingest_web_job(
             "is_admin": bool(_user.is_admin),
         },
         idempotency_key=idempotency_key,
+        reuse_terminal_idempotency_key=False,
     )
     return enqueue_background_job(db, job)
 

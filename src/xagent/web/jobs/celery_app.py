@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from importlib import import_module
 from typing import Any
 
 from celery import Celery
@@ -54,3 +55,15 @@ def create_celery_app() -> Any:
 
 
 celery_app = create_celery_app()
+
+
+def register_celery_tasks() -> None:
+    """Import task modules so fresh worker imports register every task."""
+    for module_name in (
+        "xagent.web.jobs.tasks",
+        "xagent.web.jobs.trigger_tasks",
+    ):
+        import_module(module_name)
+
+
+register_celery_tasks()

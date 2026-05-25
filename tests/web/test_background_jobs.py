@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import os
+import subprocess
+import sys
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -51,6 +54,33 @@ def test_enqueue_background_job_disabled_stays_pending(tmp_path, monkeypatch):
         db.close()
 
 
+def test_celery_worker_app_import_registers_tasks():
+    src_path = str(Path(__file__).resolve().parents[2] / "src")
+    env = os.environ.copy()
+    env["PYTHONPATH"] = (
+        src_path
+        if not env.get("PYTHONPATH")
+        else f"{src_path}{os.pathsep}{env['PYTHONPATH']}"
+    )
+    code = """
+from xagent.web.jobs.celery_app import celery_app
+expected = {
+    "xagent.web.jobs.tasks.execute_background_job",
+    "xagent.web.jobs.trigger_tasks.scan_due_triggers",
+}
+missing = expected.difference(celery_app.tasks)
+assert not missing, missing
+assert not celery_app.conf.task_always_eager
+"""
+    subprocess.run(
+        [sys.executable, "-c", code],
+        check=True,
+        env=env,
+        capture_output=True,
+        text=True,
+    )
+
+
 def test_trigger_event_job_runs_with_eager_celery(tmp_path, monkeypatch):
     monkeypatch.setenv(CELERY_ENABLED, "true")
     monkeypatch.setenv(CELERY_BROKER_URL, "memory://")
@@ -87,6 +117,87 @@ def test_trigger_event_job_runs_with_eager_celery(tmp_path, monkeypatch):
         db.close()
         celery_app.conf.task_always_eager = False
         celery_app.conf.task_eager_propagates = False
+
+
+def test_trigger_event_idempotency_is_scoped_by_user(tmp_path, monkeypatch):
+    monkeypatch.setenv(CELERY_ENABLED, "false")
+    monkeypatch.delenv(CELERY_BROKER_URL, raising=False)
+
+    SessionLocal = _init_test_db(tmp_path / "trigger-idempotency-scope.db")
+    db = SessionLocal()
+    try:
+        user_one = _create_user(db, username="trigger-user-one")
+        user_two = _create_user(db, username="trigger-user-two")
+
+        job_one = enqueue_trigger_event_job(
+            db,
+            user_id=int(user_one.id),
+            source_type="email",
+            event_type="message.received",
+            source_event_id="evt-1",
+            event_payload={"subject": "hello"},
+        )
+        job_two = enqueue_trigger_event_job(
+            db,
+            user_id=int(user_two.id),
+            source_type="email",
+            event_type="message.received",
+            source_event_id="evt-1",
+            event_payload={"subject": "hello"},
+        )
+
+        assert job_one.id != job_two.id
+        assert job_one.user_id == int(user_one.id)
+        assert job_two.user_id == int(user_two.id)
+    finally:
+        db.close()
+
+
+def test_kb_idempotency_reuses_only_non_terminal_jobs(tmp_path, monkeypatch):
+    monkeypatch.setenv(CELERY_ENABLED, "false")
+    monkeypatch.delenv(CELERY_BROKER_URL, raising=False)
+
+    SessionLocal = _init_test_db(tmp_path / "kb-idempotency-terminal.db")
+    db = SessionLocal()
+    try:
+        user = _create_user(db, username="kb-idempotency-test")
+        idempotency_key = "kb.ingest.document:test"
+        first_job = create_background_job(
+            db,
+            user_id=int(user.id),
+            job_type=BackgroundJobType.KB_INGEST_DOCUMENT,
+            payload={"collection": "kb", "version": 1},
+            idempotency_key=idempotency_key,
+            reuse_terminal_idempotency_key=False,
+        )
+        setattr(first_job, "status", BackgroundJobStatus.FAILED.value)
+        db.add(first_job)
+        db.commit()
+
+        retry_job = create_background_job(
+            db,
+            user_id=int(user.id),
+            job_type=BackgroundJobType.KB_INGEST_DOCUMENT,
+            payload={"collection": "kb", "version": 2},
+            idempotency_key=idempotency_key,
+            reuse_terminal_idempotency_key=False,
+        )
+        duplicate_in_flight = create_background_job(
+            db,
+            user_id=int(user.id),
+            job_type=BackgroundJobType.KB_INGEST_DOCUMENT,
+            payload={"collection": "kb", "version": 3},
+            idempotency_key=idempotency_key,
+            reuse_terminal_idempotency_key=False,
+        )
+
+        db.refresh(first_job)
+        assert first_job.idempotency_key is None
+        assert retry_job.id != first_job.id
+        assert retry_job.idempotency_key == idempotency_key
+        assert duplicate_in_flight.id == retry_job.id
+    finally:
+        db.close()
 
 
 def test_background_job_progress_manager_mirrors_rag_progress(tmp_path, monkeypatch):

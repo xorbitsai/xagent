@@ -25,6 +25,21 @@ QUEUE_DEFAULT = "default"
 QUEUE_KB = "kb"
 QUEUE_TRIGGERS = "triggers"
 
+NON_TERMINAL_JOB_STATUSES = frozenset(
+    {
+        BackgroundJobStatus.PENDING.value,
+        BackgroundJobStatus.ENQUEUED.value,
+        BackgroundJobStatus.RUNNING.value,
+    }
+)
+TERMINAL_JOB_STATUSES = frozenset(
+    {
+        BackgroundJobStatus.SUCCEEDED.value,
+        BackgroundJobStatus.FAILED.value,
+        BackgroundJobStatus.CANCELLED.value,
+    }
+)
+
 
 def queue_for_job_type(job_type: str) -> str:
     if job_type.startswith("kb."):
@@ -43,19 +58,25 @@ def create_background_job(
     queue: str | None = None,
     idempotency_key: str | None = None,
     max_attempts: int | None = None,
+    reuse_terminal_idempotency_key: bool = True,
 ) -> BackgroundJob:
     resolved_job_type = (
         job_type.value if isinstance(job_type, BackgroundJobType) else job_type
     )
 
     if idempotency_key:
-        existing = (
-            db.query(BackgroundJob)
-            .filter(BackgroundJob.idempotency_key == idempotency_key)
-            .first()
+        existing_query = db.query(BackgroundJob).filter(
+            BackgroundJob.idempotency_key == idempotency_key
         )
+        if not reuse_terminal_idempotency_key:
+            existing_query = existing_query.filter(
+                BackgroundJob.status.in_(NON_TERMINAL_JOB_STATUSES)
+            )
+        existing = existing_query.first()
         if existing is not None:
             return existing
+        if not reuse_terminal_idempotency_key:
+            release_terminal_background_job_idempotency_key(db, idempotency_key)
 
     job = BackgroundJob(
         user_id=user_id,
@@ -71,6 +92,36 @@ def create_background_job(
     db.commit()
     db.refresh(job)
     return job
+
+
+def get_non_terminal_background_job_by_idempotency_key(
+    db: Session,
+    idempotency_key: str,
+) -> BackgroundJob | None:
+    return (
+        db.query(BackgroundJob)
+        .filter(BackgroundJob.idempotency_key == idempotency_key)
+        .filter(BackgroundJob.status.in_(NON_TERMINAL_JOB_STATUSES))
+        .first()
+    )
+
+
+def release_terminal_background_job_idempotency_key(
+    db: Session,
+    idempotency_key: str,
+) -> None:
+    terminal_jobs = (
+        db.query(BackgroundJob)
+        .filter(BackgroundJob.idempotency_key == idempotency_key)
+        .filter(BackgroundJob.status.in_(TERMINAL_JOB_STATUSES))
+        .all()
+    )
+    if not terminal_jobs:
+        return
+    for job in terminal_jobs:
+        setattr(job, "idempotency_key", None)
+        db.add(job)
+    db.commit()
 
 
 def enqueue_background_job(db: Session, job: BackgroundJob) -> BackgroundJob:

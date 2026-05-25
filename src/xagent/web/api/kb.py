@@ -107,14 +107,18 @@ from ..config import (
     is_allowed_file,
     sanitize_path_component,
 )
-from ..models.background_job import BackgroundJob, BackgroundJobType
+from ..models.background_job import (
+    BackgroundJob,
+    BackgroundJobStatus,
+    BackgroundJobType,
+)
 from ..models.database import get_db, get_session_local
 from ..models.uploaded_file import UploadedFile
 from ..models.user import User
 from ..schemas.background_job import BackgroundJobResponse
 from ..services.background_jobs import (
+    QUEUE_DEFAULT,
     create_background_job,
-    enqueue_background_job,
     get_non_terminal_background_job_by_idempotency_key,
     is_background_job_enqueue_available,
     mark_job_failed,
@@ -212,6 +216,22 @@ def _normalize_web_title_for_filename(title: str) -> str:
         trimmed = trimmed[:-1]
     trimmed = trimmed.rstrip("._-")
     return trimmed or "untitled"
+
+
+def _truncate_utf8_bytes(value: str, max_bytes: int) -> str:
+    encoded = value.encode("utf-8")
+    if len(encoded) <= max_bytes:
+        return value
+    return encoded[:max_bytes].decode("utf-8", errors="ignore")
+
+
+def _build_ingest_backup_path(file_path: Path) -> Path:
+    suffix = f".rollback-{uuid.uuid4().hex}"
+    max_name_bytes = _MAX_FILESYSTEM_FILENAME_BYTES - len(suffix.encode("utf-8"))
+    truncated_name = _truncate_utf8_bytes(file_path.name, max_name_bytes).rstrip(" ._-")
+    if not truncated_name:
+        truncated_name = hashlib.sha256(file_path.name.encode("utf-8")).hexdigest()[:16]
+    return file_path.with_name(f"{truncated_name}{suffix}")
 
 
 def _validate_parser_for_file(
@@ -785,12 +805,49 @@ def _background_job_idempotency_key(namespace: str, payload: Dict[str, Any]) -> 
     return f"{namespace}:{digest}"
 
 
-def _enqueue_background_job_or_503(
+def _copy_upload_file_to_path(
+    file: UploadFile,
+    file_path: Path,
+    *,
+    max_size: int = MAX_FILE_SIZE,
+) -> int:
+    total_size = 0
+    file_read_buffer_size = 1024 * 1024
+    file.file.seek(0)
+    with open(file_path, "wb") as buffer:
+        while True:
+            chunk = file.file.read(file_read_buffer_size)
+            if not chunk:
+                break
+            total_size += len(chunk)
+            if total_size > max_size:
+                raise HTTPException(
+                    status_code=413,
+                    detail=f"File size exceeds maximum limit of {MAX_FILE_SIZE_LABEL}",
+                )
+            buffer.write(chunk)
+    return total_size
+
+
+async def _ensure_background_job_queue_available_async() -> None:
+    if not await asyncio.to_thread(
+        is_background_job_enqueue_available,
+        check_worker=True,
+    ):
+        raise HTTPException(
+            status_code=503,
+            detail="Background job queue is unavailable",
+        )
+
+
+async def _enqueue_background_job_or_503_async(
     db: Session,
     job: BackgroundJob,
 ) -> BackgroundJob:
-    """Enqueue a job or fail clearly so callers can use the sync endpoint."""
-    if not is_background_job_enqueue_available(check_worker=True):
+    if not await asyncio.to_thread(
+        is_background_job_enqueue_available,
+        check_worker=True,
+    ):
         mark_job_failed(
             db,
             job,
@@ -800,8 +857,26 @@ def _enqueue_background_job_or_503(
             status_code=503,
             detail="Background job queue is unavailable",
         )
+
     try:
-        return enqueue_background_job(db, job)
+        from ..jobs.tasks import execute_background_job
+
+        setattr(job, "status", BackgroundJobStatus.ENQUEUED.value)
+        db.add(job)
+        db.commit()
+        db.refresh(job)
+
+        async_result = await asyncio.to_thread(
+            execute_background_job.apply_async,
+            args=[job.id],
+            queue=str(job.queue or QUEUE_DEFAULT),
+        )
+        db.refresh(job)
+        setattr(job, "celery_task_id", async_result.id)
+        db.add(job)
+        db.commit()
+        db.refresh(job)
+        return job
     except Exception as exc:  # noqa: BLE001
         mark_job_failed(
             db,
@@ -812,14 +887,6 @@ def _enqueue_background_job_or_503(
             status_code=503,
             detail=f"Background job queue is unavailable: {exc}",
         ) from exc
-
-
-def _ensure_background_job_queue_available() -> None:
-    if not is_background_job_enqueue_available(check_worker=True):
-        raise HTTPException(
-            status_code=503,
-            detail="Background job queue is unavailable",
-        )
 
 
 def _atomic_replace_file(source_path: Path, target_path: Path) -> None:
@@ -983,9 +1050,7 @@ def _refresh_existing_file_if_changed(
         )
 
     # Mark succeeded - now atomically replace the file
-    backup_path = existing_path.with_name(
-        f"{existing_path.name}.rollback-{uuid.uuid4().hex}"
-    )
+    backup_path = _build_ingest_backup_path(existing_path)
     shutil.copy2(existing_path, backup_path)
     try:
         _atomic_replace_file(temp_file_path, existing_path)
@@ -1036,9 +1101,7 @@ def _recreate_missing_existing_file(
     backup_path: Optional[Path] = None
     had_existing_file = existing_path.exists()
     if had_existing_file:
-        backup_path = existing_path.with_name(
-            f"{existing_path.name}.rollback-{uuid.uuid4().hex}"
-        )
+        backup_path = _build_ingest_backup_path(existing_path)
         shutil.copy2(existing_path, backup_path)
 
     try:
@@ -1529,29 +1592,11 @@ async def ingest(
     had_existing_file = file_path.exists()
     file_backup_path: Optional[Path] = None
     if had_existing_file:
-        file_backup_path = file_path.with_name(
-            f"{file_path.name}.rollback-{uuid.uuid4().hex}"
-        )
+        file_backup_path = _build_ingest_backup_path(file_path)
         await asyncio.to_thread(shutil.copy2, file_path, file_backup_path)
 
     try:
-        total_size = 0
-        # Must not shadow the Form parameter ``chunk_size`` (see issue #199).
-        file_read_buffer_size = 1024 * 1024  # 1MB streaming read buffer only
-        with open(file_path, "wb") as buffer:
-            while True:
-                chunk = await file.read(file_read_buffer_size)
-                if not chunk:
-                    break
-                total_size += len(chunk)
-                if total_size > MAX_FILE_SIZE:
-                    raise HTTPException(
-                        status_code=413,
-                        detail=(
-                            f"File size exceeds maximum limit of {MAX_FILE_SIZE_LABEL}"
-                        ),
-                    )
-                await asyncio.to_thread(buffer.write, chunk)
+        total_size = await asyncio.to_thread(_copy_upload_file_to_path, file, file_path)
         logger.info(
             "File uploaded: %s -> %s (user: %s, collection: %s)",
             safe_filename,
@@ -1820,7 +1865,7 @@ async def create_ingest_job(
         ) from e
 
     await _ensure_collection_access(safe_collection, _user, allow_create=True)
-    _ensure_background_job_queue_available()
+    await _ensure_background_job_queue_available_async()
 
     try:
         get_collection_sync(safe_collection)
@@ -1837,28 +1882,11 @@ async def create_ingest_job(
     had_existing_file = file_path.exists()
     file_backup_path: Optional[Path] = None
     if had_existing_file:
-        file_backup_path = file_path.with_name(
-            f"{file_path.name}.rollback-{uuid.uuid4().hex}"
-        )
+        file_backup_path = _build_ingest_backup_path(file_path)
         await asyncio.to_thread(shutil.copy2, file_path, file_backup_path)
 
     try:
-        total_size = 0
-        file_read_buffer_size = 1024 * 1024
-        with open(file_path, "wb") as buffer:
-            while True:
-                chunk = await file.read(file_read_buffer_size)
-                if not chunk:
-                    break
-                total_size += len(chunk)
-                if total_size > MAX_FILE_SIZE:
-                    raise HTTPException(
-                        status_code=413,
-                        detail=(
-                            f"File size exceeds maximum limit of {MAX_FILE_SIZE_LABEL}"
-                        ),
-                    )
-                await asyncio.to_thread(buffer.write, chunk)
+        total_size = await asyncio.to_thread(_copy_upload_file_to_path, file, file_path)
     except HTTPException:
         try:
             _restore_ingest_file_backup(
@@ -2008,7 +2036,7 @@ async def create_ingest_job(
                 user=_user,
             )
         raise
-    return _enqueue_background_job_or_503(db, job)
+    return await _enqueue_background_job_or_503_async(db, job)
 
 
 @kb_router.post("/ingest-cloud", response_model=List[IngestionResult])
@@ -2123,10 +2151,10 @@ async def ingest_cloud(
                     # Save to local path
                     had_existing_file = file_path.exists()
                     if had_existing_file:
-                        file_backup_path = file_path.with_name(
-                            f"{file_path.name}.rollback-{uuid.uuid4().hex}"
+                        file_backup_path = _build_ingest_backup_path(file_path)
+                        await asyncio.to_thread(
+                            shutil.copy2, file_path, file_backup_path
                         )
-                        shutil.copy2(file_path, file_backup_path)
 
                     # Download file directly to disk
                     try:
@@ -3294,7 +3322,7 @@ async def create_ingest_web_job(
         if isinstance(detail, str) and detail.startswith("Value error, "):
             detail = detail.removeprefix("Value error, ")
         raise HTTPException(status_code=422, detail=detail) from exc
-    _ensure_background_job_queue_available()
+    await _ensure_background_job_queue_available_async()
 
     final_chunk_size = chunk_size if chunk_size is not None and chunk_size > 0 else 1000
     final_chunk_overlap = (
@@ -3365,7 +3393,7 @@ async def create_ingest_web_job(
         idempotency_key=idempotency_key,
         reuse_terminal_idempotency_key=False,
     )
-    return _enqueue_background_job_or_503(db, job)
+    return await _enqueue_background_job_or_503_async(db, job)
 
 
 class BatchDeleteCollectionsRequest(BaseModel):

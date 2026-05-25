@@ -15,6 +15,7 @@ end-to-end handler behavior stays covered even though ``_handle_web_file``
 is not importable directly (nested function).
 """
 
+import io
 import tempfile
 import threading
 import time
@@ -23,7 +24,7 @@ from unittest.mock import MagicMock, patch
 from uuid import uuid4
 
 import pytest
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException, UploadFile
 from fastapi.testclient import TestClient
 from sqlalchemy import create_engine
 from sqlalchemy.orm import Session, sessionmaker
@@ -32,6 +33,8 @@ from xagent.core.file_storage.factory import get_file_storage
 from xagent.web.api.kb import (
     _WEB_FILE_LOCKS,
     _atomic_replace_file,
+    _build_ingest_backup_path,
+    _copy_upload_file_to_path,
     _get_file_sha256,
     _mark_uploaded_file_for_reindex,
     _normalize_web_title_for_filename,
@@ -58,6 +61,41 @@ class TestNormalizeWebTitleForFilename:
         assert normalized != "untitled"
         assert len(normalized.encode("utf-8")) <= 235
         assert len(filename.encode("utf-8")) <= 255
+
+
+class TestIngestFileHelpers:
+    def test_build_ingest_backup_path_bounds_long_filenames(
+        self, tmp_path: Path
+    ) -> None:
+        source_path = tmp_path / f"{'你' * 100}.txt"
+
+        backup_path = _build_ingest_backup_path(source_path)
+
+        assert backup_path.parent == source_path.parent
+        backup_name, rollback_suffix = backup_path.name.rsplit(".rollback-", 1)
+        assert backup_name
+        assert len(rollback_suffix) == 32
+        assert len(backup_path.name.encode("utf-8")) <= 255
+
+    def test_copy_upload_file_to_path_enforces_size_limit(self, tmp_path: Path) -> None:
+        upload = UploadFile(file=io.BytesIO(b"abcdef"), filename="sample.txt")
+        target_path = tmp_path / "sample.txt"
+
+        with pytest.raises(HTTPException) as exc_info:
+            _copy_upload_file_to_path(upload, target_path, max_size=3)
+
+        assert exc_info.value.status_code == 413
+
+    def test_copy_upload_file_to_path_returns_written_size(
+        self, tmp_path: Path
+    ) -> None:
+        upload = UploadFile(file=io.BytesIO(b"abcdef"), filename="sample.txt")
+        target_path = tmp_path / "sample.txt"
+
+        written_size = _copy_upload_file_to_path(upload, target_path, max_size=10)
+
+        assert written_size == 6
+        assert target_path.read_bytes() == b"abcdef"
 
 
 @pytest.fixture

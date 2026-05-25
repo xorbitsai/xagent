@@ -330,19 +330,56 @@ def requeue_stale_background_jobs(
             {"message": "Requeued stale background job", "completed": 0, "total": 1},
         )
         db.add(job)
-        db.commit()
+
+    if not stale_jobs:
+        return requeued
+
+    db.commit()
+    for job in stale_jobs:
         db.refresh(job)
 
+    if not get_celery_enabled():
+        return stale_jobs
+
+    if get_celery_broker_url() is None:
+        error_message = "Celery background jobs are enabled but no broker URL is set"
+        for job in stale_jobs:
+            setattr(
+                job, "error_message", f"Failed to requeue stale job: {error_message}"
+            )
+            db.add(job)
+        db.commit()
+        for job in stale_jobs:
+            db.refresh(job)
+        return stale_jobs
+
+    from ..jobs.tasks import execute_background_job
+
+    for job in stale_jobs:
+        setattr(job, "status", BackgroundJobStatus.ENQUEUED.value)
+        db.add(job)
+    db.commit()
+    for job in stale_jobs:
+        db.refresh(job)
+
+    for job in stale_jobs:
         try:
-            requeued.append(enqueue_background_job(db, job))
+            async_result = execute_background_job.apply_async(
+                args=[job.id],
+                queue=str(job.queue or QUEUE_DEFAULT),
+            )
+            setattr(job, "celery_task_id", async_result.id)
+            requeued.append(job)
         except Exception as exc:  # noqa: BLE001
             logger.exception("Failed to requeue stale background job %s", job.id)
             setattr(job, "status", BackgroundJobStatus.PENDING.value)
             setattr(job, "error_message", f"Failed to requeue stale job: {exc}")
-            db.add(job)
-            db.commit()
-            db.refresh(job)
             requeued.append(job)
+        db.add(job)
+
+    db.commit()
+    for job in requeued:
+        db.refresh(job)
 
     return requeued
 

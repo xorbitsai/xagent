@@ -10,8 +10,10 @@ from google.oauth2.credentials import Credentials  # type: ignore
 from googleapiclient.discovery import build  # type: ignore
 from sqlalchemy.orm import Session
 
+from ...core.utils.encryption import decrypt_value
 from ..auth_dependencies import get_current_user
 from ..models.database import get_db
+from ..models.oauth_provider import OAuthProvider
 from ..models.user import User
 from ..models.user_oauth import UserOAuth
 
@@ -21,6 +23,19 @@ cloud_router = APIRouter(prefix="/api/cloud", tags=["Cloud Storage"])
 
 # Google OAuth Constants
 GOOGLE_TOKEN_URI = "https://oauth2.googleapis.com/token"
+
+
+def get_google_oauth_config(db: Session) -> tuple[Optional[str], Optional[str]]:
+    """Load Google OAuth client credentials from admin provider config."""
+    provider = (
+        db.query(OAuthProvider).filter(OAuthProvider.provider_name == "google").first()
+    )
+    if not provider:
+        return None, None
+
+    client_id = cast(str, provider.client_id)
+    client_secret = cast(str, provider.client_secret)
+    return decrypt_value(client_id), decrypt_value(client_secret)
 
 
 def get_google_credentials(
@@ -45,8 +60,10 @@ def get_google_credentials(
             status_code=401, detail="Google Drive account not connected"
         )
 
-    client_id = os.environ.get("GOOGLE_CLIENT_ID")
-    client_secret = os.environ.get("GOOGLE_CLIENT_SECRET")
+    client_id, client_secret = get_google_oauth_config(db)
+    if not client_id or not client_secret:
+        client_id = os.environ.get("GOOGLE_CLIENT_ID")
+        client_secret = os.environ.get("GOOGLE_CLIENT_SECRET")
 
     if not client_id or not client_secret:
         raise HTTPException(

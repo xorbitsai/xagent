@@ -71,6 +71,7 @@ export function AgentBuilderChat({ agentConfig, onUpdateConfig, availableOptions
   const { t } = useI18n()
   const { token } = useAuth()
   const [messages, setMessages] = useState<Message[]>([])
+  const [files, setFiles] = useState<File[]>([])
   const branding = getBrandingFromEnv()
 
   // Set initial message on mount to avoid hydration mismatch and get translation
@@ -114,7 +115,7 @@ export function AgentBuilderChat({ agentConfig, onUpdateConfig, availableOptions
   }, [messages])
 
   const handleSendMessage = useCallback(async (text: string, files?: File[], metadata?: any) => {
-    if ((!text.trim() && (!files || files.length === 0)) || isLoading) return
+    if ((!text.trim() && (!files || files.length === 0)) || isLoading) return false
 
     let displayMessage: string | React.ReactNode = text || t("chatPage.clarification.uploadedFiles")
     if (files && files.length > 0) {
@@ -171,7 +172,7 @@ export function AgentBuilderChat({ agentConfig, onUpdateConfig, availableOptions
         toast.error(err instanceof Error ? err.message : "Failed to upload files");
         setIsLoading(false);
         setMessages(prev => prev.slice(0, -1));
-        return;
+        return false;
       }
     } else if (metadata?.url) {
       const url = metadata.url;
@@ -433,7 +434,9 @@ export function AgentBuilderChat({ agentConfig, onUpdateConfig, availableOptions
       console.error(error)
       toast.error(t("builds.configForm.chat.errorInit") || "Failed to initialize connection.")
       setIsLoading(false)
+      return false
     }
+    return true
   }, [messages, isLoading, token, agentConfig, onUpdateConfig])
 
   const handleStop = () => {
@@ -466,7 +469,9 @@ export function AgentBuilderChat({ agentConfig, onUpdateConfig, availableOptions
               showProcessView={true}
               timestamp={msg.timestamp}
               interactions={msg.interactions}
-              onSendInteraction={(text, files, meta) => handleSendMessage(text, files, meta)}
+              onSendInteraction={(text, files, meta) => {
+                void handleSendMessage(text, files, meta)
+              }}
             />
           ))}
         </div>
@@ -474,11 +479,18 @@ export function AgentBuilderChat({ agentConfig, onUpdateConfig, availableOptions
 
       <div className="p-4 bg-background border-t">
         <ChatInput
-          onSend={(text) => handleSendMessage(text)}
+          onSend={async (text) => {
+            const didSend = await handleSendMessage(text, files)
+            if (didSend) {
+              setFiles([])
+            }
+          }}
           isLoading={isLoading}
           hideConfig={true}
           hideFileUpload={true}
           compact={true}
+          files={files}
+          onFilesChange={setFiles}
         />
       </div>
     </div>

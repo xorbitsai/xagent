@@ -42,7 +42,32 @@ vi.mock("sonner", () => ({
 }))
 
 vi.mock("@/components/chat/ChatInput", () => ({
-  ChatInput: () => null,
+  ChatInput: ({
+    onSend,
+    files = [],
+    onFilesChange,
+  }: {
+    onSend?: (message: string) => void | Promise<void>
+    files?: File[]
+    onFilesChange?: (files: File[]) => void
+  }) => (
+    <div>
+      <button
+        type="button"
+        onClick={() =>
+          onFilesChange?.([
+            ...files,
+            new File(["chat-input"], "chat-input.txt", { type: "text/plain" }),
+          ])
+        }
+      >
+        attach-chat-input-file
+      </button>
+      <button type="button" onClick={() => onSend?.("chat input message")}>
+        send-chat-input
+      </button>
+    </div>
+  ),
 }))
 
 vi.mock("@/components/chat/ChatMessage", () => ({
@@ -130,5 +155,36 @@ describe("AgentBuilderChat", () => {
         "Startup file storage sync failed"
       )
     })
+  })
+
+  it("uploads files added from the compact chat input before sending", async () => {
+    apiRequestMock.mockResolvedValueOnce(
+      new Response(JSON.stringify({ detail: "Compact input upload failed" }), {
+        status: 503,
+        statusText: "Service Unavailable",
+        headers: { "Content-Type": "application/json" },
+      })
+    )
+
+    render(
+      <AgentBuilderChat
+        agentConfig={agentConfig}
+        onUpdateConfig={vi.fn()}
+      />
+    )
+
+    fireEvent.click(await screen.findByText("attach-chat-input-file"))
+    fireEvent.click(screen.getByText("send-chat-input"))
+
+    await waitFor(() => {
+      expect(apiRequestMock).toHaveBeenCalledWith(
+        "http://api.local/api/files/upload",
+        expect.objectContaining({
+          method: "POST",
+        })
+      )
+    })
+
+    expect(toastErrorMock).toHaveBeenCalledWith("Compact input upload failed")
   })
 })

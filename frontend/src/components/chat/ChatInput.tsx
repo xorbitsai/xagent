@@ -82,11 +82,13 @@ export function ChatInput({
   const [internalMessage, setInternalMessage] = useState("");
   const [isFocused, setIsFocused] = useState(false);
   const [showNoModelAlert, setShowNoModelAlert] = useState(false);
+  const [isDraggingFiles, setIsDraggingFiles] = useState(false);
 
   const fileInputRef = useRef<HTMLInputElement>(null);
   const editorRef = useRef<HTMLDivElement>(null);
   const containerRef = useRef<HTMLDivElement>(null);
   const isSubmittingRef = useRef(false);
+  const dragDepthRef = useRef(0);
   const { t } = useI18n();
   const { openFilePreview } = useApp();
 
@@ -250,6 +252,23 @@ export function ChatInput({
   // State to track files currently being uploaded
   const [uploadingFiles, setUploadingFiles] = useState<Set<string>>(new Set());
 
+  const extractDroppedFiles = (dataTransfer: DataTransfer) => {
+    const itemFiles = Array.from(dataTransfer.items || [])
+      .filter((item) => item.kind === "file")
+      .map((item) => item.getAsFile())
+      .filter((file): file is File => file instanceof File);
+
+    return itemFiles.length > 0 ? itemFiles : Array.from(dataTransfer.files || []);
+  };
+
+  const isFileDragEvent = (e: React.DragEvent) =>
+    Array.from(e.dataTransfer?.types || []).includes("Files");
+
+  const resetDragState = () => {
+    dragDepthRef.current = 0;
+    setIsDraggingFiles(false);
+  };
+
   // Helper to upload files immediately
   const uploadFiles = async (newFiles: File[]) => {
     if (newFiles.length === 0) return;
@@ -325,6 +344,12 @@ export function ChatInput({
         onFilesChange(filesRef.current.filter(f => !failedFiles.has(f)));
       }
     }
+  };
+
+  const appendFiles = (newFiles: File[]) => {
+    if (newFiles.length === 0 || !onFilesChange || isInputBusy) return;
+    onFilesChange([...filesRef.current, ...newFiles]);
+    uploadFiles(newFiles);
   };
 
   // Fetch default models on mount
@@ -444,6 +469,43 @@ export function ChatInput({
       !!onPause &&
       !['completed', 'failed', 'paused', 'waiting_for_user'].includes(taskStatus || ''));
 
+  const handleDragEnter = (e: React.DragEvent<HTMLFormElement>) => {
+    if (!isFileDragEvent(e) || isInputBusy) return;
+    e.preventDefault();
+    e.stopPropagation();
+    dragDepthRef.current += 1;
+    setIsDraggingFiles(true);
+  };
+
+  const handleDragOver = (e: React.DragEvent<HTMLFormElement>) => {
+    if (!isFileDragEvent(e) || isInputBusy) return;
+    e.preventDefault();
+    e.stopPropagation();
+    e.dataTransfer.dropEffect = "copy";
+    if (!isDraggingFiles) {
+      setIsDraggingFiles(true);
+    }
+  };
+
+  const handleDragLeave = (e: React.DragEvent<HTMLFormElement>) => {
+    if (!isFileDragEvent(e)) return;
+    e.preventDefault();
+    e.stopPropagation();
+    dragDepthRef.current = Math.max(0, dragDepthRef.current - 1);
+    if (dragDepthRef.current === 0) {
+      setIsDraggingFiles(false);
+    }
+  };
+
+  const handleDrop = (e: React.DragEvent<HTMLFormElement>) => {
+    if (!isFileDragEvent(e) || isInputBusy) return;
+    e.preventDefault();
+    e.stopPropagation();
+    const droppedFiles = extractDroppedFiles(e.dataTransfer);
+    resetDragState();
+    appendFiles(droppedFiles);
+  };
+
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
 
@@ -527,10 +589,7 @@ export function ChatInput({
         }
       });
 
-      if (pastedFiles.length > 0) {
-        onFilesChange?.([...files, ...pastedFiles]);
-        uploadFiles(pastedFiles);
-      }
+      appendFiles(pastedFiles);
     } else {
       // Strip formatting from text paste
       e.preventDefault();
@@ -543,8 +602,7 @@ export function ChatInput({
 
   const handleFileSelect = (e: React.ChangeEvent<HTMLInputElement>) => {
     const selectedFiles = Array.from(e.target.files || []);
-    onFilesChange?.([...files, ...selectedFiles]);
-    uploadFiles(selectedFiles);
+    appendFiles(selectedFiles);
     if (fileInputRef.current) {
       fileInputRef.current.value = "";
     }
@@ -648,10 +706,26 @@ export function ChatInput({
               ? "shadow-[0_0_0_3px_rgba(48,64,207,0.16)]"
               : ""
           )}
+          onDragEnter={handleDragEnter}
+          onDragOver={handleDragOver}
+          onDragLeave={handleDragLeave}
+          onDrop={handleDrop}
           style={{
-            borderColor: selectedAgents.length > 0 ? "#3040cf" : isFocused ? "#3040cf" : "#d7deec"
+            borderColor: selectedAgents.length > 0 ? "#3040cf" : isDraggingFiles || isFocused ? "#3040cf" : "#d7deec"
           }}
         >
+          {isDraggingFiles && (
+            <div className="pointer-events-none absolute inset-0 z-20 flex items-center justify-center bg-primary/5 px-4">
+              <div className="flex max-w-sm items-center gap-3 rounded-2xl border border-primary/20 bg-background/95 px-4 py-3 text-left shadow-lg backdrop-blur-sm">
+                <div className="flex h-10 w-10 items-center justify-center rounded-full bg-primary/10 text-primary">
+                  <Paperclip className="h-4 w-4" />
+                </div>
+                <div className="space-y-1">
+                  <div className="text-sm font-medium text-foreground">{t("chatPage.fileUpload.dropHere")}</div>
+                </div>
+              </div>
+            </div>
+          )}
           {files.length > 0 && (
             <div className="flex flex-wrap gap-2 px-4 pt-3">
               {files.map((file, index) => {

@@ -8,11 +8,6 @@ export interface ParsedChatResponse {
     interactions?: unknown[]
 }
 
-const stripJsonBlocks = (value: string): string => {
-    const stripped = value.replace(/```json[\s\S]*?(```|$)/gi, "").trim()
-    return stripped || value.trim()
-}
-
 const readChatPayload = (value: unknown): ParsedChatPayload | null => {
     if (!value || typeof value !== "object") return null
 
@@ -136,14 +131,14 @@ export const extractBuildPreviewResponse = (payload: unknown): ParsedChatRespons
         const nestedResult = root.result as { content?: unknown }
         if (typeof nestedResult.content === "string") {
             return {
-                message: stripJsonBlocks(nestedResult.content),
+                message: nestedResult.content,
             }
         }
     }
 
     if (typeof root?.result === "string") {
         return {
-            message: stripJsonBlocks(root.result),
+            message: root.result,
         }
     }
 

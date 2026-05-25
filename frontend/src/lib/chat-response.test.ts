@@ -84,4 +84,15 @@ describe("chat-response", () => {
       ],
     })
   })
+
+  it("preserves ordinary json code blocks in non-chat preview results", () => {
+    const payload = {
+      type: "task_completed",
+      result: "Here is the schema:\n```json\n{\"name\":\"demo\"}\n```",
+    }
+
+    expect(extractBuildPreviewResponse(payload)).toEqual({
+      message: "Here is the schema:\n```json\n{\"name\":\"demo\"}\n```",
+    })
+  })
 })

@@ -53,12 +53,18 @@ def get_job_capabilities(
     """Return how clients should submit background-capable work."""
     celery_enabled = get_celery_enabled()
     broker_configured = get_celery_broker_url() is not None
-    enqueue_available = is_background_job_enqueue_available()
+    broker_reachable = is_background_job_enqueue_available(check_worker=False)
+    worker_available = (
+        is_background_job_enqueue_available(check_worker=True)
+        if broker_reachable
+        else False
+    )
     return {
-        "kb_ingest_mode": "celery" if enqueue_available else "sync",
+        "kb_ingest_mode": "celery" if worker_available else "sync",
         "celery_enabled": celery_enabled,
         "broker_configured": broker_configured,
-        "broker_reachable": enqueue_available,
+        "broker_reachable": broker_reachable,
+        "worker_available": worker_available,
     }
 
 

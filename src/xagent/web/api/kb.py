@@ -790,7 +790,7 @@ def _enqueue_background_job_or_503(
     job: BackgroundJob,
 ) -> BackgroundJob:
     """Enqueue a job or fail clearly so callers can use the sync endpoint."""
-    if not is_background_job_enqueue_available():
+    if not is_background_job_enqueue_available(check_worker=True):
         mark_job_failed(
             db,
             job,
@@ -815,7 +815,7 @@ def _enqueue_background_job_or_503(
 
 
 def _ensure_background_job_queue_available() -> None:
-    if not is_background_job_enqueue_available():
+    if not is_background_job_enqueue_available(check_worker=True):
         raise HTTPException(
             status_code=503,
             detail="Background job queue is unavailable",

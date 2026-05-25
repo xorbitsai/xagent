@@ -63,6 +63,21 @@ def test_background_job_enqueue_unavailable_without_worker(monkeypatch):
     assert is_background_job_enqueue_available(check_worker=True) is False
 
 
+def test_job_capabilities_use_sync_without_worker(monkeypatch):
+    monkeypatch.setenv(CELERY_ENABLED, "true")
+    monkeypatch.setenv(CELERY_BROKER_URL, "memory://")
+
+    from xagent.web.api.jobs import get_job_capabilities
+
+    capabilities = get_job_capabilities(_user=object())  # type: ignore[arg-type]
+
+    assert capabilities["kb_ingest_mode"] == "sync"
+    assert capabilities["celery_enabled"] is True
+    assert capabilities["broker_configured"] is True
+    assert capabilities["broker_reachable"] is True
+    assert capabilities["worker_available"] is False
+
+
 def test_celery_worker_app_import_registers_tasks():
     src_path = str(Path(__file__).resolve().parents[2] / "src")
     env = os.environ.copy()

@@ -579,6 +579,34 @@ async def test_auto_pattern_final_answer_completes_without_child_pattern() -> No
 
 
 @pytest.mark.asyncio
+async def test_auto_pattern_rederives_output_language_per_run() -> None:
+    llm = FakeLLM(
+        [
+            decision_tool_response(
+                "final_answer",
+                "Greeting only.",
+                answer="hi",
+                response_language="English",
+            )
+        ]
+    )
+    pattern = AutoPattern()
+    context = ExecutionContext()
+    context.metadata["output_language"] = "Spanish"
+    context.add_user_message("hi")
+    runtime = PatternRuntime()
+
+    result = await pattern.run(context=context, tools=[], llm=llm, runtime=runtime)
+
+    assert result["success"] is True
+    assert context.metadata["output_language"] == "English"
+    decision_context = "\n".join(
+        str(message.get("content", "")) for message in llm.calls[0]["messages"]
+    )
+    assert "Output language: Spanish" not in decision_context
+
+
+@pytest.mark.asyncio
 async def test_auto_pattern_streams_direct_final_answer_as_tool_args_arrive() -> None:
     prefix = (
         '{"action":"final_answer","reason":"simple",'

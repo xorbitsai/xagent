@@ -1416,6 +1416,14 @@ async def test_llm_plan_generator_builds_plan_from_model_json() -> None:
     assert "response_format" not in llm.calls[0]
 
 
+def test_dag_output_language_reads_dict_context_metadata() -> None:
+    assert (
+        DAGPattern._output_language({"metadata": {"output_language": "English"}})
+        == "English"
+    )
+    assert DAGPattern._output_language({"metadata": None}) == ""
+
+
 @pytest.mark.asyncio
 async def test_llm_plan_generator_filters_unknown_suggested_tools() -> None:
     generator = LLMPlanGenerator()

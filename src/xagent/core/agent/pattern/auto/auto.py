@@ -641,9 +641,26 @@ class AutoPattern(AgentPattern):
         response_language = self.decision.response_language.strip()
         if not response_language:
             return
-        metadata = getattr(context, "metadata", None)
-        if isinstance(metadata, dict):
+        metadata = self._context_metadata(context)
+        if metadata is not None:
+            # Auto is the current-turn language authority; replace any
+            # request-scoped policy left by a previous turn.
             metadata[OUTPUT_LANGUAGE_METADATA_KEY] = response_language
+
+    @staticmethod
+    def _context_metadata(context: Any) -> dict[str, Any] | None:
+        if isinstance(context, dict):
+            metadata = context.get("metadata")
+        else:
+            metadata = getattr(context, "metadata", None)
+        if isinstance(metadata, dict):
+            return metadata
+        return None
+
+    def _clear_response_language(self, context: Any) -> None:
+        metadata = self._context_metadata(context)
+        if metadata is not None:
+            metadata.pop(OUTPUT_LANGUAGE_METADATA_KEY, None)
 
     def _attach_decision_metadata(self, result: dict[str, Any]) -> None:
         if self.decision is None:
@@ -659,6 +676,9 @@ class AutoPattern(AgentPattern):
         if llm is None:
             raise RuntimeError("AutoPattern requires an LLM with tool calling support.")
 
+        # Re-derive the request-scoped language before routing so stale metadata
+        # cannot bias the current decision prompt.
+        self._clear_response_language(context)
         await runtime.compact_context_if_needed(
             context=context,
             llm=llm,

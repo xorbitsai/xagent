@@ -1503,7 +1503,10 @@ class DAGPattern(AgentPattern):
 
     @staticmethod
     def _output_language(root_context: Any) -> str:
-        metadata = getattr(root_context, "metadata", {})
+        if isinstance(root_context, dict):
+            metadata = root_context.get("metadata", {})
+        else:
+            metadata = getattr(root_context, "metadata", {})
         if isinstance(metadata, dict):
             return str(metadata.get(OUTPUT_LANGUAGE_METADATA_KEY) or "").strip()
         return ""

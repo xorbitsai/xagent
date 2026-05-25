@@ -121,17 +121,28 @@ export const getInlineFilePreviewUrl = (
 // /api/files/public/preview is intended for inline rendering (e.g. the
 // PptxPreviewRenderer feeds raw bytes into pptxviewjs) and on some
 // deployments returns a derived preview payload instead of the source
-// file. Routing the open link through /api/files/download guarantees the
-// original bytes plus a ``Content-Disposition: attachment; filename=...``
-// header, so the browser saves the file under its real name instead of a
-// bare file id. External (cross-origin) sources fall back to the source's
-// previewUrl since there's no managed download endpoint for them.
+// file. Routing the open link through /api/files/public/download
+// guarantees the original bytes plus a ``Content-Disposition:
+// attachment; filename=...`` header, so the browser saves the file
+// under its real name instead of a bare file id.
+//
+// This MUST stay on the public/* route, not /api/files/download. The
+// auth'd download route depends on ``get_current_user`` and the
+// frontend only adds the bearer token through ``apiRequest``, never
+// through plain anchor navigation. Routing ``<a href>`` clicks (and
+// middle-click / right-click "open in new tab" / "copy link") through
+// the auth'd route would 401 every navigation that doesn't pass
+// through a JS click handler — including the no-callback
+// ``InlineFilePreview`` surfaces (widget / standalone markdown).
+//
+// External (cross-origin) sources have no managed download endpoint
+// and fall back to the source's own previewUrl.
 export const getInlineFileDownloadUrl = (
   source: InlineFilePreviewSource,
   apiUrl: string
 ): string => {
   if (source.fileId) {
-    return `${apiUrl}/api/files/download/${encodeURIComponent(source.fileId)}`
+    return `${apiUrl}/api/files/public/download/${encodeURIComponent(source.fileId)}`
   }
   return getInlineFilePreviewUrl(source, apiUrl)
 }

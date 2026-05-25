@@ -523,6 +523,89 @@ class TestFileUpload:
         assert preview.status_code == 409
         assert "re-upload" in preview.json()["detail"]
 
+    def test_public_download_serves_source_bytes_without_auth(
+        self, client, temp_uploads_dir, auth_headers
+    ):
+        """Public download must serve the source bytes for plain
+        ``<a href>`` navigation that does NOT carry a bearer token —
+        otherwise the chat file-card 'Open' link, middle-click
+        'open in new tab', and right-click 'copy link' all 401."""
+        upload = client.post(
+            "/api/files/upload",
+            files={"file": ("source.txt", b"source content", "text/plain")},
+            data={"task_type": "general"},
+            headers=auth_headers,
+        )
+        assert upload.status_code == 200
+        file_id = upload.json()["file_id"]
+
+        # Deliberately omit ``headers=auth_headers``: the whole point of
+        # the public route is that it works without a token.
+        download = client.get(f"/api/files/public/download/{file_id}")
+
+        assert download.status_code == 200
+        assert download.content == b"source content"
+
+    def test_public_download_sets_attachment_content_disposition(
+        self, client, temp_uploads_dir, auth_headers
+    ):
+        """Public download must send Content-Disposition: attachment
+        with the source filename so the browser saves under the real
+        name (e.g. ``slides.pptx``) instead of the bare file id."""
+        upload = client.post(
+            "/api/files/upload",
+            files={"file": ("slides.pptx", b"slide bytes", "application/octet-stream")},
+            data={"task_type": "general"},
+            headers=auth_headers,
+        )
+        assert upload.status_code == 200
+        file_id = upload.json()["file_id"]
+
+        download = client.get(f"/api/files/public/download/{file_id}")
+
+        assert download.status_code == 200
+        disposition = download.headers.get("content-disposition", "")
+        assert disposition.startswith("attachment"), disposition
+        assert 'filename="slides.pptx"' in disposition, disposition
+
+    def test_public_download_returns_404_for_unknown_id(self, client):
+        download = client.get(
+            "/api/files/public/download/00000000-0000-4000-8000-000000000000"
+        )
+        assert download.status_code == 404
+
+    def test_public_download_registered_file_rejects_local_path_outside_uploads(
+        self, client, test_db, tmp_path
+    ):
+        """Public download must not expose registered paths outside the
+        uploads root (mirror of the same guard on public_preview)."""
+        admin_user, test_app = test_db
+        outside_path = tmp_path / "outside-public-download.txt"
+        outside_path.write_text("outside uploads", encoding="utf-8")
+
+        db = next(test_app.dependency_overrides[get_db]())
+        try:
+            db.add(
+                UploadedFile(
+                    file_id="44444444-4444-4444-8444-444444444444",
+                    user_id=admin_user.id,
+                    filename="outside-public-download.txt",
+                    storage_path=str(outside_path),
+                    storage_status="legacy",
+                    mime_type="text/plain",
+                    file_size=outside_path.stat().st_size,
+                )
+            )
+            db.commit()
+        finally:
+            db.close()
+
+        response = client.get(
+            "/api/files/public/download/44444444-4444-4444-8444-444444444444"
+        )
+
+        assert response.status_code == 403
+
     def test_upload_python_file_success(
         self, client, test_db, sample_files, temp_uploads_dir, auth_headers
     ):

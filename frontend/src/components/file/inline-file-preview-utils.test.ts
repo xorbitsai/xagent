@@ -160,18 +160,20 @@ describe('inline-file-preview-utils', () => {
     })
   })
 
-  it('routes managed file ids through the download endpoint for open links', () => {
+  it('routes managed file ids through the public download endpoint for open links', () => {
     // The "Open" affordance must hand the user the source artifact, not
     // the inline-preview payload (which on some deployments is a derived
-    // PDF), so file-id sources resolve to /api/files/download. The
-    // download endpoint also sets ``Content-Disposition: attachment;
-    // filename=...`` which preserves the real filename on save.
+    // PDF), so file-id sources resolve to /api/files/public/download.
+    // The public/* route is required because plain ``<a href>`` clicks
+    // (and middle-click / right-click "open in new tab" / "copy link")
+    // don't carry the bearer token that the auth'd /api/files/download
+    // route requires.
     expect(
       getInlineFileDownloadUrl(
         { fileId: 'slides-file-id', filename: 'slides.pptx' },
         'http://api.local'
       )
-    ).toBe('http://api.local/api/files/download/slides-file-id')
+    ).toBe('http://api.local/api/files/public/download/slides-file-id')
   })
 
   it('falls back to the preview URL for external sources without a file id', () => {
@@ -198,7 +200,7 @@ describe('inline-file-preview-utils', () => {
         },
         'http://api.local'
       )
-    ).toBe('http://api.local/api/files/download/doc-file-id')
+    ).toBe('http://api.local/api/files/public/download/doc-file-id')
   })
 
   it('returns an empty string when no file id or preview URL is available', () => {

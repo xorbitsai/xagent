@@ -107,13 +107,15 @@ describe('InlineFilePreview', () => {
     expect(handleFileClick).toHaveBeenCalledWith('slides-file-id', 'slides.pptx')
   })
 
-  it('uses the download URL as the inline preview open link href', () => {
-    // The "Open" link must route through /api/files/download, not
+  it('uses the public download URL as the inline preview open link href', () => {
+    // The "Open" link must route through /api/files/public/download, not
     // /api/files/public/preview: preview is for inline rendering (and on
-    // some deployments returns a derived payload), while the download
-    // endpoint serves the source bytes with a ``Content-Disposition:
-    // attachment; filename=...`` header so a save lands as the real
-    // filename rather than the bare file id.
+    // some deployments returns a derived payload), while public/download
+    // serves the source bytes with a ``Content-Disposition: attachment;
+    // filename=...`` header so a save lands as the real filename rather
+    // than the bare file id. The public/* route is required because
+    // plain ``<a href>`` navigation (and middle/right-click open-in-tab
+    // / copy-link) doesn't carry a bearer token.
     const handleFileClick = vi.fn()
 
     render(
@@ -130,7 +132,7 @@ describe('InlineFilePreview', () => {
     const openLink = screen.getByRole('link', { name: 'Open' })
     expect(openLink).toHaveAttribute(
       'href',
-      'http://api.local/api/files/download/slides-file-id'
+      'http://api.local/api/files/public/download/slides-file-id'
     )
 
     fireEvent.click(openLink)
@@ -188,11 +190,12 @@ describe('InlineFilePreview', () => {
     expect(screen.queryByText('Localized load failure')).not.toBeInTheDocument()
   })
 
-  it('uses the download URL as the non-previewable file link href', () => {
+  it('uses the public download URL as the non-previewable file link href', () => {
     // Non-previewable artifacts (zip, etc.) collapse the file card into
     // a single download link — same reasoning as the inline-preview Open
-    // link: route through /api/files/download so the save filename is
-    // the source name, not the file id.
+    // link: route through /api/files/public/download so the save
+    // filename is the source name, not the file id, AND so middle/
+    // right-click open-in-tab / copy-link still works without a token.
     const handleFileClick = vi.fn()
 
     render(
@@ -205,7 +208,7 @@ describe('InlineFilePreview', () => {
     const link = screen.getByRole('link', { name: 'archive.zip' })
     expect(link).toHaveAttribute(
       'href',
-      'http://api.local/api/files/download/archive-file-id'
+      'http://api.local/api/files/public/download/archive-file-id'
     )
 
     fireEvent.click(link)

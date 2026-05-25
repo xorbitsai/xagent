@@ -839,6 +839,75 @@ async def preview_file(
     )
 
 
+@file_router.get("/public/download/{file_id:path}", response_model=None)
+async def public_download_file(
+    file_id: str,
+    db: Session = Depends(get_db),
+) -> Any:
+    """Public source-download endpoint for the chat file-card 'Open' link.
+
+    Mirrors ``public_preview_file`` for resolution (UUID file id or
+    legacy cross-user path) but always returns
+    ``Content-Disposition: attachment; filename="..."`` so the browser
+    saves under the source filename instead of trying to render the
+    bytes inline. Used by ``InlineFilePreview`` 'Open' affordances
+    that render as plain ``<a href>``: those clicks — plus middle-
+    click / right-click "open in new tab" / "copy link" — don't carry
+    the frontend's bearer token, so the auth'd
+    ``/api/files/download/{file_id}`` route would 401 every plain
+    browser navigation.
+
+    The ``file_id`` is the only required capability, matching the
+    existing ``public/preview`` contract. ``relative_path`` is
+    intentionally NOT supported: 'Open' always targets the registered
+    source artifact, never a sub-path inside it.
+    """
+    file_record: Optional[UploadedFile] = None
+    target_path: Optional[Path] = None
+    file_name: str
+
+    if is_valid_uuid(file_id):
+        file_record = (
+            db.query(UploadedFile).filter(UploadedFile.file_id == file_id).first()
+        )
+
+    if file_record:
+        file_ref = ManagedFileRef(file_record)
+        owner_user_id = _file_user_id_value(file_record)
+        _ensure_under_uploads(file_ref.local_path, owner_user_id)
+        file_name = str(file_record.filename)
+        if file_ref.has_durable_object:
+            try:
+                target_path = file_ref.ensure_local()
+            except DurableObjectIntegrityError as exc:
+                raise _file_integrity_failed() from exc
+            except DurableStorageOperationError as exc:
+                raise _durable_storage_unavailable() from exc
+            except DurableObjectMissingError:
+                target_path = file_ref.local_path
+        else:
+            target_path = file_ref.local_path
+    else:
+        # Legacy non-UUID file id: resolve across user directories
+        # (same fallback as public_preview_file).
+        result = resolve_legacy_file_path_cross_user(file_id)
+        if result is None:
+            raise HTTPException(status_code=404, detail="File not found")
+        target_path, owner_user_id = result
+        _ensure_under_uploads(target_path, owner_user_id)
+        file_name = target_path.name
+
+    if not target_path.exists() or not target_path.is_file():
+        raise HTTPException(status_code=404, detail="File not found")
+
+    return FileResponse(
+        path=str(target_path),
+        filename=file_name,
+        media_type=guess_media_type(file_name),
+        headers={"Content-Disposition": f'attachment; filename="{file_name}"'},
+    )
+
+
 @file_router.get("/public/preview/{file_id:path}", response_model=None)
 async def public_preview_file(
     file_id: str,

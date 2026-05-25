@@ -9,6 +9,7 @@ from typing import Any, Callable
 
 from ...language import (
     OUTPUT_LANGUAGE_METADATA_KEY,
+    normalize_response_language_label,
     output_language_policy,
     plan_language_rules,
 )
@@ -440,7 +441,9 @@ class LLMPlanGenerator(PlanGenerator):
 
     @staticmethod
     def _apply_response_language(context: Any, plan_arguments: dict[str, Any]) -> None:
-        response_language = str(plan_arguments.get("response_language") or "").strip()
+        response_language = normalize_response_language_label(
+            str(plan_arguments.get("response_language") or "")
+        )
         if not response_language:
             return
         metadata = getattr(context, "metadata", None)

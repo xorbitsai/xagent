@@ -21,6 +21,7 @@ from ...frame import ExecutionFrame, ExecutionSnapshot, ExecutionStatus
 from ...language import (
     OUTPUT_LANGUAGE_METADATA_KEY,
     final_answer_language_rule,
+    normalize_response_language_label,
     output_language_policy,
 )
 from ...runtime import LLMCallInterrupted, PatternRuntime
@@ -94,7 +95,9 @@ class AutoDecision:
             ),
             evidence_basis=str(payload.get("evidence_basis", "")),
             missing_verification=str(payload.get("missing_verification", "")),
-            response_language=str(payload.get("response_language", "")).strip(),
+            response_language=normalize_response_language_label(
+                str(payload.get("response_language", ""))
+            ),
         )
 
 
@@ -638,7 +641,9 @@ class AutoPattern(AgentPattern):
     def _apply_response_language(self, context: Any) -> None:
         if self.decision is None:
             return
-        response_language = self.decision.response_language.strip()
+        response_language = normalize_response_language_label(
+            self.decision.response_language
+        )
         if not response_language:
             return
         metadata = self._context_metadata(context)

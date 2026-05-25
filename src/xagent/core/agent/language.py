@@ -2,10 +2,108 @@
 
 OUTPUT_LANGUAGE_METADATA_KEY = "output_language"
 
+_ALLOWED_RESPONSE_LANGUAGE_LABELS = frozenset(
+    {
+        "Afrikaans",
+        "Arabic",
+        "Basque",
+        "Bengali",
+        "Brazilian Portuguese",
+        "Bulgarian",
+        "Cantonese",
+        "Catalan",
+        "Chinese",
+        "Croatian",
+        "Czech",
+        "Danish",
+        "Dutch",
+        "English",
+        "Estonian",
+        "European Portuguese",
+        "Farsi",
+        "Filipino",
+        "Finnish",
+        "French",
+        "Galician",
+        "German",
+        "Greek",
+        "Gujarati",
+        "Hebrew",
+        "Hindi",
+        "Hungarian",
+        "Icelandic",
+        "Indonesian",
+        "Irish",
+        "Italian",
+        "Japanese",
+        "Kannada",
+        "Korean",
+        "Latvian",
+        "Lithuanian",
+        "Malay",
+        "Malayalam",
+        "Mandarin Chinese",
+        "Marathi",
+        "Norwegian",
+        "Persian",
+        "Polish",
+        "Portuguese",
+        "Punjabi",
+        "Romanian",
+        "Russian",
+        "Serbian",
+        "Simplified Chinese",
+        "Slovak",
+        "Slovenian",
+        "Spanish",
+        "Swahili",
+        "Swedish",
+        "Tagalog",
+        "Tamil",
+        "Telugu",
+        "Thai",
+        "Traditional Chinese",
+        "Turkish",
+        "Ukrainian",
+        "Urdu",
+        "Vietnamese",
+        "Welsh",
+    }
+)
+_LANGUAGE_LABEL_BY_KEY = {
+    label.casefold(): label for label in _ALLOWED_RESPONSE_LANGUAGE_LABELS
+}
+_LANGUAGE_LABEL_ALIASES = {
+    "cn": "Chinese",
+    "en": "English",
+    "en-us": "English",
+    "en_us": "English",
+    "en-gb": "English",
+    "en_gb": "English",
+    "es": "Spanish",
+    "español": "Spanish",
+    "fr": "French",
+    "français": "French",
+    "pt": "Portuguese",
+    "pt-br": "Brazilian Portuguese",
+    "pt_br": "Brazilian Portuguese",
+    "português": "Portuguese",
+    "zh": "Chinese",
+    "zh-cn": "Simplified Chinese",
+    "zh_cn": "Simplified Chinese",
+    "zh-hans": "Simplified Chinese",
+    "zh_hans": "Simplified Chinese",
+    "zh-hant": "Traditional Chinese",
+    "zh_hant": "Traditional Chinese",
+    "中文": "Chinese",
+    "简体中文": "Simplified Chinese",
+    "繁體中文": "Traditional Chinese",
+}
+
 
 def output_language_policy(response_language: str | None = None) -> str:
     """Return a compact policy for downstream language preservation."""
-    language = _normalize_response_language(response_language)
+    language = normalize_response_language_label(response_language)
     if language:
         return (
             f"Output language: {language}. Use {language} for all user-facing "
@@ -25,10 +123,17 @@ def output_language_policy(response_language: str | None = None) -> str:
     )
 
 
-def _normalize_response_language(response_language: str | None) -> str:
+def normalize_response_language_label(response_language: str | None) -> str:
+    """Return a safe, canonical response-language label or an empty string."""
     if response_language is None:
         return ""
-    return " ".join(str(response_language).strip().split())
+    language = " ".join(str(response_language).strip().split())
+    if not language or len(language) > 40:
+        return ""
+    key = language.casefold()
+    if key in _LANGUAGE_LABEL_ALIASES:
+        return _LANGUAGE_LABEL_ALIASES[key]
+    return _LANGUAGE_LABEL_BY_KEY.get(key, "")
 
 
 def response_language_rules(*, subject: str = "current user request") -> str:

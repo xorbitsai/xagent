@@ -470,7 +470,7 @@ export function ChatInput({
       !['completed', 'failed', 'paused', 'waiting_for_user'].includes(taskStatus || ''));
 
   const handleDragEnter = (e: React.DragEvent<HTMLFormElement>) => {
-    if (!isFileDragEvent(e) || isInputBusy) return;
+    if (!isFileDragEvent(e) || isInputBusy || hideFileUpload) return;
     e.preventDefault();
     e.stopPropagation();
     dragDepthRef.current += 1;
@@ -478,7 +478,7 @@ export function ChatInput({
   };
 
   const handleDragOver = (e: React.DragEvent<HTMLFormElement>) => {
-    if (!isFileDragEvent(e) || isInputBusy) return;
+    if (!isFileDragEvent(e) || isInputBusy || hideFileUpload) return;
     e.preventDefault();
     e.stopPropagation();
     e.dataTransfer.dropEffect = "copy";
@@ -498,7 +498,7 @@ export function ChatInput({
   };
 
   const handleDrop = (e: React.DragEvent<HTMLFormElement>) => {
-    if (!isFileDragEvent(e) || isInputBusy) return;
+    if (!isFileDragEvent(e) || isInputBusy || hideFileUpload) return;
     e.preventDefault();
     e.stopPropagation();
     const droppedFiles = extractDroppedFiles(e.dataTransfer);

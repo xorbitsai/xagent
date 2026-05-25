@@ -900,11 +900,17 @@ async def public_download_file(
     if not target_path.exists() or not target_path.is_file():
         raise HTTPException(status_code=404, detail="File not found")
 
+    # Pass filename= and let Starlette compose the Content-Disposition header.
+    # Starlette 0.36+ generates ``filename*=utf-8''<percent-encoded>`` for
+    # non-ASCII names (e.g. 报告.pptx) via urllib.parse.quote, so we must NOT
+    # set the header manually: a raw ``filename="报告.pptx"`` string would be
+    # latin-1 encoded by the ASGI layer and raise UnicodeEncodeError.
+    # The default content_disposition_type is already "attachment", so we
+    # only need to pass filename= here.
     return FileResponse(
         path=str(target_path),
         filename=file_name,
         media_type=guess_media_type(file_name),
-        headers={"Content-Disposition": f'attachment; filename="{file_name}"'},
     )
 
 

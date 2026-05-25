@@ -568,6 +568,40 @@ class TestFileUpload:
         assert disposition.startswith("attachment"), disposition
         assert 'filename="slides.pptx"' in disposition, disposition
 
+    def test_public_download_sets_rfc5987_content_disposition_for_non_ascii_filenames(
+        self, client, temp_uploads_dir, auth_headers
+    ):
+        """Non-ASCII filenames (e.g. Chinese) must be percent-encoded as
+        ``filename*=utf-8''<encoded>`` in the Content-Disposition header.
+        A manually composed ``filename="报告.pptx"`` would be encoded as
+        latin-1 by the ASGI layer, raising UnicodeEncodeError.  Delegating
+        header generation to Starlette's FileResponse avoids this."""
+        upload = client.post(
+            "/api/files/upload",
+            files={
+                "file": (
+                    "报告.pptx",
+                    b"slide bytes",
+                    "application/octet-stream",
+                )
+            },
+            data={"task_type": "general"},
+            headers=auth_headers,
+        )
+        assert upload.status_code == 200, upload.json()
+        file_id = upload.json()["file_id"]
+
+        download = client.get(f"/api/files/public/download/{file_id}")
+
+        assert download.status_code == 200, download.text
+        disposition = download.headers.get("content-disposition", "")
+        assert disposition.startswith("attachment"), disposition
+        # Starlette percent-encodes non-ASCII names with the RFC 5987
+        # ``filename*=utf-8''<encoded>`` form.  The raw multi-byte string
+        # must NOT appear literally in the header value.
+        assert "filename*=" in disposition, disposition
+        assert "报告" not in disposition, disposition  # '报告'
+
     def test_public_download_returns_404_for_unknown_id(self, client):
         download = client.get(
             "/api/files/public/download/00000000-0000-4000-8000-000000000000"

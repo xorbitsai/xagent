@@ -129,6 +129,8 @@ def _durable_redirect_response(
             content_type=media_type,
             content_disposition=_content_disposition_header(disposition, filename),
         )
+    except DurableObjectIntegrityError as exc:
+        raise _file_integrity_failed() from exc
     except DurableStorageOperationError as exc:
         raise _durable_storage_unavailable() from exc
 

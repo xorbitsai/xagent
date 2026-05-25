@@ -211,9 +211,16 @@ def test_signed_access_url_returns_none_without_durable_object(tmp_path):
 
 
 def test_signed_access_url_delegates_to_storage(tmp_path):
+    checksum = sha256(b"remote content").hexdigest()
+
     class SigningStorage:
         def __init__(self):
             self.calls = []
+            self.content_hash_calls = []
+
+        def content_hash(self, key):
+            self.content_hash_calls.append(key)
+            return checksum
 
         def signed_url(
             self,
@@ -232,6 +239,7 @@ def test_signed_access_url_delegates_to_storage(tmp_path):
         storage_backend="s3",
         storage_key="users/7/uploads/file-123/object.txt",
         storage_status="available",
+        checksum=checksum,
     )
 
     signed_url = ManagedFileRef(record, storage=storage).signed_access_url(
@@ -241,9 +249,59 @@ def test_signed_access_url_delegates_to_storage(tmp_path):
     )
 
     assert signed_url == "https://cdn.example.com/signed"
+    assert storage.content_hash_calls == ["users/7/uploads/file-123/object.txt"]
     assert storage.calls == [
         ("users/7/uploads/file-123/object.txt", 60, "text/plain", "inline")
     ]
+
+
+def test_signed_access_url_rejects_checksum_mismatch(tmp_path):
+    class MismatchedStorage:
+        def content_hash(self, key):
+            del key
+            return sha256(b"wrong content").hexdigest()
+
+        def signed_url(self, **kwargs):
+            raise AssertionError("signed URL should not be generated")
+
+    record = _record(
+        tmp_path / "uploads" / "object.txt",
+        storage_backend="s3",
+        storage_key="users/7/uploads/file-123/object.txt",
+        storage_status="available",
+        checksum=sha256(b"expected content").hexdigest(),
+    )
+
+    with pytest.raises(DurableObjectIntegrityError):
+        ManagedFileRef(record, storage=MismatchedStorage()).signed_access_url(
+            expires=60
+        )
+
+
+def test_signed_access_url_falls_back_when_checksum_unavailable(tmp_path):
+    class UnhashableStorage:
+        def __init__(self):
+            self.signed_calls = []
+
+        def content_hash(self, key):
+            del key
+            raise RuntimeError("head metadata unavailable")
+
+        def signed_url(self, **kwargs):
+            self.signed_calls.append(kwargs)
+            return "https://cdn.example.com/signed"
+
+    storage = UnhashableStorage()
+    record = _record(
+        tmp_path / "uploads" / "object.txt",
+        storage_backend="s3",
+        storage_key="users/7/uploads/file-123/object.txt",
+        storage_status="available",
+        checksum=sha256(b"expected content").hexdigest(),
+    )
+
+    assert ManagedFileRef(record, storage=storage).signed_access_url(expires=60) is None
+    assert storage.signed_calls == []
 
 
 def test_sync_to_durable_uploads_local_file_and_updates_record(monkeypatch, tmp_path):

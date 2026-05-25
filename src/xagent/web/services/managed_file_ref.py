@@ -8,7 +8,7 @@ import mimetypes
 import tempfile
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, BinaryIO, Literal
+from typing import Any, BinaryIO, Literal, NoReturn
 
 from ...core.file_storage import FsspecFileStorage, StoredObject, get_file_storage
 from ..models.uploaded_file import UploadedFile
@@ -73,21 +73,34 @@ def _sha256_file(path: Path) -> str:
     return digest.hexdigest()
 
 
-def _checksum_matches(expected_checksum: str, actual_sha256_hex: str) -> bool:
-    normalized_expected = expected_checksum.strip()
-    if normalized_expected.lower() == actual_sha256_hex:
-        return True
-
-    if normalized_expected.lower().startswith("sha256:"):
-        prefixed_value = normalized_expected.split(":", 1)[1]
-        if prefixed_value.lower() == actual_sha256_hex:
-            return True
+def _checksum_to_sha256_hex(checksum: str) -> str | None:
+    normalized = checksum.strip()
+    if normalized.lower().startswith("sha256:"):
+        normalized = normalized.split(":", 1)[1]
 
     try:
-        decoded = base64.b64decode(normalized_expected, validate=True)
+        bytes.fromhex(normalized)
+    except ValueError:
+        pass
+    else:
+        if len(normalized) == 64:
+            return normalized.lower()
+
+    try:
+        decoded = base64.b64decode(normalized, validate=True)
     except (binascii.Error, ValueError):
-        return False
-    return len(decoded) == 32 and decoded.hex() == actual_sha256_hex
+        return None
+    return decoded.hex() if len(decoded) == 32 else None
+
+
+def _checksum_matches(expected_checksum: str, actual_checksum: str) -> bool:
+    expected_sha256 = _checksum_to_sha256_hex(expected_checksum)
+    actual_sha256 = _checksum_to_sha256_hex(actual_checksum)
+    return (
+        expected_sha256 is not None
+        and actual_sha256 is not None
+        and expected_sha256 == actual_sha256
+    )
 
 
 @dataclass
@@ -187,6 +200,8 @@ class ManagedFileRef:
         content_disposition: str | None = None,
     ) -> str | None:
         if not self.has_durable_object:
+            return None
+        if not self._verify_durable_checksum_for_direct_access():
             return None
         try:
             return self.storage.signed_url(
@@ -320,6 +335,39 @@ class ManagedFileRef:
         if _checksum_matches(str(expected_checksum), actual_checksum):
             return
 
+        self._raise_integrity_error(str(expected_checksum), actual_checksum)
+
+    def _verify_durable_checksum_for_direct_access(self) -> bool:
+        expected_checksum = getattr(self.record, "checksum", None)
+        if not expected_checksum:
+            logger.warning(
+                "Skipping direct durable access without DB checksum: "
+                "file_id=%s storage_key=%s",
+                getattr(self.record, "file_id", None),
+                self.storage_key,
+            )
+            return False
+
+        try:
+            actual_checksum = self.storage.content_hash(self.storage_key)
+        except Exception as exc:
+            logger.warning(
+                "Falling back to backend-mediated durable access because content "
+                "hash is unavailable: file_id=%s storage_key=%s error=%s",
+                getattr(self.record, "file_id", None),
+                self.storage_key,
+                exc,
+            )
+            return False
+
+        if _checksum_matches(str(expected_checksum), str(actual_checksum)):
+            return True
+
+        self._raise_integrity_error(str(expected_checksum), str(actual_checksum))
+
+    def _raise_integrity_error(
+        self, expected_checksum: str, actual_checksum: str
+    ) -> NoReturn:
         logger.error(
             "Durable object integrity check failed: file_id=%s storage_key=%s "
             "expected_checksum=%s actual_checksum=%s",

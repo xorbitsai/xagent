@@ -533,6 +533,50 @@ class TestFileUpload:
         assert "re-upload" in download.json()["detail"]
         assert not list(temp_uploads_dir.rglob("integrity-download.txt"))
 
+    def test_download_redirect_enabled_checksum_mismatch_asks_user_to_reupload(
+        self, client, temp_uploads_dir, auth_headers, monkeypatch, tmp_path
+    ):
+        from xagent.core.file_storage.storage import FsspecFileStorage
+
+        object_root = tmp_path / "objects"
+        monkeypatch.setenv("XAGENT_FILE_STORAGE_URI", object_root.as_uri())
+        monkeypatch.setenv("XAGENT_FILE_DELIVERY_REDIRECT_ENABLED", "true")
+        get_file_storage.cache_clear()
+
+        upload = client.post(
+            "/api/files/upload",
+            files={
+                "file": (
+                    "integrity-redirect-download.txt",
+                    b"expected redirect download content",
+                    "text/plain",
+                )
+            },
+            data={"task_type": "general"},
+            headers=auth_headers,
+        )
+        assert upload.status_code == 200
+        file_id = upload.json()["file_id"]
+        _corrupt_durable_copy_and_remove_local(
+            object_root, temp_uploads_dir, "integrity-redirect-download.txt"
+        )
+
+        def fail_signed_url(self, key, **kwargs):
+            del self, key, kwargs
+            raise AssertionError("signed URL should not be generated")
+
+        monkeypatch.setattr(FsspecFileStorage, "signed_url", fail_signed_url)
+
+        download = client.get(
+            f"/api/files/download/{file_id}",
+            headers=auth_headers,
+            follow_redirects=False,
+        )
+
+        assert download.status_code == 409
+        assert "re-upload" in download.json()["detail"]
+        assert not list(temp_uploads_dir.rglob("integrity-redirect-download.txt"))
+
     def test_download_registered_file_rejects_local_path_outside_uploads(
         self, client, test_db, tmp_path, auth_headers
     ):
@@ -689,6 +733,50 @@ class TestFileUpload:
 
         assert preview.status_code == 409
         assert "re-upload" in preview.json()["detail"]
+
+    def test_preview_redirect_enabled_checksum_mismatch_asks_user_to_reupload(
+        self, client, temp_uploads_dir, auth_headers, monkeypatch, tmp_path
+    ):
+        from xagent.core.file_storage.storage import FsspecFileStorage
+
+        object_root = tmp_path / "objects"
+        monkeypatch.setenv("XAGENT_FILE_STORAGE_URI", object_root.as_uri())
+        monkeypatch.setenv("XAGENT_FILE_DELIVERY_REDIRECT_ENABLED", "true")
+        get_file_storage.cache_clear()
+
+        upload = client.post(
+            "/api/files/upload",
+            files={
+                "file": (
+                    "integrity-redirect-preview.txt",
+                    b"expected redirect preview content",
+                    "text/plain",
+                )
+            },
+            data={"task_type": "general"},
+            headers=auth_headers,
+        )
+        assert upload.status_code == 200
+        file_id = upload.json()["file_id"]
+        _corrupt_durable_copy_and_remove_local(
+            object_root, temp_uploads_dir, "integrity-redirect-preview.txt"
+        )
+
+        def fail_signed_url(self, key, **kwargs):
+            del self, key, kwargs
+            raise AssertionError("signed URL should not be generated")
+
+        monkeypatch.setattr(FsspecFileStorage, "signed_url", fail_signed_url)
+
+        preview = client.get(
+            f"/api/files/preview/{file_id}",
+            headers=auth_headers,
+            follow_redirects=False,
+        )
+
+        assert preview.status_code == 409
+        assert "re-upload" in preview.json()["detail"]
+        assert not list(temp_uploads_dir.rglob("integrity-redirect-preview.txt"))
 
     def test_public_preview_checksum_mismatch_asks_user_to_reupload(
         self, client, temp_uploads_dir, monkeypatch, tmp_path, auth_headers

@@ -122,6 +122,7 @@ def auto_decision(
                     "arguments": {
                         "action": action,
                         "reason": reason,
+                        "response_language": "English",
                         "answer": answer,
                         "requires_current_or_external_facts": False,
                         "existing_context_sufficient": True,
@@ -141,7 +142,7 @@ def dag_plan(steps: list[dict[str, Any]]) -> dict[str, Any]:
                 "id": "call-plan",
                 "function": {
                     "name": "generate_execution_plan",
-                    "arguments": {"steps": steps},
+                    "arguments": {"steps": steps, "response_language": "English"},
                 },
             }
         ]

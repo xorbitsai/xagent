@@ -243,7 +243,9 @@ def current_step_task(messages: list[dict[str, Any]]) -> str:
     return content
 
 
-def plan_tool_response(steps: list[dict[str, Any]]) -> dict[str, Any]:
+def plan_tool_response(
+    steps: list[dict[str, Any]], response_language: str = "English"
+) -> dict[str, Any]:
     return {
         "tool_calls": [
             {
@@ -251,7 +253,9 @@ def plan_tool_response(steps: list[dict[str, Any]]) -> dict[str, Any]:
                 "type": "function",
                 "function": {
                     "name": "generate_execution_plan",
-                    "arguments": json.dumps({"steps": steps}),
+                    "arguments": json.dumps(
+                        {"steps": steps, "response_language": response_language}
+                    ),
                 },
             }
         ]
@@ -443,9 +447,11 @@ async def test_dag_pattern_streams_overall_completion_not_step_result() -> None:
     assert has_tool(llm.stream_calls[1], DAG_COMPLETION_TOOL_NAME)
     completion_messages = llm.stream_calls[1]["messages"]
     assert (
-        "same natural language as the current user request"
+        "same natural language as the output language policy"
         in completion_messages[0]["content"]
     )
+    completion_payload = json.loads(completion_messages[-1]["content"])
+    assert "output_language_policy" in completion_payload
     completion_tool = llm.stream_calls[1]["tools"][0]["function"]
     answer_schema = completion_tool["parameters"]["properties"]["answer"]
     assert "tool results, source documents" in answer_schema["description"]
@@ -702,6 +708,8 @@ async def test_dag_step_appends_current_step_boundary_after_parent_context() -> 
     )
     assert messages[-1]["role"] == "user"
     assert "DAG STEP EXECUTION BOUNDARY" in messages[-1]["content"]
+    assert "OUTPUT LANGUAGE POLICY" in messages[-1]["content"]
+    assert "Use this policy only to preserve language" in messages[-1]["content"]
     assert "Current DAG step id: extract" in messages[-1]["content"]
     assert "CURRENT STEP - ONLY EXECUTABLE GOAL" in messages[-1]["content"]
     assert "TERMINATION CONDITION - AUTHORITATIVE STOP RULE" in messages[-1]["content"]
@@ -719,6 +727,7 @@ async def test_dag_step_appends_current_step_boundary_after_parent_context() -> 
     assert [message["role"] for message in messages].count("system") == 1
     assert "DAG step execution scope" in messages[0]["content"]
     assert "Overall user goal is background context only" in messages[0]["content"]
+    assert "Output language policy" in messages[0]["content"]
     assert "Extract highlights and generate two posters." not in messages[0]["content"]
     assert "Extract highlights and generate two posters." not in messages[-1]["content"]
     assert "Current step id: extract" in messages[0]["content"]
@@ -1382,14 +1391,26 @@ async def test_llm_plan_generator_builds_plan_from_model_json() -> None:
     assert "Few-shot examples" in system_prompt
     assert "must be concrete and action-specific" in system_prompt
     assert "suggested execution tool scope" in system_prompt
+    assert "response_language" in system_prompt
+    assert "output_language_policy field" in system_prompt
     assert "Plan language rules" in system_prompt
     assert (
         "Write every plan step task, description, termination_condition, "
-        "and completion_evidence in the same natural language as the current "
-        "user request"
+        "and completion_evidence in the same natural language specified by "
+        "the output_language_policy field"
     ) in system_prompt
     assert "Any final synthesis or final result produced from the plan" in system_prompt
     assert "completed step results" in system_prompt
+    prompt_payload = json.loads(llm.calls[0]["messages"][1]["content"])
+    assert "current_user_request" not in prompt_payload
+    assert "output_language_policy" in prompt_payload
+    plan_schema = llm.calls[0]["tools"][0]["function"]["parameters"]["properties"]
+    assert "response_language" in plan_schema
+    assert (
+        "response_language"
+        in llm.calls[0]["tools"][0]["function"]["parameters"]["required"]
+    )
+    assert context.metadata["output_language"] == "English"
     assert llm.calls[0]["tool_choice"] == "required"
     assert llm.calls[0]["thinking"] == {"type": "disabled", "enable": False}
     assert "response_format" not in llm.calls[0]

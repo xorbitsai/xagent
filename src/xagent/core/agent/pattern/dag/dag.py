@@ -12,7 +12,11 @@ from ...context.enrichment import (
     latest_user_text,
 )
 from ...frame import ExecutionFrame, ExecutionSnapshot, ExecutionStatus
-from ...language import final_answer_language_rule
+from ...language import (
+    OUTPUT_LANGUAGE_METADATA_KEY,
+    final_answer_language_rule,
+    output_language_policy,
+)
 from ...result import unwrap_final_answer_content
 from ...runtime import LLMCallInterrupted, PatternRuntime
 from ..base import AgentPattern, PatternResult
@@ -740,8 +744,13 @@ class DAGPattern(AgentPattern):
         step.status = "running"
 
         active_context = self.active_step_contexts.get(step.id)
+        output_language = self._output_language(root_context)
         if active_context is not None:
             child_context = type(root_context).from_dict(active_context)
+            if output_language and not child_context.metadata.get(
+                OUTPUT_LANGUAGE_METADATA_KEY
+            ):
+                child_context.metadata[OUTPUT_LANGUAGE_METADATA_KEY] = output_language
         else:
             child_context = root_context.create_child_context(
                 metadata={
@@ -750,6 +759,7 @@ class DAGPattern(AgentPattern):
                     "dag_step_description": step.description or step.task,
                     "dag_dependencies": list(step.dependencies),
                     "dag_tool_names": list(step.tool_names),
+                    OUTPUT_LANGUAGE_METADATA_KEY: output_language,
                 },
             )
             if step.dependencies:
@@ -1264,6 +1274,11 @@ class DAGPattern(AgentPattern):
             if getattr(message, "role", None) in {"user", "assistant", "tool"}
         ]
         payload = {
+            "output_language_policy": output_language_policy(
+                getattr(context, "metadata", {}).get(OUTPUT_LANGUAGE_METADATA_KEY)
+                if isinstance(getattr(context, "metadata", {}), dict)
+                else None
+            ),
             "messages": latest_messages,
             "plan": self.plan.to_dict() if self.plan is not None else None,
             "step_results": self.step_results,
@@ -1281,7 +1296,7 @@ class DAGPattern(AgentPattern):
                     "missing, choose status=incomplete, leave answer empty, and "
                     "state the missing work plus concise replan instructions. Put "
                     "status before answer in the tool arguments. "
-                    f"{final_answer_language_rule()}"
+                    f"{final_answer_language_rule(subject='output language policy')}"
                 ),
             },
             {"role": "user", "content": json.dumps(payload, ensure_ascii=False)},
@@ -1309,7 +1324,7 @@ class DAGPattern(AgentPattern):
                             "description": (
                                 "Final user-facing answer when status is completed; "
                                 "empty when status is incomplete. "
-                                f"{final_answer_language_rule()}"
+                                f"{final_answer_language_rule(subject='output language policy')}"
                             ),
                         },
                         "missing_work": {
@@ -1431,7 +1446,7 @@ class DAGPattern(AgentPattern):
         return {dep: self.step_results.get(dep) for dep in step.dependencies}
 
     def _step_instruction(self, *, root_context: Any, step: PlanStep) -> str:
-        del root_context
+        language_policy = output_language_policy(self._output_language(root_context))
         dependency_note = (
             "Dependency results, if any, are provided immediately before this "
             "message. Use them as inputs for this step only."
@@ -1449,6 +1464,11 @@ class DAGPattern(AgentPattern):
             "The overall user goal is background context only. Do not execute it "
             "directly and do not use it to expand the current step's completion "
             "criteria.\n\n"
+            "OUTPUT LANGUAGE POLICY\n"
+            f"{language_policy}\n"
+            "Use this policy only to preserve language for user-facing prose and "
+            "persisted tool arguments. Do not use it to expand this step's "
+            "completion criteria.\n\n"
             "CURRENT STEP - ONLY EXECUTABLE GOAL\n"
             f"Current DAG step id: {step.id}\n"
             f"Current DAG step title: {step.task}\n"
@@ -1480,6 +1500,13 @@ class DAGPattern(AgentPattern):
             "completed from the provided context and dependency results. When this "
             "step is done, return a final answer for this step only."
         )
+
+    @staticmethod
+    def _output_language(root_context: Any) -> str:
+        metadata = getattr(root_context, "metadata", {})
+        if isinstance(metadata, dict):
+            return str(metadata.get(OUTPUT_LANGUAGE_METADATA_KEY) or "").strip()
+        return ""
 
     async def _generate_plan(
         self,

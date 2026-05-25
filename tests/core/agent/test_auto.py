@@ -236,6 +236,7 @@ def decision_tool_response(
     action: str,
     reason: str,
     answer: str | None = None,
+    response_language: str = "English",
     requires_current_or_external_facts: bool = False,
     existing_context_sufficient: bool = True,
     evidence_basis: str = "current conversation",
@@ -244,6 +245,7 @@ def decision_tool_response(
     arguments: dict[str, Any] = {
         "action": action,
         "reason": reason,
+        "response_language": response_language,
         "requires_current_or_external_facts": requires_current_or_external_facts,
         "existing_context_sufficient": existing_context_sufficient,
         "evidence_basis": evidence_basis,
@@ -275,6 +277,7 @@ def malformed_empty_missing_verification_decision_tool_response() -> dict[str, A
                     "name": DECISION_TOOL_NAME,
                     "arguments": (
                         '{"action":"plan_execute","reason":"Needs DAG.",'
+                        '"response_language":"English",'
                         '"requires_current_or_external_facts":false,'
                         '"existing_context_sufficient":true,'
                         '"evidence_basis":"current conversation",'
@@ -296,6 +299,7 @@ def truncated_final_answer_decision_tool_response() -> dict[str, Any]:
                     "name": DECISION_TOOL_NAME,
                     "arguments": (
                         '{"action":"final_answer","reason":"simple reply",'
+                        '"response_language":"English",'
                         '"requires_current_or_external_facts":false,'
                         '"existing_context_sufficient":true,'
                         '"evidence_basis":"current conversation",'
@@ -361,7 +365,9 @@ async def test_auto_decision_sees_memory_and_skill_context() -> None:
     assert "Available Skill: auto-skill" in system_context
 
 
-def plan_tool_response(steps: list[dict[str, Any]]) -> dict[str, Any]:
+def plan_tool_response(
+    steps: list[dict[str, Any]], response_language: str = "English"
+) -> dict[str, Any]:
     return {
         "tool_calls": [
             {
@@ -369,7 +375,9 @@ def plan_tool_response(steps: list[dict[str, Any]]) -> dict[str, Any]:
                 "type": "function",
                 "function": {
                     "name": "generate_execution_plan",
-                    "arguments": json.dumps({"steps": steps}),
+                    "arguments": json.dumps(
+                        {"steps": steps, "response_language": response_language}
+                    ),
                 },
             }
         ]
@@ -522,6 +530,8 @@ async def test_auto_pattern_final_answer_completes_without_child_pattern() -> No
     assert result["output"] == "hi"
     assert pattern.decision is not None
     assert pattern.decision.action == AutoAction.FINAL_ANSWER
+    assert pattern.decision.response_language == "English"
+    assert context.metadata["output_language"] == "English"
     assert context.messages[-1].role == "assistant"
     assert context.messages[-1].content == "hi"
     assert len(llm.calls) == 1
@@ -547,9 +557,16 @@ async def test_auto_pattern_final_answer_completes_without_child_pattern() -> No
     assert "Do not choose plan_execute merely because" in decision_prompt
     assert "user-visible DAG execution" in decision_prompt
     assert "execution tools are available" in decision_prompt
+    assert "Set response_language" in decision_prompt
     assert "Available tool names" not in decision_prompt
     tool_schema = llm.calls[0]["tools"][0]["function"]
     assert "answer argument is mandatory" in tool_schema["description"]
+    response_language_schema = tool_schema["parameters"]["properties"][
+        "response_language"
+    ]
+    assert "Natural language to use" in response_language_schema["description"]
+    assert "Output language policy" in response_language_schema["description"]
+    assert "response_language" in tool_schema["parameters"]["required"]
     answer_schema = tool_schema["parameters"]["properties"]["answer"]
     assert "Mandatory when action is final_answer" in answer_schema["description"]
     assert runtime.last_checkpoint is not None
@@ -565,6 +582,7 @@ async def test_auto_pattern_final_answer_completes_without_child_pattern() -> No
 async def test_auto_pattern_streams_direct_final_answer_as_tool_args_arrive() -> None:
     prefix = (
         '{"action":"final_answer","reason":"simple",'
+        '"response_language":"English",'
         '"requires_current_or_external_facts":false,'
         '"existing_context_sufficient":true,'
         '"evidence_basis":"current conversation",'
@@ -749,7 +767,9 @@ async def test_auto_pattern_react_decision_delegates_to_react() -> None:
         "existing_context_sufficient": True,
         "evidence_basis": "current conversation",
         "missing_verification": "",
+        "response_language": "English",
     }
+    assert context.metadata["output_language"] == "English"
     assert pattern.selected_pattern == "react"
     assert pattern.react_state is not None
     assert runtime.last_checkpoint is not None
@@ -833,7 +853,9 @@ async def test_auto_pattern_plan_execute_decision_delegates_to_dag() -> None:
         "existing_context_sufficient": True,
         "evidence_basis": "current conversation",
         "missing_verification": "",
+        "response_language": "English",
     }
+    assert context.metadata["output_language"] == "English"
     assert pattern.selected_pattern == "plan_execute"
     assert pattern.dag_state is not None
     assert runtime.last_checkpoint is not None
@@ -1190,7 +1212,9 @@ async def test_auto_pattern_empty_final_answer_falls_back_to_react() -> None:
         "existing_context_sufficient": True,
         "evidence_basis": "",
         "missing_verification": "",
+        "response_language": "English",
     }
+    assert context.metadata["output_language"] == "English"
     assert pattern.selected_pattern == "react"
     assert len(llm.calls) == 2
     assert collector.events == []
@@ -1210,6 +1234,7 @@ async def test_auto_pattern_final_answer_requiring_external_facts_falls_back_to_
                 existing_context_sufficient=False,
                 evidence_basis="memory only",
                 missing_verification="Need current public-source verification.",
+                response_language="Chinese",
             ),
             "verified through react",
         ]
@@ -1243,7 +1268,9 @@ async def test_auto_pattern_final_answer_requiring_external_facts_falls_back_to_
         "existing_context_sufficient": False,
         "evidence_basis": "memory only",
         "missing_verification": "Need current public-source verification.",
+        "response_language": "Chinese",
     }
+    assert context.metadata["output_language"] == "Chinese"
     assert pattern.selected_pattern == "react"
     assert len(llm.calls) == 2
     assert collector.events == []

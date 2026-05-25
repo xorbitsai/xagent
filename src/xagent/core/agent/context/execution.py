@@ -11,7 +11,12 @@ from ...tools.artifacts import (
     format_tool_result_for_observation,
     sanitize_tool_result_for_public_context,
 )
-from ..language import dag_step_language_rules, response_language_rules
+from ..language import (
+    OUTPUT_LANGUAGE_METADATA_KEY,
+    dag_step_language_rules,
+    output_language_policy,
+    response_language_rules,
+)
 from .components import (
     COMPONENT_LOADERS,
     ExecutionComponent,
@@ -353,6 +358,13 @@ class ExecutionContext:
         dag_step_id = self.metadata.get("dag_step_id")
         current_task = self._current_user_request_text()
         if current_task and not dag_step_id:
+            language_policy = ""
+            output_language = self.metadata.get(OUTPUT_LANGUAGE_METADATA_KEY)
+            if output_language:
+                language_policy = (
+                    "\n\nOutput language policy:\n"
+                    f"{output_language_policy(output_language)}"
+                )
             parts.append(
                 "Current user request:\n"
                 f"{current_task}\n\n"
@@ -363,6 +375,7 @@ class ExecutionContext:
                 "current user request explicitly asks to revise, continue, compare, "
                 "or summarize them.\n\n"
                 f"{response_language_rules()}"
+                f"{language_policy}"
             )
         process_description = str(
             self.metadata.get("process_description") or ""
@@ -390,6 +403,9 @@ class ExecutionContext:
                     "Task input/output examples:\n" + "\n".join(formatted_examples)
                 )
         if dag_step_id:
+            language_policy = output_language_policy(
+                self.metadata.get(OUTPUT_LANGUAGE_METADATA_KEY)
+            ).strip()
             dag_step_name = str(self.metadata.get("dag_step_name") or "").strip()
             dag_step_description = str(
                 self.metadata.get("dag_step_description") or dag_step_name
@@ -409,6 +425,7 @@ class ExecutionContext:
                 "- Overall user goal is background context only and is already "
                 "available in the conversation when needed; do not treat it as "
                 "the executable goal for this step.\n"
+                f"- {language_policy}\n"
                 f"- Current step id: {dag_step_id}\n"
                 f"- Current step title: {dag_step_name or dag_step_id}\n"
                 f"- Current step description: "

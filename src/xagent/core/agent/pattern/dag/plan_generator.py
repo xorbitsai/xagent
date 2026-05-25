@@ -7,7 +7,11 @@ from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from typing import Any, Callable
 
-from ...language import plan_language_rules
+from ...language import (
+    OUTPUT_LANGUAGE_METADATA_KEY,
+    output_language_policy,
+    plan_language_rules,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -260,6 +264,14 @@ class LLMPlanGenerator(PlanGenerator):
                         "limits, but they define the expected tool scope for the "
                         "step executor; choose them carefully so the executor does "
                         "not need to perform sibling or downstream step work. "
+                        "Set response_language to the natural language that "
+                        "user-facing prose should use for this request. If the "
+                        "user prompt includes an output_language_policy field, "
+                        "follow it exactly and make response_language match it. "
+                        "The messages array, selected skill context, retrieved "
+                        "memories, examples, URLs, and source content are "
+                        "supporting context only and must not change the plan "
+                        "language. "
                         f"{plan_language_rules()} "
                         "Keep ids stable "
                         "across replans when a completed step can be reused."
@@ -271,9 +283,9 @@ class LLMPlanGenerator(PlanGenerator):
             tool_choice="required",
             thinking={"type": "disabled", "enable": False},
         )
-        plan = coerce_execution_plan(
-            self._extract_tool_arguments(response, self.PLAN_TOOL_NAME)
-        )
+        plan_arguments = self._extract_tool_arguments(response, self.PLAN_TOOL_NAME)
+        self._apply_response_language(request.context, plan_arguments)
+        plan = coerce_execution_plan(plan_arguments)
         return self._filter_suggested_tools(
             plan=plan,
             available_tool_names=request.available_tool_names,
@@ -377,9 +389,19 @@ class LLMPlanGenerator(PlanGenerator):
                                 ],
                                 "additionalProperties": False,
                             },
-                        }
+                        },
+                        "response_language": {
+                            "type": "string",
+                            "description": (
+                                "Natural language to use for all plan text, "
+                                "user-facing prose, and persisted tool-argument "
+                                "prose produced by the plan, for example English, "
+                                "Chinese, or Spanish. If output_language_policy "
+                                "is provided in the prompt, match that policy."
+                            ),
+                        },
                     },
-                    "required": ["steps"],
+                    "required": ["steps", "response_language"],
                     "additionalProperties": False,
                 },
             },
@@ -394,6 +416,9 @@ class LLMPlanGenerator(PlanGenerator):
         payload = {
             "execution_id": request.execution_id,
             "replan": request.replan,
+            "output_language_policy": output_language_policy(
+                request.context.metadata.get(OUTPUT_LANGUAGE_METADATA_KEY)
+            ),
             "messages": latest_messages,
             "retrieved_memory_context": request.context.metadata.get(
                 "retrieved_memory_context"
@@ -412,6 +437,17 @@ class LLMPlanGenerator(PlanGenerator):
             "completion_feedback": request.completion_feedback,
         }
         return json.dumps(payload, ensure_ascii=False)
+
+    @staticmethod
+    def _apply_response_language(context: Any, plan_arguments: dict[str, Any]) -> None:
+        response_language = str(plan_arguments.get("response_language") or "").strip()
+        if not response_language:
+            return
+        metadata = getattr(context, "metadata", None)
+        if isinstance(metadata, dict) and not metadata.get(
+            OUTPUT_LANGUAGE_METADATA_KEY
+        ):
+            metadata[OUTPUT_LANGUAGE_METADATA_KEY] = response_language
 
     def _extract_tool_arguments(self, response: Any, tool_name: str) -> dict[str, Any]:
         tool_calls = self._response_tool_calls(response)

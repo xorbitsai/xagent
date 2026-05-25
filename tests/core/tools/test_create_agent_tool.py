@@ -46,6 +46,27 @@ def mock_workspace_db():
 class TestCreateAgentTool:
     """Test suite for CreateAgentTool."""
 
+    def test_create_agent_tool_schema_anchors_persisted_text_language(self) -> None:
+        tool = CreateAgentTool(db=None, user_id=1)
+
+        assert (
+            "same natural language as the current output language policy"
+            in tool.description
+        )
+        assert "Do not inherit another language from DAG step text" in tool.description
+
+        schema = tool.args_type().model_json_schema()
+        description_schema = schema["properties"]["description"]["description"]
+        instructions_schema = schema["properties"]["instructions"]["description"]
+        assert (
+            "same natural language as the current output language policy"
+            in description_schema
+        )
+        assert (
+            "same natural language as the current output language policy"
+            in instructions_schema
+        )
+
     def test_coerce_db_task_id_accepts_only_db_task_formats(self) -> None:
         assert _coerce_db_task_id(12) == 12
         assert _coerce_db_task_id("12") == 12

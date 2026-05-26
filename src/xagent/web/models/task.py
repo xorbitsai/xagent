@@ -212,6 +212,12 @@ class Task(Base):  # type: ignore
 
     # Relationships
     user = relationship("User", back_populates="tasks")
+    agent = relationship(
+        "Agent",
+        primaryjoin="Task.agent_id == Agent.id",
+        foreign_keys=[agent_id],
+        viewonly=True,
+    )
     dag_executions = relationship("DAGExecution", back_populates="task")
     chat_messages = relationship(
         "TaskChatMessage",

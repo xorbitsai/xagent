@@ -298,6 +298,8 @@ interface Task {
   executionMode?: "flash" | "balanced" | "think"
   isDag?: boolean
   agentId?: number
+  agentName?: string
+  agentLogoUrl?: string
   waitingQuestion?: string
   waitingInteractions?: Interaction[]
 }
@@ -606,7 +608,12 @@ function appReducer(state: AppState, action: AppAction): AppState {
     }
 
     case "SET_CURRENT_TASK":
-      return { ...state, currentTask: action.payload }
+      return {
+        ...state,
+        currentTask: (state.currentTask && action.payload && state.currentTask.id === action.payload.id)
+          ? { ...state.currentTask, ...action.payload, agentName: action.payload.agentName || state.currentTask.agentName, agentLogoUrl: action.payload.agentLogoUrl || state.currentTask.agentLogoUrl }
+          : action.payload
+      }
 
     case "UPDATE_TASK_STATUS":
       if (!state.currentTask) {
@@ -1219,6 +1226,8 @@ export function AppProvider({ children, token }: { children: React.ReactNode; to
                 executionMode: taskData.execution_mode,
                 isDag: taskData.is_dag,
                 agentId: taskData.agent_id,
+                agentName: taskData.agent_name,
+                agentLogoUrl: taskData.agent_logo_url,
                 waitingQuestion: taskData.waiting_question,
                 waitingInteractions: normalizeInteractions(taskData.waiting_interactions),
               }
@@ -3930,6 +3939,8 @@ export function AppProvider({ children, token }: { children: React.ReactNode; to
             executionMode: taskData.execution_mode,
             isDag: taskData.is_dag,
             agentId: taskData.agent_id,
+            agentName: taskData.agent_name,
+            agentLogoUrl: taskData.agent_logo_url,
             waitingQuestion: taskData.waiting_question,
             waitingInteractions: normalizeInteractions(taskData.waiting_interactions),
           }

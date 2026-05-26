@@ -1446,6 +1446,13 @@ async def execute_task_background(
                         "description": broadcast_meta["description"],
                         "status": final_task_status,
                         "execution_mode": broadcast_meta["execution_mode"],
+                        "agent_id": task.agent_id,
+                        "agent_name": task.agent.name
+                        if getattr(task, "agent", None)
+                        else None,
+                        "agent_logo_url": task.agent.logo_url
+                        if getattr(task, "agent", None)
+                        else None,
                     },
                     broadcast_meta["updated_at"] or None,
                 ),
@@ -1621,6 +1628,13 @@ async def execute_resume_background(
                         "description": task.description,
                         "status": final_status,
                         "execution_mode": task.execution_mode,
+                        "agent_id": task.agent_id,
+                        "agent_name": task.agent.name
+                        if getattr(task, "agent", None)
+                        else None,
+                        "agent_logo_url": task.agent.logo_url
+                        if getattr(task, "agent", None)
+                        else None,
                     },
                 ),
                 task_id,
@@ -2350,6 +2364,10 @@ async def handle_chat_message(
                                 "compact_model_name": task.compact_model_name,
                                 "execution_mode": task.execution_mode,
                                 "agent_id": task.agent_id,
+                                "agent_name": task.agent.name if task.agent else None,
+                                "agent_logo_url": task.agent.logo_url
+                                if task.agent
+                                else None,
                                 "is_dag": is_dag,
                                 "created_at": safe_timestamp_to_unix(task.created_at)
                                 if task.created_at
@@ -2737,6 +2755,12 @@ async def handle_chat_message(
                                 "compact_model_name": task.compact_model_name,
                                 "execution_mode": task.execution_mode,
                                 "agent_id": task.agent_id,
+                                "agent_name": task.agent.name
+                                if getattr(task, "agent", None)
+                                else None,
+                                "agent_logo_url": task.agent.logo_url
+                                if getattr(task, "agent", None)
+                                else None,
                                 "is_dag": is_dag,
                                 "created_at": safe_timestamp_to_unix(task.created_at)
                                 if task.created_at
@@ -2974,6 +2998,13 @@ async def handle_execute_task(
                     "visual_model_name": task.visual_model_name,
                     "compact_model_name": task.compact_model_name,
                     "execution_mode": task.execution_mode,
+                    "agent_id": task.agent_id,
+                    "agent_name": task.agent.name
+                    if getattr(task, "agent", None)
+                    else None,
+                    "agent_logo_url": task.agent.logo_url
+                    if getattr(task, "agent", None)
+                    else None,
                     "created_at": safe_timestamp_to_unix(task.created_at)
                     if task.created_at
                     else None,
@@ -3217,6 +3248,12 @@ async def send_historical_data_as_stream(
                     "compact_model_name": task.compact_model_name,
                     "execution_mode": task.execution_mode,
                     "agent_id": task.agent_id,
+                    "agent_name": task.agent.name
+                    if getattr(task, "agent", None)
+                    else None,
+                    "agent_logo_url": task.agent.logo_url
+                    if getattr(task, "agent", None)
+                    else None,
                     "is_dag": is_dag,
                     "waiting_question": waiting_question,
                     "waiting_interactions": waiting_interactions,

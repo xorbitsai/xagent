@@ -102,6 +102,9 @@ class TaskCreateResponse(BaseModel):
     execution_mode: Optional[str] = None
     channel_id: Optional[int] = None
     channel_name: Optional[str] = None
+    agent_id: Optional[int] = None
+    agent_name: Optional[str] = None
+    agent_logo_url: Optional[str] = None
 
 
 class ExecutionStatus(BaseModel):

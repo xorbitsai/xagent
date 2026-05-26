@@ -2304,6 +2304,9 @@ async def create_task(
             execution_mode=task.execution_mode,
             channel_id=task.channel_id,
             channel_name=task.channel_name,
+            agent_id=task.agent_id,
+            agent_name=task.agent.name if task.agent else None,
+            agent_logo_url=task.agent.logo_url if task.agent else None,
         )
 
     except HTTPException:
@@ -2446,6 +2449,7 @@ async def get_tasks(
 
                     if task.agent_id and task.agent_id in agents_map:
                         task_data["agent_logo_url"] = agents_map[task.agent_id].logo_url
+                        task_data["agent_name"] = agents_map[task.agent_id].name
 
                     # Include user information for admin users
                     if user.is_admin:
@@ -2569,6 +2573,15 @@ async def get_task(
                     db, task_id
                 )
 
+            # Fetch agent info if agent_id exists
+            agent_name = None
+            agent_logo_url = None
+            if task.agent_id:
+                agent = db.query(Agent).filter(Agent.id == task.agent_id).first()
+                if agent:
+                    agent_name = agent.name
+                    agent_logo_url = agent.logo_url
+
             response = {
                 "task_id": task.id,
                 "title": task.title,
@@ -2589,6 +2602,9 @@ async def get_task(
                 "output_tokens": task.output_tokens or 0,
                 "total_tokens": task.total_tokens or 0,
                 "llm_calls": task.llm_calls or 0,
+                "agent_id": task.agent_id,
+                "agent_name": agent_name,
+                "agent_logo_url": agent_logo_url,
                 "channel_id": task.channel_id,
                 "channel_name": task.channel_name,
                 "waiting_question": waiting_question,
@@ -2675,6 +2691,15 @@ async def get_task_status(
                     db, task_id
                 )
 
+            # Fetch agent info if agent_id exists
+            agent_name = None
+            agent_logo_url = None
+            if task.agent_id:
+                agent = db.query(Agent).filter(Agent.id == task.agent_id).first()
+                if agent:
+                    agent_name = agent.name
+                    agent_logo_url = agent.logo_url
+
             response = {
                 "task_id": task.id,
                 "title": task.title,
@@ -2693,6 +2718,9 @@ async def get_task_status(
                 "output_tokens": task.output_tokens or 0,
                 "total_tokens": task.total_tokens or 0,
                 "llm_calls": task.llm_calls or 0,
+                "agent_id": task.agent_id,
+                "agent_name": agent_name,
+                "agent_logo_url": agent_logo_url,
                 "channel_id": task.channel_id,
                 "channel_name": task.channel_name,
                 "waiting_question": waiting_question,

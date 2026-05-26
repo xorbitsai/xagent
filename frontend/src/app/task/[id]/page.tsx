@@ -7,6 +7,7 @@ import { Button } from "@/components/ui/button"
 import { TaskConversationPanel } from "@/components/task/task-conversation-panel"
 import { useApp } from "@/contexts/app-context-chat"
 import { useI18n } from "@/contexts/i18n-context"
+import { getApiUrl } from "@/lib/utils"
 
 function TaskDetailContent() {
   const { state, setTaskId, closeFilePreview } = useApp()
@@ -31,13 +32,13 @@ function TaskDetailContent() {
   }, [closeFilePreview])
 
   return (
-    <div className="h-full relative">
+    <div className="h-full flex flex-col bg-background">
       {state.currentTask?.agentId && (
-        <div className="absolute top-4 left-4 z-50">
+        <div className="flex-none flex items-center gap-3 px-4 py-3 border-b bg-background/95 backdrop-blur z-50 sticky top-0">
           <Button
             variant="ghost"
             size="icon"
-            className="rounded-full bg-background/50 hover:bg-background/80 backdrop-blur border shadow-sm"
+            className="rounded-full hover:bg-muted flex-shrink-0"
             onClick={() => {
               const agentId = state.currentTask?.agentId
               router.push(agentId ? `/agent/${agentId}` : "/task")
@@ -46,9 +47,25 @@ function TaskDetailContent() {
           >
             <ArrowLeft className="w-5 h-5" />
           </Button>
+          {(state.currentTask?.agentName || state.currentTask?.agentLogoUrl) && (
+            <div className="flex items-center gap-3 overflow-hidden">
+              {state.currentTask?.agentLogoUrl ? (
+                <img
+                  src={state.currentTask.agentLogoUrl.startsWith('http') ? state.currentTask.agentLogoUrl : `${getApiUrl()}${state.currentTask.agentLogoUrl}`}
+                  alt={state.currentTask.agentName || 'Agent Logo'}
+                  className="w-8 h-8 object-cover rounded-sm flex-shrink-0"
+                />
+              ) : null}
+              {state.currentTask?.agentName ? (
+                <span className="text-lg font-bold text-foreground truncate">{state.currentTask.agentName}</span>
+              ) : null}
+            </div>
+          )}
         </div>
       )}
-      <TaskConversationPanel mode="page" />
+      <div className="flex-1 min-h-0 relative">
+        <TaskConversationPanel mode="page" />
+      </div>
     </div>
   )
 }

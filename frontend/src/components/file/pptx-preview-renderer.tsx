@@ -73,6 +73,15 @@ export function PptxPreviewRenderer({ base64Content, fileId }: PptxPreviewRender
   // back, so the UX never regresses below today's behaviour.
   useEffect(() => {
     if (!fileId) return
+    // Reset state for the new file: a parent that swaps fileId (e.g.
+    // navigating between two .pptx artifacts in a chat thread) reuses
+    // this component instance. Without the reset we'd keep showing the
+    // *previous* PDF in the iframe (the old object URL was revoked, so
+    // it would just break) and `pdfChecked = true` would also block the
+    // canvas fallback from running for the new file. Per PR #542 review.
+    setPdfUrl(null)
+    setPdfChecked(false)
+    setIsLoading(true)
     let cancelled = false
     let objectUrl: string | null = null
     ;(async () => {

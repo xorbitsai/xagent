@@ -591,7 +591,13 @@ async def _convert_pptx_to_pdf(pptx_path: Path) -> Optional[Path]:
     import tempfile
 
     try:
-        with tempfile.TemporaryDirectory() as temp_dir:
+        # Pin the temp dir to the same directory as `cache_path` so the final
+        # rename is a single intra-filesystem syscall. Without `dir=...`,
+        # `tempfile.TemporaryDirectory()` uses the system default (typically
+        # /tmp), which on Docker/production layouts is a different mount than
+        # the uploads volume — the later `replace()` would then fail with
+        # EXDEV (Invalid cross-device link). Per PR #542 review.
+        with tempfile.TemporaryDirectory(dir=cache_path.parent) as temp_dir:
             proc = await asyncio.create_subprocess_exec(
                 "soffice",
                 "--headless",
@@ -623,22 +629,19 @@ async def _convert_pptx_to_pdf(pptx_path: Path) -> Optional[Path]:
             pdf_files = list(Path(temp_dir).glob("*.pdf"))
             if not pdf_files:
                 return None
-            # Atomic move into cache so partial reads can't race a half-written file.
-            tmp_dest = cache_path.with_suffix(cache_path.suffix + ".tmp")
+            # The PDF is already fully written and closed inside the temp dir,
+            # and the temp dir lives in the same filesystem as `cache_path`
+            # (see `dir=` above), so `replace()` is a single atomic rename.
+            # No `.tmp` intermediate needed — that previous two-step dance
+            # could leave orphans if a concurrent request raced. Per PR #542
+            # review.
             try:
-                pdf_files[0].replace(tmp_dest)
-                tmp_dest.replace(cache_path)
+                pdf_files[0].replace(cache_path)
             except OSError as exc:
                 logger.warning(
                     "Failed to cache pptx preview PDF at %s: %s", cache_path, exc
                 )
-                # Even if we can't cache, return the temp file's contents to
-                # the caller — but we can't, the tempdir is about to vanish.
-                # Best effort: try a direct read+write copy.
-                try:
-                    cache_path.write_bytes(pdf_files[0].read_bytes())
-                except OSError:
-                    return None
+                return None
             return cache_path
     except FileNotFoundError:
         # soffice binary is missing — this is the expected "fallback" path

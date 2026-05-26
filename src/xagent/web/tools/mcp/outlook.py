@@ -76,11 +76,26 @@ def _graph_request(
     return response.json()
 
 
-def _recipient_list(addresses: list[str]) -> list[dict[str, Any]]:
+def _normalize_addresses(addresses: list[str] | str) -> list[str]:
+    if isinstance(addresses, str):
+        return [address.strip() for address in addresses.split(",") if address.strip()]
+    return [address.strip() for address in addresses if address and address.strip()]
+
+
+def _recipient_list(addresses: list[str] | str) -> list[dict[str, Any]]:
     return [
-        {"emailAddress": {"address": address.strip()}}
-        for address in addresses
-        if address and address.strip()
+        {"emailAddress": {"address": address}}
+        for address in _normalize_addresses(addresses)
+    ]
+
+
+def _attendee_list(addresses: list[str] | str) -> list[dict[str, Any]]:
+    return [
+        {
+            "emailAddress": {"address": address},
+            "type": "required",
+        }
+        for address in _normalize_addresses(addresses)
     ]
 
 
@@ -181,17 +196,17 @@ def outlook_get_message(
 
 @mcp.tool()
 def outlook_send_message(
-    to: list[str],
+    to: list[str] | str,
     subject: str,
     body: str,
-    cc: list[str] | None = None,
-    bcc: list[str] | None = None,
+    cc: list[str] | str | None = None,
+    bcc: list[str] | str | None = None,
     content_type: str = "text",
     save_to_sent_items: bool = True,
 ) -> str:
     """Send an Outlook email message."""
     try:
-        if not to:
+        if not _normalize_addresses(to):
             raise ValueError("at least one recipient is required")
         message: dict[str, Any] = {
             "subject": subject,
@@ -265,7 +280,7 @@ def outlook_create_event(
     timezone: str = "UTC",
     body: str | None = None,
     location: str | None = None,
-    attendees: list[str] | None = None,
+    attendees: list[str] | str | None = None,
     is_all_day: bool = False,
 ) -> str:
     """Create an Outlook calendar event."""
@@ -281,14 +296,7 @@ def outlook_create_event(
         if location:
             payload["location"] = {"displayName": location}
         if attendees:
-            payload["attendees"] = [
-                {
-                    "emailAddress": {"address": address.strip()},
-                    "type": "required",
-                }
-                for address in attendees
-                if address and address.strip()
-            ]
+            payload["attendees"] = _attendee_list(attendees)
 
         result = _graph_request("POST", "/me/events", body=payload)
         return _success(event=result)
@@ -306,7 +314,7 @@ def outlook_update_event(
     timezone: str = "UTC",
     body: str | None = None,
     location: str | None = None,
-    attendees: list[str] | None = None,
+    attendees: list[str] | str | None = None,
     is_all_day: bool | None = None,
 ) -> str:
     """Update an existing Outlook calendar event."""
@@ -323,14 +331,7 @@ def outlook_update_event(
         if location is not None:
             payload["location"] = {"displayName": location}
         if attendees is not None:
-            payload["attendees"] = [
-                {
-                    "emailAddress": {"address": address.strip()},
-                    "type": "required",
-                }
-                for address in attendees
-                if address and address.strip()
-            ]
+            payload["attendees"] = _attendee_list(attendees)
         if is_all_day is not None:
             payload["isAllDay"] = is_all_day
 
@@ -364,28 +365,23 @@ def outlook_list_contacts(top: int = 25, search: str | None = None) -> str:
     """List Outlook contacts for the current user, optionally filtered by search query."""
     try:
         top = max(1, min(top, 100))
+        params: dict[str, Any] = {
+            "$top": top,
+            "$select": (
+                "id,displayName,givenName,surname,emailAddresses,businessPhones,"
+                "mobilePhone,companyName,jobTitle"
+            ),
+        }
+        extra_headers = None
         if search:
-            result = _graph_request(
-                "GET",
-                "/me/people",
-                params={
-                    "$top": top,
-                    "$search": f'"{search}"',
-                },
-                extra_headers={"ConsistencyLevel": "eventual"},
-            )
-        else:
-            result = _graph_request(
-                "GET",
-                "/me/contacts",
-                params={
-                    "$top": top,
-                    "$select": (
-                        "id,displayName,givenName,surname,emailAddresses,businessPhones,"
-                        "mobilePhone,companyName,jobTitle"
-                    ),
-                },
-            )
+            params["$search"] = f'"{search}"'
+            extra_headers = {"ConsistencyLevel": "eventual"}
+        result = _graph_request(
+            "GET",
+            "/me/contacts",
+            params=params,
+            extra_headers=extra_headers,
+        )
         return _success(
             contacts=result.get("value", []),
             next_link=result.get("@odata.nextLink"),

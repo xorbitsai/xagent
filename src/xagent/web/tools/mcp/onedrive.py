@@ -53,6 +53,7 @@ def _graph_request(
     *,
     params: dict[str, Any] | None = None,
     body: dict[str, Any] | None = None,
+    data: bytes | None = None,
     extra_headers: dict[str, str] | None = None,
     raw: bool = False,
 ) -> Any:
@@ -62,6 +63,7 @@ def _graph_request(
         headers=_graph_headers(extra_headers),
         params=params,
         json=body,
+        data=data,
         timeout=DEFAULT_TIMEOUT_SECONDS,
     )
     try:
@@ -151,9 +153,10 @@ def onedrive_search_files(query: str, top: int = 25) -> str:
     try:
         if not query.strip():
             raise ValueError("query is required")
+        escaped_query = query.replace("'", "''")
         result = _graph_request(
             "GET",
-            f"/me/drive/root/search(q='{quote(query, safe='')}')",
+            f"/me/drive/root/search(q='{quote(escaped_query, safe='')}')",
             params={"$top": max(1, min(top, 100))},
         )
         return _success(items=result.get("value", []))
@@ -205,26 +208,13 @@ def onedrive_upload_text_file(
 ) -> str:
     """Upload or overwrite a UTF-8 text file in OneDrive by path."""
     try:
-        result = requests.put(
-            f"{GRAPH_BASE_URL}{_content_path(file_path)}",
-            headers=_graph_headers(
-                {
-                    "Content-Type": "text/plain; charset=utf-8",
-                }
-            ),
+        result = _graph_request(
+            "PUT",
+            _content_path(file_path),
+            extra_headers={"Content-Type": "text/plain; charset=utf-8"},
             data=content.encode("utf-8"),
-            timeout=DEFAULT_TIMEOUT_SECONDS,
         )
-        try:
-            result.raise_for_status()
-        except requests.HTTPError as exc:
-            response_text = result.text.strip()
-            message = str(exc)
-            if response_text:
-                message = f"{message} - {response_text}"
-            raise RuntimeError(message) from exc
-
-        return _success(item=result.json())
+        return _success(item=result)
     except Exception as e:
         logger.error("Error uploading OneDrive text file %s: %s", file_path, e)
         return _error(str(e))

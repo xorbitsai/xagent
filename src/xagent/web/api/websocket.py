@@ -455,7 +455,7 @@ def _stream_timestamp(timestamp: Optional[Any] = None) -> float:
 
 
 def _persist_agent_outbound_event(task_id: int, event: Dict[str, Any]) -> None:
-    """Persist v2 agent-to-user messages so waiting prompts survive reloads."""
+    """Persist agent outbound events and durable waiting prompts."""
 
     from ..models.task import Task as DatabaseTask
     from ..models.task import TraceEvent as DatabaseTraceEvent
@@ -518,6 +518,13 @@ def _persist_agent_outbound_event(task_id: int, event: Dict[str, Any]) -> None:
         db.close()
 
 
+def _agent_outbound_event_type(payload: Dict[str, Any]) -> str:
+    message_type = str(payload.get("message_type") or "info")
+    if bool(payload.get("expect_response")) or message_type == "question":
+        return "agent_message"
+    return "agent_progress"
+
+
 def make_agent_outbound_handler(task_id: int) -> Any:
     """Create a web bridge for agent agent-to-user messages."""
 
@@ -536,7 +543,7 @@ def make_agent_outbound_handler(task_id: int) -> Any:
             return
 
         event = create_stream_event(
-            "agent_message",
+            _agent_outbound_event_type(payload),
             task_id,
             {
                 "event_id": payload.get("event_id"),
@@ -4120,7 +4127,7 @@ clarification questions as plain assistant text.
             await websocket.send_text(
                 json.dumps(
                     create_stream_event(
-                        "agent_message",
+                        _agent_outbound_event_type(payload),
                         builder_task_id,
                         {
                             "event_id": payload.get("event_id"),

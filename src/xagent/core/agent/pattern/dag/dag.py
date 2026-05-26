@@ -101,11 +101,14 @@ class _DAGStepRuntime:
         expect_response: bool = False,
         metadata: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
+        outbound_metadata = dict(metadata or {})
+        outbound_metadata.setdefault("step_id", self.step_id)
+        outbound_metadata.setdefault("dag_step_id", self.step_id)
         return await self.parent.send_message(
             message=message,
             message_type=message_type,
             expect_response=expect_response,
-            metadata=metadata,
+            metadata=outbound_metadata,
         )
 
     async def checkpoint(

@@ -5,6 +5,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+from pydantic import BaseModel
 
 from xagent.core.agent import (
     Agent,
@@ -21,6 +22,11 @@ from xagent.core.agent.pattern.auto.auto import DECISION_TOOL_NAME, _AutoChildRu
 from xagent.core.model.chat.types import ChunkType, StreamChunk
 
 DAG_COMPLETION_TOOL_NAME = "assess_dag_completion"
+
+
+class SearchArgs(BaseModel):
+    query: str
+    count: int = 10
 
 
 class FakeWorkspace:
@@ -214,6 +220,24 @@ class CapturingChildPattern:
 
     def get_state(self) -> dict[str, Any]:
         return {"captured": True}
+
+
+class FakeSearchTool:
+    def __init__(self) -> None:
+        self.calls: list[dict[str, Any]] = []
+
+        class Metadata:
+            name = "zhipu_web_search"
+            description = "Search the web."
+
+        self.metadata = Metadata()
+
+    def args_type(self) -> type[BaseModel]:
+        return SearchArgs
+
+    async def run_json_async(self, args: dict[str, Any]) -> dict[str, Any]:
+        self.calls.append(args)
+        return {"results": [{"title": args["query"], "link": "https://example.com"}]}
 
 
 def test_auto_child_runtime_forwards_clear_interrupt() -> None:
@@ -714,6 +738,8 @@ async def test_auto_pattern_does_not_stream_non_final_decision() -> None:
     assert result["output"] == "child done"
     assert collector.events == []
     assert pattern.selected_pattern == "react"
+    assert child.kwargs is not None
+    assert "allow_auto_reroute" not in child.kwargs
 
 
 @pytest.mark.asyncio
@@ -799,6 +825,83 @@ async def test_auto_pattern_does_not_emit_general_task_start_or_completion() -> 
         "action_end_llm",
         "task_update_general",
     }
+
+
+@pytest.mark.asyncio
+async def test_auto_react_repetition_stays_in_single_react_trace() -> None:
+    llm = FakeLLM(
+        [
+            decision_tool_response("react", "Needs current search."),
+            {
+                "content": "",
+                "tool_calls": [
+                    {
+                        "id": "search_1",
+                        "function": {
+                            "name": "zhipu_web_search",
+                            "arguments": '{"query":"AI news","count":10}',
+                        },
+                    }
+                ],
+            },
+            {
+                "content": "",
+                "tool_calls": [
+                    {
+                        "id": "search_2",
+                        "function": {
+                            "name": "zhipu_web_search",
+                            "arguments": '{"query":"AI news latest","count":5}',
+                        },
+                    }
+                ],
+            },
+            {
+                "content": "",
+                "tool_calls": [
+                    {
+                        "id": "decision_1",
+                        "function": {
+                            "name": "react_decision",
+                            "arguments": (
+                                '{"action":"final_answer",'
+                                '"reason":"已有结果足够回答",'
+                                '"answer":"可以基于已有搜索结果回答。"}'
+                            ),
+                        },
+                    }
+                ],
+            },
+        ]
+    )
+    tracer = RecordingTracer()
+    runtime = PatternRuntime(tracer=tracer)
+    pattern = AutoPattern(
+        react_pattern=ReActPattern(
+            max_iterations=4,
+            repeated_tool_decision_after_consecutive_tool_calls=2,
+        )
+    )
+    context = ExecutionContext(execution_id="auto-react-repeat")
+    context.add_user_message("总结最近 AI 新闻")
+    tool = FakeSearchTool()
+
+    result = await pattern.run(
+        context=context,
+        tools=[tool],
+        llm=llm,
+        runtime=runtime,
+    )
+
+    event_types = [event["event_type"] for event in tracer.events]
+    assert result["success"] is True
+    assert result["response"] == "可以基于已有搜索结果回答。"
+    assert len(tool.calls) == 2
+    assert event_types.count("task_start_react") == 1
+    assert event_types.count("task_end_react") == 1
+    assert "auto_child_reroute" not in [
+        checkpoint["label"] for checkpoint in runtime.checkpoints
+    ]
 
 
 @pytest.mark.asyncio

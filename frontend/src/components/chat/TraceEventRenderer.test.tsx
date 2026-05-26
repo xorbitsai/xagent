@@ -327,6 +327,117 @@ describe("TraceEventRenderer", () => {
     expect(screen.queryByText("traceEventRenderer.toolCallNote")).not.toBeInTheDocument()
   })
 
+  it("interleaves agent progress into the active thinking process", () => {
+    render(
+      <TraceEventRenderer
+        events={[
+          {
+            event_id: "start",
+            event_type: "react_task_start",
+            step_id: "step-1",
+            timestamp: 1000,
+            data: {},
+          },
+          {
+            event_id: "first-tool",
+            event_type: "tool_execution_start",
+            step_id: "step-1",
+            timestamp: 2000,
+            data: { tool_name: "first_tool", tool_params: { query: "first" } },
+          },
+          {
+            event_id: "second-tool",
+            event_type: "tool_execution_start",
+            step_id: "step-1",
+            timestamp: 4000,
+            data: { tool_name: "second_tool", tool_params: { query: "second" } },
+          },
+          {
+            event_id: "end",
+            event_type: "react_task_end",
+            step_id: "step-1",
+            timestamp: 5000,
+            data: {},
+          },
+          {
+            event_id: "progress",
+            event_type: "agent_progress",
+            step_id: "step-1",
+            timestamp: 3000,
+            data: {
+              message: "Still searching the remaining sources.",
+              message_type: "progress",
+            },
+          },
+          {
+            event_id: "legacy-progress",
+            event_type: "agent_message",
+            timestamp: 3500,
+            data: {
+              message: "Legacy progress also stays in the process.",
+              message_type: "progress",
+              expect_response: false,
+            },
+          },
+        ]}
+      />,
+    )
+
+    const stepToggles = screen.getAllByRole("button", {
+      name: /traceEventRenderer\.(thoughtProcess|taskExecution)/,
+    })
+    expect(stepToggles).toHaveLength(1)
+
+    fireEvent.click(stepToggles[0])
+
+    expect(screen.getByText("Legacy progress also stays in the process.")).toBeInTheDocument()
+    expect(screen.getByText("Still searching the remaining sources.")).toBeInTheDocument()
+    expect(screen.queryByText("traceEventRenderer.progressMessage")).not.toBeInTheDocument()
+
+    const renderedText = document.body.textContent || ""
+    expect(renderedText.indexOf("traceEventRenderer.executeTool:first_tool")).toBeLessThan(
+      renderedText.indexOf("Still searching the remaining sources."),
+    )
+    expect(renderedText.indexOf("Legacy progress also stays in the process.")).toBeLessThan(
+      renderedText.indexOf("traceEventRenderer.executeTool:second_tool"),
+    )
+  })
+
+  it("keeps trace event ordering stable when timestamps are invalid", () => {
+    render(
+      <TraceEventRenderer
+        events={[
+          {
+            event_id: "start",
+            event_type: "react_task_start",
+            step_id: "step-1",
+            timestamp: -1,
+            data: {},
+          },
+          {
+            event_id: "invalid-start",
+            event_type: "tool_execution_start",
+            step_id: "step-1",
+            timestamp: "not-a-date" as unknown as number,
+            data: { tool_name: "invalid_time_tool", tool_params: { query: "invalid" } },
+          },
+          {
+            event_id: "also-invalid-start",
+            event_type: "tool_execution_start",
+            step_id: "step-1",
+            timestamp: undefined as unknown as number,
+            data: { tool_name: "missing_time_tool", tool_params: { query: "missing" } },
+          },
+        ]}
+      />,
+    )
+
+    const renderedText = document.body.textContent || ""
+    expect(renderedText.indexOf("traceEventRenderer.executeTool:invalid_time_tool")).toBeLessThan(
+      renderedText.indexOf("traceEventRenderer.executeTool:missing_time_tool"),
+    )
+  })
+
   it("collapses completed thinking process and keeps it visibly expandable", () => {
     render(
       <TraceEventRenderer

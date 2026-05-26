@@ -2843,6 +2843,7 @@ Build when you need.`
     searchQuery: "搜索查询",
     content: "内容",
     toolCallNote: "工具说明",
+    progressMessage: "进度",
     copy: "复制",
     previewFile: "预览文件",
     filePrefix: "文件:",

@@ -18,6 +18,7 @@ from xagent.core.agent.trace import (
 )
 from xagent.web.api.trace_handlers import DatabaseTraceHandler
 from xagent.web.api.websocket import (
+    _agent_outbound_event_type,
     _is_agent_checkpoint_data,
     _is_duplicate_user_message_turn,
     _persist_agent_outbound_event,
@@ -114,6 +115,39 @@ def test_final_answer_stream_event_is_not_trace_event() -> None:
     assert "data" not in event
 
 
+def test_agent_outbound_event_type_separates_progress_from_questions() -> None:
+    assert (
+        _agent_outbound_event_type(
+            {
+                "message": "Still working",
+                "message_type": "progress",
+                "expect_response": False,
+            }
+        )
+        == "agent_progress"
+    )
+    assert (
+        _agent_outbound_event_type(
+            {
+                "message": "Need input",
+                "message_type": "question",
+                "expect_response": False,
+            }
+        )
+        == "agent_message"
+    )
+    assert (
+        _agent_outbound_event_type(
+            {
+                "message": "Need input",
+                "message_type": "info",
+                "expect_response": True,
+            }
+        )
+        == "agent_message"
+    )
+
+
 def test_persist_agent_outbound_event_uses_payload_ids(monkeypatch) -> None:
     engine = create_engine("sqlite:///:memory:")
     SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
@@ -146,12 +180,12 @@ def test_persist_agent_outbound_event_uses_payload_ids(monkeypatch) -> None:
     monkeypatch.setattr("xagent.web.api.websocket.get_db", get_test_db)
 
     event = create_stream_event(
-        "agent_message",
+        "agent_progress",
         int(task.id),
         {
             "event_id": "agent-event-1",
             "step_id": "react-step-1",
-            "message": "Need input",
+            "message": "Still working",
             "expect_response": False,
         },
     )
@@ -162,7 +196,7 @@ def test_persist_agent_outbound_event_uses_payload_ids(monkeypatch) -> None:
     try:
         trace_event = db.query(DatabaseTraceEvent).filter_by(task_id=int(task.id)).one()
         assert trace_event.event_id == "agent-event-1"
-        assert trace_event.event_type == "agent_message"
+        assert trace_event.event_type == "agent_progress"
         assert trace_event.step_id == "react-step-1"
     finally:
         db.close()

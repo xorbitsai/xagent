@@ -168,12 +168,31 @@ const getWaitingQuestionFromEvents = (events: TraceEvent[]): string | null => {
   return null;
 };
 
+const isAgentProgressEvent = (event: TraceEvent): boolean => (
+  event.event_type === 'agent_progress' ||
+  (
+    event.event_type === 'agent_message' &&
+    event.data?.expect_response !== true &&
+    event.data?.message_type !== 'question'
+  )
+);
+
 // Process trace events into steps
 function useProcessedSteps(events: TraceEvent[]): ProcessedStep[] {
   const { t } = useI18n();
   return useMemo(() => {
     const stepsMap = new Map<string, ProcessedStep>();
     let currentReactStepId: string | null = null;
+    const orderedEvents = events
+      .map((event, index) => {
+        const timestamp = normalizeTimestampMs(event.timestamp)
+        return {
+          event,
+          index,
+          timestamp: Number.isFinite(timestamp) ? timestamp : 0,
+        }
+      })
+      .sort((a, b) => a.timestamp - b.timestamp || a.index - b.index);
 
     // Helper to find the last running action of a specific type
     const findLastRunningAction = (step: ProcessedStep, type: 'llm' | 'tool') => {
@@ -185,18 +204,23 @@ function useProcessedSteps(events: TraceEvent[]): ProcessedStep[] {
       return null;
     };
 
-    events.forEach((event, index) => {
+    orderedEvents.forEach(({ event, index, timestamp }) => {
       if (event.event_type?.startsWith('skill_select')) {
         return;
       }
 
       let stepId = event.step_id || (event.data?.step_id as string) || 'default';
+      const isProgressMessage = isAgentProgressEvent(event);
 
       if (event.event_type === 'react_task_start' || event.event_type === 'task_start_react') {
         currentReactStepId = stepId;
       }
 
       if ((event.event_type === 'react_task_end' || event.event_type === 'task_end_react' || event.event_type === 'task_completion' || event.event_type === 'react_task_failed' || event.event_type === 'task_failed_react') && stepId === 'default' && currentReactStepId) {
+        stepId = currentReactStepId;
+      }
+
+      if (isProgressMessage && stepId === 'default' && currentReactStepId) {
         stepId = currentReactStepId;
       }
 
@@ -216,7 +240,6 @@ function useProcessedSteps(events: TraceEvent[]): ProcessedStep[] {
       }
 
       const step = stepsMap.get(stepId)!;
-      const timestamp = normalizeTimestampMs(event.timestamp);
       const eventId = event.event_id || `event-${index}`;
 
       // Process different event types
@@ -270,6 +293,29 @@ function useProcessedSteps(events: TraceEvent[]): ProcessedStep[] {
             data: {
               reasoning: event.data?.response?.reasoning,
               tool_calls: event.data?.tools
+            }
+          });
+        }
+      }
+
+      if (isProgressMessage) {
+        const message = event.data?.message || event.data?.content;
+        if (typeof message === 'string' && message.trim()) {
+          if (!step.stepName) {
+            step.stepName = t('traceEventRenderer.taskExecution');
+          }
+          if (step.status === 'pending') {
+            step.status = 'running';
+          }
+          step.actions.push({
+            id: eventId,
+            type: 'info',
+            title: t('traceEventRenderer.progressMessage'),
+            status: 'completed',
+            timestamp,
+            data: {
+              output: message.trim(),
+              inline: true,
             }
           });
         }

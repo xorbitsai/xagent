@@ -310,9 +310,10 @@ export function AgentBuilderChat({ agentConfig, onUpdateConfig, availableOptions
               } else if (data.event_type === "agent_message") {
                 const displayReply = data.data?.message || ""
                 const interactions = data.data?.metadata?.interactions
-                if (data.data?.expect_response) {
-                  setIsLoading(false)
+                if (!data.data?.expect_response && data.data?.message_type !== "question") {
+                  return
                 }
+                setIsLoading(false)
                 setMessages(prev => {
                   const updated = [...prev]
                   const lastMsg = updated[updated.length - 1]

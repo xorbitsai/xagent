@@ -871,16 +871,14 @@ async def test_execution_adapter_forwards_outbound_messages() -> None:
 
     assert result["success"] is True
     assert result["output"] == "done"
-    assert sent_messages == [
-        {
-            "type": "agent_message",
-            "execution_id": "outbound-exec",
-            "message": "Still working",
-            "message_type": "progress",
-            "expect_response": False,
-            "metadata": {},
-        }
-    ]
+    assert len(sent_messages) == 1
+    outbound_message = sent_messages[0]
+    assert outbound_message["type"] == "agent_message"
+    assert outbound_message["execution_id"] == "outbound-exec"
+    assert outbound_message["message"] == "Still working"
+    assert outbound_message["message_type"] == "progress"
+    assert outbound_message["expect_response"] is False
+    assert outbound_message["step_id"] == outbound_message["metadata"]["step_id"]
 
 
 def test_execution_adapter_uses_last_assistant_message_when_output_missing() -> None:

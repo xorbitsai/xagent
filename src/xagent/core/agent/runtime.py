@@ -434,14 +434,25 @@ class PatternRuntime:
     ) -> dict[str, Any]:
         """Emit an agent-to-user message through the runtime boundary."""
 
+        outbound_metadata = dict(metadata or {})
+        step_id = (
+            outbound_metadata.get("step_id")
+            or outbound_metadata.get("dag_step_id")
+            or self.active_react_step_id
+        )
+        if step_id:
+            outbound_metadata.setdefault("step_id", str(step_id))
+
         payload = {
             "type": "agent_message",
             "execution_id": self.execution_id,
             "message": message,
             "message_type": message_type,
             "expect_response": expect_response,
-            "metadata": metadata or {},
+            "metadata": outbound_metadata,
         }
+        if step_id:
+            payload["step_id"] = str(step_id)
         self.outbound_messages.append(payload)
 
         if self.outbound_message_handler is not None:

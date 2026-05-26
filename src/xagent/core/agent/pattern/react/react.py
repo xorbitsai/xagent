@@ -18,7 +18,11 @@ from ...language import final_answer_language_rule
 from ...result import unwrap_final_answer_content
 from ...runtime import LLMCallInterrupted, PatternRuntime
 from ..base import AgentPattern, PatternResult
-from ..final_answer_stream import ReActFinalAnswerStreamer
+from ..final_answer_stream import (
+    FinalAnswerStreamSession,
+    ReActFinalAnswerStreamer,
+    ToolCallStringFieldStreamer,
+)
 
 
 class ReActReasoningMode(str, Enum):
@@ -26,6 +30,13 @@ class ReActReasoningMode(str, Enum):
 
     TOOL_CALLING = "tool_calling"
     REASONING_ACTION = "reasoning_action"
+
+
+REPEATED_TOOL_DECISION_REQUESTED_STATUS = "repeated_tool_decision_requested"
+DEFAULT_REPEATED_TOOL_DECISION_CONSECUTIVE_TOOL_CALLS = 4
+REACT_DECISION_TOOL_NAME = "react_decision"
+REACT_DECISION_FINAL_ANSWER = "final_answer"
+REACT_DECISION_TOOL_CALL = "tool_call"
 
 
 @dataclass
@@ -123,12 +134,18 @@ class ReActPattern(AgentPattern):
         tool_choice: str | dict[str, Any] | None = "required",
         reasoning_mode: ReActReasoningMode | str = ReActReasoningMode.TOOL_CALLING,
         finalize_after_tool_result: bool = False,
+        repeated_tool_decision_after_consecutive_tool_calls: int | None = (
+            DEFAULT_REPEATED_TOOL_DECISION_CONSECUTIVE_TOOL_CALLS
+        ),
     ) -> None:
         self.llm = llm
         self.max_iterations = max_iterations
         self.tool_choice = tool_choice
         self.reasoning_mode = ReActReasoningMode(reasoning_mode)
         self.finalize_after_tool_result = finalize_after_tool_result
+        self.repeated_tool_decision_after_consecutive_tool_calls = (
+            repeated_tool_decision_after_consecutive_tool_calls
+        )
         self.status = "idle"
         self.current_iteration = 0
         self.last_response: Any = None
@@ -136,6 +153,7 @@ class ReActPattern(AgentPattern):
         self.pending_tool_call_content: dict[str, str] = {}
         self.tool_ledger: dict[str, ToolCallRecord] = {}
         self.force_final_answer_next = False
+        self.repeated_tool_decision: dict[str, Any] | None = None
         self.waiting_for_user_request: dict[str, Any] | None = None
         self.task_text: str | None = None
         self._memory_store: Any | None = None
@@ -267,6 +285,15 @@ class ReActPattern(AgentPattern):
                 self.status = "thinking"
                 continue
 
+            if self.repeated_tool_decision:
+                decision_result = await self._run_repeated_tool_decision(
+                    context=context,
+                    llm=llm,
+                    runtime=runtime,
+                )
+                if decision_result is not None:
+                    return decision_result
+
             force_final_answer_now = self.force_final_answer_next or (
                 self.finalize_after_tool_result
                 and not self.pending_tool_calls
@@ -336,6 +363,7 @@ class ReActPattern(AgentPattern):
                 response=response,
                 metadata={"iteration": iteration},
             )
+            self.repeated_tool_decision = None
             self.last_response = response
             normalized = self._normalize_llm_response(response)
             if force_final_answer_now and not normalized.get("tool_calls"):
@@ -505,7 +533,11 @@ class ReActPattern(AgentPattern):
             "current_iteration": self.current_iteration,
             "max_iterations": self.max_iterations,
             "finalize_after_tool_result": self.finalize_after_tool_result,
+            "repeated_tool_decision_after_consecutive_tool_calls": (
+                self.repeated_tool_decision_after_consecutive_tool_calls
+            ),
             "force_final_answer_next": self.force_final_answer_next,
+            "repeated_tool_decision": self.repeated_tool_decision,
             "waiting_for_user_request": self.waiting_for_user_request,
             "task_text": self.task_text,
             "last_response": self.last_response,
@@ -527,7 +559,21 @@ class ReActPattern(AgentPattern):
         self.finalize_after_tool_result = bool(
             state.get("finalize_after_tool_result", self.finalize_after_tool_result)
         )
+        raw_threshold = state.get("repeated_tool_decision_after_consecutive_tool_calls")
+        if raw_threshold is None:
+            raw_threshold = state.get("auto_reroute_after_consecutive_tool_calls")
+        self.repeated_tool_decision_after_consecutive_tool_calls = (
+            int(raw_threshold)
+            if raw_threshold is not None
+            else self.repeated_tool_decision_after_consecutive_tool_calls
+        )
         self.force_final_answer_next = bool(state.get("force_final_answer_next", False))
+        repeated_tool_decision = state.get("repeated_tool_decision")
+        self.repeated_tool_decision = (
+            dict(repeated_tool_decision)
+            if isinstance(repeated_tool_decision, dict)
+            else None
+        )
         waiting_request = state.get("waiting_for_user_request")
         self.waiting_for_user_request = (
             dict(waiting_request) if isinstance(waiting_request, dict) else None
@@ -1080,10 +1126,290 @@ class ReActPattern(AgentPattern):
             )
             if self._tool_result_success(result):
                 successful_tool_result = True
+                requested_decision = (
+                    await self._request_repeated_tool_decision_if_needed(
+                        tool_call=tool_call,
+                        context=context,
+                        runtime=runtime,
+                    )
+                )
+                if requested_decision:
+                    self.pending_tool_calls = []
+                    successful_tool_result = False
+                    return None
 
         if self.finalize_after_tool_result and successful_tool_result:
             self.force_final_answer_next = True
         return None
+
+    async def _request_repeated_tool_decision_if_needed(
+        self,
+        *,
+        tool_call: dict[str, Any],
+        context: Any,
+        runtime: PatternRuntime,
+    ) -> bool:
+        metadata = self._repeated_tool_call_metadata(tool_call)
+        if metadata is None:
+            return False
+
+        self.repeated_tool_decision = metadata
+        await runtime.checkpoint(
+            REPEATED_TOOL_DECISION_REQUESTED_STATUS,
+            context=context,
+            pattern=self,
+            metadata=metadata,
+        )
+        return True
+
+    async def _run_repeated_tool_decision(
+        self,
+        *,
+        context: Any,
+        llm: Any,
+        runtime: PatternRuntime,
+    ) -> dict[str, Any] | None:
+        metadata = dict(self.repeated_tool_decision or {})
+        if not metadata:
+            return None
+
+        messages = self._messages_for_repeated_tool_decision(context, metadata)
+        decision_tools = [self._react_decision_tool_schema()]
+        llm_metadata = {
+            "phase": REPEATED_TOOL_DECISION_REQUESTED_STATUS,
+            **metadata,
+        }
+        await runtime.on_llm_start(
+            context=context,
+            messages=messages,
+            tools=decision_tools,
+            metadata=llm_metadata,
+        )
+        answer_emitter = FinalAnswerStreamSession(runtime, enabled=True)
+        answer_streamer = ToolCallStringFieldStreamer(
+            runtime=runtime,
+            tool_name=REACT_DECISION_TOOL_NAME,
+            field_name="answer",
+            guard_field="action",
+            guard_value=REACT_DECISION_FINAL_ANSWER,
+            emitter=answer_emitter,
+        )
+        try:
+            response = await runtime.run_streaming_llm_call(
+                llm,
+                messages=messages,
+                tools=decision_tools,
+                tool_choice="required",
+                thinking={"type": "disabled", "enable": False},
+                on_chunk=answer_streamer.handle_chunk,
+            )
+        except LLMCallInterrupted:
+            await answer_streamer.fail("interrupted during repeated tool decision")
+            raise
+        except Exception as exc:
+            await answer_streamer.fail(str(exc))
+            await runtime.on_llm_error(
+                context=context,
+                error=exc,
+                metadata=llm_metadata,
+            )
+            raise
+
+        await runtime.on_llm_end(
+            context=context,
+            response=response,
+            metadata=llm_metadata,
+        )
+        self.last_response = response
+        self.repeated_tool_decision = None
+
+        decision = self._parse_react_decision(response)
+        if decision is None:
+            await runtime.checkpoint(
+                "repeated_tool_decision_invalid",
+                context=context,
+                pattern=self,
+                metadata={"response": response, **metadata},
+            )
+            return None
+
+        if decision["action"] == REACT_DECISION_FINAL_ANSWER:
+            answer = decision["answer"]
+            if not answer.strip():
+                await answer_streamer.fail("empty final answer")
+                await runtime.checkpoint(
+                    "repeated_tool_decision_invalid",
+                    context=context,
+                    pattern=self,
+                    metadata={"reason": "empty final answer", **metadata},
+                )
+                return None
+            await answer_streamer.finish(answer)
+            context.add_assistant_message(answer)
+            return await self._finalize_success(
+                context=context,
+                llm=llm,
+                runtime=runtime,
+                response=answer,
+            )
+
+        await runtime.checkpoint(
+            "repeated_tool_decision_continue",
+            context=context,
+            pattern=self,
+            metadata={**metadata, "decision": decision},
+        )
+        missing_verification = decision.get("missing_verification", "").strip()
+        if missing_verification:
+            context.add_system_message(
+                "Repeated tool decision continuation guidance:\n"
+                "The previous repeated-tool decision chose to continue. The next "
+                "work-tool call should retrieve or verify this specific missing "
+                f"information: {missing_verification}",
+                metadata={
+                    "source": "repeated_tool_decision",
+                    "missing_verification": missing_verification,
+                },
+            )
+        return None
+
+    def _repeated_tool_call_metadata(
+        self,
+        tool_call: dict[str, Any],
+    ) -> dict[str, Any] | None:
+        threshold = self.repeated_tool_decision_after_consecutive_tool_calls
+        if threshold is None or threshold <= 0:
+            return None
+
+        tool_name = str(tool_call.get("name") or "")
+        if not tool_name or tool_name in self._control_tool_names():
+            return None
+
+        count = self._consecutive_successful_tool_count(tool_name)
+        if count < threshold:
+            return None
+        return {
+            "tool_name": tool_name,
+            "consecutive_tool_calls": count,
+            "threshold": threshold,
+        }
+
+    def _messages_for_repeated_tool_decision(
+        self,
+        context: Any,
+        metadata: dict[str, Any],
+    ) -> list[dict[str, Any]]:
+        messages = list(context.get_messages_for_llm())
+        tool_name = str(metadata.get("tool_name") or "the tool")
+        count = int(metadata.get("consecutive_tool_calls") or 0)
+        count_text = (
+            f"{count} consecutive successful calls"
+            if count > 0
+            else "repeated successful calls"
+        )
+        prompt = (
+            f"You must call {REACT_DECISION_TOOL_NAME} exactly once. Decide whether "
+            "the current ReAct run should finish or make another work-tool call. "
+            f"You have just made {count_text} to {tool_name}. action must be "
+            f"{REACT_DECISION_FINAL_ANSWER} or {REACT_DECISION_TOOL_CALL}. Choose "
+            f"{REACT_DECISION_FINAL_ANSWER} when the conversation and accumulated "
+            "tool results are sufficient to answer the latest user request; include "
+            "the complete answer in the same tool call. Choose "
+            f"{REACT_DECISION_TOOL_CALL} only when a specific missing fact, source, "
+            "or verification remains; the next ReAct turn will choose and call the "
+            "actual work tool. Treat the completed-call count in this instruction "
+            "as authoritative; do not count the user's requested number as already "
+            "completed. If the latest user request explicitly requires more "
+            "completed work-tool calls or results than the current context contains, "
+            f"choose {REACT_DECISION_TOOL_CALL}. Do not call work tools in this "
+            "decision."
+        )
+        return [*messages, {"role": "user", "content": prompt}]
+
+    def _react_decision_tool_schema(self) -> dict[str, Any]:
+        return {
+            "type": "function",
+            "function": {
+                "name": REACT_DECISION_TOOL_NAME,
+                "description": (
+                    "Decide whether ReAct should finish with a final answer or "
+                    "continue to one more work-tool call."
+                ),
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "action": {
+                            "type": "string",
+                            "enum": [
+                                REACT_DECISION_FINAL_ANSWER,
+                                REACT_DECISION_TOOL_CALL,
+                            ],
+                            "description": (
+                                "final_answer when current context is sufficient; "
+                                "tool_call when one more work-tool call is needed."
+                            ),
+                        },
+                        "reason": {
+                            "type": "string",
+                            "description": "Brief reason for this decision.",
+                        },
+                        "answer": {
+                            "type": "string",
+                            "description": (
+                                "Required when action is final_answer: complete "
+                                f"user-facing answer. {final_answer_language_rule()}"
+                            ),
+                        },
+                        "missing_verification": {
+                            "type": "string",
+                            "description": (
+                                "When action is tool_call, the specific missing "
+                                "fact, source, or verification that requires "
+                                "another tool call."
+                            ),
+                        },
+                    },
+                    "required": ["action", "reason"],
+                },
+            },
+        }
+
+    def _parse_react_decision(self, response: Any) -> dict[str, str] | None:
+        normalized = self._normalize_llm_response(response)
+        for tool_call in normalized.get("tool_calls", []):
+            if tool_call.get("name") != REACT_DECISION_TOOL_NAME:
+                continue
+            args = tool_call.get("args")
+            if not isinstance(args, dict):
+                return None
+            action = str(args.get("action") or "").strip()
+            if action not in {
+                REACT_DECISION_FINAL_ANSWER,
+                REACT_DECISION_TOOL_CALL,
+            }:
+                return None
+            return {
+                "action": action,
+                "reason": str(args.get("reason") or ""),
+                "answer": str(args.get("answer") or ""),
+                "missing_verification": str(args.get("missing_verification") or ""),
+            }
+        return None
+
+    def _consecutive_successful_tool_count(self, tool_name: str) -> int:
+        count = 0
+        control_tool_names = self._control_tool_names()
+        for record in reversed(list(self.tool_ledger.values())):
+            if record.tool_name in control_tool_names:
+                continue
+            if record.tool_name != tool_name:
+                break
+            if record.status != "completed" or not self._tool_result_success(
+                record.result
+            ):
+                break
+            count += 1
+        return count
 
     async def _finalize_success(
         self,

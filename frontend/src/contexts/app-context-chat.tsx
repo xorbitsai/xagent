@@ -1380,6 +1380,20 @@ export function AppProvider({ children, token }: { children: React.ReactNode; to
             }
           }
 
+          // Agent progress messages belong in the execution timeline, not the chat transcript.
+          else if (eventType === "agent_progress") {
+            dispatch({
+              type: "ADD_TRACE_EVENT",
+              payload: {
+                event_id: message.event_id || eventData.event_id || generateMessageId("trace-agent-progress"),
+                event_type: eventType,
+                step_id: message.step_id || eventData.step_id,
+                timestamp: message.timestamp?.toString() || Date.now().toString(),
+                data: eventData,
+              }
+            })
+          }
+
           // Agent-to-user messages, including ask_user_question prompts.
           else if (eventType === "agent_message" || eventType === "ai_message") {
             const rawMessageContent = eventData.message || eventData.content || ""
@@ -1395,6 +1409,19 @@ export function AppProvider({ children, token }: { children: React.ReactNode; to
               eventType === "agent_message" &&
               (eventData.expect_response === true ||
                 eventData.message_type === "question")
+            if (eventType === "agent_message" && !expectsResponse) {
+              dispatch({
+                type: "ADD_TRACE_EVENT",
+                payload: {
+                  event_id: message.event_id || eventData.event_id || generateMessageId("trace-agent-progress"),
+                  event_type: "agent_progress",
+                  step_id: message.step_id || eventData.step_id,
+                  timestamp: message.timestamp?.toString() || Date.now().toString(),
+                  data: eventData,
+                }
+              })
+              return
+            }
             if (expectsResponse) {
               dispatch({
                 type: "UPDATE_TASK_STATUS",

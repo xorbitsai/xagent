@@ -256,6 +256,39 @@ async def test_runtime_stream_final_answer_emits_ui_events() -> None:
 
 
 @pytest.mark.asyncio
+async def test_runtime_send_message_includes_active_step_id() -> None:
+    outbound = OutboundCollector()
+    runtime = PatternRuntime(execution_id="task-123", outbound_message_handler=outbound)
+    runtime.active_react_step_id = "react-step-1"
+
+    payload = await runtime.send_message(
+        message="Still working",
+        message_type="progress",
+        expect_response=False,
+    )
+
+    assert payload["step_id"] == "react-step-1"
+    assert payload["metadata"]["step_id"] == "react-step-1"
+    assert outbound.events[0]["step_id"] == "react-step-1"
+
+
+@pytest.mark.asyncio
+async def test_runtime_send_message_metadata_step_id_takes_precedence() -> None:
+    outbound = OutboundCollector()
+    runtime = PatternRuntime(execution_id="task-123", outbound_message_handler=outbound)
+    runtime.active_react_step_id = "react-step-1"
+
+    payload = await runtime.send_message(
+        message="Still working",
+        metadata={"step_id": "dag-step-1"},
+    )
+
+    assert payload["step_id"] == "dag-step-1"
+    assert payload["metadata"]["step_id"] == "dag-step-1"
+    assert outbound.events[0]["step_id"] == "dag-step-1"
+
+
+@pytest.mark.asyncio
 async def test_runtime_stream_final_answer_preserves_usage_metadata() -> None:
     outbound = OutboundCollector()
     runtime = PatternRuntime(execution_id="task-123", outbound_message_handler=outbound)

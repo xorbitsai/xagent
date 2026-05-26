@@ -7,8 +7,13 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from xagent.config import CELERY_BROKER_URL, CELERY_ENABLED
+from xagent.core.tools.core.RAG_tools.core.schemas import (
+    IngestionConfig,
+    IngestionResult,
+)
 from xagent.web.models.background_job import BackgroundJobStatus, BackgroundJobType
 from xagent.web.models.database import get_session_local, init_db
+from xagent.web.models.uploaded_file import UploadedFile
 from xagent.web.models.user import User
 from xagent.web.services.background_jobs import (
     create_background_job,
@@ -220,6 +225,79 @@ def test_kb_idempotency_reuses_only_non_terminal_jobs(tmp_path, monkeypatch):
         assert retry_job.id != first_job.id
         assert retry_job.idempotency_key == idempotency_key
         assert duplicate_in_flight.id == retry_job.id
+    finally:
+        db.close()
+
+
+def test_kb_document_job_reads_staged_file_and_publishes_canonical(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setenv(CELERY_ENABLED, "false")
+    monkeypatch.delenv(CELERY_BROKER_URL, raising=False)
+
+    from xagent.web.jobs.kb_tasks import handle_kb_ingest_document
+
+    SessionLocal = _init_test_db(tmp_path / "kb-staged-ingest.db")
+    db = SessionLocal()
+    try:
+        user = _create_user(db, username="kb-staged-ingest-test")
+        staged_file = tmp_path / "stage" / "doc.txt"
+        target_file = tmp_path / "canonical" / "doc.txt"
+        staged_file.parent.mkdir(parents=True)
+        staged_file.write_text("staged content", encoding="utf-8")
+        file_id = "11111111-1111-4111-8111-111111111111"
+        ingestion_config = IngestionConfig()
+        job = create_background_job(
+            db,
+            user_id=int(user.id),
+            job_type=BackgroundJobType.KB_INGEST_DOCUMENT,
+            payload={
+                "collection": "kb",
+                "source_path": str(staged_file),
+                "target_path": str(target_file),
+                "file_id": file_id,
+                "filename": "doc.txt",
+                "mime_type": "text/plain",
+                "file_size": staged_file.stat().st_size,
+                "user_id": int(user.id),
+                "is_admin": False,
+                "ingestion_config": ingestion_config.model_dump(mode="json"),
+                "collection_existed_before": True,
+            },
+        )
+
+        captured = {}
+
+        def fake_run_document_ingestion(**kwargs):
+            captured.update(kwargs)
+            return IngestionResult(
+                status="success",
+                doc_id="doc-1",
+                message="ok",
+                completed_steps=[
+                    {"name": "register_document", "metadata": {"created": True}}
+                ],
+            )
+
+        monkeypatch.setattr(
+            "xagent.web.jobs.kb_tasks.run_document_ingestion",
+            fake_run_document_ingestion,
+        )
+
+        result = handle_kb_ingest_document(db, job)
+
+        assert captured["source_path"] == str(staged_file)
+        assert captured["metadata_source_path"] == str(target_file)
+        assert result["file_id"] == file_id
+        assert target_file.read_text(encoding="utf-8") == "staged content"
+        assert not staged_file.exists()
+        file_record = (
+            db.query(UploadedFile)
+            .filter(UploadedFile.storage_path == str(target_file))
+            .first()
+        )
+        assert file_record is not None
+        assert str(file_record.file_id) == file_id
     finally:
         db.close()
 

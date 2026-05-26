@@ -44,6 +44,7 @@ def register_document(
     uploaded_at: Optional[str] = None,
     user_id: Optional[int] = None,
     file_id: Optional[str] = None,
+    metadata_source_path: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Register a document into the LanceDB system.
 
@@ -56,6 +57,8 @@ def register_document(
             defaults to now if not provided or parse fails
         user_id: Optional user ID for multi-tenancy ownership
         file_id: Optional UploadedFile file_id for stable file association
+        metadata_source_path: Optional canonical source path to store in metadata
+            when the file is read from a temporary immutable path
 
     Returns:
         A plain dict converted from RegisterDocumentResponse
@@ -78,6 +81,7 @@ def register_document(
         collection=collection,
         file_id=file_id,
         source_path=source_path,
+        metadata_source_path=metadata_source_path,
         file_type=file_type,
         doc_id=doc_id,
         uploaded_at=uploaded_at_dt,
@@ -110,6 +114,7 @@ def _register_document(request: RegisterDocumentRequest) -> RegisterDocumentResp
     collection = request.collection
     file_id = request.file_id
     source_path = request.source_path
+    metadata_source_path = request.metadata_source_path or source_path
     file_type = request.file_type
     doc_id = request.doc_id
     uploaded_at = request.uploaded_at
@@ -133,7 +138,7 @@ def _register_document(request: RegisterDocumentRequest) -> RegisterDocumentResp
     # same file re-upload or double-submit updates one record instead of creating two
     if not doc_id:
         try:
-            stable_key = file_id or source_path
+            stable_key = file_id or metadata_source_path
             doc_id = generate_deterministic_doc_id(collection, stable_key)
         except Exception as e:
             # Fallback to UUID if deterministic generation fails
@@ -181,7 +186,7 @@ def _register_document(request: RegisterDocumentRequest) -> RegisterDocumentResp
             "collection": collection,
             "doc_id": doc_id,
             "file_id": file_id,
-            "source_path": source_path,
+            "source_path": metadata_source_path,
             "file_type": file_type,
             "content_hash": content_hash,
             # Store timestamp object directly, let Arrow handle precision conversion

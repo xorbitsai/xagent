@@ -192,6 +192,7 @@ def run_document_ingestion(
     user_id: Optional[int] = None,
     is_admin: Optional[bool] = None,
     file_id: Optional[str] = None,
+    metadata_source_path: Optional[str] = None,
 ) -> IngestionResult:
     """Public entrypoint for LangGraph-compatible ingestion tooling.
 
@@ -210,6 +211,8 @@ def run_document_ingestion(
         user_id: Optional user ID for ownership tracking.
         is_admin: Optional admin override; when omitted, falls back to request scope.
         file_id: Optional UploadedFile file_id for stable file association.
+        metadata_source_path: Optional canonical path to store in metadata while
+            reading from ``source_path``.
 
     Returns:
         IngestionResult: Same contract as :func:`process_document`.
@@ -227,6 +230,7 @@ def run_document_ingestion(
         user_id=user_id,
         is_admin=is_admin,
         file_id=file_id,
+        metadata_source_path=metadata_source_path,
     )
 
 
@@ -487,6 +491,7 @@ def process_document(
     user_id: Optional[int] = None,
     is_admin: bool = False,
     file_id: Optional[str] = None,
+    metadata_source_path: Optional[str] = None,
 ) -> IngestionResult:
     """Execute the full ingestion pipeline for a document.
 
@@ -506,6 +511,8 @@ def process_document(
         user_id: Optional user ID for ownership tracking.
         is_admin: Whether the user has admin privileges.
         file_id: Optional UploadedFile file_id for stable file association.
+        metadata_source_path: Optional canonical path to store in metadata while
+            parsing and hashing ``source_path``.
 
     Returns:
         IngestionResult: A structured report describing the pipeline status,
@@ -671,6 +678,7 @@ def process_document(
                 source_path=source_path,
                 user_id=user_id,
                 file_id=file_id,
+                metadata_source_path=metadata_source_path,
             )
             doc_id = register_result.get("doc_id")
             if not doc_id:

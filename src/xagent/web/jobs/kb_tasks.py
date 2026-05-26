@@ -38,34 +38,57 @@ def handle_kb_ingest_document(db: Session, job: BackgroundJob) -> dict[str, Any]
     payload = dict(job.payload or {})
     ingestion_config = IngestionConfig.model_validate(payload["ingestion_config"])
     file_id = payload.get("file_id")
+    target_path = payload.get("target_path")
+    is_staged_input = bool(target_path)
     progress_manager = BackgroundJobProgressManager(db, job)
 
     update_job_progress(db, job, message="Ingesting document")
-    with user_scope_context(
-        user_id=int(payload["user_id"]),
-        is_admin=bool(payload.get("is_admin", False)),
-    ):
-        result = run_document_ingestion(
-            collection=str(payload["collection"]),
-            source_path=str(payload["source_path"]),
-            ingestion_config=ingestion_config,
-            progress_manager=progress_manager,
+    try:
+        with user_scope_context(
             user_id=int(payload["user_id"]),
             is_admin=bool(payload.get("is_admin", False)),
-            file_id=str(file_id) if file_id else None,
-        )
+        ):
+            result = run_document_ingestion(
+                collection=str(payload["collection"]),
+                source_path=str(payload["source_path"]),
+                ingestion_config=ingestion_config,
+                progress_manager=progress_manager,
+                user_id=int(payload["user_id"]),
+                is_admin=bool(payload.get("is_admin", False)),
+                file_id=str(file_id) if file_id else None,
+                metadata_source_path=str(target_path) if target_path else None,
+            )
+    except Exception:
+        if is_staged_input and int(job.attempts or 0) >= int(job.max_attempts or 1):
+            _cleanup_staged_document_input(payload)
+        raise
 
     result_payload = result.model_dump(mode="json")
     if file_id:
         result_payload["file_id"] = file_id
     if result.status in {"error", "partial"}:
-        _rollback_failed_document_ingestion(db, payload, result)
+        if is_staged_input:
+            _rollback_failed_staged_document_ingestion(db, payload, result)
+        else:
+            _rollback_failed_document_ingestion(db, payload, result)
         raise BackgroundJobHandlerError(
             result.message,
             result=result_payload,
             retryable=False,
         )
-    _discard_ingest_backup(payload)
+    if is_staged_input:
+        try:
+            file_record = _publish_staged_document_ingestion(db, payload)
+            result_payload["file_id"] = str(file_record.file_id)
+        except Exception as exc:  # noqa: BLE001
+            _rollback_failed_staged_document_ingestion(db, payload, result)
+            raise BackgroundJobHandlerError(
+                f"Document ingestion succeeded but publishing uploaded file failed: {exc}",
+                result=result_payload,
+                retryable=False,
+            ) from exc
+    else:
+        _discard_ingest_backup(payload)
     return result_payload
 
 
@@ -242,6 +265,131 @@ def _handle_web_file(
                         persistent_file,
                     )
             raise
+
+
+def _cleanup_staged_document_input(payload: dict[str, Any]) -> None:
+    from ..api.kb import _cleanup_background_ingest_staging_file
+
+    _cleanup_background_ingest_staging_file(payload.get("source_path"))
+
+
+def _rollback_failed_staged_document_ingestion(
+    db: Session,
+    payload: dict[str, Any],
+    result: IngestionResult,
+) -> None:
+    from ..api.kb import RollbackFailureError, _rollback_failed_cloud_ingestion
+
+    user_id = int(payload["user_id"])
+    user = db.query(User).filter(User.id == user_id).first()
+    if user is None:
+        _cleanup_staged_document_input(payload)
+        raise BackgroundJobHandlerError(
+            f"Cannot roll back KB ingestion for missing user {user_id}",
+            result=result.model_dump(mode="json"),
+            retryable=False,
+        )
+
+    ingestion_config_payload = payload.get("ingestion_config")
+    embedding_model_id = (
+        ingestion_config_payload.get("embedding_model_id")
+        if isinstance(ingestion_config_payload, dict)
+        else None
+    )
+
+    try:
+        asyncio.run(
+            _rollback_failed_cloud_ingestion(
+                db=db,
+                user=user,
+                collection_name=str(payload["collection"]),
+                result=result,
+                file_path=Path(str(payload["source_path"])),
+                file_record=None,
+                collection_existed_before=bool(
+                    payload.get("collection_existed_before", True)
+                ),
+                uploaded_file_existed_before=False,
+                file_backup_path=None,
+                had_existing_file=False,
+                embedding_model_id=embedding_model_id,
+            )
+        )
+    except RollbackFailureError as exc:
+        raise BackgroundJobHandlerError(
+            str(exc),
+            result=result.model_dump(mode="json"),
+            retryable=False,
+        ) from exc
+    finally:
+        _cleanup_staged_document_input(payload)
+
+
+def _publish_staged_document_ingestion(
+    db: Session,
+    payload: dict[str, Any],
+) -> UploadedFile:
+    from ..api.kb import (
+        _build_ingest_backup_path,
+        _cleanup_background_ingest_staging_file,
+        _restore_ingest_file_backup,
+        _upsert_uploaded_file_record,
+    )
+
+    source_path = Path(str(payload["source_path"]))
+    target_path = Path(str(payload["target_path"]))
+    if not source_path.exists():
+        raise FileNotFoundError(f"Missing staged ingest file: {source_path}")
+
+    payload_file_id = str(payload["file_id"]) if payload.get("file_id") else None
+    existing_record = (
+        db.query(UploadedFile)
+        .filter(UploadedFile.storage_path == str(target_path))
+        .first()
+    )
+    if (
+        existing_record is not None
+        and payload_file_id
+        and str(existing_record.file_id) != payload_file_id
+    ):
+        raise RuntimeError(
+            "Canonical upload path was updated by another upload before this job published"
+        )
+
+    target_path.parent.mkdir(parents=True, exist_ok=True)
+    had_existing_file = target_path.exists()
+    backup_path: Path | None = None
+    if had_existing_file:
+        backup_path = _build_ingest_backup_path(target_path)
+        shutil.copy2(target_path, backup_path)
+
+    try:
+        shutil.copy2(source_path, target_path)
+        file_record = _upsert_uploaded_file_record(
+            db,
+            user_id=int(payload["user_id"]),
+            filename=str(payload["filename"]),
+            storage_path=target_path,
+            mime_type=payload.get("mime_type"),
+            file_size=int(payload.get("file_size") or target_path.stat().st_size),
+            file_id=payload_file_id,
+        )
+    except Exception:
+        db.rollback()
+        _restore_ingest_file_backup(
+            file_path=target_path,
+            backup_path=backup_path,
+            had_existing_file=had_existing_file,
+        )
+        raise
+
+    if backup_path is not None and backup_path.exists():
+        try:
+            backup_path.unlink()
+        except OSError:
+            logger.warning("Failed to remove ingest backup %s", backup_path)
+    _cleanup_background_ingest_staging_file(source_path)
+    return file_record
 
 
 def _rollback_failed_document_ingestion(

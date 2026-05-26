@@ -169,6 +169,13 @@ _MAX_FILESYSTEM_FILENAME_BYTES = 255
 _MAX_WEB_TITLE_FILENAME_BYTES = _MAX_FILESYSTEM_FILENAME_BYTES - len(
     f"{'0' * _WEB_FILENAME_HASH_LENGTH}_{_WEB_FILENAME_SUFFIX}".encode("utf-8")
 )
+_BACKGROUND_INGEST_STAGING_DIR = ".background-ingest"
+
+
+@dataclass(frozen=True)
+class UploadCopyResult:
+    total_size: int
+    sha256: str
 
 
 def _like_contains_pattern(value: str) -> str:
@@ -810,11 +817,13 @@ def _copy_upload_file_to_path(
     file_path: Path,
     *,
     max_size: int | None = None,
-) -> int:
+) -> UploadCopyResult:
     effective_max_size = MAX_FILE_SIZE if max_size is None else max_size
     total_size = 0
+    hash_obj = hashlib.sha256()
     file_read_buffer_size = 1024 * 1024
     file.file.seek(0)
+    file_path.parent.mkdir(parents=True, exist_ok=True)
     with open(file_path, "wb") as buffer:
         while True:
             chunk = file.file.read(file_read_buffer_size)
@@ -826,8 +835,41 @@ def _copy_upload_file_to_path(
                     status_code=413,
                     detail=f"File size exceeds maximum limit of {MAX_FILE_SIZE_LABEL}",
                 )
+            hash_obj.update(chunk)
             buffer.write(chunk)
-    return total_size
+    return UploadCopyResult(total_size=total_size, sha256=hash_obj.hexdigest())
+
+
+def _build_background_ingest_staging_path(*, user_id: int, filename: str) -> Path:
+    user_root = get_upload_path(
+        _BACKGROUND_INGEST_STAGING_DIR,
+        user_id=user_id,
+        create_if_not_exists=True,
+    ).parent
+    staging_dir = user_root / _BACKGROUND_INGEST_STAGING_DIR / uuid.uuid4().hex
+    staging_dir.mkdir(parents=True, exist_ok=False)
+    return staging_dir / Path(filename).name
+
+
+def _background_ingest_file_id(*, user_id: int, storage_path: Path) -> str:
+    stable_key = f"xagent-kb-ingest:{user_id}:{storage_path}"
+    return str(uuid.uuid5(uuid.NAMESPACE_URL, stable_key))
+
+
+def _cleanup_background_ingest_staging_file(staging_path: Path | str | None) -> None:
+    if not staging_path:
+        return
+    path = Path(str(staging_path))
+    try:
+        if path.exists():
+            path.unlink()
+    except OSError:
+        logger.warning("Failed to remove background ingest staging file %s", path)
+        return
+    try:
+        path.parent.rmdir()
+    except OSError:
+        pass
 
 
 async def _ensure_background_job_queue_available_async() -> None:
@@ -1597,7 +1639,10 @@ async def ingest(
         await asyncio.to_thread(shutil.copy2, file_path, file_backup_path)
 
     try:
-        total_size = await asyncio.to_thread(_copy_upload_file_to_path, file, file_path)
+        copy_result = await asyncio.to_thread(
+            _copy_upload_file_to_path, file, file_path
+        )
+        total_size = copy_result.total_size
         logger.info(
             "File uploaded: %s -> %s (user: %s, collection: %s)",
             safe_filename,
@@ -1879,40 +1924,29 @@ async def create_ingest_job(
         .filter(UploadedFile.storage_path == str(file_path))
         .first()
     )
-    uploaded_file_existed_before = existing_file_record is not None
-    had_existing_file = file_path.exists()
-    file_backup_path: Optional[Path] = None
-    if had_existing_file:
-        file_backup_path = _build_ingest_backup_path(file_path)
-        await asyncio.to_thread(shutil.copy2, file_path, file_backup_path)
+    file_id = (
+        str(existing_file_record.file_id)
+        if existing_file_record is not None
+        else _background_ingest_file_id(user_id=int(_user.id), storage_path=file_path)
+    )
+    staged_file_path = _build_background_ingest_staging_path(
+        user_id=int(_user.id),
+        filename=safe_filename,
+    )
 
     try:
-        total_size = await asyncio.to_thread(_copy_upload_file_to_path, file, file_path)
+        copy_result = await asyncio.to_thread(
+            _copy_upload_file_to_path,
+            file,
+            staged_file_path,
+        )
+        total_size = copy_result.total_size
+        file_sha256 = copy_result.sha256
     except HTTPException:
-        try:
-            _restore_ingest_file_backup(
-                file_path=file_path,
-                backup_path=file_backup_path,
-                had_existing_file=had_existing_file,
-            )
-        except Exception as restore_exc:  # noqa: BLE001
-            raise RollbackFailureError(
-                "Failed to restore ingest file after async upload abort for "
-                f"{collection}/{file_path.name}: {restore_exc}"
-            ) from restore_exc
+        _cleanup_background_ingest_staging_file(staged_file_path)
         raise
     except Exception as upload_exc:
-        try:
-            _restore_ingest_file_backup(
-                file_path=file_path,
-                backup_path=file_backup_path,
-                had_existing_file=had_existing_file,
-            )
-        except Exception as restore_exc:  # noqa: BLE001
-            raise RollbackFailureError(
-                "Failed to restore ingest file after async upload error for "
-                f"{collection}/{file_path.name}: {restore_exc}"
-            ) from restore_exc
+        _cleanup_background_ingest_staging_file(staged_file_path)
         raise upload_exc
 
     mime_type = (
@@ -1951,7 +1985,6 @@ async def create_ingest_job(
         else 1.0,
     )
 
-    file_sha256 = _get_file_sha256(file_path)
     idempotency_key = _background_job_idempotency_key(
         "kb.ingest.document",
         {
@@ -1967,13 +2000,10 @@ async def create_ingest_job(
         idempotency_key,
     )
     if existing_job is not None:
-        if file_backup_path is not None and file_backup_path.exists():
-            try:
-                file_backup_path.unlink()
-            except OSError:
-                logger.warning("Failed to remove ingest backup %s", file_backup_path)
+        _cleanup_background_ingest_staging_file(staged_file_path)
         return existing_job
 
+    saved_collection_config = False
     try:
         metadata_store = get_metadata_store()
         await metadata_store.save_collection_config(
@@ -1981,63 +2011,55 @@ async def create_ingest_job(
             config_json=config.model_dump_json(exclude_unset=True),
             user_id=int(_user.id),
         )
+        saved_collection_config = True
     except Exception as e:
         logger.warning("Failed to save collection config during async ingest: %s", e)
 
-    file_record: Optional[UploadedFile] = None
-    try:
-        file_record = _upsert_uploaded_file_record(
-            db,
-            user_id=int(_user.id),
-            filename=safe_filename,
-            storage_path=file_path,
-            mime_type=mime_type,
-            file_size=int(total_size),
-        )
+    job_payload = {
+        "collection": safe_collection,
+        "source_path": str(staged_file_path),
+        "target_path": str(file_path),
+        "file_id": file_id,
+        "filename": safe_filename,
+        "mime_type": mime_type,
+        "file_size": int(total_size),
+        "user_id": int(_user.id),
+        "is_admin": bool(_user.is_admin),
+        "ingestion_config": config.model_dump(mode="json"),
+        "collection_existed_before": collection_existed_before,
+    }
 
+    try:
         job = create_background_job(
             db,
             user_id=int(_user.id),
             job_type=BackgroundJobType.KB_INGEST_DOCUMENT,
-            payload={
-                "collection": safe_collection,
-                "source_path": str(file_path),
-                "file_id": str(file_record.file_id),
-                "filename": safe_filename,
-                "user_id": int(_user.id),
-                "is_admin": bool(_user.is_admin),
-                "ingestion_config": config.model_dump(mode="json"),
-                "collection_existed_before": collection_existed_before,
-                "uploaded_file_existed_before": uploaded_file_existed_before,
-                "had_existing_file": had_existing_file,
-                "file_backup_path": str(file_backup_path)
-                if file_backup_path is not None
-                else None,
-            },
+            payload=job_payload,
             idempotency_key=idempotency_key,
             reuse_terminal_idempotency_key=False,
         )
+        if dict(job.payload or {}).get("source_path") != str(staged_file_path):
+            _cleanup_background_ingest_staging_file(staged_file_path)
+            return job
     except Exception:
-        if file_record is not None:
-            db.rollback()
-        try:
-            _restore_ingest_file_backup(
-                file_path=file_path,
-                backup_path=file_backup_path,
-                had_existing_file=had_existing_file,
-            )
-        except Exception as restore_exc:  # noqa: BLE001
-            raise RollbackFailureError(
-                "Failed to restore ingest file after async job setup error for "
-                f"{collection}/{file_path.name}: {restore_exc}"
-            ) from restore_exc
-        if not collection_existed_before:
+        db.rollback()
+        _cleanup_background_ingest_staging_file(staged_file_path)
+        if saved_collection_config and not collection_existed_before:
             await _cleanup_failed_new_collection_metadata(
                 collection_name=safe_collection,
                 user=_user,
             )
         raise
-    return await _enqueue_background_job_or_503_async(db, job)
+    try:
+        return await _enqueue_background_job_or_503_async(db, job)
+    except Exception:
+        _cleanup_background_ingest_staging_file(staged_file_path)
+        if saved_collection_config and not collection_existed_before:
+            await _cleanup_failed_new_collection_metadata(
+                collection_name=safe_collection,
+                user=_user,
+            )
+        raise
 
 
 @kb_router.post("/ingest-cloud", response_model=List[IngestionResult])

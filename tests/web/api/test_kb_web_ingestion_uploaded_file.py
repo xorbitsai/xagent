@@ -15,6 +15,7 @@ end-to-end handler behavior stays covered even though ``_handle_web_file``
 is not importable directly (nested function).
 """
 
+import hashlib
 import io
 import tempfile
 import threading
@@ -92,9 +93,10 @@ class TestIngestFileHelpers:
         upload = UploadFile(file=io.BytesIO(b"abcdef"), filename="sample.txt")
         target_path = tmp_path / "sample.txt"
 
-        written_size = _copy_upload_file_to_path(upload, target_path, max_size=10)
+        result = _copy_upload_file_to_path(upload, target_path, max_size=10)
 
-        assert written_size == 6
+        assert result.total_size == 6
+        assert result.sha256 == hashlib.sha256(b"abcdef").hexdigest()
         assert target_path.read_bytes() == b"abcdef"
 
 

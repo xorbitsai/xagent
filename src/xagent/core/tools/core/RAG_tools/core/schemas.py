@@ -268,6 +268,13 @@ class RegisterDocumentRequest(BaseModel):
         None, description="UploadedFile file_id for stable file association"
     )
     source_path: str = Field(..., description="Absolute path to uploaded file")
+    metadata_source_path: Optional[str] = Field(
+        None,
+        description=(
+            "Canonical source path to store in metadata when ingestion reads from "
+            "a temporary immutable input path"
+        ),
+    )
 
     file_type: Optional[str] = Field(
         None, description="File type (auto-detected if not provided)"

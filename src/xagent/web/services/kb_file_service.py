@@ -100,6 +100,7 @@ def upsert_uploaded_file_record(
     storage_path: Path,
     mime_type: Optional[str],
     file_size: int,
+    file_id: Optional[str] = None,
 ) -> UploadedFile:
     """Create or refresh an ``UploadedFile`` row for a stored file."""
     scope = resolve_user_scope(user_id=user_id, is_admin=False)
@@ -112,6 +113,7 @@ def upsert_uploaded_file_record(
         storage_path=storage_path,
         mime_type=mime_type,
         file_size=file_size,
+        file_id=file_id,
     )
     db.commit()
     db.refresh(file_record)

@@ -107,5 +107,10 @@ def init_db(db_url: str | None = None) -> None:
     # Create all tables
     Base.metadata.create_all(bind=_engine)
 
+    from ..builtin_mcp_registry import seed_builtin_oauth_and_public_mcp_apps
+
+    with _engine.begin() as conn:
+        seed_builtin_oauth_and_public_mcp_apps(conn)
+
     logger = logging.getLogger(__name__)
     logger.info("Database initialized. Waiting for first admin setup.")

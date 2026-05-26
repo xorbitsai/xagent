@@ -9,6 +9,8 @@ from xagent.web.api.auth import auth_router
 from xagent.web.api.mcp import mcp_router
 from xagent.web.models.database import Base, get_db, get_engine
 from xagent.web.models.mcp import MCPServer, UserMCPServer
+from xagent.web.models.oauth_provider import OAuthProvider
+from xagent.web.models.public_mcp import PublicMCPApp
 from xagent.web.models.user import User
 
 
@@ -133,6 +135,91 @@ def test_hidden_public_mcp_app_is_excluded_from_remote_connector_list() -> None:
         assert "visible-app" in app_ids
         assert "hidden-app" not in app_ids
     finally:
+        Base.metadata.drop_all(bind=get_engine())
+        try:
+            import shutil
+
+            shutil.rmtree(temp_dir)
+        except OSError:
+            pass
+
+
+def test_init_db_seeds_builtin_oauth_and_microsoft_graph_public_apps() -> None:
+    temp_dir = _setup_test_db()
+    db = next(get_db())
+    try:
+        provider_names = {row.provider_name for row in db.query(OAuthProvider).all()}
+        assert {"google", "linkedin", "microsoft"}.issubset(provider_names)
+
+        microsoft_provider = (
+            db.query(OAuthProvider)
+            .filter(OAuthProvider.provider_name == "microsoft")
+            .first()
+        )
+        assert microsoft_provider is not None
+        assert microsoft_provider.default_scopes == ["User.Read"]
+
+        app_ids = {row.app_id for row in db.query(PublicMCPApp).all()}
+        assert {
+            "linkedin",
+            "gmail",
+            "google-drive",
+            "google-calendar",
+            "teams",
+            "outlook",
+            "onedrive",
+        }.issubset(app_ids)
+
+        teams_app = (
+            db.query(PublicMCPApp).filter(PublicMCPApp.app_id == "teams").first()
+        )
+        outlook_app = (
+            db.query(PublicMCPApp).filter(PublicMCPApp.app_id == "outlook").first()
+        )
+        onedrive_app = (
+            db.query(PublicMCPApp).filter(PublicMCPApp.app_id == "onedrive").first()
+        )
+
+        assert teams_app is not None
+        assert teams_app.provider_name == "microsoft"
+        assert teams_app.oauth_scopes == [
+            "Team.ReadBasic.All",
+            "Channel.ReadBasic.All",
+            "TeamMember.Read.All",
+            "ChannelMessage.Read.All",
+            "ChannelMessage.Send",
+            "Chat.ReadWrite",
+        ]
+        assert teams_app.launch_config == {
+            "command": "uv",
+            "args": ["run", "python", "-m", "xagent.web.tools.mcp.teams"],
+            "env_mapping": {"AUTH_TOKEN": "access_token"},
+        }
+
+        assert outlook_app is not None
+        assert outlook_app.provider_name == "microsoft"
+        assert outlook_app.oauth_scopes == [
+            "Mail.Read",
+            "Mail.Send",
+            "Calendars.ReadWrite",
+            "Contacts.Read",
+        ]
+        assert outlook_app.launch_config == {
+            "command": "uv",
+            "args": ["run", "python", "-m", "xagent.web.tools.mcp.outlook"],
+            "env_mapping": {"AUTH_TOKEN": "access_token"},
+        }
+
+        assert onedrive_app is not None
+        assert onedrive_app.provider_name == "microsoft"
+        assert onedrive_app.oauth_scopes == ["Files.ReadWrite"]
+        assert onedrive_app.launch_config == {
+            "command": "uv",
+            "args": ["run", "python", "-m", "xagent.web.tools.mcp.onedrive"],
+            "env_mapping": {"AUTH_TOKEN": "access_token"},
+        }
+    finally:
+        db.close()
         Base.metadata.drop_all(bind=get_engine())
         try:
             import shutil

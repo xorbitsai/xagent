@@ -2,8 +2,7 @@
 Tests for WorkspaceFileOperations core class.
 
 This module tests the core workspace file operations functionality,
-focusing on the JSON and CSV file operations that were optimized
-to delegate to the basic file_tool functions.
+focusing on JSON and CSV workspace writes and reads.
 """
 
 import pytest
@@ -36,8 +35,8 @@ class TestWorkspaceFileOperations:
         read_data = ops.read_json_file("test.json")
         assert read_data == test_data
 
-    def test_write_json_file_delegation(self, tmp_path):
-        """Test that write_json_file correctly delegates to basic file_tool function."""
+    def test_write_json_file_returns_registered_file_ref(self, tmp_path):
+        """Test that write_json_file returns a registered FileRef."""
         workspace = TaskWorkspace("test_json", str(tmp_path))
         ops = WorkspaceFileOperations(workspace)
 
@@ -46,7 +45,12 @@ class TestWorkspaceFileOperations:
 
         # Write using workspace operation
         result = ops.write_json_file("test.json", test_data)
-        assert result is True
+        assert result["success"] is True
+        assert isinstance(result.get("file_id"), str)
+        assert result["filename"] == "test.json"
+        assert result["mime_type"] == "application/json"
+        assert result["relative_path"] == "output/test.json"
+        assert result["file_ref"]["file_id"] == result["file_id"]
 
         # Verify file was written to output directory
         test_file = workspace.output_dir / "test.json"
@@ -85,8 +89,8 @@ class TestWorkspaceFileOperations:
         read_data = ops.read_csv_file("test.csv")
         assert read_data == test_data
 
-    def test_write_csv_file_delegation(self, tmp_path):
-        """Test that write_csv_file correctly delegates to basic file_tool function."""
+    def test_write_csv_file_returns_registered_file_ref(self, tmp_path):
+        """Test that write_csv_file returns a registered FileRef."""
         workspace = TaskWorkspace("test_csv", str(tmp_path))
         ops = WorkspaceFileOperations(workspace)
 
@@ -99,7 +103,12 @@ class TestWorkspaceFileOperations:
 
         # Write using workspace operation
         result = ops.write_csv_file("test.csv", test_data)
-        assert result is True
+        assert result["success"] is True
+        assert isinstance(result.get("file_id"), str)
+        assert result["filename"] == "test.csv"
+        assert result["mime_type"] == "text/csv"
+        assert result["relative_path"] == "output/test.csv"
+        assert result["file_ref"]["file_id"] == result["file_id"]
 
         # Verify file was written to output directory
         test_file = workspace.output_dir / "test.csv"
@@ -122,7 +131,7 @@ class TestWorkspaceFileOperations:
 
         # Write should go to output directory
         result = ops.write_json_file("output_test.json", test_data)
-        assert result is True
+        assert result["success"] is True
 
         # Verify file is in output directory
         output_file = workspace.output_dir / "output_test.json"
@@ -142,7 +151,7 @@ class TestWorkspaceFileOperations:
 
         # Write should go to output directory
         result = ops.write_csv_file("output_test.csv", test_data)
-        assert result is True
+        assert result["success"] is True
 
         # Verify file is in output directory
         output_file = workspace.output_dir / "output_test.csv"
@@ -177,7 +186,7 @@ class TestWorkspaceFileOperations:
 
         # Write with custom indent
         result = ops.write_json_file("test.json", test_data, indent=4)
-        assert result is True
+        assert result["success"] is True
 
         # Verify file content has 4-space indentation
         test_file = workspace.output_dir / "test.json"
@@ -222,13 +231,26 @@ class TestWorkspaceFileOperations:
 
         # Write with tab delimiter
         result = ops.write_csv_file("test.tsv", test_data, delimiter="\t")
-        assert result is True
+        assert result["success"] is True
 
         # Verify file content uses tabs
         test_file = workspace.output_dir / "test.tsv"
         content = test_file.read_text(encoding="utf-8")
         assert "\t" in content, "File should contain tab characters"
         assert "," not in content, "File should not contain comma characters"
+
+    def test_write_empty_csv_file_creates_registered_file_ref(self, tmp_path):
+        """Test that empty CSV data still creates a registered output file."""
+        workspace = TaskWorkspace("test_empty_csv", str(tmp_path))
+        ops = WorkspaceFileOperations(workspace)
+
+        result = ops.write_csv_file("empty.csv", [])
+
+        assert result["success"] is True
+        assert isinstance(result.get("file_id"), str)
+        assert result["filename"] == "empty.csv"
+        assert result["relative_path"] == "output/empty.csv"
+        assert (workspace.output_dir / "empty.csv").read_text(encoding="utf-8") == ""
 
     def test_json_roundtrip_consistency(self, tmp_path):
         """Test that JSON data can be written and read back consistently."""

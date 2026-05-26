@@ -114,6 +114,7 @@ class SqlQueryTool:
                             - row_count: number of rows returned or affected
                             - columns: column names in the result
                             - message: what happened (includes export info when applicable)
+                            - file_ref/file_id/download_url when output_file exports results
                 """),
                     "" * 4,
                 ),

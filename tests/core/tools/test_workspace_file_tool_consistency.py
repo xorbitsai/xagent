@@ -68,6 +68,47 @@ class TestWorkspaceFileToolConsistency:
         assert read_content == test_content
 
     @pytest.mark.usefixtures("mock_workspace_db")
+    def test_write_json_returns_file_ref(self, tmp_path):
+        """Test that JSON writes expose FileRef metadata to the model."""
+        workspace = TaskWorkspace("test_task", str(tmp_path))
+        tools = WorkspaceFileTools(workspace)
+
+        result = tools.write_json_file("data/report.json", {"answer": 42})
+
+        assert result["success"] is True
+        assert isinstance(result.get("file_id"), str)
+        assert result["filename"] == "report.json"
+        assert result["mime_type"] == "application/json"
+        assert result["relative_path"] == "output/data/report.json"
+        assert result["preview_url"].endswith(result["file_id"])
+        assert result["download_url"].endswith(result["file_id"])
+        assert result["markdown_link"] == f"[report.json](file:{result['file_id']})"
+        assert result["file_ref"]["file_id"] == result["file_id"]
+        assert (workspace.output_dir / "data" / "report.json").exists()
+
+    @pytest.mark.usefixtures("mock_workspace_db")
+    def test_write_csv_returns_file_ref(self, tmp_path):
+        """Test that CSV writes expose FileRef metadata to the model."""
+        workspace = TaskWorkspace("test_task", str(tmp_path))
+        tools = WorkspaceFileTools(workspace)
+
+        result = tools.write_csv_file(
+            "data/report.csv",
+            [{"name": "Alice", "score": "10"}, {"name": "Bob", "score": "11"}],
+        )
+
+        assert result["success"] is True
+        assert isinstance(result.get("file_id"), str)
+        assert result["filename"] == "report.csv"
+        assert result["mime_type"] == "text/csv"
+        assert result["relative_path"] == "output/data/report.csv"
+        assert result["preview_url"].endswith(result["file_id"])
+        assert result["download_url"].endswith(result["file_id"])
+        assert result["markdown_link"] == f"[report.csv](file:{result['file_id']})"
+        assert result["file_ref"]["file_id"] == result["file_id"]
+        assert (workspace.output_dir / "data" / "report.csv").exists()
+
+    @pytest.mark.usefixtures("mock_workspace_db")
     def test_write_then_read_with_relative_path(self, tmp_path):
         """Test that relative paths work consistently."""
         workspace = TaskWorkspace("test_task", str(tmp_path))

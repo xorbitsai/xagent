@@ -25,6 +25,8 @@ from pydantic import BaseModel, Field
 from sqlalchemy import URL, create_engine, text
 from sqlalchemy.engine import CursorResult, Row, make_url
 
+from ...file_ref import build_workspace_file_ref
+
 if TYPE_CHECKING:
     from ...workspace import TaskWorkspace
 
@@ -126,6 +128,7 @@ def execute_sql_query(
             - row_count: number of rows returned or affected
             - columns: column names in the result
             - message: what happened
+            - file_ref/file_id/download_url when output_file exports results
     """
     # Get connection URL from environment
     url = _get_connection_url(connection_name, connection_url)
@@ -140,46 +143,52 @@ def execute_sql_query(
                 if file_ext == ".csv":
                     # Streaming export for large datasets
                     result = conn.execute(stmt)
-                    _, exported_count, columns = _stream_export_to_csv(
-                        workspace, output_file, result
-                    )
-                    return SQLQueryResult(
-                        success=True,
-                        rows=[],
-                        row_count=exported_count,
+                    with workspace.auto_register_files():
+                        exported_path, exported_count, columns = _stream_export_to_csv(
+                            workspace, output_file, result
+                        )
+                    return _build_export_result(
+                        workspace=workspace,
+                        exported_path=exported_path,
+                        connection_name=connection_name,
+                        output_file=output_file,
+                        exported_count=exported_count,
                         columns=columns,
-                        message=f"Query executed successfully on '{connection_name}', exported {exported_count} row(s) to {output_file}",
-                    ).model_dump()
+                    )
                 elif file_ext == ".parquet":
                     # Streaming export with Parquet (better compression & type preservation)
                     result = conn.execute(stmt)
-                    (
-                        _,
-                        exported_count,
-                        columns,
-                    ) = _stream_export_to_parquet(workspace, output_file, result)
-                    return SQLQueryResult(
-                        success=True,
-                        rows=[],
-                        row_count=exported_count,
+                    with workspace.auto_register_files():
+                        (
+                            exported_path,
+                            exported_count,
+                            columns,
+                        ) = _stream_export_to_parquet(workspace, output_file, result)
+                    return _build_export_result(
+                        workspace=workspace,
+                        exported_path=exported_path,
+                        connection_name=connection_name,
+                        output_file=output_file,
+                        exported_count=exported_count,
                         columns=columns,
-                        message=f"Query executed successfully on '{connection_name}', exported {exported_count} row(s) to {output_file}",
-                    ).model_dump()
+                    )
                 elif file_ext in (".json", ".jsonl", ".ndjson"):
                     # Streaming JSON Lines (NDJSON) export
                     result = conn.execute(stmt)
-                    (
-                        _,
-                        exported_count,
-                        columns,
-                    ) = _stream_export_to_jsonlines(workspace, output_file, result)
-                    return SQLQueryResult(
-                        success=True,
-                        rows=[],
-                        row_count=exported_count,
+                    with workspace.auto_register_files():
+                        (
+                            exported_path,
+                            exported_count,
+                            columns,
+                        ) = _stream_export_to_jsonlines(workspace, output_file, result)
+                    return _build_export_result(
+                        workspace=workspace,
+                        exported_path=exported_path,
+                        connection_name=connection_name,
+                        output_file=output_file,
+                        exported_count=exported_count,
                         columns=columns,
-                        message=f"Query executed successfully on '{connection_name}', exported {exported_count} row(s) to {output_file}",
-                    ).model_dump()
+                    )
                 else:
                     raise ValueError(
                         f"Unsupported file format: {file_ext}. "
@@ -222,6 +231,36 @@ def execute_sql_query(
         engine.dispose()
 
 
+def _build_export_result(
+    *,
+    workspace: "TaskWorkspace",
+    exported_path: str,
+    connection_name: str,
+    output_file: str,
+    exported_count: int,
+    columns: list[str],
+) -> dict[str, Any]:
+    file_ref = build_workspace_file_ref(
+        workspace=workspace,
+        file_path=exported_path,
+    )
+    payload = SQLQueryResult(
+        success=True,
+        rows=[],
+        row_count=exported_count,
+        columns=columns,
+        message=f"Query executed successfully on '{connection_name}', exported {exported_count} row(s) to {output_file}",
+    ).model_dump()
+    payload.update(
+        {
+            "output_file": output_file,
+            **file_ref,
+            "file_ref": file_ref,
+        }
+    )
+    return payload
+
+
 def _stream_export_to_csv(
     workspace: "TaskWorkspace",
     file_path: str,
@@ -234,6 +273,7 @@ def _stream_export_to_csv(
         Tuple of (exported_file_path, row_count, column_names)
     """
     resolved_path = workspace.resolve_path(file_path, default_dir="output")
+    resolved_path.parent.mkdir(parents=True, exist_ok=True)
 
     # Get column names BEFORE iteration
     columns = list(result.keys())
@@ -276,6 +316,7 @@ def _stream_export_to_jsonlines(
         Tuple of (exported_file_path, row_count, column_names)
     """
     resolved_path = workspace.resolve_path(file_path, default_dir="output")
+    resolved_path.parent.mkdir(parents=True, exist_ok=True)
 
     # Get column names BEFORE iteration
     columns = list(result.keys())
@@ -322,6 +363,7 @@ def _stream_export_to_parquet(
         )
 
     resolved_path = workspace.resolve_path(file_path, default_dir="output")
+    resolved_path.parent.mkdir(parents=True, exist_ok=True)
 
     # Get column names BEFORE iteration
     columns = list(result.keys())

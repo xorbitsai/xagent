@@ -321,6 +321,17 @@ class WorkspaceFileOperations:
             "file_ref": file_ref,
         }
 
+    def _registered_write_result(self, file_path: Path) -> Dict[str, Any]:
+        file_ref = build_workspace_file_ref(
+            workspace=self.workspace,
+            file_path=file_path,
+        )
+        return {
+            "success": True,
+            **file_ref,
+            "file_ref": file_ref,
+        }
+
     def prepare_html_asset(
         self,
         file_id: str,
@@ -547,12 +558,17 @@ class WorkspaceFileOperations:
         data: Dict[str, Any],
         encoding: str = "utf-8",
         indent: int = 2,
-    ) -> bool:
+    ) -> Dict[str, Any]:
         """Write JSON file in workspace"""
         from .file_tool import write_json_file as basic_write_json_file
 
         resolved_path = self._resolve_path(file_path, "output")
-        return basic_write_json_file(str(resolved_path), data, encoding, indent)
+        resolved_path.parent.mkdir(parents=True, exist_ok=True)
+
+        with self.workspace.auto_register_files():
+            basic_write_json_file(str(resolved_path), data, encoding, indent)
+
+        return self._registered_write_result(resolved_path)
 
     def read_csv_file(
         self,
@@ -584,12 +600,20 @@ class WorkspaceFileOperations:
         data: List[Dict[str, str]],
         encoding: str = "utf-8",
         delimiter: str = ",",
-    ) -> bool:
+    ) -> Dict[str, Any]:
         """Write CSV file in workspace"""
         from .file_tool import write_csv_file as basic_write_csv_file
 
         resolved_path = self._resolve_path(file_path, "output")
-        return basic_write_csv_file(str(resolved_path), data, encoding, delimiter)
+        resolved_path.parent.mkdir(parents=True, exist_ok=True)
+
+        with self.workspace.auto_register_files():
+            if data:
+                basic_write_csv_file(str(resolved_path), data, encoding, delimiter)
+            else:
+                resolved_path.write_text("", encoding=encoding)
+
+        return self._registered_write_result(resolved_path)
 
     def get_workspace_output_files(self) -> Dict[str, Any]:
         """Get output file list from current workspace"""
@@ -940,10 +964,8 @@ def workspace_write_json_file(
         True if the write operation was successful.
     """
     ops = _get_workspace_ops(workspace_id)
-    # Note: The original ops.write_json_file signature uses 'indent', not 'create_dirs' as the 4th arg.
-    # We rely on ops.write_file's default behavior for create_dirs or adjust the call if necessary.
-    # Assuming the internal implementation handles directory creation via write_file.
-    return ops.write_json_file(file_path, data, encoding, indent)
+    result = ops.write_json_file(file_path, data, encoding, indent)
+    return bool(result.get("success", False))
 
 
 def workspace_read_csv_file(
@@ -986,9 +1008,8 @@ def workspace_write_csv_file(
         True if the write operation was successful.
     """
     ops = _get_workspace_ops(workspace_id)
-    # The original ops.write_csv_file signature uses List[Dict[str, str]], not List[List[Any]].
-    # Also, the original signature takes 'delimiter' instead of 'create_dirs' as the last positional arg.
-    return ops.write_csv_file(file_path, data, encoding, delimiter)
+    result = ops.write_csv_file(file_path, data, encoding, delimiter)
+    return bool(result.get("success", False))
 
 
 def workspace_edit_file(

@@ -13,6 +13,7 @@ from xagent.core.tools.core.sql_tool import (
     execute_sql_query,
     get_database_type,
 )
+from xagent.core.workspace import TaskWorkspace
 
 
 class TestGetConnectionUrl:
@@ -184,22 +185,27 @@ class TestExecuteSqlQuery:
         ]
         mock_conn.execute.return_value = mock_result
 
-        # Mock workspace
-        mock_workspace = MagicMock()
-        output_dir = tmp_path / "output"
-        output_dir.mkdir()
-        output_file = output_dir / "test.csv"
-        mock_workspace.resolve_path.return_value = str(output_file)
+        def mock_create_record(self, file_id, file_path, db_session=None):
+            return None
+
+        monkeypatch.setattr(TaskWorkspace, "_create_file_record", mock_create_record)
+        workspace = TaskWorkspace("test_sql_export", str(tmp_path))
 
         result = execute_sql_query(
             "test",
             "SELECT * FROM users",
             output_file="test.csv",
-            workspace=mock_workspace,
+            workspace=workspace,
         )
         assert result["success"] is True
         assert result["row_count"] == 2
         assert "exported" in result["message"].lower()
+        assert isinstance(result.get("file_id"), str)
+        assert result["filename"] == "test.csv"
+        assert result["mime_type"] == "text/csv"
+        assert result["relative_path"] == "output/test.csv"
+        assert result["file_ref"]["file_id"] == result["file_id"]
+        assert (workspace.output_dir / "test.csv").exists()
 
     @patch("xagent.core.tools.core.sql_tool.create_engine")
     def test_execute_sql_query_export_parquet_no_pyarrow(

@@ -36,8 +36,8 @@ vi.mock("dagre", () => {
     nodes = new Map<string, unknown>()
     edges: Array<{ source: string; target: string; data?: unknown }> = []
 
-    setGraph() {}
-    setDefaultEdgeLabel() {}
+    setGraph() { }
+    setDefaultEdgeLabel() { }
     setNode(id: string, data: unknown) {
       if (id === "throw-step") {
         throw new Error("bad node")
@@ -189,6 +189,34 @@ describe("TaskConversationPanel", () => {
 
     expect(screen.getByText("common.loading")).toBeInTheDocument()
     expect(screen.queryByText("Which dataset should I use?")).not.toBeInTheDocument()
+  })
+
+  it("does not surface ordinary agent messages as waiting prompts", () => {
+    appState.messages = []
+    appState.traceEvents = [
+      {
+        event_id: "agent-1",
+        event_type: "agent_message",
+        timestamp: "1000",
+        data: {
+          message: "Hello! What can I help you with?",
+          message_type: "question",
+          expect_response: false,
+        },
+      },
+    ] as any
+    appState.currentTask = {
+      id: "42",
+      title: "Task",
+      description: "Task",
+      status: "waiting_for_user",
+      createdAt: "2026-01-01T00:00:00Z",
+      updatedAt: "2026-01-01T00:00:00Z",
+    } as any
+
+    render(<TaskConversationPanel mode="embedded-preview" />)
+
+    expect(screen.queryByText("Hello! What can I help you with?")).not.toBeInTheDocument()
   })
 
   it("renders trace process events as separate timeline items between messages", () => {

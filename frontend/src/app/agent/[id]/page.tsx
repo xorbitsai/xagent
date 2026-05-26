@@ -1,9 +1,9 @@
 "use client"
 
-import React, { useState, useEffect, useRef } from "react"
+import React, { useState, useEffect } from "react"
 import { useParams, useRouter } from "next/navigation"
-import { apiRequest, getUploadErrorMessage, isJsonRecord, parseApiResponse, UPLOAD_ERROR_MESSAGES } from "@/lib/api-wrapper"
-import { getApiUrl, getUploadApiUrl } from "@/lib/utils"
+import { apiRequest } from "@/lib/api-wrapper"
+import { getApiUrl } from "@/lib/utils"
 import { Button } from "@/components/ui/button"
 import { ArrowLeft, Bot } from "lucide-react"
 import { useI18n } from "@/contexts/i18n-context"
@@ -33,7 +33,7 @@ interface Agent {
 
 export default function AgentChatPage() {
   const { t } = useI18n()
-  const { dispatch, setPendingMessage, setTaskId } = useApp()
+  const { dispatch, sendMessage } = useApp()
   const params = useParams()
   const router = useRouter()
   const agentId = params.id as string
@@ -44,6 +44,10 @@ export default function AgentChatPage() {
   const [isSending, setIsSending] = useState(false)
   const [inputValue, setInputValue] = useState("")
   const [files, setFiles] = useState<File[]>([])
+
+  useEffect(() => {
+    dispatch({ type: "RESET_STATE" })
+  }, [dispatch, agentId])
 
   // Load agent
   useEffect(() => {
@@ -86,82 +90,13 @@ export default function AgentChatPage() {
     setInputValue("")
 
     try {
-      let uploadedFileIds: string[] = []
-
-      // Upload files first if present
-      if (filesToSend && filesToSend.length > 0) {
-        const formData = new FormData()
-        filesToSend.forEach(f => formData.append('files', f))
-        formData.append('task_type', 'task')
-
-        try {
-          const uploadResponse = await apiRequest(`${getUploadApiUrl()}/api/files/upload`, {
-            method: 'POST',
-            body: formData
-          })
-
-          const parsed = await parseApiResponse(uploadResponse)
-
-          if (uploadResponse.ok && isJsonRecord(parsed.data)) {
-            const uploadData = parsed.data
-            if (uploadData.success && Array.isArray(uploadData.files)) {
-              uploadedFileIds = uploadData.files
-                .filter((f): f is { file_id: string } => isJsonRecord(f) && typeof f.file_id === 'string')
-                .map(f => f.file_id)
-            }
-          } else {
-            throw new Error(getUploadErrorMessage(uploadResponse, parsed, {
-              generic: t("files.uploadFailed") || "Upload failed",
-              ...UPLOAD_ERROR_MESSAGES,
-            }))
-          }
-        } catch (e) {
-          console.error('Error uploading files before task creation:', e)
-          throw e
-        }
+      const parsedAgentId = parseInt(agentId, 10)
+      if (Number.isNaN(parsedAgentId)) {
+        throw new Error(t('builds.list.chat.notFound'))
       }
 
-      const requestBody: any = {
-        title: content,
-        description: content,
-        agent_id: parseInt(agentId),
-      }
-
-      if (uploadedFileIds.length > 0) {
-        requestBody.files = uploadedFileIds
-      }
-
-      // Create task with agent_id
-      // Backend will automatically fetch agent's model configuration from database
-      const taskResponse = await apiRequest(`${getApiUrl()}/api/chat/task/create`, {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-        },
-        body: JSON.stringify(requestBody),
-      })
-
-      if (taskResponse.ok) {
-        const taskData = await taskResponse.json()
-        const taskId = taskData.id || taskData.task_id
-
-        if (taskId) {
-          dispatch({ type: "TRIGGER_TASK_UPDATE" })
-          // Set pending message and empty files since they are already uploaded
-          setPendingMessage({
-            message: content,
-            files: [],
-            targetTaskId: typeof taskId === 'string' ? parseInt(taskId) : taskId
-          })
-
-          // Use setTaskId to trigger context update and redirect
-          setTaskId(typeof taskId === 'string' ? parseInt(taskId) : taskId)
-          return
-        }
-      } else {
-        const errorData = await taskResponse.json()
-        toast.error(t('builds.list.chat.error', { message: errorData.detail || t('builds.list.chat.sendFailed') }))
-      }
+      await sendMessage(content, { agentId: parsedAgentId }, filesToSend)
+      setFiles([])
     } catch (err) {
       console.error("Failed to send message:", err)
       toast.error(err instanceof Error ? err.message : t('builds.list.chat.sendFailed'))

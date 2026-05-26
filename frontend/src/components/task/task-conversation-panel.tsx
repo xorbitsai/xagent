@@ -79,7 +79,7 @@ const findWaitingPrompt = (currentTask: any, traceEvents: any[]) => {
   for (let i = traceEvents.length - 1; i >= 0; i--) {
     const event = traceEvents[i]
     if (event.event_type === "agent_message") {
-      const expectsResponse = event.data?.expect_response === true || event.data?.message_type === "question"
+      const expectsResponse = event.data?.expect_response === true
       const message = event.data?.message || event.data?.content
       if (expectsResponse && typeof message === "string" && message.trim()) {
         return message
@@ -107,7 +107,7 @@ const findWaitingInteractions = (currentTask: any, traceEvents: any[]) => {
   for (let i = traceEvents.length - 1; i >= 0; i--) {
     const event = traceEvents[i]
     if (event.event_type === "agent_message") {
-      const expectsResponse = event.data?.expect_response === true || event.data?.message_type === "question"
+      const expectsResponse = event.data?.expect_response === true
       const interactions = event.data?.metadata?.interactions
       if (expectsResponse && Array.isArray(interactions) && interactions.length > 0) {
         return interactions
@@ -274,7 +274,7 @@ export function TaskConversationPanel({
       (a, b) =>
         a.timestamp - b.timestamp ||
         (a.timelineOrder ?? Number.MAX_SAFE_INTEGER) -
-          (b.timelineOrder ?? Number.MAX_SAFE_INTEGER)
+        (b.timelineOrder ?? Number.MAX_SAFE_INTEGER)
     )
     return items
   }, [

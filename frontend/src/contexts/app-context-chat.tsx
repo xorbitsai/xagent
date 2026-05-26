@@ -115,6 +115,72 @@ const dispatchAutoOpenPreview = (
   })
 }
 
+const OPTIMISTIC_USER_MESSAGE_PREFIX = "msg-user-optimistic"
+const USER_MESSAGE_REPLACE_WINDOW_MS = 30000
+
+const extractTextFromReactNode = (node: React.ReactNode): string => {
+  if (typeof node === 'string') return node
+  if (typeof node === 'number') return node.toString()
+  if (Array.isArray(node)) return node.map(extractTextFromReactNode).join('')
+  if (React.isValidElement(node) && node.props.children) {
+    return extractTextFromReactNode(node.props.children)
+  }
+  return ''
+}
+
+const normalizeMessageContent = (content: string | React.ReactNode): string => {
+  if (typeof content === 'string') {
+    return content.trim()
+  }
+  if (React.isValidElement(content) || Array.isArray(content)) {
+    return extractTextFromReactNode(content).trim()
+  }
+  return ''
+}
+
+const findOptimisticUserMessageIndex = (
+  messages: Message[],
+  incomingMessage: Message,
+): number => {
+  if (incomingMessage.role !== "user") {
+    return -1
+  }
+
+  const normalizedIncomingContent = normalizeMessageContent(incomingMessage.content)
+  if (!normalizedIncomingContent) {
+    return -1
+  }
+
+  const incomingTimestamp = normalizeTimestampMs(incomingMessage.timestamp)
+
+  for (let index = messages.length - 1; index >= 0; index -= 1) {
+    const existingMessage = messages[index]
+    if (
+      existingMessage.role !== "user" ||
+      !existingMessage.id.startsWith(OPTIMISTIC_USER_MESSAGE_PREFIX)
+    ) {
+      continue
+    }
+
+    if (normalizeMessageContent(existingMessage.content) !== normalizedIncomingContent) {
+      continue
+    }
+
+    const existingTimestamp = normalizeTimestampMs(existingMessage.timestamp)
+    if (
+      Number.isFinite(existingTimestamp) &&
+      Number.isFinite(incomingTimestamp) &&
+      Math.abs(incomingTimestamp - existingTimestamp) > USER_MESSAGE_REPLACE_WINDOW_MS
+    ) {
+      continue
+    }
+
+    return index
+  }
+
+  return -1
+}
+
 // Function to clear duplicate message cache
 const clearDuplicateMessageCache = () => {
   recentMessages.clear()
@@ -134,25 +200,7 @@ let isHistoricalDataLoading = false
 // Store pending task info for auto-execution after historical data loads
 let pendingTaskToExecute: { description: string } | null = null
 const isDuplicateMessage = (content: string | React.ReactNode, type: string = 'general', force: boolean = false, shouldCache: boolean = true) => {
-  // Convert React element to string representation for comparison
-  let contentStr: string
-  if (typeof content === 'string') {
-    contentStr = content.trim()
-  } else if (React.isValidElement(content)) {
-    // For React elements, extract text content more comprehensively
-    const extractTextFromReactNode = (node: React.ReactNode): string => {
-      if (typeof node === 'string') return node
-      if (typeof node === 'number') return node.toString()
-      if (Array.isArray(node)) return node.map(extractTextFromReactNode).join('')
-      if (React.isValidElement(node) && node.props.children) {
-        return extractTextFromReactNode(node.props.children)
-      }
-      return ''
-    }
-    contentStr = extractTextFromReactNode(content).trim()
-  } else {
-    contentStr = ''
-  }
+  const contentStr = normalizeMessageContent(content)
 
   const key = `${type}:${contentStr}`
   if (!force && recentMessages.has(key)) {
@@ -565,6 +613,26 @@ function appReducer(state: AppState, action: AppAction): AppState {
             return replaceMessageAt(streamingIndex)
           }
         }
+      }
+
+      const optimisticUserMessageIndex = findOptimisticUserMessageIndex(
+        state.messages,
+        messageToAdd,
+      )
+      if (optimisticUserMessageIndex >= 0) {
+        const updatedMessages = state.messages.map((message, index) =>
+          index === optimisticUserMessageIndex
+            ? {
+              ...message,
+              ...messageToAdd,
+              id: message.id,
+            }
+            : message
+        )
+        updatedMessages.sort((a, b) => {
+          return normalizeTimestampMs(a.timestamp) - normalizeTimestampMs(b.timestamp)
+        })
+        return { ...state, messages: updatedMessages, traceEvents: newTraceEvents }
       }
 
       const updatedMessages = [...state.messages, messageToAdd]
@@ -1416,8 +1484,7 @@ export function AppProvider({ children, token }: { children: React.ReactNode; to
             const interactions = normalizeInteractions(eventData.metadata?.interactions)
             const expectsResponse =
               eventType === "agent_message" &&
-              (eventData.expect_response === true ||
-                eventData.message_type === "question")
+              eventData.expect_response === true
             const agentMessageDisplay = eventData.display || eventData.metadata?.display
             const isExplicitTranscriptMessage =
               agentMessageDisplay === "chat" ||
@@ -1454,6 +1521,9 @@ export function AppProvider({ children, token }: { children: React.ReactNode; to
               eventType === "ai_message"
                 ? getFinalAnswerStreamMessageId(eventData)
                 : undefined
+            if (eventType === "agent_message" && !expectsResponse) {
+              return
+            }
             if (!streamMessageId && isDuplicateMessage(messageContent, 'agent-message')) {
               return
             }

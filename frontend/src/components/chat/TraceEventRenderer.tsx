@@ -94,19 +94,19 @@ interface StepAction {
   title: string;
   status: 'running' | 'completed' | 'failed';
   timestamp: number;
-    data: {
-      model?: string;
-      tool?: string;
-      args?: any;
-      code?: string;
-      output?: any;
-      artifacts?: ToolArtifact[];
-      reasoning?: string;
-      assistant_content?: string;
-      error?: any;
-      tool_calls?: any;
-      sandboxed?: boolean;
-      inline?: boolean;
+  data: {
+    model?: string;
+    tool?: string;
+    args?: any;
+    code?: string;
+    output?: any;
+    artifacts?: ToolArtifact[];
+    reasoning?: string;
+    assistant_content?: string;
+    error?: any;
+    tool_calls?: any;
+    sandboxed?: boolean;
+    inline?: boolean;
   };
 }
 
@@ -140,33 +140,6 @@ interface ProcessedStep {
 interface TraceEventRendererProps {
   events: TraceEvent[];
 }
-
-const getWaitingQuestionFromEvents = (events: TraceEvent[]): string | null => {
-  for (let i = events.length - 1; i >= 0; i--) {
-    const event = events[i];
-    if (event.event_type === 'agent_message') {
-      const expectsResponse = event.data?.expect_response === true || event.data?.message_type === 'question';
-      if (!expectsResponse) {
-        continue;
-      }
-      const message = event.data?.message || event.data?.content;
-      if (typeof message === 'string' && message.trim()) {
-        return message;
-      }
-    }
-    if (event.event_type === 'react_task_end') {
-      const result = event.data?.result as any;
-      if (
-        result?.status === 'waiting_for_user' &&
-        typeof result.message === 'string' &&
-        result.message.trim()
-      ) {
-        return result.message;
-      }
-    }
-  }
-  return null;
-};
 
 const isAgentProgressEvent = (event: TraceEvent): boolean => (
   event.event_type === 'agent_progress' ||
@@ -409,8 +382,8 @@ function useProcessedSteps(events: TraceEvent[]): ProcessedStep[] {
         step.output = output;
         const artifacts =
           typeof result === 'object' &&
-          result !== null &&
-          Array.isArray(result.artifacts)
+            result !== null &&
+            Array.isArray(result.artifacts)
             ? result.artifacts
             : undefined;
 
@@ -1242,23 +1215,6 @@ export function TraceEventRenderer({ events }: TraceEventRendererProps) {
 
     dispatch({ type: "SET_FILE_PREVIEW_CONTENT", payload: { content, error: null } });
   }, [openFilePreview, dispatch, t]);
-
-  if (steps.length === 0 && !skillSelection) {
-    const waitingQuestion = getWaitingQuestionFromEvents(events);
-    if (!waitingQuestion) {
-      return null;
-    }
-    return (
-      <div className="space-y-3">
-        <div className="flex items-start gap-2">
-          <CheckCircle2 className="w-5 h-5 text-green-500 mt-0.5" />
-          <div className="text-sm leading-relaxed text-foreground">
-            <MarkdownRenderer content={waitingQuestion} />
-          </div>
-        </div>
-      </div>
-    );
-  }
 
   return (
     <div className="space-y-4">

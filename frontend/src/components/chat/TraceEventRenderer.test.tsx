@@ -64,6 +64,48 @@ describe("TraceEventRenderer", () => {
     vi.restoreAllMocks()
   })
 
+  it("does not render a waiting question for ordinary agent messages", () => {
+    const { container } = render(
+      <TraceEventRenderer
+        events={[
+          {
+            event_id: "agent-1",
+            event_type: "agent_message",
+            timestamp: Date.now(),
+            data: {
+              message: "Hello! What can I help you with?",
+              message_type: "question",
+              expect_response: false,
+            },
+          },
+        ]}
+      />,
+    )
+
+    expect(container).toBeEmptyDOMElement()
+  })
+
+  it("renders a waiting question only when expect_response is true", () => {
+    render(
+      <TraceEventRenderer
+        events={[
+          {
+            event_id: "agent-1",
+            event_type: "agent_message",
+            timestamp: Date.now(),
+            data: {
+              message: "Please choose a dataset",
+              message_type: "question",
+              expect_response: true,
+            },
+          },
+        ]}
+      />,
+    )
+
+    expect(screen.getByText("Please choose a dataset")).toBeInTheDocument()
+  })
+
   it("renders image artifacts inline from tool results", async () => {
     render(
       <TraceEventRenderer

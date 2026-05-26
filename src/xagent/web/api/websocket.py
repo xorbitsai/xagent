@@ -1515,11 +1515,11 @@ async def execute_task_background(
 async def execute_resume_background(
     task_id: int,
     agent_service: Any,
-    user: Any,
-    task: Any,
+    user_id: int | None,
     previous_task: Optional[asyncio.Task] = None,
 ) -> None:
     """Resume an agent execution after an interrupt/user-message checkpoint."""
+    from ..models.agent import Agent
     from ..models.database import get_db
     from ..models.task import Task, TaskStatus
 
@@ -1531,7 +1531,13 @@ async def execute_resume_background(
     normalized_outputs: list[Dict[str, str]] = []
     output = ""
     success = False
-    final_status = getattr(task.status, "value", str(task.status))
+    final_status = TaskStatus.RUNNING.value
+    task_title: str | None = None
+    task_description: str | None = None
+    task_execution_mode: str | None = None
+    task_agent_id: int | None = None
+    agent_name: str | None = None
+    agent_logo_url: str | None = None
     try:
         if previous_task is not None and not previous_task.done():
             try:
@@ -1563,7 +1569,6 @@ async def execute_resume_background(
             run_task_lease_heartbeat(lease, lease_stop_event)
         )
 
-        user_id = int(user.id) if user else None
         with UserContext(user_id):
             result = await agent_service.resume_execution_by_id(str(task_id))
 
@@ -1575,7 +1580,7 @@ async def execute_resume_background(
         success = bool(result.get("success", False))
         output = str(result.get("output") or result.get("error") or "")
 
-        if _task_user_id(task) is not None:
+        if user_id is not None:
             db_gen = get_db()
             db_normalize = next(db_gen)
             try:
@@ -1599,6 +1604,19 @@ async def execute_resume_background(
         try:
             task_updated = db_new.query(Task).filter(Task.id == task_id).first()
             if task_updated:
+                task_title = cast(Any, task_updated.title)
+                task_description = cast(Any, task_updated.description)
+                task_execution_mode = cast(Any, task_updated.execution_mode)
+                task_agent_id = cast(Any, task_updated.agent_id)
+                if task_updated.agent_id is not None:
+                    agent = (
+                        db_new.query(Agent)
+                        .filter(Agent.id == task_updated.agent_id)
+                        .first()
+                    )
+                    if agent is not None:
+                        agent_name = cast(Any, agent.name)
+                        agent_logo_url = cast(Any, agent.logo_url)
                 if status == "waiting_for_user":
                     final_task_status = TaskStatus.WAITING_FOR_USER
                 elif status == "interrupted":
@@ -1612,8 +1630,6 @@ async def execute_resume_background(
                 )
                 db_new.refresh(task_updated)
                 final_status = task_updated.status.value
-            else:
-                final_status = task.status.value
         finally:
             db_new.close()
 
@@ -1623,18 +1639,14 @@ async def execute_resume_background(
                     "task_info",
                     task_id,
                     {
-                        "id": task.id,
-                        "title": task.title,
-                        "description": task.description,
+                        "id": task_id,
+                        "title": task_title,
+                        "description": task_description,
                         "status": final_status,
-                        "execution_mode": task.execution_mode,
-                        "agent_id": task.agent_id,
-                        "agent_name": task.agent.name
-                        if getattr(task, "agent", None)
-                        else None,
-                        "agent_logo_url": task.agent.logo_url
-                        if getattr(task, "agent", None)
-                        else None,
+                        "execution_mode": task_execution_mode,
+                        "agent_id": task_agent_id,
+                        "agent_name": agent_name,
+                        "agent_logo_url": agent_logo_url,
                     },
                 ),
                 task_id,
@@ -1645,10 +1657,10 @@ async def execute_resume_background(
             {
                 "type": "task_completed",
                 "task": {
-                    "id": task.id,
-                    "title": task.title,
+                    "id": task_id,
+                    "title": task_title,
                     "status": final_status,
-                    "description": task.description,
+                    "description": task_description,
                 },
                 "result": output,
                 "output": output,
@@ -2652,8 +2664,7 @@ async def handle_chat_message(
                         execute_resume_background(
                             task_id=task_id,
                             agent_service=agent_service,
-                            user=user,
-                            task=task,
+                            user_id=int(user.id),
                             previous_task=previous_task,
                         )
                     )
@@ -3924,8 +3935,7 @@ async def handle_resume_task(
                 execute_resume_background(
                     task_id=task_id,
                     agent_service=agent_service,
-                    user=user,
-                    task=task,
+                    user_id=int(user.id),
                     previous_task=previous_task,
                 )
             )

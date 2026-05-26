@@ -1218,6 +1218,32 @@ class TestFileManagement:
             # If upload failed, skip download test
             pytest.skip("Upload failed, skipping download test")
 
+    def test_download_file_supports_unicode_filename(
+        self, client, test_db, temp_uploads_dir, auth_headers
+    ):
+        """Download should succeed for Unicode filenames."""
+        filename = "中文报告.txt"
+        upload_response = client.post(
+            "/api/files/upload",
+            files={"file": (filename, b"hello unicode", "text/plain")},
+            data={"task_type": "general"},
+            headers=auth_headers,
+        )
+
+        if upload_response.status_code != 200:
+            pytest.skip("Upload failed, skipping unicode download test")
+
+        file_id = upload_response.json().get("file_id")
+        assert file_id, "upload response should include file_id"
+
+        response = client.get(f"/api/files/download/{file_id}", headers=auth_headers)
+
+        assert response.status_code == 200
+        assert response.content == b"hello unicode"
+        content_disposition = response.headers["content-disposition"]
+        assert content_disposition.startswith("inline;")
+        assert "filename*=utf-8''" in content_disposition.lower()
+
     def test_download_file_not_found(self, client, test_db, auth_headers):
         """Test downloading non-existent file"""
         response = client.get(

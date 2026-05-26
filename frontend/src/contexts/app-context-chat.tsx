@@ -36,7 +36,7 @@ export interface Interaction {
 import { useWebSocket } from "@/hooks/use-websocket"
 import { useAuth } from "@/contexts/auth-context"
 import { getApiUrl, getUploadApiUrl, shouldAutoOpenTaskPreview } from "@/lib/utils"
-import { apiRequest, getUploadErrorMessage, isJsonRecord, parseApiResponse, UPLOAD_ERROR_MESSAGES } from "@/lib/api-wrapper"
+import { apiRequest, getApiErrorMessage, getUploadErrorMessage, isJsonRecord, parseApiResponse, UPLOAD_ERROR_MESSAGES } from "@/lib/api-wrapper"
 import { useI18n } from "@/contexts/i18n-context"
 import { normalizeTimestampMs } from "@/lib/time-utils"
 import { unwrapFinalAnswerContent } from "@/lib/final-answer"
@@ -132,6 +132,9 @@ const normalizeMessageContent = (content: string | React.ReactNode): string => {
   if (typeof content === 'string') {
     return content.trim()
   }
+  if (typeof content === 'number') {
+    return content.toString()
+  }
   if (React.isValidElement(content) || Array.isArray(content)) {
     return extractTextFromReactNode(content).trim()
   }
@@ -157,6 +160,7 @@ const findOptimisticUserMessageIndex = (
     const existingMessage = messages[index]
     if (
       existingMessage.role !== "user" ||
+      typeof existingMessage.id !== "string" ||
       !existingMessage.id.startsWith(OPTIMISTIC_USER_MESSAGE_PREFIX)
     ) {
       continue
@@ -4095,12 +4099,18 @@ export function AppProvider({ children, token }: { children: React.ReactNode; to
             })
           }
         } else {
-          console.error('Failed to create task:', response.statusText)
-          return
+          const parsed = await parseApiResponse(response)
+          const errorMessage = getApiErrorMessage(
+            response,
+            parsed,
+            t("builds.list.chat.sendFailed") || "Failed to create task",
+          )
+          console.error('Failed to create task:', errorMessage)
+          throw new Error(errorMessage)
         }
       } catch (error) {
         console.error('Error creating task:', error)
-        return
+        throw error
       }
     }
 

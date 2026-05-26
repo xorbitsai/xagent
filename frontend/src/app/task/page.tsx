@@ -11,6 +11,7 @@ import { apiRequest } from "@/lib/api-wrapper";
 import { getApiUrl } from "@/lib/utils";
 import { findRunnableAgentById } from "@/lib/agent-ui-access";
 import { useSearchParams } from "next/navigation";
+import { toast } from "sonner";
 
 function TaskHomePageContent() {
   const { t } = useI18n();
@@ -198,14 +199,18 @@ function TaskHomePageContent() {
       agentId: Number.isNaN(selectedAgentId) ? undefined : selectedAgentId,
     };
 
-    // Use sendMessage from AppContext - it will create task and send files via WebSocket
-    await sendMessage(message, nextConfig, filesToSend || files);
+    try {
+      // Use sendMessage from AppContext - it will create task and send files via WebSocket
+      await sendMessage(message, nextConfig, filesToSend || files);
 
-    // Clear files after sending
-    setFiles([]);
-    setInputValue("");
-    setPromptHighlightTerms([]);
-    setSelectedAgents([]);
+      setFiles([]);
+      setInputValue("");
+      setPromptHighlightTerms([]);
+      setSelectedAgents([]);
+    } catch (error) {
+      console.error("Failed to send message:", error);
+      toast.error(error instanceof Error ? error.message : t("builds.list.chat.sendFailed"));
+    }
   };
 
   const handlePromptSelect = (prompt: string, highlights?: string[]) => {

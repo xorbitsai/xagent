@@ -87,7 +87,6 @@ export default function AgentChatPage() {
 
   const handleSendMessage = async (content: string, filesToSend: File[]) => {
     setIsSending(true)
-    setInputValue("")
 
     try {
       const parsedAgentId = parseInt(agentId, 10)
@@ -96,6 +95,7 @@ export default function AgentChatPage() {
       }
 
       await sendMessage(content, { agentId: parsedAgentId }, filesToSend)
+      setInputValue("")
       setFiles([])
     } catch (err) {
       console.error("Failed to send message:", err)

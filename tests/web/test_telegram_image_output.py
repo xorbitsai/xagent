@@ -131,25 +131,20 @@ async def test_send_output_files_uploads_documents(tmp_path) -> None:
     assert reply.documents[0][1] == "report.csv"
 
 
-def test_telegram_refs_from_file_outputs_classifies_structured_outputs() -> None:
+def test_extract_telegram_output_refs_uses_final_answer_links_only() -> None:
     bot = object.__new__(TelegramBotInstance)
 
-    image_refs, file_refs = bot._telegram_refs_from_file_outputs(
-        [
-            {
-                "file_id": "image-1",
-                "filename": "plot.png",
-                "mime_type": "image/png",
-            },
-            {
-                "file_id": "file-1",
-                "filename": "report.csv",
-                "mime_type": "text/csv",
-            },
-            {"file_id": "", "filename": "ignored.txt"},
-        ]
+    assert bot._extract_telegram_output_refs(None) == ("", [], [])
+    assert bot._extract_telegram_output_refs("") == ("", [], [])
+
+    cleaned, image_refs, file_refs = bot._extract_telegram_output_refs(
+        "Final files:\n"
+        "- [report.csv](file:file-1)\n"
+        "- [draft.csv](https://example.com/draft.csv)\n"
+        "![plot.png](file:image-1)"
     )
 
+    assert cleaned == "Final files:\n- [draft.csv](https://example.com/draft.csv)"
     assert [(ref.file_id, ref.alt_text) for ref in image_refs] == [
         ("image-1", "plot.png")
     ]

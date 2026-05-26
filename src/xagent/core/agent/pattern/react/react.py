@@ -1134,11 +1134,13 @@ class ReActPattern(AgentPattern):
                     )
                 )
                 if requested_decision:
-                    self.pending_tool_calls = []
                     successful_tool_result = False
-                    return None
 
-        if self.finalize_after_tool_result and successful_tool_result:
+        if (
+            self.finalize_after_tool_result
+            and successful_tool_result
+            and not self.repeated_tool_decision
+        ):
             self.force_final_answer_next = True
         return None
 
@@ -1149,6 +1151,9 @@ class ReActPattern(AgentPattern):
         context: Any,
         runtime: PatternRuntime,
     ) -> bool:
+        if self.repeated_tool_decision is not None:
+            return False
+
         metadata = self._repeated_tool_call_metadata(tool_call)
         if metadata is None:
             return False

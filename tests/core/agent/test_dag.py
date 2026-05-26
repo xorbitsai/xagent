@@ -469,6 +469,89 @@ async def test_dag_pattern_streams_overall_completion_not_step_result() -> None:
 
 
 @pytest.mark.asyncio
+async def test_dag_child_react_repeated_decision_can_finalize() -> None:
+    class RepeatedDecisionLLM:
+        def __init__(self) -> None:
+            self.calls: list[dict[str, Any]] = []
+            self.tool_call_count = 0
+
+        async def chat(self, **kwargs: Any) -> dict[str, Any]:
+            self.calls.append(kwargs)
+            if has_tool(kwargs, DAG_COMPLETION_TOOL_NAME):
+                return default_completion_assessment_response(kwargs)
+            if has_tool(kwargs, "react_decision"):
+                return {
+                    "content": "",
+                    "tool_calls": [
+                        {
+                            "id": "decision_1",
+                            "function": {
+                                "name": "react_decision",
+                                "arguments": json.dumps(
+                                    {
+                                        "action": "final_answer",
+                                        "reason": "Enough repeated tool results.",
+                                        "answer": "DAG child answer.",
+                                    }
+                                ),
+                            },
+                        }
+                    ],
+                }
+
+            self.tool_call_count += 1
+            if self.tool_call_count > 4:
+                raise AssertionError(
+                    "expected repeated decision before another tool call"
+                )
+            return {
+                "content": "",
+                "tool_calls": [
+                    {
+                        "id": f"calc_{self.tool_call_count}",
+                        "function": {
+                            "name": "calculator",
+                            "arguments": json.dumps(
+                                {"expression": f"{self.tool_call_count}+1"}
+                            ),
+                        },
+                    }
+                ],
+            }
+
+    llm = RepeatedDecisionLLM()
+    pattern = DAGPattern(
+        lambda **_: build_plan(
+            PlanStep(
+                id="calculate",
+                task="Calculate repeatedly",
+                tool_names=["calculator"],
+            )
+        ),
+        react_max_iterations=6,
+    )
+    context = ExecutionContext(execution_id="dag-repeated-decision")
+    context.add_user_message("Use DAG and calculate.")
+    tool = FakeTool()
+    outbound = OutboundCollector()
+    runtime = PatternRuntime(
+        execution_id="dag-repeated-decision",
+        outbound_message_handler=outbound,
+    )
+
+    result = await pattern.run(context=context, tools=[tool], llm=llm, runtime=runtime)
+
+    assert result["success"] is True
+    assert result["output"] == "DAG child answer."
+    assert len(tool.calls) == 4
+    assert [event["type"] for event in outbound.events] == [
+        "final_answer_start",
+        "final_answer_delta",
+        "final_answer_end",
+    ]
+
+
+@pytest.mark.asyncio
 async def test_dag_completion_assessment_replans_when_goal_incomplete() -> None:
     class CompletionReplanGenerator(PlanGenerator):
         def __init__(self) -> None:

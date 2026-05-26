@@ -836,6 +836,71 @@ async def test_react_pattern_uses_decision_for_repeated_tools() -> None:
 
 
 @pytest.mark.asyncio
+async def test_react_repeated_decision_drains_current_tool_call_batch() -> None:
+    llm = FakeLLM(
+        responses=[
+            {
+                "content": "",
+                "tool_calls": [
+                    {
+                        "id": "search_1",
+                        "function": {
+                            "name": "zhipu_web_search",
+                            "arguments": '{"query":"AI news May 2026","count":10}',
+                        },
+                    },
+                    {
+                        "id": "search_2",
+                        "function": {
+                            "name": "zhipu_web_search",
+                            "arguments": '{"query":"OpenAI news May 2026","count":5}',
+                        },
+                    },
+                ],
+            },
+            {
+                "content": "",
+                "tool_calls": [
+                    {
+                        "id": "decision_1",
+                        "function": {
+                            "name": "react_decision",
+                            "arguments": (
+                                '{"action":"final_answer",'
+                                '"reason":"The current batch is enough.",'
+                                '"answer":"Both pending searches were executed."}'
+                            ),
+                        },
+                    }
+                ],
+            },
+        ]
+    )
+    pattern = ReActPattern(
+        max_iterations=3,
+        repeated_tool_decision_after_consecutive_tool_calls=1,
+    )
+    tool = FakeSearchTool()
+    context = ExecutionContext()
+    context.add_user_message("最近 AI 新闻")
+
+    result = await pattern.run(context=context, tools=[tool], llm=llm)
+
+    assert result["success"] is True
+    assert result["response"] == "Both pending searches were executed."
+    assert len(tool.calls) == 2
+    assert len(llm.calls) == 2
+    tool_result_ids = [
+        message.tool_call_id for message in context.messages if message.role == "tool"
+    ]
+    assert tool_result_ids[-2:] == ["search_1", "search_2"]
+    assert [schema["function"]["name"] for schema in llm.calls[1]["tools"]] == [
+        "react_decision"
+    ]
+    assert pattern.pending_tool_calls == []
+
+
+@pytest.mark.asyncio
 async def test_react_pattern_accepts_legacy_auto_reroute_kwarg() -> None:
     llm = FakeLLM(
         responses=[

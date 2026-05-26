@@ -93,6 +93,18 @@ class _DAGStepRuntime:
     async def stream_final_answer(self, llm: Any, **kwargs: Any) -> Any:
         return await self.parent.run_llm_call(llm, **kwargs)
 
+    async def start_final_answer_stream(self) -> str | None:
+        return None
+
+    async def emit_final_answer_delta(self, message_id: str, delta: str) -> None:
+        del message_id, delta
+
+    async def end_final_answer_stream(self, message_id: str, content: str) -> None:
+        del message_id, content
+
+    async def fail_final_answer_stream(self, message_id: str, error: str) -> None:
+        del message_id, error
+
     async def send_message(
         self,
         *,

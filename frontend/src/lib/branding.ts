@@ -13,7 +13,7 @@ export interface BrandingConfig {
 
 export const defaultBranding: BrandingConfig = {
   appName: 'Xagent',
-  logoPath: '/xagent_logo.svg',
+  logoPath: '/xagent_logo.png',
   whiteLogoPath: '/xagent_white_logo.png',
   logoAlt: 'Xagent Logo',
   subtitle: 'Next generation agent operating system',

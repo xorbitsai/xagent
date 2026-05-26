@@ -167,7 +167,7 @@ const LOCAL_PROVIDER_CONFIGS: Record<string, Partial<ProviderConfig>> = {
     defaultBaseUrl: "https://api.anthropic.com/v1",
   },
   xinference: {
-    icon: <img src="/xagent_logo.svg" alt="Xinference" className="w-6 h-6" />,
+    icon: <img src="/xagent_logo.png" alt="Xinference" className="w-6 h-6" />,
     category: ["llm", "embedding", "image", "speech"],
     defaultBaseUrl: "http://localhost:9997",
   },

@@ -551,6 +551,108 @@ def _pptx_text_preview(path: Path) -> str:
     return "\n\n".join(blocks)
 
 
+def _pptx_pdf_cache_path(pptx_path: Path) -> Path:
+    """Return the on-disk cache path for a converted PDF preview.
+
+    Caches sit beside the original .pptx with a ``.preview.pdf`` suffix so
+    they're cleaned up automatically when the source file is deleted (e.g.
+    by ``uploaded_files_reconcile`` for orphans). Re-converts when the
+    cache is missing or older than the source.
+    """
+    return pptx_path.with_suffix(pptx_path.suffix + ".preview.pdf")
+
+
+async def _convert_pptx_to_pdf(pptx_path: Path) -> Optional[Path]:
+    """Convert a .pptx to PDF via LibreOffice with on-disk caching.
+
+    Returns the path to the cached PDF on success, or ``None`` when soffice
+    isn't available / conversion failed. The caller decides whether to
+    surface a 503 (so the frontend can fall back) or just keep going.
+
+    The fact that this can return ``None`` is the whole point of the
+    preview-pdf endpoint: on developer machines without LibreOffice we
+    don't break the UX — we let the frontend fall back to its canvas
+    renderer. Production images (Docker) pre-install libreoffice so this
+    path always succeeds there.
+    """
+    if pptx_path.suffix.lower() != ".pptx":
+        return None
+
+    cache_path = _pptx_pdf_cache_path(pptx_path)
+    try:
+        if (
+            cache_path.exists()
+            and cache_path.stat().st_mtime >= pptx_path.stat().st_mtime
+        ):
+            return cache_path
+    except OSError:
+        pass
+
+    import tempfile
+
+    try:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            proc = await asyncio.create_subprocess_exec(
+                "soffice",
+                "--headless",
+                "--convert-to",
+                "pdf",
+                "--outdir",
+                temp_dir,
+                str(pptx_path),
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            try:
+                _, stderr = await asyncio.wait_for(proc.communicate(), timeout=60)
+            except asyncio.TimeoutError:
+                proc.kill()
+                await proc.wait()
+                logger.warning(
+                    "pptx→pdf conversion timed out for %s", pptx_path
+                )
+                return None
+            if proc.returncode != 0:
+                logger.warning(
+                    "soffice exited %s for %s: %s",
+                    proc.returncode,
+                    pptx_path,
+                    stderr.decode("utf-8", "replace")[:200],
+                )
+                return None
+            pdf_files = list(Path(temp_dir).glob("*.pdf"))
+            if not pdf_files:
+                return None
+            # Atomic move into cache so partial reads can't race a half-written file.
+            tmp_dest = cache_path.with_suffix(cache_path.suffix + ".tmp")
+            try:
+                pdf_files[0].replace(tmp_dest)
+                tmp_dest.replace(cache_path)
+            except OSError as exc:
+                logger.warning(
+                    "Failed to cache pptx preview PDF at %s: %s", cache_path, exc
+                )
+                # Even if we can't cache, return the temp file's contents to
+                # the caller — but we can't, the tempdir is about to vanish.
+                # Best effort: try a direct read+write copy.
+                try:
+                    cache_path.write_bytes(pdf_files[0].read_bytes())
+                except OSError:
+                    return None
+            return cache_path
+    except FileNotFoundError:
+        # soffice binary is missing — this is the expected "fallback" path
+        # on developer machines. Log once at INFO so it doesn't spam.
+        logger.info(
+            "soffice not on PATH; .pptx PDF previews will fall back to "
+            "client-side rendering"
+        )
+        return None
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("pptx→pdf conversion failed for %s: %s", pptx_path, exc)
+        return None
+
+
 @file_router.post("/upload")
 async def upload_file(
     file: UploadFile | None = File(None),
@@ -991,6 +1093,56 @@ async def preview_file(
         path=str(full_path),
         filename=file_name,
         media_type=media_type,
+        headers={"Content-Disposition": "inline"},
+    )
+
+
+@file_router.get("/preview-pdf/{file_id:path}", response_model=None)
+async def preview_pptx_as_pdf(
+    file_id: str,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> Any:
+    """Return a PDF rendering of a .pptx for high-fidelity in-browser preview.
+
+    The frontend hits this endpoint first; if it succeeds it shows the PDF
+    in an ``<iframe>`` (vector, text-selectable, perfect font metrics).
+    On a 503 response — meaning the server doesn't have LibreOffice on
+    PATH — the frontend falls back to the existing ``pptxviewjs`` canvas
+    renderer so the UX still works on developer machines without soffice
+    installed.
+    """
+    file_record, full_path, owner_user_id = _resolve_file_path(
+        db, file_id, _user_id_value(user)
+    )
+    if file_record:
+        _check_file_access(file_record, user)
+        file_name = str(file_record.filename)
+    else:
+        if owner_user_id != _user_id_value(user) and not _is_admin_user(user):
+            raise HTTPException(status_code=403, detail="Access denied")
+        file_name = full_path.name
+    _ensure_under_uploads(full_path, owner_user_id)
+    if not full_path.exists():
+        raise HTTPException(status_code=404, detail="File not found")
+    if full_path.suffix.lower() != ".pptx":
+        raise HTTPException(
+            status_code=400, detail="preview-pdf only supports .pptx files"
+        )
+
+    pdf_path = await _convert_pptx_to_pdf(full_path)
+    if pdf_path is None:
+        # Distinct 503 lets the frontend fall back gracefully instead of
+        # showing an error banner.
+        raise HTTPException(
+            status_code=503,
+            detail="LibreOffice unavailable; client should fall back to canvas renderer",
+        )
+
+    return FileResponse(
+        path=str(pdf_path),
+        filename=Path(file_name).stem + ".pdf",
+        media_type="application/pdf",
         headers={"Content-Disposition": "inline"},
     )
 

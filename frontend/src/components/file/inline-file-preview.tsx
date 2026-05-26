@@ -108,10 +108,13 @@ function InlineOfficeContent({
   kind,
   previewUrl,
   loadErrorText,
+  fileId,
 }: {
   kind: 'presentation' | 'document' | 'spreadsheet'
   previewUrl: string
   loadErrorText: string
+  /** Optional fileId; when set, enables server-side PDF preview for .pptx. */
+  fileId?: string
 }) {
   const [base64Content, setBase64Content] = useState('')
   const [error, setError] = useState(false)
@@ -165,12 +168,13 @@ function InlineOfficeContent({
     )
   }
 
-  // Presentation now goes through PptxPreviewRenderer (canvas-based,
-  // pptxviewjs) instead of an iframe — browsers can't render raw .pptx
-  // bytes in an iframe, and the backend's /api/files/public/preview
-  // endpoint now returns those raw bytes (rogercloud review on #465).
+  // Presentation goes through PptxPreviewRenderer. The renderer tries the
+  // server's LibreOffice-backed /api/files/preview-pdf endpoint first
+  // (vector, text-selectable, perfect font metrics) and falls back to the
+  // canvas-based pptxviewjs path on 503 — so the previous behaviour from
+  // #465 is preserved when LibreOffice isn't installed.
   if (kind === 'presentation') {
-    return <PptxPreviewRenderer base64Content={base64Content} />
+    return <PptxPreviewRenderer base64Content={base64Content} fileId={fileId} />
   }
 
   if (kind === 'document') {
@@ -300,6 +304,7 @@ export function InlineFilePreview({
           kind={kind}
           previewUrl={previewUrl}
           loadErrorText={loadErrorText}
+          fileId={source.fileId}
         />
       </div>
     </div>

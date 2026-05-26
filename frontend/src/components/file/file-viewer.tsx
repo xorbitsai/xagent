@@ -82,7 +82,7 @@ export function FileViewer({
   return (
     <div className="flex-1 overflow-auto bg-muted/30 rounded border h-full">
       {fileName.toLowerCase().endsWith('.pptx') ? (
-        <PptxPreviewRenderer base64Content={content || ''} />
+        <PptxPreviewRenderer base64Content={content || ''} fileId={fileId} />
       ) : mimeType?.startsWith('image/') || fileName.match(/\.(jpg|jpeg|png|gif|webp|svg)$/i) ? (
         <div className="flex items-center justify-center h-full p-4">
           <img

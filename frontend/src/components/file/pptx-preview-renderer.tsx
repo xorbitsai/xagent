@@ -3,9 +3,21 @@
 import { useCallback, useEffect, useRef, useState } from "react"
 import { ChevronLeft, ChevronRight, Loader2 } from "lucide-react"
 import { useI18n } from "@/contexts/i18n-context"
+import { apiRequest } from "@/lib/api-wrapper"
+import { getApiUrl } from "@/lib/utils"
 
 interface PptxPreviewRendererProps {
   base64Content: string
+  /**
+   * Optional fileId. When provided, the renderer tries the high-fidelity
+   * server-rendered PDF preview first (LibreOffice → PDF, displayed in an
+   * iframe with the browser's native PDF viewer — vector, text-selectable,
+   * correct font metrics). On a 503 (LibreOffice not installed on the
+   * server) or any other failure, the renderer transparently falls back
+   * to the canvas-based pptxviewjs rendering that ships with the bundle,
+   * so developer machines without LibreOffice still get a working preview.
+   */
+  fileId?: string
 }
 
 // Minimal subset of the runtime API we rely on. We avoid pulling in the
@@ -36,7 +48,7 @@ function base64ToUint8Array(b64: string): Uint8Array {
   return bytes
 }
 
-export function PptxPreviewRenderer({ base64Content }: PptxPreviewRendererProps) {
+export function PptxPreviewRenderer({ base64Content, fileId }: PptxPreviewRendererProps) {
   const containerRef = useRef<HTMLDivElement | null>(null)
   const canvasRef = useRef<HTMLCanvasElement | null>(null)
   const viewerRef = useRef<PPTXViewerHandle | null>(null)
@@ -45,7 +57,49 @@ export function PptxPreviewRenderer({ base64Content }: PptxPreviewRendererProps)
   const [isLoading, setIsLoading] = useState<boolean>(true)
   const [slideCount, setSlideCount] = useState<number>(0)
   const [currentSlide, setCurrentSlide] = useState<number>(0)
+  // PDF-first preview: when the server can produce a LibreOffice-rendered
+  // PDF we display that in an iframe instead of the canvas. `pdfUrl` is set
+  // by the effect below; until it resolves we render the canvas pipeline,
+  // and on 503 / fetch failure we leave it null and keep the canvas.
+  // `pdfChecked` flips to true once the probe finishes (either way) so the
+  // canvas effect can decide whether to bother loading pptxviewjs.
+  const [pdfUrl, setPdfUrl] = useState<string | null>(null)
+  const [pdfChecked, setPdfChecked] = useState<boolean>(!fileId)
   const { t } = useI18n()
+
+  // Probe the server-rendered PDF endpoint. If it 200s, use the PDF in an
+  // iframe (high fidelity). If it 503s — LibreOffice not on PATH server-side
+  // — silently fall back to the canvas renderer. Any other error also falls
+  // back, so the UX never regresses below today's behaviour.
+  useEffect(() => {
+    if (!fileId) return
+    let cancelled = false
+    let objectUrl: string | null = null
+    ;(async () => {
+      try {
+        const res = await apiRequest(
+          `${getApiUrl()}/api/files/preview-pdf/${encodeURIComponent(fileId)}`,
+          { cache: "no-cache" },
+        )
+        if (cancelled) return
+        if (res.ok) {
+          const blob = await res.blob()
+          if (cancelled) return
+          objectUrl = URL.createObjectURL(blob)
+          setPdfUrl(objectUrl)
+          setIsLoading(false)
+        }
+      } catch {
+        // network error — just fall back
+      } finally {
+        if (!cancelled) setPdfChecked(true)
+      }
+    })()
+    return () => {
+      cancelled = true
+      if (objectUrl) URL.revokeObjectURL(objectUrl)
+    }
+  }, [fileId])
 
   // Size the canvas backing store to the container before each render.
   // pptxviewjs uses the canvas's pixel dimensions to lay out slides in
@@ -88,6 +142,17 @@ export function PptxPreviewRenderer({ base64Content }: PptxPreviewRendererProps)
     let createdViewer: PPTXViewerHandle | null = null
 
     const load = async () => {
+      // PDF path is winning: skip the canvas pipeline entirely so we don't
+      // download pptxviewjs (~1MB chunk), parse the deck, or paint the
+      // canvas that the iframe is going to cover anyway.
+      if (pdfUrl) {
+        setIsLoading(false)
+        return
+      }
+      // We have a fileId but haven't finished probing the PDF endpoint
+      // yet. Wait — kicking off pptxviewjs now would race the PDF probe
+      // and could leave both pipelines fighting for the same canvas.
+      if (fileId && !pdfChecked) return
       // Empty payload: nothing to render. Drop the loading spinner so we
       // don't hang the UI in an infinite loading state.
       if (!base64Content) {
@@ -172,7 +237,7 @@ export function PptxPreviewRenderer({ base64Content }: PptxPreviewRendererProps)
         viewerRef.current = null
       }
     }
-  }, [base64Content, syncCanvasSize, t])
+  }, [base64Content, syncCanvasSize, t, pdfUrl, pdfChecked, fileId])
 
   // Re-render the current slide when the container is resized.
   useEffect(() => {
@@ -211,6 +276,22 @@ export function PptxPreviewRenderer({ base64Content }: PptxPreviewRendererProps)
 
   if (error) {
     return <div className="p-4 text-sm text-muted-foreground">{error}</div>
+  }
+
+  // High-fidelity path: server-rendered PDF in an iframe. Browsers (Chrome,
+  // Safari, Firefox) all ship a built-in PDF viewer, so no JS library is
+  // needed. The viewer comes with its own pagination + zoom controls; we
+  // skip our prev/next bar so we don't have two competing controls.
+  if (pdfUrl) {
+    return (
+      <div className="flex flex-col h-full bg-muted/30">
+        <iframe
+          src={pdfUrl}
+          title="pptx preview (server-rendered PDF)"
+          className="flex-1 w-full border-0"
+        />
+      </div>
+    )
   }
 
   const hasNav = slideCount > 1

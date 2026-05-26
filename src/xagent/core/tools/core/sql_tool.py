@@ -394,5 +394,9 @@ def _stream_export_to_parquet(
     # Close writer to finalize file
     if writer:
         writer.close()
+    else:
+        schema = pa.schema([pa.field(str(column), pa.string()) for column in columns])
+        empty_table = pa.Table.from_batches([], schema=schema)
+        pq.write_table(empty_table, resolved_path)
 
     return str(resolved_path), row_count, columns

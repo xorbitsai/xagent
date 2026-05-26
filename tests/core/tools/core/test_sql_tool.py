@@ -228,3 +228,47 @@ class TestExecuteSqlQuery:
                     output_file="test.parquet",
                     workspace=mock_workspace,
                 )
+
+    @patch("xagent.core.tools.core.sql_tool.create_engine")
+    def test_execute_sql_query_with_empty_parquet_export(
+        self, mock_create_engine, monkeypatch, tmp_path
+    ):
+        """Test empty Parquet export still writes a registered file."""
+        pq = pytest.importorskip("pyarrow.parquet")
+        monkeypatch.setenv("XAGENT_EXTERNAL_DB_TEST", "sqlite:///:memory:")
+
+        mock_engine = MagicMock()
+        mock_conn = MagicMock()
+        mock_engine.connect.return_value.__enter__.return_value = mock_conn
+        mock_create_engine.return_value = mock_engine
+
+        mock_result = MagicMock()
+        mock_result.keys.return_value = ["id", "name"]
+        mock_result.fetchmany.return_value = []
+        mock_conn.execute.return_value = mock_result
+
+        def mock_create_record(self, file_id, file_path, db_session=None):
+            return None
+
+        monkeypatch.setattr(TaskWorkspace, "_create_file_record", mock_create_record)
+        workspace = TaskWorkspace("test_sql_empty_parquet_export", str(tmp_path))
+
+        result = execute_sql_query(
+            "test",
+            "SELECT * FROM users WHERE 1 = 0",
+            output_file="empty.parquet",
+            workspace=workspace,
+        )
+
+        output_file = workspace.output_dir / "empty.parquet"
+        exported_table = pq.read_table(output_file)
+
+        assert result["success"] is True
+        assert result["row_count"] == 0
+        assert isinstance(result.get("file_id"), str)
+        assert result["filename"] == "empty.parquet"
+        assert result["relative_path"] == "output/empty.parquet"
+        assert result["file_ref"]["file_id"] == result["file_id"]
+        assert output_file.exists()
+        assert exported_table.num_rows == 0
+        assert exported_table.column_names == ["id", "name"]

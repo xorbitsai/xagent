@@ -1427,6 +1427,32 @@ async def execute_task_background(
                     "execution_mode": None,
                     "updated_at": None,
                 }
+
+            # Snapshot agent metadata before the request-scoped ORM
+            # session closes. Snapshot callers intentionally set
+            # ``task=None``, so we fall back to the off-loop snapshot.
+            if task is not None:
+                broadcast_agent_meta = {
+                    "agent_id": task.agent_id,
+                    "agent_name": task.agent.name if task.agent else None,
+                    "agent_logo_url": task.agent.logo_url if task.agent else None,
+                }
+            elif task_setup_snapshot is not None:
+                broadcast_agent_meta = {
+                    "agent_id": task_setup_snapshot.task.agent_id,
+                    "agent_name": (
+                        task_setup_snapshot.agent.name
+                        if task_setup_snapshot.agent is not None
+                        else None
+                    ),
+                    "agent_logo_url": None,
+                }
+            else:
+                broadcast_agent_meta = {
+                    "agent_id": None,
+                    "agent_name": None,
+                    "agent_logo_url": None,
+                }
         finally:
             try:
                 next(db_new_gen)
@@ -1446,9 +1472,9 @@ async def execute_task_background(
                         "description": broadcast_meta["description"],
                         "status": final_task_status,
                         "execution_mode": broadcast_meta["execution_mode"],
-                        "agent_id": task.agent_id,
-                        "agent_name": task.agent.name if task.agent else None,
-                        "agent_logo_url": task.agent.logo_url if task.agent else None,
+                        "agent_id": broadcast_agent_meta["agent_id"],
+                        "agent_name": broadcast_agent_meta["agent_name"],
+                        "agent_logo_url": broadcast_agent_meta["agent_logo_url"],
                     },
                     broadcast_meta["updated_at"] or None,
                 ),

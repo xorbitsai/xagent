@@ -1112,26 +1112,52 @@ async def preview_pptx_as_pdf(
     PATH — the frontend falls back to the existing ``pptxviewjs`` canvas
     renderer so the UX still works on developer machines without soffice
     installed.
+
+    Mirrors the durable-storage restore path that ``/preview`` uses: for
+    files whose local copy was reaped but whose ``storage_key`` is still in
+    durable storage, we materialize before conversion (returning 409 on
+    checksum mismatch, 503 on durable backend failure — same semantics as
+    ``/preview``). Without this, durable-only ``.pptx`` files would 404 here
+    and silently fall back to the canvas renderer, which is exactly the
+    UX regression flagged in PR #542 review.
     """
     file_record, full_path, owner_user_id = _resolve_file_path(
         db, file_id, _user_id_value(user)
     )
+
+    # Resolve the local .pptx path. If the file is backed by durable
+    # storage and not currently on disk, restore it first.
+    pptx_path = full_path
     if file_record:
         _check_file_access(file_record, user)
         file_name = str(file_record.filename)
+        _ensure_under_uploads(full_path, owner_user_id)
+        file_ref = ManagedFileRef(file_record)
+        if file_ref.has_durable_object:
+            try:
+                pptx_path = file_ref.materialize()
+            except DurableObjectIntegrityError as exc:
+                raise _file_integrity_failed() from exc
+            except DurableStorageOperationError as exc:
+                raise _durable_storage_unavailable() from exc
+            except DurableObjectMissingError:
+                # Durable record points at nothing; fall back to whatever
+                # is on disk (or 404 below if it's gone too).
+                pptx_path = file_ref.local_path
     else:
         if owner_user_id != _user_id_value(user) and not _is_admin_user(user):
             raise HTTPException(status_code=403, detail="Access denied")
         file_name = full_path.name
-    _ensure_under_uploads(full_path, owner_user_id)
-    if not full_path.exists():
+        _ensure_under_uploads(full_path, owner_user_id)
+
+    if pptx_path is None or not pptx_path.exists():
         raise HTTPException(status_code=404, detail="File not found")
-    if full_path.suffix.lower() != ".pptx":
+    if pptx_path.suffix.lower() != ".pptx":
         raise HTTPException(
             status_code=400, detail="preview-pdf only supports .pptx files"
         )
 
-    pdf_path = await _convert_pptx_to_pdf(full_path)
+    pdf_path = await _convert_pptx_to_pdf(pptx_path)
     if pdf_path is None:
         # Distinct 503 lets the frontend fall back gracefully instead of
         # showing an error banner.

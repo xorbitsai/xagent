@@ -2573,14 +2573,9 @@ async def get_task(
                     db, task_id
                 )
 
-            # Fetch agent info if agent_id exists
-            agent_name = None
-            agent_logo_url = None
-            if task.agent_id:
-                agent = db.query(Agent).filter(Agent.id == task.agent_id).first()
-                if agent:
-                    agent_name = agent.name
-                    agent_logo_url = agent.logo_url
+            # Fetch agent info if agent relationship is available
+            agent_name = task.agent.name if task.agent else None
+            agent_logo_url = task.agent.logo_url if task.agent else None
 
             response = {
                 "task_id": task.id,
@@ -2691,14 +2686,9 @@ async def get_task_status(
                     db, task_id
                 )
 
-            # Fetch agent info if agent_id exists
-            agent_name = None
-            agent_logo_url = None
-            if task.agent_id:
-                agent = db.query(Agent).filter(Agent.id == task.agent_id).first()
-                if agent:
-                    agent_name = agent.name
-                    agent_logo_url = agent.logo_url
+            # Fetch agent info if agent relationship is available
+            agent_name = task.agent.name if task.agent else None
+            agent_logo_url = task.agent.logo_url if task.agent else None
 
             response = {
                 "task_id": task.id,

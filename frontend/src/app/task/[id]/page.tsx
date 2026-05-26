@@ -52,7 +52,7 @@ function TaskDetailContent() {
               {state.currentTask?.agentLogoUrl ? (
                 <img
                   src={state.currentTask.agentLogoUrl.startsWith('http') ? state.currentTask.agentLogoUrl : `${getApiUrl()}${state.currentTask.agentLogoUrl}`}
-                  alt={state.currentTask.agentName || 'Agent Logo'}
+                  alt={state.currentTask.agentName || t("agent.logo")}
                   className="w-8 h-8 object-cover rounded-sm flex-shrink-0"
                 />
               ) : null}

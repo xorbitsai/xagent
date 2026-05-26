@@ -2163,6 +2163,7 @@ Build when you need.`
     loadAgentDetailsFailed: "Unable to load agent details",
   },
   agent: {
+    logo: "Agent Logo",
     header: {
       backTitle: "Back to Vibe",
       badge: {

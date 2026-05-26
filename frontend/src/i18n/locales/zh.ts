@@ -2163,6 +2163,7 @@ Build when you need.`
     loadAgentDetailsFailed: "无法加载 Agent 详情",
   },
   agent: {
+    logo: "Agent 标识",
     header: {
       backTitle: "返回Vibe",
       badge: {

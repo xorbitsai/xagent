@@ -614,9 +614,7 @@ async def _convert_pptx_to_pdf(pptx_path: Path) -> Optional[Path]:
             except asyncio.TimeoutError:
                 proc.kill()
                 await proc.wait()
-                logger.warning(
-                    "pptx→pdf conversion timed out for %s", pptx_path
-                )
+                logger.warning("pptx→pdf conversion timed out for %s", pptx_path)
                 return None
             if proc.returncode != 0:
                 logger.warning(

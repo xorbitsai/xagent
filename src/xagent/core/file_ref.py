@@ -5,7 +5,13 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import quote
 
-FILE_REF_MODEL_INSTRUCTIONS = """## FILE REFERENCES
+FILE_REF_OUTPUT_INSTRUCTIONS = """## FILE REFERENCE OUTPUTS
+When mentioning a generated or uploaded file that has a file_id, render it as a Markdown file reference:
+- Files: [filename](file:file_id)
+- Images intended for inline display: ![filename](file:file_id)
+Do not mention only the filename when a file_id or markdown_link is available. Prefer an existing markdown_link value when one is present."""
+
+FILE_REF_MODEL_INSTRUCTIONS = f"""## FILE REFERENCES
 Files are referenced by FileRef objects. Treat file_id as the canonical file handle.
 
 Rules:
@@ -13,7 +19,9 @@ Rules:
 - Do not guess storage paths such as /uploads/... or user_id/... paths.
 - For HTML assets, call prepare_html_asset(file_id, html_path, alias) first.
 - Use the returned html_src inside HTML, CSS, script, or image references.
-- For user-visible output links, use markdown_link or file:{file_id}."""
+- For user-visible output links, follow the file reference output rules below.
+
+{FILE_REF_OUTPUT_INSTRUCTIONS}"""
 
 
 def guess_mime_type(filename: str) -> str:

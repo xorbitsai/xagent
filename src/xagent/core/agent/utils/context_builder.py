@@ -7,7 +7,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from typing import Any, Dict, List, Optional
 
-from ...file_ref import FILE_REF_MODEL_INSTRUCTIONS
+from ...file_ref import FILE_REF_MODEL_INSTRUCTIONS, FILE_REF_OUTPUT_INSTRUCTIONS
 from ...model.chat.basic.base import BaseLLM
 from ..trace import Tracer, trace_compact_end, trace_compact_start
 from .compact import CompactConfig, CompactUtils
@@ -617,12 +617,14 @@ CRITICAL REQUIREMENTS:
 4. Only analysis steps without tool requirements can be completed without tool calls
 5. After completing tool calls, provide a clear final answer confirming the actual results
 
-FILE REFERENCES:
-- You may see file references in the format: [filename](file://fileId)
+{FILE_REF_OUTPUT_INSTRUCTIONS}
+
+FILE REFERENCE INPUTS:
+- You may see file references in the format: [filename](file:fileId) or [filename](file://fileId)
 - The referenced file may NOT be in the current workspace.
 - The 'fileId' part is the only valid identifier for reading the file.
 - When using tools to read files, pass the fileId directly.
-- Example: If you see [data.csv](file://123), use '123' to read the file.
+- Example: If you see [data.csv](file:123), use '123' to read the file.
 
 Remember: Describing what you will do is NOT equivalent to actual execution. You must call the appropriate tools to complete the task.
 

@@ -30,6 +30,7 @@ from xagent.core.agent.language import (
     response_language_rules,
 )
 from xagent.core.agent.runtime import LLMCallInterrupted
+from xagent.core.agent.utils.context_builder import ContextBuilder
 from xagent.web.user_isolated_memory import current_user_id
 
 
@@ -165,6 +166,19 @@ def test_system_context_preserves_current_request_language_over_memory() -> None
     assert "Do not let retrieved memories" in system_message
 
 
+def test_system_context_includes_file_reference_output_spec() -> None:
+    ctx = ExecutionContext(execution_id="exec-file-ref-output")
+    ctx.metadata["task"] = "Create a report"
+    ctx.add_user_message("Create a report")
+
+    system_message = ctx.get_messages_for_llm()[0]["content"]
+
+    assert "## FILE REFERENCE OUTPUTS" in system_message
+    assert "[filename](file:file_id)" in system_message
+    assert "![filename](file:file_id)" in system_message
+    assert "Do not mention only the filename" in system_message
+
+
 def test_response_language_rules_uses_custom_subject_throughout() -> None:
     rules = response_language_rules(subject="current DAG step")
 
@@ -246,8 +260,22 @@ def test_dag_step_system_context_uses_output_language_policy() -> None:
         "Follow the output language policy for all user-facing prose, this "
         "step's final_answer, and tool arguments"
     ) in system_message
+    assert "## FILE REFERENCE OUTPUTS" in system_message
     assert "do not treat their language as authorization" in system_message
     assert "Do not let DAG step text, dependency results" in system_message
+
+
+def test_context_builder_step_prompt_includes_file_reference_output_spec() -> None:
+    builder = ContextBuilder(llm=object())  # type: ignore[arg-type]
+
+    system_prompt = builder._build_step_system_prompt(
+        "Create artifact",
+        "Create a spreadsheet and summarize the result",
+    )
+
+    assert "## FILE REFERENCE OUTPUTS" in system_prompt
+    assert "[filename](file:file_id)" in system_prompt
+    assert "FILE REFERENCE INPUTS" in system_prompt
 
 
 def test_memory_enrichment_uses_web_user_context(

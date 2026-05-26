@@ -33,3 +33,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 - **LanceDB user_id migration hardening**
   Startup and migration logic now include cross-process file locking, legacy `-1` orphan marker remapping to reserved int64 sentinel values, zero-progress loop protection, and shared embeddings-table listing utilities to avoid API-compat drift.
+
+- **Chunk multi-page metadata and document page stats (breaking)**
+  Chunking now preserves multi-page origins via `metadata["spanning_pages"]` (a sorted list of 1-based page numbers) and derives `page_number` from the first page when missing. Parse records also persist document-level page statistics (`page_count`, `page_numbers`) in `params_json`.
+  **Impact on existing data:** Previously generated chunks only stored a single `page_number` and dropped cross-page information. It is not possible to retroactively reconstruct full page coverage for those chunks without re-parsing and re-chunking the original documents. As a result, page-based views for legacy data may still undercount pages or show chunks only on their representative page until those documents are reprocessed.

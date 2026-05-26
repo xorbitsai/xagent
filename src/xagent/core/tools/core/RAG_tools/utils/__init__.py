@@ -11,6 +11,10 @@ from .file_utils import check_file_type, validate_file_path
 from .hash_utils import compute_content_hash, compute_file_hash, validate_hash_format
 from .lancedb_query_utils import query_to_list
 from .metadata_utils import deserialize_metadata, serialize_metadata
+from .paragraph_page_utils import (
+    collect_pages_from_paragraphs,
+    normalized_pages_from_deepdoc_positions,
+)
 from .string_utils import (
     build_lancedb_filter_expression,
     escape_lancedb_string,
@@ -35,6 +39,9 @@ __all__ = [
     # Metadata utilities
     "serialize_metadata",
     "deserialize_metadata",
+    # Paragraph page utilities
+    "collect_pages_from_paragraphs",
+    "normalized_pages_from_deepdoc_positions",
     # String utilities
     "escape_lancedb_string",
     "build_lancedb_filter_expression",

@@ -306,8 +306,13 @@ def _to_parsed_content_list(
 
     segments: list[ParsedTextSegment] = []
     for i, doc in enumerate(docs):
-        # Use page number from metadata if available, else fallback to index
-        page_num = doc.metadata.get("page", i + 1)
+        # LangChain loaders (e.g. PyPDFLoader) use 0-based page numbers;
+        # normalise to 1-based for consistency across all parsers.
+        raw_page = doc.metadata.get("page")
+        if isinstance(raw_page, int):
+            page_num = raw_page + 1
+        else:
+            page_num = i + 1
         metadata = create_metadata(
             source_path=source_path,
             file_type=file_type,

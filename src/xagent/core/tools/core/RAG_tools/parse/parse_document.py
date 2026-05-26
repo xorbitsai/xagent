@@ -32,8 +32,12 @@ from ..core.schemas import (
 )
 from ..storage.factory import get_vector_index_store
 from ..utils.hash_utils import compute_parse_hash, get_parse_params_whitelist
+from ..utils.paragraph_page_utils import collect_pages_from_paragraphs
 
 logger = logging.getLogger(__name__)
+
+# Keys allowed in persisted ``params_json`` but never in user/API parse requests.
+SYSTEM_ONLY_PARSE_PARAM_KEYS: frozenset[str] = frozenset({"_derived"})
 
 
 def parse_document(
@@ -120,7 +124,8 @@ async def _parse_document_internal(
 
     _validate_parse_params(parse_method, params)
 
-    parse_hash = compute_parse_hash(str(parse_method), params)
+    user_parse_params = strip_system_only_parse_params(params)
+    parse_hash = compute_parse_hash(str(parse_method), user_parse_params)
     logger.info("Computed parse hash: %s", parse_hash)
 
     if _parse_exists(collection, doc_id, parse_hash, user_id, is_admin):
@@ -148,8 +153,7 @@ async def _parse_document_internal(
         else:
             parser_name = str(parse_method)
 
-        # Merge params with doc_id for parsers that need it (e.g., deepdoc for PDF images)
-        parse_params = {**(params or {}), "doc_id": doc_id}
+        parse_params = build_parser_kwargs(params, doc_id=doc_id)
         tool_args = DocumentParseArgs(
             file_path=source_path,
             parser_name=parser_name,
@@ -233,15 +237,26 @@ async def _parse_document_internal(
         timing_data["db_write_start"] = time.perf_counter()
         logger.debug("[PARSE TIMING] Starting database write...")
 
+    # Derive basic page statistics for downstream consumers (e.g. UI).
+    # Use the same union as chunk ``spanning_pages`` (page_number + DeepDoc bbox pages).
+    page_dicts = [
+        {"text": paragraph.text, "metadata": dict(paragraph.metadata)}
+        for paragraph in enriched_paragraphs
+    ]
+    unique_pages = collect_pages_from_paragraphs(page_dicts)
+    page_count = len(unique_pages)
+    page_stats = {"page_count": page_count, "page_numbers": unique_pages}
+
     try:
         written = _write_parse_to_db(
             collection,
             doc_id,
             parse_hash,
             str(parse_method),
-            params,
+            user_parse_params,
             enriched_paragraphs,
             user_id,
+            page_stats=page_stats,
         )
     except Exception as e:
         raise DatabaseOperationError(f"Database write failed: {e}") from e
@@ -394,14 +409,28 @@ def _get_document_from_db(
     return None
 
 
+def strip_system_only_parse_params(params: Dict[str, Any]) -> Dict[str, Any]:
+    """Return user/parser configuration keys only (excludes storage metadata)."""
+    return {k: v for k, v in params.items() if k not in SYSTEM_ONLY_PARSE_PARAM_KEYS}
+
+
+def build_parser_kwargs(params: Dict[str, Any], *, doc_id: str) -> Dict[str, Any]:
+    """Build kwargs for the core document parser without system-only keys."""
+    return {**strip_system_only_parse_params(params), "doc_id": doc_id}
+
+
 def _validate_parse_params(parse_method: ParseMethod, params: Dict[str, Any]) -> None:
-    """Validate parsing parameters against whitelist."""
+    """Validate user-supplied parsing parameters against the method whitelist."""
     valid_methods = set(ParseMethod)
     if parse_method not in valid_methods:
         raise DocumentValidationError(f"Unsupported parse method: {parse_method}")
     try:
         whitelist = get_parse_params_whitelist(str(parse_method))
         for key in params:
+            if key in SYSTEM_ONLY_PARSE_PARAM_KEYS:
+                raise DocumentValidationError(
+                    f"System-only parameter '{key}' cannot be set in parse requests"
+                )
             if key not in whitelist:
                 raise DocumentValidationError(
                     f"Invalid parameter '{key}' for parse method '{parse_method}'"
@@ -410,6 +439,13 @@ def _validate_parse_params(parse_method: ParseMethod, params: Dict[str, Any]) ->
         if isinstance(e, DocumentValidationError):
             raise
         raise ConfigurationError(f"Parameter validation failed: {e}") from e
+
+
+def _validate_persisted_parse_params(
+    parse_method: ParseMethod, params: Dict[str, Any]
+) -> None:
+    """Validate persisted ``params_json`` (user keys strict; ``_derived`` allowed)."""
+    _validate_parse_params(parse_method, strip_system_only_parse_params(params))
 
 
 def _parse_exists(
@@ -523,6 +559,7 @@ def _write_parse_to_db(
     params: Dict[str, Any],
     paragraphs: List[ParsedParagraph],
     user_id: Optional[int] = None,
+    page_stats: Optional[Dict[str, Any]] = None,
 ) -> bool:
     """Write parse record to database using abstraction layer."""
     enable_timing = os.environ.get("PARSE_DETAILED_TIMING", "0").lower() in (
@@ -569,15 +606,19 @@ def _write_parse_to_db(
                 "[PARSE TIMING]    - Starting database operation (upsert_parses)..."
             )
 
+        params_for_storage = dict(params)
+        if page_stats:
+            params_for_storage["_derived"] = {"page_stats": page_stats}
+
         parse_record = {
             "collection": collection,
             "doc_id": doc_id,
             "parse_hash": parse_hash,
             "parser": f"local:{parse_method}@v1.0.0",
             "created_at": pd.Timestamp.now(tz="UTC"),
-            "params_json": json.dumps(params, ensure_ascii=False),
+            "params_json": json.dumps(params_for_storage, ensure_ascii=False),
             "parsed_content": parsed_content,
-            "user_id": user_id,  # Add user_id for multi-tenancy
+            "user_id": user_id,
         }
 
         # Use abstraction layer for upsert

@@ -229,6 +229,45 @@ def test_init_db_seeds_builtin_oauth_and_microsoft_graph_public_apps() -> None:
             pass
 
 
+def test_init_db_does_not_reseed_deleted_builtin_app_on_existing_database() -> None:
+    from xagent.web.models.database import init_db
+
+    temp_dir = tempfile.mkdtemp()
+    temp_db_path = os.path.join(temp_dir, "test.db")
+    db_url = f"sqlite:///{temp_db_path}"
+
+    init_db(db_url=db_url)
+
+    db = next(get_db())
+    try:
+        gmail_app = (
+            db.query(PublicMCPApp).filter(PublicMCPApp.app_id == "gmail").first()
+        )
+        assert gmail_app is not None
+        db.delete(gmail_app)
+        db.commit()
+    finally:
+        db.close()
+
+    init_db(db_url=db_url)
+
+    db = next(get_db())
+    try:
+        recreated_gmail_app = (
+            db.query(PublicMCPApp).filter(PublicMCPApp.app_id == "gmail").first()
+        )
+        assert recreated_gmail_app is None
+    finally:
+        db.close()
+        Base.metadata.drop_all(bind=get_engine())
+        try:
+            import shutil
+
+            shutil.rmtree(temp_dir)
+        except OSError:
+            pass
+
+
 def test_connected_hidden_public_mcp_app_is_excluded_in_strong_hide_mode() -> None:
     temp_dir = _setup_test_db()
     try:

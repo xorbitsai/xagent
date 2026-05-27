@@ -100,17 +100,20 @@ def init_db(db_url: str | None = None) -> None:
     _SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=_engine)
 
     # Try upgrade db to head first
-    from ...db import try_upgrade_db
+    from ...db.migration import is_database_empty, try_upgrade_db
+
+    should_seed_builtin_mcp_registry = is_database_empty(_engine)
 
     try_upgrade_db(_engine)
 
     # Create all tables
     Base.metadata.create_all(bind=_engine)
 
-    from ..builtin_mcp_registry import seed_builtin_oauth_and_public_mcp_apps
+    if should_seed_builtin_mcp_registry:
+        from ..builtin_mcp_registry import seed_builtin_oauth_and_public_mcp_apps
 
-    with _engine.begin() as conn:
-        seed_builtin_oauth_and_public_mcp_apps(conn)
+        with _engine.begin() as conn:
+            seed_builtin_oauth_and_public_mcp_apps(conn)
 
     logger = logging.getLogger(__name__)
     logger.info("Database initialized. Waiting for first admin setup.")

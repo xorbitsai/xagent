@@ -7,7 +7,7 @@ enabling MCP tools to be used in DAG plan-execute patterns and other agent workf
 import asyncio
 import logging
 import os
-from typing import Any, Dict, List, Mapping, Optional, Type
+from typing import Any, Dict, List, Mapping, Optional, Type, Union, cast
 
 from mcp.types import Tool as MCPTool
 from pydantic import BaseModel, Field, create_model
@@ -205,14 +205,12 @@ class MCPToolAdapter(AbstractBaseTool):
                 ]
                 if len(non_null_options) == 1:
                     return self._json_schema_to_python_type(non_null_options[0])
-                for option in non_null_options:
-                    if self._schema_accepts_array(option):
-                        return self._json_schema_to_python_type(option)
+                resolved_types: list[Type[Any]] = []
                 for option in non_null_options:
                     resolved_type = self._json_schema_to_python_type(option)
-                    if resolved_type is not Any:
-                        return resolved_type
-                return Any
+                    if resolved_type is not Any and resolved_type not in resolved_types:
+                        resolved_types.append(resolved_type)
+                return self._build_union_type(resolved_types)
 
         all_of = schema.get("allOf")
         if isinstance(all_of, list) and all_of:
@@ -224,12 +222,17 @@ class MCPToolAdapter(AbstractBaseTool):
         schema_type = schema.get("type")
         if isinstance(schema_type, list):
             concrete_types = [item for item in schema_type if item != "null"]
-            if "array" in concrete_types:
-                schema_type = "array"
-            elif concrete_types:
-                schema_type = concrete_types[0]
-            else:
-                return Any
+            concrete_resolved_types: list[Type[Any]] = []
+            for concrete_type in concrete_types:
+                resolved_type = self._json_schema_to_python_type(
+                    {"type": concrete_type}
+                )
+                if (
+                    resolved_type is not Any
+                    and resolved_type not in concrete_resolved_types
+                ):
+                    concrete_resolved_types.append(resolved_type)
+            return self._build_union_type(concrete_resolved_types)
 
         if schema_type == "array":
             return list
@@ -244,6 +247,14 @@ class MCPToolAdapter(AbstractBaseTool):
         if schema_type == "boolean":
             return bool
         return Any
+
+    def _build_union_type(self, resolved_types: list[Type[Any]]) -> Type[Any]:
+        """Build a runtime union for multiple candidate schema types."""
+        if not resolved_types:
+            return Any
+        if len(resolved_types) == 1:
+            return resolved_types[0]
+        return cast(Type[Any], Union.__getitem__(tuple(resolved_types)))
 
     def _is_null_schema(self, schema: Any) -> bool:
         """Return True when the schema represents a JSON null type."""

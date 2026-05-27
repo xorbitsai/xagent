@@ -96,3 +96,52 @@ def test_normalize_args_by_schema_wraps_scalar_for_array_field():
     )
 
     assert normalized["add_label_ids"] == ["TRASH"]
+
+
+def test_build_args_model_handles_anyof_multi_type_schema():
+    mcp_tool = SimpleNamespace(
+        name="multi_type_tool",
+        description="Accept string or integer input",
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "value": {
+                    "anyOf": [
+                        {"type": "string"},
+                        {"type": "integer"},
+                    ]
+                }
+            },
+            "required": ["value"],
+        },
+    )
+    adapter = MCPToolAdapter(
+        mcp_tool=mcp_tool,
+        connection={"transport": "stdio", "command": "python", "args": []},
+    )
+
+    args_model = adapter.args_type()
+
+    assert args_model(value="abc").value == "abc"
+    assert args_model(value=123).value == 123
+
+
+def test_build_args_model_handles_multi_value_type_list():
+    mcp_tool = SimpleNamespace(
+        name="multi_value_type_tool",
+        description="Accept string or integer input",
+        inputSchema={
+            "type": "object",
+            "properties": {"value": {"type": ["string", "integer", "null"]}},
+            "required": ["value"],
+        },
+    )
+    adapter = MCPToolAdapter(
+        mcp_tool=mcp_tool,
+        connection={"transport": "stdio", "command": "python", "args": []},
+    )
+
+    args_model = adapter.args_type()
+
+    assert args_model(value="abc").value == "abc"
+    assert args_model(value=123).value == 123

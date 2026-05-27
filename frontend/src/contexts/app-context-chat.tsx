@@ -3784,7 +3784,7 @@ export function AppProvider({ children, token }: { children: React.ReactNode; to
     console.log('🚀 sendMessage called:', { message, files: files?.map(f => f.name), taskId: state.taskId })
 
     const targetTaskId = typeof config?.targetTaskId === 'number' ? config.targetTaskId : null
-    if (!state.taskId && targetTaskId) {
+    if (targetTaskId && state.taskId !== targetTaskId) {
       setPendingMessage({ message, files, targetTaskId })
 
       if (!isDuplicateMessage(message, 'user-message', config?.force)) {

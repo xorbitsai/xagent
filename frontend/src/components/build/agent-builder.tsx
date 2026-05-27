@@ -358,6 +358,10 @@ export function AgentBuilder({ agentId }: AgentBuilderProps) {
     setTaskId(null, { navigate: false })
   }, [closeFilePreview, dispatch, setTaskId])
 
+  const invalidatePreviewTask = useCallback(() => {
+    previewTaskIdRef.current = null
+  }, [])
+
   useEffect(() => {
     resetPreviewSession()
     return () => {
@@ -369,8 +373,8 @@ export function AgentBuilder({ agentId }: AgentBuilderProps) {
     if (!previewTaskIdRef.current) {
       return
     }
-    resetPreviewSession()
-  }, [instructions, executionMode, selectedKbs, selectedSkills, selectedToolCategories, selectedMcpServers, modelConfig, resetPreviewSession])
+    invalidatePreviewTask()
+  }, [instructions, executionMode, selectedKbs, selectedSkills, selectedToolCategories, selectedMcpServers, modelConfig, invalidatePreviewTask])
 
   // Fetch Data
   useEffect(() => {

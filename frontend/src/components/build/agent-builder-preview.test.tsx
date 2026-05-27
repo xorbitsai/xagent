@@ -7,6 +7,7 @@ const setTaskIdMock = vi.hoisted(() => vi.fn())
 const sendMessageMock = vi.hoisted(() => vi.fn())
 const dispatchMock = vi.hoisted(() => vi.fn())
 const taskConversationPanelMock = vi.hoisted(() => vi.fn())
+const closeFilePreviewMock = vi.hoisted(() => vi.fn())
 
 vi.mock("@/lib/api-wrapper", async () => {
   const actual = await vi.importActual<typeof import("@/lib/api-wrapper")>(
@@ -44,7 +45,7 @@ vi.mock("@/contexts/app-context-chat", () => ({
     setTaskId: setTaskIdMock,
     sendMessage: sendMessageMock,
     dispatch: dispatchMock,
-    closeFilePreview: vi.fn(),
+    closeFilePreview: closeFilePreviewMock,
     pauseTask: vi.fn(),
     resumeTask: vi.fn(),
     openFilePreview: vi.fn(),
@@ -256,7 +257,7 @@ describe("AgentBuilder preview", () => {
     })
   })
 
-  it("recreates the hidden preview task after builder config changes", async () => {
+  it("keeps the current preview visible after config changes and recreates the task on the next send", async () => {
     render(<AgentBuilder />)
 
     fireEvent.click(await screen.findByText("send-preview-message"))
@@ -273,13 +274,11 @@ describe("AgentBuilder preview", () => {
     fireEvent.click(screen.getByText("builds.configForm.executionMode.think.title"))
 
     await waitFor(() => {
-      expect(setTaskIdMock).toHaveBeenCalledWith(null, { navigate: false })
+      expect(apiRequestMock).not.toHaveBeenCalled()
+      expect(setTaskIdMock).not.toHaveBeenCalled()
+      expect(sendMessageMock).not.toHaveBeenCalled()
+      expect(dispatchMock).not.toHaveBeenCalled()
     })
-    expect(dispatchMock).toHaveBeenCalledWith({ type: "CLEAR_MESSAGES" })
-    expect(dispatchMock).toHaveBeenCalledWith({ type: "SET_TRACE_EVENTS", payload: [] })
-    expect(dispatchMock).toHaveBeenCalledWith({ type: "SET_STEPS", payload: [] })
-    expect(dispatchMock).toHaveBeenCalledWith({ type: "SET_DAG_EXECUTION", payload: null })
-    expect(dispatchMock).toHaveBeenCalledWith({ type: "SET_CURRENT_TASK", payload: null })
 
     fireEvent.click(screen.getByText("send-preview-message"))
 

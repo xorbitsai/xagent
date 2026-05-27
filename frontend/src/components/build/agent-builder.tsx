@@ -735,6 +735,8 @@ export function AgentBuilder({ agentId }: AgentBuilderProps) {
         }
         previewTaskIdRef.current = previewTaskId
 
+        // Close any file preview opened from the previous preview task before switching context.
+        closeFilePreview()
         setTaskId(previewTaskId, { navigate: false })
         dispatch({
           type: "SET_CURRENT_TASK",

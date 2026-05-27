@@ -270,6 +270,7 @@ describe("AgentBuilder preview", () => {
     dispatchMock.mockClear()
     setTaskIdMock.mockClear()
     sendMessageMock.mockClear()
+    closeFilePreviewMock.mockClear()
 
     fireEvent.click(screen.getByText("builds.configForm.executionMode.think.title"))
 
@@ -300,5 +301,6 @@ describe("AgentBuilder preview", () => {
         is_preview: true,
       },
     })
+    expect(closeFilePreviewMock).toHaveBeenCalledTimes(1)
   })
 })

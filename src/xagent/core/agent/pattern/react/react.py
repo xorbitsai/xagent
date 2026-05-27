@@ -569,22 +569,24 @@ class ReActPattern(AgentPattern):
         self.finalize_after_tool_result = bool(
             state.get("finalize_after_tool_result", self.finalize_after_tool_result)
         )
-        raw_threshold = state.get("repeated_tool_decision_after_consecutive_tool_calls")
-        if raw_threshold is None:
-            raw_threshold = state.get("auto_reroute_after_consecutive_tool_calls")
-        self.repeated_tool_decision_after_consecutive_tool_calls = (
-            int(raw_threshold)
-            if raw_threshold is not None
-            else self.repeated_tool_decision_after_consecutive_tool_calls
-        )
-        raw_work_threshold = state.get(
-            "repeated_tool_decision_after_consecutive_work_tool_calls"
-        )
-        self.repeated_tool_decision_after_consecutive_work_tool_calls = (
-            int(raw_work_threshold)
-            if raw_work_threshold is not None
-            else self.repeated_tool_decision_after_consecutive_work_tool_calls
-        )
+        if "repeated_tool_decision_after_consecutive_tool_calls" in state:
+            raw_threshold = state["repeated_tool_decision_after_consecutive_tool_calls"]
+            self.repeated_tool_decision_after_consecutive_tool_calls = (
+                int(raw_threshold) if raw_threshold is not None else None
+            )
+        elif "auto_reroute_after_consecutive_tool_calls" in state:
+            raw_threshold = state["auto_reroute_after_consecutive_tool_calls"]
+            self.repeated_tool_decision_after_consecutive_tool_calls = (
+                int(raw_threshold) if raw_threshold is not None else None
+            )
+
+        if "repeated_tool_decision_after_consecutive_work_tool_calls" in state:
+            raw_work_threshold = state[
+                "repeated_tool_decision_after_consecutive_work_tool_calls"
+            ]
+            self.repeated_tool_decision_after_consecutive_work_tool_calls = (
+                int(raw_work_threshold) if raw_work_threshold is not None else None
+            )
         self.force_final_answer_next = bool(state.get("force_final_answer_next", False))
         repeated_tool_decision = state.get("repeated_tool_decision")
         self.repeated_tool_decision = (

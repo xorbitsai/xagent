@@ -2607,6 +2607,19 @@ def test_react_pattern_state_roundtrip() -> None:
     assert restored.tool_ledger["call_1"].result == {"result": 2}
 
 
+def test_react_pattern_state_roundtrip_preserves_disabled_decision_thresholds() -> None:
+    pattern = ReActPattern(
+        repeated_tool_decision_after_consecutive_tool_calls=None,
+        repeated_tool_decision_after_consecutive_work_tool_calls=None,
+    )
+
+    restored = ReActPattern()
+    restored.load_state(pattern.get_state())
+
+    assert restored.repeated_tool_decision_after_consecutive_tool_calls is None
+    assert restored.repeated_tool_decision_after_consecutive_work_tool_calls is None
+
+
 def test_tool_call_record_from_dict_handles_null_args() -> None:
     record = ToolCallRecord.from_dict(
         {

@@ -542,8 +542,9 @@ def make_agent_outbound_handler(task_id: int) -> Any:
             )
             return
 
+        event_type = _agent_outbound_event_type(payload)
         event = create_stream_event(
-            _agent_outbound_event_type(payload),
+            event_type,
             task_id,
             {
                 "event_id": payload.get("event_id"),
@@ -552,6 +553,7 @@ def make_agent_outbound_handler(task_id: int) -> Any:
                 "message": payload.get("message"),
                 "message_type": payload.get("message_type", "info"),
                 "expect_response": bool(payload.get("expect_response", False)),
+                "display": "chat" if event_type == "agent_message" else "timeline",
                 "metadata": payload.get("metadata") or {},
             },
         )
@@ -3426,6 +3428,8 @@ async def send_historical_data_as_stream(
                         "message": content,
                         "content": content,
                         "role": "assistant",
+                        "source": "chat_history",
+                        "display": "chat",
                         # Historical assistant questions are transcript entries.
                         # The current WAITING_FOR_USER state is reasserted separately
                         # after replay, so old questions must not flip status back.

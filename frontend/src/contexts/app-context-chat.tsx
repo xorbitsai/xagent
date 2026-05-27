@@ -1409,7 +1409,16 @@ export function AppProvider({ children, token }: { children: React.ReactNode; to
               eventType === "agent_message" &&
               (eventData.expect_response === true ||
                 eventData.message_type === "question")
-            if (eventType === "agent_message" && !expectsResponse) {
+            const agentMessageDisplay = eventData.display || eventData.metadata?.display
+            const isExplicitTranscriptMessage =
+              agentMessageDisplay === "chat" ||
+              eventData.source === "chat_history" ||
+              eventData.role === "assistant"
+            const isTimelineAgentMessage =
+              eventType === "agent_message" &&
+              !isExplicitTranscriptMessage &&
+              agentMessageDisplay === "timeline"
+            if (isTimelineAgentMessage) {
               dispatch({
                 type: "ADD_TRACE_EVENT",
                 payload: {

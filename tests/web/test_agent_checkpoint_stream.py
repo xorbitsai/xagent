@@ -626,6 +626,71 @@ async def test_historical_replay_skips_checkpoint_rows_before_streaming(
 
 
 @pytest.mark.asyncio
+async def test_historical_replay_marks_assistant_chat_history_for_chat_display(
+    monkeypatch,
+) -> None:
+    SessionLocal, db, task = _create_trace_handler_test_task("chat-history-display")
+    try:
+        task_id = int(task.id)
+        user_id = int(task.user_id)
+        db.add(
+            TaskChatMessage(
+                task_id=task_id,
+                user_id=user_id,
+                role="assistant",
+                content="Final answer",
+                message_type="assistant",
+                created_at=datetime(2026, 5, 27, tzinfo=timezone.utc),
+            )
+        )
+        db.commit()
+    finally:
+        db.close()
+
+    def get_test_db() -> Iterator[Session]:
+        session = SessionLocal()
+        try:
+            yield session
+        finally:
+            session.close()
+
+    sent_events: list[dict] = []
+
+    async def send_personal_message(event: dict, websocket: object) -> None:
+        sent_events.append(event)
+
+    monkeypatch.setattr("xagent.web.models.database.get_db", get_test_db)
+    monkeypatch.setattr("xagent.web.api.websocket.cache_get", lambda *args: None)
+    monkeypatch.setattr(
+        "xagent.web.api.websocket.cache_set", lambda *args, **kwargs: None
+    )
+    monkeypatch.setattr(
+        "xagent.web.api.websocket.manager.send_personal_message",
+        send_personal_message,
+    )
+
+    await send_historical_data_as_stream(
+        websocket=object(),
+        task_id=task_id,
+        user=SimpleNamespace(id=user_id, is_admin=False),
+    )
+
+    assistant_events = [
+        event
+        for event in sent_events
+        if event.get("type") == "trace_event"
+        and event.get("event_type") == "agent_message"
+        and event.get("data", {}).get("message") == "Final answer"
+    ]
+    assert len(assistant_events) == 1
+    assistant_data = assistant_events[0]["data"]
+    assert assistant_data["role"] == "assistant"
+    assert assistant_data["expect_response"] is False
+    assert assistant_data["source"] == "chat_history"
+    assert assistant_data["display"] == "chat"
+
+
+@pytest.mark.asyncio
 async def test_historical_replay_orders_equal_timestamps_by_id(
     monkeypatch,
 ) -> None:

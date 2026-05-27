@@ -1,9 +1,25 @@
 "use client"
 
 import { useTheme } from "@/contexts/theme-context"
-import { Toaster as Sonner } from "sonner"
+import { Toaster as Sonner, toast as sonnerToast } from "sonner"
 
 type ToasterProps = React.ComponentProps<typeof Sonner>
+type PatchedToast = typeof sonnerToast & { __xagentErrorPatched?: boolean }
+
+const ERROR_TOAST_DURATION = 8000
+const patchedToast = sonnerToast as PatchedToast
+
+if (!patchedToast.__xagentErrorPatched) {
+  const originalError = patchedToast.error.bind(patchedToast)
+
+  // Keep a longer default for errors while still allowing per-call overrides.
+  patchedToast.error = (message, data) =>
+    originalError(message, {
+      duration: ERROR_TOAST_DURATION,
+      ...data,
+    })
+  patchedToast.__xagentErrorPatched = true
+}
 
 const Toaster = ({ ...props }: ToasterProps) => {
   const { theme } = useTheme()

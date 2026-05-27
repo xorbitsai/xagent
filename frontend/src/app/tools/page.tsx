@@ -43,7 +43,7 @@ import { CustomMcpForm } from "@/components/mcp/custom-mcp-form"
 import { useI18n } from "@/contexts/i18n-context"
 import { useAuth } from "@/contexts/auth-context"
 import { useMcpApps } from "@/contexts/mcp-apps-context"
-import { toast } from "sonner"
+import { toast } from "@/components/ui/sonner"
 import { isValidMcpName, buildCustomApiPayload } from "@/lib/mcp-utils"
 
 interface Tool {

@@ -7,7 +7,7 @@ import { ConfirmDialog } from "@/components/ui/confirm-dialog"
 import { ScrollArea } from "@/components/ui/scroll-area"
 import { apiRequest } from "@/lib/api-wrapper"
 import { getApiUrl } from "@/lib/utils"
-import { toast } from "sonner"
+import { toast } from "@/components/ui/sonner"
 
 import { buildDeleteDocumentUrl, CollectionDocumentInfo, CollectionDocumentSource, getCollectionDocuments, getDeleteErrorMessage } from "./knowledge-base-detail-helpers"
 

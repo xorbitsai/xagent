@@ -1,7 +1,7 @@
 import { useState, useEffect } from "react";
 import { apiRequest } from "@/lib/api-wrapper";
 import { getApiUrl } from "@/lib/utils";
-import { toast } from "sonner";
+import { toast } from "@/components/ui/sonner";
 import { createFileChipHTML } from "@/components/chat/FileChip";
 
 export interface FileItem {

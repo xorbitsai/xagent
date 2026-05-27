@@ -9,7 +9,7 @@ import { ArrowLeft, Bot } from "lucide-react"
 import { useI18n } from "@/contexts/i18n-context"
 import { useApp } from "@/contexts/app-context-chat"
 import { ChatStartScreen } from "@/components/chat/ChatStartScreen"
-import { toast } from "sonner"
+import { toast } from "@/components/ui/sonner"
 
 function getModelDetailUrl(modelId: string | number): string {
   return `${getApiUrl()}/api/models/by-id/${encodeURIComponent(String(modelId))}`

@@ -10,7 +10,7 @@ import { Input } from "@/components/ui/input"
 import { Badge } from "@/components/ui/badge"
 import { Rocket, LayoutGrid, Code2, Share, Webhook, ArrowRight, Copy, Check } from "lucide-react"
 import { useI18n } from "@/contexts/i18n-context"
-import { toast } from "sonner"
+import { toast } from "@/components/ui/sonner"
 import { getApiUrl } from "@/lib/utils"
 import { apiRequest } from "@/lib/api-wrapper"
 

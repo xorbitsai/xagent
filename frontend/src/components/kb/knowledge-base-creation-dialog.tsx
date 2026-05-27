@@ -38,7 +38,7 @@ import {
   ArrowRight,
   ArrowLeft,
 } from "lucide-react"
-import { toast } from "sonner"
+import { toast } from "@/components/ui/sonner"
 import { CloudConnectDialog, CloudFile } from "./cloud-connect-dialog"
 
 type IngestionResult = ReturnType<typeof normalizeKnowledgeBaseIngestionResult>

@@ -22,7 +22,7 @@ import {
   getAgentChatHref,
 } from "@/lib/agent-ui-access"
 import { ConfirmDialog } from "@/components/ui/confirm-dialog"
-import { toast } from "sonner"
+import { toast } from "@/components/ui/sonner"
 import { getBrandingFromEnv } from "@/lib/branding"
 
 interface LlmModel {

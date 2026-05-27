@@ -25,7 +25,7 @@ import {
 } from "@/lib/kb-ingest-feedback"
 import { parseSeparatorsInput, formatSeparatorsOutput } from "@/lib/separators"
 import { useI18n } from "@/contexts/i18n-context"
-import { toast } from "sonner"
+import { toast } from "@/components/ui/sonner"
 import { CollectionDocumentInfo } from "./knowledge-base-detail-helpers"
 import { KnowledgeBaseDocumentList } from "./knowledge-base-document-list"
 

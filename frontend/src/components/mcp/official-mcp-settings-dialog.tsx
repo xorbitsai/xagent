@@ -4,7 +4,7 @@ import { Button } from "@/components/ui/button"
 import { getApiUrl } from "@/lib/utils"
 import { Settings, Unlink, Plus } from "lucide-react"
 import { apiRequest } from "@/lib/api-wrapper"
-import { toast } from "sonner"
+import { toast } from "@/components/ui/sonner"
 import { useAuth } from "@/contexts/auth-context"
 import { useI18n } from "@/contexts/i18n-context"
 

@@ -28,7 +28,7 @@ import { KnowledgeBaseDetailContent } from "@/components/kb/knowledge-base-detai
 import { KnowledgeBaseCreationDialog } from "@/components/kb/knowledge-base-creation-dialog"
 import { FeatureEmptyState } from "@/components/ui/feature-empty-state"
 import { ConfirmDialog } from "@/components/ui/confirm-dialog"
-import { toast } from "sonner"
+import { toast } from "@/components/ui/sonner"
 
 interface Collection {
   name: string

@@ -7,7 +7,7 @@ import { useAuth } from "@/contexts/auth-context"
 import { getApiUrl, getUploadApiUrl } from "@/lib/utils"
 import { apiRequest, getUploadErrorMessage, isJsonRecord, parseApiResponse, UPLOAD_ERROR_MESSAGES } from "@/lib/api-wrapper"
 import { useI18n } from "@/contexts/i18n-context"
-import { toast } from "sonner"
+import { toast } from "@/components/ui/sonner"
 import { getBrandingFromEnv } from "@/lib/branding"
 
 import { Interaction } from "@/contexts/app-context-chat"

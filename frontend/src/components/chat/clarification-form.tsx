@@ -9,7 +9,7 @@ import { MultiSelect } from "@/components/ui/multi-select"
 import { Select } from "@/components/ui/select"
 import { useApp } from "@/contexts/app-context-chat"
 import { useI18n } from "@/contexts/i18n-context"
-import { toast } from "sonner"
+import { toast } from "@/components/ui/sonner"
 import { Collapsible, CollapsibleContent, CollapsibleTrigger } from "@/components/ui/collapsible"
 import { ChevronDown, ChevronRight, MessageSquare, Upload, File as FileIcon, X, Globe } from "lucide-react"
 

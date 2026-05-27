@@ -21,7 +21,7 @@ import {
 } from "lucide-react"
 import { useI18n } from "@/contexts/i18n-context"
 import { ModelManagementDialog } from "./model-management-dialog"
-import { toast } from "sonner"
+import { toast } from "@/components/ui/sonner"
 
 export function getModelDetailUrl(modelId: string): string {
   return `${getApiUrl()}/api/models/by-id/${encodeURIComponent(modelId)}`

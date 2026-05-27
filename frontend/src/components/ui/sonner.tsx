@@ -4,22 +4,24 @@ import { useTheme } from "@/contexts/theme-context"
 import { Toaster as Sonner, toast as sonnerToast } from "sonner"
 
 type ToasterProps = React.ComponentProps<typeof Sonner>
-type PatchedToast = typeof sonnerToast & { __xagentErrorPatched?: boolean }
 
 const ERROR_TOAST_DURATION = 8000
-const patchedToast = sonnerToast as PatchedToast
+const toast = new Proxy(sonnerToast, {
+  get(target, prop, receiver) {
+    if (prop === "error") {
+      return (
+        message: Parameters<typeof sonnerToast.error>[0],
+        data?: Parameters<typeof sonnerToast.error>[1]
+      ) =>
+        target.error(message, {
+          duration: ERROR_TOAST_DURATION,
+          ...data,
+        })
+    }
 
-if (!patchedToast.__xagentErrorPatched) {
-  const originalError = patchedToast.error.bind(patchedToast)
-
-  // Keep a longer default for errors while still allowing per-call overrides.
-  patchedToast.error = (message, data) =>
-    originalError(message, {
-      duration: ERROR_TOAST_DURATION,
-      ...data,
-    })
-  patchedToast.__xagentErrorPatched = true
-}
+    return Reflect.get(target, prop, receiver)
+  },
+}) as typeof sonnerToast
 
 const Toaster = ({ ...props }: ToasterProps) => {
   const { theme } = useTheme()
@@ -46,4 +48,4 @@ const Toaster = ({ ...props }: ToasterProps) => {
   )
 }
 
-export { Toaster }
+export { Toaster, toast }

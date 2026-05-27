@@ -5,7 +5,7 @@ import { Plus, Trash2, Edit2, Search } from "lucide-react"
 import { useAuth } from "@/contexts/auth-context"
 import { apiRequest } from "@/lib/api-wrapper"
 import { getApiUrl } from "@/lib/utils"
-import { toast } from "sonner"
+import { toast } from "@/components/ui/sonner"
 
 import { useI18n } from "@/contexts/i18n-context"
 

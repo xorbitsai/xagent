@@ -12,7 +12,7 @@ import { MessageSquare, Plus, Trash2, Edit } from "lucide-react"
 import { getApiUrl } from "@/lib/utils"
 import { apiRequest } from "@/lib/api-wrapper"
 import { useI18n } from "@/contexts/i18n-context"
-import { toast } from "sonner"
+import { toast } from "@/components/ui/sonner"
 
 interface Channel {
   id: number;

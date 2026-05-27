@@ -10,7 +10,7 @@ import { useI18n } from "@/contexts/i18n-context"
 import { StandaloneFilePreviewDialog } from "@/components/file/standalone-file-preview-dialog"
 import { SearchInput } from "@/components/ui/search-input"
 import { ConfirmDialog } from "@/components/ui/confirm-dialog"
-import { toast } from "sonner"
+import { toast } from "@/components/ui/sonner"
 import {
   Upload,
   FileText,

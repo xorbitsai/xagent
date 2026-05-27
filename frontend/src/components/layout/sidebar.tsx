@@ -11,7 +11,7 @@ import { useAuth } from "@/contexts/auth-context"
 import { useApp } from "@/contexts/app-context-chat"
 import { ConfirmDialog } from "@/components/ui/confirm-dialog"
 import { getBrandingFromEnv } from "@/lib/branding"
-import { toast } from "sonner"
+import { toast } from "@/components/ui/sonner"
 import {
   Activity,
   FileText,

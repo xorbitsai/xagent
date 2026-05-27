@@ -33,7 +33,7 @@ import {
 } from "@/components/ui/dialog"
 import { useRouter, useSearchParams } from "next/navigation"
 import { KnowledgeBaseCreationDialog } from "@/components/kb/knowledge-base-creation-dialog"
-import { toast } from "sonner"
+import { toast } from "@/components/ui/sonner"
 import { cn } from "@/lib/utils"
 import { getBrandingFromEnv } from "@/lib/branding"
 import { BuildFilePreviewSheet } from "./build-file-preview-sheet"

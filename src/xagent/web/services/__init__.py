@@ -22,6 +22,13 @@ from .kb_file_service import (
     resolve_document_filename,
     upsert_uploaded_file_record,
 )
+from .kb_ingest_targets import (
+    admit_kb_ingest_target,
+    is_latest_kb_ingest_generation,
+    release_kb_ingest_target_generation,
+    tombstone_kb_ingest_target,
+    tombstone_kb_ingest_targets_for_collection,
+)
 from .model_service import (
     get_default_image_edit_model,
     get_default_image_generate_model,
@@ -53,6 +60,11 @@ __all__ = [
     "get_document_record_file_id",
     "resolve_document_filename",
     "delete_uploaded_file_if_orphaned",
+    "admit_kb_ingest_target",
+    "is_latest_kb_ingest_generation",
+    "release_kb_ingest_target_generation",
+    "tombstone_kb_ingest_target",
+    "tombstone_kb_ingest_targets_for_collection",
     "get_default_model",
     "get_default_vision_model",
     "get_default_image_generate_model",

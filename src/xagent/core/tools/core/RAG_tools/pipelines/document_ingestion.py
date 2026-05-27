@@ -193,6 +193,7 @@ def run_document_ingestion(
     is_admin: Optional[bool] = None,
     file_id: Optional[str] = None,
     metadata_source_path: Optional[str] = None,
+    commit_gate: Optional[Callable[[], None]] = None,
 ) -> IngestionResult:
     """Public entrypoint for LangGraph-compatible ingestion tooling.
 
@@ -213,6 +214,7 @@ def run_document_ingestion(
         file_id: Optional UploadedFile file_id for stable file association.
         metadata_source_path: Optional canonical path to store in metadata while
             reading from ``source_path``.
+        commit_gate: Optional callback invoked before canonical RAG writes.
 
     Returns:
         IngestionResult: Same contract as :func:`process_document`.
@@ -231,6 +233,7 @@ def run_document_ingestion(
         is_admin=is_admin,
         file_id=file_id,
         metadata_source_path=metadata_source_path,
+        commit_gate=commit_gate,
     )
 
 
@@ -492,6 +495,7 @@ def process_document(
     is_admin: bool = False,
     file_id: Optional[str] = None,
     metadata_source_path: Optional[str] = None,
+    commit_gate: Optional[Callable[[], None]] = None,
 ) -> IngestionResult:
     """Execute the full ingestion pipeline for a document.
 
@@ -513,6 +517,7 @@ def process_document(
         file_id: Optional UploadedFile file_id for stable file association.
         metadata_source_path: Optional canonical path to store in metadata while
             parsing and hashing ``source_path``.
+        commit_gate: Optional callback invoked before canonical RAG writes.
 
     Returns:
         IngestionResult: A structured report describing the pipeline status,
@@ -673,6 +678,8 @@ def process_document(
         )
         register_start = time.time()
         with progress_tracker.track_step("register_document"):
+            if commit_gate is not None:
+                commit_gate()
             register_result = register_document(
                 collection=collection,
                 source_path=source_path,
@@ -740,6 +747,8 @@ def process_document(
             },
         )
         parse_start = time.time()
+        if commit_gate is not None:
+            commit_gate()
         deepdoc_env: Dict[str, Optional[str]] = {}
         if cfg.deepdoc_processing_mode:
             deepdoc_env["DEEPDOC_PROCESSING_MODE"] = cfg.deepdoc_processing_mode
@@ -1045,6 +1054,8 @@ def process_document(
                         write_batch_start = time.time()
                         current_step = "write_vectors_to_db"
                         try:
+                            if commit_gate is not None:
+                                commit_gate()
                             write_response = write_vectors_to_db(
                                 collection=collection,
                                 embeddings=embeddings_batch_async,
@@ -1141,6 +1152,8 @@ def process_document(
                         write_batch_start = time.time()
                         current_step = "write_vectors_to_db"
                         try:
+                            if commit_gate is not None:
+                                commit_gate()
                             write_response = write_vectors_to_db(
                                 collection=collection,
                                 embeddings=embeddings_batch,

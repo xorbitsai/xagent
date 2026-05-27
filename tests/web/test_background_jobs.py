@@ -6,10 +6,13 @@ import sys
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
+import pytest
+
 from xagent.config import CELERY_BROKER_URL, CELERY_ENABLED
 from xagent.core.tools.core.RAG_tools.core.schemas import (
     IngestionConfig,
     IngestionResult,
+    WebCrawlConfig,
 )
 from xagent.web.models.background_job import BackgroundJobStatus, BackgroundJobType
 from xagent.web.models.database import get_session_local, init_db
@@ -302,6 +305,216 @@ def test_kb_document_job_reads_staged_file_and_publishes_canonical(
         db.close()
 
 
+def test_kb_document_job_supersedes_older_generation_for_same_target(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setenv(CELERY_ENABLED, "false")
+    monkeypatch.delenv(CELERY_BROKER_URL, raising=False)
+
+    from xagent.web.jobs.kb_tasks import handle_kb_ingest_document
+    from xagent.web.services.kb_ingest_targets import admit_kb_ingest_target
+
+    SessionLocal = _init_test_db(tmp_path / "kb-target-generation.db")
+    db = SessionLocal()
+    try:
+        user = _create_user(db, username="kb-target-generation-test")
+        stage_dir = tmp_path / "stage"
+        target_file = tmp_path / "canonical" / "doc.txt"
+        stage_dir.mkdir(parents=True)
+        staged_a = stage_dir / "a.txt"
+        staged_b = stage_dir / "b.txt"
+        staged_a.write_text("older content", encoding="utf-8")
+        staged_b.write_text("newer content", encoding="utf-8")
+        file_id = "22222222-2222-4222-8222-222222222222"
+        generation_a = "33333333-3333-4333-8333-333333333333"
+        generation_b = "44444444-4444-4444-8444-444444444444"
+        ingestion_config = IngestionConfig()
+
+        def payload_for(path: Path, generation_id: str) -> dict:
+            return {
+                "collection": "kb",
+                "source_path": str(path),
+                "target_path": str(target_file),
+                "file_id": file_id,
+                "generation_id": generation_id,
+                "file_sha256": generation_id,
+                "filename": "doc.txt",
+                "mime_type": "text/plain",
+                "file_size": path.stat().st_size,
+                "user_id": int(user.id),
+                "is_admin": False,
+                "ingestion_config": ingestion_config.model_dump(mode="json"),
+                "collection_existed_before": True,
+            }
+
+        job_a = create_background_job(
+            db,
+            user_id=int(user.id),
+            job_type=BackgroundJobType.KB_INGEST_DOCUMENT,
+            payload=payload_for(staged_a, generation_a),
+        )
+        job_b = create_background_job(
+            db,
+            user_id=int(user.id),
+            job_type=BackgroundJobType.KB_INGEST_DOCUMENT,
+            payload=payload_for(staged_b, generation_b),
+        )
+        admit_kb_ingest_target(
+            db,
+            user_id=int(user.id),
+            collection="kb",
+            target_path=str(target_file),
+            file_id=file_id,
+            generation_id=generation_a,
+            job_id=str(job_a.id),
+            file_sha256=generation_a,
+        )
+        admit_kb_ingest_target(
+            db,
+            user_id=int(user.id),
+            collection="kb",
+            target_path=str(target_file),
+            file_id=file_id,
+            generation_id=generation_b,
+            job_id=str(job_b.id),
+            file_sha256=generation_b,
+        )
+
+        ingested_sources: list[str] = []
+
+        def fake_run_document_ingestion(**kwargs):
+            ingested_sources.append(kwargs["source_path"])
+            return IngestionResult(
+                status="success",
+                doc_id="doc-1",
+                message="ok",
+                completed_steps=[
+                    {"name": "register_document", "metadata": {"created": True}}
+                ],
+            )
+
+        monkeypatch.setattr(
+            "xagent.web.jobs.kb_tasks.run_document_ingestion",
+            fake_run_document_ingestion,
+        )
+
+        result_b = handle_kb_ingest_document(db, job_b)
+        result_a = handle_kb_ingest_document(db, job_a)
+
+        assert result_b["file_id"] == file_id
+        assert result_a["status"] == "superseded"
+        assert result_a["published"] is False
+        assert ingested_sources == [str(staged_b)]
+        assert target_file.read_text(encoding="utf-8") == "newer content"
+        assert not staged_a.exists()
+        assert not staged_b.exists()
+        file_record = (
+            db.query(UploadedFile)
+            .filter(UploadedFile.storage_path == str(target_file))
+            .first()
+        )
+        assert file_record is not None
+        assert str(file_record.file_id) == file_id
+    finally:
+        db.close()
+
+
+def test_kb_document_job_skips_canonical_rollback_when_generation_turns_stale(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setenv(CELERY_ENABLED, "false")
+    monkeypatch.delenv(CELERY_BROKER_URL, raising=False)
+
+    from xagent.web.jobs import kb_tasks
+    from xagent.web.jobs.kb_tasks import handle_kb_ingest_document
+    from xagent.web.services.kb_ingest_targets import admit_kb_ingest_target
+
+    SessionLocal = _init_test_db(tmp_path / "kb-stale-rollback.db")
+    db = SessionLocal()
+    try:
+        user = _create_user(db, username="kb-stale-rollback-test")
+        staged_file = tmp_path / "stage" / "doc.txt"
+        target_file = tmp_path / "canonical" / "doc.txt"
+        staged_file.parent.mkdir(parents=True)
+        staged_file.write_text("older content", encoding="utf-8")
+        file_id = "55555555-5555-4555-8555-555555555555"
+        generation_a = "66666666-6666-4666-8666-666666666666"
+        generation_b = "77777777-7777-4777-8777-777777777777"
+        ingestion_config = IngestionConfig()
+
+        job = create_background_job(
+            db,
+            user_id=int(user.id),
+            job_type=BackgroundJobType.KB_INGEST_DOCUMENT,
+            payload={
+                "collection": "kb",
+                "source_path": str(staged_file),
+                "target_path": str(target_file),
+                "file_id": file_id,
+                "generation_id": generation_a,
+                "file_sha256": generation_a,
+                "filename": "doc.txt",
+                "mime_type": "text/plain",
+                "file_size": staged_file.stat().st_size,
+                "user_id": int(user.id),
+                "is_admin": False,
+                "ingestion_config": ingestion_config.model_dump(mode="json"),
+                "collection_existed_before": True,
+            },
+        )
+        admit_kb_ingest_target(
+            db,
+            user_id=int(user.id),
+            collection="kb",
+            target_path=str(target_file),
+            file_id=file_id,
+            generation_id=generation_a,
+            job_id=str(job.id),
+            file_sha256=generation_a,
+        )
+
+        def fake_run_document_ingestion(**kwargs):
+            admit_kb_ingest_target(
+                db,
+                user_id=int(user.id),
+                collection="kb",
+                target_path=str(target_file),
+                file_id=file_id,
+                generation_id=generation_b,
+                job_id="newer-job",
+                file_sha256=generation_b,
+            )
+            return IngestionResult(
+                status="partial",
+                doc_id="doc-1",
+                message="partial after stale generation",
+                completed_steps=[
+                    {"name": "register_document", "metadata": {"created": True}}
+                ],
+            )
+
+        def fail_rollback(*args, **kwargs):
+            raise AssertionError("stale staged jobs must not roll back canonical state")
+
+        monkeypatch.setattr(
+            "xagent.web.jobs.kb_tasks.run_document_ingestion",
+            fake_run_document_ingestion,
+        )
+        monkeypatch.setattr(
+            kb_tasks,
+            "_rollback_failed_staged_document_ingestion",
+            fail_rollback,
+        )
+
+        result = handle_kb_ingest_document(db, job)
+
+        assert result["status"] == "superseded"
+        assert result["published"] is False
+        assert not staged_file.exists()
+    finally:
+        db.close()
+
+
 def test_background_job_progress_manager_mirrors_rag_progress(tmp_path, monkeypatch):
     monkeypatch.setenv(CELERY_ENABLED, "false")
     monkeypatch.delenv(CELERY_BROKER_URL, raising=False)
@@ -364,6 +577,60 @@ def test_background_job_progress_manager_mirrors_rag_progress(tmp_path, monkeypa
         assert (
             job.progress["metadata"]["steps"]["parse_document"]["step_progress"] == 0.5
         )
+    finally:
+        db.close()
+
+
+def test_kb_web_job_cleans_new_collection_metadata_on_ingest_error(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setenv(CELERY_ENABLED, "false")
+    monkeypatch.delenv(CELERY_BROKER_URL, raising=False)
+
+    from xagent.web.jobs.exceptions import BackgroundJobHandlerError
+    from xagent.web.jobs.kb_tasks import handle_kb_ingest_web
+
+    SessionLocal = _init_test_db(tmp_path / "web-ingest-cleanup.db")
+    db = SessionLocal()
+    try:
+        user = _create_user(db, username="web-ingest-cleanup-test")
+        job = create_background_job(
+            db,
+            user_id=int(user.id),
+            job_type=BackgroundJobType.KB_INGEST_WEB,
+            payload={
+                "collection": "web-kb",
+                "crawl_config": WebCrawlConfig(
+                    start_url="https://example.com"
+                ).model_dump(mode="json"),
+                "ingestion_config": IngestionConfig().model_dump(mode="json"),
+                "user_id": int(user.id),
+                "is_admin": False,
+                "collection_existed_before": False,
+            },
+        )
+
+        async def fake_run_web_ingestion(**kwargs):
+            return IngestionResult(status="error", message="crawl failed")
+
+        cleaned: list[tuple[str, int]] = []
+
+        async def fake_cleanup(*, collection_name, user):
+            cleaned.append((collection_name, int(user.id)))
+
+        monkeypatch.setattr(
+            "xagent.web.jobs.kb_tasks.run_web_ingestion",
+            fake_run_web_ingestion,
+        )
+        monkeypatch.setattr(
+            "xagent.web.api.kb._cleanup_failed_new_collection_metadata",
+            fake_cleanup,
+        )
+
+        with pytest.raises(BackgroundJobHandlerError):
+            handle_kb_ingest_web(db, job)
+
+        assert cleaned == [("web-kb", int(user.id))]
     finally:
         db.close()
 

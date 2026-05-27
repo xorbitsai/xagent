@@ -5,6 +5,7 @@ Provides REST API endpoints for managing and using skills in the web application
 """
 
 import logging
+from importlib import import_module
 from typing import Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Request
@@ -142,10 +143,10 @@ async def recall_skill(
     skill_manager = request.app.state.skill_manager
 
     # Get LLM from model_manager
-    from xagent.core.model.manager import (  # type: ignore[import-not-found]
-        get_model_manager,
+    get_model_manager = getattr(
+        import_module("xagent.core.model.manager"),
+        "get_model_manager",
     )
-
     model_manager = get_model_manager()
     llm = model_manager.get_llm(request_data.llm_id)
 

@@ -4,6 +4,7 @@ from .background_job import BackgroundJob, BackgroundJobStatus, BackgroundJobTyp
 from .chat_message import TaskChatMessage
 from .custom_api import CustomApi, UserCustomApi
 from .database import Base, get_db, get_engine, get_session_local
+from .kb_ingest_target import KBIngestTarget
 from .mcp import MCPServer, UserMCPServer
 from .model import Model
 from .oauth_provider import OAuthProvider
@@ -46,6 +47,7 @@ __all__ = [
     "BackgroundJob",
     "BackgroundJobStatus",
     "BackgroundJobType",
+    "KBIngestTarget",
     "TaskChatMessage",
     "UploadedFile",
     "SandboxInfo",

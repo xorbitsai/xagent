@@ -147,6 +147,12 @@ from ..services.kb_file_service import (
 from ..services.kb_file_service import (
     upsert_uploaded_file_record as _upsert_uploaded_file_record,
 )
+from ..services.kb_ingest_targets import (
+    admit_kb_ingest_target,
+    release_kb_ingest_target_generation,
+    tombstone_kb_ingest_target,
+    tombstone_kb_ingest_targets_for_collection,
+)
 from ..services.managed_file_ref import DurableObjectMissingError, ManagedFileRef
 from ..services.uploaded_file_store import UploadedFileStore
 from .cloud_storage import get_google_credentials
@@ -2003,6 +2009,8 @@ async def create_ingest_job(
         _cleanup_background_ingest_staging_file(staged_file_path)
         return existing_job
 
+    generation_id = str(uuid.uuid4())
+
     saved_collection_config = False
     try:
         metadata_store = get_metadata_store()
@@ -2020,6 +2028,8 @@ async def create_ingest_job(
         "source_path": str(staged_file_path),
         "target_path": str(file_path),
         "file_id": file_id,
+        "generation_id": generation_id,
+        "file_sha256": file_sha256,
         "filename": safe_filename,
         "mime_type": mime_type,
         "file_size": int(total_size),
@@ -2041,6 +2051,16 @@ async def create_ingest_job(
         if dict(job.payload or {}).get("source_path") != str(staged_file_path):
             _cleanup_background_ingest_staging_file(staged_file_path)
             return job
+        admit_kb_ingest_target(
+            db,
+            user_id=int(_user.id),
+            collection=safe_collection,
+            target_path=str(file_path),
+            file_id=file_id,
+            generation_id=generation_id,
+            job_id=str(job.id),
+            file_sha256=file_sha256,
+        )
     except Exception:
         db.rollback()
         _cleanup_background_ingest_staging_file(staged_file_path)
@@ -2053,6 +2073,13 @@ async def create_ingest_job(
     try:
         return await _enqueue_background_job_or_503_async(db, job)
     except Exception:
+        release_kb_ingest_target_generation(
+            db,
+            user_id=int(_user.id),
+            collection=safe_collection,
+            target_path=str(file_path),
+            generation_id=generation_id,
+        )
         _cleanup_background_ingest_staging_file(staged_file_path)
         if saved_collection_config and not collection_existed_before:
             await _cleanup_failed_new_collection_metadata(
@@ -3347,6 +3374,12 @@ async def create_ingest_web_job(
         raise HTTPException(status_code=422, detail=detail) from exc
     await _ensure_background_job_queue_available_async()
 
+    try:
+        get_collection_sync(safe_collection)
+        collection_existed_before = True
+    except ValueError:
+        collection_existed_before = False
+
     final_chunk_size = chunk_size if chunk_size is not None and chunk_size > 0 else 1000
     final_chunk_overlap = (
         chunk_overlap if chunk_overlap is not None and chunk_overlap >= 0 else 200
@@ -3390,6 +3423,7 @@ async def create_ingest_web_job(
     if existing_job is not None:
         return existing_job
 
+    saved_collection_config = False
     try:
         metadata_store = get_metadata_store()
         await metadata_store.save_collection_config(
@@ -3397,26 +3431,36 @@ async def create_ingest_web_job(
             config_json=ingestion_config.model_dump_json(exclude_unset=True),
             user_id=int(_user.id),
         )
+        saved_collection_config = True
     except Exception as e:
         logger.warning(
             "Failed to save collection config during async web ingest: %s", e
         )
 
-    job = create_background_job(
-        db,
-        user_id=int(_user.id),
-        job_type=BackgroundJobType.KB_INGEST_WEB,
-        payload={
-            "collection": safe_collection,
-            "crawl_config": crawl_config.model_dump(mode="json"),
-            "ingestion_config": ingestion_config.model_dump(mode="json"),
-            "user_id": int(_user.id),
-            "is_admin": bool(_user.is_admin),
-        },
-        idempotency_key=idempotency_key,
-        reuse_terminal_idempotency_key=False,
-    )
-    return await _enqueue_background_job_or_503_async(db, job)
+    try:
+        job = create_background_job(
+            db,
+            user_id=int(_user.id),
+            job_type=BackgroundJobType.KB_INGEST_WEB,
+            payload={
+                "collection": safe_collection,
+                "crawl_config": crawl_config.model_dump(mode="json"),
+                "ingestion_config": ingestion_config.model_dump(mode="json"),
+                "user_id": int(_user.id),
+                "is_admin": bool(_user.is_admin),
+                "collection_existed_before": collection_existed_before,
+            },
+            idempotency_key=idempotency_key,
+            reuse_terminal_idempotency_key=False,
+        )
+        return await _enqueue_background_job_or_503_async(db, job)
+    except Exception:
+        if saved_collection_config and not collection_existed_before:
+            await _cleanup_failed_new_collection_metadata(
+                collection_name=safe_collection,
+                user=_user,
+            )
+        raise
 
 
 class BatchDeleteCollectionsRequest(BaseModel):
@@ -3932,6 +3976,12 @@ def _perform_kb_collection_delete(
             is_admin=is_admin,
             db=db,
         )
+        for owner_id in sorted(mutation_scope.owner_user_ids):
+            tombstone_kb_ingest_targets_for_collection(
+                db,
+                user_id=owner_id,
+                collection=safe_collection,
+            )
 
         result = delete_collection(safe_collection, user_id, is_admin)
 
@@ -4905,6 +4955,24 @@ async def delete_document_api(
             )
         else:
             for cleanup_file_id in cleanup_candidate_file_ids:
+                if cleanup_file_id not in remaining_file_ids:
+                    cleanup_record = (
+                        db.query(UploadedFile)
+                        .filter(
+                            UploadedFile.user_id == user_id_int,
+                            UploadedFile.file_id == cleanup_file_id,
+                        )
+                        .first()
+                    )
+                    if cleanup_record is not None:
+                        tombstone_kb_ingest_target(
+                            db,
+                            user_id=user_id_int,
+                            collection=safe_collection_name,
+                            target_path=str(cleanup_record.storage_path),
+                            file_id=str(cleanup_record.file_id),
+                            commit=False,
+                        )
                 _delete_uploaded_file_if_orphaned(
                     db,
                     file_id=cleanup_file_id,

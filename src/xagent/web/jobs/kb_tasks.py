@@ -28,10 +28,17 @@ from ..models.database import get_session_local
 from ..models.uploaded_file import UploadedFile
 from ..models.user import User
 from ..services.background_jobs import update_job_progress
+from ..services.kb_ingest_targets import is_latest_kb_ingest_generation
 from .exceptions import BackgroundJobHandlerError
 from .progress import BackgroundJobProgressManager
 
 logger = logging.getLogger(__name__)
+
+_SUPERSEDED_STAGED_INGEST_MESSAGE = "KB ingest job superseded by a newer upload"
+
+
+class StagedDocumentIngestSuperseded(RuntimeError):
+    pass
 
 
 def handle_kb_ingest_document(db: Session, job: BackgroundJob) -> dict[str, Any]:
@@ -43,6 +50,14 @@ def handle_kb_ingest_document(db: Session, job: BackgroundJob) -> dict[str, Any]
     progress_manager = BackgroundJobProgressManager(db, job)
 
     update_job_progress(db, job, message="Ingesting document")
+    if is_staged_input and not _is_staged_document_generation_latest(db, payload):
+        update_job_progress(db, job, message="Superseded by newer upload")
+        return _superseded_staged_document_result(payload)
+
+    def _assert_latest_generation() -> None:
+        if is_staged_input and not _is_staged_document_generation_latest(db, payload):
+            raise StagedDocumentIngestSuperseded(_SUPERSEDED_STAGED_INGEST_MESSAGE)
+
     try:
         with user_scope_context(
             user_id=int(payload["user_id"]),
@@ -57,6 +72,7 @@ def handle_kb_ingest_document(db: Session, job: BackgroundJob) -> dict[str, Any]
                 is_admin=bool(payload.get("is_admin", False)),
                 file_id=str(file_id) if file_id else None,
                 metadata_source_path=str(target_path) if target_path else None,
+                commit_gate=_assert_latest_generation if is_staged_input else None,
             )
     except Exception:
         if is_staged_input and int(job.attempts or 0) >= int(job.max_attempts or 1):
@@ -68,7 +84,12 @@ def handle_kb_ingest_document(db: Session, job: BackgroundJob) -> dict[str, Any]
         result_payload["file_id"] = file_id
     if result.status in {"error", "partial"}:
         if is_staged_input:
-            _rollback_failed_staged_document_ingestion(db, payload, result)
+            if _is_superseded_ingestion_result(
+                result
+            ) or not _rollback_failed_staged_document_ingestion_if_current(
+                db, payload, result
+            ):
+                return _superseded_staged_document_result(payload)
         else:
             _rollback_failed_document_ingestion(db, payload, result)
         raise BackgroundJobHandlerError(
@@ -77,11 +98,18 @@ def handle_kb_ingest_document(db: Session, job: BackgroundJob) -> dict[str, Any]
             retryable=False,
         )
     if is_staged_input:
+        if not _is_staged_document_generation_latest(db, payload):
+            return _superseded_staged_document_result(payload)
         try:
             file_record = _publish_staged_document_ingestion(db, payload)
             result_payload["file_id"] = str(file_record.file_id)
+        except StagedDocumentIngestSuperseded:
+            return _superseded_staged_document_result(payload)
         except Exception as exc:  # noqa: BLE001
-            _rollback_failed_staged_document_ingestion(db, payload, result)
+            if not _rollback_failed_staged_document_ingestion_if_current(
+                db, payload, result
+            ):
+                return _superseded_staged_document_result(payload)
             raise BackgroundJobHandlerError(
                 f"Document ingestion succeeded but publishing uploaded file failed: {exc}",
                 result=result_payload,
@@ -133,21 +161,26 @@ def handle_kb_ingest_web(db: Session, job: BackgroundJob) -> dict[str, Any]:
             db_session.close()
 
     update_job_progress(db, job, message="Crawling website")
-    with user_scope_context(user_id=user_id, is_admin=is_admin):
-        result = asyncio.run(
-            run_web_ingestion(
-                collection=collection,
-                crawl_config=crawl_config,
-                ingestion_config=ingestion_config,
-                progress_callback=_progress,
-                user_id=user_id,
-                is_admin=is_admin,
-                file_handler=_file_handler_with_db,
+    try:
+        with user_scope_context(user_id=user_id, is_admin=is_admin):
+            result = asyncio.run(
+                run_web_ingestion(
+                    collection=collection,
+                    crawl_config=crawl_config,
+                    ingestion_config=ingestion_config,
+                    progress_callback=_progress,
+                    user_id=user_id,
+                    is_admin=is_admin,
+                    file_handler=_file_handler_with_db,
+                )
             )
-        )
+    except Exception:
+        _cleanup_failed_web_collection_metadata_if_new(db, payload)
+        raise
 
     result_payload = result.model_dump(mode="json")
     if result.status == "error":
+        _cleanup_failed_web_collection_metadata_if_new(db, payload)
         raise BackgroundJobHandlerError(result.message, result=result_payload)
     return result_payload
 
@@ -273,6 +306,46 @@ def _cleanup_staged_document_input(payload: dict[str, Any]) -> None:
     _cleanup_background_ingest_staging_file(payload.get("source_path"))
 
 
+def _has_generation_gate(payload: dict[str, Any]) -> bool:
+    return bool(
+        payload.get("target_path")
+        and payload.get("generation_id")
+        and payload.get("user_id") is not None
+        and payload.get("collection")
+    )
+
+
+def _is_staged_document_generation_latest(
+    db: Session,
+    payload: dict[str, Any],
+) -> bool:
+    if not _has_generation_gate(payload):
+        return True
+    return is_latest_kb_ingest_generation(
+        db,
+        user_id=int(payload["user_id"]),
+        collection=str(payload["collection"]),
+        target_path=str(payload["target_path"]),
+        generation_id=str(payload["generation_id"]),
+    )
+
+
+def _is_superseded_ingestion_result(result: IngestionResult) -> bool:
+    return str(result.message) == _SUPERSEDED_STAGED_INGEST_MESSAGE
+
+
+def _superseded_staged_document_result(payload: dict[str, Any]) -> dict[str, Any]:
+    _cleanup_staged_document_input(payload)
+    return {
+        "status": "superseded",
+        "published": False,
+        "message": _SUPERSEDED_STAGED_INGEST_MESSAGE,
+        "file_id": payload.get("file_id"),
+        "generation_id": payload.get("generation_id"),
+        "target_path": payload.get("target_path"),
+    }
+
+
 def _rollback_failed_staged_document_ingestion(
     db: Session,
     payload: dict[str, Any],
@@ -325,6 +398,18 @@ def _rollback_failed_staged_document_ingestion(
         _cleanup_staged_document_input(payload)
 
 
+def _rollback_failed_staged_document_ingestion_if_current(
+    db: Session,
+    payload: dict[str, Any],
+    result: IngestionResult,
+) -> bool:
+    if not _is_staged_document_generation_latest(db, payload):
+        _cleanup_staged_document_input(payload)
+        return False
+    _rollback_failed_staged_document_ingestion(db, payload, result)
+    return True
+
+
 def _publish_staged_document_ingestion(
     db: Session,
     payload: dict[str, Any],
@@ -340,6 +425,8 @@ def _publish_staged_document_ingestion(
     target_path = Path(str(payload["target_path"]))
     if not source_path.exists():
         raise FileNotFoundError(f"Missing staged ingest file: {source_path}")
+    if not _is_staged_document_generation_latest(db, payload):
+        raise StagedDocumentIngestSuperseded(_SUPERSEDED_STAGED_INGEST_MESSAGE)
 
     payload_file_id = str(payload["file_id"]) if payload.get("file_id") else None
     existing_record = (
@@ -466,3 +553,29 @@ def _discard_ingest_backup(payload: dict[str, Any]) -> None:
         backup.unlink()
     except OSError:
         logger.warning("Failed to remove ingest backup %s", backup)
+
+
+def _cleanup_failed_web_collection_metadata_if_new(
+    db: Session,
+    payload: dict[str, Any],
+) -> None:
+    if bool(payload.get("collection_existed_before", True)):
+        return
+
+    user_id = int(payload["user_id"])
+    user = db.query(User).filter(User.id == user_id).first()
+    if user is None:
+        logger.warning(
+            "Cannot clean failed web-ingest collection metadata for missing user %s",
+            user_id,
+        )
+        return
+
+    from ..api.kb import _cleanup_failed_new_collection_metadata
+
+    asyncio.run(
+        _cleanup_failed_new_collection_metadata(
+            collection_name=str(payload["collection"]),
+            user=user,
+        )
+    )

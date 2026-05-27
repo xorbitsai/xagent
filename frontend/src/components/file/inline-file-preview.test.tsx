@@ -58,15 +58,14 @@ describe('InlineFilePreview', () => {
     )
   })
 
-  it('renders presentation previews through PptxPreviewRenderer with fetched bytes', async () => {
-    // Arbitrary sentinel bytes; base64 encodes to "AQI=". Avoid the
-    // ZIP magic-number 0x50 0x4B because its base64 encoding trips the
-    // repo's codespell hook (false-positive on the 3-letter sequence).
-    apiRequestMock.mockResolvedValue({
-      ok: true,
-      arrayBuffer: async () => new Uint8Array([0x01, 0x02]).buffer,
-    })
-
+  it('mounts PptxPreviewRenderer immediately with fileId without eager byte fetch', () => {
+    // PDF-first path: when a managed fileId is available, InlineFilePreview
+    // skips the eager /api/files/public/preview bytes download and mounts
+    // PptxPreviewRenderer directly with the fileId.  The renderer then probes
+    // /api/files/preview-pdf/{fileId} (LibreOffice PDF) first and only
+    // lazy-fetches raw bytes if that 503s.  This avoids paying the full PPTX
+    // download + base64 memory cost for large decks when LibreOffice is
+    // available.
     render(
       <InlineFilePreview
         source={{
@@ -77,14 +76,12 @@ describe('InlineFilePreview', () => {
       />
     )
 
-    // Browsers can't render raw .pptx in an iframe, and the backend's
-    // /api/files/public/preview endpoint now returns the raw bytes, so
-    // we mirror the document/spreadsheet path: fetch the bytes, base64
-    // them, hand to PptxPreviewRenderer (canvas-based, pptxviewjs).
-    expect(await screen.findByTestId('pptx-preview')).toHaveTextContent('AQI=')
-    expect(apiRequestMock).toHaveBeenCalledWith(
+    // Renderer is mounted synchronously — no async wait needed.
+    expect(screen.getByTestId('pptx-preview')).toBeInTheDocument()
+    // No eager byte fetch — the renderer lazy-fetches on its own if needed.
+    expect(apiRequestMock).not.toHaveBeenCalledWith(
       'http://api.local/api/files/public/preview/slides-file-id',
-      expect.objectContaining({ cache: 'no-cache' })
+      expect.anything()
     )
   })
 

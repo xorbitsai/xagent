@@ -20,6 +20,7 @@ from ...config import (
     get_file_delivery_accel_redirect_prefix,
     get_file_delivery_redirect_enabled,
     get_file_delivery_signed_url_ttl_seconds,
+    get_storage_root,
     get_uploads_dir,
 )
 from ...core.file_storage.factory import get_file_storage
@@ -551,18 +552,37 @@ def _pptx_text_preview(path: Path) -> str:
     return "\n\n".join(blocks)
 
 
-def _pptx_pdf_cache_path(pptx_path: Path) -> Path:
+def _pptx_pdf_cache_path(pptx_path: Path, file_id: Optional[str] = None) -> Path:
     """Return the on-disk cache path for a converted PDF preview.
 
-    Caches sit beside the original .pptx with a ``.preview.pdf`` suffix so
-    they're cleaned up automatically when the source file is deleted (e.g.
-    by ``uploaded_files_reconcile`` for orphans). Re-converts when the
-    cache is missing or older than the source.
+    Caches are stored in ``<storage_root>/pptx_pdf_cache/`` — a dedicated
+    directory outside the uploads tree.  Keeping them out of uploads:
+
+    * prevents reconcile / backfill from treating ``.pptx.preview.pdf``
+      sidecars as normal user-uploaded files;
+    * avoids leaking derived content after a source upload is deleted
+      (delete_file() explicitly removes the cache entry by file_id);
+    * lets the uploads tree stay clean — only files written by users or
+      the upload endpoint live there.
+
+    For registered UUID files the cache key is the ``file_id``, which lets
+    ``delete_file()`` remove it with a single unlink.  For legacy / non-UUID
+    paths (no lifecycle management) we fall back to a SHA-256 prefix of the
+    resolved source path — entries there age out naturally.
     """
-    return pptx_path.with_suffix(pptx_path.suffix + ".preview.pdf")
+    import hashlib
+
+    cache_dir = get_storage_root() / "pptx_pdf_cache"
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    if file_id:
+        return cache_dir / f"{file_id}.preview.pdf"
+    path_key = hashlib.sha256(str(pptx_path.resolve()).encode()).hexdigest()[:24]
+    return cache_dir / f"{path_key}.preview.pdf"
 
 
-async def _convert_pptx_to_pdf(pptx_path: Path) -> Optional[Path]:
+async def _convert_pptx_to_pdf(
+    pptx_path: Path, file_id: Optional[str] = None
+) -> Optional[Path]:
     """Convert a .pptx to PDF via LibreOffice with on-disk caching.
 
     Returns the path to the cached PDF on success, or ``None`` when soffice
@@ -574,11 +594,15 @@ async def _convert_pptx_to_pdf(pptx_path: Path) -> Optional[Path]:
     don't break the UX — we let the frontend fall back to its canvas
     renderer. Production images (Docker) pre-install libreoffice so this
     path always succeeds there.
+
+    ``file_id`` is forwarded to ``_pptx_pdf_cache_path`` so the cache entry
+    lands in the managed cache directory (keyed by file_id) rather than as
+    a sidecar next to the source file.
     """
     if pptx_path.suffix.lower() != ".pptx":
         return None
 
-    cache_path = _pptx_pdf_cache_path(pptx_path)
+    cache_path = _pptx_pdf_cache_path(pptx_path, file_id)
     try:
         if (
             cache_path.exists()
@@ -1157,7 +1181,12 @@ async def preview_pptx_as_pdf(
             status_code=400, detail="preview-pdf only supports .pptx files"
         )
 
-    pdf_path = await _convert_pptx_to_pdf(pptx_path)
+    # Pass the UUID file_id so the cache entry lands in the managed
+    # cache directory (keyed by file_id) rather than as a sidecar next to
+    # the source file.  Legacy / non-UUID ids pass None and fall back to
+    # the path-hash key.
+    managed_file_id = file_id if is_valid_uuid(file_id) else None
+    pdf_path = await _convert_pptx_to_pdf(pptx_path, file_id=managed_file_id)
     if pdf_path is None:
         # Distinct 503 lets the frontend fall back gracefully instead of
         # showing an error banner.
@@ -1399,6 +1428,16 @@ async def delete_file(
             logger.warning("Failed to clean up deleted local file: %s", file_path)
     elif file_path.exists() and file_path.is_file():
         file_path.unlink()
+
+    # Remove any server-side PDF preview cache so derived content doesn't
+    # outlive the source upload.  Only UUID file_ids have a managed cache
+    # entry; legacy paths use a path-hash key that has no lifecycle contract.
+    if is_valid_uuid(file_id):
+        pdf_cache = get_storage_root() / "pptx_pdf_cache" / f"{file_id}.preview.pdf"
+        try:
+            pdf_cache.unlink(missing_ok=True)
+        except OSError:
+            logger.warning("Failed to remove PDF preview cache for %s", file_id)
 
     return {
         "success": True,

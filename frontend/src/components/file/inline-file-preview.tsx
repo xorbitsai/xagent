@@ -120,6 +120,10 @@ function InlineOfficeContent({
   const [error, setError] = useState(false)
 
   useEffect(() => {
+    // Presentation + fileId: skip the eager bytes download. Hooks must be
+    // called unconditionally, so we guard here rather than relying on the
+    // early render return below.  PptxPreviewRenderer lazy-fetches if needed.
+    if (kind === 'presentation' && fileId) return
     if (!previewUrl) return
 
     let isCancelled = false
@@ -156,6 +160,16 @@ function InlineOfficeContent({
     }
   }, [previewUrl])
 
+  // Fast path: presentation with a managed fileId — skip the eager PPTX
+  // download and mount the renderer immediately.  PptxPreviewRenderer will
+  // probe the LibreOffice PDF endpoint first; only if that 503s does it
+  // lazy-fetch the raw bytes from /api/files/public/preview/{fileId}.  For
+  // large decks this means the PDF iframe can appear without ever paying the
+  // base64 download + memory cost.  Per PR #542 review (rogercloud).
+  if (kind === 'presentation' && fileId) {
+    return <PptxPreviewRenderer fileId={fileId} />
+  }
+
   if (error) {
     return <div className="p-3 text-xs text-muted-foreground">{loadErrorText}</div>
   }
@@ -168,13 +182,10 @@ function InlineOfficeContent({
     )
   }
 
-  // Presentation goes through PptxPreviewRenderer. The renderer tries the
-  // server's LibreOffice-backed /api/files/preview-pdf endpoint first
-  // (vector, text-selectable, perfect font metrics) and falls back to the
-  // canvas-based pptxviewjs path on 503 — so the previous behaviour from
-  // #465 is preserved when LibreOffice isn't installed.
+  // Presentation without a managed fileId (external previewUrl path) falls
+  // through here with pre-loaded bytes.
   if (kind === 'presentation') {
-    return <PptxPreviewRenderer base64Content={base64Content} fileId={fileId} />
+    return <PptxPreviewRenderer base64Content={base64Content} />
   }
 
   if (kind === 'document') {

@@ -7,7 +7,15 @@ import { apiRequest } from "@/lib/api-wrapper"
 import { getApiUrl } from "@/lib/utils"
 
 interface PptxPreviewRendererProps {
-  base64Content: string
+  /**
+   * Pre-loaded PPTX bytes as base64.  Optional: when omitted (or empty)
+   * and a `fileId` is provided, the renderer lazy-fetches the raw bytes
+   * from `/api/files/public/preview/{fileId}` only if the PDF probe fails.
+   * Callers with a `fileId` should omit this prop to skip the eager
+   * download; callers without a `fileId` (external previewUrl path) must
+   * supply it since the renderer has no URL to fall back to.
+   */
+  base64Content?: string
   /**
    * Optional fileId. When provided, the renderer tries the high-fidelity
    * server-rendered PDF preview first (LibreOffice → PDF, displayed in an
@@ -48,6 +56,16 @@ function base64ToUint8Array(b64: string): Uint8Array {
   return bytes
 }
 
+function arrayBufferToBase64(buf: ArrayBuffer): string {
+  const bytes = new Uint8Array(buf)
+  let binary = ""
+  const chunk = 0x8000
+  for (let i = 0; i < bytes.length; i += chunk) {
+    binary += String.fromCharCode(...bytes.subarray(i, i + chunk))
+  }
+  return btoa(binary)
+}
+
 export function PptxPreviewRenderer({ base64Content, fileId }: PptxPreviewRendererProps) {
   const containerRef = useRef<HTMLDivElement | null>(null)
   const canvasRef = useRef<HTMLCanvasElement | null>(null)
@@ -72,15 +90,15 @@ export function PptxPreviewRenderer({ base64Content, fileId }: PptxPreviewRender
   // — silently fall back to the canvas renderer. Any other error also falls
   // back, so the UX never regresses below today's behaviour.
   useEffect(() => {
-    if (!fileId) return
-    // Reset state for the new file: a parent that swaps fileId (e.g.
-    // navigating between two .pptx artifacts in a chat thread) reuses
-    // this component instance. Without the reset we'd keep showing the
-    // *previous* PDF in the iframe (the old object URL was revoked, so
-    // it would just break) and `pdfChecked = true` would also block the
-    // canvas fallback from running for the new file. Per PR #542 review.
+    // Reset PDF/error state whenever fileId changes (including going to
+    // null).  Placed before the `!fileId` guard so switching from a
+    // PDF-backed file to a raw/base64-only source (fileId → undefined)
+    // doesn't inherit stale pdfUrl, pdfChecked, or error state.
+    // Per PR #542 review (rogercloud).
     setPdfUrl(null)
-    setPdfChecked(false)
+    setPdfChecked(!fileId)
+    setError(null)
+    if (!fileId) return
     setIsLoading(true)
     let cancelled = false
     let objectUrl: string | null = null
@@ -162,9 +180,38 @@ export function PptxPreviewRenderer({ base64Content, fileId }: PptxPreviewRender
       // yet. Wait — kicking off pptxviewjs now would race the PDF probe
       // and could leave both pipelines fighting for the same canvas.
       if (fileId && !pdfChecked) return
+
+      // Lazy-fetch raw bytes when the caller didn't pre-supply base64Content
+      // (PDF-first path skips the eager download) and the PDF probe has now
+      // finished without producing a URL.  Per PR #542 review (rogercloud):
+      // when `kind === 'presentation'` and a fileId is available, the parent
+      // mounts this renderer immediately without pre-loading bytes so large
+      // decks don't pay the download cost when LibreOffice is available.
+      let effectiveBase64 = base64Content ?? ""
+      if (!effectiveBase64 && fileId && pdfChecked && !pdfUrl) {
+        setIsLoading(true)
+        try {
+          const res = await apiRequest(
+            `${getApiUrl()}/api/files/public/preview/${encodeURIComponent(fileId)}`,
+            { cache: "no-cache" },
+          )
+          if (cancelled) return
+          if (!res.ok) {
+            setIsLoading(false)
+            return
+          }
+          const buf = await res.arrayBuffer()
+          if (cancelled) return
+          effectiveBase64 = arrayBufferToBase64(buf)
+        } catch {
+          if (!cancelled) setIsLoading(false)
+          return
+        }
+      }
+
       // Empty payload: nothing to render. Drop the loading spinner so we
       // don't hang the UI in an infinite loading state.
-      if (!base64Content) {
+      if (!effectiveBase64) {
         setIsLoading(false)
         return
       }
@@ -173,7 +220,7 @@ export function PptxPreviewRenderer({ base64Content, fileId }: PptxPreviewRender
       setError(null)
 
       try {
-        const bytes = base64ToUint8Array(base64Content)
+        const bytes = base64ToUint8Array(effectiveBase64)
 
         const mod = await import("pptxviewjs")
         if (cancelled) return

@@ -189,6 +189,10 @@ export function PptxPreviewRenderer({ base64Content, fileId }: PptxPreviewRender
       // decks don't pay the download cost when LibreOffice is available.
       let effectiveBase64 = base64Content ?? ""
       if (!effectiveBase64 && fileId && pdfChecked && !pdfUrl) {
+        // PDF probe failed (503 or network error) and no bytes were pre-loaded.
+        // Lazy-fetch the raw PPTX so the canvas renderer can take over.
+        // Surface a visible error on failure so the user isn't left with a
+        // blank canvas and no message (regression flagged in PR #542 review).
         setIsLoading(true)
         try {
           const res = await apiRequest(
@@ -197,14 +201,20 @@ export function PptxPreviewRenderer({ base64Content, fileId }: PptxPreviewRender
           )
           if (cancelled) return
           if (!res.ok) {
-            setIsLoading(false)
+            if (!cancelled) {
+              setError(t("files.previewDialog.errors.loadFailed"))
+              setIsLoading(false)
+            }
             return
           }
           const buf = await res.arrayBuffer()
           if (cancelled) return
           effectiveBase64 = arrayBufferToBase64(buf)
         } catch {
-          if (!cancelled) setIsLoading(false)
+          if (!cancelled) {
+            setError(t("files.previewDialog.errors.loadFailed"))
+            setIsLoading(false)
+          }
           return
         }
       }

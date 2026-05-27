@@ -46,7 +46,7 @@ from ..services.managed_file_ref import (
     ManagedFileRef,
     guess_media_type,
 )
-from ..services.uploaded_file_store import UploadedFileStore
+from ..services.uploaded_file_store import UploadedFileStore, delete_pptx_pdf_cache
 from .legacy_file import (
     infer_user_id_from_legacy_path,
     is_valid_uuid,
@@ -1430,14 +1430,10 @@ async def delete_file(
         file_path.unlink()
 
     # Remove any server-side PDF preview cache so derived content doesn't
-    # outlive the source upload.  Only UUID file_ids have a managed cache
-    # entry; legacy paths use a path-hash key that has no lifecycle contract.
-    if is_valid_uuid(file_id):
-        pdf_cache = get_storage_root() / "pptx_pdf_cache" / f"{file_id}.preview.pdf"
-        try:
-            pdf_cache.unlink(missing_ok=True)
-        except OSError:
-            logger.warning("Failed to remove PDF preview cache for %s", file_id)
+    # outlive the source upload.  Uses the same helper as UploadedFileStore.delete()
+    # so this HTTP route and every other deletion path (reconcile, orphan cleanup)
+    # behave identically.  Non-UUID ids are silently ignored by the helper.
+    delete_pptx_pdf_cache(file_id)
 
     return {
         "success": True,

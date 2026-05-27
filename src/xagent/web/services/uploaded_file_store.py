@@ -1,14 +1,34 @@
 from __future__ import annotations
 
 import hashlib
+import logging
 from pathlib import Path
 from typing import Optional
 from uuid import uuid4
 
 from sqlalchemy.orm import Session
 
+from ...config import get_storage_root
 from ..models.uploaded_file import UploadedFile
 from .managed_file_ref import ManagedFileRef, guess_media_type
+
+logger = logging.getLogger(__name__)
+
+
+def delete_pptx_pdf_cache(file_id: str) -> None:
+    """Remove the server-side LibreOffice PDF preview cache for a .pptx upload.
+
+    Must be called from every path that deletes an ``UploadedFile`` row so
+    the derived cache entry does not outlive the source artifact.  Silently
+    no-ops when the file does not exist (first delete, non-PPTX uploads, etc.).
+    """
+    if not file_id:
+        return
+    cache_path = get_storage_root() / "pptx_pdf_cache" / f"{file_id}.preview.pdf"
+    try:
+        cache_path.unlink(missing_ok=True)
+    except OSError:
+        logger.warning("Failed to remove PDF preview cache for %s", file_id)
 
 
 def create_unbound_uploaded_file_from_local_path(
@@ -198,6 +218,12 @@ class UploadedFileStore:
         ManagedFileRef(file_record).delete_durable()
         if delete_local:
             self._delete_local(file_record, local_root=local_root)
+        # Remove any server-side PDF preview cache so derived content doesn't
+        # outlive the source upload.  Called here (not only in the HTTP route)
+        # so reconcile / orphan-cleanup paths that go through this service also
+        # clean up the cache.
+        file_id = str(getattr(file_record, "file_id", "") or "")
+        delete_pptx_pdf_cache(file_id)
         self.db.delete(file_record)
         self.db.flush()
 

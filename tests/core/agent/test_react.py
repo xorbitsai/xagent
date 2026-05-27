@@ -901,6 +901,98 @@ async def test_react_repeated_decision_drains_current_tool_call_batch() -> None:
 
 
 @pytest.mark.asyncio
+async def test_react_pattern_uses_decision_after_cross_tool_attempts() -> None:
+    llm = FakeLLM(
+        responses=[
+            {
+                "content": "",
+                "tool_calls": [
+                    {
+                        "id": "failed_1",
+                        "function": {
+                            "name": "failing_result",
+                            "arguments": '{"input":"bad image ref"}',
+                        },
+                    }
+                ],
+            },
+            {
+                "content": "",
+                "tool_calls": [
+                    {
+                        "id": "search_1",
+                        "function": {
+                            "name": "zhipu_web_search",
+                            "arguments": '{"query":"Vadim Nicolai xinference","count":5}',
+                        },
+                    }
+                ],
+            },
+            {
+                "content": "",
+                "tool_calls": [
+                    {
+                        "id": "browser_1",
+                        "function": {
+                            "name": "browser_navigate",
+                            "arguments": '{"url":"https://example.com/profile"}',
+                        },
+                    }
+                ],
+            },
+            {
+                "content": "",
+                "tool_calls": [
+                    {
+                        "id": "decision_1",
+                        "function": {
+                            "name": "react_decision",
+                            "arguments": (
+                                '{"action":"final_answer",'
+                                '"reason":"Enough cross-tool attempts",'
+                                '"answer":"已有跨工具结果，直接回答。"}'
+                            ),
+                        },
+                    }
+                ],
+            },
+        ]
+    )
+    pattern = ReActPattern(
+        max_iterations=4,
+        repeated_tool_decision_after_consecutive_tool_calls=None,
+        repeated_tool_decision_after_consecutive_work_tool_calls=3,
+    )
+    search_tool = FakeSearchTool()
+    browser_tool = FakeBrowserNavigateTool()
+    context = ExecutionContext()
+    context.add_user_message("判断这封邮件是不是广撒网")
+
+    result = await pattern.run(
+        context=context,
+        tools=[FailingResultTool(), search_tool, browser_tool],
+        llm=llm,
+    )
+
+    assert result["success"] is True
+    assert result["response"] == "已有跨工具结果，直接回答。"
+    assert len(llm.calls) == 4
+    assert len(search_tool.calls) == 1
+    assert len(browser_tool.calls) == 1
+    assert [schema["function"]["name"] for schema in llm.calls[3]["tools"]] == [
+        "react_decision"
+    ]
+    assert (
+        "3 consecutive work-tool calls without a final answer"
+        in llm.calls[3]["messages"][-1]["content"]
+    )
+    assert (
+        "latest work tool was browser_navigate"
+        in (llm.calls[3]["messages"][-1]["content"])
+    )
+
+
+@pytest.mark.asyncio
 async def test_react_pattern_accepts_legacy_auto_reroute_kwarg() -> None:
     llm = FakeLLM(
         responses=[
@@ -2489,7 +2581,10 @@ async def test_react_pattern_resumes_pending_tool_call_from_checkpoint() -> None
 
 
 def test_react_pattern_state_roundtrip() -> None:
-    pattern = ReActPattern(max_iterations=5)
+    pattern = ReActPattern(
+        max_iterations=5,
+        repeated_tool_decision_after_consecutive_work_tool_calls=7,
+    )
     pattern.status = "acting"
     pattern.current_iteration = 2
     pattern.task_text = "Original task"
@@ -2506,6 +2601,7 @@ def test_react_pattern_state_roundtrip() -> None:
     assert restored.status == "acting"
     assert restored.current_iteration == 2
     assert restored.max_iterations == 5
+    assert restored.repeated_tool_decision_after_consecutive_work_tool_calls == 7
     assert restored.task_text == "Original task"
     assert restored.reasoning_mode == ReActReasoningMode.TOOL_CALLING
     assert restored.tool_ledger["call_1"].result == {"result": 2}

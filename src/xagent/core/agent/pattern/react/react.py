@@ -34,6 +34,7 @@ class ReActReasoningMode(str, Enum):
 
 REPEATED_TOOL_DECISION_REQUESTED_STATUS = "repeated_tool_decision_requested"
 DEFAULT_REPEATED_TOOL_DECISION_CONSECUTIVE_TOOL_CALLS = 4
+DEFAULT_REPEATED_TOOL_DECISION_CONSECUTIVE_WORK_TOOL_CALLS = 10
 REACT_DECISION_TOOL_NAME = "react_decision"
 REACT_DECISION_FINAL_ANSWER = "final_answer"
 REACT_DECISION_TOOL_CALL = "tool_call"
@@ -137,6 +138,9 @@ class ReActPattern(AgentPattern):
         repeated_tool_decision_after_consecutive_tool_calls: int | None = (
             DEFAULT_REPEATED_TOOL_DECISION_CONSECUTIVE_TOOL_CALLS
         ),
+        repeated_tool_decision_after_consecutive_work_tool_calls: int | None = (
+            DEFAULT_REPEATED_TOOL_DECISION_CONSECUTIVE_WORK_TOOL_CALLS
+        ),
     ) -> None:
         self.llm = llm
         self.max_iterations = max_iterations
@@ -145,6 +149,9 @@ class ReActPattern(AgentPattern):
         self.finalize_after_tool_result = finalize_after_tool_result
         self.repeated_tool_decision_after_consecutive_tool_calls = (
             repeated_tool_decision_after_consecutive_tool_calls
+        )
+        self.repeated_tool_decision_after_consecutive_work_tool_calls = (
+            repeated_tool_decision_after_consecutive_work_tool_calls
         )
         self.status = "idle"
         self.current_iteration = 0
@@ -536,6 +543,9 @@ class ReActPattern(AgentPattern):
             "repeated_tool_decision_after_consecutive_tool_calls": (
                 self.repeated_tool_decision_after_consecutive_tool_calls
             ),
+            "repeated_tool_decision_after_consecutive_work_tool_calls": (
+                self.repeated_tool_decision_after_consecutive_work_tool_calls
+            ),
             "force_final_answer_next": self.force_final_answer_next,
             "repeated_tool_decision": self.repeated_tool_decision,
             "waiting_for_user_request": self.waiting_for_user_request,
@@ -566,6 +576,14 @@ class ReActPattern(AgentPattern):
             int(raw_threshold)
             if raw_threshold is not None
             else self.repeated_tool_decision_after_consecutive_tool_calls
+        )
+        raw_work_threshold = state.get(
+            "repeated_tool_decision_after_consecutive_work_tool_calls"
+        )
+        self.repeated_tool_decision_after_consecutive_work_tool_calls = (
+            int(raw_work_threshold)
+            if raw_work_threshold is not None
+            else self.repeated_tool_decision_after_consecutive_work_tool_calls
         )
         self.force_final_answer_next = bool(state.get("force_final_answer_next", False))
         repeated_tool_decision = state.get("repeated_tool_decision")
@@ -1124,17 +1142,15 @@ class ReActPattern(AgentPattern):
                 pattern=self,
                 metadata={"tool_call": tool_call},
             )
+            requested_decision = await self._request_repeated_tool_decision_if_needed(
+                tool_call=tool_call,
+                context=context,
+                runtime=runtime,
+            )
             if self._tool_result_success(result):
                 successful_tool_result = True
-                requested_decision = (
-                    await self._request_repeated_tool_decision_if_needed(
-                        tool_call=tool_call,
-                        context=context,
-                        runtime=runtime,
-                    )
-                )
-                if requested_decision:
-                    successful_tool_result = False
+            if requested_decision:
+                successful_tool_result = False
 
         if (
             self.finalize_after_tool_result
@@ -1282,21 +1298,36 @@ class ReActPattern(AgentPattern):
         self,
         tool_call: dict[str, Any],
     ) -> dict[str, Any] | None:
-        threshold = self.repeated_tool_decision_after_consecutive_tool_calls
-        if threshold is None or threshold <= 0:
-            return None
-
         tool_name = str(tool_call.get("name") or "")
         if not tool_name or tool_name in self._control_tool_names():
             return None
 
-        count = self._consecutive_successful_tool_count(tool_name)
-        if count < threshold:
+        same_tool_threshold = self.repeated_tool_decision_after_consecutive_tool_calls
+        if same_tool_threshold is not None and same_tool_threshold > 0:
+            same_tool_count = self._consecutive_successful_tool_count(tool_name)
+            if same_tool_count >= same_tool_threshold:
+                return {
+                    "trigger": "same_tool_successes",
+                    "tool_name": tool_name,
+                    "consecutive_tool_calls": same_tool_count,
+                    "threshold": same_tool_threshold,
+                }
+
+        work_tool_threshold = (
+            self.repeated_tool_decision_after_consecutive_work_tool_calls
+        )
+        if work_tool_threshold is None or work_tool_threshold <= 0:
+            return None
+
+        work_tool_count = self._consecutive_work_tool_call_count()
+        if work_tool_count < work_tool_threshold:
             return None
         return {
+            "trigger": "work_tool_attempts",
             "tool_name": tool_name,
-            "consecutive_tool_calls": count,
-            "threshold": threshold,
+            "latest_tool_name": tool_name,
+            "consecutive_tool_calls": work_tool_count,
+            "threshold": work_tool_threshold,
         }
 
     def _messages_for_repeated_tool_decision(
@@ -1307,15 +1338,28 @@ class ReActPattern(AgentPattern):
         messages = list(context.get_messages_for_llm())
         tool_name = str(metadata.get("tool_name") or "the tool")
         count = int(metadata.get("consecutive_tool_calls") or 0)
-        count_text = (
-            f"{count} consecutive successful calls"
-            if count > 0
-            else "repeated successful calls"
-        )
+        if metadata.get("trigger") == "work_tool_attempts":
+            latest_tool_name = str(metadata.get("latest_tool_name") or tool_name)
+            count_text = (
+                f"{count} consecutive work-tool calls without a final answer"
+                if count > 0
+                else "repeated work-tool calls without a final answer"
+            )
+            call_context = (
+                f"{count_text}; the latest work tool was {latest_tool_name}. "
+                "Some attempts may have failed; count them as work already spent."
+            )
+        else:
+            count_text = (
+                f"{count} consecutive successful calls"
+                if count > 0
+                else "repeated successful calls"
+            )
+            call_context = f"{count_text} to {tool_name}."
         prompt = (
             f"You must call {REACT_DECISION_TOOL_NAME} exactly once. Decide whether "
             "the current ReAct run should finish or make another work-tool call. "
-            f"You have just made {count_text} to {tool_name}. action must be "
+            f"You have just made {call_context} action must be "
             f"{REACT_DECISION_FINAL_ANSWER} or {REACT_DECISION_TOOL_CALL}. Choose "
             f"{REACT_DECISION_FINAL_ANSWER} when the conversation and accumulated "
             "tool results are sufficient to answer the latest user request; include "
@@ -1413,6 +1457,17 @@ class ReActPattern(AgentPattern):
                 record.result
             ):
                 break
+            count += 1
+        return count
+
+    def _consecutive_work_tool_call_count(self) -> int:
+        count = 0
+        control_tool_names = self._control_tool_names()
+        for record in reversed(list(self.tool_ledger.values())):
+            if record.tool_name in control_tool_names:
+                continue
+            if record.status not in {"completed", "failed"}:
+                continue
             count += 1
         return count
 

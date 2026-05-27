@@ -554,6 +554,7 @@ def make_agent_outbound_handler(task_id: int) -> Any:
                 "message_type": payload.get("message_type", "info"),
                 "expect_response": bool(payload.get("expect_response", False)),
                 "display": "chat" if event_type == "agent_message" else "timeline",
+                "visible": bool(payload.get("visible", True)),
                 "metadata": payload.get("metadata") or {},
             },
         )
@@ -3494,6 +3495,7 @@ async def send_historical_data_as_stream(
                         # The current WAITING_FOR_USER state is reasserted separately
                         # after replay, so old questions must not flip status back.
                         "expect_response": False,
+                        "visible": True,
                     }
                     if isinstance(interactions, list):
                         data["metadata"] = {"interactions": interactions}
@@ -4201,6 +4203,7 @@ clarification questions as plain assistant text.
                             "expect_response": bool(
                                 payload.get("expect_response", False)
                             ),
+                            "visible": bool(payload.get("visible", True)),
                             "metadata": payload.get("metadata") or {},
                         },
                     )

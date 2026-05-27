@@ -111,6 +111,7 @@ class _DAGStepRuntime:
         message: str,
         message_type: str = "info",
         expect_response: bool = False,
+        visible: bool = True,
         metadata: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         outbound_metadata = dict(metadata or {})
@@ -120,6 +121,7 @@ class _DAGStepRuntime:
             message=message,
             message_type=message_type,
             expect_response=expect_response,
+            visible=visible,
             metadata=outbound_metadata,
         )
 

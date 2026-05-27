@@ -215,12 +215,14 @@ class _AutoChildRuntime:
         message: str,
         message_type: str = "info",
         expect_response: bool = False,
+        visible: bool = True,
         metadata: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         return await self.parent.send_message(
             message=message,
             message_type=message_type,
             expect_response=expect_response,
+            visible=visible,
             metadata=metadata,
         )
 

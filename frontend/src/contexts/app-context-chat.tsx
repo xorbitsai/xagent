@@ -1486,8 +1486,10 @@ export function AppProvider({ children, token }: { children: React.ReactNode; to
               return
             }
             const interactions = normalizeInteractions(eventData.metadata?.interactions)
-            const expectsResponse =
-              eventType === "agent_message" &&
+            const isAgentMessage = eventType === "agent_message"
+            const isAiMessage = eventType === "ai_message"
+            const expectsUserResponse =
+              isAgentMessage &&
               eventData.expect_response === true
             const agentMessageDisplay = eventData.display || eventData.metadata?.display
             const isExplicitTranscriptMessage =
@@ -1511,7 +1513,10 @@ export function AppProvider({ children, token }: { children: React.ReactNode; to
               })
               return
             }
-            if (expectsResponse) {
+            const shouldHideAgentMessage =
+              isAgentMessage &&
+              eventData.visible !== true
+            if (expectsUserResponse) {
               dispatch({
                 type: "UPDATE_TASK_STATUS",
                 payload: {
@@ -1522,10 +1527,10 @@ export function AppProvider({ children, token }: { children: React.ReactNode; to
               })
             }
             const streamMessageId =
-              eventType === "ai_message"
+              isAiMessage
                 ? getFinalAnswerStreamMessageId(eventData)
                 : undefined
-            if (eventType === "agent_message" && !expectsResponse) {
+            if (shouldHideAgentMessage) {
               return
             }
             if (!streamMessageId && isDuplicateMessage(messageContent, 'agent-message')) {

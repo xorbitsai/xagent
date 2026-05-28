@@ -878,6 +878,7 @@ async def test_execution_adapter_forwards_outbound_messages() -> None:
     assert outbound_message["message"] == "Still working"
     assert outbound_message["message_type"] == "progress"
     assert outbound_message["expect_response"] is False
+    assert outbound_message["visible"] is True
     assert outbound_message["step_id"] == outbound_message["metadata"]["step_id"]
 
 

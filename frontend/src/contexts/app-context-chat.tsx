@@ -1515,7 +1515,7 @@ export function AppProvider({ children, token }: { children: React.ReactNode; to
             }
             const shouldHideAgentMessage =
               isAgentMessage &&
-              eventData.visible !== true
+              eventData.visible === false
             if (expectsUserResponse) {
               dispatch({
                 type: "UPDATE_TASK_STATUS",

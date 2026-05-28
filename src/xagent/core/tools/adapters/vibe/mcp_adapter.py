@@ -284,7 +284,7 @@ class MCPToolAdapter(AbstractBaseTool):
             value = normalized_args[field_name]
             if value is None:
                 continue
-            if self._schema_accepts_array(field_schema) and not isinstance(value, list):
+            if self._schema_is_array_only(field_schema) and not isinstance(value, list):
                 normalized_args[field_name] = [value]
 
         return normalized_args
@@ -306,6 +306,32 @@ class MCPToolAdapter(AbstractBaseTool):
                 self._schema_accepts_array(variant) for variant in variants
             ):
                 return True
+
+        return False
+
+    def _schema_is_array_only(self, schema: Any) -> bool:
+        """Return True when array is the only accepted non-null JSON shape."""
+        if not isinstance(schema, dict):
+            return False
+
+        schema_type = schema.get("type")
+        if schema_type == "array":
+            return True
+        if isinstance(schema_type, list):
+            concrete_types = [item for item in schema_type if item != "null"]
+            return bool(concrete_types) and all(
+                concrete_type == "array" for concrete_type in concrete_types
+            )
+
+        for union_key in ("anyOf", "oneOf"):
+            options = schema.get(union_key)
+            if isinstance(options, list) and options:
+                non_null_options = [
+                    option for option in options if not self._is_null_schema(option)
+                ]
+                return bool(non_null_options) and all(
+                    self._schema_is_array_only(option) for option in non_null_options
+                )
 
         return False
 

@@ -431,8 +431,8 @@ class LanceDBMetadataStore(MetadataStore):
                     best_idx = i
             return str(result["config_json"][best_idx].as_py())
         except Exception as exc:
-            logger.debug("Error reading collection config: %s", exc)
-            return None
+            logger.debug("Error reading collection config: %s", exc, exc_info=True)
+            raise
         finally:
             _safe_close_table(table)
 

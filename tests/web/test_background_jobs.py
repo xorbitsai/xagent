@@ -13,6 +13,7 @@ from xagent.core.tools.core.RAG_tools.core.schemas import (
     IngestionConfig,
     IngestionResult,
     WebCrawlConfig,
+    WebIngestionResult,
 )
 from xagent.web.models.background_job import BackgroundJobStatus, BackgroundJobType
 from xagent.web.models.database import get_session_local, init_db
@@ -611,7 +612,21 @@ def test_kb_web_job_cleans_new_collection_metadata_on_ingest_error(
         )
 
         async def fake_run_web_ingestion(**kwargs):
-            return IngestionResult(status="error", message="crawl failed")
+            return WebIngestionResult(
+                status="error",
+                collection="web-kb",
+                total_urls_found=1,
+                pages_crawled=0,
+                pages_failed=1,
+                documents_created=0,
+                chunks_created=0,
+                embeddings_created=0,
+                crawled_urls=[],
+                failed_urls={"https://example.com": "crawl failed"},
+                message="crawl failed",
+                warnings=[],
+                elapsed_time_ms=1,
+            )
 
         cleaned: list[tuple[str, int]] = []
 
@@ -633,6 +648,142 @@ def test_kb_web_job_cleans_new_collection_metadata_on_ingest_error(
         assert cleaned == [("web-kb", int(user.id))]
     finally:
         db.close()
+
+
+def test_kb_web_job_keeps_new_collection_metadata_when_error_has_successful_docs(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setenv(CELERY_ENABLED, "false")
+    monkeypatch.delenv(CELERY_BROKER_URL, raising=False)
+
+    from xagent.web.jobs.exceptions import BackgroundJobHandlerError
+    from xagent.web.jobs.kb_tasks import handle_kb_ingest_web
+
+    SessionLocal = _init_test_db(tmp_path / "web-ingest-partial-error.db")
+    db = SessionLocal()
+    try:
+        user = _create_user(db, username="web-ingest-partial-error-test")
+        job = create_background_job(
+            db,
+            user_id=int(user.id),
+            job_type=BackgroundJobType.KB_INGEST_WEB,
+            payload={
+                "collection": "web-kb",
+                "crawl_config": WebCrawlConfig(
+                    start_url="https://example.com"
+                ).model_dump(mode="json"),
+                "ingestion_config": IngestionConfig().model_dump(mode="json"),
+                "user_id": int(user.id),
+                "is_admin": False,
+                "collection_existed_before": False,
+            },
+        )
+
+        async def fake_run_web_ingestion(**kwargs):
+            return WebIngestionResult(
+                status="error",
+                collection="web-kb",
+                total_urls_found=2,
+                pages_crawled=2,
+                pages_failed=1,
+                documents_created=1,
+                chunks_created=1,
+                embeddings_created=1,
+                crawled_urls=["https://example.com/a", "https://example.com/b"],
+                failed_urls={"https://example.com/b": "rollback failed"},
+                message="rollback failed",
+                warnings=[],
+                elapsed_time_ms=1,
+            )
+
+        cleaned: list[tuple[str, int]] = []
+
+        async def fake_cleanup(*, collection_name, user):
+            cleaned.append((collection_name, int(user.id)))
+
+        monkeypatch.setattr(
+            "xagent.web.jobs.kb_tasks.run_web_ingestion",
+            fake_run_web_ingestion,
+        )
+        monkeypatch.setattr(
+            "xagent.web.api.kb._cleanup_failed_new_collection_metadata",
+            fake_cleanup,
+        )
+
+        with pytest.raises(BackgroundJobHandlerError):
+            handle_kb_ingest_web(db, job)
+
+        assert cleaned == []
+    finally:
+        db.close()
+
+
+def test_background_web_file_new_branch_returns_rollback_callback(
+    tmp_path, monkeypatch
+):
+    from xagent.core.file_storage.factory import get_file_storage
+    from xagent.web.jobs.kb_tasks import _handle_web_file
+
+    monkeypatch.setenv("XAGENT_FILE_STORAGE_URI", (tmp_path / "objects").as_uri())
+    get_file_storage.cache_clear()
+
+    SessionLocal = _init_test_db(tmp_path / "web-file-handler.db")
+    db = SessionLocal()
+    try:
+        user = _create_user(db, username="web-file-handler-test")
+        temp_file = tmp_path / "temp.md"
+        temp_file.write_text("# Title\n\nBody", encoding="utf-8")
+        persistent_root = tmp_path / "uploads"
+
+        def fake_get_upload_path(
+            filename: str,
+            *,
+            user_id: int,
+            collection: str,
+            collection_is_sanitized: bool,
+        ) -> Path:
+            assert collection_is_sanitized is True
+            return persistent_root / f"user_{user_id}" / collection / filename
+
+        monkeypatch.setattr(
+            "xagent.web.jobs.kb_tasks.get_upload_path",
+            fake_get_upload_path,
+        )
+        monkeypatch.setattr(
+            "xagent.web.api.kb.get_session_local",
+            lambda: SessionLocal,
+        )
+        from unittest.mock import patch
+
+        with patch(
+            "xagent.web.api.kb._rollback_failed_web_document_ingestion"
+        ) as mock_rollback_rag:
+            result = _handle_web_file(
+                temp_file_path=temp_file,
+                title="Title",
+                collection_name="web-kb",
+                url="https://example.com/page",
+                db_session=db,
+                user_id=int(user.id),
+                is_admin=False,
+                processed_urls={},
+            )
+            assert callable(result["rollback_on_failure"])
+
+            result["rollback_on_failure"](None)
+
+        verify_db = SessionLocal()
+        try:
+            rows = verify_db.query(UploadedFile).all()
+            assert rows == []
+        finally:
+            verify_db.close()
+
+        assert not Path(result["file_path"]).exists()
+        mock_rollback_rag.assert_called_once()
+    finally:
+        db.close()
+        get_file_storage.cache_clear()
 
 
 def test_requeue_stale_background_jobs_marks_old_running_pending(tmp_path, monkeypatch):

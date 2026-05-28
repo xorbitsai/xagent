@@ -2,7 +2,7 @@
 
 from datetime import datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, Optional
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -12,7 +12,10 @@ from xagent.core.tools.core.RAG_tools.core.schemas import (
     IngestionResult,
     WebCrawlConfig,
 )
-from xagent.core.tools.core.RAG_tools.pipelines.web_ingestion import run_web_ingestion
+from xagent.core.tools.core.RAG_tools.pipelines.web_ingestion import (
+    _callback_accepts_ingestion_result,
+    run_web_ingestion,
+)
 from xagent.core.tools.core.RAG_tools.utils.string_utils import sanitize_for_doc_id
 from xagent.core.tools.core.RAG_tools.utils.user_scope import user_scope_context
 
@@ -38,6 +41,36 @@ class TestWebIngestionPipeline:
             chunk_size=500,
             chunk_overlap=100,
         )
+
+    def test_callback_accepts_ingestion_result_requires_one_arg_callable(self):
+        def no_args():
+            return None
+
+        def one_required(result):
+            return result
+
+        def one_optional(result=None):
+            return result
+
+        def two_required(result, extra):
+            return result, extra
+
+        def one_required_one_optional(result, extra=None):
+            return result, extra
+
+        def varargs(*args):
+            return args
+
+        def keyword_only(*, result):
+            return result
+
+        assert not _callback_accepts_ingestion_result(no_args)
+        assert _callback_accepts_ingestion_result(one_required)
+        assert _callback_accepts_ingestion_result(one_optional)
+        assert not _callback_accepts_ingestion_result(two_required)
+        assert _callback_accepts_ingestion_result(one_required_one_optional)
+        assert _callback_accepts_ingestion_result(varargs)
+        assert not _callback_accepts_ingestion_result(keyword_only)
 
     @pytest.mark.asyncio
     async def test_successful_web_ingestion(self, crawl_config, ingestion_config):
@@ -903,3 +936,269 @@ class TestWebIngestionFileHandler:
                 assert call_kwargs["file_id"] is None
                 # source_path should be the temporary file path
                 assert "xagent_web_ingest" in call_kwargs["source_path"]
+
+    @pytest.mark.asyncio
+    async def test_file_handler_rollback_runs_on_ingestion_error_result(
+        self, crawl_config, ingestion_config
+    ):
+        """File persistence should be compensated when per-page ingestion fails."""
+        events: list[tuple[str, Optional[IngestionResult]]] = []
+        mock_crawl_results = [
+            MagicMock(
+                url="https://example.com/page1",
+                title="Page 1",
+                content_markdown="# Page 1\n\nContent.",
+                status="success",
+                depth=0,
+                timestamp=datetime(2025, 1, 1, 12, 0, 0),
+                content_length=20,
+            )
+        ]
+        failed_ingestion = IngestionResult(
+            status="error",
+            doc_id="doc1",
+            parse_hash="hash1",
+            message="embedding failed",
+        )
+
+        def file_handler(
+            temp_file_path: Path, title: str, collection: str, url: str
+        ) -> dict[str, Any]:
+            return {
+                "file_path": str(temp_file_path),
+                "file_id": "file-1",
+                "rollback_on_failure": lambda result=None: events.append(
+                    ("rollback", result)
+                ),
+                "commit_on_success": lambda result=None: events.append(
+                    ("commit", result)
+                ),
+            }
+
+        with patch(
+            "xagent.core.tools.core.RAG_tools.pipelines.web_ingestion.WebCrawler"
+        ) as mock_crawler_class:
+            mock_crawler = MagicMock()
+            mock_crawler.crawl = AsyncMock(return_value=mock_crawl_results)
+            mock_crawler.total_urls_found = 1
+            mock_crawler.failed_urls = {}
+            mock_crawler_class.return_value = mock_crawler
+
+            with patch(
+                "xagent.core.tools.core.RAG_tools.pipelines.web_ingestion."
+                "run_document_ingestion",
+                return_value=failed_ingestion,
+            ):
+                result = await run_web_ingestion(
+                    collection="test_collection",
+                    crawl_config=crawl_config,
+                    ingestion_config=ingestion_config,
+                    file_handler=file_handler,
+                )
+
+        assert result.status == "error"
+        assert events == [("rollback", failed_ingestion)]
+
+    @pytest.mark.asyncio
+    async def test_file_handler_rollback_runs_on_ingestion_exception(
+        self, crawl_config, ingestion_config
+    ):
+        """Raised per-page ingestion failures should also compensate persistence."""
+        events: list[tuple[str, Optional[IngestionResult]]] = []
+        mock_crawl_results = [
+            MagicMock(
+                url="https://example.com/page1",
+                title="Page 1",
+                content_markdown="# Page 1\n\nContent.",
+                status="success",
+                depth=0,
+                timestamp=datetime(2025, 1, 1, 12, 0, 0),
+                content_length=20,
+            )
+        ]
+
+        def file_handler(
+            temp_file_path: Path, title: str, collection: str, url: str
+        ) -> dict[str, Any]:
+            return {
+                "file_path": str(temp_file_path),
+                "file_id": "file-1",
+                "rollback_on_failure": lambda result=None: events.append(
+                    ("rollback", result)
+                ),
+                "commit_on_success": lambda result=None: events.append(
+                    ("commit", result)
+                ),
+            }
+
+        with patch(
+            "xagent.core.tools.core.RAG_tools.pipelines.web_ingestion.WebCrawler"
+        ) as mock_crawler_class:
+            mock_crawler = MagicMock()
+            mock_crawler.crawl = AsyncMock(return_value=mock_crawl_results)
+            mock_crawler.total_urls_found = 1
+            mock_crawler.failed_urls = {}
+            mock_crawler_class.return_value = mock_crawler
+
+            with patch(
+                "xagent.core.tools.core.RAG_tools.pipelines.web_ingestion."
+                "run_document_ingestion",
+                side_effect=RuntimeError("boom"),
+            ):
+                result = await run_web_ingestion(
+                    collection="test_collection",
+                    crawl_config=crawl_config,
+                    ingestion_config=ingestion_config,
+                    file_handler=file_handler,
+                )
+
+        assert result.status == "error"
+        assert events == [("rollback", None)]
+
+    @pytest.mark.asyncio
+    async def test_file_handler_rollback_failure_forces_error_status(
+        self, crawl_config, ingestion_config
+    ):
+        """A failed compensating rollback is surfaced as an overall error."""
+        mock_crawl_results = [
+            MagicMock(
+                url="https://example.com/page1",
+                title="Page 1",
+                content_markdown="# Page 1\n\nContent.",
+                status="success",
+                depth=0,
+                timestamp=datetime(2025, 1, 1, 12, 0, 0),
+                content_length=20,
+            ),
+            MagicMock(
+                url="https://example.com/page2",
+                title="Page 2",
+                content_markdown="# Page 2\n\nContent.",
+                status="success",
+                depth=0,
+                timestamp=datetime(2025, 1, 1, 12, 0, 0),
+                content_length=20,
+            ),
+        ]
+        successful_ingestion = IngestionResult(
+            status="success",
+            doc_id="doc1",
+            parse_hash="hash1",
+            chunk_count=1,
+            embedding_count=1,
+            vector_count=1,
+            message="ok",
+        )
+        failed_ingestion = IngestionResult(
+            status="error",
+            doc_id="doc2",
+            parse_hash="hash2",
+            message="embedding failed",
+        )
+
+        def rollback(_result=None):
+            raise RuntimeError("rollback exploded")
+
+        def file_handler(
+            temp_file_path: Path, title: str, collection: str, url: str
+        ) -> dict[str, Any]:
+            return {
+                "file_path": str(temp_file_path),
+                "file_id": "file-1",
+                "rollback_on_failure": rollback,
+            }
+
+        with patch(
+            "xagent.core.tools.core.RAG_tools.pipelines.web_ingestion.WebCrawler"
+        ) as mock_crawler_class:
+            mock_crawler = MagicMock()
+            mock_crawler.crawl = AsyncMock(return_value=mock_crawl_results)
+            mock_crawler.total_urls_found = 2
+            mock_crawler.failed_urls = {}
+            mock_crawler_class.return_value = mock_crawler
+
+            with patch(
+                "xagent.core.tools.core.RAG_tools.pipelines.web_ingestion."
+                "run_document_ingestion",
+                side_effect=[successful_ingestion, failed_ingestion],
+            ):
+                result = await run_web_ingestion(
+                    collection="test_collection",
+                    crawl_config=crawl_config,
+                    ingestion_config=ingestion_config,
+                    file_handler=file_handler,
+                )
+
+        assert result.status == "error"
+        assert result.documents_created == 1
+        assert (
+            result.message
+            == "Web ingestion rollback failed for https://example.com/page2: "
+            "rollback exploded"
+        )
+        assert any("rollback_on_failure failed" in item for item in result.warnings)
+
+    @pytest.mark.asyncio
+    async def test_file_handler_commit_runs_on_ingestion_success(
+        self, crawl_config, ingestion_config
+    ):
+        """Rollback resources should be finalized after successful ingestion."""
+        events: list[tuple[str, Optional[IngestionResult]]] = []
+        mock_crawl_results = [
+            MagicMock(
+                url="https://example.com/page1",
+                title="Page 1",
+                content_markdown="# Page 1\n\nContent.",
+                status="success",
+                depth=0,
+                timestamp=datetime(2025, 1, 1, 12, 0, 0),
+                content_length=20,
+            )
+        ]
+        successful_ingestion = IngestionResult(
+            status="success",
+            doc_id="doc1",
+            parse_hash="hash1",
+            chunk_count=1,
+            embedding_count=1,
+            vector_count=1,
+            message="ok",
+        )
+
+        def file_handler(
+            temp_file_path: Path, title: str, collection: str, url: str
+        ) -> dict[str, Any]:
+            return {
+                "file_path": str(temp_file_path),
+                "file_id": "file-1",
+                "rollback_on_failure": lambda result=None: events.append(
+                    ("rollback", result)
+                ),
+                "commit_on_success": lambda result=None: events.append(
+                    ("commit", result)
+                ),
+            }
+
+        with patch(
+            "xagent.core.tools.core.RAG_tools.pipelines.web_ingestion.WebCrawler"
+        ) as mock_crawler_class:
+            mock_crawler = MagicMock()
+            mock_crawler.crawl = AsyncMock(return_value=mock_crawl_results)
+            mock_crawler.total_urls_found = 1
+            mock_crawler.failed_urls = {}
+            mock_crawler_class.return_value = mock_crawler
+
+            with patch(
+                "xagent.core.tools.core.RAG_tools.pipelines.web_ingestion."
+                "run_document_ingestion",
+                return_value=successful_ingestion,
+            ):
+                result = await run_web_ingestion(
+                    collection="test_collection",
+                    crawl_config=crawl_config,
+                    ingestion_config=ingestion_config,
+                    file_handler=file_handler,
+                )
+
+        assert result.status == "success"
+        assert events == [("commit", successful_ingestion)]

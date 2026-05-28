@@ -1859,6 +1859,13 @@ class WebIngestionResult(BaseModel):
     warnings: List[str] = Field(
         default_factory=list, description="Non-critical warnings"
     )
+    side_effects_may_remain: bool = Field(
+        default=False,
+        description=(
+            "Whether rollback failed after an ingestion error and persisted "
+            "side effects may still exist"
+        ),
+    )
     elapsed_time_ms: int = Field(
         ..., ge=0, description="Total elapsed time in milliseconds"
     )

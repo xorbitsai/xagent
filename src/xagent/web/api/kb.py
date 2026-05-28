@@ -3,6 +3,7 @@
 import asyncio
 import functools
 import hashlib
+import inspect
 import json
 import logging
 import mimetypes
@@ -162,7 +163,11 @@ from ..services.kb_ingest_targets import (
     tombstone_kb_ingest_target,
     tombstone_kb_ingest_targets_for_collection,
 )
-from ..services.managed_file_ref import DurableObjectMissingError, ManagedFileRef
+from ..services.managed_file_ref import (
+    DurableObjectMissingError,
+    ManagedFileRef,
+    build_upload_storage_key,
+)
 from ..services.uploaded_file_store import UploadedFileStore
 from .cloud_storage import get_google_credentials
 
@@ -354,6 +359,147 @@ def _ensure_cleanup_succeeded(operation_name: str, result_obj: Any) -> None:
     raise RuntimeError(f"{operation_name} failed: {message}")
 
 
+def _delete_web_rag_side_effects_for_file_id(
+    *,
+    collection_name: str,
+    file_id: str,
+    user_id: int,
+    is_admin: bool,
+) -> None:
+    """Best-effort RAG cleanup when document ingestion raised before returning."""
+    from ...core.tools.core.RAG_tools.utils.string_utils import (
+        generate_deterministic_doc_id,
+    )
+
+    doc_refs = [
+        (collection, doc_id)
+        for collection, doc_id in _list_document_refs_for_uploaded_file(file_id)
+        if collection == collection_name
+    ]
+
+    if doc_refs:
+        cleanup_errors: list[Exception] = []
+        for collection, doc_id in doc_refs:
+            try:
+                document_delete_result = delete_document(
+                    collection,
+                    doc_id,
+                    user_id,
+                    is_admin,
+                )
+                _ensure_cleanup_succeeded(
+                    f"delete document '{doc_id}' during web exception rollback",
+                    document_delete_result,
+                )
+            except Exception as exc:  # noqa: BLE001
+                cleanup_errors.append(exc)
+                logger.warning(
+                    "Failed to delete web RAG side effect during exception rollback: "
+                    "collection=%s, doc_id=%s, file_id=%s, error=%s",
+                    collection,
+                    doc_id,
+                    file_id,
+                    exc,
+                    exc_info=True,
+                )
+        if cleanup_errors:
+            raise RuntimeError(
+                "Best-effort RAG cleanup failed with "
+                f"{len(cleanup_errors)} errors. First error: {cleanup_errors[0]}"
+            ) from cleanup_errors[0]
+        return
+
+    doc_id = generate_deterministic_doc_id(collection_name, file_id)
+    vector_store = get_vector_index_store()
+    vector_store.delete_document_data(
+        collection_name=collection_name,
+        doc_id=doc_id,
+        user_id=user_id,
+        is_admin=is_admin,
+    )
+    clear_ingestion_status(
+        collection_name,
+        doc_id,
+        user_id=user_id,
+        is_admin=is_admin,
+    )
+
+
+def _rollback_failed_web_document_ingestion(
+    *,
+    collection_name: str,
+    result: Optional[IngestionResult],
+    user_id: int,
+    is_admin: bool,
+    rag_snapshot: Optional["_RagDocumentSnapshot"] = None,
+    file_id: Optional[str] = None,
+) -> None:
+    """Remove RAG-side writes from a failed per-page web ingestion."""
+    if result is None:
+        if rag_snapshot is not None:
+            _restore_rag_document_snapshot(
+                rag_snapshot,
+                user_id=user_id,
+                is_admin=is_admin,
+            )
+        if file_id and (rag_snapshot is None or not rag_snapshot.doc_refs):
+            _delete_web_rag_side_effects_for_file_id(
+                collection_name=collection_name,
+                file_id=file_id,
+                user_id=user_id,
+                is_admin=is_admin,
+            )
+        return
+
+    register_metadata = _get_completed_step_metadata(result, "register_document") or {}
+    register_created = bool(register_metadata.get("created"))
+    doc_id = result.doc_id if isinstance(result.doc_id, str) and result.doc_id else None
+    if not doc_id:
+        if rag_snapshot is not None:
+            _restore_rag_document_snapshot(
+                rag_snapshot,
+                user_id=user_id,
+                is_admin=is_admin,
+            )
+        elif file_id:
+            _delete_web_rag_side_effects_for_file_id(
+                collection_name=collection_name,
+                file_id=file_id,
+                user_id=user_id,
+                is_admin=is_admin,
+            )
+        return
+
+    if register_created:
+        document_delete_result = delete_document(
+            collection_name,
+            doc_id,
+            user_id,
+            is_admin,
+        )
+        _ensure_cleanup_succeeded(
+            f"delete document '{doc_id}' during web rollback",
+            document_delete_result,
+        )
+        if rag_snapshot is None:
+            return
+
+    if rag_snapshot is not None:
+        _restore_rag_document_snapshot(
+            rag_snapshot,
+            user_id=user_id,
+            is_admin=is_admin,
+        )
+        return
+
+    clear_ingestion_status(
+        collection_name,
+        doc_id,
+        user_id=user_id,
+        is_admin=is_admin,
+    )
+
+
 def _extract_embedding_model_id_from_error(message: str) -> Optional[str]:
     match = re.search(r"Model '([^']+)' not found in hub", message)
     if match:
@@ -436,6 +582,91 @@ async def _cleanup_failed_new_collection_metadata(
         "Cleaned failed-ingest collection metadata for %s: %s",
         collection_name,
         cleanup_result,
+    )
+
+
+def _collection_or_config_existed_before(
+    collection_existed_before: bool,
+    snapshot: Optional["_CollectionConfigSnapshot"],
+) -> bool:
+    """Treat config-only collections as pre-existing for rollback decisions."""
+    return collection_existed_before or (
+        snapshot is not None and snapshot.previous_config_json is not None
+    )
+
+
+async def _restore_or_cleanup_collection_config_after_failed_ingest(
+    *,
+    snapshot: Optional["_CollectionConfigSnapshot"],
+    collection_existed_before: bool,
+    collection_name: str,
+    user: User,
+    context: str,
+    successful_documents: int = 0,
+    side_effects_may_remain: bool = False,
+) -> None:
+    """Restore previous config or clean up only truly empty new collections."""
+    if (
+        snapshot is not None
+        and not snapshot.saved
+        and not snapshot.previous_config_known
+    ):
+        logger.warning(
+            "Skipping failed-ingest collection metadata cleanup because previous "
+            "config state is unknown: %s/user_%s",
+            collection_name,
+            int(user.id),
+        )
+        return
+
+    effective_collection_existed_before = _collection_or_config_existed_before(
+        collection_existed_before,
+        snapshot,
+    )
+    config_only_existed_before = (
+        not collection_existed_before
+        and snapshot is not None
+        and snapshot.previous_config_json is not None
+    )
+    if effective_collection_existed_before:
+        await _restore_collection_config_after_failed_ingest(
+            snapshot=snapshot,
+            collection_existed_before=effective_collection_existed_before,
+            context=context,
+        )
+        if (
+            config_only_existed_before
+            and successful_documents == 0
+            and not side_effects_may_remain
+            and snapshot is not None
+        ):
+            delete_metadata = getattr(
+                snapshot.metadata_store, "delete_collection", None
+            )
+            if callable(delete_metadata):
+                await _maybe_await(delete_metadata(collection_name))
+                logger.info(
+                    "Removed collection metadata created by failed %s while "
+                    "preserving previous config: %s/user_%s",
+                    context,
+                    collection_name,
+                    int(user.id),
+                )
+        return
+
+    if successful_documents > 0 or side_effects_may_remain:
+        if side_effects_may_remain:
+            logger.warning(
+                "Skipping failed-ingest collection metadata cleanup for %s/user_%s "
+                "because rollback side effects may remain",
+                collection_name,
+                int(user.id),
+            )
+        return
+
+    await _cleanup_failed_new_collection_metadata(
+        collection_name=collection_name,
+        user=user,
     )
 
 
@@ -1030,11 +1261,791 @@ def _mark_uploaded_file_for_reindex(file_id: str) -> bool:
         return False
 
 
+_INGESTION_RUN_COLUMNS = (
+    "collection",
+    "doc_id",
+    "status",
+    "message",
+    "parse_hash",
+    "created_at",
+    "updated_at",
+    "user_id",
+)
+
+
+@dataclass
+class _IngestionRunsSnapshot:
+    doc_refs: List[tuple[str, str]]
+    rows: List[Dict[str, Any]]
+
+
+@dataclass
+class _RagDocumentSnapshot:
+    doc_refs: List[tuple[str, str]]
+    rows_by_table: Dict[str, List[Dict[str, Any]]]
+
+
+def _ingestion_run_filter(collection: str, doc_id: str) -> str:
+    from ...core.tools.core.RAG_tools.utils.string_utils import escape_lancedb_string
+
+    safe_collection = escape_lancedb_string(collection)
+    safe_doc_id = escape_lancedb_string(doc_id)
+    return f"collection = '{safe_collection}' and doc_id = '{safe_doc_id}'"
+
+
+def _table_has_user_id_column(table: Any) -> bool:
+    schema = getattr(table, "schema", None)
+    names = getattr(schema, "names", None) or []
+    return "user_id" in names
+
+
+def _rag_document_filter(
+    table: Any,
+    *,
+    collection: str,
+    doc_id: str,
+    user_id: int,
+    is_admin: bool,
+) -> str:
+    from ...core.tools.core.RAG_tools.utils.string_utils import escape_lancedb_string
+
+    safe_collection = escape_lancedb_string(collection)
+    safe_doc_id = escape_lancedb_string(doc_id)
+    expr = f"collection = '{safe_collection}' and doc_id = '{safe_doc_id}'"
+    if not is_admin and _table_has_user_id_column(table):
+        expr = f"{expr} and user_id = {int(user_id)}"
+    return expr
+
+
+def _combine_lancedb_filters(filters: List[str]) -> str:
+    return " or ".join(f"({filter_expr})" for filter_expr in filters)
+
+
+def _rag_document_refs_filter(
+    table: Any,
+    doc_refs: List[tuple[str, str]],
+    *,
+    user_id: int,
+    is_admin: bool,
+) -> str:
+    return _combine_lancedb_filters(
+        [
+            _rag_document_filter(
+                table,
+                collection=collection,
+                doc_id=doc_id,
+                user_id=user_id,
+                is_admin=is_admin,
+            )
+            for collection, doc_id in doc_refs
+        ]
+    )
+
+
+def _snapshot_rag_documents_for_uploaded_file(
+    file_id: str,
+    *,
+    user_id: int,
+    is_admin: bool,
+) -> Optional[_RagDocumentSnapshot]:
+    """Snapshot RAG rows for documents associated with an UploadedFile."""
+    try:
+        from ...core.tools.core.RAG_tools.LanceDB.schema_manager import (
+            _safe_close_table,
+            ensure_chunks_table,
+            ensure_documents_table,
+            ensure_ingestion_runs_table,
+            ensure_main_pointers_table,
+            ensure_parses_table,
+        )
+        from ...core.tools.core.RAG_tools.utils.lancedb_query_utils import (
+            list_table_names,
+            query_to_list,
+        )
+        from ...providers.vector_store.lancedb import get_connection_from_env
+
+        doc_refs = _list_document_refs_for_uploaded_file(file_id)
+        conn = get_connection_from_env()
+        ensure_documents_table(conn)
+        ensure_parses_table(conn)
+        ensure_chunks_table(conn)
+        ensure_main_pointers_table(conn)
+        ensure_ingestion_runs_table(conn)
+
+        table_names = set(list_table_names(conn))
+        target_tables = [
+            table_name
+            for table_name in (
+                "documents",
+                "parses",
+                "chunks",
+                "main_pointers",
+                "ingestion_runs",
+            )
+            if table_name in table_names
+        ]
+        target_tables.extend(
+            sorted(name for name in table_names if name.startswith("embeddings_"))
+        )
+
+        rows_by_table: Dict[str, List[Dict[str, Any]]] = {}
+        for table_name in target_tables:
+            table = None
+            try:
+                table = conn.open_table(table_name)
+                if doc_refs:
+                    rows = query_to_list(
+                        table.search()
+                        .where(
+                            _rag_document_refs_filter(
+                                table,
+                                doc_refs,
+                                user_id=user_id,
+                                is_admin=is_admin,
+                            )
+                        )
+                        .limit(-1)
+                    )
+                else:
+                    rows = []
+                rows_by_table[table_name] = rows
+            finally:
+                _safe_close_table(table)
+        return _RagDocumentSnapshot(doc_refs=doc_refs, rows_by_table=rows_by_table)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(
+            "Failed to snapshot RAG document rows before web file refresh: "
+            "file_id=%s, error=%s",
+            file_id,
+            exc,
+            exc_info=True,
+        )
+        return None
+
+
+def _rag_snapshot_key_columns(table_name: str) -> Optional[tuple[str, ...]]:
+    if table_name == "documents":
+        return ("collection", "doc_id")
+    if table_name == "parses":
+        return ("collection", "doc_id", "parse_hash")
+    if table_name == "chunks":
+        return ("collection", "doc_id", "parse_hash", "chunk_id")
+    if table_name == "main_pointers":
+        return ("collection", "doc_id", "step_type", "model_tag")
+    if table_name == "ingestion_runs":
+        return ("collection", "doc_id")
+    if table_name.startswith("embeddings_"):
+        return ("collection", "doc_id", "chunk_id", "parse_hash", "model")
+    return None
+
+
+def _rag_snapshot_row_key(
+    row: Dict[str, Any], key_columns: tuple[str, ...]
+) -> tuple[Any, ...]:
+    return tuple(row.get(column) for column in key_columns)
+
+
+def _lancedb_literal(value: Any) -> str:
+    from ...core.tools.core.RAG_tools.utils.string_utils import escape_lancedb_string
+
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        return str(value)
+    return f"'{escape_lancedb_string(str(value))}'"
+
+
+def _rag_snapshot_key_filter(
+    table: Any,
+    row: Dict[str, Any],
+    key_columns: tuple[str, ...],
+    *,
+    user_id: int,
+    is_admin: bool,
+) -> str:
+    clauses = []
+    for column in key_columns:
+        value = row.get(column)
+        if value is None:
+            clauses.append(f"{column} IS NULL")
+        else:
+            clauses.append(f"{column} = {_lancedb_literal(value)}")
+    if not is_admin and _table_has_user_id_column(table):
+        clauses.append(f"user_id = {int(user_id)}")
+    return " and ".join(clauses)
+
+
+def _restore_rag_snapshot_rows(
+    table: Any,
+    *,
+    table_name: str,
+    snapshot_rows: List[Dict[str, Any]],
+    current_rows: List[Dict[str, Any]],
+    user_id: int,
+    is_admin: bool,
+) -> None:
+    """Upsert old rows before deleting stale rows introduced by a failed refresh."""
+    key_columns = _rag_snapshot_key_columns(table_name)
+    if key_columns is None:
+        delete_filters = [
+            _rag_snapshot_key_filter(
+                table,
+                row,
+                ("collection", "doc_id"),
+                user_id=user_id,
+                is_admin=is_admin,
+            )
+            for row in current_rows
+        ]
+        if delete_filters:
+            table.delete(_combine_lancedb_filters(delete_filters))
+        if snapshot_rows:
+            table.add(snapshot_rows)
+        return
+
+    if snapshot_rows:
+        (
+            table.merge_insert(list(key_columns))
+            .when_matched_update_all()
+            .when_not_matched_insert_all()
+            .execute(snapshot_rows)
+        )
+
+    snapshot_keys = {_rag_snapshot_row_key(row, key_columns) for row in snapshot_rows}
+    stale_rows = [
+        row
+        for row in current_rows
+        if _rag_snapshot_row_key(row, key_columns) not in snapshot_keys
+    ]
+    delete_filters = [
+        _rag_snapshot_key_filter(
+            table,
+            row,
+            key_columns,
+            user_id=user_id,
+            is_admin=is_admin,
+        )
+        for row in stale_rows
+    ]
+    if delete_filters:
+        table.delete(_combine_lancedb_filters(delete_filters))
+
+
+def _restore_rag_document_snapshot(
+    snapshot: _RagDocumentSnapshot,
+    *,
+    user_id: int,
+    is_admin: bool,
+) -> None:
+    """Restore RAG document rows after a failed refresh of an existing web file."""
+    from ...core.tools.core.RAG_tools.LanceDB.schema_manager import (
+        _safe_close_table,
+        ensure_chunks_table,
+        ensure_documents_table,
+        ensure_ingestion_runs_table,
+        ensure_main_pointers_table,
+        ensure_parses_table,
+    )
+    from ...core.tools.core.RAG_tools.utils.lancedb_query_utils import (
+        list_table_names,
+        query_to_list,
+    )
+    from ...providers.vector_store.lancedb import get_connection_from_env
+
+    vector_store = get_vector_index_store()
+    conn = get_connection_from_env()
+    ensure_documents_table(conn)
+    ensure_parses_table(conn)
+    ensure_chunks_table(conn)
+    ensure_main_pointers_table(conn)
+    ensure_ingestion_runs_table(conn)
+
+    current_table_names = set(list_table_names(conn))
+    restore_table_names = [
+        table_name
+        for table_name in (
+            "documents",
+            "parses",
+            "chunks",
+            "main_pointers",
+            "ingestion_runs",
+        )
+        if table_name in current_table_names or table_name in snapshot.rows_by_table
+    ]
+    for table_name in sorted(current_table_names):
+        if table_name.startswith("embeddings_"):
+            restore_table_names.append(table_name)
+    for table_name in snapshot.rows_by_table:
+        if (
+            table_name.startswith("embeddings_")
+            and table_name not in restore_table_names
+        ):
+            restore_table_names.append(table_name)
+
+    for table_name in restore_table_names:
+        snapshot_rows = snapshot.rows_by_table.get(table_name, [])
+        table = None
+        try:
+            table = conn.open_table(table_name)
+            if snapshot.doc_refs:
+                current_rows = query_to_list(
+                    table.search()
+                    .where(
+                        _rag_document_refs_filter(
+                            table,
+                            snapshot.doc_refs,
+                            user_id=user_id,
+                            is_admin=is_admin,
+                        )
+                    )
+                    .limit(-1)
+                )
+            else:
+                current_rows = []
+            _restore_rag_snapshot_rows(
+                table,
+                table_name=table_name,
+                snapshot_rows=snapshot_rows,
+                current_rows=current_rows,
+                user_id=user_id,
+                is_admin=is_admin,
+            )
+        finally:
+            _safe_close_table(table)
+
+    invalidate_cache = getattr(vector_store, "invalidate_table_cache", None)
+    if callable(invalidate_cache):
+        invalidate_cache()
+
+
+def _list_document_refs_for_uploaded_file(file_id: str) -> List[tuple[str, str]]:
+    from ...core.tools.core.RAG_tools.LanceDB.schema_manager import (
+        _safe_close_table,
+        ensure_documents_table,
+    )
+    from ...core.tools.core.RAG_tools.utils.lancedb_query_utils import query_to_list
+    from ...core.tools.core.RAG_tools.utils.string_utils import escape_lancedb_string
+    from ...providers.vector_store.lancedb import get_connection_from_env
+
+    conn = get_connection_from_env()
+    ensure_documents_table(conn)
+    documents_table = None
+    try:
+        documents_table = conn.open_table("documents")
+        safe_file_id = escape_lancedb_string(file_id)
+        rows = query_to_list(
+            documents_table.search()
+            .where(f"file_id = '{safe_file_id}'")
+            .select(["collection", "doc_id"])
+            .limit(-1)
+        )
+        doc_refs: List[tuple[str, str]] = []
+        for row in rows:
+            collection = str(row.get("collection") or "").strip()
+            doc_id = str(row.get("doc_id") or "").strip()
+            if collection and doc_id:
+                doc_refs.append((collection, doc_id))
+        return doc_refs
+    finally:
+        _safe_close_table(documents_table)
+
+
+def _snapshot_ingestion_runs_for_uploaded_file(
+    file_id: str,
+) -> Optional[_IngestionRunsSnapshot]:
+    """Snapshot current ingestion status rows before refreshing an existing file."""
+    try:
+        from ...core.tools.core.RAG_tools.LanceDB.schema_manager import (
+            _safe_close_table,
+            ensure_ingestion_runs_table,
+        )
+        from ...core.tools.core.RAG_tools.utils.lancedb_query_utils import query_to_list
+        from ...providers.vector_store.lancedb import get_connection_from_env
+
+        doc_refs = _list_document_refs_for_uploaded_file(file_id)
+        conn = get_connection_from_env()
+        ensure_ingestion_runs_table(conn)
+        ingestion_runs_table = None
+        try:
+            ingestion_runs_table = conn.open_table("ingestion_runs")
+            if doc_refs:
+                combined_filter = _combine_lancedb_filters(
+                    [
+                        _ingestion_run_filter(collection, doc_id)
+                        for collection, doc_id in doc_refs
+                    ]
+                )
+                rows = query_to_list(
+                    ingestion_runs_table.search()
+                    .where(combined_filter)
+                    .select(list(_INGESTION_RUN_COLUMNS))
+                    .limit(-1)
+                )
+            else:
+                rows = []
+            return _IngestionRunsSnapshot(doc_refs=doc_refs, rows=rows)
+        finally:
+            _safe_close_table(ingestion_runs_table)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(
+            "Failed to snapshot ingestion runs before web file refresh: "
+            "file_id=%s, error=%s",
+            file_id,
+            exc,
+            exc_info=True,
+        )
+        return None
+
+
+def _restore_ingestion_runs_snapshot(snapshot: _IngestionRunsSnapshot) -> None:
+    """Restore ingestion status rows after a failed existing-file refresh."""
+    from ...core.tools.core.RAG_tools.LanceDB.schema_manager import (
+        _safe_close_table,
+        ensure_ingestion_runs_table,
+    )
+    from ...providers.vector_store.lancedb import get_connection_from_env
+
+    conn = get_connection_from_env()
+    ensure_ingestion_runs_table(conn)
+    ingestion_runs_table = None
+    try:
+        ingestion_runs_table = conn.open_table("ingestion_runs")
+        if snapshot.doc_refs:
+            combined_filter = _combine_lancedb_filters(
+                [
+                    _ingestion_run_filter(collection, doc_id)
+                    for collection, doc_id in snapshot.doc_refs
+                ]
+            )
+            ingestion_runs_table.delete(combined_filter)
+        if snapshot.rows:
+            ingestion_runs_table.add(snapshot.rows)
+    finally:
+        _safe_close_table(ingestion_runs_table)
+
+
+_UPLOADED_FILE_ROLLBACK_FIELDS = (
+    "filename",
+    "storage_path",
+    "storage_backend",
+    "storage_key",
+    "storage_uri",
+    "checksum",
+    "etag",
+    "workspace_relative_path",
+    "workspace_category",
+    "storage_status",
+    "mime_type",
+    "file_size",
+)
+
+
+def _snapshot_uploaded_file_record(file_record: UploadedFile) -> Dict[str, Any]:
+    return {
+        field: getattr(file_record, field, None)
+        for field in _UPLOADED_FILE_ROLLBACK_FIELDS
+    }
+
+
+def _restore_uploaded_file_record_snapshot(
+    file_record: UploadedFile, snapshot: Dict[str, Any]
+) -> None:
+    for field, value in snapshot.items():
+        setattr(file_record, field, value)
+
+
+def _cleanup_failed_web_uploaded_file_setup(
+    db_session: Session,
+    *,
+    file_id: str,
+    user_id: int,
+    filename: str,
+    storage_path: Path,
+    mime_type: str,
+    storage_key: str,
+) -> None:
+    """Remove DB/durable side effects after web UploadedFile setup fails."""
+    cleanup_errors: list[Exception] = []
+    try:
+        db_session.rollback()
+    except Exception as exc:  # noqa: BLE001
+        cleanup_errors.append(exc)
+        logger.warning(
+            "Failed to rollback DB session after web UploadedFile setup failure: %s",
+            exc,
+            exc_info=True,
+        )
+
+    try:
+        persisted_record = (
+            db_session.query(UploadedFile)
+            .filter(
+                (UploadedFile.file_id == file_id)
+                | (UploadedFile.storage_path == str(storage_path))
+            )
+            .first()
+        )
+        if persisted_record is not None:
+            UploadedFileStore(db_session).delete(persisted_record, delete_local=False)
+            db_session.commit()
+        else:
+            placeholder = UploadedFile(
+                file_id=file_id,
+                user_id=user_id,
+                filename=filename,
+                storage_path=str(storage_path),
+                mime_type=mime_type,
+                file_size=storage_path.stat().st_size if storage_path.exists() else 0,
+                storage_key=storage_key,
+                storage_status="available",
+            )
+            ManagedFileRef(placeholder).delete_durable()
+    except Exception as exc:  # noqa: BLE001
+        db_session.rollback()
+        cleanup_errors.append(exc)
+        logger.warning(
+            "Failed to clean web UploadedFile setup side effects: "
+            "file_id=%s, storage_key=%s, error=%s",
+            file_id,
+            storage_key,
+            exc,
+            exc_info=True,
+        )
+
+    if cleanup_errors:
+        raise RuntimeError(
+            f"Failed to clean web UploadedFile setup side effects: {cleanup_errors[0]}"
+        ) from cleanup_errors[0]
+
+
+def _create_web_uploaded_file_record(
+    db_session: Session,
+    *,
+    user_id: int,
+    filename: str,
+    storage_path: Path,
+    mime_type: str,
+) -> UploadedFile:
+    """Create a web UploadedFile with a known durable key for compensation."""
+    file_id = str(uuid.uuid4())
+    storage_key = build_upload_storage_key(user_id, file_id, filename)
+    try:
+        file_record = UploadedFileStore(db_session).create_from_local_path(
+            local_path=storage_path,
+            user_id=user_id,
+            filename=filename,
+            file_id=file_id,
+            mime_type=mime_type,
+            storage_key=storage_key,
+        )
+        db_session.commit()
+        db_session.refresh(file_record)
+        return file_record
+    except Exception:
+        _cleanup_failed_web_uploaded_file_setup(
+            db_session,
+            file_id=file_id,
+            user_id=user_id,
+            filename=filename,
+            storage_path=storage_path,
+            mime_type=mime_type,
+            storage_key=storage_key,
+        )
+        raise
+
+
+def _existing_web_file_result_with_rollback(
+    *,
+    existing_record: Any,
+    file_path: Path,
+    collection_name: str,
+    user_id: int,
+    is_admin: bool,
+    url: str,
+    context: str,
+) -> FileHandlerResult:
+    """Return an existing web file only after preparing failure compensation."""
+    file_record_id = str(existing_record.file_id)
+    ingestion_runs_snapshot = _snapshot_ingestion_runs_for_uploaded_file(file_record_id)
+    if ingestion_runs_snapshot is None:
+        raise RuntimeError(
+            "Failed to snapshot ingestion status before reusing existing web file"
+        )
+
+    rag_document_snapshot = _snapshot_rag_documents_for_uploaded_file(
+        file_record_id,
+        user_id=user_id,
+        is_admin=is_admin,
+    )
+    if rag_document_snapshot is None:
+        raise RuntimeError(
+            "Failed to snapshot RAG document rows before reusing existing web file"
+        )
+
+    def _rollback_existing(
+        ingestion_result: Optional[IngestionResult] = None,
+    ) -> None:
+        rollback_error: Optional[Exception] = None
+        try:
+            _rollback_failed_web_document_ingestion(
+                collection_name=collection_name,
+                result=ingestion_result,
+                user_id=user_id,
+                is_admin=is_admin,
+                rag_snapshot=rag_document_snapshot,
+                file_id=file_record_id,
+            )
+        except Exception as exc:  # noqa: BLE001
+            rollback_error = exc
+            logger.warning(
+                "Failed to restore RAG rows during existing web file rollback: "
+                "url=%s, file_id=%s, context=%s, error=%s",
+                url,
+                file_record_id,
+                context,
+                exc,
+                exc_info=True,
+            )
+
+        try:
+            _restore_ingestion_runs_snapshot(ingestion_runs_snapshot)
+        except Exception as exc:  # noqa: BLE001
+            if rollback_error is None:
+                rollback_error = exc
+            logger.warning(
+                "Failed to restore ingestion runs during existing web file rollback: "
+                "url=%s, file_id=%s, context=%s, error=%s",
+                url,
+                file_record_id,
+                context,
+                exc,
+                exc_info=True,
+            )
+
+        if rollback_error is not None:
+            raise rollback_error
+
+    return FileHandlerResult(
+        file_path=str(file_path),
+        file_id=file_record_id,
+        rollback_on_failure=_rollback_existing,
+    )
+
+
+def _create_new_web_file_handler_result(
+    *,
+    temp_file_path: Path,
+    persistent_file: Path,
+    db_session: Session,
+    user_id: int,
+    is_admin: bool,
+    collection_name: str,
+    filename: str,
+    url: str,
+    url_hash: str,
+    processed_urls: Dict[str, str],
+) -> FileHandlerResult:
+    """Persist a new web-ingest file and attach failure compensation."""
+    try:
+        shutil.copy2(temp_file_path, persistent_file)
+        logger.info(
+            "Copied web ingestion file from %s to %s",
+            temp_file_path,
+            persistent_file,
+        )
+
+        file_record = _create_web_uploaded_file_record(
+            db_session,
+            user_id=user_id,
+            filename=filename,
+            storage_path=persistent_file,
+            mime_type="text/markdown",
+        )
+        logger.info(
+            "Created UploadedFile record for web ingestion: file_id=%s, filename=%s, url=%s",
+            file_record.file_id,
+            filename,
+            url,
+        )
+
+        processed_urls[url_hash] = str(file_record.file_id)
+        file_record_id = str(file_record.file_id)
+        persistent_file_path = Path(persistent_file)
+
+        def _rollback_new_web_file(
+            ingestion_result: Optional[IngestionResult] = None,
+        ) -> None:
+            rollback_error: Optional[Exception] = None
+            try:
+                _rollback_failed_web_document_ingestion(
+                    collection_name=collection_name,
+                    result=ingestion_result,
+                    user_id=user_id,
+                    is_admin=is_admin,
+                    file_id=file_record_id,
+                )
+            except Exception as exc:  # noqa: BLE001
+                rollback_error = exc
+                logger.warning(
+                    "Failed to clean RAG rows during new web file rollback: "
+                    "file_id=%s, error=%s",
+                    file_record_id,
+                    exc,
+                    exc_info=True,
+                )
+            SessionLocal = get_session_local()
+            rollback_db = SessionLocal()
+            try:
+                rollback_record = (
+                    rollback_db.query(UploadedFile)
+                    .filter(UploadedFile.file_id == file_record_id)
+                    .first()
+                )
+                if rollback_record is not None:
+                    UploadedFileStore(rollback_db).delete(
+                        rollback_record,
+                        delete_local=True,
+                    )
+                else:
+                    persistent_file_path.unlink(missing_ok=True)
+                rollback_db.commit()
+            except Exception:
+                rollback_db.rollback()
+                raise
+            finally:
+                rollback_db.close()
+            if rollback_error is not None:
+                raise rollback_error
+
+        return FileHandlerResult(
+            file_path=str(persistent_file),
+            file_id=file_record_id,
+            rollback_on_failure=_rollback_new_web_file,
+        )
+    except Exception:
+        if persistent_file.exists():
+            try:
+                persistent_file.unlink()
+                logger.warning(
+                    "Cleaned up orphaned persistent file due to web file setup failure: %s",
+                    persistent_file,
+                )
+            except Exception as cleanup_error:  # noqa: BLE001
+                logger.warning(
+                    "Failed to clean up orphaned persistent file %s: %s",
+                    persistent_file,
+                    cleanup_error,
+                )
+        raise
+
+
 def _refresh_existing_file_if_changed(
     existing_record: Any,
     temp_file_path: Path,
     db_session: Session,
     user_id: int,
+    is_admin: bool,
+    collection_name: str,
     url: str,
     filename: str,
     url_hash: str,
@@ -1066,9 +2077,11 @@ def _refresh_existing_file_if_changed(
         caller should continue with normal new-file handling.
     """
     existing_path = Path(str(existing_record.storage_path))
+    record_snapshot = _snapshot_uploaded_file_record(existing_record)
     if not existing_path.exists():
         try:
             existing_path = ManagedFileRef(existing_record).ensure_local()
+            record_snapshot["storage_path"] = str(existing_path)
         except DurableObjectMissingError:
             return None
         except Exception as exc:  # noqa: BLE001
@@ -1086,31 +2099,57 @@ def _refresh_existing_file_if_changed(
     new_hash = _get_file_sha256(temp_file_path)
 
     if old_hash == new_hash:
-        # Content unchanged - return existing file
-        return FileHandlerResult(
-            file_path=str(existing_record.storage_path),
-            file_id=str(existing_record.file_id),
+        return _existing_web_file_result_with_rollback(
+            existing_record=existing_record,
+            file_path=existing_path,
+            collection_name=collection_name,
+            user_id=user_id,
+            is_admin=is_admin,
+            url=url,
+            context=context,
+        )
+
+    ingestion_runs_snapshot = _snapshot_ingestion_runs_for_uploaded_file(
+        str(existing_record.file_id)
+    )
+    if ingestion_runs_snapshot is None:
+        raise RuntimeError(
+            "Failed to snapshot ingestion status before refreshing existing web file"
+        )
+
+    rag_document_snapshot = _snapshot_rag_documents_for_uploaded_file(
+        str(existing_record.file_id),
+        user_id=user_id,
+        is_admin=is_admin,
+    )
+    if rag_document_snapshot is None:
+        raise RuntimeError(
+            "Failed to snapshot RAG document rows before refreshing existing web file"
         )
 
     # Content changed - first try to mark for reindex BEFORE modifying file
     if not _mark_uploaded_file_for_reindex(str(existing_record.file_id)):
-        logger.warning(
-            "Failed to mark file for reindex, skipping file refresh to avoid inconsistent state: "
-            "url=%s, file_id=%s, context=%s",
-            url,
-            existing_record.file_id,
-            context,
-        )
-        # Return existing file without refreshing (stale embeddings but consistent state)
-        return FileHandlerResult(
-            file_path=str(existing_record.storage_path),
-            file_id=str(existing_record.file_id),
+        raise RuntimeError(
+            "Failed to mark existing web file for reindex before refresh"
         )
 
     # Mark succeeded - now atomically replace the file
     backup_path = _build_ingest_backup_path(existing_path)
-    shutil.copy2(existing_path, backup_path)
-    remove_backup = True
+    try:
+        shutil.copy2(existing_path, backup_path)
+    except Exception:
+        try:
+            _restore_ingestion_runs_snapshot(ingestion_runs_snapshot)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "Failed to restore ingestion runs after web file backup failure: "
+                "file_id=%s, error=%s",
+                existing_record.file_id,
+                exc,
+                exc_info=True,
+            )
+            raise exc
+        raise
     refresh_snapshot = _capture_uploaded_file_refresh_snapshot(
         existing_record,
         backup_path=backup_path,
@@ -1127,30 +2166,31 @@ def _refresh_existing_file_if_changed(
             file_size=existing_path.stat().st_size,
         )
     except Exception as exc:
-        try:
-            db_session.rollback()
-        except Exception as rollback_exc:  # noqa: BLE001
-            logger.warning(
-                "Failed to roll back database session before restoring refreshed "
-                "web file for url=%s, file_id=%s: %s",
-                url,
-                existing_record.file_id,
-                rollback_exc,
-            )
+        restore_error: Optional[Exception] = None
         restore_result = _restore_uploaded_file_refresh_snapshot(
             db_session,
             refresh_snapshot,
         )
         if restore_result.side_effects_may_remain:
-            remove_backup = False
-            raise RollbackFailureError(
+            restore_error = RollbackFailureError(
                 "Failed to fully restore refreshed web file "
                 f"for {url}: {'; '.join(restore_result.errors) or exc}"
-            ) from exc
+            )
+        try:
+            _restore_ingestion_runs_snapshot(ingestion_runs_snapshot)
+        except Exception as runs_exc:  # noqa: BLE001
+            restore_error = runs_exc
+            logger.warning(
+                "Failed to restore ingestion runs after web file refresh setup "
+                "failure: file_id=%s, error=%s",
+                existing_record.file_id,
+                runs_exc,
+                exc_info=True,
+            )
+        if restore_error is not None:
+            raise restore_error from exc
+        backup_path.unlink(missing_ok=True)
         raise
-    finally:
-        if remove_backup and backup_path.exists():
-            backup_path.unlink()
     processed_urls[url_hash] = str(file_record.file_id)
 
     logger.info(
@@ -1160,9 +2200,129 @@ def _refresh_existing_file_if_changed(
         context,
     )
 
+    file_record_id = str(file_record.file_id)
+
+    def _rollback_refresh(
+        ingestion_result: Optional[IngestionResult] = None,
+    ) -> None:
+        if not backup_path.exists():
+            raise FileNotFoundError(
+                f"Missing web ingest rollback backup: {backup_path}"
+            )
+
+        SessionLocal = get_session_local()
+        rollback_db = SessionLocal()
+        rollback_succeeded = False
+        try:
+            rollback_error: Optional[Exception] = None
+            try:
+                _rollback_failed_web_document_ingestion(
+                    collection_name=collection_name,
+                    result=ingestion_result,
+                    user_id=user_id,
+                    is_admin=is_admin,
+                    rag_snapshot=rag_document_snapshot,
+                    file_id=file_record_id,
+                )
+            except Exception as exc:  # noqa: BLE001
+                rollback_error = exc
+                logger.warning(
+                    "Failed to restore RAG rows during web file refresh rollback: "
+                    "file_id=%s, error=%s",
+                    file_record_id,
+                    exc,
+                    exc_info=True,
+                )
+
+            try:
+                refreshed_record = (
+                    rollback_db.query(UploadedFile)
+                    .filter(UploadedFile.file_id == file_record_id)
+                    .first()
+                )
+                if refreshed_record is None:
+                    _restore_ingest_file_backup(
+                        file_path=existing_path,
+                        backup_path=backup_path,
+                        had_existing_file=True,
+                    )
+                    rollback_db.commit()
+                else:
+                    current_storage_key = str(
+                        getattr(refreshed_record, "storage_key", "") or ""
+                    )
+                    previous_storage_key = str(record_snapshot.get("storage_key") or "")
+                    if (
+                        current_storage_key
+                        and current_storage_key != previous_storage_key
+                    ):
+                        ManagedFileRef(refreshed_record).delete_durable()
+
+                    _restore_ingest_file_backup(
+                        file_path=existing_path,
+                        backup_path=backup_path,
+                        had_existing_file=True,
+                    )
+                    _restore_uploaded_file_record_snapshot(
+                        refreshed_record, record_snapshot
+                    )
+                    if previous_storage_key:
+                        UploadedFileStore(rollback_db).sync_existing(
+                            refreshed_record,
+                            storage_key=previous_storage_key,
+                            mime_type=record_snapshot.get("mime_type"),
+                        )
+                    else:
+                        rollback_db.flush()
+                    rollback_db.commit()
+            except Exception as exc:  # noqa: BLE001
+                rollback_db.rollback()
+                if rollback_error is None:
+                    rollback_error = exc
+                logger.warning(
+                    "Failed to restore UploadedFile/local file during web file "
+                    "refresh rollback: file_id=%s, error=%s",
+                    file_record_id,
+                    exc,
+                    exc_info=True,
+                )
+
+            try:
+                _restore_ingestion_runs_snapshot(ingestion_runs_snapshot)
+            except Exception as exc:  # noqa: BLE001
+                if rollback_error is None:
+                    rollback_error = exc
+                logger.warning(
+                    "Failed to restore ingestion runs during web file refresh "
+                    "rollback: file_id=%s, error=%s",
+                    file_record_id,
+                    exc,
+                    exc_info=True,
+                )
+
+            if rollback_error is not None:
+                raise rollback_error
+            rollback_succeeded = True
+        except Exception:
+            raise
+        finally:
+            rollback_db.close()
+            if rollback_succeeded:
+                backup_path.unlink(missing_ok=True)
+            elif backup_path.exists():
+                logger.warning(
+                    "Preserving web ingest rollback backup after failed rollback: %s",
+                    backup_path,
+                )
+
+    def _commit_refresh() -> None:
+        backup_path.unlink(missing_ok=True)
+
     return FileHandlerResult(
         file_path=str(existing_record.storage_path),
         file_id=str(existing_record.file_id),
+        rollback_on_failure=_rollback_refresh,
+        commit_on_success=_commit_refresh,
     )
 
 
@@ -1172,11 +2332,32 @@ def _recreate_missing_existing_file(
     temp_file_path: Path,
     db_session: Session,
     user_id: int,
+    is_admin: bool,
+    collection_name: str,
     filename: str,
     url_hash: str,
     processed_urls: Dict[str, str],
 ) -> FileHandlerResult:
     existing_path = Path(str(existing_record.storage_path))
+    record_snapshot = _snapshot_uploaded_file_record(existing_record)
+    ingestion_runs_snapshot = _snapshot_ingestion_runs_for_uploaded_file(
+        str(existing_record.file_id)
+    )
+    if ingestion_runs_snapshot is None:
+        raise RuntimeError(
+            "Failed to snapshot ingestion status before recreating existing web file"
+        )
+
+    rag_document_snapshot = _snapshot_rag_documents_for_uploaded_file(
+        str(existing_record.file_id),
+        user_id=user_id,
+        is_admin=is_admin,
+    )
+    if rag_document_snapshot is None:
+        raise RuntimeError(
+            "Failed to snapshot RAG document rows before recreating existing web file"
+        )
+
     backup_path: Optional[Path] = None
     had_existing_file = existing_path.exists()
     if had_existing_file:
@@ -1193,22 +2374,213 @@ def _recreate_missing_existing_file(
             mime_type="text/markdown",
             file_size=existing_path.stat().st_size,
         )
-    except Exception:
-        db_session.rollback()
-        _restore_ingest_file_backup(
-            file_path=existing_path,
-            backup_path=backup_path,
-            had_existing_file=had_existing_file,
-        )
+    except Exception as setup_exc:
+        restore_error: Optional[Exception] = None
+        try:
+            db_session.rollback()
+        except Exception as exc:  # noqa: BLE001
+            restore_error = exc
+            logger.warning(
+                "Failed to rollback DB session after web file recreate setup "
+                "failure: file_id=%s, error=%s",
+                existing_record.file_id,
+                exc,
+                exc_info=True,
+            )
+        try:
+            _restore_ingest_file_backup(
+                file_path=existing_path,
+                backup_path=backup_path,
+                had_existing_file=had_existing_file,
+            )
+        except Exception as exc:  # noqa: BLE001
+            restore_error = exc
+            logger.warning(
+                "Failed to restore local file after web file recreate setup "
+                "failure: file_id=%s, path=%s, error=%s",
+                existing_record.file_id,
+                existing_path,
+                exc,
+                exc_info=True,
+            )
+        try:
+            refreshed_record = (
+                db_session.query(UploadedFile)
+                .filter(UploadedFile.file_id == str(existing_record.file_id))
+                .first()
+            )
+            if refreshed_record is not None:
+                current_storage_key = str(
+                    getattr(refreshed_record, "storage_key", "") or ""
+                )
+                previous_storage_key = str(record_snapshot.get("storage_key") or "")
+                if current_storage_key and (
+                    current_storage_key != previous_storage_key or not had_existing_file
+                ):
+                    ManagedFileRef(refreshed_record).delete_durable()
+                _restore_uploaded_file_record_snapshot(
+                    refreshed_record, record_snapshot
+                )
+                if previous_storage_key and existing_path.exists():
+                    UploadedFileStore(db_session).sync_existing(
+                        refreshed_record,
+                        storage_key=previous_storage_key,
+                        mime_type=record_snapshot.get("mime_type"),
+                    )
+                else:
+                    db_session.flush()
+                db_session.commit()
+        except Exception as exc:  # noqa: BLE001
+            db_session.rollback()
+            restore_error = exc
+            logger.warning(
+                "Failed to restore UploadedFile record after web file recreate "
+                "setup failure: file_id=%s, error=%s",
+                existing_record.file_id,
+                exc,
+                exc_info=True,
+            )
+        try:
+            _restore_ingestion_runs_snapshot(ingestion_runs_snapshot)
+        except Exception as exc:  # noqa: BLE001
+            restore_error = exc
+            logger.warning(
+                "Failed to restore ingestion runs after web file recreate setup "
+                "failure: file_id=%s, error=%s",
+                existing_record.file_id,
+                exc,
+                exc_info=True,
+            )
+        if restore_error is not None:
+            raise restore_error from setup_exc
         raise
-    finally:
-        if backup_path is not None and backup_path.exists():
-            backup_path.unlink()
 
     processed_urls[url_hash] = str(file_record.file_id)
+
+    file_record_id = str(file_record.file_id)
+    backup_for_failure = backup_path
+
+    def _rollback_recreate(
+        ingestion_result: Optional[IngestionResult] = None,
+    ) -> None:
+        SessionLocal = get_session_local()
+        rollback_db = SessionLocal()
+        rollback_succeeded = False
+        try:
+            rollback_error: Optional[Exception] = None
+            try:
+                _rollback_failed_web_document_ingestion(
+                    collection_name=collection_name,
+                    result=ingestion_result,
+                    user_id=user_id,
+                    is_admin=is_admin,
+                    rag_snapshot=rag_document_snapshot,
+                    file_id=file_record_id,
+                )
+            except Exception as exc:  # noqa: BLE001
+                rollback_error = exc
+                logger.warning(
+                    "Failed to clean RAG rows during recreated web file rollback: "
+                    "file_id=%s, error=%s",
+                    file_record_id,
+                    exc,
+                    exc_info=True,
+                )
+
+            try:
+                refreshed_record = (
+                    rollback_db.query(UploadedFile)
+                    .filter(UploadedFile.file_id == file_record_id)
+                    .first()
+                )
+                if refreshed_record is not None:
+                    current_storage_key = str(
+                        getattr(refreshed_record, "storage_key", "") or ""
+                    )
+                    previous_storage_key = str(record_snapshot.get("storage_key") or "")
+                    if (
+                        current_storage_key
+                        and current_storage_key != previous_storage_key
+                    ):
+                        ManagedFileRef(refreshed_record).delete_durable()
+
+                    _restore_uploaded_file_record_snapshot(
+                        refreshed_record, record_snapshot
+                    )
+                    if previous_storage_key and backup_for_failure is not None:
+                        _restore_ingest_file_backup(
+                            file_path=existing_path,
+                            backup_path=backup_for_failure,
+                            had_existing_file=True,
+                        )
+                        UploadedFileStore(rollback_db).sync_existing(
+                            refreshed_record,
+                            storage_key=previous_storage_key,
+                            mime_type=record_snapshot.get("mime_type"),
+                        )
+                    else:
+                        _restore_ingest_file_backup(
+                            file_path=existing_path,
+                            backup_path=backup_for_failure,
+                            had_existing_file=had_existing_file,
+                        )
+                        rollback_db.flush()
+                else:
+                    _restore_ingest_file_backup(
+                        file_path=existing_path,
+                        backup_path=backup_for_failure,
+                        had_existing_file=had_existing_file,
+                    )
+                rollback_db.commit()
+            except Exception as exc:  # noqa: BLE001
+                rollback_db.rollback()
+                if rollback_error is None:
+                    rollback_error = exc
+                logger.warning(
+                    "Failed to restore UploadedFile/local file during recreated "
+                    "web file rollback: file_id=%s, error=%s",
+                    file_record_id,
+                    exc,
+                    exc_info=True,
+                )
+
+            try:
+                _restore_ingestion_runs_snapshot(ingestion_runs_snapshot)
+            except Exception as exc:  # noqa: BLE001
+                if rollback_error is None:
+                    rollback_error = exc
+                logger.warning(
+                    "Failed to restore ingestion runs during recreated web file "
+                    "rollback: file_id=%s, error=%s",
+                    file_record_id,
+                    exc,
+                    exc_info=True,
+                )
+
+            if rollback_error is not None:
+                raise rollback_error
+            rollback_succeeded = True
+        except Exception:
+            raise
+        finally:
+            rollback_db.close()
+            if rollback_succeeded and backup_for_failure is not None:
+                backup_for_failure.unlink(missing_ok=True)
+            elif backup_for_failure is not None and backup_for_failure.exists():
+                logger.warning(
+                    "Preserving web ingest rollback backup after failed rollback: %s",
+                    backup_for_failure,
+                )
+
+    def _commit_recreate() -> None:
+        if backup_for_failure is not None:
+            backup_for_failure.unlink(missing_ok=True)
+
     return FileHandlerResult(
         file_path=str(existing_record.storage_path),
         file_id=str(existing_record.file_id),
+        rollback_on_failure=_rollback_recreate,
+        commit_on_success=_commit_recreate,
     )
 
 
@@ -1351,6 +2723,161 @@ class CloudIngestRequest(BaseModel):
 
 class RollbackFailureError(RuntimeError):
     """Raised when best-effort ingest rollback cannot complete cleanly."""
+
+
+@dataclass
+class _CollectionConfigSnapshot:
+    metadata_store: Any
+    collection: str
+    user_id: int
+    previous_config_json: Optional[str]
+    previous_config_known: bool
+    saved: bool
+
+
+async def _maybe_await(value: Any) -> Any:
+    if inspect.isawaitable(value):
+        return await value
+    return value
+
+
+async def _save_collection_config_with_snapshot(
+    *,
+    collection: str,
+    config_json: str,
+    user: User,
+    context: str,
+) -> _CollectionConfigSnapshot:
+    """Save collection config while retaining the caller's previous config."""
+    from ...core.tools.core.RAG_tools.storage.factory import get_metadata_store
+
+    metadata_store = get_metadata_store()
+    previous_config_json: Optional[str] = None
+    previous_config_known = False
+
+    try:
+        get_config = getattr(metadata_store, "get_collection_config", None)
+        if callable(get_config):
+            loaded = get_config(
+                collection=collection,
+                user_id=int(user.id),
+                is_admin=False,
+            )
+            loaded = await _maybe_await(loaded)
+            if isinstance(loaded, str):
+                previous_config_json = loaded
+                previous_config_known = True
+            elif loaded is None:
+                previous_config_known = True
+            else:
+                logger.warning(
+                    "Unexpected collection config snapshot type during %s: %s",
+                    context,
+                    type(loaded).__name__,
+                )
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(
+            "Failed to snapshot collection config during %s: %s",
+            context,
+            exc,
+        )
+
+    if not previous_config_known:
+        logger.warning(
+            "Skipping collection config save during %s because previous config "
+            "state could not be read for %s/user_%s",
+            context,
+            collection,
+            int(user.id),
+        )
+        return _CollectionConfigSnapshot(
+            metadata_store=metadata_store,
+            collection=collection,
+            user_id=int(user.id),
+            previous_config_json=previous_config_json,
+            previous_config_known=previous_config_known,
+            saved=False,
+        )
+
+    try:
+        await metadata_store.save_collection_config(
+            collection=collection,
+            config_json=config_json,
+            user_id=int(user.id),
+        )
+        return _CollectionConfigSnapshot(
+            metadata_store=metadata_store,
+            collection=collection,
+            user_id=int(user.id),
+            previous_config_json=previous_config_json,
+            previous_config_known=previous_config_known,
+            saved=True,
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Failed to save collection config during %s: %s", context, exc)
+        return _CollectionConfigSnapshot(
+            metadata_store=metadata_store,
+            collection=collection,
+            user_id=int(user.id),
+            previous_config_json=previous_config_json,
+            previous_config_known=previous_config_known,
+            saved=False,
+        )
+
+
+async def _restore_collection_config_after_failed_ingest(
+    *,
+    snapshot: Optional[_CollectionConfigSnapshot],
+    collection_existed_before: bool,
+    context: str,
+) -> None:
+    """Undo the config save made before an ingest that ultimately failed."""
+    if snapshot is None or not snapshot.saved:
+        return
+
+    try:
+        if snapshot.previous_config_json is not None:
+            await snapshot.metadata_store.save_collection_config(
+                collection=snapshot.collection,
+                config_json=snapshot.previous_config_json,
+                user_id=snapshot.user_id,
+            )
+            logger.info(
+                "Restored previous collection config after failed %s: %s/user_%s",
+                context,
+                snapshot.collection,
+                snapshot.user_id,
+            )
+            return
+
+        if not snapshot.previous_config_known:
+            logger.warning(
+                "Skipping collection config deletion after failed %s because "
+                "previous config state is unknown: %s/user_%s",
+                context,
+                snapshot.collection,
+                snapshot.user_id,
+            )
+            return
+
+        delete_result = snapshot.metadata_store.delete_collection_metadata(
+            collection_name=snapshot.collection,
+            user_id=snapshot.user_id,
+            is_admin=False,
+            delete_orphaned_metadata=not collection_existed_before,
+        )
+        await _maybe_await(delete_result)
+        logger.info(
+            "Removed collection config created by failed %s: %s/user_%s",
+            context,
+            snapshot.collection,
+            snapshot.user_id,
+        )
+    except Exception as exc:  # noqa: BLE001
+        raise RollbackFailureError(
+            "Failed to restore collection config after failed "
+            f"{context} for {snapshot.collection}/user_{snapshot.user_id}: {exc}"
+        ) from exc
 
 
 def _build_cloud_storage_filename(original_filename: str, file_id: str) -> str:
@@ -1797,17 +3324,16 @@ async def ingest(
 
     progress_manager = get_progress_manager()
 
-    try:
-        from ...core.tools.core.RAG_tools.storage.factory import get_metadata_store
-
-        metadata_store = get_metadata_store()
-        await metadata_store.save_collection_config(
-            collection=safe_collection,
-            config_json=config.model_dump_json(exclude_unset=True),
-            user_id=int(_user.id),
-        )
-    except Exception as e:
-        logger.warning("Failed to save collection config during ingest: %s", e)
+    config_snapshot = await _save_collection_config_with_snapshot(
+        collection=safe_collection,
+        config_json=config.model_dump_json(exclude_unset=True),
+        user=_user,
+        context="ingest",
+    )
+    effective_collection_existed_before = _collection_or_config_existed_before(
+        collection_existed_before,
+        config_snapshot,
+    )
 
     try:
         file_record = _upsert_uploaded_file_record(
@@ -1845,12 +3371,20 @@ async def ingest(
                 result=result,
                 file_path=file_path,
                 file_record=file_record,
-                collection_existed_before=collection_existed_before,
+                collection_existed_before=effective_collection_existed_before,
                 uploaded_file_existed_before=uploaded_file_existed_before,
                 file_backup_path=file_backup_path,
                 had_existing_file=had_existing_file,
                 embedding_model_id=embedding_model_id,
             )
+            if effective_collection_existed_before:
+                await _restore_or_cleanup_collection_config_after_failed_ingest(
+                    snapshot=config_snapshot,
+                    collection_existed_before=collection_existed_before,
+                    collection_name=collection,
+                    user=_user,
+                    context="ingest",
+                )
 
         if result.status == "error":
             return JSONResponse(
@@ -1896,27 +3430,32 @@ async def ingest(
                 result=rollback_result,
                 file_path=file_path,
                 file_record=file_record,
-                collection_existed_before=collection_existed_before,
+                collection_existed_before=effective_collection_existed_before,
                 uploaded_file_existed_before=uploaded_file_existed_before,
                 file_backup_path=file_backup_path,
                 had_existing_file=had_existing_file,
                 embedding_model_id=embedding_model_id,
             )
-        elif not collection_existed_before:
-            _restore_ingest_file_backup(
-                file_path=file_path,
-                backup_path=file_backup_path,
-                had_existing_file=had_existing_file,
-            )
-            await _cleanup_failed_new_collection_metadata(
-                collection_name=collection,
-                user=_user,
-            )
+            if effective_collection_existed_before:
+                await _restore_or_cleanup_collection_config_after_failed_ingest(
+                    snapshot=config_snapshot,
+                    collection_existed_before=collection_existed_before,
+                    collection_name=collection,
+                    user=_user,
+                    context="ingest",
+                )
         else:
             _restore_ingest_file_backup(
                 file_path=file_path,
                 backup_path=file_backup_path,
                 had_existing_file=had_existing_file,
+            )
+            await _restore_or_cleanup_collection_config_after_failed_ingest(
+                snapshot=config_snapshot,
+                collection_existed_before=collection_existed_before,
+                collection_name=collection,
+                user=_user,
+                context="ingest",
             )
         raise
 
@@ -2200,17 +3739,16 @@ async def ingest_cloud(
 
     await _ensure_collection_access(safe_collection, _user, allow_create=True)
 
-    try:
-        from ...core.tools.core.RAG_tools.storage.factory import get_metadata_store
-
-        metadata_store = get_metadata_store()
-        await metadata_store.save_collection_config(
-            collection=safe_collection,
-            config_json=config.model_dump_json(exclude_unset=True),
-            user_id=int(_user.id),
-        )
-    except Exception as e:
-        logger.warning("Failed to save collection config during ingest_cloud: %s", e)
+    config_snapshot = await _save_collection_config_with_snapshot(
+        collection=safe_collection,
+        config_json=config.model_dump_json(exclude_unset=True),
+        user=_user,
+        context="ingest_cloud",
+    )
+    effective_collection_existed_before = _collection_or_config_existed_before(
+        collection_existed_before,
+        config_snapshot,
+    )
 
     # Concurrency limit for cloud ingestion to avoid overloading
     semaphore = asyncio.Semaphore(5)
@@ -2353,7 +3891,7 @@ async def ingest_cloud(
                                 result=result,
                                 file_path=file_path,
                                 file_record=file_record,
-                                collection_existed_before=collection_existed_before,
+                                collection_existed_before=effective_collection_existed_before,
                                 uploaded_file_existed_before=uploaded_file_existed_before,
                                 file_backup_path=file_backup_path,
                                 had_existing_file=had_existing_file,
@@ -2384,7 +3922,7 @@ async def ingest_cloud(
                             result=rollback_result,
                             file_path=file_path,
                             file_record=file_record,
-                            collection_existed_before=collection_existed_before,
+                            collection_existed_before=effective_collection_existed_before,
                             uploaded_file_existed_before=uploaded_file_existed_before,
                             file_backup_path=file_backup_path,
                             had_existing_file=had_existing_file,
@@ -2441,12 +3979,17 @@ async def ingest_cloud(
     # Run all file processings concurrently
     results = await asyncio.gather(*[process_file(f) for f in request.files])
 
-    if not collection_existed_before and not any(
-        result.status == "success" for result in results
-    ):
-        await _cleanup_failed_new_collection_metadata(
+    has_success = any(result.status == "success" for result in results)
+    has_failure = any(result.status in {"error", "partial"} for result in results)
+
+    if has_failure:
+        await _restore_or_cleanup_collection_config_after_failed_ingest(
+            snapshot=config_snapshot,
+            collection_existed_before=collection_existed_before,
             collection_name=safe_collection,
             user=_user,
+            context="ingest_cloud",
+            successful_documents=1 if has_success else 0,
         )
 
     return results
@@ -3087,18 +4630,12 @@ async def ingest_web(
         except ValueError:
             collection_existed_before = False
 
-        try:
-            from ...core.tools.core.RAG_tools.storage.factory import get_metadata_store
-
-            metadata_store = get_metadata_store()
-            await metadata_store.save_collection_config(
-                collection=safe_collection,
-                config_json=ingestion_config.model_dump_json(exclude_unset=True),
-                user_id=int(_user.id),
-            )
-        except Exception as e:
-            logger.warning("Failed to save collection config during ingest_web: %s", e)
-
+        config_snapshot = await _save_collection_config_with_snapshot(
+            collection=safe_collection,
+            config_json=ingestion_config.model_dump_json(exclude_unset=True),
+            user=_user,
+            context="ingest_web",
+        )
         # Track processed URLs to prevent duplicate UploadedFile records
         # Key: URL hash, Value: file_id
         # Note: For large-scale web ingestion (>10000 pages), consider using
@@ -3162,6 +4699,8 @@ async def ingest_web(
                             temp_file_path=temp_file_path,
                             db_session=db_session,
                             user_id=int(_user.id),
+                            is_admin=bool(_user.is_admin),
+                            collection_name=collection_name,
                             url=url,
                             filename=filename,
                             url_hash=url_hash,
@@ -3193,6 +4732,8 @@ async def ingest_web(
                         temp_file_path=temp_file_path,
                         db_session=db_session,
                         user_id=int(_user.id),
+                        is_admin=bool(_user.is_admin),
+                        collection_name=collection_name,
                         url=url,
                         filename=filename,
                         url_hash=url_hash,
@@ -3215,6 +4756,8 @@ async def ingest_web(
                         temp_file_path=temp_file_path,
                         db_session=db_session,
                         user_id=int(_user.id),
+                        is_admin=bool(_user.is_admin),
+                        collection_name=collection_name,
                         filename=filename,
                         url_hash=url_hash,
                         processed_urls=_processed_urls,
@@ -3234,50 +4777,18 @@ async def ingest_web(
                 )
                 persistent_file.parent.mkdir(parents=True, exist_ok=True)
 
-                try:
-                    shutil.copy2(temp_file_path, persistent_file)
-                    logger.info(
-                        "Copied web ingestion file from %s to %s",
-                        temp_file_path,
-                        persistent_file,
-                    )
-
-                    file_record = _upsert_uploaded_file_record(
-                        db_session,
-                        user_id=int(_user.id),
-                        filename=filename,
-                        storage_path=persistent_file,
-                        mime_type="text/markdown",
-                        file_size=persistent_file.stat().st_size,
-                    )
-                    logger.info(
-                        "Created UploadedFile record for web ingestion: file_id=%s, filename=%s, url=%s",
-                        file_record.file_id,
-                        filename,
-                        url,
-                    )
-
-                    _processed_urls[url_hash] = str(file_record.file_id)
-                    _new_web_file_ids.add(str(file_record.file_id))
-                    return FileHandlerResult(
-                        file_path=str(persistent_file),
-                        file_id=str(file_record.file_id),
-                    )
-                except Exception:
-                    if persistent_file.exists():
-                        try:
-                            persistent_file.unlink()
-                            logger.warning(
-                                "Cleaned up orphaned persistent file due to upsert failure: %s",
-                                persistent_file,
-                            )
-                        except Exception as cleanup_error:
-                            logger.warning(
-                                "Failed to clean up orphaned persistent file %s: %s",
-                                persistent_file,
-                                cleanup_error,
-                            )
-                    raise
+                return _create_new_web_file_handler_result(
+                    temp_file_path=temp_file_path,
+                    persistent_file=persistent_file,
+                    db_session=db_session,
+                    user_id=int(_user.id),
+                    is_admin=bool(_user.is_admin),
+                    collection_name=collection_name,
+                    filename=filename,
+                    url=url,
+                    url_hash=url_hash,
+                    processed_urls=_processed_urls,
+                )
 
         # Create a wrapper that creates a dedicated DB session for the executor thread
         # This avoids sharing the request thread's session across thread boundaries,
@@ -3316,34 +4827,15 @@ async def ingest_web(
             result = result.model_copy(update={"message": web_updated_message})
 
         if result.status == "error":
-            cleanup_incomplete = False
-            cleanup_errors: list[str] = []
-            if result.documents_created == 0:
-                cleanup_incomplete, cleanup_errors = _compensate_new_web_ingest_files(
-                    db,
-                    file_ids=_new_web_file_ids,
-                    user_id=int(_user.id),
-                )
-
-            if cleanup_incomplete:
-                cleanup_message = "Web ingest rollback incomplete: " + "; ".join(
-                    cleanup_errors or ["side effects may remain"]
-                )
-                result = result.model_copy(
-                    update={"warnings": [*result.warnings, cleanup_message]}
-                )
-            if not collection_existed_before:
-                if cleanup_incomplete:
-                    logger.warning(
-                        "Skipping failed web-ingest collection metadata cleanup for %s "
-                        "because file rollback is incomplete",
-                        safe_collection,
-                    )
-                else:
-                    await _cleanup_failed_new_collection_metadata(
-                        collection_name=safe_collection,
-                        user=_user,
-                    )
+            await _restore_or_cleanup_collection_config_after_failed_ingest(
+                snapshot=config_snapshot,
+                collection_existed_before=collection_existed_before,
+                collection_name=safe_collection,
+                user=_user,
+                context="ingest_web",
+                successful_documents=result.documents_created,
+                side_effects_may_remain=result.side_effects_may_remain,
+            )
             return JSONResponse(status_code=500, content=result.model_dump())
         if result.status == "partial":
             logger.warning(
@@ -3353,13 +4845,30 @@ async def ingest_web(
                 _user.id,
                 result.message,
             )
+            await _restore_or_cleanup_collection_config_after_failed_ingest(
+                snapshot=config_snapshot,
+                collection_existed_before=collection_existed_before,
+                collection_name=safe_collection,
+                user=_user,
+                context="ingest_web",
+                successful_documents=result.documents_created,
+                side_effects_may_remain=result.side_effects_may_remain,
+            )
 
         return result
 
     except HTTPException:
         raise
     except (ValueError, KeyError, TypeError) as e:
-        if "collection_existed_before" in locals() and not collection_existed_before:
+        if "config_snapshot" in locals():
+            await _restore_or_cleanup_collection_config_after_failed_ingest(
+                snapshot=config_snapshot,
+                collection_existed_before=collection_existed_before,
+                collection_name=safe_collection,
+                user=_user,
+                context="ingest_web",
+            )
+        elif "collection_existed_before" in locals() and not collection_existed_before:
             await _cleanup_failed_new_collection_metadata(
                 collection_name=safe_collection,
                 user=_user,
@@ -3369,7 +4878,15 @@ async def ingest_web(
             status_code=400, detail=f"Data format error: {str(e)}"
         ) from e
     except Exception as e:
-        if "collection_existed_before" in locals() and not collection_existed_before:
+        if "config_snapshot" in locals():
+            await _restore_or_cleanup_collection_config_after_failed_ingest(
+                snapshot=config_snapshot,
+                collection_existed_before=collection_existed_before,
+                collection_name=safe_collection,
+                user=_user,
+                context="ingest_web",
+            )
+        elif "collection_existed_before" in locals() and not collection_existed_before:
             await _cleanup_failed_new_collection_metadata(
                 collection_name=safe_collection,
                 user=_user,

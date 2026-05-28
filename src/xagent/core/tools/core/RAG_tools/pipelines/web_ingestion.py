@@ -4,12 +4,13 @@ Crawls a website and imports all discovered pages into the knowledge base.
 """
 
 import asyncio
+import inspect
 import logging
 import tempfile
 from contextvars import copy_context
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import TYPE_CHECKING, Callable, Optional, TypedDict
+from typing import TYPE_CHECKING, Callable, NotRequired, Optional, TypedDict, cast
 
 from ..core.schemas import (
     CrawlResult,
@@ -29,6 +30,8 @@ if TYPE_CHECKING:
     from ..kb import KBPipelineCompatibilityFacade
 
 logger = logging.getLogger(__name__)
+
+FileHandlerCallback = Callable[..., None]
 
 
 _CRAWLER_BLOCK_ERROR_MARKERS: tuple[str, ...] = (
@@ -57,10 +60,58 @@ class FileHandlerResult(TypedDict):
     Attributes:
         file_path: Path to the file for ingestion (persistent or temporary)
         file_id: Optional file_id for stable doc_id generation
+        rollback_on_failure: Optional callback to compensate file persistence
+            when the subsequent document ingestion does not succeed.
+        commit_on_success: Optional callback to finalize temporary rollback
+            resources once the subsequent document ingestion succeeds.
     """
 
     file_path: str
     file_id: Optional[str]
+    rollback_on_failure: NotRequired[FileHandlerCallback]
+    commit_on_success: NotRequired[FileHandlerCallback]
+
+
+def _callback_accepts_ingestion_result(callback: FileHandlerCallback) -> bool:
+    try:
+        signature = inspect.signature(callback)
+    except (TypeError, ValueError):
+        return False
+
+    try:
+        signature.bind(object())
+    except TypeError:
+        return False
+    return True
+
+
+def _run_file_handler_callback(
+    file_info: Optional[FileHandlerResult],
+    callback_name: str,
+    *,
+    url: str,
+    warnings: list[str],
+    ingestion_result: Optional[IngestionResult] = None,
+) -> Optional[str]:
+    if not file_info:
+        return None
+
+    callback = cast(Optional[FileHandlerCallback], file_info.get(callback_name))
+    if callback is None:
+        return None
+
+    try:
+        if _callback_accepts_ingestion_result(callback):
+            callback(ingestion_result)
+        else:
+            callback()
+    except Exception as cleanup_error:  # noqa: BLE001
+        cleanup_reason = str(cleanup_error)
+        message = f"File persistence {callback_name} failed for {url}: {cleanup_reason}"
+        logger.warning(message, exc_info=True)
+        warnings.append(message)
+        return cleanup_reason
+    return None
 
 
 def _looks_like_crawler_block(error: str) -> bool:
@@ -144,6 +195,7 @@ async def _run_web_ingestion_impl(
     start_time = datetime.now(timezone.utc)
     warnings: list[str] = []
     failed_urls: dict[str, str] = {}
+    rollback_failed_urls: dict[str, str] = {}
 
     # Normalize ingestion config
     ing_cfg = coerce_ingestion_config(ingestion_config)
@@ -246,6 +298,7 @@ async def _run_web_ingestion_impl(
                     final_file_path = temp_file
                     final_file_id = None
                     copied_persistent_file = None
+                    file_info: Optional[FileHandlerResult] = None
 
                     if file_handler:
                         try:
@@ -349,24 +402,38 @@ async def _run_web_ingestion_impl(
                                 status="success",
                                 message=ingest_result.message,
                             )
+                            _run_file_handler_callback(
+                                file_info,
+                                "commit_on_success",
+                                url=crawl_result.url,
+                                warnings=warnings,
+                                ingestion_result=ingest_result,
+                            )
                             # Only clear temp file reference on success
                             copied_persistent_file = None
                         else:
-                            # Non-success ingestion (e.g., embedding failed) without exception.
-                            # Keep file and DB record for potential retry scenarios.
-                            # Note: This accumulates files on persistent failures.
-                            # TODO: Add periodic cleanup for orphaned files from persistent failures.
                             failed_urls[crawl_result.url] = ingest_result.message
                             msg = (
                                 f"Partial ingestion for {crawl_result.url}: "
                                 f"{ingest_result.message}"
                             )
                             warnings.append(msg)
+                            rollback_error = _run_file_handler_callback(
+                                file_info,
+                                "rollback_on_failure",
+                                url=crawl_result.url,
+                                warnings=warnings,
+                                ingestion_result=ingest_result,
+                            )
+                            if rollback_error:
+                                rollback_failed_urls[crawl_result.url] = rollback_error
                             pipeline_facade.finish_web_page_operation(
                                 page_operation,
                                 status=ingest_result.status,
                                 message=ingest_result.message,
+                                side_effects_may_remain=bool(rollback_error),
                             )
+                            copied_persistent_file = None
 
                     except Exception as e:
                         logger.exception("Failed to ingest %s", crawl_result.url)
@@ -376,8 +443,21 @@ async def _run_web_ingestion_impl(
                         )
                         warnings.append(failure_message)
 
-                        # Clean up copied persistent file on ingestion failure
-                        if copied_persistent_file and copied_persistent_file.exists():
+                        rollback_error = _run_file_handler_callback(
+                            file_info,
+                            "rollback_on_failure",
+                            url=crawl_result.url,
+                            warnings=warnings,
+                        )
+                        if rollback_error:
+                            rollback_failed_urls[crawl_result.url] = rollback_error
+
+                        # Legacy cleanup for handlers that only returned a file path.
+                        if (
+                            (not file_info or "rollback_on_failure" not in file_info)
+                            and copied_persistent_file
+                            and copied_persistent_file.exists()
+                        ):
                             try:
                                 copied_persistent_file.unlink()
                                 logger.info(
@@ -395,6 +475,7 @@ async def _run_web_ingestion_impl(
                             page_operation,
                             status="error",
                             message=failure_message,
+                            side_effects_may_remain=bool(rollback_error),
                         )
 
                 except Exception as e:
@@ -428,6 +509,8 @@ async def _run_web_ingestion_impl(
         status = "partial"
     else:
         status = "success"
+    if rollback_failed_urls:
+        status = "error"
 
     crawled_urls_list = [r.url for r in crawl_results if r.status == "success"]
 
@@ -438,7 +521,10 @@ async def _run_web_ingestion_impl(
     # check all failures for anti-bot/WAF signals and otherwise surface
     # the first failing URL and its reason so the user sees something
     # actionable.
-    if (status == "error" or status == "partial") and failed_urls:
+    if rollback_failed_urls:
+        first_url, first_err = next(iter(rollback_failed_urls.items()))
+        message = f"Web ingestion rollback failed for {first_url}: {first_err}"
+    elif (status == "error" or status == "partial") and failed_urls:
         first_url, first_err = next(iter(failed_urls.items()))
         blocking_entry = next(
             (
@@ -490,6 +576,7 @@ async def _run_web_ingestion_impl(
         message=message,
         warnings=warnings,
         elapsed_time_ms=elapsed_ms,
+        side_effects_may_remain=bool(rollback_failed_urls),
     )
 
     logger.info(

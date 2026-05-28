@@ -155,6 +155,7 @@ def handle_kb_ingest_web(db: Session, job: BackgroundJob) -> dict[str, Any]:
                 url=url,
                 db_session=db_session,
                 user_id=user_id,
+                is_admin=is_admin,
                 processed_urls=processed_urls,
             )
         finally:
@@ -180,7 +181,11 @@ def handle_kb_ingest_web(db: Session, job: BackgroundJob) -> dict[str, Any]:
 
     result_payload = result.model_dump(mode="json")
     if result.status == "error":
-        _cleanup_failed_web_collection_metadata_if_new(db, payload)
+        _cleanup_failed_web_collection_metadata_if_new(
+            db,
+            payload,
+            successful_documents=int(result.documents_created or 0),
+        )
         raise BackgroundJobHandlerError(result.message, result=result_payload)
     return result_payload
 
@@ -193,13 +198,14 @@ def _handle_web_file(
     url: str,
     db_session: Session,
     user_id: int,
+    is_admin: bool,
     processed_urls: dict[str, str],
 ) -> FileHandlerResult:
     from ..api.kb import (
+        _create_new_web_file_handler_result,
         _normalize_web_title_for_filename,
         _recreate_missing_existing_file,
         _refresh_existing_file_if_changed,
-        _upsert_uploaded_file_record,
         _WebFileLock,
     )
 
@@ -222,6 +228,8 @@ def _handle_web_file(
                     temp_file_path=temp_file_path,
                     db_session=db_session,
                     user_id=user_id,
+                    is_admin=is_admin,
+                    collection_name=collection_name,
                     url=url,
                     filename=filename,
                     url_hash=url_hash,
@@ -245,6 +253,8 @@ def _handle_web_file(
                 temp_file_path=temp_file_path,
                 db_session=db_session,
                 user_id=user_id,
+                is_admin=is_admin,
+                collection_name=collection_name,
                 url=url,
                 filename=filename,
                 url_hash=url_hash,
@@ -260,6 +270,8 @@ def _handle_web_file(
                 temp_file_path=temp_file_path,
                 db_session=db_session,
                 user_id=user_id,
+                is_admin=is_admin,
+                collection_name=collection_name,
                 filename=filename,
                 url_hash=url_hash,
                 processed_urls=processed_urls,
@@ -273,31 +285,18 @@ def _handle_web_file(
             collection_is_sanitized=True,
         )
         persistent_file.parent.mkdir(parents=True, exist_ok=True)
-        try:
-            shutil.copy2(temp_file_path, persistent_file)
-            file_record = _upsert_uploaded_file_record(
-                db_session,
-                user_id=user_id,
-                filename=filename,
-                storage_path=persistent_file,
-                mime_type="text/markdown",
-                file_size=persistent_file.stat().st_size,
-            )
-            processed_urls[url_hash] = str(file_record.file_id)
-            return FileHandlerResult(
-                file_path=str(persistent_file),
-                file_id=str(file_record.file_id),
-            )
-        except Exception:
-            if persistent_file.exists():
-                try:
-                    persistent_file.unlink()
-                except OSError:
-                    logger.warning(
-                        "Failed to clean up orphaned web-ingest file %s",
-                        persistent_file,
-                    )
-            raise
+        return _create_new_web_file_handler_result(
+            temp_file_path=temp_file_path,
+            persistent_file=persistent_file,
+            db_session=db_session,
+            user_id=user_id,
+            is_admin=is_admin,
+            collection_name=collection_name,
+            filename=filename,
+            url=url,
+            url_hash=url_hash,
+            processed_urls=processed_urls,
+        )
 
 
 def _cleanup_staged_document_input(payload: dict[str, Any]) -> None:
@@ -558,7 +557,11 @@ def _discard_ingest_backup(payload: dict[str, Any]) -> None:
 def _cleanup_failed_web_collection_metadata_if_new(
     db: Session,
     payload: dict[str, Any],
+    *,
+    successful_documents: int = 0,
 ) -> None:
+    if successful_documents > 0:
+        return
     if bool(payload.get("collection_existed_before", True)):
         return
 

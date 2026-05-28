@@ -1355,6 +1355,7 @@ def test_ingest_web_hostless_url_returns_422(app_with_kb, start_url):
 def test_ingest_web_error_cleans_new_collection_config(app_with_kb):
     """POST ingest-web should clean saved config when a new collection fails before any docs are created."""
     metadata_store = MagicMock()
+    metadata_store.get_collection_config = AsyncMock(return_value=None)
     metadata_store.save_collection_config = AsyncMock()
     metadata_store.delete_collection_metadata = AsyncMock(
         return_value={"metadata_rows": 0, "config_rows": 1}
@@ -1405,9 +1406,234 @@ def test_ingest_web_error_cleans_new_collection_config(app_with_kb):
     )
 
 
+def test_ingest_web_error_with_successful_docs_keeps_new_collection_config(
+    app_with_kb,
+):
+    """Rollback failures surface as error without deleting config used by successful pages."""
+    metadata_store = MagicMock()
+    metadata_store.get_collection_config = AsyncMock(return_value=None)
+    metadata_store.save_collection_config = AsyncMock()
+    metadata_store.delete_collection_metadata = AsyncMock()
+    metadata_store.delete_collection = AsyncMock()
+
+    with (
+        patch(
+            "xagent.core.tools.core.RAG_tools.storage.factory.get_metadata_store",
+            return_value=metadata_store,
+        ),
+        patch(
+            "xagent.web.api.kb.get_collection_sync", side_effect=ValueError("missing")
+        ),
+        patch(
+            "xagent.web.api.kb.run_web_ingestion",
+            return_value=WebIngestionResult(
+                status="error",
+                collection="web_new_collection",
+                total_urls_found=2,
+                pages_crawled=2,
+                pages_failed=1,
+                documents_created=1,
+                chunks_created=1,
+                embeddings_created=1,
+                crawled_urls=["https://example.com/ok"],
+                failed_urls={"https://example.com/bad": "rollback failed"},
+                message="rollback failed",
+                warnings=[],
+                elapsed_time_ms=0,
+            ),
+        ),
+    ):
+        client = TestClient(app_with_kb)
+        response = client.post(
+            "/api/kb/ingest-web",
+            data={
+                "collection": "web_new_collection",
+                "start_url": "https://example.com",
+            },
+        )
+
+    assert response.status_code == 500
+    metadata_store.delete_collection_metadata.assert_not_awaited()
+    metadata_store.save_collection_config.assert_awaited_once()
+    metadata_store.delete_collection.assert_not_awaited()
+
+
+def test_ingest_web_existing_collection_error_restores_previous_config(app_with_kb):
+    """POST ingest-web should restore old config when an existing collection fails."""
+    metadata_store = MagicMock()
+    metadata_store.get_collection_config = AsyncMock(return_value='{"chunk_size":333}')
+    metadata_store.save_collection_config = AsyncMock()
+    metadata_store.delete_collection_metadata = AsyncMock()
+    metadata_store.delete_collection = AsyncMock()
+
+    with (
+        patch(
+            "xagent.core.tools.core.RAG_tools.storage.factory.get_metadata_store",
+            return_value=metadata_store,
+        ),
+        patch("xagent.web.api.kb._ensure_collection_access", new_callable=AsyncMock),
+        patch("xagent.web.api.kb.get_collection_sync", return_value=MagicMock()),
+        patch(
+            "xagent.web.api.kb.run_web_ingestion",
+            return_value=WebIngestionResult(
+                status="error",
+                collection="web_existing_collection",
+                total_urls_found=1,
+                pages_crawled=0,
+                pages_failed=1,
+                documents_created=0,
+                chunks_created=0,
+                embeddings_created=0,
+                crawled_urls=[],
+                failed_urls={"https://example.com": "crawl failed"},
+                message="crawl failed",
+                warnings=[],
+                elapsed_time_ms=0,
+            ),
+        ),
+    ):
+        client = TestClient(app_with_kb)
+        response = client.post(
+            "/api/kb/ingest-web",
+            data={
+                "collection": "web_existing_collection",
+                "start_url": "https://example.com",
+                "chunk_size": "2048",
+            },
+        )
+
+    assert response.status_code == 500
+    assert metadata_store.save_collection_config.await_count == 2
+    restore_call = metadata_store.save_collection_config.await_args_list[-1]
+    assert restore_call.kwargs == {
+        "collection": "web_existing_collection",
+        "config_json": '{"chunk_size":333}',
+        "user_id": 1,
+    }
+    metadata_store.delete_collection_metadata.assert_not_awaited()
+
+
+def test_ingest_web_config_only_collection_error_restores_previous_config(
+    app_with_kb,
+):
+    """A config-only web collection should restore old config on failed ingest."""
+    metadata_store = MagicMock()
+    metadata_store.get_collection_config = AsyncMock(return_value='{"chunk_size":333}')
+    metadata_store.save_collection_config = AsyncMock()
+    metadata_store.delete_collection_metadata = AsyncMock()
+    metadata_store.delete_collection = AsyncMock()
+
+    with (
+        patch(
+            "xagent.core.tools.core.RAG_tools.storage.factory.get_metadata_store",
+            return_value=metadata_store,
+        ),
+        patch("xagent.web.api.kb._ensure_collection_access", new_callable=AsyncMock),
+        patch(
+            "xagent.web.api.kb.get_collection_sync", side_effect=ValueError("missing")
+        ),
+        patch(
+            "xagent.web.api.kb.run_web_ingestion",
+            return_value=WebIngestionResult(
+                status="error",
+                collection="web_config_only_collection",
+                total_urls_found=1,
+                pages_crawled=0,
+                pages_failed=1,
+                documents_created=0,
+                chunks_created=0,
+                embeddings_created=0,
+                crawled_urls=[],
+                failed_urls={"https://example.com": "crawl failed"},
+                message="crawl failed",
+                warnings=[],
+                elapsed_time_ms=0,
+            ),
+        ),
+    ):
+        client = TestClient(app_with_kb)
+        response = client.post(
+            "/api/kb/ingest-web",
+            data={
+                "collection": "web_config_only_collection",
+                "start_url": "https://example.com",
+                "chunk_size": "2048",
+            },
+        )
+
+    assert response.status_code == 500
+    assert metadata_store.save_collection_config.await_count == 2
+    restore_call = metadata_store.save_collection_config.await_args_list[-1]
+    assert restore_call.kwargs == {
+        "collection": "web_config_only_collection",
+        "config_json": '{"chunk_size":333}',
+        "user_id": 1,
+    }
+    metadata_store.delete_collection_metadata.assert_not_awaited()
+    metadata_store.delete_collection.assert_awaited_once_with(
+        "web_config_only_collection"
+    )
+
+
+def test_ingest_web_existing_collection_partial_restores_previous_config(app_with_kb):
+    """POST ingest-web should restore old config when an existing collection is partial."""
+    metadata_store = MagicMock()
+    metadata_store.get_collection_config = AsyncMock(return_value='{"chunk_size":555}')
+    metadata_store.save_collection_config = AsyncMock()
+    metadata_store.delete_collection_metadata = AsyncMock()
+
+    with (
+        patch(
+            "xagent.core.tools.core.RAG_tools.storage.factory.get_metadata_store",
+            return_value=metadata_store,
+        ),
+        patch("xagent.web.api.kb._ensure_collection_access", new_callable=AsyncMock),
+        patch("xagent.web.api.kb.get_collection_sync", return_value=MagicMock()),
+        patch(
+            "xagent.web.api.kb.run_web_ingestion",
+            return_value=WebIngestionResult(
+                status="partial",
+                collection="web_existing_collection",
+                total_urls_found=2,
+                pages_crawled=1,
+                pages_failed=1,
+                documents_created=1,
+                chunks_created=1,
+                embeddings_created=1,
+                crawled_urls=["https://example.com/ok"],
+                failed_urls={"https://example.com/bad": "embedding failed"},
+                message="partial failure",
+                warnings=[],
+                elapsed_time_ms=0,
+            ),
+        ),
+    ):
+        client = TestClient(app_with_kb)
+        response = client.post(
+            "/api/kb/ingest-web",
+            data={
+                "collection": "web_existing_collection",
+                "start_url": "https://example.com",
+                "chunk_size": "2048",
+            },
+        )
+
+    assert response.status_code == 200
+    assert response.json()["status"] == "partial"
+    assert metadata_store.save_collection_config.await_count == 2
+    restore_call = metadata_store.save_collection_config.await_args_list[-1]
+    assert restore_call.kwargs == {
+        "collection": "web_existing_collection",
+        "config_json": '{"chunk_size":555}',
+        "user_id": 1,
+    }
+    metadata_store.delete_collection_metadata.assert_not_awaited()
+
+
 def test_ingest_web_surfaces_embedding_configuration_fix_guidance(app_with_kb):
     """POST ingest-web should explain how to fix embedding configuration errors."""
     metadata_store = MagicMock()
+    metadata_store.get_collection_config = AsyncMock(return_value=None)
     metadata_store.save_collection_config = AsyncMock()
     metadata_store.delete_collection_metadata = AsyncMock(
         return_value={"metadata_rows": 0, "config_rows": 1}

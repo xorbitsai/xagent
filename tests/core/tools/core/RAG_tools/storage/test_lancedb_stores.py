@@ -251,6 +251,30 @@ def test_metadata_store_get_collection_config_not_found(
 @patch(
     "xagent.core.tools.core.RAG_tools.storage.lancedb_stores.get_connection_from_env"
 )
+def test_metadata_store_get_collection_config_read_error_raises(
+    mock_get_connection: Mock,
+) -> None:
+    """Read errors should not be conflated with a missing collection config."""
+    mock_conn = Mock()
+    mock_get_connection.return_value = mock_conn
+
+    mock_table = Mock()
+    mock_table.schema = Mock(names=[])
+    mock_conn.open_table.return_value = mock_table
+    mock_table.search.return_value.where.return_value.to_arrow.side_effect = (
+        RuntimeError("read failed")
+    )
+
+    store = LanceDBMetadataStore()
+    with pytest.raises(RuntimeError, match="read failed"):
+        asyncio.run(
+            store.get_collection_config(collection="test_collection", user_id=1)
+        )
+
+
+@patch(
+    "xagent.core.tools.core.RAG_tools.storage.lancedb_stores.get_connection_from_env"
+)
 def test_metadata_store_get_collection_config_admin_picks_newest(
     mock_get_connection: Mock,
 ) -> None:

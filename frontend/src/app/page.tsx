@@ -76,16 +76,25 @@ interface HomeAgent {
   updated_at?: string;
 }
 
-const formatDateTime = (value: string, locale: string) =>
-  new Date(value).toLocaleDateString(locale === "zh" ? "zh-CN" : "en-US", {
+const parseDateMs = (value: string) => {
+  const timestamp = new Date(value).getTime();
+  return Number.isNaN(timestamp) ? null : timestamp;
+};
+
+const formatDateTime = (value: string, locale: string) => {
+  const timestamp = parseDateMs(value);
+  if (timestamp === null) return "";
+
+  return new Date(timestamp).toLocaleDateString(locale === "zh" ? "zh-CN" : "en-US", {
     month: "short",
     day: "numeric",
     hour: "2-digit",
     minute: "2-digit",
   });
+};
 
-const formatElapsed = (createdAt: string) => {
-  const elapsedSeconds = Math.max(0, Math.floor((Date.now() - new Date(createdAt).getTime()) / 1000));
+const formatElapsed = (createdAtMs: number, now: number) => {
+  const elapsedSeconds = Math.max(0, Math.floor((now - createdAtMs) / 1000));
   const minutes = Math.floor(elapsedSeconds / 60);
   const seconds = elapsedSeconds % 60;
   return `${minutes}m ${String(seconds).padStart(2, "0")}s`;
@@ -132,6 +141,7 @@ export default function Home() {
   const [currentHour, setCurrentHour] = useState<number | null>(null);
   const [homeInputValue, setHomeMessageValue] = useState("");
   const [homeFiles, setHomeFiles] = useState<File[]>([]);
+  const [now, setNow] = useState(() => Date.now());
   const homeChatInputRef = useRef<HTMLTextAreaElement | null>(null);
   const homeFileInputRef = useRef<HTMLInputElement | null>(null);
 
@@ -365,9 +375,20 @@ export default function Home() {
     [recentTasks]
   );
   const primaryTask = runningTasks[0];
-  const elapsedLabel = primaryTask ? formatElapsed(primaryTask.created_at) : null;
+  const primaryTaskCreatedAtMs = primaryTask ? parseDateMs(primaryTask.created_at) : null;
+
+  useEffect(() => {
+    if (!primaryTask) return;
+
+    setNow(Date.now());
+    const intervalId = window.setInterval(() => setNow(Date.now()), 1000);
+    return () => window.clearInterval(intervalId);
+  }, [primaryTask]);
+
+  const elapsedLabel = primaryTaskCreatedAtMs === null ? null : formatElapsed(primaryTaskCreatedAtMs, now);
   const progressPercent = primaryTask
-    ? Math.min(100, Math.max(8, Math.floor((Date.now() - new Date(primaryTask.created_at).getTime()) / 18000)))
+    && primaryTaskCreatedAtMs !== null
+    ? Math.min(100, Math.max(8, Math.floor((now - primaryTaskCreatedAtMs) / 18000)))
     : 0;
   const displayAgents = useMemo(() => {
     const published = agents.filter((agent) => agent.status === "published");

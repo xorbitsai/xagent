@@ -1,6 +1,6 @@
 "use client";
 
-import type { KeyboardEvent, MouseEvent } from "react";
+import { useState, type KeyboardEvent, type MouseEvent } from "react";
 import { ChevronRight, Clock, Heart, Play } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import type { Template } from "@/types/template";
@@ -34,7 +34,7 @@ function LibraryConnections({ template }: { template: Template }) {
             <img src={connection.logo} alt={connection.name} className="h-4 w-4 object-contain" />
           ) : (
             <span className="text-[8px] font-bold text-white">
-              {connection.name.substring(0, 1).toUpperCase()}
+              {(connection.name || "").substring(0, 1).toUpperCase()}
             </span>
           )}
         </div>
@@ -60,6 +60,7 @@ export function LibraryTemplateCard({
   onLike,
   className,
 }: LibraryTemplateCardProps) {
+  const [isUseButtonHovered, setIsUseButtonHovered] = useState(false);
   const handleActivate = () => onUse(template.id);
 
   const handleKeyDown = (event: KeyboardEvent<HTMLDivElement>) => {
@@ -144,21 +145,16 @@ export function LibraryTemplateCard({
             variant="outline"
             className="mt-3 h-9 w-full rounded-lg border bg-transparent text-[12px] font-bold uppercase tracking-[0.04em] hover:text-inherit"
             style={{
-              borderColor: `${accentHex}40`,
+              borderColor: isUseButtonHovered ? accentHex : `${accentHex}40`,
+              backgroundColor: isUseButtonHovered ? `${accentHex}10` : "transparent",
               color: accentHex,
             }}
             onClick={(event) => {
               event.stopPropagation();
               handleActivate();
             }}
-            onMouseEnter={(event) => {
-              event.currentTarget.style.background = `${accentHex}10`;
-              event.currentTarget.style.borderColor = accentHex;
-            }}
-            onMouseLeave={(event) => {
-              event.currentTarget.style.background = "transparent";
-              event.currentTarget.style.borderColor = `${accentHex}40`;
-            }}
+            onMouseEnter={() => setIsUseButtonHovered(true)}
+            onMouseLeave={() => setIsUseButtonHovered(false)}
           >
             {useLabel}
           </Button>

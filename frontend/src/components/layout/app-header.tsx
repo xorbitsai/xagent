@@ -8,7 +8,6 @@ import { Sidebar } from "@/components/layout/sidebar";
 import { Button } from "@/components/ui/button";
 import { Sheet, SheetContent, SheetTrigger } from "@/components/ui/sheet";
 import { useI18n } from "@/contexts/i18n-context";
-import { useAuth } from "@/contexts/auth-context";
 import { getBrandingFromEnv } from "@/lib/branding";
 
 interface HeaderMeta {
@@ -69,7 +68,6 @@ export function AppHeader() {
   const pathname = usePathname();
   const branding = getBrandingFromEnv();
   const { t } = useI18n();
-  const { user } = useAuth();
   const [isMenuOpen, setIsMenuOpen] = useState(false);
 
   useEffect(() => {
@@ -77,7 +75,6 @@ export function AppHeader() {
   }, [pathname]);
 
   const headerMeta = useMemo(() => resolveHeaderMeta(pathname, t, branding.appName), [pathname, t, branding.appName]);
-  const userInitial = (user?.username || branding.appName).charAt(0).toUpperCase();
 
   return (
     <header className="flex h-16 shrink-0 items-center justify-between border-b border-border bg-background/95 px-4 backdrop-blur supports-[backdrop-filter]:bg-background/85 sm:px-6">

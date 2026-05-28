@@ -49,7 +49,7 @@ function HomeConnections({ template }: { template: Template }) {
             <img src={connection.logo} alt={connection.name} className="h-3.5 w-3.5 object-contain" />
           ) : (
             <span className="text-[8px] font-bold text-white">
-              {connection.name.substring(0, 1).toUpperCase()}
+              {(connection.name || "").substring(0, 1).toUpperCase()}
             </span>
           )}
         </div>

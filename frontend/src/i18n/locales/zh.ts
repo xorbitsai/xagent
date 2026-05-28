@@ -85,6 +85,7 @@ const zh = {
       running: "{count} 个任务进行中",
       liveView: "查看",
       askPlaceholder: "你可以提问、调研、写作、生成、分析……",
+      fileOnlyPrompt: "请分析我上传的文件，并总结关键信息。",
       capabilities: {
         slides: {
           label: "Slides",

@@ -85,6 +85,7 @@ const en = {
       running: "{count} task running",
       liveView: "View",
       askPlaceholder: "Ask anything — research, write, generate, analyze...",
+      fileOnlyPrompt: "Analyze the attached files and summarize the key findings.",
       capabilities: {
         slides: {
           label: "Slides",

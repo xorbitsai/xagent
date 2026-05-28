@@ -18,6 +18,7 @@ import {
   ArrowUpRight,
   Bot,
   ChevronRight,
+  File as FileIcon,
   FileImage,
   FileText,
   Loader2,
@@ -28,6 +29,7 @@ import {
   Send,
   Sparkles,
   Table2,
+  X,
 } from "lucide-react";
 import { apiRequest } from "@/lib/api-wrapper";
 import { HomeTemplateCard } from "@/components/templates/home-template-card";
@@ -128,6 +130,8 @@ export default function Home() {
   const [isCreating, setIsCreating] = useState(false);
   const [showNoModelAlert, setShowNoModelAlert] = useState(false);
   const [currentHour, setCurrentHour] = useState<number | null>(null);
+  const [homeInputValue, setHomeMessageValue] = useState("");
+  const [homeFiles, setHomeFiles] = useState<File[]>([]);
   const homeChatInputRef = useRef<HTMLTextAreaElement | null>(null);
   const homeFileInputRef = useRef<HTMLInputElement | null>(null);
 
@@ -218,7 +222,7 @@ export default function Home() {
     ];
   };
 
-  const handleCreateTask = async (content: string) => {
+  const handleCreateTask = async (content: string, filesToSend: File[] = homeFiles) => {
     if (isCreating) return;
     setIsCreating(true);
     try {
@@ -228,9 +232,11 @@ export default function Home() {
         return;
       }
 
+      const normalizedContent = content.trim() || t("home.revamp.fileOnlyPrompt");
+
       const requestBody = {
-        title: content,
-        description: content,
+        title: normalizedContent,
+        description: normalizedContent,
         llm_ids: llmIds,
       };
 
@@ -250,11 +256,13 @@ export default function Home() {
           const parsedTaskId = typeof taskId === "string" ? parseInt(taskId, 10) : taskId;
 
           setPendingMessage({
-            message: content,
-            files: [],
+            message: normalizedContent,
+            files: filesToSend,
             targetTaskId: parsedTaskId,
           });
 
+          setHomeMessageValue("");
+          setHomeFiles([]);
           setTaskId(parsedTaskId);
           router.push(`/task/${parsedTaskId}`);
         }
@@ -269,9 +277,8 @@ export default function Home() {
   };
 
   const handleChatButtonClick = () => {
-    const val = homeChatInputRef.current?.value;
-    if (val && val.trim()) {
-      handleCreateTask(val.trim());
+    if (homeInputValue.trim() || homeFiles.length > 0) {
+      handleCreateTask(homeInputValue, homeFiles);
     }
   };
 
@@ -279,11 +286,27 @@ export default function Home() {
     const input = homeChatInputRef.current;
     if (!input) return;
 
+    setHomeMessageValue(value);
     input.value = value;
     input.style.height = "auto";
     input.style.height = `${Math.min(input.scrollHeight, 120)}px`;
     input.focus();
     input.setSelectionRange(value.length, value.length);
+  };
+
+  const handleHomeFileSelect = (event: React.ChangeEvent<HTMLInputElement>) => {
+    const selectedFiles = Array.from(event.target.files || []);
+    if (selectedFiles.length > 0) {
+      setHomeFiles((prev) => [...prev, ...selectedFiles]);
+    }
+
+    if (homeFileInputRef.current) {
+      homeFileInputRef.current.value = "";
+    }
+  };
+
+  const removeHomeFile = (indexToRemove: number) => {
+    setHomeFiles((prev) => prev.filter((_, index) => index !== indexToRemove));
   };
 
   const capabilityPills = useMemo(
@@ -355,6 +378,7 @@ export default function Home() {
   const greetingLabel = t(
     currentHour === null ? "home.revamp.greeting" : getGreetingTranslationKey(currentHour)
   );
+  const canSubmitHomeTask = !isCreating && (homeInputValue.trim().length > 0 || homeFiles.length > 0);
 
   return (
     <div className="h-full overflow-y-auto bg-[#F5F7FB] dark:bg-background">
@@ -402,23 +426,32 @@ export default function Home() {
             </div>
 
             <div className="max-w-[780px] rounded-[16px] border border-white/10 bg-white/5 p-2.5 backdrop-blur-xl">
-              <input ref={homeFileInputRef} type="file" className="hidden" />
+              <input
+                ref={homeFileInputRef}
+                type="file"
+                multiple
+                onChange={handleHomeFileSelect}
+                className="hidden"
+                accept=".pdf,.doc,.docx,.txt,.md,.csv,.json,.xlsx,.xls,.ppt,.pptx,.png,.jpg,.jpeg,.gif,.webp"
+              />
               <div className="flex flex-col gap-3 rounded-[14px] bg-white px-4 py-3 shadow-[0_8px_28px_rgba(0,0,0,0.18)] sm:flex-row sm:items-center">
                 <textarea
                   ref={homeChatInputRef}
+                  value={homeInputValue}
                   placeholder={t("home.revamp.askPlaceholder")}
                   className="min-h-[26px] flex-1 resize-none border-0 bg-transparent py-1 text-[15px] leading-relaxed text-slate-900 placeholder:text-slate-400 focus-visible:outline-none focus-visible:ring-0"
                   rows={1}
                   onInput={(event) => {
                     const target = event.target as HTMLTextAreaElement;
+                    setHomeMessageValue(target.value);
                     target.style.height = "auto";
                     target.style.height = `${Math.min(target.scrollHeight, 120)}px`;
                   }}
                   onKeyDown={(event) => {
                     if (event.key === "Enter" && !event.shiftKey) {
                       event.preventDefault();
-                      if (event.currentTarget.value.trim() && !isCreating) {
-                        handleCreateTask(event.currentTarget.value.trim());
+                      if ((event.currentTarget.value.trim() || homeFiles.length > 0) && !isCreating) {
+                        handleCreateTask(event.currentTarget.value, homeFiles);
                       }
                     }
                   }}
@@ -435,12 +468,34 @@ export default function Home() {
                 <Button
                   className="h-9 rounded-[10px] px-4 text-sm font-semibold shadow-none"
                   onClick={handleChatButtonClick}
-                  disabled={isCreating}
+                  disabled={!canSubmitHomeTask}
                 >
                   {isCreating ? <Loader2 className="h-4 w-4 animate-spin" /> : <Send className="h-4 w-4" />}
                   {t("home.revamp.start")}
                 </Button>
               </div>
+
+              {homeFiles.length > 0 && (
+                <div className="mt-3 flex flex-wrap gap-2 px-1">
+                  {homeFiles.map((file, index) => (
+                    <div
+                      key={`${file.name}-${file.lastModified}-${index}`}
+                      className="inline-flex h-8 items-center gap-2 rounded-md border border-white/15 bg-white/10 px-3 text-sm text-white/90 backdrop-blur-sm"
+                    >
+                      <FileIcon className="h-3.5 w-3.5" />
+                      <span className="max-w-[220px] truncate font-medium">{file.name}</span>
+                      <button
+                        type="button"
+                        onClick={() => removeHomeFile(index)}
+                        className="rounded-sm p-0.5 text-white/65 transition-colors hover:bg-white/10 hover:text-white"
+                        title={t("common.remove")}
+                      >
+                        <X className="h-3.5 w-3.5" />
+                      </button>
+                    </div>
+                  ))}
+                </div>
+              )}
 
               <div className="mt-3 flex flex-wrap gap-2 px-1">
                 {capabilityPills.map((action) => (

@@ -254,7 +254,8 @@ const zh = {
   branding: {
     subtitle: "AI Agents for Everyone",
     tagline: `Run instantly.
-Build when you need.`
+Build when you need.`,
+    hero_description: "在同一个工作空间中规划、运行并审查你的智能体，从即时任务到完整工作流。",
   },
   settings: {
     title: "系统设置",

@@ -2,15 +2,14 @@
 
 import { useState } from "react"
 import { Button } from "@/components/ui/button"
-import { Card } from "@/components/ui/card"
 import { Input } from "@/components/ui/input"
-import { Alert, AlertDescription } from "@/components/ui/alert"
 import { getApiUrl } from "@/lib/utils"
 import { getBrandingFromEnv } from "@/lib/branding"
 import {
+  ArrowRight,
+  Loader2,
   Eye,
   EyeOff,
-  UserPlus,
   Workflow,
   Database,
   UserCheck,
@@ -22,6 +21,7 @@ import { useI18n } from "@/contexts/i18n-context"
 import { apiRequest } from "@/lib/api-wrapper"
 import { useSetupStatus } from "@/hooks/use-setup-status"
 import { AuthPageShell } from "@/components/auth/auth-page-shell"
+import { AuthFormCard } from "@/components/auth/auth-form-card"
 
 export function RegisterPage() {
   const branding = getBrandingFromEnv()
@@ -125,148 +125,138 @@ export function RegisterPage() {
       appName={branding.appName}
       logoPath={branding.logoPath}
       logoAlt={branding.logoAlt}
-      leftDescription={process.env.NEXT_PUBLIC_APP_TAGLINE ? branding.tagline : t("branding.tagline")}
+      heroTitle={process.env.NEXT_PUBLIC_APP_TAGLINE ? branding.tagline.replace(". ", ".\n") : t("branding.tagline")}
+      leftDescription={t("branding.hero_description")}
       mobileSubtitle={t("register.mobile_title")}
       features={features}
     >
-      <Card className="p-8 bg-background/10 backdrop-blur-lg border-border shadow-2xl">
-              <div className="text-center mb-8">
-                <h2 className="text-2xl font-bold text-foreground mb-2">{t("register.title", { appName: branding.appName })}</h2>
-                <p className="text-muted-foreground">{t("register.description")}</p>
-              </div>
+      <AuthFormCard
+        appName={branding.appName}
+        logoPath={branding.logoPath}
+        logoAlt={branding.logoAlt}
+        modeLabel="Register"
+        showSocialLogin={false}
+        title={t("register.title", { appName: branding.appName })}
+        description={t("register.description")}
+        footer={
+          <>
+            {t("register.login_hint.has_account")}{" "}
+            <Link href="/login" className="font-semibold text-[#3155F6] hover:text-[#2447D8]">
+              {t("register.login_hint.login_now")}
+            </Link>
+          </>
+        }
+      >
+        <form onSubmit={handleSubmit} className="space-y-5">
+          {error ? (
+            <div className="rounded-[16px] border border-[#FFD5D9] bg-[#FFF5F6] px-4 py-3">
+              <p className="text-sm text-[#C53030]">{error}</p>
+            </div>
+          ) : null}
 
-              <form onSubmit={handleSubmit} className="space-y-6">
-                {error && (
-                  <Alert className="border-red-200 bg-red-50">
-                    <AlertDescription className="text-red-800">
-                      {error}
-                    </AlertDescription>
-                  </Alert>
+          {success ? (
+            <div className="rounded-[16px] border border-[#C8F1DA] bg-[#F1FFF7] px-4 py-3">
+              <p className="text-sm text-[#137A47]">{success}</p>
+            </div>
+          ) : null}
+
+          <div className="space-y-2">
+            <label className="block text-sm font-semibold text-[#4A5365]">
+              {t("register.form.username")}
+            </label>
+            <div className="relative">
+              <User className="pointer-events-none absolute left-4 top-1/2 h-4 w-4 -translate-y-1/2 text-[#A0A9B8]" />
+              <Input
+                type="text"
+                name="username"
+                value={formData.username}
+                onChange={handleInputChange}
+                placeholder={t("register.form.username_placeholder")}
+                className="h-12 rounded-[14px] border-[#E2E8F3] bg-white pl-11 pr-4 text-[#171A2F] placeholder:text-[#A0A9B8] shadow-[0_1px_2px_rgba(16,24,40,0.04)] focus-visible:border-[#5B7CFF] focus-visible:ring-[#5B7CFF]/20"
+                required
+              />
+            </div>
+          </div>
+
+          <div className="space-y-2">
+            <label className="block text-sm font-semibold text-[#4A5365]">
+              {t("register.form.password")}
+            </label>
+            <div className="relative">
+              <Lock className="pointer-events-none absolute left-4 top-1/2 h-4 w-4 -translate-y-1/2 text-[#A0A9B8]" />
+              <Input
+                type={showPassword ? "text" : "password"}
+                name="password"
+                value={formData.password}
+                onChange={handleInputChange}
+                placeholder={t("register.form.password_placeholder")}
+                className="h-12 rounded-[14px] border-[#E2E8F3] bg-white pl-11 pr-11 text-[#171A2F] placeholder:text-[#A0A9B8] shadow-[0_1px_2px_rgba(16,24,40,0.04)] focus-visible:border-[#5B7CFF] focus-visible:ring-[#5B7CFF]/20"
+                required
+              />
+              <button
+                type="button"
+                onClick={() => setShowPassword(!showPassword)}
+                className="absolute right-4 top-1/2 -translate-y-1/2 text-[#A0A9B8] transition-colors hover:text-[#4A5365]"
+                aria-label={showPassword ? "Hide password" : "Show password"}
+              >
+                {showPassword ? (
+                  <EyeOff className="h-4 w-4" />
+                ) : (
+                  <Eye className="h-4 w-4" />
                 )}
+              </button>
+            </div>
+          </div>
 
-                {success && (
-                  <Alert className="border-green-200 bg-green-50">
-                    <AlertDescription className="text-green-800">
-                      {success}
-                    </AlertDescription>
-                  </Alert>
+          <div className="space-y-2">
+            <label className="block text-sm font-semibold text-[#4A5365]">
+              {t("register.form.confirm_password")}
+            </label>
+            <div className="relative">
+              <Lock className="pointer-events-none absolute left-4 top-1/2 h-4 w-4 -translate-y-1/2 text-[#A0A9B8]" />
+              <Input
+                type={showConfirmPassword ? "text" : "password"}
+                name="confirmPassword"
+                value={formData.confirmPassword}
+                onChange={handleInputChange}
+                placeholder={t("register.form.confirm_password_placeholder")}
+                className="h-12 rounded-[14px] border-[#E2E8F3] bg-white pl-11 pr-11 text-[#171A2F] placeholder:text-[#A0A9B8] shadow-[0_1px_2px_rgba(16,24,40,0.04)] focus-visible:border-[#5B7CFF] focus-visible:ring-[#5B7CFF]/20"
+                required
+              />
+              <button
+                type="button"
+                onClick={() => setShowConfirmPassword(!showConfirmPassword)}
+                className="absolute right-4 top-1/2 -translate-y-1/2 text-[#A0A9B8] transition-colors hover:text-[#4A5365]"
+                aria-label={showConfirmPassword ? "Hide password" : "Show password"}
+              >
+                {showConfirmPassword ? (
+                  <EyeOff className="h-4 w-4" />
+                ) : (
+                  <Eye className="h-4 w-4" />
                 )}
+              </button>
+            </div>
+          </div>
 
-                <div>
-                  <label className="block text-sm font-medium text-muted-foreground mb-2">
-                    {t("register.form.username")}
-                  </label>
-                  <div className="relative">
-                    <User className="absolute left-3 top-1/2 transform -translate-y-1/2 h-4 w-4 text-muted-foreground" />
-                    <Input
-                      type="text"
-                      name="username"
-                      value={formData.username}
-                      onChange={handleInputChange}
-                      placeholder={t("register.form.username_placeholder")}
-                      className="pl-10 bg-background/10 border-border text-foreground placeholder:text-muted-foreground focus:border-primary"
-                      required
-                    />
-                  </div>
-                </div>
-
-                <div>
-                  <label className="block text-sm font-medium text-muted-foreground mb-2">
-                    {t("register.form.password")}
-                  </label>
-                  <div className="relative">
-                    <Lock className="absolute left-3 top-1/2 transform -translate-y-1/2 h-4 w-4 text-muted-foreground" />
-                    <Input
-                      type={showPassword ? "text" : "password"}
-                      name="password"
-                      value={formData.password}
-                      onChange={handleInputChange}
-                      placeholder={t("register.form.password_placeholder")}
-                      className="pl-10 pr-10 bg-background/10 border-border text-foreground placeholder:text-muted-foreground focus:border-primary"
-                      required
-                    />
-                    <button
-                      type="button"
-                      onClick={() => setShowPassword(!showPassword)}
-                      className="absolute right-3 top-1/2 transform -translate-y-1/2 text-muted-foreground hover:text-foreground"
-                    >
-                      {showPassword ? (
-                        <EyeOff className="h-4 w-4" />
-                      ) : (
-                        <Eye className="h-4 w-4" />
-                      )}
-                    </button>
-                  </div>
-                </div>
-
-                <div>
-                  <label className="block text-sm font-medium text-muted-foreground mb-2">
-                    {t("register.form.confirm_password")}
-                  </label>
-                  <div className="relative">
-                    <Lock className="absolute left-3 top-1/2 transform -translate-y-1/2 h-4 w-4 text-muted-foreground" />
-                    <Input
-                      type={showConfirmPassword ? "text" : "password"}
-                      name="confirmPassword"
-                      value={formData.confirmPassword}
-                      onChange={handleInputChange}
-                      placeholder={t("register.form.confirm_password_placeholder")}
-                      className="pl-10 pr-10 bg-background/10 border-border text-foreground placeholder:text-muted-foreground focus:border-primary"
-                      required
-                    />
-                    <button
-                      type="button"
-                      onClick={() => setShowConfirmPassword(!showConfirmPassword)}
-                      className="absolute right-3 top-1/2 transform -translate-y-1/2 text-muted-foreground hover:text-foreground"
-                    >
-                      {showConfirmPassword ? (
-                        <EyeOff className="h-4 w-4" />
-                      ) : (
-                        <Eye className="h-4 w-4" />
-                      )}
-                    </button>
-                  </div>
-                </div>
-
-                <Button
-                  type="submit"
-                  disabled={!formData.username || !formData.password || !formData.confirmPassword || isLoading}
-                  className="w-full bg-primary hover:bg-primary/90 text-primary-foreground font-medium py-3 transition-all duration-200 transform hover:scale-[1.02] disabled:opacity-50 disabled:cursor-not-allowed disabled:transform-none"
-                >
-                  {isLoading ? (
-                    <div className="flex items-center gap-2">
-                      <div className="w-4 h-4 border-2 border-primary-foreground/30 border-t-primary-foreground rounded-full animate-spin"></div>
-                      {t("register.form.submitting")}
-                    </div>
-                  ) : (
-                    <div className="flex items-center gap-2">
-                      <UserPlus className="h-4 w-4" />
-                      {t("register.form.submit")}
-                    </div>
-                  )}
-                </Button>
-              </form>
-
-              <div className="mt-8 text-center">
-                <p className="text-muted-foreground">
-                  {t("register.login_hint.has_account")} {" "}
-                  <Link href="/login" className="text-muted-foreground hover:text-foreground font-medium">
-                    {t("register.login_hint.login_now")}
-                  </Link>
-                </p>
-              </div>
-      </Card>
-
-      <div className="mt-6 flex items-center justify-center gap-6 text-sm">
-        <div className="flex items-center gap-2">
-          <div className="w-2 h-2 bg-muted-foreground rounded-full animate-pulse"></div>
-          <span className="text-muted-foreground">{t("register.status.agent_running")}</span>
-        </div>
-        <div className="flex items-center gap-2">
-          <div className="w-2 h-2 bg-muted-foreground rounded-full animate-pulse"></div>
-          <span className="text-muted-foreground">{t("register.status.open_register")}</span>
-        </div>
-      </div>
+          <Button
+            type="submit"
+            disabled={!formData.username || !formData.password || !formData.confirmPassword || isLoading}
+            className="h-12 w-full rounded-[14px] bg-[linear-gradient(180deg,#4B6BFF_0%,#2F54EB_100%)] text-base font-semibold text-white shadow-[0_14px_30px_rgba(47,84,235,0.32)] transition-all hover:translate-y-[-1px] hover:opacity-95 disabled:translate-y-0 disabled:opacity-60"
+          >
+            {isLoading ? (
+              <span className="flex items-center gap-2">
+                <Loader2 className="h-4 w-4 animate-spin" />
+                {t("register.form.submitting")}
+              </span>
+            ) : (
+              <span className="flex items-center gap-2">
+                {t("register.form.submit")}
+                <ArrowRight className="h-4 w-4" />
+              </span>
+            )}
+          </Button>
+        </form>
+      </AuthFormCard>
     </AuthPageShell>
   )
 }

@@ -88,6 +88,7 @@ export function SetupPage() {
       appName={branding.appName}
       logoPath={branding.logoPath}
       logoAlt={branding.logoAlt}
+      heroTitle={process.env.NEXT_PUBLIC_APP_TAGLINE ? branding.tagline.replace(". ", ".\n") : t("branding.tagline")}
       leftDescription={t("setup.description")}
       features={features}
     >

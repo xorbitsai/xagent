@@ -85,6 +85,32 @@ const en = {
       running: "{count} task running",
       liveView: "View",
       askPlaceholder: "Ask anything — research, write, generate, analyze...",
+      capabilities: {
+        slides: {
+          label: "Slides",
+          prompt: "Create a 10-slide deck on ",
+        },
+        sheets: {
+          label: "Sheets",
+          prompt: "Analyze this spreadsheet: ",
+        },
+        docs: {
+          label: "Docs",
+          prompt: "Write a document about ",
+        },
+        pdf: {
+          label: "PDF",
+          prompt: "Summarize this PDF: ",
+        },
+        image: {
+          label: "Image",
+          prompt: "Generate an image of ",
+        },
+        research: {
+          label: "Research",
+          prompt: "Do deep research on ",
+        },
+      },
       followupTitle: "Need it to run again and again?",
       followupDescription: "Turn this workflow into a reusable agent you can call any time.",
       buildAgent: "Build an agent",
@@ -150,47 +176,21 @@ const en = {
     cards: {
       research: {
         title: "Research a topic in depth",
-        prompt: "I need to research the latest trends in artificial intelligence."
       },
       linkedin: {
         title: "Write a LinkedIn post about an achievement",
-        prompt: "Help me write a LinkedIn post announcing a new feature launch."
       },
       poster: {
         title: "Design a poster for an event",
-        prompt: "Design a poster for an upcoming tech conference."
       },
       compare: {
         title: "Compare products with deep research",
-        prompt: "Compare the top 3 electric vehicles on the market."
       },
       visual: {
         title: "Create visual for a topic",
-        prompt: "Create a visual representation of how a neural network works."
       },
       presentation: {
         title: "Turn a topic into a presentation deck",
-        prompt: "Create a 5-slide presentation on renewable energy."
-      },
-      createPPT: {
-        title: "Generate a PPT from a report",
-        description: "Sales reports, slides",
-        prompt: "Generate a PPT from a report"
-      },
-      dataAnalysis: {
-        title: "Analyze a dataset",
-        description: "Trends, feedback",
-        prompt: "Analyze a dataset"
-      },
-      designPoster: {
-        title: "Design a marketing poster",
-        description: "Social media assets",
-        prompt: "Design a marketing poster"
-      },
-      automatic: {
-        title: "Automate a workflow",
-        description: "Custom workflows",
-        prompt: "Automate a workflow"
       }
     },
     input: {

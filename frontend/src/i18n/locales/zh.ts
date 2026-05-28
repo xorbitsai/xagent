@@ -85,6 +85,32 @@ const zh = {
       running: "{count} 个任务进行中",
       liveView: "查看",
       askPlaceholder: "你可以提问、调研、写作、生成、分析……",
+      capabilities: {
+        slides: {
+          label: "Slides",
+          prompt: "创建一个 10 页幻灯片，主题是：",
+        },
+        sheets: {
+          label: "Sheets",
+          prompt: "分析这个表格：",
+        },
+        docs: {
+          label: "Docs",
+          prompt: "写一篇关于以下主题的文档：",
+        },
+        pdf: {
+          label: "PDF",
+          prompt: "总结这个 PDF：",
+        },
+        image: {
+          label: "Image",
+          prompt: "生成一张这样的图片：",
+        },
+        research: {
+          label: "Research",
+          prompt: "对以下主题进行深度研究：",
+        },
+      },
       followupTitle: "希望它以后能反复自动执行？",
       followupDescription: "把这次流程沉淀成可复用 Agent，下次一句话就能调用。",
       buildAgent: "构建一个 Agent",
@@ -150,47 +176,21 @@ const zh = {
     cards: {
       research: {
         title: "深入研究一个话题",
-        prompt: "我需要研究人工智能领域的最新趋势。"
       },
       linkedin: {
         title: "撰写 LinkedIn 动态",
-        prompt: "帮我写一篇 LinkedIn 动态，宣布新功能发布。"
       },
       poster: {
         title: "设计活动海报",
-        prompt: "为即将举行的科技会议设计一张海报。"
       },
       compare: {
         title: "深度对比产品",
-        prompt: "对比市场上排名前 3 的电动汽车。"
       },
       visual: {
         title: "为话题创建可视化图表",
-        prompt: "创建一张神经网络工作原理的可视化图表。"
       },
       presentation: {
         title: "将话题转化为演示文稿",
-        prompt: "创建一个关于可再生能源的 5 页幻灯片。"
-      },
-      createPPT: {
-        title: "根据报告生成一个 PPT",
-        description: "销售报告，幻灯片",
-        prompt: "根据报告生成一个 PPT"
-      },
-      dataAnalysis: {
-        title: "分析数据集",
-        description: "趋势，反馈",
-        prompt: "分析数据集"
-      },
-      designPoster: {
-        title: "设计一张营销海报",
-        description: "社交媒体素材",
-        prompt: "设计一张营销海报"
-      },
-      automatic: {
-        title: "自动化一个工作流程",
-        description: "自定义工作流",
-        prompt: "自动化一个工作流程"
       }
     },
     input: {

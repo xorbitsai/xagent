@@ -275,49 +275,60 @@ export default function Home() {
     }
   };
 
+  const setHomeInputValue = (value: string) => {
+    const input = homeChatInputRef.current;
+    if (!input) return;
+
+    input.value = value;
+    input.style.height = "auto";
+    input.style.height = `${Math.min(input.scrollHeight, 120)}px`;
+    input.focus();
+    input.setSelectionRange(value.length, value.length);
+  };
+
   const capabilityPills = useMemo(
     () => [
       {
         id: "slides",
-        label: "Slides",
+        label: t("home.revamp.capabilities.slides.label"),
         icon: Presentation,
         toneClassName: "bg-amber-400/15 text-amber-300",
-        prompt: t("chatPage.cards.presentation.prompt"),
+        prompt: t("home.revamp.capabilities.slides.prompt"),
       },
       {
         id: "sheets",
-        label: "Sheets",
+        label: t("home.revamp.capabilities.sheets.label"),
         icon: Table2,
         toneClassName: "bg-emerald-400/15 text-emerald-300",
-        prompt: t("chatPage.cards.compare.prompt"),
+        prompt: t("home.revamp.capabilities.sheets.prompt"),
       },
       {
         id: "docs",
-        label: "Docs",
+        label: t("home.revamp.capabilities.docs.label"),
         icon: FileText,
         toneClassName: "bg-blue-400/15 text-blue-300",
-        prompt: t("chatPage.cards.research.prompt"),
+        prompt: t("home.revamp.capabilities.docs.prompt"),
       },
       {
         id: "pdf",
-        label: "PDF",
+        label: t("home.revamp.capabilities.pdf.label"),
         icon: FileText,
         toneClassName: "bg-rose-400/15 text-rose-300",
-        prompt: t("chatPage.cards.presentation.prompt"),
+        prompt: t("home.revamp.capabilities.pdf.prompt"),
       },
       {
         id: "image",
-        label: "Image",
+        label: t("home.revamp.capabilities.image.label"),
         icon: FileImage,
         toneClassName: "bg-fuchsia-400/15 text-fuchsia-300",
-        prompt: t("chatPage.cards.visual.prompt"),
+        prompt: t("home.revamp.capabilities.image.prompt"),
       },
       {
         id: "research",
-        label: "Research",
+        label: t("home.revamp.capabilities.research.label"),
         icon: Search,
         toneClassName: "bg-indigo-400/15 text-indigo-300",
-        prompt: t("chatPage.cards.compare.prompt"),
+        prompt: t("home.revamp.capabilities.research.prompt"),
       },
     ],
     [t]
@@ -436,12 +447,7 @@ export default function Home() {
                   <button
                     key={action.id}
                     type="button"
-                    onClick={() => {
-                      if (homeChatInputRef.current) {
-                        homeChatInputRef.current.value = action.prompt;
-                        homeChatInputRef.current.focus();
-                      }
-                    }}
+                    onClick={() => setHomeInputValue(action.prompt)}
                     className="inline-flex items-center gap-2 rounded-full border border-transparent bg-transparent px-[5px] py-[5px] text-[12px] font-medium text-white/80 transition-all hover:border-white/20 hover:bg-white/10 hover:text-white"
                   >
                     <span className={`grid h-[22px] w-[22px] place-items-center rounded-full ${action.toneClassName}`}>

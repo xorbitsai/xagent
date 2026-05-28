@@ -581,7 +581,7 @@ export function ModelManagementDialog({
             </div>
           </DialogContent>
         ) : viewMode === 'connect' ? (
-          <DialogContent className="w-[95vw] max-w-2xl max-h-[85vh] overflow-hidden bg-slate-50 p-0 gap-0 flex flex-col">
+          <DialogContent className="w-[95vw] sm:max-w-2xl md:max-w-3xl max-h-[85vh] overflow-hidden bg-slate-50 p-0 gap-0 flex flex-col">
             <DialogHeader className="px-4 sm:px-6 py-4 border-b bg-white pr-12">
               <DialogTitle className="text-xl sm:text-2xl font-bold text-left leading-tight">{t('models.dialog.connect.title')}</DialogTitle>
               <DialogDescription className="text-left">{t('models.dialog.connect.description')}</DialogDescription>

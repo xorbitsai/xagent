@@ -98,7 +98,7 @@ export function AuthPageShell({
               </div>
               {heroTitle ? (
                 <p className="text-balance text-3xl font-semibold leading-tight tracking-[-0.04em] text-[#18214D]">
-                  {heroTitle.replace("\n", " ")}
+                  {heroTitle.replace(/\n/g, " ")}
                 </p>
               ) : null}
               {mobileSubtitle ? (

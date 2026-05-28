@@ -125,7 +125,7 @@ export function LoginPage() {
         appName={branding.appName}
         logoPath={branding.logoPath}
         logoAlt={branding.logoAlt}
-        modeLabel="Login"
+        modeLabel={t("nav.login")}
         showSocialLogin={false}
         title={t("login.title", { appName: branding.appName })}
         description={t("login.description")}

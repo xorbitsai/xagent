@@ -24,6 +24,7 @@ from xagent.web.api.websocket import (
     _persist_agent_outbound_event,
     create_final_answer_stream_event,
     create_stream_event,
+    make_agent_outbound_handler,
     send_historical_data_as_stream,
 )
 from xagent.web.api.ws_trace_handlers import (
@@ -146,6 +147,45 @@ def test_agent_outbound_event_type_separates_progress_from_questions() -> None:
         )
         == "agent_message"
     )
+
+
+@pytest.mark.asyncio
+async def test_agent_outbound_handler_skips_hidden_messages(monkeypatch) -> None:
+    persisted_calls: list[tuple[int, dict[str, object]]] = []
+    broadcast_calls: list[tuple[dict[str, object], int]] = []
+    to_thread_calls: list[tuple[object, tuple[object, ...]]] = []
+
+    def fake_persist(task_id: int, event: dict[str, object]) -> None:
+        persisted_calls.append((task_id, event))
+
+    async def fake_to_thread(func: object, /, *args: object) -> None:
+        to_thread_calls.append((func, args))
+
+    async def fake_broadcast(event: dict[str, object], task_id: int) -> None:
+        broadcast_calls.append((event, task_id))
+
+    monkeypatch.setattr(
+        "xagent.web.api.websocket._persist_agent_outbound_event", fake_persist
+    )
+    monkeypatch.setattr("xagent.web.api.websocket.asyncio.to_thread", fake_to_thread)
+    monkeypatch.setattr(
+        "xagent.web.api.websocket.manager.broadcast_to_task", fake_broadcast
+    )
+
+    handler = make_agent_outbound_handler(365)
+    await handler(
+        {
+            "execution_id": "exec-1",
+            "message": "Hidden progress",
+            "message_type": "progress",
+            "expect_response": False,
+            "visible": False,
+        }
+    )
+
+    assert persisted_calls == []
+    assert to_thread_calls == []
+    assert broadcast_calls == []
 
 
 def test_persist_agent_outbound_event_uses_payload_ids(monkeypatch) -> None:

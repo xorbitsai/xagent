@@ -542,6 +542,9 @@ def make_agent_outbound_handler(task_id: int) -> Any:
             )
             return
 
+        if payload.get("visible") is False:
+            return
+
         event_type = _agent_outbound_event_type(payload)
         event = create_stream_event(
             event_type,

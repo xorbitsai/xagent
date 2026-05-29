@@ -1,7 +1,13 @@
+import path from "node:path";
+import { fileURLToPath } from "node:url";
+
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
+
 /** @type {import('next').NextConfig} */
 const nextConfig = {
   // Enable standalone output for Docker deployment
   output: 'standalone',
+  outputFileTracingRoot: __dirname,
   experimental: {
     optimizeCss: false,
   },
@@ -11,10 +17,8 @@ const nextConfig = {
   },
   // 解决开发模式错误
   reactStrictMode: true,
-  // 开发服务器配置
   devIndicators: {
-    buildActivity: true,
-    buildActivityPosition: 'bottom-right',
+    position: 'bottom-right',
   },
   typescript: {
     ignoreBuildErrors: false,

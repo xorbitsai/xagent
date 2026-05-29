@@ -1,7 +1,11 @@
-"use client"
+import { Suspense } from "react"
 
 import { ResetPasswordPage } from "@/components/pages/reset-password"
 
 export default function ResetPassword() {
-  return <ResetPasswordPage />
+  return (
+    <Suspense fallback={null}>
+      <ResetPasswordPage />
+    </Suspense>
+  )
 }

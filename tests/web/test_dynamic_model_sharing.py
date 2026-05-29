@@ -115,7 +115,11 @@ def admin_user(test_db):
 @pytest.fixture(scope="function")
 def regular_user(test_db):
     ensure_system_initialized()
-    user_data = {"username": "regularuser", "password": "password123"}
+    user_data = {
+        "username": "regularuser",
+        "email": "regularuser@example.com",
+        "password": "password123",
+    }
     response = client.post("/api/auth/register", json=user_data)
     assert response.status_code == 200
     assert response.json().get("success") is True
@@ -1077,7 +1081,11 @@ class TestModeAMultipleUsers:
         )
 
         # Create second regular user
-        user2_data = {"username": "user2", "password": "password2"}
+        user2_data = {
+            "username": "user2",
+            "email": "user2@example.com",
+            "password": "password2",
+        }
         user2_response = client.post("/api/auth/register", json=user2_data)
         assert user2_response.status_code == 200
 

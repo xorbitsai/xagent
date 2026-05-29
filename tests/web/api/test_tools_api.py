@@ -427,7 +427,12 @@ class TestToolsGovernanceAPI:
 
     def _user_headers(self, username: str) -> dict[str, str]:
         register_response = client.post(
-            "/api/auth/register", json={"username": username, "password": "password123"}
+            "/api/auth/register",
+            json={
+                "username": username,
+                "email": f"{username}@example.com",
+                "password": "password123",
+            },
         )
         assert register_response.status_code == 200
 

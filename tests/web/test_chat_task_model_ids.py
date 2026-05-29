@@ -87,7 +87,12 @@ def reset_workforce_policy():
 def user1_headers(test_db):
     ensure_system_initialized()
     response = client.post(
-        "/api/auth/register", json={"username": "user1", "password": "password123"}
+        "/api/auth/register",
+        json={
+            "username": "user1",
+            "email": "user1@example.com",
+            "password": "password123",
+        },
     )
     assert response.status_code == 200
 
@@ -103,7 +108,12 @@ def user1_headers(test_db):
 def user2_headers(test_db):
     ensure_system_initialized()
     response = client.post(
-        "/api/auth/register", json={"username": "user2", "password": "password123"}
+        "/api/auth/register",
+        json={
+            "username": "user2",
+            "email": "user2@example.com",
+            "password": "password123",
+        },
     )
     assert response.status_code == 200
 

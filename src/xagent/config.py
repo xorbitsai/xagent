@@ -73,6 +73,16 @@ BACKGROUND_JOB_VISIBILITY_TIMEOUT_SECONDS = (
 BACKGROUND_JOB_MAX_RETRIES = "XAGENT_BACKGROUND_JOB_MAX_RETRIES"
 BACKGROUND_JOB_STALE_SECONDS = "XAGENT_BACKGROUND_JOB_STALE_SECONDS"
 BACKGROUND_JOB_SWEEP_INTERVAL_SECONDS = "XAGENT_BACKGROUND_JOB_SWEEP_INTERVAL_SECONDS"
+PASSWORD_RESET_EXPIRE_MINUTES = "XAGENT_PASSWORD_RESET_EXPIRE_MINUTES"
+APP_BASE_URL = "XAGENT_APP_BASE_URL"
+SMTP_HOST = "XAGENT_SMTP_HOST"
+SMTP_PORT = "XAGENT_SMTP_PORT"
+SMTP_USERNAME = "XAGENT_SMTP_USERNAME"
+SMTP_PASSWORD = "XAGENT_SMTP_PASSWORD"
+SMTP_USE_TLS = "XAGENT_SMTP_USE_TLS"
+SMTP_USE_SSL = "XAGENT_SMTP_USE_SSL"
+SMTP_FROM_EMAIL = "XAGENT_SMTP_FROM_EMAIL"
+SMTP_FROM_NAME = "XAGENT_SMTP_FROM_NAME"
 
 TOOL_MAX_OUTPUT_LENGTH = "XAGENT_TOOL_MAX_OUTPUT_LENGTH"
 TOOL_MAX_RECURSION_DEPTH = "XAGENT_TOOL_MAX_RECURSION_DEPTH"
@@ -225,6 +235,52 @@ def _get_bool_env(env_var: str, default: bool) -> bool:
     if value is None:
         return default
     return value.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def get_password_reset_expire_minutes() -> int:
+    """Return the password reset token expiry window in minutes."""
+    return _get_positive_int_env(PASSWORD_RESET_EXPIRE_MINUTES, 30)
+
+
+def get_app_base_url() -> str | None:
+    """Return the trusted frontend base URL used in email links."""
+    value = os.getenv(APP_BASE_URL)
+    if value is None:
+        return None
+    value = value.strip()
+    return value.rstrip("/") or None
+
+
+def get_smtp_host() -> str:
+    return os.getenv(SMTP_HOST, "").strip()
+
+
+def get_smtp_port() -> int:
+    return _get_positive_int_env(SMTP_PORT, 587)
+
+
+def get_smtp_username() -> str:
+    return os.getenv(SMTP_USERNAME, "").strip()
+
+
+def get_smtp_password() -> str:
+    return os.getenv(SMTP_PASSWORD, "")
+
+
+def get_smtp_use_tls() -> bool:
+    return _get_bool_env(SMTP_USE_TLS, True)
+
+
+def get_smtp_use_ssl() -> bool:
+    return _get_bool_env(SMTP_USE_SSL, False)
+
+
+def get_smtp_from_email() -> str:
+    return os.getenv(SMTP_FROM_EMAIL, "").strip()
+
+
+def get_smtp_from_name(default: str) -> str:
+    return os.getenv(SMTP_FROM_NAME, default).strip() or default
 
 
 def _redis_url_with_database(url: str, database: int) -> str:

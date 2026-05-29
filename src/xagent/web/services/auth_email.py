@@ -1,10 +1,21 @@
-import os
 import smtplib
 from email.message import EmailMessage
 
+from ...config import (
+    get_password_reset_expire_minutes,
+    get_smtp_from_email,
+    get_smtp_from_name,
+    get_smtp_host,
+    get_smtp_password,
+    get_smtp_port,
+    get_smtp_use_ssl,
+    get_smtp_use_tls,
+    get_smtp_username,
+)
+
 
 def get_password_reset_email_sender() -> str:
-    return os.getenv("XAGENT_SMTP_FROM_EMAIL", "").strip()
+    return get_smtp_from_email()
 
 
 def get_password_reset_email_subject(app_name: str) -> str:
@@ -12,14 +23,14 @@ def get_password_reset_email_subject(app_name: str) -> str:
 
 
 def send_password_reset_email(to_email: str, reset_link: str, app_name: str) -> None:
-    smtp_host = os.getenv("XAGENT_SMTP_HOST", "").strip()
-    smtp_port = int(os.getenv("XAGENT_SMTP_PORT", "587"))
-    smtp_username = os.getenv("XAGENT_SMTP_USERNAME", "").strip()
-    smtp_password = os.getenv("XAGENT_SMTP_PASSWORD", "")
-    smtp_use_tls = os.getenv("XAGENT_SMTP_USE_TLS", "true").lower() == "true"
-    smtp_use_ssl = os.getenv("XAGENT_SMTP_USE_SSL", "false").lower() == "true"
+    smtp_host = get_smtp_host()
+    smtp_port = get_smtp_port()
+    smtp_username = get_smtp_username()
+    smtp_password = get_smtp_password()
+    smtp_use_tls = get_smtp_use_tls()
+    smtp_use_ssl = get_smtp_use_ssl()
     from_email = get_password_reset_email_sender()
-    from_name = os.getenv("XAGENT_SMTP_FROM_NAME", app_name).strip() or app_name
+    from_name = get_smtp_from_name(app_name)
 
     if not smtp_host or not from_email:
         raise RuntimeError("SMTP is not configured for password reset emails")
@@ -36,7 +47,10 @@ def send_password_reset_email(to_email: str, reset_link: str, app_name: str) -> 
                 "Open the link below to set a new password:",
                 reset_link,
                 "",
-                "This link expires in 30 minutes.",
+                (
+                    "This link expires in "
+                    f"{get_password_reset_expire_minutes()} minutes."
+                ),
                 "If you did not request this, you can ignore this email.",
             ]
         )

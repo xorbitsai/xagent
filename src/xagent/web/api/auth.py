@@ -20,6 +20,7 @@ from pydantic import BaseModel
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
+from ...config import get_app_base_url, get_password_reset_expire_minutes
 from ..auth_config import (
     ACCESS_TOKEN_EXPIRE_MINUTES,
     JWT_ALGORITHM,
@@ -38,9 +39,6 @@ auth_router = APIRouter(prefix="/api/auth", tags=["Authentication"])
 
 REGISTRATION_ENABLED_SETTING_KEY = "registration_enabled"
 SETUP_COMPLETED_SETTING_KEY = "setup_completed"
-PASSWORD_RESET_EXPIRE_MINUTES = int(
-    os.getenv("XAGENT_PASSWORD_RESET_EXPIRE_MINUTES", "30")
-)
 EMAIL_PATTERN = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
 
 
@@ -243,11 +241,13 @@ def get_app_name() -> str:
     return os.getenv("XAGENT_APP_NAME") or os.getenv("NEXT_PUBLIC_APP_NAME") or "Xagent"
 
 
-def build_password_reset_url(request: Request, token: str) -> str:
-    configured_base_url = os.getenv("XAGENT_APP_BASE_URL", "").strip()
-    origin = request.headers.get("origin", "").strip()
-    base_url = configured_base_url or origin or "http://localhost:3000"
-    return f"{base_url.rstrip('/')}/reset-password?token={token}"
+def build_password_reset_url(token: str) -> str:
+    base_url = get_app_base_url()
+    if not base_url:
+        raise RuntimeError(
+            "XAGENT_APP_BASE_URL must be configured for password reset emails"
+        )
+    return f"{base_url}/reset-password?token={token}"
 
 
 def has_users(db: Session) -> bool:
@@ -318,11 +318,20 @@ async def setup_admin(
         if existing_user:
             return RegisterResponse(success=False, message="Username already exists")
 
+        username_namespace_error = validate_username_for_login_namespace(
+            db, request.username
+        )
+        if username_namespace_error:
+            return RegisterResponse(success=False, message=username_namespace_error)
+
         email = None
         if request.email:
             email = normalize_email(request.email)
             if not is_valid_email(email):
                 return RegisterResponse(success=False, message="Invalid email address")
+            email_namespace_error = validate_email_for_login_namespace(db, email)
+            if email_namespace_error:
+                return RegisterResponse(success=False, message=email_namespace_error)
             existing_email_user = get_user_by_email(db, email)
             if existing_email_user:
                 return RegisterResponse(success=False, message="Email already exists")
@@ -420,6 +429,36 @@ def get_user_by_email(db: Session, email: str) -> Optional[User]:
     return db.query(User).filter(User.email == normalized_email).first()
 
 
+def validate_username_for_login_namespace(
+    db: Session, username: str, *, current_user_id: int | None = None
+) -> Optional[str]:
+    normalized_username = username.strip()
+    if is_valid_email(normalized_username):
+        return "Username cannot be an email address"
+
+    conflicting_email_user = get_user_by_email(db, normalized_username)
+    if (
+        conflicting_email_user is not None
+        and conflicting_email_user.id != current_user_id
+    ):
+        return "Username conflicts with an existing email"
+
+    return None
+
+
+def validate_email_for_login_namespace(
+    db: Session, email: str, *, current_user_id: int | None = None
+) -> Optional[str]:
+    normalized_email = normalize_email(email)
+    conflicting_username_user = get_user_by_username(db, normalized_email)
+    if (
+        conflicting_username_user is not None
+        and conflicting_username_user.id != current_user_id
+    ):
+        return "Email conflicts with an existing username"
+    return None
+
+
 def serialize_auth_user(user: User, include_login_time: bool = False) -> Dict[str, Any]:
     payload: Dict[str, Any] = {
         "id": user.id,
@@ -433,16 +472,13 @@ def serialize_auth_user(user: User, include_login_time: bool = False) -> Dict[st
 
 
 def get_user_by_login_identifier(db: Session, identifier: str) -> Optional[User]:
-    """Get user by username first, then fallback to email lookup."""
+    """Resolve an identifier as email first, then fall back to username."""
     login_identifier = identifier.strip()
-    user = get_user_by_username(db, login_identifier)
-    if user is not None:
-        return user
-
     if is_valid_email(login_identifier):
-        return get_user_by_email(db, login_identifier)
-
-    return None
+        user = get_user_by_email(db, login_identifier)
+        if user is not None:
+            return user
+    return get_user_by_username(db, login_identifier)
 
 
 @auth_router.post("/login")
@@ -536,6 +572,12 @@ async def register(
         if existing_user:
             return RegisterResponse(success=False, message="Username already exists")
 
+        username_namespace_error = validate_username_for_login_namespace(
+            db, request.username
+        )
+        if username_namespace_error:
+            return RegisterResponse(success=False, message=username_namespace_error)
+
         initialized = has_users(db)
         if not initialized:
             return RegisterResponse(
@@ -552,6 +594,10 @@ async def register(
         email = normalize_email(request.email)
         if not is_valid_email(email):
             return RegisterResponse(success=False, message="Invalid email address")
+
+        email_namespace_error = validate_email_for_login_namespace(db, email)
+        if email_namespace_error:
+            return RegisterResponse(success=False, message=email_namespace_error)
 
         existing_email_user = get_user_by_email(db, email)
         if existing_email_user:
@@ -585,7 +631,6 @@ async def register(
 @auth_router.post("/forgot-password", response_model=ForgotPasswordResponse)
 async def forgot_password(
     request: ForgotPasswordRequest,
-    http_request: Request,
     db: Session = Depends(get_db),
 ) -> ForgotPasswordResponse:
     email = normalize_email(request.email)
@@ -597,12 +642,15 @@ async def forgot_password(
 
     user = get_user_by_email(db, email)
     if user is None:
-        raise HTTPException(status_code=404, detail="Email not found")
+        return ForgotPasswordResponse(
+            success=True,
+            message="If the email exists, a password reset link has been sent",
+        )
 
     reset_token = generate_password_reset_token()
     reset_token_hash = hash_password_reset_token(reset_token)
     reset_expires_at = datetime.now(timezone.utc) + timedelta(
-        minutes=PASSWORD_RESET_EXPIRE_MINUTES
+        minutes=get_password_reset_expire_minutes()
     )
 
     setattr(user, "password_reset_token_hash", reset_token_hash)
@@ -610,7 +658,7 @@ async def forgot_password(
     db.commit()
 
     try:
-        reset_link = build_password_reset_url(http_request, reset_token)
+        reset_link = build_password_reset_url(reset_token)
         await asyncio.to_thread(
             send_password_reset_email,
             email,
@@ -628,7 +676,7 @@ async def forgot_password(
 
     return ForgotPasswordResponse(
         success=True,
-        message="Password reset link has been sent successfully",
+        message="If the email exists, a password reset link has been sent",
     )
 
 
@@ -739,6 +787,12 @@ async def update_current_user_email(
     existing_user = get_user_by_email(db, email)
     if existing_user and existing_user.id != user.id:
         return UpdateEmailResponse(success=False, message="Email already exists")
+
+    email_namespace_error = validate_email_for_login_namespace(
+        db, email, current_user_id=int(user.id)
+    )
+    if email_namespace_error:
+        return UpdateEmailResponse(success=False, message=email_namespace_error)
 
     setattr(user, "email", email)
     db.commit()

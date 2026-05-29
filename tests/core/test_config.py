@@ -8,6 +8,7 @@ import pytest
 
 from xagent.config import (
     AGENT_RUNTIME,
+    APP_BASE_URL,
     BACKGROUND_JOB_MAX_RETRIES,
     BACKGROUND_JOB_STALE_SECONDS,
     BACKGROUND_JOB_SWEEP_INTERVAL_SECONDS,
@@ -33,6 +34,7 @@ from xagent.config import (
     LANCEDB_PATH,
     MAX_TRACE_PAYLOAD_BYTES,
     MAX_UPLOAD_SIZE,
+    PASSWORD_RESET_EXPIRE_MINUTES,
     PREVIEW_TMP_DIR,
     REDIS_URL,
     SANDBOX_CPUS,
@@ -42,6 +44,14 @@ from xagent.config import (
     SANDBOX_IMAGE,
     SANDBOX_MEMORY,
     SANDBOX_VOLUMES,
+    SMTP_FROM_EMAIL,
+    SMTP_FROM_NAME,
+    SMTP_HOST,
+    SMTP_PASSWORD,
+    SMTP_PORT,
+    SMTP_USE_SSL,
+    SMTP_USE_TLS,
+    SMTP_USERNAME,
     STORAGE_ROOT,
     UPLOADS_DIR,
     WEB_CRAWL_TLS_IMPERSONATE,
@@ -50,6 +60,7 @@ from xagent.config import (
     format_file_size,
     get_agent_pattern_for_execution_mode,
     get_agent_runtime,
+    get_app_base_url,
     get_background_job_max_retries,
     get_background_job_stale_seconds,
     get_background_job_sweep_interval_seconds,
@@ -77,6 +88,7 @@ from xagent.config import (
     get_lancedb_path,
     get_max_trace_payload_bytes,
     get_max_upload_size_bytes,
+    get_password_reset_expire_minutes,
     get_preview_tmp_dir,
     get_redis_url,
     get_sandbox_cpus,
@@ -86,6 +98,14 @@ from xagent.config import (
     get_sandbox_image,
     get_sandbox_memory,
     get_sandbox_volumes,
+    get_smtp_from_email,
+    get_smtp_from_name,
+    get_smtp_host,
+    get_smtp_password,
+    get_smtp_port,
+    get_smtp_use_ssl,
+    get_smtp_use_tls,
+    get_smtp_username,
     get_storage_root,
     get_uploads_dir,
     get_web_crawl_tls_impersonate,
@@ -191,6 +211,89 @@ class TestEnvironmentVariableConstants:
             BACKGROUND_JOB_SWEEP_INTERVAL_SECONDS
             == "XAGENT_BACKGROUND_JOB_SWEEP_INTERVAL_SECONDS"
         )
+
+    def test_auth_email_config_constants(self):
+        assert PASSWORD_RESET_EXPIRE_MINUTES == "XAGENT_PASSWORD_RESET_EXPIRE_MINUTES"
+        assert APP_BASE_URL == "XAGENT_APP_BASE_URL"
+        assert SMTP_HOST == "XAGENT_SMTP_HOST"
+        assert SMTP_PORT == "XAGENT_SMTP_PORT"
+        assert SMTP_USERNAME == "XAGENT_SMTP_USERNAME"
+        assert SMTP_PASSWORD == "XAGENT_SMTP_PASSWORD"
+        assert SMTP_USE_TLS == "XAGENT_SMTP_USE_TLS"
+        assert SMTP_USE_SSL == "XAGENT_SMTP_USE_SSL"
+        assert SMTP_FROM_EMAIL == "XAGENT_SMTP_FROM_EMAIL"
+        assert SMTP_FROM_NAME == "XAGENT_SMTP_FROM_NAME"
+
+
+class TestAuthEmailConfig:
+    def test_password_reset_expire_minutes_defaults_to_30(self, monkeypatch):
+        monkeypatch.delenv(PASSWORD_RESET_EXPIRE_MINUTES, raising=False)
+        assert get_password_reset_expire_minutes() == 30
+
+    @pytest.mark.parametrize("value", ["abc", "0", "-5"])
+    def test_password_reset_expire_minutes_invalid_values_fall_back(
+        self, monkeypatch, value
+    ):
+        monkeypatch.setenv(PASSWORD_RESET_EXPIRE_MINUTES, value)
+        assert get_password_reset_expire_minutes() == 30
+
+    def test_app_base_url_returns_none_when_unset_or_blank(self, monkeypatch):
+        monkeypatch.delenv(APP_BASE_URL, raising=False)
+        assert get_app_base_url() is None
+
+        monkeypatch.setenv(APP_BASE_URL, "   ")
+        assert get_app_base_url() is None
+
+    def test_app_base_url_strips_and_removes_trailing_slash(self, monkeypatch):
+        monkeypatch.setenv(APP_BASE_URL, " https://app.example.com/base/ ")
+        assert get_app_base_url() == "https://app.example.com/base"
+
+    def test_smtp_host_and_credentials_strip_expected_values(self, monkeypatch):
+        monkeypatch.setenv(SMTP_HOST, " smtp.example.com ")
+        monkeypatch.setenv(SMTP_USERNAME, " user ")
+        monkeypatch.setenv(SMTP_PASSWORD, "secret ")
+        monkeypatch.setenv(SMTP_FROM_EMAIL, " noreply@example.com ")
+
+        assert get_smtp_host() == "smtp.example.com"
+        assert get_smtp_username() == "user"
+        assert get_smtp_password() == "secret "
+        assert get_smtp_from_email() == "noreply@example.com"
+
+    def test_smtp_port_defaults_and_invalid_values_fall_back(self, monkeypatch):
+        monkeypatch.delenv(SMTP_PORT, raising=False)
+        assert get_smtp_port() == 587
+
+        monkeypatch.setenv(SMTP_PORT, "abc")
+        assert get_smtp_port() == 587
+
+        monkeypatch.setenv(SMTP_PORT, "0")
+        assert get_smtp_port() == 587
+
+    @pytest.mark.parametrize(
+        "env_var,getter,default,true_value,false_value",
+        [
+            (SMTP_USE_TLS, get_smtp_use_tls, True, "true", "false"),
+            (SMTP_USE_SSL, get_smtp_use_ssl, False, "yes", "off"),
+        ],
+    )
+    def test_smtp_bool_settings(
+        self, monkeypatch, env_var, getter, default, true_value, false_value
+    ):
+        monkeypatch.delenv(env_var, raising=False)
+        assert getter() is default
+
+        monkeypatch.setenv(env_var, true_value)
+        assert getter() is True
+
+        monkeypatch.setenv(env_var, false_value)
+        assert getter() is False
+
+    def test_smtp_from_name_uses_default_and_trimmed_override(self, monkeypatch):
+        monkeypatch.delenv(SMTP_FROM_NAME, raising=False)
+        assert get_smtp_from_name("Xagent") == "Xagent"
+
+        monkeypatch.setenv(SMTP_FROM_NAME, " Support Team ")
+        assert get_smtp_from_name("Xagent") == "Support Team"
 
 
 class TestHotPathCacheConfig:

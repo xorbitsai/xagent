@@ -1,6 +1,6 @@
 "use client"
 
-import { useState } from "react"
+import { useEffect, useState } from "react"
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card"
 import { Button } from "@/components/ui/button"
 import { Input } from "@/components/ui/input"
@@ -9,29 +9,66 @@ import { Alert, AlertDescription } from "@/components/ui/alert"
 import {
   Settings,
   Lock,
-  Brain,
   User,
-  Shield,
 } from "lucide-react"
 import { getApiUrl } from "@/lib/utils"
 import { apiRequest } from "@/lib/api-wrapper"
-import Link from "next/link"
-import { ArrowLeft } from "lucide-react"
 import { useAuth } from "@/contexts/auth-context"
 import { useI18n } from "@/contexts/i18n-context"
 import { Select } from "@/components/ui/select"
+import { AUTH_CACHE_KEY, AUTH_TOKEN_UPDATED_EVENT } from "@/lib/auth-cache"
 
 export default function SettingsPage() {
-  const { user, token } = useAuth()
+  const { user } = useAuth()
   const { t, locale, setLocale } = useI18n()
+  const [email, setEmail] = useState(user?.email || "")
+  const [isProfileLoading, setIsProfileLoading] = useState(true)
+  const [isSavingEmail, setIsSavingEmail] = useState(false)
+  const [emailMessage, setEmailMessage] = useState<{ type: 'success' | 'error', text: string } | null>(null)
   const [currentPassword, setCurrentPassword] = useState("")
   const [newPassword, setNewPassword] = useState("")
   const [confirmPassword, setConfirmPassword] = useState("")
-  const [loading, setLoading] = useState(false)
-  const [message, setMessage] = useState<{ type: 'success' | 'error', text: string } | null>(null)
+  const [isChangingPassword, setIsChangingPassword] = useState(false)
+  const [passwordMessage, setPasswordMessage] = useState<{ type: 'success' | 'error', text: string } | null>(null)
+
+  useEffect(() => {
+    let isMounted = true
+
+    const loadProfile = async () => {
+      setIsProfileLoading(true)
+      try {
+        const response = await apiRequest(`${getApiUrl()}/api/auth/me`)
+        const data = await response.json()
+
+        if (!isMounted) return
+
+        if (response.ok && data.success) {
+          setEmail(data.user.email || "")
+          syncCachedUser(data.user)
+          setEmailMessage(null)
+        } else {
+          setEmailMessage({ type: 'error', text: data.message || data.detail || t("settings.email.failed") })
+        }
+      } catch {
+        if (isMounted) {
+          setEmailMessage({ type: 'error', text: t("settings.email.errors.network") })
+        }
+      } finally {
+        if (isMounted) {
+          setIsProfileLoading(false)
+        }
+      }
+    }
+
+    void loadProfile()
+
+    return () => {
+      isMounted = false
+    }
+  }, [t])
 
   return (
-    <div className="w-full p-8 space-y-6">
+    <div className="h-full w-full overflow-y-auto p-8 space-y-6">
       <div className="flex justify-between items-center mb-8">
         <div>
           <h1 className="text-3xl font-bold mb-1">{t("settings.title")}</h1>
@@ -71,6 +108,56 @@ export default function SettingsPage() {
         <Card>
           <CardHeader>
             <CardTitle className="flex items-center gap-2">
+              <User className="h-5 w-5" />
+              {t("settings.email.title")}
+            </CardTitle>
+            <CardDescription>
+              {t("settings.email.description")}
+            </CardDescription>
+          </CardHeader>
+          <CardContent className="space-y-4">
+            {emailMessage && (
+              <Alert className={emailMessage.type === 'error' ? 'border-red-200 bg-red-50' : 'border-green-200 bg-green-50'}>
+                <AlertDescription className={emailMessage.type === 'error' ? 'text-red-800' : 'text-green-800'}>
+                  {emailMessage.text}
+                </AlertDescription>
+              </Alert>
+            )}
+
+            <div className="space-y-2">
+              <Label htmlFor="account-username">{t("settings.email.username")}</Label>
+              <Input
+                id="account-username"
+                value={user?.username || ""}
+                disabled
+              />
+            </div>
+
+            <div className="space-y-2">
+              <Label htmlFor="account-email">{t("settings.email.current")}</Label>
+              <Input
+                id="account-email"
+                type="email"
+                value={email}
+                onChange={(e) => setEmail(e.target.value)}
+                placeholder={t("settings.email.placeholder")}
+                disabled={isProfileLoading || isSavingEmail}
+              />
+            </div>
+
+            <Button
+              onClick={handleEmailUpdate}
+              disabled={isProfileLoading || isSavingEmail || !email.trim()}
+              className="w-full"
+            >
+              {isSavingEmail ? t("settings.email.submitting") : t("settings.email.submit")}
+            </Button>
+          </CardContent>
+        </Card>
+
+        <Card>
+          <CardHeader>
+            <CardTitle className="flex items-center gap-2">
               <Lock className="h-5 w-5" />
               {t("settings.password.title")}
             </CardTitle>
@@ -79,10 +166,10 @@ export default function SettingsPage() {
             </CardDescription>
           </CardHeader>
           <CardContent className="space-y-4">
-            {message && (
-              <Alert className={message.type === 'error' ? 'border-red-200 bg-red-50' : 'border-green-200 bg-green-50'}>
-                <AlertDescription className={message.type === 'error' ? 'text-red-800' : 'text-green-800'}>
-                  {message.text}
+            {passwordMessage && (
+              <Alert className={passwordMessage.type === 'error' ? 'border-red-200 bg-red-50' : 'border-green-200 bg-green-50'}>
+                <AlertDescription className={passwordMessage.type === 'error' ? 'text-red-800' : 'text-green-800'}>
+                  {passwordMessage.text}
                 </AlertDescription>
               </Alert>
             )}
@@ -122,10 +209,10 @@ export default function SettingsPage() {
 
             <Button
               onClick={handlePasswordChange}
-              disabled={loading || !currentPassword || !newPassword || !confirmPassword}
+              disabled={isChangingPassword || !currentPassword || !newPassword || !confirmPassword}
               className="w-full"
             >
-              {loading ? t("settings.password.submitting") : t("settings.password.submit")}
+              {isChangingPassword ? t("settings.password.submitting") : t("settings.password.submit")}
             </Button>
           </CardContent>
         </Card>
@@ -135,22 +222,22 @@ export default function SettingsPage() {
 
   async function handlePasswordChange() {
     if (!currentPassword || !newPassword || !confirmPassword) {
-      setMessage({ type: 'error', text: t("settings.password.errors.fill_all") })
+      setPasswordMessage({ type: 'error', text: t("settings.password.errors.fill_all") })
       return
     }
 
     if (newPassword !== confirmPassword) {
-      setMessage({ type: 'error', text: t("settings.password.errors.mismatch") })
+      setPasswordMessage({ type: 'error', text: t("settings.password.errors.mismatch") })
       return
     }
 
     if (newPassword.length < 6) {
-      setMessage({ type: 'error', text: t("settings.password.errors.too_short") })
+      setPasswordMessage({ type: 'error', text: t("settings.password.errors.too_short") })
       return
     }
 
-    setLoading(true)
-    setMessage(null)
+    setIsChangingPassword(true)
+    setPasswordMessage(null)
 
     try {
       const response = await apiRequest(`${getApiUrl()}/api/auth/change-password`, {
@@ -167,17 +254,76 @@ export default function SettingsPage() {
       const data = await response.json()
 
       if (response.ok) {
-        setMessage({ type: 'success', text: t("settings.password.success") })
+        setPasswordMessage({ type: 'success', text: t("settings.password.success") })
         setCurrentPassword('')
         setNewPassword('')
         setConfirmPassword('')
       } else {
-        setMessage({ type: 'error', text: data.message || t("settings.password.failed") })
+        setPasswordMessage({ type: 'error', text: data.message || t("settings.password.failed") })
       }
-    } catch (error) {
-      setMessage({ type: 'error', text: t("settings.password.errors.network") })
+    } catch {
+      setPasswordMessage({ type: 'error', text: t("settings.password.errors.network") })
     } finally {
-      setLoading(false)
+      setIsChangingPassword(false)
+    }
+  }
+
+  async function handleEmailUpdate() {
+    if (!email.trim()) {
+      setEmailMessage({ type: 'error', text: t("settings.email.errors.required") })
+      return
+    }
+
+    setIsSavingEmail(true)
+    setEmailMessage(null)
+
+    try {
+      const response = await apiRequest(`${getApiUrl()}/api/auth/email`, {
+        method: 'PATCH',
+        headers: {
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({
+          email,
+        })
+      })
+
+      const data = await response.json()
+
+      if (response.ok && data.success) {
+        const nextEmail = data.user?.email || ""
+        setEmail(nextEmail)
+        syncCachedUser(data.user)
+        setEmailMessage({ type: 'success', text: t("settings.email.success") })
+      } else {
+        setEmailMessage({ type: 'error', text: data.message || data.detail || t("settings.email.failed") })
+      }
+    } catch {
+      setEmailMessage({ type: 'error', text: t("settings.email.errors.network") })
+    } finally {
+      setIsSavingEmail(false)
+    }
+  }
+
+  function syncCachedUser(nextUser: { id: string; username: string; email?: string | null; is_admin?: boolean }) {
+    localStorage.setItem("auth_user", JSON.stringify(nextUser))
+
+    const cached = localStorage.getItem(AUTH_CACHE_KEY)
+    if (cached) {
+      try {
+        const parsed = JSON.parse(cached)
+        parsed.user = {
+          ...(parsed.user || {}),
+          ...nextUser,
+        }
+        localStorage.setItem(AUTH_CACHE_KEY, JSON.stringify(parsed))
+        window.dispatchEvent(new StorageEvent(AUTH_TOKEN_UPDATED_EVENT, {
+          key: AUTH_CACHE_KEY,
+          newValue: localStorage.getItem(AUTH_CACHE_KEY),
+        }))
+      } catch {
+        // Ignore cache sync failures and keep the latest profile in auth_user.
+      }
     }
   }
 }

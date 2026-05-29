@@ -1,4 +1,10 @@
-export const AUTH_PUBLIC_PATHS = ["/login", "/register", "/setup"] as const
+export const AUTH_PUBLIC_PATHS = [
+  "/login",
+  "/register",
+  "/setup",
+  "/forgot-password",
+  "/reset-password",
+] as const
 
 export function isAuthPublicPath(pathname: string | null): boolean {
   if (!pathname) {

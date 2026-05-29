@@ -3,6 +3,8 @@
 import asyncio
 import hashlib
 import os
+import re
+import secrets
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, Optional, cast
 
@@ -30,11 +32,16 @@ from ..models.database import get_db
 from ..models.system_setting import SystemSetting
 from ..models.user import User
 from ..models.user_oauth import UserOAuth
+from ..services.auth_email import send_password_reset_email
 
 auth_router = APIRouter(prefix="/api/auth", tags=["Authentication"])
 
 REGISTRATION_ENABLED_SETTING_KEY = "registration_enabled"
 SETUP_COMPLETED_SETTING_KEY = "setup_completed"
+PASSWORD_RESET_EXPIRE_MINUTES = int(
+    os.getenv("XAGENT_PASSWORD_RESET_EXPIRE_MINUTES", "30")
+)
+EMAIL_PATTERN = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
 
 
 def create_access_token(
@@ -112,6 +119,7 @@ class RegisterRequest(BaseModel):
     """User registration request model"""
 
     username: str
+    email: Optional[str] = None
     password: str
 
 
@@ -153,6 +161,22 @@ class ChangePasswordResponse(BaseModel):
     message: str
 
 
+class UserProfileResponse(BaseModel):
+    success: bool
+    message: str
+    user: Dict[str, Any]
+
+
+class UpdateEmailRequest(BaseModel):
+    email: str
+
+
+class UpdateEmailResponse(BaseModel):
+    success: bool
+    message: str
+    user: Optional[Dict[str, Any]] = None
+
+
 class RefreshTokenRequest(BaseModel):
     """Refresh token request model"""
 
@@ -170,6 +194,25 @@ class RefreshTokenResponse(BaseModel):
     refresh_expires_in: Optional[int] = None
 
 
+class ForgotPasswordRequest(BaseModel):
+    email: str
+
+
+class ForgotPasswordResponse(BaseModel):
+    success: bool
+    message: str
+
+
+class ResetPasswordRequest(BaseModel):
+    token: str
+    new_password: str
+
+
+class ResetPasswordResponse(BaseModel):
+    success: bool
+    message: str
+
+
 def hash_password(password: str) -> str:
     """Hash password using SHA-256"""
     return hashlib.sha256(password.encode()).hexdigest()
@@ -178,6 +221,33 @@ def hash_password(password: str) -> str:
 def verify_password(password: str, password_hash: str) -> bool:
     """Verify password against hash"""
     return hash_password(password) == password_hash
+
+
+def normalize_email(email: str) -> str:
+    return email.strip().lower()
+
+
+def is_valid_email(email: str) -> bool:
+    return bool(EMAIL_PATTERN.match(email))
+
+
+def hash_password_reset_token(token: str) -> str:
+    return hashlib.sha256(token.encode()).hexdigest()
+
+
+def generate_password_reset_token() -> str:
+    return secrets.token_urlsafe(32)
+
+
+def get_app_name() -> str:
+    return os.getenv("XAGENT_APP_NAME") or os.getenv("NEXT_PUBLIC_APP_NAME") or "Xagent"
+
+
+def build_password_reset_url(request: Request, token: str) -> str:
+    configured_base_url = os.getenv("XAGENT_APP_BASE_URL", "").strip()
+    origin = request.headers.get("origin", "").strip()
+    base_url = configured_base_url or origin or "http://localhost:3000"
+    return f"{base_url.rstrip('/')}/reset-password?token={token}"
 
 
 def has_users(db: Session) -> bool:
@@ -248,8 +318,18 @@ async def setup_admin(
         if existing_user:
             return RegisterResponse(success=False, message="Username already exists")
 
+        email = None
+        if request.email:
+            email = normalize_email(request.email)
+            if not is_valid_email(email):
+                return RegisterResponse(success=False, message="Invalid email address")
+            existing_email_user = get_user_by_email(db, email)
+            if existing_email_user:
+                return RegisterResponse(success=False, message="Email already exists")
+
         user = User(
             username=request.username,
+            email=email,
             password_hash=hash_password(request.password),
             is_admin=True,
         )
@@ -313,15 +393,14 @@ async def update_register_switch(
     )
 
 
-def create_user(db: Session, username: str, password: str) -> User:
-    """Create a new user without default model configurations
+def create_user(db: Session, username: str, email: str, password: str) -> User:
+    """Create a new user without default model configurations.
 
-    Users will use admin's defaults via dynamic fallback logic until they set their own.
-    No pre-creation of UserModel or UserDefaultModel records — shared model visibility
-    is determined at read time via _get_visible_user_ids().
+    Users will use admin defaults via dynamic fallback logic until they set their own.
+    No pre-creation of UserModel or UserDefaultModel records.
     """
     password_hash = hash_password(password)
-    user = User(username=username, password_hash=password_hash)
+    user = User(username=username, email=email, password_hash=password_hash)
     db.add(user)
     db.flush()  # Get the user ID without committing
     db.refresh(user)
@@ -336,6 +415,36 @@ def get_user_by_username(db: Session, username: str) -> Optional[User]:
     return db.query(User).filter(User.username == username).first()
 
 
+def get_user_by_email(db: Session, email: str) -> Optional[User]:
+    normalized_email = normalize_email(email)
+    return db.query(User).filter(User.email == normalized_email).first()
+
+
+def serialize_auth_user(user: User, include_login_time: bool = False) -> Dict[str, Any]:
+    payload: Dict[str, Any] = {
+        "id": user.id,
+        "username": user.username,
+        "email": user.email,
+        "is_admin": bool(cast(Any, user.is_admin)),
+    }
+    if include_login_time:
+        payload["loginTime"] = datetime.now(timezone.utc).timestamp()
+    return payload
+
+
+def get_user_by_login_identifier(db: Session, identifier: str) -> Optional[User]:
+    """Get user by username first, then fallback to email lookup."""
+    login_identifier = identifier.strip()
+    user = get_user_by_username(db, login_identifier)
+    if user is not None:
+        return user
+
+    if is_valid_email(login_identifier):
+        return get_user_by_email(db, login_identifier)
+
+    return None
+
+
 @auth_router.post("/login")
 async def login(request: LoginRequest, db: Session = Depends(get_db)) -> Dict[str, Any]:
     """User login endpoint"""
@@ -343,7 +452,7 @@ async def login(request: LoginRequest, db: Session = Depends(get_db)) -> Dict[st
         # Run synchronous database queries in thread pool to avoid blocking event loop
         def _get_user_sync() -> User:
             # Get user from database
-            user = get_user_by_username(db, request.username)
+            user = get_user_by_login_identifier(db, request.username)
             if not user:
                 raise HTTPException(
                     status_code=status.HTTP_401_UNAUTHORIZED,
@@ -390,12 +499,7 @@ async def login(request: LoginRequest, db: Session = Depends(get_db)) -> Dict[st
         return {
             "success": True,
             "message": "Login successful",
-            "user": {
-                "id": user.id,
-                "username": user.username,
-                "is_admin": user.is_admin,
-                "loginTime": datetime.now(timezone.utc).timestamp(),
-            },
+            "user": serialize_auth_user(user, include_login_time=True),
             "access_token": access_token,
             "refresh_token": refresh_token,
             "token_type": "bearer",
@@ -442,8 +546,19 @@ async def register(
         if not is_registration_enabled(db):
             return RegisterResponse(success=False, message="Registration is disabled")
 
+        if not request.email:
+            return RegisterResponse(success=False, message="Email is required")
+
+        email = normalize_email(request.email)
+        if not is_valid_email(email):
+            return RegisterResponse(success=False, message="Invalid email address")
+
+        existing_email_user = get_user_by_email(db, email)
+        if existing_email_user:
+            return RegisterResponse(success=False, message="Email already exists")
+
         # Create new user with inherited defaults
-        user = create_user(db, request.username, request.password)
+        user = create_user(db, request.username, email, request.password)
 
         return RegisterResponse(
             success=True,
@@ -451,6 +566,7 @@ async def register(
             user={
                 "id": user.id,
                 "username": user.username,
+                "email": user.email,
                 "createdAt": (
                     cast(Any, user.created_at).isoformat()
                     if getattr(user, "created_at", None) is not None
@@ -464,6 +580,103 @@ async def register(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Error during registration: {str(e)}",
         )
+
+
+@auth_router.post("/forgot-password", response_model=ForgotPasswordResponse)
+async def forgot_password(
+    request: ForgotPasswordRequest,
+    http_request: Request,
+    db: Session = Depends(get_db),
+) -> ForgotPasswordResponse:
+    email = normalize_email(request.email)
+    if not is_valid_email(email):
+        return ForgotPasswordResponse(
+            success=False,
+            message="Please enter a valid email address",
+        )
+
+    user = get_user_by_email(db, email)
+    if user is None:
+        raise HTTPException(status_code=404, detail="Email not found")
+
+    reset_token = generate_password_reset_token()
+    reset_token_hash = hash_password_reset_token(reset_token)
+    reset_expires_at = datetime.now(timezone.utc) + timedelta(
+        minutes=PASSWORD_RESET_EXPIRE_MINUTES
+    )
+
+    setattr(user, "password_reset_token_hash", reset_token_hash)
+    setattr(user, "password_reset_expires_at", reset_expires_at)
+    db.commit()
+
+    try:
+        reset_link = build_password_reset_url(http_request, reset_token)
+        await asyncio.to_thread(
+            send_password_reset_email,
+            email,
+            reset_link,
+            get_app_name(),
+        )
+    except Exception as exc:
+        setattr(user, "password_reset_token_hash", None)
+        setattr(user, "password_reset_expires_at", None)
+        db.commit()
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to send password reset email: {exc}",
+        )
+
+    return ForgotPasswordResponse(
+        success=True,
+        message="Password reset link has been sent successfully",
+    )
+
+
+@auth_router.post("/reset-password", response_model=ResetPasswordResponse)
+async def reset_password(
+    request: ResetPasswordRequest,
+    db: Session = Depends(get_db),
+) -> ResetPasswordResponse:
+    if len(request.new_password) < PASSWORD_MIN_LENGTH:
+        return ResetPasswordResponse(
+            success=False,
+            message=f"New password must be at least {PASSWORD_MIN_LENGTH} characters",
+        )
+
+    token_hash = hash_password_reset_token(request.token)
+    user = db.query(User).filter(User.password_reset_token_hash == token_hash).first()
+    if user is None:
+        return ResetPasswordResponse(success=False, message="Invalid reset token")
+
+    reset_expires_at = getattr(user, "password_reset_expires_at", None)
+    now = datetime.now(timezone.utc)
+    if reset_expires_at is None:
+        return ResetPasswordResponse(success=False, message="Invalid reset token")
+    if (
+        hasattr(reset_expires_at, "tzinfo")
+        and getattr(reset_expires_at, "tzinfo", None) is not None
+    ):
+        if cast(Any, reset_expires_at) < now:
+            return ResetPasswordResponse(
+                success=False, message="Reset token has expired"
+            )
+    else:
+        if cast(Any, reset_expires_at) < now.replace(tzinfo=None):
+            return ResetPasswordResponse(
+                success=False, message="Reset token has expired"
+            )
+
+    setattr(user, "password_hash", hash_password(request.new_password))
+    setattr(user, "password_reset_token_hash", None)
+    setattr(user, "password_reset_expires_at", None)
+    setattr(user, "refresh_token", None)
+    setattr(user, "refresh_token_expires_at", None)
+    db.commit()
+
+    return ResetPasswordResponse(
+        success=True,
+        message="Password has been reset successfully",
+    )
 
 
 @auth_router.post("/change-password", response_model=ChangePasswordResponse)
@@ -500,6 +713,42 @@ async def change_password(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Error during password update: {str(e)}",
         )
+
+
+@auth_router.get("/me", response_model=UserProfileResponse)
+async def get_current_user_profile(
+    user: User = Depends(get_current_user),
+) -> UserProfileResponse:
+    return UserProfileResponse(
+        success=True,
+        message="User profile fetched successfully",
+        user=serialize_auth_user(user),
+    )
+
+
+@auth_router.patch("/email", response_model=UpdateEmailResponse)
+async def update_current_user_email(
+    request: UpdateEmailRequest,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+) -> UpdateEmailResponse:
+    email = normalize_email(request.email)
+    if not is_valid_email(email):
+        return UpdateEmailResponse(success=False, message="Invalid email address")
+
+    existing_user = get_user_by_email(db, email)
+    if existing_user and existing_user.id != user.id:
+        return UpdateEmailResponse(success=False, message="Email already exists")
+
+    setattr(user, "email", email)
+    db.commit()
+    db.refresh(user)
+
+    return UpdateEmailResponse(
+        success=True,
+        message="Email updated successfully",
+        user=serialize_auth_user(user),
+    )
 
 
 @auth_router.post("/refresh", response_model=RefreshTokenResponse)
@@ -608,11 +857,7 @@ async def verify_current_token(
     return {
         "success": True,
         "message": "Token is valid",
-        "user": {
-            "id": current_user.id,
-            "username": current_user.username,
-            "is_admin": current_user.is_admin,
-        },
+        "user": serialize_auth_user(current_user),
     }
 
 

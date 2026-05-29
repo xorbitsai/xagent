@@ -8,6 +8,7 @@ import { AUTH_CACHE_KEY, AUTH_TOKEN_UPDATED_EVENT } from "@/lib/auth-cache"
 interface User {
   id: string
   username: string
+  email?: string | null
   is_admin?: boolean
 }
 
@@ -196,6 +197,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
         const userData = {
           id: data.user.id,
           username: data.user.username,
+          email: data.user.email,
           is_admin: data.user.is_admin
         }
 

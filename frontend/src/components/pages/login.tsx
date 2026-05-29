@@ -31,7 +31,7 @@ export function LoginPage() {
   const [isLoading, setIsLoading] = useState(false)
   const [error, setError] = useState("")
   const [formData, setFormData] = useState({
-    username: "",
+    identifier: "",
     password: ""
   })
 
@@ -50,12 +50,17 @@ export function LoginPage() {
         headers: {
           "Content-Type": "application/json",
         },
-        body: JSON.stringify({ username: formData.username, password: formData.password }),
+        body: JSON.stringify({ username: formData.identifier, password: formData.password }),
       })
 
       if (response.ok) {
         const data = await response.json()
-        const userData = { id: data.user.id, username: data.user.username, is_admin: data.user.is_admin }
+        const userData = {
+          id: data.user.id,
+          username: data.user.username,
+          email: data.user.email,
+          is_admin: data.user.is_admin,
+        }
 
         // Store token in localStorage using the same keys as AuthContext
         localStorage.setItem("auth_token", data.access_token)
@@ -157,8 +162,8 @@ export function LoginPage() {
               <User className="pointer-events-none absolute left-4 top-1/2 h-4 w-4 -translate-y-1/2 text-[#A0A9B8]" />
               <Input
                 type="text"
-                name="username"
-                value={formData.username}
+                name="identifier"
+                value={formData.identifier}
                 onChange={handleInputChange}
                 placeholder={t("login.form.username_placeholder")}
                 className="h-12 rounded-[14px] border-[#E2E8F3] bg-white pl-11 pr-4 text-[#171A2F] placeholder:text-[#A0A9B8] shadow-[0_1px_2px_rgba(16,24,40,0.04)] focus-visible:border-[#5B7CFF] focus-visible:ring-[#5B7CFF]/20"
@@ -205,14 +210,14 @@ export function LoginPage() {
               />
               <span>{t("login.options.remember_me")}</span>
             </label>
-            <a href="#" className="font-semibold text-[#4E63C9] transition-colors hover:text-[#3155F6]">
+            <Link href="/forgot-password" className="font-semibold text-[#4E63C9] transition-colors hover:text-[#3155F6]">
               {t("login.options.forgot_password")}
-            </a>
+            </Link>
           </div>
 
           <Button
             type="submit"
-            disabled={!formData.username || !formData.password || isLoading}
+            disabled={!formData.identifier || !formData.password || isLoading}
             className="h-12 w-full rounded-[14px] bg-[linear-gradient(180deg,#4B6BFF_0%,#2F54EB_100%)] text-base font-semibold text-white shadow-[0_14px_30px_rgba(47,84,235,0.32)] transition-all hover:translate-y-[-1px] hover:opacity-95 disabled:translate-y-0 disabled:opacity-60"
           >
             {isLoading ? (

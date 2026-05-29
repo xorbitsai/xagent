@@ -9,6 +9,8 @@ const REFRESH_EXCLUDED_AUTH_ENDPOINTS = [
   "/api/auth/login",
   "/api/auth/register",
   "/api/auth/setup-admin",
+  "/api/auth/forgot-password",
+  "/api/auth/reset-password",
 ]
 
 function shouldSkipRefresh(url: string): boolean {

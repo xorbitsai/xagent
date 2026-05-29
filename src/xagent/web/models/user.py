@@ -20,6 +20,7 @@ class User(Base):  # type: ignore
 
     id = Column(Integer, primary_key=True, index=True)
     username = Column(String(50), unique=True, index=True, nullable=False)
+    email = Column(String(255), unique=True, index=True, nullable=True)
     password_hash = Column(String(255), nullable=False)
     is_admin = Column(Boolean, default=False, nullable=False)  # Admin role flag
     created_at = Column(DateTime(timezone=True), server_default=func.now())
@@ -28,6 +29,8 @@ class User(Base):  # type: ignore
     )
     refresh_token = Column(String(255), nullable=True)
     refresh_token_expires_at = Column(DateTime(timezone=True), nullable=True)
+    password_reset_token_hash = Column(String(64), index=True, nullable=True)
+    password_reset_expires_at = Column(DateTime(timezone=True), nullable=True)
 
     # Relationships
     tasks = relationship("Task", back_populates="user")

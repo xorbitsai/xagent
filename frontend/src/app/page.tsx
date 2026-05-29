@@ -396,10 +396,10 @@ export default function Home() {
     const source = published.length > 0 ? published : agents;
     return source.slice(0, 9);
   }, [agents]);
-  const greetingName = user?.username || "cheffyyyy";
   const greetingLabel = t(
     currentHour === null ? "home.revamp.greeting" : getGreetingTranslationKey(currentHour)
   );
+  const greetingText = user?.username ? `${greetingLabel}, ${user.username}` : greetingLabel;
   const canSubmitHomeTask = !isCreating && (homeInputValue.trim().length > 0 || homeFiles.length > 0);
 
   return (
@@ -438,7 +438,7 @@ export default function Home() {
           <div className="relative z-10 flex flex-col gap-6">
             <div className="flex items-center gap-2 text-xs font-semibold uppercase tracking-[0.18em] text-white/65">
               <Sparkles className="h-4 w-4 text-fuchsia-300" />
-              <span>{`${greetingLabel}, ${greetingName}`}</span>
+              <span>{greetingText}</span>
             </div>
 
             <div className="max-w-3xl">

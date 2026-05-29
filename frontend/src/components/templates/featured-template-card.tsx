@@ -4,6 +4,7 @@ import type { KeyboardEvent, MouseEvent } from "react";
 import { Heart, Play, Star } from "lucide-react";
 import type { Template } from "@/types/template";
 import { cn } from "@/lib/utils";
+import { isNestedInteractiveElement } from "./template-card-utils";
 
 interface FeaturedTemplateCardProps {
   template: Template;
@@ -50,6 +51,10 @@ export function FeaturedTemplateCard({
   const handleActivate = () => onUse(template.id);
 
   const handleKeyDown = (event: KeyboardEvent<HTMLDivElement>) => {
+    if (isNestedInteractiveElement(event.target, event.currentTarget)) {
+      return;
+    }
+
     if (event.key === "Enter" || event.key === " ") {
       event.preventDefault();
       handleActivate();

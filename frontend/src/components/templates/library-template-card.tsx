@@ -5,6 +5,7 @@ import { ChevronRight, Clock, Heart, Play } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import type { Template } from "@/types/template";
 import { cn } from "@/lib/utils";
+import { isNestedInteractiveElement } from "./template-card-utils";
 
 interface LibraryTemplateCardProps {
   template: Template;
@@ -64,6 +65,10 @@ export function LibraryTemplateCard({
   const handleActivate = () => onUse(template.id);
 
   const handleKeyDown = (event: KeyboardEvent<HTMLDivElement>) => {
+    if (isNestedInteractiveElement(event.target, event.currentTarget)) {
+      return;
+    }
+
     if (event.key === "Enter" || event.key === " ") {
       event.preventDefault();
       handleActivate();

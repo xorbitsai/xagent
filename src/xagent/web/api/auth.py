@@ -2,6 +2,7 @@
 
 import asyncio
 import hashlib
+import logging
 import os
 import re
 import secrets
@@ -34,6 +35,8 @@ from ..models.system_setting import SystemSetting
 from ..models.user import User
 from ..models.user_oauth import UserOAuth
 from ..services.auth_email import send_password_reset_email
+
+logger = logging.getLogger(__name__)
 
 auth_router = APIRouter(prefix="/api/auth", tags=["Authentication"])
 
@@ -669,10 +672,7 @@ async def forgot_password(
         setattr(user, "password_reset_token_hash", None)
         setattr(user, "password_reset_expires_at", None)
         db.commit()
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Failed to send password reset email: {exc}",
-        )
+        logger.error("Failed to send password reset email to %s: %s", email, exc)
 
     return ForgotPasswordResponse(
         success=True,

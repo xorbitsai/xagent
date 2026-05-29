@@ -573,8 +573,8 @@ class TestAuthAPI:
         assert parsed_link.path == "/app/reset-password"
         assert "token" in parse_qs(parsed_link.query)
 
-    def test_forgot_password_requires_configured_app_base_url(
-        self, test_db, test_user_data, monkeypatch
+    def test_forgot_password_delivery_failure_returns_generic_success(
+        self, test_db, test_user_data, monkeypatch, caplog
     ):
         setup_first_admin()
         register_response = client.post("/api/auth/register", json=test_user_data)
@@ -582,15 +582,23 @@ class TestAuthAPI:
 
         monkeypatch.delenv("XAGENT_APP_BASE_URL", raising=False)
 
-        response = client.post(
-            "/api/auth/forgot-password",
-            json={"email": test_user_data["email"]},
-        )
-        assert response.status_code == 500
+        import logging
+
+        with caplog.at_level(logging.ERROR, logger="xagent.web.api.auth"):
+            response = client.post(
+                "/api/auth/forgot-password",
+                json={"email": test_user_data["email"]},
+            )
+
+        assert response.status_code == 200
         data = response.json()
+        assert data["success"] is True
         assert (
-            data["detail"] == "Failed to send password reset email: "
-            "XAGENT_APP_BASE_URL must be configured for password reset emails"
+            data["message"]
+            == "If the email exists, a password reset link has been sent"
+        )
+        assert any(
+            "Failed to send password reset email" in r.message for r in caplog.records
         )
 
     def test_register_rejects_email_shaped_username(self, test_db):

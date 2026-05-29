@@ -36,6 +36,7 @@ import { HomeTemplateCard } from "@/components/templates/home-template-card";
 import { useApp } from "@/contexts/app-context-chat";
 import { useAuth } from "@/contexts/auth-context";
 import { useI18n } from "@/contexts/i18n-context";
+import { getAgentChatHref } from "@/lib/agent-ui-access";
 import { getApiUrl } from "@/lib/utils";
 import type { Template } from "@/types/template";
 import { WelcomeModal } from "@/components/welcome-modal";
@@ -580,7 +581,7 @@ export default function Home() {
               {displayAgents.map((agent) => (
                 <Link
                   key={agent.id}
-                  href={`/build/${agent.id}`}
+                  href={agent.status === "published" ? getAgentChatHref(agent) : `/build/${agent.id}`}
                   className="group flex min-h-[76px] w-full items-center gap-3 rounded-2xl border border-border/70 bg-white px-4 py-3 shadow-sm transition-all hover:-translate-y-0.5 hover:border-primary/20 hover:shadow-md"
                 >
                   <div className="flex h-10 w-10 items-center justify-center overflow-hidden rounded-xl border border-border/60 bg-primary/5">

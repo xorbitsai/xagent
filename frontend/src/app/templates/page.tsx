@@ -102,7 +102,7 @@ export default function TemplatesPage() {
   }, [t, templates]);
 
   const featuredTemplates = useMemo(
-    () => [...templates].sort((a, b) => (b.used_count || 0) - (a.used_count || 0)).slice(0, 3),
+    () => templates.filter((template) => template.featured),
     [templates]
   );
 

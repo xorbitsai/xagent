@@ -159,7 +159,11 @@ def _setup_admin() -> None:
     if status.json().get("needs_setup", True):
         resp = client.post(
             "/api/auth/setup-admin",
-            json={"username": "admin", "password": "admin123"},
+            json={
+                "username": "admin",
+                "email": "admin@example.com",
+                "password": "admin123",
+            },
         )
         assert resp.status_code == 200
 
@@ -189,7 +193,11 @@ def _register_second_user(
     """
     resp = client.post(
         "/api/auth/register",
-        json={"username": username, "password": password},
+        json={
+            "username": username,
+            "email": f"{username}@example.com",
+            "password": password,
+        },
     )
     assert resp.status_code == 200, resp.text
     return _login(username, password)

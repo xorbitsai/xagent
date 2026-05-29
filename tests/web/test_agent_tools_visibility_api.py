@@ -48,7 +48,12 @@ def _setup_admin() -> None:
     assert status_response.status_code == 200
     if status_response.json().get("needs_setup", True):
         setup_response = client.post(
-            "/api/auth/setup-admin", json={"username": "admin", "password": "admin123"}
+            "/api/auth/setup-admin",
+            json={
+                "username": "admin",
+                "email": "admin@example.com",
+                "password": "admin123",
+            },
         )
         assert setup_response.status_code == 200
 

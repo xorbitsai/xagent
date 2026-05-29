@@ -47,7 +47,12 @@ def ensure_system_initialized() -> None:
 
     if status_data.get("needs_setup", True):
         setup_response = client.post(
-            "/api/auth/setup-admin", json={"username": "admin", "password": "admin123"}
+            "/api/auth/setup-admin",
+            json={
+                "username": "admin",
+                "email": "admin@example.com",
+                "password": "admin123",
+            },
         )
         assert setup_response.status_code == 200
         assert setup_response.json().get("success") is True

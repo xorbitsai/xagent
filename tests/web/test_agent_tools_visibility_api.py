@@ -90,7 +90,11 @@ def test_published_agent_is_callable_for_owner_and_hidden_from_other_users() -> 
 
         register_response = client.post(
             "/api/auth/register",
-            json={"username": "regular", "password": "password123"},
+            json={
+                "username": "regular",
+                "email": "regular@example.com",
+                "password": "password123",
+            },
         )
         assert register_response.status_code == 200
         regular_headers = _login("regular", "password123")

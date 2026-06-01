@@ -1,5 +1,7 @@
 import type { NavigationGroup } from "@/lib/sidebar-navigation"
 
-const extraNav: NavigationGroup[] = []
+type ExtraNavResolver = NavigationGroup[] | ((user: any) => NavigationGroup[])
+
+const extraNav: ExtraNavResolver = []
 
 export default extraNav

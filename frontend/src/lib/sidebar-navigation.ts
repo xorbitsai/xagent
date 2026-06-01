@@ -1,3 +1,4 @@
+import type { ComponentType, SVGProps } from "react"
 import {
     Activity,
     FileText,
@@ -18,7 +19,7 @@ import {
 export interface NavigationItem {
     name: string
     href: string
-    icon: any
+    icon: ComponentType<SVGProps<SVGSVGElement>>
     color?: string
     children?: NavigationItem[]
     showTasks?: boolean

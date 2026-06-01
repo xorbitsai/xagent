@@ -4,7 +4,7 @@ import Link from "next/link"
 import { usePathname, useRouter } from "next/navigation"
 import { cn } from "@/lib/utils"
 import { SearchInput } from "@/components/ui/search-input"
-import { useState, useEffect, useCallback, useRef } from "react"
+import { useState, useEffect, useCallback, useMemo, useRef } from "react"
 import { getApiUrl } from "@/lib/utils"
 import { apiRequest } from "@/lib/api-wrapper"
 import { useAuth } from "@/contexts/auth-context"
@@ -105,7 +105,10 @@ export function Sidebar({ className, allowCollapse = true }: SidebarProps) {
   const normalizedGithubUrl = githubUrl.replace(/\.git$/, "").replace(/\/$/, "")
   const githubRepoDisplay = normalizedGithubUrl.replace(/^https?:\/\/github\.com\//i, "")
   const licenseUrl = `${normalizedGithubUrl}/blob/main/LICENSE`
-  const navigationGroups = [...getNavigationGroupsForUser(user), ...extraNav]
+  const navigationGroups = useMemo(() => {
+    const extra = typeof extraNav === "function" ? extraNav(user) : extraNav
+    return [...getNavigationGroupsForUser(user), ...extra]
+  }, [user])
   const [githubStars, setGithubStars] = useState<number | null>(null)
 
   const [taskToDelete, setTaskToDelete] = useState<string | null>(null)

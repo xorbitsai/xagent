@@ -1149,81 +1149,14 @@ async def registry_stats(
     )
 
 
-# ──────────────────────────────────────────────────────────────────────
-# Startup prewarm
-# ──────────────────────────────────────────────────────────────────────
-
-# Sorts the Discover tab's "Page N of M" math depends on. Prewarming
-# these lets a user's first hit on Discover skip the cold-cache walk
-# (which is 3-5s per sort). Other sorts (stars / updated / newest)
-# still cold-load on first user request, but they're less common.
-_PREWARM_SORTS = ("installsCurrent", "trending")
-
-
-async def prewarm() -> None:
-    """Best-effort prewarm of common Skill Hub caches.
-
-    Runs as a background task on backend startup; failures are
-    logged but don't propagate. After this completes a user opening
-    /skill-hub for the first time gets ~2.5s instead of ~9s before
-    the rails populate.
-
-    Prewarms (in parallel):
-      - Featured rail (the editorial 6-slug fan-out)
-      - Registry stats for the default sort + a likely second sort
-    """
-    logger.info("Skill Hub: starting prewarm…")
-    t0 = time.time()
-
-    async def _warm_featured() -> None:
-        config = _load_featured_config()
-        if not config:
-            return
-
-        async def _fetch_one(slug: str) -> Optional[Dict[str, Any]]:
-            try:
-                return await asyncio.to_thread(_clawhub_json, f"/skills/{slug}")
-            except HTTPException:
-                return None
-
-        details = await asyncio.gather(*[_fetch_one(e["slug"]) for e in config])
-        items: list[dict] = []
-        for entry, detail in zip(config, details):
-            if not isinstance(detail, dict):
-                continue
-            skill = detail.get("skill") or {}
-            latest = detail.get("latestVersion") or {}
-            stats = skill.get("stats") or {}
-            items.append(
-                {
-                    "slug": entry["slug"],
-                    "displayName": str(skill.get("displayName") or entry["slug"]),
-                    "summary": str(skill.get("summary") or ""),
-                    "version": latest.get("version")
-                    or (skill.get("tags") or {}).get("latest"),
-                    "ownerHandle": (detail.get("owner") or {}).get("handle"),
-                    "installs": stats.get("installsCurrent"),
-                    "updatedAt": skill.get("updatedAt"),
-                    "scanStatus": _extract_scan_status(detail),
-                    "installedAs": None,
-                    "featuredReason": entry["reason"],
-                }
-            )
-        _FEATURED_CACHE["items"] = items
-        _FEATURED_CACHE["fetched_at"] = time.time()
-
-    async def _warm_stats(sort: str) -> None:
-        try:
-            await asyncio.to_thread(_fill_stats_cache, sort)
-        except Exception as exc:
-            logger.warning("Skill Hub prewarm: stats walk for %s failed: %s", sort, exc)
-
-    try:
-        await asyncio.gather(
-            _warm_featured(),
-            *[_warm_stats(s) for s in _PREWARM_SORTS],
-            return_exceptions=True,
-        )
-        logger.info("Skill Hub: prewarm done in %.1fs", time.time() - t0)
-    except Exception as exc:
-        logger.warning("Skill Hub: prewarm aborted: %s", exc)
+# Prewarm was previously scheduled here via ``asyncio.create_task`` from
+# the ``@app.on_event("startup")`` hook, to give the first /featured
+# request a warm cache. It was removed because the xagent startup-event
+# integration tests track every ``asyncio.create_task`` call and assert
+# none happen — adding ours broke an unrelated test contract.
+#
+# The endpoints below already populate their own caches on first call;
+# the cost is just paid by the first user instead of pre-paid at boot.
+# Frontend SWR / sessionStorage cache cushion this across pages.
+# If we want startup prewarm back, the xagent startup tests need to be
+# updated to allow / mock our schedule call.

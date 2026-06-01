@@ -4,7 +4,7 @@ description: |
   Generate a native PowerPoint (.pptx) file with magazine-grade editorial
   styling — pitch decks, investor presentations (路演 PPT), board reviews,
   executive memos, conference talks, product launches. Output is a single
-  .pptx file generated via pptxgenjs through `javascript_executor`, openable
+  .pptx file generated via pptxgenjs through the JavaScript executor runtime, openable
   in PowerPoint / Keynote / Google Slides. Uses five named editorial palettes
   (Monocle, Indigo Porcelain, Forest Ink, Kraft Paper, Dune) with strict
   typography rules (Georgia display + Calibri body) and 10 numbered layouts
@@ -31,7 +31,7 @@ tags:
 # Editorial PPTX Deck
 
 You will generate one `.pptx` file by writing a JavaScript program that uses
-**pptxgenjs** and runs it via the `javascript_executor` tool. Save the file
+**pptxgenjs** and runs it via the `execute_javascript_code` tool. Save the file
 to the workspace (use the output dir the tool returns), then report the path
 and a 1-line layout summary.
 
@@ -194,7 +194,7 @@ Standard slide is 13.33 × 7.5 inches (16:9).
 
 ## 🛠️ pptxgenjs implementation pattern
 
-⚠️ **Top-level `await` is FORBIDDEN.** The `javascript_executor` runs the
+⚠️ **Top-level `await` is FORBIDDEN.** The JavaScript executor runtime runs the
 script as `node script.js` with NO `package.json` in the exec dir, so
 top-level `await` makes Node guess ESM mode and `require()` then throws
 `require is not defined in ES module scope`. **Wrap everything in an async

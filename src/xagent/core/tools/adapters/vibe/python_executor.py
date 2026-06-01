@@ -135,7 +135,14 @@ class PythonExecutorTool(AbstractBaseTool):
         }
 
 
-@sandbox_config(packages=["pandas>=1.3.0", "numpy>=1.21.0", "matplotlib>=3.5.0"])
+@sandbox_config(
+    packages=[
+        "pandas>=1.3.0",
+        "numpy>=1.21.0",
+        "matplotlib>=3.5.0",
+        "openpyxl>=3.1.0",  # required by the xlsx-financial-report skill
+    ]
+)
 class PythonExecutorToolForBasic(PythonExecutorTool):
     """Python executor tool with BASIC category."""
 

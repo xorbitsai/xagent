@@ -30,18 +30,14 @@ the workspace, then report the path + a 1-line content summary.
 
 ## 📦 Required runtime packages
 
-The sandboxed `execute_python_code` ships with `pandas`, `numpy`, and
-`matplotlib` only — **openpyxl is NOT preinstalled**. Always pass it
-explicitly through the executor's `packages` argument so the sandbox
-installs it before running:
+The sandboxed `execute_python_code` ships with `pandas`, `numpy`,
+`matplotlib`, and **`openpyxl>=3.1.0`** preinstalled — no extra
+installation step is needed. Just `import openpyxl` at the top of
+your script and proceed.
 
-```python
-# When invoking the tool:
-packages=["openpyxl>=3.1.0"]
-```
-
-Without this the very first line of your script (`import openpyxl`) will
-fail with `ModuleNotFoundError`, and the report won't be produced.
+> **Note:** `execute_python_code` accepts only `code` and
+> `capture_output` arguments; there is no `packages` parameter.
+> All required libraries are already available in the sandbox image.
 
 ## 💾 How to save the file
 
@@ -348,7 +344,7 @@ ws.conditional_formatting.add(
 
 ## 📝 Output checklist
 
-- [ ] One palette, only its 3 hex values appear anywhere
+- [ ] One palette, only its 4 hex values appear anywhere
 - [ ] Only Cambria + Calibri (verify no Arial/Times slipped in)
 - [ ] No 3-D, no shadows, no gradients, no rainbow conditional formatting
 - [ ] Title row merged, frozen header at correct row

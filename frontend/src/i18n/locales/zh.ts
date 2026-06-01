@@ -48,6 +48,7 @@ const zh = {
     models: "模型",
     files: "文件",
     memory: "记忆",
+    skillHub: "Skill 中心",
     monitoring: "监控",
     knowledgeBase: "知识库",
     knowledgeBaseDetail: "知识库详情",

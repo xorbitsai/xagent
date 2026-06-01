@@ -1,0 +1,30 @@
+{
+  "schema": "xagent.skill_hub.featured.v1",
+  "comment": "Hand-picked ClawHub skills surfaced on the Discover tab's Featured rail. Editorial — what xagent recommends, not what ClawHub trends. Keep this list short (≤6) so the rail stays a real recommendation, not a second catalog. Add or remove items to update what users see; backend re-reads this file every request (cheap, no restart).",
+  "items": [
+    {
+      "slug": "notion",
+      "reason": "Connect agents to your Notion workspace — pages, databases, search."
+    },
+    {
+      "slug": "github",
+      "reason": "Read repos, file issues, browse PRs via the gh CLI from chat."
+    },
+    {
+      "slug": "gog",
+      "reason": "Google Workspace CLI — Gmail, Calendar, Drive, Contacts in one skill."
+    },
+    {
+      "slug": "obsidian",
+      "reason": "Read and write your Obsidian vault from chat."
+    },
+    {
+      "slug": "skill-creator",
+      "reason": "Meta-skill — ask the agent to scaffold a new skill for you."
+    },
+    {
+      "slug": "mcporter",
+      "reason": "Manage MCP servers (list, configure, auth, call) from the agent itself."
+    }
+  ]
+}

@@ -25,6 +25,7 @@ export default function WorkforcesPage() {
   const [pages, setPages] = useState(1)
   const [total, setTotal] = useState(0)
   const pageSize = 10
+  const hasActiveSearch = search.trim().length > 0
 
   const load = useCallback(async (nextPage: number, nextSearch: string) => {
     try {
@@ -82,36 +83,47 @@ export default function WorkforcesPage() {
 
         {!loading && !error ? (
           items.length === 0 ? (
-            <FeatureEmptyState
-              icon={Users}
-              title={t("workforces.emptyState.title")}
-              description={t("workforces.emptyState.description")}
-              features={[
-                {
-                  icon: GitBranch,
-                  title: t("workforces.emptyState.features.managerAgent.title"),
-                  description: t("workforces.emptyState.features.managerAgent.description")
-                },
-                {
-                  icon: Zap,
-                  title: t("workforces.emptyState.features.subAgents.title"),
-                  description: t("workforces.emptyState.features.subAgents.description")
-                },
-                {
-                  icon: Play,
-                  title: t("workforces.emptyState.features.parallelExecution.title"),
-                  description: t("workforces.emptyState.features.parallelExecution.description")
-                },
-                {
-                  icon: ShieldCheck,
-                  title: t("workforces.emptyState.features.approvalGates.title"),
-                  description: t("workforces.emptyState.features.approvalGates.description")
-                }
-              ]}
-              actionLabel={t("workforces.emptyState.action")}
-              onAction={() => router.push("/workforces/new")}
-              className="h-full mt-4"
-            />
+            hasActiveSearch ? (
+              <Card className="border-dashed">
+                <CardContent className="flex flex-col items-center gap-4 p-12 text-center">
+                  <div className="text-lg font-medium">{t("workforces.list.noResultsTitle")}</div>
+                  <p className="max-w-xl text-sm text-muted-foreground">
+                    {t("workforces.list.noResults")}
+                  </p>
+                </CardContent>
+              </Card>
+            ) : (
+              <FeatureEmptyState
+                icon={Users}
+                title={t("workforces.emptyState.title")}
+                description={t("workforces.emptyState.description")}
+                features={[
+                  {
+                    icon: GitBranch,
+                    title: t("workforces.emptyState.features.managerAgent.title"),
+                    description: t("workforces.emptyState.features.managerAgent.description")
+                  },
+                  {
+                    icon: Zap,
+                    title: t("workforces.emptyState.features.subAgents.title"),
+                    description: t("workforces.emptyState.features.subAgents.description")
+                  },
+                  {
+                    icon: Play,
+                    title: t("workforces.emptyState.features.parallelExecution.title"),
+                    description: t("workforces.emptyState.features.parallelExecution.description")
+                  },
+                  {
+                    icon: ShieldCheck,
+                    title: t("workforces.emptyState.features.approvalGates.title"),
+                    description: t("workforces.emptyState.features.approvalGates.description")
+                  }
+                ]}
+                actionLabel={t("workforces.emptyState.action")}
+                onAction={() => router.push("/workforces/new")}
+                className="h-full mt-4"
+              />
+            )
           ) : (
             <>
               <div className="grid gap-4">

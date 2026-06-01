@@ -3064,14 +3064,35 @@ Build when you need.`,
       description: "Create manager-led multi-agent work groups, keep worker roles explicit, and run them from a single entry point.",
       searchPlaceholder: "Search workforces...",
       emptyTitle: "No workforces yet",
-      emptyDescription: "Start with a manager agent, add a few workers, and return here to launch coordinated runs.",
-      createFirst: "Create your first workforce",
       manager: "Manager: {name}",
       workers: "Workers: {count}",
       lastUpdate: "Last update: {value}",
       lastRun: "Last run #{runId} - {status}",
       lastRunWithTask: "Last run #{runId} - task #{taskId} - {status}",
       noRuns: "No runs yet"
+    },
+    emptyState: {
+      title: "How Workforce Works",
+      description: "Orchestrate teams of agents to tackle complex, multi-step work. A Manager agent plans and delegates tasks to sub-agents automatically.",
+      features: {
+        managerAgent: {
+          title: "Manager Agent",
+          description: "A lead agent that understands your goal and delegates work to the right sub-agents."
+        },
+        subAgents: {
+          title: "Sub-Agents",
+          description: "Specialised agents for each task — research, writing, data processing, and more."
+        },
+        parallelExecution: {
+          title: "Parallel Execution",
+          description: "Run multiple agents simultaneously to complete complex workflows faster."
+        },
+        approvalGates: {
+          title: "Approval Gates",
+          description: "Require human approval before critical actions are taken by any agent."
+        }
+      },
+      action: "+ Create Workforce"
     },
     pagination: {
       showing: "Showing {start}-{end} of {total}",
@@ -3081,8 +3102,15 @@ Build when you need.`,
     },
     create: {
       backToWorkforces: "Back to Workforces",
+      backToCreate: "Back to Create",
       title: "Create Workforce",
-      description: "Start with a manager, add workers, then review the orchestration before saving.",
+      description: "Pick the starting point that suits you best.",
+      modeSelect: {
+        aiTitle: "AI-assisted setup",
+        aiSubtitle: "Recommended",
+        manualTitle: "Manual setup",
+        manualSubtitle: "Full control",
+      },
       prompt: {
         badge: "AI setup",
         title: "Create Workforce",

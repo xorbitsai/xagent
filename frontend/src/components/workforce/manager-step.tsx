@@ -26,7 +26,7 @@ export function ManagerStep({
         <CardTitle>{t("workforces.fields.manager")}</CardTitle>
       </CardHeader>
       <CardContent className="space-y-3">
-        <Label>{t("workforces.create.manager.selectLabel")}</Label>
+        <Label>{t("workforces.create.manager.selectLabel")} <span className="text-destructive">*</span></Label>
         <Select
           value={managerAgentId}
           onValueChange={onManagerAgentIdChange}

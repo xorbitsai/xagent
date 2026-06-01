@@ -3064,14 +3064,35 @@ Build when you need.`,
       description: "创建由 manager 统筹的多 Agent 工作组，明确 worker 职责，并从统一入口运行。",
       searchPlaceholder: "搜索 Workforces...",
       emptyTitle: "还没有 Workforce",
-      emptyDescription: "先选择 manager agent，再添加几个 worker，之后可以回到这里发起协同运行。",
-      createFirst: "创建第一个 Workforce",
       manager: "Manager: {name}",
       workers: "Workers: {count}",
       lastUpdate: "最后更新: {value}",
       lastRun: "最近运行 #{runId} - {status}",
       lastRunWithTask: "最近运行 #{runId} - 任务 #{taskId} - {status}",
       noRuns: "还没有运行记录"
+    },
+    emptyState: {
+      title: "Workforce 是如何工作的",
+      description: "编排 Agent 团队，处理复杂的多步骤任务。Manager Agent 自动规划并将任务委派给子 Agent。",
+      features: {
+        managerAgent: {
+          title: "Manager Agent",
+          description: "理解目标并将工作委派给合适子 Agent 的主导 Agent。"
+        },
+        subAgents: {
+          title: "Sub-Agents",
+          description: "专注于各自任务的专用 Agent——调研、写作、数据处理等。"
+        },
+        parallelExecution: {
+          title: "并行执行",
+          description: "同时运行多个 Agent，更快完成复杂工作流。"
+        },
+        approvalGates: {
+          title: "审批节点",
+          description: "在任何 Agent 执行关键操作前要求人工审批。"
+        }
+      },
+      action: "+ 创建 Workforce"
     },
     pagination: {
       showing: "显示第 {start}-{end} 条，共 {total} 条",
@@ -3081,8 +3102,15 @@ Build when you need.`,
     },
     create: {
       backToWorkforces: "返回 Workforces",
+      backToCreate: "返回创建",
       title: "创建 Workforce",
-      description: "先选择管理者，再添加 worker，最后在保存前检查编排配置。",
+      description: "选择最适合你的创建方式。",
+      modeSelect: {
+        aiTitle: "AI 辅助创建",
+        aiSubtitle: "推荐",
+        manualTitle: "手动设置",
+        manualSubtitle: "完全掌控",
+      },
       prompt: {
         badge: "AI 创建",
         title: "创建 Workforce",

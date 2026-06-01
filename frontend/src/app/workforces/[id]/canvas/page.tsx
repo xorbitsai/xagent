@@ -9,6 +9,7 @@ import { useI18n } from "@/contexts/i18n-context"
 import { getWorkforceCanvas } from "@/lib/workforces-api"
 import type { WorkforceCanvasResponse } from "@/types/workforce"
 import { WorkforceCanvas } from "@/components/workforce"
+import { toast } from "sonner"
 
 export default function WorkforceCanvasPage() {
   const { t } = useI18n()
@@ -30,7 +31,9 @@ export default function WorkforceCanvasPage() {
         const data = await getWorkforceCanvas(id)
         setCanvas(data)
       } catch (err) {
-        setError(err instanceof Error ? err.message : t("workforces.errors.loadCanvas"))
+        const nextError = err instanceof Error ? err.message : t("workforces.errors.loadCanvas")
+        setError(nextError)
+        toast.error(nextError)
       } finally {
         setLoading(false)
       }
@@ -46,7 +49,7 @@ export default function WorkforceCanvasPage() {
 
   return (
     <div className="h-full overflow-y-auto">
-      <div className="mx-auto flex w-full max-w-7xl flex-col gap-4 p-4 sm:p-8">
+      <div className="mx-auto flex w-full flex-col gap-4 p-4 sm:p-8">
         <div>
           <Link href={backHref}>
             <Button variant="outline" size="sm">

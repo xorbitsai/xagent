@@ -7,6 +7,7 @@ import { getWorkforce } from "@/lib/workforces-api"
 import type { WorkforceDetail, WorkforceRunResponse } from "@/types/workforce"
 import { WorkforceSummary, WorkforceTestPanel } from "@/components/workforce"
 import { getRunDisabledReason } from "../../workforce-ui-state"
+import { toast } from "sonner"
 
 export default function WorkforceRunPage() {
   const { t } = useI18n()
@@ -29,7 +30,9 @@ export default function WorkforceRunPage() {
         const data = await getWorkforce(id)
         setWorkforce(data)
       } catch (err) {
-        setError(err instanceof Error ? err.message : t("workforces.errors.load"))
+        const nextError = err instanceof Error ? err.message : t("workforces.errors.load")
+        setError(nextError)
+        toast.error(nextError)
       } finally {
         setLoading(false)
       }
@@ -49,7 +52,7 @@ export default function WorkforceRunPage() {
 
   return (
     <div className="h-full overflow-y-auto">
-      <div className="mx-auto grid w-full max-w-7xl gap-6 p-4 sm:p-8 lg:grid-cols-[1.1fr_0.9fr]">
+      <div className="mx-auto grid w-full gap-6 p-4 sm:p-8 lg:grid-cols-[1.1fr_0.9fr]">
         <WorkforceSummary workforce={workforce} />
         <WorkforceTestPanel
           workforceId={workforce.id}

@@ -239,7 +239,6 @@ describe("workforce frontend core components", () => {
 
     render(
       <WorkforcePromptCreator
-        onManualSetup={vi.fn()}
         onCreated={onCreated}
       />,
     )

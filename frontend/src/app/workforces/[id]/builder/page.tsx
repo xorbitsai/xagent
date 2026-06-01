@@ -64,7 +64,9 @@ export default function WorkforceBuilderPage() {
         setWorkforce(workforceData)
         setMessages(historyData.items)
       } catch (err) {
-        setError(err instanceof Error ? err.message : t("workforces.errors.loadBuilder"))
+        const nextError = err instanceof Error ? err.message : t("workforces.errors.loadBuilder")
+        setError(nextError)
+        toast.error(nextError)
       } finally {
         setLoading(false)
       }
@@ -122,7 +124,7 @@ export default function WorkforceBuilderPage() {
 
   return (
     <div className="h-full overflow-y-auto">
-      <div className="mx-auto grid w-full max-w-[1600px] gap-6 p-4 sm:p-8 xl:grid-cols-[0.95fr_1.05fr_0.8fr]">
+      <div className="mx-auto grid w-full gap-6 p-4 sm:p-8 xl:grid-cols-[0.95fr_1.05fr_0.8fr]">
         <div className="min-h-[640px]">
           <WorkforceBuilderChat
             messages={messages}

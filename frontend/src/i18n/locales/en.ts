@@ -2478,7 +2478,7 @@ Build when you need.`,
               },
               guide: {
                 title: "Dual token mechanism explanation:",
-                accessToken: "Access Token: expires in 30 minutes, used for API calls",
+                accessToken: "Access Token: expires in 120 minutes, used for API calls",
                 refreshToken: "Refresh Token: expires in 7 days, used to refresh access token",
                 autoRefresh: "Auto refresh: refreshes 1 minute before access token expiry",
                 offlineRecovery: "Offline recovery: come back after hours and still auto restore login",

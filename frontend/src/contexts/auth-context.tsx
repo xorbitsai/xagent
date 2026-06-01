@@ -1,16 +1,21 @@
 "use client"
 
-import { createContext, useContext, useEffect, useState, ReactNode } from "react"
+import { createContext, useContext, useEffect, useRef, useState, ReactNode } from "react"
 import { getApiUrl } from "@/lib/utils"
 import { apiRequest } from "@/lib/api-wrapper"
-import { AUTH_CACHE_KEY, AUTH_TOKEN_UPDATED_EVENT } from "@/lib/auth-cache"
+import {
+  AUTH_CACHE_DURATION_MS,
+  AUTH_CACHE_KEY,
+  AUTH_TOKEN_UPDATED_EVENT,
+  AuthCacheUser,
+  clearStoredAuth,
+  LEGACY_AUTH_TOKEN_KEY,
+  LEGACY_AUTH_USER_KEY,
+  readAuthCache,
+  writeAuthCache,
+} from "@/lib/auth-cache"
 
-interface User {
-  id: string
-  username: string
-  email?: string | null
-  is_admin?: boolean
-}
+type User = AuthCacheUser
 
 interface AuthContextType {
   user: User | null
@@ -26,71 +31,20 @@ interface AuthContextType {
 
 const AuthContext = createContext<AuthContextType | undefined>(undefined)
 
-// Cache configuration
-const CACHE_DURATION = 120 * 60 * 1000 // 120 minutes
-
-interface AuthCache {
-  user: User | null
-  token: string | null
-  refreshToken: string | null
-  timestamp: number
-  expiresAt?: number  // access token expiration time
-  refreshExpiresAt?: number  // refresh token expiration time
-}
-
-function getAuthCache(): AuthCache | null {
-  try {
-    const cached = localStorage.getItem(AUTH_CACHE_KEY)
-    if (!cached) return null
-
-    const cache: AuthCache = JSON.parse(cached)
-    // Check if cache is expired
-    if (Date.now() - cache.timestamp > CACHE_DURATION) {
-      localStorage.removeItem(AUTH_CACHE_KEY)
-      return null
-    }
-
-    return cache
-  } catch {
-    return null
-  }
-}
-
-function setAuthCache(
-  user: User | null,
-  token: string | null,
-  refreshToken: string | null = null,
-  expiresIn?: number,  // access token expiration time (seconds)
-  refreshExpiresIn?: number  // refresh token expiration time (seconds)
-) {
-  const cache: AuthCache = {
-    user,
-    token,
-    refreshToken,
-    timestamp: Date.now(),
-    expiresAt: expiresIn ? Date.now() + expiresIn * 1000 : undefined,
-    refreshExpiresAt: refreshExpiresIn ? Date.now() + refreshExpiresIn * 1000 : undefined,
-  }
-  localStorage.setItem(AUTH_CACHE_KEY, JSON.stringify(cache))
-}
-
-function clearAuthCache() {
-  localStorage.removeItem(AUTH_CACHE_KEY)
-}
-
 export function AuthProvider({ children }: { children: ReactNode }) {
   const [user, setUser] = useState<User | null>(null)
   const [token, setToken] = useState<string | null>(null)
   const [refreshToken, setRefreshToken] = useState<string | null>(null)
   const [isLoading, setIsLoading] = useState(true)
   const [lastCheckTime, setLastCheckTime] = useState(0)
+  const refreshAccessTokenRef = useRef<() => Promise<boolean>>(async () => false)
 
   // Timer for active token refresh
   useEffect(() => {
     if (!token || !refreshToken) return
 
     const refreshInterval = setInterval(async () => {
-      const cache = getAuthCache()
+      const cache = readAuthCache()
       if (!cache) return
 
       if (cache.expiresAt) {
@@ -100,20 +54,24 @@ export function AuthProvider({ children }: { children: ReactNode }) {
 
         if (shouldRefresh) {
           console.log("Token is about to expire, refreshing actively...")
-          const success = await refreshAccessToken()
+          const success = await refreshAccessTokenRef.current()
           if (!success) {
             // Refresh failed, stop timer (will automatically redirect to login page)
             clearInterval(refreshInterval)
           }
         }
       } else {
-        // No expiration time info, use old logic
         const timeSinceCreation = Date.now() - cache.timestamp
-        const shouldRefresh = timeSinceCreation > (CACHE_DURATION - 5 * 60 * 1000) // 5 minutes in advance
+        const shouldRefreshAccess = timeSinceCreation > (AUTH_CACHE_DURATION_MS - 5 * 60 * 1000)
+        const timeUntilRefreshExpiry = cache.refreshExpiresAt
+          ? cache.refreshExpiresAt - Date.now()
+          : Number.POSITIVE_INFINITY
+        const shouldRefreshToken = timeUntilRefreshExpiry < 5 * 60 * 1000
+        const shouldRefresh = shouldRefreshAccess || shouldRefreshToken
 
         if (shouldRefresh) {
-          console.log("Token is about to expire (based on creation time), refreshing actively...")
-          const success = await refreshAccessToken()
+          console.log("Token cache is missing access expiry info, refreshing actively...")
+          const success = await refreshAccessTokenRef.current()
           if (!success) {
             clearInterval(refreshInterval)
           }
@@ -122,21 +80,21 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     }, 60000) // Check every minute
 
     return () => clearInterval(refreshInterval)
-  }, [token, refreshToken, user])
+  }, [token, refreshToken])
 
   // Check cache on initialization
   useEffect(() => {
     const timer = setTimeout(() => {
       // Try new cache format first
-      const cache = getAuthCache()
+      const cache = readAuthCache()
       if (cache && cache.user && cache.token) {
         setUser(cache.user)
         setToken(cache.token)
         setRefreshToken(cache.refreshToken)
       } else {
         // Fall back to old format for backward compatibility
-        const savedToken = localStorage.getItem("auth_token")
-        const savedUser = localStorage.getItem("auth_user")
+        const savedToken = localStorage.getItem(LEGACY_AUTH_TOKEN_KEY)
+        const savedUser = localStorage.getItem(LEGACY_AUTH_USER_KEY)
 
         if (savedToken && savedUser) {
           try {
@@ -145,12 +103,10 @@ export function AuthProvider({ children }: { children: ReactNode }) {
             setUser(userData)
 
             // Migrate to new cache format
-            setAuthCache(userData, savedToken)
+            writeAuthCache(userData, savedToken)
           } catch (error) {
             console.error("Failed to parse saved user data:", error)
-            // Clear invalid data
-            localStorage.removeItem("auth_token")
-            localStorage.removeItem("auth_user")
+            clearStoredAuth()
           }
         }
       }
@@ -206,7 +162,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
         setUser(userData)
 
         // Update cache
-        setAuthCache(
+        writeAuthCache(
           userData,
           data.access_token,
           data.refresh_token,
@@ -227,10 +183,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     setUser(null)
     setToken(null)
     setRefreshToken(null)
-    // Clear all auth-related data
-    localStorage.removeItem("auth_token")
-    localStorage.removeItem("auth_user")
-    clearAuthCache()
+    clearStoredAuth()
     window.location.href = "/login"
   }
 
@@ -270,7 +223,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
             setUser(null)
             setToken(null)
             setRefreshToken(null)
-            clearAuthCache()
+            clearStoredAuth()
             return false
           }
         }
@@ -281,7 +234,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       const data = await response.json()
       if (data.success === true) {
         // Auth success, sync update state (because apiRequest may have updated cache)
-        const updatedCache = getAuthCache()
+        const updatedCache = readAuthCache()
         if (updatedCache && updatedCache.token && updatedCache.user) {
           setToken(updatedCache.token)
           setUser(updatedCache.user)
@@ -319,7 +272,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
           }
 
           // Update cache with new tokens and expiration times
-          setAuthCache(
+          writeAuthCache(
             user,
             data.access_token,
             data.refresh_token || refreshToken,
@@ -337,6 +290,8 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     logout()
     return false
   }
+
+  refreshAccessTokenRef.current = refreshAccessToken
 
   const value: AuthContextType = {
     user,

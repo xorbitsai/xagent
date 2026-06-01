@@ -1,7 +1,15 @@
 "lib/api-wrapper"
 
 import { getApiUrl } from "@/lib/utils"
-import { AUTH_CACHE_KEY, AUTH_TOKEN_UPDATED_EVENT } from "@/lib/auth-cache"
+import {
+  AUTH_CACHE_KEY,
+  AUTH_TOKEN_UPDATED_EVENT,
+  clearStoredAuth,
+  LEGACY_AUTH_TOKEN_KEY,
+  readAuthCache,
+  syncLegacyAuthStorage,
+  writeAuthCache,
+} from "@/lib/auth-cache"
 
 let isRefreshing = false
 let refreshSubscribers: ((token: string) => void)[] = []
@@ -78,25 +86,17 @@ function notifyRefreshSubscribers(token: string) {
 // Get current tokens
 function getCurrentTokens(): { accessToken: string | null; refreshToken: string | null } {
   // Try new cache format first
-  const cache = localStorage.getItem(AUTH_CACHE_KEY)
-  if (cache) {
-    try {
-      const authCache = JSON.parse(cache)
-      return {
-        accessToken: authCache.token || null,
-        refreshToken: authCache.refreshToken || null,
-      }
-    } catch {
-      return {
-        accessToken: localStorage.getItem("auth_token"),
-        refreshToken: null,
-      }
+  const authCache = readAuthCache()
+  if (authCache) {
+    return {
+      accessToken: authCache.token || null,
+      refreshToken: authCache.refreshToken || null,
     }
   }
 
   // Fall back to old format
   return {
-    accessToken: localStorage.getItem("auth_token"),
+    accessToken: localStorage.getItem(LEGACY_AUTH_TOKEN_KEY),
     refreshToken: null,
   }
 }
@@ -118,30 +118,18 @@ async function refreshToken(): Promise<string | null> {
     if (response.ok) {
       const data = await response.json()
       if (data.success && data.access_token) {
-        // Update tokens in cache
-        const cache = localStorage.getItem(AUTH_CACHE_KEY)
-        if (cache) {
-          try {
-            const authCache = JSON.parse(cache)
-            authCache.token = data.access_token
-            if (data.expires_in) {
-              authCache.expiresAt = Date.now() + data.expires_in * 1000
-            }
-            if (data.refresh_token) {
-              authCache.refreshToken = data.refresh_token
-            }
-            if (data.refresh_expires_in) {
-              authCache.refreshExpiresAt = Date.now() + data.refresh_expires_in * 1000
-            }
-            authCache.timestamp = Date.now()  // Update timestamp
-            localStorage.setItem(AUTH_CACHE_KEY, JSON.stringify(authCache))
-          } catch {
-            // If parsing fails, use old format
-            localStorage.setItem("auth_token", data.access_token)
-          }
+        const authCache = readAuthCache()
+        if (authCache) {
+          writeAuthCache(
+            authCache.user,
+            data.access_token,
+            data.refresh_token || authCache.refreshToken,
+            data.expires_in ? data.expires_in : undefined,
+            data.refresh_expires_in ? data.refresh_expires_in : undefined
+          )
         } else {
           // Use old format
-          localStorage.setItem("auth_token", data.access_token)
+          syncLegacyAuthStorage(undefined, data.access_token)
         }
 
         // Trigger a storage event to notify AuthContext to update state
@@ -189,9 +177,7 @@ export async function apiRequest(
 
     if (!isExpired) {
       // Explicitly invalid token, redirect to login page directly
-      localStorage.removeItem("auth_token")
-      localStorage.removeItem("auth_user")
-      localStorage.removeItem(AUTH_CACHE_KEY)
+      clearStoredAuth()
       window.location.href = "/login"
       return response
     }
@@ -228,9 +214,7 @@ export async function apiRequest(
       } else {
         // Refresh failed, clear auth data and redirect to login page
         console.error("Token refresh failed, redirecting to login")
-        localStorage.removeItem("auth_token")
-        localStorage.removeItem("auth_user")
-        localStorage.removeItem(AUTH_CACHE_KEY)
+        clearStoredAuth()
         window.location.href = "/login"
       }
     } finally {
@@ -385,10 +369,7 @@ export const api = {
 // Check response status, if auth error redirect to login
 export function handleAuthError(response: Response) {
   if (response.status === 401) {
-    // Clear auth data and redirect to login page
-    localStorage.removeItem("auth_token")
-    localStorage.removeItem("auth_user")
-    localStorage.removeItem(AUTH_CACHE_KEY)
+    clearStoredAuth()
     window.location.href = "/login"
     return true
   }

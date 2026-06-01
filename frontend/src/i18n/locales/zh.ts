@@ -2478,7 +2478,7 @@ Build when you need.`,
               },
               guide: {
                 title: "双Token机制功能说明:",
-                accessToken: "Access Token: 30分钟过期，用于API调用",
+                accessToken: "Access Token: 120分钟过期，用于API调用",
                 refreshToken: "Refresh Token: 7天过期，用于刷新access token",
                 autoRefresh: "自动刷新: Access token过期前1分钟自动刷新",
                 offlineRecovery: "离线恢复: 离开几小时回来仍可自动恢复登录状态",

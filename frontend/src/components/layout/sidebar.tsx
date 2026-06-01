@@ -12,30 +12,26 @@ import { useApp } from "@/contexts/app-context-chat"
 import { ConfirmDialog } from "@/components/ui/confirm-dialog"
 import { getBrandingFromEnv } from "@/lib/branding"
 import { toast } from "@/components/ui/sonner"
+import extraNav from "@/lib/extra-nav"
 import {
-  Activity,
+  getNavigationGroupsForUser,
+  getUserMenuItemsForUser,
+  type NavigationItem,
+  type NavigationGroup,
+} from "@/lib/sidebar-navigation"
+import {
   FileText,
   LogOut,
   X,
   ChevronDown,
   ChevronRight,
   ChevronLeft,
-  Sparkles,
-  Settings,
-  Wrench,
-  Users,
-  Brain,
-  Server,
-  Layers,
   MessageSquare,
   Loader2,
   Trash2,
   CheckCircle2,
   XCircle,
   PauseCircle,
-  Bot,
-  Box,
-  LayoutTemplate,
   Info,
   Tag,
   Github,
@@ -43,7 +39,6 @@ import {
   MoreHorizontal,
   Edit2,
   Search,
-  Globe,
   ChevronsUpDown,
 } from "lucide-react"
 import {
@@ -54,6 +49,15 @@ import {
 import { Popover, PopoverTrigger, PopoverContent } from "@/components/ui/popover"
 
 import { useI18n } from "@/contexts/i18n-context"
+
+export {
+  getNavigationGroupsForUser,
+  getUserMenuItemsForUser,
+}
+export type {
+  NavigationGroup,
+  NavigationItem,
+}
 
 interface Task {
   task_id: string
@@ -84,162 +88,6 @@ function formatStars(stars: number): string {
   return String(stars)
 }
 
-export interface NavigationItem {
-  name: string
-  href: string
-  icon: any
-  color?: string
-  children?: NavigationItem[]
-  showTasks?: boolean
-  nameKey?: string
-}
-
-export interface NavigationGroup {
-  title: string
-  titleKey?: string
-  items: NavigationItem[]
-}
-
-const baseMoreResourceItems: NavigationItem[] = [
-  {
-    name: "Tools",
-    nameKey: "nav.tools",
-    href: "/tools",
-    icon: Wrench,
-    color: "text-blue-400"
-  },
-  {
-    name: "Files",
-    nameKey: "nav.files",
-    href: "/files",
-    icon: FileText,
-    color: "text-blue-400"
-  },
-  {
-    name: "Channels",
-    nameKey: "nav.channels",
-    href: "/channels",
-    icon: MessageSquare,
-    color: "text-blue-400"
-  },
-  {
-    name: "Monitoring",
-    nameKey: "nav.monitoring",
-    href: "/monitoring",
-    icon: Activity,
-    color: "text-blue-400"
-  }
-]
-
-const getMoreResourceItemsForUser = (user: any): NavigationItem[] => {
-  const items = [...baseMoreResourceItems]
-
-  if (user?.is_admin) {
-    items.push({
-      name: "User Management",
-      nameKey: "nav.userManagement",
-      href: "/users/",
-      icon: Users,
-      color: "text-blue-400"
-    })
-    items.push({
-      name: "Public MCP Apps",
-      nameKey: "nav.adminMcp",
-      href: "/admin-mcp/",
-      icon: Server,
-      color: "text-blue-400"
-    })
-  }
-
-  return items
-}
-
-export const getNavigationGroupsForUser = (user: any): NavigationGroup[] => [
-  {
-    title: "Agent Development",
-    titleKey: "nav.sections.agentDevelopment",
-    items: [
-      {
-        name: "Task",
-        nameKey: "nav.task",
-        href: "/task",
-        icon: Sparkles,
-        color: "text-blue-500"
-      },
-      {
-        name: "Agents",
-        nameKey: "nav.build",
-        href: "/build",
-        icon: Bot,
-        color: "text-yellow-400"
-      },
-      {
-        name: "Templates",
-        nameKey: "nav.templates",
-        href: "/templates",
-        icon: LayoutTemplate,
-        color: "text-purple-400"
-      },
-      {
-        name: "Workforces",
-        nameKey: "nav.workforces",
-        href: "/workforces",
-        icon: Layers,
-        color: "text-cyan-500"
-      },
-    ]
-  },
-  {
-    title: "Resources",
-    titleKey: "nav.sections.resources",
-    items: [
-      {
-        name: "Knowledge Base",
-        nameKey: "nav.knowledgeBase",
-        href: "/kb",
-        icon: Globe,
-        color: "text-gray-500"
-      },
-      {
-        name: "Models",
-        nameKey: "nav.models",
-        href: "/models",
-        icon: Box,
-        color: "text-gray-500"
-      },
-      {
-        name: "Memory",
-        nameKey: "nav.memory",
-        href: "/memory",
-        icon: Brain,
-        color: "text-gray-500"
-      },
-      {
-        name: "More",
-        nameKey: "nav.more",
-        href: "__resources_more__",
-        icon: Layers,
-        color: "text-gray-500",
-        children: getMoreResourceItemsForUser(user)
-      }
-    ]
-  }
-]
-
-const baseUserMenuItems: NavigationItem[] = [
-  {
-    name: "Settings",
-    nameKey: "nav.settings",
-    href: "/settings",
-    icon: Settings,
-    color: "text-blue-400"
-  }
-]
-
-export const getUserMenuItemsForUser = (_user: any): NavigationItem[] => {
-  return [...baseUserMenuItems]
-}
-
 interface SidebarProps {
   isCollapsible?: boolean
   className?: string
@@ -257,7 +105,7 @@ export function Sidebar({ className, allowCollapse = true }: SidebarProps) {
   const normalizedGithubUrl = githubUrl.replace(/\.git$/, "").replace(/\/$/, "")
   const githubRepoDisplay = normalizedGithubUrl.replace(/^https?:\/\/github\.com\//i, "")
   const licenseUrl = `${normalizedGithubUrl}/blob/main/LICENSE`
-  const navigationGroups = getNavigationGroupsForUser(user)
+  const navigationGroups = [...getNavigationGroupsForUser(user), ...extraNav]
   const [githubStars, setGithubStars] = useState<number | null>(null)
 
   const [taskToDelete, setTaskToDelete] = useState<string | null>(null)
@@ -721,7 +569,7 @@ export function Sidebar({ className, allowCollapse = true }: SidebarProps) {
 
   const isItemActive = (item: NavigationItem) => {
     if (item.children?.length) {
-      return item.children.some((child) => isPathActive(child.href))
+      return item.children.some((child: NavigationItem) => isPathActive(child.href))
     }
     return isPathActive(item.href)
   }
@@ -744,7 +592,7 @@ export function Sidebar({ className, allowCollapse = true }: SidebarProps) {
         </button>
         <div className="flex flex-col gap-2 w-full px-2">
           {navigationGroups.map((group) => (
-            group.items.map((item) => {
+            group.items.map((item: NavigationItem) => {
               const isActive = isItemActive(item)
               const hasChildren = item.children && item.children.length > 0
 
@@ -840,7 +688,7 @@ export function Sidebar({ className, allowCollapse = true }: SidebarProps) {
                 {group.titleKey ? t(group.titleKey) : group.title}
               </div>
               <div className="space-y-1">
-                {group.items.map((item) => {
+                {group.items.map((item: NavigationItem) => {
                   const isActive = isItemActive(item)
                   const hasChildren = item.children && item.children.length > 0
                   const isExpanded = isMenuExpanded(item.href)
@@ -876,7 +724,7 @@ export function Sidebar({ className, allowCollapse = true }: SidebarProps) {
                         </button>
                         {isExpanded && item.children && (
                           <div className="ml-4 mt-1 space-y-1 border-l border-border/40 pl-2">
-                            {item.children.map((child) => {
+                            {item.children.map((child: NavigationItem) => {
                               const isChildActive = pathname === child.href
                               return (
                                 <div key={child.href}>
@@ -1114,7 +962,7 @@ export function Sidebar({ className, allowCollapse = true }: SidebarProps) {
         {showUserMenu && (
           <div className="absolute bottom-full left-4 right-4 mb-2 bg-popover border border-border rounded-lg shadow-lg overflow-hidden animate-in fade-in zoom-in-95 duration-200 z-50">
             <div className="py-1">
-              {getUserMenuItemsForUser(user).map((item) => (
+              {getUserMenuItemsForUser(user).map((item: NavigationItem) => (
                 <Link
                   key={item.href}
                   href={item.href}

@@ -175,7 +175,12 @@ jobs:
         run: docker version
 
       - name: Pull MinIO image
-        run: docker pull quay.io/minio/minio
+        run: |
+          for i in 1 2 3; do
+            docker pull quay.io/minio/minio && break
+            echo "Attempt $i failed, retrying in 10s..."
+            sleep 10
+          done
 
       - name: Run e2e tests
         shell: bash

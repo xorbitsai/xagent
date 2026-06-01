@@ -89,6 +89,7 @@ _HTTP.headers.update(
 # Schemas — local
 # ──────────────────────────────────────────────────────────────────────
 
+
 class SkillSummary(BaseModel):
     """List-view payload for ``GET /installed``."""
 
@@ -130,6 +131,7 @@ class EditSkillRequest(BaseModel):
 # ──────────────────────────────────────────────────────────────────────
 # Schemas — registry (ClawHub proxy)
 # ──────────────────────────────────────────────────────────────────────
+
 
 class RegistrySkillSummary(BaseModel):
     """Card-view payload for a ClawHub skill. We forward only the
@@ -189,10 +191,11 @@ class RegistryStats(BaseModel):
     and sum up. Cached per-sort for a few minutes — the first call on
     a cold cache pays for the walk, subsequent calls return instantly.
     """
+
     sort: str
     total: int
-    walked_pages: int   # how many ClawHub pages we actually fetched
-    truncated: bool     # True if we hit the safety cap without exhausting cursors
+    walked_pages: int  # how many ClawHub pages we actually fetched
+    truncated: bool  # True if we hit the safety cap without exhausting cursors
 
 
 class FeaturedSkill(RegistrySkillSummary):
@@ -205,6 +208,7 @@ class FeaturedSkill(RegistrySkillSummary):
 # ──────────────────────────────────────────────────────────────────────
 # Helpers — local skill paths
 # ──────────────────────────────────────────────────────────────────────
+
 
 def _user_skills_root() -> Path:
     """The single writable skills directory we install into. Mirrors
@@ -244,8 +248,7 @@ def _validate_skill_name(name: str) -> None:
         raise HTTPException(
             status_code=400,
             detail=(
-                "Skill name must match [A-Za-z0-9_-]+ "
-                "(no spaces, slashes, or dots)."
+                "Skill name must match [A-Za-z0-9_-]+ (no spaces, slashes, or dots)."
             ),
         )
 
@@ -274,10 +277,12 @@ def _ensure_writable_target(name: str, *, allow_existing: bool = False) -> Path:
     return target
 
 
-async def _get_manager(request: Request):
+async def _get_manager(request: Request) -> Any:
     """Hand back the SkillManager singleton xagent put on app.state.
     All web/chat/agent paths share this instance; calling ``reload()``
-    on it after a write updates everyone."""
+    on it after a write updates everyone. Returns the live
+    SkillManager; typed as ``Any`` to keep the skills package out of
+    this module's import graph."""
     mgr = getattr(request.app.state, "skill_manager", None)
     if mgr is None:
         from xagent.skills.utils import create_skill_manager
@@ -316,6 +321,7 @@ def _skill_to_detail(skill_dict: dict) -> SkillDetail:
 # Helpers — ClawHub proxy
 # ──────────────────────────────────────────────────────────────────────
 
+
 def _clawhub_json(path: str, params: Optional[dict] = None) -> Any:
     """GET ``CLAWHUB_API/<path>`` and parse JSON. Translates upstream
     errors into HTTPExceptions with useful detail (never leaks raw
@@ -333,9 +339,7 @@ def _clawhub_json(path: str, params: Optional[dict] = None) -> Any:
     # accidental gigabyte-of-JSON-from-upstream DoS.
     raw = r.raw.read(_MAX_REGISTRY_BODY + 1, decode_content=True)
     if len(raw) > _MAX_REGISTRY_BODY:
-        raise HTTPException(
-            status_code=502, detail="ClawHub response too large."
-        )
+        raise HTTPException(status_code=502, detail="ClawHub response too large.")
     if r.status_code == 404:
         raise HTTPException(status_code=404, detail="Skill not found on ClawHub.")
     if r.status_code == 429:
@@ -356,7 +360,9 @@ def _clawhub_json(path: str, params: Optional[dict] = None) -> Any:
         ) from exc
 
 
-def _summary_from_registry_item(item: dict, installed_names: set[str]) -> RegistrySkillSummary:
+def _summary_from_registry_item(
+    item: dict, installed_names: set[str]
+) -> RegistrySkillSummary:
     """Normalize one item from ``/api/v1/skills`` or ``/api/v1/search``
     into our typed summary.
 
@@ -414,7 +420,7 @@ def _extract_scan_status(item: dict) -> Optional[str]:
     return None
 
 
-def _installed_slugs(mgr) -> set[str]:
+def _installed_slugs(mgr: Any) -> set[str]:
     """Names of skills currently in the SkillManager cache. ClawHub
     slugs and local skill dir names line up because we install to
     ``<user_root>/<slug>/``, so a string-equal check is enough."""
@@ -435,7 +441,9 @@ def _safe_extract_zip(zip_bytes: bytes, dest: Path) -> Path:
     try:
         zf = zipfile.ZipFile(io.BytesIO(zip_bytes))
     except zipfile.BadZipFile as exc:
-        raise HTTPException(status_code=502, detail="ClawHub returned a bad ZIP.") from exc
+        raise HTTPException(
+            status_code=502, detail="ClawHub returned a bad ZIP."
+        ) from exc
 
     dest_resolved = dest.resolve()
     # Pass 1: refuse if any entry escapes dest or is implausibly large.
@@ -445,7 +453,9 @@ def _safe_extract_zip(zip_bytes: bytes, dest: Path) -> Path:
             raise HTTPException(status_code=413, detail="Skill ZIP member too large.")
         total += info.file_size
         if total > _MAX_DOWNLOAD_BYTES:
-            raise HTTPException(status_code=413, detail="Skill ZIP exceeds size budget.")
+            raise HTTPException(
+                status_code=413, detail="Skill ZIP exceeds size budget."
+            )
         target = (dest / info.filename).resolve()
         try:
             target.relative_to(dest_resolved)
@@ -470,6 +480,7 @@ def _safe_extract_zip(zip_bytes: bytes, dest: Path) -> Path:
 # ──────────────────────────────────────────────────────────────────────
 # Routes — local skills (list / detail / delete)
 # ──────────────────────────────────────────────────────────────────────
+
 
 @router.get("/installed", response_model=List[SkillSummary])
 async def list_installed(
@@ -539,6 +550,7 @@ async def delete_installed(
 # Routes — in-UI authoring
 # ──────────────────────────────────────────────────────────────────────
 
+
 @router.post("/create", response_model=SkillSummary)
 async def create_skill(
     body: CreateSkillRequest,
@@ -570,7 +582,9 @@ async def create_skill(
                 "YAML frontmatter at the top of SKILL.md."
             ),
         )
-    logger.info("Skill Hub: created user skill %r (%d bytes)", body.name, len(body.skill_md))
+    logger.info(
+        "Skill Hub: created user skill %r (%d bytes)", body.name, len(body.skill_md)
+    )
     return _skill_to_summary(skill)
 
 
@@ -626,6 +640,7 @@ async def edit_installed(
 # Routes — ClawHub registry proxy + install
 # ──────────────────────────────────────────────────────────────────────
 
+
 @router.get("/registry/list", response_model=RegistryListResponse)
 async def registry_list(
     request: Request,
@@ -654,11 +669,19 @@ async def registry_list(
     items_raw = payload.get("items", []) if isinstance(payload, dict) else []
     mgr = await _get_manager(request)
     installed = _installed_slugs(mgr)
-    items = [_summary_from_registry_item(i, installed) for i in items_raw if isinstance(i, dict)]
+    items = [
+        _summary_from_registry_item(i, installed)
+        for i in items_raw
+        if isinstance(i, dict)
+    ]
     next_cursor = payload.get("nextCursor") if isinstance(payload, dict) else None
     logger.info(
         "Skill Hub: registry/list sort=%s limit=%d cursor=%s → %d item(s), more=%s",
-        sort, limit, "yes" if cursor else "none", len(items), "yes" if next_cursor else "no",
+        sort,
+        limit,
+        "yes" if cursor else "none",
+        len(items),
+        "yes" if next_cursor else "no",
     )
     return RegistryListResponse(items=items, nextCursor=next_cursor)
 
@@ -677,7 +700,11 @@ async def registry_search(
     results_raw = payload.get("results", []) if isinstance(payload, dict) else []
     mgr = await _get_manager(request)
     installed = _installed_slugs(mgr)
-    items = [_summary_from_registry_item(i, installed) for i in results_raw if isinstance(i, dict)]
+    items = [
+        _summary_from_registry_item(i, installed)
+        for i in results_raw
+        if isinstance(i, dict)
+    ]
     logger.info("Skill Hub: registry/search q=%r → %d result(s)", q[:50], len(items))
     return RegistryListResponse(items=items, nextCursor=None)
 
@@ -693,7 +720,9 @@ async def registry_detail(
     flat shape the UI can render directly."""
     payload = _clawhub_json(f"/skills/{slug}")
     if not isinstance(payload, dict):
-        raise HTTPException(status_code=502, detail="Unexpected ClawHub response shape.")
+        raise HTTPException(
+            status_code=502, detail="Unexpected ClawHub response shape."
+        )
     skill = payload.get("skill") or {}
     latest = payload.get("latestVersion") or {}
     moderation = payload.get("moderation")
@@ -705,7 +734,8 @@ async def registry_detail(
         displayName=str(skill.get("displayName") or skill.get("name") or slug),
         summary=str(skill.get("summary") or metadata.get("description") or ""),
         version=latest.get("version"),
-        ownerHandle=(payload.get("owner") or {}).get("handle") or skill.get("ownerHandle"),
+        ownerHandle=(payload.get("owner") or {}).get("handle")
+        or skill.get("ownerHandle"),
         homepage=metadata.get("homepage"),
         readme=metadata.get("readme") or latest.get("readme"),
         scanStatus=(latest.get("security") or {}).get("status"),
@@ -750,7 +780,9 @@ async def install_clawhub(
     # --- 2. Scan + moderation gate ---------------------------------
     detail = _clawhub_json(f"/skills/{body.slug}")
     if not isinstance(detail, dict):
-        raise HTTPException(status_code=502, detail="ClawHub detail had unexpected shape.")
+        raise HTTPException(
+            status_code=502, detail="ClawHub detail had unexpected shape."
+        )
     scan_status = _extract_scan_status(detail)
     moderation = detail.get("moderation") or {}
     moderation_state = (
@@ -785,7 +817,9 @@ async def install_clawhub(
             status_code=502, detail=f"ClawHub download failed: {exc}"
         ) from exc
     if dl.status_code == 404:
-        raise HTTPException(status_code=404, detail="ClawHub skill or version not found.")
+        raise HTTPException(
+            status_code=404, detail="ClawHub skill or version not found."
+        )
     if dl.status_code >= 400:
         raise HTTPException(
             status_code=502,
@@ -831,7 +865,9 @@ async def install_clawhub(
         )
     logger.info(
         "Skill Hub: installed ClawHub skill %r (v%s, scan=%s)",
-        body.slug, body.version or "latest", scan_status,
+        body.slug,
+        body.version or "latest",
+        scan_status,
     )
     return _skill_to_summary(skill)
 
@@ -843,7 +879,9 @@ async def install_clawhub(
 # Editorial list of slugs xagent recommends on the Discover tab,
 # alongside our reason for each. Sibling to this module — same dir as
 # api/, one level up to xagent_saas package root.
-_FEATURED_CONFIG_PATH = Path(__file__).resolve().parent.parent / "skill_hub_featured.json"
+_FEATURED_CONFIG_PATH = (
+    Path(__file__).resolve().parent.parent / "skill_hub_featured.json"
+)
 
 # Cheap in-memory cache: every request hitting /featured triggers N
 # ClawHub detail calls (one per slug). Cache the joined result for a
@@ -906,14 +944,19 @@ async def featured(
 
     now = time.time()
     cached = _FEATURED_CACHE.get("items")
-    if cached is not None and (now - _FEATURED_CACHE["fetched_at"]) < _FEATURED_TTL_SECONDS:
+    if (
+        cached is not None
+        and (now - _FEATURED_CACHE["fetched_at"]) < _FEATURED_TTL_SECONDS
+    ):
         # Hot path. Just refresh the installedAs marker from the
         # live SkillManager so newly-installed skills flip the badge
         # without waiting for the TTL.
         mgr = await _get_manager(request)
         installed = _installed_slugs(mgr)
         return [
-            FeaturedSkill(**{**it, "installedAs": it["slug"] if it["slug"] in installed else None})
+            FeaturedSkill(
+                **{**it, "installedAs": it["slug"] if it["slug"] in installed else None}
+            )
             for it in cached
         ]
 
@@ -925,7 +968,7 @@ async def featured(
     # ``asyncio.to_thread`` to run on the default executor and gather
     # the results. Total wall time becomes max(per-call) instead of
     # sum(per-call) — typically 500ms vs 3s.
-    async def _fetch(slug: str):
+    async def _fetch(slug: str) -> Optional[Dict[str, Any]]:
         try:
             return await asyncio.to_thread(_clawhub_json, f"/skills/{slug}")
         except HTTPException as exc:
@@ -942,23 +985,28 @@ async def featured(
         skill = detail.get("skill") or {}
         latest = detail.get("latestVersion") or {}
         stats = skill.get("stats") or {}
-        items.append({
-            "slug": slug,
-            "displayName": str(skill.get("displayName") or slug),
-            "summary": str(skill.get("summary") or ""),
-            "version": latest.get("version") or (skill.get("tags") or {}).get("latest"),
-            "ownerHandle": (detail.get("owner") or {}).get("handle"),
-            "installs": stats.get("installsCurrent"),
-            "updatedAt": skill.get("updatedAt"),
-            "scanStatus": _extract_scan_status(detail),
-            "installedAs": None,  # filled per-request from live manager
-            "featuredReason": entry["reason"],
-        })
+        items.append(
+            {
+                "slug": slug,
+                "displayName": str(skill.get("displayName") or slug),
+                "summary": str(skill.get("summary") or ""),
+                "version": latest.get("version")
+                or (skill.get("tags") or {}).get("latest"),
+                "ownerHandle": (detail.get("owner") or {}).get("handle"),
+                "installs": stats.get("installsCurrent"),
+                "updatedAt": skill.get("updatedAt"),
+                "scanStatus": _extract_scan_status(detail),
+                "installedAs": None,  # filled per-request from live manager
+                "featuredReason": entry["reason"],
+            }
+        )
 
     _FEATURED_CACHE["items"] = items
     _FEATURED_CACHE["fetched_at"] = now
     return [
-        FeaturedSkill(**{**it, "installedAs": it["slug"] if it["slug"] in installed else None})
+        FeaturedSkill(
+            **{**it, "installedAs": it["slug"] if it["slug"] in installed else None}
+        )
         for it in items
     ]
 
@@ -1028,7 +1076,10 @@ def _fill_stats_cache(sort: str) -> Dict[str, Any]:
             logger.warning(
                 "Skill Hub: stats walk for sort=%s aborted at page %d (%s); "
                 "returning partial total %d",
-                sort, pages, exc.detail, total,
+                sort,
+                pages,
+                exc.detail,
+                total,
             )
             truncated = True
             break
@@ -1053,7 +1104,10 @@ def _fill_stats_cache(sort: str) -> Dict[str, Any]:
     _STATS_CACHE[sort] = entry
     logger.info(
         "Skill Hub: stats cache filled sort=%s → %d skill(s) across %d page(s)%s",
-        sort, total, pages, " (truncated)" if truncated else "",
+        sort,
+        total,
+        pages,
+        " (truncated)" if truncated else "",
     )
     return entry
 
@@ -1121,15 +1175,17 @@ async def prewarm() -> None:
     logger.info("Skill Hub: starting prewarm…")
     t0 = time.time()
 
-    async def _warm_featured():
+    async def _warm_featured() -> None:
         config = _load_featured_config()
         if not config:
             return
-        async def _fetch_one(slug: str):
+
+        async def _fetch_one(slug: str) -> Optional[Dict[str, Any]]:
             try:
                 return await asyncio.to_thread(_clawhub_json, f"/skills/{slug}")
             except HTTPException:
                 return None
+
         details = await asyncio.gather(*[_fetch_one(e["slug"]) for e in config])
         items: list[dict] = []
         for entry, detail in zip(config, details):
@@ -1138,22 +1194,25 @@ async def prewarm() -> None:
             skill = detail.get("skill") or {}
             latest = detail.get("latestVersion") or {}
             stats = skill.get("stats") or {}
-            items.append({
-                "slug": entry["slug"],
-                "displayName": str(skill.get("displayName") or entry["slug"]),
-                "summary": str(skill.get("summary") or ""),
-                "version": latest.get("version") or (skill.get("tags") or {}).get("latest"),
-                "ownerHandle": (detail.get("owner") or {}).get("handle"),
-                "installs": stats.get("installsCurrent"),
-                "updatedAt": skill.get("updatedAt"),
-                "scanStatus": _extract_scan_status(detail),
-                "installedAs": None,
-                "featuredReason": entry["reason"],
-            })
+            items.append(
+                {
+                    "slug": entry["slug"],
+                    "displayName": str(skill.get("displayName") or entry["slug"]),
+                    "summary": str(skill.get("summary") or ""),
+                    "version": latest.get("version")
+                    or (skill.get("tags") or {}).get("latest"),
+                    "ownerHandle": (detail.get("owner") or {}).get("handle"),
+                    "installs": stats.get("installsCurrent"),
+                    "updatedAt": skill.get("updatedAt"),
+                    "scanStatus": _extract_scan_status(detail),
+                    "installedAs": None,
+                    "featuredReason": entry["reason"],
+                }
+            )
         _FEATURED_CACHE["items"] = items
         _FEATURED_CACHE["fetched_at"] = time.time()
 
-    async def _warm_stats(sort: str):
+    async def _warm_stats(sort: str) -> None:
         try:
             await asyncio.to_thread(_fill_stats_cache, sort)
         except Exception as exc:

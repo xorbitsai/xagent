@@ -96,7 +96,7 @@ def run_minio_storage(monkeypatch: pytest.MonkeyPatch) -> Iterator[MinioStorage]
         container_name = f"xagent-minio-e2e-{uuid4().hex[:12]}"
         try:
             container = client.containers.run(
-                "quay.io/minio/minio",
+                "minio/minio",  # Docker Hub — more reliable than quay.io
                 "server /data --console-address :9001",
                 detach=True,
                 name=container_name,

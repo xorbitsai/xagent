@@ -326,35 +326,44 @@ def _skill_to_detail(skill_dict: dict) -> SkillDetail:
 def _clawhub_json(path: str, params: Optional[dict] = None) -> Any:
     """GET ``CLAWHUB_API/<path>`` and parse JSON. Translates upstream
     errors into HTTPExceptions with useful detail (never leaks raw
-    upstream bodies — those can contain hostile content)."""
+    upstream bodies — those can contain hostile content).
+
+    Synchronous on purpose: the response body is consumed via
+    ``r.raw.read`` so we get a hard cap on size, but that means
+    callers in async routes must wrap in ``asyncio.to_thread`` to
+    avoid blocking the event loop. The ``with`` block ensures the
+    streaming connection is returned to the pool even if the read
+    raises mid-body.
+    """
     url = f"{CLAWHUB_API}{path}"
     try:
-        r = _HTTP.get(url, params=params or {}, timeout=15, stream=True)
+        with _HTTP.get(url, params=params or {}, timeout=15, stream=True) as r:
+            status_code = r.status_code
+            # Don't fully consume oversized bodies — guard against an
+            # accidental gigabyte-of-JSON-from-upstream DoS.
+            raw = r.raw.read(_MAX_REGISTRY_BODY + 1, decode_content=True)
     except requests.RequestException as exc:
         raise HTTPException(
             status_code=502,
             detail=f"ClawHub unreachable: {exc}",
         ) from exc
 
-    # Don't fully consume oversized bodies — guard against an
-    # accidental gigabyte-of-JSON-from-upstream DoS.
-    raw = r.raw.read(_MAX_REGISTRY_BODY + 1, decode_content=True)
     if len(raw) > _MAX_REGISTRY_BODY:
         raise HTTPException(status_code=502, detail="ClawHub response too large.")
-    if r.status_code == 404:
+    if status_code == 404:
         raise HTTPException(status_code=404, detail="Skill not found on ClawHub.")
-    if r.status_code == 429:
+    if status_code == 429:
         raise HTTPException(
             status_code=429,
             detail="ClawHub rate limit hit. Try again in a moment.",
         )
-    if r.status_code >= 400:
+    if status_code >= 400:
         raise HTTPException(
             status_code=502,
-            detail=f"ClawHub returned HTTP {r.status_code}.",
+            detail=f"ClawHub returned HTTP {status_code}.",
         )
     try:
-        return r.json() if not raw else __import__("json").loads(raw.decode("utf-8"))
+        return json.loads(raw.decode("utf-8"))
     except Exception as exc:
         raise HTTPException(
             status_code=502, detail=f"Could not parse ClawHub JSON: {exc}"
@@ -670,7 +679,10 @@ async def registry_list(
     params = {"sort": sort, "limit": limit}
     if cursor:
         params["cursor"] = cursor
-    payload = _clawhub_json("/skills", params)
+    # ``_clawhub_json`` does synchronous network I/O via requests; run
+    # it on a worker thread so we don't block the event loop while
+    # ClawHub responds.
+    payload = await asyncio.to_thread(_clawhub_json, "/skills", params)
     items_raw = payload.get("items", []) if isinstance(payload, dict) else []
     mgr = await _get_manager(request)
     installed = _installed_slugs(mgr)
@@ -701,7 +713,7 @@ async def registry_search(
     """Full-text search ClawHub. Same response shape as ``/list``.
     See ``registry_list`` for why ``nonSuspiciousOnly`` is omitted."""
     params = {"q": q, "limit": limit}
-    payload = _clawhub_json("/search", params)
+    payload = await asyncio.to_thread(_clawhub_json, "/search", params)
     results_raw = payload.get("results", []) if isinstance(payload, dict) else []
     mgr = await _get_manager(request)
     installed = _installed_slugs(mgr)
@@ -723,7 +735,7 @@ async def registry_detail(
     """Single-skill detail from ClawHub. Bundles whatever upstream
     exposes (skill / latestVersion / metadata / moderation) into a
     flat shape the UI can render directly."""
-    payload = _clawhub_json(f"/skills/{slug}")
+    payload = await asyncio.to_thread(_clawhub_json, f"/skills/{slug}")
     if not isinstance(payload, dict):
         raise HTTPException(
             status_code=502, detail="Unexpected ClawHub response shape."
@@ -783,7 +795,7 @@ async def install_clawhub(
     target = _ensure_writable_target(body.slug)
 
     # --- 2. Scan + moderation gate ---------------------------------
-    detail = _clawhub_json(f"/skills/{body.slug}")
+    detail = await asyncio.to_thread(_clawhub_json, f"/skills/{body.slug}")
     if not isinstance(detail, dict):
         raise HTTPException(
             status_code=502, detail="ClawHub detail had unexpected shape."
@@ -810,27 +822,40 @@ async def install_clawhub(
     dl_params = {"slug": body.slug}
     if body.version:
         dl_params["version"] = body.version
-    try:
-        dl = _HTTP.get(
-            f"{CLAWHUB_API}/download",
-            params=dl_params,
-            timeout=60,
-            stream=True,
-        )
-    except requests.RequestException as exc:
-        raise HTTPException(
-            status_code=502, detail=f"ClawHub download failed: {exc}"
-        ) from exc
-    if dl.status_code == 404:
+
+    def _download() -> tuple[int, bytes]:
+        """Synchronous download wrapped in a helper so we can hand it
+        to ``asyncio.to_thread``. The ``with`` block guarantees the
+        streaming connection is released back to the pool even on
+        size-cap or read errors."""
+        try:
+            with _HTTP.get(
+                f"{CLAWHUB_API}/download",
+                params=dl_params,
+                timeout=60,
+                stream=True,
+            ) as dl:
+                dl_status = dl.status_code
+                if dl_status >= 400:
+                    return dl_status, b""
+                return dl_status, dl.raw.read(
+                    _MAX_DOWNLOAD_BYTES + 1, decode_content=True
+                )
+        except requests.RequestException as exc:
+            raise HTTPException(
+                status_code=502, detail=f"ClawHub download failed: {exc}"
+            ) from exc
+
+    dl_status, zip_bytes = await asyncio.to_thread(_download)
+    if dl_status == 404:
         raise HTTPException(
             status_code=404, detail="ClawHub skill or version not found."
         )
-    if dl.status_code >= 400:
+    if dl_status >= 400:
         raise HTTPException(
             status_code=502,
-            detail=f"ClawHub /download returned HTTP {dl.status_code}.",
+            detail=f"ClawHub /download returned HTTP {dl_status}.",
         )
-    zip_bytes = dl.raw.read(_MAX_DOWNLOAD_BYTES + 1, decode_content=True)
     if len(zip_bytes) > _MAX_DOWNLOAD_BYTES:
         raise HTTPException(status_code=413, detail="ClawHub artifact too large.")
 

@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import { useCallback, useEffect, useState } from "react";
 import { useParams, useRouter } from "next/navigation";
 import Link from "next/link";
 import {
@@ -62,7 +62,7 @@ export default function SkillDetailPage() {
   // Drives the ConfirmDialog. ``true`` = dialog open.
   const [confirmRemove, setConfirmRemove] = useState(false);
 
-  const loadSkill = async () => {
+  const loadSkill = useCallback(async () => {
     if (!params?.name) return;
     try {
       const res = await apiRequest(
@@ -80,12 +80,11 @@ export default function SkillDetailPage() {
     } finally {
       setLoading(false);
     }
-  };
+  }, [params?.name, apiBase]);
 
   useEffect(() => {
     loadSkill();
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [params?.name, apiBase]);
+  }, [loadSkill]);
 
   const startEdit = () => {
     if (!skill) return;

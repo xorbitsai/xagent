@@ -46,7 +46,8 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 import requests
-from fastapi import APIRouter, Depends, HTTPException, Query, Request
+from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
+from fastapi.responses import Response
 from pydantic import BaseModel, Field
 
 from xagent.web.auth_dependencies import get_current_user
@@ -510,12 +511,16 @@ async def get_installed(
     return _skill_to_detail(skill)
 
 
-@router.delete("/installed/{name}", status_code=204)
+@router.delete(
+    "/installed/{name}",
+    status_code=status.HTTP_204_NO_CONTENT,
+    response_class=Response,
+)
 async def delete_installed(
     name: str,
     request: Request,
     _user: User = Depends(get_current_user),
-) -> None:
+) -> Response:
     """Remove a user-installed skill. Builtin / external are refused."""
     mgr = await _get_manager(request)
     skill = await mgr.get_skill(name)
@@ -543,7 +548,7 @@ async def delete_installed(
     shutil.rmtree(path, ignore_errors=False)
     await mgr.reload()
     logger.info("Skill Hub: deleted user skill %r", name)
-    return None
+    return Response(status_code=status.HTTP_204_NO_CONTENT)
 
 
 # ──────────────────────────────────────────────────────────────────────

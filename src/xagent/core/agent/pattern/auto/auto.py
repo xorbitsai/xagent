@@ -1001,9 +1001,10 @@ class AutoPattern(AgentPattern):
                         "answer": {
                             "type": "string",
                             "description": (
-                                "Mandatory when action is final_answer: complete "
-                                "non-empty final response to the user. Leave unset "
-                                f"for react or plan_execute. {final_answer_language_rule()}"
+                                "Required for every decision. When action is "
+                                "final_answer, provide the complete non-empty final "
+                                "response to the user. Use an empty string for react "
+                                f"or plan_execute. {final_answer_language_rule()}"
                             ),
                         },
                         "requires_current_or_external_facts": {
@@ -1046,6 +1047,7 @@ class AutoPattern(AgentPattern):
                         "action",
                         "reason",
                         "response_language",
+                        "answer",
                         "requires_current_or_external_facts",
                         "existing_context_sufficient",
                         "evidence_basis",

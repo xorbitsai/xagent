@@ -497,8 +497,23 @@ class XinferenceLLM(BaseLLM):
         if tool_calls:
             for tool_call in tool_calls:
                 call_id = tool_call.get("id")
+                index = tool_call.get("index")
+                if not call_id and isinstance(index, int):
+                    for (
+                        existing_id,
+                        existing_tool_call,
+                    ) in accumulated_tool_calls.items():
+                        if existing_tool_call.get("index") == index:
+                            call_id = existing_id
+                            break
+                if not call_id and len(accumulated_tool_calls) == 1:
+                    call_id = next(iter(accumulated_tool_calls.keys()))
+                if not call_id:
+                    continue
+
                 if call_id and call_id not in accumulated_tool_calls:
                     accumulated_tool_calls[call_id] = {
+                        "index": index if isinstance(index, int) else None,
                         "id": call_id,
                         "type": tool_call.get("type", "function"),
                         "function": {
@@ -506,17 +521,20 @@ class XinferenceLLM(BaseLLM):
                             "arguments": "",
                         },
                     }
+                elif isinstance(index, int):
+                    accumulated_tool_calls[call_id]["index"] = index
 
-                if call_id:
-                    function = tool_call.get("function", {})
-                    if function.get("name"):
-                        accumulated_tool_calls[call_id]["function"]["name"] = function[
-                            "name"
-                        ]
-                    if function.get("arguments"):
-                        accumulated_tool_calls[call_id]["function"]["arguments"] += (
-                            function["arguments"]
-                        )
+                if tool_call.get("type"):
+                    accumulated_tool_calls[call_id]["type"] = tool_call["type"]
+                function = tool_call.get("function", {})
+                if function.get("name"):
+                    accumulated_tool_calls[call_id]["function"]["name"] = function[
+                        "name"
+                    ]
+                if "arguments" in function:
+                    accumulated_tool_calls[call_id]["function"]["arguments"] += (
+                        function.get("arguments") or ""
+                    )
 
             # Return accumulated tool calls
             tool_calls_list = list(accumulated_tool_calls.values())

@@ -602,8 +602,12 @@ async def test_auto_pattern_final_answer_completes_without_child_pattern() -> No
     assert "do not use generic Chinese" in response_language_schema["description"]
     assert "Output language policy" in response_language_schema["description"]
     assert "response_language" in tool_schema["parameters"]["required"]
+    assert "answer" in tool_schema["parameters"]["required"]
     answer_schema = tool_schema["parameters"]["properties"]["answer"]
-    assert "Mandatory when action is final_answer" in answer_schema["description"]
+    assert "Required for every decision" in answer_schema["description"]
+    assert (
+        "Use an empty string for react or plan_execute" in answer_schema["description"]
+    )
     assert runtime.last_checkpoint is not None
     assert runtime.last_checkpoint["pattern"] == "AutoPattern"
     assert (

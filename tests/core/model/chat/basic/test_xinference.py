@@ -3,9 +3,89 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from xagent.core.model.chat.basic.xinference import XinferenceLLM
+from xagent.core.model.chat.types import ChunkType
 
 
 class TestXinferenceLLM:
+    def test_parse_stream_chunk_accumulates_tool_arguments_by_index(self) -> None:
+        llm = XinferenceLLM(model_name="qwen3.5")
+        accumulated_tool_calls: dict[str, dict] = {}
+
+        first_chunk = llm._parse_stream_chunk(
+            {
+                "choices": [
+                    {
+                        "delta": {
+                            "tool_calls": [
+                                {
+                                    "index": 0,
+                                    "id": "call_1",
+                                    "type": "function",
+                                    "function": {
+                                        "name": "auto_decision",
+                                        "arguments": "{",
+                                    },
+                                }
+                            ]
+                        },
+                        "finish_reason": None,
+                    }
+                ]
+            },
+            accumulated_tool_calls,
+        )
+        second_chunk = llm._parse_stream_chunk(
+            {
+                "choices": [
+                    {
+                        "delta": {
+                            "tool_calls": [
+                                {
+                                    "index": 0,
+                                    "function": {
+                                        "arguments": '"action":"react"}',
+                                    },
+                                }
+                            ]
+                        },
+                        "finish_reason": None,
+                    }
+                ]
+            },
+            accumulated_tool_calls,
+        )
+        final_chunk = llm._parse_stream_chunk(
+            {
+                "choices": [
+                    {
+                        "delta": {"content": ""},
+                        "finish_reason": "tool_calls",
+                    }
+                ]
+            },
+            accumulated_tool_calls,
+        )
+
+        assert first_chunk is not None
+        assert first_chunk.type == ChunkType.TOOL_CALL
+        assert second_chunk is not None
+        assert second_chunk.tool_calls[0]["function"]["arguments"] == (
+            '{"action":"react"}'
+        )
+        assert final_chunk is not None
+        assert final_chunk.finish_reason == "tool_calls"
+        assert final_chunk.tool_calls == [
+            {
+                "index": 0,
+                "id": "call_1",
+                "type": "function",
+                "function": {
+                    "name": "auto_decision",
+                    "arguments": '{"action":"react"}',
+                },
+            }
+        ]
+
     @pytest.mark.asyncio
     @patch("xagent.core.model.chat.basic.xinference.XinferenceClient")
     async def test_list_available_models_handles_dict_response(

@@ -507,7 +507,14 @@ class XinferenceLLM(BaseLLM):
                             call_id = existing_id
                             break
                 if not call_id and len(accumulated_tool_calls) == 1:
-                    call_id = next(iter(accumulated_tool_calls.keys()))
+                    existing_id, existing_tool_call = next(
+                        iter(accumulated_tool_calls.items())
+                    )
+                    existing_index = existing_tool_call.get("index")
+                    if not isinstance(index, int) or (
+                        isinstance(existing_index, int) and existing_index == index
+                    ):
+                        call_id = existing_id
                 if not call_id:
                     continue
 
@@ -526,7 +533,7 @@ class XinferenceLLM(BaseLLM):
 
                 if tool_call.get("type"):
                     accumulated_tool_calls[call_id]["type"] = tool_call["type"]
-                function = tool_call.get("function", {})
+                function = tool_call.get("function") or {}
                 if function.get("name"):
                     accumulated_tool_calls[call_id]["function"]["name"] = function[
                         "name"

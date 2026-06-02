@@ -86,6 +86,108 @@ class TestXinferenceLLM:
             }
         ]
 
+    def test_parse_stream_chunk_does_not_merge_mismatched_tool_call_index(
+        self,
+    ) -> None:
+        llm = XinferenceLLM(model_name="qwen3.5")
+        accumulated_tool_calls: dict[str, dict] = {}
+
+        llm._parse_stream_chunk(
+            {
+                "choices": [
+                    {
+                        "delta": {
+                            "tool_calls": [
+                                {
+                                    "index": 0,
+                                    "id": "call_1",
+                                    "type": "function",
+                                    "function": {
+                                        "name": "auto_decision",
+                                        "arguments": "{",
+                                    },
+                                }
+                            ]
+                        },
+                        "finish_reason": None,
+                    }
+                ]
+            },
+            accumulated_tool_calls,
+        )
+
+        chunk = llm._parse_stream_chunk(
+            {
+                "choices": [
+                    {
+                        "delta": {
+                            "tool_calls": [
+                                {
+                                    "index": 1,
+                                    "function": {
+                                        "arguments": '"action":"react"}',
+                                    },
+                                }
+                            ]
+                        },
+                        "finish_reason": None,
+                    }
+                ]
+            },
+            accumulated_tool_calls,
+        )
+
+        assert chunk is not None
+        assert chunk.tool_calls == [
+            {
+                "index": 0,
+                "id": "call_1",
+                "type": "function",
+                "function": {
+                    "name": "auto_decision",
+                    "arguments": "{",
+                },
+            }
+        ]
+
+    def test_parse_stream_chunk_handles_null_tool_call_function(self) -> None:
+        llm = XinferenceLLM(model_name="qwen3.5")
+        accumulated_tool_calls: dict[str, dict] = {}
+
+        chunk = llm._parse_stream_chunk(
+            {
+                "choices": [
+                    {
+                        "delta": {
+                            "tool_calls": [
+                                {
+                                    "index": 0,
+                                    "id": "call_1",
+                                    "type": "function",
+                                    "function": None,
+                                }
+                            ]
+                        },
+                        "finish_reason": None,
+                    }
+                ]
+            },
+            accumulated_tool_calls,
+        )
+
+        assert chunk is not None
+        assert chunk.tool_calls == [
+            {
+                "index": 0,
+                "id": "call_1",
+                "type": "function",
+                "function": {
+                    "name": "",
+                    "arguments": "",
+                },
+            }
+        ]
+
     @pytest.mark.asyncio
     @patch("xagent.core.model.chat.basic.xinference.XinferenceClient")
     async def test_list_available_models_handles_dict_response(

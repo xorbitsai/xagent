@@ -5,6 +5,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest"
 const apiRequestMock = vi.hoisted(() => vi.fn())
 const openFilePreviewMock = vi.hoisted(() => vi.fn())
 const routerPushMock = vi.hoisted(() => vi.fn())
+const resetMentionMock = vi.hoisted(() => vi.fn())
 
 vi.mock("@/lib/api-wrapper", async () => {
   const actual = await vi.importActual<typeof import("@/lib/api-wrapper")>(
@@ -50,6 +51,7 @@ vi.mock("@/hooks/use-file-mention", () => ({
     handleKeyDown: vi.fn(() => false),
     insertFile: vi.fn(),
     isLoadingFiles: false,
+    resetMention: resetMentionMock,
     selectedFileIndex: 0,
     showFilePicker: false,
   }),
@@ -76,6 +78,7 @@ describe("ChatInput", () => {
     apiRequestMock.mockImplementation(() => Promise.resolve(emptyJsonResponse()))
     openFilePreviewMock.mockReset()
     routerPushMock.mockReset()
+    resetMentionMock.mockReset()
   })
 
   afterEach(() => {
@@ -124,6 +127,7 @@ describe("ChatInput", () => {
         expect.objectContaining({ model: "" })
       )
     })
+    expect(resetMentionMock).toHaveBeenCalledTimes(1)
     expect(screen.queryByText("chatPage.input.noModelAlert")).not.toBeInTheDocument()
   })
 

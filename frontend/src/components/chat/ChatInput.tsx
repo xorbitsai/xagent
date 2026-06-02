@@ -529,6 +529,7 @@ export function ChatInput({
       };
 
       await onSend(messageToSend, configToSend);
+      fileMention.resetMention();
 
       if (isControlled) {
         onInputChange?.("");

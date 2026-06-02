@@ -29,6 +29,22 @@ export function useFileMention(
   const [isLoadingFiles, setIsLoadingFiles] = useState(false);
   const [dropdownPosition, setDropdownPosition] = useState<{ top?: number; bottom?: number; left: number } | null>(null);
 
+  const getFilteredFiles = (query: string, files: FileItem[]) => {
+    const lowerQuery = query.toLowerCase();
+    return files.filter((file) =>
+      file.filename.toLowerCase().includes(lowerQuery) ||
+      (file.relative_path && file.relative_path.toLowerCase().includes(lowerQuery))
+    );
+  };
+
+  const resetMention = () => {
+    setShowFilePicker(false);
+    setFilteredFiles([]);
+    setSelectedFileIndex(0);
+    setCurrentQuery("");
+    setDropdownPosition(null);
+  };
+
   const fetchFiles = async () => {
     if (fileList.length > 0) return;
     setIsLoadingFiles(true);
@@ -50,7 +66,10 @@ export function useFileMention(
 
   const checkTrigger = () => {
     const selection = window.getSelection();
-    if (!selection || !selection.rangeCount) return;
+    if (!selection || !selection.rangeCount) {
+      resetMention();
+      return;
+    }
 
     const range = selection.getRangeAt(0);
     const node = range.startContainer;
@@ -64,9 +83,21 @@ export function useFileMention(
       if (lastAt !== -1) {
         const query = textBefore.slice(lastAt + 1);
         if (!query.includes(' ') && !query.includes('\n')) {
+          const filtered = getFilteredFiles(query, fileList);
+          const shouldShowPicker = query.length === 0 || fileList.length === 0 || filtered.length > 0;
+
           setCurrentQuery(query);
-          setShowFilePicker(true);
           fetchFiles();
+
+          if (!shouldShowPicker) {
+            setShowFilePicker(false);
+            setFilteredFiles([]);
+            setSelectedFileIndex(0);
+            setDropdownPosition(null);
+            return;
+          }
+
+          setShowFilePicker(true);
 
           // Calculate position based on the '@' symbol, not the end of the query
           const atRange = document.createRange();
@@ -95,11 +126,6 @@ export function useFileMention(
             setDropdownPosition(pos);
           }
 
-          const lowerQuery = query.toLowerCase();
-          const filtered = fileList.filter(f =>
-            (f.filename.toLowerCase().includes(lowerQuery) ||
-             (f.relative_path && f.relative_path.toLowerCase().includes(lowerQuery)))
-          );
           setFilteredFiles(filtered);
           setSelectedFileIndex(0);
           return;
@@ -107,19 +133,24 @@ export function useFileMention(
       }
     }
 
-    setShowFilePicker(false);
-    setCurrentQuery("");
+    resetMention();
   };
 
   useEffect(() => {
-    if (showFilePicker && fileList.length > 0) {
-       const lowerQuery = currentQuery.toLowerCase();
-       const filtered = fileList.filter(f =>
-          (f.filename.toLowerCase().includes(lowerQuery) ||
-           (f.relative_path && f.relative_path.toLowerCase().includes(lowerQuery)))
-        );
-        setFilteredFiles(filtered);
+    if (!showFilePicker || fileList.length === 0) {
+      return;
     }
+
+    const filtered = getFilteredFiles(currentQuery, fileList);
+    if (currentQuery.length > 0 && filtered.length === 0) {
+      setShowFilePicker(false);
+      setFilteredFiles([]);
+      setSelectedFileIndex(0);
+      setDropdownPosition(null);
+      return;
+    }
+
+    setFilteredFiles(filtered);
   }, [fileList, showFilePicker, currentQuery]);
 
   const moveCursorToEnd = () => {
@@ -171,8 +202,7 @@ export function useFileMention(
       moveCursorToEnd();
     }
 
-    setShowFilePicker(false);
-    setCurrentQuery("");
+    resetMention();
     onInput();
   };
 
@@ -197,7 +227,7 @@ export function useFileMention(
       }
       if (e.key === "Escape") {
         e.preventDefault();
-        setShowFilePicker(false);
+        resetMention();
         return true;
       }
     }
@@ -214,6 +244,7 @@ export function useFileMention(
     insertFile,
     handleKeyDown,
     checkTrigger,
+    resetMention,
     setShowFilePicker
   };
 }

@@ -37,12 +37,16 @@ export function useFileMention(
     );
   };
 
-  const resetMention = () => {
+  const closePicker = () => {
     setShowFilePicker(false);
     setFilteredFiles([]);
     setSelectedFileIndex(0);
-    setCurrentQuery("");
     setDropdownPosition(null);
+  };
+
+  const resetMention = () => {
+    closePicker();
+    setCurrentQuery("");
   };
 
   const fetchFiles = async () => {
@@ -90,10 +94,7 @@ export function useFileMention(
           fetchFiles();
 
           if (!shouldShowPicker) {
-            setShowFilePicker(false);
-            setFilteredFiles([]);
-            setSelectedFileIndex(0);
-            setDropdownPosition(null);
+            closePicker();
             return;
           }
 
@@ -143,10 +144,7 @@ export function useFileMention(
 
     const filtered = getFilteredFiles(currentQuery, fileList);
     if (currentQuery.length > 0 && filtered.length === 0) {
-      setShowFilePicker(false);
-      setFilteredFiles([]);
-      setSelectedFileIndex(0);
-      setDropdownPosition(null);
+      closePicker();
       return;
     }
 

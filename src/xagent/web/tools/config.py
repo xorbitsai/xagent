@@ -407,6 +407,17 @@ class WebToolConfig(BaseToolConfig):
         """Get allowed skill names. None means all skills are allowed."""
         return self._allowed_skills
 
+    def get_skill_scope_context(self) -> Any:
+        """Build generic context for scoped skill providers."""
+        from ...skills.library import SkillScopeContext
+
+        return SkillScopeContext(
+            user=self._user,
+            user_id=self._user_id,
+            db=self.db,
+            request=self.request,
+        )
+
     def get_tool_selection_spec(self) -> Optional[Any]:
         """Typed spec accessor (preferred over :meth:`get_allowed_tools`).
 

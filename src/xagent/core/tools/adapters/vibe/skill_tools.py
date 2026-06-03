@@ -13,6 +13,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, Dict, List, Optional
 
 from .....core.workspace import TaskWorkspace
+from .....skills.library import SkillScopeContext
 from .....skills.utils import create_skill_manager
 from .base import ToolCategory
 from .function import FunctionTool
@@ -24,6 +25,16 @@ def _get_all_skill_roots() -> List[Path]:
     """Get all skill directories."""
     skill_manager = create_skill_manager()
     return skill_manager.skills_roots
+
+
+def _run_sync(coro: Any) -> Any:
+    import asyncio
+
+    try:
+        asyncio.get_running_loop()
+    except RuntimeError:
+        return asyncio.run(coro)
+    raise RuntimeError("Use the async skill file tool methods inside an event loop")
 
 
 def _validate_skill_name(skill_name: str) -> None:
@@ -66,7 +77,10 @@ class SkillTools:
     """
 
     def __init__(
-        self, workspace: TaskWorkspace, skills_roots: Optional[List[str]] = None
+        self,
+        workspace: TaskWorkspace,
+        skills_roots: Optional[List[str]] = None,
+        skill_scope_context: SkillScopeContext | None = None,
     ):
         """Initialize with workspace binding.
 
@@ -80,6 +94,11 @@ class SkillTools:
             self.skills_roots = _get_all_skill_roots()
         else:
             self.skills_roots = [Path(p) for p in skills_roots]
+        self.skill_scope_context = skill_scope_context or SkillScopeContext()
+        self.skill_manager = create_skill_manager(
+            skills_roots=[Path(p) for p in self.skills_roots],
+            context=self.skill_scope_context,
+        )
 
     def _find_skill_dir(self, skill_name: str) -> Optional[Path]:
         """Find skill directory across all roots."""
@@ -89,7 +108,19 @@ class SkillTools:
                 return candidate
         return None
 
+    async def _get_skill_record(self, skill_name: str) -> Any | None:
+        await self.skill_manager.ensure_initialized()
+        skill = await self.skill_manager.get_skill(skill_name)
+        if not skill:
+            return None
+        return skill.get("_record")
+
     def read_skill_doc(
+        self, skill: str, path: str = "SKILL.md", encoding: str = "utf-8"
+    ) -> str:
+        return _run_sync(self.read_skill_doc_async(skill, path, encoding))
+
+    async def read_skill_doc_async(
         self, skill: str, path: str = "SKILL.md", encoding: str = "utf-8"
     ) -> str:
         """Read documentation from a skill.
@@ -114,6 +145,19 @@ class SkillTools:
         _validate_skill_name(skill)
         _validate_skill_path(path)
 
+        record = await self._get_skill_record(skill)
+        if record is not None:
+            try:
+                return (
+                    await self.skill_manager.provider.read_file(
+                        self.skill_scope_context, record, path
+                    )
+                ).decode(encoding)
+            except FileNotFoundError:
+                raise FileNotFoundError(
+                    f"Documentation not found: '{path}' in skill '{skill}'"
+                ) from None
+
         skill_dir = self._find_skill_dir(skill)
         if skill_dir is None:
             raise FileNotFoundError(f"Skill not found: '{skill}'")
@@ -127,6 +171,11 @@ class SkillTools:
         return full_path.read_text(encoding=encoding)
 
     def list_skill_docs(
+        self, skill: str, path: str = ".", recursive: bool = True
+    ) -> Dict[str, Any]:
+        return _run_sync(self.list_skill_docs_async(skill, path, recursive))
+
+    async def list_skill_docs_async(
         self, skill: str, path: str = ".", recursive: bool = True
     ) -> Dict[str, Any]:
         """List documentation within a skill.
@@ -153,6 +202,23 @@ class SkillTools:
         _validate_skill_name(skill)
         if path != ".":
             _validate_skill_path(path)
+
+        record = await self._get_skill_record(skill)
+        if record is not None:
+            prefix = "" if path == "." else path.rstrip("/") + "/"
+            documents = []
+            for rel_path, content in sorted(record.files.items()):
+                if rel_path.startswith("."):
+                    continue
+                if prefix and not rel_path.startswith(prefix):
+                    continue
+                remainder = rel_path[len(prefix) :] if prefix else rel_path
+                if not recursive and "/" in remainder:
+                    continue
+                documents.append({"path": rel_path, "size": len(content)})
+            if prefix and not documents:
+                raise FileNotFoundError(f"Directory not found: '{path}' in skill '{skill}'")
+            return {"documents": documents, "count": len(documents)}
 
         skill_dir = self._find_skill_dir(skill)
         if skill_dir is None:
@@ -190,6 +256,11 @@ class SkillTools:
     def fetch_skill_file(
         self, skill: str, path: str, dest: Optional[str] = None
     ) -> Dict[str, Any]:
+        return _run_sync(self.fetch_skill_file_async(skill, path, dest))
+
+    async def fetch_skill_file_async(
+        self, skill: str, path: str, dest: Optional[str] = None
+    ) -> Dict[str, Any]:
         """Fetch a file from skill directory to workspace.
 
         Copies a file from the skill directory to the workspace where it can be
@@ -211,6 +282,26 @@ class SkillTools:
         """
         _validate_skill_name(skill)
         _validate_skill_path(path)
+
+        record = await self._get_skill_record(skill)
+        if record is not None:
+            try:
+                content = await self.skill_manager.provider.read_file(
+                    self.skill_scope_context, record, path
+                )
+            except FileNotFoundError:
+                raise FileNotFoundError(f"File not found: '{path}' in skill '{skill}'") from None
+            if dest is None:
+                dest = Path(path).name
+            destination = self.workspace.output_dir / dest
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            destination.write_bytes(content)
+            return {
+                "source": f"{record.path or record.source}/{path}",
+                "destination": str(destination.relative_to(self.workspace.workspace_dir)),
+                "size": len(content),
+                "extracted": False,
+            }
 
         skill_dir = self._find_skill_dir(skill)
         if skill_dir is None:
@@ -243,7 +334,7 @@ class SkillTools:
         """Get all tool instances."""
         return [
             SkillTool(
-                self.read_skill_doc,
+                self.read_skill_doc_async,
                 name="read_skill_doc",
                 description="Read documentation from a skill. "
                 "Parameters: skill (str, required), path (str, optional, default='SKILL.md'), encoding (str, optional, default='utf-8'). "
@@ -251,7 +342,7 @@ class SkillTools:
                 "Returns the text content of the documentation file.",
             ),
             SkillTool(
-                self.list_skill_docs,
+                self.list_skill_docs_async,
                 name="list_skill_docs",
                 description="List available documentation within a skill. "
                 "Parameters: skill (str, required), path (str, optional, default='.'), "
@@ -259,7 +350,7 @@ class SkillTools:
                 "Returns document names and sizes.",
             ),
             SkillTool(
-                self.fetch_skill_file,
+                self.fetch_skill_file_async,
                 name="fetch_skill_file",
                 description="Fetch a file from a skill directory to the workspace for use by tools or scripts. "
                 "Parameters: skill (str, required), path (str, required), "
@@ -270,10 +361,16 @@ class SkillTools:
 
 
 def create_skill_tools(
-    workspace: TaskWorkspace, skills_roots: Optional[List[str]] = None
+    workspace: TaskWorkspace,
+    skills_roots: Optional[List[str]] = None,
+    skill_scope_context: SkillScopeContext | None = None,
 ) -> List[FunctionTool]:
     """Create skill documentation access tools bound to workspace."""
-    tools_instance = SkillTools(workspace, skills_roots=skills_roots)
+    tools_instance = SkillTools(
+        workspace,
+        skills_roots=skills_roots,
+        skill_scope_context=skill_scope_context,
+    )
     return tools_instance.get_tools()
 
 
@@ -292,7 +389,12 @@ async def create_skill_tools_from_config(config: "BaseToolConfig") -> List[Any]:
         return []
 
     try:
-        return create_skill_tools(workspace)
+        skill_scope_context = (
+            config.get_skill_scope_context()
+            if hasattr(config, "get_skill_scope_context")
+            else None
+        )
+        return create_skill_tools(workspace, skill_scope_context=skill_scope_context)
     except Exception as e:
         logger.warning(f"Failed to create skill tools: {e}")
         return []

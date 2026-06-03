@@ -8,6 +8,13 @@ from typing import List, Optional
 
 from ..config import get_external_skills_dirs
 from ..core.storage.manager import get_storage_root
+from .library import (
+    CompositeSkillLibraryProvider,
+    FilesystemSkillLibraryProvider,
+    SkillLibraryProvider,
+    SkillScopeContext,
+    get_skill_library_provider,
+)
 from .manager import SkillManager
 
 logger = logging.getLogger(__name__)
@@ -15,6 +22,9 @@ logger = logging.getLogger(__name__)
 
 def create_skill_manager(
     skills_roots: Optional[List[Path]] = None,
+    *,
+    context: SkillScopeContext | None = None,
+    provider: SkillLibraryProvider | None = None,
 ) -> "SkillManager":
     """
     Create skill_manager (not initialized)
@@ -38,13 +48,40 @@ def create_skill_manager(
         skills_roots = skills_roots + external_dirs
         logger.info(f"Appended {len(external_dirs)} external skill directories")
 
-    # Import here to avoid circular import
-    from .manager import SkillManager
-
-    # Create skill_manager (not initialized)
-    skill_manager = SkillManager(skills_roots=skills_roots)
+    skill_manager = SkillManager(
+        skills_roots=skills_roots,
+        provider=provider or get_skill_library_provider() or _build_default_provider(skills_roots),
+        context=context,
+    )
 
     return skill_manager
+
+
+def build_default_skill_library_provider(
+    overlays: Optional[List[SkillLibraryProvider]] = None,
+) -> SkillLibraryProvider:
+    """Build xagent's default provider chain.
+
+    Overlay providers are inserted between filesystem base skills and personal
+    DB skills.  SaaS uses this to add team skills below personal skills.
+    """
+
+    return _build_default_provider(_get_default_skill_dirs(), overlays=overlays)
+
+
+def _build_default_provider(
+    skills_roots: List[Path],
+    overlays: Optional[List[SkillLibraryProvider]] = None,
+) -> SkillLibraryProvider:
+    from .personal_db import XagentPersonalDbSkillProvider
+
+    return CompositeSkillLibraryProvider(
+        [
+            FilesystemSkillLibraryProvider(skills_roots),
+            *(overlays or []),
+            XagentPersonalDbSkillProvider(),
+        ]
+    )
 
 
 def _get_default_skill_dirs() -> List[Path]:

@@ -42,6 +42,7 @@ import re
 import shutil
 import time
 import zipfile
+import hashlib
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -51,6 +52,7 @@ from fastapi.responses import Response
 from pydantic import BaseModel, Field
 
 from xagent.web.auth_dependencies import get_current_user
+from xagent.web.models.database import get_db
 from xagent.web.models.user import User
 
 logger = logging.getLogger(__name__)
@@ -99,6 +101,9 @@ class SkillSummary(BaseModel):
     when_to_use: str = ""
     tags: List[str] = Field(default_factory=list)
     source: str  # "builtin" | "user" | "external"
+    scope: Optional[str] = None
+    effective: bool = True
+    shadowed_by: Optional[str] = None
 
 
 class SkillDetail(SkillSummary):
@@ -120,6 +125,7 @@ class CreateSkillRequest(BaseModel):
 
     name: str = Field(..., min_length=1, max_length=64)
     skill_md: str = Field(..., min_length=1, max_length=200_000)
+    scope: str = Field("personal", pattern="^(personal|team)$")
 
 
 class EditSkillRequest(BaseModel):
@@ -182,6 +188,7 @@ class RegistryListResponse(BaseModel):
 class InstallClawhubRequest(BaseModel):
     slug: str = Field(..., min_length=1, max_length=128)
     version: Optional[str] = None  # ClawHub default: latest
+    scope: str = Field("personal", pattern="^(personal|team)$")
 
 
 class RegistryStats(BaseModel):
@@ -294,13 +301,40 @@ async def _get_manager(request: Request) -> Any:
     return mgr
 
 
+def _scope_context(request: Request, user: User, db: Any):
+    from xagent.skills.library import SkillScopeContext
+
+    metadata: dict[str, Any] = {}
+    team_id = getattr(user, "_saas_team_id", None)
+    if isinstance(team_id, int):
+        metadata["team_id"] = team_id
+    return SkillScopeContext(
+        user=user,
+        user_id=int(user.id) if user.id is not None else None,
+        db=db,
+        request=request,
+        metadata=metadata,
+    )
+
+
+async def _get_scoped_manager(request: Request, user: User, db: Any) -> Any:
+    from xagent.skills.utils import create_skill_manager
+
+    mgr = create_skill_manager(context=_scope_context(request, user, db))
+    await mgr.ensure_initialized()
+    return mgr
+
+
 def _skill_to_summary(skill_dict: dict) -> SkillSummary:
     return SkillSummary(
         name=skill_dict["name"],
         description=skill_dict.get("description", ""),
         when_to_use=skill_dict.get("when_to_use", ""),
         tags=skill_dict.get("tags", []),
-        source=_classify_source(skill_dict.get("path", "")),
+        source=_summary_source(skill_dict),
+        scope=skill_dict.get("scope"),
+        effective=bool(skill_dict.get("effective", True)),
+        shadowed_by=skill_dict.get("shadowed_by"),
     )
 
 
@@ -310,12 +344,131 @@ def _skill_to_detail(skill_dict: dict) -> SkillDetail:
         description=skill_dict.get("description", ""),
         when_to_use=skill_dict.get("when_to_use", ""),
         tags=skill_dict.get("tags", []),
-        source=_classify_source(skill_dict.get("path", "")),
+        source=_summary_source(skill_dict),
+        scope=skill_dict.get("scope"),
+        effective=bool(skill_dict.get("effective", True)),
+        shadowed_by=skill_dict.get("shadowed_by"),
         content=skill_dict.get("content", ""),
         execution_flow=skill_dict.get("execution_flow", ""),
         files=skill_dict.get("files", []),
         path=skill_dict.get("path", ""),
     )
+
+
+def _summary_source(skill_dict: dict) -> str:
+    scope = skill_dict.get("scope")
+    if scope == "personal":
+        return "user"
+    if isinstance(scope, str) and scope:
+        return scope
+    return skill_dict.get("source") or _classify_source(skill_dict.get("path", ""))
+
+
+def _normalize_skill_files(files: dict[str, bytes]) -> dict[str, bytes]:
+    out: dict[str, bytes] = {}
+    total = 0
+    for raw_path, content in files.items():
+        path = str(raw_path).replace("\\", "/").lstrip("/")
+        if not path or path.startswith(".") or ".." in path.split("/"):
+            raise HTTPException(status_code=400, detail="Skill file path is unsafe.")
+        total += len(content)
+        if total > _MAX_DOWNLOAD_BYTES:
+            raise HTTPException(status_code=413, detail="Skill files exceed size budget.")
+        out[path] = bytes(content)
+    if "SKILL.md" not in out:
+        raise HTTPException(status_code=400, detail="Skill has no SKILL.md.")
+    return out
+
+
+def _write_personal_skill(
+    *,
+    db: Any,
+    user: User,
+    name: str,
+    files: dict[str, bytes],
+    origin: str = "custom",
+    clawhub_slug: str | None = None,
+    clawhub_version: str | None = None,
+) -> None:
+    from xagent.skills.library import guess_media_type
+    from xagent.web.models.skill import UserSkill, UserSkillFile
+
+    _validate_skill_name(name)
+    user_id = int(user.id)
+    normalized = _normalize_skill_files(files)
+    existing = (
+        db.query(UserSkill)
+        .filter(UserSkill.user_id == user_id, UserSkill.name == name)
+        .first()
+    )
+    if existing is not None:
+        raise HTTPException(
+            status_code=409,
+            detail=f"A personal skill named {name!r} already exists.",
+        )
+    skill = UserSkill(
+        user_id=user_id,
+        name=name,
+        origin=origin,
+        clawhub_slug=clawhub_slug,
+        clawhub_version=clawhub_version,
+        created_by_user_id=user_id,
+        updated_by_user_id=user_id,
+    )
+    db.add(skill)
+    db.flush()
+    for path, content in sorted(normalized.items()):
+        db.add(
+            UserSkillFile(
+                skill_id=skill.id,
+                path=path,
+                content=content,
+                size_bytes=len(content),
+                sha256=hashlib.sha256(content).hexdigest(),
+                media_type=guess_media_type(path),
+            )
+        )
+    db.commit()
+
+
+def _update_personal_skill_md(
+    *, db: Any, user: User, name: str, skill_md: str
+) -> None:
+    from xagent.skills.library import guess_media_type
+    from xagent.web.models.skill import UserSkill, UserSkillFile
+
+    skill = (
+        db.query(UserSkill)
+        .filter(UserSkill.user_id == int(user.id), UserSkill.name == name)
+        .first()
+    )
+    if skill is None:
+        raise HTTPException(status_code=404, detail="Personal skill not found")
+    content = skill_md.encode("utf-8")
+    file = next((item for item in skill.files if item.path == "SKILL.md"), None)
+    if file is None:
+        file = UserSkillFile(skill_id=skill.id, path="SKILL.md")
+        db.add(file)
+    file.content = content
+    file.size_bytes = len(content)
+    file.sha256 = hashlib.sha256(content).hexdigest()
+    file.media_type = guess_media_type("SKILL.md")
+    skill.updated_by_user_id = int(user.id)
+    db.commit()
+
+
+def _delete_personal_skill(*, db: Any, user: User, name: str) -> None:
+    from xagent.web.models.skill import UserSkill
+
+    skill = (
+        db.query(UserSkill)
+        .filter(UserSkill.user_id == int(user.id), UserSkill.name == name)
+        .first()
+    )
+    if skill is None:
+        raise HTTPException(status_code=404, detail="Personal skill not found")
+    db.delete(skill)
+    db.commit()
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -487,6 +640,46 @@ def _safe_extract_zip(zip_bytes: bytes, dest: Path) -> Path:
     return candidates[0].parent
 
 
+def _safe_zip_to_files(zip_bytes: bytes) -> dict[str, bytes]:
+    """Read a ClawHub ZIP into a normalized skill file bundle."""
+    try:
+        zf = zipfile.ZipFile(io.BytesIO(zip_bytes))
+    except zipfile.BadZipFile as exc:
+        raise HTTPException(status_code=502, detail="ClawHub returned a bad ZIP.") from exc
+
+    total = 0
+    raw_files: dict[str, bytes] = {}
+    for info in zf.infolist():
+        if info.is_dir():
+            continue
+        if info.file_size > _MAX_DOWNLOAD_BYTES:
+            raise HTTPException(status_code=413, detail="Skill ZIP member too large.")
+        total += info.file_size
+        if total > _MAX_DOWNLOAD_BYTES:
+            raise HTTPException(status_code=413, detail="Skill ZIP exceeds size budget.")
+        path = info.filename.replace("\\", "/").lstrip("/")
+        if not path or ".." in path.split("/"):
+            raise HTTPException(status_code=400, detail="Skill ZIP contains unsafe paths.")
+        raw_files[path] = zf.read(info)
+
+    skill_md_paths = sorted(path for path in raw_files if path.endswith("/SKILL.md") or path == "SKILL.md")
+    if not skill_md_paths:
+        raise HTTPException(status_code=400, detail="ClawHub artifact has no SKILL.md anywhere in it.")
+    skill_root = skill_md_paths[0].removesuffix("SKILL.md").rstrip("/")
+    files: dict[str, bytes] = {}
+    for path, content in raw_files.items():
+        if skill_root:
+            prefix = skill_root + "/"
+            if not path.startswith(prefix):
+                continue
+            rel = path[len(prefix) :]
+        else:
+            rel = path
+        if rel:
+            files[rel] = content
+    return _normalize_skill_files(files)
+
+
 # ──────────────────────────────────────────────────────────────────────
 # Routes — local skills (list / detail / delete)
 # ──────────────────────────────────────────────────────────────────────
@@ -495,10 +688,11 @@ def _safe_extract_zip(zip_bytes: bytes, dest: Path) -> Path:
 @router.get("/installed", response_model=List[SkillSummary])
 async def list_installed(
     request: Request,
+    db: Any = Depends(get_db),
     _user: User = Depends(get_current_user),
 ) -> List[SkillSummary]:
     """List every skill the SkillManager can see, tagged with source."""
-    mgr = await _get_manager(request)
+    mgr = await _get_scoped_manager(request, _user, db)
     summaries: list[SkillSummary] = []
     for skill in mgr._skills_cache.values():  # noqa: SLF001
         summaries.append(_skill_to_summary(skill))
@@ -511,9 +705,10 @@ async def list_installed(
 async def get_installed(
     name: str,
     request: Request,
+    db: Any = Depends(get_db),
     _user: User = Depends(get_current_user),
 ) -> SkillDetail:
-    mgr = await _get_manager(request)
+    mgr = await _get_scoped_manager(request, _user, db)
     skill = await mgr.get_skill(name)
     if not skill:
         raise HTTPException(status_code=404, detail="Skill not found")
@@ -528,15 +723,33 @@ async def get_installed(
 async def delete_installed(
     name: str,
     request: Request,
+    db: Any = Depends(get_db),
     _user: User = Depends(get_current_user),
 ) -> Response:
     """Remove a user-installed skill. Builtin / external are refused."""
-    mgr = await _get_manager(request)
+    mgr = await _get_scoped_manager(request, _user, db)
     skill = await mgr.get_skill(name)
     if not skill:
         raise HTTPException(status_code=404, detail="Skill not found")
-    path = Path(skill.get("path", ""))
-    source = _classify_source(str(path))
+    source = _summary_source(skill)
+    if source == "team":
+        from xagent.skills.library import get_skill_write_provider
+
+        writer = get_skill_write_provider()
+        if writer is None:
+            raise HTTPException(status_code=400, detail="No skill writer is registered for this scope.")
+        try:
+            await writer.delete_skill(
+                _scope_context(request, _user, db),
+                scope="team",
+                name=name,
+            )
+        except PermissionError as exc:
+            raise HTTPException(status_code=403, detail=str(exc)) from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        logger.info("Skill Hub: deleted team skill %r", name)
+        return Response(status_code=status.HTTP_204_NO_CONTENT)
     if source != "user":
         raise HTTPException(
             status_code=403,
@@ -545,17 +758,7 @@ async def delete_installed(
                 "can be removed."
             ),
         )
-    # Symlink-escape defense: refuse if resolved path leaves user root.
-    user_root = _user_skills_root().resolve()
-    try:
-        path.resolve().relative_to(user_root)
-    except ValueError as exc:
-        raise HTTPException(
-            status_code=500,
-            detail="Refusing to delete: resolved path escapes the user skills root.",
-        ) from exc
-    shutil.rmtree(path, ignore_errors=False)
-    await mgr.reload()
+    _delete_personal_skill(db=db, user=_user, name=name)
     logger.info("Skill Hub: deleted user skill %r", name)
     return Response(status_code=status.HTTP_204_NO_CONTENT)
 
@@ -569,6 +772,7 @@ async def delete_installed(
 async def create_skill(
     body: CreateSkillRequest,
     request: Request,
+    db: Any = Depends(get_db),
     _user: User = Depends(get_current_user),
 ) -> SkillSummary:
     """Write a brand-new skill from in-UI input.
@@ -578,12 +782,32 @@ async def create_skill(
     refuse on duplicate names — overwrite via the edit endpoint is
     explicit, not implicit.
     """
-    target = _ensure_writable_target(body.name)
-    target.mkdir(parents=True)
-    (target / "SKILL.md").write_text(body.skill_md, encoding="utf-8")
+    if body.scope != "personal":
+        from xagent.skills.library import get_skill_write_provider
 
-    mgr = await _get_manager(request)
-    await mgr.reload()
+        writer = get_skill_write_provider()
+        if writer is None:
+            raise HTTPException(status_code=400, detail="No skill writer is registered for this scope.")
+        try:
+            await writer.create_skill(
+                _scope_context(request, _user, db),
+                scope=body.scope,
+                name=body.name,
+                files={"SKILL.md": body.skill_md.encode("utf-8")},
+            )
+        except PermissionError as exc:
+            raise HTTPException(status_code=403, detail=str(exc)) from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+    else:
+        _write_personal_skill(
+            db=db,
+            user=_user,
+            name=body.name,
+            files={"SKILL.md": body.skill_md.encode("utf-8")},
+        )
+
+    mgr = await _get_scoped_manager(request, _user, db)
     skill = await mgr.get_skill(body.name)
     if skill is None:
         # Most likely cause: malformed YAML frontmatter that the parser
@@ -607,6 +831,7 @@ async def edit_installed(
     name: str,
     body: EditSkillRequest,
     request: Request,
+    db: Any = Depends(get_db),
     _user: User = Depends(get_current_user),
 ) -> SkillSummary:
     """Replace the SKILL.md of an installed user skill.
@@ -615,28 +840,37 @@ async def edit_installed(
     refused so we don't silently fork a shipped skill (and so symlinked
     external roots stay readonly from our side).
     """
-    mgr = await _get_manager(request)
+    mgr = await _get_scoped_manager(request, _user, db)
     skill = await mgr.get_skill(name)
     if not skill:
         raise HTTPException(status_code=404, detail="Skill not found")
-    path = Path(skill.get("path", ""))
-    if _classify_source(str(path)) != "user":
+    source = _summary_source(skill)
+    if source == "team":
+        from xagent.skills.library import get_skill_write_provider
+
+        writer = get_skill_write_provider()
+        if writer is None:
+            raise HTTPException(status_code=400, detail="No skill writer is registered for this scope.")
+        try:
+            await writer.update_skill_file(
+                _scope_context(request, _user, db),
+                scope="team",
+                name=name,
+                path="SKILL.md",
+                content=body.skill_md.encode("utf-8"),
+            )
+        except PermissionError as exc:
+            raise HTTPException(status_code=403, detail=str(exc)) from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+    elif source != "user":
         raise HTTPException(
             status_code=403,
             detail="Only user-installed skills can be edited via the Hub.",
         )
-    # Symlink-escape defense: same check as delete.
-    user_root = _user_skills_root().resolve()
-    try:
-        path.resolve().relative_to(user_root)
-    except ValueError as exc:
-        raise HTTPException(
-            status_code=500,
-            detail="Refusing to edit: resolved path escapes the user skills root.",
-        ) from exc
-
-    (path / "SKILL.md").write_text(body.skill_md, encoding="utf-8")
-    await mgr.reload()
+    else:
+        _update_personal_skill_md(db=db, user=_user, name=name, skill_md=body.skill_md)
+    mgr = await _get_scoped_manager(request, _user, db)
     reloaded = await mgr.get_skill(name)
     if reloaded is None:
         raise HTTPException(
@@ -661,6 +895,7 @@ async def registry_list(
     sort: str = Query("trending"),
     limit: int = Query(24, ge=1, le=100),
     cursor: Optional[str] = Query(None),
+    db: Any = Depends(get_db),
     _user: User = Depends(get_current_user),
 ) -> RegistryListResponse:
     """Browse the ClawHub catalog. ``sort`` mirrors upstream's
@@ -684,7 +919,7 @@ async def registry_list(
     # ClawHub responds.
     payload = await asyncio.to_thread(_clawhub_json, "/skills", params)
     items_raw = payload.get("items", []) if isinstance(payload, dict) else []
-    mgr = await _get_manager(request)
+    mgr = await _get_scoped_manager(request, _user, db)
     installed = _installed_slugs(mgr)
     items = [
         _summary_from_registry_item(i, installed)
@@ -708,6 +943,7 @@ async def registry_search(
     request: Request,
     q: str = Query(..., min_length=1, max_length=200),
     limit: int = Query(24, ge=1, le=100),
+    db: Any = Depends(get_db),
     _user: User = Depends(get_current_user),
 ) -> RegistryListResponse:
     """Full-text search ClawHub. Same response shape as ``/list``.
@@ -715,7 +951,7 @@ async def registry_search(
     params = {"q": q, "limit": limit}
     payload = await asyncio.to_thread(_clawhub_json, "/search", params)
     results_raw = payload.get("results", []) if isinstance(payload, dict) else []
-    mgr = await _get_manager(request)
+    mgr = await _get_scoped_manager(request, _user, db)
     installed = _installed_slugs(mgr)
     items = [
         _summary_from_registry_item(i, installed)
@@ -730,6 +966,7 @@ async def registry_search(
 async def registry_detail(
     slug: str,
     request: Request,
+    db: Any = Depends(get_db),
     _user: User = Depends(get_current_user),
 ) -> RegistrySkillDetail:
     """Single-skill detail from ClawHub. Bundles whatever upstream
@@ -744,7 +981,7 @@ async def registry_detail(
     latest = payload.get("latestVersion") or {}
     moderation = payload.get("moderation")
     metadata = payload.get("metadata") or {}
-    mgr = await _get_manager(request)
+    mgr = await _get_scoped_manager(request, _user, db)
     installed = _installed_slugs(mgr)
     return RegistrySkillDetail(
         slug=slug,
@@ -766,6 +1003,7 @@ async def registry_detail(
 async def install_clawhub(
     body: InstallClawhubRequest,
     request: Request,
+    db: Any = Depends(get_db),
     _user: User = Depends(get_current_user),
 ) -> SkillSummary:
     """Install a ClawHub skill into ``~/.xagent/skills/<slug>/``.
@@ -792,7 +1030,6 @@ async def install_clawhub(
       5. ``manager.reload()`` so the new skill is visible to agents.
     """
     _validate_skill_name(body.slug)
-    target = _ensure_writable_target(body.slug)
 
     # --- 2. Scan + moderation gate ---------------------------------
     detail = await asyncio.to_thread(_clawhub_json, f"/skills/{body.slug}")
@@ -859,37 +1096,46 @@ async def install_clawhub(
     if len(zip_bytes) > _MAX_DOWNLOAD_BYTES:
         raise HTTPException(status_code=413, detail="ClawHub artifact too large.")
 
-    # --- 4. Extract + move ------------------------------------------
-    # Extract into a sibling staging dir, then promote it on success
-    # so a half-written install doesn't end up live on disk.
-    staging = target.parent / f".{body.slug}.installing"
-    if staging.exists():
-        shutil.rmtree(staging)
-    try:
-        skill_root = _safe_extract_zip(zip_bytes, staging)
-        if skill_root != staging:
-            # ZIP wrapped the skill in a sub-dir — promote that sub-dir.
-            tmp = target.parent / f".{body.slug}.promote"
-            if tmp.exists():
-                shutil.rmtree(tmp)
-            shutil.move(str(skill_root), str(tmp))
-            shutil.rmtree(staging, ignore_errors=True)
-            shutil.move(str(tmp), str(target))
-        else:
-            shutil.move(str(staging), str(target))
-    except Exception:
-        shutil.rmtree(staging, ignore_errors=True)
-        raise
+    # --- 4. Store DB bundle -----------------------------------------
+    files = _safe_zip_to_files(zip_bytes)
+    if body.scope == "team":
+        from xagent.skills.library import get_skill_write_provider
+
+        writer = get_skill_write_provider()
+        if writer is None:
+            raise HTTPException(status_code=400, detail="No skill writer is registered for this scope.")
+        try:
+            await writer.create_skill(
+                _scope_context(request, _user, db),
+                scope="team",
+                name=body.slug,
+                files=files,
+                origin="clawhub",
+                metadata={"clawhub_slug": body.slug, "clawhub_version": body.version},
+            )
+        except PermissionError as exc:
+            raise HTTPException(status_code=403, detail=str(exc)) from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+    else:
+        _write_personal_skill(
+            db=db,
+            user=_user,
+            name=body.slug,
+            files=files,
+            origin="clawhub",
+            clawhub_slug=body.slug,
+            clawhub_version=body.version,
+        )
 
     # --- 5. Reload + return -----------------------------------------
-    mgr = await _get_manager(request)
-    await mgr.reload()
+    mgr = await _get_scoped_manager(request, _user, db)
     skill = await mgr.get_skill(body.slug)
     if skill is None:
         raise HTTPException(
             status_code=500,
             detail=(
-                f"ClawHub skill {body.slug!r} installed at {target} but failed "
+                f"ClawHub skill {body.slug!r} installed but failed "
                 "to re-parse. Inspect SKILL.md by hand or remove and retry."
             ),
         )
@@ -953,6 +1199,7 @@ def _load_featured_config() -> List[Dict[str, str]]:
 @router.get("/featured", response_model=List[FeaturedSkill])
 async def featured(
     request: Request,
+    db: Any = Depends(get_db),
     _user: User = Depends(get_current_user),
 ) -> List[FeaturedSkill]:
     """Editor's pick rail for the Discover tab.
@@ -981,7 +1228,7 @@ async def featured(
         # Hot path. Just refresh the installedAs marker from the
         # live SkillManager so newly-installed skills flip the badge
         # without waiting for the TTL.
-        mgr = await _get_manager(request)
+        mgr = await _get_scoped_manager(request, _user, db)
         installed = _installed_slugs(mgr)
         return [
             FeaturedSkill(
@@ -990,7 +1237,7 @@ async def featured(
             for it in cached
         ]
 
-    mgr = await _get_manager(request)
+    mgr = await _get_scoped_manager(request, _user, db)
     installed = _installed_slugs(mgr)
 
     # Fan out the 6 detail fetches in parallel. ``_clawhub_json`` is

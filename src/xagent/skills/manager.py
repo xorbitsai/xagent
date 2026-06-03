@@ -7,6 +7,12 @@ import logging
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
+from .library import (
+    FilesystemSkillLibraryProvider,
+    SkillLibraryProvider,
+    SkillScopeContext,
+    get_skill_library_provider,
+)
 from .parser import SkillParser
 from .selector import SkillSelector
 
@@ -16,14 +22,24 @@ logger = logging.getLogger(__name__)
 class SkillManager:
     """Core manager for the skill system"""
 
-    def __init__(self, skills_roots: List[Path]):
+    def __init__(
+        self,
+        skills_roots: List[Path] | None = None,
+        *,
+        provider: SkillLibraryProvider | None = None,
+        context: SkillScopeContext | None = None,
+    ):
         """
         Args:
             skills_roots: List of skills directory paths (supports multiple directories)
                 - First is the built-in skills directory (read-only)
                 - Subsequent ones are user-defined skills directories (writable)
         """
-        self.skills_roots = [Path(p) for p in skills_roots]
+        self.skills_roots = [Path(p) for p in skills_roots or []]
+        self.provider = provider or get_skill_library_provider()
+        if self.provider is None:
+            self.provider = FilesystemSkillLibraryProvider(self.skills_roots)
+        self.context = context or SkillScopeContext()
 
         self._skills_cache: Dict[str, Dict] = {}
         self._initialized = False
@@ -51,8 +67,9 @@ class SkillManager:
     async def initialize(self) -> None:
         """Initialize: scan all skills"""
         logger.info("📂 Scanning skills...")
-        for root in self.skills_roots:
-            logger.info(f"  from {root}...")
+        if self.skills_roots:
+            for root in self.skills_roots:
+                logger.info(f"  from {root}...")
         await self.reload()
         self._initialized = True
         logger.info(f"✓ Loaded {len(self._skills_cache)} skills")
@@ -61,40 +78,24 @@ class SkillManager:
         """Reload all skills"""
         self._skills_cache.clear()
 
-        # Scan all directories in order (later ones override earlier ones)
-        for skills_root in self.skills_roots:
-            if not skills_root.is_dir():
-                # Skip non-existent directories silently
-                continue
-
-            logger.debug(f"Scanning directory: {skills_root}")
-            found_count = 0
-
-            for skill_dir in skills_root.iterdir():
-                if not skill_dir.is_dir():
-                    continue
-
-                if not (skill_dir / "SKILL.md").exists():
-                    logger.warning("Skipping %r: no SKILL.md found", skill_dir)
-                    continue
-
-                try:
-                    skill_info = SkillParser.parse(skill_dir)
-                    self._skills_cache[skill_info["name"]] = skill_info
-                    # Determine source by checking if it's the builtin directory
-                    source = (
-                        "builtin"
-                        if skills_root == self.get_builtin_root()
-                        else skills_root.name
-                    )
-                    logger.info(f"  ✓ Loaded: {skill_info['name']} ({source})")
-                    found_count += 1
-                except Exception as e:
-                    logger.error(
-                        f"  ✗ Error loading {skill_dir.name}: {e}", exc_info=True
-                    )
-
-            logger.debug(f"Found {found_count} skills in {skills_root}")
+        records = await self.provider.list_records(self.context)
+        for record in records:
+            try:
+                skill_info = SkillParser.parse_bundle(
+                    name=record.name,
+                    files=record.files,
+                    path=record.path
+                    or f"provider://{record.source}/{record.name}",
+                )
+                skill_info["source"] = record.source
+                skill_info["scope"] = record.scope
+                skill_info["effective"] = record.effective
+                skill_info["shadowed_by"] = record.shadowed_by
+                skill_info["_record"] = record
+                self._skills_cache[skill_info["name"]] = skill_info
+                logger.info("  ✓ Loaded: %s (%s)", record.name, record.source)
+            except Exception as e:
+                logger.error("  ✗ Error loading %s: %s", record.name, e, exc_info=True)
 
         logger.info(f"Total skills loaded: {len(self._skills_cache)}")
 

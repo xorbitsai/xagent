@@ -39,11 +39,31 @@ class SkillParser:
         if not skill_md.exists():
             raise ValueError(f"SKILL.md not found in {skill_dir}")
 
-        content = skill_md.read_text()
+        files = {
+            str(file_path.relative_to(skill_dir)).replace("\\", "/"): file_path.read_bytes()
+            for file_path in skill_dir.rglob("*")
+            if file_path.is_file()
+        }
+        return SkillParser.parse_bundle(
+            name=skill_dir.name,
+            files=files,
+            path=str(skill_dir),
+        )
 
-        # Try to read template.md
-        template_md = skill_dir / "template.md"
-        template_content = template_md.read_text() if template_md.exists() else ""
+    @staticmethod
+    def parse_bundle(
+        name: str,
+        files: Dict[str, bytes],
+        path: str = "",
+        encoding: str = "utf-8",
+    ) -> Dict:
+        """Parse a skill from an in-memory file bundle."""
+        if "SKILL.md" not in files:
+            raise ValueError(f"SKILL.md not found in {path or name}")
+
+        content = files["SKILL.md"].decode(encoding)
+        template_bytes = files.get("template.md")
+        template_content = template_bytes.decode(encoding) if template_bytes else ""
 
         frontmatter = SkillParser._extract_frontmatter(content)
         section_description = SkillParser._extract_section(content, "Description")
@@ -53,8 +73,8 @@ class SkillParser:
         tags = frontmatter_tags or section_tags
 
         return {
-            "name": skill_dir.name,
-            "path": str(skill_dir),
+            "name": name,
+            "path": path,
             "content": content,  # Complete SKILL.md content
             "template": template_content,  # template.md content (if exists)
             "description": section_description
@@ -63,7 +83,7 @@ class SkillParser:
             or SkillParser._frontmatter_string(frontmatter, "when_to_use"),
             "execution_flow": SkillParser._extract_section(content, "Execution Flow"),
             "tags": tags,
-            "files": SkillParser._list_files(skill_dir),
+            "files": sorted(files),
         }
 
     @staticmethod

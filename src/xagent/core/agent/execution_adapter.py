@@ -38,6 +38,7 @@ class AgentExecutionConfig:
     memory_store: Any | None = None
     memory_similarity_threshold: float | None = None
     skill_manager: Any | None = None
+    skill_scope_context: Any | None = None
     allowed_skills: list[str] | None = None
 
 
@@ -211,7 +212,7 @@ class AgentExecutionAdapter:
         if skill_manager is None:
             from ...skills.utils import create_skill_manager
 
-            skill_manager = create_skill_manager()
+            skill_manager = create_skill_manager(context=self.config.skill_scope_context)
         agent = Agent(
             name=self.config.name,
             patterns=[pattern],

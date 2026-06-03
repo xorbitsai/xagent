@@ -212,3 +212,34 @@ tags: [image, design]
             "Use when the task asks for visual output variants.\n"
         )
         assert skill["tags"] == ["image", "design"]
+
+    def test_parse_bundle_without_filesystem_directory(self):
+        """DB-backed skills should parse from an in-memory file bundle."""
+        skill = SkillParser.parse_bundle(
+            name="db_skill",
+            files={
+                "SKILL.md": b"""---
+description: "Database skill."
+when_to_use: "Use for DB-backed skill tests."
+tags: [db, test]
+---
+
+# DB Skill
+
+## Execution Flow
+Read stored blobs.
+""",
+                "references/guide.md": b"# Guide",
+                "template.md": b"Template from DB",
+            },
+            path="provider://personal/db_skill",
+        )
+
+        assert skill["name"] == "db_skill"
+        assert skill["path"] == "provider://personal/db_skill"
+        assert skill["description"] == "Database skill."
+        assert skill["when_to_use"] == "Use for DB-backed skill tests."
+        assert skill["execution_flow"] == "Read stored blobs."
+        assert skill["tags"] == ["db", "test"]
+        assert skill["template"] == "Template from DB"
+        assert skill["files"] == ["SKILL.md", "references/guide.md", "template.md"]

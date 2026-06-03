@@ -1,4 +1,4 @@
-import { getFilePublicPreviewUrl } from '@/lib/utils'
+import { getFilePublicDownloadUrl, getFilePublicPreviewUrl } from '@/lib/utils'
 
 export type InlineFilePreviewKind =
   | 'image'
@@ -142,7 +142,7 @@ export const getInlineFileDownloadUrl = (
   apiUrl: string
 ): string => {
   if (source.fileId) {
-    return `${apiUrl}/api/files/public/download/${encodeURIComponent(source.fileId)}`
+    return getFilePublicDownloadUrl(source.fileId, apiUrl)
   }
   return getInlineFilePreviewUrl(source, apiUrl)
 }

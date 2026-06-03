@@ -4,7 +4,7 @@ import { useCallback, useEffect, useRef, useState } from "react"
 import { ChevronLeft, ChevronRight, Loader2 } from "lucide-react"
 import { useI18n } from "@/contexts/i18n-context"
 import { apiRequest } from "@/lib/api-wrapper"
-import { getApiUrl } from "@/lib/utils"
+import { getApiUrl, getFilePublicPreviewUrl } from "@/lib/utils"
 
 interface PptxPreviewRendererProps {
   /**
@@ -196,7 +196,7 @@ export function PptxPreviewRenderer({ base64Content, fileId }: PptxPreviewRender
         setIsLoading(true)
         try {
           const res = await apiRequest(
-            `${getApiUrl()}/api/files/public/preview/${encodeURIComponent(fileId)}`,
+            getFilePublicPreviewUrl(fileId, getApiUrl()),
             { cache: "no-cache" },
           )
           if (cancelled) return

@@ -1,12 +1,15 @@
 """Integration tests for agent management endpoints."""
 
+import io
 from typing import Any
 
 import pytest
 
+from xagent.config import get_uploads_dir
 from xagent.web.models.agent import Agent, AgentOrigin, AgentStatus
 from xagent.web.models.agent_api_key import AgentApiKey
 from xagent.web.models.task import Task, TaskStatus
+from xagent.web.models.uploaded_file import UploadedFile
 from xagent.web.models.user import User
 from xagent.web.models.workforce import Workforce
 from xagent.web.services.workforce_access import WorkforcePolicy, set_workforce_policy
@@ -51,6 +54,8 @@ def _create_agent_row(
     origin: str = AgentOrigin.USER.value,
     widget_enabled: bool = True,
     allowed_domains: list[str] | None = None,
+    share_enabled: bool = False,
+    share_token: str | None = None,
 ) -> int:
     db = _direct_db_session()
     try:
@@ -64,6 +69,8 @@ def _create_agent_row(
             status=status,
             widget_enabled=widget_enabled,
             allowed_domains=allowed_domains or [],
+            share_enabled=share_enabled,
+            share_token=share_token,
         )
         db.add(agent)
         db.commit()
@@ -79,6 +86,79 @@ def _user_id(username: str) -> int:
         user = db.query(User).filter(User.username == username).first()
         assert user is not None
         return int(user.id)
+    finally:
+        db.close()
+
+
+def _authenticate_share_guest(
+    share_token: str,
+    *,
+    guest_id: str = "guest-1",
+) -> dict[str, str]:
+    response = client.post(
+        "/api/share/auth",
+        json={"share_token": share_token, "guest_id": guest_id},
+    )
+    assert response.status_code == 200, response.text
+    access_token = response.json()["access_token"]
+    return {"Authorization": f"Bearer {access_token}"}
+
+
+def _authenticate_widget_guest(
+    *,
+    agent_id: int,
+    guest_id: str = "guest-1",
+    origin: str = "https://example.com",
+) -> dict[str, str]:
+    response = client.post(
+        "/api/widget/auth",
+        json={"agent_id": agent_id, "guest_id": guest_id},
+        headers={"origin": origin},
+    )
+    assert response.status_code == 200, response.text
+    access_token = response.json()["access_token"]
+    return {"Authorization": f"Bearer {access_token}"}
+
+
+def _create_public_task_file(
+    *,
+    owner_id: int,
+    agent_id: int,
+    guest_id: str,
+    filename: str = "shared-note.txt",
+    content: bytes = b"hello from public task",
+) -> str:
+    uploads_root = get_uploads_dir() / f"user_{owner_id}"
+    uploads_root.mkdir(parents=True, exist_ok=True)
+    file_path = uploads_root / filename
+    file_path.write_bytes(content)
+
+    db = _direct_db_session()
+    try:
+        task = Task(
+            user_id=owner_id,
+            title="Public task",
+            description="Public task",
+            status=TaskStatus.PENDING,
+            agent_id=agent_id,
+            agent_config={"guest_id": guest_id},
+        )
+        db.add(task)
+        db.commit()
+        db.refresh(task)
+
+        uploaded_file = UploadedFile(
+            user_id=owner_id,
+            task_id=int(task.id),
+            filename=filename,
+            storage_path=str(file_path),
+            mime_type="text/plain",
+            file_size=len(content),
+        )
+        db.add(uploaded_file)
+        db.commit()
+        db.refresh(uploaded_file)
+        return str(uploaded_file.file_id)
     finally:
         db.close()
 
@@ -263,6 +343,354 @@ def test_generated_workforce_manager_agents_cannot_authenticate_widget() -> None
 
     assert response.status_code == 401
     assert response.json()["detail"] == "Widget owner not found or invalid agent_id"
+
+
+def test_widget_public_tokens_cannot_create_tasks_for_other_agents() -> None:
+    _admin_headers()
+    owner_id = _user_id("admin")
+    allowed_agent_id = _create_agent_row(
+        user_id=owner_id,
+        name="Allowed Widget Agent",
+        status=AgentStatus.PUBLISHED,
+        widget_enabled=True,
+        allowed_domains=["example.com"],
+    )
+    other_agent_id = _create_agent_row(
+        user_id=owner_id,
+        name="Other Widget Agent",
+        status=AgentStatus.PUBLISHED,
+        widget_enabled=True,
+        allowed_domains=["example.com"],
+    )
+
+    guest_headers = _authenticate_widget_guest(agent_id=allowed_agent_id)
+
+    create_task_response = client.post(
+        "/api/widget/chat/task/create",
+        json={
+            "title": "cross agent",
+            "description": "cross agent",
+            "agent_id": other_agent_id,
+        },
+        headers=guest_headers,
+    )
+    assert create_task_response.status_code == 403, create_task_response.text
+    assert create_task_response.json()["detail"] == "Widget access is unavailable"
+
+
+def test_share_link_requires_published_agent() -> None:
+    headers = _admin_headers()
+    owner_id = _user_id("admin")
+    draft_agent_id = _create_agent_row(
+        user_id=owner_id,
+        name="Draft Share Agent",
+        status=AgentStatus.DRAFT,
+    )
+
+    response = client.post(f"/api/agents/{draft_agent_id}/share-link", headers=headers)
+
+    assert response.status_code == 400
+    assert response.json()["detail"] == "Only published agents can be shared"
+
+
+def test_share_link_can_be_enabled_rotated_and_disabled() -> None:
+    headers = _admin_headers()
+    owner_id = _user_id("admin")
+    agent_id = _create_agent_row(
+        user_id=owner_id,
+        name="Published Share Agent",
+        status=AgentStatus.PUBLISHED,
+    )
+
+    enable_response = client.post(f"/api/agents/{agent_id}/share-link", headers=headers)
+    assert enable_response.status_code == 200, enable_response.text
+    enabled_agent = enable_response.json()
+    assert enabled_agent["share_enabled"] is True
+    assert isinstance(enabled_agent["share_token"], str)
+    first_token = enabled_agent["share_token"]
+
+    rotate_response = client.post(
+        f"/api/agents/{agent_id}/share-link/rotate", headers=headers
+    )
+    assert rotate_response.status_code == 200, rotate_response.text
+    rotated_agent = rotate_response.json()
+    assert rotated_agent["share_enabled"] is True
+    assert isinstance(rotated_agent["share_token"], str)
+    assert rotated_agent["share_token"] != first_token
+
+    disable_response = client.delete(
+        f"/api/agents/{agent_id}/share-link", headers=headers
+    )
+    assert disable_response.status_code == 200, disable_response.text
+    disabled_agent = disable_response.json()
+    assert disabled_agent["share_enabled"] is False
+    assert disabled_agent["share_token"] is None
+
+
+def test_share_link_authenticates_public_chat_for_published_agent() -> None:
+    _admin_headers()
+    owner_id = _user_id("admin")
+    share_token = "public-share-token"
+    agent_id = _create_agent_row(
+        user_id=owner_id,
+        name="Public Share Agent",
+        status=AgentStatus.PUBLISHED,
+        share_enabled=True,
+        share_token=share_token,
+    )
+
+    response = client.post(
+        "/api/share/auth",
+        json={"share_token": share_token, "guest_id": "guest-1"},
+    )
+
+    assert response.status_code == 200, response.text
+    payload = response.json()
+    assert payload["agent_id"] == agent_id
+    assert payload["agent_name"] == "Public Share Agent"
+    assert isinstance(payload["access_token"], str)
+
+
+def test_disabled_share_link_invalidates_existing_public_tokens() -> None:
+    headers = _admin_headers()
+    owner_id = _user_id("admin")
+    share_token = "revoked-share-token"
+    agent_id = _create_agent_row(
+        user_id=owner_id,
+        name="Revoked Share Agent",
+        status=AgentStatus.PUBLISHED,
+        share_enabled=True,
+        share_token=share_token,
+    )
+
+    guest_headers = _authenticate_share_guest(share_token)
+
+    disable_response = client.delete(
+        f"/api/agents/{agent_id}/share-link", headers=headers
+    )
+    assert disable_response.status_code == 200, disable_response.text
+
+    create_task_response = client.post(
+        "/api/share/chat/task/create",
+        json={
+            "title": "hello",
+            "description": "hello",
+            "agent_id": agent_id,
+        },
+        headers=guest_headers,
+    )
+    assert create_task_response.status_code == 403, create_task_response.text
+    assert create_task_response.json()["detail"] == "Share link is unavailable"
+
+    upload_response = client.post(
+        "/api/share/files/upload",
+        headers=guest_headers,
+        data={"task_type": "task"},
+        files={"file": ("note.txt", io.BytesIO(b"hello"), "text/plain")},
+    )
+    assert upload_response.status_code == 403, upload_response.text
+    assert upload_response.json()["detail"] == "Share link is unavailable"
+
+
+def test_rotated_share_link_invalidates_existing_public_tokens() -> None:
+    headers = _admin_headers()
+    owner_id = _user_id("admin")
+    original_share_token = "rotating-share-token"
+    agent_id = _create_agent_row(
+        user_id=owner_id,
+        name="Rotating Share Agent",
+        status=AgentStatus.PUBLISHED,
+        share_enabled=True,
+        share_token=original_share_token,
+    )
+
+    guest_headers = _authenticate_share_guest(original_share_token)
+
+    rotate_response = client.post(
+        f"/api/agents/{agent_id}/share-link/rotate", headers=headers
+    )
+    assert rotate_response.status_code == 200, rotate_response.text
+    rotated_share_token = rotate_response.json()["share_token"]
+    assert isinstance(rotated_share_token, str)
+    assert rotated_share_token != original_share_token
+
+    create_task_response = client.post(
+        "/api/share/chat/task/create",
+        json={
+            "title": "hello after rotate",
+            "description": "hello after rotate",
+            "agent_id": agent_id,
+        },
+        headers=guest_headers,
+    )
+    assert create_task_response.status_code == 403, create_task_response.text
+    assert create_task_response.json()["detail"] == "Share link is unavailable"
+
+    refreshed_guest_headers = _authenticate_share_guest(rotated_share_token)
+    refreshed_create_task_response = client.post(
+        "/api/share/chat/task/create",
+        json={
+            "title": "hello with new token",
+            "description": "hello with new token",
+            "agent_id": agent_id,
+        },
+        headers=refreshed_guest_headers,
+    )
+    assert refreshed_create_task_response.status_code == 200, (
+        refreshed_create_task_response.text
+    )
+
+
+def test_reenabled_share_link_invalidates_existing_public_tokens() -> None:
+    headers = _admin_headers()
+    owner_id = _user_id("admin")
+    original_share_token = "reenable-share-token"
+    agent_id = _create_agent_row(
+        user_id=owner_id,
+        name="Re-enabled Share Agent",
+        status=AgentStatus.PUBLISHED,
+        share_enabled=True,
+        share_token=original_share_token,
+    )
+
+    guest_headers = _authenticate_share_guest(original_share_token)
+
+    disable_response = client.delete(
+        f"/api/agents/{agent_id}/share-link", headers=headers
+    )
+    assert disable_response.status_code == 200, disable_response.text
+
+    enable_response = client.post(f"/api/agents/{agent_id}/share-link", headers=headers)
+    assert enable_response.status_code == 200, enable_response.text
+    new_share_token = enable_response.json()["share_token"]
+    assert isinstance(new_share_token, str)
+    assert new_share_token != original_share_token
+
+    create_task_response = client.post(
+        "/api/share/chat/task/create",
+        json={
+            "title": "hello after re-enable",
+            "description": "hello after re-enable",
+            "agent_id": agent_id,
+        },
+        headers=guest_headers,
+    )
+    assert create_task_response.status_code == 403, create_task_response.text
+    assert create_task_response.json()["detail"] == "Share link is unavailable"
+
+    refreshed_guest_headers = _authenticate_share_guest(new_share_token)
+    refreshed_create_task_response = client.post(
+        "/api/share/chat/task/create",
+        json={
+            "title": "hello after reauth",
+            "description": "hello after reauth",
+            "agent_id": agent_id,
+        },
+        headers=refreshed_guest_headers,
+    )
+    assert refreshed_create_task_response.status_code == 200, (
+        refreshed_create_task_response.text
+    )
+
+
+def test_share_upload_requires_task_id() -> None:
+    _admin_headers()
+    owner_id = _user_id("admin")
+    share_token = "upload-needs-task-token"
+    _create_agent_row(
+        user_id=owner_id,
+        name="Upload Requires Task Agent",
+        status=AgentStatus.PUBLISHED,
+        share_enabled=True,
+        share_token=share_token,
+    )
+
+    guest_headers = _authenticate_share_guest(share_token)
+
+    upload_response = client.post(
+        "/api/share/files/upload",
+        headers=guest_headers,
+        data={"task_type": "task"},
+        files={"file": ("note.txt", io.BytesIO(b"hello"), "text/plain")},
+    )
+    assert upload_response.status_code == 400, upload_response.text
+    assert upload_response.json()["detail"] == "task_id is required"
+
+
+def test_share_public_file_preview_requires_valid_share_token() -> None:
+    headers = _admin_headers()
+    owner_id = _user_id("admin")
+    guest_id = "guest-preview"
+    share_token = "share-preview-token"
+    agent_id = _create_agent_row(
+        user_id=owner_id,
+        name="Preview Share Agent",
+        status=AgentStatus.PUBLISHED,
+        share_enabled=True,
+        share_token=share_token,
+    )
+    file_id = _create_public_task_file(
+        owner_id=owner_id,
+        agent_id=agent_id,
+        guest_id=guest_id,
+    )
+
+    preview_without_token = client.get(f"/api/files/public/preview/{file_id}")
+    assert preview_without_token.status_code == 403, preview_without_token.text
+
+    guest_headers = _authenticate_share_guest(share_token, guest_id=guest_id)
+    access_token = guest_headers["Authorization"].replace("Bearer ", "", 1)
+    preview_with_token = client.get(
+        f"/api/files/public/preview/{file_id}",
+        params={"token": access_token},
+    )
+    assert preview_with_token.status_code == 200, preview_with_token.text
+    assert preview_with_token.content == b"hello from public task"
+
+    disable_response = client.delete(
+        f"/api/agents/{agent_id}/share-link", headers=headers
+    )
+    assert disable_response.status_code == 200, disable_response.text
+
+    preview_after_disable = client.get(
+        f"/api/files/public/preview/{file_id}",
+        params={"token": access_token},
+    )
+    assert preview_after_disable.status_code == 403, preview_after_disable.text
+    assert preview_after_disable.json()["detail"] == "Share link is unavailable"
+
+
+def test_share_public_file_download_requires_valid_share_token() -> None:
+    _admin_headers()
+    owner_id = _user_id("admin")
+    guest_id = "guest-download"
+    share_token = "share-download-token"
+    agent_id = _create_agent_row(
+        user_id=owner_id,
+        name="Download Share Agent",
+        status=AgentStatus.PUBLISHED,
+        share_enabled=True,
+        share_token=share_token,
+    )
+    file_id = _create_public_task_file(
+        owner_id=owner_id,
+        agent_id=agent_id,
+        guest_id=guest_id,
+        filename="download-note.txt",
+    )
+
+    guest_headers = _authenticate_share_guest(share_token, guest_id=guest_id)
+    access_token = guest_headers["Authorization"].replace("Bearer ", "", 1)
+
+    download_with_token = client.get(
+        f"/api/files/public/download/{file_id}",
+        params={"token": access_token},
+    )
+    assert download_with_token.status_code == 200, download_with_token.text
+    assert download_with_token.content == b"hello from public task"
+
+    download_without_token = client.get(f"/api/files/public/download/{file_id}")
+    assert download_without_token.status_code == 403, download_without_token.text
 
 
 class TestDeleteAgent:

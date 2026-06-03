@@ -17,7 +17,7 @@ import { useI18n } from "@/contexts/i18n-context"
 import { apiRequest } from "@/lib/api-wrapper"
 import { isStreamingFinalAnswerMessage } from "@/lib/streaming-final-answer"
 import { getProcessGroupIndex } from "@/lib/task-timeline"
-import { cn, getApiUrl } from "@/lib/utils"
+import { cn } from "@/lib/utils"
 
 export type TaskConversationPanelMode = "page" | "embedded-preview"
 
@@ -28,7 +28,12 @@ interface TaskConversationPanelProps {
   showTokenUsage?: boolean
   showDagPreview?: boolean
   showTaskFiles?: boolean
+  hideFileUpload?: boolean
+  hideConfig?: boolean
+  compactInput?: boolean
   autoFocusInput?: boolean
+  uploadFile?: (file: File, params: { taskType: string }) => Promise<{ file_id: string }>
+  deferFileUpload?: boolean
   onSend?: (message: string, config?: any, files?: File[]) => Promise<void> | void
 }
 
@@ -139,10 +144,15 @@ export function TaskConversationPanel({
   showTokenUsage = mode === "page",
   showDagPreview = mode === "page",
   showTaskFiles = mode === "page",
+  hideFileUpload = false,
+  hideConfig = mode === "embedded-preview",
+  compactInput = false,
   autoFocusInput = mode === "page",
+  uploadFile,
+  deferFileUpload = false,
   onSend,
 }: TaskConversationPanelProps) {
-  const { state, sendMessage, pauseTask, resumeTask, openFilePreview, closeFilePreview, requestStatus, dispatch } = useApp()
+  const { state, sendMessage, pauseTask, resumeTask, openFilePreview, closeFilePreview, requestStatus, dispatch, getFileDownloadUrl } = useApp()
   const { t } = useI18n()
   const [files, setFiles] = useState<File[]>([])
   const [dagPreviewOpen, setDagPreviewOpen] = useState(false)
@@ -378,7 +388,7 @@ export function TaskConversationPanel({
   const handleDownload = async () => {
     try {
       if (!state.filePreview.fileId) return
-      const response = await apiRequest(`${getApiUrl()}/api/files/download/${state.filePreview.fileId}`)
+      const response = await apiRequest(getFileDownloadUrl(state.filePreview.fileId))
       if (!response.ok) {
         throw new Error(`Download failed: ${response.statusText}`)
       }
@@ -672,7 +682,7 @@ export function TaskConversationPanel({
               files={files}
               onFilesChange={setFiles}
               showModeToggle={false}
-              hideConfig={mode === "embedded-preview"}
+              hideConfig={hideConfig}
               taskStatus={state.currentTask?.status}
               onPause={pauseTask}
               onResume={resumeTask}
@@ -684,7 +694,12 @@ export function TaskConversationPanel({
                 executionMode: state.currentTask.executionMode,
               } : undefined}
               readOnlyConfig={true}
+              hideFileUpload={hideFileUpload}
+              compact={compactInput}
+              minHeightClass={compactInput ? "min-h-[44px]" : undefined}
               autoFocus={autoFocusInput}
+              uploadFile={uploadFile}
+              deferFileUpload={deferFileUpload}
             />
           </div>
         </div>

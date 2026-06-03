@@ -1,8 +1,7 @@
 "use client"
 
-import { useEffect, useState } from "react"
+import { useEffect } from "react"
 import { useApp } from "@/contexts/app-context-chat"
-import { getApiUrl } from "@/lib/utils"
 import { apiRequest } from "@/lib/api-wrapper"
 import { useI18n } from "@/contexts/i18n-context"
 import { FileViewer } from "@/components/file/file-viewer"
@@ -12,7 +11,7 @@ interface FilePreviewContentProps {
 }
 
 export function FilePreviewContent({ open }: FilePreviewContentProps) {
-  const { state, dispatch } = useApp()
+  const { state, dispatch, getFilePreviewUrl } = useApp()
   const { filePreview } = state
   const { t } = useI18n()
 
@@ -21,13 +20,11 @@ export function FilePreviewContent({ open }: FilePreviewContentProps) {
     if (open && filePreview.fileId && !filePreview.content && !filePreview.error) {
       const loadFileContent = async () => {
         try {
-          const apiUrl = getApiUrl()
-
           // The backend's preview endpoint returns raw bytes (including for
           // .pptx, which is rendered in the browser by PptxPreviewRenderer).
           // We only need to base64-encode binary responses for the
           // downstream viewers.
-          const url = `${apiUrl}/api/files/preview/${filePreview.fileId}`
+          const url = getFilePreviewUrl(filePreview.fileId)
 
           const response = await apiRequest(url, {
             cache: 'no-cache',
@@ -105,7 +102,7 @@ export function FilePreviewContent({ open }: FilePreviewContentProps) {
 
       loadFileContent()
     }
-  }, [open, filePreview.fileId, filePreview.content, filePreview.error, dispatch, t, filePreview.fileName])
+  }, [open, filePreview.fileId, filePreview.content, filePreview.error, dispatch, getFilePreviewUrl, t, filePreview.fileName])
 
   return (
     <div className="w-full h-full flex flex-col">

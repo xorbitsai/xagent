@@ -33,6 +33,9 @@ _AGENT_UPDATE_FIELDS = {
     "status",
     "widget_enabled",
     "allowed_domains",
+    "share_enabled",
+    "share_token",
+    "share_updated_at",
 }
 
 
@@ -64,6 +67,11 @@ class AgentStore:
             "updated_at": agent.updated_at.isoformat(),
             "widget_enabled": agent.widget_enabled,
             "allowed_domains": ensure_list(agent.allowed_domains) or [],
+            "share_enabled": agent.share_enabled,
+            "share_token": agent.share_token,
+            "share_updated_at": agent.share_updated_at.isoformat()
+            if agent.share_updated_at
+            else None,
         }
 
     def agent_to_list_item_dict(self, agent: Agent) -> dict[str, Any]:
@@ -79,6 +87,11 @@ class AgentStore:
             else agent.created_at.isoformat(),
             "widget_enabled": agent.widget_enabled,
             "allowed_domains": ensure_list(agent.allowed_domains) or [],
+            "share_enabled": agent.share_enabled,
+            "share_token": agent.share_token,
+            "share_updated_at": agent.share_updated_at.isoformat()
+            if agent.share_updated_at
+            else None,
         }
 
     def list_agent_items(self, user_id: int) -> list[dict[str, Any]]:
@@ -153,6 +166,9 @@ class AgentStore:
         published_at: datetime | None = None,
         widget_enabled: bool = True,
         allowed_domains: list[str] | None = None,
+        share_enabled: bool = False,
+        share_token: str | None = None,
+        share_updated_at: datetime | None = None,
     ) -> Agent:
         agent = self.add_agent(
             user_id=user_id,
@@ -170,6 +186,9 @@ class AgentStore:
             published_at=published_at,
             widget_enabled=widget_enabled,
             allowed_domains=allowed_domains,
+            share_enabled=share_enabled,
+            share_token=share_token,
+            share_updated_at=share_updated_at,
         )
         self.db.commit()
         self.db.refresh(agent)
@@ -194,6 +213,9 @@ class AgentStore:
         published_at: datetime | None = None,
         widget_enabled: bool = True,
         allowed_domains: list[str] | None = None,
+        share_enabled: bool = False,
+        share_token: str | None = None,
+        share_updated_at: datetime | None = None,
     ) -> Agent:
         if status == AgentStatus.PUBLISHED and published_at is None:
             published_at = datetime.now(timezone.utc)
@@ -213,6 +235,9 @@ class AgentStore:
             published_at=published_at,
             widget_enabled=widget_enabled,
             allowed_domains=allowed_domains or [],
+            share_enabled=share_enabled,
+            share_token=share_token,
+            share_updated_at=share_updated_at,
         )
         self.db.add(agent)
         self.db.flush()

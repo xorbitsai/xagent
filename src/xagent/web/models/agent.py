@@ -70,6 +70,9 @@ class Agent(Base):  # type: ignore
     allowed_domains = Column(
         JSON, nullable=True, default=list
     )  # List of allowed domains for the widget
+    share_enabled = Column(Boolean, default=False, nullable=False)
+    share_token = Column(String(255), nullable=True, index=True)
+    share_updated_at = Column(DateTime(timezone=True), nullable=True)
 
     # Status
     origin = Column(

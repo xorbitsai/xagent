@@ -3017,11 +3017,26 @@ Build when you need.`,
       desc: "Copy and paste this script tag into the <body> of your website.",
       copy_btn: "Copy Snippet"
     },
+    share_link: {
+      title: "Share Link",
+      desc: "Generate a public page anyone can open to chat with this agent.",
+      publish_required: "Please publish this agent before generating a share link.",
+      public_url: "Public URL",
+      anyone_access: "Anyone with this link can start a public chat with this agent.",
+      generate_btn: "Generate Link",
+      rotate_btn: "Reset Link",
+      disable_btn: "Disable Link"
+    },
     messages: {
       update_success: "Widget configuration updated",
       update_failed: "Failed to update widget configuration",
       copied: "Copied to clipboard",
-      copy_failed: "Failed to copy to clipboard"
+      copy_failed: "Failed to copy to clipboard",
+      link_copied: "Link copied to clipboard",
+      share_enabled: "Share link generated",
+      share_rotated: "Share link rotated",
+      share_disabled: "Share link disabled",
+      share_failed: "Share link action failed"
     },
     api_panel: {
       title: "Call this agent via REST API",

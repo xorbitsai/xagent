@@ -35,6 +35,7 @@ from ..config import (
     is_allowed_file,
 )
 from ..models.database import get_db
+from ..models.task import Task
 from ..models.uploaded_file import UploadedFile
 from ..models.user import User
 from ..services.kb_file_service import aggregate_uploaded_file_statuses
@@ -206,6 +207,150 @@ async def _write_upload_with_size_limit(uploaded: UploadFile, target_path: Path)
     return total_size
 
 
+async def store_uploaded_files(
+    *,
+    upload_items: list[UploadFile],
+    task_type: str,
+    task_id: str | None,
+    folder: str | None,
+    user: User,
+    db: Session,
+    single_file_mode: bool,
+) -> Dict[str, Any]:
+    parsed_task_id = _parse_task_id(task_id)
+    uploaded_files = []
+    written_paths: list[Path] = []
+    written_storage_keys: list[str] = []
+
+    try:
+        for uploaded in upload_items:
+            if not uploaded.filename or not uploaded.filename.strip():
+                raise HTTPException(status_code=422, detail="No filename provided")
+            if not is_allowed_file(uploaded.filename, task_type):
+                raise HTTPException(
+                    status_code=500,
+                    detail=f"File type {Path(uploaded.filename).suffix.lower()} not supported for task type {task_type}",
+                )
+
+            try:
+                target_path = _build_unique_file_path(
+                    get_upload_path(
+                        uploaded.filename, task_id, folder, _user_id_value(user)
+                    )
+                )
+            except ValueError as e:
+                logger.warning(f"Invalid folder name rejected: {folder!r} - {e}")
+                raise HTTPException(
+                    status_code=422, detail=f"Invalid folder name: {str(e)}"
+                ) from e
+
+            file_size = await _write_upload_with_size_limit(uploaded, target_path)
+            written_paths.append(target_path)
+            file_id = str(uuid4())
+            file_record = UploadedFileStore(db).create_from_local_path(
+                local_path=target_path,
+                user_id=_user_id_value(user),
+                file_id=file_id,
+                task_id=parsed_task_id,
+                filename=Path(uploaded.filename).name,
+                mime_type=uploaded.content_type,
+            )
+            if file_record.storage_key:
+                written_storage_keys.append(str(file_record.storage_key))
+            setattr(file_record, "file_size", file_size)
+            db.flush()
+
+            content_preview = ""
+            file_extension = Path(uploaded.filename).suffix.lower()
+            if file_extension == ".pptx":
+                try:
+                    preview_content = await asyncio.to_thread(
+                        _pptx_text_preview, target_path
+                    )
+                    content_preview = (
+                        preview_content[:500] + "..."
+                        if len(preview_content) > 500
+                        else preview_content
+                    )
+                except Exception:
+                    content_preview = ""
+            elif file_extension == ".ppt":
+                content_preview = ""
+            elif file_extension not in BINARY_EXTENSIONS:
+                try:
+                    preview_content = read_file(str(target_path))
+                    content_preview = (
+                        preview_content[:500] + "..."
+                        if isinstance(preview_content, str)
+                        and len(preview_content) > 500
+                        else preview_content
+                    )
+                except Exception:
+                    content_preview = ""
+
+            uploaded_files.append(
+                {
+                    "file_id": file_record.file_id,
+                    "filename": file_record.filename,
+                    "file_size": file_record.file_size,
+                    "mime_type": file_record.mime_type,
+                    "content_preview": content_preview,
+                }
+            )
+
+        db.commit()
+    except DurableStorageOperationError as exc:
+        db.rollback()
+        for storage_key in written_storage_keys:
+            try:
+                get_file_storage().delete(storage_key)
+            except Exception:
+                logger.warning("Failed to clean up durable upload: %s", storage_key)
+        for path in written_paths:
+            try:
+                if path.exists():
+                    path.unlink()
+            except OSError:
+                pass
+        logger.warning("Durable storage unavailable during upload: %s", exc)
+        raise _durable_storage_unavailable() from exc
+    except Exception:
+        db.rollback()
+        for storage_key in written_storage_keys:
+            try:
+                get_file_storage().delete(storage_key)
+            except Exception:
+                logger.warning("Failed to clean up durable upload: %s", storage_key)
+        for path in written_paths:
+            try:
+                if path.exists():
+                    path.unlink()
+            except OSError:
+                pass
+        raise
+
+    if single_file_mode:
+        first_file = uploaded_files[0]
+        return {
+            "success": True,
+            "file_id": first_file["file_id"],
+            "filename": first_file["filename"],
+            "file_size": first_file["file_size"],
+            "mime_type": first_file["mime_type"],
+            "task_type": task_type,
+            "content_preview": first_file["content_preview"],
+            "message": f"Successfully uploaded {first_file['filename']}",
+        }
+
+    return {
+        "success": True,
+        "files": uploaded_files,
+        "total_files": len(uploaded_files),
+        "task_type": task_type,
+        "message": f"Successfully uploaded {len(uploaded_files)} files",
+    }
+
+
 def _user_id_value(user: User) -> int:
     return int(getattr(user, "id"))
 
@@ -270,6 +415,31 @@ def _resolve_public_preview_target(
 
     _ensure_under_uploads(candidate, user_id)
     return candidate
+
+
+def _validate_public_task_file_access(
+    db: Session,
+    file_record: UploadedFile,
+    token: str | None,
+) -> None:
+    if not file_record.task_id:
+        return
+
+    task = db.query(Task).filter(Task.id == file_record.task_id).first()
+    if not task or not isinstance(task.agent_config, dict):
+        return
+
+    guest_id = task.agent_config.get("guest_id")
+    if not isinstance(guest_id, str) or not guest_id:
+        return
+
+    if not token:
+        raise HTTPException(status_code=403, detail="Public file access token required")
+
+    from .public_chat_access import get_public_chat_user, get_task_for_public_context
+
+    access_context = get_public_chat_user(token, db)
+    get_task_for_public_context(db, int(task.id), access_context)
 
 
 def _find_registered_preview_asset(
@@ -700,142 +870,15 @@ async def upload_file(
         raise HTTPException(status_code=422, detail="No files provided")
 
     single_file_mode = file is not None and (not files)
-    parsed_task_id = _parse_task_id(task_id)
-    uploaded_files = []
-    written_paths: list[Path] = []
-    written_storage_keys: list[str] = []
-
-    try:
-        for uploaded in upload_items:
-            if not uploaded.filename or not uploaded.filename.strip():
-                raise HTTPException(status_code=422, detail="No filename provided")
-            if not is_allowed_file(uploaded.filename, task_type):
-                raise HTTPException(
-                    status_code=500,
-                    detail=f"File type {Path(uploaded.filename).suffix.lower()} not supported for task type {task_type}",
-                )
-
-            # get_upload_path may raise ValueError for invalid folder/collection names
-            try:
-                target_path = _build_unique_file_path(
-                    get_upload_path(
-                        uploaded.filename, task_id, folder, _user_id_value(user)
-                    )
-                )
-            except ValueError as e:
-                logger.warning(f"Invalid folder name rejected: {folder!r} - {e}")
-                raise HTTPException(
-                    status_code=422, detail=f"Invalid folder name: {str(e)}"
-                ) from e
-
-            file_size = await _write_upload_with_size_limit(uploaded, target_path)
-            written_paths.append(target_path)
-            file_id = str(uuid4())
-            file_record = UploadedFileStore(db).create_from_local_path(
-                local_path=target_path,
-                user_id=_user_id_value(user),
-                file_id=file_id,
-                task_id=parsed_task_id,
-                filename=Path(uploaded.filename).name,
-                mime_type=uploaded.content_type,
-            )
-            if file_record.storage_key:
-                written_storage_keys.append(str(file_record.storage_key))
-            setattr(file_record, "file_size", file_size)
-            db.flush()
-
-            content_preview = ""
-            # Skip preview generation for binary files (images, videos, etc.)
-            file_extension = Path(uploaded.filename).suffix.lower()
-            if file_extension == ".pptx":
-                try:
-                    preview_content = await asyncio.to_thread(
-                        _pptx_text_preview, target_path
-                    )
-                    content_preview = (
-                        preview_content[:500] + "..."
-                        if len(preview_content) > 500
-                        else preview_content
-                    )
-                except Exception:
-                    content_preview = ""
-            elif file_extension == ".ppt":
-                # python-pptx does not support the legacy .ppt format; skip
-                # the thread dispatch and return an empty preview directly.
-                content_preview = ""
-            elif file_extension not in BINARY_EXTENSIONS:
-                try:
-                    preview_content = read_file(str(target_path))
-                    content_preview = (
-                        preview_content[:500] + "..."
-                        if isinstance(preview_content, str)
-                        and len(preview_content) > 500
-                        else preview_content
-                    )
-                except Exception:
-                    content_preview = ""
-
-            uploaded_files.append(
-                {
-                    "file_id": file_record.file_id,
-                    "filename": file_record.filename,
-                    "file_size": file_record.file_size,
-                    "mime_type": file_record.mime_type,
-                    "content_preview": content_preview,
-                }
-            )
-
-        db.commit()
-    except DurableStorageOperationError as exc:
-        db.rollback()
-        for storage_key in written_storage_keys:
-            try:
-                get_file_storage().delete(storage_key)
-            except Exception:
-                logger.warning("Failed to clean up durable upload: %s", storage_key)
-        for path in written_paths:
-            try:
-                if path.exists():
-                    path.unlink()
-            except OSError:
-                pass
-        logger.warning("Durable storage unavailable during upload: %s", exc)
-        raise _durable_storage_unavailable() from exc
-    except Exception:
-        db.rollback()
-        for storage_key in written_storage_keys:
-            try:
-                get_file_storage().delete(storage_key)
-            except Exception:
-                logger.warning("Failed to clean up durable upload: %s", storage_key)
-        for path in written_paths:
-            try:
-                if path.exists():
-                    path.unlink()
-            except OSError:
-                pass
-        raise
-
-    if single_file_mode:
-        first_file = uploaded_files[0]
-        return {
-            "success": True,
-            "file_id": first_file["file_id"],
-            "filename": first_file["filename"],
-            "file_size": first_file["file_size"],
-            "mime_type": first_file["mime_type"],
-            "task_type": task_type,
-            "content_preview": first_file["content_preview"],
-            "message": f"Successfully uploaded {first_file['filename']}",
-        }
-
-    return {
-        "success": True,
-        "files": uploaded_files,
-        "total_files": len(uploaded_files),
-        "task_type": task_type,
-        "message": f"Successfully uploaded {len(uploaded_files)} files",
-    }
+    return await store_uploaded_files(
+        upload_items=upload_items,
+        task_type=task_type,
+        task_id=task_id,
+        folder=folder,
+        user=user,
+        db=db,
+        single_file_mode=single_file_mode,
+    )
 
 
 @file_router.get("/list")
@@ -1206,6 +1249,7 @@ async def preview_pptx_as_pdf(
 @file_router.get("/public/download/{file_id:path}", response_model=None)
 async def public_download_file(
     file_id: str,
+    token: Optional[str] = Query(default=None),
     db: Session = Depends(get_db),
 ) -> Any:
     """Public source-download endpoint for the chat file-card 'Open' link.
@@ -1236,6 +1280,7 @@ async def public_download_file(
         )
 
     if file_record:
+        _validate_public_task_file_access(db, file_record, token)
         file_ref = ManagedFileRef(file_record)
         owner_user_id = _file_user_id_value(file_record)
         _ensure_under_uploads(file_ref.local_path, owner_user_id)
@@ -1282,6 +1327,7 @@ async def public_download_file(
 async def public_preview_file(
     file_id: str,
     relative_path: Optional[str] = Query(default=None),
+    token: Optional[str] = Query(default=None),
     db: Session = Depends(get_db),
 ) -> Any:
     # For public preview, we need to handle both file_id and legacy paths
@@ -1296,6 +1342,7 @@ async def public_preview_file(
         )
 
     if file_record:
+        _validate_public_task_file_access(db, file_record, token)
         file_ref = ManagedFileRef(file_record)
         base_path = file_ref.local_path
         owner_user_id = _file_user_id_value(file_record)
@@ -1341,6 +1388,7 @@ async def public_preview_file(
             relative_path=relative_path,
         )
         if asset_record is not None:
+            _validate_public_task_file_access(db, asset_record, token)
             asset_ref = ManagedFileRef(asset_record)
             try:
                 target_path = asset_ref.ensure_local()

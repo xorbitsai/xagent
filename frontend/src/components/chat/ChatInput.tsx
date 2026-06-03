@@ -55,6 +55,8 @@ interface ChatInputProps {
     name: string;
   }>;
   onRemoveSelectedAgent?: (agentId: number | string) => void;
+  uploadFile?: (file: File, params: { taskType: string }) => Promise<{ file_id: string }>;
+  deferFileUpload?: boolean;
 }
 
 export function ChatInput({
@@ -78,6 +80,8 @@ export function ChatInput({
   promptHighlightTerms = [],
   selectedAgents = [],
   onRemoveSelectedAgent,
+  uploadFile,
+  deferFileUpload = false,
 }: ChatInputProps) {
   const router = useRouter();
   const [internalMessage, setInternalMessage] = useState("");
@@ -292,33 +296,44 @@ export function ChatInput({
       uploadAbortControllersRef.current.set(fileId, controller);
 
       try {
-        const formData = new FormData();
-        formData.append('file', file);
-        // Default to task mode if not specified
-        formData.append('task_type', mode || 'task');
+        const currentTaskType = mode || 'task';
 
-        const response = await apiRequest(`${getUploadApiUrl()}/api/files/upload`, {
-          method: 'POST',
-          body: formData,
-          signal: controller.signal
-        });
-
-        const parsed = await parseApiResponse(response);
-
-        if (response.ok && isJsonRecord(parsed.data)) {
-          const data = parsed.data;
-          if (data.success && typeof data.file_id === 'string') {
-            // Attach file_id to the File object
-            (file as File & { file_id?: string }).file_id = data.file_id;
+        if (uploadFile) {
+          const result = await uploadFile(file, { taskType: currentTaskType });
+          if (result && typeof result.file_id === 'string') {
+            (file as File & { file_id?: string }).file_id = result.file_id;
           } else {
             failedFiles.add(file);
           }
         } else {
-          failedFiles.add(file);
-          uploadErrorMessage = uploadErrorMessage || getUploadErrorMessage(response, parsed, {
-            generic: t("files.uploadFailed") || "Failed to upload some files",
-            ...UPLOAD_ERROR_MESSAGES,
+          const formData = new FormData();
+          formData.append('file', file);
+          // Default to task mode if not specified
+          formData.append('task_type', currentTaskType);
+
+          const response = await apiRequest(`${getUploadApiUrl()}/api/files/upload`, {
+            method: 'POST',
+            body: formData,
+            signal: controller.signal
           });
+
+          const parsed = await parseApiResponse(response);
+
+          if (response.ok && isJsonRecord(parsed.data)) {
+            const data = parsed.data;
+            if (data.success && typeof data.file_id === 'string') {
+              // Attach file_id to the File object
+              (file as File & { file_id?: string }).file_id = data.file_id;
+            } else {
+              failedFiles.add(file);
+            }
+          } else {
+            failedFiles.add(file);
+            uploadErrorMessage = uploadErrorMessage || getUploadErrorMessage(response, parsed, {
+              generic: t("files.uploadFailed") || "Failed to upload some files",
+              ...UPLOAD_ERROR_MESSAGES,
+            });
+          }
         }
       } catch (error: any) {
         if (error.name === 'AbortError') {
@@ -350,11 +365,17 @@ export function ChatInput({
   const appendFiles = (newFiles: File[]) => {
     if (newFiles.length === 0 || !onFilesChange || isInputBusy) return;
     onFilesChange([...filesRef.current, ...newFiles]);
-    uploadFiles(newFiles);
+    if (!deferFileUpload) {
+      uploadFiles(newFiles);
+    }
   };
 
   // Fetch default models on mount
   useEffect(() => {
+    if (hideConfig) {
+      return;
+    }
+
     const fetchDefaultModels = async () => {
       try {
         const apiUrl = getApiUrl();
@@ -419,7 +440,7 @@ export function ChatInput({
     };
 
     fetchDefaultModels();
-  }, []);
+  }, [hideConfig]);
 
   // Update config when taskConfig changes
   useEffect(() => {
@@ -513,7 +534,8 @@ export function ChatInput({
     if (!canSubmit() || isSubmittingRef.current) return;
 
     const hasSelectedAgent = selectedAgents.length > 0;
-    if (!hasSelectedAgent && !agentConfig.model) {
+    const shouldRequireModelSelection = !hideConfig && !readOnlyConfig;
+    if (shouldRequireModelSelection && !hasSelectedAgent && !agentConfig.model) {
       setShowNoModelAlert(true);
       return;
     }
@@ -789,7 +811,30 @@ export function ChatInput({
 
           {/* Bottom toolbar or inline button */}
           {compact ? (
-            <div className="absolute right-2 bottom-2">
+            <div className="absolute right-2 bottom-2 flex items-center gap-2">
+              {!hideFileUpload && (
+                <>
+                  <input
+                    ref={fileInputRef}
+                    type="file"
+                    multiple
+                    onChange={handleFileSelect}
+                    className="hidden"
+                    accept=".pdf,.doc,.docx,.txt,.md,.csv,.json,.xlsx,.xls,.ppt,.pptx,.png,.jpg,.jpeg,.gif,.webp"
+                  />
+                  <Button
+                    type="button"
+                    variant="ghost"
+                    size="sm"
+                    className="h-8 w-8 p-0 text-muted-foreground hover:text-foreground hover:bg-secondary/80 rounded-full"
+                    onClick={() => fileInputRef.current?.click()}
+                    disabled={isInputBusy}
+                    title={t("chatPage.input.actions.upload")}
+                  >
+                    <Paperclip className="h-4 w-4" />
+                  </Button>
+                </>
+              )}
               <Button
                 type="submit"
                 size="icon"

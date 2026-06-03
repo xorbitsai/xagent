@@ -4,7 +4,7 @@ import { useEffect, useRef, useState, useCallback } from "react"
 import { useAuth } from "@/contexts/auth-context"
 import { apiRequest, getUploadErrorMessage, isJsonRecord, parseApiResponse, UPLOAD_ERROR_MESSAGES } from "@/lib/api-wrapper"
 import { toast } from "@/components/ui/sonner"
-import { getWsUrl, getApiUrl, getUploadApiUrl } from "@/lib/utils"
+import { getWsUrl, getUploadApiUrl } from "@/lib/utils"
 import { isFinalAnswerStreamEventType } from "@/lib/streaming-final-answer"
 
 // Duplicate message detection: record recently sent messages
@@ -28,6 +28,8 @@ interface UseWebSocketOptions {
   url?: string
   taskId?: number
   token?: string
+  buildWebSocketUrl?: (params: { baseUrl: string; taskId: number; token?: string }) => string
+  uploadFiles?: (files: File[], params: { taskId?: number | null; taskType: string }) => Promise<Array<{ file_id: string; name?: string; size?: number; type?: string }>>
   autoConnect?: boolean
   onMessage?: (message: WebSocketMessage) => void
   onConnect?: () => void
@@ -40,6 +42,8 @@ export function useWebSocket(options: UseWebSocketOptions = {}) {
     url = getWsUrl(),
     taskId,
     token,
+    buildWebSocketUrl,
+    uploadFiles,
     autoConnect = true,
     onMessage,
     onConnect,
@@ -108,7 +112,13 @@ export function useWebSocket(options: UseWebSocketOptions = {}) {
         return
       }
 
-      const wsUrl = `${url}/ws/chat/${taskId}${tokenRef.current ? `?token=${tokenRef.current}` : ''}`
+      const wsUrl = buildWebSocketUrl
+        ? buildWebSocketUrl({
+            baseUrl: url,
+            taskId,
+            token: tokenRef.current || undefined,
+          })
+        : `${url}/ws/chat/${taskId}${tokenRef.current ? `?token=${tokenRef.current}` : ''}`
       console.log('🚀 Attempting to connect to WebSocket:', wsUrl)
 
       // Test if the URL is valid before creating WebSocket
@@ -182,6 +192,14 @@ export function useWebSocket(options: UseWebSocketOptions = {}) {
             console.log('❌ No refresh token available, cannot recover WebSocket connection')
             onError?.(new Error('Authentication failed and no refresh token available'))
           }
+          return
+        }
+
+        if (event.code === 4003) {
+          const accessError = new Error(event.reason || 'Access denied')
+          setConnectionError(accessError)
+          onError?.(accessError)
+          console.log('🚫 WebSocket access revoked, stopping reconnection attempts')
           return
         }
 
@@ -461,6 +479,33 @@ export function useWebSocket(options: UseWebSocketOptions = {}) {
         }))
 
         if (filesToUpload.length > 0) {
+          const handleUploadedFiles = (uploadedFiles: Array<{ file_id: string; name?: string; size?: number; type?: string }>) => {
+            messageData.files = [...preUploadedFiles, ...uploadedFiles]
+
+            console.log(`📤 Sending message with uploaded files [${timestamp}]:`, messageData)
+            socketRef.current?.send(JSON.stringify(messageData))
+            console.log(`✅ Message sent [${timestamp}]`)
+
+            recentMessages.push({ message, timestamp, taskId: currentTaskId! })
+            const cutoffTime = timestamp - 5000
+            const firstKeepIndex = recentMessages.findIndex(msg => msg.timestamp >= cutoffTime)
+            if (firstKeepIndex === -1) {
+              recentMessages.splice(0, recentMessages.length)
+            } else if (firstKeepIndex > 0) {
+              recentMessages.splice(0, firstKeepIndex)
+            }
+          }
+
+          if (uploadFiles) {
+            uploadFiles(filesToUpload, { taskId: taskIdRef.current, taskType: 'task' })
+              .then(handleUploadedFiles)
+              .catch(err => {
+                console.error('Failed to upload files:', err)
+                toast.error(err instanceof Error ? err.message : 'Upload failed')
+              })
+            return
+          }
+
           const formData = new FormData()
           filesToUpload.forEach(f => formData.append('files', f))
           formData.append('task_type', 'task')
@@ -485,10 +530,8 @@ export function useWebSocket(options: UseWebSocketOptions = {}) {
               }
 
               const data = parsed.data
-              messageData.files = [...preUploadedFiles];
-              if (data.success && Array.isArray(data.files)) {
-                // Send file_ids in the websocket message
-                const newUploadedFiles = data.files
+              const newUploadedFiles = data.success && Array.isArray(data.files)
+                ? data.files
                   .filter((f): f is { file_id: string; filename?: string; file_size?: number; mime_type?: string } => (
                     isJsonRecord(f) && typeof f.file_id === 'string'
                   ))
@@ -497,24 +540,10 @@ export function useWebSocket(options: UseWebSocketOptions = {}) {
                     name: typeof f.filename === 'string' ? f.filename : '',
                     size: typeof f.file_size === 'number' ? f.file_size : 0,
                     type: typeof f.mime_type === 'string' ? f.mime_type : ''
-                  }));
-                messageData.files = messageData.files.concat(newUploadedFiles);
-              }
+                  }))
+                : []
 
-              console.log(`📤 Sending message with uploaded files [${timestamp}]:`, messageData)
-              socketRef.current?.send(JSON.stringify(messageData))
-              console.log(`✅ Message sent [${timestamp}]`)
-
-              // Record sent message
-              recentMessages.push({ message, timestamp, taskId: currentTaskId! })
-              // Clear records older than 5 seconds
-              const cutoffTime = timestamp - 5000
-              const firstKeepIndex = recentMessages.findIndex(msg => msg.timestamp >= cutoffTime)
-              if (firstKeepIndex === -1) {
-                recentMessages.splice(0, recentMessages.length)
-              } else if (firstKeepIndex > 0) {
-                recentMessages.splice(0, firstKeepIndex)
-              }
+              handleUploadedFiles(newUploadedFiles)
             })
             .catch(err => {
               console.error('Failed to upload files:', err)

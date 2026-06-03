@@ -12,6 +12,7 @@ import {
   isHtmlFile,
   isMarkdownFile,
   isCsvFile,
+  withPublicAccessToken,
 } from "@/lib/utils"
 
 interface FileViewerProps {
@@ -49,7 +50,7 @@ export function FileViewer({
           return `${attr}="${getFilePublicPreviewUrl(fileRef, apiUrl)}"`
         }
         if (path.startsWith("/api/files/public/preview/")) {
-          return `${attr}="${apiUrl}${path}"`
+          return `${attr}="${withPublicAccessToken(`${apiUrl}${path}`)}"`
         }
 
         return `${attr}="${getFileRelativePreviewUrl(fileId, path, apiUrl)}"`

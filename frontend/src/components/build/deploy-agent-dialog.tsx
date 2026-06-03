@@ -31,6 +31,9 @@ export interface Agent {
   can_edit?: boolean
   can_publish?: boolean
   can_delete?: boolean
+  share_enabled?: boolean
+  share_token?: string | null
+  share_updated_at?: string | null
 }
 
 interface DeployAgentDialogProps {
@@ -44,13 +47,16 @@ interface DeployAgentDialogProps {
 
 export function DeployAgentDialog({ deployAgent, onClose, onUpdate, onManageApiKey }: DeployAgentDialogProps) {
   const { t } = useI18n()
-  const [showSnippet, setShowSnippet] = useState(false)
-  const [showApiPanel, setShowApiPanel] = useState(false)
+  const [activeView, setActiveView] = useState<"options" | "embed" | "api" | "share">("options")
   const [apiTab, setApiTab] = useState<ApiSnippetTab>("curl")
   const [copiedSnippet, setCopiedSnippet] = useState(false)
-  const [copied, setCopied] = useState(false)
+  const [copiedShareLink, setCopiedShareLink] = useState(false)
   const [isUpdatingWidget, setIsUpdatingWidget] = useState(false)
+  const [isUpdatingShare, setIsUpdatingShare] = useState(false)
   const [newDomain, setNewDomain] = useState("")
+  const appOrigin = typeof window !== "undefined" ? window.location.origin : getApiUrl()
+  const shareUrl = deployAgent?.share_token ? `${appOrigin}/share/${deployAgent.share_token}` : ""
+  const isPublished = deployAgent?.status === "published"
 
   const agentId = deployAgent?.id ?? 0
   const apiSnippets: Record<ApiSnippetTab, string> = useMemo(() => {
@@ -124,9 +130,8 @@ with AgentClient(api_key="YOUR_API_KEY", base_url="${apiBase}") as agent:
 
   const handleCopySnippet = () => {
     if (!deployAgent) return
-    const origin = typeof window !== 'undefined' ? window.location.origin : getApiUrl()
     const snippet = `<script
-  src="${origin}/widget.js"
+  src="${appOrigin}/widget.js"
   data-agent-id="${deployAgent.id}"
   data-button-size="60px"
   data-button-color="#000"
@@ -134,9 +139,84 @@ with AgentClient(api_key="YOUR_API_KEY", base_url="${apiBase}") as agent:
   data-panel-bg-color="#fff">
 </script>`
     navigator.clipboard.writeText(snippet)
-    setCopied(true)
+    setCopiedSnippet(true)
     toast.success(t("deploy_agent.messages.copied") || "Copied to clipboard")
-    setTimeout(() => setCopied(false), 2000)
+    setTimeout(() => setCopiedSnippet(false), 2000)
+  }
+
+  const handleCopyShareLink = () => {
+    if (!shareUrl) return
+    navigator.clipboard.writeText(shareUrl)
+    setCopiedShareLink(true)
+    toast.success(t("deploy_agent.messages.link_copied") || "Link copied to clipboard")
+    setTimeout(() => setCopiedShareLink(false), 2000)
+  }
+
+  const handleEnableShare = async () => {
+    if (!deployAgent) return
+    try {
+      setIsUpdatingShare(true)
+      const res = await apiRequest(`${getApiUrl()}/api/agents/${deployAgent.id}/share-link`, {
+        method: "POST",
+      })
+      if (!res.ok) {
+        const errorData = await res.json().catch(() => null)
+        throw new Error(errorData?.detail || "Failed to generate share link")
+      }
+      const updatedAgent = await res.json()
+      onUpdate(updatedAgent)
+      toast.success(t("deploy_agent.messages.share_enabled") || "Share link generated")
+    } catch (err) {
+      console.error(err)
+      toast.error(t("deploy_agent.messages.share_failed") || "Failed to generate share link")
+    } finally {
+      setIsUpdatingShare(false)
+    }
+  }
+
+  const handleRotateShare = async () => {
+    if (!deployAgent) return
+    try {
+      setIsUpdatingShare(true)
+      const res = await apiRequest(`${getApiUrl()}/api/agents/${deployAgent.id}/share-link/rotate`, {
+        method: "POST",
+      })
+      if (!res.ok) {
+        const errorData = await res.json().catch(() => null)
+        throw new Error(errorData?.detail || "Failed to rotate share link")
+      }
+      const updatedAgent = await res.json()
+      onUpdate(updatedAgent)
+      toast.success(t("deploy_agent.messages.share_rotated") || "Share link rotated")
+    } catch (err) {
+      console.error(err)
+      toast.error(t("deploy_agent.messages.share_failed") || "Failed to rotate share link")
+    } finally {
+      setIsUpdatingShare(false)
+    }
+  }
+
+  const handleDisableShare = async () => {
+    if (!deployAgent) return
+    try {
+      setIsUpdatingShare(true)
+      const res = await apiRequest(`${getApiUrl()}/api/agents/${deployAgent.id}/share-link`, {
+        method: "DELETE",
+      })
+      if (!res.ok) {
+        const errorData = await res.json().catch(() => null)
+        throw new Error(errorData?.detail || "Failed to disable share link")
+      }
+      const updatedAgent = await res.json()
+      onUpdate(updatedAgent)
+      setCopiedShareLink(false)
+      toast.success(t("deploy_agent.messages.share_disabled") || "Share link disabled")
+    } catch (err) {
+      console.error(err)
+      toast.error(t("deploy_agent.messages.share_failed") || "Failed to disable share link")
+    } finally {
+      setIsUpdatingShare(false)
+    }
   }
 
   const handleOpenChange = (open: boolean) => {
@@ -144,8 +224,7 @@ with AgentClient(api_key="YOUR_API_KEY", base_url="${apiBase}") as agent:
       onClose()
       // Reset state when closing
       setTimeout(() => {
-        setShowSnippet(false)
-        setShowApiPanel(false)
+        setActiveView("options")
         setApiTab("curl")
       }, 300)
     }
@@ -162,7 +241,7 @@ with AgentClient(api_key="YOUR_API_KEY", base_url="${apiBase}") as agent:
       actionText: t("deploy_agent.options.embed.action") || "Get snippet",
       actionColor: "text-blue-600",
       className: "cursor-pointer hover:border-primary transition-colors shadow-sm",
-      onClick: () => setShowSnippet(true),
+      onClick: () => setActiveView("embed"),
     },
     {
       id: "rest_api",
@@ -174,7 +253,7 @@ with AgentClient(api_key="YOUR_API_KEY", base_url="${apiBase}") as agent:
       actionText: t("deploy_agent.options.rest_api.action") || "View endpoints",
       actionColor: "text-purple-600",
       className: "cursor-pointer hover:border-primary transition-colors shadow-sm",
-      onClick: () => setShowApiPanel(true),
+      onClick: () => setActiveView("api"),
     },
     {
       id: "shareable_link",
@@ -185,7 +264,8 @@ with AgentClient(api_key="YOUR_API_KEY", base_url="${apiBase}") as agent:
       desc: t("deploy_agent.options.shareable_link.desc") || "Generate a public URL anyone can open to chat with this agent",
       actionText: t("deploy_agent.options.shareable_link.action") || "Generate link",
       actionColor: "text-indigo-600",
-      className: "opacity-50 cursor-not-allowed shadow-sm",
+      className: "cursor-pointer hover:border-primary transition-colors shadow-sm",
+      onClick: () => setActiveView("share"),
     },
     {
       id: "webhook",
@@ -211,7 +291,7 @@ with AgentClient(api_key="YOUR_API_KEY", base_url="${apiBase}") as agent:
           <DialogDescription>{deployAgent?.name}</DialogDescription>
         </DialogHeader>
 
-        {!showSnippet && !showApiPanel ? (
+        {activeView === "options" ? (
           <div className="mt-6">
             <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
               {deploymentOptions.map((option) => (
@@ -238,9 +318,9 @@ with AgentClient(api_key="YOUR_API_KEY", base_url="${apiBase}") as agent:
               ))}
             </div>
           </div>
-        ) : showApiPanel ? (
+        ) : activeView === "api" ? (
           <div className="mt-4 space-y-4">
-            <div className="flex items-center text-sm text-muted-foreground cursor-pointer hover:text-foreground" onClick={() => setShowApiPanel(false)}>
+            <div className="flex items-center text-sm text-muted-foreground cursor-pointer hover:text-foreground" onClick={() => setActiveView("options")}>
               <ArrowRight className="h-4 w-4 mr-1 rotate-180" /> {t("deploy_agent.back_to_options") || "Back to Deploy Options"}
             </div>
 
@@ -290,13 +370,12 @@ with AgentClient(api_key="YOUR_API_KEY", base_url="${apiBase}") as agent:
               </button>
             </div>
           </div>
-        ) : (
+        ) : activeView === "embed" ? (
           <div className="mt-4 space-y-6">
-            <div className="flex items-center text-sm text-muted-foreground cursor-pointer hover:text-foreground" onClick={() => setShowSnippet(false)}>
+            <div className="flex items-center text-sm text-muted-foreground cursor-pointer hover:text-foreground" onClick={() => setActiveView("options")}>
               <ArrowRight className="h-4 w-4 mr-1 rotate-180" /> {t("deploy_agent.back_to_options") || "Back to Deploy Options"}
             </div>
 
-            {/* Access Control Section */}
             <div className="space-y-4 border rounded-lg p-4">
               <div className="flex items-center justify-between">
                 <div className="space-y-0.5">
@@ -364,7 +443,7 @@ with AgentClient(api_key="YOUR_API_KEY", base_url="${apiBase}") as agent:
               <div className="bg-muted p-4 rounded-md text-xs font-mono relative overflow-hidden group mt-4">
                 <pre className="whitespace-pre-wrap break-all text-muted-foreground">
                   {`<script
-  src="${typeof window !== 'undefined' ? window.location.origin : getApiUrl()}/widget.js"
+  src="${appOrigin}/widget.js"
   data-agent-id="${deployAgent?.id}"
   data-button-size="60px"
   data-button-color="#000"
@@ -379,9 +458,60 @@ with AgentClient(api_key="YOUR_API_KEY", base_url="${apiBase}") as agent:
                   onClick={handleCopySnippet}
                   title={t("deploy_agent.embed_snippet.copy_btn") || "Copy Snippet"}
                 >
-                  {copied ? <Check className="h-4 w-4 text-green-500" /> : <Copy className="h-4 w-4" />}
+                  {copiedSnippet ? <Check className="h-4 w-4 text-green-500" /> : <Copy className="h-4 w-4" />}
                 </Button>
               </div>
+            </div>
+          </div>
+        ) : (
+          <div className="mt-4 space-y-6">
+            <div className="flex items-center text-sm text-muted-foreground cursor-pointer hover:text-foreground" onClick={() => setActiveView("options")}>
+              <ArrowRight className="h-4 w-4 mr-1 rotate-180" /> {t("deploy_agent.back_to_options") || "Back to Deploy Options"}
+            </div>
+
+            <div className="space-y-4 border rounded-lg p-4">
+              <div className="space-y-1">
+                <div className="text-base font-medium">{t("deploy_agent.share_link.title") || "Share Link"}</div>
+                <div className="text-sm text-muted-foreground">
+                  {t("deploy_agent.share_link.desc") || "Generate a public page anyone can open to chat with this agent."}
+                </div>
+              </div>
+
+              {!isPublished ? (
+                <div className="rounded-md border border-amber-200 bg-amber-50 px-3 py-2 text-sm text-amber-900">
+                  {t("deploy_agent.share_link.publish_required") || "Please publish this agent before generating a share link."}
+                </div>
+              ) : deployAgent?.share_enabled && deployAgent?.share_token ? (
+                <div className="space-y-4 pt-2">
+                  <div className="space-y-2">
+                    <Label className="text-sm">{t("deploy_agent.share_link.public_url") || "Public URL"}</Label>
+                    <div className="flex gap-2">
+                      <Input readOnly value={shareUrl} className="flex-1" />
+                      <Button variant="secondary" onClick={handleCopyShareLink} disabled={isUpdatingShare}>
+                        {copiedShareLink ? <Check className="h-4 w-4 mr-1 text-green-500" /> : <Copy className="h-4 w-4 mr-1" />}
+                        {t("common.copy") || "Copy"}
+                      </Button>
+                    </div>
+                  </div>
+                  <div className="text-xs text-muted-foreground">
+                    {t("deploy_agent.share_link.anyone_access") || "Anyone with this link can start a public chat with this agent."}
+                  </div>
+                  <div className="flex gap-2">
+                    <Button variant="outline" onClick={handleRotateShare} disabled={isUpdatingShare}>
+                      {t("deploy_agent.share_link.rotate_btn") || "Reset Link"}
+                    </Button>
+                    <Button variant="outline" onClick={handleDisableShare} disabled={isUpdatingShare}>
+                      {t("deploy_agent.share_link.disable_btn") || "Disable Link"}
+                    </Button>
+                  </div>
+                </div>
+              ) : (
+                <div className="pt-2">
+                  <Button onClick={handleEnableShare} disabled={isUpdatingShare}>
+                    {t("deploy_agent.share_link.generate_btn") || "Generate Link"}
+                  </Button>
+                </div>
+              )}
             </div>
           </div>
         )}

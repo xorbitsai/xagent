@@ -49,6 +49,9 @@ interface ChatStartScreenProps {
   onFilesChange?: (files: File[]) => void;
   showModeToggle?: boolean;
   readOnlyConfig?: boolean;
+  hideConfig?: boolean;
+  compactInput?: boolean;
+  deferFileUpload?: boolean;
   taskConfig?: any;
   autoFocus?: boolean;
   inputMinHeightClass?: string;
@@ -73,6 +76,9 @@ export function ChatStartScreen({
   onFilesChange,
   showModeToggle = false,
   readOnlyConfig = false,
+  hideConfig = false,
+  compactInput = false,
+  deferFileUpload = false,
   taskConfig,
   autoFocus = false,
   inputMinHeightClass
@@ -110,6 +116,9 @@ export function ChatStartScreen({
             onInputChange={onInputChange}
             promptHighlightTerms={promptHighlightTerms}
             readOnlyConfig={readOnlyConfig}
+            hideConfig={hideConfig}
+            compact={compactInput}
+            deferFileUpload={deferFileUpload}
             taskConfig={taskConfig}
             autoFocus={autoFocus}
             minHeightClass={inputMinHeightClass}

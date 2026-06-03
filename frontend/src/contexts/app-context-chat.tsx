@@ -1046,6 +1046,8 @@ interface AppContextType {
   connectionError: Error | null
   setTaskId: (taskId: number | null, options?: { navigate?: boolean }) => void
   requestStatus: () => void
+  getFilePreviewUrl: (fileId: string) => string
+  getFileDownloadUrl: (fileId: string) => string
   openFilePreview: (fileId: string, fileName: string, files?: Array<{ fileId: string; fileName: string }>, index?: number) => void
   switchFilePreview: (index: number) => void
   closeFilePreview: () => void
@@ -1059,10 +1061,25 @@ interface AppContextType {
 
 const AppContext = createContext<AppContextType | undefined>(undefined)
 
+export interface AppProviderTransportConfig {
+  buildWebSocketUrl?: (params: { baseUrl: string; taskId: number; token?: string }) => string
+  buildFilePreviewUrl?: (params: { baseUrl: string; fileId: string }) => string
+  buildFileDownloadUrl?: (params: { baseUrl: string; fileId: string }) => string
+  uploadFiles?: (files: File[], params: { taskId?: number | null; taskType: string }) => Promise<Array<{ file_id: string; name?: string; size?: number; type?: string }>>
+}
+
 // Global ref to track historical data requests per task ID
 const historicalDataRequestMap = new Map<number, boolean>()
 
-export function AppProvider({ children, token }: { children: React.ReactNode; token?: string }) {
+export function AppProvider({
+  children,
+  token,
+  transport,
+}: {
+  children: React.ReactNode
+  token?: string
+  transport?: AppProviderTransportConfig
+}) {
   const [state, dispatch] = useReducer(appReducer, initialState)
   const [pendingMessage, setPendingMessage] = useState<{ message: string; files?: File[]; targetTaskId?: number } | null>(null)
   const { token: authToken } = useAuth() // Get auth token from context
@@ -1147,6 +1164,8 @@ export function AppProvider({ children, token }: { children: React.ReactNode; to
   } = useWebSocket({
     taskId: state.taskId || undefined,
     token,
+    buildWebSocketUrl: transport?.buildWebSocketUrl,
+    uploadFiles: transport?.uploadFiles,
     onMessage: (message) => {
       handleMessage(message, dispatch, stateRef.current)
     },
@@ -4383,6 +4402,20 @@ export function AppProvider({ children, token }: { children: React.ReactNode; to
     dispatch({ type: "CLOSE_FILE_PREVIEW" })
   }, [])
 
+  const getFilePreviewUrl = useCallback((fileId: string) => {
+    const baseUrl = getApiUrl()
+    return transport?.buildFilePreviewUrl
+      ? transport.buildFilePreviewUrl({ baseUrl, fileId })
+      : `${baseUrl}/api/files/preview/${encodeURIComponent(fileId)}`
+  }, [transport])
+
+  const getFileDownloadUrl = useCallback((fileId: string) => {
+    const baseUrl = getApiUrl()
+    return transport?.buildFileDownloadUrl
+      ? transport.buildFileDownloadUrl({ baseUrl, fileId })
+      : `${baseUrl}/api/files/download/${encodeURIComponent(fileId)}`
+  }, [transport])
+
 
   // Replay control methods
   const startReplay = useCallback((taskId: number, events: TraceEvent[]) => {
@@ -4426,6 +4459,8 @@ export function AppProvider({ children, token }: { children: React.ReactNode; to
         connectionError,
         setTaskId,
         requestStatus,
+        getFilePreviewUrl,
+        getFileDownloadUrl,
         openFilePreview,
         switchFilePreview,
         closeFilePreview,

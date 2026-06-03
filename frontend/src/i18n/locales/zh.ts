@@ -3017,11 +3017,26 @@ Build when you need.`,
       desc: "复制此 script 标签并将其粘贴到网站的 <body> 标签中。",
       copy_btn: "复制代码"
     },
+    share_link: {
+      title: "分享链接",
+      desc: "生成一个任何人都可以打开并与此 Agent 聊天的公开页面。",
+      publish_required: "请先发布此 Agent，再生成分享链接。",
+      public_url: "公开链接",
+      anyone_access: "任何拿到此链接的人都可以与该 Agent 发起公开对话。",
+      generate_btn: "生成链接",
+      rotate_btn: "重置链接",
+      disable_btn: "关闭链接"
+    },
     messages: {
       update_success: "Widget 配置已更新",
       update_failed: "Widget 配置更新失败",
       copied: "已复制到剪贴板",
-      copy_failed: "复制到剪贴板失败"
+      copy_failed: "复制到剪贴板失败",
+      link_copied: "链接已复制到剪贴板",
+      share_enabled: "分享链接已生成",
+      share_rotated: "分享链接已重置",
+      share_disabled: "分享链接已关闭",
+      share_failed: "分享链接操作失败"
     },
     api_panel: {
       title: "通过 REST API 调用此 Agent",

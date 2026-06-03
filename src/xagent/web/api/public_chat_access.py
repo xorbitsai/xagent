@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
+from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Any, Callable
@@ -32,6 +33,7 @@ from .websocket import (
 )
 
 logger = logging.getLogger(__name__)
+db_session_context = contextmanager(get_db)
 
 
 class PublicChatAuthResponse(BaseModel):
@@ -320,21 +322,15 @@ async def public_chat_websocket_endpoint(
     expected_auth_mode: str,
 ) -> None:
     """Serve widget/share websocket chat with per-message revalidation."""
-    db_gen = get_db()
-    db = next(db_gen)
     try:
-        access_context = get_public_chat_user(
-            token, db, expected_auth_mode=expected_auth_mode
-        )
+        with db_session_context() as db:
+            access_context = get_public_chat_user(
+                token, db, expected_auth_mode=expected_auth_mode
+            )
+            get_task_for_public_context(db, task_id, access_context)
     except Exception:
         await websocket.close(code=4001, reason="Authentication required")
-        db.close()
         return
-
-    try:
-        get_task_for_public_context(db, task_id, access_context)
-    finally:
-        db.close()
 
     await manager.connect(websocket, task_id)
 
@@ -345,20 +341,17 @@ async def public_chat_websocket_endpoint(
             data = await websocket.receive_text()
             message_data = json.loads(data)
 
-            validation_db_gen = get_db()
-            validation_db = next(validation_db_gen)
             try:
-                current_access_context = get_public_chat_user(
-                    token, validation_db, expected_auth_mode=expected_auth_mode
-                )
-                get_task_for_public_context(
-                    validation_db, task_id, current_access_context
-                )
+                with db_session_context() as validation_db:
+                    current_access_context = get_public_chat_user(
+                        token, validation_db, expected_auth_mode=expected_auth_mode
+                    )
+                    get_task_for_public_context(
+                        validation_db, task_id, current_access_context
+                    )
             except HTTPException as exc:
                 await websocket.close(code=4003, reason=exc.detail)
                 return
-            finally:
-                validation_db.close()
 
             message_data["user_id"] = access_context.user.id
             message_data["user"] = access_context.user

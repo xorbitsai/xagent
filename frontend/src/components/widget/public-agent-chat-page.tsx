@@ -62,38 +62,37 @@ function PublicConversationContent({
   const publicApiPrefix = authMode === "share" ? "/api/share" : "/api/widget"
 
   useEffect(() => {
-    setTaskId(null, { navigate: false })
-  }, [agentId, normalizedGuestId, setTaskId])
-
-  useEffect(() => {
     setHasResolvedStoredTask(false)
-  }, [storageKey])
-
-  useEffect(() => {
     const savedTaskId = localStorage.getItem(storageKey)
     if (!savedTaskId) {
+      setTaskId(null, { navigate: false })
       setHasResolvedStoredTask(true)
       return
     }
 
     const parsedTaskId = parseInt(savedTaskId, 10)
-    if (Number.isNaN(parsedTaskId) || parsedTaskId === state.taskId) {
+    if (Number.isNaN(parsedTaskId)) {
+      setTaskId(null, { navigate: false })
       setHasResolvedStoredTask(true)
       return
     }
 
     setTaskId(parsedTaskId, { navigate: false })
     setHasResolvedStoredTask(true)
-  }, [setTaskId, state.taskId, storageKey])
+  }, [setTaskId, storageKey])
 
   useEffect(() => {
+    if (!hasResolvedStoredTask) {
+      return
+    }
+
     if (state.taskId) {
       localStorage.setItem(storageKey, state.taskId.toString())
       return
     }
 
     localStorage.removeItem(storageKey)
-  }, [state.taskId, storageKey])
+  }, [hasResolvedStoredTask, state.taskId, storageKey])
 
   const handleSend = useCallback(async (message: string, config?: any, files?: File[]) => {
     if (state.taskId) {
@@ -143,8 +142,11 @@ function PublicConversationContent({
           title: taskData.title || message,
           status: normalizeTaskStatus(taskData.status) || "pending",
           description: taskData.description || message,
-          createdAt: taskData.created_at || Date.now(),
-          updatedAt: taskData.updated_at || taskData.created_at || Date.now(),
+          createdAt: taskData.created_at || new Date().toISOString(),
+          updatedAt:
+            taskData.updated_at
+            || taskData.created_at
+            || new Date().toISOString(),
           agentId: taskData.agent_id ?? agentId ?? undefined,
           agentName: taskData.agent_name || agentName || undefined,
           agentLogoUrl: taskData.agent_logo_url || agentLogo || undefined,

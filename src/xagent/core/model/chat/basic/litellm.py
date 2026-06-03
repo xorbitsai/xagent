@@ -109,6 +109,8 @@ class LiteLLM(BaseLLM):
         ) as e:
             raise LLMRetryableError(str(e)) from e
 
+        if not response.choices:
+            return ""
         choice = response.choices[0]
         message = choice.message
 
@@ -131,7 +133,13 @@ class LiteLLM(BaseLLM):
                         },
                     }
                 )
-            return {"type": "tool_call", "tool_calls": tool_calls}
+            return {
+                "type": "tool_call",
+                "tool_calls": tool_calls,
+                "raw": response.model_dump()
+                if hasattr(response, "model_dump")
+                else str(response),
+            }
 
         return message.content or ""
 
@@ -197,4 +205,4 @@ class LiteLLM(BaseLLM):
                 continue
             content = getattr(delta, "content", None)
             if content:
-                yield StreamChunk(type=ChunkType.TEXT, content=content)
+                yield StreamChunk(type=ChunkType.TOKEN, content=content)

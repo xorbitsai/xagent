@@ -110,7 +110,7 @@ class LiteLLM(BaseLLM):
             raise LLMRetryableError(str(e)) from e
 
         if not response.choices:
-            return ""
+            raise LLMRetryableError("LiteLLM returned an empty response (no choices).")
         choice = response.choices[0]
         message = choice.message
 
@@ -200,9 +200,28 @@ class LiteLLM(BaseLLM):
             raise LLMRetryableError(str(e)) from e
 
         async for chunk in response:
-            delta = chunk.choices[0].delta if chunk.choices else None
-            if delta is None:
+            if not chunk.choices:
                 continue
-            content = getattr(delta, "content", None)
+            delta = chunk.choices[0].delta
+
+            content = delta.content if hasattr(delta, "content") else None
             if content:
-                yield StreamChunk(type=ChunkType.TOKEN, content=content)
+                yield StreamChunk(type=ChunkType.TOKEN, content=content, delta=content)
+
+            if hasattr(delta, "tool_calls") and delta.tool_calls:
+                tool_calls = []
+                for tc in delta.tool_calls:
+                    tool_calls.append({
+                        "index": tc.index if hasattr(tc, "index") and tc.index is not None else 0,
+                        "id": tc.id if hasattr(tc, "id") else None,
+                        "type": "function",
+                        "function": {
+                            "name": tc.function.name if hasattr(tc, "function") and hasattr(tc.function, "name") else None,
+                            "arguments": tc.function.arguments if hasattr(tc, "function") and hasattr(tc.function, "arguments") else "",
+                        },
+                    })
+                yield StreamChunk(
+                    type=ChunkType.TOOL_CALL,
+                    tool_calls=tool_calls,
+                    raw=chunk.model_dump() if hasattr(chunk, "model_dump") else str(chunk),
+                )

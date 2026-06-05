@@ -1874,7 +1874,7 @@ export function AgentBuilder({ agentId }: AgentBuilderProps) {
 
   if (notFound) {
     return (
-      <div className="flex h-full w-full flex-col items-center justify-center bg-background p-4 text-center">
+      <div className="flex h-full min-h-[calc(100dvh-4rem)] w-full flex-col items-center justify-center bg-background p-4 text-center">
         <Bot className="w-16 h-16 text-muted-foreground mb-4 opacity-20" />
         <h2 className="text-2xl font-bold mb-2">{t("builds.editor.error.notFound")}</h2>
         <p className="text-muted-foreground max-w-md mb-6">

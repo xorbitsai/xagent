@@ -1874,7 +1874,7 @@ export function AgentBuilder({ agentId }: AgentBuilderProps) {
 
   if (notFound) {
     return (
-      <div className="flex flex-col items-center justify-center h-[100vh] w-full bg-background text-center p-4">
+      <div className="flex h-full w-full flex-col items-center justify-center bg-background p-4 text-center">
         <Bot className="w-16 h-16 text-muted-foreground mb-4 opacity-20" />
         <h2 className="text-2xl font-bold mb-2">{t("builds.editor.error.notFound")}</h2>
         <p className="text-muted-foreground max-w-md mb-6">
@@ -1888,7 +1888,7 @@ export function AgentBuilder({ agentId }: AgentBuilderProps) {
   }
 
   return (
-    <div className="flex flex-col h-[100vh] overflow-hidden">
+    <div className="flex h-full flex-col overflow-hidden">
       <div className="flex-1 min-h-0 w-full overflow-y-auto md:overflow-hidden">
         <ResizableThreeColumnLayout
           showLeftPanel={showAIAssistant}

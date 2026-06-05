@@ -34,7 +34,9 @@ from sqlalchemy.orm import Session
 
 from xagent.web.api.agents import router as agents_router
 from xagent.web.api.auth import auth_router
+from xagent.web.api.files import file_router
 from xagent.web.api.me import router as me_router
+from xagent.web.api.share import share_router
 from xagent.web.api.v1 import v1_router
 from xagent.web.api.v1.errors import V1ApiError, v1_api_error_handler
 from xagent.web.api.widget import widget_router
@@ -63,7 +65,9 @@ app_for_tests.include_router(auth_router)
 app_for_tests.include_router(me_router)
 app_for_tests.include_router(agents_router)
 app_for_tests.include_router(workforces_router)
+app_for_tests.include_router(file_router)
 app_for_tests.include_router(widget_router)
+app_for_tests.include_router(share_router)
 app_for_tests.include_router(v1_router)
 app_for_tests.add_exception_handler(V1ApiError, v1_api_error_handler)  # type: ignore[arg-type]
 

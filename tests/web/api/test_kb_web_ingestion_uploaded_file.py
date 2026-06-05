@@ -670,6 +670,8 @@ class TestWebIngestionUploadedFilePersistence:
                         temp_file_path=temp_file_path,
                         db_session=db_session,
                         user_id=int(mock_user.id),
+                        is_admin=False,
+                        collection_name="test_collection",
                         url="https://example.com/page",
                         filename="existing.md",
                         url_hash="hash",
@@ -1318,15 +1320,7 @@ class TestIngestWebHandleWebFile:
             from xagent.core.tools.core.RAG_tools.core.schemas import WebIngestionResult
             from xagent.web.services.managed_file_ref import build_upload_storage_key
 
-            captured["storage_key"] = build_upload_storage_key(
-                user.id,
-                captured["file_id"],
-                filename,
-            )
-            assert expected_persistent.exists()
-            assert get_file_storage().exists(captured["storage_key"])
-
-            return WebIngestionResult(
+            result = WebIngestionResult(
                 status="error",
                 collection=collection,
                 total_urls_found=1,
@@ -1341,6 +1335,16 @@ class TestIngestWebHandleWebFile:
                 warnings=[],
                 elapsed_time_ms=1,
             )
+            captured["storage_key"] = build_upload_storage_key(
+                user.id,
+                captured["file_id"],
+                filename,
+            )
+            assert expected_persistent.exists()
+            assert get_file_storage().exists(captured["storage_key"])
+
+            file_info["rollback_on_failure"](result)
+            return result
 
         with (
             patch(

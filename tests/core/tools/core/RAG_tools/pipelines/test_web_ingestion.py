@@ -1131,6 +1131,7 @@ class TestWebIngestionFileHandler:
 
         assert result.status == "error"
         assert result.documents_created == 1
+        assert result.side_effects_may_remain is True
         assert (
             result.message
             == "Web ingestion rollback failed for https://example.com/page2: "

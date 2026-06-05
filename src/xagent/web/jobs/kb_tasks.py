@@ -41,6 +41,78 @@ class StagedDocumentIngestSuperseded(RuntimeError):
     pass
 
 
+def _get_job_user(
+    db: Session,
+    payload: dict[str, Any],
+    *,
+    context: str,
+) -> User | None:
+    user_id = int(payload["user_id"])
+    user = db.query(User).filter(User.id == user_id).first()
+    if user is None:
+        logger.warning("Cannot %s for missing user %s", context, user_id)
+    return user
+
+
+def _save_job_collection_config_with_snapshot(
+    db: Session,
+    payload: dict[str, Any],
+    ingestion_config: IngestionConfig,
+    *,
+    context: str,
+) -> Any:
+    user = _get_job_user(
+        db, payload, context=f"save collection config during {context}"
+    )
+    if user is None:
+        return None
+
+    from ..api.kb import _save_collection_config_with_snapshot
+
+    return asyncio.run(
+        _save_collection_config_with_snapshot(
+            collection=str(payload["collection"]),
+            config_json=ingestion_config.model_dump_json(exclude_unset=True),
+            user=user,
+            context=context,
+        )
+    )
+
+
+def _restore_or_cleanup_failed_job_collection_config(
+    db: Session,
+    payload: dict[str, Any],
+    *,
+    snapshot: Any,
+    context: str,
+    successful_documents: int = 0,
+    side_effects_may_remain: bool = False,
+) -> None:
+    user = _get_job_user(
+        db,
+        payload,
+        context=f"restore failed-ingest collection config during {context}",
+    )
+    if user is None:
+        return
+
+    from ..api.kb import _restore_or_cleanup_collection_config_after_failed_ingest
+
+    asyncio.run(
+        _restore_or_cleanup_collection_config_after_failed_ingest(
+            snapshot=snapshot,
+            collection_existed_before=bool(
+                payload.get("collection_existed_before", True)
+            ),
+            collection_name=str(payload["collection"]),
+            user=user,
+            context=context,
+            successful_documents=successful_documents,
+            side_effects_may_remain=side_effects_may_remain,
+        )
+    )
+
+
 def handle_kb_ingest_document(db: Session, job: BackgroundJob) -> dict[str, Any]:
     payload = dict(job.payload or {})
     ingestion_config = IngestionConfig.model_validate(payload["ingestion_config"])
@@ -53,6 +125,13 @@ def handle_kb_ingest_document(db: Session, job: BackgroundJob) -> dict[str, Any]
     if is_staged_input and not _is_staged_document_generation_latest(db, payload):
         update_job_progress(db, job, message="Superseded by newer upload")
         return _superseded_staged_document_result(payload)
+
+    config_snapshot = _save_job_collection_config_with_snapshot(
+        db,
+        payload,
+        ingestion_config,
+        context="background document ingest",
+    )
 
     def _assert_latest_generation() -> None:
         if is_staged_input and not _is_staged_document_generation_latest(db, payload):
@@ -74,9 +153,31 @@ def handle_kb_ingest_document(db: Session, job: BackgroundJob) -> dict[str, Any]
                 metadata_source_path=str(target_path) if target_path else None,
                 commit_gate=_assert_latest_generation if is_staged_input else None,
             )
+    except StagedDocumentIngestSuperseded:
+        _restore_or_cleanup_failed_staged_job_collection_config_if_current(
+            db,
+            payload,
+            snapshot=config_snapshot,
+            context="background staged document superseded exception",
+        )
+        return _superseded_staged_document_result(payload)
     except Exception:
-        if is_staged_input and int(job.attempts or 0) >= int(job.max_attempts or 1):
-            _cleanup_staged_document_input(payload)
+        if is_staged_input:
+            if int(job.attempts or 0) >= int(job.max_attempts or 1):
+                _cleanup_staged_document_input(payload)
+            _restore_or_cleanup_failed_staged_job_collection_config_if_current(
+                db,
+                payload,
+                snapshot=config_snapshot,
+                context="background staged document ingest exception",
+            )
+        else:
+            _restore_or_cleanup_failed_job_collection_config(
+                db,
+                payload,
+                snapshot=config_snapshot,
+                context="background document ingest exception",
+            )
         raise
 
     result_payload = result.model_dump(mode="json")
@@ -84,14 +185,43 @@ def handle_kb_ingest_document(db: Session, job: BackgroundJob) -> dict[str, Any]
         result_payload["file_id"] = file_id
     if result.status in {"error", "partial"}:
         if is_staged_input:
-            if _is_superseded_ingestion_result(
-                result
-            ) or not _rollback_failed_staged_document_ingestion_if_current(
-                db, payload, result
-            ):
+            if _is_superseded_ingestion_result(result):
+                _restore_or_cleanup_failed_staged_job_collection_config_if_current(
+                    db,
+                    payload,
+                    snapshot=config_snapshot,
+                    context="background staged document superseded result",
+                )
                 return _superseded_staged_document_result(payload)
+            if not _rollback_failed_staged_document_ingestion_if_current(
+                db, payload, result, config_snapshot=config_snapshot
+            ):
+                _restore_or_cleanup_failed_staged_job_collection_config_if_current(
+                    db,
+                    payload,
+                    snapshot=config_snapshot,
+                    context="background stale staged document ingest",
+                )
+                return _superseded_staged_document_result(payload)
+            _restore_or_cleanup_failed_job_collection_config(
+                db,
+                payload,
+                snapshot=config_snapshot,
+                context="background staged document ingest",
+            )
         else:
-            _rollback_failed_document_ingestion(db, payload, result)
+            _rollback_failed_document_ingestion(
+                db,
+                payload,
+                result,
+                config_snapshot=config_snapshot,
+            )
+            _restore_or_cleanup_failed_job_collection_config(
+                db,
+                payload,
+                snapshot=config_snapshot,
+                context="background document ingest",
+            )
         raise BackgroundJobHandlerError(
             result.message,
             result=result_payload,
@@ -99,17 +229,41 @@ def handle_kb_ingest_document(db: Session, job: BackgroundJob) -> dict[str, Any]
         )
     if is_staged_input:
         if not _is_staged_document_generation_latest(db, payload):
+            _restore_or_cleanup_failed_staged_job_collection_config_if_current(
+                db,
+                payload,
+                snapshot=config_snapshot,
+                context="background stale staged document publish",
+            )
             return _superseded_staged_document_result(payload)
         try:
             file_record = _publish_staged_document_ingestion(db, payload)
             result_payload["file_id"] = str(file_record.file_id)
         except StagedDocumentIngestSuperseded:
+            _restore_or_cleanup_failed_staged_job_collection_config_if_current(
+                db,
+                payload,
+                snapshot=config_snapshot,
+                context="background staged document publish superseded",
+            )
             return _superseded_staged_document_result(payload)
         except Exception as exc:  # noqa: BLE001
             if not _rollback_failed_staged_document_ingestion_if_current(
-                db, payload, result
+                db, payload, result, config_snapshot=config_snapshot
             ):
+                _restore_or_cleanup_failed_staged_job_collection_config_if_current(
+                    db,
+                    payload,
+                    snapshot=config_snapshot,
+                    context="background stale staged document publish rollback",
+                )
                 return _superseded_staged_document_result(payload)
+            _restore_or_cleanup_failed_job_collection_config(
+                db,
+                payload,
+                snapshot=config_snapshot,
+                context="background staged document publish",
+            )
             raise BackgroundJobHandlerError(
                 f"Document ingestion succeeded but publishing uploaded file failed: {exc}",
                 result=result_payload,
@@ -128,6 +282,12 @@ def handle_kb_ingest_web(db: Session, job: BackgroundJob) -> dict[str, Any]:
     is_admin = bool(payload.get("is_admin", False))
     collection = str(payload["collection"])
     processed_urls: dict[str, str] = {}
+    config_snapshot = _save_job_collection_config_with_snapshot(
+        db,
+        payload,
+        ingestion_config,
+        context="background web ingest",
+    )
 
     def _progress(message: str, completed: int, total: int) -> None:
         update_job_progress(
@@ -176,16 +336,23 @@ def handle_kb_ingest_web(db: Session, job: BackgroundJob) -> dict[str, Any]:
                 )
             )
     except Exception:
-        _cleanup_failed_web_collection_metadata_if_new(db, payload)
-        raise
-
-    result_payload = result.model_dump(mode="json")
-    if result.status == "error":
         _cleanup_failed_web_collection_metadata_if_new(
             db,
             payload,
-            successful_documents=int(result.documents_created or 0),
+            snapshot=config_snapshot,
         )
+        raise
+
+    result_payload = result.model_dump(mode="json")
+    if result.status in {"error", "partial"}:
+        _cleanup_failed_web_collection_metadata_if_new(
+            db,
+            payload,
+            snapshot=config_snapshot,
+            successful_documents=int(result.documents_created or 0),
+            side_effects_may_remain=bool(result.side_effects_may_remain),
+        )
+    if result.status == "error":
         raise BackgroundJobHandlerError(result.message, result=result_payload)
     return result_payload
 
@@ -329,6 +496,32 @@ def _is_staged_document_generation_latest(
     )
 
 
+def _restore_or_cleanup_failed_staged_job_collection_config_if_current(
+    db: Session,
+    payload: dict[str, Any],
+    *,
+    snapshot: Any,
+    context: str,
+) -> bool:
+    if not _is_staged_document_generation_latest(db, payload):
+        logger.info(
+            "Skipping collection config restore for superseded KB ingest generation: "
+            "%s/user_%s generation=%s",
+            payload.get("collection"),
+            payload.get("user_id"),
+            payload.get("generation_id"),
+        )
+        return False
+
+    _restore_or_cleanup_failed_job_collection_config(
+        db,
+        payload,
+        snapshot=snapshot,
+        context=context,
+    )
+    return True
+
+
 def _is_superseded_ingestion_result(result: IngestionResult) -> bool:
     return str(result.message) == _SUPERSEDED_STAGED_INGEST_MESSAGE
 
@@ -349,8 +542,14 @@ def _rollback_failed_staged_document_ingestion(
     db: Session,
     payload: dict[str, Any],
     result: IngestionResult,
+    *,
+    config_snapshot: Any = None,
 ) -> None:
-    from ..api.kb import RollbackFailureError, _rollback_failed_cloud_ingestion
+    from ..api.kb import (
+        RollbackFailureError,
+        _collection_or_config_existed_before,
+        _rollback_failed_cloud_ingestion,
+    )
 
     user_id = int(payload["user_id"])
     user = db.query(User).filter(User.id == user_id).first()
@@ -368,6 +567,10 @@ def _rollback_failed_staged_document_ingestion(
         if isinstance(ingestion_config_payload, dict)
         else None
     )
+    effective_collection_existed_before = _collection_or_config_existed_before(
+        bool(payload.get("collection_existed_before", True)),
+        config_snapshot,
+    )
 
     try:
         asyncio.run(
@@ -378,9 +581,7 @@ def _rollback_failed_staged_document_ingestion(
                 result=result,
                 file_path=Path(str(payload["source_path"])),
                 file_record=None,
-                collection_existed_before=bool(
-                    payload.get("collection_existed_before", True)
-                ),
+                collection_existed_before=effective_collection_existed_before,
                 uploaded_file_existed_before=False,
                 file_backup_path=None,
                 had_existing_file=False,
@@ -401,11 +602,18 @@ def _rollback_failed_staged_document_ingestion_if_current(
     db: Session,
     payload: dict[str, Any],
     result: IngestionResult,
+    *,
+    config_snapshot: Any = None,
 ) -> bool:
     if not _is_staged_document_generation_latest(db, payload):
         _cleanup_staged_document_input(payload)
         return False
-    _rollback_failed_staged_document_ingestion(db, payload, result)
+    _rollback_failed_staged_document_ingestion(
+        db,
+        payload,
+        result,
+        config_snapshot=config_snapshot,
+    )
     return True
 
 
@@ -482,8 +690,14 @@ def _rollback_failed_document_ingestion(
     db: Session,
     payload: dict[str, Any],
     result: IngestionResult,
+    *,
+    config_snapshot: Any = None,
 ) -> None:
-    from ..api.kb import RollbackFailureError, _rollback_failed_ingestion
+    from ..api.kb import (
+        RollbackFailureError,
+        _collection_or_config_existed_before,
+        _rollback_failed_ingestion,
+    )
 
     user_id = int(payload["user_id"])
     user = db.query(User).filter(User.id == user_id).first()
@@ -514,6 +728,10 @@ def _rollback_failed_document_ingestion(
         )
 
     backup_path = payload.get("file_backup_path")
+    effective_collection_existed_before = _collection_or_config_existed_before(
+        bool(payload.get("collection_existed_before", True)),
+        config_snapshot,
+    )
     try:
         asyncio.run(
             _rollback_failed_ingestion(
@@ -523,9 +741,7 @@ def _rollback_failed_document_ingestion(
                 result=result,
                 file_path=Path(str(payload["source_path"])),
                 file_record=file_record,
-                collection_existed_before=bool(
-                    payload.get("collection_existed_before", True)
-                ),
+                collection_existed_before=effective_collection_existed_before,
                 uploaded_file_existed_before=bool(
                     payload.get("uploaded_file_existed_before", True)
                 ),
@@ -558,27 +774,15 @@ def _cleanup_failed_web_collection_metadata_if_new(
     db: Session,
     payload: dict[str, Any],
     *,
+    snapshot: Any = None,
     successful_documents: int = 0,
+    side_effects_may_remain: bool = False,
 ) -> None:
-    if successful_documents > 0:
-        return
-    if bool(payload.get("collection_existed_before", True)):
-        return
-
-    user_id = int(payload["user_id"])
-    user = db.query(User).filter(User.id == user_id).first()
-    if user is None:
-        logger.warning(
-            "Cannot clean failed web-ingest collection metadata for missing user %s",
-            user_id,
-        )
-        return
-
-    from ..api.kb import _cleanup_failed_new_collection_metadata
-
-    asyncio.run(
-        _cleanup_failed_new_collection_metadata(
-            collection_name=str(payload["collection"]),
-            user=user,
-        )
+    _restore_or_cleanup_failed_job_collection_config(
+        db,
+        payload,
+        snapshot=snapshot,
+        context="background web ingest",
+        successful_documents=successful_documents,
+        side_effects_may_remain=side_effects_may_remain,
     )

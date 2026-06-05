@@ -3610,18 +3610,6 @@ async def create_ingest_job(
 
     generation_id = str(uuid.uuid4())
 
-    saved_collection_config = False
-    try:
-        metadata_store = get_metadata_store()
-        await metadata_store.save_collection_config(
-            collection=safe_collection,
-            config_json=config.model_dump_json(exclude_unset=True),
-            user_id=int(_user.id),
-        )
-        saved_collection_config = True
-    except Exception as e:
-        logger.warning("Failed to save collection config during async ingest: %s", e)
-
     job_payload = {
         "collection": safe_collection,
         "source_path": str(staged_file_path),
@@ -3663,11 +3651,6 @@ async def create_ingest_job(
     except Exception:
         db.rollback()
         _cleanup_background_ingest_staging_file(staged_file_path)
-        if saved_collection_config and not collection_existed_before:
-            await _cleanup_failed_new_collection_metadata(
-                collection_name=safe_collection,
-                user=_user,
-            )
         raise
     try:
         return await _enqueue_background_job_or_503_async(db, job)
@@ -3680,11 +3663,6 @@ async def create_ingest_job(
             generation_id=generation_id,
         )
         _cleanup_background_ingest_staging_file(staged_file_path)
-        if saved_collection_config and not collection_existed_before:
-            await _cleanup_failed_new_collection_metadata(
-                collection_name=safe_collection,
-                user=_user,
-            )
         raise
 
 
@@ -5025,20 +5003,6 @@ async def create_ingest_web_job(
     if existing_job is not None:
         return existing_job
 
-    saved_collection_config = False
-    try:
-        metadata_store = get_metadata_store()
-        await metadata_store.save_collection_config(
-            collection=safe_collection,
-            config_json=ingestion_config.model_dump_json(exclude_unset=True),
-            user_id=int(_user.id),
-        )
-        saved_collection_config = True
-    except Exception as e:
-        logger.warning(
-            "Failed to save collection config during async web ingest: %s", e
-        )
-
     try:
         job = create_background_job(
             db,
@@ -5057,11 +5021,6 @@ async def create_ingest_web_job(
         )
         return await _enqueue_background_job_or_503_async(db, job)
     except Exception:
-        if saved_collection_config and not collection_existed_before:
-            await _cleanup_failed_new_collection_metadata(
-                collection_name=safe_collection,
-                user=_user,
-            )
         raise
 
 

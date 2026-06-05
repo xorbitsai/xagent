@@ -934,6 +934,7 @@ def test_ingest_job_uses_staged_snapshot_in_payload(app_with_kb):
             captured_payload["file_sha256"]
             == "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824"
         )
+        metadata_store.save_collection_config.assert_not_awaited()
 
 
 def test_ingest_web_job_payload_records_new_collection_state(app_with_kb):
@@ -996,7 +997,7 @@ def test_ingest_web_job_payload_records_new_collection_state(app_with_kb):
     assert captured_payload["collection_existed_before"] is False
 
 
-def test_ingest_web_job_cleans_new_collection_metadata_when_enqueue_fails(
+def test_ingest_web_job_does_not_write_collection_config_when_enqueue_fails(
     app_with_kb,
 ):
     def fake_create_background_job(db, *, payload, **kwargs):
@@ -1057,12 +1058,8 @@ def test_ingest_web_job_cleans_new_collection_metadata_when_enqueue_fails(
         )
 
     assert response.status_code == 503
-    metadata_store.delete_collection_metadata.assert_awaited_once_with(
-        collection_name="web_jobs_enqueue_failure",
-        user_id=1,
-        is_admin=False,
-        delete_orphaned_metadata=True,
-    )
+    metadata_store.save_collection_config.assert_not_awaited()
+    metadata_store.delete_collection_metadata.assert_not_awaited()
 
 
 def test_ingest_separators_invalid_json_request_succeeds_uses_default(
@@ -1456,6 +1453,58 @@ def test_ingest_web_error_with_successful_docs_keeps_new_collection_config(
     metadata_store.delete_collection_metadata.assert_not_awaited()
     metadata_store.save_collection_config.assert_awaited_once()
     metadata_store.delete_collection.assert_not_awaited()
+
+
+def test_ingest_web_error_with_rollback_side_effects_keeps_new_collection_config(
+    app_with_kb,
+):
+    """A single-page rollback failure should not orphan rows by deleting config."""
+    metadata_store = MagicMock()
+    metadata_store.get_collection_config = AsyncMock(return_value=None)
+    metadata_store.save_collection_config = AsyncMock()
+    metadata_store.delete_collection_metadata = AsyncMock()
+
+    with (
+        patch(
+            "xagent.core.tools.core.RAG_tools.storage.factory.get_metadata_store",
+            return_value=metadata_store,
+        ),
+        patch(
+            "xagent.web.api.kb.get_collection_sync", side_effect=ValueError("missing")
+        ),
+        patch(
+            "xagent.web.api.kb.run_web_ingestion",
+            return_value=WebIngestionResult(
+                status="error",
+                collection="web_new_collection",
+                total_urls_found=1,
+                pages_crawled=1,
+                pages_failed=1,
+                documents_created=0,
+                chunks_created=0,
+                embeddings_created=0,
+                crawled_urls=["https://example.com/page"],
+                failed_urls={"https://example.com/page": "rollback failed"},
+                message="rollback failed",
+                warnings=[],
+                elapsed_time_ms=0,
+                side_effects_may_remain=True,
+            ),
+        ),
+    ):
+        client = TestClient(app_with_kb)
+        response = client.post(
+            "/api/kb/ingest-web",
+            data={
+                "collection": "web_new_collection",
+                "start_url": "https://example.com",
+            },
+        )
+
+    assert response.status_code == 500
+    assert response.json()["side_effects_may_remain"] is True
+    metadata_store.delete_collection_metadata.assert_not_awaited()
+    metadata_store.save_collection_config.assert_awaited_once()
 
 
 def test_ingest_web_existing_collection_error_restores_previous_config(app_with_kb):

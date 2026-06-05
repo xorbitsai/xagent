@@ -53,8 +53,13 @@ class PublicChatAccessContext:
     guest_id: str
     auth_mode: str = "widget"
     widget_agent_id: int | None = None
-    share_agent_id: int | None = None
-    share_token: str | None = None
+
+
+@dataclass(frozen=True)
+class ShareChatAccessContext:
+    user: User
+    agent: Agent
+    share_token: str
 
 
 def create_public_chat_access_token(data: dict[str, Any]) -> str:
@@ -110,11 +115,11 @@ def get_public_chat_user(
         guest_id = payload.get("guest_id")
         auth_mode = payload.get("auth_mode") or "widget"
         widget_agent_id = payload.get("widget_agent_id")
-        share_agent_id = payload.get("share_agent_id")
-        share_token = payload.get("share_token")
-
         if expected_auth_mode and auth_mode != expected_auth_mode:
             raise HTTPException(status_code=403, detail="Access denied")
+
+        if auth_mode != "widget":
+            raise ValueError("Invalid token payload")
 
         if not user_id or not guest_id:
             raise ValueError("Invalid token payload")
@@ -127,18 +132,6 @@ def get_public_chat_user(
             if not isinstance(widget_agent_id, int):
                 raise ValueError("Invalid widget token payload")
 
-        if auth_mode == "share":
-            if not isinstance(share_agent_id, int):
-                raise ValueError("Invalid share token payload")
-            if not isinstance(share_token, str) or not share_token:
-                raise ValueError("Invalid share token payload")
-            ensure_share_agent_available(
-                db,
-                share_agent_id,
-                int(user_id),
-                expected_share_token=share_token,
-            )
-
         return PublicChatAccessContext(
             user=user,
             channel_id=channel_id,
@@ -147,14 +140,54 @@ def get_public_chat_user(
             widget_agent_id=widget_agent_id
             if isinstance(widget_agent_id, int)
             else None,
-            share_agent_id=share_agent_id if isinstance(share_agent_id, int) else None,
-            share_token=share_token if isinstance(share_token, str) else None,
         )
     except Exception as exc:
         logger.error("Public chat token validation error: %s", exc)
         if isinstance(exc, HTTPException):
             raise exc
         raise HTTPException(status_code=401, detail="Invalid widget token")
+
+
+def get_share_chat_user(token: str, db: Session) -> ShareChatAccessContext:
+    """Get share chat access context from a share token."""
+    try:
+        if token.startswith("Bearer "):
+            token = token[7:]
+
+        payload = jwt.decode(token, JWT_SECRET_KEY, algorithms=[JWT_ALGORITHM])
+        if payload.get("type") != "widget":
+            raise ValueError("Invalid token type")
+
+        user_id = payload.get("user_id")
+        auth_mode = payload.get("auth_mode")
+        share_agent_id = payload.get("share_agent_id")
+        share_token = payload.get("share_token")
+
+        if auth_mode != "share":
+            raise ValueError("Invalid token payload")
+        if not isinstance(user_id, int):
+            raise ValueError("Invalid token payload")
+        if not isinstance(share_agent_id, int):
+            raise ValueError("Invalid share token payload")
+        if not isinstance(share_token, str) or not share_token:
+            raise ValueError("Invalid share token payload")
+
+        user = db.query(User).filter(User.id == user_id).first()
+        if not user:
+            raise ValueError("User not found")
+
+        agent = ensure_share_agent_available(
+            db,
+            share_agent_id,
+            user_id,
+            expected_share_token=share_token,
+        )
+        return ShareChatAccessContext(user=user, agent=agent, share_token=share_token)
+    except Exception as exc:
+        logger.error("Share chat token validation error: %s", exc)
+        if isinstance(exc, HTTPException):
+            raise exc
+        raise HTTPException(status_code=401, detail="Invalid share token")
 
 
 security = HTTPBearer()
@@ -170,6 +203,16 @@ def build_public_chat_dependency(
         return get_public_chat_user(
             credentials.credentials, db, expected_auth_mode=expected_auth_mode
         )
+
+    return dependency
+
+
+def build_share_chat_dependency() -> Callable[..., ShareChatAccessContext]:
+    def dependency(
+        credentials: HTTPAuthorizationCredentials = Depends(security),
+        db: Session = Depends(get_db),
+    ) -> ShareChatAccessContext:
+        return get_share_chat_user(credentials.credentials, db)
 
     return dependency
 
@@ -200,9 +243,31 @@ def get_task_for_public_context(
         and int(task.agent_id or 0) != access_context.widget_agent_id
     ):
         raise HTTPException(status_code=403, detail="Widget access is unavailable")
-    if (
-        access_context.share_agent_id is not None
-        and int(task.agent_id or 0) != access_context.share_agent_id
+    return task
+
+
+def get_task_for_share_context(
+    db: Session, task_id: int, access_context: ShareChatAccessContext
+) -> Task:
+    task = (
+        db.query(Task)
+        .filter(
+            Task.id == task_id,
+            Task.user_id == access_context.user.id,
+            Task.agent_id == int(access_context.agent.id),
+        )
+        .first()
+    )
+    if not task:
+        raise HTTPException(status_code=403, detail="Task not found or access denied")
+    if task.channel_id is not None:
+        raise HTTPException(status_code=403, detail="Share link is unavailable")
+    if not isinstance(task.agent_config, dict):
+        raise HTTPException(status_code=403, detail="Share link is unavailable")
+    if task.agent_config.get("auth_mode") != "share":
+        raise HTTPException(status_code=403, detail="Share link is unavailable")
+    if int(task.agent_config.get("share_agent_id") or 0) != int(
+        access_context.agent.id
     ):
         raise HTTPException(status_code=403, detail="Share link is unavailable")
     return task
@@ -249,6 +314,47 @@ async def upload_public_chat_files(
     )
 
 
+async def upload_share_chat_files(
+    *,
+    file: UploadFile | None,
+    files: list[UploadFile] | None,
+    task_type: str,
+    message: str,
+    task_id: str | None,
+    folder: str | None,
+    access_context: ShareChatAccessContext,
+    db: Session,
+) -> Any:
+    del message
+    upload_items: list[UploadFile] = []
+    if file is not None:
+        upload_items.append(file)
+    if files:
+        upload_items.extend(files)
+
+    if not upload_items:
+        raise HTTPException(status_code=422, detail="No files provided")
+
+    if not task_id:
+        raise HTTPException(status_code=400, detail="task_id is required")
+
+    try:
+        parsed_task_id = int(task_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail="Invalid task_id") from exc
+    get_task_for_share_context(db, parsed_task_id, access_context)
+
+    return await store_uploaded_files(
+        upload_items=upload_items,
+        task_type=task_type,
+        task_id=task_id,
+        folder=folder,
+        user=access_context.user,
+        db=db,
+        single_file_mode=file is not None and (not files),
+    )
+
+
 async def create_public_chat_task(
     *,
     request: TaskCreateRequest,
@@ -276,13 +382,6 @@ async def create_public_chat_task(
             agent_id = access_context.widget_agent_id
         elif agent_id != access_context.widget_agent_id:
             raise HTTPException(status_code=403, detail="Widget access is unavailable")
-    if access_context.share_agent_id is not None:
-        if agent_id is None:
-            agent_id = access_context.share_agent_id
-        elif agent_id != access_context.share_agent_id:
-            raise HTTPException(status_code=403, detail="Share link is unavailable")
-        agent_config["share_agent_id"] = access_context.share_agent_id
-
     task_title = request.title or task_description or "Untitled Task"
     if task_title and len(task_title) > 50:
         task_title = task_title[:50] + "..."
@@ -295,6 +394,58 @@ async def create_public_chat_task(
         channel_id=access_context.channel_id,
         channel_name=channel_name,
         agent_id=agent_id,
+        agent_config=agent_config,
+    )
+
+    db.add(task)
+    db.commit()
+    db.refresh(task)
+
+    return TaskCreateResponse(
+        task_id=task.id,
+        title=task.title,
+        status=task.status.value,
+        created_at=format_datetime_for_api(task.created_at)
+        if task.created_at
+        else None,
+        channel_id=task.channel_id,
+        channel_name=task.channel_name,
+    )
+
+
+async def create_share_chat_task(
+    *,
+    request: TaskCreateRequest,
+    access_context: ShareChatAccessContext,
+    db: Session,
+    default_channel_name: str,
+) -> TaskCreateResponse:
+    task_description = request.description or ""
+
+    agent_id = request.agent_id
+    share_agent_id = int(access_context.agent.id)
+    if agent_id is None:
+        agent_id = share_agent_id
+    elif agent_id != share_agent_id:
+        raise HTTPException(status_code=403, detail="Share link is unavailable")
+
+    agent_config = dict(request.agent_config or {})
+    agent_config.pop("guest_id", None)
+    agent_config["auth_mode"] = "share"
+    agent_config["share_agent_id"] = share_agent_id
+
+    task_title = request.title or task_description or "Untitled Task"
+    if task_title and len(task_title) > 50:
+        task_title = task_title[:50] + "..."
+
+    task = Task(
+        user_id=access_context.user.id,
+        title=task_title,
+        description=task_description,
+        status=TaskStatus.PENDING,
+        channel_id=None,
+        channel_name=default_channel_name,
+        agent_id=share_agent_id,
         agent_config=agent_config,
     )
 
@@ -369,5 +520,59 @@ async def public_chat_websocket_endpoint(
             logger.info("Public chat WebSocket disconnected: %s", exc)
         else:
             logger.error("Public chat WebSocket error: %s", exc)
+    finally:
+        manager.disconnect(websocket, task_id)
+
+
+async def share_chat_websocket_endpoint(
+    *,
+    websocket: WebSocket,
+    task_id: int,
+    token: str = Query(..., description="Authentication token"),
+) -> None:
+    """Serve share websocket chat with per-message revalidation."""
+    try:
+        with db_session_context() as db:
+            access_context = get_share_chat_user(token, db)
+            get_task_for_share_context(db, task_id, access_context)
+    except Exception:
+        await websocket.close(code=4001, reason="Authentication required")
+        return
+
+    await manager.connect(websocket, task_id)
+
+    try:
+        await handle_status_request(websocket, task_id, access_context.user)
+
+        while True:
+            data = await websocket.receive_text()
+            message_data = json.loads(data)
+
+            try:
+                with db_session_context() as validation_db:
+                    current_access_context = get_share_chat_user(token, validation_db)
+                    get_task_for_share_context(
+                        validation_db, task_id, current_access_context
+                    )
+            except HTTPException as exc:
+                await websocket.close(code=4003, reason=exc.detail)
+                return
+
+            message_data["user_id"] = access_context.user.id
+            message_data["user"] = access_context.user
+
+            if message_data.get("type") == "chat":
+                await handle_chat_message(websocket, task_id, message_data)
+            elif message_data.get("type") == "execute_task":
+                await handle_execute_task(websocket, task_id, message_data)
+            elif message_data.get("type") == "intervention":
+                await handle_intervention(websocket, task_id, message_data)
+    except Exception as exc:
+        from fastapi import WebSocketDisconnect
+
+        if isinstance(exc, WebSocketDisconnect):
+            logger.info("Share chat WebSocket disconnected: %s", exc)
+        else:
+            logger.error("Share chat WebSocket error: %s", exc)
     finally:
         manager.disconnect(websocket, task_id)

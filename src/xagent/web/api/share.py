@@ -20,20 +20,19 @@ from ..models.database import get_db
 from ..models.user import User
 from ..schemas.chat import TaskCreateRequest, TaskCreateResponse
 from .public_chat_access import (
-    PublicChatAccessContext,
     PublicChatAuthResponse,
-    build_public_chat_dependency,
+    ShareChatAccessContext,
+    build_share_chat_dependency,
     create_public_chat_access_token,
-    create_public_chat_task,
-    public_chat_websocket_endpoint,
-    upload_public_chat_files,
+    create_share_chat_task,
+    share_chat_websocket_endpoint,
+    upload_share_chat_files,
 )
 
 share_router = APIRouter(prefix="/api/share", tags=["share"])
 
 
 class ShareAuthRequest(BaseModel):
-    guest_id: str
     share_token: str
 
 
@@ -64,8 +63,6 @@ async def authenticate_share_link(
         {
             "sub": user.username,
             "user_id": user.id,
-            "channel_id": None,
-            "guest_id": request.guest_id,
             "auth_mode": "share",
             "share_agent_id": int(agent.id),
             "share_token": agent.share_token,
@@ -81,7 +78,7 @@ async def authenticate_share_link(
     )
 
 
-get_current_share_user_dep = build_public_chat_dependency("share")
+get_current_share_user_dep = build_share_chat_dependency()
 
 
 @share_router.post("/files/upload")
@@ -92,10 +89,10 @@ async def upload_share_file(
     message: str = Form(""),
     task_id: str = Form(None),
     folder: str = Form(None),
-    share_info: PublicChatAccessContext = Depends(get_current_share_user_dep),
+    share_info: ShareChatAccessContext = Depends(get_current_share_user_dep),
     db: Session = Depends(get_db),
 ) -> Any:
-    return await upload_public_chat_files(
+    return await upload_share_chat_files(
         file=file,
         files=files,
         task_type=task_type,
@@ -110,10 +107,10 @@ async def upload_share_file(
 @share_router.post("/chat/task/create", response_model=TaskCreateResponse)
 async def create_share_task(
     request: TaskCreateRequest,
-    share_info: PublicChatAccessContext = Depends(get_current_share_user_dep),
+    share_info: ShareChatAccessContext = Depends(get_current_share_user_dep),
     db: Session = Depends(get_db),
 ) -> Any:
-    return await create_public_chat_task(
+    return await create_share_chat_task(
         request=request,
         access_context=share_info,
         db=db,
@@ -127,9 +124,8 @@ async def websocket_share_chat_endpoint(
     task_id: int,
     token: str = Query(..., description="Authentication token"),
 ) -> None:
-    await public_chat_websocket_endpoint(
+    await share_chat_websocket_endpoint(
         websocket=websocket,
         task_id=task_id,
         token=token,
-        expected_auth_mode="share",
     )

@@ -92,12 +92,10 @@ def _user_id(username: str) -> int:
 
 def _authenticate_share_guest(
     share_token: str,
-    *,
-    guest_id: str = "guest-1",
 ) -> dict[str, str]:
     response = client.post(
         "/api/share/auth",
-        json={"share_token": share_token, "guest_id": guest_id},
+        json={"share_token": share_token},
     )
     assert response.status_code == 200, response.text
     access_token = response.json()["access_token"]
@@ -124,7 +122,6 @@ def _create_public_task_file(
     *,
     owner_id: int,
     agent_id: int,
-    guest_id: str,
     filename: str = "shared-note.txt",
     content: bytes = b"hello from public task",
 ) -> str:
@@ -141,7 +138,12 @@ def _create_public_task_file(
             description="Public task",
             status=TaskStatus.PENDING,
             agent_id=agent_id,
-            agent_config={"guest_id": guest_id},
+            channel_id=None,
+            channel_name="Shared Agent",
+            agent_config={
+                "auth_mode": "share",
+                "share_agent_id": agent_id,
+            },
         )
         db.add(task)
         db.commit()
@@ -470,7 +472,7 @@ def test_share_link_authenticates_public_chat_for_published_agent() -> None:
 
     response = client.post(
         "/api/share/auth",
-        json={"share_token": share_token, "guest_id": "guest-1"},
+        json={"share_token": share_token},
     )
 
     assert response.status_code == 200, response.text
@@ -649,7 +651,6 @@ def test_share_upload_requires_task_id() -> None:
 def test_share_public_file_preview_requires_valid_share_token() -> None:
     headers = _admin_headers()
     owner_id = _user_id("admin")
-    guest_id = "guest-preview"
     share_token = "share-preview-token"
     agent_id = _create_agent_row(
         user_id=owner_id,
@@ -661,13 +662,12 @@ def test_share_public_file_preview_requires_valid_share_token() -> None:
     file_id = _create_public_task_file(
         owner_id=owner_id,
         agent_id=agent_id,
-        guest_id=guest_id,
     )
 
     preview_without_token = client.get(f"/api/files/public/preview/{file_id}")
     assert preview_without_token.status_code == 403, preview_without_token.text
 
-    guest_headers = _authenticate_share_guest(share_token, guest_id=guest_id)
+    guest_headers = _authenticate_share_guest(share_token)
     access_token = guest_headers["Authorization"].replace("Bearer ", "", 1)
     preview_with_token = client.get(
         f"/api/files/public/preview/{file_id}",
@@ -692,7 +692,6 @@ def test_share_public_file_preview_requires_valid_share_token() -> None:
 def test_share_public_file_download_requires_valid_share_token() -> None:
     _admin_headers()
     owner_id = _user_id("admin")
-    guest_id = "guest-download"
     share_token = "share-download-token"
     agent_id = _create_agent_row(
         user_id=owner_id,
@@ -704,11 +703,10 @@ def test_share_public_file_download_requires_valid_share_token() -> None:
     file_id = _create_public_task_file(
         owner_id=owner_id,
         agent_id=agent_id,
-        guest_id=guest_id,
         filename="download-note.txt",
     )
 
-    guest_headers = _authenticate_share_guest(share_token, guest_id=guest_id)
+    guest_headers = _authenticate_share_guest(share_token)
     access_token = guest_headers["Authorization"].replace("Bearer ", "", 1)
 
     download_with_token = client.get(

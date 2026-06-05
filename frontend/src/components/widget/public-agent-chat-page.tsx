@@ -32,7 +32,8 @@ type PublicAuthResult = {
 
 interface PublicConversationContentProps {
   authMode: "widget" | "share"
-  normalizedGuestId: string
+  routeToken: string
+  normalizedGuestId?: string | null
   accessToken: string
   agentId: number | null
   agentName: string | null
@@ -43,6 +44,7 @@ interface PublicConversationContentProps {
 
 function PublicConversationContent({
   authMode,
+  routeToken,
   normalizedGuestId,
   accessToken,
   agentId,
@@ -58,7 +60,9 @@ function PublicConversationContent({
   const [draftFiles, setDraftFiles] = useState<File[]>([])
   const [isBootstrappingTask, setIsBootstrappingTask] = useState(false)
   const [hasResolvedStoredTask, setHasResolvedStoredTask] = useState(false)
-  const storageKey = `${authMode}_task_${agentId ?? "anonymous"}_${normalizedGuestId}`
+  const storageKey = authMode === "share"
+    ? `${authMode}_task_${routeToken}_${agentId ?? "anonymous"}`
+    : `${authMode}_task_${agentId ?? "anonymous"}_${normalizedGuestId ?? "anonymous"}`
   const publicApiPrefix = authMode === "share" ? "/api/share" : "/api/widget"
 
   useEffect(() => {
@@ -257,7 +261,7 @@ export function PublicAgentChatPage({
   searchAgentId = null,
 }: PublicAgentChatPageProps) {
   const { t } = useI18n()
-  const normalizedGuestId = guestId || "anonymous"
+  const normalizedGuestId = authMode === "widget" ? (guestId || "anonymous") : null
   const [isInitializing, setIsInitializing] = useState(true)
   const [errorMessage, setErrorMessage] = useState<string | null>(null)
   const [authResult, setAuthResult] = useState<PublicAuthResult | null>(null)
@@ -267,7 +271,7 @@ export function PublicAgentChatPage({
       try {
         const authPath = authMode === "share" ? "/api/share/auth" : "/api/widget/auth"
         const authPayload = authMode === "share"
-          ? { guest_id: normalizedGuestId, share_token: routeToken }
+          ? { share_token: routeToken }
           : { guest_id: normalizedGuestId, agent_id: searchAgentId }
 
         const authResponse = await fetch(`${getApiUrl()}${authPath}`, {
@@ -367,6 +371,7 @@ export function PublicAgentChatPage({
     <AppProvider token={publicAccessToken} transport={transport}>
       <PublicConversationContent
         authMode={authMode}
+        routeToken={routeToken}
         normalizedGuestId={normalizedGuestId}
         accessToken={resolvedAuthResult.access_token}
         agentId={resolvedAuthResult.agent_id ?? searchAgentId ?? null}

@@ -68,24 +68,16 @@ export function useWebSocket(options: UseWebSocketOptions = {}) {
 
   // Update token ref when token changes
   useEffect(() => {
-    console.log('🔄 token useEffect called:', {
-      currentToken: token,
-      currentRefValue: tokenRef.current,
-      tokenType: typeof token
-    })
     tokenRef.current = token || authToken
-    console.log('🔄 tokenRef updated:', tokenRef.current)
   }, [token, authToken])
 
   // Update token ref when auth token changes (for refresh token support)
   useEffect(() => {
     if (!token && authToken) {
-      console.log('🔄 Auth token changed, updating WebSocket token:', authToken)
       tokenRef.current = authToken
 
       // If WebSocket is connected and we got a new token, reconnect with new token
       if (socketRef.current?.readyState === WebSocket.OPEN && taskId) {
-        console.log('🔄 Reconnecting WebSocket with new auth token')
         disconnect()
         setTimeout(() => {
           connect()
@@ -95,13 +87,6 @@ export function useWebSocket(options: UseWebSocketOptions = {}) {
   }, [authToken, token, taskId])
 
   const connect = useCallback(() => {
-    console.log('🔧 Connect called:', {
-      currentSocket: socketRef.current,
-      readyState: socketRef.current?.readyState,
-      isConnecting: isConnectingRef.current,
-      taskId
-    })
-
     if (socketRef.current?.readyState === WebSocket.OPEN || isConnectingRef.current) return
     isConnectingRef.current = true
 
@@ -114,35 +99,22 @@ export function useWebSocket(options: UseWebSocketOptions = {}) {
 
       const wsUrl = buildWebSocketUrl
         ? buildWebSocketUrl({
-            baseUrl: url,
-            taskId,
-            token: tokenRef.current || undefined,
-          })
+          baseUrl: url,
+          taskId,
+          token: tokenRef.current || undefined,
+        })
         : `${url}/ws/chat/${taskId}${tokenRef.current ? `?token=${tokenRef.current}` : ''}`
-      console.log('🚀 Attempting to connect to WebSocket:', wsUrl)
 
       // Test if the URL is valid before creating WebSocket
       if (!wsUrl.startsWith('ws://') && !wsUrl.startsWith('wss://')) {
-        throw new Error(`Invalid WebSocket URL: ${wsUrl}`)
+        throw new Error("Invalid WebSocket URL configuration")
       }
 
       const socket = new WebSocket(wsUrl)
       socketRef.current = socket
 
       socket.onopen = () => {
-        console.log('✅ WebSocket connection established successfully')
-        // Store socket reference for debugging
-        ;(window as any).debugWebSocket = socket
-        console.log('📊 WebSocket state:', {
-          readyState: socket.readyState,
-          url: socket.url,
-          protocol: socket.protocol,
-          extensions: socket.extensions,
-          taskId: taskId
-        })
-        console.log('🎯 About to set isConnected to true')
         setIsConnected(true)
-        console.log('✅ isConnected set to true')
         setConnectionError(null)
         reconnectAttemptsRef.current = 0
         isConnectingRef.current = false
@@ -150,46 +122,34 @@ export function useWebSocket(options: UseWebSocketOptions = {}) {
       }
 
       socket.onclose = (event) => {
-        console.log('❌ WebSocket connection closed:', event.code, event.reason)
-        console.log('📊 Close event details:', {
-          code: event.code,
-          reason: event.reason,
-          wasClean: event.wasClean,
-          target: event.target
-        })
         setIsConnected(false)
         isConnectingRef.current = false
         onDisconnect?.()
 
         // Handle authentication errors (4001 = Authentication required)
         if (event.code === 4001) {
-          console.log('🔐 WebSocket authentication failed, trying token refresh')
           if (authRefreshToken && typeof authRefreshToken === 'function') {
             try {
-              console.log('🔄 Attempting to refresh auth token for WebSocket')
               const refreshTokenFunc = authRefreshToken as () => Promise<boolean>
               refreshTokenFunc().then(refreshSuccess => {
                 if (refreshSuccess) {
-                  console.log('✅ Auth token refreshed successfully, will reconnect WebSocket')
                   setTimeout(() => {
                     if (taskIdRef.current) {
                       connect()
                     }
                   }, 1000)
                 } else {
-                  console.log('❌ Auth token refresh failed, WebSocket connection will not be restored')
                   onError?.(new Error('Authentication failed and token refresh failed'))
                 }
               }).catch(error => {
-                console.error('❌ Error during auth token refresh for WebSocket:', error)
+                console.error('Error refreshing auth token for WebSocket', error)
                 onError?.(new Error('Authentication failed and token refresh error'))
               })
             } catch (error) {
-              console.error('❌ Error during auth token refresh for WebSocket:', error)
+              console.error('Error refreshing auth token for WebSocket', error)
               onError?.(new Error('Authentication failed and token refresh error'))
             }
           } else {
-            console.log('❌ No refresh token available, cannot recover WebSocket connection')
             onError?.(new Error('Authentication failed and no refresh token available'))
           }
           return
@@ -199,25 +159,21 @@ export function useWebSocket(options: UseWebSocketOptions = {}) {
           const accessError = new Error(event.reason || 'Access denied')
           setConnectionError(accessError)
           onError?.(accessError)
-          console.log('🚫 WebSocket access revoked, stopping reconnection attempts')
           return
         }
 
         // Don't reconnect if it's a 404 error or abnormal closure (1006)
         if (event.code === 1006) {
-          console.log('🚫 WebSocket endpoint not available, stopping reconnection attempts')
           return
         }
 
         // Don't reconnect if it's a clean close (might be intentional)
         if (event.code === 1000) {
-          console.log('✅ WebSocket connection closed normally, not reconnecting')
           return
         }
 
         // Don't reconnect if the reason is component unmounting
         if (event.reason === 'Component unmounting') {
-          console.log('🛑 Component unmounting, not reconnecting')
           return
         }
 
@@ -225,27 +181,15 @@ export function useWebSocket(options: UseWebSocketOptions = {}) {
         if (reconnectAttemptsRef.current < maxReconnectAttempts && taskId) {
           reconnectAttemptsRef.current++
           const delay = Math.min(1000 * reconnectAttemptsRef.current, 5000)
-          console.log(`🔄 Attempting to reconnect in ${delay}ms... (attempt ${reconnectAttemptsRef.current}/${maxReconnectAttempts})`)
           reconnectTimeoutRef.current = setTimeout(() => {
             connect()
           }, delay)
-        } else {
-          console.log('🛑 Max reconnection attempts reached or no taskId, stopping reconnection')
         }
       }
 
       socket.onerror = (error) => {
-        console.log('❌ WebSocket error:', error)
-        console.log('❌ WebSocket error details:', {
-          type: error.type,
-          target: error.target,
-          currentTarget: error.currentTarget,
-          isTrusted: error.isTrusted,
-          readyState: socket.readyState,
-          url: wsUrl
-        })
-
-        const connectionError = new Error(`WebSocket connection failed to ${wsUrl}. The backend WebSocket endpoint may not be available.`)
+        console.error('WebSocket error', error)
+        const connectionError = new Error("WebSocket connection failed. The backend WebSocket endpoint may not be available.")
         setConnectionError(connectionError)
         setIsConnected(false)
         isConnectingRef.current = false
@@ -262,7 +206,6 @@ export function useWebSocket(options: UseWebSocketOptions = {}) {
       }
 
       socket.onmessage = (event) => {
-        console.log('🔥🔥🔥 Raw WebSocket Data 🔥🔥🔥', event.data)
         try {
           const data = JSON.parse(event.data)
 
@@ -382,12 +325,12 @@ export function useWebSocket(options: UseWebSocketOptions = {}) {
           setLastMessage(message)
           onMessage?.(message)
         } catch (error) {
-          console.log("Error parsing WebSocket message:", error)
+          console.error("Error parsing WebSocket message", error)
         }
       }
 
     } catch (error) {
-      console.log('Failed to create WebSocket connection:', error)
+      console.error('Failed to create WebSocket connection', error)
       const connectionError = error instanceof Error ? error : new Error('Failed to create WebSocket connection')
       setConnectionError(connectionError)
       onError?.(connectionError)
@@ -410,12 +353,6 @@ export function useWebSocket(options: UseWebSocketOptions = {}) {
 
   // Update taskId ref when taskId changes
   useEffect(() => {
-    console.log('🔄 taskId useEffect called:', {
-      currentTaskId: taskId,
-      currentRefValue: taskIdRef.current,
-      taskIdType: typeof taskId
-    })
-
     // If taskId changes, clear any previous connection errors to allow fresh connection attempt
     if (taskId !== taskIdRef.current) {
       setConnectionError(null)
@@ -424,12 +361,10 @@ export function useWebSocket(options: UseWebSocketOptions = {}) {
     // If taskId changes and we are connected, disconnect to ensure we connect to the new task
     // logic: if we have a new taskId (different from ref) and we are currently connected
     if (taskId && taskId !== taskIdRef.current && isConnected) {
-      console.log(`🔄 TaskId changed from ${taskIdRef.current} to ${taskId}, disconnecting old socket...`)
       disconnect()
     }
 
     taskIdRef.current = taskId
-    console.log('🔄 taskIdRef updated:', taskId)
   }, [taskId, isConnected, disconnect])
 
   const sendMessage = useCallback((message: Record<string, unknown>) => {
@@ -440,7 +375,6 @@ export function useWebSocket(options: UseWebSocketOptions = {}) {
 
   const sendChatMessage = useCallback((message: string, files?: File[], force: boolean = false) => {
     const timestamp = Date.now()
-    console.log(`🚀 sendChatMessage called [${timestamp}]:`, { message, files: files?.map(f => f.name) })
 
     // Brute force duplicate message detection
     const currentTaskId = taskIdRef.current
@@ -449,13 +383,7 @@ export function useWebSocket(options: UseWebSocketOptions = {}) {
     )
 
     if (!force && duplicateMessage) {
-      console.warn(
-        `🚨 DUPLICATE MESSAGE DETECTED (Silently ignored)!\n` +
-        `Message: "${message}"\n` +
-        `Previous send time: ${duplicateMessage.timestamp} (${timestamp - duplicateMessage.timestamp}ms ago)\n` +
-        `Current send time: ${timestamp}\n` +
-        `Task ID: ${currentTaskId}`
-      )
+      console.warn("Duplicate WebSocket chat message ignored")
       return
     }
 
@@ -468,8 +396,6 @@ export function useWebSocket(options: UseWebSocketOptions = {}) {
 
       // If there are files, upload them first via API, then send file_ids
       if (files && files.length > 0) {
-        console.log(`📁 Uploading files before sending chat [${timestamp}]:`, files.length)
-
         const filesToUpload = files.filter(f => !(f as any).file_id)
         const preUploadedFiles = files.filter(f => (f as any).file_id).map(f => ({
           file_id: (f as any).file_id,
@@ -481,10 +407,7 @@ export function useWebSocket(options: UseWebSocketOptions = {}) {
         if (filesToUpload.length > 0) {
           const handleUploadedFiles = (uploadedFiles: Array<{ file_id: string; name?: string; size?: number; type?: string }>) => {
             messageData.files = [...preUploadedFiles, ...uploadedFiles]
-
-            console.log(`📤 Sending message with uploaded files [${timestamp}]:`, messageData)
             socketRef.current?.send(JSON.stringify(messageData))
-            console.log(`✅ Message sent [${timestamp}]`)
 
             recentMessages.push({ message, timestamp, taskId: currentTaskId! })
             const cutoffTime = timestamp - 5000
@@ -551,9 +474,7 @@ export function useWebSocket(options: UseWebSocketOptions = {}) {
             })
         } else {
           messageData.files = preUploadedFiles;
-          console.log(`📤 Sending message with pre-uploaded files [${timestamp}]:`, messageData)
           socketRef.current?.send(JSON.stringify(messageData))
-          console.log(`✅ Message sent [${timestamp}]`)
 
           // Record sent message
           recentMessages.push({ message, timestamp, taskId: currentTaskId! })
@@ -567,9 +488,7 @@ export function useWebSocket(options: UseWebSocketOptions = {}) {
           }
         }
       } else {
-        console.log(`📤 Sending message without files [${timestamp}]`)
         socketRef.current?.send(JSON.stringify(messageData))
-        console.log(`✅ Message sent [${timestamp}]`)
 
         // Record sent message
         recentMessages.push({ message, timestamp, taskId: currentTaskId! })
@@ -582,24 +501,10 @@ export function useWebSocket(options: UseWebSocketOptions = {}) {
           recentMessages.splice(0, firstKeepIndex)
         }
       }
-    } else {
-      console.log('❌ Cannot send message - WebSocket not ready or no task ID:', {
-        readyState: socketRef.current?.readyState,
-        taskId: taskIdRef.current
-      })
     }
   }, [taskId])
 
   const executeTask = useCallback((taskDescription: string, files?: Array<{ name: string; type: string; size: number; content?: string }>) => {
-    console.log('🔧 executeTask called:', {
-      taskDescription,
-      taskId: taskIdRef.current,
-      files: files?.length || 0,
-      readyState: socketRef.current?.readyState,
-      readyStateText: socketRef.current ? ['CONNECTING', 'OPEN', 'CLOSING', 'CLOSED'][socketRef.current.readyState] : 'NO_SOCKET',
-      isOpen: socketRef.current?.readyState === WebSocket.OPEN
-    })
-
     if (socketRef.current?.readyState === WebSocket.OPEN && taskIdRef.current) {
       const message = JSON.stringify({
         type: "execute_task",
@@ -607,34 +512,17 @@ export function useWebSocket(options: UseWebSocketOptions = {}) {
         description: taskDescription,
         ...(files && files.length > 0 && { files })
       })
-      console.log('📤 Sending execute_task message:', message)
       socketRef.current.send(message)
-    } else {
-      console.log('❌ Cannot send execute_task - WebSocket not open or no taskId')
-      console.log('🔍 Debug info:', {
-        hasSocket: !!socketRef.current,
-        readyState: socketRef.current?.readyState,
-        taskId: taskIdRef.current
-      })
     }
   }, [taskId])
 
   const pauseTask = useCallback(() => {
-    console.log('🔘 pauseTask called:', {
-      socketReady: socketRef.current?.readyState === WebSocket.OPEN,
-      taskId: taskIdRef.current,
-      socketState: socketRef.current?.readyState
-    })
     if (socketRef.current?.readyState === WebSocket.OPEN && taskIdRef.current) {
       const message = {
         type: "pause_task",
         task_id: taskIdRef.current,
       }
-      console.log('📤 Sending pause_task message:', message)
       socketRef.current.send(JSON.stringify(message))
-      console.log('✅ pause_task message sent')
-    } else {
-      console.warn('⚠️ Cannot send pause_task: socket not ready or no taskId')
     }
   }, [taskId])
 

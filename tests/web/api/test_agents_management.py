@@ -393,6 +393,34 @@ def test_share_link_requires_published_agent() -> None:
     assert response.json()["detail"] == "Only published agents can be shared"
 
 
+def test_generic_agent_responses_do_not_expose_share_token() -> None:
+    headers = _admin_headers()
+    owner_id = _user_id("admin")
+    share_token = "hidden-from-generic-agent-response"
+    agent_id = _create_agent_row(
+        user_id=owner_id,
+        name="Hidden Share Token Agent",
+        status=AgentStatus.PUBLISHED,
+        share_enabled=True,
+        share_token=share_token,
+    )
+
+    detail_response = client.get(f"/api/agents/{agent_id}", headers=headers)
+    assert detail_response.status_code == 200, detail_response.text
+    assert "share_token" not in detail_response.json()
+
+    list_response = client.get("/api/agents", headers=headers)
+    assert list_response.status_code == 200, list_response.text
+    list_item = next(item for item in list_response.json() if item["id"] == agent_id)
+    assert "share_token" not in list_item
+
+    share_link_response = client.get(
+        f"/api/agents/{agent_id}/share-link", headers=headers
+    )
+    assert share_link_response.status_code == 200, share_link_response.text
+    assert share_link_response.json()["share_token"] == share_token
+
+
 def test_share_link_can_be_enabled_rotated_and_disabled() -> None:
     headers = _admin_headers()
     owner_id = _user_id("admin")
@@ -405,6 +433,7 @@ def test_share_link_can_be_enabled_rotated_and_disabled() -> None:
     enable_response = client.post(f"/api/agents/{agent_id}/share-link", headers=headers)
     assert enable_response.status_code == 200, enable_response.text
     enabled_agent = enable_response.json()
+    assert enabled_agent["agent_id"] == agent_id
     assert enabled_agent["share_enabled"] is True
     assert isinstance(enabled_agent["share_token"], str)
     first_token = enabled_agent["share_token"]

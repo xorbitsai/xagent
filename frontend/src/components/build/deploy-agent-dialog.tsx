@@ -1,6 +1,6 @@
 "use client"
 
-import React, { useMemo, useState } from "react"
+import React, { useEffect, useMemo, useState } from "react"
 import { Button } from "@/components/ui/button"
 import { Dialog, DialogContent, DialogDescription, DialogHeader, DialogTitle } from "@/components/ui/dialog"
 import { Card, CardHeader, CardTitle, CardDescription, CardContent } from "@/components/ui/card"
@@ -32,8 +32,14 @@ export interface Agent {
   can_publish?: boolean
   can_delete?: boolean
   share_enabled?: boolean
-  share_token?: string | null
   share_updated_at?: string | null
+}
+
+interface ShareLinkResponse {
+  agent_id: number
+  share_enabled: boolean
+  share_token: string | null
+  share_updated_at: string | null
 }
 
 interface DeployAgentDialogProps {
@@ -53,10 +59,13 @@ export function DeployAgentDialog({ deployAgent, onClose, onUpdate, onManageApiK
   const [copiedShareLink, setCopiedShareLink] = useState(false)
   const [isUpdatingWidget, setIsUpdatingWidget] = useState(false)
   const [isUpdatingShare, setIsUpdatingShare] = useState(false)
+  const [isLoadingShareLink, setIsLoadingShareLink] = useState(false)
+  const [shareLink, setShareLink] = useState<ShareLinkResponse | null>(null)
   const [newDomain, setNewDomain] = useState("")
   const appOrigin = typeof window !== "undefined" ? window.location.origin : getApiUrl()
-  const shareUrl = deployAgent?.share_token ? `${appOrigin}/share/${deployAgent.share_token}` : ""
   const isPublished = deployAgent?.status === "published"
+  const shareEnabled = shareLink?.share_enabled ?? deployAgent?.share_enabled ?? false
+  const shareUrl = shareLink?.share_token ? `${appOrigin}/share/${shareLink.share_token}` : ""
 
   const agentId = deployAgent?.id ?? 0
   const apiSnippets: Record<ApiSnippetTab, string> = useMemo(() => {
@@ -78,6 +87,73 @@ with AgentClient(api_key="YOUR_API_KEY", base_url="${apiBase}") as agent:
     print(result.output)`,
     }
   }, [agentId])
+
+  useEffect(() => {
+    setShareLink(null)
+    setCopiedShareLink(false)
+  }, [deployAgent?.id])
+
+  useEffect(() => {
+    if (activeView !== "share" || !deployAgent || !isPublished) {
+      return
+    }
+
+    if (!deployAgent.share_enabled) {
+      setShareLink({
+        agent_id: deployAgent.id,
+        share_enabled: false,
+        share_token: null,
+        share_updated_at: deployAgent.share_updated_at ?? null,
+      })
+      return
+    }
+
+    if (shareLink?.agent_id === deployAgent.id && shareLink.share_token) {
+      return
+    }
+
+    let cancelled = false
+
+    const loadShareLink = async () => {
+      try {
+        setIsLoadingShareLink(true)
+        const res = await apiRequest(`${getApiUrl()}/api/agents/${deployAgent.id}/share-link`)
+        if (!res.ok) {
+          const errorData = await res.json().catch(() => null)
+          throw new Error(errorData?.detail || "Failed to load share link")
+        }
+        const shareData = await res.json() as ShareLinkResponse
+        if (!cancelled) {
+          setShareLink(shareData)
+        }
+      } catch (err) {
+        if (!cancelled) {
+          console.error(err)
+          toast.error(t("deploy_agent.messages.share_failed") || "Share link action failed")
+        }
+      } finally {
+        if (!cancelled) {
+          setIsLoadingShareLink(false)
+        }
+      }
+    }
+
+    void loadShareLink()
+
+    return () => {
+      cancelled = true
+    }
+  }, [activeView, deployAgent, isPublished, shareLink?.agent_id, shareLink?.share_token, t])
+
+  const syncShareState = (response: ShareLinkResponse) => {
+    setShareLink(response)
+    if (!deployAgent) return
+    onUpdate({
+      ...deployAgent,
+      share_enabled: response.share_enabled,
+      share_updated_at: response.share_updated_at,
+    })
+  }
 
   const handleCopyApiSnippet = async () => {
     if (await copyToClipboard(apiSnippets[apiTab])) {
@@ -163,8 +239,8 @@ with AgentClient(api_key="YOUR_API_KEY", base_url="${apiBase}") as agent:
         const errorData = await res.json().catch(() => null)
         throw new Error(errorData?.detail || "Failed to generate share link")
       }
-      const updatedAgent = await res.json()
-      onUpdate(updatedAgent)
+      const shareData = await res.json() as ShareLinkResponse
+      syncShareState(shareData)
       toast.success(t("deploy_agent.messages.share_enabled") || "Share link generated")
     } catch (err) {
       console.error(err)
@@ -185,8 +261,8 @@ with AgentClient(api_key="YOUR_API_KEY", base_url="${apiBase}") as agent:
         const errorData = await res.json().catch(() => null)
         throw new Error(errorData?.detail || "Failed to rotate share link")
       }
-      const updatedAgent = await res.json()
-      onUpdate(updatedAgent)
+      const shareData = await res.json() as ShareLinkResponse
+      syncShareState(shareData)
       toast.success(t("deploy_agent.messages.share_rotated") || "Share link rotated")
     } catch (err) {
       console.error(err)
@@ -207,8 +283,8 @@ with AgentClient(api_key="YOUR_API_KEY", base_url="${apiBase}") as agent:
         const errorData = await res.json().catch(() => null)
         throw new Error(errorData?.detail || "Failed to disable share link")
       }
-      const updatedAgent = await res.json()
-      onUpdate(updatedAgent)
+      const shareData = await res.json() as ShareLinkResponse
+      syncShareState(shareData)
       setCopiedShareLink(false)
       toast.success(t("deploy_agent.messages.share_disabled") || "Share link disabled")
     } catch (err) {
@@ -481,7 +557,11 @@ with AgentClient(api_key="YOUR_API_KEY", base_url="${apiBase}") as agent:
                 <div className="rounded-md border border-amber-200 bg-amber-50 px-3 py-2 text-sm text-amber-900">
                   {t("deploy_agent.share_link.publish_required") || "Please publish this agent before generating a share link."}
                 </div>
-              ) : deployAgent?.share_enabled && deployAgent?.share_token ? (
+              ) : isLoadingShareLink ? (
+                <div className="pt-2 text-sm text-muted-foreground">
+                  {t("common.loading") || "Loading..."}
+                </div>
+              ) : shareEnabled && shareUrl ? (
                 <div className="space-y-4 pt-2">
                   <div className="space-y-2">
                     <Label className="text-sm">{t("deploy_agent.share_link.public_url") || "Public URL"}</Label>
@@ -495,6 +575,20 @@ with AgentClient(api_key="YOUR_API_KEY", base_url="${apiBase}") as agent:
                   </div>
                   <div className="text-xs text-muted-foreground">
                     {t("deploy_agent.share_link.anyone_access") || "Anyone with this link can start a public chat with this agent."}
+                  </div>
+                  <div className="flex gap-2">
+                    <Button variant="outline" onClick={handleRotateShare} disabled={isUpdatingShare}>
+                      {t("deploy_agent.share_link.rotate_btn") || "Reset Link"}
+                    </Button>
+                    <Button variant="outline" onClick={handleDisableShare} disabled={isUpdatingShare}>
+                      {t("deploy_agent.share_link.disable_btn") || "Disable Link"}
+                    </Button>
+                  </div>
+                </div>
+              ) : shareEnabled ? (
+                <div className="space-y-4 pt-2">
+                  <div className="text-sm text-muted-foreground">
+                    {t("deploy_agent.messages.share_failed") || "Share link action failed"}
                   </div>
                   <div className="flex gap-2">
                     <Button variant="outline" onClick={handleRotateShare} disabled={isUpdatingShare}>

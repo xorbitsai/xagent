@@ -68,7 +68,6 @@ class AgentStore:
             "widget_enabled": agent.widget_enabled,
             "allowed_domains": ensure_list(agent.allowed_domains) or [],
             "share_enabled": agent.share_enabled,
-            "share_token": agent.share_token,
             "share_updated_at": agent.share_updated_at.isoformat()
             if agent.share_updated_at
             else None,
@@ -88,7 +87,6 @@ class AgentStore:
             "widget_enabled": agent.widget_enabled,
             "allowed_domains": ensure_list(agent.allowed_domains) or [],
             "share_enabled": agent.share_enabled,
-            "share_token": agent.share_token,
             "share_updated_at": agent.share_updated_at.isoformat()
             if agent.share_updated_at
             else None,

@@ -129,7 +129,6 @@ class V1AgentSummary(BaseModel):
     widget_enabled: bool
     allowed_domains: list[str]
     share_enabled: bool
-    share_token: Optional[str]
     share_updated_at: Optional[str]
 
 
@@ -153,7 +152,6 @@ class V1AgentResponse(BaseModel):
     widget_enabled: bool
     allowed_domains: list[str]
     share_enabled: bool
-    share_token: Optional[str]
     share_updated_at: Optional[str]
 
 

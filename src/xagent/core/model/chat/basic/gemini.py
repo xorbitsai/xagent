@@ -683,6 +683,7 @@ class GeminiLLM(BaseLLM):
             candidate_diagnostics: List[Dict[str, Any]] = []
             partial_call_diagnostics: List[Dict[str, Any]] = []
             emitted_content_or_tool = False
+            tool_call_index = 0
 
             # Process streaming response (async iteration)
             async for chunk in response_stream:
@@ -779,6 +780,7 @@ class GeminiLLM(BaseLLM):
                             type=ChunkType.TOOL_CALL,
                             tool_calls=[
                                 {
+                                    "index": tool_call_index,
                                     "id": f"call_{uuid.uuid4().hex[:16]}",
                                     "type": "function",
                                     "function": {
@@ -790,6 +792,7 @@ class GeminiLLM(BaseLLM):
                             finish_reason="tool_calls",
                             raw=chunk,
                         )
+                        tool_call_index += 1
 
                     elif hasattr(part, "text") and part.text:
                         text = part.text

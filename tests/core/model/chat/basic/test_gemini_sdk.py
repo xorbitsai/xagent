@@ -6,6 +6,7 @@ from unittest.mock import MagicMock
 import pytest
 import pytest_mock
 
+from xagent.core.agent import PatternRuntime
 from xagent.core.model.chat.basic.gemini import GeminiLLM
 from xagent.core.model.chat.types import ChunkType
 
@@ -150,6 +151,77 @@ class TestGeminiLLMSDK:
         assert len(chunks) >= 2  # At least usage + token + end
         assert usage_received, "Usage chunk should be received"
         print(f"Stream chat got {len(chunks)} chunks, usage received: {usage_received}")
+
+    @pytest.mark.asyncio
+    async def test_stream_chat_tool_calls_keep_distinct_runtime_indices(
+        self, llm: GeminiLLM, mocker: pytest_mock.MockerFixture
+    ) -> None:
+        """Separate Gemini streamed function calls must not merge in runtime."""
+        mock_client = MagicMock()
+
+        def make_function_call_chunk(name: str, args: dict[str, Any]) -> MagicMock:
+            mock_chunk = MagicMock()
+            mock_candidate = MagicMock()
+            mock_content = MagicMock()
+            mock_part = MagicMock()
+            mock_function_call = MagicMock()
+
+            mock_function_call.name = name
+            mock_function_call.args = args
+            mock_function_call.partial_args = []
+            mock_function_call.will_continue = None
+            mock_part.function_call = mock_function_call
+            mock_part.text = None
+            mock_content.parts = [mock_part]
+            mock_candidate.content = mock_content
+            mock_chunk.candidates = [mock_candidate]
+            mock_chunk.usage_metadata = None
+            return mock_chunk
+
+        async def mock_stream():
+            yield make_function_call_chunk(
+                "prepare_html_asset",
+                {
+                    "file_id": "file-1",
+                    "html_path": "poster.html",
+                    "alias": "logo.png",
+                },
+            )
+            yield make_function_call_chunk(
+                "generate_image",
+                {
+                    "prompt": "Modern Humanistic Conceptual Illustration",
+                    "aspect_ratio": "16:9",
+                },
+            )
+
+        async def mock_generate_content_stream(*args, **kwargs):
+            return mock_stream()
+
+        mock_client.aio.models.generate_content_stream = mock_generate_content_stream
+        mocker.patch.object(llm, "_ensure_client")
+        llm._client = mock_client
+
+        runtime = PatternRuntime()
+        result = await runtime.run_streaming_llm_call(
+            llm,
+            messages=[{"role": "user", "content": "Make a banner."}],
+            tools=[],
+        )
+
+        tool_calls = result["tool_calls"]
+        assert [call["index"] for call in tool_calls] == [0, 1]
+        assert [call["function"]["name"] for call in tool_calls] == [
+            "prepare_html_asset",
+            "generate_image",
+        ]
+        assert tool_calls[0]["function"]["arguments"] == (
+            '{"file_id": "file-1", "html_path": "poster.html", "alias": "logo.png"}'
+        )
+        assert tool_calls[1]["function"]["arguments"] == (
+            '{"prompt": "Modern Humanistic Conceptual Illustration", '
+            '"aspect_ratio": "16:9"}'
+        )
 
     @pytest.mark.asyncio
     async def test_tool_calling_with_sdk(

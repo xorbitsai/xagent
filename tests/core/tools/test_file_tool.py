@@ -21,71 +21,92 @@ from xagent.core.tools.adapters.vibe.file_tool import (
 
 
 def test_basic_file_operations():
-    """测试基本文件操作"""
-    # 创建临时文件
+    """Test basic file operations."""
+    # Create a temporary file.
     with tempfile.NamedTemporaryFile(mode="w", delete=False, suffix=".txt") as f:
         temp_file = f.name
         f.write("Hello, World!")
 
     try:
-        # 测试读取文件
+        # Read file content.
         content = read_file(temp_file)
         assert content == "Hello, World!"
 
-        # 测试文件存在检查
+        # Check file existence.
         assert file_exists(temp_file)
 
-        # 测试获取文件信息
+        # Get file metadata.
         info = get_file_info(temp_file)
         assert info.name.endswith(".txt")
         assert info.is_file
         assert not info.is_dir
 
-        # 测试写入文件
+        # Write file content.
         write_file(temp_file, "New content")
         content = read_file(temp_file)
         assert content == "New content"
 
-        # 测试追加文件
+        # Append file content.
         append_file(temp_file, " Appended content")
         content = read_file(temp_file)
         assert content == "New content Appended content"
 
     finally:
-        # 清理临时文件
+        # Clean up the temporary file.
+        if os.path.exists(temp_file):
+            delete_file(temp_file)
+
+
+def test_read_file_line_range():
+    """Test reading a specific line range."""
+    with tempfile.NamedTemporaryFile(mode="w", delete=False, suffix=".txt") as f:
+        temp_file = f.name
+        f.write("line 1\nline 2\nline 3\nline 4\n")
+
+    try:
+        content = read_file(temp_file, start_line=2, end_line=3)
+        assert content == "line 2\nline 3\n"
+
+        with pytest.raises(ValueError, match="start_line must be >= 1"):
+            read_file(temp_file, start_line=0)
+        with pytest.raises(ValueError, match="end_line must be >= 1"):
+            read_file(temp_file, end_line=0)
+        with pytest.raises(ValueError, match="start_line must be <= end_line"):
+            read_file(temp_file, start_line=3, end_line=2)
+    finally:
         if os.path.exists(temp_file):
             delete_file(temp_file)
 
 
 def test_directory_operations():
-    """测试目录操作"""
+    """Test directory operations."""
     with tempfile.TemporaryDirectory() as temp_dir:
-        # 测试创建目录
+        # Create a directory.
         new_dir = os.path.join(temp_dir, "test_dir", "sub_dir")
         create_directory(new_dir)
         assert os.path.exists(new_dir)
 
-        # 测试列出文件
+        # List files.
         files = list_files(temp_dir)
         assert files.total_count > 0
         assert any(f.name == "test_dir" for f in files.files)
 
-        # 测试递归列出文件
+        # List files recursively.
         recursive_files = list_files(temp_dir, recursive=True)
-        assert recursive_files.total_count >= 2  # 至少包含 test_dir 和 sub_dir
+        assert recursive_files.total_count >= 2  # Includes test_dir and sub_dir.
 
 
 def test_json_operations():
-    """测试JSON文件操作"""
+    """Test JSON file operations."""
     with tempfile.NamedTemporaryFile(mode="w", delete=False, suffix=".json") as f:
         temp_file = f.name
 
     try:
-        # 测试写入JSON文件
+        # Write JSON data.
         test_data = {"name": "Test", "age": 25, "hobbies": ["reading", "coding"]}
         write_json_file(temp_file, test_data)
 
-        # 测试读取JSON文件
+        # Read JSON data.
         loaded_data = read_json_file(temp_file)
         assert loaded_data == test_data
 
@@ -95,19 +116,19 @@ def test_json_operations():
 
 
 def test_csv_operations():
-    """测试CSV文件操作"""
+    """Test CSV file operations."""
     with tempfile.NamedTemporaryFile(mode="w", delete=False, suffix=".csv") as f:
         temp_file = f.name
 
     try:
-        # 测试写入CSV文件
+        # Write CSV data.
         test_data = [
             {"name": "Alice", "age": "25", "city": "New York"},
             {"name": "Bob", "age": "30", "city": "San Francisco"},
         ]
         write_csv_file(temp_file, test_data)
 
-        # 测试读取CSV文件
+        # Read CSV data.
         loaded_data = read_csv_file(temp_file)
         assert len(loaded_data) == 2
         assert loaded_data[0]["name"] == "Alice"
@@ -119,25 +140,25 @@ def test_csv_operations():
 
 
 def test_error_handling():
-    """测试错误处理"""
-    # 测试读取不存在的文件
+    """Test error handling."""
+    # Reading a missing file raises FileNotFoundError.
     with pytest.raises(FileNotFoundError):
         read_file("/non/existent/file.txt")
 
-    # 测试检查不存在的文件
+    # A missing file does not exist.
     assert not file_exists("/non/existent/file.txt")
 
-    # 测试获取不存在文件的信息
+    # Getting metadata for a missing file raises FileNotFoundError.
     with pytest.raises(FileNotFoundError):
         get_file_info("/non/existent/file.txt")
 
 
 def test_file_tools_integration():
-    """测试FileTool集成"""
-    # 验证所有工具都能正确导入和实例化（包含新增的edit_file和find_and_replace）
+    """Test FileTool integration."""
+    # Verify all tools can be imported and instantiated.
     assert len(FILE_TOOLS) == 14
 
-    # 验证每个工具都有正确的属性
+    # Verify each tool has the expected attributes.
     for tool in FILE_TOOLS:
         assert hasattr(tool, "metadata")
         assert hasattr(tool, "name")
@@ -145,33 +166,33 @@ def test_file_tools_integration():
         assert callable(tool.run_json_sync)
         assert callable(tool.run_json_async)
 
-    # 验证工具名称唯一性
+    # Verify tool names are unique.
     tool_names = [tool.name for tool in FILE_TOOLS]
-    assert len(tool_names) == len(set(tool_names)), "工具名称应该唯一"
+    assert len(tool_names) == len(set(tool_names)), "Tool names should be unique"
 
-    # 验证新添加的工具存在
+    # Verify edit tools are present.
     assert "edit_file" in tool_names
     assert "find_and_replace" in tool_names
 
 
 def test_specific_tool_functionality():
-    """测试特定工具的功能"""
-    # 测试read_file_tool
+    """Test specific tool functionality."""
+    # Test read_file_tool.
     with tempfile.NamedTemporaryFile(mode="w", delete=False, suffix=".txt") as f:
         temp_file = f.name
         f.write("Test content")
 
     try:
-        # 使用工具实例测试
+        # Test through the tool instance.
         read_tool = next(t for t in FILE_TOOLS if t.name == "read_file")
         result = read_tool.run_json_sync({"file_path": temp_file})
         assert "Test content" in str(result)
 
-        # 测试write_file_tool
+        # Test write_file_tool.
         write_tool = next(t for t in FILE_TOOLS if t.name == "write_file")
         write_tool.run_json_sync({"file_path": temp_file, "content": "New content"})
 
-        # 验证写入成功
+        # Verify write succeeded.
         result = read_tool.run_json_sync({"file_path": temp_file})
         assert "New content" in str(result)
 

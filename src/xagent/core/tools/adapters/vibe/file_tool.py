@@ -34,7 +34,15 @@ class FileTool(FunctionTool):
 
 
 # Create basic tool instances (these tools are unsafe, for internal use only)
-read_file_tool = FileTool(read_file, name="read_file", description="Read file content")
+read_file_tool = FileTool(
+    read_file,
+    name="read_file",
+    description=(
+        "Read file content. For large files, results may be truncated in model "
+        "context; use start_line/end_line to inspect a specific 1-based "
+        "inclusive line range instead of repeating the same full-file read."
+    ),
+)
 write_file_tool = FileTool(
     write_file, name="write_file", description="Write content to file"
 )

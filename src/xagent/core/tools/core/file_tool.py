@@ -11,7 +11,7 @@ import logging
 import os
 import re
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Union
+from typing import Any, Dict, Iterable, List, Optional, Union
 
 from pydantic import BaseModel
 
@@ -80,13 +80,20 @@ class EditResult(BaseModel):
     preview: Optional[str] = None
 
 
-def read_file(file_path: str, encoding: str = "utf-8") -> str:
+def read_file(
+    file_path: str,
+    encoding: str = "utf-8",
+    start_line: int | None = None,
+    end_line: int | None = None,
+) -> str:
     """
     Read string from text file
 
     Args:
         file_path: File path
         encoding: File encoding, defaults to utf-8
+        start_line: Optional 1-based first line to read.
+        end_line: Optional 1-based last line to read, inclusive.
 
     Returns:
         File content string
@@ -95,8 +102,60 @@ def read_file(file_path: str, encoding: str = "utf-8") -> str:
         FileNotFoundError: File doesn't exist
         UnicodeDecodeError: Encoding error
     """
+    if start_line is None and end_line is None:
+        with open(file_path, "r", encoding=encoding) as f:
+            return f.read()
+
     with open(file_path, "r", encoding=encoding) as f:
-        return f.read()
+        return _read_line_range(f, start_line=start_line, end_line=end_line)
+
+
+def _slice_lines(
+    content: str,
+    *,
+    start_line: int | None = None,
+    end_line: int | None = None,
+) -> str:
+    return _read_line_range(
+        content.splitlines(keepends=True),
+        start_line=start_line,
+        end_line=end_line,
+    )
+
+
+def _read_line_range(
+    lines: Iterable[str],
+    *,
+    start_line: int | None = None,
+    end_line: int | None = None,
+) -> str:
+    _validate_line_range(start_line, end_line)
+    start_index = (start_line - 1) if start_line is not None else 0
+    end_index = end_line if end_line is not None else None
+
+    if isinstance(lines, list):
+        return "".join(lines[start_index:end_index])
+
+    selected_lines: list[str] = []
+    for index, line in enumerate(lines):
+        if index < start_index:
+            continue
+        if end_index is not None and index >= end_index:
+            break
+        selected_lines.append(line)
+    return "".join(selected_lines)
+
+
+def _validate_line_range(
+    start_line: int | None,
+    end_line: int | None,
+) -> None:
+    if start_line is not None and start_line < 1:
+        raise ValueError("start_line must be >= 1")
+    if end_line is not None and end_line < 1:
+        raise ValueError("end_line must be >= 1")
+    if start_line is not None and end_line is not None and start_line > end_line:
+        raise ValueError("start_line must be <= end_line")
 
 
 def write_file(

@@ -221,6 +221,11 @@ class ExecutionContext:
             "content_preview": result[:READ_FILE_CONTEXT_LIMIT],
             "content_truncated": True,
             "original_chars": len(result),
+            "instruction": (
+                "Content is truncated in model context. Use read_file with "
+                "start_line/end_line to inspect later lines instead of "
+                "repeating the same full-file read."
+            ),
         }
 
     def _sanitize_tool_calls_for_context(

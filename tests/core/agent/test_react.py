@@ -843,6 +843,7 @@ async def test_react_pattern_uses_decision_for_repeated_tools() -> None:
     assert "Set response_language" in decision_prompt
     assert "answer must match response_language" in decision_prompt
     assert "When choosing final_answer" in decision_prompt
+    assert "future tool action" in decision_prompt
     assert "same natural language as the current user request" in decision_prompt
     assert "Simplified Chinese versus Traditional Chinese" in decision_prompt
     assert pattern.pending_tool_calls == []

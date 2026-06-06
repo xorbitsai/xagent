@@ -654,6 +654,7 @@ def test_read_file_tool_result_truncates_large_text_for_context() -> None:
     assert tool.metadata["raw_result"]["content_truncated"] is True
     assert tool.metadata["raw_result"]["original_chars"] == len(large_text)
     assert len(tool.metadata["raw_result"]["content_preview"]) == 12_000
+    assert "start_line/end_line" in tool.metadata["raw_result"]["instruction"]
     assert len(tool.content) < len(large_text)
 
 

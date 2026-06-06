@@ -14,6 +14,17 @@ from xagent.core.workspace import TaskWorkspace
 class TestWorkspaceFileOperations:
     """Test suite for WorkspaceFileOperations core class."""
 
+    def test_read_file_line_range(self, tmp_path):
+        """Test that read_file can read a 1-based inclusive line range."""
+        workspace = TaskWorkspace("test_read_range", str(tmp_path))
+        ops = WorkspaceFileOperations(workspace)
+
+        test_file = workspace.output_dir / "notes.txt"
+        test_file.parent.mkdir(parents=True, exist_ok=True)
+        test_file.write_text("one\ntwo\nthree\nfour\n", encoding="utf-8")
+
+        assert ops.read_file("notes.txt", start_line=2, end_line=3) == "two\nthree\n"
+
     def test_read_json_file_delegation(self, tmp_path):
         """Test that read_json_file correctly delegates to basic file_tool function."""
         workspace = TaskWorkspace("test_json", str(tmp_path))

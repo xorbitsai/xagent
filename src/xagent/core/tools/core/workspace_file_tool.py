@@ -19,7 +19,13 @@ from pydantic import BaseModel
 from ...file_ref import build_workspace_file_ref, safe_asset_filename
 from ...workspace import TaskWorkspace
 from .document_parser import DocumentCapabilities, DocumentParseArgs, parse_document
-from .file_tool import EditOperation, EditResult, get_image_metadata
+from .file_tool import (
+    EditOperation,
+    EditResult,
+    _read_line_range,
+    _slice_lines,
+    get_image_metadata,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -190,7 +196,13 @@ class WorkspaceFileOperations:
     def __init__(self, workspace: TaskWorkspace):
         self.workspace = workspace
 
-    def read_file(self, file_path: str, encoding: str = "utf-8") -> str:
+    def read_file(
+        self,
+        file_path: str,
+        encoding: str = "utf-8",
+        start_line: int | None = None,
+        end_line: int | None = None,
+    ) -> str:
         """Read file content in workspace"""
         logger.debug(
             "read_file called with file_path: %s, workspace_id: %s",
@@ -246,12 +258,25 @@ class WorkspaceFileOperations:
                 len(content),
                 resolved_path,
             )
+            if start_line is not None or end_line is not None:
+                return _slice_lines(
+                    content,
+                    start_line=start_line,
+                    end_line=end_line,
+                )
             return content
 
         # Try to read as regular text file
         try:
             with open(resolved_path, "r", encoding=encoding) as f:
-                content = f.read()
+                if start_line is not None or end_line is not None:
+                    content = _read_line_range(
+                        f,
+                        start_line=start_line,
+                        end_line=end_line,
+                    )
+                else:
+                    content = f.read()
                 logger.debug(
                     "Successfully read %d bytes from %s", len(content), resolved_path
                 )
@@ -261,7 +286,14 @@ class WorkspaceFileOperations:
             for fallback_encoding in ["utf-8-sig", "latin-1", "cp1252"]:
                 try:
                     with open(resolved_path, "r", encoding=fallback_encoding) as f:
-                        content = f.read()
+                        if start_line is not None or end_line is not None:
+                            content = _read_line_range(
+                                f,
+                                start_line=start_line,
+                                end_line=end_line,
+                            )
+                        else:
+                            content = f.read()
                         logger.debug(
                             "Successfully read %d bytes from %s using %s encoding",
                             len(content),
@@ -798,7 +830,11 @@ def _get_workspace_ops(workspace_id: str) -> WorkspaceFileOperations:
 
 
 def workspace_read_file(
-    workspace_id: str, file_path: str, encoding: str = "utf-8"
+    workspace_id: str,
+    file_path: str,
+    encoding: str = "utf-8",
+    start_line: int | None = None,
+    end_line: int | None = None,
 ) -> str:
     """
     Reads the content of a file within the specified workspace.
@@ -807,12 +843,14 @@ def workspace_read_file(
         workspace_id: The ID of the workspace.
         file_path: The path to the file relative to the workspace.
         encoding: The encoding to use for reading the file (default: 'utf-8').
+        start_line: Optional 1-based first line to read.
+        end_line: Optional 1-based last line to read, inclusive.
 
     Returns:
         The content of the file as a string.
     """
     ops = _get_workspace_ops(workspace_id)
-    return ops.read_file(file_path, encoding)
+    return ops.read_file(file_path, encoding, start_line, end_line)
 
 
 def workspace_write_file(

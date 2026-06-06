@@ -40,9 +40,15 @@ class WorkspaceFileTools(WorkspaceFileOperations):
         self.inner = WorkspaceFileOperations(workspace)
         self.workspace = workspace
 
-    def read_file(self, file_path: str, encoding: str = "utf-8") -> str:
+    def read_file(
+        self,
+        file_path: str,
+        encoding: str = "utf-8",
+        start_line: int | None = None,
+        end_line: int | None = None,
+    ) -> str:
         """Read file content in workspace"""
-        return self.inner.read_file(file_path, encoding)
+        return self.inner.read_file(file_path, encoding, start_line, end_line)
 
     def write_file(
         self,
@@ -167,7 +173,7 @@ class WorkspaceFileTools(WorkspaceFileOperations):
             FileTool(
                 self.read_file,
                 name="read_file",
-                description="Read file content in workspace. Accepts either file paths (e.g., 'filename.txt') or file_ids (e.g., 'abc-123-def'). Automatically detects input type.",
+                description="Read file content in workspace. Accepts either file paths (e.g., 'filename.txt') or file_ids (e.g., 'abc-123-def'). Automatically detects input type. For large files, results may be truncated in model context; use start_line/end_line to inspect a specific 1-based inclusive line range instead of repeating the same full-file read.",
             ),
             FileTool(
                 self.write_file,

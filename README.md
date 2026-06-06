@@ -14,90 +14,35 @@
 
 ---
 
-## What is Xagent?
+# Xagent
 
-**Describe tasks. Not workflows.**
+**Start with a personal agent. Scale into an AI workforce.**
 
-**No more flowcharts.**
-**No more rigid automation.**
-**Just tell Xagent what you want.**
+Xagent helps individuals complete real tasks, teams publish reusable agents, and enterprises run agent systems with their own tools, models, knowledge, and infrastructure — without brittle workflows.
 
-👏 Join [Telegram](https://t.me/+2_-SAVLtuJNkNWFl) | [Discord](https://discord.gg/R7TDFMzuXq)
+**Describe the outcome. Not the workflow.**
 
-❤️ Like Xagent? Give it a star 🌟 to support the development!
+```text
+One task
+  ↓
+Personal Agent
+  ↓
+Reusable Agent
+  ↓
+Team Workforce
+  ↓
+Enterprise Agent Platform
+```
 
----
+**For personal work, team automation, and enterprise AI systems.**
 
-## Xagent vs OpenClaw
+Join [Telegram](https://t.me/+2_-SAVLtuJNkNWFl) | [Discord](https://discord.gg/R7TDFMzuXq)
 
-| Capability         | Xagent                                                        | OpenClaw                                                                                  |
-| ------------------ | ------------------------------------------------------------- | ----------------------------------------------------------------------------------------- |
-| Core design        | **Enterprise agent platform**                                 | Autonomous personal agent                                                                 |
-| Security           | **VM‑level sandbox** for safe agent execution                 | Only a Docker container sandbox — and real usage often requires elevated host permissions |
-| Agent architecture | **LLM‑driven planning + efficient multi‑agent orchestration** | Mostly linear task execution                                                              |
-| Model capability   | **API-compatible* + model-native intelligence**               | API or local models used as simple plug-ins (no deep integration)                        |
-| Knowledge systems  | **Enterprise RAG / knowledge platforms**                      | Local memory / lightweight RAG                                                            |
-| Deployment         | **Flexible deployment** — local, private (on‑prem), or cloud  | Mostly local runtime                                                                      |
-| Multi-tenancy      | **Tenant‑aware architecture**                                 | Primarily single‑user                                                                     |
-
-\* Xagent supports both API-based models and open-source models, powered by deep integration with Xinference for model-level optimization.
+❤️ Like Xagent? Give it a star to support the development!
 
 ---
 
-## 🎬 See Xagent Think
-
-Give it a goal.
-Watch it plan, select tools, execute, and deliver.
-
-![Xagent Demo](./assets/task_demo.jpg)
-
----
-
-## ⚡ The Problem
-
-**Workflow builders are rigid. They break when requirements change.**
-
-- You map every decision branch manually
-- You orchestrate tools by hand
-- You maintain fragile flow diagrams
-- You re-engineer when logic changes
-
----
-
-## 🎯 The Xagent Way
-
-**With Xagent, you describe the outcome — not the steps.**
-
-- Plans the task dynamically
-- Decomposes into executable steps
-- Selects the right tools automatically
-- Executes, evaluates, and iterates
-
----
-
-## 🚀 What You Can Build
-
-With Xagent, you don’t design workflows. You describe the task. That’s it.
-
-**Just define what you want done — and Xagent plans, decomposes, selects tools, and executes.**
-
-### Build Anything You Can Describe:
-
-| Domain | Examples |
-|--------|----------|
-| **Content Creation** | Automated PPT generation, marketing posters, creative design assets |
-| **Research & Analysis** | Deep analysis reports, research summaries, data synthesis |
-| **Enterprise Automation** | AI copilots for internal teams, knowledge assistants, task automation |
-| **Business Intelligence** | Data reporting automation, SaaS features, multi-step reasoning systems |
-| **Knowledge Work** | Document processing, information extraction, structured outputs |
-
-**If you can clearly describe the goal, Xagent can turn it into an executable system.**
-
-All powered by one unified runtime.
-
----
-
-## 🚀 Quick Start
+## Quick Start
 
 **Get started in 3 minutes**
 
@@ -107,6 +52,7 @@ All powered by one unified runtime.
 git clone https://github.com/xorbitsai/xagent.git
 cd xagent
 cp example.env .env
+# Edit .env to configure at least one LLM API key.
 ```
 
 ### 2️⃣ Start with Docker
@@ -123,77 +69,296 @@ http://localhost:80
 
 On first startup, Xagent redirects to `/setup`.
 
-Create the first administrator account there to complete initialization.
+Create the first administrator account to complete initialization.
 
 If the admin password is forgotten, reset it via CLI:
 
 ```bash
-python -m xagent.web.reset_admin_password --username <admin_username>
+docker compose exec backend python -m xagent.web.reset_admin_password --username <admin_username>
 ```
 
 That's it. Xagent is now running.
 
 ---
 
-## ✨ Core Features
+## One platform, three ways to use it
 
-### 🧠 Dynamic Planning Engine
+| Use Xagent as... | For... | What you get |
+| --- | --- | --- |
+| **A personal agent** | One-off tasks, research, writing, files, and data exploration | Chat-style execution with tools, files, models, and real-time progress |
+| **A team workforce** | Reusable agents, shared knowledge, repeated operations, and handoffs | Agents with roles, tools, models, knowledge bases, templates, live preview, and publishing |
+| **An enterprise agent platform** | Private data, production use cases, and internal systems | Self-hosting, private cloud and on-prem deployment, Xinference integration, monitoring, and multi-user control |
 
-Unlike traditional workflow tools, Xagent plans tasks dynamically at runtime.
+---
+
+## What is Xagent?
+
+Xagent is an agent platform for personal work, reusable team agents, and enterprise AI systems.
+
+For individuals, it works like a powerful personal agent: describe a task, attach files, use tools, and get results.
+
+For teams, it turns repeated work into reusable agents: define roles, connect tools and knowledge, test with live preview, then save and publish.
+
+For enterprises, it provides the control needed to run agents with your own models, data, infrastructure, and internal systems.
+
+Xagent is not a chatbot wrapper.
+Xagent is not a static workflow builder.
+Xagent is a runtime for agentic work.
+
+---
+
+## Why not workflow builders?
+
+Workflow builders are useful when the process is fixed.
+
+But real knowledge work is messy:
+
+- Requirements change
+- Inputs are incomplete
+- The next step depends on what the agent discovers
+- Tools need to be selected at runtime
+- The output may be a report, a file, a decision, or an action
+
+Traditional workflow builders ask you to design every branch before the work begins.
+
+Xagent plans while the work happens.
+
+**Real work does not look like a perfect flowchart.
+Real work looks like a team.**
+
+---
+
+## How Xagent works
+
+Give Xagent a goal:
+
+```text
+Analyze three competitors, summarize their positioning, and draft a launch plan.
+```
+
+Xagent can turn it into coordinated work:
+
+```text
+Planner Agent
+  ├─ Research Agent: gathers market and product signals
+  ├─ Data Agent: structures competitors and trends
+  ├─ Analyst Agent: identifies strategic opportunities
+  ├─ Writer Agent: drafts the narrative
+  └─ Operator Agent: prepares the final deliverables
+```
+
+During execution, Xagent can:
+
+- Plan the task dynamically
+- Break work into executable steps
+- Select tools and models
+- Use files, APIs, knowledge bases, and internal systems
+- Track progress in real time
+- Evaluate and iterate
+- Deliver final artifacts
+
+---
+
+## See Xagent work
+
+Give it a goal. Watch it plan, call tools, execute steps, and deliver results.
+
+![Xagent Demo](./assets/task_demo.jpg)
+
+---
+
+## What you can build
+
+### Personal agents
+
+For your own daily work:
+
+| Agent | Examples |
+| --- | --- |
+| **Research Agent** | Research a market, summarize papers, compare products |
+| **Writing Agent** | Draft posts, emails, memos, launch copy |
+| **Document Agent** | Summarize files, extract structured data, translate documents |
+| **Data Agent** | Analyze CSVs, explain trends, generate reports |
+| **Creative Agent** | Generate PPTs, posters, campaign ideas, design briefs |
+
+### Team workforces
+
+For repeated work across a team:
+
+| Workforce | What it does |
+| --- | --- |
+| **Support Workforce** | Answers customer questions from knowledge bases and docs |
+| **Marketing Workforce** | Creates launch plans, landing copy, and campaign assets |
+| **Data Workforce** | Runs analysis, explains metrics, investigates anomalies |
+| **Ops Workforce** | Handles invoices, receipts, internal requests, and policy FAQs |
+| **Security Workforce** | Analyzes suspicious emails and phishing attempts |
+
+### Enterprise agent systems
+
+For production environments:
+
+| System | What it connects |
+| --- | --- |
+| **Internal Knowledge Assistant** | Company docs, policies, FAQs, and internal knowledge bases |
+| **BI / Analytics Agent** | Databases, reports, dashboards, and SQL tools |
+| **Customer Support Agent** | Product docs, tickets, and troubleshooting workflows |
+| **Private Agent Platform** | Self-hosted models, private cloud, and on-prem infrastructure |
+
+---
+
+## Core capabilities
+
+### 1. Instant personal execution
+
+Start with a task. No workflow setup required.
+
+- One-off tasks
+- File-based work
+- Chat-style assistants
+- Tool-enabled execution
+- Real-time progress tracking
+
+### 2. Dynamic planning
+
+Xagent plans at runtime instead of following static graphs.
 
 - Automatic task decomposition
 - Plan → Execute → Reflect loops
-- Conditional branching
+- Conditional execution
 - Multi-step reasoning
 
-**No static flows. No brittle chains.**
+### 3. Reusable agents
 
----
+Turn repeated work into agents your team can reuse.
 
-### 🔌 Tool & Model Orchestration
+- Role definition
+- Tool access
+- Knowledge integration
+- Model configuration
+- Live preview
+- Save and publish
 
-Xagent connects to your entire stack:
+### 4. AI workforce patterns
 
-- OpenAI, Anthropic and other LLM providers
+Compose specialized agents for complex outcomes.
+
+- Planner agents
+- Research agents
+- Data agents
+- Writing agents
+- Domain agents
+- Operator agents
+
+### 5. Tools, models, and knowledge
+
+Connect agents to the systems they need.
+
+- OpenAI, Claude, Zhipu, DeepSeek, and other model providers
 - Self-hosted models via Xinference
-- External APIs
-- Knowledge bases (RAG)
-- Internal enterprise systems
+- Knowledge bases and RAG
+- Files and documents
+- APIs and internal systems
+- MCP tools and integrations
 
-It selects and orchestrates tools automatically during execution.
+### 6. Observability and control
 
----
-
-### ⚡ Instant Execution Mode
-
-For simple use cases, run tool-enabled LLM calls instantly.
-
-- No configuration overhead
-- Chat-style assistants
-- Embedded AI features
-
-**Start simple. Scale when needed.**
-
----
-
-### 📊 Observability & Control
-
-Built for real production use:
+Operate agents like real systems.
 
 - Task lifecycle tracking
-- Token usage monitoring
 - Execution state management
+- Real-time step details
+- Tool call visibility
+- Token usage monitoring
 - Multi-user support
-
-**Operate agents like real systems — not demos.**
 
 ---
 
-## 🎬 Xagent in Action
+## Enterprise-ready by design
 
-Watch Xagent plan, execute, and deliver results in real-time.
+Xagent can start as a personal agent, but it is built to grow into production environments.
+
+| Enterprise need | Xagent capability |
+| --- | --- |
+| **Private deployment** | Local, private cloud, and on-prem deployment |
+| **Model control** | API-based models and self-hosted models via Xinference |
+| **Data grounding** | Knowledge bases, RAG, files, and internal systems |
+| **Operational visibility** | Task lifecycle, execution state, token usage, and progress tracking |
+| **Team usage** | Multi-user support and published agents |
+| **Safer execution** | Optional sandboxed execution when enabled |
+| **Integration** | APIs, MCP tools, internal services, and external systems |
+
+You control your models, data, and infrastructure.
+
+---
+
+## Xagent vs workflow builders
+
+| Workflow builders | Xagent |
+| --- | --- |
+| You draw the flow | You describe the outcome |
+| Static branches | Runtime planning |
+| Manual tool wiring | Tool and model selection during execution |
+| Breaks when requirements change | Adapts as the task evolves |
+| Good for fixed processes | Better for ambiguous, knowledge-heavy work |
+| Automation as diagrams | Automation as agentic execution |
+
+Workflow builders automate known processes.
+
+Xagent handles work where the path is discovered during execution.
+
+---
+
+## Xagent in action
+
+Watch Xagent move from goal to plan to execution to deliverable in real time.
 
 ![Xagent in Action](./assets/task.gif)
+
+---
+
+## Architecture overview
+
+Xagent separates agent work into layers:
+
+| Layer | Responsibility |
+| --- | --- |
+| **User layer** | Tasks, agents, templates, and widgets |
+| **Agent definition** | Roles, instructions, constraints, tools, models, and knowledge |
+| **Planning engine** | Runtime decomposition, planning, reflection, and iteration |
+| **Execution runtime** | Task state, tool calls, progress tracking, and artifacts |
+| **Tool layer** | Files, APIs, MCP tools, knowledge bases, and internal systems |
+| **Model layer** | API-based models and self-hosted models via Xinference |
+| **Control layer** | Users, monitoring, token usage, deployment, and sandboxing |
+
+This architecture lets Xagent support both personal usage and enterprise-grade agent systems.
+
+---
+
+## FAQ
+
+### Is Xagent a personal AI assistant?
+
+Yes. You can use Xagent for one-off personal tasks like research, writing, file analysis, summaries, and data exploration.
+
+But Xagent does not stop there. You can turn repeated work into reusable agents and publish them for your team.
+
+### How is Xagent different from a workflow builder?
+
+Workflow builders require you to predefine the path.
+
+Xagent plans dynamically at runtime. You describe the outcome, and Xagent decides the steps, tools, and execution path.
+
+### Can Xagent be used in enterprise environments?
+
+Yes. Xagent supports self-hosted deployment, private cloud, on-prem infrastructure, multi-user usage, observability, knowledge bases, internal systems, and self-hosted models via Xinference.
+
+### Can I use my own models?
+
+Yes. Xagent supports API-based model providers and self-hosted models via Xinference.
+
+### What license does Xagent use?
+
+Xagent is released under the Xagent Source License. See the [LICENSE](LICENSE) file for details.
 
 ---
 
@@ -203,69 +368,15 @@ Xagent is actively developed and rapidly evolving.
 
 ![Stay Ahead](./assets/xagent_stay_ahead.gif)
 
-**Follow our progress:**
+Follow our progress:
+
 - ⭐ Star us on GitHub to stay updated
 - 🐛 Report issues and request features
 - 💬 Join our community discussions
 
 ---
 
-## 🏢 Deployment Options
-
-Xagent supports:
-
-- Self-hosted deployment
-- Private cloud environments
-- On-premise enterprise infrastructure
-- Docker-based setup
-
-**You control your models, data, and infrastructure.**
-
----
-
-## 🏗 Architecture Overview
-
-Xagent separates core responsibilities:
-
-| Layer | Responsibility |
-|-------|----------------|
-| **Agent Definition** | Intent & constraints |
-| **Planning Engine** | Dynamic decomposition |
-| **Execution Runtime** | Orchestration layer |
-| **Tool Layer** | Integrations & actions |
-| **Model Layer** | LLM & inference backend |
-
-**This architecture enables:**
-- Stability under complex reasoning
-- Safe iteration
-- Horizontal scalability
-- Long-term maintainability
-
----
-
-## 🔍 Not a Workflow Builder
-
-**Xagent is not:**
-- A drag-and-drop flow editor
-- A static template engine
-- A chatbot wrapper
-
-**Xagent is:**
-- A dynamic task execution engine
-- An autonomous planning system
-- A foundation for building real AI agents
-
----
-
-## 🤝 Contributing
-
-We welcome developers, product builders, and researchers.
-
-Open issues. Submit PRs. Help shape the future of AI agents.
-
----
-
-## 💬 Community & Contact
+## Community & Contact
 
 **[Documentation](https://docs.xagent.run/)** - Full documentation and guides
 
@@ -279,6 +390,6 @@ Open issues. Submit PRs. Help shape the future of AI agents.
 
 ---
 
-## 📄 License
+## License
 
 This project is licensed under the Xagent Source License - see the [LICENSE](LICENSE) file for details.

@@ -10,6 +10,8 @@ vi.mock('@/lib/utils', () => ({
   getApiUrl: () => 'http://api.local',
   getFilePublicPreviewUrl: (fileId: string, apiUrl = 'http://api.local') =>
     `${apiUrl}/api/files/public/preview/${encodeURIComponent(fileId)}`,
+  getFilePublicDownloadUrl: (fileId: string, apiUrl = 'http://api.local') =>
+    `${apiUrl}/api/files/public/download/${encodeURIComponent(fileId)}`,
 }))
 
 vi.mock('@/lib/api-wrapper', () => ({

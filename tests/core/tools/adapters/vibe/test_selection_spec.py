@@ -58,6 +58,7 @@ def test_spec_default_includes_everything():
 def test_spec_categories_restricts_category():
     spec = ToolSelectionSpec(categories=frozenset({"basic", "file"}))
     assert spec.includes_category("basic") is True
+    assert spec.includes_category("web_search") is False
     assert spec.includes_category("file") is True
     assert spec.includes_category("mcp") is False
 
@@ -815,6 +816,43 @@ def test_select_allowed_tool_names_plain_category_match() -> None:
         ],
     )
     assert sorted(result or []) == ["calculator", "python_executor"]
+
+
+def test_basic_category_does_not_admit_web_search_tools() -> None:
+    """Plain ``basic`` is a capability boundary.
+
+    Existing saved agents that need to preserve old web-search access are
+    migrated to include ``web_search`` explicitly instead of broadening this
+    steady-state selector.
+    """
+    from xagent.core.tools.adapters.vibe.selection_spec import ToolSelectionSpec
+
+    result = ToolSelectionSpec.from_raw(
+        tool_categories=["basic"]
+    ).compute_allowed_names(
+        [
+            _mock_tool("api_call", "basic"),
+            _mock_tool("fetch_web_content", "web_search"),
+            _mock_tool("knowledge_search", "knowledge"),
+        ],
+    )
+    assert sorted(result or []) == ["api_call"]
+
+
+def test_web_search_category_does_not_admit_all_basic_tools() -> None:
+    """The compatibility direction is one-way: selecting only web_search
+    must not expose unrelated basic tools."""
+    from xagent.core.tools.adapters.vibe.selection_spec import ToolSelectionSpec
+
+    result = ToolSelectionSpec.from_raw(
+        tool_categories=["web_search"]
+    ).compute_allowed_names(
+        [
+            _mock_tool("api_call", "basic"),
+            _mock_tool("fetch_web_content", "web_search"),
+        ],
+    )
+    assert sorted(result or []) == ["fetch_web_content"]
 
 
 def test_select_allowed_tool_names_mcp_server_form() -> None:

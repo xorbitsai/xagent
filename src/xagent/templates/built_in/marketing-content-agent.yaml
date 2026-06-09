@@ -91,6 +91,7 @@ agent_config:
   skills: []
   tool_categories:
   - basic
+  - web_search
   - browser
   - file
   - image

@@ -6,11 +6,10 @@ Standalone web search functionality without framework dependencies
 import logging
 import os
 from typing import Any, Dict, List, Optional
-from urllib.parse import urljoin
 
-import html2text
 import httpx
-from bs4 import BeautifulSoup
+
+from .web_content import WebContentFetcher, get_proxy_url
 
 logger = logging.getLogger(__name__)
 
@@ -26,7 +25,7 @@ class WebSearchCore:
         self,
         query: str,
         num_results: int = 3,
-        include_content: bool = True,
+        include_content: bool = False,
     ) -> List[Dict[str, str]]:
         """
         Search the web using Google Custom Search API.
@@ -34,10 +33,10 @@ class WebSearchCore:
         Args:
             query: The search query string
             num_results: Number of results to return (max 10)
-            include_content: Include full webpage content
+            include_content: Include fetched webpage content for each result
 
         Returns:
-            List of search results with title, link, snippet and content
+            List of search results with title, link, snippet, and optional content
         """
         logger.info(
             f"🔍 Starting web search for query: '{query}' "
@@ -146,98 +145,13 @@ class WebSearchCore:
     async def _fetch_page_content(
         self, url: str, proxy_url: Optional[str] = None
     ) -> str:
-        """Fetch and convert webpage content to markdown"""
-        logger.info(f"🌐 Fetching page content from: {url}")
+        """Fetch and convert webpage content to markdown."""
 
-        headers = {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
-        }
-
-        try:
-            client_kwargs: Dict[str, Any] = {}
-            if proxy_url:
-                client_kwargs["proxy"] = proxy_url
-                logger.info(f"   Using proxy: {proxy_url}")
-
-            async with httpx.AsyncClient(**client_kwargs) as client:
-                logger.info("   Making HTTP request...")
-                response = await client.get(url, headers=headers, timeout=10)
-                response.raise_for_status()
-
-                logger.info(
-                    f"   Response received: {response.status_code} {response.reason_phrase}"
-                )
-                logger.info(
-                    f"   Content-Type: {response.headers.get('content-type', 'unknown')}"
-                )
-                logger.info(f"   Content-Length: {len(response.text)} characters")
-
-                soup = BeautifulSoup(response.text, "html.parser")
-                logger.info("   HTML parsed successfully")
-
-                # Remove script and style elements
-                scripts_removed = len(soup(["script", "style"]))
-                for script in soup(["script", "style"]):
-                    script.decompose()
-                logger.info(f"   Removed {scripts_removed} script/style elements")
-
-                # Convert relative URLs to absolute
-                links_processed = 0
-                for tag in soup.find_all(["a", "img"]):
-                    if not hasattr(tag, "get") or not hasattr(tag, "__setitem__"):
-                        continue
-
-                    if hasattr(tag, "get") and hasattr(tag, "__setitem__"):
-                        if tag.get("href"):
-                            tag["href"] = urljoin(url, tag["href"])
-                            links_processed += 1
-                        if tag.get("src"):
-                            tag["src"] = urljoin(url, tag["src"])
-                            links_processed += 1
-
-                if links_processed > 0:
-                    logger.info(f"   Processed {links_processed} relative URLs")
-
-                h2t = html2text.HTML2Text()
-                h2t.body_width = 0
-                h2t.ignore_images = False
-                h2t.ignore_emphasis = False
-                h2t.ignore_links = False
-                h2t.ignore_tables = False
-
-                logger.info("   Converting HTML to markdown...")
-                markdown = h2t.handle(str(soup))
-
-                # Log a preview of the markdown content
-                lines = markdown.strip().split("\n")
-                non_empty_lines = [line.strip() for line in lines if line.strip()]
-                if non_empty_lines:
-                    preview_lines = non_empty_lines[:3]
-                    logger.info("   Content preview (first 3 lines):")
-                    for i, line in enumerate(preview_lines, 1):
-                        preview = line[:100] + "..." if len(line) > 100 else line
-                        logger.info(f"     {i}. {preview}")
-
-                return markdown.strip()
-
-        except httpx.HTTPStatusError as e:
-            error_msg = f"HTTP {e.response.status_code} error for {url}: {e.response.reason_phrase}"
-            logger.error(f"   ❌ {error_msg}")
-            return f"Error fetching content: {error_msg}"
-        except httpx.RequestError as e:
-            error_msg = f"Network error for {url}: {str(e)}"
-            logger.error(f"   ❌ {error_msg}")
-            return f"Error fetching content: {error_msg}"
-        except Exception as e:
-            error_msg = f"Unexpected error for {url}: {str(e)}"
-            logger.error(f"   ❌ {error_msg}")
-            return f"Error fetching content: {error_msg}"
+        return await WebContentFetcher(proxy_url=proxy_url).fetch_text(url)
 
     def _get_proxy_url(self) -> Optional[str]:
         """Get proxy URL from environment variables"""
-        https_proxy = os.getenv("HTTPS_PROXY") or os.getenv("https_proxy")
-        http_proxy = os.getenv("HTTP_PROXY") or os.getenv("http_proxy")
-        return https_proxy or http_proxy
+        return get_proxy_url()
 
     def _handle_403_error(self, response: httpx.Response) -> None:
         """Handle 403 Forbidden errors from Google API"""
@@ -278,7 +192,7 @@ class WebSearchCore:
 async def search_web(
     query: str,
     num_results: int = 3,
-    include_content: bool = True,
+    include_content: bool = False,
 ) -> List[Dict[str, str]]:
     """
     Search the web using Google Custom Search API.
@@ -286,10 +200,10 @@ async def search_web(
     Args:
         query: The search query string
         num_results: Number of results to return (max 10)
-        include_content: Include full webpage content
+        include_content: Include fetched webpage content for each result
 
     Returns:
-        List of search results with title, link, snippet and content
+        List of search results with title, link, snippet, and optional content
     """
     searcher = WebSearchCore()
     return await searcher.search(

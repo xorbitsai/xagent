@@ -627,6 +627,7 @@ export function AgentBuilder({ agentId }: AgentBuilderProps) {
   function getCategoryDescription(category: string): string {
     const descriptions: Record<string, string> = {
       'basic': t('builds.configForm.tools.categoryDescriptions.basic'),
+      'web_search': t('builds.configForm.tools.categoryDescriptions.webSearch'),
       'file': t('builds.configForm.tools.categoryDescriptions.file'),
       'vision': t('builds.configForm.tools.categoryDescriptions.vision'),
       'image': t('builds.configForm.tools.categoryDescriptions.image'),
@@ -647,6 +648,7 @@ export function AgentBuilder({ agentId }: AgentBuilderProps) {
   function getCategoryLabel(category: string): string {
     const labels: Record<string, string> = {
       'basic': t('builds.configForm.tools.categories.basic'),
+      'web_search': t('builds.configForm.tools.categories.webSearch'),
       'file': t('builds.configForm.tools.categories.file'),
       'vision': t('builds.configForm.tools.categories.vision'),
       'image': t('builds.configForm.tools.categories.image'),

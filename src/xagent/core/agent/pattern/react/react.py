@@ -38,6 +38,7 @@ DEFAULT_REPEATED_TOOL_DECISION_CONSECUTIVE_WORK_TOOL_CALLS = 10
 REACT_DECISION_TOOL_NAME = "react_decision"
 REACT_DECISION_FINAL_ANSWER = "final_answer"
 REACT_DECISION_TOOL_CALL = "tool_call"
+UNGROUPED_TOOL_DECISION_CATEGORIES = frozenset({"basic", "other"})
 REACT_RESPONSE_LANGUAGE_DESCRIPTION = (
     "Target natural language for user-facing prose in this ReAct response, "
     "for example English, Simplified Chinese, Traditional Chinese, or Spanish. "
@@ -172,6 +173,7 @@ class ReActPattern(AgentPattern):
         self.waiting_for_user_request: dict[str, Any] | None = None
         self.task_text: str | None = None
         self._memory_store: Any | None = None
+        self._tool_decision_groups_by_name: dict[str, str] = {}
 
     async def run(
         self,
@@ -278,6 +280,7 @@ class ReActPattern(AgentPattern):
         runtime: PatternRuntime,
     ) -> dict[str, Any]:
         self.status = "thinking"
+        self._tool_decision_groups_by_name = self._tool_decision_groups_for_tools(tools)
         base_tool_schemas = (
             []
             if self.tool_choice == "none"
@@ -539,6 +542,46 @@ class ReActPattern(AgentPattern):
             if isinstance(function, dict) and function.get("name"):
                 names.append(str(function["name"]))
         return names
+
+    def _tool_decision_groups_for_tools(self, tools: list[Any]) -> dict[str, str]:
+        groups: dict[str, str] = {}
+        for tool in tools:
+            try:
+                tool_name = self._tool_name(tool)
+            except ValueError:
+                continue
+            groups[tool_name] = self._tool_decision_group(tool, tool_name)
+        return groups
+
+    def _tool_decision_group(self, tool: Any, tool_name: str) -> str:
+        metadata = getattr(tool, "metadata", None)
+        explicit_group = self._metadata_text(metadata, "decision_group") or (
+            self._metadata_text(tool, "decision_group")
+        )
+        if explicit_group:
+            return explicit_group
+
+        category = getattr(metadata, "category", None) if metadata is not None else None
+        category_value = getattr(category, "value", category)
+        if category_value is not None:
+            category_name = str(category_value).strip()
+            if (
+                category_name
+                and category_name not in UNGROUPED_TOOL_DECISION_CATEGORIES
+            ):
+                return category_name
+        return tool_name
+
+    def _metadata_text(self, obj: Any, field_name: str) -> str:
+        if obj is None:
+            return ""
+        value = getattr(obj, field_name, None)
+        if not isinstance(value, str):
+            return ""
+        return value.strip()
+
+    def _tool_decision_group_for_name(self, tool_name: str) -> str:
+        return self._tool_decision_groups_by_name.get(tool_name, tool_name)
 
     def get_state(self) -> dict[str, Any]:
         """Return JSON-serializable ReAct state for checkpointing."""
@@ -1332,11 +1375,13 @@ class ReActPattern(AgentPattern):
 
         same_tool_threshold = self.repeated_tool_decision_after_consecutive_tool_calls
         if same_tool_threshold is not None and same_tool_threshold > 0:
-            same_tool_count = self._consecutive_successful_tool_count(tool_name)
+            tool_group = self._tool_decision_group_for_name(tool_name)
+            same_tool_count = self._consecutive_successful_tool_group_count(tool_group)
             if same_tool_count >= same_tool_threshold:
                 return {
                     "trigger": "same_tool_successes",
-                    "tool_name": tool_name,
+                    "tool_name": tool_group,
+                    "latest_tool_name": tool_name,
                     "consecutive_tool_calls": same_tool_count,
                     "threshold": same_tool_threshold,
                 }
@@ -1366,7 +1411,8 @@ class ReActPattern(AgentPattern):
         messages = list(context.get_messages_for_llm())
         tool_name = str(metadata.get("tool_name") or "the tool")
         count = int(metadata.get("consecutive_tool_calls") or 0)
-        if metadata.get("trigger") == "work_tool_attempts":
+        trigger = metadata.get("trigger")
+        if trigger == "work_tool_attempts":
             latest_tool_name = str(metadata.get("latest_tool_name") or tool_name)
             count_text = (
                 f"{count} consecutive work-tool calls without a final answer"
@@ -1378,12 +1424,19 @@ class ReActPattern(AgentPattern):
                 "Some attempts may have failed; count them as work already spent."
             )
         else:
+            latest_tool_name = str(metadata.get("latest_tool_name") or tool_name)
             count_text = (
                 f"{count} consecutive successful calls"
                 if count > 0
                 else "repeated successful calls"
             )
-            call_context = f"{count_text} to {tool_name}."
+            if latest_tool_name != tool_name:
+                call_context = (
+                    f"{count_text} in the {tool_name} tool group; "
+                    f"the latest tool was {latest_tool_name}."
+                )
+            else:
+                call_context = f"{count_text} to {tool_name}."
         prompt = (
             f"You must call {REACT_DECISION_TOOL_NAME} exactly once. Decide whether "
             "the current ReAct run should finish or make another work-tool call. "
@@ -1484,13 +1537,13 @@ class ReActPattern(AgentPattern):
             }
         return None
 
-    def _consecutive_successful_tool_count(self, tool_name: str) -> int:
+    def _consecutive_successful_tool_group_count(self, tool_group: str) -> int:
         count = 0
         control_tool_names = self._control_tool_names()
         for record in reversed(list(self.tool_ledger.values())):
             if record.tool_name in control_tool_names:
                 continue
-            if record.tool_name != tool_name:
+            if self._tool_decision_group_for_name(record.tool_name) != tool_group:
                 break
             if record.status != "completed" or not self._tool_result_success(
                 record.result

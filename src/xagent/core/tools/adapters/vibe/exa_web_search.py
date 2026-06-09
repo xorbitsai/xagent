@@ -3,7 +3,7 @@ Exa Web Search Tool for xagent
 Framework wrapper around the Exa AI-powered search API.
 """
 
-from typing import Any, Dict, List, Mapping, Optional, Type
+from typing import Any, Dict, List, Literal, Mapping, Optional, Type
 
 from pydantic import BaseModel, Field
 
@@ -20,9 +20,12 @@ class ExaWebSearchArgs(BaseModel):
         default="auto",
         description="Search type: 'auto', 'neural', 'fast', or 'instant'",
     )
-    content_mode: str = Field(
-        default="highlights",
-        description="Content retrieval mode: 'highlights', 'text', 'summary', or 'none'",
+    content_mode: Literal["none", "highlights", "text", "summary"] = Field(
+        default="none",
+        description=(
+            "Content retrieval mode: 'none', 'highlights', 'text', or 'summary'. "
+            "Defaults to none; use fetch_web_content for reading one selected URL."
+        ),
     )
     category: Optional[str] = Field(
         default=None,
@@ -50,14 +53,14 @@ class ExaWebSearchArgs(BaseModel):
 
 class ExaWebSearchResult(BaseModel):
     results: List[Dict[str, str]] = Field(
-        description="Search results with title, link, snippet and content"
+        description="Search results with title, link, snippet, and optional content"
     )
 
 
 class ExaWebSearchTool(AbstractBaseTool):
     """Framework wrapper for the Exa AI-powered web search tool."""
 
-    category = ToolCategory.BASIC
+    category = ToolCategory.WEB_SEARCH
 
     def __init__(self, api_key: str | None = None) -> None:
         self._visibility = ToolVisibility.PUBLIC
@@ -71,7 +74,9 @@ class ExaWebSearchTool(AbstractBaseTool):
     def description(self) -> str:
         return (
             "Search the web using Exa AI-powered search. "
-            "Returns results with titles, links, snippets, and content (highlights, full text, or summaries). "
+            "Returns lightweight results with titles and links by default. "
+            "Set content_mode only when search-result highlights, text, or summaries "
+            "are needed; otherwise use fetch_web_content to read one selected URL. "
             "Supports category filtering, domain filtering, text filtering, and date range filtering. "
             "Useful for finding current information, research, news, and company data."
         )

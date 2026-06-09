@@ -8,7 +8,7 @@ from typing import Any, Dict, List, Mapping, Type
 from pydantic import BaseModel, Field
 
 from ...core.tavily_web_search import TavilyWebSearchCore
-from .base import AbstractBaseTool, ToolVisibility
+from .base import AbstractBaseTool, ToolCategory, ToolVisibility
 
 
 class TavilyWebSearchArgs(BaseModel):
@@ -17,18 +17,24 @@ class TavilyWebSearchArgs(BaseModel):
         default=5, description="Number of results to return (max 20)"
     )
     include_content: bool = Field(
-        default=True, description="Include full webpage content"
+        default=False,
+        description=(
+            "Also include raw webpage content for each result. Defaults to false; "
+            "prefer fetch_web_content for reading one selected URL."
+        ),
     )
 
 
 class TavilyWebSearchResult(BaseModel):
     results: List[Dict[str, str]] = Field(
-        description="Search results with title, link, snippet and content"
+        description="Search results with title, link, snippet, and optional content"
     )
 
 
 class TavilyWebSearchTool(AbstractBaseTool):
     """Framework wrapper for the Tavily web search tool."""
+
+    category = ToolCategory.WEB_SEARCH
 
     def __init__(self, api_key: str | None = None) -> None:
         self._visibility = ToolVisibility.PUBLIC
@@ -42,8 +48,9 @@ class TavilyWebSearchTool(AbstractBaseTool):
     def description(self) -> str:
         return (
             "Search the web for information using Tavily Search. "
-            "Returns results with titles, links, snippets, and full webpage content. "
-            "Useful for finding current information, research, and factual data."
+            "Returns lightweight results with titles, links, and snippets by default. "
+            "Set include_content=true only when every result needs raw page content; "
+            "otherwise use fetch_web_content to read one selected URL."
         )
 
     @property

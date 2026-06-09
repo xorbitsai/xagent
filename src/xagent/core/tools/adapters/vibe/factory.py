@@ -195,35 +195,37 @@ class ToolRegistry:
         """Sort tools by category priority.
 
         Priority order (most important first):
-        1. BASIC - Basic tools (search, code execution)
-        2. KNOWLEDGE - Knowledge base search
-        3. FILE - File operations
-        4. VISION - Vision understanding
-        5. IMAGE - Image generation
-        6. BROWSER - Browser automation
-        7. PPT - PPT tools
-        8. DATABASE - Database tools (SQL query)
-        9. MCP - MCP tools
-        10. SKILL - Skill documentation access tools
-        11. AGENT - Agent tools (delegation)
-        12. OTHER - Other tools
+        1. BASIC - Basic tools (code execution, calculator)
+        2. WEB_SEARCH - Web search and webpage fetching
+        3. KNOWLEDGE - Knowledge base search
+        4. FILE - File operations
+        5. VISION - Vision understanding
+        6. IMAGE - Image generation
+        7. BROWSER - Browser automation
+        8. PPT - PPT tools
+        9. DATABASE - Database tools (SQL query)
+        10. MCP - MCP tools
+        11. SKILL - Skill documentation access tools
+        12. AGENT - Agent tools (delegation)
+        13. OTHER - Other tools
         """
         from .base import ToolCategory
 
         # Define category priority order
         category_order = {
             ToolCategory.BASIC: 0,
-            ToolCategory.KNOWLEDGE: 1,
-            ToolCategory.FILE: 2,
-            ToolCategory.VISION: 3,
-            ToolCategory.IMAGE: 4,
-            ToolCategory.BROWSER: 5,
-            ToolCategory.PPT: 6,
-            ToolCategory.DATABASE: 7,
-            ToolCategory.MCP: 8,
-            ToolCategory.SKILL: 9,
-            ToolCategory.AGENT: 10,
-            ToolCategory.OTHER: 11,
+            ToolCategory.WEB_SEARCH: 1,
+            ToolCategory.KNOWLEDGE: 2,
+            ToolCategory.FILE: 3,
+            ToolCategory.VISION: 4,
+            ToolCategory.IMAGE: 5,
+            ToolCategory.BROWSER: 6,
+            ToolCategory.PPT: 7,
+            ToolCategory.DATABASE: 8,
+            ToolCategory.MCP: 9,
+            ToolCategory.SKILL: 10,
+            ToolCategory.AGENT: 11,
+            ToolCategory.OTHER: 12,
         }
 
         def get_tool_priority(tool: Tool) -> int:

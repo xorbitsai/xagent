@@ -27,7 +27,7 @@ class ZhipuWebSearchCore:
         count: int = 10,
         search_domain_filter: Optional[str] = None,
         search_recency_filter: str = "noLimit",
-        content_size: str = "medium",
+        content_size: str = "low",
         request_id: Optional[str] = None,
         user_id: Optional[str] = None,
     ) -> Dict[str, Any]:
@@ -128,23 +128,25 @@ class ZhipuWebSearchCore:
             ) from e
 
     @staticmethod
-    def normalize_results(response: Dict[str, Any]) -> List[Dict[str, Any]]:
+    def normalize_results(
+        response: Dict[str, Any], *, include_content: bool = False
+    ) -> List[Dict[str, Any]]:
         """Normalize Zhipu search results into a consistent format."""
         results: List[Dict[str, Any]] = []
         for item in response.get("search_result", []) or []:
             content = item.get("content", "")
-            results.append(
-                {
-                    "title": item.get("title", ""),
-                    "link": item.get("link", ""),
-                    "snippet": content,
-                    "content": content,
-                    "media": item.get("media", ""),
-                    "icon": item.get("icon", ""),
-                    "publish_date": item.get("publish_date", ""),
-                    "refer": item.get("refer", ""),
-                }
-            )
+            result = {
+                "title": item.get("title", ""),
+                "link": item.get("link", ""),
+                "snippet": content,
+                "media": item.get("media", ""),
+                "icon": item.get("icon", ""),
+                "publish_date": item.get("publish_date", ""),
+                "refer": item.get("refer", ""),
+            }
+            if include_content:
+                result["content"] = content
+            results.append(result)
         return results
 
     @staticmethod

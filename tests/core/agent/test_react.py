@@ -111,6 +111,27 @@ class FakeSearchTool:
         }
 
 
+class FakeGroupedTool:
+    def __init__(self, name: str, category: str) -> None:
+        self.calls: list[dict[str, Any]] = []
+
+        class Metadata:
+            description = "Run grouped work."
+
+        self.metadata = Metadata()
+        self.metadata.name = name
+        self.metadata.category = category
+
+    def args_type(self) -> type[BaseModel]:
+        return SearchArgs
+
+    async def run_json_async(self, args: dict[str, Any]) -> Any:
+        self.calls.append(args)
+        return {
+            "results": [{"title": self.metadata.name, "link": "https://example.com"}]
+        }
+
+
 class FakeBrowserNavigateTool:
     def __init__(self) -> None:
         self.calls: list[dict[str, Any]] = []
@@ -1004,6 +1025,97 @@ async def test_react_pattern_uses_decision_after_cross_tool_attempts() -> None:
         "latest work tool was browser_navigate"
         in (llm.calls[3]["messages"][-1]["content"])
     )
+
+
+@pytest.mark.asyncio
+async def test_react_pattern_uses_decision_after_tool_group_successes() -> None:
+    llm = FakeLLM(
+        responses=[
+            {
+                "content": "",
+                "tool_calls": [
+                    {
+                        "id": "search_1",
+                        "function": {
+                            "name": "search_source",
+                            "arguments": '{"query":"AirPods 4 charging port"}',
+                        },
+                    }
+                ],
+            },
+            {
+                "content": "",
+                "tool_calls": [
+                    {
+                        "id": "fetch_1",
+                        "function": {
+                            "name": "fetch_source",
+                            "arguments": '{"query":"Apple AirPods 4 page"}',
+                        },
+                    }
+                ],
+            },
+            {
+                "content": "",
+                "tool_calls": [
+                    {
+                        "id": "search_2",
+                        "function": {
+                            "name": "search_source",
+                            "arguments": '{"query":"AirPods 4 USB-C"}',
+                        },
+                    }
+                ],
+            },
+            {
+                "content": "",
+                "tool_calls": [
+                    {
+                        "id": "decision_1",
+                        "function": {
+                            "name": "react_decision",
+                            "arguments": (
+                                '{"action":"final_answer",'
+                                '"reason":"Enough web research",'
+                                '"response_language":"English",'
+                                '"answer":"AirPods 4 uses USB-C."}'
+                            ),
+                        },
+                    }
+                ],
+            },
+        ]
+    )
+    pattern = ReActPattern(
+        max_iterations=4,
+        repeated_tool_decision_after_consecutive_tool_calls=3,
+        repeated_tool_decision_after_consecutive_work_tool_calls=10,
+    )
+    search_tool = FakeGroupedTool("search_source", "research")
+    fetch_tool = FakeGroupedTool("fetch_source", "research")
+    context = ExecutionContext()
+    context.add_user_message("airpods 4 是什么接口")
+
+    result = await pattern.run(
+        context=context,
+        tools=[search_tool, fetch_tool],
+        llm=llm,
+    )
+
+    assert result["success"] is True
+    assert result["response"] == "AirPods 4 uses USB-C."
+    assert len(llm.calls) == 4
+    assert len(search_tool.calls) == 2
+    assert len(fetch_tool.calls) == 1
+    assert [schema["function"]["name"] for schema in llm.calls[3]["tools"]] == [
+        "react_decision"
+    ]
+    decision_prompt = llm.calls[3]["messages"][-1]["content"]
+    assert (
+        "3 consecutive successful calls in the research tool group" in decision_prompt
+    )
+    assert "latest tool was search_source" in decision_prompt
+    assert pattern.pending_tool_calls == []
 
 
 @pytest.mark.asyncio

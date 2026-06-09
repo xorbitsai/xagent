@@ -22,7 +22,7 @@ class TavilyWebSearchCore:
         self,
         query: str,
         max_results: int = 5,
-        include_content: bool = True,
+        include_content: bool = False,
         search_depth: str = "basic",
     ) -> List[Dict[str, str]]:
         """

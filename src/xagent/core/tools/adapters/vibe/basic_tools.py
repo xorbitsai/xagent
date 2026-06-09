@@ -12,7 +12,7 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
-@register_tool(categories={"basic"})
+@register_tool(categories={"basic", "web_search"})
 async def create_basic_tools(config: "BaseToolConfig") -> List[Any]:
     """Create basic tools (web search, code executors)."""
     if not config.get_basic_tools_enabled():
@@ -47,6 +47,10 @@ async def create_basic_tools(config: "BaseToolConfig") -> List[Any]:
         from .web_search import WebSearchTool
 
         tools.append(WebSearchTool(api_key=google_api_key, cse_id=google_cse_id))
+
+    from .fetch_web_content import FetchWebContentTool
+
+    tools.append(FetchWebContentTool())
 
     # Python executor tool (if workspace available)
     if workspace:

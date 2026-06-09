@@ -7,6 +7,7 @@ import tempfile
 from pathlib import Path
 
 import pytest
+import yaml
 
 from src.xagent.templates.manager import TemplateManager
 
@@ -260,6 +261,31 @@ descriptions:
 
         assert len(templates) == 0
         assert not manager.has_templates()
+
+    def test_builtin_templates_that_use_web_search_select_web_search_category(self):
+        built_in_dir = (
+            Path(__file__).resolve().parents[2] / "src/xagent/templates/built_in"
+        )
+        markers = (
+            "web_search",
+            "zhipu_web_search",
+            "exa_web_search",
+            "tavily_web_search",
+            "web research",
+            "web search",
+        )
+        offenders: list[str] = []
+
+        for template_file in built_in_dir.glob("*.yaml"):
+            data = yaml.safe_load(template_file.read_text(encoding="utf-8")) or {}
+            agent_config = data.get("agent_config") or {}
+            instructions = str(agent_config.get("instructions") or "").lower()
+            tool_categories = agent_config.get("tool_categories") or []
+            if any(marker in instructions for marker in markers):
+                if "web_search" not in tool_categories:
+                    offenders.append(template_file.name)
+
+        assert not offenders
 
     @pytest.mark.asyncio
     async def test_nonexistent_templates_directory(self, tmp_path):

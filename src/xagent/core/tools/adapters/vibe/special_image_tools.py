@@ -11,9 +11,9 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
-@register_tool(categories={"image"})
-async def create_special_image_tools(config: "BaseToolConfig") -> List[Any]:
-    """Create special image tools (image web search, logo overlay)."""
+@register_tool(categories={"web_search"})
+async def create_image_web_search_tools(config: "BaseToolConfig") -> List[Any]:
+    """Create web-search image tools."""
     tools = []
     workspace = ToolFactory._create_workspace(config.get_workspace_config())
     if not workspace:
@@ -26,6 +26,17 @@ async def create_special_image_tools(config: "BaseToolConfig") -> List[Any]:
         tools.append(image_search_tool)
     except Exception as e:
         logger.warning(f"Failed to create image web search tool: {e}")
+
+    return tools
+
+
+@register_tool(categories={"image"})
+async def create_special_image_tools(config: "BaseToolConfig") -> List[Any]:
+    """Create special image tools."""
+    tools = []
+    workspace = ToolFactory._create_workspace(config.get_workspace_config())
+    if not workspace:
+        return []
 
     try:
         from .logo_overlay import create_logo_overlay_tool

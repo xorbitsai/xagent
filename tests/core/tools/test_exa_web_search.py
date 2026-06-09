@@ -6,6 +6,7 @@ import os
 from unittest.mock import MagicMock, patch
 
 import pytest
+from pydantic import ValidationError
 
 from xagent.core.tools.adapters.vibe.exa_web_search import (
     ExaWebSearchArgs,
@@ -79,6 +80,29 @@ class TestExaWebSearchTool:
                 ValueError, match="Missing required environment variable EXA_API_KEY"
             ):
                 await exa_search_tool.run_json_async({"query": "test search"})
+
+    @pytest.mark.asyncio
+    async def test_successful_search_default_no_content(self, exa_search_tool):
+        """Test default search without content retrieval."""
+        mock_response = _make_mock_response()
+        mock_client = MagicMock()
+        mock_client.search.return_value = mock_response
+        mock_client.headers = {}
+
+        with patch.dict(os.environ, {"EXA_API_KEY": "test_key"}):
+            with patch("exa_py.Exa", return_value=mock_client):
+                result = await exa_search_tool.run_json_async(
+                    {"query": "test search", "num_results": 2}
+                )
+
+                assert result["results"]
+                assert len(result["results"]) == 2
+                assert result["results"][0]["title"] == "Test Article 1"
+                assert result["results"][0]["link"] == "https://example.com/article1"
+                assert result["results"][0]["snippet"] == ""
+                assert "content" not in result["results"][0]
+                mock_client.search.assert_called_once()
+                mock_client.search_and_contents.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_successful_search_highlights(self, exa_search_tool):
@@ -162,7 +186,7 @@ class TestExaWebSearchTool:
         """Test search with domain and category filters"""
         mock_response = _make_mock_response()
         mock_client = MagicMock()
-        mock_client.search_and_contents.return_value = mock_response
+        mock_client.search.return_value = mock_response
         mock_client.headers = {}
 
         with patch.dict(os.environ, {"EXA_API_KEY": "test_key"}):
@@ -178,7 +202,7 @@ class TestExaWebSearchTool:
                     }
                 )
 
-                call_kwargs = mock_client.search_and_contents.call_args[1]
+                call_kwargs = mock_client.search.call_args[1]
                 assert call_kwargs["category"] == "company"
                 assert call_kwargs["include_domains"] == ["techcrunch.com"]
                 assert call_kwargs["exclude_domains"] == ["reddit.com"]
@@ -190,7 +214,7 @@ class TestExaWebSearchTool:
         """Test that the x-exa-integration header is set correctly"""
         mock_response = _make_mock_response()
         mock_client = MagicMock()
-        mock_client.search_and_contents.return_value = mock_response
+        mock_client.search.return_value = mock_response
         mock_client.headers = {}
 
         with patch.dict(os.environ, {"EXA_API_KEY": "test_key"}):
@@ -204,7 +228,7 @@ class TestExaWebSearchTool:
         """Test handling when no search results are found"""
         mock_response = _make_mock_response(results=[])
         mock_client = MagicMock()
-        mock_client.search_and_contents.return_value = mock_response
+        mock_client.search.return_value = mock_response
         mock_client.headers = {}
 
         with patch.dict(os.environ, {"EXA_API_KEY": "test_key"}):
@@ -219,9 +243,7 @@ class TestExaWebSearchTool:
     async def test_api_error_handling(self, exa_search_tool):
         """Test handling of Exa API errors"""
         mock_client = MagicMock()
-        mock_client.search_and_contents.side_effect = Exception(
-            "API rate limit exceeded"
-        )
+        mock_client.search.side_effect = Exception("API rate limit exceeded")
         mock_client.headers = {}
 
         with patch.dict(os.environ, {"EXA_API_KEY": "test_key"}):
@@ -234,7 +256,7 @@ class TestExaWebSearchTool:
         """Test that num_results is properly limited between 1 and 100"""
         mock_response = _make_mock_response()
         mock_client = MagicMock()
-        mock_client.search_and_contents.return_value = mock_response
+        mock_client.search.return_value = mock_response
         mock_client.headers = {}
 
         with patch.dict(os.environ, {"EXA_API_KEY": "test_key"}):
@@ -243,14 +265,14 @@ class TestExaWebSearchTool:
                 await exa_search_tool.run_json_async(
                     {"query": "test", "num_results": 150}
                 )
-                call_kwargs = mock_client.search_and_contents.call_args[1]
+                call_kwargs = mock_client.search.call_args[1]
                 assert call_kwargs["num_results"] == 100
 
                 # Test with num_results < 1 (should be set to 1)
                 await exa_search_tool.run_json_async(
                     {"query": "test", "num_results": 0}
                 )
-                call_kwargs = mock_client.search_and_contents.call_args[1]
+                call_kwargs = mock_client.search.call_args[1]
                 assert call_kwargs["num_results"] == 1
 
     def test_args_validation(self):
@@ -260,7 +282,7 @@ class TestExaWebSearchTool:
         assert args.query == "test search"
         assert args.num_results == 10
         assert args.search_type == "auto"
-        assert args.content_mode == "highlights"
+        assert args.content_mode == "none"
         assert args.category is None
 
         # Custom args
@@ -278,6 +300,9 @@ class TestExaWebSearchTool:
         assert args.content_mode == "text"
         assert args.category == "research paper"
         assert args.include_domains == ["arxiv.org"]
+
+        with pytest.raises(ValidationError):
+            ExaWebSearchArgs(query="test search", content_mode="invalid")
 
     def test_result_model(self):
         """Test ExaWebSearchResult model"""

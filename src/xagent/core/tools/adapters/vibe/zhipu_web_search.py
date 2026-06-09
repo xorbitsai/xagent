@@ -3,7 +3,7 @@ Zhipu Web Search Tool for xagent
 Framework wrapper around the Zhipu web search API.
 """
 
-from typing import Any, Dict, List, Mapping, Optional, Type
+from typing import Any, Dict, List, Literal, Mapping, Optional, Type
 
 from pydantic import BaseModel, Field
 
@@ -25,8 +25,15 @@ class ZhipuWebSearchArgs(BaseModel):
         default=None, description="Restrict results to a domain"
     )
     search_recency_filter: str = Field(default="noLimit", description="Recency filter")
-    content_size: str = Field(
-        default="medium", description="Summary length (low/medium/high)"
+    content_size: Literal["low", "medium", "high"] = Field(
+        default="low", description="Search-result summary length (low/medium/high)"
+    )
+    include_content: bool = Field(
+        default=False,
+        description=(
+            "Also copy the provider summary into a content field. Defaults to false; "
+            "use fetch_web_content to read one selected URL."
+        ),
     )
     request_id: Optional[str] = Field(default=None, description="Optional request id")
     user_id: Optional[str] = Field(default=None, description="Optional user id")
@@ -34,7 +41,7 @@ class ZhipuWebSearchArgs(BaseModel):
 
 class ZhipuWebSearchResult(BaseModel):
     results: List[Dict[str, Any]] = Field(
-        description="Search results with title, link, snippet and content"
+        description="Search results with title, link, snippet, and optional content"
     )
     search_intent: Optional[List[Dict[str, Any]]] = Field(
         default=None, description="Search intent analysis"
@@ -45,8 +52,9 @@ class ZhipuWebSearchResult(BaseModel):
 
 
 class ZhipuWebSearchTool(AbstractBaseTool):
-    category = ToolCategory.BASIC
     """Framework wrapper for the Zhipu web search tool."""
+
+    category = ToolCategory.WEB_SEARCH
 
     def __init__(self, api_key: str | None = None, base_url: str | None = None) -> None:
         self._visibility = ToolVisibility.PUBLIC
@@ -61,7 +69,8 @@ class ZhipuWebSearchTool(AbstractBaseTool):
     def description(self) -> str:
         return (
             "Search the web using Zhipu Web Search API. "
-            "Returns results with titles, links, snippets, and summaries."
+            "Returns lightweight results with titles, links, and snippets by default. "
+            "Use fetch_web_content to read one selected URL after search."
         )
 
     @property
@@ -93,7 +102,9 @@ class ZhipuWebSearchTool(AbstractBaseTool):
             user_id=search_args.user_id,
         )
 
-        results = ZhipuWebSearchCore.normalize_results(response)
+        results = ZhipuWebSearchCore.normalize_results(
+            response, include_content=search_args.include_content
+        )
 
         return ZhipuWebSearchResult(
             results=results,

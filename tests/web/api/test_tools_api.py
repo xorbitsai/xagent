@@ -242,6 +242,9 @@ class TestToolsAvailableAPI:
         assert tool_display_categories.get("browser_navigate") == "Browser"
         assert tool_categories.get("browser_navigate") == "browser"
 
+        assert tool_display_categories.get("fetch_web_content") == "Web Search"
+        assert tool_categories.get("fetch_web_content") == "web_search"
+
     def test_get_available_tools_requires_auth(self):
         """Test that /api/tools/available requires authentication."""
         response = client.get("/api/tools/available")

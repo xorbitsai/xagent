@@ -22,7 +22,7 @@ class ExaWebSearchCore:
         query: str,
         num_results: int = 10,
         search_type: str = "auto",
-        content_mode: str = "highlights",
+        content_mode: str = "none",
         category: Optional[str] = None,
         include_domains: Optional[List[str]] = None,
         exclude_domains: Optional[List[str]] = None,
@@ -160,8 +160,9 @@ class ExaWebSearchCore:
                 "title": title,
                 "link": url,
                 "snippet": snippet,
-                "content": content[:8192] if content else "",
             }
+            if content:
+                result["content"] = content[:8192]
 
             results.append(result)
 

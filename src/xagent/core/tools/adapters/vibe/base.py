@@ -23,6 +23,7 @@ class ToolCategory(str, Enum):
     AUDIO = "audio"
     KNOWLEDGE = "knowledge"
     FILE = "file"
+    WEB_SEARCH = "web_search"
     BASIC = "basic"
     BROWSER = "browser"
     PPT = "ppt"
@@ -47,6 +48,9 @@ class ToolMetadata(BaseModel):
     # selection (``ToolSelectionSpec.compute_allowed_names``) matches by
     # structured equality instead of re-parsing the tool name.
     source_server: Optional[str] = None
+    # Optional logical group used by generic agent-control heuristics that
+    # should treat related tools as one repeated action stream.
+    decision_group: Optional[str] = None
 
 
 @runtime_checkable
@@ -93,6 +97,7 @@ class AbstractBaseTool(ABC, Tool):
             has_state=self.state_type() is not None,
             category=getattr(self, "category", ToolCategory.OTHER),
             source_server=getattr(self, "source_server", None),
+            decision_group=getattr(self, "decision_group", None),
         )
 
     @abstractmethod

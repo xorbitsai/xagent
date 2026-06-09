@@ -307,8 +307,8 @@ class ToolSelectionSpec(ABC):
     def includes_category(self, cat: str) -> bool:
         """Whether the given category passes the spec.
 
-        ``ALL`` admits every category; ``NONE`` admits none;
-        ``BY_CATEGORIES`` admits members of :attr:`categories`.
+        ``ALL`` admits every category; ``NONE`` admits none; and
+        ``BY_CATEGORIES`` admits only members of :attr:`categories`.
         Existing callers in ``factory.py`` registry-skip and
         creator-internal short-circuits keep using this.
         """
@@ -319,7 +319,8 @@ class ToolSelectionSpec(ABC):
         # ``categories`` exists on _SpecByCategories; mypy follows it
         # through ``is_by_categories()`` narrowing in modern setups,
         # but the duck-typed attribute access is also safe here.
-        return cat in getattr(self, "categories", frozenset())
+        categories: frozenset[str] = getattr(self, "categories", frozenset())
+        return cat in categories
 
 
 def should_load_mcp_server_configs(

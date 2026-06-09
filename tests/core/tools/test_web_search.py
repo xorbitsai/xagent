@@ -3,7 +3,7 @@ Tests for WebSearch tool
 """
 
 import os
-from unittest.mock import AsyncMock, Mock, patch
+from unittest.mock import AsyncMock, Mock, call, patch
 
 import httpx
 import pytest
@@ -99,15 +99,16 @@ class TestWebSearchTool:
             mock_response.json.return_value = mock_google_response
             mock_response.raise_for_status.return_value = None
 
-            with patch("httpx.AsyncClient.get", return_value=mock_response):
+            with patch("httpx.AsyncClient.get", return_value=mock_response) as mock_get:
                 result = await web_search_tool.run_json_async(
-                    {"query": "test search", "num_results": 2, "include_content": False}
+                    {"query": "test search", "num_results": 2}
                 )
 
                 assert result["results"]
                 assert len(result["results"]) == 2
                 assert result["results"][0]["title"] == "Test Article 1"
                 assert result["results"][0]["link"] == "https://example.com/article1"
+                assert mock_get.call_count == 1
                 assert (
                     "content" not in result["results"][0]
                     or result["results"][0]["content"] == ""
@@ -115,7 +116,7 @@ class TestWebSearchTool:
 
     @pytest.mark.asyncio
     async def test_successful_search_with_content(
-        self, web_search_tool, mock_google_response, mock_webpage_content
+        self, web_search_tool, mock_google_response
     ):
         """Test successful search with webpage content fetching"""
         with patch.dict(
@@ -127,21 +128,17 @@ class TestWebSearchTool:
             mock_api_response.json.return_value = mock_google_response
             mock_api_response.raise_for_status.return_value = None
 
-            # Mock webpage content response
-            mock_page_response = Mock()
-            mock_page_response.status_code = 200
-            mock_page_response.text = mock_webpage_content
-            mock_page_response.raise_for_status.return_value = None
-            mock_page_response.headers = {"content-type": "text/html"}
-            mock_page_response.reason_phrase = "OK"
-
-            async def mock_get(url, **kwargs):
-                if "googleapis.com" in url:
-                    return mock_api_response
-                else:
-                    return mock_page_response
-
-            with patch("httpx.AsyncClient.get", side_effect=mock_get):
+            with (
+                patch("httpx.AsyncClient.get", return_value=mock_api_response),
+                patch(
+                    "xagent.core.tools.core.web_search.WebContentFetcher.fetch_text",
+                    new_callable=AsyncMock,
+                ) as mock_fetch_text,
+            ):
+                mock_fetch_text.side_effect = [
+                    "Extracted page content 1",
+                    "Extracted page content 2",
+                ]
                 result = await web_search_tool.run_json_async(
                     {"query": "test search", "num_results": 2, "include_content": True}
                 )
@@ -149,7 +146,13 @@ class TestWebSearchTool:
                 assert result["results"]
                 assert len(result["results"]) == 2
                 assert "content" in result["results"][0]
-                assert "Test Article" in result["results"][0]["content"]
+                assert result["results"][0]["content"] == "Extracted page content 1"
+                mock_fetch_text.assert_has_awaits(
+                    [
+                        call("https://example.com/article1"),
+                        call("https://example.com/article2"),
+                    ]
+                )
 
     @pytest.mark.asyncio
     async def test_api_403_error(self, web_search_tool):
@@ -269,20 +272,17 @@ class TestWebSearchTool:
             mock_api_response.json.return_value = mock_google_response
             mock_api_response.raise_for_status.return_value = None
 
-            # Mock failed webpage response
-            mock_page_error = httpx.HTTPStatusError(
-                "404 Not Found",
-                request=Mock(),
-                response=Mock(status_code=404, reason_phrase="Not Found"),
-            )
-
-            async def mock_get(url, **kwargs):
-                if "googleapis.com" in url:
-                    return mock_api_response
-                else:
-                    raise mock_page_error
-
-            with patch("httpx.AsyncClient.get", side_effect=mock_get):
+            with (
+                patch("httpx.AsyncClient.get", return_value=mock_api_response),
+                patch(
+                    "xagent.core.tools.core.web_search.WebContentFetcher.fetch_text",
+                    new_callable=AsyncMock,
+                    return_value=(
+                        "Error fetching content: HTTP 404 error for "
+                        "https://example.com/article1: Not Found"
+                    ),
+                ),
+            ):
                 result = await web_search_tool.run_json_async(
                     {"query": "test", "include_content": True}
                 )
@@ -297,7 +297,7 @@ class TestWebSearchTool:
         args = WebSearchArgs(query="test search")
         assert args.query == "test search"
         assert args.num_results == 3  # default
-        assert args.include_content is True  # default
+        assert args.include_content is False  # default
 
         # Custom args
         args = WebSearchArgs(

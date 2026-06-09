@@ -2,6 +2,8 @@ import pytest
 
 from xagent.core.tools.adapters.vibe.basic_tools import create_basic_tools
 from xagent.core.tools.adapters.vibe.config import ToolConfig
+from xagent.core.tools.adapters.vibe.factory import ToolFactory
+from xagent.core.tools.adapters.vibe.selection_spec import ToolSelectionSpec
 
 
 def _tool_names(tools):
@@ -27,7 +29,11 @@ async def test_auto_web_search_provider_preserves_existing_priority(monkeypatch)
         )
     )
 
-    assert _tool_names(tools) == ["zhipu_web_search", "api_call"]
+    assert _tool_names(tools) == [
+        "zhipu_web_search",
+        "fetch_web_content",
+        "api_call",
+    ]
 
 
 @pytest.mark.asyncio
@@ -49,7 +55,7 @@ async def test_explicit_google_web_search_provider_uses_google(monkeypatch):
         )
     )
 
-    assert _tool_names(tools) == ["web_search", "api_call"]
+    assert _tool_names(tools) == ["web_search", "fetch_web_content", "api_call"]
     assert tools[0].__class__.__name__ == "WebSearchTool"
 
 
@@ -72,7 +78,7 @@ async def test_explicit_exa_web_search_provider_uses_exa(monkeypatch):
         )
     )
 
-    assert _tool_names(tools) == ["exa_web_search", "api_call"]
+    assert _tool_names(tools) == ["exa_web_search", "fetch_web_content", "api_call"]
 
 
 @pytest.mark.asyncio
@@ -90,4 +96,83 @@ async def test_explicit_provider_without_credentials_adds_no_search_tool(monkeyp
         )
     )
 
-    assert _tool_names(tools) == ["api_call"]
+    assert _tool_names(tools) == ["fetch_web_content", "api_call"]
+
+
+@pytest.mark.asyncio
+async def test_basic_category_selection_excludes_web_fetch_tool(monkeypatch):
+    monkeypatch.setenv("XAGENT_WEB_SEARCH_PROVIDER", "google")
+    config = ToolConfig(
+        {
+            "workspace": None,
+            "tool_credentials": {},
+        }
+    )
+    config._tool_selection_spec = ToolSelectionSpec.from_raw(tool_categories=["basic"])
+
+    tools = await ToolFactory.create_all_tools(config)
+
+    names = _tool_names(tools)
+    assert "api_call" in names
+    assert "fetch_web_content" not in names
+
+
+@pytest.mark.asyncio
+async def test_web_search_category_selection_keeps_web_fetch_tool(monkeypatch):
+    monkeypatch.setenv("XAGENT_WEB_SEARCH_PROVIDER", "google")
+    config = ToolConfig(
+        {
+            "workspace": None,
+            "tool_credentials": {},
+        }
+    )
+    config._tool_selection_spec = ToolSelectionSpec.from_raw(
+        tool_categories=["web_search"]
+    )
+
+    tools = await ToolFactory.create_all_tools(config)
+
+    assert _tool_names(tools) == ["fetch_web_content"]
+
+
+@pytest.mark.asyncio
+async def test_web_search_category_selection_includes_image_web_search(
+    monkeypatch, tmp_path
+):
+    monkeypatch.setenv("XAGENT_WEB_SEARCH_PROVIDER", "google")
+    config = ToolConfig(
+        {
+            "workspace": {"task_id": "task-1", "base_dir": str(tmp_path)},
+            "tool_credentials": {},
+        }
+    )
+    config._tool_selection_spec = ToolSelectionSpec.from_raw(
+        tool_categories=["web_search"]
+    )
+
+    tools = await ToolFactory.create_all_tools(config)
+    names = _tool_names(tools)
+
+    assert "fetch_web_content" in names
+    assert "image_web_search" in names
+    assert "logo_overlay" not in names
+
+
+@pytest.mark.asyncio
+async def test_image_category_selection_excludes_image_web_search(
+    monkeypatch, tmp_path
+):
+    monkeypatch.setenv("XAGENT_WEB_SEARCH_PROVIDER", "google")
+    config = ToolConfig(
+        {
+            "workspace": {"task_id": "task-1", "base_dir": str(tmp_path)},
+            "tool_credentials": {},
+        }
+    )
+    config._tool_selection_spec = ToolSelectionSpec.from_raw(tool_categories=["image"])
+
+    tools = await ToolFactory.create_all_tools(config)
+    names = _tool_names(tools)
+
+    assert "logo_overlay" in names
+    assert "image_web_search" not in names

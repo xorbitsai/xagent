@@ -20,18 +20,22 @@ class WebSearchArgs(BaseModel):
         default=3, description="Number of results to return (max 10)"
     )
     include_content: bool = Field(
-        default=True, description="Include full webpage content"
+        default=False,
+        description=(
+            "Also fetch webpage content for each result. Defaults to false; "
+            "prefer fetch_web_content for reading one selected URL."
+        ),
     )
 
 
 class WebSearchResult(BaseModel):
     results: List[Dict[str, str]] = Field(
-        description="Search results with title, link, snippet and content"
+        description="Search results with title, link, snippet, and optional content"
     )
 
 
 class WebSearchTool(AbstractBaseTool):
-    category = ToolCategory.BASIC
+    category = ToolCategory.WEB_SEARCH
     """Framework wrapper for the pure web search tool"""
 
     def __init__(self, api_key: str | None = None, cse_id: str | None = None) -> None:
@@ -46,8 +50,9 @@ class WebSearchTool(AbstractBaseTool):
     @property
     def description(self) -> str:
         return """Search the web for information using Google Search.
-        Returns results with titles, links, snippets, and full webpage content.
-        Useful for finding current information, research, and factual data."""
+        Returns lightweight results with titles, links, and snippets by default.
+        Set include_content=true only when every result needs page text; otherwise
+        use fetch_web_content to read one selected URL after search."""
 
     @property
     def tags(self) -> list[str]:

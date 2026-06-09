@@ -48,8 +48,7 @@ class ImageWebSearchResult(BaseModel):
 class ImageWebSearchTool(AbstractBaseTool):
     """Framework wrapper for the pure image web search tool"""
 
-    # Image web search is a basic search tool, similar to web search
-    category: ToolCategory = ToolCategory.BASIC
+    category: ToolCategory = ToolCategory.WEB_SEARCH
 
     def __init__(self, workspace: Optional[TaskWorkspace] = None) -> None:
         self._visibility = ToolVisibility.PUBLIC

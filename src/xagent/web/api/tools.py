@@ -44,6 +44,7 @@ CATEGORY_DISPLAY_NAMES = {
     "audio": "Audio",
     "knowledge": "Knowledge",
     "file": "File",
+    "web_search": "Web Search",
     "basic": "Basic",
     "browser": "Browser",
     "ppt": "PPT",

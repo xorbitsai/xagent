@@ -9,8 +9,8 @@ from .base import BaseLLM
 from .claude import ClaudeLLM
 from .deepseek import DeepSeekLLM
 from .gemini import GeminiLLM
-from .openai import OpenAILLM
 from .litellm import LiteLLM
+from .openai import OpenAILLM
 from .xinference import XinferenceLLM
 from .zhipu import ZhipuLLM
 

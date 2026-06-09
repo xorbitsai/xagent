@@ -211,17 +211,29 @@ class LiteLLM(BaseLLM):
             if hasattr(delta, "tool_calls") and delta.tool_calls:
                 tool_calls = []
                 for tc in delta.tool_calls:
-                    tool_calls.append({
-                        "index": tc.index if hasattr(tc, "index") and tc.index is not None else 0,
-                        "id": tc.id if hasattr(tc, "id") else None,
-                        "type": "function",
-                        "function": {
-                            "name": tc.function.name if hasattr(tc, "function") and hasattr(tc.function, "name") else None,
-                            "arguments": tc.function.arguments if hasattr(tc, "function") and hasattr(tc.function, "arguments") else "",
-                        },
-                    })
+                    tool_calls.append(
+                        {
+                            "index": tc.index
+                            if hasattr(tc, "index") and tc.index is not None
+                            else 0,
+                            "id": tc.id if hasattr(tc, "id") else None,
+                            "type": "function",
+                            "function": {
+                                "name": tc.function.name
+                                if hasattr(tc, "function")
+                                and hasattr(tc.function, "name")
+                                else None,
+                                "arguments": tc.function.arguments
+                                if hasattr(tc, "function")
+                                and hasattr(tc.function, "arguments")
+                                else "",
+                            },
+                        }
+                    )
                 yield StreamChunk(
                     type=ChunkType.TOOL_CALL,
                     tool_calls=tool_calls,
-                    raw=chunk.model_dump() if hasattr(chunk, "model_dump") else str(chunk),
+                    raw=chunk.model_dump()
+                    if hasattr(chunk, "model_dump")
+                    else str(chunk),
                 )

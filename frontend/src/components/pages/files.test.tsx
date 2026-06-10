@@ -1,5 +1,5 @@
 import React from "react"
-import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react"
+import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react"
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest"
 
 const apiRequestMock = vi.hoisted(() => vi.fn())
@@ -227,5 +227,102 @@ describe("FilesPage", () => {
 
     await screen.findByText("second.txt")
     expect(apiRequestMock).toHaveBeenCalledWith("http://api.local/api/files/list?page=2&size=20")
+  })
+
+  it("debounces search and resets to page 1 with a single request", async () => {
+    apiRequestMock.mockImplementation((url: string) => {
+      if (url === "http://api.local/api/files/list?page=1&size=20") {
+        return Promise.resolve({
+          ok: true,
+          json: vi.fn().mockResolvedValue({
+            files: [
+              {
+                file_id: "file-1",
+                filename: "first.txt",
+                file_size: 12,
+                modified_time: Math.floor(Date.now() / 1000),
+              },
+            ],
+            total_count: 21,
+            page: 1,
+            pages: 2,
+          }),
+        })
+      }
+
+      if (url === "http://api.local/api/files/list?page=2&size=20") {
+        return Promise.resolve({
+          ok: true,
+          json: vi.fn().mockResolvedValue({
+            files: [
+              {
+                file_id: "file-2",
+                filename: "second.txt",
+                file_size: 24,
+                modified_time: Math.floor(Date.now() / 1000),
+              },
+            ],
+            total_count: 21,
+            page: 2,
+            pages: 2,
+          }),
+        })
+      }
+
+      if (url === "http://api.local/api/files/list?page=1&size=20&search=second") {
+        return Promise.resolve({
+          ok: true,
+          json: vi.fn().mockResolvedValue({
+            files: [
+              {
+                file_id: "file-2",
+                filename: "second.txt",
+                file_size: 24,
+                modified_time: Math.floor(Date.now() / 1000),
+              },
+            ],
+            total_count: 1,
+            page: 1,
+            pages: 1,
+          }),
+        })
+      }
+
+      if (url === "http://api.local/api/files/tasks") {
+        return Promise.resolve({
+          ok: true,
+          json: vi.fn().mockResolvedValue({
+            tasks: [],
+          }),
+        })
+      }
+
+      throw new Error(`Unhandled apiRequest: ${url}`)
+    })
+
+    render(<FilesPage />)
+
+    await screen.findByText("first.txt")
+    fireEvent.click(screen.getByText("files.pagination.next"))
+    await screen.findByText("second.txt")
+
+    vi.useFakeTimers()
+    apiRequestMock.mockClear()
+    fireEvent.change(screen.getByPlaceholderText("files.search.placeholder"), {
+      target: { value: "second" },
+    })
+
+    expect(apiRequestMock).not.toHaveBeenCalled()
+
+    await act(async () => {
+      vi.advanceTimersByTime(300)
+      await Promise.resolve()
+    })
+
+    expect(apiRequestMock).toHaveBeenCalledTimes(1)
+    expect(apiRequestMock).toHaveBeenCalledWith(
+      "http://api.local/api/files/list?page=1&size=20&search=second"
+    )
+    vi.useRealTimers()
   })
 })

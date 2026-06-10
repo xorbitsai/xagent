@@ -95,6 +95,7 @@ export function FilesPage() {
   useEffect(() => {
     const timer = window.setTimeout(() => {
       setDebouncedSearchQuery(searchQuery)
+      setPage(1)
     }, 300)
 
     return () => window.clearTimeout(timer)
@@ -116,7 +117,7 @@ export function FilesPage() {
     }
   }
 
-  const loadFiles = async (targetPage = page, targetSearch = searchQuery, targetCategory = selectedCategory) => {
+  const loadFiles = async (targetPage = page, targetSearch = debouncedSearchQuery, targetCategory = selectedCategory) => {
     const requestId = latestFilesRequestRef.current + 1
     latestFilesRequestRef.current = requestId
     try {
@@ -355,7 +356,6 @@ export function FilesPage() {
             value={searchQuery}
             onChange={(value) => {
               setSearchQuery(value)
-              setPage(1)
             }}
             containerClassName="flex-1 sm:w-64"
             className="h-9 w-full bg-background"

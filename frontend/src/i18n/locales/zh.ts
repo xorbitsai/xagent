@@ -1141,14 +1141,14 @@ Build when you need.`,
     sidebar: {
       folders: "文件夹",
       allFiles: "所有文件",
-      agents: "智能体",
-      noAgents: "未找到智能体",
+      tasks: "任务",
+      noTasks: "未找到包含文件的任务",
       system: "系统",
       userUploads: "用户上传",
     },
     breadcrumb: {
       files: "文件",
-      unknownAgent: "未知智能体",
+      unknownTask: "未知任务",
       unknownCategory: "未知分类",
     },
     selection: {
@@ -1176,6 +1176,12 @@ Build when you need.`,
     delete: {
       confirmSingle: "确定要删除 {name} 吗？",
       confirmMultiple: "确定要删除 {count} 个文件吗？",
+    },
+    pagination: {
+      showing: "显示第 {start}-{end} 条，共 {total} 条",
+      prev: "上一页",
+      page: "第 {page} 页，共 {pages} 页",
+      next: "下一页",
     },
     previewDialog: {
       buttons: {

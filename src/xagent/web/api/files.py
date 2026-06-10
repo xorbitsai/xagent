@@ -12,6 +12,7 @@ from fastapi.responses import (
     RedirectResponse,
     Response,
 )
+from sqlalchemy import func, or_
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
@@ -891,13 +892,44 @@ async def upload_file(
 
 @file_router.get("/list")
 async def list_files(
-    user: User = Depends(get_current_user), db: Session = Depends(get_db)
+    page: int = Query(1, ge=1, description="Page number"),
+    size: int = Query(20, ge=1, le=100, description="Page size"),
+    search: str = Query("", description="Search filename or path"),
+    task_id: int | None = Query(None, description="Filter by task ID"),
+    uploads_only: bool = Query(False, description="Only include user uploads"),
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
 ) -> Dict[str, Any]:
     query = db.query(UploadedFile)
     if not _is_admin_user(user):
         query = query.filter(UploadedFile.user_id == _user_id_value(user))
 
-    records = query.order_by(UploadedFile.created_at.desc()).all()
+    normalized_search = search.strip()
+    if normalized_search:
+        like_pattern = f"%{normalized_search}%"
+        query = query.filter(
+            or_(
+                UploadedFile.filename.ilike(like_pattern),
+                UploadedFile.workspace_relative_path.ilike(like_pattern),
+                UploadedFile.storage_path.ilike(like_pattern),
+            )
+        )
+
+    if task_id is not None:
+        query = query.filter(UploadedFile.task_id == task_id)
+    elif uploads_only:
+        query = query.filter(UploadedFile.task_id.is_(None))
+
+    total_count = query.count()
+    total_pages = max((total_count + size - 1) // size, 1)
+    current_page = min(page, total_pages)
+    offset = (current_page - 1) * size
+    records = (
+        query.order_by(UploadedFile.created_at.desc(), UploadedFile.id.desc())
+        .offset(offset)
+        .limit(size)
+        .all()
+    )
     file_status_map = aggregate_uploaded_file_statuses(
         file_ids=[str(record.file_id) for record in records if record.file_id],
         user_id=_user_id_value(user),
@@ -922,7 +954,53 @@ async def list_files(
             }
         )
 
-    return {"files": files, "total_count": len(files)}
+    return {
+        "files": files,
+        "total_count": total_count,
+        "page": current_page,
+        "size": size,
+        "pages": total_pages,
+    }
+
+
+@file_router.get("/tasks")
+async def list_file_tasks(
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> Dict[str, Any]:
+    query = (
+        db.query(
+            Task.id.label("task_id"),
+            Task.title.label("title"),
+            func.count(UploadedFile.id).label("file_count"),
+            func.max(UploadedFile.created_at).label("latest_file_at"),
+        )
+        .join(UploadedFile, UploadedFile.task_id == Task.id)
+        .filter(UploadedFile.task_id.isnot(None))
+    )
+
+    if not _is_admin_user(user):
+        query = query.filter(UploadedFile.user_id == _user_id_value(user))
+
+    rows = (
+        query.group_by(Task.id, Task.title)
+        .order_by(
+            func.max(UploadedFile.created_at).desc(),
+            Task.id.desc(),
+        )
+        .all()
+    )
+
+    return {
+        "tasks": [
+            {
+                "task_id": int(row.task_id),
+                "title": str(row.title or f"Task {row.task_id}"),
+                "file_count": int(row.file_count or 0),
+            }
+            for row in rows
+        ]
+    }
 
 
 @file_router.get("/task/{task_id}")

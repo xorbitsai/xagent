@@ -1604,3 +1604,96 @@ class TestFileUploadSecurity:
             assert response.status_code == 200
         except (OSError, ValueError):
             pass
+
+    def test_list_files_supports_pagination_and_filters(
+        self, client, test_db, auth_headers
+    ):
+        """Test listing files with pagination and server-side filters."""
+        uploaded = [
+            ("alpha.txt", None),
+            ("beta.txt", None),
+            ("agent-note.txt", "123"),
+        ]
+
+        for filename, task_id in uploaded:
+            data = {"task_type": "general"}
+            if task_id is not None:
+                data["task_id"] = task_id
+            response = client.post(
+                "/api/files/upload",
+                files={"file": (filename, filename.encode("utf-8"), "text/plain")},
+                data=data,
+                headers=auth_headers,
+            )
+            assert response.status_code == 200
+
+        response = client.get(
+            "/api/files/list?page=1&size=2",
+            headers=auth_headers,
+        )
+        assert response.status_code == 200
+        data = response.json()
+        assert data["total_count"] >= 3
+        assert data["page"] == 1
+        assert data["size"] == 2
+        assert data["pages"] >= 2
+        assert len(data["files"]) == 2
+
+        response = client.get(
+            "/api/files/list?search=agent-note",
+            headers=auth_headers,
+        )
+        assert response.status_code == 200
+        data = response.json()
+        assert data["total_count"] == 1
+        assert [item["filename"] for item in data["files"]] == ["agent-note.txt"]
+
+    def test_list_file_tasks_returns_tasks_with_files(
+        self, client, test_db, auth_headers
+    ):
+        """Test listing task filters only returns tasks that actually have files."""
+        uploads = [
+            ("task-alpha.txt", "321"),
+            ("task-beta.txt", "654"),
+            ("loose-upload.txt", None),
+        ]
+
+        for filename, task_id in uploads:
+            data = {"task_type": "general"}
+            if task_id is not None:
+                data["task_id"] = task_id
+            response = client.post(
+                "/api/files/upload",
+                files={"file": (filename, filename.encode("utf-8"), "text/plain")},
+                data=data,
+                headers=auth_headers,
+            )
+            assert response.status_code == 200
+
+        response = client.get("/api/files/tasks", headers=auth_headers)
+        assert response.status_code == 200
+        data = response.json()
+
+        assert "tasks" in data
+        task_ids = {item["task_id"] for item in data["tasks"]}
+        assert 321 in task_ids
+        assert 654 in task_ids
+        assert all(item["file_count"] >= 1 for item in data["tasks"])
+
+        response = client.get(
+            "/api/files/list?uploads_only=true",
+            headers=auth_headers,
+        )
+        assert response.status_code == 200
+        data = response.json()
+        assert data["total_count"] >= 2
+        assert all(item["task_id"] is None for item in data["files"])
+
+        response = client.get(
+            "/api/files/list?task_id=123",
+            headers=auth_headers,
+        )
+        assert response.status_code == 200
+        data = response.json()
+        assert data["total_count"] == 1
+        assert [item["filename"] for item in data["files"]] == ["agent-note.txt"]

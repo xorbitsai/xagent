@@ -86,7 +86,9 @@ vi.mock("lucide-react", () => {
     Folder: Icon,
     LayoutGrid: Icon,
     Eye: Icon,
-    Bot: Icon,
+    Briefcase: Icon,
+    ChevronLeft: Icon,
+    ChevronRight: Icon,
   }
 })
 
@@ -104,7 +106,7 @@ describe("FilesPage", () => {
 
   it("shows backend delete error details when durable storage delete is unavailable", async () => {
     apiRequestMock.mockImplementation((url: string, options?: { method?: string }) => {
-      if (url === "http://api.local/api/files/list") {
+      if (url.startsWith("http://api.local/api/files/list")) {
         return Promise.resolve({
           ok: true,
           json: vi.fn().mockResolvedValue({
@@ -114,14 +116,19 @@ describe("FilesPage", () => {
               file_size: 12,
               modified_time: Math.floor(Date.now() / 1000),
             }],
+            total_count: 1,
+            page: 1,
+            pages: 1,
           }),
         })
       }
 
-      if (url === "http://api.local/api/agents") {
+      if (url === "http://api.local/api/files/tasks") {
         return Promise.resolve({
           ok: true,
-          json: vi.fn().mockResolvedValue([]),
+          json: vi.fn().mockResolvedValue({
+            tasks: [],
+          }),
         })
       }
 
@@ -146,8 +153,79 @@ describe("FilesPage", () => {
 
     await waitFor(() => {
       expect(toastErrorMock).toHaveBeenCalledWith(
-        "Startup file storage sync failed"
+        "Startup file storage sync failed",
+        expect.anything(),
       )
     })
+  })
+
+  it("requests paginated files and loads the next page", async () => {
+    apiRequestMock.mockImplementation((url: string) => {
+      if (url === "http://api.local/api/files/list?page=1&size=20") {
+        return Promise.resolve({
+          ok: true,
+          json: vi.fn().mockResolvedValue({
+            files: [
+              {
+                file_id: "file-1",
+                filename: "first.txt",
+                file_size: 12,
+                modified_time: Math.floor(Date.now() / 1000),
+              },
+            ],
+            total_count: 21,
+            page: 1,
+            pages: 2,
+          }),
+        })
+      }
+
+      if (url === "http://api.local/api/files/list?page=2&size=20") {
+        return Promise.resolve({
+          ok: true,
+          json: vi.fn().mockResolvedValue({
+            files: [
+              {
+                file_id: "file-2",
+                filename: "second.txt",
+                file_size: 24,
+                modified_time: Math.floor(Date.now() / 1000),
+              },
+            ],
+            total_count: 21,
+            page: 2,
+            pages: 2,
+          }),
+        })
+      }
+
+      if (url === "http://api.local/api/files/tasks") {
+        return Promise.resolve({
+          ok: true,
+          json: vi.fn().mockResolvedValue({
+            tasks: [
+              {
+                task_id: 101,
+                title: "Demo task",
+                file_count: 1,
+              },
+            ],
+          }),
+        })
+      }
+
+      throw new Error(`Unhandled apiRequest: ${url}`)
+    })
+
+    render(<FilesPage />)
+
+    await screen.findByText("first.txt")
+    expect(apiRequestMock).toHaveBeenCalledWith("http://api.local/api/files/list?page=1&size=20")
+    expect(screen.getByText("Demo task")).toBeInTheDocument()
+
+    fireEvent.click(screen.getByText("files.pagination.next"))
+
+    await screen.findByText("second.txt")
+    expect(apiRequestMock).toHaveBeenCalledWith("http://api.local/api/files/list?page=2&size=20")
   })
 })

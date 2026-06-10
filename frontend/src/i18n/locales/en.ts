@@ -1141,14 +1141,14 @@ Build when you need.`,
     sidebar: {
       folders: "Folders",
       allFiles: "All Files",
-      agents: "Agents",
-      noAgents: "No agents found",
+      tasks: "Tasks",
+      noTasks: "No tasks with files found",
       system: "System",
       userUploads: "User Uploads",
     },
     breadcrumb: {
       files: "Files",
-      unknownAgent: "Unknown Agent",
+      unknownTask: "Unknown Task",
       unknownCategory: "Unknown Category",
     },
     selection: {
@@ -1176,6 +1176,12 @@ Build when you need.`,
     delete: {
       confirmSingle: "Are you sure you want to delete {name}?",
       confirmMultiple: "Are you sure you want to delete {count} files?",
+    },
+    pagination: {
+      showing: "Showing {start}-{end} of {total}",
+      prev: "Prev",
+      page: "Page {page} of {pages}",
+      next: "Next",
     },
     previewDialog: {
       buttons: {

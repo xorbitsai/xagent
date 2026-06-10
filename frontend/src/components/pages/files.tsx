@@ -25,7 +25,9 @@ import {
   Folder,
   LayoutGrid,
   Eye,
-  Bot
+  MessageSquare,
+  ChevronLeft,
+  ChevronRight
 } from "lucide-react"
 import { cn } from "@/lib/utils"
 
@@ -40,21 +42,24 @@ interface FileItem {
   relative_path?: string
 }
 
-interface Agent {
-  id: number
-  name: string
-  description?: string
-  status: string
+interface TaskFilterItem {
+  task_id: number
+  title: string
+  file_count?: number
 }
 
 export function FilesPage() {
+  const pageSize = 20
   const [files, setFiles] = useState<FileItem[]>([])
-  const [agents, setAgents] = useState<Agent[]>([])
+  const [tasks, setTasks] = useState<TaskFilterItem[]>([])
   const [searchQuery, setSearchQuery] = useState("")
   const [selectedFiles, setSelectedFiles] = useState<string[]>([])
   const [isLoading, setIsLoading] = useState(true)
   const [uploading, setUploading] = useState(false)
   const [selectedCategory, setSelectedCategory] = useState("all")
+  const [page, setPage] = useState(1)
+  const [pages, setPages] = useState(1)
+  const [totalFiles, setTotalFiles] = useState(0)
   const fileInputRef = useRef<HTMLInputElement>(null)
 
   const { t } = useI18n()
@@ -81,76 +86,52 @@ export function FilesPage() {
   const [previewFile, setPreviewFile] = useState<{ fileId: string; fileName: string } | null>(null)
   const [isPreviewOpen, setIsPreviewOpen] = useState(false)
 
-  const [displayAgents, setDisplayAgents] = useState<Agent[]>([])
-
   useEffect(() => {
-    loadFiles()
-    loadAgents()
+    loadTasks()
   }, [])
 
-  // Derive displayAgents from loaded agents and files
   useEffect(() => {
-    if (files.length === 0) {
-      setDisplayAgents(agents)
-      return
-    }
+    loadFiles(page, searchQuery, selectedCategory)
+  }, [page, searchQuery, selectedCategory])
 
-    // Extract agent IDs from file paths
-    const inferredAgentIds = new Set<number>()
-    files.forEach(file => {
-      if (typeof file.task_id === 'number') {
-        inferredAgentIds.add(file.task_id)
-      } else {
-        const match = file.relative_path?.match(/^web_task_(\d+)\//)
-        if (match) {
-          inferredAgentIds.add(parseInt(match[1]))
-        }
-      }
-    })
-
-    // Create a map of existing agents for easy lookup
-    const existingAgentMap = new Map(agents.map(a => [a.id, a]))
-
-    // Combine existing agents with inferred ones
-    const combinedAgents: Agent[] = [...agents]
-
-    inferredAgentIds.forEach(id => {
-      if (!existingAgentMap.has(id)) {
-        // Add placeholder for inferred agent
-        combinedAgents.push({
-          id,
-          name: `Agent ${id}`,
-          status: 'unknown',
-          description: 'Inferred from file path' // Internal description, maybe no need to translate? Or use t?
-        })
-      }
-    })
-
-    // Sort by ID descending (newest first)
-    combinedAgents.sort((a, b) => b.id - a.id)
-
-    setDisplayAgents(combinedAgents)
-  }, [agents, files])
-
-  const loadAgents = async () => {
+  const loadTasks = async () => {
     try {
-      const response = await apiRequest(`${getApiUrl()}/api/agents`)
+      const response = await apiRequest(`${getApiUrl()}/api/files/tasks`)
       if (response.ok) {
         const data = await response.json()
-        setAgents(data)
+        setTasks(Array.isArray(data?.tasks) ? data.tasks : [])
       }
     } catch (error) {
-      console.error('Failed to load agents:', error)
+      console.error('Failed to load tasks:', error)
     }
   }
 
-  const loadFiles = async () => {
+  const loadFiles = async (targetPage = page, targetSearch = searchQuery, targetCategory = selectedCategory) => {
     try {
-      const response = await apiRequest(`${getApiUrl()}/api/files/list`)
+      setIsLoading(true)
+      const params = new URLSearchParams({
+        page: targetPage.toString(),
+        size: pageSize.toString(),
+      })
+      const normalizedSearch = targetSearch.trim()
+      if (normalizedSearch) {
+        params.set('search', normalizedSearch)
+      }
+      if (targetCategory === 'uploads') {
+        params.set('uploads_only', 'true')
+      } else if (targetCategory.startsWith('task-')) {
+        params.set('task_id', targetCategory.split('-')[1])
+      }
+
+      const response = await apiRequest(`${getApiUrl()}/api/files/list?${params.toString()}`)
       if (response.ok) {
         const data = await response.json()
         if (data && data.files) {
           setFiles(data.files)
+          setSelectedFiles(prev => prev.filter(fileId => data.files.some((file: FileItem) => file.file_id === fileId)))
+          setTotalFiles(typeof data.total_count === 'number' ? data.total_count : data.files.length)
+          setPage(typeof data.page === 'number' ? data.page : targetPage)
+          setPages(typeof data.pages === 'number' && data.pages > 0 ? data.pages : 1)
         }
       }
     } catch (error) {
@@ -182,7 +163,9 @@ export function FilesPage() {
       const parsed = await parseApiResponse(response)
 
       if (response.ok && parsed.data) {
-        await loadFiles()
+        await loadFiles(1, searchQuery, selectedCategory)
+        await loadTasks()
+        setPage(1)
         if (fileInputRef.current) {
           fileInputRef.current.value = ''
         }
@@ -270,39 +253,6 @@ export function FilesPage() {
     return <FileText className="h-4 w-4 text-slate-500" />
   }
 
-  const filteredFiles = files.filter(file => {
-    // Search filter
-    const matchesSearch = file.filename.toLowerCase().includes(searchQuery.toLowerCase()) ||
-      (file.relative_path && file.relative_path.toLowerCase().includes(searchQuery.toLowerCase()))
-
-    if (!matchesSearch) return false
-
-    // Category filter
-    if (selectedCategory === 'all') return true
-
-    // Check if file belongs to an agent task (web_task_{id})
-    // Format: "web_task_13/output/hello.txt" -> Agent ID 13
-    const fileAgentId = typeof file.task_id === 'number' ? file.task_id : null
-
-    if (selectedCategory.startsWith('agent-')) {
-      const targetAgentId = parseInt(selectedCategory.split('-')[1])
-
-      // If we found an agent ID in the file path, compare it
-      if (fileAgentId !== null) {
-        return fileAgentId === targetAgentId
-      }
-
-      return false
-    }
-
-    if (selectedCategory === 'uploads') {
-      // User uploads are files that DO NOT match the agent task pattern
-      return fileAgentId === null
-    }
-
-    return true
-  })
-
   const toggleFileSelection = (fileId: string) => {
     setSelectedFiles(prev =>
       prev.includes(fileId)
@@ -326,8 +276,9 @@ export function FilesPage() {
         })
 
         if (response.ok) {
-          setFiles(prev => prev.filter(f => f.file_id !== file.file_id))
           setSelectedFiles(prev => prev.filter(f => f !== file.file_id))
+          await loadFiles(page, searchQuery, selectedCategory)
+          await loadTasks()
         } else {
           const parsed = await parseApiResponse(response)
           toast.error(getApiErrorMessage(
@@ -346,6 +297,7 @@ export function FilesPage() {
             })
             if (response.ok) {
               setFiles(prev => prev.filter(f => f.file_id !== fileToDelete.file_id))
+              setTotalFiles(prev => Math.max(prev - 1, 0))
             } else {
               const parsed = await parseApiResponse(response)
               errorMessage = errorMessage || getApiErrorMessage(
@@ -357,6 +309,8 @@ export function FilesPage() {
           }
         }
         setSelectedFiles([])
+        await loadFiles(page, searchQuery, selectedCategory)
+        await loadTasks()
         if (errorMessage) {
           toast.error(errorMessage)
         }
@@ -383,7 +337,10 @@ export function FilesPage() {
           <SearchInput
             placeholder={t('files.search.placeholder')}
             value={searchQuery}
-            onChange={setSearchQuery}
+            onChange={(value) => {
+              setSearchQuery(value)
+              setPage(1)
+            }}
             containerClassName="flex-1 sm:w-64"
             className="h-9 w-full bg-background"
           />
@@ -420,37 +377,46 @@ export function FilesPage() {
                 <Button
                   variant={selectedCategory === 'all' ? 'secondary' : 'ghost'}
                   className={cn("w-full justify-start", selectedCategory === 'all' && "bg-blue-100 text-blue-700 hover:bg-blue-200 dark:bg-blue-900/30 dark:text-blue-300")}
-                  onClick={() => setSelectedCategory('all')}
+                  onClick={() => {
+                    setSelectedCategory('all')
+                    setPage(1)
+                  }}
                 >
                   <LayoutGrid className="h-4 w-4 mr-2" />
                   {t('files.sidebar.allFiles')}
                 </Button>
               </div>
 
-              {/* Agents Section */}
+              {/* Tasks Section */}
               <div className="space-y-2">
                 <h3 className="text-xs font-semibold text-muted-foreground uppercase tracking-wider px-3 mb-3">
-                  {t('files.sidebar.agents')}
+                  {t('files.sidebar.tasks')}
                 </h3>
                 <div className="space-y-1 max-h-[300px] overflow-y-auto pr-1">
-                  {displayAgents.length > 0 ? (
-                    displayAgents.map((agent) => (
+                  {tasks.length > 0 ? (
+                    tasks.map((task) => (
                       <Button
-                        key={agent.id}
-                        variant={selectedCategory === `agent-${agent.id}` ? 'secondary' : 'ghost'}
+                        key={task.task_id}
+                        variant={selectedCategory === `task-${task.task_id}` ? 'secondary' : 'ghost'}
                         className={cn(
                           "w-full justify-start text-muted-foreground hover:text-foreground",
-                          selectedCategory === `agent-${agent.id}` && "bg-blue-100 text-blue-700 hover:bg-blue-200 dark:bg-blue-900/30 dark:text-blue-300"
+                          selectedCategory === `task-${task.task_id}` && "bg-blue-100 text-blue-700 hover:bg-blue-200 dark:bg-blue-900/30 dark:text-blue-300"
                         )}
-                        onClick={() => setSelectedCategory(`agent-${agent.id}`)}
+                        onClick={() => {
+                          setSelectedCategory(`task-${task.task_id}`)
+                          setPage(1)
+                        }}
+                        title={task.title}
                       >
-                        <Bot className="h-4 w-4 mr-2" />
-                        {agent.name}
+                        <MessageSquare className="h-4 w-4 mr-2" />
+                        <span className="truncate">
+                          {task.title}
+                        </span>
                       </Button>
                     ))
                   ) : (
                     <div className="px-3 text-xs text-muted-foreground">
-                      {t('files.sidebar.noAgents')}
+                      {t('files.sidebar.noTasks')}
                     </div>
                   )}
                 </div>
@@ -467,7 +433,10 @@ export function FilesPage() {
                     "w-full justify-start text-muted-foreground hover:text-foreground",
                     selectedCategory === 'uploads' && "bg-blue-100 text-blue-700 hover:bg-blue-200 dark:bg-blue-900/30 dark:text-blue-300"
                   )}
-                  onClick={() => setSelectedCategory('uploads')}
+                  onClick={() => {
+                    setSelectedCategory('uploads')
+                    setPage(1)
+                  }}
                 >
                   <Folder className="h-4 w-4 mr-2" />
                   {t('files.sidebar.userUploads')}
@@ -480,24 +449,24 @@ export function FilesPage() {
         {/* Main Content */}
         <main className="flex-1 flex flex-col overflow-hidden bg-background">
 
-        {/* Breadcrumb / Title Bar */}
-        <div className="px-8 py-4 flex items-center justify-between text-sm text-muted-foreground">
-          <div className="flex items-center gap-2">
-            <span className="font-medium text-foreground">{t('files.breadcrumb.files')}</span>
-            <span>&gt;</span>
-            <span className="font-medium text-foreground">
-              {selectedCategory === 'all'
-                ? t('files.sidebar.allFiles')
-                : selectedCategory === 'uploads'
-                  ? t('files.sidebar.userUploads')
-                  : selectedCategory.startsWith('agent-')
-                    ? displayAgents.find(a => `agent-${a.id}` === selectedCategory)?.name || t('files.breadcrumb.unknownAgent')
-                    : t('files.breadcrumb.unknownCategory')}
-            </span>
-          </div>
+          {/* Breadcrumb / Title Bar */}
+          <div className="px-8 py-4 flex items-center justify-between text-sm text-muted-foreground">
+            <div className="flex items-center gap-2">
+              <span className="font-medium text-foreground">{t('files.breadcrumb.files')}</span>
+              <span>&gt;</span>
+              <span className="font-medium text-foreground">
+                {selectedCategory === 'all'
+                  ? t('files.sidebar.allFiles')
+                  : selectedCategory === 'uploads'
+                    ? t('files.sidebar.userUploads')
+                    : selectedCategory.startsWith('task-')
+                      ? tasks.find(task => `task-${task.task_id}` === selectedCategory)?.title || t('files.breadcrumb.unknownTask')
+                      : t('files.breadcrumb.unknownCategory')}
+              </span>
+            </div>
 
-          {selectedFiles.length > 0 && (
-             <div className="flex items-center gap-2">
+            {selectedFiles.length > 0 && (
+              <div className="flex items-center gap-2">
                 <Badge variant="secondary">
                   {t('files.selection.selected', { count: selectedFiles.length })}
                 </Badge>
@@ -510,118 +479,152 @@ export function FilesPage() {
                   <Trash2 className="h-4 w-4 mr-2" />
                   {t('files.actions.delete')}
                 </Button>
-             </div>
-          )}
-        </div>
-
-        {/* File List Table */}
-        <div className="flex-1 overflow-auto px-8 pb-8">
-          <div className="border rounded-lg bg-card shadow-sm">
-            {/* Table Header */}
-            <div className="grid grid-cols-12 gap-4 p-4 border-b text-xs font-medium text-muted-foreground uppercase tracking-wider bg-muted/30">
-              <div className="col-span-5 pl-2">{t('files.table.name')}</div>
-              <div className="col-span-2">{t('files.table.type')}</div>
-              <div className="col-span-2">{t('files.table.size')}</div>
-              <div className="col-span-3">{t('files.table.dateModified')}</div>
-            </div>
-
-            {/* Table Body */}
-            {isLoading ? (
-              <div className="p-12 text-center text-muted-foreground">
-                {t('files.table.empty.loading')}
-              </div>
-            ) : filteredFiles.length === 0 ? (
-              <div className="p-12 text-center text-muted-foreground">
-                {searchQuery ? t('files.table.empty.noMatch') : t('files.table.empty.noFiles')}
-              </div>
-            ) : (
-              <div className="divide-y">
-                {filteredFiles.map((file) => (
-                  <div
-                    key={file.file_id}
-                    className="grid grid-cols-12 gap-4 p-4 hover:bg-muted/50 transition-colors items-center group text-sm"
-                  >
-                    <div className="col-span-5 flex items-center gap-3 min-w-0">
-                      {/* Checkbox only visible on hover or selected */}
-                      <div className="w-5 flex justify-center">
-                        <input
-                          type="checkbox"
-                          checked={selectedFiles.includes(file.file_id)}
-                          onChange={() => toggleFileSelection(file.file_id)}
-                          className={cn(
-                            "rounded border-gray-300 text-primary focus:ring-primary accent-primary h-4 w-4 transition-opacity",
-                            selectedFiles.includes(file.file_id) ? "opacity-100" : "opacity-0 group-hover:opacity-100"
-                          )}
-                        />
-                      </div>
-
-                      <div className="flex-shrink-0">
-                        {getFileIcon(file.filename)}
-                      </div>
-                      <span className="font-medium truncate text-foreground select-text" title={file.filename}>
-                        {file.filename}
-                      </span>
-                    </div>
-
-                    <div className="col-span-2 text-muted-foreground uppercase text-xs">
-                      {file.filename.split('.').pop() || '-'}
-                    </div>
-
-                    <div className="col-span-2 text-muted-foreground text-xs">
-                      {formatFileSize(file.file_size)}
-                    </div>
-
-                    <div className="col-span-3 text-muted-foreground text-xs flex items-center justify-between">
-                      <span>{formatRelativeTime(file.modified_time)}</span>
-
-                      {/* Actions */}
-                      <div className="flex items-center gap-1 opacity-0 group-hover:opacity-100 transition-opacity justify-end">
-                        <Button
-                          variant="ghost"
-                          size="sm"
-                          className="h-8 w-8 p-0 text-muted-foreground hover:text-foreground"
-                          onClick={() => handlePreviewFile(file)}
-                          title={t('files.actions.preview')}
-                        >
-                          <Eye className="h-4 w-4" />
-                        </Button>
-                        <Button
-                          variant="ghost"
-                          size="sm"
-                          className="h-8 w-8 p-0 text-muted-foreground hover:text-foreground"
-                          onClick={() => downloadFile(file)}
-                          title={t('files.actions.download')}
-                        >
-                          <Download className="h-4 w-4" />
-                        </Button>
-                        <Button
-                          variant="ghost"
-                          size="sm"
-                          className="h-8 w-8 p-0 text-muted-foreground hover:text-destructive"
-                          onClick={() => deleteFile(file)}
-                          title={t('files.actions.delete')}
-                        >
-                          <Trash2 className="h-4 w-4" />
-                        </Button>
-                      </div>
-                    </div>
-                  </div>
-                ))}
               </div>
             )}
           </div>
-        </div>
+
+          {/* File List Table */}
+          <div className="flex-1 overflow-auto px-8 pb-8">
+            <div className="border rounded-lg bg-card shadow-sm">
+              {/* Table Header */}
+              <div className="grid grid-cols-12 gap-4 p-4 border-b text-xs font-medium text-muted-foreground uppercase tracking-wider bg-muted/30">
+                <div className="col-span-5 pl-2">{t('files.table.name')}</div>
+                <div className="col-span-2">{t('files.table.type')}</div>
+                <div className="col-span-2">{t('files.table.size')}</div>
+                <div className="col-span-3">{t('files.table.dateModified')}</div>
+              </div>
+
+              {/* Table Body */}
+              {isLoading ? (
+                <div className="p-12 text-center text-muted-foreground">
+                  {t('files.table.empty.loading')}
+                </div>
+              ) : files.length === 0 ? (
+                <div className="p-12 text-center text-muted-foreground">
+                  {searchQuery ? t('files.table.empty.noMatch') : t('files.table.empty.noFiles')}
+                </div>
+              ) : (
+                <div className="divide-y">
+                  {files.map((file) => (
+                    <div
+                      key={file.file_id}
+                      className="grid grid-cols-12 gap-4 p-4 hover:bg-muted/50 transition-colors items-center group text-sm"
+                    >
+                      <div className="col-span-5 flex items-center gap-3 min-w-0">
+                        {/* Checkbox only visible on hover or selected */}
+                        <div className="w-5 flex justify-center">
+                          <input
+                            type="checkbox"
+                            checked={selectedFiles.includes(file.file_id)}
+                            onChange={() => toggleFileSelection(file.file_id)}
+                            className={cn(
+                              "rounded border-gray-300 text-primary focus:ring-primary accent-primary h-4 w-4 transition-opacity",
+                              selectedFiles.includes(file.file_id) ? "opacity-100" : "opacity-0 group-hover:opacity-100"
+                            )}
+                          />
+                        </div>
+
+                        <div className="flex-shrink-0">
+                          {getFileIcon(file.filename)}
+                        </div>
+                        <span className="font-medium truncate text-foreground select-text" title={file.filename}>
+                          {file.filename}
+                        </span>
+                      </div>
+
+                      <div className="col-span-2 text-muted-foreground uppercase text-xs">
+                        {file.filename.split('.').pop() || '-'}
+                      </div>
+
+                      <div className="col-span-2 text-muted-foreground text-xs">
+                        {formatFileSize(file.file_size)}
+                      </div>
+
+                      <div className="col-span-3 text-muted-foreground text-xs flex items-center justify-between">
+                        <span>{formatRelativeTime(file.modified_time)}</span>
+
+                        {/* Actions */}
+                        <div className="flex items-center gap-1 opacity-0 group-hover:opacity-100 transition-opacity justify-end">
+                          <Button
+                            variant="ghost"
+                            size="sm"
+                            className="h-8 w-8 p-0 text-muted-foreground hover:text-foreground"
+                            onClick={() => handlePreviewFile(file)}
+                            title={t('files.actions.preview')}
+                          >
+                            <Eye className="h-4 w-4" />
+                          </Button>
+                          <Button
+                            variant="ghost"
+                            size="sm"
+                            className="h-8 w-8 p-0 text-muted-foreground hover:text-foreground"
+                            onClick={() => downloadFile(file)}
+                            title={t('files.actions.download')}
+                          >
+                            <Download className="h-4 w-4" />
+                          </Button>
+                          <Button
+                            variant="ghost"
+                            size="sm"
+                            className="h-8 w-8 p-0 text-muted-foreground hover:text-destructive"
+                            onClick={() => deleteFile(file)}
+                            title={t('files.actions.delete')}
+                          >
+                            <Trash2 className="h-4 w-4" />
+                          </Button>
+                        </div>
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              )}
+            </div>
+            {pages > 1 && !isLoading && (
+              <div className="mt-4 flex items-center justify-between">
+                <div className="text-sm text-muted-foreground">
+                  {t('files.pagination.showing', {
+                    start: totalFiles === 0 ? 0 : (page - 1) * pageSize + 1,
+                    end: Math.min(page * pageSize, totalFiles),
+                    total: totalFiles,
+                  })}
+                </div>
+                <div className="flex items-center gap-2">
+                  <Button
+                    variant="outline"
+                    size="sm"
+                    onClick={() => setPage(current => current - 1)}
+                    disabled={page <= 1}
+                  >
+                    <ChevronLeft className="mr-1 h-4 w-4" />
+                    {t('files.pagination.prev')}
+                  </Button>
+                  <span className="text-sm text-muted-foreground">
+                    {t('files.pagination.page', { page, pages })}
+                  </span>
+                  <Button
+                    variant="outline"
+                    size="sm"
+                    onClick={() => setPage(current => current + 1)}
+                    disabled={page >= pages}
+                  >
+                    {t('files.pagination.next')}
+                    <ChevronRight className="ml-1 h-4 w-4" />
+                  </Button>
+                </div>
+              </div>
+            )}
+          </div>
         </main>
       </div>
 
       {/* File Preview Dialog */}
       {previewFile && (
-         <StandaloneFilePreviewDialog
-            open={isPreviewOpen}
-            onOpenChange={setIsPreviewOpen}
-            fileId={previewFile.fileId}
-            fileName={previewFile.fileName}
-          />
+        <StandaloneFilePreviewDialog
+          open={isPreviewOpen}
+          onOpenChange={setIsPreviewOpen}
+          fileId={previewFile.fileId}
+          fileName={previewFile.fileName}
+        />
       )}
 
       <ConfirmDialog

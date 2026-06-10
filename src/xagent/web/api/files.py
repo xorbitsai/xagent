@@ -902,10 +902,7 @@ async def list_files(
 ) -> Dict[str, Any]:
     query = db.query(UploadedFile)
     if not _is_admin_user(user):
-        query = query.filter(
-            UploadedFile.user_id == _user_id_value(user),
-            Task.user_id == _user_id_value(user),
-        )
+        query = query.filter(UploadedFile.user_id == _user_id_value(user))
 
     normalized_search = search.strip()
     if normalized_search:
@@ -983,7 +980,10 @@ async def list_file_tasks(
     )
 
     if not _is_admin_user(user):
-        query = query.filter(UploadedFile.user_id == _user_id_value(user))
+        query = query.filter(
+            UploadedFile.user_id == _user_id_value(user),
+            Task.user_id == _user_id_value(user),
+        )
 
     rows = (
         query.group_by(Task.id, Task.title)

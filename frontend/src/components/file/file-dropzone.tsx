@@ -10,6 +10,7 @@ interface FileDropzoneProps {
     disabled?: boolean;
     onFilesDrop: (files: File[]) => void;
     children: (state: FileDropzoneRenderState) => React.ReactNode;
+    className?: string;
 }
 
 const extractDroppedFiles = (dataTransfer: DataTransfer) => {
@@ -28,6 +29,7 @@ export function FileDropzone({
     disabled = false,
     onFilesDrop,
     children,
+    className,
 }: FileDropzoneProps) {
     const [isDragging, setIsDragging] = useState(false);
     const dragDepthRef = useRef(0);
@@ -78,6 +80,7 @@ export function FileDropzone({
 
     return (
         <div
+            className={className}
             onDragEnter={handleDragEnter}
             onDragOver={handleDragOver}
             onDragLeave={handleDragLeave}

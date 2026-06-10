@@ -668,6 +668,7 @@ export function ChatInput({
         <FileDropzone
           disabled={isInputBusy || hideFileUpload}
           onFilesDrop={appendFiles}
+          className="w-full"
         >
           {({ isDragging }) => (
             <form

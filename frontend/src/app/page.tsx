@@ -451,10 +451,11 @@ export default function Home() {
             <FileDropzone
               disabled={isCreating}
               onFilesDrop={(droppedFiles) => setHomeFiles((prev) => [...prev, ...droppedFiles])}
+              className="max-w-[780px] w-full"
             >
               {({ isDragging }) => (
                 <div
-                  className={`max-w-[780px] rounded-[16px] border bg-white/5 p-2.5 backdrop-blur-xl transition-colors ${
+                  className={`rounded-[16px] border bg-white/5 p-2.5 backdrop-blur-xl transition-colors ${
                     isDragging ? "border-primary/70" : "border-white/10"
                   }`}
                 >

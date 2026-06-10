@@ -39,6 +39,12 @@ export function FileDropzone({
         setIsDragging(false);
     };
 
+    React.useEffect(() => {
+        if (disabled) {
+            resetDragState();
+        }
+    }, [disabled]);
+
     const handleDragEnter = (event: React.DragEvent<HTMLDivElement>) => {
         if (!isFileDragEvent(event) || disabled) return;
         event.preventDefault();
@@ -68,9 +74,10 @@ export function FileDropzone({
     };
 
     const handleDrop = (event: React.DragEvent<HTMLDivElement>) => {
-        if (!isFileDragEvent(event) || disabled) return;
+        if (!isFileDragEvent(event)) return;
         event.preventDefault();
         event.stopPropagation();
+        if (disabled) return;
         const droppedFiles = extractDroppedFiles(event.dataTransfer);
         resetDragState();
         if (droppedFiles.length > 0) {

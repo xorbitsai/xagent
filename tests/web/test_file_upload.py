@@ -1701,10 +1701,10 @@ class TestFileUploadSecurity:
         assert all(item["task_id"] is None for item in data["files"])
 
         response = client.get(
-            "/api/files/list?task_id=123",
+            "/api/files/list?task_id=321",
             headers=auth_headers,
         )
         assert response.status_code == 200
         data = response.json()
         assert data["total_count"] == 1
-        assert [item["filename"] for item in data["files"]] == ["agent-note.txt"]
+        assert [item["filename"] for item in data["files"]] == ["task-alpha.txt"]

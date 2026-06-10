@@ -180,9 +180,12 @@ export function FilesPage() {
       const parsed = await parseApiResponse(response)
 
       if (response.ok && parsed.data) {
-        await loadFiles(1, searchQuery, selectedCategory)
         await loadTasks()
-        setPage(1)
+        if (page === 1) {
+          await loadFiles(1)
+        } else {
+          setPage(1)
+        }
         if (fileInputRef.current) {
           fileInputRef.current.value = ''
         }
@@ -294,7 +297,7 @@ export function FilesPage() {
 
         if (response.ok) {
           setSelectedFiles(prev => prev.filter(f => f !== file.file_id))
-          await loadFiles(page, searchQuery, selectedCategory)
+          await loadFiles(page)
           await loadTasks()
         } else {
           const parsed = await parseApiResponse(response)
@@ -326,7 +329,7 @@ export function FilesPage() {
           }
         }
         setSelectedFiles([])
-        await loadFiles(page, searchQuery, selectedCategory)
+        await loadFiles(page)
         await loadTasks()
         if (errorMessage) {
           toast.error(errorMessage)

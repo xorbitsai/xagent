@@ -53,6 +53,7 @@ export function FilesPage() {
   const [files, setFiles] = useState<FileItem[]>([])
   const [tasks, setTasks] = useState<TaskFilterItem[]>([])
   const [searchQuery, setSearchQuery] = useState("")
+  const [debouncedSearchQuery, setDebouncedSearchQuery] = useState("")
   const [selectedFiles, setSelectedFiles] = useState<string[]>([])
   const [isLoading, setIsLoading] = useState(true)
   const [uploading, setUploading] = useState(false)
@@ -61,6 +62,7 @@ export function FilesPage() {
   const [pages, setPages] = useState(1)
   const [totalFiles, setTotalFiles] = useState(0)
   const fileInputRef = useRef<HTMLInputElement>(null)
+  const latestFilesRequestRef = useRef(0)
 
   const { t } = useI18n()
 
@@ -91,8 +93,16 @@ export function FilesPage() {
   }, [])
 
   useEffect(() => {
-    loadFiles(page, searchQuery, selectedCategory)
-  }, [page, searchQuery, selectedCategory])
+    const timer = window.setTimeout(() => {
+      setDebouncedSearchQuery(searchQuery)
+    }, 300)
+
+    return () => window.clearTimeout(timer)
+  }, [searchQuery])
+
+  useEffect(() => {
+    loadFiles(page, debouncedSearchQuery, selectedCategory)
+  }, [page, debouncedSearchQuery, selectedCategory])
 
   const loadTasks = async () => {
     try {
@@ -107,6 +117,8 @@ export function FilesPage() {
   }
 
   const loadFiles = async (targetPage = page, targetSearch = searchQuery, targetCategory = selectedCategory) => {
+    const requestId = latestFilesRequestRef.current + 1
+    latestFilesRequestRef.current = requestId
     try {
       setIsLoading(true)
       const params = new URLSearchParams({
@@ -126,7 +138,7 @@ export function FilesPage() {
       const response = await apiRequest(`${getApiUrl()}/api/files/list?${params.toString()}`)
       if (response.ok) {
         const data = await response.json()
-        if (data && data.files) {
+        if (requestId === latestFilesRequestRef.current && data && data.files) {
           setFiles(data.files)
           setSelectedFiles(prev => prev.filter(fileId => data.files.some((file: FileItem) => file.file_id === fileId)))
           setTotalFiles(typeof data.total_count === 'number' ? data.total_count : data.files.length)
@@ -135,9 +147,13 @@ export function FilesPage() {
         }
       }
     } catch (error) {
-      console.error('Failed to load files:', error)
+      if (requestId === latestFilesRequestRef.current) {
+        console.error('Failed to load files:', error)
+      }
     } finally {
-      setIsLoading(false)
+      if (requestId === latestFilesRequestRef.current) {
+        setIsLoading(false)
+      }
     }
   }
 

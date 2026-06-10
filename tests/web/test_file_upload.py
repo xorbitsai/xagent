@@ -1652,6 +1652,17 @@ class TestFileUploadSecurity:
         self, client, test_db, auth_headers
     ):
         """Test listing task filters only returns tasks that actually have files."""
+        from xagent.web.models.task import Task
+
+        admin_user, test_app = test_db
+        db = next(test_app.dependency_overrides[get_db]())
+        try:
+            db.add(Task(id=321, title="Task 321", user_id=admin_user.id))
+            db.add(Task(id=654, title="Task 654", user_id=admin_user.id))
+            db.commit()
+        finally:
+            db.close()
+
         uploads = [
             ("task-alpha.txt", "321"),
             ("task-beta.txt", "654"),

@@ -86,7 +86,7 @@ vi.mock("lucide-react", () => {
     Folder: Icon,
     LayoutGrid: Icon,
     Eye: Icon,
-    Briefcase: Icon,
+    MessageSquare: Icon,
     ChevronLeft: Icon,
     ChevronRight: Icon,
   }

@@ -34,16 +34,16 @@ export function FileDropzone({
     const [isDragging, setIsDragging] = useState(false);
     const dragDepthRef = useRef(0);
 
-    const resetDragState = () => {
+    const resetDragState = React.useCallback(() => {
         dragDepthRef.current = 0;
         setIsDragging(false);
-    };
+    }, []);
 
     React.useEffect(() => {
         if (disabled) {
             resetDragState();
         }
-    }, [disabled]);
+    }, [disabled, resetDragState]);
 
     const handleDragEnter = (event: React.DragEvent<HTMLDivElement>) => {
         if (!isFileDragEvent(event) || disabled) return;
@@ -64,7 +64,7 @@ export function FileDropzone({
     };
 
     const handleDragLeave = (event: React.DragEvent<HTMLDivElement>) => {
-        if (!isFileDragEvent(event)) return;
+        if (!isFileDragEvent(event) || disabled) return;
         event.preventDefault();
         event.stopPropagation();
         dragDepthRef.current = Math.max(0, dragDepthRef.current - 1);

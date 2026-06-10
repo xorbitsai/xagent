@@ -40,6 +40,7 @@ import { getAgentChatHref } from "@/lib/agent-ui-access";
 import { getApiUrl } from "@/lib/utils";
 import type { Template } from "@/types/template";
 import { WelcomeModal } from "@/components/welcome-modal";
+import { FileDropzone } from "@/components/file/file-dropzone";
 
 interface RecentTask {
   task_id: number | string;
@@ -447,94 +448,117 @@ export default function Home() {
               </h1>
             </div>
 
-            <div className="max-w-[780px] rounded-[16px] border border-white/10 bg-white/5 p-2.5 backdrop-blur-xl">
-              <input
-                ref={homeFileInputRef}
-                type="file"
-                multiple
-                onChange={handleHomeFileSelect}
-                className="hidden"
-                accept=".pdf,.doc,.docx,.txt,.md,.csv,.json,.xlsx,.xls,.ppt,.pptx,.png,.jpg,.jpeg,.gif,.webp"
-              />
-              <div className="flex flex-col gap-3 rounded-[14px] bg-white px-4 py-3 shadow-[0_8px_28px_rgba(0,0,0,0.18)] sm:flex-row sm:items-center">
-                <textarea
-                  ref={homeChatInputRef}
-                  value={homeInputValue}
-                  placeholder={t("home.revamp.askPlaceholder")}
-                  className="min-h-[26px] flex-1 resize-none border-0 bg-transparent py-1 text-[15px] leading-relaxed text-slate-900 placeholder:text-slate-400 focus-visible:outline-none focus-visible:ring-0"
-                  rows={1}
-                  onInput={(event) => {
-                    const target = event.target as HTMLTextAreaElement;
-                    setHomeMessageValue(target.value);
-                    target.style.height = "auto";
-                    target.style.height = `${Math.min(target.scrollHeight, 120)}px`;
-                  }}
-                  onKeyDown={(event) => {
-                    if (event.key === "Enter" && !event.shiftKey) {
-                      event.preventDefault();
-                      if ((event.currentTarget.value.trim() || homeFiles.length > 0) && !isCreating) {
-                        handleCreateTask(event.currentTarget.value, homeFiles);
-                      }
-                    }
-                  }}
-                />
-                <Button
-                  type="button"
-                  variant="ghost"
-                  size="icon"
-                  className="h-9 w-9 shrink-0 rounded-[10px] text-slate-500 hover:bg-slate-100 hover:text-slate-700"
-                  onClick={() => homeFileInputRef.current?.click()}
+            <FileDropzone
+              disabled={isCreating}
+              onFilesDrop={(droppedFiles) => setHomeFiles((prev) => [...prev, ...droppedFiles])}
+            >
+              {({ isDragging }) => (
+                <div
+                  className={`max-w-[780px] rounded-[16px] border bg-white/5 p-2.5 backdrop-blur-xl transition-colors ${
+                    isDragging ? "border-primary/70" : "border-white/10"
+                  }`}
                 >
-                  <Paperclip className="h-4 w-4" />
-                </Button>
-                <Button
-                  className="h-9 rounded-[10px] px-4 text-sm font-semibold shadow-none"
-                  onClick={handleChatButtonClick}
-                  disabled={!canSubmitHomeTask}
-                >
-                  {isCreating ? <Loader2 className="h-4 w-4 animate-spin" /> : <Send className="h-4 w-4" />}
-                  {t("home.revamp.start")}
-                </Button>
-              </div>
-
-              {homeFiles.length > 0 && (
-                <div className="mt-3 flex flex-wrap gap-2 px-1">
-                  {homeFiles.map((file, index) => (
-                    <div
-                      key={`${file.name}-${file.lastModified}-${index}`}
-                      className="inline-flex h-8 items-center gap-2 rounded-md border border-white/15 bg-white/10 px-3 text-sm text-white/90 backdrop-blur-sm"
+                  <input
+                    ref={homeFileInputRef}
+                    type="file"
+                    multiple
+                    onChange={handleHomeFileSelect}
+                    className="hidden"
+                    accept=".pdf,.doc,.docx,.txt,.md,.csv,.json,.xlsx,.xls,.ppt,.pptx,.png,.jpg,.jpeg,.gif,.webp"
+                  />
+                  <div className="relative flex flex-col gap-3 rounded-[14px] bg-white px-4 py-3 shadow-[0_8px_28px_rgba(0,0,0,0.18)] sm:flex-row sm:items-center">
+                    {isDragging && (
+                      <div className="pointer-events-none absolute inset-0 z-10 flex items-center justify-center rounded-[14px] bg-primary/5 px-4">
+                        <div className="flex items-center gap-3 rounded-2xl border border-primary/20 bg-white/95 px-4 py-3 text-left shadow-lg backdrop-blur-sm">
+                          <div className="flex h-10 w-10 items-center justify-center rounded-full bg-primary/10 text-primary">
+                            <Paperclip className="h-4 w-4" />
+                          </div>
+                          <div className="text-sm font-medium text-foreground">
+                            {t("chatPage.fileUpload.dropHere")}
+                          </div>
+                        </div>
+                      </div>
+                    )}
+                    <textarea
+                      ref={homeChatInputRef}
+                      value={homeInputValue}
+                      placeholder={t("home.revamp.askPlaceholder")}
+                      className="min-h-[26px] flex-1 resize-none border-0 bg-transparent py-1 text-[15px] leading-relaxed text-slate-900 placeholder:text-slate-400 focus-visible:outline-none focus-visible:ring-0"
+                      rows={1}
+                      onInput={(event) => {
+                        const target = event.target as HTMLTextAreaElement;
+                        setHomeMessageValue(target.value);
+                        target.style.height = "auto";
+                        target.style.height = `${Math.min(target.scrollHeight, 120)}px`;
+                      }}
+                      onKeyDown={(event) => {
+                        if (event.key === "Enter" && !event.shiftKey) {
+                          event.preventDefault();
+                          if ((event.currentTarget.value.trim() || homeFiles.length > 0) && !isCreating) {
+                            handleCreateTask(event.currentTarget.value, homeFiles);
+                          }
+                        }
+                      }}
+                    />
+                    <Button
+                      type="button"
+                      variant="ghost"
+                      size="icon"
+                      className="h-9 w-9 shrink-0 rounded-[10px] text-slate-500 hover:bg-slate-100 hover:text-slate-700"
+                      onClick={() => homeFileInputRef.current?.click()}
                     >
-                      <FileIcon className="h-3.5 w-3.5" />
-                      <span className="max-w-[220px] truncate font-medium">{file.name}</span>
-                      <button
-                        type="button"
-                        onClick={() => removeHomeFile(index)}
-                        className="rounded-sm p-0.5 text-white/65 transition-colors hover:bg-white/10 hover:text-white"
-                        title={t("common.remove")}
-                      >
-                        <X className="h-3.5 w-3.5" />
-                      </button>
+                      <Paperclip className="h-4 w-4" />
+                    </Button>
+                    <Button
+                      className="h-9 rounded-[10px] px-4 text-sm font-semibold shadow-none"
+                      onClick={handleChatButtonClick}
+                      disabled={!canSubmitHomeTask}
+                    >
+                      {isCreating ? <Loader2 className="h-4 w-4 animate-spin" /> : <Send className="h-4 w-4" />}
+                      {t("home.revamp.start")}
+                    </Button>
+                  </div>
+
+                  {homeFiles.length > 0 && (
+                    <div className="mt-3 flex flex-wrap gap-2 px-1">
+                      {homeFiles.map((file, index) => (
+                        <div
+                          key={`${file.name}-${file.lastModified}-${index}`}
+                          className="inline-flex h-8 items-center gap-2 rounded-md border border-white/15 bg-white/10 px-3 text-sm text-white/90 backdrop-blur-sm"
+                        >
+                          <FileIcon className="h-3.5 w-3.5" />
+                          <span className="max-w-[220px] truncate font-medium">{file.name}</span>
+                          <button
+                            type="button"
+                            onClick={() => removeHomeFile(index)}
+                            className="rounded-sm p-0.5 text-white/65 transition-colors hover:bg-white/10 hover:text-white"
+                            title={t("common.remove")}
+                          >
+                            <X className="h-3.5 w-3.5" />
+                          </button>
+                        </div>
+                      ))}
                     </div>
-                  ))}
+                  )}
+
+                  <div className="mt-3 flex flex-wrap gap-2 px-1">
+                    {capabilityPills.map((action) => (
+                      <button
+                        key={action.id}
+                        type="button"
+                        onClick={() => setHomeInputValue(action.prompt)}
+                        className="inline-flex items-center gap-2 rounded-full border border-transparent bg-transparent px-[5px] py-[5px] text-[12px] font-medium text-white/80 transition-all hover:border-white/20 hover:bg-white/10 hover:text-white"
+                      >
+                        <span className={`grid h-[22px] w-[22px] place-items-center rounded-full ${action.toneClassName}`}>
+                          <action.icon className="h-3 w-3" />
+                        </span>
+                        <span>{action.label}</span>
+                      </button>
+                    ))}
+                  </div>
                 </div>
               )}
-
-              <div className="mt-3 flex flex-wrap gap-2 px-1">
-                {capabilityPills.map((action) => (
-                  <button
-                    key={action.id}
-                    type="button"
-                    onClick={() => setHomeInputValue(action.prompt)}
-                    className="inline-flex items-center gap-2 rounded-full border border-transparent bg-transparent px-[5px] py-[5px] text-[12px] font-medium text-white/80 transition-all hover:border-white/20 hover:bg-white/10 hover:text-white"
-                  >
-                    <span className={`grid h-[22px] w-[22px] place-items-center rounded-full ${action.toneClassName}`}>
-                      <action.icon className="h-3 w-3" />
-                    </span>
-                    <span>{action.label}</span>
-                  </button>
-                ))}
-              </div>
-            </div>
+            </FileDropzone>
 
             <div className="flex max-w-[780px] flex-col items-start justify-between gap-3 rounded-[12px] border border-white/10 bg-white/5 px-4 py-3 backdrop-blur-xl sm:flex-row sm:items-center">
               <div className="min-w-0">

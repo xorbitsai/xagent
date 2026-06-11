@@ -1697,7 +1697,8 @@ class TestFileUploadSecurity:
         )
         assert response.status_code == 200
         data = response.json()
-        assert data["total_count"] >= 2
+        assert data["total_count"] == 1
+        assert [item["filename"] for item in data["files"]] == ["loose-upload.txt"]
         assert all(item["task_id"] is None for item in data["files"])
 
         response = client.get(

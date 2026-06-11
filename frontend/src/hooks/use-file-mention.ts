@@ -1,4 +1,4 @@
-import { useState, useEffect } from "react";
+import { useState, useEffect, useRef } from "react";
 import { apiRequest } from "@/lib/api-wrapper";
 import { getApiUrl } from "@/lib/utils";
 import { toast } from "@/components/ui/sonner";
@@ -28,14 +28,7 @@ export function useFileMention(
   const [currentQuery, setCurrentQuery] = useState("");
   const [isLoadingFiles, setIsLoadingFiles] = useState(false);
   const [dropdownPosition, setDropdownPosition] = useState<{ top?: number; bottom?: number; left: number } | null>(null);
-
-  const getFilteredFiles = (query: string, files: FileItem[]) => {
-    const lowerQuery = query.toLowerCase();
-    return files.filter((file) =>
-      file.filename.toLowerCase().includes(lowerQuery) ||
-      (file.relative_path && file.relative_path.toLowerCase().includes(lowerQuery))
-    );
-  };
+  const latestFetchRequestRef = useRef(0);
 
   const closePicker = () => {
     setShowFilePicker(false);
@@ -49,22 +42,44 @@ export function useFileMention(
     setCurrentQuery("");
   };
 
-  const fetchFiles = async () => {
-    if (fileList.length > 0) return;
+  const fetchFiles = async (query: string) => {
+    const requestId = latestFetchRequestRef.current + 1;
+    latestFetchRequestRef.current = requestId;
+    const params = new URLSearchParams({
+      page: "1",
+      size: "20",
+    });
+    const normalizedQuery = query.trim();
+    if (normalizedQuery) {
+      params.set("search", normalizedQuery);
+    }
+
     setIsLoadingFiles(true);
     try {
-      const response = await apiRequest(`${getApiUrl()}/api/files/list`);
+      const response = await apiRequest(`${getApiUrl()}/api/files/list?${params.toString()}`);
       if (response.ok) {
         const data = await response.json();
+        if (requestId !== latestFetchRequestRef.current) {
+          return;
+        }
         if (data && data.files) {
           setFileList(data.files);
+          setFilteredFiles(data.files);
+          setSelectedFileIndex(0);
+          if (normalizedQuery.length > 0 && data.files.length === 0) {
+            closePicker();
+          }
         }
       }
     } catch (error) {
-      console.error("Failed to load files", error);
-      toast.error(t("files.previewDialog.errors.loadFailed"));
+      if (requestId === latestFetchRequestRef.current) {
+        console.error("Failed to load files", error);
+        toast.error(t("files.previewDialog.errors.loadFailed"));
+      }
     } finally {
-      setIsLoadingFiles(false);
+      if (requestId === latestFetchRequestRef.current) {
+        setIsLoadingFiles(false);
+      }
     }
   };
 
@@ -87,17 +102,7 @@ export function useFileMention(
       if (lastAt !== -1) {
         const query = textBefore.slice(lastAt + 1);
         if (!query.includes(' ') && !query.includes('\n')) {
-          const filtered = getFilteredFiles(query, fileList);
-          const shouldShowPicker = query.length === 0 || fileList.length === 0 || filtered.length > 0;
-
           setCurrentQuery(query);
-          fetchFiles();
-
-          if (!shouldShowPicker) {
-            closePicker();
-            return;
-          }
-
           setShowFilePicker(true);
 
           // Calculate position based on the '@' symbol, not the end of the query
@@ -127,8 +132,6 @@ export function useFileMention(
             setDropdownPosition(pos);
           }
 
-          setFilteredFiles(filtered);
-          setSelectedFileIndex(0);
           return;
         }
       }
@@ -138,18 +141,16 @@ export function useFileMention(
   };
 
   useEffect(() => {
-    if (!showFilePicker || fileList.length === 0) {
+    if (!showFilePicker) {
       return;
     }
 
-    const filtered = getFilteredFiles(currentQuery, fileList);
-    if (currentQuery.length > 0 && filtered.length === 0) {
-      closePicker();
-      return;
-    }
+    const timer = window.setTimeout(() => {
+      void fetchFiles(currentQuery);
+    }, 150);
 
-    setFilteredFiles(filtered);
-  }, [fileList, showFilePicker, currentQuery]);
+    return () => window.clearTimeout(timer);
+  }, [showFilePicker, currentQuery]);
 
   const moveCursorToEnd = () => {
     const editor = editorRef.current;

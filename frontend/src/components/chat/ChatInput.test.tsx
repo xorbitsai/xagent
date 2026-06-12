@@ -36,6 +36,10 @@ vi.mock("@/contexts/app-context-chat", () => ({
   }),
 }))
 
+vi.mock("@/components/config-dialog", () => ({
+  ConfigDialog: ({ trigger }: { trigger: unknown }) => trigger,
+}))
+
 vi.mock("next/navigation", () => ({
   useRouter: () => ({
     push: routerPushMock,
@@ -89,7 +93,6 @@ describe("ChatInput", () => {
     const onSend = vi.fn()
     const { container } = render(
       <ChatInput
-        hideConfig
         hideFileUpload
         inputValue="hello"
         onInputChange={vi.fn()}
@@ -147,5 +150,108 @@ describe("ChatInput", () => {
 
     expect(screen.queryByTitle("agent.input.actions.pauseTask")).not.toBeInTheDocument()
     expect(container.querySelector('button[type="submit"]')).not.toBeDisabled()
+  })
+
+  it("allows live guidance while a task is running", async () => {
+    const onSend = vi.fn()
+    const onPause = vi.fn()
+    const { container } = render(
+      <ChatInput
+        hideConfig
+        hideFileUpload
+        inputValue="please focus on the API contract"
+        isLoading
+        onInputChange={vi.fn()}
+        onPause={onPause}
+        onSend={onSend}
+        taskStatus="running"
+      />
+    )
+
+    expect(screen.queryByTitle("agent.input.actions.pauseTask")).not.toBeInTheDocument()
+    expect(container.querySelector('button[type="submit"]')).not.toBeDisabled()
+
+    fireEvent.submit(container.querySelector("form") as HTMLFormElement)
+
+    await waitFor(() => {
+      expect(onSend).toHaveBeenCalledWith(
+        "please focus on the API contract",
+        expect.objectContaining({ model: "" })
+      )
+    })
+  })
+
+  it("keeps generic loading input disabled without a live task status", () => {
+    const { container } = render(
+      <ChatInput
+        hideConfig
+        hideFileUpload
+        inputValue="wait"
+        isLoading
+        onInputChange={vi.fn()}
+        onSend={vi.fn()}
+      />
+    )
+
+    expect(container.querySelector('button[type="submit"]')).toBeDisabled()
+  })
+
+  it("shows pause for a running task when there is no draft to send", () => {
+    const { container } = render(
+      <ChatInput
+        hideConfig
+        hideFileUpload
+        inputValue=""
+        isLoading
+        onInputChange={vi.fn()}
+        onPause={vi.fn()}
+        onSend={vi.fn()}
+        taskStatus="running"
+      />
+    )
+
+    expect(screen.getByTitle("agent.input.actions.pauseTask")).toBeInTheDocument()
+    expect(container.querySelector('button[type="submit"]')).toBeDisabled()
+  })
+
+  it("keeps pause hidden while running draft files are still uploading", async () => {
+    const onPause = vi.fn()
+    const uploadFile = vi.fn(() => new Promise<{ file_id: string }>(() => {}))
+
+    function Harness() {
+      const [files, setFiles] = React.useState<File[]>([])
+
+      return (
+        <ChatInput
+          hideConfig
+          inputValue=""
+          files={files}
+          isLoading
+          onFilesChange={setFiles}
+          onInputChange={vi.fn()}
+          onPause={onPause}
+          onSend={vi.fn()}
+          taskStatus="running"
+          uploadFile={uploadFile}
+        />
+      )
+    }
+
+    const { container } = render(<Harness />)
+    const fileInput = container.querySelector('input[type="file"]') as HTMLInputElement
+    const file = new File(["draft"], "draft.txt", { type: "text/plain" })
+
+    fireEvent.change(fileInput, { target: { files: [file] } })
+
+    await waitFor(() => {
+      expect(uploadFile).toHaveBeenCalledWith(
+        file,
+        expect.objectContaining({ taskType: "task" })
+      )
+    })
+    await waitFor(() => {
+      expect(screen.queryByTitle("agent.input.actions.pauseTask")).not.toBeInTheDocument()
+    })
+    expect(container.querySelector('button[type="submit"]')).toBeDisabled()
   })
 })

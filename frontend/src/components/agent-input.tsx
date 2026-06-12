@@ -43,7 +43,7 @@ interface AgentConfig {
 interface AgentInputProps {
   value: string
   onChange: (value: string) => void
-  onSend: (files?: File[]) => void
+  onSend: (files?: File[]) => void | Promise<void>
   onKeyDown?: (e: React.KeyboardEvent) => void
   onCompositionStart?: () => void
   onCompositionEnd?: () => void
@@ -108,7 +108,21 @@ export function AgentInput({
   }, [externalSetSelectedFiles, externalSelectedFiles, internalSelectedFiles, setInternalSelectedFiles])
 
   const [isComposing, setIsComposing] = useState(false)
+  const [isSubmitting, setIsSubmitting] = useState(false)
+  const isSubmittingRef = useRef(false)
   const fileInputRef = useRef<HTMLInputElement>(null)
+  const hasDraft = value.trim().length > 0 || files.length > 0
+
+  const clearSubmitting = useCallback(() => {
+    isSubmittingRef.current = false
+    setIsSubmitting(false)
+  }, [])
+
+  useEffect(() => {
+    if (isSubmittingRef.current && !hasDraft) {
+      clearSubmitting()
+    }
+  }, [clearSubmitting, hasDraft])
 
   // Debug: Log currentTask and onPauseTask
   useEffect(() => {
@@ -185,20 +199,23 @@ export function AgentInput({
   }
 
   const handleSend = async () => {
+    if (isSubmittingRef.current || !hasDraft) return
+
     console.log('🚀 AgentInput handleSend called:', {
       value: value.trim(),
       selectedFiles: files.map(f => f.name),
       hasFiles: files.length > 0
     })
 
-    if (value.trim() || files.length > 0) {
-      // Send message with files if there's text or files
-      if (value.trim() || files.length > 0) {
-        console.log('📤 AgentInput calling onSend with files:', files.map(f => f.name))
-        onSend(files.length > 0 ? files : undefined)
-      }
-
+    console.log('📤 AgentInput calling onSend with files:', files.map(f => f.name))
+    try {
+      isSubmittingRef.current = true
+      setIsSubmitting(true)
+      await onSend(files.length > 0 ? files : undefined)
       setFiles([])
+    } catch (error) {
+      clearSubmitting()
+      throw error
     }
   }
 
@@ -233,9 +250,13 @@ export function AgentInput({
     }
   }
 
-  // Allow input in paused/waiting state, used for adjusting execution plan or answering the agent.
+  // Allow input in active-control states so the user can guide a running task.
+  const allowsLiveGuidanceInput =
+    currentTask?.status === 'running' ||
+    currentTask?.status === 'paused' ||
+    currentTask?.status === 'waiting_for_user'
   const isPaused = currentTask?.status === 'paused' || currentTask?.status === 'waiting_for_user'
-  const isSendDisabled = (!value.trim() && files.length === 0) || disabled || (!isPaused && isProcessing)
+  const isSendDisabled = !hasDraft || disabled || isSubmitting || (!allowsLiveGuidanceInput && isProcessing)
 
   // Dynamic placeholder
   const dynamicPlaceholder = isPaused
@@ -290,7 +311,7 @@ export function AgentInput({
             variant === "expanded" && "text-base"
           )}
           rows={rows}
-          disabled={disabled || (!isPaused && isProcessing)}
+          disabled={disabled || (!allowsLiveGuidanceInput && isProcessing)}
           autoFocus={variant === "expanded"}
         />
 
@@ -331,13 +352,13 @@ export function AgentInput({
               onChange={handleFileSelect}
               multiple
               className="hidden"
-              disabled={disabled || isProcessing}
+              disabled={disabled || (!allowsLiveGuidanceInput && isProcessing)}
             />
             <Button
               variant="ghost"
               size="sm"
               onClick={() => fileInputRef.current?.click()}
-              disabled={disabled || isProcessing}
+              disabled={disabled || (!allowsLiveGuidanceInput && isProcessing)}
               className="h-7 w-7 p-0 text-muted-foreground hover:text-foreground hover:bg-muted rounded-md"
               title={t('agent.input.actions.uploadFile')}
             >
@@ -356,7 +377,7 @@ export function AgentInput({
             </Button>
 
             {/* Pause/Resume Button */}
-            {currentTask && currentTask.status === 'running' && onPauseTask && (
+            {currentTask && currentTask.status === 'running' && !hasDraft && onPauseTask && (
               <Button
                 onClick={onPauseTask}
                 disabled={disabled}

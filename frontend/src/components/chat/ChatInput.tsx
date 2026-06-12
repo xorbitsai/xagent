@@ -477,19 +477,25 @@ export function ChatInput({
   };
 
   const normalizedTaskStatus = normalizeTaskStatus(taskStatus);
-  const allowsInterruptedInput = normalizedTaskStatus === 'paused' || normalizedTaskStatus === 'waiting_for_user';
-  const isInputBusy = !!isLoading && !allowsInterruptedInput && !isStoppedTaskStatus(normalizedTaskStatus);
+  const allowsLiveGuidanceInput =
+    normalizedTaskStatus === 'running' ||
+    normalizedTaskStatus === 'paused' ||
+    normalizedTaskStatus === 'waiting_for_user';
+  const isInputBusy =
+    !!isLoading &&
+    !allowsLiveGuidanceInput &&
+    !isStoppedTaskStatus(normalizedTaskStatus);
 
+  const hasDraft = message.trim().length > 0 || files.length > 0;
   const canSubmit = () => {
-    const hasText = message.trim().length > 0;
-    const hasFiles = files.length > 0;
     const isUploadingFiles = uploadingFiles.size > 0;
-    return (hasText || hasFiles) && !isInputBusy && !isUploadingFiles;
+    return hasDraft && !isInputBusy && !isUploadingFiles;
   };
   const canPauseTask =
     !!isLoading &&
     !!onPause &&
     isPausableTaskStatus(normalizedTaskStatus);
+  const shouldShowPauseButton = canPauseTask && !hasDraft;
 
   const handleDragEnter = (e: React.DragEvent<HTMLFormElement>) => {
     if (!isFileDragEvent(e) || isInputBusy || hideFileUpload) return;
@@ -920,8 +926,8 @@ export function ChatInput({
                 )}
               </div>
 
-              <div className="flex items-center gap-3">
-                {canPauseTask ? (
+              <div className="flex items-center gap-2">
+                {shouldShowPauseButton && (
                   <Button
                     type="button"
                     size="icon"
@@ -931,38 +937,35 @@ export function ChatInput({
                   >
                     <Pause className="h-4 w-4" />
                   </Button>
-                ) : (
-                  <div className="flex items-center gap-2">
-                    <span className="text-[13px] font-medium text-muted-foreground/50 select-none mr-1">
-                      ⏎ {t("common.send")}
-                    </span>
-                    <Button
-                      type="submit"
-                      size="icon"
-                      disabled={!canSubmit()}
-                      className={cn(
-                        "h-8 w-8 rounded-lg transition-all duration-300",
-                        !canSubmit() && "bg-muted text-muted-foreground/50"
-                      )}
-                    >
-                      {isInputBusy ? (
-                        <Sparkles className="h-4 w-4 animate-pulse" />
-                      ) : (
-                        <ArrowUp className="h-4 w-4" />
-                      )}
-                    </Button>
-                    {normalizedTaskStatus === 'paused' && onResume && (
-                      <Button
-                        type="button"
-                        size="icon"
-                        onClick={onResume}
-                        className="h-8 w-8 rounded-full transition-all duration-300 bg-green-500 hover:bg-green-600 text-white"
-                        title={t('agent.input.actions.resumeTask')}
-                      >
-                        <Play className="h-4 w-4" />
-                      </Button>
-                    )}
-                  </div>
+                )}
+                <span className="text-[13px] font-medium text-muted-foreground/50 select-none mr-1">
+                  ⏎ {t("common.send")}
+                </span>
+                <Button
+                  type="submit"
+                  size="icon"
+                  disabled={!canSubmit()}
+                  className={cn(
+                    "h-8 w-8 rounded-lg transition-all duration-300",
+                    !canSubmit() && "bg-muted text-muted-foreground/50"
+                  )}
+                >
+                  {isInputBusy ? (
+                    <Sparkles className="h-4 w-4 animate-pulse" />
+                  ) : (
+                    <ArrowUp className="h-4 w-4" />
+                  )}
+                </Button>
+                {normalizedTaskStatus === 'paused' && onResume && (
+                  <Button
+                    type="button"
+                    size="icon"
+                    onClick={onResume}
+                    className="h-8 w-8 rounded-full transition-all duration-300 bg-green-500 hover:bg-green-600 text-white"
+                    title={t('agent.input.actions.resumeTask')}
+                  >
+                    <Play className="h-4 w-4" />
+                  </Button>
                 )}
               </div>
             </div>

@@ -2,17 +2,19 @@
 
 import Link from "next/link"
 import React, { useCallback, useEffect, useState } from "react"
-import { ChevronLeft, ChevronRight, Play, Plus, Users, Zap, GitBranch, ShieldCheck } from "lucide-react"
+import { ChevronLeft, ChevronRight, Play, Plus, Users, Zap, GitBranch, ShieldCheck, Pencil } from "lucide-react"
 import { Button } from "@/components/ui/button"
 import { Card, CardContent } from "@/components/ui/card"
 import { SearchInput } from "@/components/ui/search-input"
 import { useI18n } from "@/contexts/i18n-context"
 import { useRouter } from "next/navigation"
 import { listWorkforces } from "@/lib/workforces-api"
+import { formatTime } from "@/lib/time-utils"
 import type { WorkforceListItem } from "@/types/workforce"
 import { getRunDisabledReason } from "./workforce-ui-state"
 import { FeatureEmptyState } from "@/components/ui/feature-empty-state"
 import { toast } from "sonner"
+import { WorkforceCreateDialog } from "@/components/workforce/workforce-create-dialog"
 
 export default function WorkforcesPage() {
   const { locale, t } = useI18n()
@@ -25,6 +27,7 @@ export default function WorkforcesPage() {
   const [pages, setPages] = useState(1)
   const [total, setTotal] = useState(0)
   const pageSize = 10
+  const [createDialogOpen, setCreateDialogOpen] = useState(false)
   const hasActiveSearch = search.trim().length > 0
 
   const load = useCallback(async (nextPage: number, nextSearch: string) => {
@@ -52,30 +55,28 @@ export default function WorkforcesPage() {
   return (
     <div className="h-full overflow-y-auto">
       <div className="mx-auto flex w-full flex-col gap-6 p-4 sm:p-8">
-        <div className="flex flex-col gap-4 lg:flex-row lg:items-end lg:justify-between">
+        <div className="flex flex-col gap-4 lg:flex-row lg:items-start lg:justify-between">
           <div>
             <h1 className="text-3xl font-bold">{t("workforces.list.title")}</h1>
             <p className="mt-2 max-w-2xl text-muted-foreground">
               {t("workforces.list.description")}
             </p>
           </div>
-          <div className="flex flex-col gap-3 sm:flex-row sm:items-center">
-            <SearchInput
-              placeholder={t("workforces.list.searchPlaceholder")}
-              value={search}
-              onChange={(value) => {
-                setSearch(value)
-                setPage(1)
-              }}
-              containerClassName="w-full sm:w-80"
-            />
-            <Link href="/workforces/new">
-              <Button>
-                <Plus className="mr-2 h-4 w-4" />
-                {t("workforces.actions.new")}
-              </Button>
-            </Link>
-          </div>
+          <Button onClick={() => setCreateDialogOpen(true)} className="bg-blue-600 hover:bg-blue-700 text-white rounded-full px-6">
+            <Plus className="mr-2 h-4 w-4" />
+            {t("workforces.actions.new")}
+          </Button>
+        </div>
+        <div className="mt-2">
+          <SearchInput
+            placeholder={t("workforces.list.searchPlaceholder")}
+            value={search}
+            onChange={(value) => {
+              setSearch(value)
+              setPage(1)
+            }}
+            containerClassName="w-full sm:w-80"
+          />
         </div>
 
         {loading ? <div className="p-8 text-muted-foreground">{t("workforces.loading.list")}</div> : null}
@@ -120,92 +121,89 @@ export default function WorkforcesPage() {
                   }
                 ]}
                 actionLabel={t("workforces.emptyState.action")}
-                onAction={() => router.push("/workforces/new")}
+                onAction={() => setCreateDialogOpen(true)}
                 className="h-full mt-4"
               />
             )
           ) : (
             <>
-              <div className="grid gap-4">
+              <div className="grid gap-4 md:grid-cols-2 lg:grid-cols-3">
                 {items.map((item) => {
                   const runDisabledReason = getRunDisabledReason(item.status, t)
                   return (
-                    <Card key={item.id} className="overflow-hidden">
-                      <CardContent className="p-0">
-                        <div className="grid gap-6 p-6 lg:grid-cols-[1.4fr_0.6fr] lg:items-center">
-                          <div className="space-y-4">
-                            <div className="flex flex-wrap items-center gap-3">
-                              <Link
-                                href={`/workforces/${item.id}`}
-                                className="text-xl font-semibold hover:underline"
-                              >
+                    <Card
+                      key={item.id}
+                      className="overflow-hidden flex flex-col h-full cursor-pointer hover:shadow-md transition-shadow"
+                      onClick={() => router.push(`/workforces/${item.id}`)}
+                    >
+                      <CardContent className="flex flex-col h-full">
+                        <div className="flex items-start gap-3 mb-4">
+                          <div className="flex h-10 w-10 shrink-0 items-center justify-center rounded-lg bg-blue-600 text-white">
+                            <Users className="h-5 w-5" />
+                          </div>
+                          <div className="flex-1 min-w-0">
+                            <div className="flex items-center justify-between gap-2">
+                              <span className="text-base font-semibold truncate">
                                 {item.name}
-                              </Link>
-                              <span className="rounded-full border px-2.5 py-1 text-xs capitalize text-muted-foreground">
+                              </span>
+                              <span className={`shrink-0 rounded-full px-2 py-0.5 text-[10px] font-medium uppercase tracking-wider ${item.status === 'active' ? 'bg-green-100 text-green-700' : 'bg-gray-100 text-gray-600'
+                                }`}>
                                 {t(`workforces.status.${item.status}`)}
                               </span>
                             </div>
-                            <p className="text-sm text-muted-foreground">
-                              {item.description || t("workforces.common.noDescription")}
-                            </p>
-                            <div className="flex flex-wrap gap-6 text-sm text-muted-foreground">
-                              <span>{t("workforces.list.manager", { name: item.manager.name })}</span>
-                              <span>{t("workforces.list.workers", { count: item.worker_count })}</span>
-                              <span suppressHydrationWarning>
-                                {t("workforces.list.lastUpdate", {
-                                  value: item.updated_at
-                                    ? new Date(item.updated_at).toLocaleString(locale)
-                                    : t("workforces.common.notAvailable"),
-                                })}
-                              </span>
+                            <div className="text-xs text-muted-foreground truncate mt-0.5">
+                              {t("workforces.list.manager", { name: item.manager.name })}
                             </div>
                           </div>
-                          <div className="flex flex-col gap-3 lg:items-end">
-                            <div className="flex w-full flex-col gap-1 lg:w-auto lg:items-end">
-                              {runDisabledReason ? (
-                                <Button className="w-full lg:w-auto" disabled>
-                                  <Play className="mr-2 h-4 w-4" />
+                        </div>
+
+                        <div className="flex-1">
+                          <p className="text-sm text-muted-foreground line-clamp-2 mb-4">
+                            {item.description || t("workforces.common.noDescription")}
+                          </p>
+
+                          <div className="flex items-center gap-2 mb-4">
+                            <div className="flex -space-x-2">
+                              {Array.from({ length: Math.min(item.worker_count, 4) }).map((_, i) => (
+                                <div key={i} className="flex h-6 w-6 items-center justify-center rounded-full border-2 border-background bg-blue-600 text-[10px] font-medium text-white">
+                                  {String.fromCharCode(65 + i)}
+                                </div>
+                              ))}
+                            </div>
+                            <span className="text-xs text-muted-foreground">
+                              {t("workforces.list.workers", { count: item.worker_count })}
+                            </span>
+                          </div>
+                        </div>
+
+                        <div className="mt-auto pt-4 border-t flex items-center justify-between">
+                          <div className="text-xs text-muted-foreground">
+                            {item.last_run?.created_at ? (
+                              <span>{t("workforces.list.lastRunTime")} {formatTime(item.last_run.created_at, 'datetime')}</span>
+                            ) : (
+                              t("workforces.list.noRuns")
+                            )}
+                          </div>
+                          <div className="flex items-center gap-2">
+                            {runDisabledReason ? (
+                              <Button size="sm" className="h-8 bg-blue-600 hover:bg-blue-700 text-white rounded-md px-3" disabled>
+                                <Play className="mr-1.5 h-3.5 w-3.5 fill-current" />
+                                {t("workforces.actions.run")}
+                              </Button>
+                            ) : (
+                              <Link href={`/workforces/${item.id}/run`} onClick={(e) => e.stopPropagation()}>
+                                <Button size="sm" className="h-8 bg-blue-600 hover:bg-blue-700 text-white rounded-md px-3">
+                                  <Play className="mr-1.5 h-3.5 w-3.5 fill-current" />
                                   {t("workforces.actions.run")}
                                 </Button>
-                              ) : (
-                                <Link href={`/workforces/${item.id}/run`}>
-                                  <Button className="w-full lg:w-auto">
-                                    <Play className="mr-2 h-4 w-4" />
-                                    {t("workforces.actions.run")}
-                                  </Button>
-                                </Link>
-                              )}
-                              {runDisabledReason ? (
-                                <div className="text-xs text-muted-foreground">{runDisabledReason}</div>
-                              ) : null}
-                            </div>
-                            <div className="flex gap-3">
-                              <Link href={`/workforces/${item.id}`}>
-                                <Button variant="outline">{t("workforces.actions.details")}</Button>
                               </Link>
-                              <Link href={`/workforces/${item.id}/builder`}>
-                                <Button variant="outline">{t("workforces.actions.builder")}</Button>
-                              </Link>
-                              <Link href={`/workforces/${item.id}/canvas`}>
-                                <Button variant="outline">{t("workforces.actions.canvas")}</Button>
-                              </Link>
-                            </div>
-                            {item.last_run ? (
-                              <div className="text-xs text-muted-foreground">
-                                {item.last_run.task_id != null
-                                  ? t("workforces.list.lastRunWithTask", {
-                                    runId: item.last_run.id,
-                                    taskId: item.last_run.task_id,
-                                    status: item.last_run.status,
-                                  })
-                                  : t("workforces.list.lastRun", {
-                                    runId: item.last_run.id,
-                                    status: item.last_run.status,
-                                  })}
-                              </div>
-                            ) : (
-                              <div className="text-xs text-muted-foreground">{t("workforces.list.noRuns")}</div>
                             )}
+                            <Link href={`/workforces/${item.id}`} onClick={(e) => e.stopPropagation()}>
+                              <Button size="sm" variant="outline" className="h-8 rounded-md px-3">
+                                <Pencil className="mr-1.5 h-3.5 w-3.5" />
+                                {t("workforces.actions.edit")}
+                              </Button>
+                            </Link>
                           </div>
                         </div>
                       </CardContent>
@@ -252,6 +250,14 @@ export default function WorkforcesPage() {
           )
         ) : null}
       </div>
+
+      <WorkforceCreateDialog
+        open={createDialogOpen}
+        onOpenChange={setCreateDialogOpen}
+        onCreated={(workforce) => {
+          router.push(`/workforces/${workforce.id}`)
+        }}
+      />
     </div>
   )
 }

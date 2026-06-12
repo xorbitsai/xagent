@@ -2,7 +2,6 @@
 
 import React, { useState } from "react"
 import { Button } from "@/components/ui/button"
-import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card"
 import { Textarea } from "@/components/ui/textarea"
 import { useI18n } from "@/contexts/i18n-context"
 import { runWorkforce } from "@/lib/workforces-api"
@@ -42,17 +41,18 @@ export function WorkforceTestPanel({
   }
 
   return (
-    <Card>
-      <CardHeader>
-        <CardTitle>{t("workforces.run.testTitle")}</CardTitle>
-      </CardHeader>
-      <CardContent className="space-y-4">
+    <div className="flex flex-col h-full">
+      <div className="p-4 border-b bg-background">
+        <h3 className="font-semibold leading-none tracking-tight">{t("workforces.run.testTitle")}</h3>
+      </div>
+      <div className="flex flex-1 flex-col gap-3 min-h-0 p-4">
         <Textarea
           placeholder={t("workforces.run.placeholder")}
           value={message}
           onChange={(event) => setMessage(event.target.value)}
-          rows={8}
+          rows={6}
           disabled={disabled}
+          className="flex-1 min-h-[120px]"
         />
         {disabled && disabledReason ? (
           <div className="text-sm text-muted-foreground">{disabledReason}</div>
@@ -64,7 +64,7 @@ export function WorkforceTestPanel({
         >
           {loading ? t("workforces.loading.starting") : t("workforces.actions.runWorkforce")}
         </Button>
-      </CardContent>
-    </Card>
+      </div>
+    </div>
   )
 }

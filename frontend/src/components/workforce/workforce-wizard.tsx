@@ -1,9 +1,7 @@
 "use client"
 
 import React, { useEffect, useMemo, useState } from "react"
-import { ArrowLeft } from "lucide-react"
 import { Button } from "@/components/ui/button"
-import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card"
 import { Input } from "@/components/ui/input"
 import { Label } from "@/components/ui/label"
 import { Textarea } from "@/components/ui/textarea"
@@ -131,131 +129,117 @@ export function WorkforceWizard({
     setStep((current) => Math.max(0, current - 1))
   }
 
-  if (loadingAgents) {
-    return (
-      <div className="h-full overflow-y-auto p-4 text-muted-foreground sm:p-8">
-        {t("workforces.loading.agents")}
-      </div>
-    )
-  }
-
   return (
-    <div className="h-full overflow-y-auto">
-      <div className="mx-auto flex w-full flex-col gap-6 p-4 sm:p-8">
-        {onBack ? (
-          <Button variant="ghost" className="w-fit gap-2 px-0" onClick={onBack}>
-            <ArrowLeft className="h-4 w-4" />
-            {t("workforces.create.backToCreate")}
-          </Button>
-        ) : null}
-        <Stepper
-          currentStep={step + 1}
-          steps={[
-            {
-              label: t("workforces.create.steps.basics"),
-              content: (
-                <div className="grid gap-6 lg:grid-cols-[1.2fr_0.8fr]">
-                  <Card>
-                    <CardHeader>
-                      <CardTitle>{t("workforces.create.steps.basics")}</CardTitle>
-                    </CardHeader>
-                    <CardContent className="space-y-4">
-                      <div className="space-y-2">
-                        <Label>{t("workforces.fields.name")} <span className="text-destructive">*</span></Label>
-                        <Input
-                          value={name}
-                          onChange={(event) => setName(event.target.value)}
-                          placeholder={t("workforces.create.placeholders.name")}
-                        />
-                      </div>
-                      <div className="space-y-2">
-                        <Label>{t("workforces.fields.description")}</Label>
-                        <Textarea
-                          value={description}
-                          onChange={(event) => setDescription(event.target.value)}
-                          placeholder={t("workforces.create.placeholders.description")}
-                          rows={4}
-                        />
-                      </div>
-                      <div className="space-y-2">
-                        <Label>{t("workforces.fields.managerInstructions")}</Label>
-                        <Textarea
-                          value={managerInstructions}
-                          onChange={(event) => setManagerInstructions(event.target.value)}
-                          placeholder={t("workforces.create.placeholders.managerInstructions")}
-                          rows={5}
-                        />
-                      </div>
-                    </CardContent>
-                  </Card>
-                  <ManagerStep
-                    managerAgentId={managerAgentId}
-                    onManagerAgentIdChange={setManagerAgentId}
-                    agents={agents}
-                  />
+    <div className="flex w-full flex-col gap-6">
+      <Stepper
+        currentStep={step + 1}
+        steps={[
+          {
+            label: t("workforces.create.steps.basics"),
+            content: (
+              <div className="flex flex-col gap-6">
+                <div className="space-y-4">
+                  <div className="space-y-2">
+                    <Label>{t("workforces.fields.name")} <span className="text-destructive">*</span></Label>
+                    <Input
+                      value={name}
+                      onChange={(event) => setName(event.target.value)}
+                      placeholder={t("workforces.create.placeholders.name")}
+                    />
+                  </div>
+                  <div className="space-y-2">
+                    <Label>{t("workforces.fields.description")}</Label>
+                    <Textarea
+                      value={description}
+                      onChange={(event) => setDescription(event.target.value)}
+                      placeholder={t("workforces.create.placeholders.description")}
+                      rows={3}
+                    />
+                  </div>
+                  <div className="space-y-2">
+                    <Label>{t("workforces.fields.managerInstructions")}</Label>
+                    <Textarea
+                      value={managerInstructions}
+                      onChange={(event) => setManagerInstructions(event.target.value)}
+                      placeholder={t("workforces.create.placeholders.managerInstructions")}
+                      rows={3}
+                    />
+                  </div>
                 </div>
-              ),
-            },
-            {
-              label: t("workforces.create.steps.workers"),
-              content: (
-                <WorkersStep
+                <ManagerStep
                   managerAgentId={managerAgentId}
+                  onManagerAgentIdChange={setManagerAgentId}
                   agents={agents}
-                  workers={workers}
-                  onWorkersChange={setWorkers}
+                  loadingAgents={loadingAgents}
                 />
-              ),
-            },
-            {
-              label: t("workforces.create.steps.review"),
-              content: (
-                <ReviewStep
-                  name={name}
-                  description={description}
-                  managerAgentId={managerAgentId}
-                  managerInstructions={managerInstructions}
-                  workers={workers}
-                  agents={agents}
-                />
-              ),
-            },
-          ]}
-        />
+              </div>
+            ),
+          },
+          {
+            label: t("workforces.create.steps.workers"),
+            content: (
+              <WorkersStep
+                managerAgentId={managerAgentId}
+                agents={agents}
+                workers={workers}
+                onWorkersChange={setWorkers}
+              />
+            ),
+          },
+          {
+            label: t("workforces.create.steps.review"),
+            content: (
+              <ReviewStep
+                name={name}
+                description={description}
+                managerAgentId={managerAgentId}
+                managerInstructions={managerInstructions}
+                workers={workers}
+                agents={agents}
+              />
+            ),
+          },
+        ]}
+      />
 
-        {managerWorkerConflictMessage ? (
-          <div className="rounded-lg border border-amber-200 bg-amber-50 px-4 py-3 text-sm text-amber-900">
-            {managerWorkerConflictMessage}
-          </div>
-        ) : null}
+      {managerWorkerConflictMessage ? (
+        <div className="rounded-lg border border-amber-200 bg-amber-50 px-4 py-3 text-sm text-amber-900">
+          {managerWorkerConflictMessage}
+        </div>
+      ) : null}
 
-        <div className="flex items-center justify-between">
-          <Button
-            variant="outline"
-            onClick={handleBack}
-            disabled={submitting || step === 0}
-          >
-            {t("common.back")}
-          </Button>
-          <div className="flex items-center gap-3">
-            {step < 2 ? (
-              <Button
-                onClick={() => setStep((current) => current + 1)}
-                disabled={!canMoveForward}
-              >
-                {t("common.next")}
-              </Button>
-            ) : (
-              <Button
-                onClick={handleCreate}
-                disabled={submitting || !canMoveForward || !workersAreValid}
-              >
-                {submitting
-                  ? t("workforces.loading.creating")
-                  : t("workforces.actions.create")}
-              </Button>
-            )}
-          </div>
+      <div className="flex items-center justify-between mt-4">
+        <Button
+          variant="outline"
+          onClick={() => {
+            if (step === 0 && onBack) {
+              onBack()
+            } else {
+              handleBack()
+            }
+          }}
+          disabled={submitting}
+        >
+          {step === 0 ? t("common.cancel") : t("common.back")}
+        </Button>
+        <div className="flex items-center gap-3">
+          {step < 2 ? (
+            <Button
+              onClick={() => setStep((current) => current + 1)}
+              disabled={!canMoveForward}
+            >
+              {t("common.next")}
+            </Button>
+          ) : (
+            <Button
+              onClick={handleCreate}
+              disabled={submitting || !canMoveForward || !workersAreValid}
+            >
+              {submitting
+                ? t("workforces.loading.creating")
+                : t("workforces.actions.create")}
+            </Button>
+          )}
         </div>
       </div>
     </div>

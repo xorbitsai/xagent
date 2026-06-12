@@ -3,13 +3,6 @@
 import React, { useState } from "react"
 import { Loader2 } from "lucide-react"
 import { Button } from "@/components/ui/button"
-import {
-  Card,
-  CardContent,
-  CardDescription,
-  CardHeader,
-  CardTitle,
-} from "@/components/ui/card"
 import { Textarea } from "@/components/ui/textarea"
 import { useI18n } from "@/contexts/i18n-context"
 import { createWorkforceFromPrompt } from "@/lib/workforces-api"
@@ -45,36 +38,34 @@ export function WorkforcePromptCreator({
   }
 
   return (
-    <Card>
-      <CardHeader>
-        <CardTitle>{t("workforces.create.prompt.cardTitle")}</CardTitle>
-        <CardDescription>{t("workforces.create.prompt.cardDescription")}</CardDescription>
-      </CardHeader>
-      <CardContent className="space-y-4">
-        <Textarea
-          value={prompt}
-          onChange={(event) => setPrompt(event.target.value)}
-          placeholder={t("workforces.create.prompt.placeholder")}
-          rows={10}
-        />
-        <div className="flex justify-end gap-3">
-          {onCancel ? (
-            <Button variant="outline" onClick={onCancel} disabled={submitting}>
-              {t("common.cancel")}
-            </Button>
-          ) : null}
-          <Button onClick={handleCreate} disabled={submitting || !prompt.trim()}>
-            {submitting ? (
-              <>
-                <Loader2 className="h-4 w-4 animate-spin" />
-                {t("workforces.loading.creating")}
-              </>
-            ) : (
-              t("workforces.create.prompt.generate")
-            )}
+    <div className="flex flex-col gap-4">
+      <div className="space-y-1.5">
+        <h3 className="font-semibold leading-none tracking-tight">{t("workforces.create.prompt.cardTitle")}</h3>
+        <p className="text-sm text-muted-foreground">{t("workforces.create.prompt.cardDescription")}</p>
+      </div>
+      <Textarea
+        value={prompt}
+        onChange={(event) => setPrompt(event.target.value)}
+        placeholder={t("workforces.create.prompt.placeholder")}
+        rows={10}
+      />
+      <div className="flex justify-end gap-3 mt-4">
+        {onCancel ? (
+          <Button variant="outline" onClick={onCancel} disabled={submitting}>
+            {t("common.cancel")}
           </Button>
-        </div>
-      </CardContent>
-    </Card>
+        ) : null}
+        <Button onClick={handleCreate} disabled={submitting || !prompt.trim()}>
+          {submitting ? (
+            <>
+              <Loader2 className="h-4 w-4 animate-spin" />
+              {t("workforces.loading.creating")}
+            </>
+          ) : (
+            t("workforces.create.prompt.generate")
+          )}
+        </Button>
+      </div>
+    </div>
   )
 }

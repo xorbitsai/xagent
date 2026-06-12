@@ -11,12 +11,14 @@ interface ManagerStepProps {
   managerAgentId: string
   onManagerAgentIdChange: (value: string) => void
   agents: WorkforceAgentOption[]
+  loadingAgents?: boolean
 }
 
 export function ManagerStep({
   managerAgentId,
   onManagerAgentIdChange,
   agents,
+  loadingAgents,
 }: ManagerStepProps) {
   const { t } = useI18n()
 
@@ -27,16 +29,22 @@ export function ManagerStep({
       </CardHeader>
       <CardContent className="space-y-3">
         <Label>{t("workforces.create.manager.selectLabel")} <span className="text-destructive">*</span></Label>
-        <Select
-          value={managerAgentId}
-          onValueChange={onManagerAgentIdChange}
-          placeholder={t("workforces.create.manager.placeholder")}
-          options={agents.map((agent) => ({
-            value: String(agent.id),
-            label: agent.name,
-            description: agent.description || undefined,
-          }))}
-        />
+        {loadingAgents ? (
+          <div className="text-sm text-muted-foreground py-2">
+            {t("workforces.loading.agents")}
+          </div>
+        ) : (
+          <Select
+            value={managerAgentId}
+            onValueChange={onManagerAgentIdChange}
+            placeholder={t("workforces.create.manager.placeholder")}
+            options={agents.map((agent) => ({
+              value: String(agent.id),
+              label: agent.name,
+              description: agent.description || undefined,
+            }))}
+          />
+        )}
       </CardContent>
     </Card>
   )

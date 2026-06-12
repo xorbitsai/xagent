@@ -6,8 +6,8 @@ import { useParams } from "next/navigation"
 import { ArrowLeft } from "lucide-react"
 import { Button } from "@/components/ui/button"
 import { useI18n } from "@/contexts/i18n-context"
-import { getWorkforceCanvas } from "@/lib/workforces-api"
-import type { WorkforceCanvasResponse } from "@/types/workforce"
+import { getWorkforce, getWorkforceCanvas } from "@/lib/workforces-api"
+import type { WorkforceCanvasResponse, WorkforceDetail } from "@/types/workforce"
 import { WorkforceCanvas } from "@/components/workforce"
 import { toast } from "sonner"
 
@@ -16,6 +16,7 @@ export default function WorkforceCanvasPage() {
   const params = useParams()
   const id = Array.isArray(params.id) ? params.id[0] : params.id
   const [canvas, setCanvas] = useState<WorkforceCanvasResponse | null>(null)
+  const [workforce, setWorkforce] = useState<WorkforceDetail | null>(null)
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState<string | null>(null)
 
@@ -26,10 +27,15 @@ export default function WorkforceCanvasPage() {
         setError(null)
         if (!id) {
           setCanvas(null)
+          setWorkforce(null)
           return
         }
-        const data = await getWorkforceCanvas(id)
-        setCanvas(data)
+        const [canvasData, workforceData] = await Promise.all([
+          getWorkforceCanvas(id),
+          getWorkforce(id)
+        ])
+        setCanvas(canvasData)
+        setWorkforce(workforceData)
       } catch (err) {
         const nextError = err instanceof Error ? err.message : t("workforces.errors.loadCanvas")
         setError(nextError)
@@ -45,20 +51,20 @@ export default function WorkforceCanvasPage() {
 
   if (loading) return <div className="h-full overflow-y-auto p-4 text-muted-foreground sm:p-8">{t("workforces.loading.canvas")}</div>
   if (error) return <div className="h-full overflow-y-auto p-4 text-red-500 sm:p-8">{error}</div>
-  if (!canvas) return <div className="h-full overflow-y-auto p-4 text-muted-foreground sm:p-8">{t("workforces.errors.canvasUnavailable")}</div>
+  if (!canvas || !workforce) return <div className="h-full overflow-y-auto p-4 text-muted-foreground sm:p-8">{t("workforces.errors.canvasUnavailable")}</div>
 
   return (
-    <div className="h-full overflow-y-auto">
-      <div className="mx-auto flex w-full flex-col gap-4 p-4 sm:p-8">
-        <div>
-          <Link href={backHref}>
-            <Button variant="outline" size="sm">
-              <ArrowLeft className="mr-2 h-4 w-4" />
-              {t("workforces.canvas.backToDetails")}
-            </Button>
-          </Link>
-        </div>
-        <WorkforceCanvas canvas={canvas} />
+    <div className="flex h-full flex-col">
+      <div className="flex-none p-8 pb-0">
+        <Link href={backHref}>
+          <Button variant="outline" size="sm">
+            <ArrowLeft className="mr-2 h-4 w-4" />
+            {t("workforces.canvas.backToDetails")}
+          </Button>
+        </Link>
+      </div>
+      <div className="flex-1 p-8">
+        <WorkforceCanvas canvas={canvas} workforce={workforce} />
       </div>
     </div>
   )

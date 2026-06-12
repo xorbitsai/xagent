@@ -4,7 +4,6 @@ import React from "react"
 import Link from "next/link"
 import { AlertTriangle } from "lucide-react"
 import { Badge } from "@/components/ui/badge"
-import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card"
 import { useI18n } from "@/contexts/i18n-context"
 import { canEditAgent } from "@/lib/agent-ui-access"
 import type {
@@ -57,117 +56,136 @@ export function ReviewStep({
   }
 
   return (
-    <Card>
-      <CardHeader>
-        <CardTitle>{t("workforces.create.steps.review")}</CardTitle>
-      </CardHeader>
-      <CardContent className="space-y-6">
-        {warnings.length > 0 ? (
-          <div className="rounded-xl border border-amber-200 bg-amber-50 p-4 text-amber-900">
-            <div className="flex items-center gap-2 font-medium">
-              <AlertTriangle className="size-4" />
-              {t("workforces.review.potentialRisks")}
-            </div>
-            <div className="mt-2 space-y-1 text-sm">
-              {warnings.map((warning, index) => (
-                <p key={`${warning}-${index}`}>{warning}</p>
-              ))}
-            </div>
+    <div className="space-y-6">
+      {warnings.length > 0 ? (
+        <div className="rounded-xl border border-amber-200 bg-amber-50 p-4 text-amber-900">
+          <div className="flex items-center gap-2 font-medium">
+            <AlertTriangle className="size-4" />
+            {t("workforces.review.potentialRisks")}
           </div>
-        ) : null}
-
-        <div className="grid gap-4 md:grid-cols-2">
-          <div>
-            <div className="text-xs uppercase tracking-wide text-muted-foreground">
-              {t("workforces.fields.name")}
-            </div>
-            <div className="mt-1 font-medium">
-              {name || t("workforces.review.untitled")}
-            </div>
-          </div>
-          <div>
-            <div className="text-xs uppercase tracking-wide text-muted-foreground">
-              {t("workforces.fields.manager")}
-            </div>
-            <div className="mt-1 flex items-center gap-2 font-medium">
-              <span>{manager?.name || t("workforces.common.notSelected")}</span>
-              {manager ? (
-                <Badge variant="outline">{t(`workforces.status.${manager.status}`)}</Badge>
-              ) : null}
-              {manager && !canEditAgent(manager) ? (
-                <Badge variant="secondary">{t("workforces.actions.readOnly")}</Badge>
-              ) : null}
-            </div>
-            {manager && canEditAgent(manager) ? (
-              <Link
-                href={getAgentHref(manager.id)}
-                target="_blank"
-                className="mt-2 inline-block text-sm text-primary hover:underline"
-              >
-                {t("workforces.actions.openAgentEditor")}
-              </Link>
-            ) : null}
+          <div className="mt-2 space-y-1 text-sm">
+            {warnings.map((warning, index) => (
+              <p key={`${warning}-${index}`}>{warning}</p>
+            ))}
           </div>
         </div>
-        <div>
-          <div className="text-xs uppercase tracking-wide text-muted-foreground">
-            {t("workforces.fields.description")}
+      ) : null}
+
+      <div className="space-y-2">
+        <div className="text-xs font-semibold uppercase tracking-wider text-muted-foreground">
+          {t("workforces.fields.name")}
+        </div>
+        <div className="rounded-lg border bg-card p-4">
+          <div className="font-medium">
+            {name || t("workforces.review.untitled")}
           </div>
           <div className="mt-1 text-sm text-muted-foreground">
             {description || t("workforces.common.noDescription")}
           </div>
         </div>
-        <div>
-          <div className="text-xs uppercase tracking-wide text-muted-foreground">
-            {t("workforces.fields.managerInstructions")}
+      </div>
+
+      <div className="space-y-2">
+        <div className="text-xs font-semibold uppercase tracking-wider text-muted-foreground">
+          {t("workforces.fields.manager")}
+        </div>
+        <div className="rounded-lg border bg-card p-4">
+          <div className="flex items-center gap-3">
+            <div className="flex h-10 w-10 shrink-0 items-center justify-center rounded-lg bg-blue-600 text-white font-medium">
+              {manager?.name?.charAt(0).toUpperCase() || "M"}
+            </div>
+            <div>
+              <div className="flex items-center gap-2 font-medium">
+                <span>{manager?.name || t("workforces.common.notSelected")}</span>
+                {manager ? (
+                  <Badge variant="outline">{t(`workforces.status.${manager.status}`)}</Badge>
+                ) : null}
+                {manager && !canEditAgent(manager) ? (
+                  <Badge variant="secondary">{t("workforces.actions.readOnly")}</Badge>
+                ) : null}
+              </div>
+              <div className="text-sm text-muted-foreground">
+                {manager?.description || t("workforces.fields.manager")}
+              </div>
+            </div>
           </div>
-          <div className="mt-1 whitespace-pre-wrap text-sm text-muted-foreground">
+          {manager && canEditAgent(manager) ? (
+            <Link
+              href={getAgentHref(manager.id)}
+              target="_blank"
+              className="mt-3 inline-block text-sm text-primary hover:underline"
+            >
+              {t("workforces.actions.openAgentEditor")}
+            </Link>
+          ) : null}
+        </div>
+      </div>
+
+      <div className="space-y-2">
+        <div className="text-xs font-semibold uppercase tracking-wider text-muted-foreground">
+          {t("workforces.fields.managerInstructions")}
+        </div>
+        <div className="rounded-lg border bg-card p-4 max-h-48 overflow-y-auto">
+          <div className="whitespace-pre-wrap text-sm text-muted-foreground">
             {managerInstructions || t("workforces.review.noManagerInstructions")}
           </div>
         </div>
-        <div>
-          <div className="text-xs uppercase tracking-wide text-muted-foreground">
-            {t("workforces.fields.workers")}
-          </div>
-          <div className="mt-3 space-y-3">
-            {workers.length === 0 ? (
-              <div className="rounded-lg border border-dashed p-4 text-sm text-muted-foreground">
-                {t("workforces.workers.noneConfigured")}
-              </div>
-            ) : (
-              workers.map((worker, index) => {
-                const agent = agents.find((item) => item.id === worker.agent_id)
-                const title = worker.alias
-                  || agent?.name
-                  || t("workforces.workers.fallbackName", { index: index + 1 })
+      </div>
 
-                return (
-                  <div key={`${worker.source_type}-${index}`} className="rounded-lg border p-4">
-                    <div className="flex flex-wrap items-center gap-2">
-                      <div className="font-medium">{title}</div>
-                      <Badge variant="outline">
-                        {t(`workforces.sourceTypes.${worker.source_type}`)}
-                      </Badge>
-                      {agent ? (
-                        <Badge variant="secondary">{t(`workforces.status.${agent.status}`)}</Badge>
-                      ) : null}
-                      {agent && !canEditAgent(agent) ? (
-                        <Badge variant="secondary">{t("workforces.actions.readOnly")}</Badge>
-                      ) : null}
+      <div className="space-y-2">
+        <div className="text-xs font-semibold uppercase tracking-wider text-muted-foreground">
+          {t("workforces.fields.workers")}
+        </div>
+        <div className="space-y-3">
+          {workers.length === 0 ? (
+            <div className="rounded-lg border border-dashed p-4 text-sm text-muted-foreground">
+              {t("workforces.workers.noneConfigured")}
+            </div>
+          ) : (
+            workers.map((worker, index) => {
+              const agent = agents.find((item) => item.id === worker.agent_id)
+              const title = worker.alias
+                || agent?.name
+                || t("workforces.workers.fallbackName", { index: index + 1 })
+
+              return (
+                <div key={`${worker.source_type}-${index}`} className="rounded-xl border overflow-hidden">
+                  <div className="flex items-center gap-3 bg-muted/50 p-4 border-b">
+                    <div className="flex h-10 w-10 shrink-0 items-center justify-center rounded-lg bg-blue-600 text-white font-medium">
+                      {title.charAt(0).toUpperCase()}
                     </div>
-                    <div className="mt-1 text-sm text-muted-foreground">
-                      {agent?.description || t("workforces.workers.publishedAgent")}
+                    <div>
+                      <div className="flex flex-wrap items-center gap-2">
+                        <div className="font-medium">{title}</div>
+                        <Badge variant="outline">
+                          {t(`workforces.sourceTypes.${worker.source_type}`)}
+                        </Badge>
+                        {agent ? (
+                          <Badge variant="secondary">{t(`workforces.status.${agent.status}`)}</Badge>
+                        ) : null}
+                        {agent && !canEditAgent(agent) ? (
+                          <Badge variant="secondary">{t("workforces.actions.readOnly")}</Badge>
+                        ) : null}
+                      </div>
+                      <div className="text-sm text-muted-foreground">
+                        {agent?.description || t("workforces.workers.publishedAgent")}
+                      </div>
                     </div>
-                    <div className="mt-3 text-sm text-muted-foreground">
+                  </div>
+                  <div className="p-4">
+                    <div className="text-sm font-medium mb-2">
+                      {t("workforces.fields.assignmentInstructions")}
+                    </div>
+                    <div className="rounded-lg border p-3 text-sm text-muted-foreground max-h-48 overflow-y-auto whitespace-pre-wrap">
                       {worker.assignment_instructions}
                     </div>
                   </div>
-                )
-              })
-            )}
-          </div>
+                </div>
+              )
+            })
+          )}
         </div>
-      </CardContent>
-    </Card>
+      </div>
+    </div>
   )
 }

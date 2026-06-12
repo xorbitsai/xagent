@@ -1,96 +1,157 @@
 "use client"
 
-import React from "react"
-import { ArrowRight, Network } from "lucide-react"
-import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card"
-import { useI18n } from "@/contexts/i18n-context"
-import type { WorkforceCanvasNode, WorkforceCanvasResponse } from "@/types/workforce"
+import React, { useMemo } from "react"
+import {
+  ReactFlow,
+  Background,
+  BackgroundVariant,
+  Controls,
+  Handle,
+  Position,
+  MarkerType,
+  Node,
+  Edge,
+} from "@xyflow/react"
+import "@xyflow/react/dist/style.css"
+import { Crown, ShieldAlert } from "lucide-react"
+import type { WorkforceCanvasResponse, WorkforceDetail } from "@/types/workforce"
 
 interface WorkforceCanvasProps {
   canvas: WorkforceCanvasResponse
+  workforce: WorkforceDetail
 }
 
-export function WorkforceCanvas({ canvas }: WorkforceCanvasProps) {
-  const { t } = useI18n()
-  const nodesById = React.useMemo(
-    () => new Map(canvas.nodes.map((node) => [node.id, node])),
-    [canvas.nodes],
-  )
-
-  const nodeTypeLabel = (node: WorkforceCanvasNode) => {
-    const key = `workforces.canvas.nodeTypes.${node.type}`
-    const translated = t(key)
-    return translated === key ? node.type : translated
-  }
-
+function ManagerNode({ data }: { data: any }) {
   return (
-    <Card>
-      <CardHeader>
-        <CardTitle>{t("workforces.actions.canvas")}</CardTitle>
-      </CardHeader>
-      <CardContent className="space-y-6">
-        <div className="grid gap-3 md:grid-cols-3">
-          {canvas.nodes.map((node) => (
-            <div key={node.id} className="rounded-lg border bg-background/40 p-4">
-              <div className="text-xs uppercase tracking-wide text-muted-foreground">
-                {nodeTypeLabel(node)}
-              </div>
-              <div className="mt-2 font-medium">{node.label}</div>
-              {node.enabled === false ? (
-                <div className="mt-2 text-xs text-muted-foreground">
-                  {t("workforces.status.disabled")}
-                </div>
-              ) : null}
-            </div>
-          ))}
+    <div className="flex w-80 flex-col items-center justify-center rounded-xl border-2 border-blue-500 bg-white p-6 shadow-sm">
+      <div className="flex h-12 w-12 items-center justify-center rounded-full bg-blue-600 text-xl font-bold text-white">
+        {data.avatar}
+      </div>
+      <div className="mt-3 text-lg font-bold text-gray-900">{data.name}</div>
+      <div className="mt-2 flex items-center gap-1 rounded-full bg-blue-50 px-2.5 py-0.5 text-xs font-medium text-blue-700">
+        <Crown className="h-3.5 w-3.5" />
+        Manager
+      </div>
+      {data.description && (
+        <div className="mt-4 text-center text-sm text-gray-500 line-clamp-3">
+          {data.description}
         </div>
-        <div>
-          <div className="mb-3 flex items-center gap-2 text-xs uppercase tracking-wide text-muted-foreground">
-            <Network className="h-3.5 w-3.5" />
-            <span>{t("workforces.canvas.connections")}</span>
-          </div>
-          {canvas.edges.length > 0 ? (
-            <div className="grid gap-2 lg:grid-cols-2">
-              {canvas.edges.map((edge) => {
-                const sourceNode = nodesById.get(edge.source)
-                const targetNode = nodesById.get(edge.target)
-                return (
-                  <div
-                    key={edge.id}
-                    className="flex min-w-0 items-center gap-3 rounded-lg border bg-background/40 px-3 py-2 text-sm"
-                  >
-                    <div className="min-w-0 flex-1">
-                      <div className="truncate font-medium">
-                        {sourceNode?.label || edge.source}
-                      </div>
-                      {sourceNode ? (
-                        <div className="text-xs uppercase tracking-wide text-muted-foreground">
-                          {nodeTypeLabel(sourceNode)}
-                        </div>
-                      ) : null}
-                    </div>
-                    <ArrowRight className="h-4 w-4 shrink-0 text-muted-foreground" />
-                    <div className="min-w-0 flex-1">
-                      <div className="truncate font-medium">
-                        {targetNode?.label || edge.target}
-                      </div>
-                      {targetNode ? (
-                        <div className="text-xs uppercase tracking-wide text-muted-foreground">
-                          {nodeTypeLabel(targetNode)}
-                        </div>
-                      ) : null}
-                    </div>
-                  </div>
-                )
-              })}
-            </div>
-          ) : (
-            <div className="rounded-lg border border-dashed px-3 py-4 text-sm text-muted-foreground">
-              {t("workforces.canvas.noConnections")}
-            </div>
+      )}
+      <Handle type="source" position={Position.Bottom} className="!border-none !bg-transparent" />
+    </div>
+  )
+}
+
+function WorkerNode({ data }: { data: any }) {
+  return (
+    <div className="flex w-64 flex-col rounded-xl border border-gray-200 bg-white p-5 shadow-sm">
+      <Handle type="target" position={Position.Top} className="!border-none !bg-transparent" />
+      <div className="flex items-center gap-3">
+        <div className="flex h-10 w-10 shrink-0 items-center justify-center rounded-lg bg-blue-50 text-lg font-bold text-blue-600">
+          {data.avatar}
+        </div>
+        <div className="min-w-0 flex-1">
+          <div className="truncate font-bold text-gray-900">{data.name}</div>
+          {data.subtitle && (
+            <div className="truncate text-xs text-gray-500">{data.subtitle}</div>
           )}
         </div>
-      </CardContent>
-    </Card>
+      </div>
+      {data.description && (
+        <div className="mt-4 text-sm italic text-gray-500 line-clamp-3">
+          "{data.description}"
+        </div>
+      )}
+      {data.approvalRequired && (
+        <div className="mt-4 flex w-fit items-center gap-1 rounded-full bg-orange-50 px-2.5 py-0.5 text-xs font-medium text-orange-600">
+          <ShieldAlert className="h-3.5 w-3.5" />
+          Approval required
+        </div>
+      )}
+    </div>
+  )
+}
+
+const nodeTypes = {
+  manager: ManagerNode,
+  worker: WorkerNode,
+}
+
+export function WorkforceCanvas({ workforce }: WorkforceCanvasProps) {
+  const { nodes, edges } = useMemo(() => {
+    const newNodes: Node[] = []
+    const newEdges: Edge[] = []
+
+    // Manager Node
+    const manager = workforce.manager
+    newNodes.push({
+      id: "manager",
+      type: "manager",
+      position: { x: 0, y: 0 },
+      origin: [0.5, 0],
+      data: {
+        name: manager.name,
+        avatar: manager.name.charAt(0).toUpperCase(),
+        description: workforce.manager_instructions || manager.description,
+      },
+    })
+
+    // Worker Nodes
+    const workers = workforce.workers || []
+    const workerWidth = 256 // w-64 = 16rem = 256px
+    const gap = 32
+    const totalWidth = workers.length * workerWidth + (workers.length - 1) * gap
+    const startX = -totalWidth / 2 + workerWidth / 2
+
+    workers.forEach((worker, index) => {
+      const workerId = `worker-${worker.id}`
+      newNodes.push({
+        id: workerId,
+        type: "worker",
+        position: { x: startX + index * (workerWidth + gap), y: 250 },
+        origin: [0.5, 0],
+        data: {
+          name: worker.agent.name,
+          avatar: worker.agent.name.charAt(0).toUpperCase(),
+          subtitle: worker.agent.description,
+          description: worker.assignment_instructions,
+          // We can infer approval required from instructions or some other field if available
+          // For now, let's just check if instructions contain "approval"
+          approvalRequired: worker.assignment_instructions?.toLowerCase().includes("approval"),
+        },
+      })
+
+      newEdges.push({
+        id: `edge-manager-${workerId}`,
+        source: "manager",
+        target: workerId,
+        type: "smoothstep",
+        animated: true,
+        style: { stroke: "#cbd5e1", strokeWidth: 2 },
+        markerEnd: {
+          type: MarkerType.ArrowClosed,
+          color: "#cbd5e1",
+        },
+      })
+    })
+
+    return { nodes: newNodes, edges: newEdges }
+  }, [workforce])
+
+  return (
+    <div className="h-full w-full rounded-xl border bg-gray-50/50">
+      <ReactFlow
+        nodes={nodes}
+        edges={edges}
+        nodeTypes={nodeTypes}
+        fitView
+        fitViewOptions={{ padding: 0.2 }}
+        minZoom={0.1}
+        maxZoom={1.5}
+      >
+        <Background variant={BackgroundVariant.Dots} gap={16} size={1} color="#cbd5e1" />
+        <Controls />
+      </ReactFlow>
+    </div>
   )
 }

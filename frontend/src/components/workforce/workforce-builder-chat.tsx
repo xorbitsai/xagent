@@ -1,20 +1,15 @@
 "use client"
 
 import React, { useEffect, useMemo, useRef, useState } from "react"
-import { Bot, Loader2, User } from "lucide-react"
+import { AlertTriangle, Bot, CheckCircle2, Loader2, Sparkles, User } from "lucide-react"
+import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert"
+import { Badge } from "@/components/ui/badge"
 import { Button } from "@/components/ui/button"
-import {
-  Card,
-  CardContent,
-  CardDescription,
-  CardHeader,
-  CardTitle,
-} from "@/components/ui/card"
 import { ScrollArea } from "@/components/ui/scroll-area"
 import { Textarea } from "@/components/ui/textarea"
 import { useI18n } from "@/contexts/i18n-context"
 import { cn, formatDate } from "@/lib/utils"
-import type { WorkforceBuilderMessage } from "@/types/workforce"
+import type { WorkforceBuilderMessage, WorkforceBuilderPatch } from "@/types/workforce"
 
 interface WorkforceBuilderChatProps {
   messages: WorkforceBuilderMessage[]
@@ -22,11 +17,144 @@ interface WorkforceBuilderChatProps {
   submitting?: boolean
   readOnly?: boolean
   readOnlyReason?: string
+  activeProposal?: WorkforceBuilderMessage | null
+  applying?: boolean
   onSubmit: (message: string) => Promise<void> | void
+  onApplyPatch?: (messageId: number, patch: WorkforceBuilderPatch) => Promise<void> | void
 }
 
 function roleIcon(role: string) {
   return role === "assistant" ? Bot : User
+}
+
+function formatOperationTitle(op: string) {
+  return op
+    .split("_")
+    .map((part) => part.charAt(0).toUpperCase() + part.slice(1))
+    .join(" ")
+}
+
+function operationTitle(op: string, t: (key: string) => string) {
+  const key = `workforces.builder.operations.${op}`
+  const value = t(key)
+  return value === key ? formatOperationTitle(op) : value
+}
+
+function InlinePatchCard({
+  patch,
+  messageId,
+  status,
+  applying,
+  readOnly,
+  onApply,
+  t,
+}: {
+  patch: WorkforceBuilderPatch
+  messageId: number
+  status?: string | null
+  applying: boolean
+  readOnly: boolean
+  onApply: (messageId: number, patch: WorkforceBuilderPatch) => void
+  t: (key: string) => string
+}) {
+  const alreadyApplied = status === "applied"
+  const canApply =
+    patch.operations.length > 0 && !applying && !alreadyApplied && !readOnly
+
+  return (
+    <div className="mt-3 space-y-3" onClick={(e) => e.stopPropagation()}>
+      {/* Summary */}
+      <div className="flex items-start gap-2.5 rounded-lg border bg-muted/30 p-3">
+        <Sparkles className="mt-0.5 size-3.5 shrink-0 text-primary" />
+        <div className="text-xs text-muted-foreground">{patch.summary}</div>
+      </div>
+
+      {/* Clarification */}
+      {patch.clarification ? (
+        <Alert className="p-3 text-xs">
+          <AlertTriangle className="size-3.5" />
+          <AlertTitle>{t("workforces.builder.clarificationNeeded")}</AlertTitle>
+          <AlertDescription>{patch.clarification}</AlertDescription>
+        </Alert>
+      ) : null}
+
+      {/* Warnings */}
+      {patch.warnings.length > 0 ? (
+        <div className="rounded-lg border border-amber-200 bg-amber-50 p-3">
+          <div className="flex items-center gap-1.5 text-xs font-medium text-amber-800 mb-1.5">
+            <AlertTriangle className="size-3.5" />
+            {t("workforces.builder.warnings")}
+          </div>
+          <div className="space-y-1">
+            {patch.warnings.map((warning, index) => (
+              <div key={`${warning}-${index}`} className="text-xs text-amber-700">
+                {warning}
+              </div>
+            ))}
+          </div>
+        </div>
+      ) : (
+        <div className="flex items-center gap-1.5 text-xs text-emerald-600">
+          <CheckCircle2 className="size-3.5" />
+          {t("workforces.builder.noDestructiveWarning")}
+        </div>
+      )}
+
+      {/* Operations */}
+      <div className="space-y-2">
+        <div className="flex items-center gap-2">
+          <span className="text-xs font-medium">{t("workforces.builder.operationsTitle")}</span>
+          <Badge variant="secondary" className="text-[10px] h-4 px-1.5">
+            {patch.operations.length}
+          </Badge>
+        </div>
+        {patch.operations.map((operation, index) => (
+          <div
+            key={`${operation.op}-${index}`}
+            className="rounded-lg border bg-background p-3"
+          >
+            <div className="flex items-center justify-between gap-2 mb-2">
+              <span className="text-xs font-medium">
+                {operationTitle(operation.op, t)}
+              </span>
+              <Badge variant="outline" className="text-[10px] h-4 px-1.5">
+                #{index + 1}
+              </Badge>
+            </div>
+            <pre className="overflow-x-auto whitespace-pre-wrap break-words text-[11px] leading-5 text-muted-foreground bg-muted/40 rounded-md p-2.5">
+              {JSON.stringify(operation, null, 2)}
+            </pre>
+          </div>
+        ))}
+      </div>
+
+      {/* Apply button */}
+      <Button
+        size="sm"
+        className="w-full"
+        variant={alreadyApplied ? "outline" : "default"}
+        disabled={!canApply}
+        onClick={(e) => {
+          e.preventDefault()
+          e.stopPropagation()
+          onApply(messageId, patch)
+        }}
+      >
+        {applying ? (
+          <>
+            <Loader2 className="size-3.5 animate-spin mr-1.5" />
+            {t("workforces.loading.applyingChanges")}
+          </>
+        ) : alreadyApplied ? (
+          t("workforces.actions.alreadyApplied")
+        ) : readOnly ? (
+          t("workforces.actions.readOnly")
+        ) : (
+          t("workforces.actions.applyChanges")
+        )}
+      </Button>
+    </div>
+  )
 }
 
 export function WorkforceBuilderChat({
@@ -35,7 +163,10 @@ export function WorkforceBuilderChat({
   submitting = false,
   readOnly = false,
   readOnlyReason,
+  activeProposal,
+  applying = false,
   onSubmit,
+  onApplyPatch,
 }: WorkforceBuilderChatProps) {
   const { t } = useI18n()
   const [message, setMessage] = useState("")
@@ -63,14 +194,14 @@ export function WorkforceBuilderChat({
   }
 
   return (
-    <Card className="h-full min-h-[640px]">
-      <CardHeader>
-        <CardTitle>{t("workforces.builder.chatTitle")}</CardTitle>
-        <CardDescription>{t("workforces.builder.chatDescription")}</CardDescription>
-      </CardHeader>
-      <CardContent className="flex h-full flex-col gap-4">
-        <div ref={containerRef}>
-          <ScrollArea className="h-[440px] rounded-lg border bg-muted/20">
+    <div className="flex flex-col h-full">
+      <div className="p-4 border-b bg-background">
+        <h3 className="font-semibold leading-none tracking-tight">{t("workforces.builder.chatTitle")}</h3>
+        <p className="text-sm text-muted-foreground mt-1">{t("workforces.builder.chatDescription")}</p>
+      </div>
+      <div className="flex flex-1 flex-col min-h-0">
+        <div ref={containerRef} className="flex-1 min-h-0">
+          <ScrollArea className="h-full rounded-lg bg-muted/20">
             <div className="space-y-4 p-4">
               {loading ? (
                 <div className="text-sm text-muted-foreground">
@@ -83,6 +214,11 @@ export function WorkforceBuilderChat({
               ) : (
                 messages.map((item) => {
                   const Icon = roleIcon(item.role)
+                  const isActiveProposal =
+                    item.role === "assistant" &&
+                    activeProposal?.id === item.id &&
+                    item.proposed_patch
+
                   return (
                     <div
                       key={item.id}
@@ -122,6 +258,19 @@ export function WorkforceBuilderChat({
                         <div className="whitespace-pre-wrap text-sm leading-6">
                           {item.content}
                         </div>
+
+                        {/* Inline patch card for the active proposal */}
+                        {isActiveProposal && onApplyPatch ? (
+                          <InlinePatchCard
+                            patch={item.proposed_patch!}
+                            messageId={item.id}
+                            status={item.status}
+                            applying={applying}
+                            readOnly={readOnly}
+                            onApply={onApplyPatch}
+                            t={t}
+                          />
+                        ) : null}
                       </div>
                       {item.role === "user" ? (
                         <div className="mt-1 flex size-8 shrink-0 items-center justify-center rounded-full bg-secondary text-secondary-foreground">
@@ -142,12 +291,12 @@ export function WorkforceBuilderChat({
           </ScrollArea>
         </div>
 
-        <div className="space-y-3">
+        <div className="space-y-3 shrink-0 p-4">
           <Textarea
             placeholder={t("workforces.builder.messagePlaceholder")}
             value={message}
             onChange={(event) => setMessage(event.target.value)}
-            rows={6}
+            rows={4}
             disabled={readOnly}
             onKeyDown={(event) => {
               if ((event.metaKey || event.ctrlKey) && event.key === "Enter") {
@@ -164,12 +313,12 @@ export function WorkforceBuilderChat({
               {readOnly
                 ? t("workforces.actions.readOnly")
                 : submitting
-                ? t("workforces.loading.proposing")
-                : t("workforces.actions.proposeChanges")}
+                  ? t("workforces.loading.proposing")
+                  : t("workforces.actions.proposeChanges")}
             </Button>
           </div>
         </div>
-      </CardContent>
-    </Card>
+      </div>
+    </div>
   )
 }

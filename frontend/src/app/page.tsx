@@ -2,7 +2,7 @@
 
 import Link from "next/link";
 import { useRouter } from "next/navigation";
-import { useEffect, useMemo, useRef, useState } from "react";
+import React, { useEffect, useMemo, useRef, useState } from "react";
 import {
   AlertDialog,
   AlertDialogAction,
@@ -36,7 +36,7 @@ import { HomeTemplateCard } from "@/components/templates/home-template-card";
 import { useApp } from "@/contexts/app-context-chat";
 import { useAuth } from "@/contexts/auth-context";
 import { useI18n } from "@/contexts/i18n-context";
-import { getAgentChatHref } from "@/lib/agent-ui-access";
+import { getAgentChatHref, isPublishedAgent } from "@/lib/agent-ui-access";
 import { getApiUrl } from "@/lib/utils";
 import type { Template } from "@/types/template";
 import { WelcomeModal } from "@/components/welcome-modal";
@@ -392,9 +392,7 @@ export default function Home() {
     ? Math.min(100, Math.max(8, Math.floor((now - primaryTaskCreatedAtMs) / 18000)))
     : 0;
   const displayAgents = useMemo(() => {
-    const published = agents.filter((agent) => agent.status === "published");
-    const source = published.length > 0 ? published : agents;
-    return source.slice(0, 9);
+    return agents.filter(isPublishedAgent).slice(0, 9);
   }, [agents]);
   const greetingLabel = t(
     currentHour === null ? "home.revamp.greeting" : getGreetingTranslationKey(currentHour)

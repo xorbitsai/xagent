@@ -522,10 +522,19 @@ export default function WorkforceDetailPage() {
                 onNewWorkerInstructionsChange={setNewWorkerInstructions}
                 onAddWorker={addWorker}
                 onWorkerEditChange={(workerId, edit) => {
-                  setWorkerEdits((current) => ({
-                    ...current,
-                    [workerId]: { ...current[workerId], ...edit },
-                  }))
+                  setWorkerEdits((current) => {
+                    const worker = workforce?.workers.find((w) => w.id === workerId)
+                    const base = current[workerId] || {
+                      alias: worker?.alias || "",
+                      assignment_instructions: worker?.assignment_instructions || "",
+                      enabled: worker?.enabled ?? true,
+                      sort_order: String(worker?.sort_order ?? 1),
+                    }
+                    return {
+                      ...current,
+                      [workerId]: { ...base, ...edit },
+                    }
+                  })
                 }}
                 onSaveWorker={saveWorker}
                 onRemoveWorker={removeWorker}

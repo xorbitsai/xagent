@@ -83,16 +83,16 @@ export function WorkforceCanvas({ workforce }: WorkforceCanvasProps) {
     const newEdges: Edge[] = []
 
     // Manager Node
-    const manager = workforce.manager
+    const manager = workforce?.manager
     newNodes.push({
       id: "manager",
       type: "manager",
       position: { x: 0, y: 0 },
       origin: [0.5, 0],
       data: {
-        name: manager.name,
-        avatar: manager.name.charAt(0).toUpperCase(),
-        description: workforce.manager_instructions || manager.description,
+        name: manager?.name || "Manager",
+        avatar: manager?.name ? manager.name.charAt(0).toUpperCase() : "M",
+        description: workforce?.manager_instructions || manager?.description || "",
       },
     })
 
@@ -111,9 +111,9 @@ export function WorkforceCanvas({ workforce }: WorkforceCanvasProps) {
         position: { x: startX + index * (workerWidth + gap), y: 250 },
         origin: [0.5, 0],
         data: {
-          name: worker.agent.name,
-          avatar: worker.agent.name.charAt(0).toUpperCase(),
-          subtitle: worker.agent.description,
+          name: worker.agent?.name || "Worker",
+          avatar: worker.agent?.name ? worker.agent.name.charAt(0).toUpperCase() : "W",
+          subtitle: worker.agent?.description || "",
           description: worker.assignment_instructions,
           // We can infer approval required from instructions or some other field if available
           // For now, let's just check if instructions contain "approval"

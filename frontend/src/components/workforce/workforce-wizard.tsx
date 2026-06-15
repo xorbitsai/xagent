@@ -209,19 +209,23 @@ export function WorkforceWizard({
       ) : null}
 
       <div className="flex items-center justify-between mt-4">
-        <Button
-          variant="outline"
-          onClick={() => {
-            if (step === 0 && onBack) {
-              onBack()
-            } else {
-              handleBack()
-            }
-          }}
-          disabled={submitting}
-        >
-          {step === 0 ? t("common.cancel") : t("common.back")}
-        </Button>
+        {step > 0 || onBack ? (
+          <Button
+            variant="outline"
+            onClick={() => {
+              if (step === 0 && onBack) {
+                onBack()
+              } else {
+                handleBack()
+              }
+            }}
+            disabled={submitting}
+          >
+            {step === 0 ? t("common.cancel") : t("common.back")}
+          </Button>
+        ) : (
+          <div />
+        )}
         <div className="flex items-center gap-3">
           {step < 2 ? (
             <Button

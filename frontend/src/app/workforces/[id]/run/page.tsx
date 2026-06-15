@@ -51,7 +51,12 @@ export default function WorkforceRunPage() {
     setRunning(true)
     try {
       const result: WorkforceRunResponse = await runWorkforce(id, { message: value })
-      router.push(result.redirect_url || `/task/${result.task_id}`)
+      const target = result?.redirect_url || (result?.task_id ? `/task/${result.task_id}` : null)
+      if (target) {
+        router.push(target)
+      } else {
+        throw new Error("Invalid run response: missing redirect_url or task_id")
+      }
     } catch (err) {
       const nextError = err instanceof Error ? err.message : t("workforces.errors.run")
       toast.error(nextError)

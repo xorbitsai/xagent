@@ -297,11 +297,13 @@ describe("workforce route entry points", () => {
     await waitFor(() => {
       const submitBtn = container.querySelector(".rounded-2xl button:not([disabled])")
       expect(submitBtn).not.toBeNull()
-      fireEvent.click(submitBtn!)
     })
 
+    const submitBtn = container.querySelector(".rounded-2xl button:not([disabled])")
+    fireEvent.click(submitBtn!)
+
     await waitFor(() => {
-      expect(runWorkforceMock).toHaveBeenCalledWith(42, {
+      expect(runWorkforceMock).toHaveBeenCalledWith("42", {
         message: "Draft launch plan",
       })
     })

@@ -60,6 +60,7 @@ export default function WorkforceRunPage() {
     } catch (err) {
       const nextError = err instanceof Error ? err.message : t("workforces.errors.run")
       toast.error(nextError)
+    } finally {
       setRunning(false)
     }
   }

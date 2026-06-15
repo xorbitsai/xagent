@@ -5,6 +5,8 @@ import { useParams } from "next/navigation"
 import { MessageSquare } from "lucide-react"
 import { useI18n } from "@/contexts/i18n-context"
 import { useApp } from "@/contexts/app-context-chat"
+import type { Task } from "@/contexts/app-context-chat"
+import { type TaskStatus } from "@/lib/task-status"
 import {
   addWorkforceAgent,
   applyWorkforceChanges,
@@ -425,7 +427,7 @@ export default function WorkforceDetailPage() {
 
   // ---- Test preview actions ----
 
-  const handleTestSendMessage = async (content: string, _config?: any, files?: File[]) => {
+  const handleTestSendMessage = async (content: string, _config?: any, files?: (File & { file_id?: string })[]) => {
     if (!id) return
 
     let taskId = previewTaskIdRef.current
@@ -439,7 +441,7 @@ export default function WorkforceDetailPage() {
         // First message: create the workforce run
         const result: WorkforceRunResponse = await runWorkforce(id, {
           message: content,
-          files: (files || []).map(f => (f as any).file_id).filter(Boolean),
+          files: (files || []).map(f => f.file_id).filter(Boolean) as string[],
         })
 
         taskId = result.task_id
@@ -453,22 +455,16 @@ export default function WorkforceDetailPage() {
         setTaskId(taskId, { navigate: false })
 
         // Set the current task info so the panel knows the status
-        dispatch({
-          type: "SET_CURRENT_TASK",
-          payload: {
-            id: String(taskId),
-            title: content.slice(0, 80),
-            description: content,
-            status: result.status as any,
-            createdAt: new Date().toISOString(),
-            updatedAt: new Date().toISOString(),
-          },
-        } as any)
+        const taskPayload: Task = {
+          id: String(taskId),
+          title: content.slice(0, 80),
+          description: content,
+          status: result.status as TaskStatus,
+          createdAt: new Date().toISOString(),
+          updatedAt: new Date().toISOString(),
+        }
+        dispatch({ type: "SET_CURRENT_TASK", payload: taskPayload })
         dispatch({ type: "TRIGGER_TASK_UPDATE" })
-
-        // Always use sendMessage to handle UI display (same as agent builder)
-        // The optimistic add happens before history replay, preventing duplicates
-        await sendMessage(content, { force: true, targetTaskId: taskId }, files)
       } else {
         // Subsequent messages: send via websocket
         await sendMessage(content, { force: true, targetTaskId: taskId }, files)

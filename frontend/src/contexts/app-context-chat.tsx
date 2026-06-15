@@ -333,7 +333,7 @@ interface Message {
   interactions?: Interaction[]
 }
 
-interface Task {
+export interface Task {
   id: string
   title: string
   status: TaskStatus
@@ -1439,6 +1439,10 @@ export function AppProvider({
               console.log('⚠️ User message filtered as duplicate:', messageContent)
               return
             }
+
+            // Cache the message to prevent duplicate dispatch if a
+            // "chat"-type message for the same content also arrives.
+            recentMessages.add(`user-message:${messageContent}`)
 
             // Extract files from context.state.file_info (based on the actual WS event structure)
             let files = eventData.files || []

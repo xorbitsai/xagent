@@ -1437,7 +1437,8 @@ class ReActPattern(AgentPattern):
                 )
             else:
                 call_context = f"{count_text} to {tool_name}."
-        current_request = self._task_text(context).strip()
+        task_text = self._task_text(context)
+        current_request = task_text.strip() if task_text else ""
         language_anchor = (
             "Latest user request text, quoted for response_language selection:\n"
             f"{current_request or '(unavailable)'}\n\n"

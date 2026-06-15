@@ -6,7 +6,7 @@ import pytest
 
 from xagent.core.agent.checkpoint import CHECKPOINT_TYPE, LEGACY_CHECKPOINT_TYPES
 from xagent.web.models.database import Base, get_db, get_engine, init_db
-from xagent.web.models.task import Task, TaskStatus, TraceEvent
+from xagent.web.models.task import ExecutionMode, Task, TaskStatus, TraceEvent
 from xagent.web.models.user import User
 from xagent.web.services.task_lease_service import (
     acquire_task_lease,
@@ -44,6 +44,26 @@ def _create_task(db, *, status=TaskStatus.PENDING) -> Task:
     db.commit()
     db.refresh(task)
     return task
+
+
+def test_task_model_default_execution_mode_is_auto(db_session) -> None:
+    user = User(username="default-mode-user", password_hash="hash", is_admin=False)
+    db_session.add(user)
+    db_session.commit()
+    db_session.refresh(user)
+
+    task = Task(
+        user_id=user.id,
+        title="Default mode",
+        description="Default mode",
+        status=TaskStatus.PENDING,
+    )
+    db_session.add(task)
+    db_session.commit()
+    db_session.refresh(task)
+
+    assert task.execution_mode == "auto"
+    assert task.execution_mode_enum == ExecutionMode.AUTO
 
 
 def test_task_lease_acquire_refresh_and_release(db_session) -> None:

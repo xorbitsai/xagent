@@ -861,6 +861,10 @@ async def test_react_pattern_uses_decision_for_repeated_tools() -> None:
     assert "Traditional Chinese" in response_language_schema["description"]
     assert "generic Chinese" in response_language_schema["description"]
     decision_prompt = llm.calls[2]["messages"][-1]["content"]
+    assert "Latest user request text" in decision_prompt
+    assert "最近 AI 新闻" in decision_prompt
+    assert "Choose response_language from that latest user request" in decision_prompt
+    assert "Do not choose response_language from tool results" in decision_prompt
     assert "Set response_language" in decision_prompt
     assert "answer must match response_language" in decision_prompt
     assert "When choosing final_answer" in decision_prompt

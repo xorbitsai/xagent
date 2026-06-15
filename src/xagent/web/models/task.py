@@ -112,7 +112,7 @@ class Task(Base):  # type: ignore
 
     # Execution mode configuration
     execution_mode = Column(
-        String(20), default=ExecutionMode.BALANCED.value, nullable=True
+        String(20), default=ExecutionMode.AUTO.value, nullable=True
     )  # "flash" | "balanced" | "think" | "auto"
     process_description = Column(
         Text, nullable=True
@@ -186,10 +186,10 @@ class Task(Base):  # type: ignore
             return (
                 ExecutionMode(self.execution_mode)
                 if self.execution_mode
-                else ExecutionMode.BALANCED
+                else ExecutionMode.AUTO
             )
         except ValueError:
-            return ExecutionMode.BALANCED
+            return ExecutionMode.AUTO
 
     @execution_mode_enum.setter
     def execution_mode_enum(self, value: ExecutionMode) -> None:

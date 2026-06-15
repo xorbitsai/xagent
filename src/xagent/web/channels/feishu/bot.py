@@ -12,6 +12,7 @@ from lark_oapi.api.im.v1 import (
     PatchMessageRequestBody,
 )
 
+from ....config import get_default_task_execution_mode
 from ...api.chat import get_agent_manager
 from ...models.database import get_db
 from ...models.task import Task, TaskStatus
@@ -233,6 +234,7 @@ class FeishuBotInstance:
                     title=task_title,
                     description=text,
                     status=TaskStatus.PENDING,
+                    execution_mode=get_default_task_execution_mode(),
                     channel_id=self.channel_id,
                     channel_name=self.channel_name,
                 )

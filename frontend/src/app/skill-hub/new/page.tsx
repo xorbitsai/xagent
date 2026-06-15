@@ -6,6 +6,7 @@ import Link from "next/link";
 import { ChevronLeft, Loader2, Plus } from "lucide-react";
 
 import { MarkdownEditor } from "@/components/skill-hub/markdown-editor";
+import { useI18n } from "@/contexts/i18n-context";
 import { apiRequest } from "@/lib/api-wrapper";
 import { getApiUrl } from "@/lib/utils";
 
@@ -48,6 +49,7 @@ Spell out the scenarios where the agent should pick this skill.
 export default function NewSkillPage() {
   const apiBase = getApiUrl();
   const router = useRouter();
+  const { t } = useI18n();
 
   const [name, setName] = useState("");
   const [skillMd, setSkillMd] = useState(STARTER_TEMPLATE);
@@ -86,16 +88,16 @@ export default function NewSkillPage() {
 
   return (
     <div className="flex h-full flex-col overflow-y-auto bg-background">
-      <div className="mx-auto w-full max-w-6xl flex-1 px-6 py-10">
+      <div className="mx-auto w-full flex-1 px-6 py-10">
         <Link
           href="/skill-hub"
           className="mb-6 inline-flex items-center gap-1 text-sm text-muted-foreground hover:text-foreground"
         >
-          <ChevronLeft className="h-4 w-4" /> Back to Skill Hub
+          <ChevronLeft className="h-4 w-4" /> {t("skillHub.newSkill.back")}
         </Link>
 
         <div className="mb-6 flex items-center justify-between gap-3">
-          <h1 className="text-2xl font-bold tracking-tight">Create a new skill</h1>
+          <h1 className="text-2xl font-bold tracking-tight">{t("skillHub.newSkill.title")}</h1>
           <button
             type="button"
             onClick={handleCreate}
@@ -103,13 +105,13 @@ export default function NewSkillPage() {
             className="inline-flex h-9 items-center gap-1.5 rounded-md bg-primary px-4 text-xs font-medium text-primary-foreground hover:bg-primary/90 disabled:opacity-50"
           >
             {saving ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <Plus className="h-3.5 w-3.5" />}
-            {saving ? "Creating…" : "Create"}
+            {saving ? t("skillHub.newSkill.creating") : t("skillHub.newSkill.create")}
           </button>
         </div>
 
         <div className="mb-4">
           <label className="mb-1 block text-xs font-semibold text-muted-foreground uppercase tracking-wider">
-            Skill name
+            {t("skillHub.newSkill.skillName")}
           </label>
           <input
             type="text"
@@ -119,12 +121,11 @@ export default function NewSkillPage() {
             className="h-10 w-full rounded-md border bg-background px-3 text-sm focus:outline-none focus:ring-2 focus:ring-primary/40"
           />
           <p className="mt-1 text-[11px] text-muted-foreground">
-            Letters, digits, hyphens, underscores only. Becomes the directory name under{" "}
-            <code className="rounded bg-muted px-1 py-px">~/.xagent/skills/</code>.
+            {t("skillHub.newSkill.nameHint", { path: "~/.xagent/skills/" })}
           </p>
           {name && !nameValid && (
             <p className="mt-1 text-[11px] text-destructive">
-              Name must match <code>[A-Za-z0-9_-]+</code>.
+              {t("skillHub.newSkill.nameInvalid", { pattern: "[A-Za-z0-9_-]+" })}
             </p>
           )}
         </div>
@@ -133,7 +134,7 @@ export default function NewSkillPage() {
           value={skillMd}
           onChange={setSkillMd}
           rows={26}
-          placeholder="Start typing your SKILL.md…"
+          placeholder={t("skillHub.newSkill.placeholder")}
         />
 
         {error && (

@@ -3,6 +3,7 @@
 import { useCallback } from "react";
 
 import { MarkdownRenderer } from "@/components/ui/markdown-renderer";
+import { useI18n } from "@/contexts/i18n-context";
 import { cn } from "@/lib/utils";
 
 /**
@@ -27,6 +28,7 @@ export function MarkdownEditor({
   className?: string;
   rows?: number;
 }) {
+  const { t } = useI18n();
   // Tab-key indent — sounds tiny but writing YAML frontmatter without
   // tab support is genuinely annoying.
   const handleKeyDown = useCallback(
@@ -49,7 +51,7 @@ export function MarkdownEditor({
     <div className={cn("grid gap-3 lg:grid-cols-2", className)}>
       <div className="flex flex-col">
         <div className="mb-2 text-[11px] font-semibold text-muted-foreground uppercase tracking-wider">
-          SKILL.md
+          {t("skillHub.editor.skillMd")}
         </div>
         <textarea
           value={value}
@@ -63,7 +65,7 @@ export function MarkdownEditor({
       </div>
       <div className="flex flex-col">
         <div className="mb-2 text-[11px] font-semibold text-muted-foreground uppercase tracking-wider">
-          Preview
+          {t("skillHub.editor.preview")}
         </div>
         <div className="flex-1 overflow-y-auto rounded-md border bg-card p-4">
           {value.trim() ? (
@@ -73,7 +75,7 @@ export function MarkdownEditor({
             />
           ) : (
             <div className="text-xs italic text-muted-foreground">
-              Live preview will appear here.
+              {t("skillHub.editor.livePreviewHint")}
             </div>
           )}
         </div>

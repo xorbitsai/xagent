@@ -21,6 +21,7 @@ import {
 
 import { ConfirmDialog } from "@/components/ui/confirm-dialog";
 import { Select, type SelectOption } from "@/components/ui/select";
+import { useI18n } from "@/contexts/i18n-context";
 import { apiRequest } from "@/lib/api-wrapper";
 import { cn, getApiUrl } from "@/lib/utils";
 import type {
@@ -94,41 +95,42 @@ type Tab = "discover" | "mine";
 function badgeForSource(source: SkillSource) {
   switch (source) {
     case "builtin":
-      return { label: "Built-in", classes: "bg-violet-500/10 text-violet-600 border-violet-500/30" };
+      return { label: "builtin", classes: "bg-violet-500/10 text-violet-600 border-violet-500/30" };
     case "user":
-      return { label: "Installed", classes: "bg-emerald-500/10 text-emerald-600 border-emerald-500/30" };
+      return { label: "user", classes: "bg-emerald-500/10 text-emerald-600 border-emerald-500/30" };
     case "team":
-      return { label: "Team", classes: "bg-blue-500/10 text-blue-600 border-blue-500/30" };
+      return { label: "team", classes: "bg-blue-500/10 text-blue-600 border-blue-500/30" };
     default:
-      return { label: "External", classes: "bg-amber-500/10 text-amber-600 border-amber-500/30" };
+      return { label: "external", classes: "bg-amber-500/10 text-amber-600 border-amber-500/30" };
   }
 }
 
 function ScanBadge({ status }: { status: ScanStatus }) {
+  const { t } = useI18n();
   if (status === "clean") {
     return (
       <span className="inline-flex items-center gap-1 rounded-full border border-emerald-500/30 bg-emerald-500/10 px-2 py-0.5 text-[10px] font-medium text-emerald-600">
-        <ShieldCheck className="h-3 w-3" /> Scanned clean
+        <ShieldCheck className="h-3 w-3" /> {t("skillHub.discover.scanBadge.clean")}
       </span>
     );
   }
   if (status === "suspicious") {
     return (
       <span className="inline-flex items-center gap-1 rounded-full border border-amber-500/30 bg-amber-500/10 px-2 py-0.5 text-[10px] font-medium text-amber-600">
-        <ShieldAlert className="h-3 w-3" /> Flagged
+        <ShieldAlert className="h-3 w-3" /> {t("skillHub.discover.scanBadge.flagged")}
       </span>
     );
   }
   if (status === "malicious") {
     return (
       <span className="inline-flex items-center gap-1 rounded-full border border-rose-500/30 bg-rose-500/10 px-2 py-0.5 text-[10px] font-medium text-rose-600">
-        <ShieldAlert className="h-3 w-3" /> Malicious
+        <ShieldAlert className="h-3 w-3" /> {t("skillHub.discover.scanBadge.malicious")}
       </span>
     );
   }
   return (
     <span className="inline-flex items-center gap-1 rounded-full border border-muted-foreground/20 bg-muted/40 px-2 py-0.5 text-[10px] font-medium text-muted-foreground">
-      <ShieldQuestion className="h-3 w-3" /> Not scanned
+      <ShieldQuestion className="h-3 w-3" /> {t("skillHub.discover.scanBadge.notScanned")}
     </span>
   );
 }
@@ -142,6 +144,7 @@ function formatInstalls(n: number | null): string {
 
 export default function SkillHubPage() {
   const apiBase = getApiUrl();
+  const { t } = useI18n();
   const [tab, setTab] = useState<Tab>("mine");
 
   // ── installed (mine) ──────────────────────────────────────────────
@@ -525,11 +528,11 @@ export default function SkillHubPage() {
     const q = installedQuery.trim().toLowerCase();
     const base = q
       ? installed.filter(
-          (s) =>
-            s.name.toLowerCase().includes(q) ||
-            s.description.toLowerCase().includes(q) ||
-            s.tags.some((t) => t.toLowerCase().includes(q)),
-        )
+        (s) =>
+          s.name.toLowerCase().includes(q) ||
+          s.description.toLowerCase().includes(q) ||
+          s.tags.some((t) => t.toLowerCase().includes(q)),
+      )
       : installed;
     // ``source`` mode preserves the original "user → team → builtin → external"
     // grouping (already applied server-side); just sort by name within.
@@ -549,16 +552,15 @@ export default function SkillHubPage() {
 
   return (
     <div className="flex h-full flex-col overflow-y-auto bg-background">
-      <div className="mx-auto w-full max-w-6xl flex-1 px-6 py-10">
+      <div className="mx-auto w-full flex-1 px-6 py-10">
         {/* Header */}
         <div className="mb-6 flex flex-col items-center gap-3 text-center">
           <div className="rounded-2xl bg-emerald-500/10 p-3 text-emerald-500">
             <Library className="h-8 w-8" />
           </div>
-          <h1 className="text-3xl font-bold tracking-tight">Skill Hub</h1>
+          <h1 className="text-3xl font-bold tracking-tight">{t("skillHub.page.title")}</h1>
           <p className="max-w-2xl text-sm text-muted-foreground">
-            Install skills from ClawHub or write your own. Agents
-            automatically pick the right skill for each task.
+            {t("skillHub.page.subtitle")}
           </p>
         </div>
 
@@ -576,7 +578,7 @@ export default function SkillHubPage() {
               )}
             >
               <Compass className="h-4 w-4" />
-              Discover
+              {t("skillHub.tabs.discover")}
             </button>
             <button
               type="button"
@@ -589,7 +591,7 @@ export default function SkillHubPage() {
               )}
             >
               <Library className="h-4 w-4" />
-              My Skills · {installed.length}
+              {t("skillHub.tabs.mySkills")} · {installed.length}
             </button>
           </div>
           <Link
@@ -597,7 +599,7 @@ export default function SkillHubPage() {
             className="inline-flex items-center gap-1.5 rounded-md border bg-card px-3 py-1.5 text-xs font-medium hover:bg-muted"
           >
             <Plus className="h-3.5 w-3.5" />
-            Create new
+            {t("skillHub.page.createNew")}
           </Link>
         </div>
 
@@ -650,13 +652,13 @@ export default function SkillHubPage() {
           if (!open && deleting !== deleteTarget) setDeleteTarget(null);
         }}
         onConfirm={performDelete}
-        title="Remove skill"
+        title={t("skillHub.mySkills.removeTitle")}
         description={
           deleteTarget
-            ? `Remove "${deleteTarget}" from your installed skills? This deletes the files under ~/.xagent/skills/${deleteTarget}/.`
+            ? t("skillHub.mySkills.removeDescription", { name: deleteTarget, path: `~/.xagent/skills/${deleteTarget}/` })
             : ""
         }
-        confirmText="Remove"
+        confirmText={t("skillHub.mySkills.remove")}
         isLoading={!!deleting && deleting === deleteTarget}
       />
     </div>
@@ -666,34 +668,6 @@ export default function SkillHubPage() {
 // ────────────────────────────────────────────────────────────────────
 // Discover tab
 // ────────────────────────────────────────────────────────────────────
-
-/** Roadmap surface: only the first is wired today. Adding a new
- * registry later means a new entry here plus a backend ``/registry/*``
- * implementation; the rest of DiscoverTab stays unchanged. */
-const SOURCE_OPTIONS: SelectOption[] = [
-  { value: "clawhub", label: "OpenClaw", description: "ClawHub public registry" },
-  {
-    value: "huggingface",
-    label: "Hugging Face (coming soon)",
-    description: "Browse Claude-format skills on HF Hub",
-  },
-  {
-    value: "anthropic",
-    label: "Anthropic Skills (coming soon)",
-    description: "Official Anthropic skill catalog",
-  },
-];
-
-/** Sort dimensions ClawHub honors today (audited 2026-05). The
- * ``value`` strings are passed verbatim to the registry's ``sort``
- * query param. */
-const SORT_OPTIONS: SelectOption[] = [
-  { value: "trending", label: "Trending" },
-  { value: "newest", label: "Newest" },
-  { value: "installsCurrent", label: "Most installed" },
-  { value: "stars", label: "Most starred" },
-  { value: "updated", label: "Recently updated" },
-];
 
 function DiscoverTab({
   registry, loading, error, query, setQuery, sort, setSort,
@@ -725,6 +699,32 @@ function DiscoverTab({
   installError: { slug: string; msg: string } | null;
   onInstall: (slug: string) => void;
 }) {
+  const { t } = useI18n();
+
+  /** Roadmap surface: only the first is wired today. */
+  const SOURCE_OPTIONS: SelectOption[] = [
+    { value: "clawhub", label: t("skillHub.discover.source.clawhub"), description: t("skillHub.discover.source.clawhubDesc") },
+    {
+      value: "huggingface",
+      label: t("skillHub.discover.source.huggingfaceLabel"),
+      description: t("skillHub.discover.source.huggingfaceDesc"),
+    },
+    {
+      value: "anthropic",
+      label: t("skillHub.discover.source.anthropicLabel"),
+      description: t("skillHub.discover.source.anthropicDesc"),
+    },
+  ];
+
+  /** Sort dimensions ClawHub honors today. */
+  const SORT_OPTIONS: SelectOption[] = [
+    { value: "trending", label: t("skillHub.discover.sort.trending") },
+    { value: "newest", label: t("skillHub.discover.sort.newest") },
+    { value: "installsCurrent", label: t("skillHub.discover.sort.mostInstalled") },
+    { value: "stars", label: t("skillHub.discover.sort.mostStarred") },
+    { value: "updated", label: t("skillHub.discover.sort.recentlyUpdated") },
+  ];
+
   // Derive total pages from total skills + the page size the grid
   // uses. Stats may be null (still loading) or truncated (we hit the
   // safety cap before exhausting cursors — show "≥M" then).
@@ -736,7 +736,7 @@ function DiscoverTab({
   const handleSourceChange = (v: string) => {
     if (v === "clawhub") return;
     const label = SOURCE_OPTIONS.find((o) => o.value === v)?.label || v;
-    setComingSoon(`${label.replace(" (coming soon)", "")} isn't wired yet — for now only OpenClaw is supported.`);
+    setComingSoon(t("skillHub.discover.comingSoon", { source: label }));
     setTimeout(() => setComingSoon(null), 3500);
   };
 
@@ -744,13 +744,12 @@ function DiscoverTab({
 
   return (
     <>
-      {/* Featured rail — editorial, only in browse mode. Hides in
-       * search so search-result space isn't cluttered. */}
-      {!inSearchMode && (featuredLoading || featured.length > 0) && (
+      {/* Featured rail — editorial. */}
+      {(featuredLoading || featured.length > 0) && (
         <section className="mb-6">
           <div className="mb-2 flex items-center gap-1.5 text-sm font-semibold">
             <Sparkles className="h-4 w-4 text-amber-500" />
-            <span>Featured by xagent</span>
+            <span>{t("skillHub.discover.featured")}</span>
           </div>
           {featuredLoading ? (
             <div className="flex justify-center py-6">
@@ -773,13 +772,13 @@ function DiscoverTab({
                         </div>
                         {s.ownerHandle && (
                           <div className="text-[10px] text-muted-foreground">
-                            by {s.ownerHandle}
+                            {t("skillHub.discover.by", { owner: s.ownerHandle })}
                           </div>
                         )}
                       </div>
                       {isInstalled ? (
                         <span className="inline-flex shrink-0 items-center gap-1 rounded-md border border-emerald-500/30 bg-emerald-500/10 px-2 py-0.5 text-[10px] font-medium text-emerald-600">
-                          <Check className="h-3 w-3" /> Installed
+                          <Check className="h-3 w-3" /> {t("skillHub.discover.installed")}
                         </span>
                       ) : (
                         <button
@@ -793,7 +792,7 @@ function DiscoverTab({
                           ) : (
                             <Plus className="h-3 w-3" />
                           )}
-                          Install
+                          {installing ? t("skillHub.discover.installing") : t("skillHub.discover.install")}
                         </button>
                       )}
                     </div>
@@ -811,13 +810,12 @@ function DiscoverTab({
       {/* Popular rail — ClawHub's installsCurrent angle. Distinct
        * from Trending (which weights recency), so the same skill
        * may appear in both Trending and Popular but the lists rarely
-       * match exactly. Hidden in search mode (same reasoning as
-       * Featured). */}
-      {!inSearchMode && (popularLoading || popular.length > 0) && (
+       * match exactly. */}
+      {(popularLoading || popular.length > 0) && (
         <section className="mb-6">
           <div className="mb-2 flex items-center gap-1.5 text-sm font-semibold">
             <Flame className="h-4 w-4 text-rose-500" />
-            <span>Popular this week</span>
+            <span>{t("skillHub.discover.popular")}</span>
           </div>
           {popularLoading ? (
             <div className="flex justify-center py-6">
@@ -840,13 +838,13 @@ function DiscoverTab({
                         </div>
                         {s.installs != null && (
                           <div className="text-[10px] text-muted-foreground">
-                            {formatInstalls(s.installs)} installs
+                            {t("skillHub.discover.installs", { count: formatInstalls(s.installs) })}
                           </div>
                         )}
                       </div>
                       {isInstalled ? (
                         <span className="inline-flex shrink-0 items-center gap-1 rounded-md border border-emerald-500/30 bg-emerald-500/10 px-2 py-0.5 text-[10px] font-medium text-emerald-600">
-                          <Check className="h-3 w-3" /> Installed
+                          <Check className="h-3 w-3" /> {t("skillHub.discover.installed")}
                         </span>
                       ) : (
                         <button
@@ -860,12 +858,12 @@ function DiscoverTab({
                           ) : (
                             <Plus className="h-3 w-3" />
                           )}
-                          Install
+                          {installing ? t("skillHub.discover.installing") : t("skillHub.discover.install")}
                         </button>
                       )}
                     </div>
                     <p className="text-[11px] text-muted-foreground line-clamp-2">
-                      {s.summary || "No description."}
+                      {s.summary || t("skillHub.discover.noDescription")}
                     </p>
                   </div>
                 );
@@ -878,12 +876,10 @@ function DiscoverTab({
       {/* "All" header — the section below this is the full sortable
        * browse grid. The label is what flips Discover from
        * "showcase" into "catalog" mode visually. */}
-      {!inSearchMode && (
-        <div className="mb-2 flex items-center gap-1.5 text-sm font-semibold">
-          <Compass className="h-4 w-4 text-blue-500" />
-          <span>Browse all</span>
-        </div>
-      )}
+      <div className="mb-2 flex items-center gap-1.5 text-sm font-semibold">
+        <Compass className="h-4 w-4 text-blue-500" />
+        <span>{t("skillHub.discover.browseAll")}</span>
+      </div>
 
       <div className="mb-3 flex flex-col gap-3 sm:flex-row sm:items-stretch">
         <div className="sm:w-48">
@@ -910,7 +906,7 @@ function DiscoverTab({
             type="text"
             value={query}
             onChange={(e) => setQuery(e.target.value)}
-            placeholder="Search ClawHub…"
+            placeholder={t("skillHub.discover.searchPlaceholder")}
             className="h-10 w-full rounded-md border bg-background pl-10 pr-4 text-sm focus:outline-none focus:ring-2 focus:ring-primary/40"
           />
         </div>
@@ -931,25 +927,21 @@ function DiscoverTab({
         <div className="mb-4 text-xs text-muted-foreground">
           {inSearchMode ? (
             <>
-              {registry.length} result{registry.length === 1 ? "" : "s"} for
-              {" "}<span className="font-semibold text-foreground">&quot;{query.trim()}&quot;</span>
+              {registry.length === 1
+                ? t("skillHub.discover.pagination.resultFor", { count: registry.length, query: query.trim() })
+                : t("skillHub.discover.pagination.resultsFor", { count: registry.length, query: query.trim() })}
             </>
           ) : (
             <>
-              Page <span className="font-semibold text-foreground">{pageIndex + 1}</span>
-              {totalPages && (
-                <>
-                  {" "}of <span className="font-semibold text-foreground">
-                    {stats?.truncated ? `≥${totalPages}` : totalPages}
-                  </span>
-                </>
-              )}
+              {totalPages
+                ? t("skillHub.discover.pagination.pageOf", { page: pageIndex + 1, total: stats?.truncated ? `≥${totalPages}` : String(totalPages) })
+                : t("skillHub.discover.pagination.page", { page: pageIndex + 1 })}
               {stats && (
                 <>
-                  {" "}· {stats.truncated ? "≥" : ""}{stats.total.toLocaleString()} skills in {sort}
+                  {" "}· {t("skillHub.discover.pagination.skillsInSort", { count: `${stats.truncated ? "≥" : ""}${stats.total.toLocaleString()}`, sort: SORT_OPTIONS.find(o => o.value === sort)?.label || sort })}
                 </>
               )}
-              {!stats && <> · {registry.length} shown</>}
+              {!stats && <> · {t("skillHub.discover.pagination.shown", { count: registry.length })}</>}
             </>
           )}
         </div>
@@ -965,114 +957,109 @@ function DiscoverTab({
         </div>
       ) : registry.length === 0 ? (
         <div className="mt-10 rounded-xl border bg-card p-10 text-center text-sm text-muted-foreground">
-          {query ? "No skills match your search." : "Registry is empty."}
+          {query ? t("skillHub.discover.noMatchSearch") : t("skillHub.discover.registryEmpty")}
         </div>
       ) : (
         <>
-        <div className="grid grid-cols-1 gap-3 sm:grid-cols-2 lg:grid-cols-3">
-          {registry.map((s) => {
-            const installing = installingSlug === s.slug;
-            const isInstalled = !!s.installedAs;
-            const showError = installError?.slug === s.slug;
-            return (
-              <div
-                key={s.slug}
-                className="flex flex-col gap-2 rounded-xl border bg-card p-4 transition-all hover:border-primary/40 hover:shadow-sm"
-              >
-                <div className="flex items-start justify-between gap-2">
-                  <div className="min-w-0 flex-1">
-                    <div className="truncate text-sm font-semibold leading-tight">
-                      {s.displayName || s.slug}
-                    </div>
-                    {s.ownerHandle && (
-                      <div className="text-[11px] text-muted-foreground">
-                        by {s.ownerHandle}
+          <div className="grid grid-cols-1 gap-3 sm:grid-cols-2 lg:grid-cols-3">
+            {registry.map((s) => {
+              const installing = installingSlug === s.slug;
+              const isInstalled = !!s.installedAs;
+              const showError = installError?.slug === s.slug;
+              return (
+                <div
+                  key={s.slug}
+                  className="flex flex-col gap-2 rounded-xl border bg-card p-4 transition-all hover:border-primary/40 hover:shadow-sm"
+                >
+                  <div className="flex items-start justify-between gap-2">
+                    <div className="min-w-0 flex-1">
+                      <div className="truncate text-sm font-semibold leading-tight">
+                        {s.displayName || s.slug}
                       </div>
-                    )}
-                  </div>
-                  <ScanBadge status={s.scanStatus} />
-                </div>
-                <p className="text-xs text-muted-foreground line-clamp-3">
-                  {s.summary || "No description."}
-                </p>
-                <div className="flex items-center justify-between gap-2 pt-1">
-                  <div className="text-[11px] text-muted-foreground">
-                    {s.version ? `v${s.version}` : ""}
-                    {s.installs != null && (
-                      <span className="ml-2">{formatInstalls(s.installs)} installs</span>
-                    )}
-                  </div>
-                  {isInstalled ? (
-                    <span className="inline-flex items-center gap-1 rounded-md border border-emerald-500/30 bg-emerald-500/10 px-2.5 py-1 text-[11px] font-medium text-emerald-600">
-                      <Check className="h-3 w-3" /> Installed
-                    </span>
-                  ) : (
-                    <button
-                      type="button"
-                      disabled={installing}
-                      onClick={() => onInstall(s.slug)}
-                      className="inline-flex items-center gap-1 rounded-md bg-primary px-2.5 py-1 text-[11px] font-medium text-primary-foreground hover:bg-primary/90 disabled:opacity-50"
-                    >
-                      {installing ? (
-                        <>
-                          <Loader2 className="h-3 w-3 animate-spin" /> Installing…
-                        </>
-                      ) : (
-                        <>
-                          <Plus className="h-3 w-3" /> Install
-                        </>
+                      {s.ownerHandle && (
+                        <div className="text-[11px] text-muted-foreground">
+                          {t("skillHub.discover.by", { owner: s.ownerHandle })}
+                        </div>
                       )}
-                    </button>
+                    </div>
+                    <ScanBadge status={s.scanStatus} />
+                  </div>
+                  <p className="text-xs text-muted-foreground line-clamp-3">
+                    {s.summary || t("skillHub.discover.noDescription")}
+                  </p>
+                  <div className="flex items-center justify-between gap-2 pt-1">
+                    <div className="text-[11px] text-muted-foreground">
+                      {s.version ? `v${s.version}` : ""}
+                      {s.installs != null && (
+                        <span className="ml-2">{t("skillHub.discover.installs", { count: formatInstalls(s.installs) })}</span>
+                      )}
+                    </div>
+                    {isInstalled ? (
+                      <span className="inline-flex items-center gap-1 rounded-md border border-emerald-500/30 bg-emerald-500/10 px-2.5 py-1 text-[11px] font-medium text-emerald-600">
+                        <Check className="h-3 w-3" /> {t("skillHub.discover.installed")}
+                      </span>
+                    ) : (
+                      <button
+                        type="button"
+                        disabled={installing}
+                        onClick={() => onInstall(s.slug)}
+                        className="inline-flex items-center gap-1 rounded-md bg-primary px-2.5 py-1 text-[11px] font-medium text-primary-foreground hover:bg-primary/90 disabled:opacity-50"
+                      >
+                        {installing ? (
+                          <>
+                            <Loader2 className="h-3 w-3 animate-spin" /> {t("skillHub.discover.installing")}
+                          </>
+                        ) : (
+                          <>
+                            <Plus className="h-3 w-3" /> {t("skillHub.discover.install")}
+                          </>
+                        )}
+                      </button>
+                    )}
+                  </div>
+                  {showError && (
+                    <div className="rounded border border-destructive/40 bg-destructive/10 p-2 text-[11px] leading-snug text-destructive">
+                      {installError!.msg}
+                    </div>
                   )}
                 </div>
-                {showError && (
-                  <div className="rounded border border-destructive/40 bg-destructive/10 p-2 text-[11px] leading-snug text-destructive">
-                    {installError!.msg}
-                  </div>
-                )}
-              </div>
-            );
-          })}
-        </div>
-        {/* Prev / Next pagination. Only meaningful in browse mode
+              );
+            })}
+          </div>
+          {/* Prev / Next pagination. Only meaningful in browse mode
          * (search results don't paginate). Always rendered in browse
          * mode so the affordance is predictable — buttons disable
          * themselves when there's nowhere to go (e.g. sort=trending
          * only has ~100 items so Next disables on page 2). Hiding the
          * whole control on edge sorts made users think "the feature
          * disappeared". */}
-        {!inSearchMode && (
-          <div className="mt-5 flex items-center justify-end gap-3">
-            <button
-              type="button"
-              onClick={onPrev}
-              disabled={!hasPrev}
-              className="inline-flex items-center gap-1 rounded-md border bg-card px-4 py-2 text-xs font-medium hover:bg-muted disabled:opacity-30"
-            >
-              <ChevronLeft className="h-3.5 w-3.5" />
-              Prev
-            </button>
-            <span className="text-xs text-muted-foreground">
-              Page <span className="font-semibold text-foreground">{pageIndex + 1}</span>
-              {totalPages && (
-                <>
-                  {" "}/ <span className="font-semibold text-foreground">
-                    {stats?.truncated ? `≥${totalPages}` : totalPages}
-                  </span>
-                </>
-              )}
-            </span>
-            <button
-              type="button"
-              onClick={onNext}
-              disabled={!hasNext}
-              className="inline-flex items-center gap-1 rounded-md border bg-card px-4 py-2 text-xs font-medium hover:bg-muted disabled:opacity-30"
-            >
-              Next
-              <ChevronRight className="h-3.5 w-3.5" />
-            </button>
-          </div>
-        )}
+          {!inSearchMode && (
+            <div className="mt-5 flex items-center justify-end gap-3">
+              <button
+                type="button"
+                onClick={onPrev}
+                disabled={!hasPrev}
+                className="inline-flex items-center gap-1 rounded-md border bg-card px-4 py-2 text-xs font-medium hover:bg-muted disabled:opacity-30"
+              >
+                <ChevronLeft className="h-3.5 w-3.5" />
+                {t("skillHub.discover.pagination.prev")}
+              </button>
+              <span className="text-xs text-muted-foreground">
+                {totalPages
+                  ? t("skillHub.discover.pagination.pageOf", { page: pageIndex + 1, total: stats?.truncated ? `≥${totalPages}` : String(totalPages) })
+                  : t("skillHub.discover.pagination.page", { page: pageIndex + 1 })}
+              </span>
+              <button
+                type="button"
+                onClick={onNext}
+                disabled={!hasNext}
+                className="inline-flex items-center gap-1 rounded-md border bg-card px-4 py-2 text-xs font-medium hover:bg-muted disabled:opacity-30"
+              >
+                {t("skillHub.discover.pagination.next")}
+                <ChevronRight className="h-3.5 w-3.5" />
+              </button>
+            </div>
+          )}
         </>
       )}
     </>
@@ -1082,11 +1069,6 @@ function DiscoverTab({
 // ────────────────────────────────────────────────────────────────────
 // My Skills tab
 // ────────────────────────────────────────────────────────────────────
-
-const INSTALLED_SORT_OPTIONS: SelectOption[] = [
-  { value: "source", label: "Group by source", description: "User → Built-in → External" },
-  { value: "name", label: "Name (A-Z)", description: "Flat alphabetical" },
-];
 
 function MyTab({
   installed, totalCount, loading, error, query, setQuery, sort, setSort, deleting, onDelete,
@@ -1102,6 +1084,13 @@ function MyTab({
   deleting: string | null;
   onDelete: (name: string) => void;
 }) {
+  const { t } = useI18n();
+
+  const INSTALLED_SORT_OPTIONS: SelectOption[] = [
+    { value: "source", label: t("skillHub.mySkills.sort.groupBySource"), description: t("skillHub.mySkills.sort.groupBySourceDesc") },
+    { value: "name", label: t("skillHub.mySkills.sort.byName"), description: t("skillHub.mySkills.sort.byNameDesc") },
+  ];
+
   return (
     <>
       <div className="mb-3 flex flex-col gap-3 sm:flex-row sm:items-stretch">
@@ -1118,7 +1107,7 @@ function MyTab({
             type="text"
             value={query}
             onChange={(e) => setQuery(e.target.value)}
-            placeholder="Search installed skills…"
+            placeholder={t("skillHub.mySkills.searchPlaceholder")}
             className="h-10 w-full rounded-md border bg-background pl-10 pr-4 text-sm focus:outline-none focus:ring-2 focus:ring-primary/40"
           />
         </div>
@@ -1126,8 +1115,8 @@ function MyTab({
       {!loading && !error && totalCount > 0 && (
         <div className="mb-4 text-[11px] text-muted-foreground">
           {query
-            ? `${installed.length} of ${totalCount} match`
-            : `${totalCount} skill${totalCount === 1 ? "" : "s"} installed`}
+            ? t("skillHub.mySkills.matchSummary", { shown: installed.length, total: totalCount })
+            : t("skillHub.mySkills.skillsInstalled", { count: totalCount })}
         </div>
       )}
 
@@ -1142,12 +1131,10 @@ function MyTab({
       ) : installed.length === 0 ? (
         <div className="mt-10 rounded-xl border bg-card p-10 text-center text-sm text-muted-foreground">
           {query ? (
-            "No skills match your filter."
+            t("skillHub.mySkills.noFilterMatch")
           ) : (
             <>
-              No installed skills yet. Browse the{" "}
-              <span className="font-medium text-foreground">Discover</span> tab or
-              create one from scratch.
+              {t("skillHub.mySkills.noInstalled", { discover: t("skillHub.mySkills.discover") })}
             </>
           )}
         </div>
@@ -1176,14 +1163,14 @@ function MyTab({
                       badge.classes,
                     )}
                   >
-                    {badge.label}
+                    {t(`skillHub.sourceLabel.${badge.label}`)}
                   </span>
                 </div>
                 <Link
                   href={`/skill-hub/${encodeURIComponent(s.name)}`}
                   className="text-xs text-muted-foreground line-clamp-3"
                 >
-                  {s.description || "No description."}
+                  {s.description || t("skillHub.mySkills.noDescription")}
                 </Link>
                 {s.tags.length > 0 && (
                   <div className="flex flex-wrap gap-1">
@@ -1209,7 +1196,7 @@ function MyTab({
                     ) : (
                       <Trash2 className="h-3 w-3" />
                     )}
-                    Remove
+                    {t("skillHub.mySkills.remove")}
                   </button>
                 )}
               </div>

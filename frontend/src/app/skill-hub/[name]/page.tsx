@@ -16,6 +16,7 @@ import {
 import { ConfirmDialog } from "@/components/ui/confirm-dialog";
 import { MarkdownRenderer } from "@/components/ui/markdown-renderer";
 import { MarkdownEditor } from "@/components/skill-hub/markdown-editor";
+import { useI18n } from "@/contexts/i18n-context";
 import { apiRequest } from "@/lib/api-wrapper";
 import { cn, getApiUrl } from "@/lib/utils";
 import type { SkillDetail, SkillSource } from "@/types/skill-hub";
@@ -35,13 +36,13 @@ import type { SkillDetail, SkillSource } from "@/types/skill-hub";
 function badgeForSource(source: SkillSource) {
   switch (source) {
     case "builtin":
-      return { label: "Built-in", classes: "bg-violet-500/10 text-violet-600 border-violet-500/30" };
+      return { label: "builtin", classes: "bg-violet-500/10 text-violet-600 border-violet-500/30" };
     case "user":
-      return { label: "Installed", classes: "bg-emerald-500/10 text-emerald-600 border-emerald-500/30" };
+      return { label: "user", classes: "bg-emerald-500/10 text-emerald-600 border-emerald-500/30" };
     case "team":
-      return { label: "Team", classes: "bg-blue-500/10 text-blue-600 border-blue-500/30" };
+      return { label: "team", classes: "bg-blue-500/10 text-blue-600 border-blue-500/30" };
     default:
-      return { label: "External", classes: "bg-amber-500/10 text-amber-600 border-amber-500/30" };
+      return { label: "external", classes: "bg-amber-500/10 text-amber-600 border-amber-500/30" };
   }
 }
 
@@ -49,6 +50,7 @@ export default function SkillDetailPage() {
   const params = useParams<{ name: string }>();
   const router = useRouter();
   const apiBase = getApiUrl();
+  const { t } = useI18n();
 
   const [skill, setSkill] = useState<SkillDetail | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -175,7 +177,7 @@ export default function SkillDetailPage() {
     return (
       <div className="flex h-full items-center justify-center">
         <div className="rounded-md border border-destructive/40 bg-destructive/10 p-3 text-sm text-destructive">
-          {error || "Skill not found."}
+          {error || t("skillHub.detail.notFound")}
         </div>
       </div>
     );
@@ -186,15 +188,12 @@ export default function SkillDetailPage() {
 
   return (
     <div className="flex h-full flex-col overflow-y-auto bg-background">
-      <div className={cn(
-        "mx-auto w-full flex-1 px-6 py-10",
-        editing ? "max-w-6xl" : "max-w-4xl",
-      )}>
+      <div className="mx-auto w-full flex-1 px-6 py-10">
         <Link
           href="/skill-hub"
           className="mb-6 inline-flex items-center gap-1 text-sm text-muted-foreground hover:text-foreground"
         >
-          <ChevronLeft className="h-4 w-4" /> Back to Skill Hub
+          <ChevronLeft className="h-4 w-4" /> {t("skillHub.detail.back")}
         </Link>
 
         {/* Header */}
@@ -213,7 +212,7 @@ export default function SkillDetailPage() {
                   badge.classes,
                 )}
               >
-                {badge.label}
+                {t(`skillHub.sourceLabel.${badge.label}`)}
               </span>
             </div>
             {skill.description && (
@@ -240,7 +239,7 @@ export default function SkillDetailPage() {
                 className="inline-flex h-9 items-center gap-1.5 rounded-md border bg-card px-3 text-xs font-medium hover:bg-muted"
               >
                 <Pencil className="h-3.5 w-3.5" />
-                Edit
+                {t("skillHub.detail.edit")}
               </button>
               <button
                 type="button"
@@ -253,7 +252,7 @@ export default function SkillDetailPage() {
                 ) : (
                   <Trash2 className="h-3.5 w-3.5" />
                 )}
-                Remove
+                {t("skillHub.detail.remove")}
               </button>
             </div>
           )}
@@ -266,7 +265,7 @@ export default function SkillDetailPage() {
                 className="inline-flex h-9 items-center gap-1.5 rounded-md border bg-card px-3 text-xs font-medium hover:bg-muted disabled:opacity-50"
               >
                 <X className="h-3.5 w-3.5" />
-                Cancel
+                {t("skillHub.detail.cancel")}
               </button>
               <button
                 type="button"
@@ -275,7 +274,7 @@ export default function SkillDetailPage() {
                 className="inline-flex h-9 items-center gap-1.5 rounded-md bg-primary px-3 text-xs font-medium text-primary-foreground hover:bg-primary/90 disabled:opacity-50"
               >
                 {saving ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <Save className="h-3.5 w-3.5" />}
-                {saving ? "Saving…" : "Save"}
+                {saving ? t("skillHub.detail.saving") : t("skillHub.detail.save")}
               </button>
             </div>
           )}
@@ -294,12 +293,12 @@ export default function SkillDetailPage() {
           <>
             {skill.source === "team" && (
               <div className="mb-4 rounded-md border border-blue-500/30 bg-blue-500/10 p-3 text-xs text-blue-700">
-                Team skills are managed from Team settings.
+                {t("skillHub.detail.teamNote")}
               </div>
             )}
             <section className="mb-6 rounded-xl border bg-card p-6">
               <div className="mb-3 text-xs font-semibold text-muted-foreground uppercase tracking-wider">
-                SKILL.md
+                {t("skillHub.detail.skillMd")}
               </div>
               {skill.content ? (
                 <MarkdownRenderer
@@ -307,13 +306,13 @@ export default function SkillDetailPage() {
                   className="prose-sm text-foreground prose-headings:text-foreground prose-strong:text-foreground prose-code:text-foreground"
                 />
               ) : (
-                <div className="text-sm italic text-muted-foreground">SKILL.md is empty.</div>
+                <div className="text-sm italic text-muted-foreground">{t("skillHub.detail.skillMdEmpty")}</div>
               )}
             </section>
             {skill.files.length > 0 && (
               <section className="mb-6 rounded-xl border bg-card p-6">
                 <div className="mb-3 text-xs font-semibold text-muted-foreground uppercase tracking-wider">
-                  Files · {skill.files.length}
+                  {t("skillHub.detail.files")} · {skill.files.length}
                 </div>
                 <ul className="space-y-1">
                   {skill.files.map((f) => (
@@ -326,7 +325,7 @@ export default function SkillDetailPage() {
               </section>
             )}
             <div className="text-[11px] text-muted-foreground">
-              Installed at: <code className="rounded bg-muted px-1 py-0.5">{skill.path}</code>
+              {t("skillHub.detail.installedAt")} <code className="rounded bg-muted px-1 py-0.5">{skill.path}</code>
             </div>
           </>
         )}
@@ -339,13 +338,13 @@ export default function SkillDetailPage() {
           if (!open && !deleting) setConfirmRemove(false);
         }}
         onConfirm={performDelete}
-        title="Remove skill"
+        title={t("skillHub.detail.removeTitle")}
         description={
           skill
-            ? `Remove "${skill.name}" from your installed skills? This deletes the files under ${skill.path}.`
+            ? t("skillHub.detail.removeDescription", { name: skill.name, path: skill.path })
             : ""
         }
-        confirmText="Remove"
+        confirmText={t("skillHub.detail.remove")}
         isLoading={deleting}
       />
     </div>

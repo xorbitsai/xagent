@@ -88,6 +88,7 @@ class WorkforceRunRequest(BaseModel):
     message: str = Field(..., min_length=1)
     files: list[str] = Field(default_factory=list)
     execution_mode: str | None = None
+    is_visible: bool = True
 
 
 class WorkforceBuilderProposeRequest(BaseModel):
@@ -733,6 +734,7 @@ async def create_workforce_run(
         message=request.message,
         selected_file_ids=request.files,
         execution_mode=request.execution_mode,
+        is_visible=request.is_visible,
     )
     return {
         "workforce_run_id": result.workforce_run.id,

@@ -95,6 +95,7 @@ async def create_workforce_run(
     message: str,
     selected_file_ids: list[str] | None = None,
     execution_mode: str | None = None,
+    is_visible: bool = True,
 ) -> WorkforceRunStartResult:
     workforce = ensure_workforce_access(db, user, workforce, action="run")
     policy = get_workforce_policy()
@@ -121,6 +122,7 @@ async def create_workforce_run(
             ),
             execution_mode=manager_execution_mode,
             source="internal",
+            is_visible=is_visible,
         )
         db.add(task)
         db.flush()

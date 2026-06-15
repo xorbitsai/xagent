@@ -5,7 +5,7 @@
  * directly so the Hub contract stays consistent end-to-end.
  */
 
-export type SkillSource = "builtin" | "user" | "external";
+export type SkillSource = "builtin" | "user" | "team" | "external";
 
 /** Trust badge. ``null`` is "not yet scanned" — most skills on
  * ClawHub today fall into this bucket, so the UI shouldn't treat it
@@ -22,6 +22,9 @@ export interface SkillSummary {
   when_to_use: string;
   tags: string[];
   source: SkillSource;
+  scope?: string | null;
+  effective?: boolean;
+  shadowed_by?: string | null;
 }
 
 export interface SkillDetail extends SkillSummary {

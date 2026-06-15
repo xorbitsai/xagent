@@ -38,6 +38,8 @@ function badgeForSource(source: SkillSource) {
       return { label: "Built-in", classes: "bg-violet-500/10 text-violet-600 border-violet-500/30" };
     case "user":
       return { label: "Installed", classes: "bg-emerald-500/10 text-emerald-600 border-emerald-500/30" };
+    case "team":
+      return { label: "Team", classes: "bg-blue-500/10 text-blue-600 border-blue-500/30" };
     default:
       return { label: "External", classes: "bg-amber-500/10 text-amber-600 border-amber-500/30" };
   }
@@ -290,6 +292,11 @@ export default function SkillDetailPage() {
           </>
         ) : (
           <>
+            {skill.source === "team" && (
+              <div className="mb-4 rounded-md border border-blue-500/30 bg-blue-500/10 p-3 text-xs text-blue-700">
+                Team skills are managed from Team settings.
+              </div>
+            )}
             <section className="mb-6 rounded-xl border bg-card p-6">
               <div className="mb-3 text-xs font-semibold text-muted-foreground uppercase tracking-wider">
                 SKILL.md

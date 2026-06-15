@@ -97,6 +97,8 @@ function badgeForSource(source: SkillSource) {
       return { label: "Built-in", classes: "bg-violet-500/10 text-violet-600 border-violet-500/30" };
     case "user":
       return { label: "Installed", classes: "bg-emerald-500/10 text-emerald-600 border-emerald-500/30" };
+    case "team":
+      return { label: "Team", classes: "bg-blue-500/10 text-blue-600 border-blue-500/30" };
     default:
       return { label: "External", classes: "bg-amber-500/10 text-amber-600 border-amber-500/30" };
   }
@@ -529,7 +531,7 @@ export default function SkillHubPage() {
             s.tags.some((t) => t.toLowerCase().includes(q)),
         )
       : installed;
-    // ``source`` mode preserves the original "user → builtin → external"
+    // ``source`` mode preserves the original "user → team → builtin → external"
     // grouping (already applied server-side); just sort by name within.
     // ``name`` mode collapses all sources into one alphabetical list.
     const sorted = [...base];
@@ -537,7 +539,7 @@ export default function SkillHubPage() {
       sorted.sort((a, b) => a.name.localeCompare(b.name));
     } else {
       sorted.sort((a, b) => {
-        const rank = { user: 0, builtin: 1, external: 2 } as const;
+        const rank = { user: 0, team: 1, builtin: 2, external: 3 } as const;
         const r = rank[a.source] - rank[b.source];
         return r !== 0 ? r : a.name.localeCompare(b.name);
       });

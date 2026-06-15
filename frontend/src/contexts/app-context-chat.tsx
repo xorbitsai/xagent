@@ -1425,10 +1425,11 @@ export function AppProvider({
               timestamp: message.timestamp
             })
 
-            // Check if this is a duplicate message
-            // Note: We don't cache messages from WebSocket to prevent blocking subsequent identical messages
-            // This is especially important for historical data loading where we might receive multiple identical messages
-            const isDuplicate = isDuplicateMessage(messageContent, 'user-message', false, false)
+            // Check if this is a duplicate message.
+            // Use caching so the entry expires after 30s, preventing the
+            // immediate chat/user_message duplicate pair without permanently
+            // blocking subsequent identical messages later in the session.
+            const isDuplicate = isDuplicateMessage(messageContent, 'user-message', false, true)
             console.log('🔍 Duplicate check:', {
               messageContent,
               isDuplicate,
@@ -1439,10 +1440,6 @@ export function AppProvider({
               console.log('⚠️ User message filtered as duplicate:', messageContent)
               return
             }
-
-            // Cache the message to prevent duplicate dispatch if a
-            // "chat"-type message for the same content also arrives.
-            recentMessages.add(`user-message:${messageContent}`)
 
             // Extract files from context.state.file_info (based on the actual WS event structure)
             let files = eventData.files || []

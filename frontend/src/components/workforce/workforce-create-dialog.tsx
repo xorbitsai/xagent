@@ -39,11 +39,11 @@ export function WorkforceCreateDialog({ open, onOpenChange, onCreated }: Workfor
             </TabsTrigger>
           </TabsList>
 
-          <TabsContent value="prompt" className="flex-1 mt-0">
+          <TabsContent value="prompt" className="flex-1 mt-0 data-[state=inactive]:hidden" forceMount>
             <WorkforcePromptCreator onCreated={onCreated} onCancel={() => onOpenChange(false)} />
           </TabsContent>
 
-          <TabsContent value="manual" className="flex-1 mt-0">
+          <TabsContent value="manual" className="flex-1 mt-0 data-[state=inactive]:hidden" forceMount>
             <WorkforceWizard onCreated={onCreated} onBack={() => onOpenChange(false)} />
           </TabsContent>
         </Tabs>

@@ -211,7 +211,7 @@ export default function WorkforceRunPage() {
 
             {/* Input area - styled like ChatStartScreen */}
             {canRun ? (
-              <div className="rounded-2xl border-2 bg-card shadow-sm overflow-hidden" style={{ borderColor: "rgb(215, 222, 236)" }}>
+              <div className="rounded-2xl border-2 border-border bg-card shadow-sm overflow-hidden">
                 <Textarea
                   placeholder={t("workforces.run.placeholder")}
                   value={message}

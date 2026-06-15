@@ -146,7 +146,7 @@ export function WorkersStep({
                 </div>
               </div>
               <div className="p-4 space-y-4">
-                <div className="flex gap-4">
+                <div className="flex gap-4 items-end">
                   <div className="space-y-2 flex-1">
                     <Label>{t("workforces.fields.alias")}</Label>
                     <Input
@@ -155,7 +155,7 @@ export function WorkersStep({
                         updateWorker(index, { ...worker, alias: event.target.value })}
                     />
                   </div>
-                  <div className="flex items-center justify-between rounded-lg border px-4 mt-8 min-w-[140px]">
+                  <div className="flex h-10 items-center justify-between rounded-lg border px-4 min-w-[140px]">
                     <div className="flex items-center gap-2">
                       <div className="font-medium">{t("workforces.fields.enabled")}</div>
                       <InfoTooltip content={t("workforces.workers.disabledHelp")} />

@@ -169,20 +169,24 @@ export default function WorkforceDetailPage() {
     void load()
   }, [load])
 
+  const cleanupRef = useRef({ closeFilePreview, dispatch, setTaskId })
+  cleanupRef.current = { closeFilePreview, dispatch, setTaskId }
+
   // Reset preview session on unmount
   useEffect(() => {
     return () => {
+      const { closeFilePreview: close, dispatch: d, setTaskId: set } = cleanupRef.current
       previewTaskIdRef.current = null
-      closeFilePreview()
-      dispatch({ type: "CLEAR_MESSAGES" })
-      dispatch({ type: "SET_TRACE_EVENTS", payload: [] })
-      dispatch({ type: "SET_STEPS", payload: [] })
-      dispatch({ type: "SET_DAG_EXECUTION", payload: null })
-      dispatch({ type: "SET_CURRENT_TASK", payload: null })
-      dispatch({ type: "SET_HISTORY_LOADING", payload: false })
-      setTaskId(null, { navigate: false })
+      close()
+      d({ type: "CLEAR_MESSAGES" })
+      d({ type: "SET_TRACE_EVENTS", payload: [] })
+      d({ type: "SET_STEPS", payload: [] })
+      d({ type: "SET_DAG_EXECUTION", payload: null })
+      d({ type: "SET_CURRENT_TASK", payload: null })
+      d({ type: "SET_HISTORY_LOADING", payload: false })
+      set(null, { navigate: false })
     }
-  }, [closeFilePreview, dispatch, setTaskId])
+  }, [])
 
   const managerOptions = useMemo(() => {
     const options = publishedAgents

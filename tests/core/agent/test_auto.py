@@ -573,6 +573,11 @@ async def test_auto_pattern_final_answer_completes_without_child_pattern() -> No
     )
     decision_prompt = llm.calls[0]["messages"][-1]["content"]
     assert llm.calls[0]["messages"][-1]["role"] == "user"
+    assert "Latest user request text" in decision_prompt
+    assert "hi" in decision_prompt
+    assert "Choose response_language from that latest user request" in decision_prompt
+    assert "retrieved memories, source documents" in decision_prompt
+    assert "tool results, or earlier turns" in decision_prompt
     assert "must include a complete non-empty answer field" in decision_prompt
     assert (
         "available retrieved context already provide enough evidence" in decision_prompt

@@ -32,6 +32,7 @@ from ..base import (
     RequiredToolCallError,
     append_user_message_preserving_turns,
     extract_required_tool_arguments,
+    truncate_prompt_preview,
 )
 from ..dag import DAGPattern
 from ..final_answer_stream import (
@@ -760,7 +761,10 @@ class AutoPattern(AgentPattern):
         )
 
         base_messages = context.get_messages_for_llm()
-        current_request = (latest_user_text(context) or "").strip()
+        current_request = truncate_prompt_preview(
+            latest_user_text(context) or "",
+            limit=400,
+        )
         decision_prompt = self._decision_prompt(
             tools,
             current_request=current_request,
@@ -898,10 +902,7 @@ class AutoPattern(AgentPattern):
         )
 
     def _truncate_retry_preview(self, value: str, *, limit: int = 1200) -> str:
-        stripped = value.strip()
-        if len(stripped) <= limit:
-            return stripped
-        return f"{stripped[:limit]}... [truncated]"
+        return truncate_prompt_preview(value, limit=limit)
 
     def _decision_prompt(
         self,

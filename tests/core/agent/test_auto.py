@@ -623,6 +623,29 @@ async def test_auto_pattern_final_answer_completes_without_child_pattern() -> No
 
 
 @pytest.mark.asyncio
+async def test_auto_pattern_truncates_language_anchor_request_preview() -> None:
+    llm = FakeLLM(
+        [decision_tool_response("final_answer", "Greeting only.", answer="done")]
+    )
+    pattern = AutoPattern()
+    context = ExecutionContext()
+    tail = "TAIL_SHOULD_NOT_BE_IN_LANGUAGE_ANCHOR"
+    context.add_user_message(f"{'x' * 450}{tail}")
+    runtime = PatternRuntime()
+
+    result = await pattern.run(context=context, tools=[], llm=llm, runtime=runtime)
+
+    assert result["success"] is True
+    prompt = llm.calls[0]["messages"][-1]["content"]
+    anchor_start = prompt.index("Latest user request text")
+    anchor_end = prompt.index("Choose response_language", anchor_start)
+    anchor = prompt[anchor_start:anchor_end]
+    assert "x" * 400 in anchor
+    assert "... [truncated]" in anchor
+    assert tail not in anchor
+
+
+@pytest.mark.asyncio
 async def test_auto_pattern_rederives_output_language_per_run() -> None:
     llm = FakeLLM(
         [

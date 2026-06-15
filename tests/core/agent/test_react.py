@@ -874,6 +874,33 @@ async def test_react_pattern_uses_decision_for_repeated_tools() -> None:
     assert pattern.pending_tool_calls == []
 
 
+def test_react_repeated_decision_anchors_latest_user_text_not_cached_task() -> None:
+    pattern = ReActPattern()
+    pattern.task_text = "search AI news"
+    context = ExecutionContext()
+    context.add_user_message("search AI news")
+    tail = "TAIL_SHOULD_NOT_BE_IN_LANGUAGE_ANCHOR"
+    context.add_user_message(f"请用简体中文回答 {'x' * 430}{tail}")
+
+    messages = pattern._messages_for_repeated_tool_decision(
+        context,
+        {
+            "tool_name": "zhipu_web_search",
+            "latest_tool_name": "zhipu_web_search",
+            "consecutive_tool_calls": 2,
+        },
+    )
+
+    prompt = messages[-1]["content"]
+    anchor_start = prompt.index("Latest user request text")
+    anchor_end = prompt.index("Choose response_language", anchor_start)
+    anchor = prompt[anchor_start:anchor_end]
+    assert "请用简体中文回答" in anchor
+    assert "search AI news" not in anchor
+    assert "... [truncated]" in anchor
+    assert tail not in anchor
+
+
 @pytest.mark.asyncio
 async def test_react_repeated_decision_drains_current_tool_call_batch() -> None:
     llm = FakeLLM(

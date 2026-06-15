@@ -9,6 +9,13 @@ from ..context import ExecutionContext
 REQUIRED_TOOL_CALL_FAILURE_REASON = "missing_required_tool_call"
 
 
+def truncate_prompt_preview(value: str, *, limit: int = 1200) -> str:
+    stripped = value.strip()
+    if len(stripped) <= limit:
+        return stripped
+    return f"{stripped[:limit]}... [truncated]"
+
+
 class RequiredToolCallError(ValueError):
     """Raised when an LLM response omits a tool call the caller requires."""
 

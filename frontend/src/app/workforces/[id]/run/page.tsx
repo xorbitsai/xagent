@@ -168,8 +168,8 @@ export default function WorkforceRunPage() {
                 <div className="text-xs uppercase tracking-wide text-muted-foreground mb-1">
                   {t("workforces.fields.manager")}
                 </div>
-                <div className="font-medium">{workforce.manager.name}</div>
-                {workforce.manager.description && (
+                <div className="font-medium">{workforce.manager?.name}</div>
+                {workforce.manager?.description && (
                   <div className="text-sm text-muted-foreground mt-0.5">{workforce.manager.description}</div>
                 )}
               </div>

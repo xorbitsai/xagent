@@ -117,7 +117,7 @@ export function WorkforceCanvas({ workforce }: WorkforceCanvasProps) {
           description: worker.assignment_instructions,
           // We can infer approval required from instructions or some other field if available
           // For now, let's just check if instructions contain "approval"
-          approvalRequired: worker.assignment_instructions?.toLowerCase().includes("approval"),
+          approvalRequired: worker.assignment_instructions?.toLowerCase()?.includes("approval") ?? false,
         },
       })
 

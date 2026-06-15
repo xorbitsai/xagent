@@ -151,7 +151,7 @@ export default function WorkforcesPage() {
                               </span>
                             </div>
                             <div className="text-xs text-muted-foreground truncate mt-0.5">
-                              {t("workforces.list.manager", { name: item.manager.name })}
+                              {t("workforces.list.manager", { name: item.manager?.name })}
                             </div>
                           </div>
                         </div>

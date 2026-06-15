@@ -781,6 +781,7 @@ def test_run_endpoint_delegates_to_run_service(monkeypatch: pytest.MonkeyPatch) 
         message: str,
         selected_file_ids: list[str] | None = None,
         execution_mode: str | None = None,
+        is_visible: bool = True,
     ) -> Any:
         captured.update(
             {
@@ -789,6 +790,7 @@ def test_run_endpoint_delegates_to_run_service(monkeypatch: pytest.MonkeyPatch) 
                 "message": message,
                 "selected_file_ids": selected_file_ids,
                 "execution_mode": execution_mode,
+                "is_visible": is_visible,
             }
         )
         return SimpleNamespace(
@@ -820,6 +822,7 @@ def test_run_endpoint_delegates_to_run_service(monkeypatch: pytest.MonkeyPatch) 
         "message": "go",
         "selected_file_ids": ["file-1"],
         "execution_mode": "think",
+        "is_visible": True,
     }
 
 

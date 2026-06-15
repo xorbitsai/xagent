@@ -97,7 +97,7 @@ export function WorkforceCanvas({ workforce }: WorkforceCanvasProps) {
     })
 
     // Worker Nodes
-    const workers = workforce.workers || []
+    const workers = workforce?.workers || []
     const workerWidth = 256 // w-64 = 16rem = 256px
     const gap = 32
     const totalWidth = workers.length * workerWidth + (workers.length - 1) * gap

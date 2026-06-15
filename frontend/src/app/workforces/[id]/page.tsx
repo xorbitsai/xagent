@@ -443,6 +443,9 @@ export default function WorkforceDetailPage() {
         })
 
         taskId = result.task_id
+        if (!taskId) {
+          throw new Error("Invalid run response: missing task_id")
+        }
         previewTaskIdRef.current = taskId
 
         // Connect to the task without navigating

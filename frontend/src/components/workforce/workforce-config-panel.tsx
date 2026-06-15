@@ -227,7 +227,7 @@ export function WorkforceConfigPanel({
               .map((worker) => {
                 const edit = workerEdits[worker.id] || {
                   alias: worker.alias || "",
-                  assignment_instructions: worker.assignment_instructions,
+                  assignment_instructions: worker.assignment_instructions || "",
                   enabled: worker.enabled,
                   sort_order: String(worker.sort_order ?? 1),
                 }
@@ -331,7 +331,7 @@ export function WorkforceConfigPanel({
 function workerEditState(worker: WorkforceWorker): WorkerEditState {
   return {
     alias: worker.alias || "",
-    assignment_instructions: worker.assignment_instructions,
+    assignment_instructions: worker.assignment_instructions || "",
     enabled: worker.enabled,
     sort_order: String(worker.sort_order ?? 1),
   }

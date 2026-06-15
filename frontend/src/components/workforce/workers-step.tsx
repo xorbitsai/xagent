@@ -150,7 +150,7 @@ export function WorkersStep({
                   <div className="space-y-2 flex-1">
                     <Label>{t("workforces.fields.alias")}</Label>
                     <Input
-                      value={worker.alias}
+                      value={worker.alias || ""}
                       onChange={(event) =>
                         updateWorker(index, { ...worker, alias: event.target.value })}
                     />

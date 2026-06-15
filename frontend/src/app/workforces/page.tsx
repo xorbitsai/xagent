@@ -191,19 +191,19 @@ export default function WorkforcesPage() {
                                 {t("workforces.actions.run")}
                               </Button>
                             ) : (
-                              <Link href={`/workforces/${item.id}/run`} onClick={(e) => e.stopPropagation()}>
-                                <Button size="sm" className="h-8 bg-blue-600 hover:bg-blue-700 text-white rounded-md px-3">
+                              <Button size="sm" className="h-8 bg-blue-600 hover:bg-blue-700 text-white rounded-md px-3" asChild>
+                                <Link href={`/workforces/${item.id}/run`} onClick={(e) => e.stopPropagation()}>
                                   <Play className="mr-1.5 h-3.5 w-3.5 fill-current" />
                                   {t("workforces.actions.run")}
-                                </Button>
-                              </Link>
+                                </Link>
+                              </Button>
                             )}
-                            <Link href={`/workforces/${item.id}`} onClick={(e) => e.stopPropagation()}>
-                              <Button size="sm" variant="outline" className="h-8 rounded-md px-3">
+                            <Button size="sm" variant="outline" className="h-8 rounded-md px-3" asChild>
+                              <Link href={`/workforces/${item.id}`} onClick={(e) => e.stopPropagation()}>
                                 <Pencil className="mr-1.5 h-3.5 w-3.5" />
                                 {t("workforces.actions.edit")}
-                              </Button>
-                            </Link>
+                              </Link>
+                            </Button>
                           </div>
                         </div>
                       </CardContent>

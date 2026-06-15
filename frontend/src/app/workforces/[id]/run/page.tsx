@@ -217,6 +217,12 @@ export default function WorkforceRunPage() {
                   value={message}
                   onChange={(e) => setMessage(e.target.value)}
                   className="border-0 bg-transparent text-[15px] outline-none placeholder:text-muted-foreground/60 resize-none focus-visible:ring-0 min-h-[130px] px-4 py-3 pb-16 max-h-[400px]"
+                  onKeyDown={(event) => {
+                    if (event.key === "Enter" && !event.shiftKey) {
+                      event.preventDefault()
+                      void handleRun()
+                    }
+                  }}
                 />
                 <div className="flex items-center justify-between bg-card px-4 py-3">
                   <div className="flex items-center gap-2" />

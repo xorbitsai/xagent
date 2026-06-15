@@ -131,11 +131,7 @@ export default function WorkforcesPage() {
                 {items.map((item) => {
                   const runDisabledReason = getRunDisabledReason(item.status, t)
                   return (
-                    <Card
-                      key={item.id}
-                      className="overflow-hidden flex flex-col h-full cursor-pointer hover:shadow-md transition-shadow"
-                      onClick={() => router.push(`/workforces/${item.id}`)}
-                    >
+                    <Card key={item.id} className="overflow-hidden flex flex-col h-full hover:shadow-md transition-shadow">
                       <CardContent className="flex flex-col h-full">
                         <div className="flex items-start gap-3 mb-4">
                           <div className="flex h-10 w-10 shrink-0 items-center justify-center rounded-lg bg-blue-600 text-white">
@@ -143,9 +139,12 @@ export default function WorkforcesPage() {
                           </div>
                           <div className="flex-1 min-w-0">
                             <div className="flex items-center justify-between gap-2">
-                              <span className="text-base font-semibold truncate">
+                              <Link
+                                href={`/workforces/${item.id}`}
+                                className="text-base font-semibold truncate hover:underline"
+                              >
                                 {item.name}
-                              </span>
+                              </Link>
                               <span className={`shrink-0 rounded-full px-2 py-0.5 text-[10px] font-medium uppercase tracking-wider ${item.status === 'active' ? 'bg-green-100 text-green-700' : 'bg-gray-100 text-gray-600'
                                 }`}>
                                 {t(`workforces.status.${item.status}`)}
@@ -192,14 +191,14 @@ export default function WorkforcesPage() {
                               </Button>
                             ) : (
                               <Button size="sm" className="h-8 bg-blue-600 hover:bg-blue-700 text-white rounded-md px-3" asChild>
-                                <Link href={`/workforces/${item.id}/run`} onClick={(e) => e.stopPropagation()}>
+                                <Link href={`/workforces/${item.id}/run`}>
                                   <Play className="mr-1.5 h-3.5 w-3.5 fill-current" />
                                   {t("workforces.actions.run")}
                                 </Link>
                               </Button>
                             )}
                             <Button size="sm" variant="outline" className="h-8 rounded-md px-3" asChild>
-                              <Link href={`/workforces/${item.id}`} onClick={(e) => e.stopPropagation()}>
+                              <Link href={`/workforces/${item.id}`}>
                                 <Pencil className="mr-1.5 h-3.5 w-3.5" />
                                 {t("workforces.actions.edit")}
                               </Link>

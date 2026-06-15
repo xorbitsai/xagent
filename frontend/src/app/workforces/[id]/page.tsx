@@ -428,10 +428,14 @@ export default function WorkforceDetailPage() {
   const handleTestSendMessage = async (content: string, _config?: any, files?: File[]) => {
     if (!id) return
 
-    try {
-      let taskId = previewTaskIdRef.current
+    let taskId = previewTaskIdRef.current
+    // Prevent concurrent runWorkforce calls while the first one is pending
+    if (taskId === -1) return
 
+    try {
       if (!taskId) {
+        previewTaskIdRef.current = -1
+
         // First message: create the workforce run
         const result: WorkforceRunResponse = await runWorkforce(id, {
           message: content,
@@ -467,6 +471,10 @@ export default function WorkforceDetailPage() {
         await sendMessage(content, { force: true, targetTaskId: taskId }, files)
       }
     } catch (err) {
+      // Reset sentinel on failure so the user can retry
+      if (previewTaskIdRef.current === -1) {
+        previewTaskIdRef.current = null
+      }
       const nextError = err instanceof Error ? err.message : t("workforces.errors.run")
       toast.error(nextError)
     }

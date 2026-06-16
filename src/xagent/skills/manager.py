@@ -78,14 +78,14 @@ class SkillManager:
         """Reload all skills"""
         self._skills_cache.clear()
 
+        assert self.provider is not None  # set in __init__
         records = await self.provider.list_records(self.context)
         for record in records:
             try:
                 skill_info = SkillParser.parse_bundle(
                     name=record.name,
                     files=record.files,
-                    path=record.path
-                    or f"provider://{record.source}/{record.name}",
+                    path=record.path or f"provider://{record.source}/{record.name}",
                 )
                 skill_info["source"] = record.source
                 skill_info["scope"] = record.scope

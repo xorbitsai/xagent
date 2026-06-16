@@ -70,18 +70,11 @@ export interface RegistryListResponse {
   nextCursor: string | null;
 }
 
-/** Hand-picked skill surfaced on the Discover tab's Featured rail.
- * Same shape as RegistrySkillSummary plus our editorial pitch. */
-export interface FeaturedSkill extends RegistrySkillSummary {
-  featuredReason: string;
-}
 
-/** Pagination metadata. ClawHub has no count endpoint; backend walks
- * the cursor pages and caches. ``truncated`` means the backend hit a
- * safety cap before exhausting cursors (so the real total is ≥ this). */
-export interface RegistryStats {
-  sort: string;
-  total: number;
-  walked_pages: number;
-  truncated: boolean;
+
+/** A supported skill registry (returned by GET /registries). */
+export interface RegistryInfo {
+  id: string;
+  displayName: string;
+  description: string;
 }

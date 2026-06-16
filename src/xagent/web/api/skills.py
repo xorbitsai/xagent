@@ -6,7 +6,7 @@ Provides REST API endpoints for managing and using skills in the web application
 
 import logging
 from importlib import import_module
-from typing import Optional
+from typing import Any, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel, Field
@@ -66,7 +66,9 @@ class ReloadResponse(BaseModel):
 router = APIRouter(prefix="/api/skills", tags=["skills"])
 
 
-def _skill_context(current_user: User, request: Request, db: object | None = None):
+def _skill_context(
+    current_user: User, request: Request, db: object | None = None
+) -> Any:
     from ...skills.library import SkillScopeContext
 
     return SkillScopeContext(
@@ -77,12 +79,14 @@ def _skill_context(current_user: User, request: Request, db: object | None = Non
     )
 
 
-async def _request_skill_manager(request: Request, current_user: User):
+async def _request_skill_manager(request: Request, current_user: User) -> Any:
     from ...skills.utils import create_skill_manager
     from ..models.database import get_session_local
 
     db = get_session_local()()
-    manager = create_skill_manager(context=_skill_context(current_user, request, db))
+    manager: Any = create_skill_manager(
+        context=_skill_context(current_user, request, db)
+    )
     manager._scope_db_session = db  # noqa: SLF001 - closed by route helper
     await manager.ensure_initialized()
     return manager

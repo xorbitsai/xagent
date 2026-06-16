@@ -118,7 +118,7 @@ class SkillTools:
     def read_skill_doc(
         self, skill: str, path: str = "SKILL.md", encoding: str = "utf-8"
     ) -> str:
-        return _run_sync(self.read_skill_doc_async(skill, path, encoding))
+        return _run_sync(self.read_skill_doc_async(skill, path, encoding))  # type: ignore[no-any-return]
 
     async def read_skill_doc_async(
         self, skill: str, path: str = "SKILL.md", encoding: str = "utf-8"
@@ -148,6 +148,7 @@ class SkillTools:
         record = await self._get_skill_record(skill)
         if record is not None:
             try:
+                assert self.skill_manager.provider is not None
                 return (
                     await self.skill_manager.provider.read_file(
                         self.skill_scope_context, record, path
@@ -173,7 +174,7 @@ class SkillTools:
     def list_skill_docs(
         self, skill: str, path: str = ".", recursive: bool = True
     ) -> Dict[str, Any]:
-        return _run_sync(self.list_skill_docs_async(skill, path, recursive))
+        return _run_sync(self.list_skill_docs_async(skill, path, recursive))  # type: ignore[no-any-return]
 
     async def list_skill_docs_async(
         self, skill: str, path: str = ".", recursive: bool = True
@@ -217,7 +218,9 @@ class SkillTools:
                     continue
                 documents.append({"path": rel_path, "size": len(content)})
             if prefix and not documents:
-                raise FileNotFoundError(f"Directory not found: '{path}' in skill '{skill}'")
+                raise FileNotFoundError(
+                    f"Directory not found: '{path}' in skill '{skill}'"
+                )
             return {"documents": documents, "count": len(documents)}
 
         skill_dir = self._find_skill_dir(skill)
@@ -256,7 +259,7 @@ class SkillTools:
     def fetch_skill_file(
         self, skill: str, path: str, dest: Optional[str] = None
     ) -> Dict[str, Any]:
-        return _run_sync(self.fetch_skill_file_async(skill, path, dest))
+        return _run_sync(self.fetch_skill_file_async(skill, path, dest))  # type: ignore[no-any-return]
 
     async def fetch_skill_file_async(
         self, skill: str, path: str, dest: Optional[str] = None
@@ -286,11 +289,14 @@ class SkillTools:
         record = await self._get_skill_record(skill)
         if record is not None:
             try:
+                assert self.skill_manager.provider is not None
                 content = await self.skill_manager.provider.read_file(
                     self.skill_scope_context, record, path
                 )
             except FileNotFoundError:
-                raise FileNotFoundError(f"File not found: '{path}' in skill '{skill}'") from None
+                raise FileNotFoundError(
+                    f"File not found: '{path}' in skill '{skill}'"
+                ) from None
             if dest is None:
                 dest = Path(path).name
             destination = self.workspace.output_dir / dest
@@ -298,7 +304,9 @@ class SkillTools:
             destination.write_bytes(content)
             return {
                 "source": f"{record.path or record.source}/{path}",
-                "destination": str(destination.relative_to(self.workspace.workspace_dir)),
+                "destination": str(
+                    destination.relative_to(self.workspace.workspace_dir)
+                ),
                 "size": len(content),
                 "extracted": False,
             }

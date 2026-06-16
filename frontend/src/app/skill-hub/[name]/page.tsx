@@ -5,9 +5,11 @@ import { useParams, useRouter } from "next/navigation";
 import Link from "next/link";
 import {
   ChevronLeft,
+  ExternalLink,
   FileText,
   Loader2,
   Pencil,
+  Plus,
   Save,
   Trash2,
   X,
@@ -16,35 +18,28 @@ import {
 import { ConfirmDialog } from "@/components/ui/confirm-dialog";
 import { MarkdownRenderer } from "@/components/ui/markdown-renderer";
 import { MarkdownEditor } from "@/components/skill-hub/markdown-editor";
+import { badgeForSource, ScanBadge } from "@/components/skill-hub/badges";
 import { useI18n } from "@/contexts/i18n-context";
 import { apiRequest } from "@/lib/api-wrapper";
 import { cn, getApiUrl } from "@/lib/utils";
-import type { SkillDetail, SkillSource } from "@/types/skill-hub";
+import type {
+  RegistrySkillDetail,
+  SkillDetail,
+} from "@/types/skill-hub";
 
 /**
- * Skill detail page. Two modes:
- *   - **view**: SKILL.md rendered as markdown + file listing
- *   - **edit** (user-source only): split-pane MarkdownEditor with
- *     Save / Cancel. Save PUTs the new SKILL.md, refreshes the
- *     parsed detail, and drops back to view mode.
+ * Skill detail page.
  *
- * Builtin and external skills can be viewed but not edited or
- * deleted — the backend enforces both checks too, but we hide the
- * buttons up front so the affordance matches the actual capability.
+ * Two entry points:
+ *   - **Installed**  → ``/skill-hub/<name>`` loads from
+ *     ``/api/skill-hub/installed/{name}``. Shows SKILL.md, file
+ *     listing, and Edit/Remove for user-owned skills.
+ *   - **Registry**   → same URL when the skill isn't installed yet.
+ *     Falls back to ``/api/skill-hub/registry/{name}`` and renders
+ *     the upstream README with an Install button.
  */
 
-function badgeForSource(source: SkillSource) {
-  switch (source) {
-    case "builtin":
-      return { label: "builtin", classes: "bg-violet-500/10 text-violet-600 border-violet-500/30" };
-    case "user":
-      return { label: "user", classes: "bg-emerald-500/10 text-emerald-600 border-emerald-500/30" };
-    case "team":
-      return { label: "team", classes: "bg-blue-500/10 text-blue-600 border-blue-500/30" };
-    default:
-      return { label: "external", classes: "bg-amber-500/10 text-amber-600 border-amber-500/30" };
-  }
-}
+type ViewMode = "installed" | "registry";
 
 export default function SkillDetailPage() {
   const params = useParams<{ name: string }>();
@@ -52,32 +47,60 @@ export default function SkillDetailPage() {
   const apiBase = getApiUrl();
   const { t } = useI18n();
 
-  const [skill, setSkill] = useState<SkillDetail | null>(null);
-  const [error, setError] = useState<string | null>(null);
-  const [loading, setLoading] = useState(true);
+  const [mode, setMode] = useState<ViewMode>("installed");
 
-  // Edit-mode state
+  // ── installed state ────────────────────────────────────────
+  const [skill, setSkill] = useState<SkillDetail | null>(null);
   const [editing, setEditing] = useState(false);
   const [draft, setDraft] = useState("");
   const [saving, setSaving] = useState(false);
   const [saveError, setSaveError] = useState<string | null>(null);
-
   const [deleting, setDeleting] = useState(false);
-  // Drives the ConfirmDialog. ``true`` = dialog open.
   const [confirmRemove, setConfirmRemove] = useState(false);
 
+  // ── registry state ─────────────────────────────────────────
+  const [regSkill, setRegSkill] = useState<RegistrySkillDetail | null>(null);
+  const [installing, setInstalling] = useState(false);
+  const [installError, setInstallError] = useState<string | null>(null);
+
+  // ── shared ─────────────────────────────────────────────────
+  const [error, setError] = useState<string | null>(null);
+  const [loading, setLoading] = useState(true);
+
   const loadSkill = useCallback(async () => {
-    if (!params?.name) return;
+    const name = params?.name;
+    if (!name) return;
+    setLoading(true);
+    setError(null);
+
+    // 1) Try installed first.
     try {
       const res = await apiRequest(
-        `${apiBase}/api/skill-hub/installed/${encodeURIComponent(params.name)}`,
+        `${apiBase}/api/skill-hub/installed/${encodeURIComponent(name)}`,
       );
-      if (!res.ok) {
-        setError(`Failed to load skill (HTTP ${res.status})`);
+      if (res.ok) {
+        setSkill((await res.json()) as SkillDetail);
+        setMode("installed");
+        setLoading(false);
         return;
       }
-      const data = (await res.json()) as SkillDetail;
-      setSkill(data);
+    } catch {
+      // Fall through to registry.
+    }
+
+    // 2) Not installed → try registry.
+    try {
+      const res = await apiRequest(
+        `${apiBase}/api/skill-hub/registry/${encodeURIComponent(name)}`,
+      );
+      if (res.ok) {
+        const data = (await res.json()) as RegistrySkillDetail;
+        setRegSkill(data);
+        setMode("registry");
+        setLoading(false);
+        return;
+      }
+      setError(`Failed to load skill (HTTP ${res.status})`);
     } catch (e) {
       console.error(e);
       setError("Network error.");
@@ -89,6 +112,8 @@ export default function SkillDetailPage() {
   useEffect(() => {
     loadSkill();
   }, [loadSkill]);
+
+  // ── installed-edit handlers ────────────────────────────────
 
   const startEdit = () => {
     if (!skill) return;
@@ -121,9 +146,6 @@ export default function SkillDetailPage() {
         setSaveError(body.detail || `Save failed (HTTP ${res.status})`);
         return;
       }
-      // Re-fetch detail so files / tags / description reflect the
-      // saved content. The PUT response is a summary, not the full
-      // detail.
       await loadSkill();
       setEditing(false);
       setDraft("");
@@ -135,8 +157,6 @@ export default function SkillDetailPage() {
     }
   };
 
-  // Click the Remove button → open the dialog. Actual DELETE runs
-  // from ``performDelete`` once the user confirms.
   const handleDelete = () => {
     if (!skill) return;
     setConfirmRemove(true);
@@ -166,6 +186,35 @@ export default function SkillDetailPage() {
     }
   };
 
+  // ── registry-install handler ───────────────────────────────
+
+  const handleInstall = async () => {
+    if (!regSkill) return;
+    setInstalling(true);
+    setInstallError(null);
+    try {
+      const res = await apiRequest(`${apiBase}/api/skill-hub/install/clawhub`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ slug: regSkill.slug }),
+      });
+      if (!res.ok) {
+        const body = await res.json().catch(() => ({}));
+        setInstallError(body.detail || `Install failed (HTTP ${res.status})`);
+        return;
+      }
+      // Reload — will pick up the now-installed skill.
+      await loadSkill();
+    } catch (e) {
+      console.error(e);
+      setInstallError("Network error while installing.");
+    } finally {
+      setInstalling(false);
+    }
+  };
+
+  // ── render ─────────────────────────────────────────────────
+
   if (loading) {
     return (
       <div className="flex h-full items-center justify-center">
@@ -173,7 +222,7 @@ export default function SkillDetailPage() {
       </div>
     );
   }
-  if (error || !skill) {
+  if (error || (mode === "installed" && !skill) || (mode === "registry" && !regSkill)) {
     return (
       <div className="flex h-full items-center justify-center">
         <div className="rounded-md border border-destructive/40 bg-destructive/10 p-3 text-sm text-destructive">
@@ -183,170 +232,268 @@ export default function SkillDetailPage() {
     );
   }
 
-  const badge = badgeForSource(skill.source);
-  const editable = skill.source === "user";
+  // ── Installed view ─────────────────────────────────────────
 
-  return (
-    <div className="flex h-full flex-col overflow-y-auto bg-background">
-      <div className="mx-auto w-full flex-1 px-6 py-10">
-        <Link
-          href="/skill-hub"
-          className="mb-6 inline-flex items-center gap-1 text-sm text-muted-foreground hover:text-foreground"
-        >
-          <ChevronLeft className="h-4 w-4" /> {t("skillHub.detail.back")}
-        </Link>
+  if (mode === "installed" && skill) {
+    const badge = badgeForSource(skill.source);
+    const editable = skill.source === "user";
 
-        {/* Header */}
-        <div className="mb-6 flex items-start gap-4">
-          <div className="flex h-14 w-14 shrink-0 items-center justify-center rounded-2xl bg-gradient-to-br from-emerald-400 to-teal-600 text-white shadow-sm">
-            <FileText className="h-6 w-6" />
-          </div>
-          <div className="min-w-0 flex-1">
-            <div className="flex items-center gap-2">
-              <h1 className="truncate text-2xl font-bold tracking-tight">
-                {skill.name}
-              </h1>
-              <span
-                className={cn(
-                  "shrink-0 rounded-full border px-2 py-0.5 text-[11px] font-medium",
-                  badge.classes,
-                )}
-              >
-                {t(`skillHub.sourceLabel.${badge.label}`)}
-              </span>
-            </div>
-            {skill.description && (
-              <p className="mt-1 text-sm text-muted-foreground">{skill.description}</p>
-            )}
-            {skill.tags.length > 0 && (
-              <div className="mt-2 flex flex-wrap gap-1">
-                {skill.tags.map((t) => (
-                  <span
-                    key={t}
-                    className="rounded-full bg-muted px-2 py-0.5 text-[10px] text-muted-foreground"
-                  >
-                    {t}
-                  </span>
-                ))}
-              </div>
-            )}
-          </div>
-          {!editing && editable && (
-            <div className="flex shrink-0 gap-2">
-              <button
-                type="button"
-                onClick={startEdit}
-                className="inline-flex h-9 items-center gap-1.5 rounded-md border bg-card px-3 text-xs font-medium hover:bg-muted"
-              >
-                <Pencil className="h-3.5 w-3.5" />
-                {t("skillHub.detail.edit")}
-              </button>
-              <button
-                type="button"
-                onClick={handleDelete}
-                disabled={deleting}
-                className="inline-flex h-9 items-center gap-1.5 rounded-md border border-destructive/40 bg-destructive/10 px-3 text-xs font-medium text-destructive hover:bg-destructive/20 disabled:opacity-50"
-              >
-                {deleting ? (
-                  <Loader2 className="h-3.5 w-3.5 animate-spin" />
-                ) : (
-                  <Trash2 className="h-3.5 w-3.5" />
-                )}
-                {t("skillHub.detail.remove")}
-              </button>
-            </div>
-          )}
-          {editing && (
-            <div className="flex shrink-0 gap-2">
-              <button
-                type="button"
-                onClick={cancelEdit}
-                disabled={saving}
-                className="inline-flex h-9 items-center gap-1.5 rounded-md border bg-card px-3 text-xs font-medium hover:bg-muted disabled:opacity-50"
-              >
-                <X className="h-3.5 w-3.5" />
-                {t("skillHub.detail.cancel")}
-              </button>
-              <button
-                type="button"
-                onClick={handleSave}
-                disabled={saving || draft === skill.content}
-                className="inline-flex h-9 items-center gap-1.5 rounded-md bg-primary px-3 text-xs font-medium text-primary-foreground hover:bg-primary/90 disabled:opacity-50"
-              >
-                {saving ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <Save className="h-3.5 w-3.5" />}
-                {saving ? t("skillHub.detail.saving") : t("skillHub.detail.save")}
-              </button>
-            </div>
-          )}
-        </div>
+    return (
+      <div className="flex h-full flex-col overflow-y-auto bg-background">
+        <div className="mx-auto w-full flex-1 px-6 py-10">
+          <Link
+            href="/skill-hub"
+            className="mb-6 inline-flex items-center gap-1 text-sm text-muted-foreground hover:text-foreground"
+          >
+            <ChevronLeft className="h-4 w-4" /> {t("skillHub.detail.back")}
+          </Link>
 
-        {editing ? (
-          <>
-            <MarkdownEditor value={draft} onChange={setDraft} rows={26} />
-            {saveError && (
-              <div className="mt-3 rounded-md border border-destructive/40 bg-destructive/10 p-3 text-xs text-destructive">
-                {saveError}
+          {/* Header */}
+          <div className="mb-6 flex items-start gap-4">
+            <div className="flex h-14 w-14 shrink-0 items-center justify-center rounded-2xl bg-gradient-to-br from-emerald-400 to-teal-600 text-white shadow-sm">
+              <FileText className="h-6 w-6" />
+            </div>
+            <div className="min-w-0 flex-1">
+              <div className="flex items-center gap-2">
+                <h1 className="truncate text-2xl font-bold tracking-tight">
+                  {skill.name}
+                </h1>
+                <span
+                  className={cn(
+                    "shrink-0 rounded-full border px-2 py-0.5 text-[11px] font-medium",
+                    badge.classes,
+                  )}
+                >
+                  {t(`skillHub.sourceLabel.${badge.label}`)}
+                </span>
               </div>
-            )}
-          </>
-        ) : (
-          <>
-            {skill.source === "team" && (
-              <div className="mb-4 rounded-md border border-blue-500/30 bg-blue-500/10 p-3 text-xs text-blue-700">
-                {t("skillHub.detail.teamNote")}
-              </div>
-            )}
-            <section className="mb-6 rounded-xl border bg-card p-6">
-              <div className="mb-3 text-xs font-semibold text-muted-foreground uppercase tracking-wider">
-                {t("skillHub.detail.skillMd")}
-              </div>
-              {skill.content ? (
-                <MarkdownRenderer
-                  content={skill.content}
-                  className="prose-sm text-foreground prose-headings:text-foreground prose-strong:text-foreground prose-code:text-foreground"
-                />
-              ) : (
-                <div className="text-sm italic text-muted-foreground">{t("skillHub.detail.skillMdEmpty")}</div>
+              {skill.description && (
+                <p className="mt-1 text-sm text-muted-foreground">{skill.description}</p>
               )}
-            </section>
-            {skill.files.length > 0 && (
+              {skill.tags.length > 0 && (
+                <div className="mt-2 flex flex-wrap gap-1">
+                  {skill.tags.map((t) => (
+                    <span
+                      key={t}
+                      className="rounded-full bg-muted px-2 py-0.5 text-[10px] text-muted-foreground"
+                    >
+                      {t}
+                    </span>
+                  ))}
+                </div>
+              )}
+            </div>
+            {!editing && editable && (
+              <div className="flex shrink-0 gap-2">
+                <button
+                  type="button"
+                  onClick={startEdit}
+                  className="inline-flex h-9 items-center gap-1.5 rounded-md border bg-card px-3 text-xs font-medium hover:bg-muted"
+                >
+                  <Pencil className="h-3.5 w-3.5" />
+                  {t("skillHub.detail.edit")}
+                </button>
+                <button
+                  type="button"
+                  onClick={handleDelete}
+                  disabled={deleting}
+                  className="inline-flex h-9 items-center gap-1.5 rounded-md border border-destructive/40 bg-destructive/10 px-3 text-xs font-medium text-destructive hover:bg-destructive/20 disabled:opacity-50"
+                >
+                  {deleting ? (
+                    <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                  ) : (
+                    <Trash2 className="h-3.5 w-3.5" />
+                  )}
+                  {t("skillHub.detail.remove")}
+                </button>
+              </div>
+            )}
+            {editing && (
+              <div className="flex shrink-0 gap-2">
+                <button
+                  type="button"
+                  onClick={cancelEdit}
+                  disabled={saving}
+                  className="inline-flex h-9 items-center gap-1.5 rounded-md border bg-card px-3 text-xs font-medium hover:bg-muted disabled:opacity-50"
+                >
+                  <X className="h-3.5 w-3.5" />
+                  {t("skillHub.detail.cancel")}
+                </button>
+                <button
+                  type="button"
+                  onClick={handleSave}
+                  disabled={saving || draft === skill.content}
+                  className="inline-flex h-9 items-center gap-1.5 rounded-md bg-primary px-3 text-xs font-medium text-primary-foreground hover:bg-primary/90 disabled:opacity-50"
+                >
+                  {saving ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <Save className="h-3.5 w-3.5" />}
+                  {saving ? t("skillHub.detail.saving") : t("skillHub.detail.save")}
+                </button>
+              </div>
+            )}
+          </div>
+
+          {editing ? (
+            <>
+              <MarkdownEditor value={draft} onChange={setDraft} rows={26} />
+              {saveError && (
+                <div className="mt-3 rounded-md border border-destructive/40 bg-destructive/10 p-3 text-xs text-destructive">
+                  {saveError}
+                </div>
+              )}
+            </>
+          ) : (
+            <>
+              {skill.source === "team" && (
+                <div className="mb-4 rounded-md border border-blue-500/30 bg-blue-500/10 p-3 text-xs text-blue-700">
+                  {t("skillHub.detail.teamNote")}
+                </div>
+              )}
               <section className="mb-6 rounded-xl border bg-card p-6">
                 <div className="mb-3 text-xs font-semibold text-muted-foreground uppercase tracking-wider">
-                  {t("skillHub.detail.files")} · {skill.files.length}
+                  {t("skillHub.detail.skillMd")}
                 </div>
-                <ul className="space-y-1">
-                  {skill.files.map((f) => (
-                    <li key={f} className="flex items-center gap-2 text-xs text-foreground/80">
-                      <FileText className="h-3 w-3 text-muted-foreground" />
-                      <span className="truncate">{f}</span>
-                    </li>
-                  ))}
-                </ul>
+                {skill.content ? (
+                  <MarkdownRenderer
+                    content={skill.content}
+                    className="prose-sm text-foreground prose-headings:text-foreground prose-strong:text-foreground prose-code:text-foreground"
+                  />
+                ) : (
+                  <div className="text-sm italic text-muted-foreground">{t("skillHub.detail.skillMdEmpty")}</div>
+                )}
               </section>
-            )}
-            <div className="text-[11px] text-muted-foreground">
-              {t("skillHub.detail.installedAt")} <code className="rounded bg-muted px-1 py-0.5">{skill.path}</code>
-            </div>
-          </>
-        )}
+              {skill.files.length > 0 && (
+                <section className="mb-6 rounded-xl border bg-card p-6">
+                  <div className="mb-3 text-xs font-semibold text-muted-foreground uppercase tracking-wider">
+                    {t("skillHub.detail.files")} · {skill.files.length}
+                  </div>
+                  <ul className="space-y-1">
+                    {skill.files.map((f) => (
+                      <li key={f} className="flex items-center gap-2 text-xs text-foreground/80">
+                        <FileText className="h-3 w-3 text-muted-foreground" />
+                        <span className="truncate">{f}</span>
+                      </li>
+                    ))}
+                  </ul>
+                </section>
+              )}
+              <div className="text-[11px] text-muted-foreground">
+                {t("skillHub.detail.installedAt")} <code className="rounded bg-muted px-1 py-0.5">{skill.path}</code>
+              </div>
+            </>
+          )}
+        </div>
+        <ConfirmDialog
+          isOpen={confirmRemove}
+          onOpenChange={(open) => {
+            if (!open && !deleting) setConfirmRemove(false);
+          }}
+          onConfirm={performDelete}
+          title={t("skillHub.detail.removeTitle")}
+          description={
+            skill
+              ? t("skillHub.detail.removeDescription", { name: skill.name, path: skill.path })
+              : ""
+          }
+          confirmText={t("skillHub.detail.remove")}
+          isLoading={deleting}
+        />
       </div>
-      <ConfirmDialog
-        isOpen={confirmRemove}
-        onOpenChange={(open) => {
-          // Keep the dialog open while the request is in flight so the
-          // spinner stays visible; only allow close when idle.
-          if (!open && !deleting) setConfirmRemove(false);
-        }}
-        onConfirm={performDelete}
-        title={t("skillHub.detail.removeTitle")}
-        description={
-          skill
-            ? t("skillHub.detail.removeDescription", { name: skill.name, path: skill.path })
-            : ""
-        }
-        confirmText={t("skillHub.detail.remove")}
-        isLoading={deleting}
-      />
-    </div>
-  );
+    );
+  }
+
+  // ── Registry view ──────────────────────────────────────────
+
+  if (mode === "registry" && regSkill) {
+    return (
+      <div className="flex h-full flex-col overflow-y-auto bg-background">
+        <div className="mx-auto w-full flex-1 px-6 py-10">
+          <Link
+            href="/skill-hub"
+            className="mb-6 inline-flex items-center gap-1 text-sm text-muted-foreground hover:text-foreground"
+          >
+            <ChevronLeft className="h-4 w-4" /> {t("skillHub.detail.back")}
+          </Link>
+
+          {/* Header */}
+          <div className="mb-6 flex items-start gap-4">
+            <div className="flex h-14 w-14 shrink-0 items-center justify-center rounded-2xl bg-gradient-to-br from-blue-400 to-indigo-600 text-white shadow-sm">
+              <ExternalLink className="h-6 w-6" />
+            </div>
+            <div className="min-w-0 flex-1">
+              <div className="flex items-center gap-2">
+                <h1 className="truncate text-2xl font-bold tracking-tight">
+                  {regSkill.displayName || regSkill.slug}
+                </h1>
+                <ScanBadge status={regSkill.scanStatus} />
+              </div>
+              {regSkill.ownerHandle && (
+                <div className="mt-1 text-sm text-muted-foreground">
+                  {t("skillHub.discover.by", { owner: regSkill.ownerHandle })}
+                </div>
+              )}
+              {regSkill.version && (
+                <div className="mt-1 text-[11px] text-muted-foreground">
+                  v{regSkill.version}
+                </div>
+              )}
+              {regSkill.summary && (
+                <p className="mt-2 text-sm text-muted-foreground">{regSkill.summary}</p>
+              )}
+            </div>
+            <div className="flex shrink-0 gap-2">
+              <button
+                type="button"
+                onClick={handleInstall}
+                disabled={installing}
+                className="inline-flex h-9 items-center gap-1.5 rounded-md bg-primary px-3 text-xs font-medium text-primary-foreground hover:bg-primary/90 disabled:opacity-50"
+              >
+                {installing ? (
+                  <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                ) : (
+                  <Plus className="h-3.5 w-3.5" />
+                )}
+                {installing ? t("skillHub.discover.installing") : t("skillHub.discover.install")}
+              </button>
+              {regSkill.homepage && (
+                <a
+                  href={regSkill.homepage}
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  className="inline-flex h-9 items-center gap-1.5 rounded-md border bg-card px-3 text-xs font-medium hover:bg-muted"
+                >
+                  <ExternalLink className="h-3.5 w-3.5" />
+                  Homepage
+                </a>
+              )}
+            </div>
+          </div>
+
+          {installError && (
+            <div className="mb-4 rounded-md border border-destructive/40 bg-destructive/10 p-3 text-xs text-destructive">
+              {installError}
+            </div>
+          )}
+
+          {/* Readme */}
+          <section className="rounded-xl border bg-card p-6">
+            <div className="mb-3 text-xs font-semibold text-muted-foreground uppercase tracking-wider">
+              README
+            </div>
+            {regSkill.readme ? (
+              <MarkdownRenderer
+                content={regSkill.readme}
+                className="prose-sm text-foreground prose-headings:text-foreground prose-strong:text-foreground prose-code:text-foreground"
+              />
+            ) : (
+              <div className="text-sm italic text-muted-foreground">
+                No README available for this skill.
+              </div>
+            )}
+          </section>
+        </div>
+      </div>
+    );
+  }
+
+  return null;
 }

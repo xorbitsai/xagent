@@ -35,22 +35,24 @@ become visible to agents on the next task run after
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import io
-import json
 import logging
 import re
-import shutil
-import time
 import zipfile
-import hashlib
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-import requests
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
 from fastapi.responses import Response
 from pydantic import BaseModel, Field
 
+from xagent.web.api.skill_hub_registry import (
+    _MAX_DOWNLOAD_BYTES,
+    SkillRegistry,
+    all_registries,
+    get_registry,
+)
 from xagent.web.auth_dependencies import get_current_user
 from xagent.web.models.database import get_db
 from xagent.web.models.user import User
@@ -58,34 +60,6 @@ from xagent.web.models.user import User
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api/skill-hub", tags=["skill-hub"])
-
-
-# ──────────────────────────────────────────────────────────────────────
-# Constants
-# ──────────────────────────────────────────────────────────────────────
-
-# Per docs.openclaw.ai/clawhub/http-api — base for the v1 surface.
-# A future ``.well-known/clawhub.json`` lookup could make this dynamic,
-# but v0 hardcodes (no SaaS-side config plumbing needed yet).
-CLAWHUB_BASE = "https://clawhub.ai"
-CLAWHUB_API = f"{CLAWHUB_BASE}/api/v1"
-
-# Hard cap on registry response bodies — the registry pages well under
-# this, and we don't want a malformed upstream response to OOM us.
-_MAX_REGISTRY_BODY = 2 * 1024 * 1024  # 2 MiB
-_MAX_DOWNLOAD_BYTES = 50 * 1024 * 1024  # 50 MiB — well above any sane skill ZIP
-
-# A request-scoped session would be nicer but requires app-state
-# plumbing; module-level is fine for v0 traffic levels.
-_HTTP = requests.Session()
-_HTTP.headers.update(
-    {
-        # ClawHub doesn't gate on user-agent today, but identifying our
-        # traffic helps them debug if anything breaks downstream.
-        "User-Agent": "xagent-saas-skill-hub/0.1 (+https://github.com/xorbitsai/xagent)",
-        "Accept": "application/json",
-    }
-)
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -185,32 +159,10 @@ class RegistryListResponse(BaseModel):
     nextCursor: Optional[str] = None
 
 
-class InstallClawhubRequest(BaseModel):
+class InstallSkillRequest(BaseModel):
     slug: str = Field(..., min_length=1, max_length=128)
-    version: Optional[str] = None  # ClawHub default: latest
+    version: Optional[str] = None
     scope: str = Field("personal", pattern="^(personal|team)$")
-
-
-class RegistryStats(BaseModel):
-    """Pagination metadata for the UI.
-
-    ClawHub has no total-count endpoint, so we walk the cursor pages
-    on the server (max 100 per round-trip via ClawHub's page-size cap)
-    and sum up. Cached per-sort for a few minutes — the first call on
-    a cold cache pays for the walk, subsequent calls return instantly.
-    """
-
-    sort: str
-    total: int
-    walked_pages: int  # how many ClawHub pages we actually fetched
-    truncated: bool  # True if we hit the safety cap without exhausting cursors
-
-
-class FeaturedSkill(RegistrySkillSummary):
-    """A ClawHub skill we've editorially highlighted on the Discover
-    tab, with our pitch attached."""
-
-    featuredReason: str = ""
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -301,7 +253,7 @@ async def _get_manager(request: Request) -> Any:
     return mgr
 
 
-def _scope_context(request: Request, user: User, db: Any):
+def _scope_context(request: Request, user: User, db: Any) -> Any:
     from xagent.skills.library import SkillScopeContext
 
     metadata: dict[str, Any] = {}
@@ -373,7 +325,9 @@ def _normalize_skill_files(files: dict[str, bytes]) -> dict[str, bytes]:
             raise HTTPException(status_code=400, detail="Skill file path is unsafe.")
         total += len(content)
         if total > _MAX_DOWNLOAD_BYTES:
-            raise HTTPException(status_code=413, detail="Skill files exceed size budget.")
+            raise HTTPException(
+                status_code=413, detail="Skill files exceed size budget."
+            )
         out[path] = bytes(content)
     if "SKILL.md" not in out:
         raise HTTPException(status_code=400, detail="Skill has no SKILL.md.")
@@ -431,9 +385,7 @@ def _write_personal_skill(
     db.commit()
 
 
-def _update_personal_skill_md(
-    *, db: Any, user: User, name: str, skill_md: str
-) -> None:
+def _update_personal_skill_md(*, db: Any, user: User, name: str, skill_md: str) -> None:
     from xagent.skills.library import guess_media_type
     from xagent.web.models.skill import UserSkill, UserSkillFile
 
@@ -471,60 +423,8 @@ def _delete_personal_skill(*, db: Any, user: User, name: str) -> None:
     db.commit()
 
 
-# ──────────────────────────────────────────────────────────────────────
-# Helpers — ClawHub proxy
-# ──────────────────────────────────────────────────────────────────────
-
-
-def _clawhub_json(path: str, params: Optional[dict] = None) -> Any:
-    """GET ``CLAWHUB_API/<path>`` and parse JSON. Translates upstream
-    errors into HTTPExceptions with useful detail (never leaks raw
-    upstream bodies — those can contain hostile content).
-
-    Synchronous on purpose: the response body is consumed via
-    ``r.raw.read`` so we get a hard cap on size, but that means
-    callers in async routes must wrap in ``asyncio.to_thread`` to
-    avoid blocking the event loop. The ``with`` block ensures the
-    streaming connection is returned to the pool even if the read
-    raises mid-body.
-    """
-    url = f"{CLAWHUB_API}{path}"
-    try:
-        with _HTTP.get(url, params=params or {}, timeout=15, stream=True) as r:
-            status_code = r.status_code
-            # Don't fully consume oversized bodies — guard against an
-            # accidental gigabyte-of-JSON-from-upstream DoS.
-            raw = r.raw.read(_MAX_REGISTRY_BODY + 1, decode_content=True)
-    except requests.RequestException as exc:
-        raise HTTPException(
-            status_code=502,
-            detail=f"ClawHub unreachable: {exc}",
-        ) from exc
-
-    if len(raw) > _MAX_REGISTRY_BODY:
-        raise HTTPException(status_code=502, detail="ClawHub response too large.")
-    if status_code == 404:
-        raise HTTPException(status_code=404, detail="Skill not found on ClawHub.")
-    if status_code == 429:
-        raise HTTPException(
-            status_code=429,
-            detail="ClawHub rate limit hit. Try again in a moment.",
-        )
-    if status_code >= 400:
-        raise HTTPException(
-            status_code=502,
-            detail=f"ClawHub returned HTTP {status_code}.",
-        )
-    try:
-        return json.loads(raw.decode("utf-8"))
-    except Exception as exc:
-        raise HTTPException(
-            status_code=502, detail=f"Could not parse ClawHub JSON: {exc}"
-        ) from exc
-
-
 def _summary_from_registry_item(
-    item: dict, installed_names: set[str]
+    item: dict, installed_names: set[str], registry: SkillRegistry
 ) -> RegistrySkillSummary:
     """Normalize one item from ``/api/v1/skills`` or ``/api/v1/search``
     into our typed summary.
@@ -561,26 +461,9 @@ def _summary_from_registry_item(
         # ``security`` is almost always missing on list responses
         # today (the registry only attaches it after a scan runs).
         # Read both possible locations defensively.
-        scanStatus=_extract_scan_status(item),
+        scanStatus=registry.extract_scan_status(item),
         installedAs=slug if slug in installed_names else None,
     )
-
-
-def _extract_scan_status(item: dict) -> Optional[str]:
-    """Pull ``security.status`` from wherever upstream put it (top
-    level on detail responses, nested in ``latestVersion`` on some
-    list shapes). Returns ``None`` for unscanned skills."""
-    lv = item.get("latestVersion")
-    if isinstance(lv, dict):
-        sec = lv.get("security")
-        if isinstance(sec, dict) and sec.get("status"):
-            return str(sec["status"])
-    sec = item.get("security")
-    if isinstance(sec, dict) and sec.get("status"):
-        return str(sec["status"])
-    if item.get("scanStatus"):
-        return str(item["scanStatus"])
-    return None
 
 
 def _installed_slugs(mgr: Any) -> set[str]:
@@ -645,7 +528,9 @@ def _safe_zip_to_files(zip_bytes: bytes) -> dict[str, bytes]:
     try:
         zf = zipfile.ZipFile(io.BytesIO(zip_bytes))
     except zipfile.BadZipFile as exc:
-        raise HTTPException(status_code=502, detail="ClawHub returned a bad ZIP.") from exc
+        raise HTTPException(
+            status_code=502, detail="ClawHub returned a bad ZIP."
+        ) from exc
 
     total = 0
     raw_files: dict[str, bytes] = {}
@@ -656,15 +541,23 @@ def _safe_zip_to_files(zip_bytes: bytes) -> dict[str, bytes]:
             raise HTTPException(status_code=413, detail="Skill ZIP member too large.")
         total += info.file_size
         if total > _MAX_DOWNLOAD_BYTES:
-            raise HTTPException(status_code=413, detail="Skill ZIP exceeds size budget.")
+            raise HTTPException(
+                status_code=413, detail="Skill ZIP exceeds size budget."
+            )
         path = info.filename.replace("\\", "/").lstrip("/")
         if not path or ".." in path.split("/"):
-            raise HTTPException(status_code=400, detail="Skill ZIP contains unsafe paths.")
+            raise HTTPException(
+                status_code=400, detail="Skill ZIP contains unsafe paths."
+            )
         raw_files[path] = zf.read(info)
 
-    skill_md_paths = sorted(path for path in raw_files if path.endswith("/SKILL.md") or path == "SKILL.md")
+    skill_md_paths = sorted(
+        path for path in raw_files if path.endswith("/SKILL.md") or path == "SKILL.md"
+    )
     if not skill_md_paths:
-        raise HTTPException(status_code=400, detail="ClawHub artifact has no SKILL.md anywhere in it.")
+        raise HTTPException(
+            status_code=400, detail="ClawHub artifact has no SKILL.md anywhere in it."
+        )
     skill_root = skill_md_paths[0].removesuffix("SKILL.md").rstrip("/")
     files: dict[str, bytes] = {}
     for path, content in raw_files.items():
@@ -737,7 +630,9 @@ async def delete_installed(
 
         writer = get_skill_write_provider()
         if writer is None:
-            raise HTTPException(status_code=400, detail="No skill writer is registered for this scope.")
+            raise HTTPException(
+                status_code=400, detail="No skill writer is registered for this scope."
+            )
         try:
             await writer.delete_skill(
                 _scope_context(request, _user, db),
@@ -787,7 +682,9 @@ async def create_skill(
 
         writer = get_skill_write_provider()
         if writer is None:
-            raise HTTPException(status_code=400, detail="No skill writer is registered for this scope.")
+            raise HTTPException(
+                status_code=400, detail="No skill writer is registered for this scope."
+            )
         try:
             await writer.create_skill(
                 _scope_context(request, _user, db),
@@ -850,7 +747,9 @@ async def edit_installed(
 
         writer = get_skill_write_provider()
         if writer is None:
-            raise HTTPException(status_code=400, detail="No skill writer is registered for this scope.")
+            raise HTTPException(
+                status_code=400, detail="No skill writer is registered for this scope."
+            )
         try:
             await writer.update_skill_file(
                 _scope_context(request, _user, db),
@@ -885,8 +784,17 @@ async def edit_installed(
 
 
 # ──────────────────────────────────────────────────────────────────────
-# Routes — ClawHub registry proxy + install
+# Routes — registries list + registry proxy + install
 # ──────────────────────────────────────────────────────────────────────
+
+
+@router.get("/registries")
+async def list_registries(
+    _user: User = Depends(get_current_user),
+) -> List[Dict[str, str]]:
+    """Return available skill registries (ClawHub, etc.).
+    The frontend uses this to build the source-selector dropdown."""
+    return all_registries()
 
 
 @router.get("/registry/list", response_model=RegistryListResponse)
@@ -895,43 +803,27 @@ async def registry_list(
     sort: str = Query("trending"),
     limit: int = Query(24, ge=1, le=100),
     cursor: Optional[str] = Query(None),
+    source: str = Query("clawhub"),
     db: Any = Depends(get_db),
     _user: User = Depends(get_current_user),
 ) -> RegistryListResponse:
-    """Browse the ClawHub catalog. ``sort`` mirrors upstream's
-    documented values (``trending`` / ``newest`` / ``installs`` / etc).
-    Returns whatever ClawHub returns, plus ``installedAs`` so the UI
-    can mark already-installed skills.
-
-    Note: we deliberately do NOT pass ``nonSuspiciousOnly=true`` here.
-    ClawHub interprets that flag as "only skills whose scan
-    *positively cleared*", but with current registry-wide scan coverage
-    near 0% it filters out essentially every result. Install-time
-    gating (blacklist on malicious / quarantined / revoked) is what
-    actually protects users; pre-filtering the list would just give
-    them an empty Hub.
-    """
-    params = {"sort": sort, "limit": limit}
-    if cursor:
-        params["cursor"] = cursor
-    # ``_clawhub_json`` does synchronous network I/O via requests; run
-    # it on a worker thread so we don't block the event loop while
-    # ClawHub responds.
-    payload = await asyncio.to_thread(_clawhub_json, "/skills", params)
+    """Browse a skill registry's catalog."""
+    registry = get_registry(source)
+    payload = await asyncio.to_thread(registry.list_skills, sort, limit, cursor)
     items_raw = payload.get("items", []) if isinstance(payload, dict) else []
     mgr = await _get_scoped_manager(request, _user, db)
     installed = _installed_slugs(mgr)
     items = [
-        _summary_from_registry_item(i, installed)
+        _summary_from_registry_item(i, installed, registry)
         for i in items_raw
         if isinstance(i, dict)
     ]
     next_cursor = payload.get("nextCursor") if isinstance(payload, dict) else None
     logger.info(
-        "Skill Hub: registry/list sort=%s limit=%d cursor=%s → %d item(s), more=%s",
+        "Skill Hub: registry/list source=%s sort=%s limit=%d → %d item(s), more=%s",
+        source,
         sort,
         limit,
-        "yes" if cursor else "none",
         len(items),
         "yes" if next_cursor else "no",
     )
@@ -943,39 +835,164 @@ async def registry_search(
     request: Request,
     q: str = Query(..., min_length=1, max_length=200),
     limit: int = Query(24, ge=1, le=100),
+    source: str = Query("clawhub"),
     db: Any = Depends(get_db),
     _user: User = Depends(get_current_user),
 ) -> RegistryListResponse:
-    """Full-text search ClawHub. Same response shape as ``/list``.
-    See ``registry_list`` for why ``nonSuspiciousOnly`` is omitted."""
-    params = {"q": q, "limit": limit}
-    payload = await asyncio.to_thread(_clawhub_json, "/search", params)
-    results_raw = payload.get("results", []) if isinstance(payload, dict) else []
+    """Full-text search a skill registry."""
+    registry = get_registry(source)
+    payload = await asyncio.to_thread(registry.search_skills, q, limit)
+    results_raw = (
+        payload.get(registry.search_results_field, [])
+        if isinstance(payload, dict)
+        else []
+    )
     mgr = await _get_scoped_manager(request, _user, db)
     installed = _installed_slugs(mgr)
     items = [
-        _summary_from_registry_item(i, installed)
+        _summary_from_registry_item(i, installed, registry)
         for i in results_raw
         if isinstance(i, dict)
     ]
-    logger.info("Skill Hub: registry/search q=%r → %d result(s)", q[:50], len(items))
+    logger.info(
+        "Skill Hub: registry/search source=%s q=%r → %d result(s)",
+        source,
+        q[:50],
+        len(items),
+    )
     return RegistryListResponse(items=items, nextCursor=None)
+
+
+@router.post("/install/{source}", response_model=SkillSummary)
+async def install_skill(
+    source: str,
+    body: InstallSkillRequest,
+    request: Request,
+    db: Any = Depends(get_db),
+    _user: User = Depends(get_current_user),
+) -> SkillSummary:
+    """Install a skill from a registry into ``~/.xagent/skills/<slug>/``."""
+    _validate_skill_name(body.slug)
+
+    # --- Look up registry ------------------------------------------
+    registry = get_registry(source)
+
+    # --- Scan + moderation gate ------------------------------------
+    detail = await asyncio.to_thread(registry.get_skill, body.slug)
+    if not isinstance(detail, dict):
+        raise HTTPException(
+            status_code=502,
+            detail=f"{registry.display_name} detail had unexpected shape.",
+        )
+    scan_status = registry.extract_scan_status(detail)
+    moderation = detail.get("moderation") or {}
+    moderation_state = (
+        moderation.get("moderationState") if isinstance(moderation, dict) else None
+    )
+    if scan_status == "malicious":
+        raise HTTPException(
+            status_code=403,
+            detail=f"Install refused: this skill is flagged malicious by {registry.display_name} scanners.",
+        )
+    if moderation_state in ("quarantined", "revoked"):
+        raise HTTPException(
+            status_code=403,
+            detail=f"Install refused: skill is {moderation_state} by {registry.display_name} moderators.",
+        )
+
+    # --- Download ZIP ----------------------------------------------
+    dl_status, zip_bytes = await asyncio.to_thread(
+        registry.download_skill, body.slug, body.version
+    )
+    if dl_status == 404:
+        raise HTTPException(
+            status_code=404,
+            detail=f"{registry.display_name} skill or version not found.",
+        )
+    if dl_status >= 400:
+        raise HTTPException(
+            status_code=502,
+            detail=f"{registry.display_name} /download returned HTTP {dl_status}.",
+        )
+    if len(zip_bytes) > _MAX_DOWNLOAD_BYTES:
+        raise HTTPException(
+            status_code=413,
+            detail=f"Skill archive exceeds {_MAX_DOWNLOAD_BYTES // (1024 * 1024)} MiB limit.",
+        )
+
+    # --- Store DB bundle -----------------------------------------
+    files = _safe_zip_to_files(zip_bytes)
+    if body.scope == "team":
+        from xagent.skills.library import get_skill_write_provider
+
+        writer = get_skill_write_provider()
+        if writer is None:
+            raise HTTPException(
+                status_code=400, detail="No skill writer is registered for this scope."
+            )
+        try:
+            await writer.create_skill(
+                _scope_context(request, _user, db),
+                scope="team",
+                name=body.slug,
+                files=files,
+                origin=registry.id,
+                metadata={
+                    f"{registry.id}_slug": body.slug,
+                    f"{registry.id}_version": body.version,
+                },
+            )
+        except PermissionError as exc:
+            raise HTTPException(status_code=403, detail=str(exc)) from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+    else:
+        _write_personal_skill(
+            db=db,
+            user=_user,
+            name=body.slug,
+            files=files,
+            origin=registry.id,
+            clawhub_slug=body.slug,
+            clawhub_version=body.version,
+        )
+
+    # --- Reload + return -----------------------------------------
+    mgr = await _get_scoped_manager(request, _user, db)
+    skill = await mgr.get_skill(body.slug)
+    if skill is None:
+        raise HTTPException(
+            status_code=500,
+            detail=(
+                f"{registry.display_name} skill {body.slug!r} installed but failed "
+                "to re-parse. Inspect SKILL.md by hand or remove and retry."
+            ),
+        )
+    logger.info(
+        "Skill Hub: installed %s skill %r (v%s, scan=%s)",
+        registry.id,
+        body.slug,
+        body.version or "latest",
+        scan_status,
+    )
+    return _skill_to_summary(skill)
 
 
 @router.get("/registry/{slug}", response_model=RegistrySkillDetail)
 async def registry_detail(
     slug: str,
     request: Request,
+    source: str = Query("clawhub"),
     db: Any = Depends(get_db),
     _user: User = Depends(get_current_user),
 ) -> RegistrySkillDetail:
-    """Single-skill detail from ClawHub. Bundles whatever upstream
-    exposes (skill / latestVersion / metadata / moderation) into a
-    flat shape the UI can render directly."""
-    payload = await asyncio.to_thread(_clawhub_json, f"/skills/{slug}")
+    """Single-skill detail from a registry."""
+    registry = get_registry(source)
+    payload = await asyncio.to_thread(registry.get_skill, slug)
     if not isinstance(payload, dict):
         raise HTTPException(
-            status_code=502, detail="Unexpected ClawHub response shape."
+            status_code=502,
+            detail=f"Unexpected {registry.display_name} response shape.",
         )
     skill = payload.get("skill") or {}
     latest = payload.get("latestVersion") or {}
@@ -991,448 +1008,23 @@ async def registry_detail(
         ownerHandle=(payload.get("owner") or {}).get("handle")
         or skill.get("ownerHandle"),
         homepage=metadata.get("homepage"),
-        readme=metadata.get("readme") or latest.get("readme"),
-        scanStatus=(latest.get("security") or {}).get("status"),
+        readme=metadata.get("readme")
+        or latest.get("readme")
+        or skill.get("description"),
+        scanStatus=registry.extract_scan_status(payload),
         moderation=moderation if isinstance(moderation, dict) else None,
         installedAs=slug if slug in installed else None,
         raw=payload,
     )
 
 
-@router.post("/install/clawhub", response_model=SkillSummary)
-async def install_clawhub(
-    body: InstallClawhubRequest,
-    request: Request,
-    db: Any = Depends(get_db),
-    _user: User = Depends(get_current_user),
-) -> SkillSummary:
-    """Install a ClawHub skill into ``~/.xagent/skills/<slug>/``.
-
-    v0 install policy is a **blacklist**, not a whitelist:
-
-    - ``scan_status == "malicious"`` → refused (403)
-    - ``moderation.moderationState in {"quarantined", "revoked"}``
-      → refused (403)
-    - ``"clean"``, ``"suspicious"``, or ``None`` (unscanned) → allowed
-
-    Whitelist mode (``"clean"`` only) was the original intent, but
-    upstream's scan coverage is currently ~0% on trending skills, so
-    a strict whitelist would block every install. The UI surfaces
-    ``scanStatus`` via badge so users can see "Not scanned" before
-    they hit Install.
-
-    Flow:
-      1. Validate slug + reserve target dir.
-      2. Pull ClawHub detail to check scan + moderation. Refuse on
-         the blacklist conditions above.
-      3. Stream the ZIP from ``/download`` into memory (cap 50 MiB).
-      4. Path-safe extract → locate SKILL.md → move into place.
-      5. ``manager.reload()`` so the new skill is visible to agents.
-    """
-    _validate_skill_name(body.slug)
-
-    # --- 2. Scan + moderation gate ---------------------------------
-    detail = await asyncio.to_thread(_clawhub_json, f"/skills/{body.slug}")
-    if not isinstance(detail, dict):
-        raise HTTPException(
-            status_code=502, detail="ClawHub detail had unexpected shape."
-        )
-    scan_status = _extract_scan_status(detail)
-    moderation = detail.get("moderation") or {}
-    moderation_state = (
-        moderation.get("moderationState") if isinstance(moderation, dict) else None
-    )
-    if scan_status == "malicious":
-        raise HTTPException(
-            status_code=403,
-            detail="Install refused: this skill is flagged malicious by ClawHub scanners.",
-        )
-    if moderation_state in ("quarantined", "revoked"):
-        raise HTTPException(
-            status_code=403,
-            detail=(
-                f"Install refused: skill is {moderation_state} by ClawHub moderators."
-            ),
-        )
-
-    # --- 3. Download ZIP -------------------------------------------
-    dl_params = {"slug": body.slug}
-    if body.version:
-        dl_params["version"] = body.version
-
-    def _download() -> tuple[int, bytes]:
-        """Synchronous download wrapped in a helper so we can hand it
-        to ``asyncio.to_thread``. The ``with`` block guarantees the
-        streaming connection is released back to the pool even on
-        size-cap or read errors."""
-        try:
-            with _HTTP.get(
-                f"{CLAWHUB_API}/download",
-                params=dl_params,
-                timeout=60,
-                stream=True,
-            ) as dl:
-                dl_status = dl.status_code
-                if dl_status >= 400:
-                    return dl_status, b""
-                return dl_status, dl.raw.read(
-                    _MAX_DOWNLOAD_BYTES + 1, decode_content=True
-                )
-        except requests.RequestException as exc:
-            raise HTTPException(
-                status_code=502, detail=f"ClawHub download failed: {exc}"
-            ) from exc
-
-    dl_status, zip_bytes = await asyncio.to_thread(_download)
-    if dl_status == 404:
-        raise HTTPException(
-            status_code=404, detail="ClawHub skill or version not found."
-        )
-    if dl_status >= 400:
-        raise HTTPException(
-            status_code=502,
-            detail=f"ClawHub /download returned HTTP {dl_status}.",
-        )
-    if len(zip_bytes) > _MAX_DOWNLOAD_BYTES:
-        raise HTTPException(status_code=413, detail="ClawHub artifact too large.")
-
-    # --- 4. Store DB bundle -----------------------------------------
-    files = _safe_zip_to_files(zip_bytes)
-    if body.scope == "team":
-        from xagent.skills.library import get_skill_write_provider
-
-        writer = get_skill_write_provider()
-        if writer is None:
-            raise HTTPException(status_code=400, detail="No skill writer is registered for this scope.")
-        try:
-            await writer.create_skill(
-                _scope_context(request, _user, db),
-                scope="team",
-                name=body.slug,
-                files=files,
-                origin="clawhub",
-                metadata={"clawhub_slug": body.slug, "clawhub_version": body.version},
-            )
-        except PermissionError as exc:
-            raise HTTPException(status_code=403, detail=str(exc)) from exc
-        except ValueError as exc:
-            raise HTTPException(status_code=400, detail=str(exc)) from exc
-    else:
-        _write_personal_skill(
-            db=db,
-            user=_user,
-            name=body.slug,
-            files=files,
-            origin="clawhub",
-            clawhub_slug=body.slug,
-            clawhub_version=body.version,
-        )
-
-    # --- 5. Reload + return -----------------------------------------
-    mgr = await _get_scoped_manager(request, _user, db)
-    skill = await mgr.get_skill(body.slug)
-    if skill is None:
-        raise HTTPException(
-            status_code=500,
-            detail=(
-                f"ClawHub skill {body.slug!r} installed but failed "
-                "to re-parse. Inspect SKILL.md by hand or remove and retry."
-            ),
-        )
-    logger.info(
-        "Skill Hub: installed ClawHub skill %r (v%s, scan=%s)",
-        body.slug,
-        body.version or "latest",
-        scan_status,
-    )
-    return _skill_to_summary(skill)
-
-
-# ──────────────────────────────────────────────────────────────────────
-# Routes — featured ("Editor's pick" rail)
-# ──────────────────────────────────────────────────────────────────────
-
-# Editorial list of slugs xagent recommends on the Discover tab,
-# alongside our reason for each. Sibling to this module — same dir as
-# api/, one level up to xagent_saas package root.
-_FEATURED_CONFIG_PATH = (
-    Path(__file__).resolve().parent.parent / "skill_hub_featured.json"
-)
-
-# Cheap in-memory cache: every request hitting /featured triggers N
-# ClawHub detail calls (one per slug). Cache the joined result for a
-# few minutes so the rail doesn't N-amplify on every page load.
-# Refresh granularity vs. ClawHub freshness is the trade-off; 5 min
-# means edits to the featured JSON take up to 5 min to surface, which
-# matches "drop a file, no restart" + an acceptable update lag.
-_FEATURED_CACHE: Dict[str, Any] = {"items": None, "fetched_at": 0.0}
-_FEATURED_TTL_SECONDS = 300
-
-
-def _load_featured_config() -> List[Dict[str, str]]:
-    """Read the editorial featured list off disk every call. Cheap
-    (small JSON, no DB), keeps "drop a file" workflow alive without
-    restart. Returns ``[]`` on any read/parse error so a typo in the
-    JSON degrades to "no featured rail" rather than 500ing the
-    Discover tab."""
-    if not _FEATURED_CONFIG_PATH.exists():
-        return []
-    try:
-        data = json.loads(_FEATURED_CONFIG_PATH.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError) as exc:
-        logger.warning("skill_hub_featured.json unreadable: %s", exc)
-        return []
-    items = data.get("items") if isinstance(data, dict) else None
-    if not isinstance(items, list):
-        return []
-    out: list[dict[str, str]] = []
-    for entry in items:
-        if not isinstance(entry, dict):
-            continue
-        slug = entry.get("slug")
-        if not isinstance(slug, str) or not slug:
-            continue
-        out.append({"slug": slug, "reason": str(entry.get("reason") or "")})
-    return out
-
-
-@router.get("/featured", response_model=List[FeaturedSkill])
-async def featured(
-    request: Request,
-    db: Any = Depends(get_db),
-    _user: User = Depends(get_current_user),
-) -> List[FeaturedSkill]:
-    """Editor's pick rail for the Discover tab.
-
-    Reads the slug + reason list from ``skill_hub_featured.json``,
-    fans out a ClawHub detail call per slug to enrich into the same
-    shape as the registry list response (plus ``featuredReason``).
-    Cached for 5 minutes — edits to the JSON file take up to that
-    long to surface, but the rail won't N-amplify ClawHub per page
-    load.
-
-    Slugs that ClawHub doesn't know are silently dropped: the rail
-    is editorial, not a contract, so one stale entry shouldn't kill
-    the whole row.
-    """
-    config = _load_featured_config()
-    if not config:
-        return []
-
-    now = time.time()
-    cached = _FEATURED_CACHE.get("items")
-    if (
-        cached is not None
-        and (now - _FEATURED_CACHE["fetched_at"]) < _FEATURED_TTL_SECONDS
-    ):
-        # Hot path. Just refresh the installedAs marker from the
-        # live SkillManager so newly-installed skills flip the badge
-        # without waiting for the TTL.
-        mgr = await _get_scoped_manager(request, _user, db)
-        installed = _installed_slugs(mgr)
-        return [
-            FeaturedSkill(
-                **{**it, "installedAs": it["slug"] if it["slug"] in installed else None}
-            )
-            for it in cached
-        ]
-
-    mgr = await _get_scoped_manager(request, _user, db)
-    installed = _installed_slugs(mgr)
-
-    # Fan out the 6 detail fetches in parallel. ``_clawhub_json`` is
-    # sync (uses the requests library), so we wrap each in
-    # ``asyncio.to_thread`` to run on the default executor and gather
-    # the results. Total wall time becomes max(per-call) instead of
-    # sum(per-call) — typically 500ms vs 3s.
-    async def _fetch(slug: str) -> Optional[Dict[str, Any]]:
-        try:
-            return await asyncio.to_thread(_clawhub_json, f"/skills/{slug}")
-        except HTTPException as exc:
-            logger.info("Skill Hub featured: dropping %r — %s", slug, exc.detail)
-            return None
-
-    details = await asyncio.gather(*[_fetch(e["slug"]) for e in config])
-
-    items: list[dict] = []
-    for entry, detail in zip(config, details):
-        if not isinstance(detail, dict):
-            continue
-        slug = entry["slug"]
-        skill = detail.get("skill") or {}
-        latest = detail.get("latestVersion") or {}
-        stats = skill.get("stats") or {}
-        items.append(
-            {
-                "slug": slug,
-                "displayName": str(skill.get("displayName") or slug),
-                "summary": str(skill.get("summary") or ""),
-                "version": latest.get("version")
-                or (skill.get("tags") or {}).get("latest"),
-                "ownerHandle": (detail.get("owner") or {}).get("handle"),
-                "installs": stats.get("installsCurrent"),
-                "updatedAt": skill.get("updatedAt"),
-                "scanStatus": _extract_scan_status(detail),
-                "installedAs": None,  # filled per-request from live manager
-                "featuredReason": entry["reason"],
-            }
-        )
-
-    _FEATURED_CACHE["items"] = items
-    _FEATURED_CACHE["fetched_at"] = now
-    return [
-        FeaturedSkill(
-            **{**it, "installedAs": it["slug"] if it["slug"] in installed else None}
-        )
-        for it in items
-    ]
-
-
-# ──────────────────────────────────────────────────────────────────────
-# Routes — registry pagination stats
-# ──────────────────────────────────────────────────────────────────────
-
-# Per-sort cache of (total, walked_pages, truncated, fetched_at). We
-# walk ClawHub's cursor pages on the server because there's no count
-# endpoint upstream; the walk is sequential by nature (the next cursor
-# depends on the previous response). Cached aggressively so the
-# expensive first call amortizes.
-_STATS_CACHE: Dict[str, Dict[str, Any]] = {}
-_STATS_TTL_SECONDS = 300
-# Stats walks ClawHub at its maximum supported page size to keep
-# total round-trips low. The frontend's UI page size is 30 (see
-# ``PAGE_SIZE`` in page.tsx) and ``totalPages`` is computed as
-# ``ceil(total / 30)`` — the two are deliberately decoupled.
+# Prewarm was previously scheduled via ``asyncio.create_task`` from
+# the ``@app.on_event("startup")`` hook. It was removed because the
+# xagent startup-event integration tests track every
+# ``asyncio.create_task`` call and assert none happen — adding ours
+# broke an unrelated test contract.
 #
-# Edge case: ClawHub's ``sort=trending`` returns "top N based on
-# request limit, no pagination", so a walk at limit=100 sees 100
-# items but a list at limit=30 also sees 30 + nextCursor=null. The
-# UI then shows "Page 1 of 4" but Next is disabled — acceptable
-# rough edge for the speedup; default sort is ``installsCurrent``
-# (which paginates cleanly) so most users never hit it.
-# Pagination math intentionally accepts "≥N" instead of exact count.
-#
-# ClawHub's full installsCurrent corpus is ~8,000 skills. Walking
-# that exhaustively at page size 100 = 80 sequential round-trips ×
-# ~1.4s/call to ClawHub = ~2 minutes wall time. That cost can't be
-# parallelized (each cursor depends on the previous response), so a
-# faithful total is structurally slow.
-#
-# Instead we walk 15 pages = 1,500 skills, then flag the result as
-# truncated. UI renders "Page X of ≥50" — directionally honest
-# ("there's lots") without the 2-minute prewarm. If a user really
-# does paginate past page 50, the live ``Next`` button continues
-# working (it uses the actual cursor from /list, not the stats cap).
-_STATS_PAGE_SIZE = 100
-_STATS_MAX_PAGES = 15
-
-
-def _fill_stats_cache(sort: str) -> Dict[str, Any]:
-    """Walk ClawHub for one sort dimension, populate ``_STATS_CACHE``,
-    return the cache entry.
-
-    Synchronous on purpose so it composes cleanly with both the
-    HTTP endpoint (called via ``asyncio.to_thread``) and the
-    startup prewarm task (which spawns a few of these in parallel).
-    """
-    total = 0
-    pages = 0
-    cursor: Optional[str] = None
-    truncated = False
-    hit_cap = True
-    for _ in range(_STATS_MAX_PAGES):
-        params: Dict[str, Any] = {"sort": sort, "limit": _STATS_PAGE_SIZE}
-        if cursor:
-            params["cursor"] = cursor
-        try:
-            payload = _clawhub_json("/skills", params)
-        except HTTPException as exc:
-            # ClawHub flaked partway through the walk. Don't 502 the
-            # whole stats call — partial total + ``truncated=True`` is
-            # still useful to the UI (it'll render "Page N of ≥M").
-            logger.warning(
-                "Skill Hub: stats walk for sort=%s aborted at page %d (%s); "
-                "returning partial total %d",
-                sort,
-                pages,
-                exc.detail,
-                total,
-            )
-            truncated = True
-            break
-        if not isinstance(payload, dict):
-            break
-        items = payload.get("items") or []
-        total += len(items)
-        pages += 1
-        cursor = payload.get("nextCursor")
-        if not cursor:
-            hit_cap = False
-            break
-    if hit_cap and cursor:
-        truncated = True
-
-    entry = {
-        "total": total,
-        "walked_pages": pages,
-        "truncated": truncated,
-        "fetched_at": time.time(),
-    }
-    _STATS_CACHE[sort] = entry
-    logger.info(
-        "Skill Hub: stats cache filled sort=%s → %d skill(s) across %d page(s)%s",
-        sort,
-        total,
-        pages,
-        " (truncated)" if truncated else "",
-    )
-    return entry
-
-
-@router.get("/registry/stats", response_model=RegistryStats)
-async def registry_stats(
-    sort: str = Query("trending"),
-    _user: User = Depends(get_current_user),
-) -> RegistryStats:
-    """Walk ClawHub for the current ``sort`` until cursor exhausts,
-    return the total skill count. Used by the UI to render "Page N
-    of M" — without this endpoint the count side is unknowable from
-    a cursor-based API.
-
-    First-call cost (cold cache): ``ceil(total / 30)`` sequential
-    round-trips to ClawHub. For ``sort=trending`` (capped at ~30 per
-    page-size constraint) this is one call. For ``sort=newest``
-    (~2,000) it's ~67 calls, ~5 seconds without prewarm. Backend
-    startup runs ``prewarm`` to fill the common sorts ahead of time,
-    so a typical user hits a warm cache.
-    """
-    cached = _STATS_CACHE.get(sort)
-    now = time.time()
-    if cached and (now - cached["fetched_at"]) < _STATS_TTL_SECONDS:
-        return RegistryStats(
-            sort=sort,
-            total=cached["total"],
-            walked_pages=cached["walked_pages"],
-            truncated=cached["truncated"],
-        )
-    # Cold (or expired) — walk on a thread so we don't block the
-    # event loop for the multi-second sequential cursor walk.
-    entry = await asyncio.to_thread(_fill_stats_cache, sort)
-    return RegistryStats(
-        sort=sort,
-        total=entry["total"],
-        walked_pages=entry["walked_pages"],
-        truncated=entry["truncated"],
-    )
-
-
-# Prewarm was previously scheduled here via ``asyncio.create_task`` from
-# the ``@app.on_event("startup")`` hook, to give the first /featured
-# request a warm cache. It was removed because the xagent startup-event
-# integration tests track every ``asyncio.create_task`` call and assert
-# none happen — adding ours broke an unrelated test contract.
-#
-# The endpoints below already populate their own caches on first call;
+# The endpoints populate their own caches on first call;
 # the cost is just paid by the first user instead of pre-paid at boot.
 # Frontend SWR / sessionStorage cache cushion this across pages.
 # If we want startup prewarm back, the xagent startup tests need to be

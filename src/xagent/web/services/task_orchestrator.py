@@ -628,6 +628,7 @@ def finish_turn(bg_db: Any, task_id: int) -> None:
             fresh.output = latest_assistant.content
             fresh.error_message = None
             sync_workforce_run_status(bg_db, fresh, TaskStatus.COMPLETED)
+            _sync_trigger_run_status(bg_db, fresh, TaskStatus.COMPLETED)
             bg_db.commit()
             invalidate_task_cache(task_id)
             logger.info(
@@ -640,7 +641,11 @@ def finish_turn(bg_db: Any, task_id: int) -> None:
                 "finish_turn: task %s completed but no assistant message found",
                 task_id,
             )
-            if sync_workforce_run_status(bg_db, fresh, TaskStatus.COMPLETED):
+            run_changed = sync_workforce_run_status(bg_db, fresh, TaskStatus.COMPLETED)
+            trigger_run_changed = _sync_trigger_run_status(
+                bg_db, fresh, TaskStatus.COMPLETED
+            )
+            if run_changed or trigger_run_changed:
                 bg_db.commit()
                 invalidate_task_cache(task_id)
         return
@@ -658,7 +663,8 @@ def finish_turn(bg_db: Any, task_id: int) -> None:
             fresh.output = None
             changed = True
         run_changed = sync_workforce_run_status(bg_db, fresh, TaskStatus.FAILED)
-        if changed or run_changed:
+        trigger_run_changed = _sync_trigger_run_status(bg_db, fresh, TaskStatus.FAILED)
+        if changed or run_changed or trigger_run_changed:
             bg_db.commit()
             invalidate_task_cache(task_id)
             logger.info(
@@ -697,6 +703,7 @@ def finish_turn(bg_db: Any, task_id: int) -> None:
         fresh.error_message = "Task execution failed without status update; see /steps."
         fresh.output = None  # latest-turn snapshot invariant
         sync_workforce_run_status(bg_db, fresh, TaskStatus.FAILED)
+        _sync_trigger_run_status(bg_db, fresh, TaskStatus.FAILED)
         bg_db.commit()
         invalidate_task_cache(task_id)
         logger.warning(
@@ -707,6 +714,49 @@ def finish_turn(bg_db: Any, task_id: int) -> None:
         return
 
     # PAUSED / WAITING_FOR_USER / other: leave alone.
+
+
+def finish_turn_isolated(task_id: int) -> None:
+    """Run finish_turn with a short-lived session owned by this thread."""
+    from ..models.database import get_session_local
+
+    SessionLocal = get_session_local()
+    with SessionLocal() as finalize_db:
+        finish_turn(finalize_db, task_id)
+
+
+def _sync_trigger_run_status(bg_db: Any, task: Task, status: TaskStatus) -> bool:
+    """Best-effort mirror from task terminal state to trigger run history."""
+    from ..models.trigger import TriggerRun, TriggerRunStatus
+
+    rows = (
+        bg_db.query(TriggerRun)
+        .filter(
+            TriggerRun.task_id == int(task.id),
+            TriggerRun.status.in_(
+                [TriggerRunStatus.PENDING.value, TriggerRunStatus.RUNNING.value]
+            ),
+        )
+        .all()
+    )
+    if not rows:
+        return False
+
+    now = datetime.now(timezone.utc)
+    run_status = (
+        TriggerRunStatus.COMPLETED.value
+        if status == TaskStatus.COMPLETED
+        else TriggerRunStatus.FAILED.value
+    )
+    for run in rows:
+        run.status = run_status
+        run.finished_at = now
+        if status == TaskStatus.FAILED:
+            run.error_message = task.error_message
+        else:
+            run.error_message = None
+        bg_db.add(run)
+    return True
 
 
 def _schedule_bg(
@@ -854,19 +904,18 @@ def _schedule_bg(
                     # not stuck mid-lifecycle.
 
                 # Short-lived finalize session. ``finish_turn`` only
-                # reads / updates the task row once; opening here keeps
-                # the pool slot freed for the entire agent run above.
-                SessionLocal = get_session_local()
-                with SessionLocal() as finalize_db:
-                    try:
-                        finish_turn(finalize_db, task_id)
-                    except Exception as e:
-                        logger.error(
-                            "finish_turn failed for task %s: %s",
-                            task_id,
-                            e,
-                            exc_info=True,
-                        )
+                # reads / updates the task row once, but the DB work can
+                # still block the event loop under load; run it in a
+                # worker-thread session.
+                try:
+                    await asyncio.to_thread(finish_turn_isolated, task_id)
+                except Exception as e:
+                    logger.error(
+                        "finish_turn failed for task %s: %s",
+                        task_id,
+                        e,
+                        exc_info=True,
+                    )
             finally:
                 stop_event.set()
                 try:

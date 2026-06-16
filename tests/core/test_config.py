@@ -53,6 +53,9 @@ from xagent.config import (
     SMTP_USE_TLS,
     SMTP_USERNAME,
     STORAGE_ROOT,
+    TRIGGER_DISPATCHER_BATCH_SIZE,
+    TRIGGER_DISPATCHER_ENABLED,
+    TRIGGER_DISPATCHER_INTERVAL_SECONDS,
     UPLOADS_DIR,
     WEB_CRAWL_TLS_IMPERSONATE,
     WEB_DIR,
@@ -107,6 +110,9 @@ from xagent.config import (
     get_smtp_use_tls,
     get_smtp_username,
     get_storage_root,
+    get_trigger_dispatcher_batch_size,
+    get_trigger_dispatcher_enabled,
+    get_trigger_dispatcher_interval_seconds,
     get_uploads_dir,
     get_web_crawl_tls_impersonate,
     get_web_dir,
@@ -211,6 +217,12 @@ class TestEnvironmentVariableConstants:
             BACKGROUND_JOB_SWEEP_INTERVAL_SECONDS
             == "XAGENT_BACKGROUND_JOB_SWEEP_INTERVAL_SECONDS"
         )
+        assert TRIGGER_DISPATCHER_ENABLED == "XAGENT_TRIGGER_DISPATCHER_ENABLED"
+        assert (
+            TRIGGER_DISPATCHER_INTERVAL_SECONDS
+            == "XAGENT_TRIGGER_DISPATCHER_INTERVAL_SECONDS"
+        )
+        assert TRIGGER_DISPATCHER_BATCH_SIZE == "XAGENT_TRIGGER_DISPATCHER_BATCH_SIZE"
 
     def test_auth_email_config_constants(self):
         assert PASSWORD_RESET_EXPIRE_MINUTES == "XAGENT_PASSWORD_RESET_EXPIRE_MINUTES"
@@ -366,6 +378,21 @@ class TestCeleryBackgroundJobConfig:
         assert get_background_job_max_retries() == 3
         assert get_background_job_stale_seconds() == 7200
         assert get_background_job_sweep_interval_seconds() == 300
+
+    def test_trigger_dispatcher_tuning(self, monkeypatch):
+        monkeypatch.delenv(TRIGGER_DISPATCHER_ENABLED, raising=False)
+        monkeypatch.delenv(TRIGGER_DISPATCHER_INTERVAL_SECONDS, raising=False)
+        monkeypatch.delenv(TRIGGER_DISPATCHER_BATCH_SIZE, raising=False)
+        assert get_trigger_dispatcher_enabled() is True
+        assert get_trigger_dispatcher_interval_seconds() == 5
+        assert get_trigger_dispatcher_batch_size() == 20
+
+        monkeypatch.setenv(TRIGGER_DISPATCHER_ENABLED, "false")
+        monkeypatch.setenv(TRIGGER_DISPATCHER_INTERVAL_SECONDS, "9")
+        monkeypatch.setenv(TRIGGER_DISPATCHER_BATCH_SIZE, "3")
+        assert get_trigger_dispatcher_enabled() is False
+        assert get_trigger_dispatcher_interval_seconds() == 9
+        assert get_trigger_dispatcher_batch_size() == 3
 
 
 class TestGetWebSearchProvider:

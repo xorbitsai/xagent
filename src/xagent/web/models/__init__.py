@@ -15,6 +15,7 @@ from .system_setting import SystemSetting
 from .task import DAGExecution, Task
 from .template_stats import TemplateStats, UserTemplateRelation
 from .tool_config import ToolConfig, ToolUsage
+from .trigger import AgentTrigger, TriggerRun, TriggerRunStatus, TriggerType
 from .uploaded_file import UploadedFile
 from .user import User, UserDefaultModel, UserModel
 from .user_api_key import UserApiKey
@@ -46,6 +47,10 @@ __all__ = [
     "UserTemplateRelation",
     "ToolConfig",
     "ToolUsage",
+    "AgentTrigger",
+    "TriggerRun",
+    "TriggerRunStatus",
+    "TriggerType",
     "SystemSetting",
     "Agent",
     "AgentApiKey",

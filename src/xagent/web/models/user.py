@@ -72,6 +72,9 @@ class User(Base):  # type: ignore
     background_jobs = relationship(
         "BackgroundJob", back_populates="user", cascade="all, delete-orphan"
     )
+    agent_triggers = relationship(
+        "AgentTrigger", back_populates="user", cascade="all, delete-orphan"
+    )
     tool_configs = relationship(
         "UserToolConfig", back_populates="user", cascade="all, delete-orphan"
     )

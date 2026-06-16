@@ -73,6 +73,9 @@ BACKGROUND_JOB_VISIBILITY_TIMEOUT_SECONDS = (
 BACKGROUND_JOB_MAX_RETRIES = "XAGENT_BACKGROUND_JOB_MAX_RETRIES"
 BACKGROUND_JOB_STALE_SECONDS = "XAGENT_BACKGROUND_JOB_STALE_SECONDS"
 BACKGROUND_JOB_SWEEP_INTERVAL_SECONDS = "XAGENT_BACKGROUND_JOB_SWEEP_INTERVAL_SECONDS"
+TRIGGER_DISPATCHER_ENABLED = "XAGENT_TRIGGER_DISPATCHER_ENABLED"
+TRIGGER_DISPATCHER_INTERVAL_SECONDS = "XAGENT_TRIGGER_DISPATCHER_INTERVAL_SECONDS"
+TRIGGER_DISPATCHER_BATCH_SIZE = "XAGENT_TRIGGER_DISPATCHER_BATCH_SIZE"
 PASSWORD_RESET_EXPIRE_MINUTES = "XAGENT_PASSWORD_RESET_EXPIRE_MINUTES"
 APP_BASE_URL = "XAGENT_APP_BASE_URL"
 SMTP_HOST = "XAGENT_SMTP_HOST"
@@ -388,6 +391,29 @@ def get_background_job_sweep_interval_seconds() -> int:
         BACKGROUND_JOB_SWEEP_INTERVAL_SECONDS,
         300,
         minimum=30,
+    )
+
+
+def get_trigger_dispatcher_enabled() -> bool:
+    """Return whether the backend should start prepared trigger runs."""
+    return _get_bool_env(TRIGGER_DISPATCHER_ENABLED, True)
+
+
+def get_trigger_dispatcher_interval_seconds() -> int:
+    """Return how often backend processes poll prepared trigger runs."""
+    return _get_positive_int_env(
+        TRIGGER_DISPATCHER_INTERVAL_SECONDS,
+        5,
+        minimum=1,
+    )
+
+
+def get_trigger_dispatcher_batch_size() -> int:
+    """Return max prepared trigger runs one backend poll should start."""
+    return _get_positive_int_env(
+        TRIGGER_DISPATCHER_BATCH_SIZE,
+        20,
+        minimum=1,
     )
 
 

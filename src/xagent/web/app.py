@@ -17,6 +17,9 @@ from ..config import (
     get_agent_runtime,
     get_file_storage_startup_sync_enabled,
     get_session_secret,
+    get_trigger_dispatcher_batch_size,
+    get_trigger_dispatcher_enabled,
+    get_trigger_dispatcher_interval_seconds,
     get_uploads_dir,
 )
 from ..core.tracing.langfuse import flush_langfuse, initialize_langfuse
@@ -42,6 +45,7 @@ from .api.skills import router as skills_router
 from .api.system import system_router
 from .api.templates import router as templates_router
 from .api.tools import tools_router
+from .api.triggers import router as triggers_router
 from .api.v1 import v1_router
 from .api.v1.errors import V1ApiError, v1_api_error_handler
 from .api.websocket import ws_router
@@ -73,6 +77,7 @@ app = FastAPI(
 # Track background migration task for graceful shutdown cleanup.
 _migration_task: asyncio.Task[None] | None = None
 _file_storage_startup_sync_task: asyncio.Task[Any] | None = None
+_trigger_dispatcher_task: asyncio.Task[Any] | None = None
 
 FILE_STORAGE_STARTUP_SYNC_EXEMPT_PATHS = frozenset({"/health", "/ready"})
 FILE_STORAGE_STARTUP_SYNC_RETRY_INTERVAL_SECONDS = 5.0
@@ -176,6 +181,62 @@ def start_file_storage_startup_sync_task(
 
     task.add_done_callback(_record_file_storage_sync_result)
     logger.info("Started background startup file storage sync task")
+    return task
+
+
+async def _run_trigger_dispatcher(
+    *,
+    poll_interval_seconds: int,
+    batch_size: int,
+) -> None:
+    from .models.database import get_session_local
+    from .services.triggers import dispatch_pending_trigger_runs
+
+    while True:
+        try:
+            SessionLocal = get_session_local()
+            db = SessionLocal()
+            try:
+                started = await dispatch_pending_trigger_runs(db, limit=batch_size)
+                if started:
+                    logger.info("Trigger dispatcher started %s trigger run(s)", started)
+            finally:
+                db.close()
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Trigger dispatcher tick failed: %s", exc, exc_info=True)
+
+        await asyncio.sleep(poll_interval_seconds)
+
+
+def start_trigger_dispatcher_task(app_instance: FastAPI) -> asyncio.Task[Any] | None:
+    """Start backend-side trigger execution dispatcher."""
+    global _trigger_dispatcher_task
+
+    app_instance.state.trigger_dispatcher_task = None
+    if not get_trigger_dispatcher_enabled():
+        logger.info("Trigger dispatcher is disabled")
+        return None
+    if os.getenv("PYTEST_CURRENT_TEST"):
+        logger.info("Skipping trigger dispatcher (test environment)")
+        return None
+
+    poll_interval_seconds = get_trigger_dispatcher_interval_seconds()
+    batch_size = get_trigger_dispatcher_batch_size()
+    task = asyncio.create_task(
+        _run_trigger_dispatcher(
+            poll_interval_seconds=poll_interval_seconds,
+            batch_size=batch_size,
+        )
+    )
+    _trigger_dispatcher_task = task
+    app_instance.state.trigger_dispatcher_task = task
+    logger.info(
+        "Started trigger dispatcher task (interval=%ss, batch_size=%s)",
+        poll_interval_seconds,
+        batch_size,
+    )
     return task
 
 
@@ -462,6 +523,7 @@ app.include_router(skills_router)
 app.include_router(system_router)
 app.include_router(templates_router)
 app.include_router(agents_router)
+app.include_router(triggers_router)
 app.include_router(workforces_router)
 app.include_router(channel_router, prefix="/api/channels", tags=["Channels"])
 app.include_router(widget_router)
@@ -480,6 +542,7 @@ async def startup_event() -> None:
     init_db()
     logger.info("Database initialized successfully")
     start_file_storage_startup_sync_task(app)
+    start_trigger_dispatcher_task(app)
 
     initialize_langfuse()
 
@@ -905,7 +968,7 @@ async def startup_event() -> None:
 
 @app.on_event("shutdown")
 async def shutdown_event() -> None:
-    global _file_storage_startup_sync_task, _migration_task
+    global _file_storage_startup_sync_task, _migration_task, _trigger_dispatcher_task
 
     flush_langfuse()
 
@@ -915,6 +978,13 @@ async def shutdown_event() -> None:
         with suppress(asyncio.CancelledError):
             await _file_storage_startup_sync_task
     _file_storage_startup_sync_task = None
+
+    if _trigger_dispatcher_task and not _trigger_dispatcher_task.done():
+        logger.info("Cancelling trigger dispatcher task...")
+        _trigger_dispatcher_task.cancel()
+        with suppress(asyncio.CancelledError):
+            await _trigger_dispatcher_task
+    _trigger_dispatcher_task = None
 
     if _migration_task and not _migration_task.done():
         logger.info("Cancelling background LanceDB migration task...")

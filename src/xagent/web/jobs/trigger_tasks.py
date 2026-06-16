@@ -12,6 +12,7 @@ from ..services.background_jobs import (
     requeue_stale_background_jobs,
     update_job_progress,
 )
+from ..services.triggers import prepare_trigger_run, scan_due_scheduled_triggers
 from .celery_app import celery_app
 
 logger = logging.getLogger(__name__)
@@ -26,6 +27,30 @@ def handle_trigger_event(db: Session, job: BackgroundJob) -> dict[str, Any]:
     """
     payload = dict(job.payload or {})
     update_job_progress(db, job, message="Processing trigger event")
+    trigger_id = payload.get("trigger_id")
+    if trigger_id:
+        from ..models.trigger import AgentTrigger
+
+        trigger = (
+            db.query(AgentTrigger).filter(AgentTrigger.id == int(trigger_id)).first()
+        )
+        if trigger is None:
+            raise ValueError(f"Trigger not found: {trigger_id}")
+        run, created = prepare_trigger_run(
+            db,
+            trigger=trigger,
+            event_payload=dict(payload.get("event_payload") or {}),
+            source_event_id=payload.get("source_event_id"),
+            background_job_id=str(job.id),
+        )
+        return {
+            "status": "prepared" if created else "duplicate",
+            "trigger_id": int(trigger.id),
+            "trigger_run_id": int(run.id),
+            "task_id": int(run.task_id) if run.task_id is not None else None,
+            "processed_at": datetime.now(timezone.utc).isoformat(),
+        }
+
     logger.info(
         "Processed trigger event job=%s source=%s event=%s",
         job.id,
@@ -44,10 +69,12 @@ def handle_trigger_scan(db: Session, job: BackgroundJob) -> dict[str, Any]:
     payload = dict(job.payload or {})
     update_job_progress(db, job, message="Scanning scheduled triggers")
     requeued_jobs = requeue_stale_background_jobs(db)
+    runs = scan_due_scheduled_triggers(db)
     return {
         "status": "scanned",
         "scan_scope": payload.get("scope", "all"),
         "requeued_stale_jobs": len(requeued_jobs),
+        "trigger_runs_created": len(runs),
         "processed_at": datetime.now(timezone.utc).isoformat(),
     }
 
@@ -69,9 +96,11 @@ def scan_due_triggers() -> dict[str, Any]:
     db = SessionLocal()
     try:
         requeued_jobs = requeue_stale_background_jobs(db)
+        runs = scan_due_scheduled_triggers(db)
         return {
             "status": "ok",
             "requeued_stale_jobs": len(requeued_jobs),
+            "trigger_runs_created": len(runs),
             "processed_at": datetime.now(timezone.utc).isoformat(),
         }
     finally:

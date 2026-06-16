@@ -99,6 +99,9 @@ class Agent(Base):  # type: ignore
 
     # Relationships
     user = relationship("User", back_populates="agents")
+    triggers = relationship(
+        "AgentTrigger", back_populates="agent", cascade="all, delete-orphan"
+    )
 
     @property
     def is_workforce_generated_manager(self) -> bool:

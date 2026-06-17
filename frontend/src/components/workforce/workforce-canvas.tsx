@@ -13,15 +13,23 @@ import {
   Edge,
 } from "@xyflow/react"
 import "@xyflow/react/dist/style.css"
-import { Crown, ShieldAlert } from "lucide-react"
-import type { WorkforceCanvasResponse, WorkforceDetail } from "@/types/workforce"
+import { Crown } from "lucide-react"
+import { useI18n } from "@/contexts/i18n-context"
+import type { WorkforceDetail } from "@/types/workforce"
 
 interface WorkforceCanvasProps {
-  canvas: WorkforceCanvasResponse
   workforce: WorkforceDetail
 }
 
-function ManagerNode({ data }: { data: any }) {
+interface NodeData {
+  name: string
+  avatar: string
+  description: string
+  subtitle?: string
+}
+
+function ManagerNode({ data }: { data: NodeData }) {
+  const { t } = useI18n()
   return (
     <div className="flex w-80 flex-col items-center justify-center rounded-xl border-2 border-blue-500 bg-white p-6 shadow-sm">
       <div className="flex h-12 w-12 items-center justify-center rounded-full bg-blue-600 text-xl font-bold text-white">
@@ -30,7 +38,7 @@ function ManagerNode({ data }: { data: any }) {
       <div className="mt-3 text-lg font-bold text-gray-900">{data.name}</div>
       <div className="mt-2 flex items-center gap-1 rounded-full bg-blue-50 px-2.5 py-0.5 text-xs font-medium text-blue-700">
         <Crown className="h-3.5 w-3.5" />
-        Manager
+        {t("workforces.canvas.nodeTypes.manager")}
       </div>
       {data.description && (
         <div className="mt-4 text-center text-sm text-gray-500 line-clamp-3">
@@ -42,7 +50,7 @@ function ManagerNode({ data }: { data: any }) {
   )
 }
 
-function WorkerNode({ data }: { data: any }) {
+function WorkerNode({ data }: { data: NodeData }) {
   return (
     <div className="flex w-64 flex-col rounded-xl border border-gray-200 bg-white p-5 shadow-sm">
       <Handle type="target" position={Position.Top} className="!border-none !bg-transparent" />
@@ -59,13 +67,7 @@ function WorkerNode({ data }: { data: any }) {
       </div>
       {data.description && (
         <div className="mt-4 text-sm italic text-gray-500 line-clamp-3">
-          "{data.description}"
-        </div>
-      )}
-      {data.approvalRequired && (
-        <div className="mt-4 flex w-fit items-center gap-1 rounded-full bg-orange-50 px-2.5 py-0.5 text-xs font-medium text-orange-600">
-          <ShieldAlert className="h-3.5 w-3.5" />
-          Approval required
+          &ldquo;{data.description}&rdquo;
         </div>
       )}
     </div>
@@ -78,6 +80,7 @@ const nodeTypes = {
 }
 
 export function WorkforceCanvas({ workforce }: WorkforceCanvasProps) {
+  const { t } = useI18n()
   const { nodes, edges } = useMemo(() => {
     const newNodes: Node[] = []
     const newEdges: Edge[] = []
@@ -90,7 +93,7 @@ export function WorkforceCanvas({ workforce }: WorkforceCanvasProps) {
       position: { x: 0, y: 0 },
       origin: [0.5, 0],
       data: {
-        name: manager?.name || "Manager",
+        name: manager?.name || t("workforces.canvas.nodeTypes.manager"),
         avatar: manager?.name ? manager.name.charAt(0).toUpperCase() : "M",
         description: workforce?.manager_instructions || manager?.description || "",
       },
@@ -111,13 +114,10 @@ export function WorkforceCanvas({ workforce }: WorkforceCanvasProps) {
         position: { x: startX + index * (workerWidth + gap), y: 250 },
         origin: [0.5, 0],
         data: {
-          name: worker.agent?.name || "Worker",
+          name: worker.agent?.name || t("workforces.canvas.nodeTypes.worker"),
           avatar: worker.agent?.name ? worker.agent.name.charAt(0).toUpperCase() : "W",
           subtitle: worker.agent?.description || "",
           description: worker.assignment_instructions,
-          // We can infer approval required from instructions or some other field if available
-          // For now, let's just check if instructions contain "approval"
-          approvalRequired: worker.assignment_instructions?.toLowerCase()?.includes("approval") ?? false,
         },
       })
 
@@ -136,7 +136,7 @@ export function WorkforceCanvas({ workforce }: WorkforceCanvasProps) {
     })
 
     return { nodes: newNodes, edges: newEdges }
-  }, [workforce])
+  }, [workforce, t])
 
   return (
     <div className="h-full w-full rounded-xl border bg-gray-50/50">

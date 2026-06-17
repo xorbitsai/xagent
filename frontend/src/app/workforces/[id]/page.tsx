@@ -58,7 +58,7 @@ interface SyncFormOptions {
 function workerEditState(worker: WorkforceWorker): WorkerEditState {
   return {
     alias: worker.alias || "",
-    assignment_instructions: worker.assignment_instructions,
+    assignment_instructions: worker.assignment_instructions || "",
     enabled: worker.enabled,
     sort_order: String(worker.sort_order ?? 1),
   }

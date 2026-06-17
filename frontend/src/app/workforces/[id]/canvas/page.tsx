@@ -6,8 +6,8 @@ import { useParams } from "next/navigation"
 import { ArrowLeft } from "lucide-react"
 import { Button } from "@/components/ui/button"
 import { useI18n } from "@/contexts/i18n-context"
-import { getWorkforce, getWorkforceCanvas } from "@/lib/workforces-api"
-import type { WorkforceCanvasResponse, WorkforceDetail } from "@/types/workforce"
+import { getWorkforce } from "@/lib/workforces-api"
+import type { WorkforceDetail } from "@/types/workforce"
 import { WorkforceCanvas } from "@/components/workforce"
 import { toast } from "sonner"
 
@@ -15,7 +15,6 @@ export default function WorkforceCanvasPage() {
   const { t } = useI18n()
   const params = useParams()
   const id = Array.isArray(params.id) ? params.id[0] : params.id
-  const [canvas, setCanvas] = useState<WorkforceCanvasResponse | null>(null)
   const [workforce, setWorkforce] = useState<WorkforceDetail | null>(null)
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState<string | null>(null)
@@ -26,15 +25,10 @@ export default function WorkforceCanvasPage() {
         setLoading(true)
         setError(null)
         if (!id) {
-          setCanvas(null)
           setWorkforce(null)
           return
         }
-        const [canvasData, workforceData] = await Promise.all([
-          getWorkforceCanvas(id),
-          getWorkforce(id)
-        ])
-        setCanvas(canvasData)
+        const workforceData = await getWorkforce(id)
         setWorkforce(workforceData)
       } catch (err) {
         const nextError = err instanceof Error ? err.message : t("workforces.errors.loadCanvas")
@@ -51,7 +45,7 @@ export default function WorkforceCanvasPage() {
 
   if (loading) return <div className="h-full overflow-y-auto p-4 text-muted-foreground sm:p-8">{t("workforces.loading.canvas")}</div>
   if (error) return <div className="h-full overflow-y-auto p-4 text-red-500 sm:p-8">{error}</div>
-  if (!canvas || !workforce) return <div className="h-full overflow-y-auto p-4 text-muted-foreground sm:p-8">{t("workforces.errors.canvasUnavailable")}</div>
+  if (!workforce) return <div className="h-full overflow-y-auto p-4 text-muted-foreground sm:p-8">{t("workforces.errors.canvasUnavailable")}</div>
 
   return (
     <div className="flex h-full flex-col">
@@ -64,7 +58,7 @@ export default function WorkforceCanvasPage() {
         </Link>
       </div>
       <div className="flex-1 p-8">
-        <WorkforceCanvas canvas={canvas} workforce={workforce} />
+        <WorkforceCanvas workforce={workforce} />
       </div>
     </div>
   )

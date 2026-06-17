@@ -157,7 +157,7 @@ export default function WorkforceRunPage() {
           <div className="mb-6">
             <Button variant="link" className="h-auto p-0 text-sm" onClick={() => router.push(`/workforces/${id}`)}>
               <ArrowLeft className="mr-1 h-4 w-4" />
-              {t("workforces.run.testTitle")}
+              {t("workforces.canvas.backToDetails")}
             </Button>
           </div>
 

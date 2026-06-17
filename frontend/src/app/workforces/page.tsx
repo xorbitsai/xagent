@@ -15,9 +15,10 @@ import { getRunDisabledReason } from "./workforce-ui-state"
 import { FeatureEmptyState } from "@/components/ui/feature-empty-state"
 import { toast } from "sonner"
 import { WorkforceCreateDialog } from "@/components/workforce/workforce-create-dialog"
+import { WorkforceStatusBadge } from "@/components/workforce"
 
 export default function WorkforcesPage() {
-  const { locale, t } = useI18n()
+  const { t } = useI18n()
   const router = useRouter()
   const [items, setItems] = useState<WorkforceListItem[]>([])
   const [loading, setLoading] = useState(true)
@@ -145,10 +146,7 @@ export default function WorkforcesPage() {
                               >
                                 {item.name}
                               </Link>
-                              <span className={`shrink-0 rounded-full px-2 py-0.5 text-[10px] font-medium uppercase tracking-wider ${item.status === 'active' ? 'bg-green-100 text-green-700' : 'bg-gray-100 text-gray-600'
-                                }`}>
-                                {t(`workforces.status.${item.status}`)}
-                              </span>
+                              <WorkforceStatusBadge status={item.status} />
                             </div>
                             <div className="text-xs text-muted-foreground truncate mt-0.5">
                               {t("workforces.list.manager", { name: item.manager?.name })}

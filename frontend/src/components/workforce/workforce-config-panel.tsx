@@ -10,7 +10,7 @@ import { Select } from "@/components/ui/select"
 import { Switch } from "@/components/ui/switch"
 import { Textarea } from "@/components/ui/textarea"
 import { useI18n } from "@/contexts/i18n-context"
-import type { WorkforceAgentOption, WorkforceDetail, WorkforceWorker } from "@/types/workforce"
+import type { WorkforceDetail, WorkforceWorker } from "@/types/workforce"
 import { canEditAgent } from "@/lib/agent-ui-access"
 
 interface WorkerEditState {

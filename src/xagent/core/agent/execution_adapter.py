@@ -212,7 +212,9 @@ class AgentExecutionAdapter:
         if skill_manager is None:
             from ...skills.utils import create_skill_manager
 
-            skill_manager = create_skill_manager(context=self.config.skill_scope_context)
+            skill_manager = create_skill_manager(
+                context=self.config.skill_scope_context
+            )
         agent = Agent(
             name=self.config.name,
             patterns=[pattern],

@@ -50,7 +50,9 @@ def create_skill_manager(
 
     skill_manager = SkillManager(
         skills_roots=skills_roots,
-        provider=provider or get_skill_library_provider() or _build_default_provider(skills_roots),
+        provider=provider
+        or get_skill_library_provider()
+        or _build_default_provider(skills_roots),
         context=context,
     )
 

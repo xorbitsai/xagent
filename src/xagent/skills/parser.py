@@ -40,7 +40,9 @@ class SkillParser:
             raise ValueError(f"SKILL.md not found in {skill_dir}")
 
         files = {
-            str(file_path.relative_to(skill_dir)).replace("\\", "/"): file_path.read_bytes()
+            str(file_path.relative_to(skill_dir)).replace(
+                "\\", "/"
+            ): file_path.read_bytes()
             for file_path in skill_dir.rglob("*")
             if file_path.is_file()
         }

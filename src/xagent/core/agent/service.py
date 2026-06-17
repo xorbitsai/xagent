@@ -106,7 +106,9 @@ class AgentService:
         self._execution_context_messages: list[dict[str, str]] = []
         self._recovered_skill_context: str | None = None
         self.allowed_skills = self._get_allowed_skills_from_config(tool_config)
-        self.skill_scope_context = self._get_skill_scope_context_from_config(tool_config)
+        self.skill_scope_context = self._get_skill_scope_context_from_config(
+            tool_config
+        )
 
         if use_dag_pattern is True:
             pattern = "dag_plan_execute"
@@ -407,7 +409,9 @@ class AgentService:
                 self.memory if self.memory_enabled else None
             )
             self._execution_adapter.config.allowed_skills = self.allowed_skills
-            self._execution_adapter.config.skill_scope_context = self.skill_scope_context
+            self._execution_adapter.config.skill_scope_context = (
+                self.skill_scope_context
+            )
 
         return cast(
             dict[str, Any],
@@ -465,7 +469,9 @@ class AgentService:
             return cast(list[str] | None, tool_config.get_allowed_skills())
         return None
 
-    def _get_skill_scope_context_from_config(self, tool_config: Any | None) -> Any | None:
+    def _get_skill_scope_context_from_config(
+        self, tool_config: Any | None
+    ) -> Any | None:
         if tool_config and hasattr(tool_config, "get_skill_scope_context"):
             return tool_config.get_skill_scope_context()
         return None

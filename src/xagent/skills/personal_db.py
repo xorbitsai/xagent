@@ -46,4 +46,3 @@ class XagentPersonalDbSkillProvider:
         if path in record.files:
             return record.files[path]
         raise FileNotFoundError(f"File not found: {path!r} in skill {record.name!r}")
-

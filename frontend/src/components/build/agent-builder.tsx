@@ -1502,7 +1502,7 @@ export function AgentBuilder({ agentId }: AgentBuilderProps) {
                 <DialogDescription className="flex items-center gap-1.5">
                   {t("builds.configForm.model.configureDescription")}
                   <a
-                    href="https://docs.xagent.run/models/overview"
+                    href="https://docs.xagent.co/models/overview"
                     target="_blank"
                     rel="noopener noreferrer"
                     className="inline-flex items-center text-muted-foreground hover:text-primary transition-colors"

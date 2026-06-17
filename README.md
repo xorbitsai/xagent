@@ -6,7 +6,7 @@
 [![Telegram](https://img.shields.io/badge/Telegram-2CA5E0?style=for-the-badge&logo=telegram&logoColor=white)](https://t.me/+2_-SAVLtuJNkNWFl)
 [![Twitter](https://img.shields.io/twitter/follow/xorbitsio?logo=x&style=for-the-badge)](https://twitter.com/xorbitsio)
 
-[![Documentation](https://img.shields.io/badge/docs-docs.xagent.run-blue?style=for-the-badge&logo=gitbook)](https://docs.xagent.run/)
+[![Documentation](https://img.shields.io/badge/docs-docs.xagent.co-blue?style=for-the-badge&logo=gitbook)](https://docs.xagent.co/)
 [![GitHub Release](https://img.shields.io/github/v/release/xorbitsai/xagent?logo=github&style=for-the-badge)](https://github.com/xorbitsai/xagent/releases)
 [![Docker Pulls](https://img.shields.io/docker/pulls/xprobe/xagent-backend?style=for-the-badge&logo=docker)](https://hub.docker.com/r/xprobe/xagent-backend)
 
@@ -378,7 +378,7 @@ Follow our progress:
 
 ## Community & Contact
 
-**[Documentation](https://docs.xagent.run/)** - Full documentation and guides
+**[Documentation](https://docs.xagent.co/)** - Full documentation and guides
 
 **[GitHub Issues](https://github.com/xorbitsai/xagent/issues)** - Report bugs or propose features
 

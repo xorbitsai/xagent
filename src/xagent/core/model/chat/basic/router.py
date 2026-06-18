@@ -196,13 +196,17 @@ class RouterLLM(BaseLLM):
     def _dispatch(model_id: str) -> tuple[str, str]:
         """Map a chosen model id to (provider, downstream model name).
 
-        Claude/Anthropic models take the claude path; everything else takes the
-        OpenAI-compatible path. The model id is passed through as the downstream
-        model name, so registry ids should equal the callable model string
-        (Anthropic model name for Claude, OpenRouter slug for the rest).
+        Claude and DeepSeek models go to their official APIs (claude / deepseek
+        providers); everything else goes through the OpenAI-compatible path
+        (point OPENAI_BASE_URL at OpenRouter). The model id is passed through as
+        the downstream model name, so registry ids must equal the callable model
+        string (Anthropic model name, DeepSeek model name, or OpenRouter slug).
         """
-        if "claude" in model_id.lower():
+        lowered = model_id.lower()
+        if "claude" in lowered:
             return "claude", model_id
+        if "deepseek" in lowered:
+            return "deepseek", model_id
         return "openai", model_id
 
     @staticmethod

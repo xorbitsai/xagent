@@ -903,13 +903,13 @@ async def test_auto_react_repetition_stays_in_single_react_trace() -> None:
                             "name": "react_decision",
                             "arguments": (
                                 '{"action":"final_answer",'
-                                '"reason":"已有结果足够回答",'
-                                '"answer":"可以基于已有搜索结果回答。"}'
+                                '"reason":"已有结果足够回答。"}'
                             ),
                         },
                     }
                 ],
             },
+            "可以基于已有搜索结果回答。",
         ]
     )
     tracer = RecordingTracer()

@@ -19,9 +19,7 @@ from ...result import unwrap_final_answer_content
 from ...runtime import LLMCallInterrupted, PatternRuntime
 from ..base import AgentPattern, PatternResult, truncate_prompt_preview
 from ..final_answer_stream import (
-    FinalAnswerStreamSession,
     ReActFinalAnswerStreamer,
-    ToolCallStringFieldStreamer,
 )
 
 
@@ -1277,15 +1275,6 @@ class ReActPattern(AgentPattern):
             tools=decision_tools,
             metadata=llm_metadata,
         )
-        answer_emitter = FinalAnswerStreamSession(runtime, enabled=True)
-        answer_streamer = ToolCallStringFieldStreamer(
-            runtime=runtime,
-            tool_name=REACT_DECISION_TOOL_NAME,
-            field_name="answer",
-            guard_field="action",
-            guard_value=REACT_DECISION_FINAL_ANSWER,
-            emitter=answer_emitter,
-        )
         try:
             response = await runtime.run_streaming_llm_call(
                 llm,
@@ -1293,13 +1282,10 @@ class ReActPattern(AgentPattern):
                 tools=decision_tools,
                 tool_choice="required",
                 thinking={"type": "disabled", "enable": False},
-                on_chunk=answer_streamer.handle_chunk,
             )
         except LLMCallInterrupted:
-            await answer_streamer.fail("interrupted during repeated tool decision")
             raise
         except Exception as exc:
-            await answer_streamer.fail(str(exc))
             await runtime.on_llm_error(
                 context=context,
                 error=exc,
@@ -1326,24 +1312,27 @@ class ReActPattern(AgentPattern):
             return None
 
         if decision["action"] == REACT_DECISION_FINAL_ANSWER:
-            answer = decision["answer"]
-            if not answer.strip():
-                await answer_streamer.fail("empty final answer")
-                await runtime.checkpoint(
-                    "repeated_tool_decision_invalid",
-                    context=context,
-                    pattern=self,
-                    metadata={"reason": "empty final answer", **metadata},
-                )
-                return None
-            await answer_streamer.finish(answer)
-            context.add_assistant_message(answer)
-            return await self._finalize_success(
+            self.force_final_answer_next = True
+            await runtime.checkpoint(
+                "repeated_tool_decision_final_requested",
                 context=context,
-                llm=llm,
-                runtime=runtime,
-                response=answer,
+                pattern=self,
+                metadata={**metadata, "decision": decision},
             )
+            context.add_system_message(
+                "Repeated tool decision completion guidance:\n"
+                "The repeated-tool decision selected final_answer, so the next "
+                "normal ReAct step must produce the final user-facing answer from "
+                "the accumulated conversation and tool results. Do not call more "
+                "tools in that final step. Do not send a progress update or promise "
+                "future work as the final answer; if the accumulated results are "
+                "insufficient or show the task is incomplete, say that directly.",
+                metadata={
+                    "source": "repeated_tool_decision",
+                    **metadata,
+                },
+            )
+            return None
 
         await runtime.checkpoint(
             "repeated_tool_decision_continue",
@@ -1441,36 +1430,33 @@ class ReActPattern(AgentPattern):
             latest_user_text(context) or "",
             limit=400,
         )
-        language_anchor = (
-            "Latest user request text, quoted for response_language selection:\n"
+        request_anchor = (
+            "Latest user request text:\n"
             f"{current_request or '(unavailable)'}\n\n"
-            "Choose response_language from that latest user request, including "
-            "any explicit language change requested inside it. Do not choose "
-            "response_language from tool results, source documents, retrieved "
-            "memories, or earlier turns."
+            "Use this as the controlling request when deciding whether the "
+            "accumulated tool results have completed the user's requested work."
         )
         prompt = (
             f"You must call {REACT_DECISION_TOOL_NAME} exactly once. Decide whether "
             "the current ReAct run should finish or make another work-tool call. "
-            f"{language_anchor} "
+            f"{request_anchor} "
             f"You have just made {call_context} action must be "
             f"{REACT_DECISION_FINAL_ANSWER} or {REACT_DECISION_TOOL_CALL}. Choose "
             f"{REACT_DECISION_FINAL_ANSWER} when the conversation and accumulated "
-            "tool results are sufficient to answer the latest user request; include "
-            "the complete answer in the same tool call. A final answer means the "
-            "latest user request is already completed; if the answer would describe "
-            f"a future tool action, choose {REACT_DECISION_TOOL_CALL} instead. Choose "
+            "tool results are sufficient to answer the latest user request. A "
+            "final answer means the latest user request is already completed; if "
+            "the next user-facing answer would describe a future tool action or "
+            "say work is still in progress, choose tool_call instead. Choose "
             f"{REACT_DECISION_TOOL_CALL} only when a specific missing fact, source, "
-            "or verification remains; the next ReAct turn will choose and call the "
-            "actual work tool. Treat the completed-call count in this instruction "
-            "as authoritative; do not count the user's requested number as already "
-            "completed. If the latest user request explicitly requires more "
-            "completed work-tool calls or results than the current context contains, "
-            f"choose {REACT_DECISION_TOOL_CALL}. Do not call work tools in this "
-            "decision. Set response_language to the target output language for "
-            "this decision. When choosing final_answer, the answer must match "
-            "response_language. "
-            f"{final_answer_language_rule()}"
+            "verification, or work step remains; the next normal ReAct turn will "
+            "choose and call the actual work tool from the full available tool set. "
+            "Do not call work tools in this decision. Do not put user-facing final "
+            "answer text in this decision; the next normal ReAct step will produce "
+            "the final answer if you choose final_answer. Treat the completed-call "
+            "count in this instruction as authoritative; do not count the user's "
+            "requested number as already completed. If the latest user request "
+            "explicitly requires more completed work-tool calls or results than "
+            f"the current context contains, choose {REACT_DECISION_TOOL_CALL}."
         )
         return [*messages, {"role": "user", "content": prompt}]
 
@@ -1480,8 +1466,8 @@ class ReActPattern(AgentPattern):
             "function": {
                 "name": REACT_DECISION_TOOL_NAME,
                 "description": (
-                    "Decide whether ReAct should finish with a final answer or "
-                    "continue to one more work-tool call."
+                    "Decide whether ReAct should finish in the next normal final "
+                    "answer step or continue to another work-tool call."
                 ),
                 "parameters": {
                     "type": "object",
@@ -1501,29 +1487,16 @@ class ReActPattern(AgentPattern):
                             "type": "string",
                             "description": "Brief reason for this decision.",
                         },
-                        "response_language": {
-                            "type": "string",
-                            "description": REACT_RESPONSE_LANGUAGE_DESCRIPTION,
-                        },
-                        "answer": {
-                            "type": "string",
-                            "description": (
-                                "Required when action is final_answer: complete "
-                                "user-facing answer. It must match "
-                                "response_language. "
-                                f"{final_answer_language_rule()}"
-                            ),
-                        },
                         "missing_verification": {
                             "type": "string",
                             "description": (
                                 "When action is tool_call, the specific missing "
-                                "fact, source, or verification that requires "
-                                "another tool call."
+                                "fact, source, verification, or work step that "
+                                "requires another tool call."
                             ),
                         },
                     },
-                    "required": ["action", "reason", "response_language"],
+                    "required": ["action", "reason"],
                 },
             },
         }
@@ -1545,7 +1518,6 @@ class ReActPattern(AgentPattern):
             return {
                 "action": action,
                 "reason": str(args.get("reason") or ""),
-                "answer": str(args.get("answer") or ""),
                 "missing_verification": str(args.get("missing_verification") or ""),
             }
         return None

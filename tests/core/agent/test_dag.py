@@ -491,18 +491,19 @@ async def test_dag_child_react_repeated_decision_can_finalize() -> None:
                                     {
                                         "action": "final_answer",
                                         "reason": "Enough repeated tool results.",
-                                        "answer": "DAG child answer.",
                                     }
                                 ),
                             },
                         }
                     ],
                 }
+            if not kwargs.get("tools"):
+                return "DAG child answer."
 
             self.tool_call_count += 1
             if self.tool_call_count > 4:
                 raise AssertionError(
-                    "expected repeated decision before another tool call"
+                    "expected repeated decision final step before another tool call"
                 )
             return {
                 "content": "",
@@ -544,6 +545,11 @@ async def test_dag_child_react_repeated_decision_can_finalize() -> None:
     assert result["success"] is True
     assert result["output"] == "DAG child answer."
     assert len(tool.calls) == 4
+    assert len(llm.calls) == 7
+    assert [schema["function"]["name"] for schema in llm.calls[4]["tools"]] == [
+        "react_decision"
+    ]
+    assert llm.calls[5]["tools"] is None
     assert [event["type"] for event in outbound.events] == [
         "final_answer_start",
         "final_answer_delta",

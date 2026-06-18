@@ -367,12 +367,12 @@ class StreamingMixedFinalAnswerAndToolLLM:
         yield StreamChunk(type=ChunkType.END)
 
 
-class StreamingRepeatedDecisionEmptyAnswerLLM:
+class StreamingRepeatedGuardFinalAnswerLLM:
     def __init__(self) -> None:
         self.stream_calls: list[dict[str, Any]] = []
 
     async def chat(self, **kwargs: Any) -> Any:
-        raise AssertionError("streaming repeated decision path should not call chat()")
+        raise AssertionError("streaming repeated guard path should not call chat()")
 
     async def stream_chat(self, **kwargs: Any) -> Any:
         self.stream_calls.append(kwargs)
@@ -413,8 +413,7 @@ class StreamingRepeatedDecisionEmptyAnswerLLM:
                             "name": "react_decision",
                             "arguments": (
                                 '{"action":"final_answer",'
-                                '"reason":"empty answer",'
-                                '"answer":"   "}'
+                                '"reason":"已有搜索结果足够回答。"}'
                             ),
                         },
                     }
@@ -827,14 +826,13 @@ async def test_react_pattern_uses_decision_for_repeated_tools() -> None:
                             "name": "react_decision",
                             "arguments": (
                                 '{"action":"final_answer",'
-                                '"reason":"已有结果足够回答",'
-                                '"response_language":"Simplified Chinese",'
-                                '"answer":"可以基于已有搜索结果回答。"}'
+                                '"reason":"已有结果足够回答。"}'
                             ),
                         },
                     }
                 ],
             },
+            "可以基于已有搜索结果回答。",
         ]
     )
     pattern = ReActPattern(
@@ -849,28 +847,22 @@ async def test_react_pattern_uses_decision_for_repeated_tools() -> None:
 
     assert result["success"] is True
     assert result["response"] == "可以基于已有搜索结果回答。"
-    assert len(llm.calls) == 3
+    assert len(llm.calls) == 4
     assert len(tool.calls) == 2
-    assert [schema["function"]["name"] for schema in llm.calls[2]["tools"]] == [
-        "react_decision"
-    ]
-    decision_schema = llm.calls[2]["tools"][0]["function"]["parameters"]
-    response_language_schema = decision_schema["properties"]["response_language"]
-    assert "response_language" in decision_schema["required"]
-    assert "Simplified Chinese" in response_language_schema["description"]
-    assert "Traditional Chinese" in response_language_schema["description"]
-    assert "generic Chinese" in response_language_schema["description"]
+    tool_names = [schema["function"]["name"] for schema in llm.calls[2]["tools"]]
+    assert tool_names == ["react_decision"]
     decision_prompt = llm.calls[2]["messages"][-1]["content"]
     assert "Latest user request text" in decision_prompt
     assert "最近 AI 新闻" in decision_prompt
-    assert "Choose response_language from that latest user request" in decision_prompt
-    assert "Do not choose response_language from tool results" in decision_prompt
-    assert "Set response_language" in decision_prompt
-    assert "answer must match response_language" in decision_prompt
-    assert "When choosing final_answer" in decision_prompt
+    assert "Do not put user-facing final answer text in this decision" in (
+        decision_prompt
+    )
     assert "future tool action" in decision_prompt
-    assert "same natural language as the current user request" in decision_prompt
-    assert "Simplified Chinese versus Traditional Chinese" in decision_prompt
+    assert "response_language" not in decision_prompt
+    decision_schema = llm.calls[2]["tools"][0]["function"]["parameters"]
+    assert "response_language" not in decision_schema["properties"]
+    assert "response_language" not in decision_schema["required"]
+    assert llm.calls[3]["tools"] is None
     assert pattern.pending_tool_calls == []
 
 
@@ -893,12 +885,13 @@ def test_react_repeated_decision_anchors_latest_user_text_not_cached_task() -> N
 
     prompt = messages[-1]["content"]
     anchor_start = prompt.index("Latest user request text")
-    anchor_end = prompt.index("Choose response_language", anchor_start)
+    anchor_end = prompt.index("Use this as the controlling request", anchor_start)
     anchor = prompt[anchor_start:anchor_end]
     assert "请用简体中文回答" in anchor
     assert "search AI news" not in anchor
     assert "... [truncated]" in anchor
     assert tail not in anchor
+    assert "response_language" not in prompt
 
 
 @pytest.mark.asyncio
@@ -933,13 +926,13 @@ async def test_react_repeated_decision_drains_current_tool_call_batch() -> None:
                             "name": "react_decision",
                             "arguments": (
                                 '{"action":"final_answer",'
-                                '"reason":"The current batch is enough.",'
-                                '"answer":"Both pending searches were executed."}'
+                                '"reason":"The current batch is enough."}'
                             ),
                         },
                     }
                 ],
             },
+            "Both pending searches were executed.",
         ]
     )
     pattern = ReActPattern(
@@ -955,14 +948,17 @@ async def test_react_repeated_decision_drains_current_tool_call_batch() -> None:
     assert result["success"] is True
     assert result["response"] == "Both pending searches were executed."
     assert len(tool.calls) == 2
-    assert len(llm.calls) == 2
+    assert len(llm.calls) == 3
     tool_result_ids = [
-        message.tool_call_id for message in context.messages if message.role == "tool"
+        message.tool_call_id
+        for message in context.messages
+        if message.role == "tool"
+        and (message.metadata or {}).get("tool_name") == "zhipu_web_search"
     ]
     assert tool_result_ids[-2:] == ["search_1", "search_2"]
-    assert [schema["function"]["name"] for schema in llm.calls[1]["tools"]] == [
-        "react_decision"
-    ]
+    tool_names = [schema["function"]["name"] for schema in llm.calls[1]["tools"]]
+    assert tool_names == ["react_decision"]
+    assert llm.calls[2]["tools"] is None
     assert pattern.pending_tool_calls == []
 
 
@@ -1015,13 +1011,13 @@ async def test_react_pattern_uses_decision_after_cross_tool_attempts() -> None:
                             "name": "react_decision",
                             "arguments": (
                                 '{"action":"final_answer",'
-                                '"reason":"Enough cross-tool attempts",'
-                                '"answer":"已有跨工具结果，直接回答。"}'
+                                '"reason":"Enough cross-tool attempts."}'
                             ),
                         },
                     }
                 ],
             },
+            "已有跨工具结果，直接回答。",
         ]
     )
     pattern = ReActPattern(
@@ -1042,20 +1038,15 @@ async def test_react_pattern_uses_decision_after_cross_tool_attempts() -> None:
 
     assert result["success"] is True
     assert result["response"] == "已有跨工具结果，直接回答。"
-    assert len(llm.calls) == 4
+    assert len(llm.calls) == 5
     assert len(search_tool.calls) == 1
     assert len(browser_tool.calls) == 1
-    assert [schema["function"]["name"] for schema in llm.calls[3]["tools"]] == [
-        "react_decision"
-    ]
-    assert (
-        "3 consecutive work-tool calls without a final answer"
-        in llm.calls[3]["messages"][-1]["content"]
-    )
-    assert (
-        "latest work tool was browser_navigate"
-        in (llm.calls[3]["messages"][-1]["content"])
-    )
+    tool_names = [schema["function"]["name"] for schema in llm.calls[3]["tools"]]
+    assert tool_names == ["react_decision"]
+    decision_prompt = llm.calls[3]["messages"][-1]["content"]
+    assert "3 consecutive work-tool calls without a final answer" in decision_prompt
+    assert "latest work tool was browser_navigate" in decision_prompt
+    assert llm.calls[4]["tools"] is None
 
 
 @pytest.mark.asyncio
@@ -1107,14 +1098,13 @@ async def test_react_pattern_uses_decision_after_tool_group_successes() -> None:
                             "name": "react_decision",
                             "arguments": (
                                 '{"action":"final_answer",'
-                                '"reason":"Enough web research",'
-                                '"response_language":"English",'
-                                '"answer":"AirPods 4 uses USB-C."}'
+                                '"reason":"Enough web research."}'
                             ),
                         },
                     }
                 ],
             },
+            "AirPods 4 uses USB-C.",
         ]
     )
     pattern = ReActPattern(
@@ -1135,17 +1125,17 @@ async def test_react_pattern_uses_decision_after_tool_group_successes() -> None:
 
     assert result["success"] is True
     assert result["response"] == "AirPods 4 uses USB-C."
-    assert len(llm.calls) == 4
+    assert len(llm.calls) == 5
     assert len(search_tool.calls) == 2
     assert len(fetch_tool.calls) == 1
-    assert [schema["function"]["name"] for schema in llm.calls[3]["tools"]] == [
-        "react_decision"
-    ]
+    tool_names = [schema["function"]["name"] for schema in llm.calls[3]["tools"]]
+    assert tool_names == ["react_decision"]
     decision_prompt = llm.calls[3]["messages"][-1]["content"]
     assert (
         "3 consecutive successful calls in the research tool group" in decision_prompt
     )
     assert "latest tool was search_source" in decision_prompt
+    assert llm.calls[4]["tools"] is None
     assert pattern.pending_tool_calls == []
 
 
@@ -1186,13 +1176,13 @@ async def test_react_pattern_accepts_legacy_auto_reroute_kwarg() -> None:
                             "name": "react_decision",
                             "arguments": (
                                 '{"action":"final_answer",'
-                                '"reason":"已有结果足够回答",'
-                                '"answer":"可以基于已有搜索结果回答。"}'
+                                '"reason":"已有结果足够回答。"}'
                             ),
                         },
                     }
                 ],
             },
+            "可以基于已有搜索结果回答。",
         ]
     )
     pattern = ReActPattern(
@@ -1212,7 +1202,7 @@ async def test_react_pattern_accepts_legacy_auto_reroute_kwarg() -> None:
 
     assert result["success"] is True
     assert result["response"] == "可以基于已有搜索结果回答。"
-    assert len(llm.calls) == 3
+    assert len(llm.calls) == 4
     assert len(tool.calls) == 2
     next_tool_names = [
         tool_schema["function"]["name"] for tool_schema in llm.calls[2]["tools"]
@@ -1223,12 +1213,12 @@ async def test_react_pattern_accepts_legacy_auto_reroute_kwarg() -> None:
         in (llm.calls[2]["messages"][-1]["content"])
     )
     assert llm.calls[2]["tool_choice"] == "required"
-    assert pattern.force_final_answer_next is False
+    assert llm.calls[3]["tools"] is None
     assert pattern.repeated_tool_decision is None
 
 
 @pytest.mark.asyncio
-async def test_react_pattern_repeated_decision_can_continue_to_tool_call() -> None:
+async def test_react_pattern_repeated_guard_can_switch_to_non_repeated_tool() -> None:
     llm = FakeLLM(
         responses=[
             {
@@ -1264,7 +1254,118 @@ async def test_react_pattern_repeated_decision_can_continue_to_tool_call() -> No
                             "name": "react_decision",
                             "arguments": (
                                 '{"action":"tool_call",'
-                                '"reason":"Need one more source",'
+                                '"reason":"Need to write the output file.",'
+                                '"missing_verification":"write summarized search results"}'
+                            ),
+                        },
+                    }
+                ],
+            },
+            {
+                "content": "",
+                "tool_calls": [
+                    {
+                        "id": "write_1",
+                        "function": {
+                            "name": "write_file",
+                            "arguments": (
+                                '{"file_path":"ai_news.md",'
+                                '"content":"summarized search results"}'
+                            ),
+                        },
+                    }
+                ],
+            },
+            {
+                "content": "",
+                "tool_calls": [
+                    {
+                        "id": "final_1",
+                        "function": {
+                            "name": "final_answer",
+                            "arguments": (
+                                '{"response_language":"Simplified Chinese",'
+                                '"answer":"搜索后已写入文件。"}'
+                            ),
+                        },
+                    }
+                ],
+            },
+        ]
+    )
+    pattern = ReActPattern(
+        max_iterations=5,
+        repeated_tool_decision_after_consecutive_tool_calls=2,
+    )
+    search_tool = FakeSearchTool()
+    write_tool = FakeWriteFileTool()
+    context = ExecutionContext()
+    context.add_user_message("最近 AI 新闻")
+
+    result = await pattern.run(
+        context=context,
+        tools=[search_tool, write_tool],
+        llm=llm,
+    )
+
+    assert result["success"] is True
+    assert result["response"] == "搜索后已写入文件。"
+    assert len(search_tool.calls) == 2
+    assert len(write_tool.calls) == 1
+    assert len(llm.calls) == 5
+    decision_tool_names = [
+        schema["function"]["name"] for schema in llm.calls[2]["tools"]
+    ]
+    assert decision_tool_names == ["react_decision"]
+    normal_tool_names = [schema["function"]["name"] for schema in llm.calls[3]["tools"]]
+    assert "zhipu_web_search" in normal_tool_names
+    assert "write_file" in normal_tool_names
+    assert "write summarized search results" in "\n".join(
+        str(message.get("content") or "") for message in llm.calls[3]["messages"]
+    )
+    final_tool_names = [schema["function"]["name"] for schema in llm.calls[4]["tools"]]
+    assert "final_answer" in final_tool_names
+    assert "react_decision" not in final_tool_names
+
+
+@pytest.mark.asyncio
+async def test_react_pattern_repeated_guard_can_fire_twice_in_single_run() -> None:
+    llm = FakeLLM(
+        responses=[
+            {
+                "content": "",
+                "tool_calls": [
+                    {
+                        "id": "search_1",
+                        "function": {
+                            "name": "zhipu_web_search",
+                            "arguments": '{"query":"AI news May 2026","count":10}',
+                        },
+                    }
+                ],
+            },
+            {
+                "content": "",
+                "tool_calls": [
+                    {
+                        "id": "search_2",
+                        "function": {
+                            "name": "zhipu_web_search",
+                            "arguments": '{"query":"Google AI news May 2026","count":5}',
+                        },
+                    }
+                ],
+            },
+            {
+                "content": "",
+                "tool_calls": [
+                    {
+                        "id": "decision_1",
+                        "function": {
+                            "name": "react_decision",
+                            "arguments": (
+                                '{"action":"tool_call",'
+                                '"reason":"Need one more source.",'
                                 '"missing_verification":"official source"}'
                             ),
                         },
@@ -1278,7 +1379,9 @@ async def test_react_pattern_repeated_decision_can_continue_to_tool_call() -> No
                         "id": "search_3",
                         "function": {
                             "name": "zhipu_web_search",
-                            "arguments": '{"query":"OpenAI news May 2026 official","count":3}',
+                            "arguments": (
+                                '{"query":"OpenAI news May 2026 official","count":3}'
+                            ),
                         },
                     }
                 ],
@@ -1292,13 +1395,13 @@ async def test_react_pattern_repeated_decision_can_continue_to_tool_call() -> No
                             "name": "react_decision",
                             "arguments": (
                                 '{"action":"final_answer",'
-                                '"reason":"Now enough sources",'
-                                '"answer":"第三次搜索后信息足够。"}'
+                                '"reason":"Now enough sources."}'
                             ),
                         },
                     }
                 ],
             },
+            "第三次搜索后信息足够。",
         ]
     )
     pattern = ReActPattern(
@@ -1314,25 +1417,138 @@ async def test_react_pattern_repeated_decision_can_continue_to_tool_call() -> No
     assert result["success"] is True
     assert result["response"] == "第三次搜索后信息足够。"
     assert len(tool.calls) == 3
-    assert len(llm.calls) == 5
+    assert len(llm.calls) == 6
     assert [schema["function"]["name"] for schema in llm.calls[2]["tools"]] == [
         "react_decision"
     ]
-    assert "zhipu_web_search" in [
-        schema["function"]["name"] for schema in llm.calls[3]["tools"]
-    ]
-    assert any(
-        "official source" in str(message.get("content") or "")
-        for message in llm.calls[3]["messages"]
+    assert "official source" in "\n".join(
+        str(message.get("content") or "") for message in llm.calls[3]["messages"]
     )
     assert [schema["function"]["name"] for schema in llm.calls[4]["tools"]] == [
         "react_decision"
     ]
+    assert llm.calls[5]["tools"] is None
 
 
 @pytest.mark.asyncio
-async def test_react_pattern_fails_empty_repeated_decision_answer_stream() -> None:
-    llm = StreamingRepeatedDecisionEmptyAnswerLLM()
+async def test_react_pattern_defers_repeated_final_decision_to_normal_loop() -> None:
+    llm = FakeLLM(
+        responses=[
+            {
+                "content": "",
+                "tool_calls": [
+                    {
+                        "id": "search_1",
+                        "function": {
+                            "name": "zhipu_web_search",
+                            "arguments": '{"query":"locate source file","count":10}',
+                        },
+                    }
+                ],
+            },
+            {
+                "content": "",
+                "tool_calls": [
+                    {
+                        "id": "search_2",
+                        "function": {
+                            "name": "zhipu_web_search",
+                            "arguments": '{"query":"find pptx input path","count":5}',
+                        },
+                    }
+                ],
+            },
+            {
+                "content": "",
+                "tool_calls": [
+                    {
+                        "id": "decision_1",
+                        "function": {
+                            "name": "react_decision",
+                            "arguments": (
+                                '{"action":"tool_call",'
+                                '"reason":"Need to perform the actual file edit.",'
+                                '"missing_verification":"remove the NotebookLM watermark from the PPTX"}'
+                            ),
+                        },
+                    }
+                ],
+            },
+            {
+                "content": "",
+                "tool_calls": [
+                    {
+                        "id": "write_1",
+                        "function": {
+                            "name": "write_file",
+                            "arguments": (
+                                '{"file_path":"MegaCube_Infinite_AI2.pptx",'
+                                '"content":"watermark removed"}'
+                            ),
+                        },
+                    }
+                ],
+            },
+            {
+                "content": "",
+                "tool_calls": [
+                    {
+                        "id": "final_1",
+                        "function": {
+                            "name": "final_answer",
+                            "arguments": (
+                                '{"response_language":"Simplified Chinese",'
+                                '"answer":"已完成处理。"}'
+                            ),
+                        },
+                    }
+                ],
+            },
+        ]
+    )
+    pattern = ReActPattern(
+        max_iterations=5,
+        repeated_tool_decision_after_consecutive_tool_calls=2,
+    )
+    search_tool = FakeSearchTool()
+    write_tool = FakeWriteFileTool()
+    context = ExecutionContext()
+    context.add_user_message("去除右下角 notebooklm 水印")
+    runtime = PatternRuntime()
+
+    result = await pattern.run(
+        context=context,
+        tools=[search_tool, write_tool],
+        llm=llm,
+        runtime=runtime,
+    )
+
+    assert result["success"] is True
+    assert result["response"] == "已完成处理。"
+    assert len(search_tool.calls) == 2
+    assert len(write_tool.calls) == 1
+    assistant_messages = [
+        message.content for message in context.messages if message.role == "assistant"
+    ]
+    assert "已找到源文件路径。正在处理去除水印，请稍候..." not in assistant_messages
+    assert assistant_messages[-1] == "已完成处理。"
+    continue_checkpoints = [
+        checkpoint
+        for checkpoint in runtime.checkpoints
+        if checkpoint["label"] == "repeated_tool_decision_continue"
+    ]
+    assert len(continue_checkpoints) == 1
+    assert any(
+        message.role == "system"
+        and "Repeated tool decision continuation guidance" in message.content
+        and "remove the NotebookLM watermark from the PPTX" in message.content
+        for message in context.messages
+    )
+
+
+@pytest.mark.asyncio
+async def test_react_pattern_streams_final_answer_after_repeated_guard() -> None:
+    llm = StreamingRepeatedGuardFinalAnswerLLM()
     pattern = ReActPattern(
         max_iterations=4,
         repeated_tool_decision_after_consecutive_tool_calls=2,
@@ -1355,9 +1571,9 @@ async def test_react_pattern_fails_empty_repeated_decision_answer_stream() -> No
     assert [event["type"] for event in outbound.events] == [
         "final_answer_start",
         "final_answer_delta",
-        "final_answer_error",
+        "final_answer_end",
     ]
-    assert outbound.events[-1]["error"] == "empty final answer"
+    assert outbound.events[-1]["content"] == "Fallback answer."
 
 
 @pytest.mark.asyncio

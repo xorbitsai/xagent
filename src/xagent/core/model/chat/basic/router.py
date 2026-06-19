@@ -13,10 +13,15 @@ registry returns ids that are already canonical OpenRouter slugs (e.g.
 `anthropic/claude-opus-4.8`, `openai/gpt-5.5`), so the chosen id is passed
 straight through as the downstream model name.
 
+Every decision (prompt, candidate models with their predicted completion and
+cost, and the chosen slug) is logged to a SQLite call history via xrouter-llm's
+CallStore, defaulting to ``<storage_root>/xrouter/calls.db``.
+
 Env overrides (all optional; default to the bundled package data):
   XAGENT_XROUTER_MODEL          path to a trained predictor .joblib
   XAGENT_XROUTER_MODELS_DIR     model-profile registry dir/file
   XAGENT_XROUTER_ROUTERS_DIR    router configs dir/file
+  XAGENT_XROUTER_DB             routing-decision SQLite history path
   XAGENT_ROUTER_FALLBACK_MODEL  slug to use if routing fails
 """
 
@@ -36,10 +41,23 @@ logger = logging.getLogger(__name__)
 
 
 class _NullStore:
-    """Duck-typed CallStore that drops the decision log (xagent has its own)."""
+    """Duck-typed CallStore that drops the decision log (degradation fallback)."""
 
     def record(self, **_kwargs: Any) -> int:
         return 0
+
+
+def _store_path() -> str:
+    """SQLite path for the routing-decision history."""
+    override = os.getenv("XAGENT_XROUTER_DB")
+    if override:
+        return override
+    try:
+        from xagent.config import get_storage_root
+
+        return str(get_storage_root() / "xrouter" / "calls.db")
+    except Exception:  # pragma: no cover - config unavailable
+        return "xrouter_calls.db"
 
 
 # A RoutingService loads a trained predictor plus a multilingual embedding model,
@@ -54,6 +72,7 @@ def _build_service(model_path: str, models_dir: str, routers_dir: str) -> Any:
         import joblib
         from xrouter_llm import load_benchmark_profiles
         from xrouter_llm.serving import RoutingService, load_router_configs
+        from xrouter_llm.store import CallStore
     except ImportError as exc:  # pragma: no cover - dependency missing
         raise RuntimeError(
             "The 'router' (auto) provider needs the xrouter-llm package. "
@@ -65,9 +84,12 @@ def _build_service(model_path: str, models_dir: str, routers_dir: str) -> Any:
         raise TypeError(f"{model_path} is not a fitted xrouter-llm predictor")
     profiles = load_benchmark_profiles(models_dir)
     configs = load_router_configs(routers_dir)
-    return RoutingService(
-        predictor, profiles=profiles, configs=configs, store=_NullStore()
-    )
+    try:
+        store: Any = CallStore(_store_path())
+    except Exception as exc:  # noqa: BLE001 - history must not break routing
+        logger.warning("xrouter call history disabled (%s)", exc)
+        store = _NullStore()
+    return RoutingService(predictor, profiles=profiles, configs=configs, store=store)
 
 
 def _get_service() -> Any:

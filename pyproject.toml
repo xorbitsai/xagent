@@ -81,6 +81,11 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+# In-process LLM routing for the "auto" (router) provider. Heavy (pulls
+# torch + sentence-transformers via xrouter-llm), so kept optional.
+router = [
+  "xrouter-llm>=0.1.0",
+]
 # document processing libraries(Non-AI)
 document-processing = [
   "pdfplumber>=0.10.0",
@@ -271,6 +276,9 @@ module = [
   "kombu.*",
   "fsspec",
   "fsspec.*",
+  "joblib",
+  "xrouter_llm",
+  "xrouter_llm.*",
 ]
 ignore_missing_imports = true
 

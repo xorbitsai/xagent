@@ -26,8 +26,6 @@ _DEFAULT_BASE_URL_BY_PROVIDER: dict[str, str] = {
     "minimax-coding-plan": "https://api.minimax.io/anthropic",
     "minimax-cn-coding-plan": "https://api.minimaxi.com/anthropic",
     "kimi-for-coding": "https://api.kimi.com/coding",
-    # xrouter-llm routing-decision service (picks one concrete model per call).
-    "router": "http://127.0.0.1:8080",
 }
 
 _CURATED_MODELS_BY_PROVIDER: dict[str, tuple[str, ...]] = {
@@ -91,10 +89,11 @@ _SUPPORTED_PROVIDER_METADATA: tuple[dict[str, Any], ...] = (
         "id": "router",
         "name": "XRouter (auto)",
         "description": (
-            "Virtual model: asks xrouter-llm to pick one concrete model per call, "
-            "then dispatches it through your configured OpenRouter model"
+            "Virtual model: uses the in-process xrouter-llm library to pick one "
+            "concrete model per call, then dispatches it through your configured "
+            "OpenRouter model"
         ),
-        "requires_base_url": True,
+        "requires_base_url": False,
     },
     {
         "id": "claude",

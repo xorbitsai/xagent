@@ -23,30 +23,9 @@ def test_router_default_base_url():
     assert default_base_url_for_provider("router") == "http://127.0.0.1:8080"
 
 
-def test_router_normalizes_to_openrouter_slug():
-    # Everything is served via OpenRouter. Bare Claude/DeepSeek ids get their
-    # provider prefix; ids that already carry a namespace pass through unchanged.
-    assert (
-        RouterLLM._to_openrouter_slug("claude-opus-4-8") == "anthropic/claude-opus-4-8"
-    )
-    assert (
-        RouterLLM._to_openrouter_slug("claude-sonnet-4-6")
-        == "anthropic/claude-sonnet-4-6"
-    )
-    assert (
-        RouterLLM._to_openrouter_slug("deepseek-v4-pro") == "deepseek/deepseek-v4-pro"
-    )
-    assert (
-        RouterLLM._to_openrouter_slug("deepseek-v4-flash")
-        == "deepseek/deepseek-v4-flash"
-    )
-    assert RouterLLM._to_openrouter_slug("z-ai/glm-5.2") == "z-ai/glm-5.2"
-    assert RouterLLM._to_openrouter_slug("openai/gpt-5.5") == "openai/gpt-5.5"
-
-
-async def test_router_dispatches_through_injected_downstream_resolver():
-    # "auto" reuses the configured OpenRouter model: the injected resolver is
-    # called with the normalized slug and its LLM is returned as-is.
+async def test_router_dispatches_chosen_slug_through_downstream_resolver():
+    # The xrouter-llm registry returns canonical OpenRouter slugs, so the chosen
+    # id is passed straight to the injected resolver and its LLM returned as-is.
     seen: dict[str, str] = {}
 
     def resolver(slug: str):
@@ -56,12 +35,12 @@ async def test_router_dispatches_through_injected_downstream_resolver():
     llm = RouterLLM(model_name="auto", downstream_resolver=resolver)
 
     async def fake_select(_prompt: str) -> str:
-        return "claude-opus-4-8"
+        return "anthropic/claude-opus-4.8"
 
     llm._select_model = fake_select  # type: ignore[assignment]
 
     result = await llm._resolve([{"role": "user", "content": "hi"}])
-    assert seen["slug"] == "anthropic/claude-opus-4-8"
+    assert seen["slug"] == "anthropic/claude-opus-4.8"
     assert result == "DOWNSTREAM_LLM"
 
 

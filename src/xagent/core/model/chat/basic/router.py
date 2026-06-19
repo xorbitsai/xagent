@@ -7,9 +7,9 @@ DeepSeek, Gemini, GLM, GPT, ...) is reached via OpenRouter, so xagent needs
 only ONE credential pair: `OPENAI_API_KEY` (an OpenRouter key) and
 `OPENAI_BASE_URL` (https://openrouter.ai/api/v1).
 
-The router returns a registry id; ids that already carry a provider namespace
-(`google/...`, `openai/...`) are OpenRouter slugs as-is, and bare Claude/DeepSeek
-ids are normalized to their OpenRouter slug (`anthropic/...`, `deepseek/...`).
+The xrouter-llm registry returns ids that are already canonical OpenRouter
+slugs (e.g. `anthropic/claude-opus-4.8`, `openai/gpt-5.5`), so the chosen id is
+passed straight through as the downstream model name.
 """
 
 from __future__ import annotations
@@ -155,11 +155,10 @@ class RouterLLM(BaseLLM):
     # ---- Routing ------------------------------------------------------------
     async def _resolve(self, messages: list[dict[str, Any]]) -> BaseLLM:
         model_id = await self._select_model(self._extract_prompt(messages))
-        slug = self._to_openrouter_slug(model_id)
-        logger.info("xrouter selected %s -> openrouter:%s", model_id, slug)
+        logger.info("xrouter selected %s -> openrouter", model_id)
         if self._downstream_resolver is not None:
             # Reuse the user-configured OpenRouter model (credentials + base_url).
-            return self._downstream_resolver(slug)
+            return self._downstream_resolver(model_id)
         # Fallback when no OpenRouter model is configured: an OpenAI-compatible
         # client using the ambient OPENAI_BASE_URL / OPENAI_API_KEY env.
         # Lazy import avoids a circular import (adapter imports this module).
@@ -167,7 +166,7 @@ class RouterLLM(BaseLLM):
 
         config = ChatModelConfig(
             id=f"router:{model_id}",
-            model_name=slug,
+            model_name=model_id,
             model_provider="openai",
             base_url=None,
             api_key=None,
@@ -205,25 +204,6 @@ class RouterLLM(BaseLLM):
                 return self._fallback_model
             raise RuntimeError("xrouter-llm returned no selected model")
         return str(selected[0])
-
-    @staticmethod
-    def _to_openrouter_slug(model_id: str) -> str:
-        """Normalize a chosen registry id to an OpenRouter model slug.
-
-        Everything is served through OpenRouter. Ids that already carry a
-        provider namespace (``google/...``, ``openai/...``, ``z-ai/...``) are
-        OpenRouter slugs as-is. Bare Claude/DeepSeek ids get their OpenRouter
-        provider prefix. (Normalizing the registry ids themselves is a separate
-        cleanup; until then this keeps the dispatch self-contained.)
-        """
-        if "/" in model_id:
-            return model_id
-        lowered = model_id.lower()
-        if "claude" in lowered:
-            return f"anthropic/{model_id}"
-        if "deepseek" in lowered:
-            return f"deepseek/{model_id}"
-        return model_id
 
     @staticmethod
     def _extract_prompt(messages: list[dict[str, Any]]) -> str:

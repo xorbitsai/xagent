@@ -20,7 +20,10 @@ from ...core.model.model import (
     ModelConfig,
     RerankModelConfig,
 )
-from ...core.model.providers import is_placeholder_api_key
+from ...core.model.providers import (
+    canonical_provider_name,
+    is_placeholder_api_key,
+)
 from ..models.model import Model
 from ..models.user import UserDefaultModel, UserModel
 
@@ -231,14 +234,22 @@ class CoreStorage:
 
         return result
 
-    def create_llm_instance(self, model_config: ModelConfig) -> Optional[BaseLLM]:
-        """Create LLM instance from ModelConfig"""
+    def create_llm_instance(
+        self,
+        model_config: ModelConfig,
+        downstream_resolver: Optional[Callable[[str], BaseLLM]] = None,
+    ) -> Optional[BaseLLM]:
+        """Create LLM instance from ModelConfig.
+
+        ``downstream_resolver`` is forwarded to the router provider so the
+        "auto" model dispatches through the user-configured OpenRouter model.
+        """
         try:
             if not isinstance(model_config, ChatModelConfig):
                 logger.warning(f"Model is not a chat model: {model_config.model_name}")
                 return None
 
-            return create_base_llm(model_config)
+            return create_base_llm(model_config, downstream_resolver)
         except Exception as e:
             logger.error(f"Error creating LLM instance: {e}")
             return None
@@ -502,13 +513,56 @@ class UserAwareModelStorage:
                 else:
                     logger.info(f"User {user_id} has access to model '{model_name}'")
 
-            return self.core_storage.create_llm_instance(model_config)
+            downstream_resolver = None
+            if canonical_provider_name(model_config.model_provider) == "router":
+                downstream_resolver = self._build_openrouter_resolver(user_id)
+            return self.core_storage.create_llm_instance(
+                model_config, downstream_resolver=downstream_resolver
+            )
         except Exception as e:
             logger.error(f"Error getting LLM instance for model '{model_name}': {e}")
             import traceback
 
             logger.error(f"Full traceback: {traceback.format_exc()}")
             return None
+
+    def _build_openrouter_resolver(
+        self, user_id: Optional[int] = None
+    ) -> Optional[Callable[[str], BaseLLM]]:
+        """Build the "auto" downstream resolver: reuse a configured OpenRouter model.
+
+        Finds the first active model whose provider is OpenRouter and returns a
+        closure that, given a chosen OpenRouter slug, builds an LLM with that
+        model's credentials + base_url. Returns None if no OpenRouter model is
+        configured (the router then falls back to its env-based default).
+        """
+        openrouter_cfg: Optional[ChatModelConfig] = None
+        for cfg in self.core_storage.list().values():
+            if (
+                isinstance(cfg, ChatModelConfig)
+                and canonical_provider_name(cfg.model_provider) == "openrouter"
+            ):
+                openrouter_cfg = cfg
+                break
+        if openrouter_cfg is None:
+            logger.warning(
+                "router 'auto' selected but no OpenRouter model is configured; "
+                "falling back to env-based OpenAI-compatible defaults"
+            )
+            return None
+
+        def _resolve(slug: str) -> BaseLLM:
+            child = openrouter_cfg.model_copy(
+                update={"id": f"router:{slug}", "model_name": slug}
+            )
+            llm = self.core_storage.create_llm_instance(child)
+            if llm is None:
+                raise RuntimeError(
+                    f"failed to build OpenRouter downstream LLM for {slug!r}"
+                )
+            return llm
+
+        return _resolve
 
     def get_configured_defaults(
         self, user_id: Optional[int] = None

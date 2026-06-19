@@ -1,4 +1,5 @@
 import os
+from typing import Callable, Optional
 
 from ....model import ChatModelConfig, ModelConfig
 from ....retry import create_retry_wrapper
@@ -15,9 +16,16 @@ from .xinference import XinferenceLLM
 from .zhipu import ZhipuLLM
 
 
-def create_base_llm(model: ModelConfig) -> BaseLLM:
+def create_base_llm(
+    model: ModelConfig,
+    downstream_resolver: Optional[Callable[[str], BaseLLM]] = None,
+) -> BaseLLM:
     """
     Creates a custom BaseLLM instance from a ModelConfig.
+
+    ``downstream_resolver`` is only used by the ``router`` provider: given a
+    chosen OpenRouter slug it returns the LLM that runs it, so "auto" reuses the
+    user-configured OpenRouter model instead of any environment variable.
     """
     if not isinstance(model, ChatModelConfig):
         raise TypeError(f"Invalid model type: {type(model).__name__}")
@@ -35,6 +43,7 @@ def create_base_llm(model: ModelConfig) -> BaseLLM:
             default_max_tokens=model.default_max_tokens,
             timeout=model.timeout,
             abilities=model.abilities,
+            downstream_resolver=downstream_resolver,
         )
     elif provider == "deepseek":
         llm = DeepSeekLLM(

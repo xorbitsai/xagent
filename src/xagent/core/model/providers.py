@@ -13,6 +13,7 @@ _PROVIDER_ALIASES: dict[str, str] = {
 # Provider default base URLs used when callers omit an explicit base URL.
 _DEFAULT_BASE_URL_BY_PROVIDER: dict[str, str] = {
     "openai": "https://api.openai.com/v1",
+    "openrouter": "https://openrouter.ai/api/v1",
     "deepseek": "https://api.deepseek.com",
     "dashscope": "https://dashscope.aliyuncs.com/compatible-mode/v1",
     "zhipu": "https://open.bigmodel.cn/api/paas/v4",
@@ -71,6 +72,16 @@ _SUPPORTED_PROVIDER_METADATA: tuple[dict[str, Any], ...] = (
         "compatibility": "openai_compatible",
     },
     {
+        "id": "openrouter",
+        "name": "OpenRouter",
+        "description": (
+            "OpenRouter aggregator: reach Claude, Gemini, GPT, DeepSeek, GLM, "
+            "and more through one OpenAI-compatible key"
+        ),
+        "requires_base_url": False,
+        "compatibility": "openai_compatible",
+    },
+    {
         "id": "deepseek",
         "name": "DeepSeek",
         "description": "DeepSeek v4 models with tool calling and thinking mode",
@@ -81,7 +92,7 @@ _SUPPORTED_PROVIDER_METADATA: tuple[dict[str, Any], ...] = (
         "name": "XRouter (auto)",
         "description": (
             "Virtual model: asks xrouter-llm to pick one concrete model per call, "
-            "then dispatches to Claude (Anthropic) or OpenAI-compatible backends"
+            "then dispatches it through your configured OpenRouter model"
         ),
         "requires_base_url": True,
     },

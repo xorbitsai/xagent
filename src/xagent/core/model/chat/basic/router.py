@@ -16,7 +16,7 @@ from __future__ import annotations
 
 import logging
 import os
-from typing import Any, AsyncIterator, List, Optional
+from typing import Any, AsyncIterator, Callable, List, Optional
 
 import httpx
 
@@ -39,9 +39,14 @@ class RouterLLM(BaseLLM):
         default_max_tokens: Optional[int] = None,
         timeout: float = 180.0,
         abilities: Optional[List[str]] = None,
+        downstream_resolver: Optional[Callable[[str], BaseLLM]] = None,
     ) -> None:
         # model_name doubles as the xrouter-llm router config name (e.g. "auto").
         self._config_name = model_name or "auto"
+        # Given a chosen OpenRouter slug, build the LLM that runs it. Injected by
+        # the model store so "auto" reuses the user-configured OpenRouter model
+        # (credentials + base_url) instead of any environment variable.
+        self._downstream_resolver = downstream_resolver
         self._base_url = (
             base_url or os.getenv("XAGENT_XROUTER_BASE_URL") or _DEFAULT_ROUTER_BASE_URL
         ).rstrip("/")
@@ -152,14 +157,19 @@ class RouterLLM(BaseLLM):
         model_id = await self._select_model(self._extract_prompt(messages))
         slug = self._to_openrouter_slug(model_id)
         logger.info("xrouter selected %s -> openrouter:%s", model_id, slug)
+        if self._downstream_resolver is not None:
+            # Reuse the user-configured OpenRouter model (credentials + base_url).
+            return self._downstream_resolver(slug)
+        # Fallback when no OpenRouter model is configured: an OpenAI-compatible
+        # client using the ambient OPENAI_BASE_URL / OPENAI_API_KEY env.
         # Lazy import avoids a circular import (adapter imports this module).
         from .adapter import create_base_llm
 
         config = ChatModelConfig(
             id=f"router:{model_id}",
             model_name=slug,
-            model_provider="openai",  # OpenAI-compatible client pointed at OpenRouter
-            base_url=None,  # use env default OPENAI_BASE_URL (-> OpenRouter)
+            model_provider="openai",
+            base_url=None,
             api_key=None,
             default_temperature=self.default_temperature,
             default_max_tokens=self.default_max_tokens,

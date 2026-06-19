@@ -44,6 +44,27 @@ def test_router_normalizes_to_openrouter_slug():
     assert RouterLLM._to_openrouter_slug("openai/gpt-5.5") == "openai/gpt-5.5"
 
 
+async def test_router_dispatches_through_injected_downstream_resolver():
+    # "auto" reuses the configured OpenRouter model: the injected resolver is
+    # called with the normalized slug and its LLM is returned as-is.
+    seen: dict[str, str] = {}
+
+    def resolver(slug: str):
+        seen["slug"] = slug
+        return "DOWNSTREAM_LLM"
+
+    llm = RouterLLM(model_name="auto", downstream_resolver=resolver)
+
+    async def fake_select(_prompt: str) -> str:
+        return "claude-opus-4-8"
+
+    llm._select_model = fake_select  # type: ignore[assignment]
+
+    result = await llm._resolve([{"role": "user", "content": "hi"}])
+    assert seen["slug"] == "anthropic/claude-opus-4-8"
+    assert result == "DOWNSTREAM_LLM"
+
+
 def test_router_extract_prompt_uses_latest_user_message():
     messages = [
         {"role": "system", "content": "you are helpful"},

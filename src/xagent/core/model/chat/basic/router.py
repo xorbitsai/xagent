@@ -1,11 +1,15 @@
 """Router LLM: a virtual model that delegates to xrouter-llm for selection.
 
 On every call it asks the xrouter-llm decision service to pick ONE concrete
-model for the prompt, then dispatches the actual completion to the matching
-backend: Claude models go through the Anthropic path, everything else through
-the OpenAI-compatible path. Downstream credentials come from the usual env
-(`ANTHROPIC_API_KEY` for Claude, `OPENAI_API_KEY` / `OPENAI_BASE_URL` for the
-rest -- point the latter at OpenRouter to serve the registry models).
+model for the prompt, then dispatches the actual completion through a single
+OpenAI-compatible backend pointed at OpenRouter. Every provider (Claude,
+DeepSeek, Gemini, GLM, GPT, ...) is reached via OpenRouter, so xagent needs
+only ONE credential pair: `OPENAI_API_KEY` (an OpenRouter key) and
+`OPENAI_BASE_URL` (https://openrouter.ai/api/v1).
+
+The router returns a registry id; ids that already carry a provider namespace
+(`google/...`, `openai/...`) are OpenRouter slugs as-is, and bare Claude/DeepSeek
+ids are normalized to their OpenRouter slug (`anthropic/...`, `deepseek/...`).
 """
 
 from __future__ import annotations
@@ -146,16 +150,16 @@ class RouterLLM(BaseLLM):
     # ---- Routing ------------------------------------------------------------
     async def _resolve(self, messages: list[dict[str, Any]]) -> BaseLLM:
         model_id = await self._select_model(self._extract_prompt(messages))
-        provider, downstream_name = self._dispatch(model_id)
-        logger.info("xrouter selected %s -> provider=%s", model_id, provider)
+        slug = self._to_openrouter_slug(model_id)
+        logger.info("xrouter selected %s -> openrouter:%s", model_id, slug)
         # Lazy import avoids a circular import (adapter imports this module).
         from .adapter import create_base_llm
 
         config = ChatModelConfig(
             id=f"router:{model_id}",
-            model_name=downstream_name,
-            model_provider=provider,
-            base_url=None,  # use env defaults (OPENAI_BASE_URL / Anthropic official)
+            model_name=slug,
+            model_provider="openai",  # OpenAI-compatible client pointed at OpenRouter
+            base_url=None,  # use env default OPENAI_BASE_URL (-> OpenRouter)
             api_key=None,
             default_temperature=self.default_temperature,
             default_max_tokens=self.default_max_tokens,
@@ -193,21 +197,23 @@ class RouterLLM(BaseLLM):
         return str(selected[0])
 
     @staticmethod
-    def _dispatch(model_id: str) -> tuple[str, str]:
-        """Map a chosen model id to (provider, downstream model name).
+    def _to_openrouter_slug(model_id: str) -> str:
+        """Normalize a chosen registry id to an OpenRouter model slug.
 
-        Claude and DeepSeek models go to their official APIs (claude / deepseek
-        providers); everything else goes through the OpenAI-compatible path
-        (point OPENAI_BASE_URL at OpenRouter). The model id is passed through as
-        the downstream model name, so registry ids must equal the callable model
-        string (Anthropic model name, DeepSeek model name, or OpenRouter slug).
+        Everything is served through OpenRouter. Ids that already carry a
+        provider namespace (``google/...``, ``openai/...``, ``z-ai/...``) are
+        OpenRouter slugs as-is. Bare Claude/DeepSeek ids get their OpenRouter
+        provider prefix. (Normalizing the registry ids themselves is a separate
+        cleanup; until then this keeps the dispatch self-contained.)
         """
+        if "/" in model_id:
+            return model_id
         lowered = model_id.lower()
         if "claude" in lowered:
-            return "claude", model_id
+            return f"anthropic/{model_id}"
         if "deepseek" in lowered:
-            return "deepseek", model_id
-        return "openai", model_id
+            return f"deepseek/{model_id}"
+        return model_id
 
     @staticmethod
     def _extract_prompt(messages: list[dict[str, Any]]) -> str:

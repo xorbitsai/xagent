@@ -134,8 +134,12 @@ class RouterLLM(BaseLLM):
         # the model store so "auto" reuses the user-configured OpenRouter model
         # (credentials + base_url) instead of any environment variable.
         self._downstream_resolver = downstream_resolver
-        # api_key / base_url are accepted for adapter compatibility but unused:
-        # routing is now in-process, not an HTTP call.
+        # The auto model's own OpenRouter credentials. Routing is in-process (not
+        # an HTTP call), but these are used by the fallback resolver below when no
+        # downstream OpenRouter model is injected (e.g. test-connection paths), so
+        # the chosen slug still runs against the user's configured key/base_url.
+        self._api_key = api_key
+        self._base_url = base_url
         self.default_temperature = default_temperature
         self.default_max_tokens = default_max_tokens
         self.timeout = timeout
@@ -249,8 +253,9 @@ class RouterLLM(BaseLLM):
         if self._downstream_resolver is not None:
             # Reuse the user-configured OpenRouter model (credentials + base_url).
             return self._downstream_resolver(model_id)
-        # Fallback when no OpenRouter model is configured: an OpenAI-compatible
-        # client using the ambient OPENAI_BASE_URL / OPENAI_API_KEY env.
+        # Fallback when no downstream resolver was injected: an OpenAI-compatible
+        # client using this model's own OpenRouter credentials (or the ambient
+        # OPENAI_BASE_URL / OPENAI_API_KEY env when those are unset).
         # Lazy import avoids a circular import (adapter imports this module).
         from .adapter import create_base_llm
 
@@ -258,8 +263,8 @@ class RouterLLM(BaseLLM):
             id=f"router:{model_id}",
             model_name=model_id,
             model_provider="openai",
-            base_url=None,
-            api_key=None,
+            base_url=self._base_url,
+            api_key=self._api_key,
             default_temperature=self.default_temperature,
             default_max_tokens=self.default_max_tokens,
             timeout=self.timeout,

@@ -226,6 +226,7 @@ jobs:
     name: Pytest Fast (${{ matrix.name }})
     runs-on: ubuntu-latest
     if: github.event_name != 'pull_request' || github.event.pull_request.draft == false
+    needs: pre-commit
     strategy:
       fail-fast: false
       matrix:
@@ -287,7 +288,7 @@ jobs:
     name: Pytest Fast Deepdoc (${{ matrix.name }})
     runs-on: ubuntu-latest
     if: github.event_name != 'pull_request' || github.event.pull_request.draft == false
-    needs: prepare-deepdoc-cache
+    needs: [prepare-deepdoc-cache, pre-commit]
     strategy:
       fail-fast: false
       matrix:
@@ -432,7 +433,7 @@ jobs:
   pytest-slow:
     runs-on: ubuntu-latest
     if: github.event_name != 'pull_request' || github.event.pull_request.draft == false
-    needs: prepare-deepdoc-cache
+    needs: [prepare-deepdoc-cache, pre-commit]
 
     steps:
       - name: Checkout code
@@ -558,6 +559,7 @@ jobs:
   e2e:
     runs-on: ubuntu-latest
     if: github.event_name != 'pull_request' || github.event.pull_request.draft == false
+    needs: pre-commit
     timeout-minutes: 30
 
     steps:

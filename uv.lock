@@ -1,5 +1,5 @@
 version = 1
-revision = 3
+revision = 2
 requires-python = ">=3.11"
 resolution-markers = [
     "python_full_version >= '3.14' and sys_platform == 'darwin'",
@@ -7494,6 +7494,9 @@ milvus = [
 postgresql = [
     { name = "psycopg2-binary" },
 ]
+router = [
+    { name = "xrouter-llm" },
+]
 waf-crawl = [
     { name = "curl-cffi" },
 ]
@@ -7655,9 +7658,10 @@ requires-dist = [
     { name = "uvicorn", specifier = ">=0.35.0" },
     { name = "websockets", specifier = ">=15.0.1" },
     { name = "xinference-client", specifier = ">=2.3.0" },
+    { name = "xrouter-llm", marker = "extra == 'router'", specifier = ">=0.1.0" },
     { name = "zai-sdk", specifier = ">=0.0.3.2" },
 ]
-provides-extras = ["ai-document", "all", "browser", "chromadb", "document-processing", "duckdb", "milvus", "postgresql", "waf-crawl"]
+provides-extras = ["ai-document", "all", "browser", "chromadb", "document-processing", "duckdb", "milvus", "postgresql", "router", "waf-crawl"]
 
 [package.metadata.requires-dev]
 backend-image = [
@@ -7774,6 +7778,24 @@ source = { registry = "https://pypi.org/simple" }
 sdist = { url = "https://files.pythonhosted.org/packages/16/f2/d548d2f91106644b1b51df4cc59c1b3fabe9048954f18011775250c32d53/xpinyin-0.7.6.tar.gz", hash = "sha256:dec6aa0f4d9f9b6788d8131245293f1951180333a6d474b467b2d556221862fe", size = 131664, upload-time = "2020-12-21T07:58:32.453Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/a5/30/40e099a8da32105c8adf996abe92a5bbf5ecd338de2c4cc491b5718299ce/xpinyin-0.7.6-py3-none-any.whl", hash = "sha256:1d78eac9f612c20e155d7c3eb9dd7f9d3ec4e2667c52049e990b8bd036171a52", size = 129510, upload-time = "2020-12-21T07:58:30.32Z" },
+]
+
+[[package]]
+name = "xrouter-llm"
+version = "0.1.1"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "huggingface-hub" },
+    { name = "joblib" },
+    { name = "numpy" },
+    { name = "pandas" },
+    { name = "pyyaml" },
+    { name = "scikit-learn" },
+    { name = "scipy" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/fd/7b/ecafb589320a4b4183bb7394e67c894b2ab809126b70e45ae3cfe2ea687f/xrouter_llm-0.1.1.tar.gz", hash = "sha256:63c769b8911cb159e47e38519c84397d4f96906a72180eaef48cd4bd6168a102", size = 110328, upload-time = "2026-06-20T17:20:13.027Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/ed/75/094eb6c4633781ec12bf39ccb2364b9ee452c36a1d03068ac462ad30f492/xrouter_llm-0.1.1-py3-none-any.whl", hash = "sha256:d549ce76bb593aa01baab865347904277e073ea719b28f31fd900a4b0015dc35", size = 112760, upload-time = "2026-06-20T17:20:11.675Z" },
 ]
 
 [[package]]

@@ -21,7 +21,7 @@ from ...core.model.model import (
     RerankModelConfig,
 )
 from ...core.model.providers import (
-    canonical_provider_name,
+    is_auto_router_model,
     is_placeholder_api_key,
 )
 from ..models.model import Model
@@ -514,8 +514,10 @@ class UserAwareModelStorage:
                     logger.info(f"User {user_id} has access to model '{model_name}'")
 
             downstream_resolver = None
-            if canonical_provider_name(model_config.model_provider) == "router":
-                downstream_resolver = self._build_openrouter_resolver(user_id)
+            if is_auto_router_model(
+                model_config.model_provider, model_config.model_name
+            ):
+                downstream_resolver = self._build_openrouter_resolver(model_config)
             return self.core_storage.create_llm_instance(
                 model_config, downstream_resolver=downstream_resolver
             )
@@ -527,29 +529,14 @@ class UserAwareModelStorage:
             return None
 
     def _build_openrouter_resolver(
-        self, user_id: Optional[int] = None
-    ) -> Optional[Callable[[str], BaseLLM]]:
-        """Build the "auto" downstream resolver: reuse a configured OpenRouter model.
+        self, openrouter_cfg: ChatModelConfig
+    ) -> Callable[[str], BaseLLM]:
+        """Build the "auto" downstream resolver from its own OpenRouter config.
 
-        Finds the first active model whose provider is OpenRouter and returns a
-        closure that, given a chosen OpenRouter slug, builds an LLM with that
-        model's credentials + base_url. Returns None if no OpenRouter model is
-        configured (the router then falls back to its env-based default).
+        The ``auto`` model *is* an OpenRouter model, so the chosen slug is run
+        with that same config's credentials + base_url. Returns a closure that,
+        given a slug, builds the concrete downstream LLM.
         """
-        openrouter_cfg: Optional[ChatModelConfig] = None
-        for cfg in self.core_storage.list().values():
-            if (
-                isinstance(cfg, ChatModelConfig)
-                and canonical_provider_name(cfg.model_provider) == "openrouter"
-            ):
-                openrouter_cfg = cfg
-                break
-        if openrouter_cfg is None:
-            logger.warning(
-                "router 'auto' selected but no OpenRouter model is configured; "
-                "falling back to env-based OpenAI-compatible defaults"
-            )
-            return None
 
         def _resolve(slug: str) -> BaseLLM:
             child = openrouter_cfg.model_copy(

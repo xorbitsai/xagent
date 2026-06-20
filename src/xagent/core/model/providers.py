@@ -1,5 +1,9 @@
 from typing import Any, Optional
 
+# When an OpenRouter model carries this name, route the prompt through
+# xrouter-llm (in-process) instead of calling OpenRouter directly with it.
+AUTO_MODEL_NAME = "auto"
+
 _PROVIDER_ALIASES: dict[str, str] = {
     "zai_coding_plan": "zai-coding-plan",
     "zhipuai_coding_plan": "zhipuai-coding-plan",
@@ -29,6 +33,9 @@ _DEFAULT_BASE_URL_BY_PROVIDER: dict[str, str] = {
 }
 
 _CURATED_MODELS_BY_PROVIDER: dict[str, tuple[str, ...]] = {
+    # "auto" routes via xrouter-llm; the other entries are dispatched to
+    # OpenRouter directly. Users may also type any OpenRouter slug.
+    "openrouter": (AUTO_MODEL_NAME,),
     "deepseek": (
         "deepseek-v4-flash",
         "deepseek-v4-pro",
@@ -70,32 +77,6 @@ _SUPPORTED_PROVIDER_METADATA: tuple[dict[str, Any], ...] = (
         "compatibility": "openai_compatible",
     },
     {
-        "id": "openrouter",
-        "name": "OpenRouter",
-        "description": (
-            "OpenRouter aggregator: reach Claude, Gemini, GPT, DeepSeek, GLM, "
-            "and more through one OpenAI-compatible key"
-        ),
-        "requires_base_url": False,
-        "compatibility": "openai_compatible",
-    },
-    {
-        "id": "deepseek",
-        "name": "DeepSeek",
-        "description": "DeepSeek v4 models with tool calling and thinking mode",
-        "requires_base_url": False,
-    },
-    {
-        "id": "router",
-        "name": "XRouter (auto)",
-        "description": (
-            "Virtual model: uses the in-process xrouter-llm library to pick one "
-            "concrete model per call, then dispatches it through your configured "
-            "OpenRouter model"
-        ),
-        "requires_base_url": False,
-    },
-    {
         "id": "claude",
         "name": "Anthropic Claude",
         "description": "Anthropic's Claude models",
@@ -113,6 +94,23 @@ _SUPPORTED_PROVIDER_METADATA: tuple[dict[str, Any], ...] = (
         "name": "Xinference",
         "description": "Xinference models for local inference",
         "requires_base_url": True,
+    },
+    {
+        "id": "deepseek",
+        "name": "DeepSeek",
+        "description": "DeepSeek v4 models with tool calling and thinking mode",
+        "requires_base_url": False,
+    },
+    {
+        "id": "openrouter",
+        "name": "OpenRouter",
+        "description": (
+            "OpenRouter aggregator: reach Claude, Gemini, GPT, DeepSeek, GLM, "
+            "and more through one OpenAI-compatible key. Use model 'auto' to let "
+            "xrouter-llm pick the cheapest capable model per prompt."
+        ),
+        "requires_base_url": False,
+        "compatibility": "openai_compatible",
     },
     {
         "id": "dashscope",
@@ -208,6 +206,18 @@ def default_base_url_for_provider(provider: str) -> Optional[str]:
 
 def curated_models_for_provider(provider: str) -> tuple[str, ...]:
     return _CURATED_MODELS_BY_PROVIDER.get(canonical_provider_name(provider), ())
+
+
+def is_auto_router_model(provider: str, model_name: Optional[str]) -> bool:
+    """True when an OpenRouter model is the virtual ``auto`` router.
+
+    Such a model is served by xrouter-llm (in-process selection) instead of
+    being sent to OpenRouter directly.
+    """
+    return (
+        canonical_provider_name(provider) == "openrouter"
+        and (model_name or "").strip().lower() == AUTO_MODEL_NAME
+    )
 
 
 def provider_compatibility_for_provider(provider: str) -> Optional[str]:

@@ -3,7 +3,12 @@ from typing import Callable, Optional
 
 from ....model import ChatModelConfig, ModelConfig
 from ....retry import create_retry_wrapper
-from ...providers import canonical_provider_name, provider_compatibility_for_provider
+from ...providers import (
+    AUTO_MODEL_NAME,
+    canonical_provider_name,
+    is_auto_router_model,
+    provider_compatibility_for_provider,
+)
 from ..error import retry_on
 from .azure_openai import AzureOpenAILLM
 from .base import BaseLLM
@@ -23,9 +28,9 @@ def create_base_llm(
     """
     Creates a custom BaseLLM instance from a ModelConfig.
 
-    ``downstream_resolver`` is only used by the ``router`` provider: given a
-    chosen OpenRouter slug it returns the LLM that runs it, so "auto" reuses the
-    user-configured OpenRouter model instead of any environment variable.
+    ``downstream_resolver`` is only used by the OpenRouter ``auto`` model: given
+    a chosen OpenRouter slug it returns the LLM that runs it, so "auto" reuses
+    the user-configured OpenRouter model instead of any environment variable.
     """
     if not isinstance(model, ChatModelConfig):
         raise TypeError(f"Invalid model type: {type(model).__name__}")
@@ -34,9 +39,11 @@ def create_base_llm(
     compatibility = provider_compatibility_for_provider(provider)
     llm: BaseLLM
 
-    if provider == "router":
+    if is_auto_router_model(provider, model.model_name):
+        # OpenRouter model named "auto": pick a concrete model via xrouter-llm,
+        # then dispatch it through this same OpenRouter config.
         llm = RouterLLM(
-            model_name=model.model_name,
+            model_name=AUTO_MODEL_NAME,
             api_key=model.api_key,
             base_url=model.base_url,
             default_temperature=model.default_temperature,

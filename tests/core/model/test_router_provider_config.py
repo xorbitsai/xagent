@@ -2,13 +2,13 @@ from xagent.core.model import ChatModelConfig
 from xagent.core.model.chat.basic import router as router_module
 from xagent.core.model.chat.basic.adapter import create_base_llm
 from xagent.core.model.chat.basic.router import RouterLLM
-from xagent.core.model.providers import default_base_url_for_provider
 
 
-def test_create_base_llm_returns_router_llm():
+def test_openrouter_auto_returns_router_llm():
+    # "auto" is now an OpenRouter model name (no separate router provider).
     config = ChatModelConfig(
         id="auto-model",
-        model_provider="router",
+        model_provider="openrouter",
         model_name="auto",
     )
 
@@ -19,9 +19,21 @@ def test_create_base_llm_returns_router_llm():
     assert llm._inner.model_name == "auto"
 
 
-def test_router_provider_has_no_base_url():
-    # Routing is in-process now; the router provider needs no service URL.
-    assert default_base_url_for_provider("router") is None
+def test_openrouter_non_auto_is_not_router_llm():
+    # A normal OpenRouter slug is dispatched directly, not via xrouter.
+    config = ChatModelConfig(
+        id="or-claude",
+        model_provider="openrouter",
+        model_name="anthropic/claude-opus-4.8",
+    )
+    llm = create_base_llm(config)
+    assert not isinstance(getattr(llm, "_inner", llm), RouterLLM)
+
+
+def test_auto_is_curated_under_openrouter():
+    from xagent.core.model.providers import curated_models_for_provider
+
+    assert "auto" in curated_models_for_provider("openrouter")
 
 
 async def test_router_dispatches_chosen_slug_through_downstream_resolver():

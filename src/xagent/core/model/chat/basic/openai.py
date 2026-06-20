@@ -17,6 +17,68 @@ from .base import BaseLLM
 logger = logging.getLogger(__name__)
 
 
+def _truncate_error_detail(value: Any, limit: int = 4000) -> str:
+    text = (
+        value
+        if isinstance(value, str)
+        else json.dumps(value, ensure_ascii=False, default=str)
+    )
+    if len(text) <= limit:
+        return text
+    return f"{text[:limit]}...<truncated {len(text) - limit} chars>"
+
+
+def _openai_error_body(error: BaseException) -> Any:
+    body = getattr(error, "body", None)
+    if body is not None:
+        return body
+    response = getattr(error, "response", None)
+    if response is None:
+        return None
+    try:
+        return response.json()
+    except Exception:
+        return None
+
+
+def _openai_error_details(error: BaseException) -> list[str]:
+    details: list[str] = []
+    body = _openai_error_body(error)
+    if isinstance(body, dict):
+        error_payload = body.get("error")
+        if isinstance(error_payload, dict):
+            metadata = error_payload.get("metadata")
+            if isinstance(metadata, dict):
+                provider_name = metadata.get("provider_name")
+                if provider_name:
+                    details.append(f"provider_name={provider_name}")
+                raw = metadata.get("raw")
+                if raw:
+                    details.append("provider_raw=" + _truncate_error_detail(raw))
+                previous_errors = metadata.get("previous_errors")
+                if previous_errors:
+                    details.append(
+                        "previous_errors=" + _truncate_error_detail(previous_errors)
+                    )
+            elif metadata is not None:
+                details.append("metadata=" + _truncate_error_detail(metadata))
+    return details
+
+
+def _format_openai_error(prefix: str, error: BaseException) -> str:
+    message = str(getattr(error, "message", None) or error)
+    status_code = getattr(error, "status_code", None)
+    if status_code is not None:
+        formatted = f"{prefix} ({status_code}): {message}"
+    else:
+        formatted = f"{prefix}: {message}"
+
+    details = _openai_error_details(error)
+    if details:
+        formatted = f"{formatted} | " + " | ".join(details)
+    return formatted
+
+
 class OpenAILLM(BaseLLM):
     """
     OpenAI LLM client using the official OpenAI SDK.
@@ -358,7 +420,7 @@ class OpenAILLM(BaseLLM):
 
         except openai.BadRequestError as e:
             # Handle bad request errors
-            error_msg = str(e.message) if hasattr(e, "message") else str(e)
+            error_msg = _format_openai_error("OpenAI bad request", e)
 
             # Check if error is related to response_format
             if (
@@ -375,7 +437,7 @@ class OpenAILLM(BaseLLM):
                 response = await _make_api_call()
                 return _process_response(response)
 
-            raise RuntimeError(f"OpenAI bad request: {error_msg}") from e
+            raise RuntimeError(error_msg) from e
 
         except openai.APITimeoutError as e:
             # Handle timeout errors
@@ -391,10 +453,7 @@ class OpenAILLM(BaseLLM):
 
         except openai.APIError as e:
             # Handle OpenAI API errors
-            error_msg = f"OpenAI API error: {e.message}"
-            if (status_code := getattr(e, "status_code", None)) is not None:
-                error_msg = f"OpenAI API error ({status_code}): {e.message}"
-            raise RuntimeError(error_msg) from e
+            raise RuntimeError(_format_openai_error("OpenAI API error", e)) from e
 
         except Exception as e:
             # Handle any other unexpected errors
@@ -706,7 +765,7 @@ class OpenAILLM(BaseLLM):
 
         except openai.BadRequestError as e:
             # Handle bad request errors
-            error_msg = str(e.message) if hasattr(e, "message") else str(e)
+            error_msg = _format_openai_error("OpenAI bad request", e)
 
             # Check if error is related to response_format
             if (
@@ -729,14 +788,11 @@ class OpenAILLM(BaseLLM):
                         **completion_params
                     )
             else:
-                raise RuntimeError(f"OpenAI bad request: {error_msg}") from e
+                raise RuntimeError(error_msg) from e
 
         except openai.APIError as e:
             # Handle OpenAI API errors
-            error_msg = f"OpenAI API error: {e.message}"
-            if (status_code := getattr(e, "status_code", None)) is not None:
-                error_msg = f"OpenAI API error ({status_code}): {e.message}"
-            raise RuntimeError(error_msg) from e
+            raise RuntimeError(_format_openai_error("OpenAI API error", e)) from e
 
         except Exception as e:
             # Handle any other unexpected errors
@@ -873,7 +929,7 @@ class OpenAILLM(BaseLLM):
                     )
             except openai.BadRequestError as e:
                 # Check if error is related to response_format
-                error_msg = str(e.message) if hasattr(e, "message") else str(e)
+                error_msg = _format_openai_error("OpenAI bad request", e)
                 if (
                     "response_format" in error_msg.lower()
                     and "response_format" in completion_params
@@ -1006,14 +1062,11 @@ class OpenAILLM(BaseLLM):
 
         except openai.BadRequestError as e:
             logger.error("OpenAI bad request: %s", redact_sensitive_text(str(e)))
-            raise RuntimeError(f"OpenAI bad request: {e.message}") from e
+            raise RuntimeError(_format_openai_error("OpenAI bad request", e)) from e
 
         except openai.APIError as e:
             logger.error("OpenAI API error: %s", redact_sensitive_text(str(e)))
-            error_msg = f"OpenAI API error: {e.message}"
-            if (status_code := getattr(e, "status_code", None)) is not None:
-                error_msg = f"OpenAI API error ({status_code}): {e.message}"
-            raise RuntimeError(error_msg) from e
+            raise RuntimeError(_format_openai_error("OpenAI API error", e)) from e
 
         except TimeoutError:
             raise

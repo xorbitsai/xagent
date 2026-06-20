@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import importlib
+import json
 import re
 from typing import Any
 
@@ -556,9 +557,10 @@ async def test_react_pattern_runs_tool_call_then_final_answer() -> None:
     assert context.messages[1].tool_calls == [
         {
             "id": "call_1",
+            "type": "function",
             "function": {
                 "name": "calculator",
-                "arguments": '{"expression":"2+2"}',
+                "arguments": json.dumps({"expression": "2+2"}),
             },
         }
     ]
@@ -572,6 +574,66 @@ async def test_react_pattern_runs_tool_call_then_final_answer() -> None:
     assert "Do not write assistant text in the same response as a work tool call" in (
         system_prompt
     )
+
+
+@pytest.mark.asyncio
+async def test_react_pattern_does_not_persist_invalid_raw_tool_calls() -> None:
+    llm = FakeLLM(
+        responses=[
+            {
+                "content": "",
+                "tool_calls": [
+                    {
+                        "id": "call_search",
+                        "type": "function",
+                        "function": {
+                            "name": "zhipu_web_search",
+                            "arguments": (
+                                '{"query": "Germany vs Ivory Coast live score"'
+                            ),
+                        },
+                    },
+                    {
+                        "id": "",
+                        "type": "function",
+                        "function": {
+                            "arguments": (
+                                '}{"query":"德国 科特迪瓦 世界杯 比分 2026 6月"}'
+                            ),
+                        },
+                    },
+                ],
+            },
+            {"content": "No live score found.", "done": True},
+        ]
+    )
+    pattern = ReActPattern(max_iterations=3)
+    context = ExecutionContext()
+    context.add_user_message("搜索啊")
+
+    result = await pattern.run(context=context, tools=[FakeSearchTool()], llm=llm)
+
+    assert result["success"] is True
+    assistant_tool_calls = context.messages[1].tool_calls
+    assert assistant_tool_calls == [
+        {
+            "id": "call_search",
+            "type": "function",
+            "function": {
+                "name": "zhipu_web_search",
+                "arguments": json.dumps(
+                    {"input": ('{"query": "Germany vs Ivory Coast live score"')},
+                    ensure_ascii=False,
+                ),
+            },
+        }
+    ]
+    second_prompt_tool_calls = [
+        message["tool_calls"]
+        for message in llm.calls[1]["messages"]
+        if message.get("role") == "assistant" and message.get("tool_calls")
+    ]
+    assert second_prompt_tool_calls == [assistant_tool_calls]
 
 
 @pytest.mark.asyncio

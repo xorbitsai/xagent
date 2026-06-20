@@ -386,14 +386,16 @@ class ReActPattern(AgentPattern):
                 normalized["done"] = True
 
             assistant_content = normalized.get("content")
+            tool_calls = normalized.get("tool_calls", [])
             if assistant_content is not None or normalized.get("tool_calls"):
                 context.add_assistant_message(
                     assistant_content or "",
-                    tool_calls=normalized.get("raw_tool_calls")
-                    or normalized.get("tool_calls"),
+                    tool_calls=[
+                        self._tool_call_for_context(tool_call)
+                        for tool_call in tool_calls
+                    ],
                 )
 
-            tool_calls = normalized.get("tool_calls", [])
             if answer_streamer is not None:
                 await self._finish_streamed_answer_if_final(
                     answer_streamer=answer_streamer,
@@ -1621,7 +1623,11 @@ class ReActPattern(AgentPattern):
             "type": "function",
             "function": {
                 "name": tool_call.get("name"),
-                "arguments": json.dumps(tool_call.get("args", {}), default=str),
+                "arguments": json.dumps(
+                    tool_call.get("args", {}),
+                    ensure_ascii=False,
+                    default=str,
+                ),
             },
         }
 

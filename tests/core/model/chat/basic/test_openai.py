@@ -6,7 +6,7 @@ from unittest.mock import MagicMock
 
 import pytest
 
-from xagent.core.model.chat.basic.openai import OpenAILLM
+from xagent.core.model.chat.basic.openai import OpenAILLM, _format_openai_error
 
 
 class TestOpenAILLM:
@@ -221,6 +221,40 @@ class TestOpenAILLM:
         error_msg = str(exc_info.value)
         assert "OpenAI API error" in error_msg
         print(f"Error handling test passed: {error_msg}")
+
+    def test_format_openrouter_error_preserves_provider_metadata(self):
+        """OpenRouter provider metadata should survive OpenAI-compatible errors."""
+
+        class FakeOpenRouterError(Exception):
+            message = "Provider returned error"
+            status_code = 400
+            body = {
+                "error": {
+                    "metadata": {
+                        "provider_name": "DeepSeek",
+                        "raw": '{"error":{"message":"missing field `name`"}}',
+                        "previous_errors": [
+                            {
+                                "provider_name": "WandB",
+                                "code": 400,
+                                "raw": '{"error":"invalid request params"}',
+                            }
+                        ],
+                    }
+                }
+            }
+
+        error_msg = _format_openai_error(
+            "OpenAI bad request",
+            FakeOpenRouterError("Provider returned error"),
+        )
+
+        assert "OpenAI bad request (400): Provider returned error" in error_msg
+        assert "provider_name=DeepSeek" in error_msg
+        assert "provider_raw=" in error_msg
+        assert "missing field `name`" in error_msg
+        assert "previous_errors=" in error_msg
+        assert "WandB" in error_msg
 
     @pytest.mark.asyncio
     async def test_custom_parameters(self, llm, mock_chat_completion, mocker):

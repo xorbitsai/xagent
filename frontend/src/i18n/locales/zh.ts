@@ -2059,6 +2059,7 @@ Build when you need.`,
         delete: "删除",
         edit: "编辑",
         apiKey: "API Key",
+        triggers: "Triggers",
         deleteConfirm: "确定要删除这个 Agent 吗？",
       },
       createModal: {
@@ -3091,6 +3092,129 @@ Build when you need.`,
       revoke_failed: "撤销 API Key 失败",
       copied: "已复制到剪贴板",
       copy_failed: "复制到剪贴板失败"
+    }
+  },
+  triggers: {
+    title: "Triggers",
+    subtitle: "选择此 Agent 的触发方式",
+    defaults: {
+      webhookName: "API / Webhook",
+      scheduledName: "Schedule"
+    },
+    overview: {
+      info: "Triggers 定义此 Agent 什么时候运行。启用一个或多个触发方式，让外部事件或定时计划自动启动 Agent。"
+    },
+    cards: {
+      webhook: {
+        title: "API / Webhook",
+        description: "通过 REST API 调用或 incoming webhook 触发"
+      },
+      scheduled: {
+        title: "Schedule",
+        description: "按固定时间间隔自动运行 Agent"
+      },
+      activeCount: "{count} Active"
+    },
+    builder: {
+      title: "Triggers",
+      description: "选择此 Agent 的自动触发入口。",
+      saveFirst: "保存 Agent 后即可配置 Triggers。",
+      tooltip: "Triggers 会在外部事件或定时计划发生时自动启动此 Agent。",
+      open: "Triggers",
+      configure: "配置 Trigger"
+    },
+    type: {
+      webhook: "Webhook",
+      scheduled: "定时"
+    },
+    status: {
+      enabled: "已启用",
+      disabled: "已停用"
+    },
+    runStatus: {
+      pending: "等待中",
+      running: "运行中",
+      completed: "已完成",
+      failed: "失败"
+    },
+    list: {
+      title: "Triggers",
+      empty: "还没有 Trigger"
+    },
+    form: {
+      createTitle: "新建 Trigger",
+      createSubtitle: "为此 Agent 创建 webhook 或定时触发入口。",
+      editTitle: "Trigger 设置",
+      editSubtitle: "更新触发定义和执行提示词。",
+      name: "名称",
+      namePlaceholder: "日报、CRM webhook...",
+      type: "类型",
+      intervalSeconds: "每多少秒重复",
+      nextRunAt: "首次运行时间",
+      secret: "Webhook Secret",
+      secretPlaceholder: "留空则自动生成",
+      secretEditPlaceholder: "留空则保留当前 secret",
+      promptTemplate: "提示词模板",
+      promptPlaceholder: "可使用 {{payload}}、{{trigger_type}}、{{source_event_id}} 和 {{test}}。"
+    },
+    actions: {
+      new: "新建",
+      create: "创建 Trigger",
+      enable: "启用 Trigger",
+      save: "保存修改",
+      delete: "删除",
+      confirmDelete: "确认删除",
+      rotateSecret: "轮换 secret",
+      test: "测试触发",
+      addAnother: "新增"
+    },
+    secret: {
+      title: "请立即复制此 secret，它只显示一次。"
+    },
+    webhook: {
+      title: "Webhook 地址",
+      secretHeader: "调用时通过 x-xagent-trigger-secret header 传入 secret。"
+    },
+    test: {
+      title: "测试运行",
+      subtitle: "使用示例 payload 启动一次 trigger run。",
+      sourceEventId: "Source event ID",
+      sourceEventPlaceholder: "可选事件 ID"
+    },
+    runs: {
+      title: "最近运行",
+      nextRun: "下次运行",
+      noNextRun: "暂无下次运行计划",
+      status: "状态",
+      source: "来源",
+      task: "任务",
+      created: "创建时间",
+      empty: "还没有运行记录"
+    },
+    validation: {
+      name: "Trigger 名称不能为空",
+      nameLength: "Trigger 名称最多 200 个字符",
+      interval: "重复间隔必须是正整数",
+      nextRunAt: "首次运行时间无效",
+      scheduleRequired: "定时 Trigger 需要重复间隔或首次运行时间",
+      testPayload: "测试 payload 必须是 JSON object"
+    },
+    messages: {
+      loadFailed: "加载 Triggers 失败",
+      runsLoadFailed: "加载 Trigger 运行记录失败",
+      created: "Trigger 已创建",
+      updated: "Trigger 已更新",
+      enabled: "Trigger 已启用",
+      disabled: "Trigger 已停用",
+      deleted: "Trigger 已删除",
+      saveFailed: "保存 Trigger 失败",
+      deleteFailed: "删除 Trigger 失败",
+      secretRotated: "Webhook secret 已轮换",
+      secretRotateFailed: "轮换 webhook secret 失败",
+      testStarted: "测试触发已启动",
+      testDuplicate: "复用了重复的 trigger run",
+      testFailed: "测试 Trigger 失败",
+      copyFailed: "复制到剪贴板失败"
     }
   },
   workforces: {

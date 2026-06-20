@@ -2059,6 +2059,7 @@ Build when you need.`,
         delete: "Delete",
         edit: "Edit",
         apiKey: "API Key",
+        triggers: "Triggers",
         deleteConfirm: "Are you sure you want to delete this agent?",
       },
       createModal: {
@@ -3091,6 +3092,129 @@ Build when you need.`,
       revoke_failed: "Failed to revoke API key",
       copied: "Copied to clipboard",
       copy_failed: "Failed to copy to clipboard"
+    }
+  },
+  triggers: {
+    title: "Triggers",
+    subtitle: "Choose how this agent gets activated",
+    defaults: {
+      webhookName: "API / Webhook",
+      scheduledName: "Schedule"
+    },
+    overview: {
+      info: "Triggers define when this agent runs. Enable one or more ways to automatically activate the agent in response to external events or schedules."
+    },
+    cards: {
+      webhook: {
+        title: "API / Webhook",
+        description: "Trigger via REST API call or incoming webhook"
+      },
+      scheduled: {
+        title: "Schedule",
+        description: "Run the agent automatically on a recurring interval"
+      },
+      activeCount: "{count} Active"
+    },
+    builder: {
+      title: "Triggers",
+      description: "Choose automatic entry points for this agent.",
+      saveFirst: "Save the agent before configuring triggers.",
+      tooltip: "Triggers automatically start this agent when an external event or schedule fires.",
+      open: "Triggers",
+      configure: "Configure trigger"
+    },
+    type: {
+      webhook: "Webhook",
+      scheduled: "Scheduled"
+    },
+    status: {
+      enabled: "Enabled",
+      disabled: "Disabled"
+    },
+    runStatus: {
+      pending: "Pending",
+      running: "Running",
+      completed: "Completed",
+      failed: "Failed"
+    },
+    list: {
+      title: "Triggers",
+      empty: "No triggers yet"
+    },
+    form: {
+      createTitle: "New trigger",
+      createSubtitle: "Create a webhook or scheduled trigger for this agent.",
+      editTitle: "Trigger settings",
+      editSubtitle: "Update the trigger definition and execution prompt.",
+      name: "Name",
+      namePlaceholder: "Daily report, CRM webhook...",
+      type: "Type",
+      intervalSeconds: "Repeat every seconds",
+      nextRunAt: "First run at",
+      secret: "Webhook secret",
+      secretPlaceholder: "Leave blank to generate one",
+      secretEditPlaceholder: "Leave blank to keep the current secret",
+      promptTemplate: "Prompt template",
+      promptPlaceholder: "Use {{payload}}, {{trigger_type}}, {{source_event_id}}, and {{test}}."
+    },
+    actions: {
+      new: "New",
+      create: "Create trigger",
+      enable: "Enable trigger",
+      save: "Save changes",
+      delete: "Delete",
+      confirmDelete: "Confirm delete",
+      rotateSecret: "Rotate secret",
+      test: "Test trigger",
+      addAnother: "Add"
+    },
+    secret: {
+      title: "Copy this secret now. It is shown only once."
+    },
+    webhook: {
+      title: "Webhook endpoint",
+      secretHeader: "Send the secret with the x-xagent-trigger-secret header."
+    },
+    test: {
+      title: "Test run",
+      subtitle: "Start a trigger run with a sample payload.",
+      sourceEventId: "Source event ID",
+      sourceEventPlaceholder: "optional-event-id"
+    },
+    runs: {
+      title: "Recent runs",
+      nextRun: "Next run",
+      noNextRun: "No next run scheduled",
+      status: "Status",
+      source: "Source",
+      task: "Task",
+      created: "Created",
+      empty: "No runs yet"
+    },
+    validation: {
+      name: "Trigger name is required",
+      nameLength: "Trigger name must be at most 200 characters",
+      interval: "Interval must be a positive integer",
+      nextRunAt: "First run time is invalid",
+      scheduleRequired: "Scheduled triggers need an interval or a first run time",
+      testPayload: "Test payload must be a JSON object"
+    },
+    messages: {
+      loadFailed: "Failed to load triggers",
+      runsLoadFailed: "Failed to load trigger runs",
+      created: "Trigger created",
+      updated: "Trigger updated",
+      enabled: "Trigger enabled",
+      disabled: "Trigger disabled",
+      deleted: "Trigger deleted",
+      saveFailed: "Failed to save trigger",
+      deleteFailed: "Failed to delete trigger",
+      secretRotated: "Webhook secret rotated",
+      secretRotateFailed: "Failed to rotate webhook secret",
+      testStarted: "Test trigger started",
+      testDuplicate: "Duplicate trigger run reused",
+      testFailed: "Failed to test trigger",
+      copyFailed: "Failed to copy to clipboard"
     }
   },
   workforces: {

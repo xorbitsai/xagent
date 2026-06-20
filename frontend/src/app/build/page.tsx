@@ -3,12 +3,13 @@
 import React, { useState, useEffect, useRef } from "react"
 import { SearchInput } from "@/components/ui/search-input"
 import { Button } from "@/components/ui/button"
-import { Plus, Bot, Trash2, MessageSquare, Edit, MoreVertical, Globe, Calendar, Clock, Rocket, Sparkles, Settings2, ArrowRight, FileText, Wrench, Database, Plug, KeyRound } from "lucide-react"
+import { Plus, Bot, Trash2, MessageSquare, Edit, MoreVertical, Globe, Calendar, Clock, Rocket, Sparkles, Settings2, ArrowRight, FileText, Wrench, Database, Plug, KeyRound, Webhook } from "lucide-react"
 import { Popover, PopoverTrigger, PopoverContent } from "@/components/ui/popover"
 import { Dialog, DialogContent, DialogHeader, DialogTitle } from "@/components/ui/dialog"
 import { Textarea } from "@/components/ui/textarea"
 import { DeployAgentDialog, Agent } from "@/components/build/deploy-agent-dialog"
 import { AgentApiKeyDialog } from "@/components/build/agent-api-key-dialog"
+import { AgentTriggersDialog } from "@/components/build/agent-triggers-dialog"
 import { FeatureEmptyState } from "@/components/ui/feature-empty-state"
 import { useI18n } from "@/contexts/i18n-context"
 import { useApp } from "@/contexts/app-context-chat"
@@ -77,6 +78,7 @@ export default function BuildsPage() {
   // Deploy Dialog State
   const [deployAgent, setDeployAgent] = useState<Agent | null>(null)
   const [apiKeyAgent, setApiKeyAgent] = useState<Agent | null>(null)
+  const [triggersAgent, setTriggersAgent] = useState<Agent | null>(null)
 
   // Check for template parameter and redirect to create page
   useEffect(() => {
@@ -418,6 +420,19 @@ export default function BuildsPage() {
                                       {t('builds.list.actions.apiKey') || 'API Key'}
                                     </Button>
                                   )}
+                                  {canEditAgent(agent) && (
+                                    <Button
+                                      variant="ghost"
+                                      className="justify-start px-2 py-1.5 h-auto font-normal text-sm"
+                                      onClick={(e) => {
+                                        e.stopPropagation()
+                                        setTriggersAgent(agent)
+                                      }}
+                                    >
+                                      <Webhook className="mr-2 h-4 w-4" />
+                                      {t('builds.list.actions.triggers') || 'Triggers'}
+                                    </Button>
+                                  )}
                                   {canEditAgent(agent) && (canPublishAgent(agent) || canDeleteAgent(agent)) && (
                                     <div className="h-px bg-border my-1 mx-1" />
                                   )}
@@ -570,6 +585,7 @@ export default function BuildsPage() {
           setAgents(agents.map(a => a.id === updatedAgent.id ? updatedAgent : a))
         }}
         onManageApiKey={() => { if (deployAgent) setApiKeyAgent(deployAgent) }}
+        onManageTriggers={() => { if (deployAgent) setTriggersAgent(deployAgent) }}
       />
 
       <AgentApiKeyDialog
@@ -577,6 +593,13 @@ export default function BuildsPage() {
         agentName={apiKeyAgent?.name}
         open={apiKeyAgent !== null}
         onOpenChange={(open) => { if (!open) setApiKeyAgent(null) }}
+      />
+
+      <AgentTriggersDialog
+        agentId={triggersAgent?.id ?? null}
+        agentName={triggersAgent?.name}
+        open={triggersAgent !== null}
+        onOpenChange={(open) => { if (!open) setTriggersAgent(null) }}
       />
 
       <Dialog open={isCreateModalOpen} onOpenChange={setIsCreateModalOpen}>

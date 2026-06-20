@@ -49,9 +49,10 @@ interface DeployAgentDialogProps {
   // Opens the shared API-key dialog (a single instance lives in the parent),
   // so this dialog never nests its own Radix Dialog.
   onManageApiKey?: () => void
+  onManageTriggers?: () => void
 }
 
-export function DeployAgentDialog({ deployAgent, onClose, onUpdate, onManageApiKey }: DeployAgentDialogProps) {
+export function DeployAgentDialog({ deployAgent, onClose, onUpdate, onManageApiKey, onManageTriggers }: DeployAgentDialogProps) {
   const { t } = useI18n()
   const [activeView, setActiveView] = useState<"options" | "embed" | "api" | "share">("options")
   const [apiTab, setApiTab] = useState<ApiSnippetTab>("curl")
@@ -352,7 +353,8 @@ with AgentClient(api_key="YOUR_API_KEY", base_url="${apiBase}") as agent:
       desc: t("deploy_agent.options.webhook.desc") || "Trigger agent runs via webhook events from external systems",
       actionText: t("deploy_agent.options.webhook.action") || "Configure",
       actionColor: "text-emerald-600",
-      className: "opacity-50 cursor-not-allowed shadow-sm",
+      className: "cursor-pointer hover:border-primary transition-colors shadow-sm",
+      onClick: onManageTriggers,
     },
   ]
 

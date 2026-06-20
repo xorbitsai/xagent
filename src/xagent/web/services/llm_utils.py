@@ -249,7 +249,11 @@ class CoreStorage:
                 logger.warning(f"Model is not a chat model: {model_config.model_name}")
                 return None
 
-            return create_base_llm(model_config, downstream_resolver)
+            # Keep the bare create_base_llm(config) call for ordinary models;
+            # only the OpenRouter "auto" model needs the downstream resolver.
+            if downstream_resolver is not None:
+                return create_base_llm(model_config, downstream_resolver)
+            return create_base_llm(model_config)
         except Exception as e:
             logger.error(f"Error creating LLM instance: {e}")
             return None

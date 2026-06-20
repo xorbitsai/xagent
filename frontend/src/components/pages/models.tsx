@@ -97,6 +97,11 @@ const LOCAL_PROVIDER_CONFIGS: Record<string, Partial<ProviderConfig>> = {
     category: ["llm", "embedding"],
     defaultBaseUrl: "https://api.openai.com/v1",
   },
+  openrouter: {
+    icon: <img src="/openrouter.jpg" alt="OpenRouter" className="w-6 h-6" />,
+    category: ["llm"],
+    defaultBaseUrl: "https://openrouter.ai/api/v1",
+  },
   deepseek: {
     icon: <img src="/deepseek.svg" alt="DeepSeek" className="w-6 h-6" />,
     category: ["llm"],

@@ -20,6 +20,7 @@ from xagent.core.model.model import (
 from xagent.core.model.providers import (
     canonical_provider_name,
     default_base_url_for_provider,
+    is_auto_router_model,
 )
 from xagent.core.utils.security import redact_sensitive_text
 
@@ -207,6 +208,11 @@ async def _validate_provider_model_listing(
         fetch_models_from_provider(provider, api_key or "", base_url),
         timeout=10.0,
     )
+    # "auto" is a virtual OpenRouter model routed in-process by xrouter-llm; it is
+    # not a real OpenRouter slug, so the fetch above only confirms connectivity —
+    # skip the model-membership and per-model ability checks.
+    if is_auto_router_model(provider, model_name):
+        return
     provider_model = _find_provider_model(models, model_name)
     if provider_model is None:
         raise ValueError(f"Model '{model_name}' was not found in provider '{provider}'")

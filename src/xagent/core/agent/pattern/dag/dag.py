@@ -6,6 +6,7 @@ import logging
 from dataclasses import dataclass
 from typing import Any
 
+from ....model.intent import goal_scope
 from ...context.enrichment import (
     enrich_context_with_memory,
     enrich_context_with_skill,
@@ -766,6 +767,14 @@ class DAGPattern(AgentPattern):
         return None
 
     async def _execute_step(
+        self, *, step: PlanStep, **kwargs: Any
+    ) -> dict[str, Any] | None:
+        # While a step runs, its own objective is the active goal — so the
+        # "auto" model routes that step on the step, not the whole-task request.
+        with goal_scope(step.description or step.task):
+            return await self._execute_step_impl(step=step, **kwargs)
+
+    async def _execute_step_impl(
         self,
         *,
         step: PlanStep,

@@ -238,7 +238,13 @@ class RouterLLM(BaseLLM):
 
     # ---- Routing ------------------------------------------------------------
     async def _resolve(self, messages: list[dict[str, Any]]) -> BaseLLM:
-        model_id = await self._select_model(self._extract_prompt(messages))
+        # Route on the agent's current goal (the user's request, or a DAG step's
+        # objective) rather than the scaffolded sub-prompt this particular LLM
+        # call happens to carry.
+        from ...intent import current_goal
+
+        prompt = current_goal() or self._extract_prompt(messages)
+        model_id = await self._select_model(prompt)
         logger.info("xrouter selected %s -> openrouter", model_id)
         if self._downstream_resolver is not None:
             # Reuse the user-configured OpenRouter model (credentials + base_url).

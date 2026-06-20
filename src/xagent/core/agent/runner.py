@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from typing import Any, cast
 from uuid import uuid4
 
+from ..model.intent import enter_goal, exit_goal
 from ..workspace import WorkspaceManager
 from .context import ContextManager, ExecutionContext
 from .result import extract_assistant_message
@@ -112,6 +113,11 @@ class AgentRunner:
             runtime=runtime,
             task=task,
         )
+
+        # Establish the user's request as the turn's goal. The "auto" model
+        # routes on this rather than on the scaffolded sub-prompt a given LLM
+        # call carries; finer units (DAG steps) override it with their own goal.
+        goal_token = enter_goal(task)
 
         await self._dispatch_callback(
             "on_run_start",
@@ -239,6 +245,7 @@ class AgentRunner:
             return result
         finally:
             self._active_controls.pop(execution_id, None)
+            exit_goal(goal_token)
 
     def pause(self, execution_id: str, reason: str | None = None) -> bool:
         control = self._active_controls.get(execution_id)

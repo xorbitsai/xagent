@@ -72,6 +72,33 @@ async def test_router_selects_in_process_via_service(monkeypatch):
     assert await llm._select_model("hello") == "openai/gpt-5.5"
 
 
+async def test_router_routes_on_active_goal_not_scaffold(monkeypatch):
+    # The agent sets the active goal (user request / DAG step); routing must use
+    # it, not the scaffolded message this LLM call carries.
+    from xagent.core.model.intent import goal_scope
+
+    seen: dict[str, str] = {}
+
+    async def fake_select(prompt: str) -> str:
+        seen["prompt"] = prompt
+        return "openai/gpt-5.5"
+
+    llm = RouterLLM(model_name="auto", downstream_resolver=lambda s: "DOWNSTREAM")
+    llm._select_model = fake_select  # type: ignore[assignment]
+
+    with goal_scope("你好"):
+        await llm._resolve(
+            [
+                {
+                    "role": "user",
+                    "content": "## User Task\n你好\n\n## Available Skills\n...",
+                }
+            ]
+        )
+
+    assert seen["prompt"] == "你好"
+
+
 async def test_router_uses_fallback_when_routing_fails(monkeypatch):
     monkeypatch.setenv("XAGENT_ROUTER_FALLBACK_MODEL", "anthropic/claude-opus-4.8")
 

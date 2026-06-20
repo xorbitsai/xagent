@@ -513,14 +513,14 @@ class UserAwareModelStorage:
                 else:
                     logger.info(f"User {user_id} has access to model '{model_name}'")
 
-            downstream_resolver = None
             if is_auto_router_model(
                 model_config.model_provider, model_config.model_name
             ):
-                downstream_resolver = self._build_openrouter_resolver(model_config)
-            return self.core_storage.create_llm_instance(
-                model_config, downstream_resolver=downstream_resolver
-            )
+                return self.core_storage.create_llm_instance(
+                    model_config,
+                    downstream_resolver=self._build_openrouter_resolver(model_config),
+                )
+            return self.core_storage.create_llm_instance(model_config)
         except Exception as e:
             logger.error(f"Error getting LLM instance for model '{model_name}': {e}")
             import traceback

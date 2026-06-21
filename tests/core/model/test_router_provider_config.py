@@ -163,6 +163,33 @@ async def test_router_retries_stream_without_thinking_for_tool_choice_error():
     assert downstream.stream_calls[1]["extra_body"] == _DISABLE_REASONING_EXTRA_BODY
 
 
+async def test_router_retries_stream_without_explicit_thinking_for_tool_choice_error():
+    downstream = _RejectThinkingToolChoiceLLM()
+
+    llm = RouterLLM(model_name="auto", downstream_resolver=lambda _s: downstream)
+
+    async def fake_select(_prompt: str) -> str:
+        return "deepseek/deepseek-v4-flash"
+
+    llm._select_model = fake_select  # type: ignore[assignment]
+
+    chunks = [
+        chunk
+        async for chunk in llm.stream_chat(
+            [{"role": "user", "content": "hi"}],
+            tool_choice="required",
+        )
+    ]
+
+    assert [chunk.delta for chunk in chunks] == ["ok"]
+    assert len(downstream.stream_calls) == 2
+    assert downstream.stream_calls[0]["tool_choice"] == "required"
+    assert downstream.stream_calls[0]["thinking"] is None
+    assert downstream.stream_calls[1]["tool_choice"] == "required"
+    assert downstream.stream_calls[1]["thinking"] == _DISABLE_DOWNSTREAM_THINKING
+    assert downstream.stream_calls[1]["extra_body"] == _DISABLE_REASONING_EXTRA_BODY
+
+
 async def test_router_does_not_retry_unrelated_errors():
     downstream = _RejectThinkingToolChoiceLLM()
 

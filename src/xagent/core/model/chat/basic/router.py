@@ -53,7 +53,7 @@ def _should_retry_without_thinking(
 ) -> bool:
     exc_msg = str(exc).lower()
     return (
-        isinstance(thinking, dict)
+        (thinking is None or isinstance(thinking, dict))
         and tool_choice is not None
         and "thinking" in exc_msg
         and "tool_choice" in exc_msg

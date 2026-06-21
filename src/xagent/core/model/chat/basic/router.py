@@ -34,6 +34,7 @@ import threading
 from typing import Any, AsyncIterator, Callable, List, Optional
 
 from ....model import ChatModelConfig
+from ...providers import default_base_url_for_provider
 from ..types import StreamChunk
 from .base import BaseLLM
 
@@ -262,8 +263,8 @@ class RouterLLM(BaseLLM):
         config = ChatModelConfig(
             id=f"router:{model_id}",
             model_name=model_id,
-            model_provider="openai",
-            base_url=self._base_url,
+            model_provider="openrouter",
+            base_url=self._base_url or default_base_url_for_provider("openrouter"),
             api_key=self._api_key,
             default_temperature=self.default_temperature,
             default_max_tokens=self.default_max_tokens,

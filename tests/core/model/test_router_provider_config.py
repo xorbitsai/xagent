@@ -57,6 +57,43 @@ async def test_router_dispatches_chosen_slug_through_downstream_resolver():
     assert result == "DOWNSTREAM_LLM"
 
 
+async def test_router_fallback_uses_openrouter_config(monkeypatch):
+    # Test-connection paths may not inject a downstream resolver. The fallback
+    # still has to run chosen OpenRouter slugs against OpenRouter, not OpenAI.
+    from xagent.core.model.chat.basic import adapter as adapter_module
+
+    seen: dict[str, object] = {}
+
+    def fake_create_base_llm(config):
+        seen["config"] = config
+        return "FALLBACK_LLM"
+
+    monkeypatch.setattr(adapter_module, "create_base_llm", fake_create_base_llm)
+
+    llm = RouterLLM(
+        model_name="auto",
+        api_key="configured-key",
+        default_temperature=0.2,
+        default_max_tokens=123,
+    )
+
+    async def fake_select(_prompt: str) -> str:
+        return "deepseek/deepseek-v4-flash"
+
+    llm._select_model = fake_select  # type: ignore[assignment]
+
+    result = await llm._resolve([{"role": "user", "content": "hi"}])
+
+    config = seen["config"]
+    assert result == "FALLBACK_LLM"
+    assert config.model_provider == "openrouter"
+    assert config.model_name == "deepseek/deepseek-v4-flash"
+    assert config.base_url == "https://openrouter.ai/api/v1"
+    assert config.api_key == "configured-key"
+    assert config.default_temperature == 0.2
+    assert config.default_max_tokens == 123
+
+
 async def test_router_selects_in_process_via_service(monkeypatch):
     # _select_model runs the in-process RoutingService (no HTTP) and returns the
     # first selected slug.

@@ -64,6 +64,51 @@ def _should_retry_without_thinking(
     )
 
 
+def _should_retry_with_relaxed_tool_choice(
+    exc: Exception,
+    *,
+    tools: list[dict[str, Any]] | None,
+    tool_choice: str | dict[str, Any] | None,
+) -> bool:
+    if not tools or tool_choice in (None, "auto", "none"):
+        return False
+
+    # Deliberate OpenRouter compatibility bridge: official provider routing can
+    # reject strict tool_choice values before selecting an endpoint. This
+    # degrades forced tool use to "auto" instead of failing the whole agent run.
+    # Replace string matching with typed provider errors when available.
+    exc_msg = str(exc).lower()
+    return "no endpoints found" in exc_msg and "tool_choice" in exc_msg
+
+
+def _next_retry_state(
+    exc: Exception,
+    *,
+    tools: list[dict[str, Any]] | None,
+    thinking: dict[str, Any] | None,
+    tool_choice: str | dict[str, Any] | None,
+) -> tuple[str | dict[str, Any] | None, dict[str, Any] | None, str, str] | None:
+    if _should_retry_without_thinking(exc, thinking=thinking, tool_choice=tool_choice):
+        return (
+            tool_choice,
+            _DISABLE_DOWNSTREAM_THINKING,
+            "selected model rejected thinking with tool_choice; retrying without thinking",
+            "disable_thinking",
+        )
+
+    if _should_retry_with_relaxed_tool_choice(
+        exc, tools=tools, tool_choice=tool_choice
+    ):
+        return (
+            "auto",
+            thinking,
+            "selected OpenRouter endpoint rejected tool_choice; retrying with tool_choice=auto",
+            "relax_tool_choice",
+        )
+
+    return None
+
+
 class _NullStore:
     """Duck-typed CallStore that drops the decision log (degradation fallback)."""
 
@@ -189,7 +234,7 @@ class RouterLLM(BaseLLM):
     def supports_thinking_mode(self) -> bool:
         return "thinking_mode" in self._abilities
 
-    async def _run_non_streaming_with_thinking_retry(
+    async def _run_non_streaming_with_provider_retry(
         self,
         method: Callable[..., Any],
         messages: list[dict[str, Any]],
@@ -203,42 +248,42 @@ class RouterLLM(BaseLLM):
         output_config: dict[str, Any] | None,
         kwargs: dict[str, Any],
     ) -> str | dict[str, Any]:
-        try:
-            result = await method(
-                messages,
-                temperature=temperature,
-                max_tokens=max_tokens,
-                tools=tools,
-                tool_choice=tool_choice,
-                response_format=response_format,
-                thinking=thinking,
-                output_config=output_config,
-                **kwargs,
-            )
-            return cast(str | dict[str, Any], result)
-        except Exception as exc:  # noqa: BLE001 - inspect a provider compatibility error.
-            if not _should_retry_without_thinking(
-                exc, thinking=thinking, tool_choice=tool_choice
-            ):
-                raise
-            logger.info(
-                "selected model rejected thinking with tool_choice; retrying without thinking"
-            )
-            # Auto routing dispatches selected slugs through OpenRouterLLM
-            # (injected resolver or fallback), whose disabled-thinking hook emits
-            # the provider-specific reasoning payload.
-            result = await method(
-                messages,
-                temperature=temperature,
-                max_tokens=max_tokens,
-                tools=tools,
-                tool_choice=tool_choice,
-                response_format=response_format,
-                thinking=_DISABLE_DOWNSTREAM_THINKING,
-                output_config=output_config,
-                **kwargs,
-            )
-            return cast(str | dict[str, Any], result)
+        current_tool_choice = tool_choice
+        current_thinking = thinking
+        attempted_retry_actions: set[str] = set()
+
+        while True:
+            try:
+                result = await method(
+                    messages,
+                    temperature=temperature,
+                    max_tokens=max_tokens,
+                    tools=tools,
+                    tool_choice=current_tool_choice,
+                    response_format=response_format,
+                    thinking=current_thinking,
+                    output_config=output_config,
+                    **kwargs,
+                )
+                return cast(str | dict[str, Any], result)
+            except Exception as exc:  # noqa: BLE001 - inspect a provider compatibility error.
+                retry_state = _next_retry_state(
+                    exc,
+                    tools=tools,
+                    thinking=current_thinking,
+                    tool_choice=current_tool_choice,
+                )
+                if retry_state is None:
+                    raise
+
+                next_tool_choice, next_thinking, log_message, action_key = retry_state
+                if action_key in attempted_retry_actions:
+                    raise
+
+                attempted_retry_actions.add(action_key)
+                logger.info(log_message)
+                current_tool_choice = next_tool_choice
+                current_thinking = next_thinking
 
     async def chat(
         self,
@@ -253,7 +298,7 @@ class RouterLLM(BaseLLM):
         **kwargs: Any,
     ) -> str | dict[str, Any]:
         llm = await self._resolve(messages)
-        return await self._run_non_streaming_with_thinking_retry(
+        return await self._run_non_streaming_with_provider_retry(
             llm.chat,
             messages,
             temperature=temperature,
@@ -279,7 +324,7 @@ class RouterLLM(BaseLLM):
         **kwargs: Any,
     ) -> str | dict[str, Any]:
         llm = await self._resolve(messages)
-        return await self._run_non_streaming_with_thinking_retry(
+        return await self._run_non_streaming_with_provider_retry(
             llm.vision_chat,
             messages,
             temperature=temperature,
@@ -306,42 +351,47 @@ class RouterLLM(BaseLLM):
     ) -> AsyncIterator[StreamChunk]:
         llm = await self._resolve(messages)
         has_yielded = False
-        try:
-            async for chunk in llm.stream_chat(
-                messages,
-                temperature=temperature,
-                max_tokens=max_tokens,
-                tools=tools,
-                tool_choice=tool_choice,
-                response_format=response_format,
-                thinking=thinking,
-                output_config=output_config,
-                **kwargs,
-            ):
-                has_yielded = True
-                yield chunk
-        except Exception as exc:  # noqa: BLE001 - inspect a provider compatibility error.
-            if has_yielded or not _should_retry_without_thinking(
-                exc, thinking=thinking, tool_choice=tool_choice
-            ):
-                raise
-            logger.info(
-                "selected model rejected thinking with tool_choice; retrying stream without thinking"
-            )
-            # See _run_non_streaming_with_thinking_retry: OpenRouterLLM owns the
-            # provider-specific disabled-reasoning payload.
-            async for chunk in llm.stream_chat(
-                messages,
-                temperature=temperature,
-                max_tokens=max_tokens,
-                tools=tools,
-                tool_choice=tool_choice,
-                response_format=response_format,
-                thinking=_DISABLE_DOWNSTREAM_THINKING,
-                output_config=output_config,
-                **kwargs,
-            ):
-                yield chunk
+        current_tool_choice = tool_choice
+        current_thinking = thinking
+        attempted_retry_actions: set[str] = set()
+
+        while True:
+            try:
+                async for chunk in llm.stream_chat(
+                    messages,
+                    temperature=temperature,
+                    max_tokens=max_tokens,
+                    tools=tools,
+                    tool_choice=current_tool_choice,
+                    response_format=response_format,
+                    thinking=current_thinking,
+                    output_config=output_config,
+                    **kwargs,
+                ):
+                    has_yielded = True
+                    yield chunk
+                return
+            except Exception as exc:  # noqa: BLE001 - inspect a provider compatibility error.
+                if has_yielded:
+                    raise
+
+                retry_state = _next_retry_state(
+                    exc,
+                    tools=tools,
+                    thinking=current_thinking,
+                    tool_choice=current_tool_choice,
+                )
+                if retry_state is None:
+                    raise
+
+                next_tool_choice, next_thinking, log_message, action_key = retry_state
+                if action_key in attempted_retry_actions:
+                    raise
+
+                attempted_retry_actions.add(action_key)
+                logger.info(log_message)
+                current_tool_choice = next_tool_choice
+                current_thinking = next_thinking
 
     # ---- Routing ------------------------------------------------------------
     async def _resolve(self, messages: list[dict[str, Any]]) -> BaseLLM:

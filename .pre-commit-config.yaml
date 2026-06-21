@@ -31,7 +31,7 @@ repos:
           - langchain-openai
           - langchain-community
           - numexpr
-          - numpy
+          - numpy==1.26.4
           - html2text
           - rich
           - prompt_toolkit

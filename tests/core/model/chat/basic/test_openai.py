@@ -408,6 +408,39 @@ class TestOpenAILLM:
         }
 
     @pytest.mark.asyncio
+    async def test_stream_chat_can_omit_enable_thinking(
+        self, openai_llm_config, mocker
+    ):
+        async def empty_stream():
+            if False:
+                yield None
+
+        mock_client = mocker.AsyncMock()
+        mock_client.chat.completions.create.return_value = empty_stream()
+        mocker.patch(
+            "xagent.core.model.chat.basic.openai.AsyncOpenAI",
+            return_value=mock_client,
+        )
+
+        llm = OpenAILLM(
+            **openai_llm_config,
+            abilities=["chat", "tool_calling", "thinking_mode"],
+        )
+
+        _ = [
+            chunk
+            async for chunk in llm.stream_chat(
+                [{"role": "user", "content": "Hello"}],
+                tool_choice="required",
+                thinking={"type": "omit"},
+            )
+        ]
+
+        call_kwargs = mock_client.chat.completions.create.call_args.kwargs
+        assert "extra_body" not in call_kwargs
+        assert call_kwargs["tool_choice"] == "required"
+
+    @pytest.mark.asyncio
     async def test_stream_chat_marks_early_transport_disconnect_retryable(
         self, openai_llm_config, mocker
     ):

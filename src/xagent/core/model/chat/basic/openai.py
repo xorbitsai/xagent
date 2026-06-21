@@ -18,6 +18,7 @@ from .base import BaseLLM
 logger = logging.getLogger(__name__)
 
 OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
+_OMIT_ENABLE_THINKING_TYPE = "omit"
 
 _OPENROUTER_OFFICIAL_PROVIDERS_BY_AUTHOR: dict[str, tuple[str, ...]] = {
     "anthropic": ("anthropic",),
@@ -89,6 +90,10 @@ def _format_openai_error(prefix: str, error: BaseException) -> str:
     if details:
         formatted = f"{formatted} | " + " | ".join(details)
     return formatted
+
+
+def _should_omit_enable_thinking(thinking: Optional[Dict[str, Any]]) -> bool:
+    return thinking is not None and thinking.get("type") == _OMIT_ENABLE_THINKING_TYPE
 
 
 def _is_retryable_stream_transport_error(error: BaseException) -> bool:
@@ -318,6 +323,8 @@ class OpenAILLM(BaseLLM):
         elif is_thinking_only:
             # For thinking-only models, thinking mode is inherent - no extra_body needed
             # The model naturally thinks as part of its core functionality
+            pass
+        elif _should_omit_enable_thinking(thinking):
             pass
         elif thinking is not None:
             # User explicitly specified thinking mode for hybrid models
@@ -694,6 +701,8 @@ class OpenAILLM(BaseLLM):
             # For thinking-only models, thinking mode is inherent - no extra_body needed
             # The model naturally thinks as part of its core functionality
             pass
+        elif _should_omit_enable_thinking(thinking):
+            pass
         elif thinking is not None:
             # User explicitly specified thinking mode for hybrid models
             if thinking.get("type") == "enabled" or thinking.get("enable", False):
@@ -977,6 +986,8 @@ class OpenAILLM(BaseLLM):
         if not self.supports_enable_thinking_param:
             pass
         elif is_thinking_only:
+            pass
+        elif _should_omit_enable_thinking(thinking):
             pass
         elif thinking is not None:
             if thinking.get("type") == "enabled" or thinking.get("enable", False):

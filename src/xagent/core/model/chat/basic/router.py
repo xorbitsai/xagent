@@ -43,6 +43,7 @@ logger = logging.getLogger(__name__)
 _DEFAULT_ROUTER_ABILITIES = ["chat", "tool_calling"]
 _UNROUTED_ROUTER_ABILITIES = {"vision", "thinking_mode"}
 _THINKING_TOOL_CHOICE_ERROR = "Thinking mode does not support this tool_choice"
+_OMIT_DOWNSTREAM_THINKING = {"type": "omit"}
 
 
 def _should_retry_without_thinking(
@@ -223,7 +224,7 @@ class RouterLLM(BaseLLM):
                 tools=tools,
                 tool_choice=tool_choice,
                 response_format=response_format,
-                thinking=None,
+                thinking=_OMIT_DOWNSTREAM_THINKING,
                 output_config=output_config,
                 **kwargs,
             )
@@ -268,7 +269,7 @@ class RouterLLM(BaseLLM):
                 tools=tools,
                 tool_choice=tool_choice,
                 response_format=response_format,
-                thinking=None,
+                thinking=_OMIT_DOWNSTREAM_THINKING,
                 output_config=output_config,
                 **kwargs,
             )
@@ -316,7 +317,7 @@ class RouterLLM(BaseLLM):
                 tools=tools,
                 tool_choice=tool_choice,
                 response_format=response_format,
-                thinking=None,
+                thinking=_OMIT_DOWNSTREAM_THINKING,
                 output_config=output_config,
                 **kwargs,
             ):

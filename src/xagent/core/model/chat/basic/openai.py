@@ -16,6 +16,17 @@ from .base import BaseLLM
 
 logger = logging.getLogger(__name__)
 
+OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
+
+_OPENROUTER_OFFICIAL_PROVIDERS_BY_AUTHOR: dict[str, tuple[str, ...]] = {
+    "anthropic": ("anthropic",),
+    "deepseek": ("deepseek",),
+    "google": ("google-ai-studio", "google-vertex"),
+    "minimax": ("minimax",),
+    "openai": ("openai",),
+    "z-ai": ("z-ai",),
+}
+
 
 def _truncate_error_detail(value: Any, limit: int = 4000) -> str:
     text = (
@@ -109,6 +120,12 @@ def _is_retryable_stream_transport_error(error: BaseException) -> bool:
     return False
 
 
+def _openrouter_model_author(model_name: str) -> str:
+    model_slug = model_name.strip().split(":", 1)[0]
+    author, separator, _model = model_slug.partition("/")
+    return author.lower() if separator else ""
+
+
 class OpenAILLM(BaseLLM):
     """
     OpenAI LLM client using the official OpenAI SDK.
@@ -166,6 +183,30 @@ class OpenAILLM(BaseLLM):
                 timeout=self.timeout,
             )
 
+    def _is_openrouter_client(self) -> bool:
+        return self.base_url.rstrip("/") == OPENROUTER_BASE_URL
+
+    def _openrouter_official_provider_extra_body(
+        self, extra_body: Dict[str, Any]
+    ) -> Dict[str, Any]:
+        """Pin OpenRouter-hosted official models to their official provider."""
+        if not self._is_openrouter_client() or "provider" in extra_body:
+            return extra_body
+
+        author = _openrouter_model_author(self._model_name)
+        official_providers = _OPENROUTER_OFFICIAL_PROVIDERS_BY_AUTHOR.get(author)
+        if not official_providers:
+            return extra_body
+
+        return {
+            **extra_body,
+            "provider": {
+                "only": list(official_providers),
+                "allow_fallbacks": False,
+                "require_parameters": True,
+            },
+        }
+
     async def chat(
         self,
         messages: List[Dict[str, str]],
@@ -202,7 +243,9 @@ class OpenAILLM(BaseLLM):
         self._ensure_client()
         assert self._client is not None
 
-        extra_body = dict(kwargs.pop("extra_body", {}) or {})
+        extra_body = self._openrouter_official_provider_extra_body(
+            dict(kwargs.pop("extra_body", {}) or {})
+        )
 
         # Prepare the completion parameters
         completion_params = {
@@ -579,6 +622,10 @@ class OpenAILLM(BaseLLM):
         self._ensure_client()
         assert self._client is not None
 
+        extra_body = self._openrouter_official_provider_extra_body(
+            dict(kwargs.pop("extra_body", {}) or {})
+        )
+
         # Prepare the completion parameters
         completion_params = {
             "model": self._model_name,
@@ -626,10 +673,6 @@ class OpenAILLM(BaseLLM):
             else:
                 # Pass through other output_config formats
                 completion_params["output_config"] = output_config
-
-        # Handle thinking mode using extra_body as specified in the requirements
-        # Only add enable_thinking if the client supports this parameter (e.g., standard OpenAI)
-        extra_body = {}
 
         # Check if this is a thinking-only model (only supports thinking_mode, not chat)
         is_thinking_only = (
@@ -865,7 +908,9 @@ class OpenAILLM(BaseLLM):
         self._ensure_client()
         assert self._client is not None
 
-        extra_body = dict(kwargs.pop("extra_body", {}) or {})
+        extra_body = self._openrouter_official_provider_extra_body(
+            dict(kwargs.pop("extra_body", {}) or {})
+        )
 
         # Prepare completion parameters
         completion_params = {

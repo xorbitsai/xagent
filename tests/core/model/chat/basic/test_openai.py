@@ -258,6 +258,122 @@ class TestOpenAILLM:
         assert "WandB" in error_msg
 
     @pytest.mark.asyncio
+    async def test_openrouter_deepseek_uses_official_provider(
+        self, mock_chat_completion, mocker
+    ):
+        """OpenRouter DeepSeek slugs should avoid third-party host fallbacks."""
+
+        mock_client = mocker.AsyncMock()
+        mock_client.chat.completions.create.return_value = mock_chat_completion
+        mocker.patch(
+            "xagent.core.model.chat.basic.openai.AsyncOpenAI",
+            return_value=mock_client,
+        )
+
+        llm = OpenAILLM(
+            model_name="deepseek/deepseek-v4-flash",
+            base_url="https://openrouter.ai/api/v1",
+            api_key="test-key",
+        )
+
+        await llm.chat([{"role": "user", "content": "Hello"}])
+
+        call_kwargs = mock_client.chat.completions.create.call_args.kwargs
+        assert call_kwargs["extra_body"]["provider"] == {
+            "only": ["deepseek"],
+            "allow_fallbacks": False,
+            "require_parameters": True,
+        }
+
+    def test_openrouter_official_provider_mapping_covers_auto_router_authors(self):
+        """Auto-selected official slugs should pin to official OpenRouter providers."""
+
+        cases = {
+            "anthropic/claude-sonnet-4.6": ["anthropic"],
+            "deepseek/deepseek-v4-flash": ["deepseek"],
+            "google/gemini-3-flash-preview": ["google-ai-studio", "google-vertex"],
+            "minimax/minimax-m3": ["minimax"],
+            "openai/gpt-5.5": ["openai"],
+            "z-ai/glm-5.2": ["z-ai"],
+        }
+
+        for model_name, expected_providers in cases.items():
+            llm = OpenAILLM(
+                model_name=model_name,
+                base_url="https://openrouter.ai/api/v1",
+                api_key="test-key",
+            )
+
+            extra_body = llm._openrouter_official_provider_extra_body({})
+
+            assert extra_body["provider"]["only"] == expected_providers
+            assert extra_body["provider"]["allow_fallbacks"] is False
+            assert extra_body["provider"]["require_parameters"] is True
+
+    @pytest.mark.asyncio
+    async def test_openrouter_provider_override_is_preserved(
+        self, mock_chat_completion, mocker
+    ):
+        """Explicit provider routing should win over automatic official pinning."""
+
+        mock_client = mocker.AsyncMock()
+        mock_client.chat.completions.create.return_value = mock_chat_completion
+        mocker.patch(
+            "xagent.core.model.chat.basic.openai.AsyncOpenAI",
+            return_value=mock_client,
+        )
+
+        llm = OpenAILLM(
+            model_name="deepseek/deepseek-v4-flash",
+            base_url="https://openrouter.ai/api/v1",
+            api_key="test-key",
+        )
+
+        await llm.chat(
+            [{"role": "user", "content": "Hello"}],
+            extra_body={"provider": {"only": ["deepinfra"]}, "trace_id": "manual"},
+        )
+
+        call_kwargs = mock_client.chat.completions.create.call_args.kwargs
+        assert call_kwargs["extra_body"] == {
+            "provider": {"only": ["deepinfra"]},
+            "trace_id": "manual",
+        }
+
+    @pytest.mark.asyncio
+    async def test_openrouter_stream_deepseek_uses_official_provider(self, mocker):
+        """Streaming calls should carry the same OpenRouter provider routing."""
+
+        async def empty_stream():
+            if False:
+                yield None
+
+        mock_client = mocker.AsyncMock()
+        mock_client.chat.completions.create.return_value = empty_stream()
+        mocker.patch(
+            "xagent.core.model.chat.basic.openai.AsyncOpenAI",
+            return_value=mock_client,
+        )
+
+        llm = OpenAILLM(
+            model_name="deepseek/deepseek-v4-flash",
+            base_url="https://openrouter.ai/api/v1",
+            api_key="test-key",
+        )
+
+        _ = [
+            chunk
+            async for chunk in llm.stream_chat([{"role": "user", "content": "Hello"}])
+        ]
+
+        call_kwargs = mock_client.chat.completions.create.call_args.kwargs
+        assert call_kwargs["extra_body"]["provider"] == {
+            "only": ["deepseek"],
+            "allow_fallbacks": False,
+            "require_parameters": True,
+        }
+
+    @pytest.mark.asyncio
     async def test_stream_chat_marks_early_transport_disconnect_retryable(
         self, openai_llm_config, mocker
     ):

@@ -6182,6 +6182,26 @@ wheels = [
 ]
 
 [[package]]
+name = "sentence-transformers"
+version = "5.6.0"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "huggingface-hub" },
+    { name = "numpy" },
+    { name = "scikit-learn" },
+    { name = "scipy" },
+    { name = "torch", version = "2.12.0", source = { registry = "https://download.pytorch.org/whl/cpu" }, marker = "sys_platform == 'darwin'" },
+    { name = "torch", version = "2.12.0+cpu", source = { registry = "https://download.pytorch.org/whl/cpu" }, marker = "sys_platform != 'darwin'" },
+    { name = "tqdm" },
+    { name = "transformers" },
+    { name = "typing-extensions" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/f9/56/d2cb00765a6b15c994a7fccf20f9032f16e8193ca49147cb5155166ad744/sentence_transformers-5.6.0.tar.gz", hash = "sha256:0e7164d051e416c1853ade7c274ff52af3f9da0f4be7f0b83d734c27699e1057", size = 453194, upload-time = "2026-06-16T14:01:56.42Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/76/c1/dc1582b79e9a2eb0cddf9559cd9bcdff084f541d6fe881fdd9d98630dba7/sentence_transformers-5.6.0-py3-none-any.whl", hash = "sha256:d2075b5e687a1611005e20ab04a6846994d51adfcf39610aed066af3c0c0b81f", size = 596411, upload-time = "2026-06-16T14:01:55.103Z" },
+]
+
+[[package]]
 name = "setuptools"
 version = "75.9.1"
 source = { registry = "https://pypi.org/simple" }
@@ -7495,6 +7515,9 @@ postgresql = [
     { name = "psycopg2-binary" },
 ]
 router = [
+    { name = "sentence-transformers" },
+    { name = "torch", version = "2.12.0", source = { registry = "https://download.pytorch.org/whl/cpu" }, marker = "sys_platform == 'darwin'" },
+    { name = "torch", version = "2.12.0+cpu", source = { registry = "https://download.pytorch.org/whl/cpu" }, marker = "sys_platform != 'darwin'" },
     { name = "xrouter-llm" },
 ]
 waf-crawl = [
@@ -7648,8 +7671,10 @@ requires-dist = [
     { name = "requests", specifier = ">=2.32.0" },
     { name = "rich", specifier = ">=14.0.0" },
     { name = "s3fs", specifier = ">=2026.2.0" },
+    { name = "sentence-transformers", marker = "extra == 'router'", specifier = ">=3.0.0" },
     { name = "sqlalchemy", specifier = ">=2.0.0" },
     { name = "tiktoken", specifier = ">=0.8.0" },
+    { name = "torch", marker = "extra == 'router'", specifier = ">=2.0.0", index = "https://download.pytorch.org/whl/cpu" },
     { name = "tqdm", specifier = ">=4.66.0" },
     { name = "typer", marker = "extra == 'all'", specifier = ">=0.9.0" },
     { name = "typer", marker = "extra == 'document-processing'", specifier = ">=0.9.0" },
@@ -7658,7 +7683,7 @@ requires-dist = [
     { name = "uvicorn", specifier = ">=0.35.0" },
     { name = "websockets", specifier = ">=15.0.1" },
     { name = "xinference-client", specifier = ">=2.3.0" },
-    { name = "xrouter-llm", marker = "extra == 'router'", specifier = ">=0.1.0" },
+    { name = "xrouter-llm", marker = "extra == 'router'", specifier = ">=0.1.1" },
     { name = "zai-sdk", specifier = ">=0.0.3.2" },
 ]
 provides-extras = ["ai-document", "all", "browser", "chromadb", "document-processing", "duckdb", "milvus", "postgresql", "router", "waf-crawl"]

@@ -81,10 +81,13 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-# In-process LLM routing for the "auto" (router) provider. Heavy (pulls
-# torch + sentence-transformers via xrouter-llm), so kept optional.
+# In-process LLM routing for OpenRouter's "auto" model. xrouter-llm currently
+# does not declare its bundled predictor runtime deps, so keep them explicit
+# here until upstream does.
 router = [
-  "xrouter-llm>=0.1.0",
+  "xrouter-llm>=0.1.1",
+  "sentence-transformers>=3.0.0",
+  "torch>=2.0.0",
 ]
 # document processing libraries(Non-AI)
 document-processing = [

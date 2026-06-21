@@ -40,6 +40,9 @@ from .base import BaseLLM
 
 logger = logging.getLogger(__name__)
 
+_DEFAULT_ROUTER_ABILITIES = ["chat", "tool_calling"]
+_UNROUTED_ROUTER_ABILITIES = {"vision", "thinking_mode"}
+
 
 class _NullStore:
     """Duck-typed CallStore that drops the decision log (degradation fallback)."""
@@ -144,11 +147,12 @@ class RouterLLM(BaseLLM):
         self.default_temperature = default_temperature
         self.default_max_tokens = default_max_tokens
         self.timeout = timeout
-        self._abilities = abilities or [
-            "chat",
-            "tool_calling",
-            "vision",
-            "thinking_mode",
+        # xrouter-llm currently routes from text only and does not filter
+        # candidates by multimodal or reasoning support.
+        self._abilities = [
+            ability
+            for ability in (abilities or _DEFAULT_ROUTER_ABILITIES)
+            if ability not in _UNROUTED_ROUTER_ABILITIES
         ]
         self._fallback_model = os.getenv("XAGENT_ROUTER_FALLBACK_MODEL") or None
 
@@ -163,7 +167,7 @@ class RouterLLM(BaseLLM):
 
     @property
     def supports_thinking_mode(self) -> bool:
-        return True
+        return "thinking_mode" in self._abilities
 
     async def chat(
         self,

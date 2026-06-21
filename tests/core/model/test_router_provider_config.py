@@ -14,9 +14,8 @@ def test_openrouter_auto_returns_router_llm():
 
     llm = create_base_llm(config)
 
-    assert hasattr(llm, "_inner")
-    assert isinstance(llm._inner, RouterLLM)
-    assert llm._inner.model_name == "auto"
+    assert isinstance(llm, RouterLLM)
+    assert llm.model_name == "auto"
 
 
 def test_openrouter_non_auto_is_not_router_llm():
@@ -34,6 +33,16 @@ def test_auto_is_curated_under_openrouter():
     from xagent.core.model.providers import curated_models_for_provider
 
     assert "auto" in curated_models_for_provider("openrouter")
+
+
+def test_router_does_not_advertise_unrouted_capabilities():
+    llm = RouterLLM(
+        model_name="auto",
+        abilities=["chat", "tool_calling", "vision", "thinking_mode"],
+    )
+
+    assert llm.abilities == ["chat", "tool_calling"]
+    assert llm.supports_thinking_mode is False
 
 
 async def test_router_dispatches_chosen_slug_through_downstream_resolver():

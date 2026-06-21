@@ -42,7 +42,7 @@ def create_base_llm(
     if is_auto_router_model(provider, model.model_name):
         # OpenRouter model named "auto": pick a concrete model via xrouter-llm,
         # then dispatch it through this same OpenRouter config.
-        llm = RouterLLM(
+        return RouterLLM(
             model_name=AUTO_MODEL_NAME,
             api_key=model.api_key,
             base_url=model.base_url,

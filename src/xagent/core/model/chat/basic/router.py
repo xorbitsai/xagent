@@ -42,7 +42,6 @@ logger = logging.getLogger(__name__)
 
 _DEFAULT_ROUTER_ABILITIES = ["chat", "tool_calling"]
 _UNROUTED_ROUTER_ABILITIES = {"vision", "thinking_mode"}
-_THINKING_TOOL_CHOICE_ERROR = "Thinking mode does not support this tool_choice"
 _DISABLE_DOWNSTREAM_THINKING = {"type": "disabled", "enable": False}
 
 
@@ -52,10 +51,12 @@ def _should_retry_without_thinking(
     thinking: dict[str, Any] | None,
     tool_choice: str | dict[str, Any] | None,
 ) -> bool:
+    exc_msg = str(exc).lower()
     return (
-        thinking is not None
+        isinstance(thinking, dict)
         and tool_choice is not None
-        and _THINKING_TOOL_CHOICE_ERROR in str(exc)
+        and "thinking" in exc_msg
+        and "tool_choice" in exc_msg
     )
 
 

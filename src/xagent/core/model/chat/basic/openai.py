@@ -79,6 +79,36 @@ def _format_openai_error(prefix: str, error: BaseException) -> str:
     return formatted
 
 
+def _is_retryable_stream_transport_error(error: BaseException) -> bool:
+    retryable_messages = (
+        "peer closed connection",
+        "incomplete chunked read",
+        "remoteprotocolerror",
+        "server disconnected",
+        "connection reset",
+        "connection aborted",
+        "connection lost",
+    )
+    current: BaseException | None = error
+    seen: set[int] = set()
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        if isinstance(
+            current,
+            (
+                LLMRetryableError,
+                openai.APIConnectionError,
+                openai.APITimeoutError,
+            ),
+        ):
+            return True
+        detail = f"{type(current).__module__}.{type(current).__name__}: {current}"
+        if any(message in detail.lower() for message in retryable_messages):
+            return True
+        current = current.__cause__ or current.__context__
+    return False
+
+
 class OpenAILLM(BaseLLM):
     """
     OpenAI LLM client using the official OpenAI SDK.
@@ -1054,6 +1084,12 @@ class OpenAILLM(BaseLLM):
             )
             raise LLMRetryableError(f"OpenAI rate limit exceeded: {e.message}") from e
 
+        except openai.APIConnectionError as e:
+            logger.error(
+                "OpenAI stream connection failed: %s", redact_sensitive_text(str(e))
+            )
+            raise LLMRetryableError(f"OpenAI stream connection failed: {str(e)}") from e
+
         except openai.AuthenticationError as e:
             logger.error(
                 "OpenAI authentication failed: %s", redact_sensitive_text(str(e))
@@ -1073,6 +1109,10 @@ class OpenAILLM(BaseLLM):
 
         except Exception as e:
             logger.error("OpenAI stream chat failed: %s", redact_sensitive_text(str(e)))
+            if _is_retryable_stream_transport_error(e):
+                raise LLMRetryableError(
+                    f"OpenAI stream connection failed: {str(e)}"
+                ) from e
             raise RuntimeError(f"LLM stream chat failed: {str(e)}") from e
 
     def _parse_stream_chunk(

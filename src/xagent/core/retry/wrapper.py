@@ -131,6 +131,7 @@ def create_retry_wrapper(
                         last_exception: Optional[Exception] = None
 
                         for attempt in range(self._retry_wrapper.max_retries):
+                            yielded_item = False
                             try:
                                 # Get a new async generator for each attempt
                                 async_gen = getattr(self._inner, method_name)(
@@ -139,12 +140,16 @@ def create_retry_wrapper(
 
                                 # Yield items from the generator
                                 async for item in async_gen:
+                                    yielded_item = True
                                     yield item
 
                                 # If we get here, the generator completed successfully
                                 return
 
                             except Exception as e:
+                                if yielded_item:
+                                    raise
+
                                 if not self._retry_wrapper.retry_on(e):
                                     raise
 

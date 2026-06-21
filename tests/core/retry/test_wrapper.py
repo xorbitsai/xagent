@@ -1,4 +1,5 @@
 from abc import ABC, abstractmethod
+from collections.abc import AsyncIterator
 from typing import Protocol
 
 import pytest
@@ -10,6 +11,10 @@ from xagent.core.retry.wrapper import create_retry_wrapper
 class SimpleProtocol(Protocol):
     def process(self, value: str) -> str: ...
     async def aprocess(self, value: str) -> str: ...
+
+
+class StreamProtocol(Protocol):
+    def stream(self) -> AsyncIterator[str]: ...
 
 
 class ConcreteImpl:
@@ -211,6 +216,64 @@ def test_create_retry_wrapper_preserves_attributes():
     wrapper = create_retry_wrapper(impl, SimpleProtocol, retry_methods={"process"})
 
     assert wrapper.custom_attr == "custom_value"
+
+
+@pytest.mark.asyncio
+async def test_create_retry_wrapper_retries_async_generator_before_first_item():
+    class FlakyStreamImpl:
+        def __init__(self):
+            self.call_count = 0
+
+        async def stream(self) -> AsyncIterator[str]:
+            self.call_count += 1
+            if self.call_count == 1:
+                raise ValueError("stream failed before payload")
+            yield "ok"
+
+    impl = FlakyStreamImpl()
+    wrapper = create_retry_wrapper(
+        impl,
+        StreamProtocol,
+        retry_methods={"stream"},
+        strategy=FixedDelay(delay_ms=1),
+        max_retries=2,
+        retry_on=lambda e: isinstance(e, ValueError),
+    )
+
+    chunks = [chunk async for chunk in wrapper.stream()]
+
+    assert chunks == ["ok"]
+    assert impl.call_count == 2
+
+
+@pytest.mark.asyncio
+async def test_create_retry_wrapper_does_not_retry_async_generator_after_item():
+    class FailingAfterYieldStreamImpl:
+        def __init__(self):
+            self.call_count = 0
+
+        async def stream(self) -> AsyncIterator[str]:
+            self.call_count += 1
+            yield f"chunk-{self.call_count}"
+            raise ValueError("stream failed after payload")
+
+    impl = FailingAfterYieldStreamImpl()
+    wrapper = create_retry_wrapper(
+        impl,
+        StreamProtocol,
+        retry_methods={"stream"},
+        strategy=FixedDelay(delay_ms=1),
+        max_retries=2,
+        retry_on=lambda e: isinstance(e, ValueError),
+    )
+
+    chunks = []
+    with pytest.raises(ValueError, match="stream failed after payload"):
+        async for chunk in wrapper.stream():
+            chunks.append(chunk)
+
+    assert chunks == ["chunk-1"]
+    assert impl.call_count == 1
 
 
 def test_create_retry_wrapper_no_retry_methods():

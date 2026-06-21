@@ -7,6 +7,7 @@ from unittest.mock import MagicMock
 import pytest
 
 from xagent.core.model.chat.basic.openai import OpenAILLM, _format_openai_error
+from xagent.core.model.chat.exceptions import LLMRetryableError
 
 
 class TestOpenAILLM:
@@ -255,6 +256,36 @@ class TestOpenAILLM:
         assert "missing field `name`" in error_msg
         assert "previous_errors=" in error_msg
         assert "WandB" in error_msg
+
+    @pytest.mark.asyncio
+    async def test_stream_chat_marks_early_transport_disconnect_retryable(
+        self, openai_llm_config, mocker
+    ):
+        """Early stream transport disconnects should be retried by the wrapper."""
+
+        async def failing_stream():
+            raise RuntimeError(
+                "peer closed connection without sending complete message body "
+                "(incomplete chunked read)"
+            )
+            yield
+
+        mock_client = mocker.AsyncMock()
+        mock_client.chat.completions.create.return_value = failing_stream()
+        mocker.patch(
+            "xagent.core.model.chat.basic.openai.AsyncOpenAI",
+            return_value=mock_client,
+        )
+
+        llm = OpenAILLM(**openai_llm_config)
+
+        with pytest.raises(LLMRetryableError, match="stream connection failed"):
+            _ = [
+                chunk
+                async for chunk in llm.stream_chat(
+                    [{"role": "user", "content": "Hello"}]
+                )
+            ]
 
     @pytest.mark.asyncio
     async def test_custom_parameters(self, llm, mock_chat_completion, mocker):

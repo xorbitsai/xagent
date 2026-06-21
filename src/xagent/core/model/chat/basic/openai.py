@@ -7,6 +7,7 @@ from typing import Any, AsyncIterator, Dict, List, Optional, Union
 import openai
 from openai import AsyncOpenAI
 
+from .....config import get_openrouter_official_providers_only
 from ....utils.security import redact_sensitive_text
 from ..exceptions import LLMRetryableError, LLMTimeoutError
 from ..timeout_config import TimeoutConfig
@@ -190,7 +191,11 @@ class OpenAILLM(BaseLLM):
         self, extra_body: Dict[str, Any]
     ) -> Dict[str, Any]:
         """Pin OpenRouter-hosted official models to their official provider."""
-        if not self._is_openrouter_client() or "provider" in extra_body:
+        if (
+            not get_openrouter_official_providers_only()
+            or not self._is_openrouter_client()
+            or "provider" in extra_body
+        ):
             return extra_body
 
         author = _openrouter_model_author(self._model_name)

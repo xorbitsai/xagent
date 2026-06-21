@@ -93,6 +93,7 @@ FRONTEND_URL = "XAGENT_FRONTEND_URL"
 OIDC_LOGIN_TTL_SECONDS = "XAGENT_OIDC_LOGIN_TTL_SECONDS"
 OIDC_EXCHANGE_TTL_SECONDS = "XAGENT_OIDC_EXCHANGE_TTL_SECONDS"
 SESSION_SECRET = "XAGENT_SESSION_SECRET"
+OPENROUTER_OFFICIAL_PROVIDERS_ONLY = "XAGENT_OPENROUTER_OFFICIAL_PROVIDERS_ONLY"
 
 TOOL_MAX_OUTPUT_LENGTH = "XAGENT_TOOL_MAX_OUTPUT_LENGTH"
 TOOL_MAX_RECURSION_DEPTH = "XAGENT_TOOL_MAX_RECURSION_DEPTH"
@@ -291,6 +292,11 @@ def get_smtp_from_email() -> str:
 
 def get_smtp_from_name(default: str) -> str:
     return os.getenv(SMTP_FROM_NAME, default).strip() or default
+
+
+def get_openrouter_official_providers_only() -> bool:
+    """Return whether OpenRouter requests should pin official provider endpoints."""
+    return _get_bool_env(OPENROUTER_OFFICIAL_PROVIDERS_ONLY, False)
 
 
 def _redis_url_with_database(url: str, database: int) -> str:

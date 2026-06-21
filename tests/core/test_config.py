@@ -34,6 +34,7 @@ from xagent.config import (
     LANCEDB_PATH,
     MAX_TRACE_PAYLOAD_BYTES,
     MAX_UPLOAD_SIZE,
+    OPENROUTER_OFFICIAL_PROVIDERS_ONLY,
     PASSWORD_RESET_EXPIRE_MINUTES,
     PREVIEW_TMP_DIR,
     REDIS_URL,
@@ -91,6 +92,7 @@ from xagent.config import (
     get_lancedb_path,
     get_max_trace_payload_bytes,
     get_max_upload_size_bytes,
+    get_openrouter_official_providers_only,
     get_password_reset_expire_minutes,
     get_preview_tmp_dir,
     get_redis_url,
@@ -164,6 +166,12 @@ class TestEnvironmentVariableConstants:
 
     def test_web_crawl_tls_impersonate_constant(self):
         assert WEB_CRAWL_TLS_IMPERSONATE == "XAGENT_WEB_CRAWL_TLS_IMPERSONATE"
+
+    def test_openrouter_official_providers_only_constant(self):
+        assert (
+            OPENROUTER_OFFICIAL_PROVIDERS_ONLY
+            == "XAGENT_OPENROUTER_OFFICIAL_PROVIDERS_ONLY"
+        )
 
     def test_file_storage_uri_constant(self):
         assert FILE_STORAGE_URI == "XAGENT_FILE_STORAGE_URI"
@@ -306,6 +314,22 @@ class TestAuthEmailConfig:
 
         monkeypatch.setenv(SMTP_FROM_NAME, " Support Team ")
         assert get_smtp_from_name("Xagent") == "Support Team"
+
+
+class TestOpenRouterConfig:
+    def test_official_providers_only_defaults_false(self, monkeypatch):
+        monkeypatch.delenv(OPENROUTER_OFFICIAL_PROVIDERS_ONLY, raising=False)
+        assert get_openrouter_official_providers_only() is False
+
+    @pytest.mark.parametrize("value", ["true", "1", "yes", "on", " TRUE "])
+    def test_official_providers_only_true_values(self, monkeypatch, value):
+        monkeypatch.setenv(OPENROUTER_OFFICIAL_PROVIDERS_ONLY, value)
+        assert get_openrouter_official_providers_only() is True
+
+    @pytest.mark.parametrize("value", ["false", "0", "no", "off", "", "unknown"])
+    def test_official_providers_only_false_values(self, monkeypatch, value):
+        monkeypatch.setenv(OPENROUTER_OFFICIAL_PROVIDERS_ONLY, value)
+        assert get_openrouter_official_providers_only() is False
 
 
 class TestHotPathCacheConfig:

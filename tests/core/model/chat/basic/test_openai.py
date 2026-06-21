@@ -258,11 +258,37 @@ class TestOpenAILLM:
         assert "WandB" in error_msg
 
     @pytest.mark.asyncio
+    async def test_openrouter_official_provider_pinning_disabled_by_default(
+        self, mock_chat_completion, mocker, monkeypatch
+    ):
+        """OpenRouter provider pinning is opt-in to preserve fallback behavior."""
+
+        monkeypatch.delenv("XAGENT_OPENROUTER_OFFICIAL_PROVIDERS_ONLY", raising=False)
+        mock_client = mocker.AsyncMock()
+        mock_client.chat.completions.create.return_value = mock_chat_completion
+        mocker.patch(
+            "xagent.core.model.chat.basic.openai.AsyncOpenAI",
+            return_value=mock_client,
+        )
+
+        llm = OpenAILLM(
+            model_name="deepseek/deepseek-v4-flash",
+            base_url="https://openrouter.ai/api/v1",
+            api_key="test-key",
+        )
+
+        await llm.chat([{"role": "user", "content": "Hello"}])
+
+        call_kwargs = mock_client.chat.completions.create.call_args.kwargs
+        assert "extra_body" not in call_kwargs
+
+    @pytest.mark.asyncio
     async def test_openrouter_deepseek_uses_official_provider(
-        self, mock_chat_completion, mocker
+        self, mock_chat_completion, mocker, monkeypatch
     ):
         """OpenRouter DeepSeek slugs should avoid third-party host fallbacks."""
 
+        monkeypatch.setenv("XAGENT_OPENROUTER_OFFICIAL_PROVIDERS_ONLY", "true")
         mock_client = mocker.AsyncMock()
         mock_client.chat.completions.create.return_value = mock_chat_completion
         mocker.patch(
@@ -285,9 +311,12 @@ class TestOpenAILLM:
             "require_parameters": True,
         }
 
-    def test_openrouter_official_provider_mapping_covers_auto_router_authors(self):
+    def test_openrouter_official_provider_mapping_covers_auto_router_authors(
+        self, monkeypatch
+    ):
         """Auto-selected official slugs should pin to official OpenRouter providers."""
 
+        monkeypatch.setenv("XAGENT_OPENROUTER_OFFICIAL_PROVIDERS_ONLY", "true")
         cases = {
             "anthropic/claude-sonnet-4.6": ["anthropic"],
             "deepseek/deepseek-v4-flash": ["deepseek"],
@@ -312,10 +341,11 @@ class TestOpenAILLM:
 
     @pytest.mark.asyncio
     async def test_openrouter_provider_override_is_preserved(
-        self, mock_chat_completion, mocker
+        self, mock_chat_completion, mocker, monkeypatch
     ):
         """Explicit provider routing should win over automatic official pinning."""
 
+        monkeypatch.setenv("XAGENT_OPENROUTER_OFFICIAL_PROVIDERS_ONLY", "true")
         mock_client = mocker.AsyncMock()
         mock_client.chat.completions.create.return_value = mock_chat_completion
         mocker.patch(
@@ -341,8 +371,12 @@ class TestOpenAILLM:
         }
 
     @pytest.mark.asyncio
-    async def test_openrouter_stream_deepseek_uses_official_provider(self, mocker):
+    async def test_openrouter_stream_deepseek_uses_official_provider(
+        self, mocker, monkeypatch
+    ):
         """Streaming calls should carry the same OpenRouter provider routing."""
+
+        monkeypatch.setenv("XAGENT_OPENROUTER_OFFICIAL_PROVIDERS_ONLY", "true")
 
         async def empty_stream():
             if False:

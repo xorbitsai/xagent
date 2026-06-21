@@ -42,6 +42,20 @@ logger = logging.getLogger(__name__)
 
 _DEFAULT_ROUTER_ABILITIES = ["chat", "tool_calling"]
 _UNROUTED_ROUTER_ABILITIES = {"vision", "thinking_mode"}
+_THINKING_TOOL_CHOICE_ERROR = "Thinking mode does not support this tool_choice"
+
+
+def _should_retry_without_thinking(
+    exc: Exception,
+    *,
+    thinking: dict[str, Any] | None,
+    tool_choice: str | dict[str, Any] | None,
+) -> bool:
+    return (
+        thinking is not None
+        and tool_choice is not None
+        and _THINKING_TOOL_CHOICE_ERROR in str(exc)
+    )
 
 
 class _NullStore:
@@ -182,17 +196,37 @@ class RouterLLM(BaseLLM):
         **kwargs: Any,
     ) -> str | dict[str, Any]:
         llm = await self._resolve(messages)
-        return await llm.chat(
-            messages,
-            temperature=temperature,
-            max_tokens=max_tokens,
-            tools=tools,
-            tool_choice=tool_choice,
-            response_format=response_format,
-            thinking=thinking,
-            output_config=output_config,
-            **kwargs,
-        )
+        try:
+            return await llm.chat(
+                messages,
+                temperature=temperature,
+                max_tokens=max_tokens,
+                tools=tools,
+                tool_choice=tool_choice,
+                response_format=response_format,
+                thinking=thinking,
+                output_config=output_config,
+                **kwargs,
+            )
+        except Exception as exc:  # noqa: BLE001 - inspect a provider compatibility error.
+            if not _should_retry_without_thinking(
+                exc, thinking=thinking, tool_choice=tool_choice
+            ):
+                raise
+            logger.info(
+                "selected model rejected thinking with tool_choice; retrying without thinking"
+            )
+            return await llm.chat(
+                messages,
+                temperature=temperature,
+                max_tokens=max_tokens,
+                tools=tools,
+                tool_choice=tool_choice,
+                response_format=response_format,
+                thinking=None,
+                output_config=output_config,
+                **kwargs,
+            )
 
     async def vision_chat(
         self,
@@ -207,17 +241,37 @@ class RouterLLM(BaseLLM):
         **kwargs: Any,
     ) -> str | dict[str, Any]:
         llm = await self._resolve(messages)
-        return await llm.vision_chat(
-            messages,
-            temperature=temperature,
-            max_tokens=max_tokens,
-            tools=tools,
-            tool_choice=tool_choice,
-            response_format=response_format,
-            thinking=thinking,
-            output_config=output_config,
-            **kwargs,
-        )
+        try:
+            return await llm.vision_chat(
+                messages,
+                temperature=temperature,
+                max_tokens=max_tokens,
+                tools=tools,
+                tool_choice=tool_choice,
+                response_format=response_format,
+                thinking=thinking,
+                output_config=output_config,
+                **kwargs,
+            )
+        except Exception as exc:  # noqa: BLE001 - inspect a provider compatibility error.
+            if not _should_retry_without_thinking(
+                exc, thinking=thinking, tool_choice=tool_choice
+            ):
+                raise
+            logger.info(
+                "selected model rejected thinking with tool_choice; retrying without thinking"
+            )
+            return await llm.vision_chat(
+                messages,
+                temperature=temperature,
+                max_tokens=max_tokens,
+                tools=tools,
+                tool_choice=tool_choice,
+                response_format=response_format,
+                thinking=None,
+                output_config=output_config,
+                **kwargs,
+            )
 
     async def stream_chat(
         self,
@@ -232,18 +286,41 @@ class RouterLLM(BaseLLM):
         **kwargs: Any,
     ) -> AsyncIterator[StreamChunk]:
         llm = await self._resolve(messages)
-        async for chunk in llm.stream_chat(
-            messages,
-            temperature=temperature,
-            max_tokens=max_tokens,
-            tools=tools,
-            tool_choice=tool_choice,
-            response_format=response_format,
-            thinking=thinking,
-            output_config=output_config,
-            **kwargs,
-        ):
-            yield chunk
+        has_yielded = False
+        try:
+            async for chunk in llm.stream_chat(
+                messages,
+                temperature=temperature,
+                max_tokens=max_tokens,
+                tools=tools,
+                tool_choice=tool_choice,
+                response_format=response_format,
+                thinking=thinking,
+                output_config=output_config,
+                **kwargs,
+            ):
+                has_yielded = True
+                yield chunk
+        except Exception as exc:  # noqa: BLE001 - inspect a provider compatibility error.
+            if has_yielded or not _should_retry_without_thinking(
+                exc, thinking=thinking, tool_choice=tool_choice
+            ):
+                raise
+            logger.info(
+                "selected model rejected thinking with tool_choice; retrying stream without thinking"
+            )
+            async for chunk in llm.stream_chat(
+                messages,
+                temperature=temperature,
+                max_tokens=max_tokens,
+                tools=tools,
+                tool_choice=tool_choice,
+                response_format=response_format,
+                thinking=None,
+                output_config=output_config,
+                **kwargs,
+            ):
+                yield chunk
 
     # ---- Routing ------------------------------------------------------------
     async def _resolve(self, messages: list[dict[str, Any]]) -> BaseLLM:

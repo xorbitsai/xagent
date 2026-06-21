@@ -144,22 +144,29 @@ class PatternRuntime:
             tool_call_chunks: dict[int, dict[str, Any]] = {}
             usage_payload: dict[str, Any] = {}
             saw_payload_chunk = False
-            async for chunk in stream_chat(**kwargs):
-                await self._raise_if_interrupted("interrupted during LLM stream")
-                self._raise_for_stream_error(chunk)
-                text_delta = self._chunk_text_delta(chunk)
-                if text_delta:
-                    saw_payload_chunk = True
-                    content_parts.append(text_delta)
-                chunk_tool_calls = self._chunk_tool_calls(chunk)
-                if chunk_tool_calls:
-                    saw_payload_chunk = True
-                    self._merge_tool_call_chunks(tool_call_chunks, chunk_tool_calls)
-                chunk_usage = self._chunk_usage(chunk)
-                if chunk_usage:
-                    self._merge_usage(usage_payload, chunk_usage)
-                if on_chunk is not None:
-                    await self._maybe_await(on_chunk(chunk))
+            try:
+                async for chunk in stream_chat(**kwargs):
+                    await self._raise_if_interrupted("interrupted during LLM stream")
+                    self._raise_for_stream_error(chunk)
+                    text_delta = self._chunk_text_delta(chunk)
+                    if text_delta:
+                        saw_payload_chunk = True
+                        content_parts.append(text_delta)
+                    chunk_tool_calls = self._chunk_tool_calls(chunk)
+                    if chunk_tool_calls:
+                        saw_payload_chunk = True
+                        self._merge_tool_call_chunks(tool_call_chunks, chunk_tool_calls)
+                    chunk_usage = self._chunk_usage(chunk)
+                    if chunk_usage:
+                        self._merge_usage(usage_payload, chunk_usage)
+                    if on_chunk is not None:
+                        await self._maybe_await(on_chunk(chunk))
+            except LLMCallInterrupted:
+                raise
+            except Exception:
+                if not saw_payload_chunk:
+                    return await self.run_llm_call(llm, **kwargs)
+                raise
 
             content = "".join(content_parts)
             tool_calls = [

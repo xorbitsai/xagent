@@ -137,6 +137,21 @@ class ErrorAfterTokenLLM:
         raise RuntimeError("provider disconnected")
 
 
+class ErrorBeforePayloadLLM:
+    def __init__(self) -> None:
+        self.chat_kwargs: dict[str, Any] | None = None
+        self.stream_kwargs: dict[str, Any] | None = None
+
+    async def chat(self, **kwargs: Any) -> str:
+        self.chat_kwargs = kwargs
+        return "fallback answer"
+
+    async def stream_chat(self, **kwargs: Any) -> Any:
+        self.stream_kwargs = kwargs
+        raise RuntimeError("peer closed connection")
+        yield StreamChunk(type=ChunkType.END)
+
+
 class ChatOnlyLLM:
     async def chat(self, **_: Any) -> str:
         return "complete answer"
@@ -388,6 +403,31 @@ async def test_runtime_streaming_llm_call_falls_back_when_stream_has_only_usage(
     result = await runtime.run_streaming_llm_call(UsageOnlyStreamingLLM(), messages=[])
 
     assert result == "fallback answer"
+
+
+@pytest.mark.asyncio
+async def test_runtime_streaming_llm_call_falls_back_when_stream_fails_before_payload() -> (
+    None
+):
+    runtime = PatternRuntime()
+    llm = ErrorBeforePayloadLLM()
+
+    result = await runtime.run_streaming_llm_call(
+        llm,
+        messages=[{"role": "user", "content": "hi"}],
+        tools=[{"type": "function", "function": {"name": "noop"}}],
+    )
+
+    assert result == "fallback answer"
+    assert llm.stream_kwargs == llm.chat_kwargs
+
+
+@pytest.mark.asyncio
+async def test_runtime_streaming_llm_call_does_not_fallback_after_payload() -> None:
+    runtime = PatternRuntime()
+
+    with pytest.raises(RuntimeError, match="provider disconnected"):
+        await runtime.run_streaming_llm_call(ErrorAfterTokenLLM(), messages=[])
 
 
 @pytest.mark.asyncio

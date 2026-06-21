@@ -217,6 +217,13 @@ class OpenAILLM(BaseLLM):
             },
         }
 
+    def _uses_deepseek_thinking_payload(self) -> bool:
+        return (
+            not self.supports_enable_thinking_param
+            or self._is_openrouter_client()
+            and _openrouter_model_author(self._model_name) == "deepseek"
+        )
+
     async def chat(
         self,
         messages: List[Dict[str, str]],
@@ -325,7 +332,7 @@ class OpenAILLM(BaseLLM):
             # The model naturally thinks as part of its core functionality
             pass
         elif _should_omit_enable_thinking(thinking):
-            pass
+            extra_body = self._disable_thinking_extra_body(extra_body)
         elif thinking is not None:
             # User explicitly specified thinking mode for hybrid models
             if thinking.get("type") == "enabled" or thinking.get("enable", False):
@@ -334,12 +341,12 @@ class OpenAILLM(BaseLLM):
                     extra_body["enable_thinking"] = True
                 else:
                     # For non-streaming calls, enable_thinking must be false
-                    extra_body["enable_thinking"] = False
+                    extra_body = self._disable_thinking_extra_body(extra_body)
             elif thinking.get("type") == "disabled" or not thinking.get(
                 "enable", False
             ):
                 # For hybrid models, allow disabling thinking mode
-                extra_body["enable_thinking"] = False
+                extra_body = self._disable_thinking_extra_body(extra_body)
 
         # Helper function to process response
         async def _make_api_call() -> Any:
@@ -571,7 +578,10 @@ class OpenAILLM(BaseLLM):
     ) -> Dict[str, Any]:
         """Return provider-specific extra_body for disabling thinking."""
         updated_extra_body = dict(extra_body or {})
-        if self.supports_enable_thinking_param:
+        if self._uses_deepseek_thinking_payload():
+            updated_extra_body["thinking"] = {"type": "disabled"}
+            updated_extra_body.pop("enable_thinking", None)
+        elif self.supports_enable_thinking_param:
             updated_extra_body["enable_thinking"] = False
         return updated_extra_body
 
@@ -702,7 +712,7 @@ class OpenAILLM(BaseLLM):
             # The model naturally thinks as part of its core functionality
             pass
         elif _should_omit_enable_thinking(thinking):
-            pass
+            extra_body = self._disable_thinking_extra_body(extra_body)
         elif thinking is not None:
             # User explicitly specified thinking mode for hybrid models
             if thinking.get("type") == "enabled" or thinking.get("enable", False):
@@ -711,19 +721,19 @@ class OpenAILLM(BaseLLM):
                     extra_body["enable_thinking"] = True
                 else:
                     # For non-streaming calls, enable_thinking must be false
-                    extra_body["enable_thinking"] = False
+                    extra_body = self._disable_thinking_extra_body(extra_body)
             elif thinking.get("type") == "disabled" or not thinking.get(
                 "enable", False
             ):
                 # For hybrid models, allow disabling thinking mode
-                extra_body["enable_thinking"] = False
+                extra_body = self._disable_thinking_extra_body(extra_body)
         elif self.supports_thinking_mode and "thinking_mode" in self.abilities:
             # For hybrid models with thinking_mode ability, auto-enable thinking mode only for streaming
             if is_streaming:
                 extra_body["enable_thinking"] = True
             else:
                 # For non-streaming calls, enable_thinking must be false
-                extra_body["enable_thinking"] = False
+                extra_body = self._disable_thinking_extra_body(extra_body)
 
         try:
             # Make the API call with extra_body if needed
@@ -988,14 +998,14 @@ class OpenAILLM(BaseLLM):
         elif is_thinking_only:
             pass
         elif _should_omit_enable_thinking(thinking):
-            pass
+            extra_body = self._disable_thinking_extra_body(extra_body)
         elif thinking is not None:
             if thinking.get("type") == "enabled" or thinking.get("enable", False):
                 extra_body["enable_thinking"] = True
             elif thinking.get("type") == "disabled" or not thinking.get(
                 "enable", False
             ):
-                extra_body["enable_thinking"] = False
+                extra_body = self._disable_thinking_extra_body(extra_body)
         elif self.supports_thinking_mode and "thinking_mode" in self.abilities:
             # For hybrid models with thinking_mode ability
             # If response_format is requested, disable thinking to avoid JSON corruption
@@ -1003,7 +1013,7 @@ class OpenAILLM(BaseLLM):
                 logger.debug(
                     "Disabling thinking mode for response_format to ensure valid JSON output"
                 )
-                extra_body["enable_thinking"] = False
+                extra_body = self._disable_thinking_extra_body(extra_body)
             else:
                 extra_body["enable_thinking"] = True
 

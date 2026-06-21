@@ -408,9 +408,11 @@ class TestOpenAILLM:
         }
 
     @pytest.mark.asyncio
-    async def test_stream_chat_can_omit_enable_thinking(
-        self, openai_llm_config, mocker
+    async def test_openrouter_deepseek_stream_uses_disabled_thinking_payload(
+        self, mocker, monkeypatch
     ):
+        monkeypatch.setenv("XAGENT_OPENROUTER_OFFICIAL_PROVIDERS_ONLY", "false")
+
         async def empty_stream():
             if False:
                 yield None
@@ -423,7 +425,9 @@ class TestOpenAILLM:
         )
 
         llm = OpenAILLM(
-            **openai_llm_config,
+            model_name="deepseek/deepseek-v4-flash",
+            base_url="https://openrouter.ai/api/v1",
+            api_key="test-key",
             abilities=["chat", "tool_calling", "thinking_mode"],
         )
 
@@ -437,7 +441,8 @@ class TestOpenAILLM:
         ]
 
         call_kwargs = mock_client.chat.completions.create.call_args.kwargs
-        assert "extra_body" not in call_kwargs
+        assert call_kwargs["extra_body"] == {"thinking": {"type": "disabled"}}
+        assert "enable_thinking" not in call_kwargs["extra_body"]
         assert call_kwargs["tool_choice"] == "required"
 
     @pytest.mark.asyncio

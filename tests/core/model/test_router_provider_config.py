@@ -3,6 +3,7 @@ import pytest
 from xagent.core.model import ChatModelConfig
 from xagent.core.model.chat.basic import router as router_module
 from xagent.core.model.chat.basic.adapter import create_base_llm
+from xagent.core.model.chat.basic.openrouter import OpenRouterLLM
 from xagent.core.model.chat.basic.router import RouterLLM
 from xagent.core.model.chat.types import ChunkType, StreamChunk
 
@@ -59,6 +60,7 @@ def test_openrouter_non_auto_is_not_router_llm():
     )
     llm = create_base_llm(config)
     assert not isinstance(getattr(llm, "_inner", llm), RouterLLM)
+    assert isinstance(getattr(llm, "_inner", llm), OpenRouterLLM)
 
 
 def test_auto_is_curated_under_openrouter():

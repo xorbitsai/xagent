@@ -16,6 +16,7 @@ from .claude import ClaudeLLM
 from .deepseek import DeepSeekLLM
 from .gemini import GeminiLLM
 from .openai import OpenAILLM
+from .openrouter import OpenRouterLLM
 from .router import RouterLLM
 from .xinference import XinferenceLLM
 from .zhipu import ZhipuLLM
@@ -54,6 +55,16 @@ def create_base_llm(
         )
     elif provider == "deepseek":
         llm = DeepSeekLLM(
+            model_name=model.model_name,
+            api_key=model.api_key,
+            base_url=model.base_url,
+            default_temperature=model.default_temperature,
+            default_max_tokens=model.default_max_tokens,
+            timeout=model.timeout,
+            abilities=model.abilities,
+        )
+    elif provider == "openrouter":
+        llm = OpenRouterLLM(
             model_name=model.model_name,
             api_key=model.api_key,
             base_url=model.base_url,

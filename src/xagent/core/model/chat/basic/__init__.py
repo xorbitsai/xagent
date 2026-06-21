@@ -5,11 +5,13 @@ from .claude import ClaudeLLM
 from .deepseek import DeepSeekLLM
 from .gemini import GeminiLLM
 from .openai import OpenAILLM
+from .openrouter import OpenRouterLLM
 from .zhipu import ZhipuLLM
 
 __all__ = [
     "BaseLLM",
     "OpenAILLM",
+    "OpenRouterLLM",
     "AzureOpenAILLM",
     "DeepSeekLLM",
     "ZhipuLLM",

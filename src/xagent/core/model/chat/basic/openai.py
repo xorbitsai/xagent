@@ -18,8 +18,6 @@ from .base import BaseLLM
 logger = logging.getLogger(__name__)
 
 OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
-_OMIT_ENABLE_THINKING_TYPE = "omit"
-_THINKING_TOOL_CHOICE_ERROR = "Thinking mode does not support this tool_choice"
 
 _OPENROUTER_OFFICIAL_PROVIDERS_BY_AUTHOR: dict[str, tuple[str, ...]] = {
     "anthropic": ("anthropic",),
@@ -91,10 +89,6 @@ def _format_openai_error(prefix: str, error: BaseException) -> str:
     if details:
         formatted = f"{formatted} | " + " | ".join(details)
     return formatted
-
-
-def _should_omit_enable_thinking(thinking: Optional[Dict[str, Any]]) -> bool:
-    return thinking is not None and thinking.get("type") == _OMIT_ENABLE_THINKING_TYPE
 
 
 def _is_retryable_stream_transport_error(error: BaseException) -> bool:
@@ -222,22 +216,6 @@ class OpenAILLM(BaseLLM):
             },
         }
 
-    def _uses_deepseek_thinking_payload(self) -> bool:
-        return (
-            self._is_openrouter_client()
-            and _openrouter_model_author(self._model_name) == "deepseek"
-        )
-
-    def _should_retry_without_thinking_for_tool_choice(
-        self,
-        error_msg: str,
-        completion_params: Dict[str, Any],
-    ) -> bool:
-        return (
-            "tool_choice" in completion_params
-            and _THINKING_TOOL_CHOICE_ERROR.lower() in error_msg.lower()
-        )
-
     async def chat(
         self,
         messages: List[Dict[str, str]],
@@ -345,8 +323,6 @@ class OpenAILLM(BaseLLM):
             # For thinking-only models, thinking mode is inherent - no extra_body needed
             # The model naturally thinks as part of its core functionality
             pass
-        elif _should_omit_enable_thinking(thinking):
-            extra_body = self._disable_thinking_extra_body(extra_body)
         elif thinking is not None:
             # User explicitly specified thinking mode for hybrid models
             if thinking.get("type") == "enabled" or thinking.get("enable", False):
@@ -528,17 +504,6 @@ class OpenAILLM(BaseLLM):
             # Handle bad request errors
             error_msg = _format_openai_error("OpenAI bad request", e)
 
-            if self._should_retry_without_thinking_for_tool_choice(
-                error_msg, completion_params
-            ):
-                logger.warning(
-                    "API rejected thinking mode with tool_choice, retrying with thinking disabled. Error: %s",
-                    redact_sensitive_text(error_msg),
-                )
-                extra_body = self._disable_thinking_extra_body(extra_body)
-                response = await _make_api_call()
-                return _process_response(response)
-
             # Check if error is related to response_format
             if (
                 "response_format" in error_msg.lower()
@@ -603,7 +568,8 @@ class OpenAILLM(BaseLLM):
     ) -> Dict[str, Any]:
         """Return provider-specific extra_body for disabling thinking."""
         updated_extra_body = dict(extra_body or {})
-        if self._uses_deepseek_thinking_payload():
+        if self._is_openrouter_client():
+            updated_extra_body["reasoning"] = {"enabled": False}
             updated_extra_body["thinking"] = {"type": "disabled"}
             updated_extra_body.pop("enable_thinking", None)
         elif self.supports_enable_thinking_param:
@@ -736,8 +702,6 @@ class OpenAILLM(BaseLLM):
             # For thinking-only models, thinking mode is inherent - no extra_body needed
             # The model naturally thinks as part of its core functionality
             pass
-        elif _should_omit_enable_thinking(thinking):
-            extra_body = self._disable_thinking_extra_body(extra_body)
         elif thinking is not None:
             # User explicitly specified thinking mode for hybrid models
             if thinking.get("type") == "enabled" or thinking.get("enable", False):
@@ -1022,8 +986,6 @@ class OpenAILLM(BaseLLM):
             pass
         elif is_thinking_only:
             pass
-        elif _should_omit_enable_thinking(thinking):
-            extra_body = self._disable_thinking_extra_body(extra_body)
         elif thinking is not None:
             if thinking.get("type") == "enabled" or thinking.get("enable", False):
                 extra_body["enable_thinking"] = True
@@ -1056,23 +1018,7 @@ class OpenAILLM(BaseLLM):
             except openai.BadRequestError as e:
                 # Check if error is related to response_format
                 error_msg = _format_openai_error("OpenAI bad request", e)
-                if self._should_retry_without_thinking_for_tool_choice(
-                    error_msg, completion_params
-                ):
-                    logger.warning(
-                        "API rejected thinking mode with tool_choice, retrying stream with thinking disabled. Error: %s",
-                        redact_sensitive_text(error_msg),
-                    )
-                    extra_body = self._disable_thinking_extra_body(extra_body)
-                    if extra_body:
-                        stream = await self._client.chat.completions.create(
-                            extra_body=extra_body, **completion_params
-                        )
-                    else:
-                        stream = await self._client.chat.completions.create(
-                            **completion_params
-                        )
-                elif (
+                if (
                     "response_format" in error_msg.lower()
                     and "response_format" in completion_params
                 ):
@@ -1209,7 +1155,7 @@ class OpenAILLM(BaseLLM):
             raise RuntimeError(f"OpenAI authentication failed: {e.message}") from e
 
         except openai.BadRequestError as e:
-            logger.error("OpenAI bad request: %s", redact_sensitive_text(str(e)))
+            logger.debug("OpenAI bad request: %s", redact_sensitive_text(str(e)))
             raise RuntimeError(_format_openai_error("OpenAI bad request", e)) from e
 
         except openai.APIError as e:

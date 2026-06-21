@@ -4,8 +4,6 @@ import asyncio
 import json
 from unittest.mock import MagicMock
 
-import httpx
-import openai
 import pytest
 
 from xagent.core.model.chat.basic.openai import OpenAILLM, _format_openai_error
@@ -457,73 +455,12 @@ class TestOpenAILLM:
         ]
 
         call_kwargs = mock_client.chat.completions.create.call_args.kwargs
-        assert call_kwargs["extra_body"] == {"thinking": {"type": "disabled"}}
+        assert call_kwargs["extra_body"] == {
+            "reasoning": {"enabled": False},
+            "thinking": {"type": "disabled"},
+        }
         assert "enable_thinking" not in call_kwargs["extra_body"]
         assert call_kwargs["tool_choice"] == "required"
-
-    @pytest.mark.asyncio
-    async def test_openrouter_deepseek_stream_retries_tool_choice_thinking_error(
-        self, mocker, monkeypatch
-    ):
-        monkeypatch.setenv("XAGENT_OPENROUTER_OFFICIAL_PROVIDERS_ONLY", "false")
-
-        async def empty_stream():
-            if False:
-                yield None
-
-        error_body = {
-            "error": {
-                "message": "Provider returned error",
-                "code": 400,
-                "metadata": {
-                    "raw": (
-                        '{"error":{"message":"Thinking mode does not support '
-                        'this tool_choice","type":"invalid_request_error"}}'
-                    ),
-                    "provider_name": "DeepSeek",
-                },
-            }
-        }
-        request = httpx.Request("POST", "https://openrouter.ai/api/v1/chat/completions")
-        response = httpx.Response(400, request=request, json=error_body)
-
-        mock_client = mocker.AsyncMock()
-        mock_client.chat.completions.create.side_effect = [
-            openai.BadRequestError(
-                "Error code: 400 - Provider returned error",
-                response=response,
-                body=error_body,
-            ),
-            empty_stream(),
-        ]
-        mocker.patch(
-            "xagent.core.model.chat.basic.openai.AsyncOpenAI",
-            return_value=mock_client,
-        )
-
-        llm = OpenAILLM(
-            model_name="deepseek/deepseek-v4-flash",
-            base_url="https://openrouter.ai/api/v1",
-            api_key="test-key",
-            abilities=["chat", "tool_calling", "thinking_mode"],
-        )
-
-        chunks = [
-            chunk
-            async for chunk in llm.stream_chat(
-                [{"role": "user", "content": "Hello"}],
-                tool_choice="required",
-            )
-        ]
-
-        assert chunks == []
-        assert mock_client.chat.completions.create.call_count == 2
-        first_call = mock_client.chat.completions.create.call_args_list[0].kwargs
-        second_call = mock_client.chat.completions.create.call_args_list[1].kwargs
-        assert first_call["extra_body"] == {"enable_thinking": True}
-        assert second_call["extra_body"] == {"thinking": {"type": "disabled"}}
-        assert "enable_thinking" not in second_call["extra_body"]
-        assert second_call["tool_choice"] == "required"
 
     @pytest.mark.asyncio
     async def test_stream_chat_marks_early_transport_disconnect_retryable(

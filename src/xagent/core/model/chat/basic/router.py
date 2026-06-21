@@ -43,7 +43,7 @@ logger = logging.getLogger(__name__)
 _DEFAULT_ROUTER_ABILITIES = ["chat", "tool_calling"]
 _UNROUTED_ROUTER_ABILITIES = {"vision", "thinking_mode"}
 _THINKING_TOOL_CHOICE_ERROR = "Thinking mode does not support this tool_choice"
-_OMIT_DOWNSTREAM_THINKING = {"type": "omit"}
+_DISABLE_DOWNSTREAM_THINKING = {"type": "disabled", "enable": False}
 
 
 def _should_retry_without_thinking(
@@ -57,6 +57,20 @@ def _should_retry_without_thinking(
         and tool_choice is not None
         and _THINKING_TOOL_CHOICE_ERROR in str(exc)
     )
+
+
+def _with_reasoning_disabled(kwargs: dict[str, Any]) -> dict[str, Any]:
+    retry_kwargs = dict(kwargs)
+    extra_body = dict(retry_kwargs.pop("extra_body", {}) or {})
+    reasoning = dict(extra_body.get("reasoning") or {})
+    reasoning["enabled"] = False
+    extra_body["reasoning"] = reasoning
+    thinking = dict(extra_body.get("thinking") or {})
+    thinking["type"] = "disabled"
+    extra_body["thinking"] = thinking
+    extra_body.pop("enable_thinking", None)
+    retry_kwargs["extra_body"] = extra_body
+    return retry_kwargs
 
 
 class _NullStore:
@@ -217,6 +231,7 @@ class RouterLLM(BaseLLM):
             logger.info(
                 "selected model rejected thinking with tool_choice; retrying without thinking"
             )
+            retry_kwargs = _with_reasoning_disabled(kwargs)
             return await llm.chat(
                 messages,
                 temperature=temperature,
@@ -224,9 +239,9 @@ class RouterLLM(BaseLLM):
                 tools=tools,
                 tool_choice=tool_choice,
                 response_format=response_format,
-                thinking=_OMIT_DOWNSTREAM_THINKING,
+                thinking=_DISABLE_DOWNSTREAM_THINKING,
                 output_config=output_config,
-                **kwargs,
+                **retry_kwargs,
             )
 
     async def vision_chat(
@@ -262,6 +277,7 @@ class RouterLLM(BaseLLM):
             logger.info(
                 "selected model rejected thinking with tool_choice; retrying without thinking"
             )
+            retry_kwargs = _with_reasoning_disabled(kwargs)
             return await llm.vision_chat(
                 messages,
                 temperature=temperature,
@@ -269,9 +285,9 @@ class RouterLLM(BaseLLM):
                 tools=tools,
                 tool_choice=tool_choice,
                 response_format=response_format,
-                thinking=_OMIT_DOWNSTREAM_THINKING,
+                thinking=_DISABLE_DOWNSTREAM_THINKING,
                 output_config=output_config,
-                **kwargs,
+                **retry_kwargs,
             )
 
     async def stream_chat(
@@ -310,6 +326,7 @@ class RouterLLM(BaseLLM):
             logger.info(
                 "selected model rejected thinking with tool_choice; retrying stream without thinking"
             )
+            retry_kwargs = _with_reasoning_disabled(kwargs)
             async for chunk in llm.stream_chat(
                 messages,
                 temperature=temperature,
@@ -317,9 +334,9 @@ class RouterLLM(BaseLLM):
                 tools=tools,
                 tool_choice=tool_choice,
                 response_format=response_format,
-                thinking=_OMIT_DOWNSTREAM_THINKING,
+                thinking=_DISABLE_DOWNSTREAM_THINKING,
                 output_config=output_config,
-                **kwargs,
+                **retry_kwargs,
             ):
                 yield chunk
 

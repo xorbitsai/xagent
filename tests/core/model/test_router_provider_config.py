@@ -9,10 +9,6 @@ from xagent.core.model.chat.types import ChunkType, StreamChunk
 
 _THINKING_TOOL_CHOICE_ERROR = "Thinking mode does not support this tool_choice"
 _DISABLE_DOWNSTREAM_THINKING = {"type": "disabled", "enable": False}
-_DISABLE_REASONING_EXTRA_BODY = {
-    "reasoning": {"enabled": False},
-    "thinking": {"type": "disabled"},
-}
 
 
 class _RejectThinkingToolChoiceLLM:
@@ -128,7 +124,7 @@ async def test_router_retries_chat_without_thinking_for_tool_choice_error():
     }
     assert downstream.chat_calls[1]["tool_choice"] == "required"
     assert downstream.chat_calls[1]["thinking"] == _DISABLE_DOWNSTREAM_THINKING
-    assert downstream.chat_calls[1]["extra_body"] == _DISABLE_REASONING_EXTRA_BODY
+    assert "extra_body" not in downstream.chat_calls[1]
 
 
 async def test_router_retries_stream_without_thinking_for_tool_choice_error():
@@ -162,7 +158,7 @@ async def test_router_retries_stream_without_thinking_for_tool_choice_error():
     }
     assert downstream.stream_calls[1]["tool_choice"] == "required"
     assert downstream.stream_calls[1]["thinking"] == _DISABLE_DOWNSTREAM_THINKING
-    assert downstream.stream_calls[1]["extra_body"] == _DISABLE_REASONING_EXTRA_BODY
+    assert "extra_body" not in downstream.stream_calls[1]
 
 
 async def test_router_retries_stream_without_explicit_thinking_for_tool_choice_error():
@@ -189,7 +185,7 @@ async def test_router_retries_stream_without_explicit_thinking_for_tool_choice_e
     assert downstream.stream_calls[0]["thinking"] is None
     assert downstream.stream_calls[1]["tool_choice"] == "required"
     assert downstream.stream_calls[1]["thinking"] == _DISABLE_DOWNSTREAM_THINKING
-    assert downstream.stream_calls[1]["extra_body"] == _DISABLE_REASONING_EXTRA_BODY
+    assert "extra_body" not in downstream.stream_calls[1]
 
 
 async def test_router_does_not_retry_unrelated_errors():

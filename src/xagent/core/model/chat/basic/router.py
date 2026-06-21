@@ -31,7 +31,7 @@ import asyncio
 import logging
 import os
 import threading
-from typing import Any, AsyncIterator, Callable, List, Optional
+from typing import Any, AsyncIterator, Callable, List, Optional, cast
 
 from ....model import ChatModelConfig
 from ...providers import default_base_url_for_provider
@@ -51,6 +51,10 @@ def _should_retry_without_thinking(
     thinking: dict[str, Any] | None,
     tool_choice: str | dict[str, Any] | None,
 ) -> bool:
+    # Deliberate OpenRouter/DeepSeek compatibility bridge: the provider returns
+    # an OpenAI-compatible 400 without a typed error for this thinking/tool_choice
+    # conflict. Replace this with provider-owned typed exceptions once the
+    # follow-up tracking issue lands.
     exc_msg = str(exc).lower()
     return (
         (thinking is None or isinstance(thinking, dict))
@@ -58,20 +62,6 @@ def _should_retry_without_thinking(
         and "thinking" in exc_msg
         and "tool_choice" in exc_msg
     )
-
-
-def _with_reasoning_disabled(kwargs: dict[str, Any]) -> dict[str, Any]:
-    retry_kwargs = dict(kwargs)
-    extra_body = dict(retry_kwargs.pop("extra_body", {}) or {})
-    reasoning = dict(extra_body.get("reasoning") or {})
-    reasoning["enabled"] = False
-    extra_body["reasoning"] = reasoning
-    thinking = dict(extra_body.get("thinking") or {})
-    thinking["type"] = "disabled"
-    extra_body["thinking"] = thinking
-    extra_body.pop("enable_thinking", None)
-    retry_kwargs["extra_body"] = extra_body
-    return retry_kwargs
 
 
 class _NullStore:
@@ -199,6 +189,57 @@ class RouterLLM(BaseLLM):
     def supports_thinking_mode(self) -> bool:
         return "thinking_mode" in self._abilities
 
+    async def _run_non_streaming_with_thinking_retry(
+        self,
+        method: Callable[..., Any],
+        messages: list[dict[str, Any]],
+        *,
+        temperature: float | None,
+        max_tokens: int | None,
+        tools: list[dict[str, Any]] | None,
+        tool_choice: str | dict[str, Any] | None,
+        response_format: dict[str, Any] | None,
+        thinking: dict[str, Any] | None,
+        output_config: dict[str, Any] | None,
+        kwargs: dict[str, Any],
+    ) -> str | dict[str, Any]:
+        try:
+            result = await method(
+                messages,
+                temperature=temperature,
+                max_tokens=max_tokens,
+                tools=tools,
+                tool_choice=tool_choice,
+                response_format=response_format,
+                thinking=thinking,
+                output_config=output_config,
+                **kwargs,
+            )
+            return cast(str | dict[str, Any], result)
+        except Exception as exc:  # noqa: BLE001 - inspect a provider compatibility error.
+            if not _should_retry_without_thinking(
+                exc, thinking=thinking, tool_choice=tool_choice
+            ):
+                raise
+            logger.info(
+                "selected model rejected thinking with tool_choice; retrying without thinking"
+            )
+            # Auto routing dispatches selected slugs through OpenRouterLLM
+            # (injected resolver or fallback), whose disabled-thinking hook emits
+            # the provider-specific reasoning payload.
+            result = await method(
+                messages,
+                temperature=temperature,
+                max_tokens=max_tokens,
+                tools=tools,
+                tool_choice=tool_choice,
+                response_format=response_format,
+                thinking=_DISABLE_DOWNSTREAM_THINKING,
+                output_config=output_config,
+                **kwargs,
+            )
+            return cast(str | dict[str, Any], result)
+
     async def chat(
         self,
         messages: list[dict[str, str]],
@@ -212,38 +253,18 @@ class RouterLLM(BaseLLM):
         **kwargs: Any,
     ) -> str | dict[str, Any]:
         llm = await self._resolve(messages)
-        try:
-            return await llm.chat(
-                messages,
-                temperature=temperature,
-                max_tokens=max_tokens,
-                tools=tools,
-                tool_choice=tool_choice,
-                response_format=response_format,
-                thinking=thinking,
-                output_config=output_config,
-                **kwargs,
-            )
-        except Exception as exc:  # noqa: BLE001 - inspect a provider compatibility error.
-            if not _should_retry_without_thinking(
-                exc, thinking=thinking, tool_choice=tool_choice
-            ):
-                raise
-            logger.info(
-                "selected model rejected thinking with tool_choice; retrying without thinking"
-            )
-            retry_kwargs = _with_reasoning_disabled(kwargs)
-            return await llm.chat(
-                messages,
-                temperature=temperature,
-                max_tokens=max_tokens,
-                tools=tools,
-                tool_choice=tool_choice,
-                response_format=response_format,
-                thinking=_DISABLE_DOWNSTREAM_THINKING,
-                output_config=output_config,
-                **retry_kwargs,
-            )
+        return await self._run_non_streaming_with_thinking_retry(
+            llm.chat,
+            messages,
+            temperature=temperature,
+            max_tokens=max_tokens,
+            tools=tools,
+            tool_choice=tool_choice,
+            response_format=response_format,
+            thinking=thinking,
+            output_config=output_config,
+            kwargs=kwargs,
+        )
 
     async def vision_chat(
         self,
@@ -258,38 +279,18 @@ class RouterLLM(BaseLLM):
         **kwargs: Any,
     ) -> str | dict[str, Any]:
         llm = await self._resolve(messages)
-        try:
-            return await llm.vision_chat(
-                messages,
-                temperature=temperature,
-                max_tokens=max_tokens,
-                tools=tools,
-                tool_choice=tool_choice,
-                response_format=response_format,
-                thinking=thinking,
-                output_config=output_config,
-                **kwargs,
-            )
-        except Exception as exc:  # noqa: BLE001 - inspect a provider compatibility error.
-            if not _should_retry_without_thinking(
-                exc, thinking=thinking, tool_choice=tool_choice
-            ):
-                raise
-            logger.info(
-                "selected model rejected thinking with tool_choice; retrying without thinking"
-            )
-            retry_kwargs = _with_reasoning_disabled(kwargs)
-            return await llm.vision_chat(
-                messages,
-                temperature=temperature,
-                max_tokens=max_tokens,
-                tools=tools,
-                tool_choice=tool_choice,
-                response_format=response_format,
-                thinking=_DISABLE_DOWNSTREAM_THINKING,
-                output_config=output_config,
-                **retry_kwargs,
-            )
+        return await self._run_non_streaming_with_thinking_retry(
+            llm.vision_chat,
+            messages,
+            temperature=temperature,
+            max_tokens=max_tokens,
+            tools=tools,
+            tool_choice=tool_choice,
+            response_format=response_format,
+            thinking=thinking,
+            output_config=output_config,
+            kwargs=kwargs,
+        )
 
     async def stream_chat(
         self,
@@ -327,7 +328,8 @@ class RouterLLM(BaseLLM):
             logger.info(
                 "selected model rejected thinking with tool_choice; retrying stream without thinking"
             )
-            retry_kwargs = _with_reasoning_disabled(kwargs)
+            # See _run_non_streaming_with_thinking_retry: OpenRouterLLM owns the
+            # provider-specific disabled-reasoning payload.
             async for chunk in llm.stream_chat(
                 messages,
                 temperature=temperature,
@@ -337,7 +339,7 @@ class RouterLLM(BaseLLM):
                 response_format=response_format,
                 thinking=_DISABLE_DOWNSTREAM_THINKING,
                 output_config=output_config,
-                **retry_kwargs,
+                **kwargs,
             ):
                 yield chunk
 

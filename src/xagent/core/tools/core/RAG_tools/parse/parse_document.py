@@ -5,13 +5,11 @@ document parsing by calling the unified document parsing tool.
 """
 
 import asyncio
-import json
 import logging
 import os
 import time
 from typing import TYPE_CHECKING, Any, Dict, List, Optional
 
-import pandas as pd
 
 from ......core.tools.core.document_parser import (
     DocumentCapabilities,
@@ -35,6 +33,7 @@ from ..utils.hash_utils import compute_parse_hash, get_parse_params_whitelist
 
 if TYPE_CHECKING:
     from ..kb import KBLegacyStepCompatibilityFacade
+    from ..kb.collection_handle import LanceDBCollectionHandle
 
 logger = logging.getLogger(__name__)
 
@@ -75,6 +74,8 @@ def _parse_document_impl(
     user_id: Optional[int] = None,
     is_admin: bool = False,
     progress_callback: Optional[Any] = None,
+    *,
+    handle: "LanceDBCollectionHandle",
 ) -> Dict[str, Any]:
     """
     Parse a document using the specified method.
@@ -103,7 +104,9 @@ def _parse_document_impl(
         is_admin=is_admin,
     )
 
-    response = asyncio.run(_parse_document_internal(request, progress_callback))
+    response = asyncio.run(
+        _parse_document_internal(request, progress_callback, handle=handle)
+    )
 
     return response.model_dump()
 
@@ -111,6 +114,8 @@ def _parse_document_impl(
 async def _parse_document_internal(
     request: ParseDocumentRequest,
     progress_callback: Optional[Any] = None,
+    *,
+    handle: "LanceDBCollectionHandle",
 ) -> ParseDocumentResponse:
     """
     Internal document parsing logic.
@@ -154,9 +159,9 @@ async def _parse_document_internal(
     parse_hash = compute_parse_hash(str(parse_method), params)
     logger.info("Computed parse hash: %s", parse_hash)
 
-    if _parse_exists(collection, doc_id, parse_hash, user_id, is_admin):
-        existing_paragraphs = _get_existing_parse_content(
-            collection, doc_id, parse_hash, user_id, is_admin
+    if handle.parse_exists(doc_id, parse_hash, user_id=user_id, is_admin=is_admin):
+        existing_paragraphs = handle.read_parse_paragraphs(
+            doc_id, parse_hash, user_id=user_id, is_admin=is_admin
         )
         logger.info(
             "Parse record already exists for doc_id=%s, parse_hash=%s",
@@ -265,14 +270,13 @@ async def _parse_document_internal(
         logger.debug("[PARSE TIMING] Starting database write...")
 
     try:
-        written = _write_parse_to_db(
-            collection,
+        written = handle.write_parse(
             doc_id,
             parse_hash,
             str(parse_method),
             params,
             enriched_paragraphs,
-            user_id,
+            user_id=user_id,
         )
     except Exception as e:
         raise DatabaseOperationError(f"Database write failed: {e}") from e
@@ -441,192 +445,3 @@ def _validate_parse_params(parse_method: ParseMethod, params: Dict[str, Any]) ->
         if isinstance(e, DocumentValidationError):
             raise
         raise ConfigurationError(f"Parameter validation failed: {e}") from e
-
-
-def _parse_exists(
-    collection: str,
-    doc_id: str,
-    parse_hash: str,
-    user_id: Optional[int] = None,
-    is_admin: bool = False,
-) -> bool:
-    """Check if parse record already exists using abstraction layer.
-
-    Args:
-        collection: Collection name
-        doc_id: Document ID
-        parse_hash: Parse hash to check
-        user_id: Optional user ID for filtering (for multi-tenancy)
-        is_admin: Whether user has admin privileges
-
-    Returns:
-        True if parse record exists and is accessible to the user
-    """
-    try:
-        vector_store = get_vector_index_store()
-        query_filters = {
-            "collection": collection,
-            "doc_id": doc_id,
-            "parse_hash": parse_hash,
-        }
-        return bool(
-            vector_store.count_rows_or_zero(
-                "parses", filters=query_filters, user_id=user_id, is_admin=is_admin
-            )
-            > 0
-        )
-    except Exception as e:
-        raise DatabaseOperationError(f"Database query failed: {e}") from e
-
-
-def _get_existing_parse_content(
-    collection: str,
-    doc_id: str,
-    parse_hash: str,
-    user_id: Optional[int] = None,
-    is_admin: bool = False,
-) -> List[ParsedParagraph]:
-    """Get existing parse content from database using abstraction layer.
-
-    Args:
-        collection: Collection name
-        doc_id: Document ID
-        parse_hash: Parse hash to retrieve
-        user_id: Optional user ID for filtering (for multi-tenancy)
-        is_admin: Whether user has admin privileges
-
-    Returns:
-        List of parsed paragraphs if found and accessible, empty list otherwise
-    """
-    try:
-        vector_store = get_vector_index_store()
-        query_filters = {
-            "collection": collection,
-            "doc_id": doc_id,
-            "parse_hash": parse_hash,
-        }
-
-        if (
-            vector_store.count_rows_or_zero(
-                "parses", filters=query_filters, user_id=user_id, is_admin=is_admin
-            )
-            == 0
-        ):
-            return []
-
-        # Use iter_batches to load the parse content
-        for batch in vector_store.iter_batches(
-            table_name="parses",
-            filters=query_filters,
-            user_id=user_id,
-            is_admin=is_admin,
-        ):
-            batch_df = batch.to_pandas()
-            for _, row in batch_df.iterrows():
-                record = row.to_dict()
-                parsed_content = record.get("parsed_content")
-                if not parsed_content:
-                    continue
-
-                data = json.loads(parsed_content)
-                paragraphs = []
-                for item in data:
-                    paragraphs.append(
-                        ParsedParagraph(
-                            text=item.get("text", ""),
-                            metadata=item.get("metadata", {}),
-                        )
-                    )
-                return paragraphs
-
-        return []
-
-    except Exception as e:
-        logger.error("Failed to read parse content: %s", e)
-        raise DatabaseOperationError(f"Failed reading parse content: {e}") from e
-
-
-def _write_parse_to_db(
-    collection: str,
-    doc_id: str,
-    parse_hash: str,
-    parse_method: str,
-    params: Dict[str, Any],
-    paragraphs: List[ParsedParagraph],
-    user_id: Optional[int] = None,
-) -> bool:
-    """Write parse record to database using abstraction layer."""
-    enable_timing = os.environ.get("PARSE_DETAILED_TIMING", "0").lower() in (
-        "1",
-        "true",
-        "yes",
-    )
-
-    try:
-        vector_store = get_vector_index_store()
-
-        if enable_timing:
-            serialize_start = time.perf_counter()
-            logger.debug(
-                "[PARSE TIMING]    - Starting serialization of paragraphs (%s items)...",
-                len(paragraphs),
-            )
-
-        paragraphs_data = [para.model_dump() for para in paragraphs]
-
-        if enable_timing:
-            serialize_end = time.perf_counter()
-            serialize_time = serialize_end - serialize_start
-            logger.debug(
-                "[PARSE TIMING]    - Serialization completed: %.3f seconds",
-                serialize_time,
-            )
-            json_start = time.perf_counter()
-            logger.debug("[PARSE TIMING]    - Starting JSON serialization...")
-
-        parsed_content = json.dumps(paragraphs_data, ensure_ascii=False)
-
-        if enable_timing:
-            json_end = time.perf_counter()
-            json_time = json_end - json_start
-            json_size_mb = len(parsed_content.encode("utf-8")) / (1024 * 1024)
-            logger.debug(
-                "[PARSE TIMING]    - JSON serialization completed: %.3f seconds (size: %.2f MB)",
-                json_time,
-                json_size_mb,
-            )
-            db_op_start = time.perf_counter()
-            logger.debug(
-                "[PARSE TIMING]    - Starting database operation (upsert_parses)..."
-            )
-
-        parse_record = {
-            "collection": collection,
-            "doc_id": doc_id,
-            "parse_hash": parse_hash,
-            "parser": f"local:{parse_method}@v1.0.0",
-            "created_at": pd.Timestamp.now(tz="UTC"),
-            "params_json": json.dumps(params, ensure_ascii=False),
-            "parsed_content": parsed_content,
-            "user_id": user_id,  # Add user_id for multi-tenancy
-        }
-
-        # Use abstraction layer for upsert
-        vector_store.upsert_parses([parse_record])
-
-        if enable_timing:
-            db_op_end = time.perf_counter()
-            db_op_time = db_op_end - db_op_start
-            logger.debug(
-                "[PARSE TIMING]    - Database operation completed: %.3f seconds",
-                db_op_time,
-            )
-
-        logger.info(
-            "Parse record written to database: doc_id=%s, parse_hash=%s",
-            doc_id,
-            parse_hash,
-        )
-        return True
-    except Exception as e:
-        raise DatabaseOperationError(f"Database write failed: {e}") from e

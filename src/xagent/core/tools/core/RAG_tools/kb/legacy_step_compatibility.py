@@ -22,6 +22,7 @@ from ..core.schemas import (
     RegisterDocumentRequest,
     SparseSearchResponse,
 )
+from .models import KBAccessMode, KBContextRequest
 from .operation_compatibility import (
     KBOperation,
     KBOperationCompatibilityFacade,
@@ -31,6 +32,7 @@ from .operation_compatibility import (
 )
 
 if TYPE_CHECKING:
+    from .collection_handle import LanceDBCollectionHandle
     from .coordinator import KBCoordinator
     from .storage_shim import KBStorageShimCompatibilityFacade
 
@@ -164,6 +166,25 @@ class KBLegacyStepCompatibilityFacade:
         with bind_storage_shim_for_current_context(storage_shim):
             yield
 
+    def _open_collection_handle(
+        self, collection: str, *, user_id: Optional[int], is_admin: bool
+    ) -> "LanceDBCollectionHandle":
+        """Open the collection handle that owns parse/chunk storage (#509).
+
+        Routed through the active coordinator so an injected shim keeps
+        parse/chunk storage bound to that shim (preserves the facade's
+        injection boundary).
+        """
+        return self._active_coordinator().open_collection_sync(
+            KBContextRequest(
+                collection=collection,
+                user_id=user_id,
+                is_admin=is_admin,
+                access_mode=KBAccessMode.WRITE,
+                hide_missing=True,
+            )
+        )
+
     def register_document(
         self,
         collection: str,
@@ -252,6 +273,9 @@ class KBLegacyStepCompatibilityFacade:
             operation_type="legacy_parse_document", collection=collection
         ) as (operation, owns_operation):
             with self._storage_context():
+                handle = self._open_collection_handle(
+                    collection, user_id=user_id, is_admin=is_admin
+                )
                 result = _parse_document_impl(
                     collection=collection,
                     doc_id=doc_id,
@@ -260,6 +284,7 @@ class KBLegacyStepCompatibilityFacade:
                     user_id=user_id,
                     is_admin=is_admin,
                     progress_callback=progress_callback,
+                    handle=handle,
                 )
             self._record_parse_side_effect(
                 operation, collection=collection, doc_id=doc_id, result=result
@@ -293,6 +318,9 @@ class KBLegacyStepCompatibilityFacade:
             operation_type="legacy_chunk_document", collection=collection
         ) as (operation, owns_operation):
             with self._storage_context():
+                handle = self._open_collection_handle(
+                    collection, user_id=user_id, is_admin=is_admin
+                )
                 result = _chunk_document_impl(
                     collection=collection,
                     doc_id=doc_id,
@@ -310,6 +338,7 @@ class KBLegacyStepCompatibilityFacade:
                     image_context_size=image_context_size,
                     user_id=user_id,
                     is_admin=is_admin,
+                    handle=handle,
                     **kwargs,
                 )
             self._record_chunk_side_effect(
@@ -338,6 +367,11 @@ class KBLegacyStepCompatibilityFacade:
             operation_type="legacy_chunk_recursive", collection=collection
         ) as (operation, owns_operation):
             with self._storage_context():
+                handle = self._open_collection_handle(
+                    collection,
+                    user_id=kwargs.get("user_id"),
+                    is_admin=bool(kwargs.get("is_admin", False)),
+                )
                 result = _chunk_recursive_impl(
                     collection=collection,
                     doc_id=doc_id,
@@ -345,6 +379,7 @@ class KBLegacyStepCompatibilityFacade:
                     chunk_size=chunk_size,
                     chunk_overlap=chunk_overlap,
                     separators=separators,
+                    handle=handle,
                     **kwargs,
                 )
             self._record_chunk_side_effect(
@@ -374,6 +409,11 @@ class KBLegacyStepCompatibilityFacade:
             operation_type="legacy_chunk_markdown", collection=collection
         ) as (operation, owns_operation):
             with self._storage_context():
+                handle = self._open_collection_handle(
+                    collection,
+                    user_id=kwargs.get("user_id"),
+                    is_admin=bool(kwargs.get("is_admin", False)),
+                )
                 result = _chunk_markdown_impl(
                     collection=collection,
                     doc_id=doc_id,
@@ -382,6 +422,7 @@ class KBLegacyStepCompatibilityFacade:
                     chunk_overlap=chunk_overlap,
                     headers_to_split_on=headers_to_split_on,
                     separators=separators,
+                    handle=handle,
                     **kwargs,
                 )
             self._record_chunk_side_effect(
@@ -409,12 +450,18 @@ class KBLegacyStepCompatibilityFacade:
             operation_type="legacy_chunk_fixed_size", collection=collection
         ) as (operation, owns_operation):
             with self._storage_context():
+                handle = self._open_collection_handle(
+                    collection,
+                    user_id=kwargs.get("user_id"),
+                    is_admin=bool(kwargs.get("is_admin", False)),
+                )
                 result = _chunk_fixed_size_impl(
                     collection=collection,
                     doc_id=doc_id,
                     parse_hash=parse_hash,
                     chunk_size=chunk_size,
                     chunk_overlap=chunk_overlap,
+                    handle=handle,
                     **kwargs,
                 )
             self._record_chunk_side_effect(

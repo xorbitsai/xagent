@@ -4,7 +4,6 @@ This module provides the main chunk_document function that orchestrates
 document chunking using various chunking strategies.
 """
 
-import json
 import logging
 import uuid
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
@@ -22,9 +21,7 @@ from ..core.exceptions import (
     DocumentValidationError,
 )
 from ..core.schemas import ChunkStrategy
-from ..storage.factory import get_vector_index_store
 from ..utils.hash_utils import compute_chunk_hash
-from ..utils.metadata_utils import deserialize_metadata, serialize_metadata
 from .chunk_strategies import (
     _create_chunk_record,
     apply_fixed_size_strategy,
@@ -35,6 +32,7 @@ from .chunk_strategies import (
 
 if TYPE_CHECKING:
     from ..kb import KBLegacyStepCompatibilityFacade
+    from ..kb.collection_handle import LanceDBCollectionHandle
 
 logger = logging.getLogger(__name__)
 
@@ -133,6 +131,8 @@ def _chunk_document_impl(
     image_context_size: int = DEFAULT_IMAGE_CONTEXT_SIZE,
     user_id: Optional[int] = None,
     is_admin: bool = False,
+    *,
+    handle: "LanceDBCollectionHandle",
     **kwargs: Any,
 ) -> Dict[str, Any]:
     """
@@ -204,11 +204,10 @@ def _chunk_document_impl(
 
     logger.info("Computed chunk config hash: %s", config_hash)
 
-    # OPTIMIZATION: Check and get existing chunks in a single query
-    # Instead of calling _chunks_exist() then _get_existing_chunks() (2 queries),
-    # directly call _get_existing_chunks() and check if result is empty (1 query)
-    existing_chunks = _get_existing_chunks(
-        collection, doc_id, parse_hash, config_hash, user_id, is_admin
+    # Combined existence + read in a single query: an empty result means no
+    # reusable chunks exist for this (parse_hash, config_hash).
+    existing_chunks = handle.read_existing_chunks(
+        doc_id, parse_hash, config_hash, user_id=user_id, is_admin=is_admin
     )
 
     if existing_chunks:
@@ -227,7 +226,9 @@ def _chunk_document_impl(
         }
 
     # Load parsed content from database
-    paragraphs = _load_paragraphs(collection, doc_id, parse_hash, user_id, is_admin)
+    paragraphs = handle.read_parse_paragraph_dicts(
+        doc_id, parse_hash, user_id=user_id, is_admin=is_admin
+    )
     if not paragraphs:
         raise DocumentNotFoundError(
             f"No parsed content found for doc_id={doc_id}, parse_hash={parse_hash}"
@@ -284,15 +285,13 @@ def _chunk_document_impl(
 
     # Write to database
     try:
-        written = _write_chunks_to_db(
-            collection,
+        written = handle.write_chunks(
             doc_id,
             parse_hash,
             config_hash,
             params,
             indexed_chunks,
-            user_id,
-            is_admin,
+            user_id=user_id,
         )
     except Exception as e:
         logger.error("Failed to write chunks to database: %s", e)
@@ -356,181 +355,6 @@ def _validate_chunk_params(
         raise DocumentValidationError("chunk_overlap must be less than chunk_size")
 
 
-def _chunks_exist(
-    collection: str, doc_id: str, parse_hash: str, config_hash: str
-) -> bool:
-    """Check if chunk records already exist."""
-    try:
-        vector_store = get_vector_index_store()
-
-        # Build safe filter expression using utility function
-        query_filters = {
-            "collection": collection,
-            "doc_id": doc_id,
-            "parse_hash": parse_hash,
-            "config_hash": config_hash,
-        }
-        return vector_store.count_rows_or_zero("chunks", filters=query_filters) > 0
-    except Exception as e:
-        logger.error("Failed to check chunk existence: %s", e)
-        raise DatabaseOperationError(f"Database query failed: {e}") from e
-
-
-def _get_existing_chunks(
-    collection: str,
-    doc_id: str,
-    parse_hash: str,
-    config_hash: str,
-    user_id: Optional[int] = None,
-    is_admin: bool = False,
-) -> List[Dict[str, Any]]:
-    """Get existing chunks from database.
-
-    OPTIMIZATION: Uses count_rows() for memory-efficient existence check,
-    then to_list() to avoid pandas overhead when loading data.
-
-    Args:
-        collection: Collection name
-        doc_id: Document ID
-        parse_hash: Parse hash
-        config_hash: Configuration hash
-        user_id: Optional user ID for multi-tenancy filtering
-        is_admin: Whether user has admin privileges
-
-    Returns:
-        List of existing chunks accessible to the user
-    """
-    try:
-        vector_store = get_vector_index_store()
-
-        # Build safe filter expression using utility function
-        query_filters = {
-            "collection": collection,
-            "doc_id": doc_id,
-            "parse_hash": parse_hash,
-            "config_hash": config_hash,
-        }
-
-        # OPTIMIZATION: Use count_rows_or_zero() for memory-efficient existence check
-        if (
-            vector_store.count_rows_or_zero(
-                "chunks", filters=query_filters, user_id=user_id, is_admin=is_admin
-            )
-            == 0
-        ):
-            return []
-
-        # Use iter_batches to load chunks
-        chunks_data = []
-        for batch in vector_store.iter_batches(
-            table_name="chunks",
-            filters=query_filters,
-            user_id=user_id,
-            is_admin=is_admin,
-        ):
-            # Convert batch to pandas for easier row-by-row processing
-            batch_df = batch.to_pandas()
-            for _, row in batch_df.iterrows():
-                chunks_data.append(row.to_dict())
-
-        # Convert to expected format with metadata deserialization
-        # Arrow/to_list() returns None instead of NaN, so direct None check is sufficient
-        chunks = []
-        for row in chunks_data:
-            # Deserialize metadata from JSON string to dictionary
-            metadata = deserialize_metadata(row.get("metadata"))
-
-            # Handle index with None check (NaN already normalized to None in pandas fallback)
-            index_value = row.get("index")
-            index = int(index_value) if index_value is not None else 0
-
-            # Normalize optional fields: None check is sufficient
-            page_number = (
-                row.get("page_number") if row.get("page_number") is not None else None
-            )
-            section = row.get("section") if row.get("section") is not None else None
-            anchor = row.get("anchor") if row.get("anchor") is not None else None
-            json_path = (
-                row.get("json_path") if row.get("json_path") is not None else None
-            )
-
-            chunks.append(
-                {
-                    "chunk_id": row["chunk_id"],
-                    "index": index,
-                    "text": row["text"],
-                    "page_number": page_number,
-                    "section": section,
-                    "anchor": anchor,
-                    "json_path": json_path,
-                    "created_at": row["created_at"],
-                    "metadata": metadata,
-                }
-            )
-        return chunks
-    except Exception as e:
-        logger.error("Failed to get existing chunks: %s", e)
-        raise DatabaseOperationError(f"Database query failed: {e}") from e
-
-
-def _load_paragraphs(
-    collection: str,
-    doc_id: str,
-    parse_hash: str,
-    user_id: Optional[int] = None,
-    is_admin: bool = False,
-) -> List[Dict[str, Any]]:
-    """Load parsed content from parses table."""
-    try:
-        vector_store = get_vector_index_store()
-
-        # Build safe filter expression using utility function
-        query_filters = {
-            "collection": collection,
-            "doc_id": doc_id,
-            "parse_hash": parse_hash,
-        }
-
-        # First check if any parse exists using efficient count_rows_or_zero
-        if (
-            vector_store.count_rows_or_zero(
-                "parses", filters=query_filters, user_id=user_id, is_admin=is_admin
-            )
-            == 0
-        ):
-            return []
-
-        # Load data using iter_batches
-        records = []
-        for batch in vector_store.iter_batches(
-            table_name="parses",
-            filters=query_filters,
-            user_id=user_id,
-            is_admin=is_admin,
-        ):
-            # Convert batch to pandas for easier row-by-row processing
-            batch_df = batch.to_pandas()
-            for _, row in batch_df.iterrows():
-                records.append(row.to_dict())
-
-        if not records:
-            return []
-        record = records[0]
-
-        parsed_content = record.get("parsed_content")
-        if not parsed_content:
-            return []
-
-        data = json.loads(parsed_content)
-        return [
-            {"text": item.get("text", ""), "metadata": item.get("metadata", {})}
-            for item in data
-        ]
-    except Exception as e:
-        logger.error("Failed to read parses: %s", e)
-        raise DatabaseOperationError(f"Failed reading parses: {e}") from e
-
-
 def _apply_chunking_strategy(
     paragraphs: List[Dict[str, Any]],
     chunk_strategy: ChunkStrategy,
@@ -545,62 +369,6 @@ def _apply_chunking_strategy(
         return apply_fixed_size_strategy(paragraphs, params)
     else:
         raise DocumentValidationError(f"Unsupported chunk strategy: {chunk_strategy}")
-
-
-def _write_chunks_to_db(
-    collection: str,
-    doc_id: str,
-    parse_hash: str,
-    config_hash: str,
-    params: Dict[str, Any],
-    chunks: List[Dict[str, Any]],
-    user_id: Optional[int] = None,
-    is_admin: bool = False,
-) -> bool:
-    """Write chunk records to database using abstraction layer."""
-    try:
-        rows = []
-        for chunk in chunks:
-            text = chunk["text"]
-            # Serialize metadata dictionary to JSON string for database storage
-            metadata = chunk.get("metadata")
-            row = {
-                "collection": collection,
-                "doc_id": doc_id,
-                "parse_hash": parse_hash,
-                "chunk_id": chunk["chunk_id"],
-                "index": int(chunk["index"]),
-                "text": text,
-                "page_number": chunk.get("page_number"),
-                "section": chunk.get("section"),
-                "anchor": chunk.get("anchor"),
-                "json_path": chunk.get("json_path"),
-                "chunk_hash": compute_chunk_hash(text, params),
-                "config_hash": config_hash,
-                "created_at": chunk["created_at"],
-                "metadata": serialize_metadata(metadata),
-                "user_id": user_id,  # Add user_id for multi-tenancy
-            }
-            rows.append(row)
-
-        if not rows:
-            return False
-
-        # Use abstraction layer for upsert
-        vector_store = get_vector_index_store()
-        vector_store.upsert_chunks(rows)
-
-        logger.info(
-            "Chunk records written to database: doc_id=%s, parse_hash=%s, config_hash=%s",
-            doc_id,
-            parse_hash,
-            config_hash,
-        )
-        return True
-
-    except Exception as e:
-        logger.error("Failed to write chunk records: %s", e)
-        raise DatabaseOperationError(f"Database write failed: {e}") from e
 
 
 def _compute_stats(chunks: List[Dict[str, Any]]) -> Dict[str, Any]:

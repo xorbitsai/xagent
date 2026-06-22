@@ -18,7 +18,7 @@ from ..core.schemas import (
 
 if TYPE_CHECKING:
     from ..kb import KBParseDisplayCompatibilityFacade
-    from ..storage.contracts import VectorIndexStore
+    from ..kb.collection_handle import LanceDBCollectionHandle
 
 logger = logging.getLogger(__name__)
 
@@ -68,29 +68,20 @@ def _reconstruct_parse_result_from_db_impl(
     user_id: Optional[int] = None,
     is_admin: bool = False,
     *,
-    vector_store: Optional["VectorIndexStore"] = None,
+    handle: "LanceDBCollectionHandle",
 ) -> Tuple[List[Dict[str, Any]], Optional[str]]:
-    """Implementation for reconstruct_parse_result_from_db."""
+    """Implementation for reconstruct_parse_result_from_db.
+
+    The handle owns the storage read and latest-parse selection; this helper
+    keeps the legacy ``DocumentNotFoundError`` mapping, JSON-corruption
+    handling, and the display element conversion.
+    """
     try:
-        if vector_store is None:
-            from ..storage.factory import get_vector_index_store
-
-            vector_store = get_vector_index_store()
-
-        # Build base filter expression
-        query_filters: Dict[str, Any] = {
-            "collection": collection,
-            "doc_id": doc_id,
-        }
-        if parse_hash:
-            query_filters["parse_hash"] = parse_hash
-
-        if (
-            vector_store.count_rows_or_zero(
-                "parses", filters=query_filters, user_id=user_id, is_admin=is_admin
-            )
-            == 0
-        ):
+        # The handle owns the parse read + latest-by-created_at selection.
+        record = handle.read_latest_parse_record(
+            doc_id, parse_hash=parse_hash, user_id=user_id, is_admin=is_admin
+        )
+        if record is None:
             if parse_hash:
                 raise DocumentNotFoundError(
                     f"Parse result not found: doc_id={doc_id}, parse_hash={parse_hash}"
@@ -99,34 +90,9 @@ def _reconstruct_parse_result_from_db_impl(
                 f"No parse results found for document: doc_id={doc_id}"
             )
 
-        # Use iter_batches to load all matching records
-        records = []
-        for batch in vector_store.iter_batches(
-            table_name="parses",
-            filters=query_filters,
-            user_id=user_id,
-            is_admin=is_admin,
-        ):
-            batch_df = batch.to_pandas()
-            for _, row in batch_df.iterrows():
-                records.append(row.to_dict())
+        actual_parse_hash = record.parse_hash
 
-        if not records:
-            raise DocumentNotFoundError(
-                f"No parse results found for document: doc_id={doc_id}"
-            )
-
-        # When multiple records match (e.g. parse_hash not specified), use latest by created_at
-        def _created_at_key(r: Dict[str, Any]) -> Any:
-            t = r.get("created_at")
-            # (True, t) for real timestamps, (False, x) for None -> reverse=True puts latest first, None last
-            return (t is not None, t)
-
-        records_sorted = sorted(records, key=_created_at_key, reverse=True)
-        record = records_sorted[0]
-        actual_parse_hash = record.get("parse_hash")
-
-        parsed_content = record.get("parsed_content")
+        parsed_content = record.parsed_content
         if not parsed_content:
             logger.warning("Empty parsed_content for doc_id=%s", doc_id)
             return ([], actual_parse_hash)

@@ -1,12 +1,19 @@
-"""Tests for the KB parse display compatibility facade."""
+"""Tests for the KB parse display compatibility facade.
+
+#509 moved parse storage + latest-parse selection into the collection handle;
+the facade opens the handle (via its active coordinator, preserving shim
+injection) and the display impl keeps the DocumentNotFoundError mapping,
+JSON-corruption handling, and element conversion. These tests exercise the real
+handle path against the isolated LanceDB store provided by the autouse
+``isolate_rag_storage`` fixture in ``tests/conftest.py``.
+"""
 
 from __future__ import annotations
 
 import inspect
 import json
-from datetime import datetime, timedelta
-from types import SimpleNamespace
-from typing import Any, Optional
+from datetime import datetime, timedelta, timezone
+from typing import Any
 
 import pytest
 
@@ -14,130 +21,36 @@ from xagent.core.tools.core.RAG_tools.core.exceptions import (
     DatabaseOperationError,
     DocumentNotFoundError,
 )
+from xagent.core.tools.core.RAG_tools.storage.factory import get_vector_index_store
 
 
-class _FakeRow:
-    def __init__(self, record: dict[str, Any]) -> None:
-        self._record = record
-
-    def to_dict(self) -> dict[str, Any]:
-        return dict(self._record)
-
-
-class _FakeDataFrame:
-    def __init__(self, records: list[dict[str, Any]]) -> None:
-        self._records = records
-
-    def iterrows(self):
-        for index, record in enumerate(self._records):
-            yield index, _FakeRow(record)
-
-
-class _FakeBatch:
-    def __init__(self, records: list[dict[str, Any]]) -> None:
-        self._records = records
-
-    def to_pandas(self) -> _FakeDataFrame:
-        return _FakeDataFrame(self._records)
-
-
-class _FakeVectorStore:
-    def __init__(self, records: list[dict[str, Any]]) -> None:
-        self._records = records
-        self.count_calls: list[dict[str, Any]] = []
-        self.iter_calls: list[dict[str, Any]] = []
-
-    def _matches(
-        self,
-        record: dict[str, Any],
-        filters: dict[str, Any],
-        user_id: Optional[int],
-        is_admin: bool,
-    ) -> bool:
-        for field, value in filters.items():
-            if record.get(field) != value:
-                return False
-        if not is_admin and record.get("user_id") != user_id:
-            return False
-        return True
-
-    def _matching_records(
-        self,
-        filters: dict[str, Any],
-        user_id: Optional[int],
-        is_admin: bool,
-    ) -> list[dict[str, Any]]:
-        return [
-            record
-            for record in self._records
-            if self._matches(record, filters, user_id, is_admin)
-        ]
-
-    def count_rows_or_zero(
-        self,
-        table_name: str,
-        *,
-        filters: dict[str, Any],
-        user_id: Optional[int],
-        is_admin: bool,
-    ) -> int:
-        self.count_calls.append(
-            {
-                "table_name": table_name,
-                "filters": filters,
-                "user_id": user_id,
-                "is_admin": is_admin,
-            }
-        )
-        assert table_name == "parses"
-        return len(self._matching_records(filters, user_id, is_admin))
-
-    def iter_batches(
-        self,
-        *,
-        table_name: str,
-        filters: dict[str, Any],
-        user_id: Optional[int],
-        is_admin: bool,
-    ):
-        self.iter_calls.append(
-            {
-                "table_name": table_name,
-                "filters": filters,
-                "user_id": user_id,
-                "is_admin": is_admin,
-            }
-        )
-        assert table_name == "parses"
-        yield _FakeBatch(self._matching_records(filters, user_id, is_admin))
-
-
-class _FakeStorageShim:
-    def __init__(self, vector_store: _FakeVectorStore) -> None:
-        self.vector_store = vector_store
-
-    def get_vector_index_store(self) -> _FakeVectorStore:
-        return self.vector_store
-
-
-def _parse_record(
+def _seed_parse(
     *,
+    collection: str = "docs",
+    doc_id: str = "doc-1",
     parse_hash: str,
     created_at: datetime,
-    text: str,
-    layout_type: str = "text",
+    parsed_content: str,
     user_id: int = 1,
-) -> dict[str, Any]:
-    return {
-        "collection": "docs",
-        "doc_id": "doc-1",
-        "parse_hash": parse_hash,
-        "created_at": created_at,
-        "parsed_content": json.dumps(
-            [{"text": text, "metadata": {"layout_type": layout_type}}]
-        ),
-        "user_id": user_id,
-    }
+) -> None:
+    get_vector_index_store().upsert_parses(
+        [
+            {
+                "collection": collection,
+                "doc_id": doc_id,
+                "parse_hash": parse_hash,
+                "parser": "local:default@v1.0.0",
+                "created_at": created_at,
+                "params_json": "{}",
+                "parsed_content": parsed_content,
+                "user_id": user_id,
+            }
+        ]
+    )
+
+
+def _content(text: str, layout_type: str = "text") -> str:
+    return json.dumps([{"text": text, "metadata": {"layout_type": layout_type}}])
 
 
 def _signature_shape(callable_obj: Any) -> list[tuple[str, Any, Any]]:
@@ -171,9 +84,7 @@ def test_parse_display_facade_methods_match_public_helper_signatures() -> None:
     from xagent.core.tools.core.RAG_tools.kb import KBParseDisplayCompatibilityFacade
     from xagent.core.tools.core.RAG_tools.parse import parse_display
 
-    facade = KBParseDisplayCompatibilityFacade(
-        storage_shim=_FakeStorageShim(_FakeVectorStore([]))
-    )
+    facade = KBParseDisplayCompatibilityFacade()
 
     assert _signature_shape(facade.reconstruct_parse_result_from_db) == (
         _signature_shape(parse_display.reconstruct_parse_result_from_db)
@@ -231,32 +142,29 @@ def test_public_parse_display_helpers_remain_sync_and_route_through_facade(
     ]
 
 
+def _facade():
+    from xagent.core.tools.core.RAG_tools.kb import get_kb_coordinator
+
+    return get_kb_coordinator().parse_display_compatibility
+
+
 def test_parse_display_facade_preserves_sync_tuple_shapes_and_latest_selection() -> (
     None
 ):
     """Given direct sync calls, latest fallback and explicit hash behavior stay stable."""
-    from xagent.core.tools.core.RAG_tools.kb import KBParseDisplayCompatibilityFacade
-
-    created_at = datetime(2026, 1, 1, 12, 0, 0)
-    vector_store = _FakeVectorStore(
-        [
-            _parse_record(parse_hash="old", created_at=created_at, text="old body"),
-            _parse_record(
-                parse_hash="new",
-                created_at=created_at + timedelta(seconds=1),
-                text="new body",
-            ),
-        ]
+    created_at = datetime(2026, 1, 1, 12, 0, 0, tzinfo=timezone.utc)
+    _seed_parse(
+        parse_hash="old", created_at=created_at, parsed_content=_content("old body")
     )
-    facade = KBParseDisplayCompatibilityFacade(
-        storage_shim=_FakeStorageShim(vector_store)
+    _seed_parse(
+        parse_hash="new",
+        created_at=created_at + timedelta(seconds=1),
+        parsed_content=_content("new body"),
     )
+    facade = _facade()
 
     elements, actual_hash = facade.reconstruct_parse_result_from_db(
-        "docs",
-        "doc-1",
-        user_id=1,
-        is_admin=False,
+        "docs", "doc-1", user_id=1, is_admin=False
     )
     assert actual_hash == "new"
     assert elements == [
@@ -264,19 +172,13 @@ def test_parse_display_facade_preserves_sync_tuple_shapes_and_latest_selection()
     ]
 
     explicit_elements, explicit_hash = facade.reconstruct_parse_result_from_db(
-        "docs",
-        "doc-1",
-        parse_hash="old",
-        user_id=1,
-        is_admin=False,
+        "docs", "doc-1", parse_hash="old", user_id=1, is_admin=False
     )
     assert explicit_hash == "old"
     assert explicit_elements[0]["text"] == "old body"
 
     page_elements, pagination = facade.paginate_parse_results(
-        elements + explicit_elements,
-        page=1,
-        page_size=1,
+        elements + explicit_elements, page=1, page_size=1
     )
     assert len(page_elements) == 1
     assert pagination == {
@@ -287,127 +189,73 @@ def test_parse_display_facade_preserves_sync_tuple_shapes_and_latest_selection()
         "has_next": True,
         "has_previous": False,
     }
-    assert vector_store.count_calls[0]["filters"] == {
-        "collection": "docs",
-        "doc_id": "doc-1",
-    }
-    assert vector_store.count_calls[1]["filters"] == {
-        "collection": "docs",
-        "doc_id": "doc-1",
-        "parse_hash": "old",
-    }
 
 
 def test_parse_display_lookup_after_rolled_back_ingest_keeps_not_found_behavior() -> (
     None
 ):
     """Rolled-back ingest leaves no parse row, so lookup stays legacy not-found."""
-    from xagent.core.tools.core.RAG_tools.kb import KBParseDisplayCompatibilityFacade
-
-    vector_store = _FakeVectorStore([])
-    facade = KBParseDisplayCompatibilityFacade(
-        storage_shim=_FakeStorageShim(vector_store)
-    )
+    facade = _facade()
 
     with pytest.raises(
         DocumentNotFoundError,
         match="No parse results found for document: doc_id=doc-rolled-back",
     ):
         facade.reconstruct_parse_result_from_db(
-            "docs",
-            "doc-rolled-back",
-            user_id=1,
-            is_admin=False,
+            "docs", "doc-rolled-back", user_id=1, is_admin=False
         )
 
-    assert vector_store.count_calls[0]["filters"] == {
-        "collection": "docs",
-        "doc_id": "doc-rolled-back",
-    }
-    assert vector_store.iter_calls == []
+
+def test_parse_display_explicit_hash_not_found_message() -> None:
+    """An explicit missing parse_hash preserves the legacy not-found message."""
+    facade = _facade()
+
+    with pytest.raises(
+        DocumentNotFoundError,
+        match="Parse result not found: doc_id=doc-1, parse_hash=missing",
+    ):
+        facade.reconstruct_parse_result_from_db(
+            "docs", "doc-1", parse_hash="missing", user_id=1, is_admin=False
+        )
 
 
-def test_parse_display_facade_rebinds_coordinator_storage_for_legacy_impl(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Facade delegation rebinds storage factory access to its coordinator shim."""
+def test_parse_display_facade_honors_injected_storage_shim() -> None:
+    """An injected storage shim routes parse reads through that shim's stores."""
     from xagent.core.tools.core.RAG_tools.kb import KBParseDisplayCompatibilityFacade
-    from xagent.core.tools.core.RAG_tools.parse import parse_display
-    from xagent.core.tools.core.RAG_tools.storage.factory import (
-        bind_storage_shim_for_current_context,
-        get_vector_index_store,
+    from xagent.core.tools.core.RAG_tools.kb.storage_shim import (
+        KBStorageShimCompatibilityFacade,
+    )
+    from xagent.core.tools.core.RAG_tools.storage.factory import StorageFactory
+
+    created_at = datetime(2026, 1, 1, 12, 0, 0, tzinfo=timezone.utc)
+    _seed_parse(
+        parse_hash="h1", created_at=created_at, parsed_content=_content("shim body")
     )
 
-    outer_store = _FakeVectorStore([])
-    inner_store = _FakeVectorStore([])
-    outer_shim = _FakeStorageShim(outer_store)
-    inner_shim = _FakeStorageShim(inner_store)
-
-    class _FakeCoordinator:
-        @property
-        def storage_shim(self) -> _FakeStorageShim:
-            return inner_shim
-
-        def get_context_sync(self, _request: Any) -> Any:
-            return SimpleNamespace(vector_index_store=inner_store)
-
-    def fake_impl(
-        collection: str,
-        doc_id: str,
-        parse_hash: Optional[str] = None,
-        user_id: Optional[int] = None,
-        is_admin: bool = False,
-        **_kwargs: Any,
-    ) -> tuple[list[dict[str, Any]], Optional[str]]:
-        assert collection == "docs"
-        assert doc_id == "doc-inner"
-        assert parse_hash is None
-        assert user_id == 1
-        assert is_admin is False
-        assert get_vector_index_store() is inner_store
-        return ([{"type": "text", "text": "inner", "metadata": {}}], "inner")
-
-    monkeypatch.setattr(
-        parse_display,
-        "_reconstruct_parse_result_from_db_impl",
-        fake_impl,
+    # A facade with only an injected shim (no coordinator) must back its handle
+    # with that shim instead of the process-global coordinator.
+    shim = KBStorageShimCompatibilityFacade(
+        storage_factory=StorageFactory.get_factory()
     )
+    facade = KBParseDisplayCompatibilityFacade(storage_shim=shim)
 
-    facade = KBParseDisplayCompatibilityFacade(coordinator=_FakeCoordinator())
-    with bind_storage_shim_for_current_context(outer_shim):
-        elements, parse_hash = facade.reconstruct_parse_result_from_db(
-            "docs", "doc-inner", user_id=1, is_admin=False
-        )
-        assert get_vector_index_store() is outer_store
-
-    assert parse_hash == "inner"
-    assert elements[0]["text"] == "inner"
+    elements, actual_hash = facade.reconstruct_parse_result_from_db(
+        "docs", "doc-1", user_id=1, is_admin=False
+    )
+    assert actual_hash == "h1"
+    assert elements[0]["text"] == "shim body"
 
 
 def test_parse_display_facade_preserves_json_corruption_mapping() -> None:
     """Given corrupt parse JSON, facade preserves the legacy DatabaseOperationError."""
-    from xagent.core.tools.core.RAG_tools.kb import KBParseDisplayCompatibilityFacade
-
-    vector_store = _FakeVectorStore(
-        [
-            {
-                "collection": "docs",
-                "doc_id": "doc-1",
-                "parse_hash": "bad",
-                "created_at": datetime(2026, 1, 1, 12, 0, 0),
-                "parsed_content": "{not-json",
-                "user_id": 1,
-            }
-        ]
+    _seed_parse(
+        parse_hash="bad",
+        created_at=datetime(2026, 1, 1, 12, 0, 0, tzinfo=timezone.utc),
+        parsed_content="{not-json",
     )
-    facade = KBParseDisplayCompatibilityFacade(
-        storage_shim=_FakeStorageShim(vector_store)
-    )
+    facade = _facade()
 
     with pytest.raises(DatabaseOperationError, match="Failed to read parse result"):
         facade.reconstruct_parse_result_from_db(
-            "docs",
-            "doc-1",
-            user_id=1,
-            is_admin=False,
+            "docs", "doc-1", user_id=1, is_admin=False
         )

@@ -15,6 +15,7 @@ from fastapi import HTTPException
 
 from xagent.skills.registries.base import (
     _HTTP,
+    MAX_DOWNLOAD_BYTES,
     SkillRegistry,
 )
 
@@ -70,12 +71,25 @@ class ClawHubRegistry(SkillRegistry):
         if version:
             params["version"] = version
         try:
-            dl = _HTTP.get(
+            with _HTTP.get(
                 f"{self.base_url}/download",
                 params=params,
                 timeout=60,
-            )
-            return dl.status_code, dl.content
+                stream=True,
+            ) as dl:
+                chunks: list[bytes] = []
+                total = 0
+                for chunk in dl.iter_content(chunk_size=65536):
+                    total += len(chunk)
+                    if total > MAX_DOWNLOAD_BYTES:
+                        raise HTTPException(
+                            status_code=502,
+                            detail=f"{self.display_name} download too large (>{MAX_DOWNLOAD_BYTES} bytes).",
+                        )
+                    chunks.append(chunk)
+                return dl.status_code, b"".join(chunks)
+        except HTTPException:
+            raise
         except requests.RequestException as exc:
             raise HTTPException(
                 status_code=502,

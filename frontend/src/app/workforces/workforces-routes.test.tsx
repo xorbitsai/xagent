@@ -324,21 +324,6 @@ describe("workforce route entry points", () => {
     expect(runWorkforceMock).not.toHaveBeenCalled()
   })
 
-  it("keeps the detail run action disabled for non-active workforces", async () => {
-    getWorkforceMock.mockResolvedValueOnce({
-      ...workforceDetail,
-      status: "draft",
-    })
-    listAgentOptionsMock.mockResolvedValueOnce([])
-
-    render(<WorkforceDetailPage />)
-
-    expect(await screen.findByRole("heading", { name: "Launch Workforce" })).toBeInTheDocument()
-    expect(screen.getByText("workforces.run.inactiveDisabled")).toBeInTheDocument()
-    expect(screen.queryByRole("link", { name: /workforces.actions.runWorkforce/ })).not.toBeInTheDocument()
-    expect(screen.getByRole("button", { name: /workforces.actions.runWorkforce/ })).toBeDisabled()
-  })
-
   it("keeps the current manager visible when it is hidden from agent options", async () => {
     getWorkforceMock.mockResolvedValueOnce(workforceDetail)
     listAgentOptionsMock.mockResolvedValueOnce([

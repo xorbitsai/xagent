@@ -11,6 +11,8 @@ fixture in ``tests/conftest.py``.
 import json
 from datetime import datetime, timedelta, timezone
 
+import pytest
+
 from xagent.core.tools.core.RAG_tools.core.schemas import (
     ParsedParagraph,
     ParseMethod,
@@ -409,3 +411,116 @@ class TestHandleParseChunkCleanup:
 
         assert handle.delete_chunk_records("d1", is_admin=True) == 2
         assert handle.delete_chunk_records("d1", is_admin=True) == 0
+
+
+class TestHandleParseRollback:
+    def test_new_parse_rollback_idempotent_no_cascade(self) -> None:
+        handle = make_handle("coll")
+        _seed_parse("coll", "d1", "h1")
+        _seed_chunk("coll", "d1", "h1", "cfg1", "c0")
+
+        assert handle.delete_created_parse("d1", "h1", is_admin=True) == 1
+        store = get_vector_index_store()
+        assert store.count_rows("parses", {"collection": "coll"}, is_admin=True) == 0
+        # No cascade into chunks.
+        assert store.count_rows("chunks", {"collection": "coll"}, is_admin=True) == 1
+        # Idempotent.
+        assert handle.delete_created_parse("d1", "h1", is_admin=True) == 0
+
+    def test_snapshot_then_restore_preserves_fields(self) -> None:
+        handle = make_handle("coll")
+        _seed_parse(
+            "coll",
+            "d1",
+            "h1",
+            paragraphs=[{"text": "original"}],
+            parser="local:custom@v1.0.0",
+            user_id=7,
+        )
+        snapshot = handle.snapshot_parse("d1", "h1", is_admin=True)
+        assert snapshot is not None
+
+        # Overwrite the parse row with different content.
+        handle.write_parse(
+            "d1", "h1", ParseMethod.DEFAULT, {"x": 1}, [ParsedParagraph(text="changed")]
+        )
+        latest = handle.read_latest_parse_record("d1", parse_hash="h1", is_admin=True)
+        assert latest is not None
+        assert json.loads(latest.parsed_content) == [
+            {"text": "changed", "metadata": {}}
+        ]
+
+        # Restore brings every field back.
+        handle.restore_parse(snapshot)
+        restored = handle.read_latest_parse_record("d1", parse_hash="h1", is_admin=True)
+        assert restored is not None
+        assert restored.parser == "local:custom@v1.0.0"
+        assert restored.user_id == 7
+        assert json.loads(restored.parsed_content) == [{"text": "original"}]
+
+    def test_snapshot_none_when_absent(self) -> None:
+        handle = make_handle("coll")
+        assert handle.snapshot_parse("d1", "h1", is_admin=True) is None
+
+    def test_restore_rejects_snapshot_from_other_collection(self) -> None:
+        from xagent.core.tools.core.RAG_tools.core.exceptions import (
+            DocumentValidationError,
+        )
+
+        source = make_handle("coll_a")
+        _seed_parse("coll_a", "d1", "h1")
+        snapshot = source.snapshot_parse("d1", "h1", is_admin=True)
+        assert snapshot is not None
+
+        other = make_handle("coll_b")
+        with pytest.raises(DocumentValidationError, match="cannot restore"):
+            other.restore_parse(snapshot)
+
+
+class TestHandleChunkRollback:
+    def test_new_chunks_rollback_idempotent(self) -> None:
+        handle = make_handle("coll")
+        _seed_chunk("coll", "d1", "h1", "cfg1", "c0")
+        _seed_chunk("coll", "d1", "h1", "cfg1", "c1")
+
+        assert handle.delete_created_chunks("d1", "h1", "cfg1", is_admin=True) == 2
+        store = get_vector_index_store()
+        assert store.count_rows("chunks", {"collection": "coll"}, is_admin=True) == 0
+        assert handle.delete_created_chunks("d1", "h1", "cfg1", is_admin=True) == 0
+
+    def test_snapshot_then_restore_preserves_all_rows(self) -> None:
+        handle = make_handle("coll")
+        _seed_chunk("coll", "d1", "h1", "cfg1", "c0", index=0, metadata={"a": 1})
+        _seed_chunk("coll", "d1", "h1", "cfg1", "c1", index=1, metadata={"b": 2})
+
+        snapshot = handle.snapshot_chunks("d1", "h1", "cfg1", is_admin=True)
+        assert snapshot is not None
+        assert [c.chunk_id for c in snapshot.chunks] == ["c0", "c1"]
+
+        # Destroy then restore.
+        assert handle.delete_chunk_records("d1", is_admin=True) == 2
+        handle.restore_chunks(snapshot)
+
+        restored = handle.read_existing_chunks("d1", "h1", "cfg1", is_admin=True)
+        assert {c["chunk_id"] for c in restored} == {"c0", "c1"}
+        by_id = {c["chunk_id"]: c for c in restored}
+        assert by_id["c0"]["metadata"] == {"a": 1}
+        assert by_id["c1"]["index"] == 1
+
+    def test_snapshot_none_when_absent(self) -> None:
+        handle = make_handle("coll")
+        assert handle.snapshot_chunks("d1", "h1", "cfg1", is_admin=True) is None
+
+    def test_restore_rejects_snapshot_from_other_collection(self) -> None:
+        from xagent.core.tools.core.RAG_tools.core.exceptions import (
+            DocumentValidationError,
+        )
+
+        source = make_handle("coll_a")
+        _seed_chunk("coll_a", "d1", "h1", "cfg1", "c0")
+        snapshot = source.snapshot_chunks("d1", "h1", "cfg1", is_admin=True)
+        assert snapshot is not None
+
+        other = make_handle("coll_b")
+        with pytest.raises(DocumentValidationError, match="cannot restore"):
+            other.restore_chunks(snapshot)

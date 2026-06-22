@@ -27,6 +27,7 @@ from ..core.exceptions import (
     HashComputationError,
 )
 from ..core.schemas import (
+    ChunkRecordSnapshot,
     DocumentRecordDetail,
     DocumentRecordListResult,
     ParsedParagraph,
@@ -268,6 +269,62 @@ class KBCollectionHandle(ABC):
 
         Row-only (no cascade into embeddings); idempotent.
         """
+
+    # --- Parse/chunk rollback compensation (methods only; wiring in #514) ---
+
+    @abstractmethod
+    def snapshot_parse(
+        self,
+        doc_id: str,
+        parse_hash: str,
+        *,
+        user_id: int | None = None,
+        is_admin: bool = False,
+    ) -> ParseRecordDetail | None:
+        """Capture a parse row for later restore (None if absent)."""
+
+    @abstractmethod
+    def restore_parse(self, snapshot: ParseRecordDetail) -> None:
+        """Restore a snapshotted parse row, preserving every field."""
+
+    @abstractmethod
+    def delete_created_parse(
+        self,
+        doc_id: str,
+        parse_hash: str,
+        *,
+        user_id: int | None = None,
+        is_admin: bool = False,
+    ) -> int:
+        """Idempotently delete a newly created parse row (compensation)."""
+
+    @abstractmethod
+    def snapshot_chunks(
+        self,
+        doc_id: str,
+        parse_hash: str,
+        config_hash: str,
+        *,
+        user_id: int | None = None,
+        is_admin: bool = False,
+    ) -> ChunkRecordSnapshot | None:
+        """Capture all chunk rows for a config for later restore (None if absent)."""
+
+    @abstractmethod
+    def restore_chunks(self, snapshot: ChunkRecordSnapshot) -> None:
+        """Restore snapshotted chunk rows, preserving every field."""
+
+    @abstractmethod
+    def delete_created_chunks(
+        self,
+        doc_id: str,
+        parse_hash: str,
+        config_hash: str,
+        *,
+        user_id: int | None = None,
+        is_admin: bool = False,
+    ) -> int:
+        """Idempotently delete newly created chunk rows (compensation)."""
 
 
 @dataclass(frozen=True)
@@ -859,6 +916,124 @@ class LanceDBCollectionHandle(KBCollectionHandle):
         return self.vector_index_store.delete_chunk_records(
             collection_name=self.context.collection,
             doc_id=doc_id,
+            parse_hash=parse_hash,
+            config_hash=config_hash,
+            user_id=user_id,
+            is_admin=is_admin,
+        )
+
+    # --- Parse/chunk rollback compensation (methods only; wiring in #514) ---
+
+    def snapshot_parse(
+        self,
+        doc_id: str,
+        parse_hash: str,
+        *,
+        user_id: int | None = None,
+        is_admin: bool = False,
+    ) -> ParseRecordDetail | None:
+        """Capture a parse row before a destructive operation (None if absent)."""
+        return self.read_latest_parse_record(
+            doc_id, parse_hash=parse_hash, user_id=user_id, is_admin=is_admin
+        )
+
+    def restore_parse(self, snapshot: ParseRecordDetail) -> None:
+        """Restore a snapshotted parse row, preserving every field.
+
+        Refuses snapshots from another collection so the collection-scoped
+        boundary holds even on direct handle reuse.
+        """
+        if snapshot.collection != self.context.collection:
+            raise DocumentValidationError(
+                f"Handle bound to collection {self.context.collection!r} "
+                f"cannot restore a parse snapshot from {snapshot.collection!r}"
+            )
+        self.vector_index_store.upsert_parses([snapshot.to_legacy_dict()])
+
+    def delete_created_parse(
+        self,
+        doc_id: str,
+        parse_hash: str,
+        *,
+        user_id: int | None = None,
+        is_admin: bool = False,
+    ) -> int:
+        """Idempotently delete a newly created parse row (compensation)."""
+        return self.delete_parse_records(
+            doc_id, parse_hash=parse_hash, user_id=user_id, is_admin=is_admin
+        )
+
+    def snapshot_chunks(
+        self,
+        doc_id: str,
+        parse_hash: str,
+        config_hash: str,
+        *,
+        user_id: int | None = None,
+        is_admin: bool = False,
+    ) -> ChunkRecordSnapshot | None:
+        """Capture all chunk rows for a config (None if none exist)."""
+        vector_store = self.vector_index_store
+        query_filters = {
+            "collection": self.context.collection,
+            "doc_id": doc_id,
+            "parse_hash": parse_hash,
+            "config_hash": config_hash,
+        }
+        try:
+            if (
+                vector_store.count_rows_or_zero(
+                    "chunks", filters=query_filters, user_id=user_id, is_admin=is_admin
+                )
+                == 0
+            ):
+                return None
+            rows: list[dict[str, Any]] = []
+            for batch in vector_store.iter_batches(
+                table_name="chunks",
+                filters=query_filters,
+                user_id=user_id,
+                is_admin=is_admin,
+            ):
+                rows.extend(batch.to_pylist())
+            if not rows:
+                return None
+            # Preserve original chunk order for a faithful restore.
+            rows.sort(key=lambda row: row.get("index") or 0)
+            return ChunkRecordSnapshot.from_rows(rows)
+        except Exception as e:
+            logger.error("Failed to snapshot chunks: %s", e)
+            raise DatabaseOperationError(f"Failed to snapshot chunks: {e}") from e
+
+    def restore_chunks(self, snapshot: ChunkRecordSnapshot) -> None:
+        """Restore snapshotted chunk rows, preserving every field.
+
+        Refuses snapshots whose rows belong to another collection so the
+        collection-scoped boundary holds even on direct handle reuse.
+        """
+        rows = snapshot.to_legacy_dicts()
+        if not rows:
+            return
+        for chunk in snapshot.chunks:
+            if chunk.collection != self.context.collection:
+                raise DocumentValidationError(
+                    f"Handle bound to collection {self.context.collection!r} "
+                    f"cannot restore a chunk snapshot from {chunk.collection!r}"
+                )
+        self.vector_index_store.upsert_chunks(rows)
+
+    def delete_created_chunks(
+        self,
+        doc_id: str,
+        parse_hash: str,
+        config_hash: str,
+        *,
+        user_id: int | None = None,
+        is_admin: bool = False,
+    ) -> int:
+        """Idempotently delete newly created chunk rows (compensation)."""
+        return self.delete_chunk_records(
+            doc_id,
             parse_hash=parse_hash,
             config_hash=config_hash,
             user_id=user_id,

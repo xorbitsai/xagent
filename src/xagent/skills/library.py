@@ -160,7 +160,11 @@ class FilesystemSkillLibraryProvider:
                         continue
                     rel = str(file_path.relative_to(skill_dir)).replace("\\", "/")
                     mt = mimetypes.guess_type(file_path.name)[0] or ""
-                    if mt.startswith("text/") or not mt:
+                    if not (
+                        mt.startswith("image/")
+                        or mt.startswith("audio/")
+                        or mt.startswith("video/")
+                    ):
                         files[rel] = file_path.read_bytes()
                 records.append(
                     SkillRecord(

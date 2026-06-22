@@ -788,6 +788,9 @@ class LanceDBCollectionHandle(KBCollectionHandle):
                             "metadata": deserialize_metadata(row.get("metadata")),
                         }
                     )
+            # LanceDB does not guarantee scan order; sort by index so reused
+            # chunks come back deterministically (mirrors snapshot_chunks).
+            chunks.sort(key=lambda chunk: chunk["index"])
             return chunks
         except Exception as e:
             logger.error("Failed to get existing chunks: %s", e)

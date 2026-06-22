@@ -268,17 +268,16 @@ async def _parse_document_internal(
         timing_data["db_write_start"] = time.perf_counter()
         logger.debug("[PARSE TIMING] Starting database write...")
 
-    try:
-        written = handle.write_parse(
-            doc_id,
-            parse_hash,
-            str(parse_method),
-            params,
-            enriched_paragraphs,
-            user_id=user_id,
-        )
-    except Exception as e:
-        raise DatabaseOperationError(f"Database write failed: {e}") from e
+    # handle.write_parse already raises DatabaseOperationError on failure;
+    # no outer wrap here to avoid double-wrapping the message.
+    written = handle.write_parse(
+        doc_id,
+        parse_hash,
+        str(parse_method),
+        params,
+        enriched_paragraphs,
+        user_id=user_id,
+    )
 
     if enable_timing:
         assert timing_data is not None  # Type guard for mypy

@@ -901,6 +901,95 @@ class LanceDBVectorIndexStore(VectorIndexStore):
         self.invalidate_table_cache("documents")
         return deleted
 
+    def _delete_rows_for_table(
+        self,
+        *,
+        table_name: str,
+        collection_name: str,
+        doc_id: str,
+        extra_predicates: List[tuple[str, Optional[str]]],
+        user_id: Optional[int],
+        is_admin: bool,
+    ) -> int:
+        """Row-only delete on a parse/chunk table with optional equality narrowing.
+
+        Builds the same tenant-safe document filter used by
+        :meth:`delete_document_record`, then ANDs equality predicates for the
+        supplied (column, value) pairs whose value is not ``None``. Idempotent:
+        returns 0 when the table is absent.
+        """
+        from ..LanceDB.schema_manager import _safe_close_table
+        from ..utils.string_utils import escape_lancedb_string
+        from ..version_management.cascade_cleaner import (
+            _build_document_filter,
+            _delete_rows_by_filters,
+        )
+
+        if table_name not in self.list_table_names():
+            return 0
+
+        conn = self._get_connection()
+        filter_expr = _build_document_filter(
+            conn=conn,
+            table_name=table_name,
+            collection=collection_name,
+            doc_id=doc_id,
+            user_id=user_id,
+            is_admin=is_admin,
+        )
+        for column, value in extra_predicates:
+            if value is not None:
+                filter_expr = (
+                    f"{filter_expr} AND {column} == '{escape_lancedb_string(value)}'"
+                )
+        table = conn.open_table(table_name)
+        try:
+            deleted = _delete_rows_by_filters(table, [filter_expr])
+        finally:
+            _safe_close_table(table)
+        self.invalidate_table_cache(table_name)
+        return deleted
+
+    def delete_parse_records(
+        self,
+        collection_name: str,
+        doc_id: str,
+        parse_hash: Optional[str],
+        user_id: Optional[int],
+        is_admin: bool,
+    ) -> int:
+        """Delete only ``parses`` rows for a document (optionally one parse_hash)."""
+        return self._delete_rows_for_table(
+            table_name="parses",
+            collection_name=collection_name,
+            doc_id=doc_id,
+            extra_predicates=[("parse_hash", parse_hash)],
+            user_id=user_id,
+            is_admin=is_admin,
+        )
+
+    def delete_chunk_records(
+        self,
+        collection_name: str,
+        doc_id: str,
+        parse_hash: Optional[str],
+        config_hash: Optional[str],
+        user_id: Optional[int],
+        is_admin: bool,
+    ) -> int:
+        """Delete only ``chunks`` rows for a document (optionally narrowed)."""
+        return self._delete_rows_for_table(
+            table_name="chunks",
+            collection_name=collection_name,
+            doc_id=doc_id,
+            extra_predicates=[
+                ("parse_hash", parse_hash),
+                ("config_hash", config_hash),
+            ],
+            user_id=user_id,
+            is_admin=is_admin,
+        )
+
     def delete_documents_data(
         self,
         collection_name: str,

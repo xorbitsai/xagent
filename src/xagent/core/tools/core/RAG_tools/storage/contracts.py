@@ -561,6 +561,50 @@ class VectorIndexStore(ABC):
         """
 
     @abstractmethod
+    def delete_parse_records(
+        self,
+        collection_name: str,
+        doc_id: str,
+        parse_hash: Optional[str],
+        user_id: Optional[int],
+        is_admin: bool,
+    ) -> int:
+        """Delete only ``parses`` table row(s) for a document.
+
+        Row-only cleanup primitive (no cascade into chunks/embeddings). When
+        ``parse_hash`` is provided only that parse version is removed; when
+        ``None`` all parse rows for the document are removed. Implementations
+        must preserve document-scoped tenant safety (collection + doc_id, plus
+        user_id where the table supports it) and must be idempotent, returning
+        0 when nothing matched or the table is absent.
+
+        Returns:
+            Number of parse rows deleted (0 if none matched).
+        """
+
+    @abstractmethod
+    def delete_chunk_records(
+        self,
+        collection_name: str,
+        doc_id: str,
+        parse_hash: Optional[str],
+        config_hash: Optional[str],
+        user_id: Optional[int],
+        is_admin: bool,
+    ) -> int:
+        """Delete only ``chunks`` table row(s) for a document.
+
+        Row-only cleanup primitive (no cascade into embeddings). ``parse_hash``
+        and ``config_hash`` optionally narrow the deletion; ``None`` for both
+        removes all chunk rows for the document. Implementations must preserve
+        document-scoped tenant safety and be idempotent, returning 0 when
+        nothing matched or the table is absent.
+
+        Returns:
+            Number of chunk rows deleted (0 if none matched).
+        """
+
+    @abstractmethod
     def aggregate_collection_stats(
         self,
         user_id: Optional[int],

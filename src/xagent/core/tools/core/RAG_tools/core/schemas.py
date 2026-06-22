@@ -1722,6 +1722,163 @@ class DocumentRecordListResult(BaseModel):
         return [record.to_legacy_dict() for record in self.documents]
 
 
+def _clean_row_value(value: Any) -> Any:
+    """Normalize pandas null sentinels (``None``, ``NaN``, ``NaT``) to ``None``."""
+    if value is None:
+        return None
+    try:
+        # NaN / NaT are never equal to themselves.
+        if value != value:  # noqa: PLR0124
+            return None
+    except Exception:  # noqa: BLE001 - non-comparable values are kept
+        pass
+    return value
+
+
+class ParseRecordDetail(BaseModel):
+    """Lossless semantic record for a single ``parses`` table row (#509).
+
+    Mirrors the full ``parses`` schema (see LanceDB schema_manager) so a
+    snapshot can be restored by re-upserting every column exactly.
+    """
+
+    model_config = ConfigDict(frozen=True)
+
+    collection: str = Field(..., description="Collection name for data isolation")
+    doc_id: str = Field(..., description="Document identifier inside the collection")
+    parse_hash: str = Field(..., description="Hash identifying the parse version")
+    parser: Optional[str] = Field(None, description="Parser identifier and version")
+    created_at: Optional[datetime] = Field(None, description="Parse creation timestamp")
+    params_json: Optional[str] = Field(
+        None, description="JSON-encoded parse parameters"
+    )
+    parsed_content: Optional[str] = Field(
+        None, description="JSON-encoded parsed paragraphs"
+    )
+    user_id: Optional[int] = Field(
+        None, description="Owner user id for multi-tenancy (None for legacy data)"
+    )
+
+    @classmethod
+    def from_row(cls, row: Dict[str, Any]) -> "ParseRecordDetail":
+        """Build a record from a raw ``parses`` table row dict."""
+        user_id = _clean_row_value(row.get("user_id"))
+        return cls(
+            collection=_clean_row_value(row.get("collection")),
+            doc_id=_clean_row_value(row.get("doc_id")),
+            parse_hash=_clean_row_value(row.get("parse_hash")),
+            parser=_clean_row_value(row.get("parser")),
+            created_at=_clean_row_value(row.get("created_at")),
+            params_json=_clean_row_value(row.get("params_json")),
+            parsed_content=_clean_row_value(row.get("parsed_content")),
+            user_id=int(user_id) if user_id is not None else None,
+        )
+
+    def to_legacy_dict(self) -> Dict[str, Any]:
+        """Return the legacy raw-row dict shape (all ``parses`` columns)."""
+        return {
+            "collection": self.collection,
+            "doc_id": self.doc_id,
+            "parse_hash": self.parse_hash,
+            "parser": self.parser,
+            "created_at": self.created_at,
+            "params_json": self.params_json,
+            "parsed_content": self.parsed_content,
+            "user_id": self.user_id,
+        }
+
+
+class ChunkRecordDetail(BaseModel):
+    """Lossless semantic record for a single ``chunks`` table row (#509).
+
+    Mirrors the full ``chunks`` schema so a snapshot can be restored by
+    re-upserting every column exactly.
+    """
+
+    model_config = ConfigDict(frozen=True)
+
+    collection: str = Field(..., description="Collection name for data isolation")
+    doc_id: str = Field(..., description="Document identifier inside the collection")
+    parse_hash: str = Field(..., description="Parse version the chunk belongs to")
+    chunk_id: str = Field(..., description="Chunk identifier")
+    index: int = Field(0, description="Chunk ordinal index within the document")
+    text: Optional[str] = Field(None, description="Chunk text content")
+    page_number: Optional[int] = Field(None, description="Source page number")
+    section: Optional[str] = Field(None, description="Source section label")
+    anchor: Optional[str] = Field(None, description="Source anchor")
+    json_path: Optional[str] = Field(None, description="Structured-document json path")
+    chunk_hash: Optional[str] = Field(None, description="Per-chunk content hash")
+    config_hash: Optional[str] = Field(None, description="Chunk configuration hash")
+    created_at: Optional[datetime] = Field(None, description="Chunk creation timestamp")
+    metadata: Optional[str] = Field(None, description="Serialized chunk metadata")
+    user_id: Optional[int] = Field(
+        None, description="Owner user id for multi-tenancy (None for legacy data)"
+    )
+
+    @classmethod
+    def from_row(cls, row: Dict[str, Any]) -> "ChunkRecordDetail":
+        """Build a record from a raw ``chunks`` table row dict."""
+        index = _clean_row_value(row.get("index"))
+        page_number = _clean_row_value(row.get("page_number"))
+        user_id = _clean_row_value(row.get("user_id"))
+        return cls(
+            collection=_clean_row_value(row.get("collection")),
+            doc_id=_clean_row_value(row.get("doc_id")),
+            parse_hash=_clean_row_value(row.get("parse_hash")),
+            chunk_id=_clean_row_value(row.get("chunk_id")),
+            index=int(index) if index is not None else 0,
+            text=_clean_row_value(row.get("text")),
+            page_number=int(page_number) if page_number is not None else None,
+            section=_clean_row_value(row.get("section")),
+            anchor=_clean_row_value(row.get("anchor")),
+            json_path=_clean_row_value(row.get("json_path")),
+            chunk_hash=_clean_row_value(row.get("chunk_hash")),
+            config_hash=_clean_row_value(row.get("config_hash")),
+            created_at=_clean_row_value(row.get("created_at")),
+            metadata=_clean_row_value(row.get("metadata")),
+            user_id=int(user_id) if user_id is not None else None,
+        )
+
+    def to_legacy_dict(self) -> Dict[str, Any]:
+        """Return the legacy raw-row dict shape (all ``chunks`` columns)."""
+        return {
+            "collection": self.collection,
+            "doc_id": self.doc_id,
+            "parse_hash": self.parse_hash,
+            "chunk_id": self.chunk_id,
+            "index": self.index,
+            "text": self.text,
+            "page_number": self.page_number,
+            "section": self.section,
+            "anchor": self.anchor,
+            "json_path": self.json_path,
+            "chunk_hash": self.chunk_hash,
+            "config_hash": self.config_hash,
+            "created_at": self.created_at,
+            "metadata": self.metadata,
+            "user_id": self.user_id,
+        }
+
+
+class ChunkRecordSnapshot(BaseModel):
+    """Ordered set of ``chunks`` rows captured for rollback restore (#509)."""
+
+    model_config = ConfigDict(frozen=True)
+
+    chunks: List[ChunkRecordDetail] = Field(
+        default_factory=list, description="Chunk rows in their original order"
+    )
+
+    @classmethod
+    def from_rows(cls, rows: List[Dict[str, Any]]) -> "ChunkRecordSnapshot":
+        """Build a snapshot from raw ``chunks`` table row dicts."""
+        return cls(chunks=[ChunkRecordDetail.from_row(row) for row in rows])
+
+    def to_legacy_dicts(self) -> List[Dict[str, Any]]:
+        """Return the legacy ``list[dict]`` shape for all chunk rows."""
+        return [chunk.to_legacy_dict() for chunk in self.chunks]
+
+
 class DocumentOperationResult(BaseModel):
     """Standard response for document management operations."""
 

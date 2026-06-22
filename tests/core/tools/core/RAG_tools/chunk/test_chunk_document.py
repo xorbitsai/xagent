@@ -1364,7 +1364,7 @@ class TestChunkDocument:
         # Note: Some chunks might not have metadata, which is acceptable
         # But if metadata exists, it should be properly deserializable
 
-        # Step 4: Test idempotency - verify that _get_existing_chunks returns metadata
+        # Step 4: Test idempotency - verify the chunk reuse path returns metadata
         # This tests that metadata is correctly retrieved when chunks already exist
         chunk_result2 = chunk_document(
             collection=test_collection,

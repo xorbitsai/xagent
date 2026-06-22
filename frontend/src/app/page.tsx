@@ -70,7 +70,7 @@ export default function Home() {
 
         if (templatesRes.ok) {
           const data = await templatesRes.json();
-          setTemplates(data.slice(0, 3));
+          setTemplates(Array.isArray(data) ? data.slice(0, 3) : []);
         }
 
         if (tasksRes.ok) {
@@ -426,7 +426,7 @@ export default function Home() {
                             <div className="flex gap-1.5">
                               {template.connections.slice(0, 4).map((conn: any, idx: number) => (
                                 <div key={idx} className="w-8 h-8 rounded-lg bg-background border border-border flex items-center justify-center overflow-hidden shadow-sm">
-                                  {conn.logo ? <img src={conn.logo} alt={conn.name} className="w-5 h-5 object-contain" /> : <span className="text-[10px] font-bold text-primary/70">{conn.name.substring(0, 2).toUpperCase()}</span>}
+                                  {conn.logo ? <img src={conn.logo} alt={conn.name} className="w-5 h-5 object-contain" /> : <span className="text-[10px] font-bold text-primary/70">{(conn.name || "").substring(0, 2).toUpperCase()}</span>}
                                 </div>
                               ))}
                             </div>
@@ -466,7 +466,7 @@ export default function Home() {
                     <div className="flex items-center gap-5">
                       <div className="w-12 h-12 rounded-xl bg-primary/5 flex items-center justify-center shrink-0 border border-primary/10">
                         {task.agent_logo_url ? (
-                          <img src={`${getApiUrl()}${task.agent_logo_url}`} alt="Agent" className="w-7 h-7 rounded object-cover" />
+                          <img src={task.agent_logo_url.startsWith("http") ? task.agent_logo_url : `${getApiUrl()}${task.agent_logo_url}`} alt="Agent" className="w-7 h-7 rounded object-cover" />
                         ) : (
                           <Bot className="w-6 h-6 text-primary/80" />
                         )}
@@ -474,7 +474,7 @@ export default function Home() {
                       <div>
                         <h4 className="font-semibold text-[16px] group-hover:text-primary transition-colors">{task.title || t("home.recent.untitledTask")}</h4>
                         <p className="text-[13px] text-muted-foreground mt-0.5 font-medium">
-                          {task.agent_name || t("home.recent.defaultAgent")} • {new Date(task.created_at).toLocaleDateString(undefined, { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' })}
+                          {task.agent_name || t("home.recent.defaultAgent")} • {new Date(task.created_at).toLocaleDateString(locale === 'zh' ? 'zh-CN' : 'en-US', { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' })}
                         </p>
                       </div>
                     </div>

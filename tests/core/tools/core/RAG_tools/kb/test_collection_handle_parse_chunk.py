@@ -360,3 +360,52 @@ class TestHandleWriteChunks:
         store = get_vector_index_store()
         assert store.count_rows("chunks", {"collection": "coll_a"}, is_admin=True) == 1
         assert store.count_rows("chunks", {"collection": "coll_b"}, is_admin=True) == 0
+
+
+class TestHandleParseChunkCleanup:
+    def test_delete_parse_records_by_hash_collection_scoped(self) -> None:
+        handle = make_handle("coll")
+        _seed_parse("coll", "d1", "h1")
+        _seed_parse("coll", "d1", "h2")
+        # A parse in another collection must not be touched.
+        _seed_parse("other", "d1", "h1")
+
+        deleted = handle.delete_parse_records("d1", parse_hash="h1", is_admin=True)
+        assert deleted == 1
+
+        store = get_vector_index_store()
+        assert store.count_rows("parses", {"collection": "coll"}, is_admin=True) == 1
+        assert store.count_rows("parses", {"collection": "other"}, is_admin=True) == 1
+
+    def test_delete_all_parses_for_doc_and_idempotent(self) -> None:
+        handle = make_handle("coll")
+        _seed_parse("coll", "d1", "h1")
+        _seed_parse("coll", "d1", "h2")
+
+        assert handle.delete_parse_records("d1", is_admin=True) == 2
+        assert handle.delete_parse_records("d1", is_admin=True) == 0
+
+    def test_delete_chunk_records_by_config_no_cascade(self) -> None:
+        handle = make_handle("coll")
+        _seed_parse("coll", "d1", "h1")
+        _seed_chunk("coll", "d1", "h1", "cfg1", "c0")
+        _seed_chunk("coll", "d1", "h1", "cfg1", "c1")
+        _seed_chunk("coll", "d1", "h1", "cfg2", "c2")
+
+        deleted = handle.delete_chunk_records(
+            "d1", parse_hash="h1", config_hash="cfg1", is_admin=True
+        )
+        assert deleted == 2
+
+        store = get_vector_index_store()
+        assert store.count_rows("chunks", {"collection": "coll"}, is_admin=True) == 1
+        # Parse rows are not cascaded by the chunk cleanup.
+        assert store.count_rows("parses", {"collection": "coll"}, is_admin=True) == 1
+
+    def test_delete_all_chunks_for_doc_and_idempotent(self) -> None:
+        handle = make_handle("coll")
+        _seed_chunk("coll", "d1", "h1", "cfg1", "c0")
+        _seed_chunk("coll", "d1", "h2", "cfg2", "c1")
+
+        assert handle.delete_chunk_records("d1", is_admin=True) == 2
+        assert handle.delete_chunk_records("d1", is_admin=True) == 0

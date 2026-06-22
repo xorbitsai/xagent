@@ -238,6 +238,37 @@ class KBCollectionHandle(ABC):
         Returns ``False`` when there are no chunks to write.
         """
 
+    # --- Parse/chunk cleanup (row only, collection scoped) (#509) ---
+
+    @abstractmethod
+    def delete_parse_records(
+        self,
+        doc_id: str,
+        *,
+        parse_hash: str | None = None,
+        user_id: int | None = None,
+        is_admin: bool = False,
+    ) -> int:
+        """Delete parse rows for a document (optionally one parse_hash).
+
+        Row-only (no cascade into chunks/embeddings); idempotent.
+        """
+
+    @abstractmethod
+    def delete_chunk_records(
+        self,
+        doc_id: str,
+        *,
+        parse_hash: str | None = None,
+        config_hash: str | None = None,
+        user_id: int | None = None,
+        is_admin: bool = False,
+    ) -> int:
+        """Delete chunk rows for a document (optionally narrowed).
+
+        Row-only (no cascade into embeddings); idempotent.
+        """
+
 
 @dataclass(frozen=True)
 class LanceDBCollectionHandle(KBCollectionHandle):
@@ -795,3 +826,41 @@ class LanceDBCollectionHandle(KBCollectionHandle):
         except Exception as e:
             logger.error("Failed to write chunk records: %s", e)
             raise DatabaseOperationError(f"Database write failed: {e}") from e
+
+    # --- Parse/chunk cleanup (row only, collection scoped) (#509) ---
+
+    def delete_parse_records(
+        self,
+        doc_id: str,
+        *,
+        parse_hash: str | None = None,
+        user_id: int | None = None,
+        is_admin: bool = False,
+    ) -> int:
+        """Delete parse rows for a document via the bound store (no cascade)."""
+        return self.vector_index_store.delete_parse_records(
+            collection_name=self.context.collection,
+            doc_id=doc_id,
+            parse_hash=parse_hash,
+            user_id=user_id,
+            is_admin=is_admin,
+        )
+
+    def delete_chunk_records(
+        self,
+        doc_id: str,
+        *,
+        parse_hash: str | None = None,
+        config_hash: str | None = None,
+        user_id: int | None = None,
+        is_admin: bool = False,
+    ) -> int:
+        """Delete chunk rows for a document via the bound store (no cascade)."""
+        return self.vector_index_store.delete_chunk_records(
+            collection_name=self.context.collection,
+            doc_id=doc_id,
+            parse_hash=parse_hash,
+            config_hash=config_hash,
+            user_id=user_id,
+            is_admin=is_admin,
+        )

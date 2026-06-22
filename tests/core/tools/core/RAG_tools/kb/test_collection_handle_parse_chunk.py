@@ -191,3 +191,172 @@ class TestHandleReadLatestParseRecord:
     def test_none_when_absent(self) -> None:
         handle = make_handle("coll")
         assert handle.read_latest_parse_record("d1", is_admin=True) is None
+
+
+def _seed_chunk(
+    collection: str,
+    doc_id: str,
+    parse_hash: str,
+    config_hash: str,
+    chunk_id: str,
+    *,
+    index: int = 0,
+    metadata=None,
+    user_id=None,
+) -> None:
+    from xagent.core.tools.core.RAG_tools.utils.metadata_utils import serialize_metadata
+
+    get_vector_index_store().upsert_chunks(
+        [
+            {
+                "collection": collection,
+                "doc_id": doc_id,
+                "parse_hash": parse_hash,
+                "chunk_id": chunk_id,
+                "index": index,
+                "text": f"text-{chunk_id}",
+                "page_number": None,
+                "section": None,
+                "anchor": None,
+                "json_path": None,
+                "chunk_hash": f"ch-{chunk_id}",
+                "config_hash": config_hash,
+                "created_at": datetime.now(timezone.utc),
+                "metadata": serialize_metadata(metadata or {"k": "v"}),
+                "user_id": user_id,
+            }
+        ]
+    )
+
+
+class TestHandleChunkExists:
+    def test_true_when_chunks_present(self) -> None:
+        handle = make_handle("coll")
+        _seed_chunk("coll", "d1", "h1", "cfg1", "c0")
+        assert handle.chunk_exists("d1", "h1", "cfg1", is_admin=True) is True
+
+    def test_false_when_absent(self) -> None:
+        handle = make_handle("coll")
+        _seed_chunk("coll", "d1", "h1", "cfg1", "c0")
+        assert handle.chunk_exists("d1", "h1", "other", is_admin=True) is False
+
+
+class TestHandleReadExistingChunks:
+    def test_returns_normalized_chunks(self) -> None:
+        handle = make_handle("coll")
+        _seed_chunk("coll", "d1", "h1", "cfg1", "c0", index=0, metadata={"a": 1})
+        _seed_chunk("coll", "d1", "h1", "cfg1", "c1", index=1, metadata={"b": 2})
+
+        chunks = handle.read_existing_chunks("d1", "h1", "cfg1", is_admin=True)
+        assert {c["chunk_id"] for c in chunks} == {"c0", "c1"}
+        sample = next(c for c in chunks if c["chunk_id"] == "c0")
+        # metadata is deserialized back to a dict; optional fields preserved.
+        assert sample["metadata"] == {"a": 1}
+        assert sample["index"] == 0
+        assert sample["page_number"] is None
+        assert set(sample.keys()) == {
+            "chunk_id",
+            "index",
+            "text",
+            "page_number",
+            "section",
+            "anchor",
+            "json_path",
+            "created_at",
+            "metadata",
+        }
+
+    def test_empty_when_absent(self) -> None:
+        handle = make_handle("coll")
+        assert handle.read_existing_chunks("d1", "h1", "cfg1", is_admin=True) == []
+
+
+class TestHandleReadParseParagraphDicts:
+    def test_returns_text_metadata_dicts(self) -> None:
+        handle = make_handle("coll")
+        _seed_parse(
+            "coll",
+            "d1",
+            "h1",
+            paragraphs=[
+                {"text": "alpha", "metadata": {"layout_type": "text"}},
+                {"text": "beta", "metadata": {}},
+            ],
+        )
+        paras = handle.read_parse_paragraph_dicts("d1", "h1", is_admin=True)
+        assert paras == [
+            {"text": "alpha", "metadata": {"layout_type": "text"}},
+            {"text": "beta", "metadata": {}},
+        ]
+
+    def test_empty_when_absent(self) -> None:
+        handle = make_handle("coll")
+        assert handle.read_parse_paragraph_dicts("d1", "h1", is_admin=True) == []
+
+
+class TestHandleWriteChunks:
+    def test_persists_exact_chunk_rows(self) -> None:
+        from xagent.core.tools.core.RAG_tools.utils.hash_utils import compute_chunk_hash
+
+        handle = make_handle("coll")
+        params = {"chunk_strategy": "recursive", "chunk_size": 1000}
+        indexed_chunks = [
+            {
+                "chunk_id": "c0",
+                "index": 0,
+                "text": "hello",
+                "page_number": 1,
+                "section": "Intro",
+                "anchor": "a0",
+                "json_path": None,
+                "created_at": datetime.now(timezone.utc),
+                "metadata": {"layout_type": "text"},
+            }
+        ]
+
+        written = handle.write_chunks(
+            "d1", "h1", "cfg1", params, indexed_chunks, user_id=7
+        )
+        assert written is True
+
+        store = get_vector_index_store()
+        rows = []
+        for batch in store.iter_batches(
+            table_name="chunks",
+            filters={"collection": "coll", "doc_id": "d1", "parse_hash": "h1"},
+            is_admin=True,
+        ):
+            rows.extend(batch.to_pylist())
+        assert len(rows) == 1
+        row = rows[0]
+        assert row["collection"] == "coll"
+        assert row["chunk_id"] == "c0"
+        assert row["config_hash"] == "cfg1"
+        assert row["user_id"] == 7
+        assert row["chunk_hash"] == compute_chunk_hash("hello", params)
+        assert json.loads(row["metadata"]) == {"layout_type": "text"}
+
+    def test_empty_chunks_returns_false(self) -> None:
+        handle = make_handle("coll")
+        assert handle.write_chunks("d1", "h1", "cfg1", {}, []) is False
+
+    def test_persists_into_context_collection(self) -> None:
+        handle = make_handle("coll_a")
+        handle.write_chunks(
+            "d1",
+            "h1",
+            "cfg1",
+            {},
+            [
+                {
+                    "chunk_id": "c0",
+                    "index": 0,
+                    "text": "x",
+                    "created_at": datetime.now(timezone.utc),
+                    "metadata": None,
+                }
+            ],
+        )
+        store = get_vector_index_store()
+        assert store.count_rows("chunks", {"collection": "coll_a"}, is_admin=True) == 1
+        assert store.count_rows("chunks", {"collection": "coll_b"}, is_admin=True) == 0

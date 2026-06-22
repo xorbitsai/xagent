@@ -36,6 +36,8 @@ from ..core.schemas import (
 )
 from ..storage.contracts import MetadataStore, VectorIndexStore
 from ..utils import check_file_type, compute_file_hash
+from ..utils.hash_utils import compute_chunk_hash
+from ..utils.metadata_utils import deserialize_metadata, serialize_metadata
 from ..utils.string_utils import generate_deterministic_doc_id
 from .models import KBBackendCapabilities, KBCollectionContext, KBStorageBackend
 
@@ -178,6 +180,62 @@ class KBCollectionHandle(ABC):
         When ``parse_hash`` is given only that version is considered. Returns
         ``None`` when no visible parse row exists; the display layer maps that
         to the appropriate ``DocumentNotFoundError``.
+        """
+
+    # --- Chunk data-plane (#509) ---
+
+    @abstractmethod
+    def chunk_exists(
+        self,
+        doc_id: str,
+        parse_hash: str,
+        config_hash: str,
+        *,
+        user_id: int | None = None,
+        is_admin: bool = False,
+    ) -> bool:
+        """Return whether chunk rows exist for ``(doc_id, parse_hash, config_hash)``."""
+
+    @abstractmethod
+    def read_existing_chunks(
+        self,
+        doc_id: str,
+        parse_hash: str,
+        config_hash: str,
+        *,
+        user_id: int | None = None,
+        is_admin: bool = False,
+    ) -> list[dict[str, Any]]:
+        """Return the reuse-hit chunk dicts (metadata deserialized).
+
+        Empty list when no visible chunk rows exist.
+        """
+
+    @abstractmethod
+    def read_parse_paragraph_dicts(
+        self,
+        doc_id: str,
+        parse_hash: str,
+        *,
+        user_id: int | None = None,
+        is_admin: bool = False,
+    ) -> list[dict[str, Any]]:
+        """Return parsed paragraphs as ``{text, metadata}`` dicts for chunking."""
+
+    @abstractmethod
+    def write_chunks(
+        self,
+        doc_id: str,
+        parse_hash: str,
+        config_hash: str,
+        params: dict[str, Any],
+        chunks: list[dict[str, Any]],
+        *,
+        user_id: int | None = None,
+    ) -> bool:
+        """Persist chunk rows for this collection (idempotent upsert).
+
+        Returns ``False`` when there are no chunks to write.
         """
 
 
@@ -563,3 +621,177 @@ class LanceDBCollectionHandle(KBCollectionHandle):
         except Exception as e:
             logger.error("Failed to read latest parse record: %s", e)
             raise DatabaseOperationError(f"Failed to read parse result: {e}") from e
+
+    # --- Chunk data-plane (#509) ---
+
+    def chunk_exists(
+        self,
+        doc_id: str,
+        parse_hash: str,
+        config_hash: str,
+        *,
+        user_id: int | None = None,
+        is_admin: bool = False,
+    ) -> bool:
+        """Return whether chunk rows exist for the given config."""
+        try:
+            return bool(
+                self.vector_index_store.count_rows_or_zero(
+                    "chunks",
+                    filters={
+                        "collection": self.context.collection,
+                        "doc_id": doc_id,
+                        "parse_hash": parse_hash,
+                        "config_hash": config_hash,
+                    },
+                    user_id=user_id,
+                    is_admin=is_admin,
+                )
+                > 0
+            )
+        except Exception as e:
+            raise DatabaseOperationError(f"Database query failed: {e}") from e
+
+    def read_existing_chunks(
+        self,
+        doc_id: str,
+        parse_hash: str,
+        config_hash: str,
+        *,
+        user_id: int | None = None,
+        is_admin: bool = False,
+    ) -> list[dict[str, Any]]:
+        """Return the reuse-hit chunk dicts (metadata deserialized)."""
+        vector_store = self.vector_index_store
+        query_filters = {
+            "collection": self.context.collection,
+            "doc_id": doc_id,
+            "parse_hash": parse_hash,
+            "config_hash": config_hash,
+        }
+        try:
+            if (
+                vector_store.count_rows_or_zero(
+                    "chunks", filters=query_filters, user_id=user_id, is_admin=is_admin
+                )
+                == 0
+            ):
+                return []
+
+            chunks: list[dict[str, Any]] = []
+            for batch in vector_store.iter_batches(
+                table_name="chunks",
+                filters=query_filters,
+                user_id=user_id,
+                is_admin=is_admin,
+            ):
+                for row in batch.to_pylist():
+                    index_value = row.get("index")
+                    chunks.append(
+                        {
+                            "chunk_id": row["chunk_id"],
+                            "index": int(index_value) if index_value is not None else 0,
+                            "text": row["text"],
+                            "page_number": row.get("page_number"),
+                            "section": row.get("section"),
+                            "anchor": row.get("anchor"),
+                            "json_path": row.get("json_path"),
+                            "created_at": row["created_at"],
+                            "metadata": deserialize_metadata(row.get("metadata")),
+                        }
+                    )
+            return chunks
+        except Exception as e:
+            logger.error("Failed to get existing chunks: %s", e)
+            raise DatabaseOperationError(f"Database query failed: {e}") from e
+
+    def read_parse_paragraph_dicts(
+        self,
+        doc_id: str,
+        parse_hash: str,
+        *,
+        user_id: int | None = None,
+        is_admin: bool = False,
+    ) -> list[dict[str, Any]]:
+        """Return parsed paragraphs as ``{text, metadata}`` dicts for chunking."""
+        vector_store = self.vector_index_store
+        query_filters = {
+            "collection": self.context.collection,
+            "doc_id": doc_id,
+            "parse_hash": parse_hash,
+        }
+        try:
+            if (
+                vector_store.count_rows_or_zero(
+                    "parses", filters=query_filters, user_id=user_id, is_admin=is_admin
+                )
+                == 0
+            ):
+                return []
+
+            records: list[dict[str, Any]] = []
+            for batch in vector_store.iter_batches(
+                table_name="parses",
+                filters=query_filters,
+                user_id=user_id,
+                is_admin=is_admin,
+            ):
+                records.extend(batch.to_pylist())
+
+            if not records:
+                return []
+            parsed_content = records[0].get("parsed_content")
+            if not parsed_content:
+                return []
+            data = json.loads(parsed_content)
+            return [
+                {"text": item.get("text", ""), "metadata": item.get("metadata", {})}
+                for item in data
+            ]
+        except Exception as e:
+            logger.error("Failed to read parses: %s", e)
+            raise DatabaseOperationError(f"Failed reading parses: {e}") from e
+
+    def write_chunks(
+        self,
+        doc_id: str,
+        parse_hash: str,
+        config_hash: str,
+        params: dict[str, Any],
+        chunks: list[dict[str, Any]],
+        *,
+        user_id: int | None = None,
+    ) -> bool:
+        """Persist chunk rows into this collection (idempotent upsert)."""
+        try:
+            rows = []
+            for chunk in chunks:
+                text = chunk["text"]
+                rows.append(
+                    {
+                        "collection": self.context.collection,
+                        "doc_id": doc_id,
+                        "parse_hash": parse_hash,
+                        "chunk_id": chunk["chunk_id"],
+                        "index": int(chunk["index"]),
+                        "text": text,
+                        "page_number": chunk.get("page_number"),
+                        "section": chunk.get("section"),
+                        "anchor": chunk.get("anchor"),
+                        "json_path": chunk.get("json_path"),
+                        "chunk_hash": compute_chunk_hash(text, params),
+                        "config_hash": config_hash,
+                        "created_at": chunk["created_at"],
+                        "metadata": serialize_metadata(chunk.get("metadata")),
+                        "user_id": user_id,
+                    }
+                )
+
+            if not rows:
+                return False
+
+            self.vector_index_store.upsert_chunks(rows)
+            return True
+        except Exception as e:
+            logger.error("Failed to write chunk records: %s", e)
+            raise DatabaseOperationError(f"Database write failed: {e}") from e

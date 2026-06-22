@@ -1,20 +1,22 @@
 """Collection-scoped KB backend handle.
 
 ``KBCollectionHandle`` is the collection-scoped backend boundary that owns
-backend-specific data-plane mechanics (starting with the document-row
-lifecycle in #508). ``LanceDBCollectionHandle`` is the first implementation and
-delegates to the current LanceDB documents-table mechanics via the bound
+backend-specific data-plane mechanics (the document-row lifecycle in #508 and
+the parse/chunk lifecycle in #509). ``LanceDBCollectionHandle`` is the first
+implementation and delegates to the current LanceDB tables via the bound
 vector index store.
 """
 
 from __future__ import annotations
 
+import json
 import logging
 import uuid
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from datetime import timezone
 from pathlib import Path
+from typing import Any
 
 import pandas as pd
 
@@ -27,6 +29,8 @@ from ..core.exceptions import (
 from ..core.schemas import (
     DocumentRecordDetail,
     DocumentRecordListResult,
+    ParsedParagraph,
+    ParseRecordDetail,
     RegisterDocumentRequest,
     RegisterDocumentResponse,
 )
@@ -119,6 +123,62 @@ class KBCollectionHandle(ABC):
         self, doc_id: str, *, user_id: int | None = None, is_admin: bool = False
     ) -> int:
         """Idempotently delete a newly created document row (compensation)."""
+
+    # --- Parse data-plane (#509) ---
+
+    @abstractmethod
+    def parse_exists(
+        self,
+        doc_id: str,
+        parse_hash: str,
+        *,
+        user_id: int | None = None,
+        is_admin: bool = False,
+    ) -> bool:
+        """Return whether a parse row exists for ``(doc_id, parse_hash)``."""
+
+    @abstractmethod
+    def read_parse_paragraphs(
+        self,
+        doc_id: str,
+        parse_hash: str,
+        *,
+        user_id: int | None = None,
+        is_admin: bool = False,
+    ) -> list[ParsedParagraph]:
+        """Return the reuse-hit parsed paragraphs for ``(doc_id, parse_hash)``.
+
+        Empty list when no visible parse row exists.
+        """
+
+    @abstractmethod
+    def write_parse(
+        self,
+        doc_id: str,
+        parse_hash: str,
+        parse_method: Any,
+        params: dict[str, Any],
+        paragraphs: list[ParsedParagraph],
+        *,
+        user_id: int | None = None,
+    ) -> bool:
+        """Persist a parse row for this collection (idempotent upsert)."""
+
+    @abstractmethod
+    def read_latest_parse_record(
+        self,
+        doc_id: str,
+        parse_hash: str | None = None,
+        *,
+        user_id: int | None = None,
+        is_admin: bool = False,
+    ) -> ParseRecordDetail | None:
+        """Return the latest parse row (by ``created_at``) for display.
+
+        When ``parse_hash`` is given only that version is considered. Returns
+        ``None`` when no visible parse row exists; the display layer maps that
+        to the appropriate ``DocumentNotFoundError``.
+        """
 
 
 @dataclass(frozen=True)
@@ -353,3 +413,153 @@ class LanceDBCollectionHandle(KBCollectionHandle):
     ) -> int:
         """Idempotently delete a newly created document row (row-only)."""
         return self.delete_document_record(doc_id, user_id=user_id, is_admin=is_admin)
+
+    # --- Parse data-plane (#509) ---
+
+    def parse_exists(
+        self,
+        doc_id: str,
+        parse_hash: str,
+        *,
+        user_id: int | None = None,
+        is_admin: bool = False,
+    ) -> bool:
+        """Return whether a parse row exists for ``(doc_id, parse_hash)``."""
+        try:
+            return bool(
+                self.vector_index_store.count_rows_or_zero(
+                    "parses",
+                    filters={
+                        "collection": self.context.collection,
+                        "doc_id": doc_id,
+                        "parse_hash": parse_hash,
+                    },
+                    user_id=user_id,
+                    is_admin=is_admin,
+                )
+                > 0
+            )
+        except Exception as e:
+            raise DatabaseOperationError(f"Database query failed: {e}") from e
+
+    def read_parse_paragraphs(
+        self,
+        doc_id: str,
+        parse_hash: str,
+        *,
+        user_id: int | None = None,
+        is_admin: bool = False,
+    ) -> list[ParsedParagraph]:
+        """Return the reuse-hit parsed paragraphs for ``(doc_id, parse_hash)``."""
+        vector_store = self.vector_index_store
+        query_filters = {
+            "collection": self.context.collection,
+            "doc_id": doc_id,
+            "parse_hash": parse_hash,
+        }
+        try:
+            if (
+                vector_store.count_rows_or_zero(
+                    "parses", filters=query_filters, user_id=user_id, is_admin=is_admin
+                )
+                == 0
+            ):
+                return []
+            for batch in vector_store.iter_batches(
+                table_name="parses",
+                filters=query_filters,
+                user_id=user_id,
+                is_admin=is_admin,
+            ):
+                for record in batch.to_pylist():
+                    parsed_content = record.get("parsed_content")
+                    if not parsed_content:
+                        continue
+                    data = json.loads(parsed_content)
+                    return [
+                        ParsedParagraph(
+                            text=item.get("text", ""),
+                            metadata=item.get("metadata", {}),
+                        )
+                        for item in data
+                    ]
+            return []
+        except Exception as e:
+            logger.error("Failed to read parse content: %s", e)
+            raise DatabaseOperationError(f"Failed reading parse content: {e}") from e
+
+    def write_parse(
+        self,
+        doc_id: str,
+        parse_hash: str,
+        parse_method: Any,
+        params: dict[str, Any],
+        paragraphs: list[ParsedParagraph],
+        *,
+        user_id: int | None = None,
+    ) -> bool:
+        """Persist a parse row into this collection (idempotent upsert)."""
+        try:
+            parsed_content = json.dumps(
+                [para.model_dump() for para in paragraphs], ensure_ascii=False
+            )
+            parse_record = {
+                "collection": self.context.collection,
+                "doc_id": doc_id,
+                "parse_hash": parse_hash,
+                "parser": f"local:{parse_method}@v1.0.0",
+                "created_at": pd.Timestamp.now(tz="UTC"),
+                "params_json": json.dumps(params, ensure_ascii=False),
+                "parsed_content": parsed_content,
+                "user_id": user_id,
+            }
+            self.vector_index_store.upsert_parses([parse_record])
+            return True
+        except Exception as e:
+            raise DatabaseOperationError(f"Database write failed: {e}") from e
+
+    def read_latest_parse_record(
+        self,
+        doc_id: str,
+        parse_hash: str | None = None,
+        *,
+        user_id: int | None = None,
+        is_admin: bool = False,
+    ) -> ParseRecordDetail | None:
+        """Return the latest parse row (by ``created_at``) for display."""
+        vector_store = self.vector_index_store
+        query_filters: dict[str, Any] = {
+            "collection": self.context.collection,
+            "doc_id": doc_id,
+        }
+        if parse_hash:
+            query_filters["parse_hash"] = parse_hash
+        try:
+            if (
+                vector_store.count_rows_or_zero(
+                    "parses", filters=query_filters, user_id=user_id, is_admin=is_admin
+                )
+                == 0
+            ):
+                return None
+            records: list[dict[str, Any]] = []
+            for batch in vector_store.iter_batches(
+                table_name="parses",
+                filters=query_filters,
+                user_id=user_id,
+                is_admin=is_admin,
+            ):
+                records.extend(batch.to_pylist())
+            if not records:
+                return None
+
+            # Latest by created_at desc; (t is not None, t) sorts None rows last.
+            def _created_at_key(record: dict[str, Any]) -> Any:
+                created_at = record.get("created_at")
+                return (created_at is not None, created_at)
+
+            records_sorted = sorted(records, key=_created_at_key, reverse=True)
+            return ParseRecordDetail.from_row(records_sorted[0])
+        except Exception as e:
+            logger.error("Failed to read latest parse record: %s", e)
+            raise DatabaseOperationError(f"Failed to read parse result: {e}") from e

@@ -115,19 +115,26 @@ class SkillRegistry(ABC):
         """GET ``{base_url}{path}``, parse JSON, raise on errors."""
         url = f"{self.base_url}{path}"
         try:
-            r = _HTTP.get(url, params=params or {}, timeout=15)
-            status = r.status_code
-            raw = r.content
+            with _HTTP.get(url, params=params or {}, timeout=15, stream=True) as r:
+                status = r.status_code
+                chunks: list[bytes] = []
+                total = 0
+                for chunk in r.iter_content(chunk_size=65536):
+                    total += len(chunk)
+                    if total > MAX_REGISTRY_BODY:
+                        raise HTTPException(
+                            status_code=502,
+                            detail=f"{self.display_name} response too large.",
+                        )
+                    chunks.append(chunk)
+                raw = b"".join(chunks)
+        except HTTPException:
+            raise
         except requests.RequestException as exc:
             raise HTTPException(
                 status_code=502,
                 detail=f"{self.display_name} unreachable: {exc}",
             ) from exc
-        if len(raw) > MAX_REGISTRY_BODY:
-            raise HTTPException(
-                status_code=502,
-                detail=f"{self.display_name} response too large.",
-            )
         if status == 404:
             raise HTTPException(
                 status_code=404,

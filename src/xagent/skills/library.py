@@ -132,6 +132,11 @@ class CompositeSkillLibraryProvider:
     ) -> bytes:
         if path in record.files:
             return record.files[path]
+        if record.path:
+            target = (Path(record.path) / path).resolve()
+            root = Path(record.path).resolve()
+            target.relative_to(root)
+            return target.read_bytes()
         raise FileNotFoundError(f"File not found: {path!r} in skill {record.name!r}")
 
 
@@ -154,7 +159,9 @@ class FilesystemSkillLibraryProvider:
                     if not file_path.is_file():
                         continue
                     rel = str(file_path.relative_to(skill_dir)).replace("\\", "/")
-                    files[rel] = file_path.read_bytes()
+                    mt = mimetypes.guess_type(file_path.name)[0] or ""
+                    if mt.startswith("text/") or not mt:
+                        files[rel] = file_path.read_bytes()
                 records.append(
                     SkillRecord(
                         name=skill_dir.name,

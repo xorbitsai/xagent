@@ -25,11 +25,10 @@ binaries with provenance and scan results, so we don't need to
 re-implement that surface area. If someone really wants an
 unscanned-source install path back, ``git`` is still on the box.
 
-All writes land under ``<storage_root>/skills/`` (default
-``~/.xagent/skills/``) — the same writable third root that
-``skills/utils._get_default_skill_dirs`` configures, so installs
-become visible to agents on the next task run after
-``manager.reload()``.
+All writes (installs, creates, edits) persist to the database via
+``UserSkill`` / ``UserSkillFile`` models.  The ``DatabaseSkillLibraryProvider``
+surfaces them back to the SkillManager, so they become visible to agents
+on the next ``manager.reload()``.
 """
 
 from __future__ import annotations
@@ -213,30 +212,6 @@ def _validate_skill_name(name: str) -> None:
         )
 
 
-def _ensure_writable_target(name: str, *, allow_existing: bool = False) -> Path:
-    """Resolve ``<user_skills_root>/<name>``, optionally allowing the
-    directory to already exist (for edits). Always checks the resolved
-    path can't escape the user root via symlinks."""
-    _validate_skill_name(name)
-    root = _user_skills_root().resolve()
-    target = (root / name).resolve()
-    try:
-        target.relative_to(root)
-    except ValueError as exc:
-        raise HTTPException(
-            status_code=400,
-            detail="Resolved skill path escapes the user skills root.",
-        ) from exc
-    if target.exists() and not allow_existing:
-        raise HTTPException(
-            status_code=409,
-            detail=(
-                f"A skill named {name!r} already exists. Delete it first or rename."
-            ),
-        )
-    return target
-
-
 async def _get_manager(request: Request) -> Any:
     """Hand back the SkillManager singleton xagent put on app.state.
     All web/chat/agent paths share this instance; calling ``reload()``
@@ -321,8 +296,15 @@ def _normalize_skill_files(files: dict[str, bytes]) -> dict[str, bytes]:
     total = 0
     for raw_path, content in files.items():
         path = str(raw_path).replace("\\", "/").lstrip("/")
-        if not path or path.startswith(".") or ".." in path.split("/"):
-            raise HTTPException(status_code=400, detail="Skill file path is unsafe.")
+        if not path or ".." in path.split("/"):
+            raise HTTPException(
+                status_code=400,
+                detail="Skill file path contains a path-traversal sequence.",
+            )
+        if path.startswith("."):
+            raise HTTPException(
+                status_code=400, detail="Skill file path must not start with a dot."
+            )
         total += len(content)
         if total > _MAX_DOWNLOAD_BYTES:
             raise HTTPException(
@@ -471,56 +453,6 @@ def _installed_slugs(mgr: Any) -> set[str]:
     slugs and local skill dir names line up because we install to
     ``<user_root>/<slug>/``, so a string-equal check is enough."""
     return set(mgr._skills_cache.keys())  # noqa: SLF001 — internal but stable
-
-
-def _safe_extract_zip(zip_bytes: bytes, dest: Path) -> Path:
-    """Extract a ClawHub skill ZIP into ``dest`` with path-safety.
-
-    ClawHub ZIPs may wrap their content in a top-level directory
-    (e.g. ``my-skill/SKILL.md``) or place ``SKILL.md`` at the root —
-    we handle both. Returns the directory that contains SKILL.md.
-    Raises HTTPException on:
-      - bad zip / oversized members / path traversal
-      - no SKILL.md anywhere in the archive
-    """
-    dest.mkdir(parents=True, exist_ok=True)
-    try:
-        zf = zipfile.ZipFile(io.BytesIO(zip_bytes))
-    except zipfile.BadZipFile as exc:
-        raise HTTPException(
-            status_code=502, detail="ClawHub returned a bad ZIP."
-        ) from exc
-
-    dest_resolved = dest.resolve()
-    # Pass 1: refuse if any entry escapes dest or is implausibly large.
-    total = 0
-    for info in zf.infolist():
-        if info.file_size > _MAX_DOWNLOAD_BYTES:
-            raise HTTPException(status_code=413, detail="Skill ZIP member too large.")
-        total += info.file_size
-        if total > _MAX_DOWNLOAD_BYTES:
-            raise HTTPException(
-                status_code=413, detail="Skill ZIP exceeds size budget."
-            )
-        target = (dest / info.filename).resolve()
-        try:
-            target.relative_to(dest_resolved)
-        except ValueError as exc:
-            raise HTTPException(
-                status_code=400, detail="Skill ZIP contains unsafe paths."
-            ) from exc
-
-    # Pass 2: actually extract.
-    zf.extractall(dest)
-
-    # Locate SKILL.md — accept root or one level deep.
-    candidates = sorted(dest.rglob("SKILL.md"))
-    if not candidates:
-        raise HTTPException(
-            status_code=400,
-            detail="ClawHub artifact has no SKILL.md anywhere in it.",
-        )
-    return candidates[0].parent
 
 
 def _safe_zip_to_files(zip_bytes: bytes) -> dict[str, bytes]:
@@ -800,7 +732,7 @@ async def list_registries(
 @router.get("/registry/list", response_model=RegistryListResponse)
 async def registry_list(
     request: Request,
-    sort: str = Query("trending"),
+    sort: str = Query("installsCurrent"),
     limit: int = Query(24, ge=1, le=100),
     cursor: Optional[str] = Query(None),
     source: str = Query("clawhub"),

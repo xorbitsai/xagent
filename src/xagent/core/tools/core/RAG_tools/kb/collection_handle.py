@@ -71,6 +71,22 @@ def _safe_int_value(value: Any, default: int = 0) -> int:
         return default
 
 
+def _int_env(name: str, default: int) -> int:
+    """Read an integer environment variable, falling back to ``default``.
+
+    A missing variable, or one set to a non-numeric value, yields ``default``
+    instead of raising, so a malformed operator override cannot crash an
+    embedding write.
+    """
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    try:
+        return int(raw)
+    except (ValueError, TypeError):
+        return default
+
+
 def _safe_optional_str(value: Any) -> str | None:
     """Return the string value or ``None`` for ``None``/NaN sentinels."""
     if value is None:
@@ -1164,7 +1180,12 @@ class LanceDBCollectionHandle(KBCollectionHandle):
                 index = _safe_int_value(chunk_dict.get("index"), default=0)
 
                 page_number_value = chunk_dict.get("page_number")
-                if page_number_value is not None:
+                # A missing page number can arrive as None or as a pandas/LanceDB
+                # NaN sentinel (NaN != NaN); both mean "no page", not page 1.
+                if (
+                    page_number_value is not None
+                    and page_number_value == page_number_value
+                ):
                     page_num = _safe_int_value(page_number_value, default=1)
                     page_number = page_num if page_num > 0 else None
                 else:
@@ -1291,12 +1312,10 @@ class LanceDBCollectionHandle(KBCollectionHandle):
                 f"Multiple vector dimensions found for model {model}: {unique_dims}"
             )
 
-        original_batch_size = int(
-            os.getenv("LANCEDB_BATCH_SIZE", str(DEFAULT_LANCEDB_BATCH_SIZE))
-        )
+        original_batch_size = _int_env("LANCEDB_BATCH_SIZE", DEFAULT_LANCEDB_BATCH_SIZE)
         batch_size = original_batch_size
         batch_timestamp = pd.Timestamp.now(tz="UTC")
-        max_spill_retries = int(os.getenv("LANCEDB_MAX_SPILL_RETRIES", "3"))
+        max_spill_retries = _int_env("LANCEDB_MAX_SPILL_RETRIES", 3)
         spill_retry_count = 0
 
         upserted_count = 0

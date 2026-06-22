@@ -224,6 +224,37 @@ class TestHandleReadChunksNeedingEmbedding:
         assert result.pending_count == 1
         assert to_model_tag("other_model") == "other_model"
 
+    def test_nan_page_number_normalized_to_none(self) -> None:
+        # A missing page number can surface as a pandas/LanceDB NaN sentinel; it
+        # must normalize to None, not be coerced to page 1.
+        from unittest.mock import MagicMock
+
+        handle, store = _mock_store_handle("coll")
+        store.count_rows_or_zero.side_effect = [1, 0]  # 1 chunk, 0 embeddings
+        batch = MagicMock()
+        batch.to_pylist.return_value = [
+            {
+                "doc_id": "d1",
+                "chunk_id": "c0",
+                "parse_hash": "h1",
+                "index": 0,
+                "text": "t",
+                "chunk_hash": "ch-c0",
+                "page_number": float("nan"),
+                "section": None,
+                "anchor": None,
+                "json_path": None,
+                "metadata": None,
+            }
+        ]
+        store.iter_batches.return_value = [batch]
+
+        result = handle.read_chunks_needing_embedding(
+            "d1", "h1", "test_model", is_admin=True
+        )
+        assert result.pending_count == 1
+        assert result.chunks[0].page_number is None
+
 
 def _embedding(
     doc_id: str,
@@ -534,6 +565,19 @@ class TestHandleWriteEmbeddingsMechanics:
         assert result.upsert_count == 3
         # 3 embeddings in batches of 2 -> two upsert calls.
         assert store.upsert_embeddings.call_count == 2
+
+    def test_invalid_int_env_falls_back_to_defaults(self, monkeypatch) -> None:
+        # A malformed integer override must fall back to the default instead of
+        # crashing the write with a ValueError.
+        monkeypatch.setenv("LANCEDB_BATCH_SIZE", "not-a-number")
+        monkeypatch.setenv("LANCEDB_MAX_SPILL_RETRIES", "")
+        handle, store = _mock_store_handle()
+        result = handle.write_embeddings(
+            [_embedding("d1", "c0", "h1", "m1", vector=[0.1, 0.2])],
+            create_index=False,
+        )
+        assert result.upsert_count == 1
+        store.upsert_embeddings.assert_called_once()
 
     def test_spill_error_reduces_batch_and_retries(self, monkeypatch) -> None:
         monkeypatch.setenv("LANCEDB_BATCH_SIZE", "100")

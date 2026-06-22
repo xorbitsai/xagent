@@ -1350,6 +1350,8 @@ class LanceDBCollectionHandle(KBCollectionHandle):
                 current_idx = end_idx
                 spill_retry_count = 0
             except Exception as batch_error:  # noqa: BLE001 - spill-retry then re-raise
+                # TODO: brittle string match; replace with a typed lancedb spill
+                # exception if/when one is exposed (cf. is_non_recoverable_merge_error).
                 if "Spill has sent an error" in str(batch_error):
                     spill_retry_count += 1
                     if spill_retry_count <= max_spill_retries:

@@ -81,7 +81,7 @@ export function DeployAgentDialog({ deployAgent, onClose, onUpdate, onManageApiK
 
   useEffect(() => {
     setApiSnippetTarget(getApiSnippetTarget())
-    setAppOrigin(getBrowserLocationOrigin() || getApiUrl())
+    setAppOrigin(getBrowserLocationOrigin())
   }, [])
 
   useEffect(() => {

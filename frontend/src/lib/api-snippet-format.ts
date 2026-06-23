@@ -1,11 +1,10 @@
-import { getApiSnippetTarget } from "@/lib/api-snippet-base-url"
 import type { ApiSnippetTarget } from "@/lib/api-snippet-target"
 
 export type ApiSnippetTab = "curl" | "python"
 
 export function formatAgentApiSnippets(
   agentId: number,
-  apiTarget: ApiSnippetTarget = getApiSnippetTarget(),
+  apiTarget: ApiSnippetTarget,
 ): Record<ApiSnippetTab, string> {
   const baseUrl = apiTarget.baseUrl || "YOUR_API_BASE_URL"
 

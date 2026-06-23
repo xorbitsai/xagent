@@ -28,7 +28,10 @@ export function resolveApiSnippetBaseUrl(
   }
 
   try {
-    return normalizeApiSnippetBaseUrl(new URL(candidate, `${origin}/`).toString())
+    const resolved = normalizeApiSnippetBaseUrl(
+      new URL(candidate, `${origin}/`).toString()
+    )
+    return isHttpUrl(resolved) ? resolved : ""
   } catch {
     return ""
   }

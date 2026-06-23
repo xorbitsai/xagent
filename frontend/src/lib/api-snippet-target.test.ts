@@ -43,4 +43,10 @@ describe("resolveApiSnippetBaseUrl", () => {
   it("returns an empty string when a relative URL has no usable origin", () => {
     expect(resolveApiSnippetBaseUrl("/api", "")).toBe("")
   })
+
+  it("rejects non-HTTP absolute URLs after URL resolution", () => {
+    expect(resolveApiSnippetBaseUrl("javascript:alert(1)", "https://app.example.test")).toBe("")
+    expect(resolveApiSnippetBaseUrl("ftp://api.example.test", "https://app.example.test")).toBe("")
+    expect(resolveApiSnippetBaseUrl("ws://api.example.test", "https://app.example.test")).toBe("")
+  })
 })

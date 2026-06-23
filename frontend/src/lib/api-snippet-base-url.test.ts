@@ -25,6 +25,14 @@ describe("getApiSnippetTarget", () => {
     })
   })
 
+  it("resolves relative API URLs against the browser origin", () => {
+    getApiUrlMock.mockReturnValue("/api")
+
+    expect(getApiSnippetTarget()).toEqual({
+      baseUrl: `${window.location.origin}/api`,
+    })
+  })
+
   it("falls back to the browser origin for same-origin deployments", () => {
     getApiUrlMock.mockReturnValue("")
 
@@ -35,6 +43,15 @@ describe("getApiSnippetTarget", () => {
 
   it("returns an empty string when no base URL is available", () => {
     getApiUrlMock.mockReturnValue("")
+    vi.stubGlobal("window", undefined)
+
+    expect(getApiSnippetTarget()).toEqual({
+      baseUrl: "",
+    })
+  })
+
+  it("returns an empty string when a relative API URL has no browser origin", () => {
+    getApiUrlMock.mockReturnValue("/api")
     vi.stubGlobal("window", undefined)
 
     expect(getApiSnippetTarget()).toEqual({

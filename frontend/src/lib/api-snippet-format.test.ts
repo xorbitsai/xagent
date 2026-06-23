@@ -24,4 +24,13 @@ describe("formatAgentApiSnippets", () => {
     expect(snippets.python).toContain('base_url="https://api.example.test"')
     expect(snippets.python).not.toContain("Region")
   })
+
+  it("uses a placeholder when the base URL is empty", () => {
+    const snippets = formatAgentApiSnippets(42, {
+      baseUrl: "",
+    })
+
+    expect(snippets.curl).toContain("YOUR_API_BASE_URL/v1/chat/tasks")
+    expect(snippets.python).toContain('base_url="YOUR_API_BASE_URL"')
+  })
 })

@@ -33,10 +33,12 @@ describe("getApiSnippetTarget", () => {
     })
   })
 
-  it("throws when no base URL is available", () => {
+  it("returns an empty string when no base URL is available", () => {
     getApiUrlMock.mockReturnValue("")
     vi.stubGlobal("window", undefined)
 
-    expect(() => getApiSnippetTarget()).toThrow("Unable to determine API snippet base URL")
+    expect(getApiSnippetTarget()).toEqual({
+      baseUrl: "",
+    })
   })
 })

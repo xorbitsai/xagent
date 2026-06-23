@@ -9,9 +9,7 @@ describe("normalizeApiSnippetBaseUrl", () => {
     )
   })
 
-  it("rejects empty base URLs", () => {
-    expect(() => normalizeApiSnippetBaseUrl(" / ")).toThrow(
-      "Unable to determine API snippet base URL"
-    )
+  it("handles empty base URLs gracefully", () => {
+    expect(normalizeApiSnippetBaseUrl(" / ")).toBe("")
   })
 })

@@ -1,9 +1,14 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest"
 
 const getApiUrlMock = vi.hoisted(() => vi.fn())
+const browserOriginMock = vi.hoisted(() => vi.fn())
 
 vi.mock("@/lib/utils", () => ({
   getApiUrl: getApiUrlMock,
+}))
+
+vi.mock("@/lib/browser-location", () => ({
+  getBrowserLocationOrigin: browserOriginMock,
 }))
 
 import { getApiSnippetTarget } from "./api-snippet-base-url"
@@ -11,6 +16,8 @@ import { getApiSnippetTarget } from "./api-snippet-base-url"
 describe("getApiSnippetTarget", () => {
   beforeEach(() => {
     getApiUrlMock.mockReset()
+    browserOriginMock.mockReset()
+    browserOriginMock.mockReturnValue(window.location.origin)
   })
 
   afterEach(() => {
@@ -43,7 +50,7 @@ describe("getApiSnippetTarget", () => {
 
   it("returns an empty string when no base URL is available", () => {
     getApiUrlMock.mockReturnValue("")
-    vi.stubGlobal("window", undefined)
+    browserOriginMock.mockReturnValue("")
 
     expect(getApiSnippetTarget()).toEqual({
       baseUrl: "",
@@ -52,7 +59,7 @@ describe("getApiSnippetTarget", () => {
 
   it("returns an empty string when a relative API URL has no browser origin", () => {
     getApiUrlMock.mockReturnValue("/api")
-    vi.stubGlobal("window", undefined)
+    browserOriginMock.mockReturnValue("")
 
     expect(getApiSnippetTarget()).toEqual({
       baseUrl: "",

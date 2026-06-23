@@ -14,7 +14,9 @@ import { toast } from "@/components/ui/sonner"
 import { getApiUrl } from "@/lib/utils"
 import { copyToClipboard } from "@/lib/clipboard"
 import { apiRequest } from "@/lib/api-wrapper"
+import { getApiSnippetTarget } from "@/lib/api-snippet-base-url"
 import { formatAgentApiSnippets, type ApiSnippetTab } from "@/lib/api-snippet-format"
+import type { ApiSnippetTarget } from "@/lib/api-snippet-target"
 
 export interface Agent {
   id: number
@@ -69,9 +71,16 @@ export function DeployAgentDialog({ deployAgent, onClose, onUpdate, onManageApiK
   const shareUrl = shareLink?.share_token ? `${appOrigin}/share/${shareLink.share_token}` : ""
 
   const agentId = deployAgent?.id ?? 0
+  const [apiSnippetTarget, setApiSnippetTarget] = useState<ApiSnippetTarget>({
+    baseUrl: "",
+  })
   const apiSnippets: Record<ApiSnippetTab, string> = useMemo(() => {
-    return formatAgentApiSnippets(agentId)
-  }, [agentId])
+    return formatAgentApiSnippets(agentId, apiSnippetTarget)
+  }, [agentId, apiSnippetTarget])
+
+  useEffect(() => {
+    setApiSnippetTarget(getApiSnippetTarget())
+  }, [])
 
   useEffect(() => {
     setShareLink(null)

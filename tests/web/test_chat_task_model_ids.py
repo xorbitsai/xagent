@@ -613,14 +613,15 @@ def test_get_tasks_hides_invisible_tasks_by_default(test_db, user1_headers):
             description="normal",
             status=TaskStatus.PENDING,
         )
-        preview_task = Task(
+        sdk_task = Task(
             user_id=user.id,
-            title="preview task",
-            description="preview",
+            title="sdk task",
+            description="sdk",
             status=TaskStatus.PENDING,
+            source="sdk",
             is_visible=False,
         )
-        db.add_all([normal_task, preview_task])
+        db.add_all([normal_task, sdk_task])
         db.commit()
 
         default_response = client.get("/api/chat/tasks", headers=user1_headers)
@@ -636,7 +637,7 @@ def test_get_tasks_hides_invisible_tasks_by_default(test_db, user1_headers):
         assert include_response.status_code == 200
         assert {task["title"] for task in include_response.json()["tasks"]} == {
             "normal task",
-            "preview task",
+            "sdk task",
         }
     finally:
         db.close()

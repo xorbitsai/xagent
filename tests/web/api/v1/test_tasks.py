@@ -97,8 +97,9 @@ def mock_start_task():
 
 
 def test_create_task_happy_path(mock_start_task):
-    """Returns 202 + task_id, writes Task with source='sdk' + input,
-    persists first user message, kicks off background.
+    """Returns 202 + task_id, writes hidden SDK Task + input,
+    persists first user message, kicks off background, and leaves the
+    task readable through the SDK API surface.
     """
     agent_id, full_key = _create_agent_with_key()
 
@@ -129,6 +130,7 @@ def test_create_task_happy_path(mock_start_task):
         assert task is not None
         assert task.agent_id == agent_id
         assert task.source == "sdk"
+        assert task.is_visible is False
         assert task.input == "first user message"
         assert task.status == TaskStatus.RUNNING
 
@@ -143,6 +145,10 @@ def test_create_task_happy_path(mock_start_task):
         assert msgs[0].content == "first user message"
     finally:
         db.close()
+
+    sdk_task = client.get(f"/v1/chat/tasks/{task_id}", headers=_bearer(full_key))
+    assert sdk_task.status_code == 200, sdk_task.text
+    assert sdk_task.json()["task_id"] == task_id
 
     # Background kickoff was called exactly once for this task. The
     # scheduler receives a ``TaskTurnPayload`` carrying both transcript

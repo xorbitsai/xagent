@@ -1,6 +1,7 @@
 from unittest.mock import MagicMock, Mock, patch
 
 import pytest
+from alembic import command
 from alembic.script import ScriptDirectory
 from sqlalchemy import create_engine, inspect, text
 
@@ -27,6 +28,49 @@ class TestTryUpgradeDb:
 
         script = ScriptDirectory.from_config(create_alembic_config(engine))
         assert version == script.get_current_head()
+
+    def test_upgrade_backfills_legacy_sdk_tasks_as_hidden(self):
+        engine = create_engine("sqlite:///:memory:")
+        cfg = create_alembic_config(engine)
+
+        with engine.begin() as conn:
+            conn.execute(
+                text(
+                    "CREATE TABLE alembic_version "
+                    "(version_num VARCHAR(255) NOT NULL)"
+                )
+            )
+            conn.execute(
+                text(
+                    "INSERT INTO alembic_version (version_num) "
+                    "VALUES ('20260616_add_agent_triggers')"
+                )
+            )
+            conn.execute(
+                text(
+                    "CREATE TABLE tasks ("
+                    "id INTEGER PRIMARY KEY, "
+                    "source VARCHAR(20), "
+                    "is_visible BOOLEAN NOT NULL)"
+                )
+            )
+            conn.execute(
+                text(
+                    "INSERT INTO tasks (id, source, is_visible) VALUES "
+                    "(1, 'sdk', 1), "
+                    "(2, 'internal', 1), "
+                    "(3, 'sdk', 0)"
+                )
+            )
+
+            cfg.attributes["connection"] = conn
+            command.upgrade(cfg, "head")
+
+            rows = conn.execute(
+                text("SELECT id, is_visible FROM tasks ORDER BY id")
+            ).all()
+
+        assert rows == [(1, 0), (2, 1), (3, 0)]
 
     @patch("xagent.db.migration.command.upgrade")
     @patch("xagent.db.migration.create_alembic_config")

@@ -75,8 +75,8 @@ async def create_chat_task(
          (404 not 403, so the existence of unrelated agents isn't
          leaked via error code).
       2. Persists a new :class:`Task` row owned by the agent's user,
-         with ``source='sdk'`` and ``input`` set to the user message.
-         Also persists the first user message to
+         with ``source='sdk'``, ``is_visible=False``, and ``input`` set
+         to the user message. Also persists the first user message to
          ``task_chat_messages`` so the existing background execution
          path can consume it without special-casing this entry point.
       3. Schedules background execution via
@@ -131,8 +131,11 @@ async def create_chat_task(
 
     # Create the Task row with SDK-specific fields populated.
     # ``source='sdk'`` lets adoption metrics queries split SDK traffic
-    # from web/widget; ``input`` records this turn's user message so
-    # GET endpoint can return it without going through task_chat_messages.
+    # from web/widget; ``is_visible=False`` keeps SDK/REST runs out of
+    # Web UI discovery surfaces while preserving exact task-id access
+    # for SDK polling and audit views; ``input`` records this turn's
+    # user message so GET endpoint can return it without going through
+    # task_chat_messages.
     task = Task(
         user_id=agent.user_id,
         title=title,
@@ -141,6 +144,7 @@ async def create_chat_task(
         agent_id=agent.id,
         input=request.message.content,
         source="sdk",
+        is_visible=False,
     )
     db.add(task)
     db.commit()

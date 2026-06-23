@@ -26,9 +26,9 @@ re-implement that surface area. If someone really wants an
 unscanned-source install path back, ``git`` is still on the box.
 
 All writes (installs, creates, edits) persist to the database via
-``UserSkill`` / ``UserSkillFile`` models.  The ``DatabaseSkillLibraryProvider``
-surfaces them back to the SkillManager, so they become visible to agents
-on the next ``manager.reload()``.
+``UserSkill`` / ``UserSkillFile`` models.  The ``XagentPersonalDbSkillProvider``
+(``skills/personal_db.py``) surfaces them back to the SkillManager, so they
+become visible to agents on the next ``manager.reload()``.
 """
 
 from __future__ import annotations

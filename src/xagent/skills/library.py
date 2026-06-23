@@ -38,9 +38,13 @@ class SkillRecord:
     effective: bool = True
     shadowed_by: str | None = None
     provider_id: str | None = None
+    _all_file_names: list[str] = field(default_factory=list)
 
     @property
     def file_names(self) -> list[str]:
+        """All file names in this skill, including those not pre-loaded into memory."""
+        if self._all_file_names:
+            return sorted(self._all_file_names)
         return sorted(self.files)
 
 
@@ -155,10 +159,12 @@ class FilesystemSkillLibraryProvider:
                 if not skill_dir.is_dir() or not (skill_dir / "SKILL.md").exists():
                     continue
                 files: dict[str, bytes] = {}
+                all_names: list[str] = []
                 for file_path in sorted(skill_dir.rglob("*")):
                     if not file_path.is_file():
                         continue
                     rel = str(file_path.relative_to(skill_dir)).replace("\\", "/")
+                    all_names.append(rel)
                     mt = mimetypes.guess_type(file_path.name)[0] or ""
                     if not (
                         mt.startswith("image/")
@@ -174,6 +180,7 @@ class FilesystemSkillLibraryProvider:
                         files=files,
                         path=str(skill_dir),
                         provider_id="filesystem",
+                        _all_file_names=all_names,
                     )
                 )
         return records

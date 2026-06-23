@@ -3,7 +3,11 @@ export interface ApiSnippetTarget {
 }
 
 export function normalizeApiSnippetBaseUrl(rawBaseUrl: string): string {
-  return rawBaseUrl.trim().replace(/\/+$/, "")
+  const trimmed = rawBaseUrl.trim()
+  if (trimmed === "/") {
+    return "/"
+  }
+  return trimmed.replace(/\/+$/, "")
 }
 
 export function resolveApiSnippetBaseUrl(

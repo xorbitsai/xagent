@@ -13,7 +13,11 @@ describe("normalizeApiSnippetBaseUrl", () => {
   })
 
   it("handles empty base URLs gracefully", () => {
-    expect(normalizeApiSnippetBaseUrl(" / ")).toBe("")
+    expect(normalizeApiSnippetBaseUrl("   ")).toBe("")
+  })
+
+  it("preserves a single slash representing the root path", () => {
+    expect(normalizeApiSnippetBaseUrl(" / ")).toBe("/")
   })
 })
 
@@ -27,6 +31,12 @@ describe("resolveApiSnippetBaseUrl", () => {
   it("resolves relative URLs against an absolute browser origin", () => {
     expect(resolveApiSnippetBaseUrl("/api", "https://app.example.test")).toBe(
       "https://app.example.test/api"
+    )
+  })
+
+  it("resolves the root path against an absolute browser origin", () => {
+    expect(resolveApiSnippetBaseUrl("/", "https://app.example.test")).toBe(
+      "https://app.example.test"
     )
   })
 

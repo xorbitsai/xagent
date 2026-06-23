@@ -14,7 +14,7 @@ import { toast } from "@/components/ui/sonner"
 import { getApiUrl } from "@/lib/utils"
 import { copyToClipboard } from "@/lib/clipboard"
 import { apiRequest } from "@/lib/api-wrapper"
-type ApiSnippetTab = "curl" | "python"
+import { formatAgentApiSnippets, type ApiSnippetTab } from "@/lib/api-snippet-format"
 
 export interface Agent {
   id: number
@@ -70,23 +70,7 @@ export function DeployAgentDialog({ deployAgent, onClose, onUpdate, onManageApiK
 
   const agentId = deployAgent?.id ?? 0
   const apiSnippets: Record<ApiSnippetTab, string> = useMemo(() => {
-    const apiBase =
-      getApiUrl() || (typeof window !== "undefined" ? window.location.origin : "")
-    return {
-      curl: `curl -X POST ${apiBase}/v1/chat/tasks \\
-  -H "Authorization: Bearer YOUR_API_KEY" \\
-  -H "Content-Type: application/json" \\
-  -d '{
-    "agent_id": ${agentId},
-    "message": { "role": "user", "content": "Hello" }
-  }'`,
-      python: `# pip install "xagent-sdk @ git+https://github.com/xorbitsai/xagent-sdk@v0.3.0#subdirectory=python"
-from xagent_sdk import AgentClient
-
-with AgentClient(api_key="YOUR_API_KEY", base_url="${apiBase}") as agent:
-    result = agent.tasks.run(agent_id=${agentId}, message="Hello")
-    print(result.output)`,
-    }
+    return formatAgentApiSnippets(agentId)
   }, [agentId])
 
   useEffect(() => {

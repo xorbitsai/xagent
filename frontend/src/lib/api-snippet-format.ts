@@ -1,4 +1,5 @@
-import { getApiSnippetTarget, type ApiSnippetTarget } from "@/lib/api-snippet-base-url"
+import { getApiSnippetTarget } from "@/lib/api-snippet-base-url"
+import type { ApiSnippetTarget } from "@/lib/api-snippet-target"
 
 export type ApiSnippetTab = "curl" | "python"
 

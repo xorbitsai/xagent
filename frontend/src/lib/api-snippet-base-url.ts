@@ -1,11 +1,8 @@
 import { getApiUrl } from "@/lib/utils"
-
-export interface ApiSnippetTarget {
-  baseUrl: string
-}
+import { normalizeApiSnippetBaseUrl, type ApiSnippetTarget } from "@/lib/api-snippet-target"
 
 export function getApiSnippetTarget(): ApiSnippetTarget {
-  const baseUrl =
+  const candidate =
     getApiUrl() || (typeof window !== "undefined" ? window.location.origin : "")
-  return { baseUrl }
+  return { baseUrl: normalizeApiSnippetBaseUrl(candidate) }
 }

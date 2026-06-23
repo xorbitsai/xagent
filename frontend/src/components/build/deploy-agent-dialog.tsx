@@ -17,6 +17,7 @@ import { apiRequest } from "@/lib/api-wrapper"
 import { getApiSnippetTarget } from "@/lib/api-snippet-base-url"
 import { formatAgentApiSnippets, type ApiSnippetTab } from "@/lib/api-snippet-format"
 import type { ApiSnippetTarget } from "@/lib/api-snippet-target"
+import { getBrowserLocationOrigin } from "@/lib/browser-location"
 
 export interface Agent {
   id: number
@@ -65,7 +66,7 @@ export function DeployAgentDialog({ deployAgent, onClose, onUpdate, onManageApiK
   const [isLoadingShareLink, setIsLoadingShareLink] = useState(false)
   const [shareLink, setShareLink] = useState<ShareLinkResponse | null>(null)
   const [newDomain, setNewDomain] = useState("")
-  const appOrigin = typeof window !== "undefined" ? window.location.origin : getApiUrl()
+  const [appOrigin, setAppOrigin] = useState("")
   const isPublished = deployAgent?.status === "published"
   const shareEnabled = shareLink?.share_enabled ?? deployAgent?.share_enabled ?? false
   const shareUrl = shareLink?.share_token ? `${appOrigin}/share/${shareLink.share_token}` : ""
@@ -80,6 +81,7 @@ export function DeployAgentDialog({ deployAgent, onClose, onUpdate, onManageApiK
 
   useEffect(() => {
     setApiSnippetTarget(getApiSnippetTarget())
+    setAppOrigin(getBrowserLocationOrigin() || getApiUrl())
   }, [])
 
   useEffect(() => {

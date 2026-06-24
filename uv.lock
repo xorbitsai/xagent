@@ -7485,8 +7485,10 @@ all = [
     { name = "pypdf2" },
     { name = "python-docx" },
     { name = "python-pptx" },
+    { name = "sentence-transformers" },
     { name = "typer" },
     { name = "unstructured" },
+    { name = "xrouter-llm" },
 ]
 browser = [
     { name = "playwright" },
@@ -7537,12 +7539,14 @@ backend-image = [
     { name = "pypdf2" },
     { name = "python-docx" },
     { name = "python-pptx" },
+    { name = "sentence-transformers" },
     { name = "torch", version = "2.12.0", source = { registry = "https://download.pytorch.org/whl/cpu" }, marker = "sys_platform == 'darwin'" },
     { name = "torch", version = "2.12.0+cpu", source = { registry = "https://download.pytorch.org/whl/cpu" }, marker = "sys_platform != 'darwin'" },
     { name = "torchvision", version = "0.27.0", source = { registry = "https://download.pytorch.org/whl/cpu" }, marker = "sys_platform == 'darwin'" },
     { name = "torchvision", version = "0.27.0+cpu", source = { registry = "https://download.pytorch.org/whl/cpu" }, marker = "sys_platform != 'darwin'" },
     { name = "typer" },
     { name = "unstructured" },
+    { name = "xrouter-llm" },
 ]
 dev = [
     { name = "chromadb" },
@@ -7671,6 +7675,7 @@ requires-dist = [
     { name = "requests", specifier = ">=2.32.0" },
     { name = "rich", specifier = ">=14.0.0" },
     { name = "s3fs", specifier = ">=2026.2.0" },
+    { name = "sentence-transformers", marker = "extra == 'all'", specifier = ">=3.0.0" },
     { name = "sentence-transformers", marker = "extra == 'router'", specifier = ">=3.0.0" },
     { name = "sqlalchemy", specifier = ">=2.0.0" },
     { name = "tiktoken", specifier = ">=0.8.0" },
@@ -7683,6 +7688,7 @@ requires-dist = [
     { name = "uvicorn", specifier = ">=0.35.0" },
     { name = "websockets", specifier = ">=15.0.1" },
     { name = "xinference-client", specifier = ">=2.3.0" },
+    { name = "xrouter-llm", marker = "extra == 'all'", specifier = ">=0.1.1" },
     { name = "xrouter-llm", marker = "extra == 'router'", specifier = ">=0.1.1" },
     { name = "zai-sdk", specifier = ">=0.0.3.2" },
 ]
@@ -7701,10 +7707,12 @@ backend-image = [
     { name = "pypdf2", specifier = ">=3.0.1" },
     { name = "python-docx", specifier = ">=1.1.0" },
     { name = "python-pptx", specifier = ">=0.6.0" },
+    { name = "sentence-transformers", specifier = ">=3.0.0" },
     { name = "torch", index = "https://download.pytorch.org/whl/cpu" },
     { name = "torchvision", index = "https://download.pytorch.org/whl/cpu" },
     { name = "typer", specifier = ">=0.9.0" },
     { name = "unstructured", specifier = ">=0.15.0" },
+    { name = "xrouter-llm", specifier = ">=0.1.1" },
 ]
 dev = [
     { name = "chromadb" },

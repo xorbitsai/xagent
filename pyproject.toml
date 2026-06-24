@@ -136,6 +136,8 @@ all = [
   "curl_cffi>=0.14.0",
   "chromadb",
   "pymilvus>=2.6.9,<3.0.0",
+  "xrouter-llm>=0.1.1",
+  "sentence-transformers>=3.0.0",
 ]
 
 [dependency-groups]
@@ -155,6 +157,8 @@ backend-image = [
   "pymilvus>=2.6.9,<3.0.0",
   "torch",
   "torchvision",
+  "xrouter-llm>=0.1.1",
+  "sentence-transformers>=3.0.0",
 ]
 
 # Development tools (linting, formatting)

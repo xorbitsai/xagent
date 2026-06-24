@@ -3,7 +3,7 @@
 import logging
 import os
 import tempfile
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -101,9 +101,7 @@ def user1_headers(test_db):
     )
     assert response.status_code == 200
 
-    login = client.post(
-        "/api/auth/login", json={"username": "user1", "password": "password123"}
-    )
+    login = client.post("/api/auth/login", json={"username": "user1", "password": "password123"})
     assert login.status_code == 200
     token = login.json()["access_token"]
     return {"Authorization": f"Bearer {token}"}
@@ -122,9 +120,7 @@ def user2_headers(test_db):
     )
     assert response.status_code == 200
 
-    login = client.post(
-        "/api/auth/login", json={"username": "user2", "password": "password123"}
-    )
+    login = client.post("/api/auth/login", json={"username": "user2", "password": "password123"})
     assert login.status_code == 200
     token = login.json()["access_token"]
     return {"Authorization": f"Bearer {token}"}
@@ -243,8 +239,7 @@ def test_runtime_config_preserves_task_llm_when_agent_model_is_unavailable():
             return_value=fake_agent_builder_config,
         ) as load_cfg_mock,
         patch(
-            "xagent.web.services.llm_utils.UserAwareModelStorage."
-            "resolve_llms_from_names",
+            "xagent.web.services.llm_utils.UserAwareModelStorage.resolve_llms_from_names",
             return_value=(task_llm, None, None, None),
         ),
         patch(
@@ -304,8 +299,7 @@ def test_runtime_config_uses_accessible_agent_model_over_task_baseline():
             return_value=fake_agent_builder_config,
         ),
         patch(
-            "xagent.web.services.llm_utils.UserAwareModelStorage."
-            "resolve_llms_from_names",
+            "xagent.web.services.llm_utils.UserAwareModelStorage.resolve_llms_from_names",
             return_value=(task_llm, None, None, None),
         ),
         patch(
@@ -345,11 +339,7 @@ def test_pick_default_llm_warns_with_agent_context_when_builder_config_present(c
         )
 
     assert chosen is default_llm
-    matched = [
-        rec
-        for rec in caplog.records
-        if "falling back to default LLM" in rec.getMessage()
-    ]
+    matched = [rec for rec in caplog.records if "falling back to default LLM" in rec.getMessage()]
     assert len(matched) == 1
     message = matched[0].getMessage()
     assert "task_id=42" in message
@@ -378,11 +368,7 @@ def test_pick_default_llm_falls_back_to_saved_model_ids_when_descriptors_missing
             user_id=3,
         )
 
-    matched = [
-        rec
-        for rec in caplog.records
-        if "falling back to default LLM" in rec.getMessage()
-    ]
+    matched = [rec for rec in caplog.records if "falling back to default LLM" in rec.getMessage()]
     assert len(matched) == 1
     message = matched[0].getMessage()
     assert "agent_saved_models=" in message
@@ -405,11 +391,7 @@ def test_pick_default_llm_warns_with_task_only_message_when_no_builder_config(ca
         )
 
     assert chosen is default_llm
-    matched = [
-        rec
-        for rec in caplog.records
-        if "no valid LLM configuration" in rec.getMessage()
-    ]
+    matched = [rec for rec in caplog.records if "no valid LLM configuration" in rec.getMessage()]
     assert len(matched) == 1
     assert "Task 42" in matched[0].getMessage()
     assert "default-llm" in matched[0].getMessage()
@@ -475,9 +457,7 @@ def test_task_create_allows_shared_model_ids(
 ):
     """When admin shares a model, other users can use it in task creation (Mode B two-step)."""
     # Admin creates and shares a model
-    admin_login = client.post(
-        "/api/auth/login", json={"username": "admin", "password": "admin123"}
-    )
+    admin_login = client.post("/api/auth/login", json={"username": "admin", "password": "admin123"})
     assert admin_login.status_code == 200
     admin_headers = {"Authorization": f"Bearer {admin_login.json()['access_token']}"}
 
@@ -626,9 +606,7 @@ def test_get_tasks_hides_invisible_tasks_by_default(test_db, user1_headers):
 
         default_response = client.get("/api/chat/tasks", headers=user1_headers)
         assert default_response.status_code == 200
-        assert [task["title"] for task in default_response.json()["tasks"]] == [
-            "normal task"
-        ]
+        assert [task["title"] for task in default_response.json()["tasks"]] == ["normal task"]
 
         include_response = client.get(
             "/api/chat/tasks?include_hidden=true",
@@ -730,9 +708,7 @@ def test_task_create_skips_stale_user_default(test_db, user1_headers):
         db.close()
 
 
-def test_task_create_rejects_agent_id_from_another_user(
-    test_db, user1_headers, user2_headers
-):
+def test_task_create_rejects_agent_id_from_another_user(test_db, user1_headers, user2_headers):
     from xagent.web.models.agent import Agent, AgentStatus
     from xagent.web.models.database import get_db
     from xagent.web.models.user import User
@@ -822,9 +798,7 @@ def test_task_create_rejects_generated_workforce_manager_agent(
         db.close()
 
 
-def test_task_create_allows_policy_visible_published_agent(
-    test_db, user1_headers, user2_headers
-):
+def test_task_create_allows_policy_visible_published_agent(test_db, user1_headers, user2_headers):
     from xagent.web.models.agent import Agent, AgentStatus
     from xagent.web.models.database import get_db
     from xagent.web.models.task import Task
@@ -928,7 +902,7 @@ def test_delete_task_removes_trace_blobs_and_task_owned_rows(test_db, user1_head
                     build_id=None,
                     event_id="vibe-event",
                     event_type="dag_execute_end",
-                    timestamp=datetime.now(timezone.utc),
+                    timestamp=datetime.now(UTC),
                     data={"ok": True},
                 ),
                 TraceEvent(
@@ -936,7 +910,7 @@ def test_delete_task_removes_trace_blobs_and_task_owned_rows(test_db, user1_head
                     build_id="builder-session",
                     event_id="build-event",
                     event_type="agent_message",
-                    timestamp=datetime.now(timezone.utc),
+                    timestamp=datetime.now(UTC),
                     data={"ok": True},
                 ),
                 TraceMessageBlob(
@@ -991,9 +965,7 @@ def test_delete_task_removes_trace_blobs_and_task_owned_rows(test_db, user1_head
         db.close()
 
 
-def test_delete_task_keeps_cross_user_access_denied(
-    test_db, user1_headers, user2_headers
-):
+def test_delete_task_keeps_cross_user_access_denied(test_db, user1_headers, user2_headers):
     from xagent.web.models.database import get_db
     from xagent.web.models.task import Task
     from xagent.web.models.user import User

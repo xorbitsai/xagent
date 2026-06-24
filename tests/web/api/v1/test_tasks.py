@@ -136,7 +136,9 @@ def test_create_task_happy_path(mock_start_task):
         # task_chat_messages: one user-role message written
         from xagent.web.models.chat_message import TaskChatMessage
 
-        msgs = db.query(TaskChatMessage).filter(TaskChatMessage.task_id == task_id).all()
+        msgs = (
+            db.query(TaskChatMessage).filter(TaskChatMessage.task_id == task_id).all()
+        )
         assert len(msgs) == 1
         assert msgs[0].role == "user"
         assert msgs[0].content == "first user message"
@@ -285,9 +287,9 @@ def test_create_task_cross_user_agent_returns_404(mock_start_task):
         },
     ).json()
     bob_agent_id = bob_agent["id"]
-    bob_key = client.post(f"/api/agents/{bob_agent_id}/api-key", headers=bob_headers).json()[
-        "full_key"
-    ]
+    bob_key = client.post(
+        f"/api/agents/{bob_agent_id}/api-key", headers=bob_headers
+    ).json()["full_key"]
 
     # Bob's key + Alice's agent_id in body -> 404
     resp = client.post(
@@ -610,9 +612,9 @@ def test_append_message_to_other_agents_task_returns_404(mock_start_task):
         },
     ).json()
     bob_agent_id = bob_agent["id"]
-    bob_key = client.post(f"/api/agents/{bob_agent_id}/api-key", headers=bob_headers).json()[
-        "full_key"
-    ]
+    bob_key = client.post(
+        f"/api/agents/{bob_agent_id}/api-key", headers=bob_headers
+    ).json()["full_key"]
 
     resp = client.post(
         f"/v1/chat/tasks/{alice_task_id}/messages",
@@ -742,9 +744,9 @@ def test_get_other_agents_task_returns_404(mock_start_task):
         },
     ).json()
     bob_agent_id = bob_agent["id"]
-    bob_key = client.post(f"/api/agents/{bob_agent_id}/api-key", headers=bob_headers).json()[
-        "full_key"
-    ]
+    bob_key = client.post(
+        f"/api/agents/{bob_agent_id}/api-key", headers=bob_headers
+    ).json()["full_key"]
 
     resp = client.get(f"/v1/chat/tasks/{alice_task_id}", headers=_bearer(bob_key))
     assert resp.status_code == 404
@@ -919,9 +921,9 @@ def test_get_steps_other_agents_task_returns_404(mock_start_task):
         },
     ).json()
     bob_agent_id = bob_agent["id"]
-    bob_key = client.post(f"/api/agents/{bob_agent_id}/api-key", headers=bob_headers).json()[
-        "full_key"
-    ]
+    bob_key = client.post(
+        f"/api/agents/{bob_agent_id}/api-key", headers=bob_headers
+    ).json()["full_key"]
 
     resp = client.get(f"/v1/chat/tasks/{alice_task_id}/steps", headers=_bearer(bob_key))
     assert resp.status_code == 404
@@ -985,8 +987,12 @@ def test_get_steps_cache_reuses_mapping_until_trace_event_changes(mock_start_tas
             "xagent.web.api.v1.tasks.map_trace_events_to_public_steps",
             wraps=_step_mapping.map_trace_events_to_public_steps,
         ) as mapper:
-            first = client.get(f"/v1/chat/tasks/{task_id}/steps", headers=_bearer(full_key))
-            second = client.get(f"/v1/chat/tasks/{task_id}/steps", headers=_bearer(full_key))
+            first = client.get(
+                f"/v1/chat/tasks/{task_id}/steps", headers=_bearer(full_key)
+            )
+            second = client.get(
+                f"/v1/chat/tasks/{task_id}/steps", headers=_bearer(full_key)
+            )
 
             assert first.status_code == 200, first.text
             assert second.status_code == 200, second.text
@@ -1000,7 +1006,9 @@ def test_get_steps_cache_reuses_mapping_until_trace_event_changes(mock_start_tas
                 timestamp=base.replace(second=1),
                 data={"content": "new"},
             )
-            third = client.get(f"/v1/chat/tasks/{task_id}/steps", headers=_bearer(full_key))
+            third = client.get(
+                f"/v1/chat/tasks/{task_id}/steps", headers=_bearer(full_key)
+            )
 
             assert third.status_code == 200, third.text
             assert mapper.call_count == 2
@@ -1089,7 +1097,9 @@ def test_get_steps_returns_404_for_non_sdk_source(mock_start_task):
     agent_id, full_key = _create_agent_with_key()
     internal_task_id = _insert_internal_task(agent_id)
 
-    resp = client.get(f"/v1/chat/tasks/{internal_task_id}/steps", headers=_bearer(full_key))
+    resp = client.get(
+        f"/v1/chat/tasks/{internal_task_id}/steps", headers=_bearer(full_key)
+    )
     assert resp.status_code == 404
     assert resp.json()["error"]["code"] == "task_not_found"
 

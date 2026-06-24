@@ -16,11 +16,15 @@ class TestTryUpgradeDb:
         try_upgrade_db(engine)
 
         columns = inspect(engine).get_columns("alembic_version")
-        version_num = next(column for column in columns if column["name"] == "version_num")
+        version_num = next(
+            column for column in columns if column["name"] == "version_num"
+        )
         assert version_num["type"].length == 255
 
         with engine.begin() as conn:
-            version = conn.execute(text("SELECT version_num FROM alembic_version")).scalar()
+            version = conn.execute(
+                text("SELECT version_num FROM alembic_version")
+            ).scalar()
 
         script = ScriptDirectory.from_config(create_alembic_config(engine))
         assert version == script.get_current_head()
@@ -30,7 +34,9 @@ class TestTryUpgradeDb:
         cfg = create_alembic_config(engine)
 
         with engine.begin() as conn:
-            conn.execute(text("CREATE TABLE alembic_version (version_num VARCHAR(255) NOT NULL)"))
+            conn.execute(
+                text("CREATE TABLE alembic_version (version_num VARCHAR(255) NOT NULL)")
+            )
             conn.execute(
                 text(
                     "INSERT INTO alembic_version (version_num) "
@@ -57,14 +63,18 @@ class TestTryUpgradeDb:
             cfg.attributes["connection"] = conn
             command.upgrade(cfg, "head")
 
-            rows = conn.execute(text("SELECT id, is_visible FROM tasks ORDER BY id")).all()
+            rows = conn.execute(
+                text("SELECT id, is_visible FROM tasks ORDER BY id")
+            ).all()
 
         assert rows == [(1, 0), (2, 1), (3, 0)]
 
     @patch("xagent.db.migration.command.upgrade")
     @patch("xagent.db.migration.create_alembic_config")
     @patch("xagent.db.migration.get_alembic_revision")
-    def test_successful_upgrade(self, mock_get_revision, mock_create_config, mock_upgrade):
+    def test_successful_upgrade(
+        self, mock_get_revision, mock_create_config, mock_upgrade
+    ):
         engine = MagicMock()
         mock_get_revision.return_value = "abc123"
         mock_config = mock_create_config.return_value
@@ -112,7 +122,9 @@ class TestTryUpgradeDb:
         mock_get_revision.return_value = None
         mock_is_empty.return_value = False  # Database has tables but no revision
 
-        with pytest.raises(RuntimeError, match="Database exists without alembic revision"):
+        with pytest.raises(
+            RuntimeError, match="Database exists without alembic revision"
+        ):
             try_upgrade_db(engine)
 
     @patch("xagent.db.migration.command.upgrade")

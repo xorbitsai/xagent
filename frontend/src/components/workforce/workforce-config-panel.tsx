@@ -13,7 +13,7 @@ import { useI18n } from "@/contexts/i18n-context"
 import type { WorkforceDetail, WorkforceWorker } from "@/types/workforce"
 import { canEditAgent } from "@/lib/agent-ui-access"
 
-interface WorkerEditState {
+export interface WorkerEditState {
   alias: string
   assignment_instructions: string
   enabled: boolean

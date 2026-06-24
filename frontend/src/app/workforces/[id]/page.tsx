@@ -33,19 +33,14 @@ import type {
 import {
   buildWorkerEditState,
   normalizeWorkerSortOrder,
+  workerEditState,
   WorkforceBuilderChat,
   WorkforceConfigPanel,
+  type WorkerEditState,
 } from "@/components/workforce"
 import { TaskConversationPanel } from "@/components/task/task-conversation-panel"
 import { ResizableThreeColumnLayout } from "@/components/layout/resizable-three-column-layout"
 import { toast } from "sonner"
-
-interface WorkerEditState {
-  alias: string
-  assignment_instructions: string
-  enabled: boolean
-  sort_order: string
-}
 
 interface LoadOptions {
   silent?: boolean
@@ -53,15 +48,6 @@ interface LoadOptions {
 
 interface SyncFormOptions {
   preserveEditableState?: boolean
-}
-
-function workerEditState(worker: WorkforceWorker): WorkerEditState {
-  return {
-    alias: worker.alias || "",
-    assignment_instructions: worker.assignment_instructions || "",
-    enabled: worker.enabled,
-    sort_order: String(worker.sort_order ?? 1),
-  }
 }
 
 function latestProposedAssistantMessage(
@@ -427,7 +413,7 @@ export default function WorkforceDetailPage() {
 
   // ---- Test preview actions ----
 
-  const handleTestSendMessage = async (content: string, _config?: any, files?: (File & { file_id?: string })[]) => {
+  const handleTestSendMessage = async (content: string, _config?: unknown, files?: (File & { file_id?: string })[]) => {
     if (!id) return
 
     let taskId = previewTaskIdRef.current

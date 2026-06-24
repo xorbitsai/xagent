@@ -7688,8 +7688,8 @@ requires-dist = [
     { name = "uvicorn", specifier = ">=0.35.0" },
     { name = "websockets", specifier = ">=15.0.1" },
     { name = "xinference-client", specifier = ">=2.3.0" },
-    { name = "xrouter-llm", marker = "extra == 'all'", specifier = ">=0.1.1" },
-    { name = "xrouter-llm", marker = "extra == 'router'", specifier = ">=0.1.1" },
+    { name = "xrouter-llm", marker = "extra == 'all'", specifier = ">=0.1.2" },
+    { name = "xrouter-llm", marker = "extra == 'router'", specifier = ">=0.1.2" },
     { name = "zai-sdk", specifier = ">=0.0.3.2" },
 ]
 provides-extras = ["ai-document", "all", "browser", "chromadb", "document-processing", "duckdb", "milvus", "postgresql", "router", "waf-crawl"]
@@ -7712,7 +7712,7 @@ backend-image = [
     { name = "torchvision", index = "https://download.pytorch.org/whl/cpu" },
     { name = "typer", specifier = ">=0.9.0" },
     { name = "unstructured", specifier = ">=0.15.0" },
-    { name = "xrouter-llm", specifier = ">=0.1.1" },
+    { name = "xrouter-llm", specifier = ">=0.1.2" },
 ]
 dev = [
     { name = "chromadb" },
@@ -7815,7 +7815,7 @@ wheels = [
 
 [[package]]
 name = "xrouter-llm"
-version = "0.1.1"
+version = "0.1.2"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "huggingface-hub" },
@@ -7826,9 +7826,9 @@ dependencies = [
     { name = "scikit-learn" },
     { name = "scipy" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/fd/7b/ecafb589320a4b4183bb7394e67c894b2ab809126b70e45ae3cfe2ea687f/xrouter_llm-0.1.1.tar.gz", hash = "sha256:63c769b8911cb159e47e38519c84397d4f96906a72180eaef48cd4bd6168a102", size = 110328, upload-time = "2026-06-20T17:20:13.027Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/62/36/63ccf8f0db5c0bdb8bcd04eae05e07ec7d013c2ec9854dd0e3c720cf74df/xrouter_llm-0.1.2.tar.gz", hash = "sha256:0d3b184f749505fc80b0049ee9a466d7472171145dad98977a778e4effd3d7c9", size = 1506669, upload-time = "2026-06-23T13:41:34.143Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/ed/75/094eb6c4633781ec12bf39ccb2364b9ee452c36a1d03068ac462ad30f492/xrouter_llm-0.1.1-py3-none-any.whl", hash = "sha256:d549ce76bb593aa01baab865347904277e073ea719b28f31fd900a4b0015dc35", size = 112760, upload-time = "2026-06-20T17:20:11.675Z" },
+    { url = "https://files.pythonhosted.org/packages/3f/77/f4082e25dad8d123bd85173735e66dd547c34a43c39aa87e43713fbe83bd/xrouter_llm-0.1.2-py3-none-any.whl", hash = "sha256:df1b5c2f36c091b27f3e97355ba154c2bb0c5cfecac52b6ca3ec5e867041ada8", size = 116349, upload-time = "2026-06-23T13:41:32.776Z" },
 ]
 
 [[package]]

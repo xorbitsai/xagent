@@ -85,7 +85,7 @@ dependencies = [
 # does not declare its bundled predictor runtime deps, so keep them explicit
 # here until upstream does.
 router = [
-  "xrouter-llm>=0.1.1",
+  "xrouter-llm>=0.1.2",
   "sentence-transformers>=3.0.0",
   "torch>=2.0.0",
 ]
@@ -136,7 +136,7 @@ all = [
   "curl_cffi>=0.14.0",
   "chromadb",
   "pymilvus>=2.6.9,<3.0.0",
-  "xrouter-llm>=0.1.1",
+  "xrouter-llm>=0.1.2",
   "sentence-transformers>=3.0.0",
 ]
 
@@ -157,7 +157,7 @@ backend-image = [
   "pymilvus>=2.6.9,<3.0.0",
   "torch",
   "torchvision",
-  "xrouter-llm>=0.1.1",
+  "xrouter-llm>=0.1.2",
   "sentence-transformers>=3.0.0",
 ]
 

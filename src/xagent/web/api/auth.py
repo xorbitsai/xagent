@@ -122,6 +122,11 @@ class RegisterRequest(BaseModel):
     username: str
     email: Optional[str] = None
     password: str
+    first_name: Optional[str] = None
+    last_name: Optional[str] = None
+    organization: Optional[str] = None
+    country: Optional[str] = None
+    phone: Optional[str] = None
 
 
 class RegisterResponse(BaseModel):
@@ -405,14 +410,33 @@ async def update_register_switch(
     )
 
 
-def create_user(db: Session, username: str, email: str, password: str) -> User:
+def create_user(
+    db: Session,
+    username: str,
+    email: str,
+    password: str,
+    first_name: Optional[str] = None,
+    last_name: Optional[str] = None,
+    organization: Optional[str] = None,
+    country: Optional[str] = None,
+    phone: Optional[str] = None,
+) -> User:
     """Create a new user without default model configurations.
 
     Users will use admin defaults via dynamic fallback logic until they set their own.
     No pre-creation of UserModel or UserDefaultModel records.
     """
     password_hash = hash_password(password)
-    user = User(username=username, email=email, password_hash=password_hash)
+    user = User(
+        username=username,
+        email=email,
+        password_hash=password_hash,
+        first_name=first_name,
+        last_name=last_name,
+        organization=organization,
+        country=country,
+        phone=phone,
+    )
     db.add(user)
     db.flush()  # Get the user ID without committing
     db.refresh(user)
@@ -607,7 +631,17 @@ async def register(
             return RegisterResponse(success=False, message="Email already exists")
 
         # Create new user with inherited defaults
-        user = create_user(db, request.username, email, request.password)
+        user = create_user(
+            db,
+            request.username,
+            email,
+            request.password,
+            first_name=request.first_name,
+            last_name=request.last_name,
+            organization=request.organization,
+            country=request.country,
+            phone=request.phone,
+        )
 
         return RegisterResponse(
             success=True,

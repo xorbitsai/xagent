@@ -27,6 +27,11 @@ class User(Base):  # type: ignore
     updated_at = Column(
         DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
     )
+    first_name = Column(String(100), nullable=True)
+    last_name = Column(String(100), nullable=True)
+    organization = Column(String(255), nullable=True)
+    country = Column(String(100), nullable=True)
+    phone = Column(String(50), nullable=True)
     refresh_token = Column(String(255), nullable=True)
     refresh_token_expires_at = Column(DateTime(timezone=True), nullable=True)
     password_reset_token_hash = Column(String(64), index=True, nullable=True)

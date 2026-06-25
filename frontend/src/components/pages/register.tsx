@@ -56,9 +56,12 @@ export function RegisterPage() {
 
   // Auto-detect country from IP
   useEffect(() => {
+    const controller = new AbortController()
+    const timeoutId = setTimeout(() => controller.abort(), 3000)
+
     const detectCountry = async () => {
       try {
-        const response = await fetch("https://ipapi.co/json/", { signal: AbortSignal.timeout(3000) })
+        const response = await fetch("https://ipapi.co/json/", { signal: controller.signal })
         if (!response.ok) return
         const data = await response.json()
         const countryCode = data.country_code as string
@@ -66,9 +69,16 @@ export function RegisterPage() {
         if (found) setSelectedCountry(found)
       } catch {
         // silently fall back to default
+      } finally {
+        clearTimeout(timeoutId)
       }
     }
     void detectCountry()
+
+    return () => {
+      controller.abort()
+      clearTimeout(timeoutId)
+    }
   }, [])
 
   const handleSubmit = async (e: React.FormEvent) => {
@@ -94,8 +104,9 @@ export function RegisterPage() {
     setIsLoading(true)
 
     try {
-      const phone = formData.phone
-        ? `${selectedCountry.dialCode} ${formData.phone}`
+      const trimmedPhone = formData.phone.trim()
+      const phone = trimmedPhone
+        ? `${selectedCountry.dialCode} ${trimmedPhone}`
         : undefined
 
       const response = await apiRequest(`${getApiUrl()}/api/auth/register`, {

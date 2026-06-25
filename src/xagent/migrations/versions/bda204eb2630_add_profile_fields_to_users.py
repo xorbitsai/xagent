@@ -18,11 +18,14 @@ depends_on: Union[str, Sequence[str], None] = None
 
 
 def upgrade() -> None:
-    from alembic import context
-    from sqlalchemy import inspect
+    from sqlalchemy.engine.reflection import Inspector
 
-    bind = context.get_bind()
-    inspector = inspect(bind)
+    bind = op.get_bind()
+    inspector = Inspector.from_engine(bind)
+
+    if "users" not in inspector.get_table_names():
+        return
+
     existing_columns = {c["name"] for c in inspector.get_columns("users")}
 
     new_columns = [
@@ -33,11 +36,13 @@ def upgrade() -> None:
         ("phone", sa.String(50)),
     ]
 
-    for col_name, col_type in new_columns:
-        if col_name not in existing_columns:
-            op.add_column("users", sa.Column(col_name, col_type, nullable=True))
+    with op.batch_alter_table("users") as batch_op:
+        for col_name, col_type in new_columns:
+            if col_name not in existing_columns:
+                batch_op.add_column(sa.Column(col_name, col_type, nullable=True))
 
 
 def downgrade() -> None:
-    for col_name in ["phone", "country", "organization", "last_name", "first_name"]:
-        op.drop_column("users", col_name)
+    with op.batch_alter_table("users") as batch_op:
+        for col_name in ["phone", "country", "organization", "last_name", "first_name"]:
+            batch_op.drop_column(col_name)

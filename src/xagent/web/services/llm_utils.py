@@ -1355,6 +1355,6 @@ def load_agent_builder_config(agent: Any, db: Session, user_id: int) -> dict:
         "skills": list(agent.skills or []),
         "knowledge_bases": list(agent.knowledge_bases or []),
         "tool_categories": list(agent.tool_categories)
-        if agent.tool_categories
+        if agent.tool_categories is not None
         else None,
     }

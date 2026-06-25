@@ -217,8 +217,10 @@ class ToolSelectionSpec(ABC):
         production code to use ``from_raw``.
 
         Empty / unset input semantics:
-          - ``tool_categories=None`` or ``[]`` → ``_SpecAll``
+          - ``tool_categories=None`` → ``_SpecAll``
             (legacy "未配置" — build every default tool).
+          - ``tool_categories=[]`` → ``_SpecNone``
+            (caller explicitly selected zero tools — no tools injected).
           - ``explicit_none=True`` → ``_SpecNone`` regardless of
             ``tool_categories`` (reserved for future "zero tools"
             product UI).
@@ -261,6 +263,11 @@ class ToolSelectionSpec(ABC):
                     published_agent_ids=pids,
                     name_allowlist=names,
                 )
+            # ``None`` means truly unconfigured (legacy "all tools" behaviour).
+            # An explicit empty list ``[]`` means the caller intentionally
+            # selected zero tools — return NONE so no tools are injected.
+            if tool_categories is not None:
+                return _SpecNone()
             return _SpecAll()
 
         # ``tool_categories`` mixes two orthogonal shapes:

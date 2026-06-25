@@ -2304,8 +2304,9 @@ class TestCreateAndCallAgent:
         """A delegated agent that did not select MCP (``tool_categories``
         without ``mcp``) must build its WebToolConfig with
         ``include_mcp_tools=False`` -- so it does not pay MCP server init.
-        Empty and NULL categories still build an ALL-mode selection spec
-        for final filtering, but should not opt into MCP config loading."""
+        NULL categories build an ALL-mode spec (legacy unconfigured agent).
+        Empty list ``[]`` builds a NONE-mode spec (explicitly zero tools).
+        Neither opts into MCP config loading."""
         db, db_path, SessionLocal = _create_session()
         try:
             user = User(username="basicdeleg", password_hash="x", is_admin=False)
@@ -2373,10 +2374,16 @@ class TestCreateAndCallAgent:
             tool_config = mock_agent_service_class.call_args.kwargs["tool_config"]
             spec = tool_config.get_tool_selection_spec()
             if tool_categories:
+                # non-empty list: scoped, MCP not selected
                 assert spec.includes_mcp() is False
-            else:
+            elif tool_categories is None:
+                # None → _SpecAll (legacy unconfigured agent, all tools)
                 assert spec.is_all()
                 assert spec.includes_mcp() is True
+            else:
+                # [] → _SpecNone (explicitly zero tools)
+                assert spec.is_none()
+                assert spec.includes_mcp() is False
             assert tool_config._include_mcp_tools is False
         finally:
             db.close()

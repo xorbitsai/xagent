@@ -927,7 +927,7 @@ class AgentServiceManager:
             "instructions": inline_config.get("instructions"),
             "skills": inline_config.get("skills") or [],
             "knowledge_bases": inline_config.get("knowledge_bases") or [],
-            "tool_categories": inline_config.get("tool_categories") or [],
+            "tool_categories": inline_config.get("tool_categories"),
             "memory_similarity_threshold": inline_config.get(
                 "memory_similarity_threshold"
             ),

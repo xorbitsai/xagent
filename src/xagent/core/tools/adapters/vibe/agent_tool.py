@@ -1760,10 +1760,10 @@ class AgentTool(AbstractBaseTool):
                     self.user = type("obj", (), {"id": user_id})()
 
             # Delegated-agent tool selection goes through the shared
-            # ``ToolSelectionSpec.from_raw`` normalizer so the
-            # "empty / None tool_categories → build every default tool"
-            # invariant is preserved for legacy agents whose
-            # ``tool_categories`` field defaults to ``[]``.
+            # ``ToolSelectionSpec.from_raw`` normalizer.
+            # ``None`` → _SpecAll (unconfigured legacy agent, all tools).
+            # ``[]``  → _SpecNone (agent explicitly saved with zero tools).
+            # Non-empty list → _SpecByCategories (scoped to declared tools).
             from .selection_spec import (
                 ToolSelectionSpec,
                 should_load_mcp_server_configs,

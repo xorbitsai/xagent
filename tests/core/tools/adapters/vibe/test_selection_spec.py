@@ -488,8 +488,8 @@ def test_scoped_mcp_servers_parent_child_table() -> None:
     assert raw(tool_categories=["mcp"]).scoped_mcp_servers() is None
     # parent + child -> parent wins (unrestricted)
     assert raw(tool_categories=["mcp", "mcp:Gmail"]).scoped_mcp_servers() is None
-    # unconfigured (_SpecAll) -> unrestricted (维持现状)
-    assert raw(tool_categories=[]).scoped_mcp_servers() is None
+    # explicit zero tools (_SpecNone) -> initialize nothing
+    assert raw(tool_categories=[]).scoped_mcp_servers() == frozenset()
     # explicit none -> initialize nothing
     assert raw(explicit_none=True).scoped_mcp_servers() == frozenset()
     # category without mcp -> nothing
@@ -709,21 +709,19 @@ async def test_e2e_mcp_server_name_normalization_matches_prod_shape(static_creat
 
 
 async def test_e2e_empty_categories_yields_none_spec(static_creators):
-    """An agent with no ``tool_categories`` (or an empty list) is the
-    backward-compat path: the chat helper returns ``None``, the
-    factory falls through to "build everything", and every registered
+    """``tool_categories=None`` is the backward-compat "unconfigured" path:
+    the factory falls through to "build everything" and every registered
     creator is dispatched.
 
-    This is the property production code relies on to never
-    accidentally suppress tools for legacy agents that pre-date the
-    tool_categories field."""
+    ``tool_categories=[]`` now means the caller explicitly selected zero
+    tools (e.g. a preview agent with no tools configured) and yields
+    _SpecNone, which suppresses all tool injection."""
     from xagent.core.tools.adapters.vibe.selection_spec import ToolSelectionSpec
 
-    # Empty / None → _SpecAll (mode predicate is_all()), not None.
-    # "No restriction" is represented as an explicit mode subclass
-    # rather than a sentinel value on a single dataclass.
+    # None → _SpecAll (unconfigured legacy agent, all tools).
     assert ToolSelectionSpec.from_raw(tool_categories=None).is_all()
-    assert ToolSelectionSpec.from_raw(tool_categories=[]).is_all()
+    # [] → _SpecNone (explicitly zero tools).
+    assert ToolSelectionSpec.from_raw(tool_categories=[]).is_none()
 
     await ToolFactory.create_all_tools(
         _E2EConfig(None), apply_user_override_filter=False
@@ -780,11 +778,12 @@ def test_select_allowed_tool_names_none_input_returns_none() -> None:
 
 
 def test_select_allowed_tool_names_empty_input_returns_none() -> None:
-    """Legacy-default invariant. ``Agent.tool_categories`` defaults
-    to ``[]`` for legacy / default agents. Inline implementations
-    that treat ``[]`` as "explicit no tools" would strip every tool
-    from those agents. The SSOT helper normalizes ``[]`` to the same
-    "未配置 → ALL" semantics as ``None``.
+    """``tool_categories=[]`` means the caller explicitly selected zero
+    tools (e.g. a preview agent with no tools configured).
+    ``compute_allowed_names`` must return an empty frozenset so the
+    factory suppresses all tools, not ``None`` which would keep everything.
+    Agents stored with ``tool_categories=None`` in the DB still reach
+    ``from_raw`` as ``None`` and get ``_SpecAll`` (all tools).
     """
     from xagent.core.tools.adapters.vibe.selection_spec import ToolSelectionSpec
 
@@ -794,10 +793,9 @@ def test_select_allowed_tool_names_empty_input_returns_none() -> None:
             _mock_tool("file_read", "file"),
         ],
     )
-    assert result is None, (
-        "tool_categories=[] must yield None (legacy 'unconfigured' = "
-        "ALL); a non-None result lets the factory strip every tool "
-        "from default agents."
+    assert result == frozenset(), (
+        "tool_categories=[] must yield frozenset() (explicit zero tools); "
+        "None would let the factory keep every tool."
     )
 
 
@@ -1145,14 +1143,15 @@ def test_from_raw_none_categories_yields_all_mode():
     assert isinstance(spec, _SpecAll)
 
 
-def test_from_raw_empty_categories_yields_all_mode():
-    """Legacy "未配置" semantics: empty list is NOT zero tools, it's
-    ALL — every callsite must go through ``from_raw`` so this holds
-    consistently."""
-    from xagent.core.tools.adapters.vibe.selection_spec import _SpecAll
+def test_from_raw_empty_categories_yields_none_mode():
+    """Explicit empty list means zero tools, not "unconfigured".
+    Callers that have no agent context pass ``None`` (→ ``_SpecAll``);
+    callers with an agent that has no tools configured pass ``[]``
+    (→ ``_SpecNone``) so tools from other agents cannot leak in."""
+    from xagent.core.tools.adapters.vibe.selection_spec import _SpecNone
 
     spec = ToolSelectionSpec.from_raw(tool_categories=[])
-    assert isinstance(spec, _SpecAll)
+    assert isinstance(spec, _SpecNone)
 
 
 def test_from_raw_categories_yields_by_categories_mode():
@@ -1497,8 +1496,8 @@ def test_no_inline_tool_categories_matching_in_production():
     assert not offenders, (
         f"Inline ``for tool in all_tools: ...metadata.category`` found in "
         f"{offenders}. This bypasses the ToolSelectionSpec SSOT and risks "
-        f"the P1 regression where ``Agent.tool_categories=[]`` is misread "
-        f"as 'zero tools'. Replace with "
+        f"the P1 regression where ``Agent.tool_categories=[]`` bypasses "
+        f"``_SpecNone`` zero-tool enforcement. Replace with "
         f"``ToolSelectionSpec.from_raw(tool_categories=...)`` and let "
         f"``spec.compute_allowed_names`` do the matching."
     )

@@ -508,6 +508,7 @@ async def test_model_connection(
                 model_name_lower.startswith(("o1", "o3", "gpt-5"))
                 or "-o1" in model_name_lower
                 or "-o3" in model_name_lower
+                or "-gpt-5" in model_name_lower
                 or "thinking" in model_name_lower
                 or "reasoner" in model_name_lower
             )

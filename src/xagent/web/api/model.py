@@ -505,7 +505,7 @@ async def test_model_connection(
             # and max_tokens might be replaced by max_completion_tokens. We use a more minimal test strategy here.
             model_name_lower = request.model_name.lower()
             is_reasoning_model = (
-                model_name_lower.startswith(("o1", "o3"))
+                model_name_lower.startswith(("o1", "o3", "gpt-5"))
                 or "-o1" in model_name_lower
                 or "-o3" in model_name_lower
                 or "thinking" in model_name_lower

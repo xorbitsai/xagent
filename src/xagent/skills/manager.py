@@ -92,6 +92,7 @@ class SkillManager:
                 skill_info["effective"] = record.effective
                 skill_info["shadowed_by"] = record.shadowed_by
                 skill_info["_record"] = record
+                skill_info["files"] = record.file_names
                 self._skills_cache[skill_info["name"]] = skill_info
                 logger.info("  ✓ Loaded: %s (%s)", record.name, record.source)
             except Exception as e:

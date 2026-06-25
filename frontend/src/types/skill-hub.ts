@@ -62,6 +62,7 @@ export interface RegistrySkillDetail {
   scanStatus: ScanStatus;
   moderation: Record<string, unknown> | null;
   installedAs: string | null;
+  registrySource: string;
   raw: Record<string, unknown>;
 }
 

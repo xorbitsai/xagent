@@ -229,11 +229,15 @@ def guess_media_type(path: str) -> str | None:
 
 
 def _source_for_root(root: Path) -> str:
+    from ..core.storage.manager import get_storage_root
     from .manager import SkillManager
 
     try:
-        if root.resolve() == SkillManager.get_builtin_root().resolve():
+        resolved = root.resolve()
+        if resolved == SkillManager.get_builtin_root().resolve():
             return "builtin"
+        if resolved == (get_storage_root() / "skills").resolve():
+            return "user"
     except OSError:
         pass
-    return "filesystem"
+    return "external"

@@ -193,7 +193,8 @@ export default function SkillDetailPage() {
     setInstalling(true);
     setInstallError(null);
     try {
-      const res = await apiRequest(`${apiBase}/api/skill-hub/install/clawhub`, {
+      const registrySource = regSkill.registrySource || "clawhub";
+      const res = await apiRequest(`${apiBase}/api/skill-hub/install/${encodeURIComponent(registrySource)}`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ slug: regSkill.slug }),

@@ -10,9 +10,10 @@ machinery (``SkillManager`` + ``SkillParser``):
 
   2. **ClawHub registry browse & install** — a thin proxy in front of
      ``https://clawhub.ai/api/v1/*`` (the public, anonymous-readable
-     OpenClaw skill registry). v0 install policy: ``scanStatus !=
-     "clean"`` is refused server-side; never trust the client to honor
-     a "are you sure?" prompt for malware.
+     OpenClaw skill registry). v0 install policy: skills flagged
+     ``"malicious"`` or in moderation state ``"quarantined"``/``"revoked"``
+     are refused server-side; never trust the client to honor a
+     "are you sure?" prompt for malware.
 
   3. **In-UI authoring** — write a new SKILL.md from scratch
      (``POST /create``) or edit an installed one in place
@@ -147,6 +148,7 @@ class RegistrySkillDetail(BaseModel):
     scanStatus: Optional[str] = None
     moderation: Optional[Dict[str, Any]] = None
     installedAs: Optional[str] = None
+    registrySource: str = "clawhub"
     # Raw upstream blob for any UI bits we don't have a typed slot for
     # yet (provenance, capability tags, etc.). UI can poke at this for
     # secondary detail panels.
@@ -247,7 +249,21 @@ def _scope_context(request: Request, user: User, db: Any) -> Any:
 async def _get_scoped_manager(request: Request, user: User, db: Any) -> Any:
     from xagent.skills.utils import create_skill_manager
 
-    mgr = create_skill_manager(context=_scope_context(request, user, db))
+    cache = getattr(request.app.state, "_scoped_skill_managers", None)
+    if cache is None:
+        request.app.state._scoped_skill_managers = {}
+        cache = request.app.state._scoped_skill_managers
+
+    ctx = _scope_context(request, user, db)
+    user_id = int(user.id)
+    mgr = cache.get(user_id)
+    if mgr is None:
+        mgr = create_skill_manager(context=ctx)
+        cache[user_id] = mgr
+    else:
+        # Refresh db session and request context; filesystem scan is already cached.
+        mgr.context = ctx
+
     await mgr.ensure_initialized()
     return mgr
 
@@ -637,6 +653,7 @@ async def create_skill(
         )
 
     mgr = await _get_scoped_manager(request, _user, db)
+    await mgr.reload()
     skill = await mgr.get_skill(body.name)
     if skill is None:
         # Most likely cause: malformed YAML frontmatter that the parser
@@ -702,6 +719,7 @@ async def edit_installed(
     else:
         _update_personal_skill_md(db=db, user=_user, name=name, skill_md=body.skill_md)
     mgr = await _get_scoped_manager(request, _user, db)
+    await mgr.reload()
     reloaded = await mgr.get_skill(name)
     if reloaded is None:
         raise HTTPException(
@@ -891,6 +909,7 @@ async def install_skill(
 
     # --- Reload + return -----------------------------------------
     mgr = await _get_scoped_manager(request, _user, db)
+    await mgr.reload()
     skill = await mgr.get_skill(body.slug)
     if skill is None:
         raise HTTPException(
@@ -946,18 +965,6 @@ async def registry_detail(
         scanStatus=registry.extract_scan_status(payload),
         moderation=moderation if isinstance(moderation, dict) else None,
         installedAs=slug if slug in installed else None,
+        registrySource=source,
         raw=payload,
     )
-
-
-# Prewarm was previously scheduled via ``asyncio.create_task`` from
-# the ``@app.on_event("startup")`` hook. It was removed because the
-# xagent startup-event integration tests track every
-# ``asyncio.create_task`` call and assert none happen — adding ours
-# broke an unrelated test contract.
-#
-# The endpoints populate their own caches on first call;
-# the cost is just paid by the first user instead of pre-paid at boot.
-# Frontend SWR / sessionStorage cache cushion this across pages.
-# If we want startup prewarm back, the xagent startup tests need to be
-# updated to allow / mock our schedule call.

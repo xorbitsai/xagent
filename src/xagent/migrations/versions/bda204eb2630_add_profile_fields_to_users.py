@@ -43,6 +43,17 @@ def upgrade() -> None:
 
 
 def downgrade() -> None:
+    from sqlalchemy.engine.reflection import Inspector
+
+    bind = op.get_bind()
+    inspector = Inspector.from_engine(bind)
+
+    if "users" not in inspector.get_table_names():
+        return
+
+    existing_columns = {c["name"] for c in inspector.get_columns("users")}
+
     with op.batch_alter_table("users") as batch_op:
         for col_name in ["phone", "country", "organization", "last_name", "first_name"]:
-            batch_op.drop_column(col_name)
+            if col_name in existing_columns:
+                batch_op.drop_column(col_name)

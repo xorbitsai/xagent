@@ -76,11 +76,39 @@ class OpenRouterLLM(OpenAILLM):
             },
         }
 
-    def _disable_thinking_extra_body(
-        self, extra_body: Optional[Dict[str, Any]] = None
+    def _prepare_provider_reasoning_extra_body(
+        self,
+        *,
+        extra_body: Dict[str, Any],
+        thinking: Optional[Dict[str, Any]],
+        tools: Optional[List[Dict[str, Any]]],
+        response_format: Optional[Dict[str, Any]],
+        output_config: Optional[Dict[str, Any]],
+        is_streaming: bool,
     ) -> Dict[str, Any]:
-        updated_extra_body = dict(extra_body or {})
-        updated_extra_body["reasoning"] = {"enabled": False}
-        updated_extra_body["thinking"] = {"type": "disabled"}
+        _ = tools, output_config
+        updated_extra_body = dict(extra_body)
+        should_disable = False
+
+        if thinking is not None:
+            should_enable = thinking.get("type") == "enabled" or thinking.get(
+                "enable", False
+            )
+            should_disable = not should_enable and (
+                thinking.get("type") == "disabled" or not thinking.get("enable", False)
+            )
+        elif is_streaming and response_format:
+            should_disable = self.supports_thinking_mode
+            should_enable = False
+        else:
+            should_enable = False
+
+        if should_disable:
+            updated_extra_body["reasoning"] = {"enabled": False}
+            updated_extra_body["thinking"] = {"type": "disabled"}
+        elif should_enable:
+            updated_extra_body["reasoning"] = {"enabled": True}
+            updated_extra_body["thinking"] = {"type": "enabled"}
+
         updated_extra_body.pop("enable_thinking", None)
         return updated_extra_body

@@ -119,6 +119,83 @@ class TestOpenAILLM:
         assert "tools" in call_args.kwargs
         assert call_args.kwargs["tools"] == tools
 
+    @pytest.mark.asyncio
+    async def test_openai_chat_omits_enable_thinking_when_disabled(
+        self, openai_llm_config, mock_chat_completion, mocker
+    ):
+        """Official OpenAI chat completions must not receive Qwen extensions."""
+
+        mock_client = mocker.AsyncMock()
+        mock_client.chat.completions.create.return_value = mock_chat_completion
+        mocker.patch(
+            "xagent.core.model.chat.basic.openai.AsyncOpenAI",
+            return_value=mock_client,
+        )
+
+        llm = OpenAILLM(
+            **openai_llm_config,
+            abilities=["chat", "tool_calling", "thinking_mode"],
+        )
+
+        await llm.chat(
+            [{"role": "user", "content": "Hello"}],
+            thinking={"type": "disabled"},
+        )
+
+        call_kwargs = mock_client.chat.completions.create.call_args.kwargs
+        assert "extra_body" not in call_kwargs
+
+    @pytest.mark.asyncio
+    async def test_openai_stream_omits_enable_thinking_when_enabled(
+        self, openai_llm_config, mocker
+    ):
+        """Thinking intent should not add unsupported OpenAI chat parameters."""
+
+        async def empty_stream():
+            if False:
+                yield None
+
+        mock_client = mocker.AsyncMock()
+        mock_client.chat.completions.create.return_value = empty_stream()
+        mocker.patch(
+            "xagent.core.model.chat.basic.openai.AsyncOpenAI",
+            return_value=mock_client,
+        )
+
+        llm = OpenAILLM(
+            **openai_llm_config,
+            abilities=["chat", "tool_calling", "thinking_mode"],
+        )
+
+        chunks = [
+            chunk
+            async for chunk in llm.stream_chat(
+                [{"role": "user", "content": "Hello"}],
+                thinking={"type": "enabled"},
+            )
+        ]
+
+        call_kwargs = mock_client.chat.completions.create.call_args.kwargs
+        assert chunks == []
+        assert "extra_body" not in call_kwargs
+
+    def test_openai_provider_reasoning_hook_is_noop_by_default(self, openai_llm_config):
+        """Official OpenAI chat completions do not add provider reasoning payloads."""
+
+        llm = OpenAILLM(
+            **openai_llm_config,
+            abilities=["chat", "tool_calling", "thinking_mode"],
+        )
+
+        assert llm._prepare_provider_reasoning_extra_body(
+            extra_body={"trace_id": "abc"},
+            thinking={"type": "enabled"},
+            tools=None,
+            response_format=None,
+            output_config=None,
+            is_streaming=True,
+        ) == {"trace_id": "abc"}
+
     def test_parse_stream_chunk_ignores_empty_idless_tool_call_placeholder(self, llm):
         """Some OpenAI-compatible providers emit empty id-less tool-call slots."""
 

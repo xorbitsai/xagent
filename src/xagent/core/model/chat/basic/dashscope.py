@@ -57,6 +57,28 @@ class DashScopeLLM(OpenAILLM):
         exc_msg = str(exc).lower()
         return "thinking" in exc_msg and "tool_choice" in exc_msg
 
+    def _prepare_provider_reasoning_extra_body(
+        self,
+        *,
+        extra_body: Dict[str, Any],
+        thinking: Optional[Dict[str, Any]],
+        tools: Optional[List[Dict[str, Any]]],
+        response_format: Optional[Dict[str, Any]],
+        output_config: Optional[Dict[str, Any]],
+        is_streaming: bool,
+    ) -> Dict[str, Any]:
+        _ = tools, response_format, output_config, is_streaming
+        updated_extra_body = dict(extra_body)
+        if thinking is None:
+            return updated_extra_body
+
+        if thinking.get("type") == "enabled" or thinking.get("enable", False):
+            updated_extra_body["enable_thinking"] = True
+        elif thinking.get("type") == "disabled" or not thinking.get("enable", False):
+            updated_extra_body["enable_thinking"] = False
+
+        return updated_extra_body
+
     @staticmethod
     def _with_disabled_thinking(kwargs: Dict[str, Any]) -> Dict[str, Any]:
         updated_kwargs = dict(kwargs)

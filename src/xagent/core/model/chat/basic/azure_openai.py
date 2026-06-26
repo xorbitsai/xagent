@@ -94,15 +94,3 @@ class AzureOpenAILLM(OpenAILLM):
                 api_key=self.api_key,
                 timeout=self.timeout,
             )
-
-    @property
-    def supports_enable_thinking_param(self) -> bool:
-        """
-        Check if this client supports the 'enable_thinking' parameter in extra_body.
-
-        Azure OpenAI does not support this parameter (it's OpenAI-specific).
-
-        Returns:
-            bool: False for Azure OpenAI
-        """
-        return False

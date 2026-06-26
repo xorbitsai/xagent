@@ -63,15 +63,25 @@ class TestDeepSeekLLM:
         with pytest.raises(ValueError, match="Unsupported DeepSeek model"):
             DeepSeekLLM(model_name="not-a-deepseek-model", api_key="test-api-key")
 
-    def test_supports_enable_thinking_param_is_false(self, llm):
-        assert llm.supports_enable_thinking_param is False
-
     def test_structured_output_capabilities(self, llm):
         assert llm.supports_json_schema_response_format is False
         assert llm.supports_json_object_response_format is True
 
     def test_deepseek_is_not_openai_subclass(self):
         assert not issubclass(DeepSeekLLM, OpenAILLM)
+
+    def test_provider_reasoning_hook_disables_deepseek_thinking(self, llm):
+        assert llm._prepare_provider_reasoning_extra_body(
+            extra_body={"trace_id": "abc"},
+            thinking={"type": "disabled"},
+            tools=None,
+            response_format=None,
+            output_config=None,
+            is_streaming=False,
+        ) == {
+            "trace_id": "abc",
+            "thinking": {"type": "disabled"},
+        }
 
     @pytest.mark.asyncio
     async def test_explicit_thinking_enabled_uses_deepseek_extra_body(

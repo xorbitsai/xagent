@@ -205,3 +205,27 @@ async def test_openrouter_deepseek_stream_uses_disabled_thinking_payload(
     }
     assert "enable_thinking" not in call_kwargs["extra_body"]
     assert call_kwargs["tool_choice"] == "required"
+
+
+def test_openrouter_reasoning_hook_enables_reasoning_payload(monkeypatch):
+    monkeypatch.setenv("XAGENT_OPENROUTER_OFFICIAL_PROVIDERS_ONLY", "false")
+    llm = OpenRouterLLM(
+        model_name="deepseek/deepseek-v4-flash",
+        api_key="test-key",
+        abilities=["chat", "tool_calling", "thinking_mode"],
+    )
+
+    extra_body = llm._prepare_provider_reasoning_extra_body(
+        extra_body={"trace_id": "abc", "enable_thinking": False},
+        thinking={"type": "enabled"},
+        tools=None,
+        response_format=None,
+        output_config=None,
+        is_streaming=True,
+    )
+
+    assert extra_body == {
+        "trace_id": "abc",
+        "reasoning": {"enabled": True},
+        "thinking": {"type": "enabled"},
+    }

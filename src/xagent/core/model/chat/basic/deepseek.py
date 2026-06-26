@@ -87,11 +87,6 @@ class DeepSeekLLM(OpenAICompatibleLLM):
             )
 
     @property
-    def supports_enable_thinking_param(self) -> bool:
-        """DeepSeek uses a `thinking` payload instead of `enable_thinking`."""
-        return False
-
-    @property
     def supports_json_schema_response_format(self) -> bool:
         """DeepSeek supports JSON object mode, not OpenAI json_schema mode."""
         return False
@@ -101,51 +96,42 @@ class DeepSeekLLM(OpenAICompatibleLLM):
         """DeepSeek supports response_format={"type": "json_object"}."""
         return True
 
-    def _build_deepseek_extra_body(
+    def _prepare_provider_reasoning_extra_body(
         self,
         *,
+        extra_body: Dict[str, Any],
         tools: Optional[List[Dict[str, Any]]],
         response_format: Optional[Dict[str, Any]],
         output_config: Optional[Dict[str, Any]],
         thinking: Optional[Dict[str, Any]],
+        is_streaming: bool,
     ) -> Dict[str, Any]:
-        extra_body: Dict[str, Any] = {}
+        _ = is_streaming
+        updated_extra_body = dict(extra_body)
 
         if thinking is not None:
             if thinking.get("type") == "enabled" or thinking.get("enable", False):
-                extra_body["thinking"] = {"type": "enabled"}
+                updated_extra_body["thinking"] = {"type": "enabled"}
             else:
-                extra_body["thinking"] = {"type": "disabled"}
+                updated_extra_body["thinking"] = {"type": "disabled"}
         else:
-            extra_body["thinking"] = {"type": "disabled"}
+            updated_extra_body["thinking"] = {"type": "disabled"}
 
-        return extra_body
+        updated_extra_body.pop("enable_thinking", None)
+        return updated_extra_body
 
     def _prepare_deepseek_kwargs(
         self,
-        *,
-        tools: Optional[List[Dict[str, Any]]],
-        response_format: Optional[Dict[str, Any]],
-        output_config: Optional[Dict[str, Any]],
-        thinking: Optional[Dict[str, Any]],
         kwargs: Dict[str, Any],
-    ) -> tuple[Dict[str, Any], Dict[str, Any]]:
+    ) -> Dict[str, Any]:
         updated_kwargs = dict(kwargs)
-        caller_extra_body = dict(updated_kwargs.pop("extra_body", {}) or {})
-        provider_extra_body = self._build_deepseek_extra_body(
-            tools=tools,
-            response_format=response_format,
-            output_config=output_config,
-            thinking=thinking,
-        )
-        extra_body = {**caller_extra_body, **provider_extra_body}
 
         if "reasoning_effort" not in updated_kwargs:
             reasoning_effort = os.getenv("DEEPSEEK_REASONING_EFFORT")
             if reasoning_effort:
                 updated_kwargs["reasoning_effort"] = reasoning_effort
 
-        return extra_body, updated_kwargs
+        return updated_kwargs
 
     def _prepare_messages_for_request(
         self,
@@ -235,14 +221,6 @@ class DeepSeekLLM(OpenAICompatibleLLM):
 
         return response_format, output_config
 
-    def _disable_thinking_extra_body(
-        self, extra_body: Optional[Dict[str, Any]] = None
-    ) -> Dict[str, Any]:
-        updated_extra_body = dict(extra_body or {})
-        updated_extra_body["thinking"] = {"type": "disabled"}
-        updated_extra_body.pop("enable_thinking", None)
-        return updated_extra_body
-
     async def chat(
         self,
         messages: List[Dict[str, str]],
@@ -259,13 +237,7 @@ class DeepSeekLLM(OpenAICompatibleLLM):
             response_format=response_format,
             output_config=output_config,
         )
-        extra_body, kwargs = self._prepare_deepseek_kwargs(
-            tools=tools,
-            response_format=response_format,
-            output_config=output_config,
-            thinking=thinking,
-            kwargs=kwargs,
-        )
+        kwargs = self._prepare_deepseek_kwargs(kwargs=kwargs)
         return await super().chat(
             messages=messages,
             temperature=temperature,
@@ -275,7 +247,6 @@ class DeepSeekLLM(OpenAICompatibleLLM):
             response_format=response_format,
             thinking=thinking,
             output_config=output_config,
-            extra_body=extra_body,
             **kwargs,
         )
 
@@ -295,13 +266,7 @@ class DeepSeekLLM(OpenAICompatibleLLM):
             response_format=response_format,
             output_config=output_config,
         )
-        extra_body, kwargs = self._prepare_deepseek_kwargs(
-            tools=tools,
-            response_format=response_format,
-            output_config=output_config,
-            thinking=thinking,
-            kwargs=kwargs,
-        )
+        kwargs = self._prepare_deepseek_kwargs(kwargs=kwargs)
         async for chunk in super().stream_chat(
             messages=messages,
             temperature=temperature,
@@ -311,7 +276,6 @@ class DeepSeekLLM(OpenAICompatibleLLM):
             response_format=response_format,
             thinking=thinking,
             output_config=output_config,
-            extra_body=extra_body,
             **kwargs,
         ):
             yield chunk

@@ -83,6 +83,34 @@ def dashscope_llm() -> DashScopeLLM:
     )
 
 
+def test_dashscope_provider_reasoning_hook_disables_qwen_thinking(dashscope_llm):
+    assert dashscope_llm._prepare_provider_reasoning_extra_body(
+        extra_body={"trace_id": "abc"},
+        thinking={"type": "disabled"},
+        tools=None,
+        response_format=None,
+        output_config=None,
+        is_streaming=False,
+    ) == {
+        "trace_id": "abc",
+        "enable_thinking": False,
+    }
+
+
+def test_dashscope_provider_reasoning_hook_enables_qwen_thinking(dashscope_llm):
+    assert dashscope_llm._prepare_provider_reasoning_extra_body(
+        extra_body={"trace_id": "abc"},
+        thinking={"type": "enabled"},
+        tools=None,
+        response_format=None,
+        output_config=None,
+        is_streaming=True,
+    ) == {
+        "trace_id": "abc",
+        "enable_thinking": True,
+    }
+
+
 @pytest.mark.asyncio
 async def test_strict_tool_call_disables_thinking_for_chat(
     dashscope_llm, mock_tool_call_completion, mocker
@@ -104,6 +132,26 @@ async def test_strict_tool_call_disables_thinking_for_chat(
     call_kwargs = mock_client.chat.completions.create.call_args.kwargs
     assert call_kwargs["tool_choice"] == "required"
     assert call_kwargs["extra_body"] == {"enable_thinking": False}
+
+
+@pytest.mark.asyncio
+async def test_enabled_thinking_sets_dashscope_payload(
+    dashscope_llm, mock_chat_completion, mocker
+):
+    mock_client = mocker.AsyncMock()
+    mock_client.chat.completions.create.return_value = mock_chat_completion
+    mocker.patch(
+        "xagent.core.model.chat.basic.openai.AsyncOpenAI",
+        return_value=mock_client,
+    )
+
+    await dashscope_llm.chat(
+        [{"role": "user", "content": "Think through this."}],
+        thinking={"type": "enabled"},
+    )
+
+    call_kwargs = mock_client.chat.completions.create.call_args.kwargs
+    assert call_kwargs["extra_body"] == {"enable_thinking": True}
 
 
 @pytest.mark.asyncio

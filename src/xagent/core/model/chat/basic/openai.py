@@ -253,6 +253,20 @@ class OpenAICompatibleLLM(BaseLLM):
 
         completion_params["output_config"] = output_config
 
+    def _prepare_provider_reasoning_extra_body(
+        self,
+        *,
+        extra_body: Dict[str, Any],
+        thinking: Optional[Dict[str, Any]],
+        tools: Optional[List[Dict[str, Any]]],
+        response_format: Optional[Dict[str, Any]],
+        output_config: Optional[Dict[str, Any]],
+        is_streaming: bool,
+    ) -> Dict[str, Any]:
+        """Hook for subclasses to add provider-specific reasoning payloads."""
+        _ = thinking, tools, response_format, output_config, is_streaming
+        return dict(extra_body)
+
     async def chat(
         self,
         messages: List[Dict[str, str]],
@@ -275,7 +289,7 @@ class OpenAICompatibleLLM(BaseLLM):
             tools: List of tool definitions for function calling
             tool_choice: Tool choice strategy
             response_format: Response format specification (e.g., {"type": "json_object"})
-            thinking: Thinking mode configuration (enables thinking mode for supported models)
+            thinking: Provider-specific reasoning configuration for subclasses.
             output_config: Output configuration for structured outputs (e.g., {"format": {"type": "json_schema", "schema": {...}}})
             **kwargs: Additional parameters to pass to the OpenAI API
 
@@ -320,37 +334,14 @@ class OpenAICompatibleLLM(BaseLLM):
 
         self._apply_output_config(completion_params, output_config)
 
-        # Handle thinking mode using extra_body as specified in the requirements
-        # Only add enable_thinking if the client supports this parameter (e.g., standard OpenAI)
-        # Check if this is a thinking-only model (only supports thinking_mode, not chat)
-        is_thinking_only = (
-            "thinking_mode" in self.abilities and "chat" not in self.abilities
+        extra_body = self._prepare_provider_reasoning_extra_body(
+            extra_body=extra_body,
+            thinking=thinking,
+            tools=tools,
+            response_format=response_format,
+            output_config=output_config,
+            is_streaming=False,
         )
-
-        # Check if this is a streaming call
-        is_streaming = completion_params.get("stream", False)
-
-        if not self.supports_enable_thinking_param:
-            # Skip all enable_thinking logic for clients that don't support it (e.g., Azure OpenAI)
-            pass
-        elif is_thinking_only:
-            # For thinking-only models, thinking mode is inherent - no extra_body needed
-            # The model naturally thinks as part of its core functionality
-            pass
-        elif thinking is not None:
-            # User explicitly specified thinking mode for hybrid models
-            if thinking.get("type") == "enabled" or thinking.get("enable", False):
-                # Only enable thinking for streaming calls
-                if is_streaming:
-                    extra_body["enable_thinking"] = True
-                else:
-                    # For non-streaming calls, enable_thinking must be false
-                    extra_body = self._disable_thinking_extra_body(extra_body)
-            elif thinking.get("type") == "disabled" or not thinking.get(
-                "enable", False
-            ):
-                # For hybrid models, allow disabling thinking mode
-                extra_body = self._disable_thinking_extra_body(extra_body)
 
         # Helper function to process response
         async def _make_api_call() -> Any:
@@ -489,9 +480,8 @@ class OpenAICompatibleLLM(BaseLLM):
             response = await _make_api_call()
             result = _process_response(response)
 
-            # Handle thinking mode models with response_format returning invalid JSON
-            # Some models (like DashScope qwen3) return garbage in content when thinking is enabled
-            # Detect this and retry with thinking disabled
+            # Provider reasoning can corrupt structured JSON on some compatible
+            # endpoints. Subclasses can disable provider reasoning for a retry.
             if (
                 response_format
                 and "thinking_mode" in self.abilities
@@ -513,7 +503,14 @@ class OpenAICompatibleLLM(BaseLLM):
                             "Model returned non-JSON content with response_format while thinking was enabled. "
                             "Retrying with thinking disabled."
                         )
-                        extra_body = self._disable_thinking_extra_body(extra_body)
+                        extra_body = self._prepare_provider_reasoning_extra_body(
+                            extra_body=extra_body,
+                            thinking={"type": "disabled", "enable": False},
+                            tools=tools,
+                            response_format=response_format,
+                            output_config=output_config,
+                            is_streaming=False,
+                        )
                         response = await _make_api_call()
                         result = _process_response(response)
 
@@ -570,27 +567,6 @@ class OpenAICompatibleLLM(BaseLLM):
         """
         return "thinking_mode" in self.abilities
 
-    @property
-    def supports_enable_thinking_param(self) -> bool:
-        """
-        Check if this client supports the 'enable_thinking' parameter in extra_body.
-
-        Standard OpenAI API supports this parameter for certain models.
-
-        Returns:
-            bool: True for standard OpenAI, can be overridden in subclasses
-        """
-        return True
-
-    def _disable_thinking_extra_body(
-        self, extra_body: Optional[Dict[str, Any]] = None
-    ) -> Dict[str, Any]:
-        """Return provider-specific extra_body for disabling thinking."""
-        updated_extra_body = dict(extra_body or {})
-        if self.supports_enable_thinking_param:
-            updated_extra_body["enable_thinking"] = False
-        return updated_extra_body
-
     def _attach_reasoning_content_to_raw(
         self,
         raw_payload: Any,
@@ -636,7 +612,7 @@ class OpenAICompatibleLLM(BaseLLM):
             tools: List of tool definitions for function calling
             tool_choice: Tool choice strategy
             response_format: Response format specification
-            thinking: Thinking mode configuration (enables thinking mode for supported models)
+            thinking: Provider-specific reasoning configuration for subclasses.
             **kwargs: Additional parameters to pass to the OpenAI API
 
         Returns:
@@ -683,42 +659,14 @@ class OpenAICompatibleLLM(BaseLLM):
 
         self._apply_output_config(completion_params, output_config)
 
-        # Check if this is a thinking-only model (only supports thinking_mode, not chat)
-        is_thinking_only = (
-            "thinking_mode" in self.abilities and "chat" not in self.abilities
+        extra_body = self._prepare_provider_reasoning_extra_body(
+            extra_body=extra_body,
+            thinking=thinking,
+            tools=tools,
+            response_format=response_format,
+            output_config=output_config,
+            is_streaming=False,
         )
-
-        # Check if this is a streaming call
-        is_streaming = completion_params.get("stream", False)
-
-        if not self.supports_enable_thinking_param:
-            # Skip all enable_thinking logic for clients that don't support it (e.g., Azure OpenAI)
-            pass
-        elif is_thinking_only:
-            # For thinking-only models, thinking mode is inherent - no extra_body needed
-            # The model naturally thinks as part of its core functionality
-            pass
-        elif thinking is not None:
-            # User explicitly specified thinking mode for hybrid models
-            if thinking.get("type") == "enabled" or thinking.get("enable", False):
-                # Only enable thinking for streaming calls
-                if is_streaming:
-                    extra_body["enable_thinking"] = True
-                else:
-                    # For non-streaming calls, enable_thinking must be false
-                    extra_body = self._disable_thinking_extra_body(extra_body)
-            elif thinking.get("type") == "disabled" or not thinking.get(
-                "enable", False
-            ):
-                # For hybrid models, allow disabling thinking mode
-                extra_body = self._disable_thinking_extra_body(extra_body)
-        elif self.supports_thinking_mode and "thinking_mode" in self.abilities:
-            # For hybrid models with thinking_mode ability, auto-enable thinking mode only for streaming
-            if is_streaming:
-                extra_body["enable_thinking"] = True
-            else:
-                # For non-streaming calls, enable_thinking must be false
-                extra_body = self._disable_thinking_extra_body(extra_body)
 
         try:
             # Make the API call with extra_body if needed
@@ -912,7 +860,7 @@ class OpenAICompatibleLLM(BaseLLM):
             tools: List of tool definitions for function calling
             tool_choice: Tool choice strategy
             response_format: Response format specification
-            thinking: Thinking mode configuration
+            thinking: Provider-specific reasoning configuration for subclasses.
             **kwargs: Additional parameters to pass to the OpenAI API
 
         Yields:
@@ -958,32 +906,14 @@ class OpenAICompatibleLLM(BaseLLM):
 
         self._apply_output_config(completion_params, output_config)
 
-        # Handle thinking mode
-        is_thinking_only = (
-            "thinking_mode" in self.abilities and "chat" not in self.abilities
+        extra_body = self._prepare_provider_reasoning_extra_body(
+            extra_body=extra_body,
+            thinking=thinking,
+            tools=tools,
+            response_format=response_format,
+            output_config=output_config,
+            is_streaming=True,
         )
-
-        if not self.supports_enable_thinking_param:
-            pass
-        elif is_thinking_only:
-            pass
-        elif thinking is not None:
-            if thinking.get("type") == "enabled" or thinking.get("enable", False):
-                extra_body["enable_thinking"] = True
-            elif thinking.get("type") == "disabled" or not thinking.get(
-                "enable", False
-            ):
-                extra_body = self._disable_thinking_extra_body(extra_body)
-        elif self.supports_thinking_mode and "thinking_mode" in self.abilities:
-            # For hybrid models with thinking_mode ability
-            # If response_format is requested, disable thinking to avoid JSON corruption
-            if response_format:
-                logger.debug(
-                    "Disabling thinking mode for response_format to ensure valid JSON output"
-                )
-                extra_body = self._disable_thinking_extra_body(extra_body)
-            else:
-                extra_body["enable_thinking"] = True
 
         try:
             # Create streaming response

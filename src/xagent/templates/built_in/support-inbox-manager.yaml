@@ -33,7 +33,7 @@ agent_config:
     **Responsibilities**
 
 
-    - **Read & Retrieve** emails from the user''s Gmail inbox, including threads, attachments metadata, and sender details.
+    - **Read & Retrieve** emails from the user''s Gmail or Outlook inbox, including threads, attachments metadata, and sender details.
 
     - **Summarize** emails and threads clearly and concisely, highlighting key information, action items, deadlines, and sender intent.
 

@@ -1,6 +1,6 @@
 "use client"
 
-import { useEffect, useState } from "react"
+import { useEffect, useRef, useState } from "react"
 import { Button } from "@/components/ui/button"
 import { Input } from "@/components/ui/input"
 import { getApiUrl } from "@/lib/utils"
@@ -27,6 +27,7 @@ import { useSetupStatus } from "@/hooks/use-setup-status"
 import { AuthPageShell } from "@/components/auth/auth-page-shell"
 import { AuthFormCard } from "@/components/auth/auth-form-card"
 import { COUNTRIES, DEFAULT_COUNTRY } from "@/lib/countries"
+import type { Country } from "@/lib/countries"
 
 export function RegisterPage() {
   const branding = getBrandingFromEnv()
@@ -37,7 +38,9 @@ export function RegisterPage() {
   const [error, setError] = useState("")
   const [success, setSuccess] = useState("")
   const [showCountryDropdown, setShowCountryDropdown] = useState(false)
-  const [selectedCountry, setSelectedCountry] = useState(DEFAULT_COUNTRY)
+  // null = not yet detected/selected; user must explicitly choose if detection fails
+  const [selectedCountry, setSelectedCountry] = useState<Country | null>(null)
+  const countryDropdownRef = useRef<HTMLDivElement>(null)
   const [formData, setFormData] = useState({
     username: "",
     email: "",
@@ -54,7 +57,7 @@ export function RegisterPage() {
     redirectToLoginIfRegistrationClosed: true,
   })
 
-  // Auto-detect country from IP
+  // Auto-detect country from IP (best-effort; no default applied on failure)
   useEffect(() => {
     const controller = new AbortController()
     const timeoutId = setTimeout(() => controller.abort(), 3000)
@@ -68,7 +71,7 @@ export function RegisterPage() {
         const found = COUNTRIES.find((c) => c.code === countryCode)
         if (found) setSelectedCountry(found)
       } catch {
-        // silently fall back to default
+        // silently leave selectedCountry as null; user selects manually
       } finally {
         clearTimeout(timeoutId)
       }
@@ -79,6 +82,17 @@ export function RegisterPage() {
       controller.abort()
       clearTimeout(timeoutId)
     }
+  }, [])
+
+  // Close dropdown on outside click
+  useEffect(() => {
+    const handleClickOutside = (e: MouseEvent) => {
+      if (countryDropdownRef.current && !countryDropdownRef.current.contains(e.target as Node)) {
+        setShowCountryDropdown(false)
+      }
+    }
+    document.addEventListener("mousedown", handleClickOutside)
+    return () => document.removeEventListener("mousedown", handleClickOutside)
   }, [])
 
   const handleSubmit = async (e: React.FormEvent) => {
@@ -105,9 +119,9 @@ export function RegisterPage() {
 
     try {
       const trimmedPhone = formData.phone.trim()
-      const phone = trimmedPhone
+      const phone = trimmedPhone && selectedCountry
         ? `${selectedCountry.dialCode} ${trimmedPhone}`
-        : undefined
+        : trimmedPhone || undefined
 
       const response = await apiRequest(`${getApiUrl()}/api/auth/register`, {
         method: "POST",
@@ -119,7 +133,7 @@ export function RegisterPage() {
           first_name: formData.firstName || undefined,
           last_name: formData.lastName || undefined,
           organization: formData.organization || undefined,
-          country: selectedCountry.name,
+          country: selectedCountry?.name ?? undefined,
           phone,
         }),
       })
@@ -176,6 +190,8 @@ export function RegisterPage() {
     },
   ]
 
+  const displayCountry = selectedCountry ?? DEFAULT_COUNTRY
+
   return (
     <AuthPageShell
       appName={branding.appName}
@@ -230,6 +246,7 @@ export function RegisterPage() {
                 onChange={handleInputChange}
                 placeholder={t("register.form.username_placeholder")}
                 className={inputClass}
+                maxLength={50}
                 required
               />
             </div>
@@ -249,6 +266,7 @@ export function RegisterPage() {
                 onChange={handleInputChange}
                 placeholder={t("register.form.email_placeholder")}
                 className={inputClass}
+                maxLength={255}
                 required
               />
             </div>
@@ -269,6 +287,7 @@ export function RegisterPage() {
                   onChange={handleInputChange}
                   placeholder={t("register.form.first_name_placeholder")}
                   className={inputClass}
+                  maxLength={100}
                 />
               </div>
             </div>
@@ -285,6 +304,7 @@ export function RegisterPage() {
                   onChange={handleInputChange}
                   placeholder={t("register.form.last_name_placeholder")}
                   className={inputClass}
+                  maxLength={100}
                 />
               </div>
             </div>
@@ -304,6 +324,7 @@ export function RegisterPage() {
                 onChange={handleInputChange}
                 placeholder={t("register.form.organization_placeholder")}
                 className={inputClass}
+                maxLength={255}
               />
             </div>
           </div>
@@ -370,35 +391,46 @@ export function RegisterPage() {
               </label>
               <span className="text-xs text-[#A0A9B8]">{t("register.form.country_auto")}</span>
             </div>
-            <div className="relative">
+            <div className="relative" ref={countryDropdownRef}>
               <button
                 type="button"
                 onClick={() => setShowCountryDropdown((v) => !v)}
+                aria-haspopup="listbox"
+                aria-expanded={showCountryDropdown}
+                onKeyDown={(e) => {
+                  if (e.key === "Escape") setShowCountryDropdown(false)
+                }}
                 className="flex h-12 w-full items-center gap-3 rounded-[14px] border border-[#E2E8F3] bg-white px-4 text-sm text-[#171A2F] shadow-[0_1px_2px_rgba(16,24,40,0.04)] transition-colors hover:border-[#5B7CFF] focus:outline-none focus:border-[#5B7CFF]"
               >
-                <span className="text-base">{selectedCountry.flag}</span>
-                <span className="flex-1 text-left">{selectedCountry.name}</span>
+                <span className="text-base">{displayCountry.flag}</span>
+                <span className={`flex-1 text-left ${!selectedCountry ? "text-[#A0A9B8]" : ""}`}>
+                  {selectedCountry ? selectedCountry.name : t("register.form.country_placeholder")}
+                </span>
                 <ChevronDown className="h-4 w-4 text-[#A0A9B8]" />
               </button>
 
               {showCountryDropdown ? (
-                <div className="absolute top-[calc(100%+4px)] left-0 z-50 w-full max-h-56 overflow-y-auto rounded-[14px] border border-[#E2E8F3] bg-white shadow-[0_8px_24px_rgba(16,24,40,0.12)]">
+                <ul
+                  role="listbox"
+                  className="absolute top-[calc(100%+4px)] left-0 z-50 w-full max-h-56 overflow-y-auto rounded-[14px] border border-[#E2E8F3] bg-white shadow-[0_8px_24px_rgba(16,24,40,0.12)]"
+                >
                   {COUNTRIES.map((country) => (
-                    <button
-                      key={country.code}
-                      type="button"
-                      onClick={() => {
-                        setSelectedCountry(country)
-                        setShowCountryDropdown(false)
-                      }}
-                      className="flex w-full items-center gap-3 px-4 py-2.5 text-sm text-[#171A2F] hover:bg-[#F7F9FC] text-left"
-                    >
-                      <span className="text-base">{country.flag}</span>
-                      <span>{country.name}</span>
-                      <span className="ml-auto text-xs text-[#A0A9B8]">{country.dialCode}</span>
-                    </button>
+                    <li key={country.code} role="option" aria-selected={selectedCountry?.code === country.code}>
+                      <button
+                        type="button"
+                        onClick={() => {
+                          setSelectedCountry(country)
+                          setShowCountryDropdown(false)
+                        }}
+                        className="flex w-full items-center gap-3 px-4 py-2.5 text-sm text-[#171A2F] hover:bg-[#F7F9FC] text-left"
+                      >
+                        <span className="text-base">{country.flag}</span>
+                        <span>{country.name}</span>
+                        <span className="ml-auto text-xs text-[#A0A9B8]">{country.dialCode}</span>
+                      </button>
+                    </li>
                   ))}
-                </div>
+                </ul>
               ) : null}
             </div>
           </div>
@@ -414,7 +446,7 @@ export function RegisterPage() {
             <div className="flex h-12 overflow-hidden rounded-[14px] border border-[#E2E8F3] bg-white shadow-[0_1px_2px_rgba(16,24,40,0.04)] focus-within:border-[#5B7CFF]">
               <div className="flex shrink-0 items-center gap-1.5 border-r border-[#E2E8F3] px-3 text-sm text-[#4A5365]">
                 <Phone className="h-4 w-4 text-[#A0A9B8]" />
-                <span>{selectedCountry.dialCode}</span>
+                <span>{displayCountry.dialCode}</span>
               </div>
               <input
                 type="tel"
@@ -422,6 +454,7 @@ export function RegisterPage() {
                 value={formData.phone}
                 onChange={handleInputChange}
                 placeholder="555 000 0000"
+                maxLength={50}
                 className="flex-1 bg-transparent px-3 text-sm text-[#171A2F] placeholder:text-[#A0A9B8] outline-none"
               />
             </div>

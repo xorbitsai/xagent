@@ -298,6 +298,34 @@ class TestAuthAPI:
         )
         db.close()
 
+    def test_register_profile_fields_persisted(self, test_db):
+        """Test that profile fields submitted during registration are stored on the user"""
+        setup_first_admin()
+        payload = {
+            "username": "profileuser",
+            "email": "profileuser@example.com",
+            "password": "password123",
+            "first_name": "Ada",
+            "last_name": "Lovelace",
+            "organization": "Analytical Engine Co.",
+            "country": "United Kingdom",
+            "phone": "+44 7700 900000",
+        }
+        response = client.post("/api/auth/register", json=payload)
+        assert response.status_code == 200
+        data = response.json()
+        assert data["success"] is True
+
+        db = TestingSessionLocal()
+        user = db.query(User).filter(User.username == "profileuser").first()
+        assert user is not None
+        assert user.first_name == "Ada"
+        assert user.last_name == "Lovelace"
+        assert user.organization == "Analytical Engine Co."
+        assert user.country == "United Kingdom"
+        assert user.phone == "+44 7700 900000"
+        db.close()
+
     def test_register_duplicate_username(self, test_db, test_user_data):
         """Test registration with duplicate username"""
         setup_first_admin()

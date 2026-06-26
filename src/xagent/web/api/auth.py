@@ -17,7 +17,7 @@ os.environ["OAUTHLIB_RELAX_TOKEN_SCOPE"] = "1"
 from fastapi import APIRouter, Depends, HTTPException, Request, status
 from fastapi.responses import HTMLResponse, RedirectResponse
 from jose import JWTError, jwt
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
@@ -122,11 +122,11 @@ class RegisterRequest(BaseModel):
     username: str
     email: Optional[str] = None
     password: str
-    first_name: Optional[str] = None
-    last_name: Optional[str] = None
-    organization: Optional[str] = None
-    country: Optional[str] = None
-    phone: Optional[str] = None
+    first_name: Optional[str] = Field(None, max_length=100)
+    last_name: Optional[str] = Field(None, max_length=100)
+    organization: Optional[str] = Field(None, max_length=255)
+    country: Optional[str] = Field(None, max_length=100)
+    phone: Optional[str] = Field(None, max_length=50)
 
 
 class RegisterResponse(BaseModel):

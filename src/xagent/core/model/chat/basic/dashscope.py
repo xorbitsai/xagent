@@ -1,0 +1,187 @@
+import logging
+import os
+from typing import Any, AsyncIterator, Dict, List, Optional, Union
+
+from ..types import StreamChunk
+from .openai import OpenAILLM
+
+logger = logging.getLogger(__name__)
+
+_DISABLE_THINKING = {"type": "disabled", "enable": False}
+
+
+class DashScopeLLM(OpenAILLM):
+    """DashScope/OpenAI-compatible chat client with Qwen request policy.
+
+    Qwen thinking mode rejects strict tool selection (``required`` or a
+    function object). Xagent's agent patterns intentionally use strict tool
+    choice for reliable tool execution, so this adapter disables thinking for
+    those calls before falling back to ``auto`` only if the provider still
+    rejects the request.
+    """
+
+    def __init__(
+        self,
+        model_name: str = "qwen-plus",
+        base_url: Optional[str] = None,
+        api_key: Optional[str] = None,
+        default_temperature: Optional[float] = None,
+        default_max_tokens: Optional[int] = None,
+        timeout: float = 180.0,
+        abilities: Optional[List[str]] = None,
+        timeout_config: Optional[Any] = None,
+    ):
+        super().__init__(
+            model_name=model_name,
+            base_url=(
+                base_url
+                or os.getenv("DASHSCOPE_BASE_URL")
+                or "https://dashscope.aliyuncs.com/compatible-mode/v1"
+            ),
+            api_key=api_key if api_key is not None else os.getenv("DASHSCOPE_API_KEY"),
+            default_temperature=default_temperature,
+            default_max_tokens=default_max_tokens,
+            timeout=timeout,
+            abilities=abilities,
+            timeout_config=timeout_config,
+        )
+
+    @staticmethod
+    def _is_strict_tool_choice(
+        tool_choice: Optional[Union[str, Dict[str, Any]]],
+    ) -> bool:
+        return tool_choice == "required" or isinstance(tool_choice, dict)
+
+    @staticmethod
+    def _is_thinking_tool_choice_error(exc: Exception) -> bool:
+        exc_msg = str(exc).lower()
+        return "thinking" in exc_msg and "tool_choice" in exc_msg
+
+    @staticmethod
+    def _with_disabled_thinking(kwargs: Dict[str, Any]) -> Dict[str, Any]:
+        updated_kwargs = dict(kwargs)
+        extra_body = dict(updated_kwargs.get("extra_body") or {})
+        extra_body["enable_thinking"] = False
+        updated_kwargs["extra_body"] = extra_body
+        return updated_kwargs
+
+    @classmethod
+    def _requires_thinking_disabled(
+        cls,
+        *,
+        tools: Optional[List[Dict[str, Any]]],
+        tool_choice: Optional[Union[str, Dict[str, Any]]],
+    ) -> bool:
+        return bool(tools) and cls._is_strict_tool_choice(tool_choice)
+
+    async def chat(
+        self,
+        messages: List[Dict[str, str]],
+        temperature: Optional[float] = None,
+        max_tokens: Optional[int] = None,
+        tools: Optional[List[Dict[str, Any]]] = None,
+        tool_choice: Optional[Union[str, Dict[str, Any]]] = None,
+        response_format: Optional[Dict[str, Any]] = None,
+        thinking: Optional[Dict[str, Any]] = None,
+        output_config: Optional[Dict[str, Any]] = None,
+        **kwargs: Any,
+    ) -> Any:
+        strict_tool_choice = self._requires_thinking_disabled(
+            tools=tools,
+            tool_choice=tool_choice,
+        )
+        call_kwargs = (
+            self._with_disabled_thinking(kwargs) if strict_tool_choice else kwargs
+        )
+        call_thinking = _DISABLE_THINKING if strict_tool_choice else thinking
+
+        try:
+            return await super().chat(
+                messages,
+                temperature=temperature,
+                max_tokens=max_tokens,
+                tools=tools,
+                tool_choice=tool_choice,
+                response_format=response_format,
+                thinking=call_thinking,
+                output_config=output_config,
+                **call_kwargs,
+            )
+        except RuntimeError as exc:
+            if not strict_tool_choice or not self._is_thinking_tool_choice_error(exc):
+                raise
+
+            logger.warning(
+                "DashScope rejected strict tool_choice while thinking; retrying with tool_choice=auto"
+            )
+            return await super().chat(
+                messages,
+                temperature=temperature,
+                max_tokens=max_tokens,
+                tools=tools,
+                tool_choice="auto",
+                response_format=response_format,
+                thinking=_DISABLE_THINKING,
+                output_config=output_config,
+                **self._with_disabled_thinking(kwargs),
+            )
+
+    async def stream_chat(
+        self,
+        messages: List[Dict[str, str]],
+        temperature: Optional[float] = None,
+        max_tokens: Optional[int] = None,
+        tools: Optional[List[Dict[str, Any]]] = None,
+        tool_choice: Optional[Union[str, Dict[str, Any]]] = None,
+        response_format: Optional[Dict[str, Any]] = None,
+        thinking: Optional[Dict[str, Any]] = None,
+        output_config: Optional[Dict[str, Any]] = None,
+        **kwargs: Any,
+    ) -> AsyncIterator[StreamChunk]:
+        strict_tool_choice = self._requires_thinking_disabled(
+            tools=tools,
+            tool_choice=tool_choice,
+        )
+        call_kwargs = (
+            self._with_disabled_thinking(kwargs) if strict_tool_choice else kwargs
+        )
+        call_thinking = _DISABLE_THINKING if strict_tool_choice else thinking
+        yielded = False
+
+        try:
+            async for chunk in super().stream_chat(
+                messages,
+                temperature=temperature,
+                max_tokens=max_tokens,
+                tools=tools,
+                tool_choice=tool_choice,
+                response_format=response_format,
+                thinking=call_thinking,
+                output_config=output_config,
+                **call_kwargs,
+            ):
+                yielded = True
+                yield chunk
+        except RuntimeError as exc:
+            if (
+                yielded
+                or not strict_tool_choice
+                or not self._is_thinking_tool_choice_error(exc)
+            ):
+                raise
+
+            logger.warning(
+                "DashScope rejected strict streaming tool_choice while thinking; retrying with tool_choice=auto"
+            )
+            async for chunk in super().stream_chat(
+                messages,
+                temperature=temperature,
+                max_tokens=max_tokens,
+                tools=tools,
+                tool_choice="auto",
+                response_format=response_format,
+                thinking=_DISABLE_THINKING,
+                output_config=output_config,
+                **self._with_disabled_thinking(kwargs),
+            ):
+                yield chunk

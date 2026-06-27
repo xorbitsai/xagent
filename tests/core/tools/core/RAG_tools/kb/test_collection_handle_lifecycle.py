@@ -1,8 +1,11 @@
-"""Tests for delete_collection_data and delete_documents_data on KBCollectionHandle.
+"""Tests for delete_collection_data, delete_documents_data, and rename primitives on KBCollectionHandle.
 
 H05 Phase 1 – These tests drive out collection-level cascade delete methods on
 ``LanceDBCollectionHandle``.  They must FAIL before the implementation is added
 (RED) and PASS afterwards (GREEN).
+
+H05 Phase 2 – Adds rename_collection_data, rename_collection_status, and
+rename_collection_metadata primitives.
 
 Storage isolation is provided by the autouse ``isolate_rag_storage`` fixture in
 ``tests/conftest.py``.
@@ -10,6 +13,7 @@ Storage isolation is provided by the autouse ``isolate_rag_storage`` fixture in
 
 from __future__ import annotations
 
+import asyncio
 import inspect
 from datetime import datetime, timezone
 from unittest.mock import MagicMock, patch
@@ -29,6 +33,7 @@ from xagent.core.tools.core.RAG_tools.kb.models import (
     KBUserScope,
 )
 from xagent.core.tools.core.RAG_tools.storage.factory import (
+    get_ingestion_status_store,
     get_metadata_store,
     get_vector_index_store,
 )
@@ -280,3 +285,158 @@ class TestDeleteDocumentsDataPartialFailurePreservesContract:
         assert isinstance(details["deleted_counts"], dict)
         assert isinstance(details["deleted_doc_ids"], list)
         assert isinstance(details["failed_batch_index"], int)
+
+
+# ---------------------------------------------------------------------------
+# Phase 2 – Cycle 2.1: rename_collection_data
+# ---------------------------------------------------------------------------
+
+
+class TestRenameCollectionDataUpdatesAllTables:
+    def test_rename_collection_data_updates_all_five_tables(self) -> None:
+        """rename_collection_data updates collection field in documents/parses/chunks tables.
+
+        Inserts rows under "old_name", calls handle.rename_collection_data with
+        new_name="new_name", then asserts:
+        - 0 rows remain under "old_name" in each seeded table
+        - original row count is visible under "new_name"
+        - method returns a list of warnings (may be empty)
+        """
+        store = get_vector_index_store()
+        handle = make_handle("old_name")
+
+        # Seed documents/parses/chunks under "old_name".
+        _seed_collection("old_name", ["r1", "r2"])
+
+        # Confirm rows exist before rename.
+        assert store.count_rows("documents", {"collection": "old_name"}, is_admin=True) == 2
+        assert store.count_rows("parses", {"collection": "old_name"}, is_admin=True) == 2
+        assert store.count_rows("chunks", {"collection": "old_name"}, is_admin=True) == 2
+
+        warnings = handle.rename_collection_data(
+            new_name="new_name",
+            user_id=None,
+            is_admin=True,
+        )
+
+        # Must return a list (may be empty).
+        assert isinstance(warnings, list)
+
+        # All rows moved from "old_name" → "new_name".
+        assert store.count_rows("documents", {"collection": "old_name"}, is_admin=True) == 0
+        assert store.count_rows("parses", {"collection": "old_name"}, is_admin=True) == 0
+        assert store.count_rows("chunks", {"collection": "old_name"}, is_admin=True) == 0
+
+        assert store.count_rows("documents", {"collection": "new_name"}, is_admin=True) == 2
+        assert store.count_rows("parses", {"collection": "new_name"}, is_admin=True) == 2
+        assert store.count_rows("chunks", {"collection": "new_name"}, is_admin=True) == 2
+
+
+# ---------------------------------------------------------------------------
+# Phase 2 – Cycle 2.2: rename_collection_status
+# ---------------------------------------------------------------------------
+
+
+class TestRenameCollectionStatusUpdatesStatusTable:
+    def test_rename_collection_status_updates_status_table(self) -> None:
+        """rename_collection_status renames ingestion_runs rows from old to new name.
+
+        Inserts status rows under "old_status", calls handle.rename_collection_status,
+        then asserts the rows now live under "new_status".
+        """
+        status_store = get_ingestion_status_store()
+        handle = make_handle("old_status")
+
+        # Insert ingestion status rows under "old_status".
+        status_store.write_ingestion_status(
+            "old_status", "doc1", status="pending", user_id=None
+        )
+        status_store.write_ingestion_status(
+            "old_status", "doc2", status="done", user_id=None
+        )
+
+        # Verify rows exist before rename.
+        rows_before = status_store.load_ingestion_status(
+            collection="old_status", user_id=None, is_admin=True
+        )
+        assert len(rows_before) == 2
+
+        warnings = handle.rename_collection_status(
+            new_name="new_status",
+            user_id=None,
+            is_admin=True,
+        )
+
+        # Returns a list (may be empty).
+        assert isinstance(warnings, list)
+
+        # Rows no longer under "old_status".
+        rows_old = status_store.load_ingestion_status(
+            collection="old_status", user_id=None, is_admin=True
+        )
+        assert len(rows_old) == 0
+
+        # Rows now under "new_status".
+        rows_new = status_store.load_ingestion_status(
+            collection="new_status", user_id=None, is_admin=True
+        )
+        assert len(rows_new) == 2
+
+
+# ---------------------------------------------------------------------------
+# Phase 2 – Cycle 2.3: rename_collection_metadata (async)
+# ---------------------------------------------------------------------------
+
+
+class TestRenameCollectionMetadataAsyncMovesConfig:
+    def test_rename_collection_metadata_async_moves_config(self) -> None:
+        """rename_collection_metadata moves collection config from old_name to new_name.
+
+        Sets up a collection config under "old_meta", calls
+        await handle.rename_collection_metadata(new_name="new_meta", ...),
+        then asserts:
+        - "old_meta" is no longer listed
+        - config is readable under "new_meta"
+
+        This is the ONLY async method on the handle – it wraps an async
+        metadata-store operation and must be declared ``async def``.
+        Uses ``asyncio.run()`` to drive the coroutine without pytest-asyncio.
+        """
+        asyncio.run(self._run())
+
+    async def _run(self) -> None:
+        meta_store = get_metadata_store()
+        handle = make_handle("old_meta")
+
+        # Ensure table exists and seed a collection config entry.
+        await meta_store.ensure_collection_metadata_table()
+        import json
+        await meta_store.save_collection_config(
+            collection="old_meta",
+            config_json=json.dumps({"embed_model": "test-model"}),
+            user_id=0,
+        )
+
+        # Verify the config exists under "old_meta" before rename.
+        config_before = await meta_store.get_collection_config(
+            collection="old_meta", user_id=None, is_admin=True
+        )
+        assert config_before is not None
+
+        await handle.rename_collection_metadata(
+            new_name="new_meta",
+            user_id=None,
+            is_admin=True,
+        )
+
+        # Config must no longer be accessible under "old_meta".
+        config_old = await meta_store.get_collection_config(
+            collection="old_meta", user_id=None, is_admin=True
+        )
+        assert config_old is None
+
+        # Config must be accessible under "new_meta".
+        config_new = await meta_store.get_collection_config(
+            collection="new_meta", user_id=None, is_admin=True
+        )
+        assert config_new is not None

@@ -638,6 +638,78 @@ class KBCollectionHandle(ABC):
     ) -> int:
         """Idempotently delete newly created chunk rows (compensation)."""
 
+    # --- Collection-level rename primitives (#H05 Phase 2) ---
+
+    @abstractmethod
+    def rename_collection_data(
+        self,
+        new_name: str,
+        user_id: str | None,
+        is_admin: bool,
+        warnings_out: list[str] | None = None,
+    ) -> list[str]:
+        """Rename the collection field across all vector-side data tables.
+
+        Updates the ``collection`` column from ``self.context.collection`` to
+        ``new_name`` in the documents, parses, chunks, and all embeddings_*
+        tables.  Uses the same multi-tenancy filter semantics as other store
+        writes.
+
+        Args:
+            new_name: Target collection name.
+            user_id: User ID for tenant-scoped rename; ``None`` treated as 0
+                for non-admin callers.
+            is_admin: When ``True`` renames all matching rows regardless of
+                ``user_id``.
+            warnings_out: Optional list to accumulate per-table warning
+                messages (best-effort updates).
+
+        Returns:
+            List of warning messages generated during best-effort updates
+            (empty on full success).
+        """
+
+    @abstractmethod
+    def rename_collection_status(
+        self,
+        new_name: str,
+        user_id: str | None,
+        is_admin: bool,
+    ) -> list[str]:
+        """Rename ingestion status rows from this collection's name to ``new_name``.
+
+        Updates the ``collection`` column in the ``ingestion_runs`` table from
+        ``self.context.collection`` to ``new_name``.
+
+        Args:
+            new_name: Target collection name.
+            user_id: User ID for tenant-scoped rename.
+            is_admin: When ``True`` renames all matching rows regardless of
+                ``user_id``.
+
+        Returns:
+            List of warning messages on partial failure (empty on success).
+        """
+
+    @abstractmethod
+    async def rename_collection_metadata(
+        self,
+        new_name: str,
+        user_id: str | None,
+        is_admin: bool,
+    ) -> None:
+        """Rename control-plane metadata from this collection's name to ``new_name``.
+
+        Async – this is the **only** async method on ``KBCollectionHandle``.
+        Wraps ``await metadata_store.rename_collection(...)`` to update the
+        ``collection_config`` and ``collection_metadata`` rows.
+
+        Args:
+            new_name: Target collection name.
+            user_id: User ID for tenant-scoped rename.
+            is_admin: When ``True`` renames across all tenants.
+        """
+
     # --- Collection-level cascade delete (#H05) ---
 
     @abstractmethod
@@ -3065,4 +3137,93 @@ class LanceDBCollectionHandle(KBCollectionHandle):
             user_id=user_id,
             is_admin=is_admin,
             warnings_out=warnings_out,
+        )
+
+    # --- Collection-level rename primitives (#H05 Phase 2) ---
+
+    def rename_collection_data(
+        self,
+        new_name: str,
+        user_id: str | None,
+        is_admin: bool,
+        warnings_out: list[str] | None = None,
+    ) -> list[str]:
+        """Rename the collection field across all vector-side data tables.
+
+        Delegates to the bound vector index store's ``rename_collection_data``,
+        passing ``self.context.collection`` as the old name.  The coordinator
+        should call this via ``asyncio.to_thread`` when running in an async
+        context.
+
+        The table cache is invalidated after the rename so that subsequent
+        ``count_rows`` / ``iter_batches`` calls see the updated rows (matching
+        the behaviour of ``delete_collection_data``).
+
+        Returns:
+            List of per-table warning messages (empty on full success).
+        """
+        store = self.vector_index_store
+        warnings = store.rename_collection_data(
+            collection_name=self.context.collection,
+            new_name=new_name,
+            user_id=user_id,
+            is_admin=is_admin,
+        )
+        # Invalidate the table cache so subsequent reads observe the renamed rows.
+        if hasattr(store, "invalidate_table_cache"):
+            store.invalidate_table_cache()
+        if warnings_out is not None:
+            warnings_out.extend(warnings)
+        return warnings
+
+    def rename_collection_status(
+        self,
+        new_name: str,
+        user_id: str | None,
+        is_admin: bool,
+    ) -> list[str]:
+        """Rename ingestion status rows in the ``ingestion_runs`` table.
+
+        Delegates to the ingestion status store's ``rename_collection_status``,
+        passing ``self.context.collection`` as the old name.  The coordinator
+        should call this via ``asyncio.to_thread`` when running in an async
+        context.
+
+        Returns:
+            List of warning messages on partial failure (empty on success).
+        """
+        from ..storage.factory import get_ingestion_status_store
+
+        store = get_ingestion_status_store()
+        return store.rename_collection_status(
+            old_name=self.context.collection,
+            new_name=new_name,
+            user_id=user_id,
+            is_admin=is_admin,
+        )
+
+    async def rename_collection_metadata(
+        self,
+        new_name: str,
+        user_id: str | None,
+        is_admin: bool,
+    ) -> None:
+        """Rename control-plane metadata rows to ``new_name``.
+
+        This is the **only** async method on ``KBCollectionHandle``.  It wraps
+        ``await metadata_store.rename_collection(...)`` which updates the
+        ``collection_config`` and ``collection_metadata`` rows.  The coordinator
+        calls this directly with ``await`` (no ``asyncio.to_thread`` wrapper
+        needed, unlike the two sync rename primitives above).
+
+        Args:
+            new_name: Target collection name.
+            user_id: User ID for tenant-scoped rename.
+            is_admin: When ``True`` renames across all tenants.
+        """
+        await self.metadata_store.rename_collection(
+            old_name=self.context.collection,
+            new_name=new_name,
+            user_id=user_id,
+            is_admin=is_admin,
         )

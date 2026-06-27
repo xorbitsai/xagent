@@ -30,7 +30,7 @@ except ImportError:  # pragma: no cover - pyarrow is an optional runtime dep
     pa = None
     PyArrowTable = Any
 
-from ..core.config import DEFAULT_LANCEDB_BATCH_SIZE
+from ..core.config import DEFAULT_LANCEDB_BATCH_SIZE, DEFAULT_VECTOR_STORE_DELETE_BATCH_SIZE
 from ..core.exceptions import (
     ConfigurationError,
     DatabaseOperationError,
@@ -637,6 +637,46 @@ class KBCollectionHandle(ABC):
         is_admin: bool = False,
     ) -> int:
         """Idempotently delete newly created chunk rows (compensation)."""
+
+    # --- Collection-level cascade delete (#H05) ---
+
+    @abstractmethod
+    def delete_collection_data(
+        self,
+        *,
+        user_id: int | None,
+        is_admin: bool,
+        warnings_out: list[str] | None = None,
+    ) -> dict[str, int]:
+        """Delete all data for this collection (cascade across all vector-side tables).
+
+        Uses ``self.context.collection`` as the collection name; no external
+        ``collection_name`` argument is accepted (the handle is already scoped).
+
+        Returns a ``dict[str, int]`` mapping table names to deleted row counts.
+        Raises ``DatabaseOperationError`` on failure.
+        """
+
+    @abstractmethod
+    def delete_documents_data(
+        self,
+        doc_ids: list[str],
+        *,
+        user_id: int | None,
+        is_admin: bool,
+        warnings_out: list[str] | None = None,
+    ) -> dict[str, int]:
+        """Delete vector-side data for specific document IDs in this collection.
+
+        Batches deletes internally.  On partial failure raises
+        ``DatabaseOperationError`` with ``details`` containing:
+            ``{"deleted_counts": dict, "deleted_doc_ids": list, "failed_batch_index": int}``
+        This exact shape is the downstream contract for
+        ``CollectionOperationResult.partial_success``.
+
+        Returns a ``dict[str, int]`` mapping table names to total deleted row
+        counts across all successfully processed batches.
+        """
 
 
 @dataclass(frozen=True)
@@ -2978,4 +3018,51 @@ class LanceDBCollectionHandle(KBCollectionHandle):
             config_hash=config_hash,
             user_id=user_id,
             is_admin=is_admin,
+        )
+
+    # --- Collection-level cascade delete (#H05) ---
+
+    def delete_collection_data(
+        self,
+        *,
+        user_id: int | None,
+        is_admin: bool,
+        warnings_out: list[str] | None = None,
+    ) -> dict[str, int]:
+        """Delete all data for this collection from vector-side tables.
+
+        Delegates to the bound vector index store's ``delete_collection_data``,
+        passing ``self.context.collection`` so the handle boundary is respected.
+        Subsequent reads will not observe stale cached table handles because the
+        store invalidates its table cache internally.
+        """
+        return self.vector_index_store.delete_collection_data(
+            collection_name=self.context.collection,
+            user_id=user_id,
+            is_admin=is_admin,
+            warnings_out=warnings_out,
+        )
+
+    def delete_documents_data(
+        self,
+        doc_ids: list[str],
+        *,
+        user_id: int | None,
+        is_admin: bool,
+        warnings_out: list[str] | None = None,
+    ) -> dict[str, int]:
+        """Delete vector-side data for specific document IDs in this collection.
+
+        Delegates to the bound vector index store's ``delete_documents_data``.
+        On partial failure the store raises ``DatabaseOperationError`` with
+        ``details={"deleted_counts": ..., "deleted_doc_ids": ..., "failed_batch_index": ...}``
+        which is the downstream contract for ``CollectionOperationResult.partial_success``.
+        That exception propagates unchanged so callers receive the exact details dict.
+        """
+        return self.vector_index_store.delete_documents_data(
+            collection_name=self.context.collection,
+            doc_ids=doc_ids,
+            user_id=user_id,
+            is_admin=is_admin,
+            warnings_out=warnings_out,
         )

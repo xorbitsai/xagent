@@ -750,6 +750,60 @@ class KBCollectionHandle(ABC):
         counts across all successfully processed batches.
         """
 
+    # --- Collection-level rollback config primitives (#H05 Phase 4) ---
+
+    @abstractmethod
+    async def capture_collection_config_snapshot(
+        self,
+    ) -> "CollectionConfigSnapshot":
+        """Capture the collection_config row for this collection before mutation.
+
+        Returns a :class:`CollectionConfigSnapshot` whose ``existed`` flag is
+        ``True`` when a config row was present and ``False`` otherwise.  A
+        snapshot with ``existed=False`` is safe to pass to
+        :meth:`restore_collection_config_snapshot` – the restore is a no-op.
+        """
+
+    @abstractmethod
+    async def restore_collection_config_snapshot(
+        self,
+        snapshot: "CollectionConfigSnapshot",
+    ) -> None:
+        """Restore or remove a collection_config row from a snapshot.
+
+        When ``snapshot.existed`` is ``True`` the original config JSON is
+        written back via :meth:`MetadataStore.save_collection_config`.  When
+        ``snapshot.existed`` is ``False`` this is a no-op (the config row did
+        not exist before the mutation so there is nothing to restore).
+
+        The rollback-complete / side-effects-may-remain guard logic lives in
+        the coordinator/policy layer, not here.
+        """
+
+    @abstractmethod
+    async def delete_collection_config(self) -> int:
+        """Delete the collection_config row(s) for this collection.
+
+        Idempotent – returns the number of rows deleted (0 when no row
+        existed, which is not an error).
+        """
+
+    @abstractmethod
+    def cleanup_collection_data_after_rollback(
+        self,
+        *,
+        user_id: int | None,
+        is_admin: bool,
+    ) -> dict[str, int]:
+        """Remove all vector-side data for this collection (rollback compensation).
+
+        Composes the Phase 1 :meth:`delete_collection_data` primitive to clean
+        up a failed new-collection ingestion.  Does **not** touch the
+        filesystem; physical file cleanup is the caller's responsibility.
+
+        Returns a ``dict[str, int]`` mapping table names to deleted row counts.
+        """
+
     # --- Collection-level statistics (#H05 Phase 3) ---
 
     @abstractmethod
@@ -3314,3 +3368,88 @@ class LanceDBCollectionHandle(KBCollectionHandle):
         ``user_id``.  Otherwise only rows owned by ``user_id`` are counted.
         """
         return self.collection_stats(user_id=user_id, is_admin=is_admin)["documents"]
+
+    # --- Collection-level rollback config primitives (#H05 Phase 4) ---
+
+    async def capture_collection_config_snapshot(
+        self,
+    ) -> "CollectionConfigSnapshot":
+        """Capture the collection_config row for this collection (metadata read only).
+
+        Reads the config row via the metadata store and wraps it in a
+        :class:`CollectionConfigSnapshot`.  ``config_user_id`` is normalized to
+        0 when ``user_id`` is ``None``, matching legacy ownership convention.
+        """
+        from .maintenance_compatibility import CollectionConfigSnapshot
+
+        collection = self.context.collection
+        # Normalize: None user_id maps to 0 (legacy convention).
+        user_id = self.context.user_scope.user_id
+        config_user_id: int = 0 if user_id is None else int(user_id)
+
+        config_json = await self.metadata_store.get_collection_config(
+            collection,
+            config_user_id,
+            is_admin=False,
+        )
+        return CollectionConfigSnapshot(
+            collection_name=collection,
+            user_id=user_id,
+            config_user_id=config_user_id,
+            config_json=config_json,
+            existed=config_json is not None,
+        )
+
+    async def restore_collection_config_snapshot(
+        self,
+        snapshot: "CollectionConfigSnapshot",
+    ) -> None:
+        """Restore a collection_config row from snapshot (metadata write only).
+
+        When ``snapshot.existed`` is ``True`` the config JSON is written back
+        via :meth:`MetadataStore.save_collection_config`.  When
+        ``snapshot.existed`` is ``False`` this is a no-op.
+
+        The rollback-complete / side-effects-may-remain guard lives in the
+        coordinator/policy layer and is intentionally absent here.
+        """
+        if not snapshot.existed:
+            return
+        if snapshot.config_json is None:
+            return
+        await self.metadata_store.save_collection_config(
+            snapshot.collection_name,
+            snapshot.config_json,
+            snapshot.config_user_id,
+        )
+
+    async def delete_collection_config(self) -> int:
+        """Delete the collection_config row(s) for this collection (idempotent).
+
+        Delegates to :meth:`MetadataStore.delete_collection_metadata` using
+        ``is_admin=True`` so all tenant rows for this collection are removed.
+        Returns the number of config rows deleted (0 when none existed).
+        """
+        result = await self.metadata_store.delete_collection_metadata(
+            collection_name=self.context.collection,
+            user_id=None,
+            is_admin=True,
+            delete_orphaned_metadata=False,
+        )
+        return result.get("config_rows", 0)
+
+    def cleanup_collection_data_after_rollback(
+        self,
+        *,
+        user_id: int | None,
+        is_admin: bool,
+    ) -> dict[str, int]:
+        """Remove all vector-side data for this collection (rollback compensation).
+
+        Composes the Phase 1 :meth:`delete_collection_data` primitive.  Does
+        **not** access the filesystem; physical file cleanup is the caller's
+        responsibility.
+
+        Returns a ``dict[str, int]`` mapping table names to deleted row counts.
+        """
+        return self.delete_collection_data(user_id=user_id, is_admin=is_admin)

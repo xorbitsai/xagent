@@ -521,3 +521,169 @@ class TestCollectionStatsAggregatesAcrossTables:
         assert stats["chunks"] == 4, f"Expected 4 chunks, got {stats['chunks']}"
         # No embeddings were written so embeddings count should be 0.
         assert stats["embeddings"] == 0, f"Expected 0 embeddings, got {stats['embeddings']}"
+
+
+# ---------------------------------------------------------------------------
+# Phase 4 – Cycle 4.1: snapshot/restore/delete_collection_config
+# ---------------------------------------------------------------------------
+
+
+class TestConfigSnapshotAndRestoreRoundTrip:
+    """capture_collection_config_snapshot / restore_collection_config_snapshot."""
+
+    def test_config_snapshot_and_restore_round_trip(self) -> None:
+        """Snapshot, mutate, restore → config is back to original value."""
+        asyncio.run(self._run())
+
+    async def _run(self) -> None:
+        import json
+
+        meta_store = get_metadata_store()
+        handle = make_handle("snap_coll")
+
+        # Ensure table exists.
+        await meta_store.ensure_collection_metadata_table()
+
+        # Write an initial config.
+        original_config = json.dumps({"embed_model": "original-model"})
+        await meta_store.save_collection_config(
+            collection="snap_coll",
+            config_json=original_config,
+            user_id=0,
+        )
+
+        # Capture snapshot before mutation.
+        snapshot = await handle.capture_collection_config_snapshot()
+        assert snapshot.collection_name == "snap_coll"
+        assert snapshot.existed is True
+        assert snapshot.config_json == original_config
+
+        # Mutate the config.
+        mutated_config = json.dumps({"embed_model": "mutated-model"})
+        await meta_store.save_collection_config(
+            collection="snap_coll",
+            config_json=mutated_config,
+            user_id=0,
+        )
+        mutated = await meta_store.get_collection_config(
+            collection="snap_coll", user_id=None, is_admin=True
+        )
+        assert mutated == mutated_config
+
+        # Restore from snapshot.
+        await handle.restore_collection_config_snapshot(snapshot)
+
+        # Config must be back to original.
+        restored = await meta_store.get_collection_config(
+            collection="snap_coll", user_id=None, is_admin=True
+        )
+        assert restored == original_config, (
+            f"Expected original config after restore, got: {restored}"
+        )
+
+
+class TestConfigSnapshotNonexistentCollectionReturnsEmptySnapshot:
+    """Snapshot on a collection with no config row returns a safe empty snapshot."""
+
+    def test_config_snapshot_nonexistent_collection_returns_empty_snapshot(self) -> None:
+        asyncio.run(self._run())
+
+    async def _run(self) -> None:
+        meta_store = get_metadata_store()
+        handle = make_handle("no_config_coll")
+
+        # Ensure table exists (no rows written for "no_config_coll").
+        await meta_store.ensure_collection_metadata_table()
+
+        snapshot = await handle.capture_collection_config_snapshot()
+        assert snapshot.collection_name == "no_config_coll"
+        assert snapshot.existed is False
+        assert snapshot.config_json is None
+
+        # restore on an empty snapshot must be a no-op (does not raise).
+        await handle.restore_collection_config_snapshot(snapshot)
+
+        # Still no config row after the no-op restore.
+        config_after = await meta_store.get_collection_config(
+            collection="no_config_coll", user_id=None, is_admin=True
+        )
+        assert config_after is None
+
+
+class TestDeleteCollectionConfigIsIdempotent:
+    """delete_collection_config is idempotent (second delete returns 0, no error)."""
+
+    def test_delete_collection_config_is_idempotent(self) -> None:
+        asyncio.run(self._run())
+
+    async def _run(self) -> None:
+        import json
+
+        meta_store = get_metadata_store()
+        handle = make_handle("del_cfg_coll")
+
+        # Ensure table exists and write a config row.
+        await meta_store.ensure_collection_metadata_table()
+        await meta_store.save_collection_config(
+            collection="del_cfg_coll",
+            config_json=json.dumps({"embed_model": "test"}),
+            user_id=0,
+        )
+
+        # First delete must remove the row.
+        deleted_first = await handle.delete_collection_config()
+        assert deleted_first >= 1, f"First delete expected >=1 rows, got {deleted_first}"
+
+        # Second delete must be a no-op (0 rows, no exception).
+        deleted_second = await handle.delete_collection_config()
+        assert deleted_second == 0, f"Second delete expected 0 rows, got {deleted_second}"
+
+        # Config must be gone.
+        config_after = await meta_store.get_collection_config(
+            collection="del_cfg_coll", user_id=None, is_admin=True
+        )
+        assert config_after is None
+
+
+# ---------------------------------------------------------------------------
+# Phase 4 – Cycle 4.2: cleanup_collection_data_after_rollback
+# ---------------------------------------------------------------------------
+
+
+class TestCleanupAfterRollbackRemovesCollectionLocalDataOnly:
+    """cleanup_collection_data_after_rollback removes only the bound collection's data."""
+
+    def test_cleanup_after_rollback_removes_collection_local_data_only(self) -> None:
+        """Cleanup removes new_coll data; other_coll is untouched; no FS calls made."""
+        from unittest.mock import patch as _patch
+
+        store = get_vector_index_store()
+        handle_new = make_handle("new_coll")
+
+        # Seed data for new_coll (the failed new-collection ingestion).
+        _seed_collection("new_coll", ["nc1", "nc2"])
+        # Seed data for other_coll (must remain untouched).
+        _seed_collection("other_coll", ["oc1"])
+
+        # Patch shutil.rmtree and os.remove to assert no filesystem calls occur.
+        with _patch("shutil.rmtree") as mock_rmtree, _patch("os.remove") as mock_os_remove:
+            counts = handle_new.cleanup_collection_data_after_rollback(
+                user_id=None, is_admin=True
+            )
+
+        # No filesystem calls must be made by the handle.
+        mock_rmtree.assert_not_called()
+        mock_os_remove.assert_not_called()
+
+        # Returns a dict[str, int].
+        assert isinstance(counts, dict)
+
+        # new_coll data must be removed.
+        assert (
+            store.count_rows("documents", {"collection": "new_coll"}, is_admin=True) == 0
+        ), "new_coll documents should be deleted after rollback cleanup"
+
+        # other_coll data must be untouched.
+        assert (
+            store.count_rows("documents", {"collection": "other_coll"}, is_admin=True) == 1
+        ), "other_coll documents must not be touched by new_coll cleanup"

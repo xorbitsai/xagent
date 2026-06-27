@@ -109,7 +109,7 @@ class TestCoordinatorDeleteCollection:
         asyncio.run(
             coordinator.delete_collection(
                 collection="tenant_coll",
-                user_id="u1",
+                user_id=1,
                 is_admin=False,
                 doc_ids=doc_ids,
             )
@@ -435,7 +435,7 @@ class TestConfigOnlyInvariant:
         result = asyncio.run(
             coordinator.delete_collection(
                 collection="shared_coll",
-                user_id="u1",
+                user_id=1,
                 is_admin=False,
                 doc_ids=None,  # caller says: I have no owned docs to delete
                 delete_orphaned_metadata=True,
@@ -500,7 +500,7 @@ class TestConfigOnlyInvariant:
         result = asyncio.run(
             coordinator.delete_collection(
                 collection="shared_coll",
-                user_id="u1",
+                user_id=1,
                 is_admin=False,
                 doc_ids=[],  # empty list — no docs owned by user
                 delete_orphaned_metadata=False,

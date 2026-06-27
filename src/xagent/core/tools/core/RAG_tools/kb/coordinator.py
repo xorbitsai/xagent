@@ -451,8 +451,8 @@ class KBCoordinator:
         if user_id is not None:
             try:
                 int_user_id = int(user_id)
-            except (ValueError, TypeError):
-                int_user_id = None
+            except (ValueError, TypeError) as exc:
+                raise ValueError(f"Invalid user_id: {user_id!r}") from exc
 
         handle = await self.open_collection(
             KBContextRequest(
@@ -478,6 +478,18 @@ class KBCoordinator:
                 is_admin=is_admin,
             )
         except Exception as exc:  # noqa: BLE001
+            # For a tenant caller where doc_ids=None (delete their entire collection),
+            # discovery failure means we cannot determine the correct deletion scope.
+            # Silently skipping data-plane delete and returning "success" would be wrong.
+            if not is_admin and doc_ids is None:
+                return CollectionOperationResult(
+                    status="error",
+                    collection=collection,
+                    message=f"Failed to list documents before delete for {collection!r}: {exc}",
+                    warnings=list(warnings),
+                    affected_documents=[],
+                    deleted_counts={},
+                )
             warnings.append(
                 f"Failed to list documents before delete for {collection!r}: {exc}"
             )
@@ -602,8 +614,8 @@ class KBCoordinator:
         if user_id is not None:
             try:
                 int_user_id = int(user_id)
-            except (ValueError, TypeError):
-                int_user_id = None
+            except (ValueError, TypeError) as exc:
+                raise ValueError(f"Invalid user_id: {user_id!r}") from exc
 
         handle = await self.open_collection(
             KBContextRequest(

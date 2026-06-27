@@ -837,6 +837,29 @@ class KBCollectionHandle(ABC):
               tables
         """
 
+    @abstractmethod
+    def list_collection_documents(
+        self,
+        user_id: int | None,
+        is_admin: bool,
+        max_results: int = 1_000_000,
+    ) -> list[str]:
+        """List document IDs visible to the given user in this collection.
+
+        Returns a sorted list of unique doc_id strings for documents visible
+        to the caller under the given user/admin scope.  Used by the coordinator
+        before deletion to populate ``affected_documents`` and to collect
+        tenant-owned doc_ids when the caller has not pre-computed them.
+
+        Args:
+            user_id: Owner filter; ``None`` treated as 0 for non-admin callers.
+            is_admin: When ``True`` lists all documents regardless of user_id.
+            max_results: Upper bound on the number of document IDs returned.
+
+        Returns:
+            Sorted list of unique doc_id strings.
+        """
+
 
 @dataclass(frozen=True)
 class LanceDBCollectionHandle(KBCollectionHandle):
@@ -3369,6 +3392,28 @@ class LanceDBCollectionHandle(KBCollectionHandle):
         ``user_id``.  Otherwise only rows owned by ``user_id`` are counted.
         """
         return self.collection_stats(user_id=user_id, is_admin=is_admin)["documents"]
+
+    def list_collection_documents(
+        self,
+        user_id: int | None,
+        is_admin: bool,
+        max_results: int = 1_000_000,
+    ) -> list[str]:
+        """List document IDs for this collection.
+
+        Delegates to the bound vector index store's ``list_document_records`` and
+        returns a sorted list of unique doc_id strings.  The coordinator uses this
+        before deletion to collect tenant-owned doc_ids (when the caller has not
+        pre-computed them) and to populate ``affected_documents`` in the result.
+        """
+        store = self.vector_index_store
+        records = store.list_document_records(
+            collection_name=self.context.collection,
+            user_id=user_id,
+            is_admin=is_admin,
+            max_results=max_results,
+        )
+        return sorted({r.doc_id for r in records})
 
     # --- Collection-level rollback config primitives (#H05 Phase 4) ---
 

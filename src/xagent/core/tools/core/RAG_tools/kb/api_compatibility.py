@@ -723,6 +723,13 @@ class KBApiCompatibilityFacade:
         user_id: Optional[int],
         is_admin: bool = False,
     ) -> None:
+        if self._coordinator is not None:
+            # rename_collection_data (called earlier in the web API rename sequence)
+            # already routed all three rename steps (data + status + metadata) through
+            # coordinator.rename_collection().  This call is a no-op to avoid a
+            # double-rename of metadata rows that no longer exist under old_name.
+            return
+
         with self._storage_context():
             from ..storage.factory import get_metadata_store
 
@@ -742,6 +749,12 @@ class KBApiCompatibilityFacade:
         user_id: Optional[int],
         is_admin: bool = False,
     ) -> list[str]:
+        if self._coordinator is not None:
+            # rename_collection_data already completed all three rename steps via
+            # coordinator.rename_collection().  Return empty warnings to avoid
+            # double-renaming status rows that no longer exist under old_name.
+            return []
+
         with self._storage_context():
             from ..storage.factory import get_ingestion_status_store
 

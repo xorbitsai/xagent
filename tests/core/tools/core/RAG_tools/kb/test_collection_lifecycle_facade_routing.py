@@ -37,6 +37,9 @@ def _make_mock_handle() -> MagicMock:
     handle.rename_collection_data = MagicMock(return_value=[])
     handle.rename_collection_status = MagicMock(return_value=[])
     handle.rename_collection_metadata = AsyncMock(return_value=None)
+    # H05 additions
+    handle.list_collection_documents = MagicMock(return_value=[])
+    handle.count_documents = MagicMock(return_value=0)
     return handle
 
 
@@ -340,12 +343,35 @@ class TestApiCompatRenameRoutingSwitch:
 
 
 class TestManagementFacadeDeleteRoutingSwitch:
-    """Cycle 5.3: management facade delete_collection routing."""
+    """Cycle 5.3: management facade delete_collection routing (sync AND async)."""
 
-    def test_management_facade_delete_collection_routes_through_coordinator_when_present(
+    def test_management_facade_delete_collection_sync_routes_through_coordinator_when_present(
         self,
     ) -> None:
-        """delete_collection calls coordinator.delete_collection when coordinator set."""
+        """Sync delete_collection bridges to coordinator.delete_collection via thread."""
+        coordinator = MagicMock()
+        expected = CollectionOperationResult(
+            status="success",
+            collection="c",
+            message="ok",
+        )
+        coordinator.delete_collection = AsyncMock(return_value=expected)
+        facade = KBCoreManagementCompatibilityFacade(coordinator=coordinator)
+
+        # Call the SYNC method — it should route to coordinator without async/await
+        result = facade.delete_collection(
+            collection="c",
+            user_id=None,
+            is_admin=True,
+        )
+
+        coordinator.delete_collection.assert_called_once()
+        assert result.status == "success"
+
+    def test_management_facade_delete_collection_async_routes_through_coordinator_when_present(
+        self,
+    ) -> None:
+        """Async delete_collection_async also routes to coordinator.delete_collection."""
         coordinator = MagicMock()
         expected = CollectionOperationResult(
             status="success",
@@ -369,7 +395,7 @@ class TestManagementFacadeDeleteRoutingSwitch:
     def test_management_facade_delete_collection_falls_back_to_impl_when_no_coordinator(
         self,
     ) -> None:
-        """delete_collection falls back to _delete_collection_impl when no coordinator."""
+        """Sync delete_collection falls back to _delete_collection_impl when no coordinator."""
         facade = KBCoreManagementCompatibilityFacade(coordinator=None)
 
         expected = CollectionOperationResult(
@@ -485,3 +511,176 @@ class TestConfigOnlyInvariant:
         handle.delete_collection_data.assert_not_called()
         handle.delete_documents_data.assert_not_called()
         assert isinstance(result, CollectionOperationResult)
+
+
+# ---------------------------------------------------------------------------
+# Bug-fix regression tests (issues found in review)
+# ---------------------------------------------------------------------------
+
+
+class TestCoordinatorDeleteOrphanedMetadataGuard:
+    """Coordinator must not delete orphaned metadata when other tenants still have data."""
+
+    def test_delete_collection_config_not_called_when_remaining_records_exist(
+        self,
+    ) -> None:
+        """When count_documents > 0 after deletion, delete_collection_config must not be called."""
+        handle = _make_mock_handle()
+        # Simulate another tenant still having rows
+        handle.count_documents = MagicMock(return_value=5)
+        coordinator = _make_coordinator_with_mock_handle(handle)
+
+        asyncio.run(
+            coordinator.delete_collection(
+                collection="shared_coll",
+                user_id=1,
+                is_admin=False,
+                doc_ids=["doc-1"],
+                delete_orphaned_metadata=True,
+            )
+        )
+
+        # Data was deleted but metadata must NOT be cleaned up
+        handle.delete_documents_data.assert_called_once()
+        handle.delete_collection_config.assert_not_called()
+
+    def test_delete_collection_config_called_when_collection_is_empty(
+        self,
+    ) -> None:
+        """When count_documents == 0 after deletion, delete_collection_config IS called."""
+        handle = _make_mock_handle()
+        handle.count_documents = MagicMock(return_value=0)
+        coordinator = _make_coordinator_with_mock_handle(handle)
+
+        asyncio.run(
+            coordinator.delete_collection(
+                collection="my_coll",
+                user_id=None,
+                is_admin=True,
+                delete_orphaned_metadata=True,
+            )
+        )
+
+        handle.delete_collection_data.assert_called_once()
+        handle.delete_collection_config.assert_called_once()
+
+
+class TestCoordinatorDeleteAutoDiscoversDocIds:
+    """Coordinator must auto-discover tenant doc_ids when caller does not provide them."""
+
+    def test_tenant_delete_without_doc_ids_discovers_and_deletes_own_docs(
+        self,
+    ) -> None:
+        """When is_admin=False and doc_ids=None, coordinator lists and deletes own docs."""
+        handle = _make_mock_handle()
+        handle.list_collection_documents = MagicMock(return_value=["doc-a", "doc-b"])
+        handle.count_documents = MagicMock(return_value=0)
+        coordinator = _make_coordinator_with_mock_handle(handle)
+
+        asyncio.run(
+            coordinator.delete_collection(
+                collection="my_coll",
+                user_id=42,
+                is_admin=False,
+                doc_ids=None,  # caller did NOT pre-compute doc_ids
+                delete_orphaned_metadata=False,
+            )
+        )
+
+        # Must have discovered doc_ids from the handle
+        handle.list_collection_documents.assert_called()
+        # Must have passed discovered ids to delete_documents_data
+        handle.delete_documents_data.assert_called_once()
+        call_args = handle.delete_documents_data.call_args
+        passed_ids = (
+            call_args.args[0] if call_args.args else call_args.kwargs.get("doc_ids")
+        )
+        assert sorted(passed_ids) == ["doc-a", "doc-b"]
+
+    def test_tenant_delete_with_explicit_doc_ids_does_not_call_list(
+        self,
+    ) -> None:
+        """When doc_ids is explicitly provided, list_collection_documents is only called for affected_documents."""
+        handle = _make_mock_handle()
+        handle.list_collection_documents = MagicMock(return_value=["doc-x"])
+        handle.count_documents = MagicMock(return_value=0)
+        coordinator = _make_coordinator_with_mock_handle(handle)
+
+        asyncio.run(
+            coordinator.delete_collection(
+                collection="my_coll",
+                user_id=42,
+                is_admin=False,
+                doc_ids=["doc-x"],  # explicitly provided
+                delete_orphaned_metadata=False,
+            )
+        )
+
+        # delete_documents_data uses the explicitly provided list
+        handle.delete_documents_data.assert_called_once()
+        call_args = handle.delete_documents_data.call_args
+        passed_ids = (
+            call_args.args[0] if call_args.args else call_args.kwargs.get("doc_ids")
+        )
+        assert passed_ids == ["doc-x"]
+
+
+class TestRenameFacadeCoordinatorEarlyReturn:
+    """rename_collection_status/_metadata must be no-ops when coordinator is active."""
+
+    def test_rename_collection_status_returns_empty_when_coordinator_present(
+        self,
+    ) -> None:
+        """rename_collection_status returns [] without hitting store when coordinator set."""
+        coordinator = MagicMock()
+        facade = KBApiCompatibilityFacade(coordinator=coordinator)
+
+        result = facade.rename_collection_status(
+            old_name="old",
+            new_name="new",
+            user_id=1,
+            is_admin=False,
+        )
+
+        assert result == []
+
+    def test_rename_collection_metadata_is_noop_when_coordinator_present(
+        self,
+    ) -> None:
+        """rename_collection_metadata returns None without hitting store when coordinator set."""
+        coordinator = MagicMock()
+        facade = KBApiCompatibilityFacade(coordinator=coordinator)
+
+        # Should return None (no-op) without touching any store
+        result = asyncio.run(
+            facade.rename_collection_metadata(
+                old_name="old",
+                new_name="new",
+                user_id=1,
+                is_admin=False,
+            )
+        )
+
+        assert result is None
+
+    def test_rename_collection_status_hits_store_when_no_coordinator(
+        self,
+    ) -> None:
+        """rename_collection_status uses store when coordinator is None."""
+        facade = KBApiCompatibilityFacade(coordinator=None)
+        mock_store = MagicMock()
+        mock_store.rename_collection_status = MagicMock(return_value=[])
+
+        with patch(
+            "xagent.core.tools.core.RAG_tools.storage.factory.get_ingestion_status_store",
+            return_value=mock_store,
+        ):
+            result = facade.rename_collection_status(
+                old_name="old",
+                new_name="new",
+                user_id=1,
+                is_admin=False,
+            )
+
+        mock_store.rename_collection_status.assert_called_once()
+        assert isinstance(result, list)

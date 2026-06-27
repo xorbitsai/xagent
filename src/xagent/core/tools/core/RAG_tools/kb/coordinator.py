@@ -10,7 +10,9 @@ from typing import Any, Optional, TypeVar
 
 from ..core.exceptions import DatabaseOperationError
 from ..core.schemas import (
+    CollectionOperationDetail,
     CollectionOperationResult,
+    DocumentProcessingStatus,
     DocumentRecordDetail,
     DocumentRecordListResult,
     RegisterDocumentRequest,
@@ -456,6 +458,28 @@ class KBCoordinator:
         deleted_counts: dict[str, int] = {}
         data_error: Exception | None = None
 
+        # Collect doc_ids BEFORE deletion for affected_documents tracking.
+        # For tenant callers: also auto-discover doc_ids when caller hasn't provided them
+        # (mirrors _delete_collection_impl which always collects from list_document_records).
+        affected_doc_ids: list[str] = []
+        try:
+            affected_doc_ids = await asyncio.to_thread(
+                handle.list_collection_documents,
+                user_id=user_id,
+                is_admin=is_admin,
+            )
+        except Exception as exc:  # noqa: BLE001
+            warnings.append(
+                f"Failed to list documents before delete for {collection!r}: {exc}"
+            )
+
+        # For tenant (non-admin) callers: use caller-supplied doc_ids when provided,
+        # otherwise fall back to the discovered set so the data-plane delete always
+        # operates on the right scope (consistent with _delete_collection_impl).
+        effective_doc_ids: list[str] | None = doc_ids
+        if not is_admin and effective_doc_ids is None:
+            effective_doc_ids = affected_doc_ids
+
         try:
             if is_admin:
                 result_counts = await asyncio.to_thread(
@@ -465,10 +489,10 @@ class KBCoordinator:
                     warnings_out=warnings,
                 )
                 deleted_counts.update(result_counts or {})
-            elif doc_ids:
+            elif effective_doc_ids:
                 result_counts = await asyncio.to_thread(
                     handle.delete_documents_data,
-                    doc_ids,
+                    effective_doc_ids,
                     user_id=user_id,
                     is_admin=is_admin,
                     warnings_out=warnings,
@@ -484,12 +508,30 @@ class KBCoordinator:
                     deleted_counts.update(raw_counts)
 
         if delete_orphaned_metadata:
+            # Only delete orphaned metadata when the collection is truly empty:
+            # if other tenants still have rows, the config/metadata must be preserved.
+            # This matches the behaviour of _delete_collection_impl which checks
+            # remaining_collection_records before calling delete_collection_metadata_sync.
             try:
-                await handle.delete_collection_config()
-            except Exception as cfg_exc:  # noqa: BLE001 - best-effort
-                warnings.append(
-                    f"Failed to delete collection config for {collection!r}: {cfg_exc}"
+                remaining = await asyncio.to_thread(
+                    handle.count_documents,
+                    user_id=None,
+                    is_admin=True,
                 )
+            except Exception:  # noqa: BLE001 - conservative: assume non-empty on error
+                remaining = 1
+            if remaining == 0:
+                try:
+                    await handle.delete_collection_config()
+                except Exception as cfg_exc:  # noqa: BLE001 - best-effort
+                    warnings.append(
+                        f"Failed to delete collection config for {collection!r}: {cfg_exc}"
+                    )
+
+        def _to_details(
+            doc_ids: list[str], status: DocumentProcessingStatus
+        ) -> list[CollectionOperationDetail]:
+            return [CollectionOperationDetail(doc_id=d, status=status) for d in doc_ids]
 
         if data_error is not None:
             if deleted_counts:
@@ -498,7 +540,9 @@ class KBCoordinator:
                     collection=collection,
                     message=f"Partially deleted collection {collection!r}: {data_error}",
                     warnings=list(warnings),
-                    affected_documents=[],
+                    affected_documents=_to_details(
+                        affected_doc_ids, DocumentProcessingStatus.FAILED
+                    ),
                     deleted_counts=dict(deleted_counts),
                 )
             return CollectionOperationResult(
@@ -506,7 +550,9 @@ class KBCoordinator:
                 collection=collection,
                 message=f"Failed to delete collection {collection!r}: {data_error}",
                 warnings=list(warnings),
-                affected_documents=[],
+                affected_documents=_to_details(
+                    affected_doc_ids, DocumentProcessingStatus.FAILED
+                ),
                 deleted_counts={},
             )
 
@@ -515,7 +561,9 @@ class KBCoordinator:
             collection=collection,
             message=f"Collection {collection!r} deleted successfully.",
             warnings=list(warnings),
-            affected_documents=[],
+            affected_documents=_to_details(
+                affected_doc_ids, DocumentProcessingStatus.SUCCESS
+            ),
             deleted_counts=dict(deleted_counts),
         )
 

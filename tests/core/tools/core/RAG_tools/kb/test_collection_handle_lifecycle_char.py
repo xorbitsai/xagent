@@ -93,18 +93,24 @@ class TestAdminDeleteCollectionData:
         store = get_vector_index_store()
 
         # Seed documents, parses, and chunks for col_a.
-        store.upsert_documents([
-            _doc_row("col_a", "d1"),
-            _doc_row("col_a", "d2"),
-        ])
-        store.upsert_parses([
-            _parse_row("col_a", "d1", "h1"),
-            _parse_row("col_a", "d2", "h2"),
-        ])
-        store.upsert_chunks([
-            _chunk_row("col_a", "d1", "h1", "cfg1", "c0"),
-            _chunk_row("col_a", "d1", "h1", "cfg1", "c1"),
-        ])
+        store.upsert_documents(
+            [
+                _doc_row("col_a", "d1"),
+                _doc_row("col_a", "d2"),
+            ]
+        )
+        store.upsert_parses(
+            [
+                _parse_row("col_a", "d1", "h1"),
+                _parse_row("col_a", "d2", "h2"),
+            ]
+        )
+        store.upsert_chunks(
+            [
+                _chunk_row("col_a", "d1", "h1", "cfg1", "c0"),
+                _chunk_row("col_a", "d1", "h1", "cfg1", "c1"),
+            ]
+        )
 
         # Seed a second collection to verify isolation.
         store.upsert_documents([_doc_row("col_b", "d3")])
@@ -125,12 +131,16 @@ class TestAdminDeleteCollectionData:
             assert isinstance(val, int), f"count for {key!r} must be int"
 
         # All col_a rows must be gone.
-        assert store.count_rows("documents", {"collection": "col_a"}, is_admin=True) == 0
+        assert (
+            store.count_rows("documents", {"collection": "col_a"}, is_admin=True) == 0
+        )
         assert store.count_rows("parses", {"collection": "col_a"}, is_admin=True) == 0
         assert store.count_rows("chunks", {"collection": "col_a"}, is_admin=True) == 0
 
         # col_b must be unaffected.
-        assert store.count_rows("documents", {"collection": "col_b"}, is_admin=True) == 1
+        assert (
+            store.count_rows("documents", {"collection": "col_b"}, is_admin=True) == 1
+        )
         assert store.count_rows("parses", {"collection": "col_b"}, is_admin=True) == 1
 
 
@@ -147,18 +157,24 @@ class TestTenantDeleteDocumentsData:
         """
         store = get_vector_index_store()
 
-        store.upsert_documents([
-            _doc_row("coll", "d1", user_id=1),
-            _doc_row("coll", "d2", user_id=2),
-        ])
-        store.upsert_parses([
-            _parse_row("coll", "d1", "h1", user_id=1),
-            _parse_row("coll", "d2", "h2", user_id=2),
-        ])
-        store.upsert_chunks([
-            _chunk_row("coll", "d1", "h1", "cfg1", "c0", user_id=1),
-            _chunk_row("coll", "d2", "h2", "cfg1", "c1", user_id=2),
-        ])
+        store.upsert_documents(
+            [
+                _doc_row("coll", "d1", user_id=1),
+                _doc_row("coll", "d2", user_id=2),
+            ]
+        )
+        store.upsert_parses(
+            [
+                _parse_row("coll", "d1", "h1", user_id=1),
+                _parse_row("coll", "d2", "h2", user_id=2),
+            ]
+        )
+        store.upsert_chunks(
+            [
+                _chunk_row("coll", "d1", "h1", "cfg1", "c0", user_id=1),
+                _chunk_row("coll", "d2", "h2", "cfg1", "c1", user_id=2),
+            ]
+        )
 
         warnings_out: list[str] = []
         store.delete_documents_data(
@@ -171,29 +187,41 @@ class TestTenantDeleteDocumentsData:
 
         # d1's rows should be gone.
         assert (
-            store.count_rows("documents", {"collection": "coll", "doc_id": "d1"}, is_admin=True)
+            store.count_rows(
+                "documents", {"collection": "coll", "doc_id": "d1"}, is_admin=True
+            )
             == 0
         )
         assert (
-            store.count_rows("parses", {"collection": "coll", "doc_id": "d1"}, is_admin=True)
+            store.count_rows(
+                "parses", {"collection": "coll", "doc_id": "d1"}, is_admin=True
+            )
             == 0
         )
         assert (
-            store.count_rows("chunks", {"collection": "coll", "doc_id": "d1"}, is_admin=True)
+            store.count_rows(
+                "chunks", {"collection": "coll", "doc_id": "d1"}, is_admin=True
+            )
             == 0
         )
 
         # d2's rows must still be present.
         assert (
-            store.count_rows("documents", {"collection": "coll", "doc_id": "d2"}, is_admin=True)
+            store.count_rows(
+                "documents", {"collection": "coll", "doc_id": "d2"}, is_admin=True
+            )
             == 1
         )
         assert (
-            store.count_rows("parses", {"collection": "coll", "doc_id": "d2"}, is_admin=True)
+            store.count_rows(
+                "parses", {"collection": "coll", "doc_id": "d2"}, is_admin=True
+            )
             == 1
         )
         assert (
-            store.count_rows("chunks", {"collection": "coll", "doc_id": "d2"}, is_admin=True)
+            store.count_rows(
+                "chunks", {"collection": "coll", "doc_id": "d2"}, is_admin=True
+            )
             == 1
         )
 
@@ -219,10 +247,12 @@ class TestDeleteDocumentsPartialFailure:
         store = get_vector_index_store()
 
         # Insert two docs so we get at least two batches when batch_size=1.
-        store.upsert_documents([
-            _doc_row("coll", "d1", user_id=None),
-            _doc_row("coll", "d2", user_id=None),
-        ])
+        store.upsert_documents(
+            [
+                _doc_row("coll", "d1", user_id=None),
+                _doc_row("coll", "d2", user_id=None),
+            ]
+        )
 
         call_count = 0
 
@@ -263,7 +293,9 @@ class TestDeleteDocumentsPartialFailure:
         # All three downstream-contract keys must be present.
         assert "deleted_counts" in details, "missing 'deleted_counts' in .details"
         assert "deleted_doc_ids" in details, "missing 'deleted_doc_ids' in .details"
-        assert "failed_batch_index" in details, "missing 'failed_batch_index' in .details"
+        assert "failed_batch_index" in details, (
+            "missing 'failed_batch_index' in .details"
+        )
 
         # Type checks.
         assert isinstance(details["deleted_counts"], dict)
@@ -280,7 +312,9 @@ class TestDeleteDocumentsPartialFailure:
 
 
 class TestRenameCollectionData:
-    def test_rename_collection_data_updates_collection_field_in_all_tables(self) -> None:
+    def test_rename_collection_data_updates_collection_field_in_all_tables(
+        self,
+    ) -> None:
         """rename_collection_data rewrites the 'collection' field in every table.
 
         After rename:
@@ -289,17 +323,23 @@ class TestRenameCollectionData:
         """
         store = get_vector_index_store()
 
-        store.upsert_documents([
-            _doc_row("old_name", "d1"),
-            _doc_row("old_name", "d2"),
-        ])
-        store.upsert_parses([
-            _parse_row("old_name", "d1", "h1"),
-            _parse_row("old_name", "d2", "h2"),
-        ])
-        store.upsert_chunks([
-            _chunk_row("old_name", "d1", "h1", "cfg1", "c0"),
-        ])
+        store.upsert_documents(
+            [
+                _doc_row("old_name", "d1"),
+                _doc_row("old_name", "d2"),
+            ]
+        )
+        store.upsert_parses(
+            [
+                _parse_row("old_name", "d1", "h1"),
+                _parse_row("old_name", "d2", "h2"),
+            ]
+        )
+        store.upsert_chunks(
+            [
+                _chunk_row("old_name", "d1", "h1", "cfg1", "c0"),
+            ]
+        )
 
         original_doc_count = store.count_rows(
             "documents", {"collection": "old_name"}, is_admin=True
@@ -333,9 +373,16 @@ class TestRenameCollectionData:
         store.invalidate_table_cache()
 
         # old_name must have 0 rows in every table.
-        assert store.count_rows("documents", {"collection": "old_name"}, is_admin=True) == 0
-        assert store.count_rows("parses", {"collection": "old_name"}, is_admin=True) == 0
-        assert store.count_rows("chunks", {"collection": "old_name"}, is_admin=True) == 0
+        assert (
+            store.count_rows("documents", {"collection": "old_name"}, is_admin=True)
+            == 0
+        )
+        assert (
+            store.count_rows("parses", {"collection": "old_name"}, is_admin=True) == 0
+        )
+        assert (
+            store.count_rows("chunks", {"collection": "old_name"}, is_admin=True) == 0
+        )
 
         # new_name must have the original row counts.
         assert (
@@ -369,16 +416,20 @@ class TestCountDocumentsGroupedByCollection:
         store = get_vector_index_store()
 
         # Insert 3 docs into col_a.
-        store.upsert_documents([
-            _doc_row("col_a", "a1"),
-            _doc_row("col_a", "a2"),
-            _doc_row("col_a", "a3"),
-        ])
+        store.upsert_documents(
+            [
+                _doc_row("col_a", "a1"),
+                _doc_row("col_a", "a2"),
+                _doc_row("col_a", "a3"),
+            ]
+        )
         # Insert 2 docs into col_b.
-        store.upsert_documents([
-            _doc_row("col_b", "b1"),
-            _doc_row("col_b", "b2"),
-        ])
+        store.upsert_documents(
+            [
+                _doc_row("col_b", "b1"),
+                _doc_row("col_b", "b2"),
+            ]
+        )
 
         result = store.count_documents_grouped_by_collection(
             collection_names=["col_a", "col_b"],

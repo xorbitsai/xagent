@@ -682,6 +682,7 @@ class LanceDBVectorIndexStore(VectorIndexStore):
         finally:
             _safe_close_table(table)
 
+    # Deprecated: use KBCollectionHandle.rename_collection_data instead. Remove in #514.
     def rename_collection_data(
         self,
         collection_name: str,
@@ -812,6 +813,7 @@ class LanceDBVectorIndexStore(VectorIndexStore):
             error_msg += ")"
         raise DatabaseOperationError(error_msg) from last_error
 
+    # Deprecated: use KBCollectionHandle.delete_collection_data instead. Remove in #514.
     def delete_collection_data(
         self,
         collection_name: str,
@@ -1042,6 +1044,7 @@ class LanceDBVectorIndexStore(VectorIndexStore):
             self.invalidate_table_cache(table_name)
         return deleted
 
+    # Deprecated: use KBCollectionHandle.delete_documents_data instead. Remove in #514.
     def delete_documents_data(
         self,
         collection_name: str,
@@ -2491,6 +2494,7 @@ class LanceDBIngestionStatusStore(IngestionStatusStore):
         finally:
             _safe_close_table(table)
 
+    # Deprecated: use KBCollectionHandle.rename_collection_status instead. Remove in #514.
     def rename_collection_status(
         self,
         old_name: str,

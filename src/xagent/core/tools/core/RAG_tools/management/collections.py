@@ -1306,6 +1306,7 @@ def delete_collection(
     )
 
 
+# Deprecated: delete logic is now routed through KBCollectionHandle via coordinator. Remove in #514.
 def _delete_collection_impl(
     collection: str,
     user_id: Optional[int] = None,

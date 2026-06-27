@@ -19,7 +19,10 @@ from collections.abc import AsyncIterator
 from dataclasses import dataclass
 from datetime import timezone
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, Set, cast
+from typing import TYPE_CHECKING, Any, Dict, Iterable, List, Optional, Set, cast
+
+if TYPE_CHECKING:
+    from .maintenance_compatibility import CollectionConfigSnapshot
 
 import pandas as pd
 
@@ -30,7 +33,9 @@ except ImportError:  # pragma: no cover - pyarrow is an optional runtime dep
     pa = None
     PyArrowTable = Any
 
-from ..core.config import DEFAULT_LANCEDB_BATCH_SIZE, DEFAULT_VECTOR_STORE_DELETE_BATCH_SIZE
+from ..core.config import (
+    DEFAULT_LANCEDB_BATCH_SIZE,
+)
 from ..core.exceptions import (
     ConfigurationError,
     DatabaseOperationError,
@@ -818,9 +823,7 @@ class KBCollectionHandle(ABC):
         """
 
     @abstractmethod
-    def collection_stats(
-        self, user_id: int | None, is_admin: bool
-    ) -> dict[str, int]:
+    def collection_stats(self, user_id: int | None, is_admin: bool) -> dict[str, int]:
         """Return aggregate statistics for this collection.
 
         Counts rows across the documents, chunks, and all embeddings_* tables
@@ -3314,9 +3317,7 @@ class LanceDBCollectionHandle(KBCollectionHandle):
 
     # --- Collection-level statistics (#H05 Phase 3) ---
 
-    def collection_stats(
-        self, user_id: int | None, is_admin: bool
-    ) -> dict[str, int]:
+    def collection_stats(self, user_id: int | None, is_admin: bool) -> dict[str, int]:
         """Return aggregate statistics for this collection.
 
         Counts document rows, chunk rows, and all embedding rows (summed across

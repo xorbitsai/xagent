@@ -10,19 +10,17 @@ Cycles:
 from __future__ import annotations
 
 import asyncio
-from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
-
-import pytest
 
 from xagent.core.tools.core.RAG_tools.core.exceptions import DatabaseOperationError
 from xagent.core.tools.core.RAG_tools.core.schemas import CollectionOperationResult
-from xagent.core.tools.core.RAG_tools.kb.api_compatibility import KBApiCompatibilityFacade
+from xagent.core.tools.core.RAG_tools.kb.api_compatibility import (
+    KBApiCompatibilityFacade,
+)
 from xagent.core.tools.core.RAG_tools.kb.coordinator import KBCoordinator
 from xagent.core.tools.core.RAG_tools.kb.management_facade import (
     KBCoreManagementCompatibilityFacade,
 )
-from xagent.core.tools.core.RAG_tools.kb.models import KBContextRequest
 
 
 # ---------------------------------------------------------------------------
@@ -80,7 +78,7 @@ class TestCoordinatorDeleteCollection:
         handle = _make_mock_handle()
         coordinator = _make_coordinator_with_mock_handle(handle)
 
-        result = asyncio.run(
+        asyncio.run(
             coordinator.delete_collection(
                 collection="my_coll",
                 user_id=None,
@@ -106,7 +104,7 @@ class TestCoordinatorDeleteCollection:
         coordinator = _make_coordinator_with_mock_handle(handle)
         doc_ids = ["doc-1", "doc-2"]
 
-        result = asyncio.run(
+        asyncio.run(
             coordinator.delete_collection(
                 collection="tenant_coll",
                 user_id="u1",

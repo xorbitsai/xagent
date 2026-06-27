@@ -16,13 +16,12 @@ from __future__ import annotations
 import asyncio
 import inspect
 from datetime import datetime, timezone
-from unittest.mock import MagicMock, patch
+from unittest.mock import patch
 
 import pytest
 
 from xagent.core.tools.core.RAG_tools.core.exceptions import DatabaseOperationError
 from xagent.core.tools.core.RAG_tools.kb.collection_handle import (
-    KBCollectionHandle,
     LanceDBCollectionHandle,
 )
 from xagent.core.tools.core.RAG_tools.kb.models import (
@@ -122,9 +121,20 @@ def _seed_collection(collection: str, doc_ids: list[str], *, user_id=None) -> No
     store = get_vector_index_store()
     for doc_id in doc_ids:
         store.upsert_documents([_doc_row(collection, doc_id, user_id=user_id)])
-        store.upsert_parses([_parse_row(collection, doc_id, f"h-{doc_id}", user_id=user_id)])
+        store.upsert_parses(
+            [_parse_row(collection, doc_id, f"h-{doc_id}", user_id=user_id)]
+        )
         store.upsert_chunks(
-            [_chunk_row(collection, doc_id, f"h-{doc_id}", "cfg1", f"c-{doc_id}", user_id=user_id)]
+            [
+                _chunk_row(
+                    collection,
+                    doc_id,
+                    f"h-{doc_id}",
+                    "cfg1",
+                    f"c-{doc_id}",
+                    user_id=user_id,
+                )
+            ]
         )
 
 
@@ -160,11 +170,15 @@ class TestDeleteCollectionDataAdminClearsAllTables:
         assert sum(result.values()) > 0
 
         # test_coll is empty afterwards.
-        doc_count = store.count_rows("documents", {"collection": "test_coll"}, is_admin=True)
+        doc_count = store.count_rows(
+            "documents", {"collection": "test_coll"}, is_admin=True
+        )
         assert doc_count == 0
 
         # other_coll is untouched.
-        other_count = store.count_rows("documents", {"collection": "other_coll"}, is_admin=True)
+        other_count = store.count_rows(
+            "documents", {"collection": "other_coll"}, is_admin=True
+        )
         assert other_count == 1
 
 
@@ -207,7 +221,9 @@ class TestDeleteCollectionDataUsesContextCollection:
 
 
 class TestDeleteDocumentsDataTenantScoped:
-    def test_delete_documents_data_tenant_scoped_removes_only_specified_docs(self) -> None:
+    def test_delete_documents_data_tenant_scoped_removes_only_specified_docs(
+        self,
+    ) -> None:
         """delete_documents_data removes d1, d2 but leaves d3 untouched.
 
         Uses is_admin=False with a user_id to exercise tenant-scoped deletion.
@@ -229,11 +245,26 @@ class TestDeleteDocumentsDataTenantScoped:
         assert isinstance(result, dict)
 
         # d1 and d2 should be gone.
-        assert store.count_rows("documents", {"collection": "test_coll", "doc_id": "d1"}, is_admin=True) == 0
-        assert store.count_rows("documents", {"collection": "test_coll", "doc_id": "d2"}, is_admin=True) == 0
+        assert (
+            store.count_rows(
+                "documents", {"collection": "test_coll", "doc_id": "d1"}, is_admin=True
+            )
+            == 0
+        )
+        assert (
+            store.count_rows(
+                "documents", {"collection": "test_coll", "doc_id": "d2"}, is_admin=True
+            )
+            == 0
+        )
 
         # d3 must remain.
-        assert store.count_rows("documents", {"collection": "test_coll", "doc_id": "d3"}, is_admin=True) == 1
+        assert (
+            store.count_rows(
+                "documents", {"collection": "test_coll", "doc_id": "d3"}, is_admin=True
+            )
+            == 1
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -274,11 +305,17 @@ class TestDeleteDocumentsDataPartialFailurePreservesContract:
                 )
 
         err = exc_info.value
-        assert hasattr(err, "details"), "DatabaseOperationError must have a 'details' attribute"
+        assert hasattr(err, "details"), (
+            "DatabaseOperationError must have a 'details' attribute"
+        )
         details = err.details
         assert details is not None, "details must not be None"
-        assert "deleted_counts" in details, f"Missing 'deleted_counts' in details: {details}"
-        assert "deleted_doc_ids" in details, f"Missing 'deleted_doc_ids' in details: {details}"
+        assert "deleted_counts" in details, (
+            f"Missing 'deleted_counts' in details: {details}"
+        )
+        assert "deleted_doc_ids" in details, (
+            f"Missing 'deleted_doc_ids' in details: {details}"
+        )
         assert "failed_batch_index" in details, (
             f"Missing 'failed_batch_index' in details: {details}"
         )
@@ -309,9 +346,16 @@ class TestRenameCollectionDataUpdatesAllTables:
         _seed_collection("old_name", ["r1", "r2"])
 
         # Confirm rows exist before rename.
-        assert store.count_rows("documents", {"collection": "old_name"}, is_admin=True) == 2
-        assert store.count_rows("parses", {"collection": "old_name"}, is_admin=True) == 2
-        assert store.count_rows("chunks", {"collection": "old_name"}, is_admin=True) == 2
+        assert (
+            store.count_rows("documents", {"collection": "old_name"}, is_admin=True)
+            == 2
+        )
+        assert (
+            store.count_rows("parses", {"collection": "old_name"}, is_admin=True) == 2
+        )
+        assert (
+            store.count_rows("chunks", {"collection": "old_name"}, is_admin=True) == 2
+        )
 
         warnings = handle.rename_collection_data(
             new_name="new_name",
@@ -323,13 +367,27 @@ class TestRenameCollectionDataUpdatesAllTables:
         assert isinstance(warnings, list)
 
         # All rows moved from "old_name" → "new_name".
-        assert store.count_rows("documents", {"collection": "old_name"}, is_admin=True) == 0
-        assert store.count_rows("parses", {"collection": "old_name"}, is_admin=True) == 0
-        assert store.count_rows("chunks", {"collection": "old_name"}, is_admin=True) == 0
+        assert (
+            store.count_rows("documents", {"collection": "old_name"}, is_admin=True)
+            == 0
+        )
+        assert (
+            store.count_rows("parses", {"collection": "old_name"}, is_admin=True) == 0
+        )
+        assert (
+            store.count_rows("chunks", {"collection": "old_name"}, is_admin=True) == 0
+        )
 
-        assert store.count_rows("documents", {"collection": "new_name"}, is_admin=True) == 2
-        assert store.count_rows("parses", {"collection": "new_name"}, is_admin=True) == 2
-        assert store.count_rows("chunks", {"collection": "new_name"}, is_admin=True) == 2
+        assert (
+            store.count_rows("documents", {"collection": "new_name"}, is_admin=True)
+            == 2
+        )
+        assert (
+            store.count_rows("parses", {"collection": "new_name"}, is_admin=True) == 2
+        )
+        assert (
+            store.count_rows("chunks", {"collection": "new_name"}, is_admin=True) == 2
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -411,6 +469,7 @@ class TestRenameCollectionMetadataAsyncMovesConfig:
         # Ensure table exists and seed a collection config entry.
         await meta_store.ensure_collection_metadata_table()
         import json
+
         await meta_store.save_collection_config(
             collection="old_meta",
             config_json=json.dumps({"embed_model": "test-model"}),
@@ -503,12 +562,14 @@ class TestCollectionStatsAggregatesAcrossTables:
         store.upsert_parses([_parse_row("stats_coll", "s2", "ph3", user_id=1)])
 
         # Insert 4 chunks across the two docs.
-        store.upsert_chunks([
-            _chunk_row("stats_coll", "s1", "ph1", "cfg1", "ck1", user_id=1),
-            _chunk_row("stats_coll", "s1", "ph1", "cfg1", "ck2", user_id=1),
-            _chunk_row("stats_coll", "s2", "ph3", "cfg1", "ck3", user_id=1),
-            _chunk_row("stats_coll", "s2", "ph3", "cfg1", "ck4", user_id=1),
-        ])
+        store.upsert_chunks(
+            [
+                _chunk_row("stats_coll", "s1", "ph1", "cfg1", "ck1", user_id=1),
+                _chunk_row("stats_coll", "s1", "ph1", "cfg1", "ck2", user_id=1),
+                _chunk_row("stats_coll", "s2", "ph3", "cfg1", "ck3", user_id=1),
+                _chunk_row("stats_coll", "s2", "ph3", "cfg1", "ck4", user_id=1),
+            ]
+        )
 
         stats = handle.collection_stats(user_id=1, is_admin=True)
 
@@ -517,10 +578,14 @@ class TestCollectionStatsAggregatesAcrossTables:
         assert "chunks" in stats, f"Missing 'chunks' key in stats: {stats}"
         assert "embeddings" in stats, f"Missing 'embeddings' key in stats: {stats}"
 
-        assert stats["documents"] == 2, f"Expected 2 documents, got {stats['documents']}"
+        assert stats["documents"] == 2, (
+            f"Expected 2 documents, got {stats['documents']}"
+        )
         assert stats["chunks"] == 4, f"Expected 4 chunks, got {stats['chunks']}"
         # No embeddings were written so embeddings count should be 0.
-        assert stats["embeddings"] == 0, f"Expected 0 embeddings, got {stats['embeddings']}"
+        assert stats["embeddings"] == 0, (
+            f"Expected 0 embeddings, got {stats['embeddings']}"
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -585,7 +650,9 @@ class TestConfigSnapshotAndRestoreRoundTrip:
 class TestConfigSnapshotNonexistentCollectionReturnsEmptySnapshot:
     """Snapshot on a collection with no config row returns a safe empty snapshot."""
 
-    def test_config_snapshot_nonexistent_collection_returns_empty_snapshot(self) -> None:
+    def test_config_snapshot_nonexistent_collection_returns_empty_snapshot(
+        self,
+    ) -> None:
         asyncio.run(self._run())
 
     async def _run(self) -> None:
@@ -632,11 +699,15 @@ class TestDeleteCollectionConfigIsIdempotent:
 
         # First delete must remove the row.
         deleted_first = await handle.delete_collection_config()
-        assert deleted_first >= 1, f"First delete expected >=1 rows, got {deleted_first}"
+        assert deleted_first >= 1, (
+            f"First delete expected >=1 rows, got {deleted_first}"
+        )
 
         # Second delete must be a no-op (0 rows, no exception).
         deleted_second = await handle.delete_collection_config()
-        assert deleted_second == 0, f"Second delete expected 0 rows, got {deleted_second}"
+        assert deleted_second == 0, (
+            f"Second delete expected 0 rows, got {deleted_second}"
+        )
 
         # Config must be gone.
         config_after = await meta_store.get_collection_config(
@@ -666,7 +737,10 @@ class TestCleanupAfterRollbackRemovesCollectionLocalDataOnly:
         _seed_collection("other_coll", ["oc1"])
 
         # Patch shutil.rmtree and os.remove to assert no filesystem calls occur.
-        with _patch("shutil.rmtree") as mock_rmtree, _patch("os.remove") as mock_os_remove:
+        with (
+            _patch("shutil.rmtree") as mock_rmtree,
+            _patch("os.remove") as mock_os_remove,
+        ):
             counts = handle_new.cleanup_collection_data_after_rollback(
                 user_id=None, is_admin=True
             )
@@ -680,10 +754,12 @@ class TestCleanupAfterRollbackRemovesCollectionLocalDataOnly:
 
         # new_coll data must be removed.
         assert (
-            store.count_rows("documents", {"collection": "new_coll"}, is_admin=True) == 0
+            store.count_rows("documents", {"collection": "new_coll"}, is_admin=True)
+            == 0
         ), "new_coll documents should be deleted after rollback cleanup"
 
         # other_coll data must be untouched.
         assert (
-            store.count_rows("documents", {"collection": "other_coll"}, is_admin=True) == 1
+            store.count_rows("documents", {"collection": "other_coll"}, is_admin=True)
+            == 1
         ), "other_coll documents must not be touched by new_coll cleanup"

@@ -445,8 +445,8 @@ class TestConfigOnlyInvariant:
         # Neither data delete should be called when there are no doc_ids to delete
         handle.delete_collection_data.assert_not_called()
         handle.delete_documents_data.assert_not_called()
-        # Config is cleaned up
-        handle.delete_collection_config.assert_called_once()
+        # Config cleanup is scoped to this tenant only (non-admin must not delete other tenants' rows)
+        handle.delete_collection_config.assert_called_once_with(tenant_only=True)
         assert isinstance(result, CollectionOperationResult)
 
     def test_resolve_delete_mode_returns_config_only_for_shared_collection(
@@ -543,10 +543,10 @@ class TestCoordinatorDeleteOrphanedMetadataGuard:
         handle.delete_documents_data.assert_called_once()
         handle.delete_collection_config.assert_called_once_with(tenant_only=True)
 
-    def test_delete_collection_config_called_when_collection_is_empty(
+    def test_delete_collection_config_admin_scope_when_admin_and_empty(
         self,
     ) -> None:
-        """When count_documents == 0 after deletion, delete_collection_config IS called."""
+        """Admin caller + remaining == 0: full admin-scope config cleanup (all tenant rows)."""
         handle = _make_mock_handle()
         handle.count_documents = MagicMock(return_value=0)
         coordinator = _make_coordinator_with_mock_handle(handle)
@@ -561,7 +561,30 @@ class TestCoordinatorDeleteOrphanedMetadataGuard:
         )
 
         handle.delete_collection_data.assert_called_once()
-        handle.delete_collection_config.assert_called_once()
+        # Admin + empty collection → full cleanup, no tenant_only restriction
+        handle.delete_collection_config.assert_called_once_with()
+
+    def test_delete_collection_config_tenant_only_when_non_admin_and_empty(
+        self,
+    ) -> None:
+        """Non-admin caller + remaining == 0: only the current tenant's config row is removed."""
+        handle = _make_mock_handle()
+        handle.count_documents = MagicMock(return_value=0)
+        coordinator = _make_coordinator_with_mock_handle(handle)
+
+        asyncio.run(
+            coordinator.delete_collection(
+                collection="my_coll",
+                user_id=1,
+                is_admin=False,
+                doc_ids=["doc-a"],
+                delete_orphaned_metadata=True,
+            )
+        )
+
+        handle.delete_documents_data.assert_called_once()
+        # Non-admin must not escalate to admin-scope cleanup even when collection appears empty
+        handle.delete_collection_config.assert_called_once_with(tenant_only=True)
 
 
 class TestCoordinatorDeleteAutoDiscoversDocIds:

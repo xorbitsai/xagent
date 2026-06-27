@@ -564,8 +564,14 @@ class KBCoordinator:
                 # Extract successfully deleted doc_ids from error details to provide
                 # accurate per-document status instead of marking everything FAILED.
                 err_details = getattr(data_error, "details", {}) or {}
-                raw_deleted = err_details.get("deleted_doc_ids") if isinstance(err_details, dict) else None
-                deleted_doc_ids: list[str] = raw_deleted if isinstance(raw_deleted, list) else []
+                raw_deleted = (
+                    err_details.get("deleted_doc_ids")
+                    if isinstance(err_details, dict)
+                    else None
+                )
+                deleted_doc_ids: list[str] = (
+                    raw_deleted if isinstance(raw_deleted, list) else []
+                )
                 deleted_set = set(deleted_doc_ids)
                 failed_doc_ids = [d for d in affected_doc_ids if d not in deleted_set]
                 return CollectionOperationResult(

@@ -3469,8 +3469,9 @@ class LanceDBCollectionHandle(KBCollectionHandle):
         """
         if not snapshot.existed:
             return
-        if snapshot.config_json is None:
-            return
+        assert (
+            snapshot.config_json is not None
+        )  # invariant: existed ↔ config_json is not None
         await self.metadata_store.save_collection_config(
             snapshot.collection_name,
             snapshot.config_json,

@@ -8,7 +8,11 @@ from collections.abc import Coroutine
 from contextvars import copy_context
 from typing import Any, Optional, TypeVar
 
-from ..core.exceptions import DatabaseOperationError
+from ..core.exceptions import (
+    CascadeCleanupError,
+    DatabaseOperationError,
+    RagCoreException,
+)
 from ..core.schemas import (
     CollectionOperationDetail,
     CollectionOperationResult,
@@ -46,6 +50,20 @@ from .version_compatibility import KBVersionCompatibilityFacade
 T = TypeVar("T")
 
 KB_STORAGE_METADATA_KEY = "kb_storage"
+
+
+def _normalize_user_id(user_id: str | int | None) -> int | None:
+    """Coerce ``user_id`` from ``str | int | None`` to ``int | None``.
+
+    Raises:
+        ValueError: If ``user_id`` is provided but cannot be converted to int.
+    """
+    if user_id is None:
+        return None
+    try:
+        return int(user_id)
+    except (ValueError, TypeError) as exc:
+        raise ValueError(f"Invalid user_id: {user_id!r}") from exc
 
 
 class KBCoordinator:
@@ -445,14 +463,7 @@ class KBCoordinator:
             ``partial_success`` (when a :class:`DatabaseOperationError` was
             caught during the data-plane delete), or ``error``.
         """
-        # Normalize user_id from str | int | None → int | None for handle methods
-        # and KBContextRequest (which expects int | None).
-        int_user_id: int | None = None
-        if user_id is not None:
-            try:
-                int_user_id = int(user_id)
-            except (ValueError, TypeError) as exc:
-                raise ValueError(f"Invalid user_id: {user_id!r}") from exc
+        int_user_id = _normalize_user_id(user_id)
 
         handle = await self.open_collection(
             KBContextRequest(
@@ -525,7 +536,9 @@ class KBCoordinator:
                 )
                 deleted_counts.update(result_counts or {})
             # else: config-only — no data-plane delete
-        except DatabaseOperationError as exc:
+        except (DatabaseOperationError, CascadeCleanupError) as exc:
+            # CascadeCleanupError (admin cascade path) carries no per-doc details;
+            # DatabaseOperationError (tenant batch path) may carry deleted_counts.
             data_error = exc
             details = getattr(exc, "details", {}) or {}
             if isinstance(details, dict):
@@ -544,7 +557,7 @@ class KBCoordinator:
                     user_id=None,
                     is_admin=True,
                 )
-            except Exception:  # noqa: BLE001 - conservative: assume non-empty on error
+            except (RagCoreException, OSError):
                 remaining = 1
             try:
                 if is_admin and remaining == 0:
@@ -632,14 +645,7 @@ class KBCoordinator:
         Returns:
             A list of warning strings (empty on full success).
         """
-        # Normalize user_id from str | int | None → int | None for handle methods
-        # and KBContextRequest (which expects int | None).
-        int_user_id: int | None = None
-        if user_id is not None:
-            try:
-                int_user_id = int(user_id)
-            except (ValueError, TypeError) as exc:
-                raise ValueError(f"Invalid user_id: {user_id!r}") from exc
+        int_user_id = _normalize_user_id(user_id)
 
         handle = await self.open_collection(
             KBContextRequest(

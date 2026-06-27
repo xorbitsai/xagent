@@ -547,12 +547,12 @@ class KBCoordinator:
             except Exception:  # noqa: BLE001 - conservative: assume non-empty on error
                 remaining = 1
             try:
-                if remaining == 0:
-                    # Admin cleanup removes all tenant rows (including current tenant's).
+                if is_admin and remaining == 0:
+                    # Admin caller + collection fully empty: remove all tenant rows.
                     await handle.delete_collection_config()
                 else:
-                    # Only remove the current tenant's config row; other tenants' rows
-                    # must be preserved because they still have data.
+                    # Non-admin caller, or other tenants still have data: only remove
+                    # the current tenant's config row to preserve tenant isolation.
                     await handle.delete_collection_config(tenant_only=True)
             except Exception as cfg_exc:  # noqa: BLE001 - best-effort
                 warnings.append(

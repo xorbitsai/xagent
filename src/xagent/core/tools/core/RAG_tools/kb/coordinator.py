@@ -445,10 +445,19 @@ class KBCoordinator:
             ``partial_success`` (when a :class:`DatabaseOperationError` was
             caught during the data-plane delete), or ``error``.
         """
+        # Normalize user_id from str | int | None → int | None for handle methods
+        # and KBContextRequest (which expects int | None).
+        int_user_id: int | None = None
+        if user_id is not None:
+            try:
+                int_user_id = int(user_id)
+            except (ValueError, TypeError):
+                int_user_id = None
+
         handle = await self.open_collection(
             KBContextRequest(
                 collection=collection,
-                user_id=user_id,
+                user_id=int_user_id,
                 is_admin=is_admin,
                 hide_missing=True,
             )
@@ -457,14 +466,6 @@ class KBCoordinator:
         warnings: list[str] = warnings_out if warnings_out is not None else []
         deleted_counts: dict[str, int] = {}
         data_error: Exception | None = None
-
-        # Normalize user_id from str | int | None → int | None for handle methods.
-        int_user_id: int | None = None
-        if user_id is not None:
-            try:
-                int_user_id = int(user_id)
-            except (ValueError, TypeError):
-                int_user_id = None
 
         # Collect doc_ids BEFORE deletion for affected_documents tracking.
         # For tenant callers: also auto-discover doc_ids when caller hasn't provided them
@@ -595,24 +596,25 @@ class KBCoordinator:
         Returns:
             A list of warning strings (empty on full success).
         """
-        handle = await self.open_collection(
-            KBContextRequest(
-                collection=old_name,
-                user_id=user_id,
-                is_admin=is_admin,
-                hide_missing=True,
-            )
-        )
-
-        warnings: list[str] = []
-
-        # Normalize user_id from str | int | None → int | None for handle methods.
+        # Normalize user_id from str | int | None → int | None for handle methods
+        # and KBContextRequest (which expects int | None).
         int_user_id: int | None = None
         if user_id is not None:
             try:
                 int_user_id = int(user_id)
             except (ValueError, TypeError):
                 int_user_id = None
+
+        handle = await self.open_collection(
+            KBContextRequest(
+                collection=old_name,
+                user_id=int_user_id,
+                is_admin=is_admin,
+                hide_missing=True,
+            )
+        )
+
+        warnings: list[str] = []
 
         try:
             data_warnings = await asyncio.to_thread(

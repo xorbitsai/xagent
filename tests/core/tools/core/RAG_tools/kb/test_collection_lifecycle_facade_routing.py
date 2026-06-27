@@ -22,7 +22,6 @@ from xagent.core.tools.core.RAG_tools.kb.management_facade import (
     KBCoreManagementCompatibilityFacade,
 )
 
-
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------

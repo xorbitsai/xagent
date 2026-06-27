@@ -16,7 +16,6 @@ import pytest
 from xagent.core.tools.core.RAG_tools.core.exceptions import DatabaseOperationError
 from xagent.core.tools.core.RAG_tools.storage.factory import get_vector_index_store
 
-
 # ---------------------------------------------------------------------------
 # Helpers – row builders
 # ---------------------------------------------------------------------------

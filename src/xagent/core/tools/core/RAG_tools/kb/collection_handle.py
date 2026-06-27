@@ -750,6 +750,36 @@ class KBCollectionHandle(ABC):
         counts across all successfully processed batches.
         """
 
+    # --- Collection-level statistics (#H05 Phase 3) ---
+
+    @abstractmethod
+    def count_documents(self, user_id: int | None, is_admin: bool) -> int:
+        """Count documents visible to the given user in this collection.
+
+        When ``is_admin`` is ``True`` all rows are counted regardless of
+        ``user_id``.  Otherwise only rows owned by ``user_id`` are counted.
+
+        Returns:
+            Number of document rows visible to the caller.
+        """
+
+    @abstractmethod
+    def collection_stats(
+        self, user_id: int | None, is_admin: bool
+    ) -> dict[str, int]:
+        """Return aggregate statistics for this collection.
+
+        Counts rows across the documents, chunks, and all embeddings_* tables
+        that are visible to the caller under the given user/admin scope.
+
+        Returns:
+            A ``dict`` with at least these keys:
+            - ``"documents"`` – count of document rows
+            - ``"chunks"``    – count of chunk rows
+            - ``"embeddings"``– total count of embedding rows across all model
+              tables
+        """
+
 
 @dataclass(frozen=True)
 class LanceDBCollectionHandle(KBCollectionHandle):
@@ -3227,3 +3257,60 @@ class LanceDBCollectionHandle(KBCollectionHandle):
             user_id=user_id,
             is_admin=is_admin,
         )
+
+    # --- Collection-level statistics (#H05 Phase 3) ---
+
+    def collection_stats(
+        self, user_id: int | None, is_admin: bool
+    ) -> dict[str, int]:
+        """Return aggregate statistics for this collection.
+
+        Counts document rows, chunk rows, and all embedding rows (summed across
+        all ``embeddings_*`` tables) that are visible to the caller under the
+        given user/admin scope.
+
+        Returns:
+            A ``dict`` with keys ``"documents"``, ``"chunks"``, and
+            ``"embeddings"``.
+        """
+        collection = self.context.collection
+        store = self.vector_index_store
+
+        documents = store.count_rows_or_zero(
+            "documents",
+            filters={"collection": collection},
+            user_id=user_id,
+            is_admin=is_admin,
+        )
+        chunks = store.count_rows_or_zero(
+            "chunks",
+            filters={"collection": collection},
+            user_id=user_id,
+            is_admin=is_admin,
+        )
+        embeddings = sum(
+            store.count_rows_or_zero(
+                table_name,
+                filters={"collection": collection},
+                user_id=user_id,
+                is_admin=is_admin,
+            )
+            for table_name in store.list_table_names()
+            if table_name.startswith("embeddings_")
+        )
+        return {
+            "documents": documents,
+            "chunks": chunks,
+            "embeddings": embeddings,
+        }
+
+    def count_documents(self, user_id: int | None, is_admin: bool) -> int:
+        """Count documents visible to the given user in this collection.
+
+        Delegates to :meth:`collection_stats` and returns the ``"documents"``
+        entry so that both methods share the same query path.
+
+        When ``is_admin`` is ``True`` all rows are counted regardless of
+        ``user_id``.  Otherwise only rows owned by ``user_id`` are counted.
+        """
+        return self.collection_stats(user_id=user_id, is_admin=is_admin)["documents"]

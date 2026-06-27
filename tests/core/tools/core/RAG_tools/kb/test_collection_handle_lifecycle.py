@@ -440,3 +440,84 @@ class TestRenameCollectionMetadataAsyncMovesConfig:
             collection="new_meta", user_id=None, is_admin=True
         )
         assert config_new is not None
+
+
+# ---------------------------------------------------------------------------
+# Phase 3 – Cycle 3.1: count_documents
+# ---------------------------------------------------------------------------
+
+
+class TestCountDocumentsReturnsTenantCount:
+    def test_count_documents_returns_tenant_count(self) -> None:
+        """count_documents returns per-user and admin counts correctly.
+
+        Insert 2 docs from user_a and 1 doc from user_b in the same collection.
+        - handle.count_documents(user_id="user_a", is_admin=False) -> 2
+        - handle.count_documents(user_id="user_a", is_admin=True)  -> 3 (admin sees all)
+        """
+        store = get_vector_index_store()
+        handle = make_handle("count_coll")
+
+        # Insert 2 docs for user_a.
+        store.upsert_documents([_doc_row("count_coll", "da1", user_id=10)])
+        store.upsert_documents([_doc_row("count_coll", "da2", user_id=10)])
+        # Insert 1 doc for user_b.
+        store.upsert_documents([_doc_row("count_coll", "db1", user_id=20)])
+
+        # Non-admin: user_a sees only their own 2 docs.
+        count_user = handle.count_documents(user_id=10, is_admin=False)
+        assert count_user == 2, f"Expected 2 for user_a non-admin, got {count_user}"
+
+        # Admin: sees all 3 docs regardless of user_id.
+        count_admin = handle.count_documents(user_id=10, is_admin=True)
+        assert count_admin == 3, f"Expected 3 for admin, got {count_admin}"
+
+
+# ---------------------------------------------------------------------------
+# Phase 3 – Cycle 3.2: collection_stats
+# ---------------------------------------------------------------------------
+
+
+class TestCollectionStatsAggregatesAcrossTables:
+    def test_collection_stats_aggregates_across_tables(self) -> None:
+        """collection_stats returns document, chunk, and embedding counts for the collection.
+
+        Insert known counts:
+        - 2 documents
+        - 3 chunks (parses)
+        - 4 chunk rows (chunks table)
+
+        Then assert stats["documents"], stats["chunks"], stats["embeddings"]
+        match expected values. Embeddings may be 0 if no embedding table exists.
+        """
+        store = get_vector_index_store()
+        handle = make_handle("stats_coll")
+
+        # Insert 2 documents for user 1.
+        store.upsert_documents([_doc_row("stats_coll", "s1", user_id=1)])
+        store.upsert_documents([_doc_row("stats_coll", "s2", user_id=1)])
+
+        # Insert 3 parses (one parse per doc, plus an extra parse for s1).
+        store.upsert_parses([_parse_row("stats_coll", "s1", "ph1", user_id=1)])
+        store.upsert_parses([_parse_row("stats_coll", "s1", "ph2", user_id=1)])
+        store.upsert_parses([_parse_row("stats_coll", "s2", "ph3", user_id=1)])
+
+        # Insert 4 chunks across the two docs.
+        store.upsert_chunks([
+            _chunk_row("stats_coll", "s1", "ph1", "cfg1", "ck1", user_id=1),
+            _chunk_row("stats_coll", "s1", "ph1", "cfg1", "ck2", user_id=1),
+            _chunk_row("stats_coll", "s2", "ph3", "cfg1", "ck3", user_id=1),
+            _chunk_row("stats_coll", "s2", "ph3", "cfg1", "ck4", user_id=1),
+        ])
+
+        stats = handle.collection_stats(user_id=1, is_admin=True)
+
+        assert isinstance(stats, dict), f"Expected dict, got {type(stats)}"
+        assert "documents" in stats, f"Missing 'documents' key in stats: {stats}"
+        assert "chunks" in stats, f"Missing 'chunks' key in stats: {stats}"
+        assert "embeddings" in stats, f"Missing 'embeddings' key in stats: {stats}"
+
+        assert stats["documents"] == 2, f"Expected 2 documents, got {stats['documents']}"
+        assert stats["chunks"] == 4, f"Expected 4 chunks, got {stats['chunks']}"
+        # No embeddings were written so embeddings count should be 0.
+        assert stats["embeddings"] == 0, f"Expected 0 embeddings, got {stats['embeddings']}"

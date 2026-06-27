@@ -458,6 +458,14 @@ class KBCoordinator:
         deleted_counts: dict[str, int] = {}
         data_error: Exception | None = None
 
+        # Normalize user_id from str | int | None → int | None for handle methods.
+        int_user_id: int | None = None
+        if user_id is not None:
+            try:
+                int_user_id = int(user_id)
+            except (ValueError, TypeError):
+                int_user_id = None
+
         # Collect doc_ids BEFORE deletion for affected_documents tracking.
         # For tenant callers: also auto-discover doc_ids when caller hasn't provided them
         # (mirrors _delete_collection_impl which always collects from list_document_records).
@@ -465,7 +473,7 @@ class KBCoordinator:
         try:
             affected_doc_ids = await asyncio.to_thread(
                 handle.list_collection_documents,
-                user_id=user_id,
+                user_id=int_user_id,
                 is_admin=is_admin,
             )
         except Exception as exc:  # noqa: BLE001
@@ -484,7 +492,7 @@ class KBCoordinator:
             if is_admin:
                 result_counts = await asyncio.to_thread(
                     handle.delete_collection_data,
-                    user_id=user_id,
+                    user_id=int_user_id,
                     is_admin=is_admin,
                     warnings_out=warnings,
                 )
@@ -493,7 +501,7 @@ class KBCoordinator:
                 result_counts = await asyncio.to_thread(
                     handle.delete_documents_data,
                     effective_doc_ids,
-                    user_id=user_id,
+                    user_id=int_user_id,
                     is_admin=is_admin,
                     warnings_out=warnings,
                 )
@@ -598,11 +606,19 @@ class KBCoordinator:
 
         warnings: list[str] = []
 
+        # Normalize user_id from str | int | None → int | None for handle methods.
+        int_user_id: int | None = None
+        if user_id is not None:
+            try:
+                int_user_id = int(user_id)
+            except (ValueError, TypeError):
+                int_user_id = None
+
         try:
             data_warnings = await asyncio.to_thread(
                 handle.rename_collection_data,
                 new_name,
-                user_id,
+                int_user_id,
                 is_admin,
             )
             if data_warnings:
@@ -616,7 +632,7 @@ class KBCoordinator:
             status_warnings = await asyncio.to_thread(
                 handle.rename_collection_status,
                 new_name,
-                user_id,
+                int_user_id,
                 is_admin,
             )
             if status_warnings:
@@ -627,7 +643,7 @@ class KBCoordinator:
             )
 
         try:
-            await handle.rename_collection_metadata(new_name, user_id, is_admin)
+            await handle.rename_collection_metadata(new_name, int_user_id, is_admin)
         except Exception as exc:  # noqa: BLE001 - best-effort
             warnings.append(
                 f"rename_collection_metadata for {old_name!r} → {new_name!r} failed: {exc}"

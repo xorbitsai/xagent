@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-import asyncio
-import concurrent.futures
 from collections.abc import Iterator
 from contextlib import contextmanager
 from typing import TYPE_CHECKING, Any, Dict, List, Optional
@@ -129,18 +127,15 @@ class KBCoreManagementCompatibilityFacade:
         is_admin: bool = False,
     ) -> CollectionOperationResult:
         if self._coordinator is not None:
-            # Bridge sync → async: run in a dedicated thread so asyncio.run() can
-            # create a fresh event loop without conflicting with a running one.
-            with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
-                future = executor.submit(
-                    asyncio.run,
-                    self.delete_collection_async(
-                        collection=collection,
-                        user_id=user_id,
-                        is_admin=is_admin,
-                    ),
+            from .coordinator import _run_in_separate_loop
+
+            return _run_in_separate_loop(
+                self.delete_collection_async(
+                    collection=collection,
+                    user_id=user_id,
+                    is_admin=is_admin,
                 )
-                return future.result()
+            )
 
         from ..management import collections as management_collections
 

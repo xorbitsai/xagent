@@ -649,7 +649,7 @@ class KBCollectionHandle(ABC):
     def rename_collection_data(
         self,
         new_name: str,
-        user_id: str | None,
+        user_id: int | None,
         is_admin: bool,
         warnings_out: list[str] | None = None,
     ) -> list[str]:
@@ -678,7 +678,7 @@ class KBCollectionHandle(ABC):
     def rename_collection_status(
         self,
         new_name: str,
-        user_id: str | None,
+        user_id: int | None,
         is_admin: bool,
     ) -> list[str]:
         """Rename ingestion status rows from this collection's name to ``new_name``.
@@ -700,7 +700,7 @@ class KBCollectionHandle(ABC):
     async def rename_collection_metadata(
         self,
         new_name: str,
-        user_id: str | None,
+        user_id: int | None,
         is_admin: bool,
     ) -> None:
         """Rename control-plane metadata from this collection's name to ``new_name``.
@@ -3254,7 +3254,7 @@ class LanceDBCollectionHandle(KBCollectionHandle):
     def rename_collection_data(
         self,
         new_name: str,
-        user_id: str | None,
+        user_id: int | None,
         is_admin: bool,
         warnings_out: list[str] | None = None,
     ) -> list[str]:
@@ -3289,7 +3289,7 @@ class LanceDBCollectionHandle(KBCollectionHandle):
     def rename_collection_status(
         self,
         new_name: str,
-        user_id: str | None,
+        user_id: int | None,
         is_admin: bool,
     ) -> list[str]:
         """Rename ingestion status rows in the ``ingestion_runs`` table.
@@ -3315,7 +3315,7 @@ class LanceDBCollectionHandle(KBCollectionHandle):
     async def rename_collection_metadata(
         self,
         new_name: str,
-        user_id: str | None,
+        user_id: int | None,
         is_admin: bool,
     ) -> None:
         """Rename control-plane metadata rows to ``new_name``.
@@ -3385,13 +3385,15 @@ class LanceDBCollectionHandle(KBCollectionHandle):
     def count_documents(self, user_id: int | None, is_admin: bool) -> int:
         """Count documents visible to the given user in this collection.
 
-        Delegates to :meth:`collection_stats` and returns the ``"documents"``
-        entry so that both methods share the same query path.
-
         When ``is_admin`` is ``True`` all rows are counted regardless of
         ``user_id``.  Otherwise only rows owned by ``user_id`` are counted.
         """
-        return self.collection_stats(user_id=user_id, is_admin=is_admin)["documents"]
+        return self.vector_index_store.count_rows_or_zero(
+            "documents",
+            filters={"collection": self.context.collection},
+            user_id=user_id,
+            is_admin=is_admin,
+        )
 
     def list_collection_documents(
         self,

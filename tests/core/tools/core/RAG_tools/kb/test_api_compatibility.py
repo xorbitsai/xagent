@@ -574,7 +574,7 @@ async def test_api_facade_storage_operations_rebind_storage_context() -> None:
         )
         assert await facade.delete_collection_metadata_entry("old") is True
         assert facade.list_collection_config_owner_ids("old") == {7, 8}
-        assert facade.rename_collection_data(
+        assert await facade.rename_collection_data(
             collection_name="old",
             new_name="new",
             user_id=7,
@@ -992,7 +992,7 @@ async def test_rename_collection_routes_storage_metadata_and_status(
 
     facade = KBApiCompatibilityFacade()
 
-    assert facade.rename_collection_data(
+    assert await facade.rename_collection_data(
         collection_name="old",
         new_name="new",
         user_id=7,

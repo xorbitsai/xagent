@@ -234,9 +234,12 @@ class TestDeleteDocumentsPartialFailure:
             # First call succeeds – return minimal counts dict.
             return {"documents": 1, "parses": 0, "chunks": 0}
 
+        # cascade_delete_documents is imported locally inside delete_documents_data;
+        # patch it at its definition site in cascade_cleaner so the local import
+        # picks up the patched version.
         target = (
-            "xagent.core.tools.core.RAG_tools.storage.lancedb_stores"
-            ".cascade_delete_documents"
+            "xagent.core.tools.core.RAG_tools.version_management"
+            ".cascade_cleaner.cascade_delete_documents"
         )
         with patch(target, side_effect=_fail_on_second):
             # Force batch_size to 1 so each doc is its own batch.
@@ -321,6 +324,13 @@ class TestRenameCollectionData:
 
         # The call must return a list (of warning strings).
         assert isinstance(warnings, list)
+
+        # rename_collection_data opens tables via conn.open_table() directly and
+        # does not invalidate the in-process table cache. We must flush it before
+        # counting so that count_rows() sees the on-disk state rather than a stale
+        # cached handle. This is the current behavior contract – callers must
+        # invalidate the cache after a rename.
+        store.invalidate_table_cache()
 
         # old_name must have 0 rows in every table.
         assert store.count_rows("documents", {"collection": "old_name"}, is_admin=True) == 0

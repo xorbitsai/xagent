@@ -170,10 +170,13 @@ class KBCoreManagementCompatibilityFacade:
                 delete_orphaned_metadata=delete_orphaned_metadata,
             )
 
+        import asyncio
+
         from ..management import collections as management_collections
 
         with self._storage_context():
-            return management_collections._delete_collection_impl(
+            return await asyncio.to_thread(
+                management_collections._delete_collection_impl,
                 collection=collection,
                 user_id=user_id,
                 is_admin=is_admin,

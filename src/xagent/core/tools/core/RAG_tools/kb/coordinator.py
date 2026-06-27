@@ -468,31 +468,36 @@ class KBCoordinator:
         data_error: Exception | None = None
 
         # Collect doc_ids BEFORE deletion for affected_documents tracking.
-        # For tenant callers: also auto-discover doc_ids when caller hasn't provided them
-        # (mirrors _delete_collection_impl which always collects from list_document_records).
+        # Skip discovery when the caller already provided explicit doc_ids — those
+        # are the affected documents.  Only query when we need auto-discovery (admin
+        # deletes all, or tenant lets us discover their scope via doc_ids=None).
         affected_doc_ids: list[str] = []
-        try:
-            affected_doc_ids = await asyncio.to_thread(
-                handle.list_collection_documents,
-                user_id=int_user_id,
-                is_admin=is_admin,
-            )
-        except Exception as exc:  # noqa: BLE001
-            # For a tenant caller where doc_ids=None (delete their entire collection),
-            # discovery failure means we cannot determine the correct deletion scope.
-            # Silently skipping data-plane delete and returning "success" would be wrong.
-            if not is_admin and doc_ids is None:
-                return CollectionOperationResult(
-                    status="error",
-                    collection=collection,
-                    message=f"Failed to list documents before delete for {collection!r}: {exc}",
-                    warnings=list(warnings),
-                    affected_documents=[],
-                    deleted_counts={},
+        if is_admin or doc_ids is None:
+            try:
+                affected_doc_ids = await asyncio.to_thread(
+                    handle.list_collection_documents,
+                    user_id=int_user_id,
+                    is_admin=is_admin,
                 )
-            warnings.append(
-                f"Failed to list documents before delete for {collection!r}: {exc}"
-            )
+            except Exception as exc:  # noqa: BLE001
+                # For a tenant caller where doc_ids=None (delete their entire collection),
+                # discovery failure means we cannot determine the correct deletion scope.
+                # Silently skipping data-plane delete and returning "success" would be wrong.
+                if not is_admin and doc_ids is None:
+                    return CollectionOperationResult(
+                        status="error",
+                        collection=collection,
+                        message=f"Failed to list documents before delete for {collection!r}: {exc}",
+                        warnings=list(warnings),
+                        affected_documents=[],
+                        deleted_counts={},
+                    )
+                warnings.append(
+                    f"Failed to list documents before delete for {collection!r}: {exc}"
+                )
+        else:
+            # Caller supplied explicit doc_ids — they are the affected documents.
+            affected_doc_ids = list(doc_ids)
 
         # For tenant (non-admin) callers: use caller-supplied doc_ids when provided,
         # otherwise fall back to the discovered set so the data-plane delete always
@@ -556,13 +561,21 @@ class KBCoordinator:
 
         if data_error is not None:
             if deleted_counts:
+                # Extract successfully deleted doc_ids from error details to provide
+                # accurate per-document status instead of marking everything FAILED.
+                err_details = getattr(data_error, "details", {}) or {}
+                raw_deleted = err_details.get("deleted_doc_ids") if isinstance(err_details, dict) else None
+                deleted_doc_ids: list[str] = raw_deleted if isinstance(raw_deleted, list) else []
+                deleted_set = set(deleted_doc_ids)
+                failed_doc_ids = [d for d in affected_doc_ids if d not in deleted_set]
                 return CollectionOperationResult(
                     status="partial_success",
                     collection=collection,
                     message=f"Partially deleted collection {collection!r}: {data_error}",
                     warnings=list(warnings),
-                    affected_documents=_to_details(
-                        affected_doc_ids, DocumentProcessingStatus.FAILED
+                    affected_documents=(
+                        _to_details(deleted_doc_ids, DocumentProcessingStatus.SUCCESS)
+                        + _to_details(failed_doc_ids, DocumentProcessingStatus.FAILED)
                     ),
                     deleted_counts=dict(deleted_counts),
                 )

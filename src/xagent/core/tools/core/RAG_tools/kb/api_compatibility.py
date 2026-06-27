@@ -704,11 +704,14 @@ class KBApiCompatibilityFacade:
                 is_admin=is_admin,
             )
 
+        import asyncio
+
         with self._storage_context():
             from ..storage.factory import get_vector_index_store
 
             store = get_vector_index_store()
-            return store.rename_collection_data(
+            return await asyncio.to_thread(
+                store.rename_collection_data,
                 collection_name=collection_name,
                 new_name=new_name,
                 user_id=user_id,

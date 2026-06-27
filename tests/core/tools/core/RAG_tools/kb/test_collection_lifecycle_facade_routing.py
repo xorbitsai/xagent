@@ -520,10 +520,10 @@ class TestConfigOnlyInvariant:
 class TestCoordinatorDeleteOrphanedMetadataGuard:
     """Coordinator must not delete orphaned metadata when other tenants still have data."""
 
-    def test_delete_collection_config_not_called_when_remaining_records_exist(
+    def test_delete_collection_config_tenant_only_when_remaining_records_exist(
         self,
     ) -> None:
-        """When count_documents > 0 after deletion, delete_collection_config must not be called."""
+        """When count_documents > 0 after deletion, only the current tenant's config row is removed."""
         handle = _make_mock_handle()
         # Simulate another tenant still having rows
         handle.count_documents = MagicMock(return_value=5)
@@ -539,9 +539,9 @@ class TestCoordinatorDeleteOrphanedMetadataGuard:
             )
         )
 
-        # Data was deleted but metadata must NOT be cleaned up
+        # Data was deleted; tenant's own config row is removed but other tenants' rows are preserved.
         handle.delete_documents_data.assert_called_once()
-        handle.delete_collection_config.assert_not_called()
+        handle.delete_collection_config.assert_called_once_with(tenant_only=True)
 
     def test_delete_collection_config_called_when_collection_is_empty(
         self,

@@ -534,10 +534,10 @@ class KBCoordinator:
                     deleted_counts.update(raw_counts)
 
         if delete_orphaned_metadata:
-            # Only delete orphaned metadata when the collection is truly empty:
-            # if other tenants still have rows, the config/metadata must be preserved.
-            # This matches the behaviour of _delete_collection_impl which checks
-            # remaining_collection_records before calling delete_collection_metadata_sync.
+            # Always remove the current tenant's config row so it does not
+            # become orphaned when other tenants still have documents.
+            # When the collection is completely empty across all tenants, also
+            # do an admin-scope cleanup to remove any remaining rows.
             try:
                 remaining = await asyncio.to_thread(
                     handle.count_documents,
@@ -546,13 +546,18 @@ class KBCoordinator:
                 )
             except Exception:  # noqa: BLE001 - conservative: assume non-empty on error
                 remaining = 1
-            if remaining == 0:
-                try:
+            try:
+                if remaining == 0:
+                    # Admin cleanup removes all tenant rows (including current tenant's).
                     await handle.delete_collection_config()
-                except Exception as cfg_exc:  # noqa: BLE001 - best-effort
-                    warnings.append(
-                        f"Failed to delete collection config for {collection!r}: {cfg_exc}"
-                    )
+                else:
+                    # Only remove the current tenant's config row; other tenants' rows
+                    # must be preserved because they still have data.
+                    await handle.delete_collection_config(tenant_only=True)
+            except Exception as cfg_exc:  # noqa: BLE001 - best-effort
+                warnings.append(
+                    f"Failed to delete collection config for {collection!r}: {cfg_exc}"
+                )
 
         def _to_details(
             doc_ids: list[str], status: DocumentProcessingStatus

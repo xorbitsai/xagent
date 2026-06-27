@@ -786,8 +786,14 @@ class KBCollectionHandle(ABC):
         """
 
     @abstractmethod
-    async def delete_collection_config(self) -> int:
+    async def delete_collection_config(self, *, tenant_only: bool = False) -> int:
         """Delete the collection_config row(s) for this collection.
+
+        When ``tenant_only`` is ``False`` (default) all tenant rows for this
+        collection are removed (admin scope – use only when the collection is
+        completely empty across all tenants).  When ``tenant_only`` is ``True``
+        only the row belonging to the handle's bound user scope is deleted,
+        leaving other tenants' rows intact.
 
         Idempotent – returns the number of rows deleted (0 when no row
         existed, which is not an error).
@@ -3471,17 +3477,26 @@ class LanceDBCollectionHandle(KBCollectionHandle):
             snapshot.config_user_id,
         )
 
-    async def delete_collection_config(self) -> int:
+    async def delete_collection_config(self, *, tenant_only: bool = False) -> int:
         """Delete the collection_config row(s) for this collection (idempotent).
 
-        Delegates to :meth:`MetadataStore.delete_collection_metadata` using
+        When ``tenant_only`` is ``False`` (default) delegates with
         ``is_admin=True`` so all tenant rows for this collection are removed.
-        Returns the number of config rows deleted (0 when none existed).
+        When ``tenant_only`` is ``True`` uses the handle's bound user scope so
+        only that tenant's config row is removed, leaving other tenants' rows
+        intact.  Returns the number of config rows deleted (0 when none
+        existed).
         """
+        if tenant_only:
+            user_id = self.context.user_scope.user_id
+            is_admin = self.context.user_scope.is_admin
+        else:
+            user_id = None
+            is_admin = True
         result = await self.metadata_store.delete_collection_metadata(
             collection_name=self.context.collection,
-            user_id=None,
-            is_admin=True,
+            user_id=user_id,
+            is_admin=is_admin,
             delete_orphaned_metadata=False,
         )
         return result.get("config_rows", 0)

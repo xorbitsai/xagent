@@ -135,6 +135,39 @@ class KBCoreManagementCompatibilityFacade:
                 is_admin=is_admin,
             )
 
+    async def delete_collection_async(
+        self,
+        collection: str,
+        user_id: Optional[int] = None,
+        is_admin: bool = False,
+        doc_ids: Optional[List[str]] = None,
+        delete_orphaned_metadata: bool = True,
+    ) -> CollectionOperationResult:
+        """Async delete routed through coordinator when available.
+
+        When a coordinator is present, delegates to
+        :meth:`KBCoordinator.delete_collection` so the operation goes through
+        the handle boundary. Falls back to :func:`_delete_collection_impl` for
+        legacy callers without a coordinator.
+        """
+        if self._coordinator is not None:
+            return await self._coordinator.delete_collection(
+                collection=collection,
+                user_id=user_id,
+                is_admin=is_admin,
+                doc_ids=doc_ids,
+                delete_orphaned_metadata=delete_orphaned_metadata,
+            )
+
+        from ..management import collections as management_collections
+
+        with self._storage_context():
+            return management_collections._delete_collection_impl(
+                collection=collection,
+                user_id=user_id,
+                is_admin=is_admin,
+            )
+
     def retry_document(
         self,
         collection: str,

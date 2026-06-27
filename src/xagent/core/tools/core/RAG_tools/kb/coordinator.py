@@ -8,7 +8,9 @@ from collections.abc import Coroutine
 from contextvars import copy_context
 from typing import Any, Optional, TypeVar
 
+from ..core.exceptions import DatabaseOperationError
 from ..core.schemas import (
+    CollectionOperationResult,
     DocumentRecordDetail,
     DocumentRecordListResult,
     RegisterDocumentRequest,
@@ -414,6 +416,176 @@ class KBCoordinator:
                 collection, doc_id, user_id=user_id, is_admin=is_admin
             )
         )
+
+    async def delete_collection(
+        self,
+        collection: str,
+        user_id: str | int | None,
+        is_admin: bool,
+        doc_ids: list[str] | None = None,
+        warnings_out: list[str] | None = None,
+        delete_orphaned_metadata: bool = True,
+    ) -> CollectionOperationResult:
+        """Delete a collection by routing through the collection handle.
+
+        When ``is_admin`` is ``True`` all rows are deleted via
+        :meth:`LanceDBCollectionHandle.delete_collection_data`.  For a tenant
+        caller, only the rows identified by ``doc_ids`` are removed via
+        :meth:`LanceDBCollectionHandle.delete_documents_data`.  When
+        ``doc_ids`` is ``None`` or empty and ``is_admin`` is ``False`` the
+        data plane is left untouched (config-only path).
+
+        ``delete_orphaned_metadata=True`` (default) additionally removes the
+        collection config row via :meth:`LanceDBCollectionHandle.delete_collection_config`.
+
+        Returns:
+            :class:`CollectionOperationResult` with status ``success``,
+            ``partial_success`` (when a :class:`DatabaseOperationError` was
+            caught during the data-plane delete), or ``error``.
+        """
+        handle = await self.open_collection(
+            KBContextRequest(
+                collection=collection,
+                user_id=user_id,
+                is_admin=is_admin,
+                hide_missing=True,
+            )
+        )
+
+        warnings: list[str] = warnings_out if warnings_out is not None else []
+        deleted_counts: dict[str, int] = {}
+        data_error: Exception | None = None
+
+        try:
+            if is_admin:
+                result_counts = await asyncio.to_thread(
+                    handle.delete_collection_data,
+                    user_id=user_id,
+                    is_admin=is_admin,
+                    warnings_out=warnings,
+                )
+                deleted_counts.update(result_counts or {})
+            elif doc_ids:
+                result_counts = await asyncio.to_thread(
+                    handle.delete_documents_data,
+                    doc_ids,
+                    user_id=user_id,
+                    is_admin=is_admin,
+                    warnings_out=warnings,
+                )
+                deleted_counts.update(result_counts or {})
+            # else: config-only — no data-plane delete
+        except DatabaseOperationError as exc:
+            data_error = exc
+            details = getattr(exc, "details", {}) or {}
+            if isinstance(details, dict):
+                raw_counts = details.get("deleted_counts")
+                if isinstance(raw_counts, dict):
+                    deleted_counts.update(raw_counts)
+
+        if delete_orphaned_metadata:
+            try:
+                await handle.delete_collection_config()
+            except Exception as cfg_exc:  # noqa: BLE001 - best-effort
+                warnings.append(
+                    f"Failed to delete collection config for {collection!r}: {cfg_exc}"
+                )
+
+        if data_error is not None:
+            if deleted_counts:
+                return CollectionOperationResult(
+                    status="partial_success",
+                    collection=collection,
+                    message=f"Partially deleted collection {collection!r}: {data_error}",
+                    warnings=list(warnings),
+                    affected_documents=[],
+                    deleted_counts=dict(deleted_counts),
+                )
+            return CollectionOperationResult(
+                status="error",
+                collection=collection,
+                message=f"Failed to delete collection {collection!r}: {data_error}",
+                warnings=list(warnings),
+                affected_documents=[],
+                deleted_counts={},
+            )
+
+        return CollectionOperationResult(
+            status="success",
+            collection=collection,
+            message=f"Collection {collection!r} deleted successfully.",
+            warnings=list(warnings),
+            affected_documents=[],
+            deleted_counts=dict(deleted_counts),
+        )
+
+    async def rename_collection(
+        self,
+        old_name: str,
+        new_name: str,
+        user_id: str | int | None,
+        is_admin: bool,
+    ) -> list[str]:
+        """Rename a collection's data, status, and metadata in best-effort order.
+
+        Calls three handle primitives sequentially:
+        1. :meth:`LanceDBCollectionHandle.rename_collection_data` – vector-side data tables
+        2. :meth:`LanceDBCollectionHandle.rename_collection_status` – ingestion status rows
+        3. :meth:`LanceDBCollectionHandle.rename_collection_metadata` – control-plane metadata (async)
+
+        Each step is best-effort: if one raises, the error is recorded as a
+        warning and the remaining steps still execute.
+
+        Returns:
+            A list of warning strings (empty on full success).
+        """
+        handle = await self.open_collection(
+            KBContextRequest(
+                collection=old_name,
+                user_id=user_id,
+                is_admin=is_admin,
+                hide_missing=True,
+            )
+        )
+
+        warnings: list[str] = []
+
+        try:
+            data_warnings = await asyncio.to_thread(
+                handle.rename_collection_data,
+                new_name,
+                user_id,
+                is_admin,
+            )
+            if data_warnings:
+                warnings.extend(data_warnings)
+        except Exception as exc:  # noqa: BLE001 - best-effort
+            warnings.append(
+                f"rename_collection_data for {old_name!r} → {new_name!r} failed: {exc}"
+            )
+
+        try:
+            status_warnings = await asyncio.to_thread(
+                handle.rename_collection_status,
+                new_name,
+                user_id,
+                is_admin,
+            )
+            if status_warnings:
+                warnings.extend(status_warnings)
+        except Exception as exc:  # noqa: BLE001 - best-effort
+            warnings.append(
+                f"rename_collection_status for {old_name!r} → {new_name!r} failed: {exc}"
+            )
+
+        try:
+            await handle.rename_collection_metadata(new_name, user_id, is_admin)
+        except Exception as exc:  # noqa: BLE001 - best-effort
+            warnings.append(
+                f"rename_collection_metadata for {old_name!r} → {new_name!r} failed: {exc}"
+            )
+
+        return warnings
 
     @staticmethod
     def _normalize_collection(collection: str) -> str:

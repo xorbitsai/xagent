@@ -688,7 +688,7 @@ class KBApiCompatibilityFacade:
         with self._storage_context():
             return collections_module.delete_collection(collection, user_id, is_admin)
 
-    def rename_collection_data(
+    async def rename_collection_data(
         self,
         *,
         collection_name: str,
@@ -696,6 +696,14 @@ class KBApiCompatibilityFacade:
         user_id: Optional[int],
         is_admin: bool = False,
     ) -> list[str]:
+        if self._coordinator is not None:
+            return await self._coordinator.rename_collection(
+                old_name=collection_name,
+                new_name=new_name,
+                user_id=user_id,
+                is_admin=is_admin,
+            )
+
         with self._storage_context():
             from ..storage.factory import get_vector_index_store
 

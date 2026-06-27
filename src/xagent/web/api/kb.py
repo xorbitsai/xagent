@@ -7420,7 +7420,7 @@ async def rename_collection_api(
     # Step 2: Update collection name in all tables (documents, parses, chunks, embeddings)
     # Use storage abstraction layer which handles all tables including embeddings
     warnings.extend(
-        _get_api_compatibility_facade().rename_collection_data(
+        await _get_api_compatibility_facade().rename_collection_data(
             collection_name=safe_old_collection,
             new_name=safe_new_collection,
             user_id=int(_user.id),

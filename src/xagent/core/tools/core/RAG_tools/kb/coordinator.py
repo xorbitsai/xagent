@@ -66,6 +66,25 @@ def _normalize_user_id(user_id: str | int | None) -> int | None:
         raise ValueError(f"Invalid user_id: {user_id!r}") from exc
 
 
+def _merge_positive_counts(
+    target: dict[str, int], source: dict[str, int] | None
+) -> None:
+    """Merge ``source`` row counts into ``target``, dropping non-positive values.
+
+    Mirrors the legacy ``_delete_collection_impl`` accounting: a ``{"documents": 0}``
+    entry means "no rows of that kind were deleted" and is omitted so callers do
+    not see misleading zero-count clutter in ``deleted_counts``.
+    """
+    for key, value in dict(source or {}).items():
+        try:
+            count = int(value)
+        except (ValueError, TypeError):
+            continue
+        if count <= 0:
+            continue
+        target[str(key)] = target.get(str(key), 0) + count
+
+
 class KBCoordinator:
     """KB-level semantic entry point for future compatibility facades."""
 
@@ -525,7 +544,7 @@ class KBCoordinator:
                     is_admin=is_admin,
                     warnings_out=warnings,
                 )
-                deleted_counts.update(result_counts or {})
+                _merge_positive_counts(deleted_counts, result_counts)
             elif effective_doc_ids:
                 result_counts = await asyncio.to_thread(
                     handle.delete_documents_data,
@@ -534,7 +553,7 @@ class KBCoordinator:
                     is_admin=is_admin,
                     warnings_out=warnings,
                 )
-                deleted_counts.update(result_counts or {})
+                _merge_positive_counts(deleted_counts, result_counts)
             # else: config-only — no data-plane delete
         except (DatabaseOperationError, CascadeCleanupError) as exc:
             # CascadeCleanupError (admin cascade path) carries no per-doc details;
@@ -544,7 +563,7 @@ class KBCoordinator:
             if isinstance(details, dict):
                 raw_counts = details.get("deleted_counts")
                 if isinstance(raw_counts, dict):
-                    deleted_counts.update(raw_counts)
+                    _merge_positive_counts(deleted_counts, raw_counts)
 
         if delete_orphaned_metadata:
             # Always remove the current tenant's config row so it does not
@@ -614,10 +633,22 @@ class KBCoordinator:
                 deleted_counts={},
             )
 
+        # Best-effort data-plane deletes (delete_collection_data / config cleanup)
+        # surface partial failures as appended warnings rather than raising.  When
+        # such warnings accompany an actual deletion, report ``partial_success`` so
+        # the caller is not told the operation fully succeeded — mirroring the
+        # legacy ``_delete_collection_impl`` status semantics.
+        something_deleted = bool(deleted_counts) or bool(affected_doc_ids)
+        status = "partial_success" if warnings and something_deleted else "success"
+        message = (
+            f"Partially deleted collection {collection!r}."
+            if status == "partial_success"
+            else f"Collection {collection!r} deleted successfully."
+        )
         return CollectionOperationResult(
-            status="success",
+            status=status,
             collection=collection,
-            message=f"Collection {collection!r} deleted successfully.",
+            message=message,
             warnings=list(warnings),
             affected_documents=_to_details(
                 affected_doc_ids, DocumentProcessingStatus.SUCCESS

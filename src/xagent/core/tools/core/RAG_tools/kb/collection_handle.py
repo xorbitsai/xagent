@@ -3487,6 +3487,13 @@ class LanceDBCollectionHandle(KBCollectionHandle):
         only that tenant's config row is removed, leaving other tenants' rows
         intact.  Returns the number of config rows deleted (0 when none
         existed).
+
+        ``delete_orphaned_metadata=True`` lets the metadata store drop the
+        collection_metadata record once removing this tenant's config row
+        leaves the collection with zero config rows (a true orphan).  This is
+        scope-safe: it only ever deletes the current tenant's own config row
+        and the shared metadata record when nothing remains — it never touches
+        another tenant's config row.
         """
         if tenant_only:
             user_id = self.context.user_scope.user_id
@@ -3498,7 +3505,7 @@ class LanceDBCollectionHandle(KBCollectionHandle):
             collection_name=self.context.collection,
             user_id=user_id,
             is_admin=is_admin,
-            delete_orphaned_metadata=False,
+            delete_orphaned_metadata=True,
         )
         return result.get("config_rows", 0)
 

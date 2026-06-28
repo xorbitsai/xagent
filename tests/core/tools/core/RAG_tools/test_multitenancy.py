@@ -1040,10 +1040,16 @@ class TestAPIMultiTenancy:
 
     @pytest.mark.asyncio
     @patch(
-        "xagent.core.tools.core.RAG_tools.storage.factory.get_ingestion_status_store"
+        "xagent.core.tools.core.RAG_tools.kb.api_compatibility."
+        "KBApiCompatibilityFacade.rename_collection_data",
+        new_callable=AsyncMock,
     )
-    @patch("xagent.core.tools.core.RAG_tools.storage.factory.get_metadata_store")
-    @patch("xagent.core.tools.core.RAG_tools.storage.factory.get_vector_index_store")
+    @patch(
+        "xagent.core.tools.core.RAG_tools.kb.api_compatibility."
+        "KBApiCompatibilityFacade.list_collection_config_owner_ids",
+        return_value=set(),
+    )
+    @patch("xagent.web.api.kb.list_document_records")
     @patch("xagent.web.api.kb._list_collections_with_retry", new_callable=AsyncMock)
     @patch("xagent.web.api.kb._ensure_collection_access", new_callable=AsyncMock)
     @patch(
@@ -1057,12 +1063,19 @@ class TestAPIMultiTenancy:
         _mock_uploaded_owner_ids,
         _mock_ensure_collection_access,
         mock_list_collections,
-        mock_get_vector_store,
-        mock_get_metadata_store,
-        mock_get_ingestion_status_store,
+        mock_list_document_records,
+        _mock_config_owner_ids,
+        mock_rename_collection_data,
         tmp_path,
     ):
-        """Admin global rename should reuse tenant storage rename for every owner."""
+        """Admin global rename fans physical rename out to every owner and renames
+        the shared data with admin scope.
+
+        Routed through the coordinator, the data/status/metadata rename happens
+        inside ``KBApiCompatibilityFacade.rename_collection_data`` — we assert the
+        admin scope (``user_id``/``is_admin``) reaching that production seam; the
+        coordinator → store scoping is covered by the kb/ routing tests.
+        """
         from xagent.core.tools.core.RAG_tools.core.schemas import ListCollectionsResult
         from xagent.web.models.user import User
         from xagent.web.services.kb_collection_service import (
@@ -1080,37 +1093,25 @@ class TestAPIMultiTenancy:
             message="",
             warnings=[],
         )
-        vector_store = MagicMock()
-        vector_store.list_document_records.return_value = [
+        # Owner discovery: two distinct owners, each contributing one file.
+        mock_list_document_records.return_value = [
             DocumentRecord(doc_id="doc-a", file_id="file-a", user_id=101),
             DocumentRecord(doc_id="doc-b", file_id="file-b", user_id=202),
         ]
-        vector_store.rename_collection_data.return_value = []
-        mock_get_vector_store.return_value = vector_store
-        metadata_store = MagicMock()
-        metadata_store.rename_collection = AsyncMock()
-        metadata_store.list_collection_config_owner_ids.return_value = set()
-        mock_get_metadata_store.return_value = metadata_store
-        status_store = MagicMock()
-        status_store.rename_collection_status.return_value = []
-        mock_get_ingestion_status_store.return_value = status_store
-        mock_rename_collection_storage.side_effect = [
-            CollectionPhysicalRenameResult(
-                status="not_found",
-                old_collection_dir=tmp_path / "user_101" / "old",
-                new_collection_dir=tmp_path / "user_101" / "new",
-            ),
-            CollectionPhysicalRenameResult(
-                status="not_found",
-                old_collection_dir=tmp_path / "user_202" / "old",
-                new_collection_dir=tmp_path / "user_202" / "new",
-            ),
-        ]
+        mock_rename_collection_data.return_value = []
+        # Physical rename: not_found for every owner forces partial_success without
+        # triggering rollback/HTTP errors.
+        mock_rename_collection_storage.return_value = CollectionPhysicalRenameResult(
+            status="not_found",
+            old_collection_dir=tmp_path / "old",
+            new_collection_dir=tmp_path / "new",
+        )
 
         result = await rename_collection_api(
             "old", new_name="new", _user=mock_user, db=MagicMock()
         )
 
+        # Physical rename fans out to BOTH owners with their own file ids.
         assert mock_rename_collection_storage.call_args_list == [
             call(
                 ANY,
@@ -1127,20 +1128,9 @@ class TestAPIMultiTenancy:
                 collection_file_ids={"file-b"},
             ),
         ]
-        vector_store.rename_collection_data.assert_called_once_with(
+        # Data rename routed through the coordinator with admin scope.
+        mock_rename_collection_data.assert_awaited_once_with(
             collection_name="old",
-            new_name="new",
-            user_id=999,
-            is_admin=True,
-        )
-        metadata_store.rename_collection.assert_awaited_once_with(
-            old_name="old",
-            new_name="new",
-            user_id=999,
-            is_admin=True,
-        )
-        status_store.rename_collection_status.assert_called_once_with(
-            old_name="old",
             new_name="new",
             user_id=999,
             is_admin=True,
@@ -1149,10 +1139,11 @@ class TestAPIMultiTenancy:
 
     @pytest.mark.asyncio
     @patch(
-        "xagent.core.tools.core.RAG_tools.storage.factory.get_ingestion_status_store"
+        "xagent.core.tools.core.RAG_tools.kb.api_compatibility."
+        "KBApiCompatibilityFacade.rename_collection_data",
+        new_callable=AsyncMock,
     )
-    @patch("xagent.core.tools.core.RAG_tools.storage.factory.get_metadata_store")
-    @patch("xagent.core.tools.core.RAG_tools.storage.factory.get_vector_index_store")
+    @patch("xagent.web.api.kb.list_document_records")
     @patch("xagent.web.api.kb._list_collections_with_retry", new_callable=AsyncMock)
     @patch("xagent.web.api.kb._ensure_collection_access", new_callable=AsyncMock)
     @patch("xagent.web.api.kb.rename_collection_storage")
@@ -1161,12 +1152,16 @@ class TestAPIMultiTenancy:
         mock_rename_collection_storage,
         _mock_ensure_collection_access,
         mock_list_collections,
-        mock_get_vector_store,
-        mock_get_metadata_store,
-        mock_get_ingestion_status_store,
+        mock_list_document_records,
+        mock_rename_collection_data,
         tmp_path,
     ):
-        """Regular rename should not mutate another user's same-name collection."""
+        """Regular rename should not mutate another user's same-name collection.
+
+        A non-admin caller resolves to a single owner (itself), so physical rename
+        runs once for that tenant and the data rename routes through the coordinator
+        with tenant scope (``is_admin=False``).
+        """
         from xagent.core.tools.core.RAG_tools.core.schemas import ListCollectionsResult
         from xagent.web.models.user import User
         from xagent.web.services.kb_collection_service import (
@@ -1184,18 +1179,10 @@ class TestAPIMultiTenancy:
             message="",
             warnings=[],
         )
-        vector_store = MagicMock()
-        vector_store.list_document_records.return_value = [
+        mock_list_document_records.return_value = [
             DocumentRecord(doc_id="doc-a", file_id="file-a", user_id=101),
         ]
-        vector_store.rename_collection_data.return_value = []
-        mock_get_vector_store.return_value = vector_store
-        metadata_store = MagicMock()
-        metadata_store.rename_collection = AsyncMock()
-        mock_get_metadata_store.return_value = metadata_store
-        status_store = MagicMock()
-        status_store.rename_collection_status.return_value = []
-        mock_get_ingestion_status_store.return_value = status_store
+        mock_rename_collection_data.return_value = []
         mock_rename_collection_storage.return_value = CollectionPhysicalRenameResult(
             status="not_found",
             old_collection_dir=tmp_path / "user_101" / "old",
@@ -1206,6 +1193,7 @@ class TestAPIMultiTenancy:
             "old", new_name="new", _user=mock_user, db=MagicMock()
         )
 
+        # Only the requester's own tenant storage is renamed (no fan-out).
         mock_rename_collection_storage.assert_called_once_with(
             ANY,
             user_id=101,
@@ -1213,20 +1201,9 @@ class TestAPIMultiTenancy:
             new_collection_name="new",
             collection_file_ids={"file-a"},
         )
-        vector_store.rename_collection_data.assert_called_once_with(
+        # Data rename routed through the coordinator with tenant scope.
+        mock_rename_collection_data.assert_awaited_once_with(
             collection_name="old",
-            new_name="new",
-            user_id=101,
-            is_admin=False,
-        )
-        metadata_store.rename_collection.assert_awaited_once_with(
-            old_name="old",
-            new_name="new",
-            user_id=101,
-            is_admin=False,
-        )
-        status_store.rename_collection_status.assert_called_once_with(
-            old_name="old",
             new_name="new",
             user_id=101,
             is_admin=False,

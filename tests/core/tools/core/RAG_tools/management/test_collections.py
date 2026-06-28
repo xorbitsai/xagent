@@ -5,7 +5,6 @@ from __future__ import annotations
 import os
 from datetime import datetime, timezone
 from pathlib import Path
-from types import SimpleNamespace
 from typing import Dict, List
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -43,7 +42,6 @@ from src.xagent.core.tools.core.RAG_tools.management.status import (
     write_ingestion_status,
 )
 from src.xagent.core.tools.core.RAG_tools.storage import get_vector_index_store
-from src.xagent.core.tools.core.RAG_tools.storage.contracts import DocumentRecord
 from src.xagent.core.tools.core.RAG_tools.storage.factory import get_metadata_store
 from src.xagent.providers.vector_store.lancedb import get_connection_from_env
 from xagent.core.tools.core.RAG_tools.file.register_document import register_document
@@ -526,32 +524,24 @@ def test_delete_collection_invokes_cleanup_all_documents(
 
 
 def test_delete_collection_preserves_partial_vector_cleanup(
-    monkeypatch: pytest.MonkeyPatch,
+    monkeypatch: pytest.MonkeyPatch, temp_lancedb_dir: str
 ) -> None:
+    """Best-effort vector cleanup warnings (no exception) yield partial_success.
+
+    The admin data-plane delete reports a per-table failure by appending to
+    ``warnings_out`` rather than raising.  Routed through the coordinator/handle,
+    such a warning alongside an actual deletion must surface as
+    ``partial_success`` so callers are not told the delete fully succeeded.
+    """
     warnings_from_store = "Failed to delete from 'parses': parse delete failed"
 
-    mock_store = MagicMock()
-    mock_store.list_document_records.side_effect = [
-        [SimpleNamespace(doc_id="doc-1")],
-        [],
-    ]
+    store = get_vector_index_store()
 
-    def _delete_collection_data(**kwargs):
-        kwargs["warnings_out"].append(warnings_from_store)
+    def _delete_collection_data(**kwargs: object) -> dict[str, int]:
+        kwargs["warnings_out"].append(warnings_from_store)  # type: ignore[union-attr]
         return {"documents": 1}
 
-    mock_store.delete_collection_data.side_effect = _delete_collection_data
-    monkeypatch.setattr(
-        collections_module, "get_vector_index_store", lambda: mock_store
-    )
-    monkeypatch.setattr(
-        collections_module, "_clear_ingestion_status_impl", lambda *args, **kwargs: None
-    )
-    monkeypatch.setattr(
-        collections_module,
-        "delete_collection_metadata_sync",
-        lambda **kwargs: {},
-    )
+    monkeypatch.setattr(store, "delete_collection_data", _delete_collection_data)
 
     result = delete_collection("demo", user_id=1, is_admin=True)
 
@@ -561,117 +551,142 @@ def test_delete_collection_preserves_partial_vector_cleanup(
 
 
 def test_delete_collection_non_admin_uses_batched_document_scoped_delete(
-    monkeypatch: pytest.MonkeyPatch,
+    monkeypatch: pytest.MonkeyPatch, temp_lancedb_dir: str
 ) -> None:
-    """Non-admin collection delete should avoid collection-wide legacy cleanup."""
+    """Non-admin collection delete batches the tenant's docs, never collection-wide."""
 
-    class FakeVectorStore:
-        def __init__(self) -> None:
-            self.documents_delete_calls: list[dict[str, object]] = []
-
-        def list_document_records(self, **_kwargs: object) -> list[DocumentRecord]:
-            return [
-                DocumentRecord(doc_id="doc-1", file_id=None, source_path=None),
-                DocumentRecord(doc_id="doc-2", file_id=None, source_path=None),
-            ]
-
-        def delete_collection_data(self, **_kwargs: object) -> dict[str, int]:
-            raise AssertionError(
-                "non-admin delete must not use collection-wide cleanup"
-            )
-
-        def delete_documents_data(self, **_kwargs: object) -> dict[str, int]:
-            self.documents_delete_calls.append(dict(_kwargs))
-            return {"chunks": 2}
-
-        def delete_document_data(
-            self,
-            *,
-            collection_name: str,
-            doc_id: str,
-            user_id: int | None,
-            is_admin: bool,
-        ) -> dict[str, int]:
-            raise AssertionError("collection delete should not fan out per document")
-
-    store = FakeVectorStore()
-    monkeypatch.setattr(collections_module, "get_vector_index_store", lambda: store)
-    monkeypatch.setattr(
-        collections_module,
-        "_clear_ingestion_status_impl",
-        lambda *args, **kwargs: None,
+    now = datetime.now(timezone.utc)
+    _insert_documents(
+        [
+            {
+                "collection": "shared",
+                "doc_id": "doc-1",
+                "source_path": "/path/doc-1.pdf",
+                "file_type": "pdf",
+                "content_hash": "hash-1",
+                "uploaded_at": now,
+                "title": "First",
+                "language": "zh",
+                "user_id": 7,
+            },
+            {
+                "collection": "shared",
+                "doc_id": "doc-2",
+                "source_path": "/path/doc-2.pdf",
+                "file_type": "pdf",
+                "content_hash": "hash-2",
+                "uploaded_at": now,
+                "title": "Second",
+                "language": "zh",
+                "user_id": 7,
+            },
+        ]
     )
+
+    store = get_vector_index_store()
+    batched_calls: list[dict[str, object]] = []
+    original_delete_documents_data = store.delete_documents_data
+
+    def _spy_delete_documents_data(*args: object, **kwargs: object) -> dict[str, int]:
+        batched_calls.append(dict(kwargs))
+        return original_delete_documents_data(*args, **kwargs)
+
+    def _no_collection_wide(**_kwargs: object) -> dict[str, int]:
+        raise AssertionError("non-admin delete must not use collection-wide cleanup")
+
+    monkeypatch.setattr(store, "delete_documents_data", _spy_delete_documents_data)
+    monkeypatch.setattr(store, "delete_collection_data", _no_collection_wide)
 
     result = delete_collection("shared", user_id=7, is_admin=False)
 
     assert result.status == "success"
-    assert len(store.documents_delete_calls) == 1
-    assert store.documents_delete_calls[0]["collection_name"] == "shared"
-    assert store.documents_delete_calls[0]["doc_ids"] == ["doc-1", "doc-2"]
-    assert store.documents_delete_calls[0]["user_id"] == 7
-    assert store.documents_delete_calls[0]["is_admin"] is False
+    # A single batched call carrying both of the tenant's doc_ids, tenant-scoped.
+    assert len(batched_calls) == 1
+    assert batched_calls[0]["collection_name"] == "shared"
+    assert batched_calls[0]["doc_ids"] == ["doc-1", "doc-2"]
+    assert batched_calls[0]["user_id"] == 7
+    assert batched_calls[0]["is_admin"] is False
+    # End-to-end: the tenant's documents are gone afterwards.
+    remaining = list_documents(collection="shared", user_id=7, is_admin=False)
+    assert remaining.documents == []
 
 
 def test_delete_collection_reports_partial_batched_delete_failure(
-    monkeypatch: pytest.MonkeyPatch,
+    monkeypatch: pytest.MonkeyPatch, temp_lancedb_dir: str
 ) -> None:
-    """Prior successful batches should be visible when a later batch fails."""
+    """A failed batch surfaces prior progress as partial_success with per-doc status."""
 
-    class FakeVectorStore:
-        def list_document_records(self, **kwargs: object) -> list[DocumentRecord]:
-            if kwargs.get("is_admin") is True:
-                return []
-            return [
-                DocumentRecord(doc_id="doc-1", file_id=None, source_path=None),
-                DocumentRecord(doc_id="doc-2", file_id=None, source_path=None),
-            ]
-
-        def delete_collection_data(self, **_kwargs: object) -> dict[str, int]:
-            raise AssertionError(
-                "non-admin delete must not use collection-wide cleanup"
-            )
-
-        def delete_documents_data(self, **kwargs: object) -> dict[str, int]:
-            kwargs["warnings_out"].append("Failed to delete document batch 2: boom")
-            raise DatabaseOperationError(
-                "Failed to delete document batch",
-                details={
-                    "deleted_counts": {"documents": 1, "chunks": 2},
-                    "deleted_doc_ids": ["doc-1"],
-                },
-            )
-
-    monkeypatch.setattr(
-        collections_module, "get_vector_index_store", lambda: FakeVectorStore()
+    now = datetime.now(timezone.utc)
+    _insert_documents(
+        [
+            {
+                "collection": "shared",
+                "doc_id": "doc-1",
+                "source_path": "/path/doc-1.pdf",
+                "file_type": "pdf",
+                "content_hash": "hash-1",
+                "uploaded_at": now,
+                "title": "First",
+                "language": "zh",
+                "user_id": 7,
+            },
+            {
+                "collection": "shared",
+                "doc_id": "doc-2",
+                "source_path": "/path/doc-2.pdf",
+                "file_type": "pdf",
+                "content_hash": "hash-2",
+                "uploaded_at": now,
+                "title": "Second",
+                "language": "zh",
+                "user_id": 7,
+            },
+        ]
     )
+
+    store = get_vector_index_store()
+
+    def _delete_documents_data(**kwargs: object) -> dict[str, int]:
+        kwargs["warnings_out"].append(  # type: ignore[union-attr]
+            "Failed to delete document batch 2: boom"
+        )
+        raise DatabaseOperationError(
+            "Failed to delete document batch",
+            details={
+                "deleted_counts": {"documents": 1, "chunks": 2},
+                "deleted_doc_ids": ["doc-1"],
+            },
+        )
+
+    monkeypatch.setattr(store, "delete_documents_data", _delete_documents_data)
 
     result = delete_collection("shared", user_id=7, is_admin=False)
 
     assert result.status == "partial_success"
     assert result.deleted_counts == {"documents": 1, "chunks": 2}
     assert result.warnings == ["Failed to delete document batch 2: boom"]
-    assert [detail.doc_id for detail in result.affected_documents] == ["doc-1"]
+    # The successfully deleted doc is SUCCESS; the rest are reported FAILED.
+    status_by_doc = {d.doc_id: d.status for d in result.affected_documents}
+    assert status_by_doc["doc-1"] == DocumentProcessingStatus.SUCCESS
+    assert status_by_doc["doc-2"] == DocumentProcessingStatus.FAILED
 
 
 def test_delete_collection_reports_success_when_only_orphan_artifacts_deleted(
-    monkeypatch: pytest.MonkeyPatch,
+    monkeypatch: pytest.MonkeyPatch, temp_lancedb_dir: str
 ) -> None:
     """Deleting orphan vector artifacts without documents is still success."""
 
-    class FakeVectorStore:
-        def list_document_records(self, **_kwargs: object) -> list[DocumentRecord]:
-            return []
+    store = get_vector_index_store()
 
-        def delete_collection_data(self, **_kwargs: object) -> dict[str, int]:
-            return {"documents": 0, "chunks": 2, "embeddings_m1": 3}
+    def _delete_collection_data(**_kwargs: object) -> dict[str, int]:
+        return {"documents": 0, "chunks": 2, "embeddings_m1": 3}
 
-    monkeypatch.setattr(
-        collections_module, "get_vector_index_store", lambda: FakeVectorStore()
-    )
+    monkeypatch.setattr(store, "delete_collection_data", _delete_collection_data)
 
     result = delete_collection("orphaned", user_id=None, is_admin=True)
 
     assert result.status == "success"
+    # Zero-count tables are dropped from the summary (no "documents": 0 clutter).
     assert result.deleted_counts == {"chunks": 2, "embeddings_m1": 3}
 
 

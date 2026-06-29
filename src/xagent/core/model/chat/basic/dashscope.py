@@ -78,14 +78,6 @@ class DashScopeLLM(OpenAILLM):
 
         return updated_extra_body
 
-    @staticmethod
-    def _with_disabled_thinking(kwargs: Dict[str, Any]) -> Dict[str, Any]:
-        updated_kwargs = dict(kwargs)
-        extra_body = dict(updated_kwargs.get("extra_body") or {})
-        extra_body["enable_thinking"] = False
-        updated_kwargs["extra_body"] = extra_body
-        return updated_kwargs
-
     @classmethod
     def _requires_thinking_disabled(
         cls,
@@ -111,9 +103,6 @@ class DashScopeLLM(OpenAILLM):
             tools=tools,
             tool_choice=tool_choice,
         )
-        call_kwargs = (
-            self._with_disabled_thinking(kwargs) if strict_tool_choice else kwargs
-        )
         call_thinking = _DISABLE_THINKING if strict_tool_choice else thinking
 
         try:
@@ -126,7 +115,7 @@ class DashScopeLLM(OpenAILLM):
                 response_format=response_format,
                 thinking=call_thinking,
                 output_config=output_config,
-                **call_kwargs,
+                **kwargs,
             )
         except RuntimeError as exc:
             if not strict_tool_choice or not self._is_thinking_tool_choice_error(exc):
@@ -144,7 +133,7 @@ class DashScopeLLM(OpenAILLM):
                 response_format=response_format,
                 thinking=_DISABLE_THINKING,
                 output_config=output_config,
-                **self._with_disabled_thinking(kwargs),
+                **kwargs,
             )
 
     async def stream_chat(
@@ -163,9 +152,6 @@ class DashScopeLLM(OpenAILLM):
             tools=tools,
             tool_choice=tool_choice,
         )
-        call_kwargs = (
-            self._with_disabled_thinking(kwargs) if strict_tool_choice else kwargs
-        )
         call_thinking = _DISABLE_THINKING if strict_tool_choice else thinking
         yielded = False
 
@@ -179,7 +165,7 @@ class DashScopeLLM(OpenAILLM):
                 response_format=response_format,
                 thinking=call_thinking,
                 output_config=output_config,
-                **call_kwargs,
+                **kwargs,
             ):
                 yielded = True
                 yield chunk
@@ -203,6 +189,6 @@ class DashScopeLLM(OpenAILLM):
                 response_format=response_format,
                 thinking=_DISABLE_THINKING,
                 output_config=output_config,
-                **self._with_disabled_thinking(kwargs),
+                **kwargs,
             ):
                 yield chunk

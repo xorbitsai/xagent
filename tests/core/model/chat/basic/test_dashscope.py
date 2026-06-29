@@ -212,6 +212,38 @@ async def test_thinking_tool_choice_error_falls_back_to_auto(
 
 
 @pytest.mark.asyncio
+async def test_stream_thinking_tool_choice_error_falls_back_to_auto(
+    dashscope_llm, mocker
+):
+    mock_client = mocker.AsyncMock()
+    mock_client.chat.completions.create.side_effect = [
+        _thinking_tool_choice_error(),
+        _stream_token(),
+    ]
+    mocker.patch(
+        "xagent.core.model.chat.basic.openai.AsyncOpenAI",
+        return_value=mock_client,
+    )
+
+    chunks = [
+        chunk
+        async for chunk in dashscope_llm.stream_chat(
+            [{"role": "user", "content": "Use the weather tool."}],
+            tools=[_tool_schema()],
+            tool_choice="required",
+        )
+    ]
+
+    first_call = mock_client.chat.completions.create.call_args_list[0].kwargs
+    second_call = mock_client.chat.completions.create.call_args_list[1].kwargs
+    assert [chunk.type for chunk in chunks] == [ChunkType.TOKEN]
+    assert first_call["tool_choice"] == "required"
+    assert first_call["extra_body"] == {"enable_thinking": False}
+    assert second_call["tool_choice"] == "auto"
+    assert second_call["extra_body"] == {"enable_thinking": False}
+
+
+@pytest.mark.asyncio
 async def test_non_thinking_tool_choice_bad_request_does_not_fallback(
     dashscope_llm, mocker
 ):

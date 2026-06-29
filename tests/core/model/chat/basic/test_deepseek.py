@@ -23,14 +23,13 @@ class TestDeepSeekLLM:
         assert llm.api_key == "test-api-key"
         assert llm.abilities == ["chat", "tool_calling", "thinking_mode"]
 
-    def test_env_fallbacks(self, monkeypatch):
+    def test_api_key_env_fallback(self, monkeypatch):
         monkeypatch.setenv("DEEPSEEK_API_KEY", "env-deepseek-key")
-        monkeypatch.setenv("DEEPSEEK_BASE_URL", "https://deepseek.example.com")
 
         llm = DeepSeekLLM(api_key=None, base_url=None)
 
         assert llm.api_key == "env-deepseek-key"
-        assert llm.base_url == "https://deepseek.example.com"
+        assert llm.base_url == DEEPSEEK_DEFAULT_BASE_URL
 
     def test_api_key_falls_back_to_openai_key_after_deepseek_key(self, monkeypatch):
         monkeypatch.delenv("DEEPSEEK_API_KEY", raising=False)

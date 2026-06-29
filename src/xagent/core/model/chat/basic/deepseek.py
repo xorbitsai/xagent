@@ -67,9 +67,7 @@ class DeepSeekLLM(OpenAICompatibleLLM):
 
         super().__init__(
             model_name=model_name,
-            base_url=(
-                base_url or os.getenv("DEEPSEEK_BASE_URL") or DEEPSEEK_DEFAULT_BASE_URL
-            ),
+            base_url=base_url or DEEPSEEK_DEFAULT_BASE_URL,
             api_key=resolved_api_key,
             default_temperature=default_temperature,
             default_max_tokens=default_max_tokens,

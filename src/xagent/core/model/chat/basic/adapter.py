@@ -59,7 +59,7 @@ def create_base_llm(
         llm = DeepSeekLLM(
             model_name=model.model_name,
             api_key=model.api_key,
-            base_url=model.base_url,
+            base_url=resolve_base_url_for_provider(provider, model.base_url),
             default_temperature=model.default_temperature,
             default_max_tokens=model.default_max_tokens,
             timeout=model.timeout,

@@ -36,6 +36,22 @@ def test_create_base_llm_accepts_canonicalized_deepseek_provider():
     assert isinstance(llm._inner, DeepSeekLLM)
 
 
+def test_create_base_llm_uses_deepseek_base_url_env(monkeypatch):
+    monkeypatch.setenv("DEEPSEEK_BASE_URL", "https://deepseek.example.com")
+    config = ChatModelConfig(
+        id="deepseek-model",
+        model_provider="deepseek",
+        model_name="deepseek-v4-flash",
+        api_key="test-api-key",
+    )
+
+    llm = create_base_llm(config)
+
+    assert hasattr(llm, "_inner")
+    assert isinstance(llm._inner, DeepSeekLLM)
+    assert llm._inner.base_url == "https://deepseek.example.com"
+
+
 def test_deepseek_provider_has_no_openai_compatibility_marker():
     assert provider_compatibility_for_provider("deepseek") is None
 

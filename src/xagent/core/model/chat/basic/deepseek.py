@@ -98,13 +98,13 @@ class DeepSeekLLM(OpenAICompatibleLLM):
         self,
         *,
         extra_body: Dict[str, Any],
+        thinking: Optional[Dict[str, Any]],
         tools: Optional[List[Dict[str, Any]]],
         response_format: Optional[Dict[str, Any]],
         output_config: Optional[Dict[str, Any]],
-        thinking: Optional[Dict[str, Any]],
         is_streaming: bool,
     ) -> Dict[str, Any]:
-        _ = is_streaming
+        _ = tools, response_format, output_config, is_streaming
         updated_extra_body = dict(extra_body)
 
         if thinking is not None:

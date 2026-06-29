@@ -7,6 +7,19 @@ import pytest
 from xagent.core.model.chat.basic.dashscope import DashScopeLLM
 from xagent.core.model.chat.types import ChunkType
 
+_VISION_MESSAGES = [
+    {
+        "role": "user",
+        "content": [
+            {"type": "text", "text": "Describe this image."},
+            {
+                "type": "image_url",
+                "image_url": {"url": "data:image/jpeg;base64,ZmFrZV9pbWFnZV9kYXRh"},
+            },
+        ],
+    }
+]
+
 _DASHSCOPE_BASE_URL = "https://dashscope.aliyuncs.com/compatible-mode/v1"
 
 
@@ -262,3 +275,92 @@ async def test_non_thinking_tool_choice_bad_request_does_not_fallback(
         )
 
     assert mock_client.chat.completions.create.call_count == 1
+
+
+@pytest.mark.asyncio
+async def test_stream_chat_without_thinking_does_not_set_enable_thinking(
+    dashscope_llm, mocker
+):
+    mock_client = mocker.AsyncMock()
+    mock_client.chat.completions.create.return_value = _stream_token()
+    mocker.patch(
+        "xagent.core.model.chat.basic.openai.AsyncOpenAI",
+        return_value=mock_client,
+    )
+
+    _ = [
+        chunk
+        async for chunk in dashscope_llm.stream_chat(
+            [{"role": "user", "content": "Hello"}]
+        )
+    ]
+
+    call_kwargs = mock_client.chat.completions.create.call_args.kwargs
+    assert "enable_thinking" not in call_kwargs.get("extra_body", {})
+
+
+@pytest.mark.asyncio
+async def test_vision_chat_injects_dashscope_thinking_payload(
+    mock_chat_completion, mocker
+):
+    mock_client = mocker.AsyncMock()
+    mock_client.chat.completions.create.return_value = mock_chat_completion
+    mocker.patch(
+        "xagent.core.model.chat.basic.openai.AsyncOpenAI",
+        return_value=mock_client,
+    )
+
+    llm = DashScopeLLM(
+        model_name="qwen3.5-plus",
+        base_url=_DASHSCOPE_BASE_URL,
+        api_key="test-key",
+        abilities=["thinking_mode", "vision"],
+    )
+    await llm.vision_chat(_VISION_MESSAGES, thinking={"type": "enabled"})
+
+    call_kwargs = mock_client.chat.completions.create.call_args.kwargs
+    assert call_kwargs["extra_body"] == {"enable_thinking": True}
+
+
+@pytest.mark.asyncio
+async def test_structured_output_retry_disables_dashscope_thinking(
+    dashscope_llm, mocker
+):
+    first_message = SimpleNamespace(
+        content="not json",
+        tool_calls=None,
+        reasoning_content="I need to think...",
+    )
+    second_message = SimpleNamespace(
+        content='{"status": "ok"}',
+        tool_calls=None,
+        reasoning_content=None,
+    )
+    first_response = SimpleNamespace(
+        choices=[SimpleNamespace(message=first_message)],
+        usage=None,
+        model_dump=lambda: {"id": "dashscope-first"},
+    )
+    second_response = SimpleNamespace(
+        choices=[SimpleNamespace(message=second_message)],
+        usage=None,
+        model_dump=lambda: {"id": "dashscope-second"},
+    )
+
+    mock_client = mocker.AsyncMock()
+    mock_client.chat.completions.create.side_effect = [first_response, second_response]
+    mocker.patch(
+        "xagent.core.model.chat.basic.openai.AsyncOpenAI",
+        return_value=mock_client,
+    )
+
+    result = await dashscope_llm.chat(
+        [{"role": "user", "content": "Return JSON"}],
+        response_format={"type": "json_object"},
+        thinking={"type": "enabled"},
+    )
+
+    assert result["type"] == "text"
+    assert result["content"] == '{"status": "ok"}'
+    second_call = mock_client.chat.completions.create.call_args_list[1].kwargs
+    assert second_call["extra_body"] == {"enable_thinking": False}

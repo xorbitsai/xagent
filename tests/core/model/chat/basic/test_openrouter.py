@@ -1,5 +1,7 @@
 """Test cases for OpenRouter LLM provider behavior."""
 
+from types import SimpleNamespace
+
 import pytest
 
 from xagent.core.model.chat.basic.openrouter import OpenRouterLLM
@@ -229,3 +231,56 @@ def test_openrouter_reasoning_hook_enables_reasoning_payload(monkeypatch):
         "reasoning": {"enabled": True},
         "thinking": {"type": "enabled"},
     }
+
+
+@pytest.mark.asyncio
+async def test_structured_output_retry_disables_openrouter_reasoning(
+    mocker, monkeypatch
+):
+    monkeypatch.setenv("XAGENT_OPENROUTER_OFFICIAL_PROVIDERS_ONLY", "false")
+
+    first_message = SimpleNamespace(
+        content="not json",
+        tool_calls=None,
+        reasoning_content="reasoning here",
+    )
+    second_message = SimpleNamespace(
+        content='{"status": "ok"}',
+        tool_calls=None,
+        reasoning_content=None,
+    )
+    first_response = SimpleNamespace(
+        choices=[SimpleNamespace(message=first_message)],
+        usage=None,
+        model_dump=lambda: {"id": "openrouter-first"},
+    )
+    second_response = SimpleNamespace(
+        choices=[SimpleNamespace(message=second_message)],
+        usage=None,
+        model_dump=lambda: {"id": "openrouter-second"},
+    )
+
+    mock_client = mocker.AsyncMock()
+    mock_client.chat.completions.create.side_effect = [first_response, second_response]
+    mocker.patch(
+        "xagent.core.model.chat.basic.openai.AsyncOpenAI",
+        return_value=mock_client,
+    )
+
+    llm = OpenRouterLLM(
+        model_name="deepseek/deepseek-v4-flash",
+        api_key="test-key",
+        abilities=["chat", "tool_calling", "thinking_mode"],
+    )
+
+    result = await llm.chat(
+        [{"role": "user", "content": "Return JSON"}],
+        response_format={"type": "json_object"},
+        thinking={"type": "enabled"},
+    )
+
+    assert result["type"] == "text"
+    assert result["content"] == '{"status": "ok"}'
+    second_call = mock_client.chat.completions.create.call_args_list[1].kwargs
+    assert second_call["extra_body"]["reasoning"] == {"enabled": False}
+    assert second_call["extra_body"]["thinking"] == {"type": "disabled"}

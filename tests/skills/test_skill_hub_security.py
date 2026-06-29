@@ -8,7 +8,11 @@ import zipfile
 import pytest
 from fastapi import HTTPException
 
-from xagent.web.api.skill_hub import _normalize_skill_files, _safe_zip_to_files
+from xagent.web.api.skill_hub import (
+    _check_registry_security_gate,
+    _normalize_skill_files,
+    _safe_zip_to_files,
+)
 
 # ── helpers ───────────────────────────────────────────────────────────────────
 
@@ -117,3 +121,79 @@ class TestSafeZipToFiles:
         with pytest.raises(HTTPException) as exc:
             _safe_zip_to_files(data)
         assert exc.value.status_code == 413
+
+
+# ── _check_registry_security_gate ────────────────────────────────────────────
+
+
+def _make_registry(display_name: str = "TestHub"):
+    """Minimal registry stub with a ClawHub-compatible extract_scan_status."""
+    from types import SimpleNamespace
+
+    def extract_scan_status(raw_item):
+        latest = raw_item.get("latestVersion") or {}
+        security = latest.get("security") or {}
+        return security.get("status") if isinstance(security, dict) else None
+
+    return SimpleNamespace(
+        display_name=display_name, extract_scan_status=extract_scan_status
+    )
+
+
+def _detail(*, scan_status=None, moderation_state=None):
+    """Build a fake registry detail payload."""
+    d = {}
+    if scan_status is not None:
+        d["latestVersion"] = {"security": {"status": scan_status}}
+    if moderation_state is not None:
+        d["moderation"] = {"moderationState": moderation_state}
+    return d
+
+
+class TestCheckRegistrySecurityGate:
+    def test_malicious_scan_status_refused(self):
+        with pytest.raises(HTTPException) as exc:
+            _check_registry_security_gate(
+                _make_registry(), _detail(scan_status="malicious")
+            )
+        assert exc.value.status_code == 403
+        assert "malicious" in exc.value.detail.lower()
+
+    def test_quarantined_refused(self):
+        with pytest.raises(HTTPException) as exc:
+            _check_registry_security_gate(
+                _make_registry(), _detail(moderation_state="quarantined")
+            )
+        assert exc.value.status_code == 403
+        assert "quarantined" in exc.value.detail.lower()
+
+    def test_revoked_refused(self):
+        with pytest.raises(HTTPException) as exc:
+            _check_registry_security_gate(
+                _make_registry(), _detail(moderation_state="revoked")
+            )
+        assert exc.value.status_code == 403
+        assert "revoked" in exc.value.detail.lower()
+
+    def test_clean_scan_status_allowed(self):
+        # Must not raise.
+        _check_registry_security_gate(_make_registry(), _detail(scan_status="clean"))
+
+    def test_suspicious_scan_status_allowed(self):
+        # "suspicious" is a warning, not a hard block.
+        _check_registry_security_gate(
+            _make_registry(), _detail(scan_status="suspicious")
+        )
+
+    def test_no_security_data_allowed(self):
+        # Missing keys → None scan status → gate passes.
+        _check_registry_security_gate(_make_registry(), {})
+
+    def test_both_signals_malicious_wins(self):
+        with pytest.raises(HTTPException) as exc:
+            _check_registry_security_gate(
+                _make_registry(),
+                _detail(scan_status="malicious", moderation_state="quarantined"),
+            )
+        assert exc.value.status_code == 403
+        assert "malicious" in exc.value.detail.lower()

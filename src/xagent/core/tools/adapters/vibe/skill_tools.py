@@ -208,7 +208,8 @@ class SkillTools:
         if record is not None:
             prefix = "" if path == "." else path.rstrip("/") + "/"
             documents = []
-            for rel_path, content in sorted(record.files.items()):
+            # Use file_names (all files including media) rather than files (text-only).
+            for rel_path in sorted(record.file_names):
                 if rel_path.startswith("."):
                     continue
                 if prefix and not rel_path.startswith(prefix):
@@ -216,7 +217,16 @@ class SkillTools:
                 remainder = rel_path[len(prefix) :] if prefix else rel_path
                 if not recursive and "/" in remainder:
                     continue
-                documents.append({"path": rel_path, "size": len(content)})
+                if rel_path in record.files:
+                    size = len(record.files[rel_path])
+                elif record.path:
+                    try:
+                        size = (Path(record.path) / rel_path).stat().st_size
+                    except OSError:
+                        size = 0
+                else:
+                    size = 0
+                documents.append({"path": rel_path, "size": size})
             if prefix and not documents:
                 raise FileNotFoundError(
                     f"Directory not found: '{path}' in skill '{skill}'"

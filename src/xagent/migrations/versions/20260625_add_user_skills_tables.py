@@ -1,7 +1,7 @@
 """add user_skills and user_skill_files tables
 
 Revision ID: 20260625_add_user_skills_tables
-Revises: 20260616_add_agent_triggers
+Revises: 20260624_add_mcp_concurrency_config
 Create Date: 2026-06-25 00:00:00.000000
 
 """
@@ -13,7 +13,7 @@ from alembic import op
 from sqlalchemy.engine.reflection import Inspector
 
 revision: str = "20260625_add_user_skills_tables"
-down_revision: Union[str, None] = "20260616_add_agent_triggers"
+down_revision: Union[str, None] = "20260624_add_mcp_concurrency_config"
 branch_labels: Union[str, Sequence[str], None] = None
 depends_on: Union[str, Sequence[str], None] = None
 

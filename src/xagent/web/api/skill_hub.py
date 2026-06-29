@@ -554,6 +554,32 @@ def _safe_zip_to_files(zip_bytes: bytes) -> dict[str, bytes]:
     return _normalize_skill_files(files)
 
 
+def _check_registry_security_gate(registry: Any, detail: dict) -> None:
+    """Raise HTTP 403 if the registry flags this skill as unsafe.
+
+    Checks two independent signals:
+    * ``scan_status == "malicious"`` — AV/scanner verdict via
+      ``registry.extract_scan_status``
+    * ``moderation.moderationState in {"quarantined", "revoked"}`` — human
+      moderation verdict embedded directly in the detail payload
+    """
+    scan_status = registry.extract_scan_status(detail)
+    moderation = detail.get("moderation") or {}
+    moderation_state = (
+        moderation.get("moderationState") if isinstance(moderation, dict) else None
+    )
+    if scan_status == "malicious":
+        raise HTTPException(
+            status_code=403,
+            detail=f"Install refused: this skill is flagged malicious by {registry.display_name} scanners.",
+        )
+    if moderation_state in ("quarantined", "revoked"):
+        raise HTTPException(
+            status_code=403,
+            detail=f"Install refused: skill is {moderation_state} by {registry.display_name} moderators.",
+        )
+
+
 # ──────────────────────────────────────────────────────────────────────
 # Routes — local skills (list / detail / delete)
 # ──────────────────────────────────────────────────────────────────────
@@ -867,21 +893,8 @@ async def install_skill(
             status_code=502,
             detail=f"{registry.display_name} detail had unexpected shape.",
         )
+    _check_registry_security_gate(registry, detail)
     scan_status = registry.extract_scan_status(detail)
-    moderation = detail.get("moderation") or {}
-    moderation_state = (
-        moderation.get("moderationState") if isinstance(moderation, dict) else None
-    )
-    if scan_status == "malicious":
-        raise HTTPException(
-            status_code=403,
-            detail=f"Install refused: this skill is flagged malicious by {registry.display_name} scanners.",
-        )
-    if moderation_state in ("quarantined", "revoked"):
-        raise HTTPException(
-            status_code=403,
-            detail=f"Install refused: skill is {moderation_state} by {registry.display_name} moderators.",
-        )
 
     # --- Download ZIP ----------------------------------------------
     dl_status, zip_bytes = await asyncio.to_thread(

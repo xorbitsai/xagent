@@ -1,3 +1,4 @@
+import os
 from typing import Any, Optional
 
 # When an OpenRouter model carries this name, route the prompt through
@@ -30,6 +31,13 @@ _DEFAULT_BASE_URL_BY_PROVIDER: dict[str, str] = {
     "minimax-coding-plan": "https://api.minimax.io/anthropic",
     "minimax-cn-coding-plan": "https://api.minimaxi.com/anthropic",
     "kimi-for-coding": "https://api.kimi.com/coding",
+}
+
+# Provider-scoped base URL environment overrides. Keep these narrow so shared
+# client implementations do not redirect sibling providers to the wrong API.
+_BASE_URL_ENV_BY_PROVIDER: dict[str, str] = {
+    "deepseek": "DEEPSEEK_BASE_URL",
+    "dashscope": "DASHSCOPE_BASE_URL",
 }
 
 _CURATED_MODELS_BY_PROVIDER: dict[str, tuple[str, ...]] = {
@@ -202,6 +210,26 @@ def is_placeholder_api_key(api_key: Optional[str]) -> bool:
 
 def default_base_url_for_provider(provider: str) -> Optional[str]:
     return _DEFAULT_BASE_URL_BY_PROVIDER.get(canonical_provider_name(provider))
+
+
+def resolve_base_url_for_provider(
+    provider: str, explicit_base_url: Optional[str] = None
+) -> Optional[str]:
+    """Resolve a provider base URL using explicit value, scoped env, then default.
+
+    Environment overrides are keyed by canonical provider, not by client class.
+    This prevents providers that share a transport implementation from
+    inheriting unrelated endpoint overrides.
+    """
+    if explicit_base_url:
+        return explicit_base_url
+
+    canonical = canonical_provider_name(provider)
+    env_name = _BASE_URL_ENV_BY_PROVIDER.get(canonical)
+    if env_name and (env_value := os.getenv(env_name)):
+        return env_value
+
+    return _DEFAULT_BASE_URL_BY_PROVIDER.get(canonical)
 
 
 def curated_models_for_provider(provider: str) -> tuple[str, ...]:

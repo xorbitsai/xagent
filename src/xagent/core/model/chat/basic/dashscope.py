@@ -31,13 +31,12 @@ class DashScopeLLM(OpenAILLM):
         abilities: Optional[List[str]] = None,
         timeout_config: Optional[Any] = None,
     ):
+        if base_url is None:
+            raise ValueError("DashScopeLLM requires a resolved base_url")
+
         super().__init__(
             model_name=model_name,
-            base_url=(
-                base_url
-                or os.getenv("DASHSCOPE_BASE_URL")
-                or "https://dashscope.aliyuncs.com/compatible-mode/v1"
-            ),
+            base_url=base_url,
             api_key=api_key if api_key is not None else os.getenv("DASHSCOPE_API_KEY"),
             default_temperature=default_temperature,
             default_max_tokens=default_max_tokens,

@@ -83,6 +83,66 @@ def test_dashscope_family_routes_to_dashscope_llm(provider, expected_base_url):
     assert inner.base_url == expected_base_url
 
 
+def test_dashscope_provider_uses_scoped_env_base_url(monkeypatch):
+    monkeypatch.setenv("DASHSCOPE_BASE_URL", "https://dashscope.example.test/v1")
+    config = ChatModelConfig(
+        id="dashscope-qwen",
+        model_provider="dashscope",
+        model_name="qwen3.5-plus",
+        api_key="test-key",
+    )
+
+    llm = create_base_llm(config)
+    inner = getattr(llm, "_inner", llm)
+
+    assert isinstance(inner, DashScopeLLM)
+    assert inner.base_url == "https://dashscope.example.test/v1"
+
+
+@pytest.mark.parametrize(
+    ("provider", "expected_base_url"),
+    [
+        ("alibaba-coding-plan", "https://coding-intl.dashscope.aliyuncs.com/v1"),
+        ("alibaba-coding-plan-cn", "https://coding.dashscope.aliyuncs.com/v1"),
+    ],
+)
+def test_alibaba_coding_plan_ignores_dashscope_base_url_env(
+    monkeypatch, provider, expected_base_url
+):
+    monkeypatch.setenv("DASHSCOPE_BASE_URL", "https://dashscope.example.test/v1")
+    config = ChatModelConfig(
+        id=f"{provider}-qwen",
+        model_provider=provider,
+        model_name="qwen3.5-plus",
+        api_key="test-key",
+    )
+
+    llm = create_base_llm(config)
+    inner = getattr(llm, "_inner", llm)
+
+    assert isinstance(inner, DashScopeLLM)
+    assert inner.base_url == expected_base_url
+
+
+def test_dashscope_family_explicit_base_url_overrides_provider_resolution(
+    monkeypatch,
+):
+    monkeypatch.setenv("DASHSCOPE_BASE_URL", "https://dashscope.example.test/v1")
+    config = ChatModelConfig(
+        id="alibaba-qwen",
+        model_provider="alibaba-coding-plan",
+        model_name="qwen3.5-plus",
+        api_key="test-key",
+        base_url="https://explicit.example.test/v1",
+    )
+
+    llm = create_base_llm(config)
+    inner = getattr(llm, "_inner", llm)
+
+    assert isinstance(inner, DashScopeLLM)
+    assert inner.base_url == "https://explicit.example.test/v1"
+
+
 def test_auto_is_curated_under_openrouter():
     from xagent.core.model.providers import curated_models_for_provider
 

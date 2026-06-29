@@ -7,6 +7,8 @@ import pytest
 from xagent.core.model.chat.basic.dashscope import DashScopeLLM
 from xagent.core.model.chat.types import ChunkType
 
+_DASHSCOPE_BASE_URL = "https://dashscope.aliyuncs.com/compatible-mode/v1"
+
 
 def _tool_schema() -> dict:
     return {
@@ -78,6 +80,7 @@ async def _stream_token():
 def dashscope_llm() -> DashScopeLLM:
     return DashScopeLLM(
         model_name="qwen3.5-plus",
+        base_url=_DASHSCOPE_BASE_URL,
         api_key="test-key",
         abilities=["thinking_mode"],
     )

@@ -565,11 +565,13 @@ class KBCoordinator:
                 if isinstance(raw_counts, dict):
                     _merge_positive_counts(deleted_counts, raw_counts)
 
-        if delete_orphaned_metadata:
+        if delete_orphaned_metadata and data_error is None:
             # Always remove the current tenant's config row so it does not
             # become orphaned when other tenants still have documents.
             # When the collection is completely empty across all tenants, also
             # do an admin-scope cleanup to remove any remaining rows.
+            # Skip config cleanup when the data-plane delete failed — removing
+            # config while data rows remain would lose the user's KB state.
             try:
                 remaining = await asyncio.to_thread(
                     handle.count_documents,
@@ -689,19 +691,17 @@ class KBCoordinator:
 
         warnings: list[str] = []
 
-        try:
-            data_warnings = await asyncio.to_thread(
-                handle.rename_collection_data,
-                new_name,
-                int_user_id,
-                is_admin,
-            )
-            if data_warnings:
-                warnings.extend(data_warnings)
-        except Exception as exc:  # noqa: BLE001 - best-effort
-            warnings.append(
-                f"rename_collection_data for {old_name!r} → {new_name!r} failed: {exc}"
-            )
+        # Data rename is the gate: if it fails, abort before touching control-plane
+        # state (status rows, metadata) to avoid a split-brain collection where
+        # vector data remains under old_name while metadata has moved to new_name.
+        data_warnings = await asyncio.to_thread(
+            handle.rename_collection_data,
+            new_name,
+            int_user_id,
+            is_admin,
+        )
+        if data_warnings:
+            warnings.extend(data_warnings)
 
         try:
             status_warnings = await asyncio.to_thread(

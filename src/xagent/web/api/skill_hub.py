@@ -28,8 +28,9 @@ unscanned-source install path back, ``git`` is still on the box.
 
 All writes (installs, creates, edits) persist to the database via
 ``UserSkill`` / ``UserSkillFile`` models.  The ``XagentPersonalDbSkillProvider``
-(``skills/personal_db.py``) surfaces them back to the SkillManager, so they
-become visible to agents on the next ``manager.reload()``.
+(``skills/personal_db.py``) surfaces them back to the SkillManager; because
+scoped managers are built fresh per request (no per-user cache), changes are
+visible immediately on the next API call without an explicit ``reload()``.
 """
 
 from __future__ import annotations
@@ -215,11 +216,11 @@ def _validate_skill_name(name: str) -> None:
 
 
 async def _get_manager(request: Request) -> Any:
-    """Hand back the SkillManager singleton xagent put on app.state.
-    All web/chat/agent paths share this instance; calling ``reload()``
-    on it after a write updates everyone. Returns the live
-    SkillManager; typed as ``Any`` to keep the skills package out of
-    this module's import graph."""
+    """Return the process-wide SkillManager singleton from app.state.
+    This manager holds only filesystem (builtin / external / project) records.
+    Per-request scoped views add the personal-DB layer on top; see
+    ``_get_scoped_manager``.  Typed as ``Any`` to keep the skills package
+    out of this module's import graph."""
     mgr = getattr(request.app.state, "skill_manager", None)
     if mgr is None:
         from xagent.skills.utils import create_skill_manager
@@ -247,24 +248,56 @@ def _scope_context(request: Request, user: User, db: Any) -> Any:
 
 
 async def _get_scoped_manager(request: Request, user: User, db: Any) -> Any:
-    from xagent.skills.utils import create_skill_manager
+    """Build a per-request SkillManager (no persistent per-user cache).
 
-    cache = getattr(request.app.state, "_scoped_skill_managers", None)
-    if cache is None:
-        request.app.state._scoped_skill_managers = {}
-        cache = request.app.state._scoped_skill_managers
+    Caching strategy — decouple by volatility:
+
+    *Default path* (no custom provider registered):
+      - Filesystem records (builtin / external / project skills) are stable, so
+        we reuse the records already loaded by the process-wide
+        ``app.state.skill_manager`` via ``StaticRecordsProvider``.
+      - Personal-DB records are volatile, so ``XagentPersonalDbSkillProvider``
+        is queried fresh on every request (cheap: one SQL query).
+
+    *Custom-provider path* (SaaS / overlay installed via
+    ``set_skill_library_provider``): the provider is used as-is with the
+    user context so that team-scoped records are included.  Each request
+    still gets its own ``SkillManager`` instance, so there is no shared
+    mutable state between concurrent requests.
+
+    In both paths:
+    * No stale-delete bug — the DB layer is always re-queried.
+    * No unbounded memory — no persistent per-user dict.
+    * No concurrency hazard — each request owns its manager instance.
+    """
+    from xagent.skills.library import (
+        CompositeSkillLibraryProvider,
+        StaticRecordsProvider,
+        get_skill_library_provider,
+    )
+    from xagent.skills.manager import SkillManager
+    from xagent.skills.personal_db import XagentPersonalDbSkillProvider
 
     ctx = _scope_context(request, user, db)
-    user_id = int(user.id)
-    mgr = cache.get(user_id)
-    if mgr is None:
-        mgr = create_skill_manager(context=ctx)
-        cache[user_id] = mgr
-    else:
-        # Refresh db session and request context; filesystem scan is already cached.
-        mgr.context = ctx
 
-    await mgr.ensure_initialized()
+    custom_provider = get_skill_library_provider()
+    if custom_provider is not None:
+        # Custom (e.g. SaaS) provider — use as-is; it handles all layers.
+        mgr = SkillManager(provider=custom_provider, context=ctx)
+    else:
+        # Default path: cached FS records + fresh personal-DB per request.
+        global_mgr = await _get_manager(request)
+        fs_records = [
+            info["_record"]
+            for info in global_mgr._skills_cache.values()
+            if "_record" in info
+        ]
+        provider = CompositeSkillLibraryProvider(
+            [StaticRecordsProvider(fs_records), XagentPersonalDbSkillProvider()]
+        )
+        mgr = SkillManager(provider=provider, context=ctx)
+
+    await mgr.reload()
     return mgr
 
 

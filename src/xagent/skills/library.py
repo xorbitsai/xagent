@@ -198,6 +198,33 @@ class FilesystemSkillLibraryProvider:
         raise FileNotFoundError(f"File not found: {path!r} in skill {record.name!r}")
 
 
+class StaticRecordsProvider:
+    """Wraps a pre-fetched list of SkillRecords.
+
+    Used to share a process-wide filesystem scan result across per-request
+    SkillManager instances, avoiding repeated disk scans while still
+    allowing a fresh DB layer to be queried each time.
+    """
+
+    def __init__(self, records: list[SkillRecord]) -> None:
+        self._records = list(records)
+
+    async def list_records(self, context: SkillScopeContext) -> list[SkillRecord]:
+        return list(self._records)
+
+    async def read_file(
+        self, context: SkillScopeContext, record: SkillRecord, path: str
+    ) -> bytes:
+        if path in record.files:
+            return record.files[path]
+        if record.path:
+            target = (Path(record.path) / path).resolve()
+            root = Path(record.path).resolve()
+            target.relative_to(root)
+            return target.read_bytes()
+        raise FileNotFoundError(f"File not found: {path!r} in skill {record.name!r}")
+
+
 _skill_library_provider: SkillLibraryProvider | None = None
 _skill_write_provider: SkillWriteProvider | None = None
 

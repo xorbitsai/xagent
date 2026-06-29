@@ -10,6 +10,7 @@ from .library import (
     SkillLibraryProvider,
     SkillRecord,
     SkillScopeContext,
+    StaticRecordsProvider,
     get_skill_library_provider,
     set_skill_library_provider,
 )
@@ -25,6 +26,7 @@ __all__ = [
     "SkillRecord",
     "SkillScopeContext",
     "SkillSelector",
+    "StaticRecordsProvider",
     "get_skill_library_provider",
     "set_skill_library_provider",
 ]

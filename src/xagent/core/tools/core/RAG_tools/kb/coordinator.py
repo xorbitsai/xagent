@@ -691,9 +691,13 @@ class KBCoordinator:
 
         warnings: list[str] = []
 
-        # Data rename is the gate: if it fails, abort before touching control-plane
-        # state (status rows, metadata) to avoid a split-brain collection where
-        # vector data remains under old_name while metadata has moved to new_name.
+        # The data rename is the gate for the control-plane rename: if any vector
+        # row was not moved, abort before touching status/metadata to avoid a
+        # split-brain collection where metadata points at new_name while vector
+        # data remains under old_name.  Failures surface two ways and BOTH must
+        # gate: a hard exception (e.g. no DB connection) propagates out, and
+        # per-table failures are returned as a non-empty warnings list (the store
+        # catches them per table rather than raising) — short-circuit on those too.
         data_warnings = await asyncio.to_thread(
             handle.rename_collection_data,
             new_name,
@@ -702,6 +706,7 @@ class KBCoordinator:
         )
         if data_warnings:
             warnings.extend(data_warnings)
+            return warnings
 
         try:
             status_warnings = await asyncio.to_thread(

@@ -12,6 +12,8 @@ from __future__ import annotations
 import asyncio
 from unittest.mock import AsyncMock, MagicMock, patch
 
+import pytest
+
 from xagent.core.tools.core.RAG_tools.core.exceptions import DatabaseOperationError
 from xagent.core.tools.core.RAG_tools.core.schemas import CollectionOperationResult
 from xagent.core.tools.core.RAG_tools.kb.api_compatibility import (
@@ -228,13 +230,45 @@ class TestCoordinatorRenameCollection:
 
         assert call_order == ["data", "status", "metadata"]
 
-    def test_coordinator_rename_collects_warnings_from_all_steps_best_effort(
-        self,
-    ) -> None:
-        """Warnings from each step are all collected even if data step raises."""
+    def test_coordinator_rename_aborts_when_data_step_raises(self) -> None:
+        """A hard exception from the data rename gates the control-plane rename.
+
+        The data rename is the gate: if it raises, the exception propagates and
+        status/metadata are never renamed, avoiding a split-brain collection.
+        """
         handle = _make_mock_handle()
         handle.rename_collection_data = MagicMock(
             side_effect=DatabaseOperationError("data step failed")
+        )
+        handle.rename_collection_status = MagicMock(return_value=["status_warn"])
+        handle.rename_collection_metadata = AsyncMock(return_value=None)
+        coordinator = _make_coordinator_with_mock_handle(handle)
+
+        with pytest.raises(DatabaseOperationError):
+            asyncio.run(
+                coordinator.rename_collection(
+                    old_name="old_coll",
+                    new_name="new_coll",
+                    user_id=None,
+                    is_admin=True,
+                )
+            )
+
+        # Control-plane steps must NOT run after a failed data rename.
+        handle.rename_collection_status.assert_not_called()
+        handle.rename_collection_metadata.assert_not_called()
+
+    def test_coordinator_rename_aborts_when_data_step_returns_warnings(self) -> None:
+        """Non-empty data warnings also gate the control-plane rename.
+
+        ``rename_collection_data`` catches per-table failures and returns them as
+        warnings rather than raising, so a non-empty list means some vector rows
+        were not moved.  The coordinator must short-circuit and not rename
+        status/metadata, returning the data warnings to the caller.
+        """
+        handle = _make_mock_handle()
+        handle.rename_collection_data = MagicMock(
+            return_value=["Failed to update 'chunks': boom"]
         )
         handle.rename_collection_status = MagicMock(return_value=["status_warn"])
         handle.rename_collection_metadata = AsyncMock(return_value=None)
@@ -249,10 +283,10 @@ class TestCoordinatorRenameCollection:
             )
         )
 
-        # All subsequent steps still ran and their warnings were collected
-        handle.rename_collection_status.assert_called_once()
-        handle.rename_collection_metadata.assert_called_once()
-        assert any("status_warn" in w for w in warnings) or "status_warn" in warnings
+        handle.rename_collection_status.assert_not_called()
+        handle.rename_collection_metadata.assert_not_called()
+        assert any("Failed to update 'chunks'" in w for w in warnings)
+        assert all("status_warn" not in w for w in warnings)
 
     def test_coordinator_rename_returns_list_of_warnings(self) -> None:
         """rename_collection always returns a list."""

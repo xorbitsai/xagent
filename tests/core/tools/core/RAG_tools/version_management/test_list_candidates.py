@@ -7,6 +7,7 @@ import tempfile
 from datetime import datetime, timedelta
 from unittest.mock import MagicMock
 
+import numpy as np
 import pandas as pd
 import pytest
 
@@ -282,6 +283,52 @@ class TestListCandidates:
                     candidate["stats"]["upsert_count"] == 1
                 )  # Each parse_hash has 1 row
                 assert candidate["stats"]["vector_dim"] == 3
+
+    def test_embed_candidates_numpy_vector(self):
+        """Regression for #709/#708: a numpy-ndarray ``vector`` column must not
+        crash candidate listing. The pre-#708 ``if vector:`` check raised
+        ``ValueError: truth value of an array ... is ambiguous`` on np.ndarray.
+        """
+        mock_conn = MagicMock(spec=["table_names", "open_table"])
+        mock_conn.table_names.return_value = ["embeddings_bge_large"]
+
+        mock_table = MagicMock()
+        mock_data = pd.DataFrame(
+            [
+                {
+                    "collection": "test_collection",
+                    "doc_id": "test_doc",
+                    "model": "BAAI/bge-large-zh-v1.5",
+                    "parse_hash": "parse_hash1",
+                    "vector": np.array([0.1, 0.2, 0.3]),  # numpy, not list
+                    "created_at": datetime.now(),
+                },
+                {
+                    "collection": "test_collection",
+                    "doc_id": "test_doc",
+                    "model": "BAAI/bge-large-zh-v1.5",
+                    "parse_hash": "parse_hash2",
+                    "vector": np.array([0.4, 0.5, 0.6]),  # numpy, not list
+                    "created_at": datetime.now(),
+                },
+            ]
+        )
+        # Force the to_pandas fallback (where vector columns come back as
+        # np.ndarray); to_arrow/to_list raise as in the sibling tests.
+        mock_where = mock_table.search.return_value.where.return_value
+        mock_where.to_arrow.side_effect = AttributeError("to_arrow not available")
+        mock_where.to_list.side_effect = AttributeError("to_list not available")
+        mock_where.to_pandas.return_value = mock_data
+        mock_conn.open_table.return_value = mock_table
+
+        with self._patch_get_connection_from_env(mock_conn):
+            result = list_candidates(
+                "test_collection", "test_doc", StepType.EMBED, model_tag="bge_large"
+            )
+
+        assert len(result["candidates"]) == 2
+        for candidate in result["candidates"]:
+            assert candidate["stats"]["vector_dim"] == 3
 
     def test_state_filter(self):
         """Test that state filter works correctly."""

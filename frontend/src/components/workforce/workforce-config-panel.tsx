@@ -167,18 +167,19 @@ function AgentPickerDialog({
         const err = await publishRes.json().catch(() => ({}))
         throw new Error((err as { detail?: string }).detail || "")
       }
-      toast.success(t("workforces.templates.createSuccess", { name: newAgent!.name }))
-      setPendingTemplate(null)
-      setPendingName("")
-      await onSelectAgent(newAgent!.id, newAgent!.description || pendingTemplate.name)
     } catch (e) {
       if (newAgent?.id) {
         await apiRequest(`${getApiUrl()}/api/agents/${newAgent.id}`, { method: "DELETE" }).catch(() => {})
       }
       toast.error(e instanceof Error && e.message ? e.message : t("workforces.templates.createError"))
+      return
     } finally {
       setCreatingId(null)
     }
+    toast.success(t("workforces.templates.createSuccess", { name: newAgent!.name }))
+    setPendingTemplate(null)
+    setPendingName("")
+    await onSelectAgent(newAgent!.id, newAgent!.description || pendingTemplate.name)
   }
 
   const tabBtn = (id: "my-agents" | "built-in", label: string) => (

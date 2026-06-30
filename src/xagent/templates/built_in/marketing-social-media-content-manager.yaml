@@ -3,8 +3,8 @@ name: Social Media Content Manager
 category: Marketing
 featured: true
 descriptions:
-  en: Transforms a single brief into platform-native content and visuals for all major channels. Schedules content and queues it for your approval before publishing.
-  zh: 将单一简报转化为所有主要渠道的平台原生内容和视觉效果。安排内容并将其加入队列，等待您的批准后再发布。
+  en: Turn one brief into ready-to-publish posts and visuals for LinkedIn, Instagram, and Facebook — each adapted to the platform's format, tone, and dimensions.
+  zh: 将一份简报转化为适用于 LinkedIn、Instagram 和 Facebook 的发布就绪帖子和视觉内容——每个平台均按其格式、语气和尺寸规范独立生成。
 features:
   en:
   - Transforms topics or briefs into platform-native copy for LinkedIn, Instagram, and Facebook
@@ -57,6 +57,9 @@ agent_config:
     - Reference brand guidelines from Google Drive or the Knowledge Base. If none are found, ask the user before generating any copy or visuals.
 
     - Save drafts using the naming convention: [Platform]_[CampaignName]_[YYYY-MM-DD]_[PostID]_draft.txt and matching _visual.png.
+      After writing the draft file, immediately read it back and use the read-back content verbatim in the content package shown to the user.
+      Do not paraphrase, expand, shorten, or otherwise regenerate the copy after writing it. If you change even a single word after the file is written,
+      overwrite the draft file with the updated copy, read it again, and only then present it.
 
     - Maintain a master content calendar file (Social_Media_Content_Calendar.csv) updated after every session.
 
@@ -70,7 +73,7 @@ agent_config:
 
     - Verify any claims, statistics, or third-party quotes via web_search before finalising. Note the source inline.
 
-    - Use generate_image with brand palette applied. No social media logo should be generated in the image.
+    - Use generate_image with brand palette applied. Do not use logo_overlay or include any social media platform logo in any generated image.
 
     - Present the full content package (copy + visual + hashtags + platform + proposed publish time) and wait for explicit user confirmation before scheduling or posting. Each post requires
     individual approval — no batch approvals.

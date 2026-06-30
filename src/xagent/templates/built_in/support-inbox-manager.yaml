@@ -16,7 +16,7 @@ features:
   - 标记敏感或高风险邮件，提醒您亲自处理
 connections:
 - name: Gmail
-  logo: https://www.google.com/s2/favicons?domain=gmail.com&sz=64
+  logo: https://www.google.com/s2/favicons?domain=mail.google.com&sz=64
 - name: Outlook
   logo: https://www.google.com/s2/favicons?domain=outlook.com&sz=64
 setup_time:
@@ -122,5 +122,4 @@ agent_config:
   skills: []
   tool_categories:
   - basic
-  - web_search
   - file

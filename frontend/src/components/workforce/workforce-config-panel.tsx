@@ -158,7 +158,11 @@ function AgentPickerDialog({
         throw new Error((err as { detail?: string }).detail || "")
       }
       const newAgent = await res.json()
-      await apiRequest(`${getApiUrl()}/api/agents/${newAgent.id}/publish`, { method: "POST" })
+      const publishRes = await apiRequest(`${getApiUrl()}/api/agents/${newAgent.id}/publish`, { method: "POST" })
+      if (!publishRes.ok) {
+        const err = await publishRes.json().catch(() => ({}))
+        throw new Error((err as { detail?: string }).detail || "")
+      }
       toast.success(t("workforces.templates.createSuccess", { name: newAgent.name }))
       setPendingTemplate(null)
       setPendingName("")
@@ -672,6 +676,17 @@ export function WorkforceConfigPanel({
               <div className="space-y-4 mt-2 overflow-y-auto flex-1 min-h-0">
                 <div className="space-y-1.5">
                   <Label className="text-xs font-semibold uppercase tracking-wider text-muted-foreground">
+                    {t("workforces.fields.alias")}
+                  </Label>
+                  <Input
+                    value={memberAlias}
+                    onChange={(e) => setMemberAlias(e.target.value)}
+                    placeholder={t("workforces.workers.aliasPlaceholder")}
+                    disabled={saving || isArchived}
+                  />
+                </div>
+                <div className="space-y-1.5">
+                  <Label className="text-xs font-semibold uppercase tracking-wider text-muted-foreground">
                     {t("workforces.fields.delegationPrompt")}
                   </Label>
                   <Textarea
@@ -681,7 +696,6 @@ export function WorkforceConfigPanel({
                     disabled={saving || isArchived}
                   />
                 </div>
-
               </div>
 
               <div className="flex items-center justify-between mt-4 pt-4 border-t shrink-0">

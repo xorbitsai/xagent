@@ -14,7 +14,7 @@ import type { WorkforceListItem } from "@/types/workforce"
 import { getRunDisabledReason } from "./workforce-ui-state"
 import { FeatureEmptyState } from "@/components/ui/feature-empty-state"
 import { toast } from "sonner"
-import { WorkforceCreateDialog } from "@/components/workforce/workforce-create-dialog"
+import { WorkforceCreateView } from "@/components/workforce/workforce-create-view"
 import { WorkforceStatusBadge } from "@/components/workforce"
 
 export default function WorkforcesPage() {
@@ -28,7 +28,7 @@ export default function WorkforcesPage() {
   const [pages, setPages] = useState(1)
   const [total, setTotal] = useState(0)
   const pageSize = 10
-  const [createDialogOpen, setCreateDialogOpen] = useState(false)
+  const [view, setView] = useState<"list" | "create">("list")
   const hasActiveSearch = search.trim().length > 0
 
   const load = useCallback(async (nextPage: number, nextSearch: string) => {
@@ -53,6 +53,19 @@ export default function WorkforcesPage() {
     void load(page, search)
   }, [load, page, search])
 
+  if (view === "create") {
+    return (
+      <div className="h-full overflow-y-auto">
+        <WorkforceCreateView
+          onBack={() => setView("list")}
+          onCreated={(workforce) => {
+            router.push(`/workforces/${workforce.id}`)
+          }}
+        />
+      </div>
+    )
+  }
+
   return (
     <div className="h-full overflow-y-auto">
       <div className="mx-auto flex w-full flex-col gap-6 p-4 sm:p-8">
@@ -63,7 +76,7 @@ export default function WorkforcesPage() {
               {t("workforces.list.description")}
             </p>
           </div>
-          <Button onClick={() => setCreateDialogOpen(true)} className="bg-blue-600 hover:bg-blue-700 text-white rounded-full px-6">
+          <Button onClick={() => setView("create")} className="bg-blue-600 hover:bg-blue-700 text-white rounded-full px-6">
             <Plus className="mr-2 h-4 w-4" />
             {t("workforces.actions.new")}
           </Button>
@@ -122,7 +135,7 @@ export default function WorkforcesPage() {
                   }
                 ]}
                 actionLabel={t("workforces.emptyState.action")}
-                onAction={() => setCreateDialogOpen(true)}
+                onAction={() => setView("create")}
                 className="h-full mt-4"
               />
             )
@@ -248,13 +261,6 @@ export default function WorkforcesPage() {
         ) : null}
       </div>
 
-      <WorkforceCreateDialog
-        open={createDialogOpen}
-        onOpenChange={setCreateDialogOpen}
-        onCreated={(workforce) => {
-          router.push(`/workforces/${workforce.id}`)
-        }}
-      />
     </div>
   )
 }

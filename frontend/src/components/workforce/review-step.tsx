@@ -6,6 +6,7 @@ import { AlertTriangle } from "lucide-react"
 import { Badge } from "@/components/ui/badge"
 import { useI18n } from "@/contexts/i18n-context"
 import { canEditAgent } from "@/lib/agent-ui-access"
+import { WorkforceDraftCanvas } from "./workforce-canvas"
 import type {
   WorkforceAgentOption,
   WorkforceWorkerDraft,
@@ -57,6 +58,30 @@ export function ReviewStep({
 
   return (
     <div className="space-y-6">
+      {/* Workforce name summary */}
+      <div className="rounded-lg border bg-muted/30 px-4 py-3">
+        <div className="text-xs font-semibold uppercase tracking-wider text-muted-foreground mb-1">{t("workforces.list.badge")}</div>
+        <div className="font-medium">{name || t("workforces.review.untitled")}</div>
+        {description && <div className="text-sm text-muted-foreground mt-0.5">{description}</div>}
+      </div>
+
+      {/* Canvas preview — real ReactFlow canvas */}
+      {manager && (
+        <div>
+          <div className="text-xs font-semibold uppercase tracking-wider text-muted-foreground mb-2">
+            {t("workforces.review.canvasPreview")}
+          </div>
+          <div className="h-72 rounded-xl overflow-hidden border">
+            <WorkforceDraftCanvas
+              managerAgent={manager}
+              managerInstructions={managerInstructions}
+              workers={workers}
+              agents={agents}
+            />
+          </div>
+        </div>
+      )}
+
       {warnings.length > 0 ? (
         <div className="rounded-xl border border-amber-200 bg-amber-50 p-4 text-amber-900">
           <div className="flex items-center gap-2 font-medium">
@@ -70,20 +95,6 @@ export function ReviewStep({
           </div>
         </div>
       ) : null}
-
-      <div className="space-y-2">
-        <div className="text-xs font-semibold uppercase tracking-wider text-muted-foreground">
-          {t("workforces.fields.name")}
-        </div>
-        <div className="rounded-lg border bg-card p-4">
-          <div className="font-medium">
-            {name || t("workforces.review.untitled")}
-          </div>
-          <div className="mt-1 text-sm text-muted-foreground">
-            {description || t("workforces.common.noDescription")}
-          </div>
-        </div>
-      </div>
 
       <div className="space-y-2">
         <div className="text-xs font-semibold uppercase tracking-wider text-muted-foreground">
@@ -134,7 +145,7 @@ export function ReviewStep({
 
       <div className="space-y-2">
         <div className="text-xs font-semibold uppercase tracking-wider text-muted-foreground">
-          {t("workforces.fields.workers")}
+          {t("workforces.review.subAgentsDelegation")}
         </div>
         <div className="space-y-3">
           {workers.length === 0 ? (

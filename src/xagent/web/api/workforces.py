@@ -26,12 +26,6 @@ from ..services.workforce_access import (
     filter_visible_workforces,
     resolve_create_scope,
 )
-from ..services.workforce_builder import (
-    apply_workforce_builder_changes,
-    list_builder_messages,
-    propose_workforce_builder_changes,
-    serialize_builder_message,
-)
 from ..services.workforce_creator import create_workforce_from_prompt
 from ..services.workforce_names import workforce_name_exists
 from ..services.workforce_runs import create_workforce_run as start_workforce_run
@@ -89,15 +83,6 @@ class WorkforceRunRequest(BaseModel):
     files: list[str] = Field(default_factory=list)
     execution_mode: str | None = None
     is_visible: bool = True
-
-
-class WorkforceBuilderProposeRequest(BaseModel):
-    message: str = Field(..., min_length=1)
-
-
-class WorkforceBuilderApplyRequest(BaseModel):
-    message_id: int
-    proposed_patch: dict[str, Any]
 
 
 def _field_supplied(model: BaseModel, field_name: str) -> bool:
@@ -741,79 +726,6 @@ async def create_workforce_run(
         "task_id": result.task.id,
         "status": result.workforce_run.status,
         "redirect_url": f"/task/{result.task.id}",
-    }
-
-
-@router.get("/{workforce_id}/builder/messages")
-async def get_workforce_builder_messages(
-    workforce_id: int,
-    db: Session = Depends(get_db),
-    user: User = Depends(get_current_user),
-) -> dict[str, Any]:
-    workforce = ensure_workforce_access(
-        db,
-        user,
-        _load_workforce(db, workforce_id),
-        action="view",
-    )
-    messages = list_builder_messages(db, user, workforce)
-    return {"items": [serialize_builder_message(message) for message in messages]}
-
-
-@router.post("/{workforce_id}/builder/propose")
-async def propose_workforce_changes(
-    workforce_id: int,
-    request: WorkforceBuilderProposeRequest,
-    db: Session = Depends(get_db),
-    user: User = Depends(get_current_user),
-) -> dict[str, Any]:
-    result = await propose_workforce_builder_changes(
-        db,
-        user,
-        ensure_workforce_access(
-            db,
-            user,
-            _load_workforce(db, workforce_id),
-            action="edit",
-        ),
-        message=request.message,
-    )
-    assistant_message = serialize_builder_message(result.assistant_message)
-    return {
-        "message_id": result.assistant_message.id,
-        "user_message": serialize_builder_message(result.user_message),
-        "assistant_message": result.assistant_message.content,
-        "message": assistant_message,
-        "proposed_patch": result.proposed_patch,
-        "requires_confirmation": result.requires_confirmation,
-    }
-
-
-@router.post("/{workforce_id}/builder/apply")
-async def apply_workforce_changes(
-    workforce_id: int,
-    request: WorkforceBuilderApplyRequest,
-    db: Session = Depends(get_db),
-    user: User = Depends(get_current_user),
-) -> dict[str, Any]:
-    result = apply_workforce_builder_changes(
-        db,
-        user,
-        ensure_workforce_access(
-            db,
-            user,
-            _load_workforce(db, workforce_id),
-            action="edit",
-        ),
-        message_id=request.message_id,
-        proposed_patch=request.proposed_patch,
-    )
-    workforce = _reload_workforce(db, result.workforce)
-    return {
-        "status": "applied",
-        "message_id": result.message.id,
-        "message": serialize_builder_message(result.message),
-        "workforce": _serialize_workforce_detail(workforce, user),
     }
 
 

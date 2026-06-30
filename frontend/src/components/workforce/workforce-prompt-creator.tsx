@@ -1,7 +1,7 @@
 "use client"
 
 import React, { useState } from "react"
-import { Loader2 } from "lucide-react"
+import { Loader2, Sparkles } from "lucide-react"
 import { Button } from "@/components/ui/button"
 import { Textarea } from "@/components/ui/textarea"
 import { useI18n } from "@/contexts/i18n-context"
@@ -22,6 +22,12 @@ export function WorkforcePromptCreator({
   const [prompt, setPrompt] = useState("")
   const [submitting, setSubmitting] = useState(false)
 
+  const examples = [
+    t("workforces.create.prompt.example1"),
+    t("workforces.create.prompt.example2"),
+    t("workforces.create.prompt.example3"),
+  ]
+
   const handleCreate = async () => {
     const value = prompt.trim()
     if (!value || submitting) return
@@ -38,31 +44,53 @@ export function WorkforcePromptCreator({
   }
 
   return (
-    <div className="flex flex-col gap-4">
-      <div className="space-y-1.5">
-        <h3 className="font-semibold leading-none tracking-tight">{t("workforces.create.prompt.cardTitle")}</h3>
-        <p className="text-sm text-muted-foreground">{t("workforces.create.prompt.cardDescription")}</p>
-      </div>
+    <div className="flex flex-col gap-6">
       <Textarea
         value={prompt}
         onChange={(event) => setPrompt(event.target.value)}
         placeholder={t("workforces.create.prompt.placeholder")}
-        rows={10}
+        rows={7}
+        className="resize-y"
       />
-      <div className="flex justify-end gap-3 mt-4">
+
+      {examples.length > 0 && (
+        <div className="space-y-2.5">
+          <div className="text-xs font-semibold uppercase tracking-wider text-indigo-500">
+            {t("workforces.create.prompt.tryAnExample")}
+          </div>
+          {examples.map((example) => (
+            <button
+              key={example}
+              onClick={() => setPrompt(example)}
+              className="w-full rounded-lg border border-transparent bg-muted px-4 py-3 text-left text-sm text-foreground transition-colors hover:bg-muted/70 hover:border-border"
+            >
+              {example}
+            </button>
+          ))}
+        </div>
+      )}
+
+      <div className="flex items-center justify-end gap-3">
         {onCancel ? (
           <Button variant="outline" onClick={onCancel} disabled={submitting}>
             {t("common.cancel")}
           </Button>
         ) : null}
-        <Button onClick={handleCreate} disabled={submitting || !prompt.trim()}>
+        <Button
+          onClick={handleCreate}
+          disabled={submitting || !prompt.trim()}
+          className="bg-violet-600 hover:bg-violet-700 text-white disabled:bg-violet-300"
+        >
           {submitting ? (
             <>
-              <Loader2 className="h-4 w-4 animate-spin" />
+              <Loader2 className="mr-2 h-4 w-4 animate-spin" />
               {t("workforces.loading.creating")}
             </>
           ) : (
-            t("workforces.create.prompt.generate")
+            <>
+              <Sparkles className="mr-2 h-4 w-4" />
+              {t("workforces.create.prompt.buildWorkforce")}
+            </>
           )}
         </Button>
       </div>

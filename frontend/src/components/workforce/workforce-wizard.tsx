@@ -135,12 +135,12 @@ export function WorkforceWizard({
         currentStep={step + 1}
         steps={[
           {
-            label: t("workforces.create.steps.basics"),
+            label: t("workforces.create.steps.nameAndManager"),
             content: (
               <div className="flex flex-col gap-6">
                 <div className="space-y-4">
                   <div className="space-y-2">
-                    <Label>{t("workforces.fields.name")} <span className="text-destructive">*</span></Label>
+                    <Label>{t("workforces.create.fields.workforceName")} <span className="text-destructive">*</span></Label>
                     <Input
                       value={name}
                       onChange={(event) => setName(event.target.value)}
@@ -148,7 +148,7 @@ export function WorkforceWizard({
                     />
                   </div>
                   <div className="space-y-2">
-                    <Label>{t("workforces.fields.description")}</Label>
+                    <Label>{t("workforces.fields.description")} <span className="text-muted-foreground text-xs font-normal">{t("common.optional")}</span></Label>
                     <Textarea
                       value={description}
                       onChange={(event) => setDescription(event.target.value)}
@@ -157,32 +157,38 @@ export function WorkforceWizard({
                     />
                   </div>
                   <div className="space-y-2">
-                    <Label>{t("workforces.fields.managerInstructions")}</Label>
+                    <Label>{t("workforces.create.fields.workforceInstructions")} <span className="text-destructive">*</span></Label>
+                    <p className="text-xs text-muted-foreground">{t("workforces.create.fields.workforceInstructionsHint")}</p>
                     <Textarea
                       value={managerInstructions}
                       onChange={(event) => setManagerInstructions(event.target.value)}
                       placeholder={t("workforces.create.placeholders.managerInstructions")}
-                      rows={3}
+                      rows={4}
                     />
                   </div>
                 </div>
-                <ManagerStep
-                  managerAgentId={managerAgentId}
-                  onManagerAgentIdChange={setManagerAgentId}
-                  agents={agents}
-                  loadingAgents={loadingAgents}
-                />
+                <div className="space-y-2">
+                  <Label>{t("workforces.create.fields.agentManager")} <span className="text-destructive">*</span></Label>
+                  <p className="text-xs text-muted-foreground">{t("workforces.create.fields.agentManagerHint")}</p>
+                  <ManagerStep
+                    managerAgentId={managerAgentId}
+                    onManagerAgentIdChange={setManagerAgentId}
+                    agents={agents}
+                    loadingAgents={loadingAgents}
+                  />
+                </div>
               </div>
             ),
           },
           {
-            label: t("workforces.create.steps.workers"),
+            label: t("workforces.create.steps.subAgents"),
             content: (
               <WorkersStep
                 managerAgentId={managerAgentId}
                 agents={agents}
                 workers={workers}
                 onWorkersChange={setWorkers}
+                onAgentCreated={(agent) => setAgents((prev) => [...prev, agent])}
               />
             ),
           },
@@ -238,10 +244,11 @@ export function WorkforceWizard({
             <Button
               onClick={handleCreate}
               disabled={submitting || !canMoveForward || !workersAreValid}
+              className="bg-blue-600 hover:bg-blue-700 text-white"
             >
               {submitting
                 ? t("workforces.loading.creating")
-                : t("workforces.actions.create")}
+                : t("workforces.actions.createTeam")}
             </Button>
           )}
         </div>

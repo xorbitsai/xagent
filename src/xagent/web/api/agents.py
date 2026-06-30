@@ -7,7 +7,7 @@ import uuid
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
-from fastapi import APIRouter, Body, Depends, HTTPException
+from fastapi import APIRouter, Body, Depends, HTTPException, Request
 from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
 
@@ -30,6 +30,11 @@ from ..services.agent_access import (
     AccessibleAgent,
     accessible_agent_permissions,
     list_accessible_agents,
+)
+from ..services.agent_management import (
+    AgentManagementService,
+    DuplicateAgentNameError,
+    TemplateNotFoundError,
 )
 from ..services.agent_store import AgentStore
 from ..services.api_keys import AgentApiKeyService, KeyRotationConflict
@@ -424,6 +429,43 @@ async def optimize_instructions(
 
     except Exception as e:
         logger.error(f"Failed to optimize instructions: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+class AgentFromTemplateRequest(BaseModel):
+    template_id: str
+    name: Optional[str] = None
+
+
+@router.post("/from-template", response_model=AgentResponse)
+async def create_agent_from_template(
+    data: AgentFromTemplateRequest,
+    fastapi_request: Request,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> AgentResponse:
+    """Create an agent from a template (session-auth wrapper for /v1/agents/from-template)."""
+    template_manager = getattr(fastapi_request.app.state, "template_manager", None)
+    service = AgentManagementService(db, template_manager=template_manager)
+    try:
+        agent, _api_key = await service.create_agent_from_template(
+            user_id=int(current_user.id),
+            is_admin=bool(current_user.is_admin),
+            template_id=data.template_id,
+            name=data.name,
+            generate_runtime_key=False,
+        )
+        store = AgentStore(db)
+        return AgentResponse.model_validate(store.agent_to_response_dict(agent))
+    except TemplateNotFoundError:
+        raise HTTPException(status_code=404, detail="Template not found")
+    except DuplicateAgentNameError:
+        raise HTTPException(
+            status_code=400, detail="Agent with this name already exists"
+        )
+    except Exception as e:
+        logger.error(f"Failed to create agent from template: {e}")
+        db.rollback()
         raise HTTPException(status_code=500, detail=str(e))
 
 

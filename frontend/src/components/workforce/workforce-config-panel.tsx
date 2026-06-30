@@ -117,7 +117,10 @@ function AgentPickerDialog({
     if (tab !== "built-in" || templates.length > 0) return
     setTemplatesLoading(true)
     apiRequest(`${getApiUrl()}/api/templates/?lang=${locale}`)
-      .then((res) => res.json())
+      .then((res) => {
+        if (!res.ok) throw new Error("Failed to load templates")
+        return res.json()
+      })
       .then((data) => setTemplates(Array.isArray(data) ? data : (data.items ?? [])))
       .catch(() => toast.error(t("workforces.templates.loadError")))
       .finally(() => setTemplatesLoading(false))
@@ -147,6 +150,7 @@ function AgentPickerDialog({
   const handleCreateFromTemplate = async () => {
     if (!pendingTemplate || !pendingName.trim()) return
     setCreatingId(pendingTemplate.id)
+    let newAgent: { id: number; name: string; description?: string } | null = null
     try {
       const res = await apiRequest(`${getApiUrl()}/api/agents/from-template`, {
         method: "POST",
@@ -157,17 +161,20 @@ function AgentPickerDialog({
         const err = await res.json().catch(() => ({}))
         throw new Error((err as { detail?: string }).detail || "")
       }
-      const newAgent = await res.json()
-      const publishRes = await apiRequest(`${getApiUrl()}/api/agents/${newAgent.id}/publish`, { method: "POST" })
+      newAgent = await res.json()
+      const publishRes = await apiRequest(`${getApiUrl()}/api/agents/${newAgent!.id}/publish`, { method: "POST" })
       if (!publishRes.ok) {
         const err = await publishRes.json().catch(() => ({}))
         throw new Error((err as { detail?: string }).detail || "")
       }
-      toast.success(t("workforces.templates.createSuccess", { name: newAgent.name }))
+      toast.success(t("workforces.templates.createSuccess", { name: newAgent!.name }))
       setPendingTemplate(null)
       setPendingName("")
-      await onSelectAgent(newAgent.id, newAgent.description || pendingTemplate.name)
+      await onSelectAgent(newAgent!.id, newAgent!.description || pendingTemplate.name)
     } catch (e) {
+      if (newAgent?.id) {
+        await apiRequest(`${getApiUrl()}/api/agents/${newAgent.id}`, { method: "DELETE" }).catch(() => {})
+      }
       toast.error(e instanceof Error && e.message ? e.message : t("workforces.templates.createError"))
     } finally {
       setCreatingId(null)
@@ -424,7 +431,7 @@ export function WorkforceConfigPanel({
   const handleAddMember = async (agentId: number, description?: string) => {
     const agent = agents.find((a) => a.id === agentId)
     const instructions = description || agent?.description || agent?.name || String(agentId)
-    await onAddWorker(agentId, instructions)
+    await onAddWorker(agentId, instructions, undefined)
     setAddMemberOpen(false)
   }
 

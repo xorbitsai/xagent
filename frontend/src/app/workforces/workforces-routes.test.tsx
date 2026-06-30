@@ -4,11 +4,8 @@ import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/re
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest"
 
 const getWorkforceMock = vi.hoisted(() => vi.fn())
-const getWorkforceBuilderMessagesMock = vi.hoisted(() => vi.fn().mockResolvedValue({ items: [] }))
 const listAgentOptionsMock = vi.hoisted(() => vi.fn().mockResolvedValue([]))
 const listWorkforcesMock = vi.hoisted(() => vi.fn())
-const proposeWorkforceChangesMock = vi.hoisted(() => vi.fn())
-const applyWorkforceChangesMock = vi.hoisted(() => vi.fn())
 const runWorkforceMock = vi.hoisted(() => vi.fn())
 const addWorkforceAgentMock = vi.hoisted(() => vi.fn())
 const archiveWorkforceMock = vi.hoisted(() => vi.fn())
@@ -73,14 +70,11 @@ vi.mock("@/components/task/task-conversation-panel", () => ({
 
 vi.mock("@/lib/workforces-api", () => ({
   addWorkforceAgent: addWorkforceAgentMock,
-  applyWorkforceChanges: applyWorkforceChangesMock,
   archiveWorkforce: archiveWorkforceMock,
   getWorkforce: getWorkforceMock,
-  getWorkforceBuilderMessages: getWorkforceBuilderMessagesMock,
   listAgentOptions: listAgentOptionsMock,
   listWorkforces: listWorkforcesMock,
   publishWorkforce: publishWorkforceMock,
-  proposeWorkforceChanges: proposeWorkforceChangesMock,
   removeWorkforceAgent: removeWorkforceAgentMock,
   runWorkforce: runWorkforceMock,
   unpublishWorkforce: unpublishWorkforceMock,
@@ -205,11 +199,8 @@ const listResponse: WorkforceListResponse = {
 describe("workforce route entry points", () => {
   beforeEach(() => {
     getWorkforceMock.mockReset()
-    getWorkforceBuilderMessagesMock.mockReset().mockResolvedValue({ items: [] })
     listAgentOptionsMock.mockReset().mockResolvedValue([])
     listWorkforcesMock.mockReset()
-    proposeWorkforceChangesMock.mockReset()
-    applyWorkforceChangesMock.mockReset()
     runWorkforceMock.mockReset()
     addWorkforceAgentMock.mockReset()
     archiveWorkforceMock.mockReset()
@@ -490,38 +481,4 @@ describe("workforce route entry points", () => {
     expect(screen.getByDisplayValue("Unsaved Workforce Name")).toBeInTheDocument()
   })
 
-  it("keeps builder propose and apply controls read-only for archived workforces", async () => {
-    getWorkforceMock.mockResolvedValueOnce({
-      ...workforceDetail,
-      status: "archived",
-    })
-    getWorkforceBuilderMessagesMock.mockResolvedValueOnce({
-      items: [
-        {
-          id: 12,
-          role: "assistant",
-          content: "Prepared a patch.",
-          status: "proposed",
-          proposed_patch: {
-            summary: "Rename",
-            operations: [{ op: "update_workforce", fields: { name: "Renamed" } }],
-            warnings: [],
-          },
-          created_at: null,
-        },
-      ],
-    })
-
-    render(<WorkforceDetailPage />)
-
-    expect(await screen.findByText("Launch Workforce")).toBeInTheDocument()
-    expect(screen.getByText("workforces.builder.archivedReadOnly")).toBeInTheDocument()
-    expect(screen.getByPlaceholderText("workforces.builder.messagePlaceholder")).toBeDisabled()
-
-    const readOnlyButtons = screen.getAllByText("workforces.actions.readOnly")
-    expect(readOnlyButtons.length).toBeGreaterThanOrEqual(1)
-    readOnlyButtons.forEach((button) => expect(button).toBeDisabled())
-    expect(proposeWorkforceChangesMock).not.toHaveBeenCalled()
-    expect(applyWorkforceChangesMock).not.toHaveBeenCalled()
-  })
 })

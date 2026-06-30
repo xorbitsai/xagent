@@ -29,6 +29,7 @@ from ..models.database import get_db
 from ..models.model import Model as DBModel
 from ..models.user import User, UserDefaultModel, UserModel
 from ..schemas.model import (
+    AbilitySuggestionResponse,
     ModelConnectionTestRequest,
     ModelCreate,
     ModelTestRequest,
@@ -39,6 +40,7 @@ from ..schemas.model import (
     UserDefaultModelResponse,
 )
 from ..services.llm_utils import CoreStorage
+from ..services.model_catalog import lookup as lookup_ability_suggestion
 from ..services.model_store import ModelSharingConflictError, ModelStore
 from ..user_isolated_memory import UserContext
 
@@ -907,6 +909,31 @@ async def list_model_abilities(
     return {
         "abilities": sorted(list(abilities_set)),
     }
+
+
+@model_router.get(
+    "/abilities/suggest",
+    response_model=AbilitySuggestionResponse,
+)
+async def suggest_model_abilities(
+    provider: str = Query(..., description="Model provider id, e.g. 'openai'"),
+    model_name: str = Query(..., description="Model name, e.g. 'gpt-4o'"),
+    user: User = Depends(get_current_user),
+) -> AbilitySuggestionResponse:
+    """Suggest abilities for a (provider, model_name) pair from the curated
+    static catalog. Read-only; returns ``source='none'`` when no rule matches
+    so the frontend can fall back to current defaults without erroring.
+
+    Auth-gated only to keep the catalog out of unauthenticated probes — the
+    answers themselves are not user-specific.
+    """
+
+    suggestion = lookup_ability_suggestion(provider, model_name)
+    return AbilitySuggestionResponse(
+        abilities=suggestion.abilities,
+        matched_pattern=suggestion.matched_pattern,
+        source=suggestion.source,
+    )
 
 
 @model_router.get("/summary")

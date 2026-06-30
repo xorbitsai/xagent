@@ -236,3 +236,68 @@ export async function getProviderModels(
   }
   return Array.isArray(data) ? data : [];
 }
+
+/**
+ * Result of looking up abilities for a (provider, model_name) pair against
+ * the curated ability catalog on the backend.
+ *
+ * `source` semantics:
+ *   - "exact":              matched a provider-specific rule
+ *   - "wildcard_provider":  matched a cross-provider rule (e.g. DeepSeek
+ *                           served via an OpenAI-compatible endpoint)
+ *   - "none":               no rule matched; abilities array will be empty
+ */
+export interface AbilitySuggestion {
+  abilities: string[]
+  matched_pattern: string | null
+  source: "exact" | "wildcard_provider" | "none"
+}
+
+/**
+ * Ask the backend which abilities to pre-select for a given model.
+ * Returns `{ abilities: [], source: "none" }` for unknown models so callers
+ * can simply test `source !== "none"` to decide whether to auto-fill.
+ *
+ * Network failures are swallowed and surfaced as `source: "none"` — the
+ * Add-Model wizard should keep working even if the catalog endpoint is down.
+ */
+export async function getAbilitySuggestion(
+  provider: string,
+  modelName: string,
+): Promise<AbilitySuggestion> {
+  if (!provider || !modelName) {
+    return { abilities: [], matched_pattern: null, source: "none" }
+  }
+  const apiUrl = getApiUrl()
+  const qs = new URLSearchParams({ provider, model_name: modelName }).toString()
+  try {
+    const response = await apiRequest(`${apiUrl}/api/models/abilities/suggest?${qs}`, {
+      method: "GET",
+    })
+    if (!response.ok) {
+      return { abilities: [], matched_pattern: null, source: "none" }
+    }
+    const data = (await response.json()) as Partial<AbilitySuggestion>
+    // Whitelist-validate `source` instead of casting: an unexpected value
+    // from the backend would otherwise leak through the cast into React
+    // state and break downstream union-narrowing.
+    const validSources: AbilitySuggestion["source"][] = [
+      "exact",
+      "wildcard_provider",
+      "none",
+    ]
+    const source: AbilitySuggestion["source"] = validSources.includes(
+      data.source as AbilitySuggestion["source"],
+    )
+      ? (data.source as AbilitySuggestion["source"])
+      : "none"
+    return {
+      abilities: Array.isArray(data.abilities) ? data.abilities : [],
+      matched_pattern: data.matched_pattern ?? null,
+      source,
+    }
+  } catch (error) {
+    console.error("Failed to get ability suggestion:", error)
+    return { abilities: [], matched_pattern: null, source: "none" }
+  }
+}

@@ -1,6 +1,6 @@
 "use client"
 
-import { useState, useMemo } from "react"
+import { useState, useMemo, useRef } from "react"
 import { Button } from "@/components/ui/button"
 import { Input } from "@/components/ui/input"
 import { Label } from "@/components/ui/label"
@@ -13,11 +13,13 @@ import { getApiUrl } from "@/lib/utils"
 import { useAuth } from "@/contexts/auth-context"
 import { apiRequest } from "@/lib/api-wrapper"
 import {
+  AbilitySuggestion,
   DefaultModelType,
+  getAbilitySuggestion,
   getProviderModels,
   ProviderModel,
   removeUserDefaultModel,
-  setUserDefaultModel
+  setUserDefaultModel,
 } from "@/lib/models"
 import {
   ArrowLeft,
@@ -92,6 +94,33 @@ export function ModelManagementDialog({
   const [hasInitializedDefaults, setHasInitializedDefaults] = useState(false)
   const [selectedDefaultConfigTypes, setSelectedDefaultConfigTypes] = useState<string[]>([])
 
+  // Ability auto-fill from curated catalog.
+  // - userTouchedAbilities: once the user clicks any ability button we stop
+  //   overwriting their selection. This survives switching to a different
+  //   model_name within the same Add-Model session, by design.
+  //   Initialised to true when the dialog opens in edit mode so we never
+  //   silently overwrite abilities the user previously chose.
+  // - abilitySuggestion: the latest catalog response, used to render a hint.
+  // - suggestionRequestCounter: monotonic counter used to discard responses
+  //   from stale in-flight requests when the user types quickly (e.g. in
+  //   the edit-mode Input where every keystroke triggers a lookup). Without
+  //   this, an older request resolving after a newer one would overwrite
+  //   the UI with a stale suggestion.
+  const [userTouchedAbilities, setUserTouchedAbilities] = useState(!!initialEditingModel)
+  const [abilitySuggestion, setAbilitySuggestion] = useState<
+    Pick<AbilitySuggestion, "source" | "matched_pattern"> | null
+  >(null)
+  const suggestionRequestCounter = useRef(0)
+  // Mirror userTouchedAbilities in a ref so async callbacks see the latest
+  // value rather than the closure-captured render-time value. Required so
+  // an in-flight applyAbilitySuggestion can't overwrite an ability edit the
+  // user makes while the request is still in flight.
+  const userTouchedAbilitiesRef = useRef<boolean>(!!initialEditingModel)
+  const setUserTouched = (value: boolean) => {
+    userTouchedAbilitiesRef.current = value
+    setUserTouchedAbilities(value)
+  }
+
   const getDefaultAbilitiesForCategory = (category: string): string[] => {
     if (category === 'llm') return ['chat']
     if (category === 'embedding') return ['embedding']
@@ -131,6 +160,69 @@ export function ModelManagementDialog({
         { value: "rerank", label: t('models.defaults.rerank') }
       ] : [])
     ]
+  }
+
+  /**
+   * Reset all "fresh wizard run" ability auto-fill state. Used wherever
+   * the user starts a new model_name selection from scratch (entering the
+   * wizard, switching category, switching provider).
+   *
+   * Bumps suggestionRequestCounter so that any applyAbilitySuggestion()
+   * already in flight from the previous selection has its response
+   * discarded — otherwise a stale fetch could resolve after the reset
+   * and auto-fill the form with the previous model's abilities.
+   */
+  const resetAbilitySuggestionState = () => {
+    suggestionRequestCounter.current++
+    setUserTouched(false)
+    setAbilitySuggestion(null)
+  }
+
+  /**
+   * Look up abilities for the chosen (provider, model_name) against the
+   * backend catalog and, if the user hasn't manually touched the ability
+   * buttons yet, apply the suggestion. Always updates `abilitySuggestion`
+   * so the hint stays in sync, even when we don't auto-fill.
+   *
+   * Only applies for category='llm' — other categories have a fixed,
+   * single-ability shape that doesn't benefit from a catalog lookup.
+   *
+   * Race-condition safety: every call bumps a monotonic counter, and the
+   * response is only applied if the counter is still the latest when we
+   * resolve. This prevents an older keystroke's response from overwriting
+   * a newer one when network round-trips finish out of order.
+   */
+  const applyAbilitySuggestion = async (provider: string, modelName: string, category: string) => {
+    const requestId = ++suggestionRequestCounter.current
+    if (category !== 'llm' || !provider || !modelName) {
+      setAbilitySuggestion(null)
+      return
+    }
+    const result = await getAbilitySuggestion(provider, modelName)
+    // A newer request has been fired since — drop this stale response.
+    if (requestId !== suggestionRequestCounter.current) {
+      return
+    }
+    setAbilitySuggestion({ source: result.source, matched_pattern: result.matched_pattern })
+    // Re-check the ref instead of the closure value: the user may have
+    // edited abilities while this network request was in flight.
+    if (result.source !== 'none' && !userTouchedAbilitiesRef.current) {
+      setFormData(prev => ({ ...prev, abilities: result.abilities }))
+    }
+  }
+
+  /**
+   * Centralised handler for model_name changes. Used by both wizard and
+   * form-mode Inputs/Selects to avoid duplicating the setFormData +
+   * applyAbilitySuggestion pair. We read provider/category from the
+   * functional setState `prev` to avoid stale closure values when the
+   * user changes them in quick succession.
+   */
+  const handleModelNameChange = (newModelName: string) => {
+    setFormData(prev => {
+      void applyAbilitySuggestion(prev.model_provider, newModelName, prev.category)
+      return { ...prev, model_name: newModelName }
+    })
   }
 
   const resetConnectionState = () => {
@@ -260,6 +352,13 @@ export function ModelManagementDialog({
     setDefaultTargetModel(null)
     setEditingModel(model)
     const currentDefaults = getModelDefaultTypes(model.id)
+    // Editing an existing model: the user has already explicitly chosen
+    // these abilities (or accepted the catalog defaults at creation time),
+    // so we must not silently overwrite them when they tweak model_name.
+    // The hint UI still updates so they can see what the catalog would
+    // suggest for the new name.
+    setUserTouched(true)
+    setAbilitySuggestion(null)
     setFormData({
       model_id: model.model_id,
       category: model.category,
@@ -274,6 +373,8 @@ export function ModelManagementDialog({
       share_with_users: model.is_shared
     })
     setViewMode('form')
+    // Show the hint for the model they're editing, without changing abilities.
+    void applyAbilitySuggestion(model.model_provider, model.model_name, model.category)
   }
 
   const handleManageDefaults = (model: Model) => {
@@ -288,6 +389,8 @@ export function ModelManagementDialog({
     const providerConfig = providers.find(p => p.id === managingProviderId)
     resetConnectionState()
     setDefaultTargetModel(null)
+    // Fresh wizard run -> drop any prior auto-fill state.
+    resetAbilitySuggestionState()
     setFormData({
       model_id: "",
       category: activeTab,
@@ -608,6 +711,7 @@ export function ModelManagementDialog({
                           value={formData.category}
                           onValueChange={(value) => {
                             resetConnectionState()
+                            resetAbilitySuggestionState()
                             setFormData(prev => ({
                               ...prev,
                               category: value,
@@ -651,6 +755,9 @@ export function ModelManagementDialog({
                                 className={`flex items-center gap-4 p-4 cursor-pointer hover:bg-muted/50 ${formData.model_provider === provider.id ? 'bg-muted' : ''}`}
                                 onClick={() => {
                                   resetConnectionState()
+                                  // Provider change implies the prior model_name is gone, so any
+                                  // earlier suggestion no longer applies. Allow auto-fill again.
+                                  resetAbilitySuggestionState()
                                   setFormData(prev => ({
                                     ...prev,
                                     model_provider: provider.id,
@@ -774,7 +881,7 @@ export function ModelManagementDialog({
                         <Select
                           value={formData.model_name}
                           onValueChange={(val) => {
-                            setFormData({ ...formData, model_name: val })
+                            handleModelNameChange(val)
                             setTestConnectionStatus('idle')
                             setTestConnectionError(null)
                           }}
@@ -788,7 +895,7 @@ export function ModelManagementDialog({
                               ? prev
                               : [...prev, { id: val, object: "model", created: Date.now(), owned_by: formData.model_provider }]
                             )
-                            setFormData({ ...formData, model_name: val })
+                            handleModelNameChange(val)
                             setTestConnectionStatus('idle')
                             setTestConnectionError(null)
                           }}
@@ -825,6 +932,22 @@ export function ModelManagementDialog({
 
                       <div className="space-y-2">
                         <Label className="text-base font-medium">{t('models.form.abilities')}</Label>
+                        {formData.category === 'llm' && formData.model_name && abilitySuggestion && (
+                          abilitySuggestion.source !== 'none' ? (
+                            <p className="text-xs text-muted-foreground">
+                              {t('models.form.abilitiesAutoFilled', {
+                                pattern: abilitySuggestion.matched_pattern || '',
+                                defaultValue: 'Pre-selected based on a known model ({{pattern}}). Adjust if needed.'
+                              })}
+                            </p>
+                          ) : (
+                            <p className="text-xs text-muted-foreground">
+                              {t('models.form.abilitiesUnknownModel', {
+                                defaultValue: "We don't have ability info for this model — please pick what it supports."
+                              })}
+                            </p>
+                          )
+                        )}
                         <div className="flex gap-2 flex-wrap">
                           {getAbilityOptionsForCategory(formData.category).map(({ value, label }) => {
                             const cap = value
@@ -848,6 +971,8 @@ export function ModelManagementDialog({
                                 onClick={() => {
                                   const abilities = formData.abilities || []
                                   resetConnectionState()
+                                  // From this point on, never overwrite user choices from the catalog.
+                                  setUserTouched(true)
                                   if (isSelected) setFormData({ ...formData, abilities: abilities.filter(a => a !== cap) })
                                   else setFormData({ ...formData, abilities: [...abilities, cap] })
                                 }}
@@ -1171,7 +1296,14 @@ export function ModelManagementDialog({
                   <Select
                     value={formData.model_provider}
                     onValueChange={(value) => {
+                      // Upstream already clears model_name + resets abilities
+                      // to the new provider's defaults here, which by itself
+                      // prevents the stale-suggestion bug rogercloud/qinxuye
+                      // flagged. We still reset the suggestion hint state
+                      // explicitly so the "Auto-filled from <pattern>" badge
+                      // doesn't linger after the provider change.
                       resetConnectionState()
+                      resetAbilitySuggestionState()
                       setFormData(prev => ({
                         ...prev,
                         model_provider: value,
@@ -1250,13 +1382,19 @@ export function ModelManagementDialog({
                   <Input
                     id="model_name"
                     value={formData.model_name}
-                    onChange={(e) => setFormData({ ...formData, model_name: e.target.value })}
+                    onChange={(e) => {
+                      // Refresh the hint; userTouchedAbilities=true keeps
+                      // the actual ability buttons intact (set in handleEdit).
+                      handleModelNameChange(e.target.value)
+                    }}
                     placeholder={t('models.form.enterModelName')}
                   />
                 ) : (
                   <Select
                     value={formData.model_name}
-                    onValueChange={(value) => setFormData({ ...formData, model_name: value })}
+                    onValueChange={(value) => {
+                      handleModelNameChange(value)
+                    }}
                     options={fetchedModels.map(m => ({ value: m.id, label: m.id }))}
                     placeholder={t('models.form.selectModel')}
                     allowCustom={formData.model_provider !== 'deepseek'}
@@ -1266,7 +1404,7 @@ export function ModelManagementDialog({
                       if (!fetchedModels.find(m => m.id === value)) {
                         setFetchedModels([...fetchedModels, { id: value, object: "model", created: Date.now(), owned_by: formData.model_provider }])
                       }
-                      setFormData({ ...formData, model_name: value })
+                      handleModelNameChange(value)
                     }}
                   />
                 )}
@@ -1276,7 +1414,13 @@ export function ModelManagementDialog({
                 <Label className="mb-2 block">{t('models.form.abilities')}</Label>
                 <MultiSelect
                   values={formData.abilities || []}
-                  onValuesChange={(values) => setFormData({ ...formData, abilities: values })}
+                  onValuesChange={(values) => {
+                    // Mark abilities as user-touched so a later model_name
+                    // change in form mode doesn't auto-fill over the user's
+                    // explicit selection. Matches the wizard ability button.
+                    setUserTouched(true)
+                    setFormData({ ...formData, abilities: values })
+                  }}
                   options={
                     formData.category === 'llm' ? abilityOptions :
                       formData.category === 'embedding' ? embeddingAbilityOptions :

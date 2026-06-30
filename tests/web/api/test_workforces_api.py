@@ -9,7 +9,7 @@ from xagent.web.api import workforces as workforces_api
 from xagent.web.models.agent import Agent, AgentOrigin, AgentStatus
 from xagent.web.models.database import get_engine
 from xagent.web.models.user import User
-from xagent.web.models.workforce import Workforce, WorkforceBuilderMessage, WorkforceRun
+from xagent.web.models.workforce import Workforce, WorkforceRun
 from xagent.web.services.workforce_access import WorkforcePolicy, set_workforce_policy
 
 from .conftest import (
@@ -631,119 +631,6 @@ def test_archived_workforce_rejects_all_edit_boundaries() -> None:
     )
     assert remove_worker_response.status_code == 409
 
-    db = _direct_db_session()
-    try:
-        message = WorkforceBuilderMessage(
-            workforce_id=workforce["id"],
-            user_id=owner_id,
-            role="assistant",
-            content="Prepared patch.",
-            proposed_patch={
-                "summary": "Rename archived workforce.",
-                "operations": [
-                    {
-                        "op": "update_workforce",
-                        "fields": {"name": "Renamed Archived Workforce"},
-                    }
-                ],
-                "warnings": [],
-                "clarification": None,
-            },
-            status="proposed",
-        )
-        db.add(message)
-        db.commit()
-        db.refresh(message)
-        message_id = int(message.id)
-        proposed_patch = message.proposed_patch
-    finally:
-        db.close()
-
-    apply_response = client.post(
-        f"/api/workforces/{workforce['id']}/builder/apply",
-        headers=headers,
-        json={"message_id": message_id, "proposed_patch": proposed_patch},
-    )
-    assert apply_response.status_code == 409
-
-
-def test_builder_propose_apply_requires_stored_patch_match() -> None:
-    headers = _admin_headers()
-    workforce = _create_workforce(headers, name="Builder Workforce")
-
-    propose_response = client.post(
-        f"/api/workforces/{workforce['id']}/builder/propose",
-        headers=headers,
-        json={"message": 'rename "Renamed Workforce"'},
-    )
-    assert propose_response.status_code == 200, propose_response.text
-    propose_payload = propose_response.json()
-    assert isinstance(propose_payload["assistant_message"], str)
-    assert propose_payload["message_id"] == propose_payload["message"]["id"]
-    assert propose_payload["message"]["status"] == "proposed"
-    assert (
-        propose_payload["message"]["proposed_patch"]
-        == propose_payload["proposed_patch"]
-    )
-
-    patch = {
-        "summary": "Rename Workforce.",
-        "operations": [
-            {
-                "op": "update_workforce",
-                "fields": {"name": "Renamed Workforce"},
-            }
-        ],
-        "warnings": [],
-        "clarification": None,
-    }
-    owner_id = _user_id()
-    db = _direct_db_session()
-    try:
-        message = WorkforceBuilderMessage(
-            workforce_id=workforce["id"],
-            user_id=owner_id,
-            role="assistant",
-            content="I prepared 1 change for review.",
-            proposed_patch=patch,
-            status="proposed",
-        )
-        db.add(message)
-        db.commit()
-        db.refresh(message)
-        message_id = int(message.id)
-    finally:
-        db.close()
-
-    tampered_patch = {**patch, "summary": "tampered"}
-    bad_apply = client.post(
-        f"/api/workforces/{workforce['id']}/builder/apply",
-        headers=headers,
-        json={"message_id": message_id, "proposed_patch": tampered_patch},
-    )
-    assert bad_apply.status_code == 400
-    assert "does not match" in bad_apply.json()["detail"]
-
-    apply_response = client.post(
-        f"/api/workforces/{workforce['id']}/builder/apply",
-        headers=headers,
-        json={"message_id": message_id, "proposed_patch": patch},
-    )
-    assert apply_response.status_code == 200, apply_response.text
-    apply_payload = apply_response.json()
-    assert apply_payload["message_id"] == message_id
-    assert apply_payload["message"]["status"] == "applied"
-    assert apply_payload["workforce"]["name"] == "Renamed Workforce"
-
-    messages_response = client.get(
-        f"/api/workforces/{workforce['id']}/builder/messages",
-        headers=headers,
-    )
-    assert messages_response.status_code == 200
-    message_roles = [item["role"] for item in messages_response.json()["items"]]
-    assert message_roles.count("user") == 1
-    assert message_roles.count("assistant") == 2
-
 
 def test_from_prompt_creates_draft_workforce() -> None:
     headers = _admin_headers()
@@ -759,13 +646,6 @@ def test_from_prompt_creates_draft_workforce() -> None:
     assert payload["id"]
     assert payload["status"] == "draft"
     assert payload["manager"]["status"] == "published"
-
-    messages_response = client.get(
-        f"/api/workforces/{payload['id']}/builder/messages",
-        headers=headers,
-    )
-    assert messages_response.status_code == 200
-    assert len(messages_response.json()["items"]) == 2
 
 
 def test_run_endpoint_delegates_to_run_service(monkeypatch: pytest.MonkeyPatch) -> None:

@@ -227,6 +227,62 @@ class TestListCandidates:
             assert candidate1["technical_id"] == "parse_hash1"
             assert candidate1["stats"]["chunks_count"] == 2
 
+    def test_chunk_candidates_none_text(self):
+        """Regression for #709/#708: a chunk row whose ``text`` value is None
+        must not crash. The pre-#708 ``len(row.get("text", ""))`` raised
+        ``TypeError: object of type 'NoneType' has no len()`` (get() only
+        substitutes the default when the key is *absent*, not when it is None).
+        Also verifies avg_length treats the None row as length 0.
+        """
+        mock_conn = MagicMock(spec=["table_names", "open_table"])
+        mock_conn.table_names.return_value = ["chunks"]
+
+        mock_table = MagicMock()
+        base = datetime.now()
+        mock_data = pd.DataFrame(
+            [
+                {
+                    "collection": "test_collection",
+                    "doc_id": "test_doc",
+                    "parse_hash": "parse_hash1",
+                    "chunk_id": "chunk1",
+                    "text": "0123456789",  # len 10
+                    "created_at": base + timedelta(milliseconds=2),
+                },
+                {
+                    "collection": "test_collection",
+                    "doc_id": "test_doc",
+                    "parse_hash": "parse_hash1",
+                    "chunk_id": "chunk2",
+                    "text": None,  # len treated as 0 -> avg (10+0)/2 = 5
+                    "created_at": base + timedelta(milliseconds=1),
+                },
+                {
+                    "collection": "test_collection",
+                    "doc_id": "test_doc",
+                    "parse_hash": "parse_hash2",
+                    "chunk_id": "chunk3",
+                    "text": "0123456789",  # len 10 -> avg 10
+                    "created_at": base,
+                },
+            ]
+        )
+        mock_where = mock_table.search.return_value.where.return_value
+        mock_where.to_arrow.side_effect = AttributeError("to_arrow not available")
+        mock_where.to_list.side_effect = AttributeError("to_list not available")
+        mock_where.to_pandas.return_value = mock_data
+        mock_conn.open_table.return_value = mock_table
+
+        with self._patch_get_connection_from_env(mock_conn):
+            result = list_candidates("test_collection", "test_doc", StepType.CHUNK)
+
+        assert len(result["candidates"]) == 2  # grouped by parse_hash
+        by_hash = {c["technical_id"]: c for c in result["candidates"]}
+        assert by_hash["parse_hash1"]["stats"]["chunks_count"] == 2
+        assert by_hash["parse_hash1"]["stats"]["avg_length"] == 5
+        assert by_hash["parse_hash2"]["stats"]["chunks_count"] == 1
+        assert by_hash["parse_hash2"]["stats"]["avg_length"] == 10
+
     def test_embed_candidates_with_data(self):
         """Test list_candidates returns embed candidates when data exists."""
         mock_conn = MagicMock(spec=["table_names", "open_table"])

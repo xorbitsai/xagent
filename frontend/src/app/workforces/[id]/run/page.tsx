@@ -137,7 +137,7 @@ function WorkforceFlowPanel({ workforce, taskStatus, onClose }: WorkforceFlowPan
     workers.forEach((worker, index) => {
       const name = worker.alias || worker.agent.name
       const workerId = `worker-${worker.id}`
-      const workerStatus: FlowNodeData["status"] =
+      const globalTaskStatus: FlowNodeData["status"] =
         taskStatus === "completed" ? "done" :
         taskStatus === "failed" ? "failed" :
         taskStatus === "running" ? "running" :
@@ -152,7 +152,7 @@ function WorkforceFlowPanel({ workforce, taskStatus, onClose }: WorkforceFlowPan
           name,
           avatar: name.charAt(0).toUpperCase(),
           description: worker.agent.description || undefined,
-          status: workerStatus,
+          status: globalTaskStatus,
         },
       })
 

@@ -5,11 +5,6 @@ import { getApiUrl } from "@/lib/utils"
 import type {
   WorkforceAgentOption,
   WorkforceArchiveResponse,
-  WorkforceBuilderApplyPayload,
-  WorkforceBuilderApplyResponse,
-  WorkforceBuilderMessagesResponse,
-  WorkforceBuilderProposePayload,
-  WorkforceBuilderProposeResponse,
   WorkforceCanvasResponse,
   WorkforceCreatePayload,
   WorkforceDetail,
@@ -228,53 +223,6 @@ export async function runWorkforce(
   return response.json()
 }
 
-export async function getWorkforceBuilderMessages(
-  workforceId: number | string,
-): Promise<WorkforceBuilderMessagesResponse> {
-  const response = await apiRequest(
-    `${getApiUrl()}/api/workforces/${workforceId}/builder/messages`,
-  )
-  if (!response.ok) {
-    throw await parseApiError(response, "Failed to load builder messages")
-  }
-  return response.json()
-}
-
-export async function proposeWorkforceChanges(
-  workforceId: number | string,
-  payload: WorkforceBuilderProposePayload,
-): Promise<WorkforceBuilderProposeResponse> {
-  const response = await apiRequest(
-    `${getApiUrl()}/api/workforces/${workforceId}/builder/propose`,
-    {
-      method: "POST",
-      headers: jsonHeaders(),
-      body: JSON.stringify(payload),
-    },
-  )
-  if (!response.ok) {
-    throw await parseApiError(response, "Failed to propose workforce changes")
-  }
-  return response.json()
-}
-
-export async function applyWorkforceChanges(
-  workforceId: number | string,
-  payload: WorkforceBuilderApplyPayload,
-): Promise<WorkforceBuilderApplyResponse> {
-  const response = await apiRequest(
-    `${getApiUrl()}/api/workforces/${workforceId}/builder/apply`,
-    {
-      method: "POST",
-      headers: jsonHeaders(),
-      body: JSON.stringify(payload),
-    },
-  )
-  if (!response.ok) {
-    throw await parseApiError(response, "Failed to apply workforce changes")
-  }
-  return response.json()
-}
 
 export async function getWorkforceCanvas(
   workforceId: number | string,

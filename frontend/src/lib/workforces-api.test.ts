@@ -15,7 +15,6 @@ import {
   createWorkforce,
   listAgentOptions,
   listWorkforces,
-  proposeWorkforceChanges,
   runWorkforce,
 } from "./workforces-api"
 
@@ -124,36 +123,6 @@ describe("workforces-api", () => {
       }),
     )
     expect(result.redirect_url).toBe("/task/10")
-  })
-
-  it("keeps the builder hybrid response intact", async () => {
-    const response = {
-      message_id: 12,
-      user_message: {
-        id: 11,
-        role: "user",
-        content: "Add Research",
-        status: "stored",
-        proposed_patch: null,
-        created_at: null,
-      },
-      assistant_message: "I prepared a patch.",
-      message: {
-        id: 12,
-        role: "assistant",
-        content: "I prepared a patch.",
-        status: "proposed",
-        proposed_patch: { summary: "Add worker", operations: [], warnings: [] },
-        created_at: null,
-      },
-      proposed_patch: { summary: "Add worker", operations: [], warnings: [] },
-      requires_confirmation: true,
-    }
-    apiRequestMock.mockResolvedValueOnce(jsonResponse(response))
-
-    await expect(
-      proposeWorkforceChanges(5, { message: "Add Research" }),
-    ).resolves.toEqual(response)
   })
 
   it("surfaces backend detail strings for archived edit boundaries", async () => {

@@ -179,35 +179,6 @@ export interface WorkforceBuilderMessage {
   created_at: string | null
 }
 
-export interface WorkforceBuilderMessagesResponse {
-  items: WorkforceBuilderMessage[]
-}
-
-export interface WorkforceBuilderProposePayload {
-  message: string
-}
-
-export interface WorkforceBuilderProposeResponse {
-  message_id: number
-  user_message: WorkforceBuilderMessage
-  assistant_message: string
-  message: WorkforceBuilderMessage
-  proposed_patch: WorkforceBuilderPatch
-  requires_confirmation: boolean
-}
-
-export interface WorkforceBuilderApplyPayload {
-  message_id: number
-  proposed_patch: WorkforceBuilderPatch
-}
-
-export interface WorkforceBuilderApplyResponse {
-  status: "applied"
-  message_id: number
-  message: WorkforceBuilderMessage
-  workforce: WorkforceDetail
-}
-
 export interface WorkforceCanvasNode {
   id: string
   type: "human" | "manager" | "worker" | string

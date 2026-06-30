@@ -1,6 +1,5 @@
 export { ManagerStep } from "./manager-step"
 export { ReviewStep } from "./review-step"
-export { WorkforceBuilderChat } from "./workforce-builder-chat"
 export { WorkforceCanvas } from "./workforce-canvas"
 export { WorkforceConfigPanel, buildWorkerEditState, normalizeWorkerSortOrder, workerEditState } from "./workforce-config-panel"
 export type { WorkerEditState } from "./workforce-config-panel"

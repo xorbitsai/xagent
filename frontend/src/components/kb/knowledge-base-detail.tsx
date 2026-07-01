@@ -33,9 +33,20 @@ import {
   normalizeKnowledgeBaseIngestionResult,
 } from "@/lib/kb-ingest-feedback"
 import { parseSeparatorsInput, formatSeparatorsOutput } from "@/lib/separators"
+import {
+  KB_UPLOAD_ENQUEUE_CONCURRENCY_LIMIT,
+  KB_UPLOAD_SYNC_CONCURRENCY_LIMIT,
+  runWithConcurrencyLimit,
+} from "@/lib/concurrency"
 import { useI18n } from "@/contexts/i18n-context"
 import { toast } from "@/components/ui/sonner"
-import { CollectionDocumentInfo } from "./knowledge-base-detail-helpers"
+import {
+  CollectionDocumentInfo,
+  fetchCollectionDocumentStatuses,
+  isTerminalDocumentStatus,
+  KnowledgeBaseDocumentStatus,
+  mergeDocumentStatuses,
+} from "./knowledge-base-detail-helpers"
 import { KnowledgeBaseDocumentList } from "./knowledge-base-document-list"
 
 interface CollectionInfo {
@@ -166,6 +177,14 @@ export function KnowledgeBaseDetailContent({ collectionName }: { collectionName:
   const [reuploadDialogOpen, setReuploadDialogOpen] = useState(false)
   const [existingFilenamesForReupload, setExistingFilenamesForReupload] = useState<string[]>([])
 
+  // Per-document ingestion status rows + optimistic rows for in-flight uploads.
+  const [documentStatuses, setDocumentStatuses] = useState<KnowledgeBaseDocumentStatus[]>([])
+  const [optimisticUploads, setOptimisticUploads] = useState<string[]>([])
+  // Collections whose status polling has been permanently stopped due to an
+  // auth/not-found response. Durable across effect re-subscribes (a plain
+  // effect-local flag resets whenever a dependency changes).
+  const pollingDisabledCollectionsRef = useRef<Set<string>>(new Set())
+
   const handleDragOver = (e: React.DragEvent) => {
     e.preventDefault()
     e.stopPropagation()
@@ -265,7 +284,52 @@ export function KnowledgeBaseDetailContent({ collectionName }: { collectionName:
     fetchCollectionInfo()
     fetchEmbeddingModels()
     fetchRerankModels()
+    refreshDocumentStatuses()
   }, [collectionName])
+
+  // Bounded polling while any document row is non-terminal or an upload is in
+  // flight. Stops on all-terminal, on auth/not-found, and on unmount / switch.
+  const hasNonTerminalStatus = documentStatuses.some(
+    (row) => !isTerminalDocumentStatus(row.status)
+  )
+  useEffect(() => {
+    const shouldPoll =
+      isUploading || optimisticUploads.length > 0 || hasNonTerminalStatus
+    if (!shouldPoll) return
+    // Already permanently stopped for this collection (auth/not-found).
+    if (pollingDisabledCollectionsRef.current.has(collectionName)) return
+
+    let cancelled = false
+    let stopped = false
+
+    const poll = async () => {
+      if (stopped) return
+      try {
+        const rows = await fetchCollectionDocumentStatuses(
+          getApiUrl(),
+          collectionName,
+          (url) => apiRequest(url)
+        )
+        if (cancelled) return
+        if (rows === null) {
+          // Auth / not-found: stop polling for this collection durably so a
+          // later dependency change cannot resurrect the polling loop.
+          pollingDisabledCollectionsRef.current.add(collectionName)
+          stopped = true
+          return
+        }
+        setDocumentStatuses(rows)
+      } catch {
+        // Transient failure: retain last rows and retry on the next tick.
+      }
+    }
+
+    const interval = window.setInterval(poll, 2000)
+    return () => {
+      cancelled = true
+      window.clearInterval(interval)
+    }
+  }, [collectionName, isUploading, optimisticUploads.length, hasNonTerminalStatus])
 
   useEffect(() => {
     if (!isUploading || !currentUploadFileName) return
@@ -393,6 +457,26 @@ export function KnowledgeBaseDetailContent({ collectionName }: { collectionName:
     }
   }
 
+  // Load per-document ingestion status separately from the collection summary so
+  // status refreshes never overwrite ingestion config / rerank / collection state.
+  const refreshDocumentStatuses = async () => {
+    try {
+      const rows = await fetchCollectionDocumentStatuses(
+        getApiUrl(),
+        collectionName,
+        (url) => apiRequest(url)
+      )
+      if (rows !== null) {
+        setDocumentStatuses(rows)
+      } else {
+        // Auth / not-found: don't let the polling effect start for this collection.
+        pollingDisabledCollectionsRef.current.add(collectionName)
+      }
+    } catch {
+      // Retain last rows on transient failure; polling will retry.
+    }
+  }
+
   const handleFileSelect = (event: React.ChangeEvent<HTMLInputElement>) => {
     const files = Array.from(event.target.files || [])
     setSelectedFiles(prev => [...prev, ...files])
@@ -406,21 +490,39 @@ export function KnowledgeBaseDetailContent({ collectionName }: { collectionName:
   const doUpload = async () => {
     if (selectedFiles.length === 0) return
 
+    const filesToUpload = selectedFiles
+    const totalFiles = filesToUpload.length
+
     setIsUploading(true)
     setUploadProgress(0)
     setUploadProgressDetail(null)
     setIngestionResults([])
     setCompletedUploadCount(0)
+    // Optimistic rows so uploaded files appear immediately with a status.
+    setOptimisticUploads(filesToUpload.map((file) => file.name))
 
     try {
       const apiUrl = getApiUrl()
       const useBackgroundJobs = await shouldUseBackgroundJobs(apiUrl)
-      for (let i = 0; i < selectedFiles.length; i++) {
-        const file = selectedFiles[i]
-        const formData = new FormData()
-        setCurrentUploadFileName(file.name)
-        setUploadProgressDetail(null)
+      const concurrencyLimit = useBackgroundJobs
+        ? KB_UPLOAD_ENQUEUE_CONCURRENCY_LIMIT
+        : KB_UPLOAD_SYNC_CONCURRENCY_LIMIT
 
+      let completed = 0
+      const markCompleted = () => {
+        completed += 1
+        setCompletedUploadCount(completed)
+        setUploadProgress((completed / Math.max(totalFiles, 1)) * 100)
+      }
+
+      const uploadSingleFile = async (file: File): Promise<void> => {
+        // Only the serial (sync) path keeps the single-file /api/progress poll
+        // meaningful; advance the tracked filename per file so the progress
+        // label follows the file currently being ingested.
+        if (concurrencyLimit === 1) {
+          setCurrentUploadFileName(file.name)
+        }
+        const formData = new FormData()
         formData.append("file", file)
         formData.append("collection", collectionName)
         appendIngestionConfigToFormData(
@@ -428,96 +530,126 @@ export function KnowledgeBaseDetailContent({ collectionName }: { collectionName:
           normalizeIngestionConfigForFilename(ingestionConfig, file.name)
         )
 
-        const response = await apiRequest(
-          `${apiUrl}/api/kb/ingest${useBackgroundJobs ? "/jobs" : ""}`,
-          {
-            method: "POST",
-            body: formData
-          }
-        )
+        try {
+          const response = await apiRequest(
+            `${apiUrl}/api/kb/ingest${useBackgroundJobs ? "/jobs" : ""}`,
+            {
+              method: "POST",
+              body: formData
+            }
+          )
 
-        const parsed = await parseApiResponse(response)
+          const parsed = await parseApiResponse(response)
 
-        if (!response.ok) {
-          const errorData = isJsonRecord(parsed.data) ? parsed.data : {}
-          if (errorData.status === 'error') {
+          if (!response.ok) {
+            const errorData = isJsonRecord(parsed.data) ? parsed.data : {}
+            if (errorData.status === 'error') {
+              setIngestionResults(prev => [
+                ...prev,
+                normalizeKnowledgeBaseIngestionResult(
+                  errorData as unknown as KnowledgeBaseIngestionResultLike,
+                  { collection: collectionName, fileName: file.name }
+                ),
+              ])
+              throw new Error((typeof errorData.message === 'string' && errorData.message) || t("kb.errors.uploadFailedFile", { name: file.name }))
+            }
+            const errorMessage = getUploadErrorMessage(response, parsed, {
+              generic: t("kb.detail.errors.uploadFailedWithName", { name: file.name }) || `Failed to upload file: ${file.name}`,
+              ...UPLOAD_ERROR_MESSAGES,
+            })
             setIngestionResults(prev => [
               ...prev,
               normalizeKnowledgeBaseIngestionResult(
-                errorData as unknown as KnowledgeBaseIngestionResultLike,
+                buildKnowledgeBaseErrorResult(collectionName, errorMessage, undefined, file.name),
                 { collection: collectionName, fileName: file.name }
               ),
             ])
-            throw new Error((typeof errorData.message === 'string' && errorData.message) || t("kb.errors.uploadFailedFile", { name: file.name }))
+            throw new Error(errorMessage)
           }
-          const errorMessage = getUploadErrorMessage(response, parsed, {
-            generic: t("kb.detail.errors.uploadFailedWithName", { name: file.name }) || `Failed to upload file: ${file.name}`,
-            ...UPLOAD_ERROR_MESSAGES,
-          })
-          setIngestionResults(prev => [
-            ...prev,
-            normalizeKnowledgeBaseIngestionResult(
-              buildKnowledgeBaseErrorResult(collectionName, errorMessage, undefined, file.name),
-              { collection: collectionName, fileName: file.name }
-            ),
-          ])
-          throw new Error(errorMessage)
-        }
 
-        const job = useBackgroundJobs && isBackgroundJobResponse(parsed.data)
-          ? await waitForBackgroundJob(apiUrl, parsed.data, (updatedJob) => {
-              const detail = getBackgroundJobProgressMessage(updatedJob)
-              const taskPercent = getBackgroundJobProgressPercent(updatedJob)
-              if (detail) setUploadProgressDetail(detail)
-              if (typeof taskPercent === "number") {
-                const overall = ((i + taskPercent / 100) / Math.max(selectedFiles.length, 1)) * 100
-                setUploadProgress(Math.max(0, Math.min(100, overall)))
-              }
-            })
-          : null
-        const result = job
-          ? getBackgroundJobResult(job)
-          : isJsonRecord(parsed.data)
-            ? parsed.data as unknown as KnowledgeBaseIngestionResultLike
+          const job = useBackgroundJobs && isBackgroundJobResponse(parsed.data)
+            ? await waitForBackgroundJob(apiUrl, parsed.data, (updatedJob) => {
+                // With bounded parallelism the overall bar is driven by the
+                // completion counter; per-job percent only feeds the label.
+                const detail = getBackgroundJobProgressMessage(updatedJob)
+                if (detail) setUploadProgressDetail(detail)
+              })
             : null
-        if (job?.status === "failed" || job?.status === "cancelled") {
-          const errorMessage = getBackgroundJobFailureMessage(
-            job,
-            t("kb.detail.errors.uploadFailedWithName", { name: file.name })
-          )
+          const result = job
+            ? getBackgroundJobResult(job)
+            : isJsonRecord(parsed.data)
+              ? parsed.data as unknown as KnowledgeBaseIngestionResultLike
+              : null
+          if (job?.status === "failed" || job?.status === "cancelled") {
+            const errorMessage = getBackgroundJobFailureMessage(
+              job,
+              t("kb.detail.errors.uploadFailedWithName", { name: file.name })
+            )
+            setIngestionResults(prev => [
+              ...prev,
+              normalizeKnowledgeBaseIngestionResult(
+                isJsonRecord(result)
+                  ? result as unknown as KnowledgeBaseIngestionResultLike
+                  : buildKnowledgeBaseErrorResult(collectionName, errorMessage, undefined, file.name),
+                { collection: collectionName, fileName: file.name }
+              ),
+            ])
+            throw new Error(errorMessage)
+          }
+          const ingestionResult = isJsonRecord(result)
+            ? result as unknown as KnowledgeBaseIngestionResultLike
+            : null
+          if (!ingestionResult) {
+            throw new Error(t("kb.detail.errors.uploadFailedWithName", { name: file.name }))
+          }
           setIngestionResults(prev => [
             ...prev,
             normalizeKnowledgeBaseIngestionResult(
-              isJsonRecord(result)
-                ? result as unknown as KnowledgeBaseIngestionResultLike
-                : buildKnowledgeBaseErrorResult(collectionName, errorMessage, undefined, file.name),
+              ingestionResult,
               { collection: collectionName, fileName: file.name }
             ),
           ])
-          throw new Error(errorMessage)
+        } finally {
+          markCompleted()
         }
-        const ingestionResult = isJsonRecord(result)
-          ? result as unknown as KnowledgeBaseIngestionResultLike
-          : null
-        if (!ingestionResult) {
-          throw new Error(t("kb.detail.errors.uploadFailedWithName", { name: file.name }))
-        }
-        setIngestionResults(prev => [
-          ...prev,
-          normalizeKnowledgeBaseIngestionResult(
-            ingestionResult,
-            { collection: collectionName, fileName: file.name }
-          ),
-        ])
-        setCompletedUploadCount(i + 1)
-        setUploadProgress(((i + 1) / selectedFiles.length) * 100)
       }
 
+      const settled = await runWithConcurrencyLimit(
+        filesToUpload,
+        concurrencyLimit,
+        (file) => uploadSingleFile(file)
+      )
+
+      const failedFiles = filesToUpload.filter(
+        (_, index) => settled[index]?.status === "rejected"
+      )
+
       await fetchCollectionInfo()
-      setSelectedFiles([])
+      await refreshDocumentStatuses()
       setUploadProgress(0)
-      setIsAddSourceOpen(false)
-      closeReuploadDialog()
+      setOptimisticUploads([])
+
+      if (failedFiles.length > 0) {
+        // Keep failed files selected so the user can retry; leave the dialog open.
+        setSelectedFiles(failedFiles)
+        const firstFailure = settled.find(
+          (outcome): outcome is PromiseRejectedResult => outcome.status === "rejected"
+        )
+        const rawMessage = firstFailure?.reason instanceof Error
+          ? firstFailure.reason.message
+          : t("kb.detail.errors.uploadFailedGeneric")
+        const toastContent = getKnowledgeBaseErrorToastContent(
+          rawMessage,
+          getKnowledgeBaseToastCopy(t, t("kb.detail.errors.uploadFailedGeneric"))
+        )
+        toast.error(toastContent.title, {
+          description: toastContent.description,
+        })
+      } else {
+        setSelectedFiles([])
+        setIsAddSourceOpen(false)
+        closeReuploadDialog()
+      }
     } catch (err) {
       const rawMessage = err instanceof Error
         ? err.message
@@ -529,6 +661,7 @@ export function KnowledgeBaseDetailContent({ collectionName }: { collectionName:
       toast.error(toastContent.title, {
         description: toastContent.description,
       })
+      setOptimisticUploads([])
     } finally {
       setIsUploading(false)
       setCurrentUploadFileName(null)
@@ -944,7 +1077,11 @@ export function KnowledgeBaseDetailContent({ collectionName }: { collectionName:
               <KnowledgeBaseDocumentList
                 collectionInfo={collectionInfo}
                 collectionName={collectionName}
-                onRefresh={fetchCollectionInfo}
+                documentStatuses={mergeDocumentStatuses(documentStatuses, optimisticUploads)}
+                onRefresh={async () => {
+                  await fetchCollectionInfo()
+                  await refreshDocumentStatuses()
+                }}
                 t={t}
               />
             </div>

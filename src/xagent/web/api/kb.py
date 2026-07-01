@@ -26,6 +26,7 @@ from typing import (
     Optional,
     TypedDict,
     TypeVar,
+    Union,
     cast,
 )
 
@@ -54,6 +55,7 @@ from ...core.tools.core.RAG_tools.core.schemas import (
     ChunkStrategy,
     CollectionDocumentMetadata,
     CollectionOperationResult,
+    DocumentProcessingStatus,
     FusionConfig,
     IngestionConfig,
     IngestionResult,
@@ -71,7 +73,10 @@ from ...core.tools.core.RAG_tools.kb import (
     KBApiOperationResult,
     get_kb_coordinator,
 )
-from ...core.tools.core.RAG_tools.management.status import clear_ingestion_status
+from ...core.tools.core.RAG_tools.management.status import (
+    clear_ingestion_status,
+    load_ingestion_status,
+)
 from ...core.tools.core.RAG_tools.pipelines.web_ingestion import FileHandlerResult
 from ...core.tools.core.RAG_tools.progress import get_progress_manager
 from ...core.tools.core.RAG_tools.storage.contracts import DocumentRecord
@@ -6497,6 +6502,195 @@ async def batch_delete_collections_api(
     return BatchDeleteCollectionsResponse(deleted=deleted, failed=failed)
 
 
+# Ingestion statuses that mean the document is still being processed and cannot
+# be safely deleted mid-pipeline. Terminal states plus the not-yet-started
+# ``pending`` state remain deletable.
+_NON_DELETABLE_DOCUMENT_STATUSES = frozenset(
+    {
+        DocumentProcessingStatus.RUNNING.value,
+        DocumentProcessingStatus.CHUNKED.value,
+        DocumentProcessingStatus.PARTIALLY_EMBEDDED.value,
+    }
+)
+
+
+class KnowledgeBaseDocumentStatus(BaseModel):
+    """Per-document ingestion status row for the KB detail view."""
+
+    filename: str = Field(..., description="Display filename for the document")
+    file_id: Optional[str] = Field(
+        default=None, description="UploadedFile identifier when available"
+    )
+    doc_id: Optional[str] = Field(
+        default=None, description="Knowledge base document identifier when available"
+    )
+    status: str = Field(
+        ...,
+        description=(
+            "Ingestion status: pending, running, chunked, partially_embedded, "
+            "success, failed, or cancelled"
+        ),
+    )
+    message: Optional[str] = Field(
+        default=None, description="Latest status message or error detail"
+    )
+    updated_at: Optional[str] = Field(
+        default=None, description="ISO timestamp of the latest status update"
+    )
+    can_delete: bool = Field(
+        default=True,
+        description="Whether the document can be deleted in its current state",
+    )
+
+
+class ListDocumentStatusResult(BaseModel):
+    """Response envelope for per-document ingestion status."""
+
+    collection: str = Field(..., description="Collection name")
+    documents: List[KnowledgeBaseDocumentStatus] = Field(
+        default_factory=list, description="Per-document ingestion status rows"
+    )
+
+
+def _extract_document_record_doc_id(
+    record: Union[Dict[str, Any], DocumentRecord],
+) -> Optional[str]:
+    """Extract a normalized ``doc_id`` from a KB document record."""
+    raw = record.get("doc_id") if isinstance(record, dict) else getattr(
+        record, "doc_id", None
+    )
+    if not isinstance(raw, str):
+        return None
+    normalized = raw.strip()
+    return normalized or None
+
+
+def _normalize_ingestion_status_value(value: Any) -> str:
+    """Map a stored ingestion status onto the public lifecycle enum."""
+    normalized = str(value or "").strip().lower()
+    valid = {status.value for status in DocumentProcessingStatus}
+    if normalized in valid:
+        return normalized
+    # Legacy/free-form values seen in older records.
+    if normalized in {"processing", "in_progress", "started"}:
+        return DocumentProcessingStatus.RUNNING.value
+    if normalized in {"", "completed", "done", "indexed"}:
+        return DocumentProcessingStatus.SUCCESS.value
+    # Truly unknown value: default to a terminal state. Defaulting to a
+    # non-terminal status (e.g. running) would make the frontend poll forever
+    # and, via ``can_delete``, permanently lock the row from deletion.
+    return DocumentProcessingStatus.SUCCESS.value
+
+
+@kb_router.get(
+    "/collections/{collection_name}/documents",
+    response_model=ListDocumentStatusResult,
+)
+@handle_kb_exceptions
+async def list_document_status_api(
+    collection_name: str,
+    _user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> ListDocumentStatusResult:
+    """Return per-document ingestion status for a collection.
+
+    Joins the collection's document records (filename/file_id/doc_id) with the
+    latest ingestion status records keyed by ``doc_id``. Documents that are
+    indexed but have no explicit status record (legacy data) are reported as
+    ``success``. Used by the KB detail page to show live processing status and
+    to poll while documents are still being ingested.
+    """
+    try:
+        safe_collection = sanitize_path_component(collection_name, "collection")
+    except ValueError as e:
+        raise HTTPException(
+            status_code=422, detail=f"Invalid collection name: {str(e)}"
+        ) from e
+
+    await _ensure_collection_access(safe_collection, _user, hide_missing=False)
+
+    records = list_document_records(
+        collection_name=safe_collection,
+        user_id=int(_user.id),
+        is_admin=False,
+        max_results=DEFAULT_VECTOR_STORE_SCAN_LIMIT,
+    )
+
+    filename_map = _build_uploaded_filename_map(
+        db,
+        user_id=int(_user.id),
+        file_ids=[
+            file_id
+            for file_id in (
+                _get_document_record_file_id(record) for record in records
+            )
+            if file_id
+        ],
+    )
+
+    # doc_id -> latest status record for this collection.
+    status_by_doc: Dict[str, Dict[str, Any]] = {}
+    try:
+        for entry in load_ingestion_status(
+            collection=safe_collection,
+            user_id=int(_user.id),
+            is_admin=False,
+        ):
+            entry_doc_id = str(entry.get("doc_id") or "").strip()
+            if entry_doc_id:
+                status_by_doc[entry_doc_id] = entry
+    except Exception as exc:  # pragma: no cover - degrade gracefully on read failure
+        logger.warning(
+            "Failed to load ingestion status (collection=%s): %s",
+            safe_collection,
+            exc,
+        )
+
+    documents: List[KnowledgeBaseDocumentStatus] = []
+    seen_keys: set[tuple[str, str, str]] = set()
+    for record in records:
+        resolved_filename = _resolve_document_filename(record, filename_map)
+        if not resolved_filename:
+            continue
+        file_id = _get_document_record_file_id(record)
+        doc_id = _extract_document_record_doc_id(record)
+
+        dedupe_key = (resolved_filename, file_id or "", doc_id or "")
+        if dedupe_key in seen_keys:
+            continue
+        seen_keys.add(dedupe_key)
+
+        status_entry = status_by_doc.get(doc_id or "")
+        if status_entry is not None:
+            status_value = _normalize_ingestion_status_value(status_entry.get("status"))
+            message = status_entry.get("message")
+            updated_raw = status_entry.get("updated_at") or status_entry.get(
+                "created_at"
+            )
+            updated_at = str(updated_raw) if updated_raw else None
+        else:
+            # Present in the documents table but no explicit status record:
+            # treat legacy/indexed rows as success.
+            status_value = DocumentProcessingStatus.SUCCESS.value
+            message = None
+            updated_at = None
+
+        documents.append(
+            KnowledgeBaseDocumentStatus(
+                filename=resolved_filename,
+                file_id=file_id,
+                doc_id=doc_id,
+                status=status_value,
+                message=str(message) if message else None,
+                updated_at=updated_at,
+                can_delete=status_value not in _NON_DELETABLE_DOCUMENT_STATUSES,
+            )
+        )
+
+    documents.sort(key=lambda doc: doc.filename.lower())
+    return ListDocumentStatusResult(collection=safe_collection, documents=documents)
+
+
 @kb_router.post(
     "/collections/{collection_name}/documents/check",
 )
@@ -6597,6 +6791,14 @@ async def delete_document_api(
     doc_id: Optional[str] = Query(
         None, description="Preferred doc_id for document lookup"
     ),
+    force: bool = Query(
+        False,
+        description=(
+            "Bypass the in-progress ingestion guard and delete even when the "
+            "document is still being processed (running/chunked/partially "
+            "embedded). Use to remove a document stranded by a crashed worker."
+        ),
+    ),
     _user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ) -> dict:
@@ -6612,6 +6814,9 @@ async def delete_document_api(
     Note:
         This endpoint prefers `file_id` or `doc_id` when provided. The path
         `filename` is retained as a compatibility fallback for older clients.
+        Documents in a non-terminal ingestion state (running/chunked/partially
+        embedded) are rejected with 409 unless ``force=true`` is supplied; this
+        mirrors the ``can_delete`` flag surfaced by the document status list.
     """
     # Parameter validation
     try:
@@ -7114,6 +7319,50 @@ async def delete_document_api(
             status_code=404,
             detail=f"Document not found: {filename}",
         )
+
+    # Guard: refuse to delete a document mid-ingestion so a running pipeline does
+    # not race the deletion. Mirrors the ``can_delete`` flag from the document
+    # status list. ``force=true`` bypasses it (e.g. a row stranded by a crashed
+    # worker). A status-read failure must not block deletion.
+    if not force:
+        blocked_doc_ids: list[str] = []
+        try:
+            status_by_doc: Dict[str, str] = {}
+            for entry in load_ingestion_status(
+                collection=safe_collection_name,
+                user_id=int(_user.id),
+                is_admin=bool(_user.is_admin),
+            ):
+                entry_doc_id = str(entry.get("doc_id") or "").strip()
+                if entry_doc_id:
+                    status_by_doc[entry_doc_id] = _normalize_ingestion_status_value(
+                        entry.get("status")
+                    )
+        except Exception as exc:  # pragma: no cover - degrade open on read failure
+            logger.warning(
+                "Failed to load ingestion status for delete guard "
+                "(collection=%s): %s",
+                safe_collection_name,
+                exc,
+            )
+            status_by_doc = {}
+
+        for doc_info in matching_docs:
+            resolved_doc_id = str(doc_info.get("doc_id") or "").strip()
+            if not resolved_doc_id:
+                continue
+            if status_by_doc.get(resolved_doc_id) in _NON_DELETABLE_DOCUMENT_STATUSES:
+                blocked_doc_ids.append(resolved_doc_id)
+
+        if blocked_doc_ids:
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    "Document is still being processed and cannot be deleted; "
+                    "retry after ingestion finishes or pass force=true. "
+                    f"(doc_id: {', '.join(blocked_doc_ids)})"
+                ),
+            )
 
     deleted_doc_ids = []
     deletion_errors = []

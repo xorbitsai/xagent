@@ -587,7 +587,14 @@ export function AgentBuilder({ agentId }: AgentBuilderProps) {
             .filter((c: string) => c.startsWith('mcp:'))
             .map((c: string) => c.replace('mcp:', ''))
 
-          let connectedMcpApps: string[] = [...explicitlyConfiguredMcps]
+          // When connections are present, _enrich_template has already merged them into
+          // tool_categories as mcp: entries. Starting from explicitlyConfiguredMcps and
+          // also iterating connections would add each server twice (once as the raw
+          // connection name, once as the resolved server name). Use connections as the
+          // sole source when available; fall back to explicitlyConfiguredMcps otherwise.
+          let connectedMcpApps: string[] = template.connections?.length
+            ? []
+            : [...explicitlyConfiguredMcps]
 
           // Use the template's 'connections' to figure out which MCP apps to select
           if (template.connections && Array.isArray(template.connections)) {
@@ -598,7 +605,7 @@ export function AgentBuilder({ agentId }: AgentBuilderProps) {
               // Find the actual server object to use its exact name, to avoid case mismatches
               const server = findMatchingMcpServer(mcpServers, connName)
               const finalName = server ? server.name : connName;
-              if (!connectedMcpApps.includes(finalName)) {
+              if (!connectedMcpApps.some(existing => mcpNameMatches(existing, finalName) || mcpNameMatches(existing, connName))) {
                 connectedMcpApps.push(finalName)
               }
             });

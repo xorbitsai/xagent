@@ -1,7 +1,7 @@
 id: marketing-linkedIn-content-manager
 name: LinkedIn Content Manager
 category: Marketing
-featured: true
+featured: false
 descriptions:
   en: Transforms a single brief into platform-native content and visuals for all major channels. Schedules content and queues it for your approval before publishing.
   zh: 将单一简报转化为所有主要渠道的平台原生内容和视觉效果。安排内容并将其加入队列，等待您的批准后再发布。

@@ -1,7 +1,7 @@
 id: sales-inbound-agent
 name: Inbound Agent
 category: Sales
-featured: true
+featured: false
 descriptions:
   en: Processes inbound leads, researches prospect, scores and qualifies leads. Initiates calendar bookings for qualified prospects.
   zh: 处理入站线索，研究潜在客户，对线索进行评分和资格审查。为合格的潜在客户发起日历预订。

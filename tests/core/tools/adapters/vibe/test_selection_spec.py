@@ -1249,7 +1249,7 @@ def test_name_allowlist_alone_does_not_trigger_published_dispatch():
     assert spec.includes_published_agent() is False
 
 
-# ----- P2 fix: includes_custom_api with category restriction -------------
+# ----- Custom API creator dispatch ---------------------------------------
 
 
 def test_by_categories_excludes_custom_api_when_other_missing():
@@ -1264,12 +1264,22 @@ def test_by_categories_excludes_custom_api_when_other_missing():
     assert spec.includes_custom_api() is False
 
 
-def test_by_categories_includes_custom_api_when_other_present():
-    """Mirror of the P2 fix: ``"other"`` IN categories means custom
-    API tools survive the filter; creator must run."""
+def test_by_categories_excludes_custom_api_when_other_present():
+    """Plain ``"other"`` must not bulk-enable every configured Custom API."""
     from xagent.core.tools.adapters.vibe.selection_spec import _SpecByCategories
 
     spec = _SpecByCategories(categories=frozenset({"other"}))
+    assert spec.includes_custom_api() is False
+
+
+def test_by_categories_includes_custom_api_when_mcp_server_scoped():
+    """A specific connector scope may load its matching Custom API wrapper."""
+    from xagent.core.tools.adapters.vibe.selection_spec import _SpecByCategories
+
+    spec = _SpecByCategories(
+        categories=frozenset(),
+        mcp_servers=frozenset({"onedrive"}),
+    )
     assert spec.includes_custom_api() is True
 
 
@@ -1660,9 +1670,8 @@ def test_compute_allowed_names_plain_mcp_admits_all_mcp_tools():
     assert result == frozenset({"mcp_gmail_send", "mcp_slack_post"})
 
 
-def test_compute_allowed_names_plain_other_admits_all_other_tools():
-    """User picked plain ``["other"]`` — MUST admit every other-
-    category tool."""
+def test_compute_allowed_names_plain_other_is_ignored():
+    """Plain ``other`` is not an assignable agent capability."""
     spec = ToolSelectionSpec.from_raw(tool_categories=["other"])
     result = spec.compute_allowed_names(
         [
@@ -1671,7 +1680,7 @@ def test_compute_allowed_names_plain_other_admits_all_other_tools():
             _mock_tool("calc", "basic"),
         ]
     )
-    assert result == frozenset({"api_custom_call", "api_legacy_call"})
+    assert result == frozenset()
 
 
 def test_compute_allowed_names_mcp_server_does_not_broaden_to_all_mcp():
@@ -1688,8 +1697,7 @@ def test_compute_allowed_names_mcp_server_does_not_broaden_to_all_mcp():
 
 
 def test_compute_allowed_names_mixed_plain_and_server_picks():
-    """``["mcp:Gmail", "other"]`` should pick only Gmail's mcp tools
-    plus every other-category tool."""
+    """``other`` is ignored even when mixed with a scoped connector."""
     spec = ToolSelectionSpec.from_raw(tool_categories=["mcp:Gmail", "other"])
     result = spec.compute_allowed_names(
         [
@@ -1699,7 +1707,7 @@ def test_compute_allowed_names_mixed_plain_and_server_picks():
             _mock_tool("calc", "basic"),
         ]
     )
-    assert result == frozenset({"mcp_gmail_send", "api_custom_call"})
+    assert result == frozenset({"mcp_gmail_send"})
 
 
 def test_compute_allowed_names_plain_mcp_wins_over_server_scope():

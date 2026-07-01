@@ -30,6 +30,10 @@ logger = logging.getLogger(__name__)
 MAX_AGENT_NAME_LENGTH = 200
 
 
+def _assignable_tool_categories() -> list[str]:
+    return [cat.value for cat in ToolCategory if cat is not ToolCategory.OTHER]
+
+
 class _DelegatedAgentDatabaseTraceHandler:
     """Persist child-agent traces without broadcasting them to the parent UI."""
 
@@ -475,10 +479,9 @@ class ListToolCategoriesTool(AbstractBaseTool):
         raise NotImplementedError("Only supports async execution.")
 
     async def run_json_async(self, args: Mapping[str, Any]) -> Any:
-        from .base import ToolCategory
-
-        available_categories = [cat.value for cat in ToolCategory]
-        return ListToolCategoriesResult(categories=available_categories).model_dump()
+        return ListToolCategoriesResult(
+            categories=_assignable_tool_categories()
+        ).model_dump()
 
 
 class CreateAgentTool(AbstractBaseTool):
@@ -525,11 +528,6 @@ class CreateAgentTool(AbstractBaseTool):
     @property
     def description(self) -> str:
         """Tool description."""
-        # Get available tool categories
-        from .base import ToolCategory
-
-        available_categories = [cat.value for cat in ToolCategory]
-
         # Get available skills (from builtin skills directory)
         import os
 
@@ -544,7 +542,7 @@ class CreateAgentTool(AbstractBaseTool):
                     available_skills.append(skill_dir)
 
         skills_list = ", ".join(available_skills) if available_skills else "none"
-        categories_list = ", ".join(available_categories)
+        categories_list = ", ".join(_assignable_tool_categories())
 
         return (
             "Create a new agent with specific capabilities during task execution. "
@@ -871,11 +869,6 @@ class UpdateAgentTool(AbstractBaseTool):
     @property
     def description(self) -> str:
         """Tool description."""
-        # Get available tool categories
-        from .base import ToolCategory
-
-        available_categories = [cat.value for cat in ToolCategory]
-
         # Get available skills (from builtin skills directory)
         import os
 
@@ -890,7 +883,7 @@ class UpdateAgentTool(AbstractBaseTool):
                     available_skills.append(skill_dir)
 
         skills_list = ", ".join(available_skills) if available_skills else "none"
-        categories_list = ", ".join(available_categories)
+        categories_list = ", ".join(_assignable_tool_categories())
 
         return (
             "Update an existing agent with specific capabilities during task execution. "

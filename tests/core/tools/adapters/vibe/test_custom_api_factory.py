@@ -6,6 +6,7 @@ from xagent.core.tools.adapters.vibe.config import BaseToolConfig
 from xagent.core.tools.adapters.vibe.custom_api_factory import (
     create_db_custom_api_tools,
 )
+from xagent.core.tools.adapters.vibe.selection_spec import ToolSelectionSpec
 
 
 @pytest.mark.asyncio
@@ -25,6 +26,21 @@ async def test_create_db_custom_api_tools_no_configs():
 
     tools = await create_db_custom_api_tools(config)
     assert tools == []
+
+
+@pytest.mark.asyncio
+async def test_create_db_custom_api_tools_other_category_does_not_load_configs():
+    config = MagicMock()
+    config.get_tool_selection_spec.return_value = ToolSelectionSpec.from_raw(
+        tool_categories=["other"]
+    )
+    config.get_user_id.return_value = 1
+    config.get_custom_api_configs.return_value = []
+
+    tools = await create_db_custom_api_tools(config)
+
+    assert tools == []
+    config.get_custom_api_configs.assert_not_called()
 
 
 @pytest.mark.asyncio

@@ -14,6 +14,7 @@ from xagent.core.tools.adapters.vibe.agent_tool import (
     AgentTool,
     CreateAgentTool,
     ListAgentsTool,
+    ListToolCategoriesTool,
     UpdateAgentTool,
     _coerce_db_task_id,
     gen_agent_tool_name,
@@ -74,6 +75,30 @@ class TestCreateAgentTool:
             "same natural language as the current output language policy"
             in instructions_schema
         )
+
+    @pytest.mark.asyncio
+    async def test_assignable_tool_categories_hide_other(self) -> None:
+        categories = (await ListToolCategoriesTool().run_json_async({}))["categories"]
+        create_description = CreateAgentTool(
+            session_factory=None, user_id=1
+        ).description
+        update_description = UpdateAgentTool(
+            session_factory=None, user_id=1
+        ).description
+        create_categories_line = next(
+            line
+            for line in create_description.splitlines()
+            if "Available categories:" in line
+        )
+        update_categories_line = next(
+            line
+            for line in update_description.splitlines()
+            if "Available categories:" in line
+        )
+
+        assert "other" not in categories
+        assert "other" not in create_categories_line
+        assert "other" not in update_categories_line
 
     def test_coerce_db_task_id_accepts_only_db_task_formats(self) -> None:
         assert _coerce_db_task_id(12) == 12

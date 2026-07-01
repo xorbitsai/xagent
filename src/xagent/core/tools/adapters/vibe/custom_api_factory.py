@@ -19,10 +19,9 @@ logger = logging.getLogger(__name__)
 async def create_db_custom_api_tools(config: BaseToolConfig) -> Sequence[Tool]:
     """Create Custom API tools from database configurations.
 
-    Internal short-circuit via ``ToolSelectionSpec.includes_custom_api()``
-    (``"other" in categories or bool(mcp_servers)``): when the spec
-    selects neither the ``"other"`` category nor any ``mcp:<server>``
-    scope, this creator returns early WITHOUT calling
+    Internal short-circuit via ``ToolSelectionSpec.includes_custom_api()``:
+    when the spec selects no ``mcp:<server>`` connector scope, this creator
+    returns early WITHOUT calling
     ``config.get_custom_api_configs()`` — that call goes through the DB
     to enumerate the user's Custom API rows. The creator is registered
     bare (no ``categories=``), so the registry always dispatches it;

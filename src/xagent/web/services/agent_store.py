@@ -39,6 +39,10 @@ _AGENT_UPDATE_FIELDS = {
 }
 
 
+def clean_tool_categories(categories: Any) -> list[str]:
+    return [c for c in (ensure_list(categories) or []) if c != "other"]
+
+
 class AgentStore:
     """Owns Agent reads/writes that participate in hot-path cache policy."""
 
@@ -56,7 +60,7 @@ class AgentStore:
             "models": agent.models,
             "knowledge_bases": ensure_list(agent.knowledge_bases) or [],
             "skills": ensure_list(agent.skills) or [],
-            "tool_categories": ensure_list(agent.tool_categories) or [],
+            "tool_categories": clean_tool_categories(agent.tool_categories),
             "suggested_prompts": ensure_list(agent.suggested_prompts) or [],
             "logo_url": agent.logo_url,
             "status": agent.status.value,
@@ -226,7 +230,7 @@ class AgentStore:
             models=models,
             knowledge_bases=knowledge_bases or [],
             skills=skills or [],
-            tool_categories=tool_categories or [],
+            tool_categories=clean_tool_categories(tool_categories),
             suggested_prompts=suggested_prompts or [],
             origin=origin,
             status=status,
@@ -255,6 +259,8 @@ class AgentStore:
             )
 
         for field, value in updates.items():
+            if field == "tool_categories":
+                value = clean_tool_categories(value)
             setattr(agent, field, value)
 
         self.db.commit()

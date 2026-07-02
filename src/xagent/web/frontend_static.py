@@ -78,8 +78,15 @@ def mount_frontend(app: FastAPI, dist_dir: Path) -> bool:
 
     shell_patterns = _build_shell_patterns(dist_dir)
     not_found = dist_dir / "404.html"
+    resolved_root = dist_dir.resolve()
 
     def _resolve(rel_path: str) -> Path | None:
+        # Reject path traversal: the request path must stay within dist_dir.
+        try:
+            (resolved_root / rel_path).resolve().relative_to(resolved_root)
+        except (ValueError, RuntimeError):
+            return None
+
         # Exact asset (favicon, images, etc.)
         candidate = dist_dir / rel_path
         if rel_path and candidate.is_file():

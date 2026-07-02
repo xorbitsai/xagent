@@ -19,26 +19,35 @@ import re
 from pathlib import Path
 
 from fastapi import FastAPI
-from fastapi.responses import FileResponse, Response
+from fastapi.responses import FileResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
 
 logger = logging.getLogger(__name__)
 
-# Path prefixes owned by the backend; never shadowed by the SPA catch-all so an
-# unknown API path still returns a JSON 404 rather than index.html.
-_API_PREFIXES = (
-    "api",
-    "v1",
-    "uploads",
-    "ws",
-    "health",
-    "ready",
-    "docs",
-    "redoc",
-    "openapi.json",
-)
-
 _SHELL_TOKEN = "__shell__"
+
+
+def _collect_backend_prefixes(app: FastAPI) -> frozenset[str]:
+    """Collect the literal first path segments owned by the backend.
+
+    Derived from the registered route table rather than hand-maintained, so it
+    can't silently drift from the real routes. Any request whose first segment
+    is in this set but reached the SPA catch-all (i.e. matched no route) gets a
+    JSON 404 instead of the SPA shell. Must be called after all routers/mounts
+    are registered and before the catch-all is added (the catch-all's own
+    ``{full_path:path}`` segment is dynamic and therefore skipped here).
+    """
+    prefixes: set[str] = set()
+    for route in app.routes:
+        path = getattr(route, "path", None)
+        if not path or not path.startswith("/"):
+            continue
+        first = path[1:].split("/", 1)[0]
+        # Skip empty (root) and dynamic segments like "{full_path:path}".
+        if not first or first.startswith("{"):
+            continue
+        prefixes.add(first)
+    return frozenset(prefixes)
 
 
 def _build_shell_patterns(dist_dir: Path) -> list[tuple[re.Pattern[str], Path]]:
@@ -79,6 +88,7 @@ def mount_frontend(app: FastAPI, dist_dir: Path) -> bool:
     shell_patterns = _build_shell_patterns(dist_dir)
     not_found = dist_dir / "404.html"
     resolved_root = dist_dir.resolve()
+    backend_prefixes = _collect_backend_prefixes(app)
 
     def _resolve(rel_path: str) -> Path | None:
         # Reject path traversal: the request path must stay within dist_dir.
@@ -87,33 +97,50 @@ def mount_frontend(app: FastAPI, dist_dir: Path) -> bool:
         except (ValueError, RuntimeError):
             return None
 
-        # Exact asset (favicon, images, etc.)
+        # Exact asset (favicon, images, and static routes' own .html/.txt files).
         candidate = dist_dir / rel_path
         if rel_path and candidate.is_file():
             return candidate
-        # Static route emitted as "<name>.html"
-        html = dist_dir / f"{rel_path}.html"
-        if rel_path and html.is_file():
-            return html
-        # Directory index
-        index = candidate / "index.html"
-        if candidate.is_dir() and index.is_file():
-            return index
-        # Dynamic route -> shell
+
+        # Next prefetches a route's RSC flight payload at "<route>.txt". Match it
+        # against the route table on the base path and serve the .txt variant, so
+        # dynamic-route prefetches get the shell's flight payload (not the HTML,
+        # which would break client-side soft navigation).
+        is_rsc = rel_path.endswith(".txt")
+        lookup = rel_path[:-4] if is_rsc else rel_path
+        ext = ".txt" if is_rsc else ".html"
+
+        # Static route emitted as "<name>.html" / "<name>.txt".
+        static_file = dist_dir / f"{lookup}{ext}"
+        if lookup and static_file.is_file():
+            return static_file
+
+        # Directory index (HTML navigations only).
+        if not is_rsc:
+            index = candidate / "index.html"
+            if candidate.is_dir() and index.is_file():
+                return index
+
+        # Dynamic route -> shell, in the format the request asked for.
         for pattern, target in shell_patterns:
-            if pattern.match(rel_path):
+            if pattern.match(lookup):
+                if is_rsc:
+                    txt = target.with_suffix(".txt")
+                    return txt if txt.is_file() else target
                 return target
         return None
 
     @app.get("/{full_path:path}", include_in_schema=False)
     async def serve_spa(full_path: str) -> Response:
-        if full_path == "" or full_path == "/":
+        if full_path == "":
             return FileResponse(dist_dir / "index.html")
 
         first_segment = full_path.split("/", 1)[0]
-        if first_segment in _API_PREFIXES:
-            # Owned by the backend but unmatched above -> genuine 404.
-            return Response(status_code=404)
+        if first_segment in backend_prefixes:
+            # Owned by the backend but unmatched above -> genuine 404. Mirror
+            # Starlette's default 404 body so API clients see a consistent shape
+            # whether or not the frontend is mounted.
+            return JSONResponse({"detail": "Not Found"}, status_code=404)
 
         resolved = _resolve(full_path)
         if resolved is not None:
@@ -121,7 +148,7 @@ def mount_frontend(app: FastAPI, dist_dir: Path) -> bool:
 
         if not_found.is_file():
             return FileResponse(not_found, status_code=404)
-        return Response(status_code=404)
+        return JSONResponse({"detail": "Not Found"}, status_code=404)
 
     logger.info(
         "Serving frontend static export from %s (%d dynamic-route shells)",

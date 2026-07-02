@@ -28,6 +28,12 @@ type Locale = "en" | "zh";
 // Static export cannot read cookies/headers at request time, so the shell is
 // rendered with a fixed initial locale. I18nProvider corrects it from
 // localStorage on the client immediately after hydration.
+//
+// Known trade-off: zh users see a brief flash-of-English on every fresh load,
+// since the prerendered HTML is English until the client re-renders. This is
+// inherent to static export (the server can't know the locale); a full fix
+// would need the locale baked into the HTML at request time, which the
+// single-process deployment doesn't do.
 const resolveInitialLocale = (): Locale => "en";
 
 const buildThemeStyle = (themeName: string): CSSProperties => {

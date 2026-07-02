@@ -3,6 +3,10 @@ name: Publish to PyPI
 on:
   release:
     types: [published]
+  # Manual trigger for re-running the build/publish of an already-tagged ref
+  # (e.g. after a transient publish failure). Run it from a release tag: on a
+  # non-tag ref hatch-vcs produces a local-version string (X.Y.devN+g<sha>) that
+  # PyPI rejects, so the publish step fails without uploading anything.
   workflow_dispatch:
 
 jobs:
@@ -40,6 +44,13 @@ jobs:
         run: |
           python -m pip install build
           python -m build
+
+      - name: Verify the bundled frontend is in the artifacts
+        run: |
+          set -e
+          python -m zipfile -l dist/*.whl | grep -q "xagent/web/frontend_dist/index.html" \
+            || { echo "::error::wheel is missing the bundled frontend (frontend_dist)"; exit 1; }
+          echo "Frontend bundle present in wheel."
 
       - name: Publish to PyPI (trusted publishing)
         uses: pypa/gh-action-pypi-publish@release/v1

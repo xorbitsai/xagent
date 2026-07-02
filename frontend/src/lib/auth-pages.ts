@@ -5,6 +5,8 @@ export const AUTH_PUBLIC_PATHS = [
   "/forgot-password",
   "/reset-password",
   "/auth/oidc/callback",
+  "/privacy-policy",
+  "/terms-of-service",
 ] as const
 
 export function isAuthPublicPath(pathname: string | null): boolean {

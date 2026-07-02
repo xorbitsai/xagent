@@ -488,6 +488,16 @@ export default function Home() {
           )}
 
         </div>
+
+        <div className="flex items-center justify-center gap-4 py-6 text-xs text-muted-foreground shrink-0">
+          <Link href="/privacy-policy" className="hover:text-primary transition-colors">
+            {t("footer.privacyPolicy")}
+          </Link>
+          <span>·</span>
+          <Link href="/terms-of-service" className="hover:text-primary transition-colors">
+            {t("footer.termsOfService")}
+          </Link>
+        </div>
       </div>
     </div>
   );

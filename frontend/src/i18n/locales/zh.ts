@@ -3657,6 +3657,10 @@ Build when you need.`,
       successTitle: "配置已保存！",
       successDesc: "该 MCP 应用程序已添加到公共注册表中。用户现在可以从他们的工具菜单中看到并连接到这个应用。"
     }
+  },
+  footer: {
+    privacyPolicy: "隐私政策",
+    termsOfService: "服务条款",
   }
 } as const
 

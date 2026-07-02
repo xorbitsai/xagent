@@ -3657,6 +3657,10 @@ Build when you need.`,
       successTitle: "Configuration Saved!",
       successDesc: "The MCP application has been added to the public registry. Users can now see and connect to this app from their Tools menu."
     }
+  },
+  footer: {
+    privacyPolicy: "Privacy Policy",
+    termsOfService: "Terms of Service",
   }
 } as const
 

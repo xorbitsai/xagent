@@ -3,7 +3,7 @@ authors = [
   { name = "Jicheng Shi", email = "rogershijicheng@gmail.com" },
   { name = "Xuye Qin", email = "qinxuye@gmail.com" },
 ]
-name = "xagent"
+name = "xagent-ai"
 dynamic = ["version"]
 description = "a powerful agent os with great compatibility"
 license = { text = "Xagent Source License" }
@@ -207,6 +207,7 @@ static-type-check = [
 ]
 
 [project.scripts]
+xagent = "xagent.web.__main__:main"
 xagent-web = "xagent.web.__main__:main"
 
 

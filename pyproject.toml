@@ -321,23 +321,15 @@ warn_unused_ignores = false
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/xagent"]
-include = [
-  "src/xagent/skills/builtin/**",
-  "src/xagent/templates/built_in/**",
-  "src/xagent/web/README.md",
-]
-# The built frontend static export is .gitignore'd (it is a build output staged
-# by the release workflow), so it must be listed as an artifact for hatchling to
-# include it. This lets the single-process (pip / uvx) deployment serve the UI
-# without a Node runtime.
+# `packages` already includes the whole src/xagent tree (Python sources plus the
+# tracked skills/templates data files). Do NOT add an explicit `include` here:
+# in hatchling an `include` list becomes the authoritative allowlist and would
+# drop everything else (the entire Python package). The built frontend static
+# export is .gitignore'd as a build output, so it must be declared as an
+# artifact for the single-process (pip / uvx) deployment to serve the UI.
 artifacts = ["src/xagent/web/frontend_dist/**"]
 
 [tool.hatch.build.targets.sdist]
-include = [
-  "src/xagent/skills/builtin/**",
-  "src/xagent/templates/built_in/**",
-  "src/xagent/web/README.md",
-]
 artifacts = ["src/xagent/web/frontend_dist/**"]
 
 [tool.hatch.metadata]

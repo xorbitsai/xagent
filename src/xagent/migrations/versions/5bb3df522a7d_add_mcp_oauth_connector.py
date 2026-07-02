@@ -28,10 +28,22 @@ def upgrade() -> None:
         # Tables don't exist yet, will be created by SQLAlchemy
         return
 
-    op.add_column("mcp_servers", sa.Column("oauth_client", sa.JSON(), nullable=True))
-    op.add_column(
-        "mcp_servers", sa.Column("auth_server_metadata", sa.JSON(), nullable=True)
-    )
+    # A database created via SQLAlchemy's create_all() at the current model
+    # state (then stamped to an older Alembic revision, as the incremental
+    # migration test does) may already have these columns/table -- only add
+    # what's actually missing so replaying this migration is idempotent.
+    mcp_servers_columns = {col["name"] for col in inspector.get_columns("mcp_servers")}
+    if "oauth_client" not in mcp_servers_columns:
+        op.add_column(
+            "mcp_servers", sa.Column("oauth_client", sa.JSON(), nullable=True)
+        )
+    if "auth_server_metadata" not in mcp_servers_columns:
+        op.add_column(
+            "mcp_servers", sa.Column("auth_server_metadata", sa.JSON(), nullable=True)
+        )
+
+    if "mcp_user_oauth_tokens" in tables:
+        return
 
     op.create_table(
         "mcp_user_oauth_tokens",

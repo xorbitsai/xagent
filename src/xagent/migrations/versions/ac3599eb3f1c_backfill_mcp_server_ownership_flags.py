@@ -34,7 +34,16 @@ def upgrade() -> None:
     flag is already truthy is left untouched, so deliberate narrower grants
     are preserved.
     """
+    from sqlalchemy.engine.reflection import Inspector
+
     bind = op.get_bind()
+    inspector = Inspector.from_engine(bind)
+    if "user_mcpservers" not in inspector.get_table_names():
+        # Table doesn't exist yet in this database (e.g. a synthetic test DB
+        # stamped past the migration that creates it, or a from-scratch
+        # replay that hasn't reached create_all() yet) -- nothing to backfill.
+        return
+
     is_postgres = bind.dialect.name == "postgresql"
     true_literal = "true" if is_postgres else "1"
     false_literal = "false" if is_postgres else "0"

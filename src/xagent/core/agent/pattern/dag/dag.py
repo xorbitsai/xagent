@@ -75,6 +75,15 @@ class _DAGStepRuntime:
     def active_react_step_id(self) -> str:
         return self.step_id
 
+    @property
+    def on_mcp_reauthorization_required(self) -> Any | None:
+        # Explicit passthrough (this proxy has no ``__getattr__`` fallback):
+        # without it, ``ReActPattern._execute_tool_safely`` running a DAG
+        # step would always see ``None`` here via ``getattr(...)`` and the
+        # mid-run reauth hook would silently never fire for DAG-mode tool
+        # calls, even though it fires correctly for plain ReAct runs.
+        return getattr(self.parent, "on_mcp_reauthorization_required", None)
+
     async def should_interrupt(self) -> bool:
         return await self.parent.should_interrupt()
 

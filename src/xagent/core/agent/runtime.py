@@ -34,6 +34,13 @@ class PatternRuntime:
     execution_id: str | None = None
     interrupt_checker: Callable[[], bool] | Callable[[], Any] | None = None
     outbound_message_handler: Callable[[dict[str, Any]], Any] | None = None
+    # Optional async hook ``Callable[[int | None], Awaitable[None]]``, mirroring
+    # ``BaseToolConfig.on_mcp_reauthorization_required``. Invoked by
+    # ``ReActPattern._execute_tool_safely`` when a mid-run MCP tool call fails
+    # because its OAuth token cannot be used/refreshed, so the connection gets
+    # flagged for reconnect even when the failure happens well after tool
+    # creation (see ``MCPReauthorizationRequired``).
+    on_mcp_reauthorization_required: Callable[[int | None], Any] | None = None
     _interrupt_requested: bool = False
     interrupt_reason: str | None = None
     last_checkpoint: dict[str, Any] | None = None

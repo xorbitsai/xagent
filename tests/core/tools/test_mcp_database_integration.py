@@ -316,7 +316,7 @@ class TestToolFactoryMCPIntegration:
         """Test successful MCP tools creation."""
         # Setup mock
         mock_tools = [MagicMock(), MagicMock()]
-        mock_load_mcp.return_value = mock_tools
+        mock_load_mcp.return_value = (mock_tools, [])
 
         # Add MCP server to database
         manager = DatabaseMCPServerManager(test_db)

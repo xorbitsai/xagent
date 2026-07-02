@@ -830,6 +830,94 @@ async def test_react_passes_runtime_step_to_browser_tool_call() -> None:
     ]
 
 
+class ReauthRequiredTool:
+    """Simulates a mid-run MCP tool call whose OAuth token can no longer be
+    used/refreshed (see ``MCPReauthorizationRequired``, distinct from a
+    generic tool failure)."""
+
+    def __init__(self) -> None:
+        class Metadata:
+            name = "mcp_notion_search"
+            description = "Search Notion (OAuth-connected MCP server)."
+
+        self.metadata = Metadata()
+
+    async def run_json_async(self, args: dict[str, Any]) -> Any:
+        from xagent.core.tools.core.mcp.oauth.errors import (
+            MCPReauthorizationRequired,
+        )
+
+        raise MCPReauthorizationRequired("notion", 7)
+
+
+@pytest.mark.asyncio
+async def test_execute_tool_safely_labels_reauth_failure_and_calls_hook() -> None:
+    """A mid-run ``MCPReauthorizationRequired`` must produce a result that is
+    clearly distinguishable from a generic tool error (``requires_reconnect``)
+    and must invoke the runtime's ``on_mcp_reauthorization_required`` hook,
+    so the connection gets flagged for reconnect even when the failure
+    happens well after initial tool creation (Finding 5)."""
+    pattern = ReActPattern()
+    hook_calls: list[int | None] = []
+
+    async def hook(mcpserver_id: int | None) -> None:
+        hook_calls.append(mcpserver_id)
+
+    runtime = PatternRuntime(on_mcp_reauthorization_required=hook)
+    tool = ReauthRequiredTool()
+
+    result = await pattern._execute_tool_safely(
+        {"id": "call-mcp", "name": "mcp_notion_search", "args": {"query": "x"}},
+        [tool],
+        runtime,
+    )
+
+    assert result["success"] is False
+    assert result["requires_reconnect"] is True
+    assert result["mcpserver_id"] == 7
+    assert result["server_name"] == "notion"
+    assert hook_calls == [7]
+    assert pattern.tool_ledger["call-mcp"].status == "failed"
+
+
+@pytest.mark.asyncio
+async def test_execute_tool_safely_reauth_failure_without_hook_still_labeled() -> None:
+    """Even when the runtime has no reauth hook configured (e.g. a bare
+    ``PatternRuntime()`` in tests, or an execution path that never wired one
+    up), the result must still be distinguishable from a generic failure."""
+    pattern = ReActPattern()
+    runtime = PatternRuntime()
+    tool = ReauthRequiredTool()
+
+    result = await pattern._execute_tool_safely(
+        {"id": "call-mcp-2", "name": "mcp_notion_search", "args": {"query": "x"}},
+        [tool],
+        runtime,
+    )
+
+    assert result["success"] is False
+    assert result["requires_reconnect"] is True
+    assert result["mcpserver_id"] == 7
+
+
+@pytest.mark.asyncio
+async def test_execute_tool_safely_generic_failure_has_no_reconnect_flag() -> None:
+    """A plain (non-MCP-reauth) tool exception must NOT carry
+    ``requires_reconnect`` — only the specific OAuth-reauth failure is
+    labeled this way."""
+    pattern = ReActPattern()
+    runtime = PatternRuntime()
+
+    result = await pattern._execute_tool_safely(
+        {"id": "call-broken", "name": "broken", "args": {}},
+        [BrokenTool()],
+        runtime,
+    )
+
+    assert result["success"] is False
+    assert "requires_reconnect" not in result
+
+
 @pytest.mark.asyncio
 async def test_react_pattern_unwraps_textual_final_answer_json() -> None:
     llm = FakeLLM(

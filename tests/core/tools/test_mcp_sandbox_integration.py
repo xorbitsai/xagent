@@ -90,12 +90,13 @@ class TestLoadMcpToolsAsAgentTools:
                 new=AsyncMock(),
             ) as mock_direct,
         ):
-            tools = await load_mcp_tools_as_agent_tools(
+            tools, reauth_failures = await load_mcp_tools_as_agent_tools(
                 {"demo": connection},
                 sandbox=sandbox,
             )
 
         assert tools == [wrapped_tool]
+        assert reauth_failures == []
         mock_list.assert_awaited_once_with(sandbox, connection)
         mock_wrap.assert_awaited_once()
         mock_direct.assert_not_awaited()
@@ -119,11 +120,12 @@ class TestLoadMcpToolsAsAgentTools:
                 new=AsyncMock(),
             ) as mock_sandboxed,
         ):
-            tools = await load_mcp_tools_as_agent_tools(
+            tools, reauth_failures = await load_mcp_tools_as_agent_tools(
                 {"demo": connection},
                 sandbox=MagicMock(),
             )
 
         assert tools == [direct_tool]
+        assert reauth_failures == []
         mock_direct.assert_awaited_once()
         mock_sandboxed.assert_not_awaited()

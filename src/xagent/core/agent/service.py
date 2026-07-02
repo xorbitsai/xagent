@@ -406,6 +406,9 @@ class AgentService:
                 self.memory if self.memory_enabled else None
             )
             self._execution_adapter.config.allowed_skills = self.allowed_skills
+            self._execution_adapter.config.on_mcp_reauthorization_required = (
+                self._mcp_reauthorization_hook()
+            )
 
         return cast(
             dict[str, Any],
@@ -452,8 +455,21 @@ class AgentService:
                 memory_store=self.memory if self.memory_enabled else None,
                 memory_similarity_threshold=self.memory_similarity_threshold,
                 allowed_skills=self.allowed_skills,
+                on_mcp_reauthorization_required=self._mcp_reauthorization_hook(),
             )
         )
+
+    def _mcp_reauthorization_hook(self) -> Callable[[Any], Any] | None:
+        """Return ``tool_config``'s ``on_mcp_reauthorization_required`` hook.
+
+        Mirrors the ``getattr(config, "on_mcp_reauthorization_required", None)``
+        pattern used at tool-creation time (``ToolRegistry.create_registered_tools``,
+        ``ToolFactory._create_mcp_tools_from_configs``) so a mid-run MCP tool
+        failure (see ``ReActPattern._execute_tool_safely``) can flag the same
+        connection for reconnect, not just a failure encountered while
+        building tools.
+        """
+        return getattr(self.tool_config, "on_mcp_reauthorization_required", None)
 
     def _get_allowed_skills_from_config(
         self, tool_config: Any | None

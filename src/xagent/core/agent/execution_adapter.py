@@ -39,6 +39,7 @@ class AgentExecutionConfig:
     memory_similarity_threshold: float | None = None
     skill_manager: Any | None = None
     allowed_skills: list[str] | None = None
+    on_mcp_reauthorization_required: Any | None = None
 
 
 class AgentExecutionAdapter:
@@ -232,6 +233,7 @@ class AgentExecutionAdapter:
                 callbacks=[TraceEventCallback()],
                 workspace_base_dir=self.config.workspace_base_dir,
                 outbound_message_handler=self.config.outbound_message_handler,
+                on_mcp_reauthorization_required=self.config.on_mcp_reauthorization_required,
             ),
             execution_type,
         )

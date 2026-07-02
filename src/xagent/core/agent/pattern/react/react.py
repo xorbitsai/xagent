@@ -1948,11 +1948,40 @@ class ReActPattern(AgentPattern):
             try:
                 result = await self._execute_tool(tool_call, tools)
             except Exception as exc:  # noqa: BLE001
-                error_result = {
-                    "success": False,
-                    "error": str(exc),
-                    "tool_name": tool_call["name"],
-                }
+                # A mid-run MCP tool call whose OAuth token cannot be
+                # used/refreshed raises this distinctly (see
+                # ``mcp_adapter.MCPToolAdapter.run_json_async``). Left to the
+                # generic branch below it would collapse into an ordinary
+                # failed-tool-call result and nothing would flag the
+                # connection for reconnect — unlike the tool-creation path
+                # (``ToolRegistry.create_registered_tools``), which already
+                # does. Label the result distinctly and call the runtime's
+                # reauth hook (mirrors the tool-creation-time hook call)
+                # when one is available.
+                from ....tools.core.mcp.oauth.errors import (
+                    MCPReauthorizationRequired,
+                )
+
+                if isinstance(exc, MCPReauthorizationRequired):
+                    error_result = {
+                        "success": False,
+                        "error": str(exc),
+                        "tool_name": tool_call["name"],
+                        "requires_reconnect": True,
+                        "mcpserver_id": exc.mcpserver_id,
+                        "server_name": exc.server_name,
+                    }
+                    hook = getattr(runtime, "on_mcp_reauthorization_required", None)
+                    if hook is not None:
+                        maybe_awaitable = hook(exc.mcpserver_id)
+                        if inspect.isawaitable(maybe_awaitable):
+                            await maybe_awaitable
+                else:
+                    error_result = {
+                        "success": False,
+                        "error": str(exc),
+                        "tool_name": tool_call["name"],
+                    }
                 await runtime.on_tool_error(
                     tool_call=tool_call, error=exc, result=error_result
                 )

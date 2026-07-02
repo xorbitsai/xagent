@@ -3,6 +3,7 @@
 import logging
 from typing import TYPE_CHECKING, Any, List
 
+from ...core.mcp.oauth.errors import MCPReauthorizationRequired
 from .factory import register_tool
 
 if TYPE_CHECKING:
@@ -71,7 +72,10 @@ async def create_mcp_tools(config: "BaseToolConfig") -> List[Any]:
         return await ToolFactory._create_mcp_tools_from_configs(
             mcp_configs,
             sandbox=config.get_sandbox(),
+            tool_config=config,
         )
+    except MCPReauthorizationRequired:
+        raise
     except Exception as e:
         logger.warning(f"Failed to create MCP tools: {e}")
         return []

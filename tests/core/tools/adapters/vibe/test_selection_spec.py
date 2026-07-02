@@ -324,7 +324,7 @@ async def test_mcp_per_server_filter_skips_non_matching_configs(monkeypatch):
 
     received = []
 
-    async def _fake_create(mcp_configs, sandbox=None):
+    async def _fake_create(mcp_configs, sandbox=None, **_kwargs):
         received.append(mcp_configs)
         return []
 
@@ -359,7 +359,7 @@ async def test_mcp_per_server_filter_normalizes_whitespace(monkeypatch):
 
     received = []
 
-    async def _fake_create(mcp_configs, sandbox=None):
+    async def _fake_create(mcp_configs, sandbox=None, **_kwargs):
         received.append(mcp_configs)
         return []
 
@@ -394,7 +394,7 @@ async def test_mcp_per_server_filter_empty_match_short_circuits(monkeypatch):
 
     call_count = 0
 
-    async def _fake_create(mcp_configs, sandbox=None):
+    async def _fake_create(mcp_configs, sandbox=None, **_kwargs):
         nonlocal call_count
         call_count += 1
         return []
@@ -426,7 +426,7 @@ async def test_mcp_parent_category_forwards_all_servers(monkeypatch):
 
     received = []
 
-    async def _fake_create(mcp_configs, sandbox=None):
+    async def _fake_create(mcp_configs, sandbox=None, **_kwargs):
         received.append(mcp_configs)
         return []
 
@@ -456,7 +456,7 @@ async def test_mcp_no_per_server_filter_when_spec_lacks_servers(monkeypatch):
 
     received = []
 
-    async def _fake_create(mcp_configs, sandbox=None):
+    async def _fake_create(mcp_configs, sandbox=None, **_kwargs):
         received.append(mcp_configs)
         return []
 

@@ -37,6 +37,7 @@ class AgentRunner:
         context_manager: ContextManager | None = None,
         workspace_base_dir: str = "workspace",
         outbound_message_handler: Any | None = None,
+        on_mcp_reauthorization_required: Any | None = None,
     ) -> None:
         self.agent = agent
         self.workspace_manager = workspace_manager or WorkspaceManager()
@@ -46,6 +47,12 @@ class AgentRunner:
         self.context_manager = context_manager or ContextManager()
         self.workspace_base_dir = workspace_base_dir
         self.outbound_message_handler = outbound_message_handler
+        # Optional async hook, mirroring ``BaseToolConfig.on_mcp_reauthorization_required``,
+        # invoked when a mid-run MCP tool call fails because its OAuth token
+        # cannot be used/refreshed. Threaded onto the default ``PatternRuntime``
+        # below so ``ReActPattern._execute_tool_safely`` can flag the owning
+        # connection for reconnect instead of only surfacing a generic error.
+        self.on_mcp_reauthorization_required = on_mcp_reauthorization_required
         self._active_controls: dict[str, ExecutionControl] = {}
 
     async def run(
@@ -108,6 +115,7 @@ class AgentRunner:
             execution_id=execution_id,
             interrupt_checker=interrupt_checker,
             outbound_message_handler=self.outbound_message_handler,
+            on_mcp_reauthorization_required=self.on_mcp_reauthorization_required,
         )
         self._active_controls[execution_id] = ExecutionControl(
             runtime=runtime,

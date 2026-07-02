@@ -14,6 +14,7 @@ from sqlalchemy.orm import Session
 
 from .....config import get_uploads_dir
 from .....core.workspace import TaskWorkspace
+from ...core.mcp.oauth.errors import MCPReauthorizationRequired
 from .base import AbstractBaseTool, Tool
 from .config import BaseToolConfig
 from .output_filter_wrapper import OutputFilteredToolWrapper
@@ -183,6 +184,16 @@ class ToolRegistry:
             try:
                 created_tools = await creator(config)
                 tools.extend(created_tools)
+            except MCPReauthorizationRequired as exc:
+                logger.warning(
+                    "MCP server '%s' needs reconnection (creator %s): %s",
+                    exc.server_name,
+                    creator.__name__,
+                    exc,
+                )
+                hook = getattr(config, "on_mcp_reauthorization_required", None)
+                if hook is not None:
+                    await hook(exc.mcpserver_id)
             except Exception as e:
                 logger.warning(f"Tool creator {creator.__name__} failed: {e}")
 
@@ -492,18 +503,29 @@ class ToolFactory:
     async def _create_mcp_tools_from_configs(
         mcp_configs: List[Dict[str, Any]],
         sandbox: Optional["Sandbox"] = None,
+        tool_config: Optional[BaseToolConfig] = None,
     ) -> List[Tool]:
-        """Create MCP tools from configurations."""
+        """Create MCP tools from configurations.
+
+        Args:
+            mcp_configs: Per-server MCP connection configurations.
+            sandbox: Optional sandbox for stdio connection isolation.
+            tool_config: Optional owning ``BaseToolConfig``/``WebToolConfig``.
+                When it exposes an ``on_mcp_reauthorization_required`` hook,
+                the hook is invoked for every server in this batch whose
+                token could not be used/refreshed (see ``reauth_failures``
+                handling below).
+        """
         try:
             from .mcp_adapter import load_mcp_tools_as_agent_tools
 
             # Convert configs to connection format
             connections = {}
 
-            for config in mcp_configs:
+            for mcp_config in mcp_configs:
                 connection_config = {
-                    "transport": config["transport"],
-                    **config["config"],
+                    "transport": mcp_config["transport"],
+                    **mcp_config["config"],
                 }
 
                 # Fix args field if it's a string instead of list
@@ -525,14 +547,33 @@ class ToolFactory:
                         # Fallback to simple split
                         connection_config["args"] = connection_config["args"].split()
 
-                connections[config["name"]] = connection_config
+                connections[mcp_config["name"]] = connection_config
 
-            # Load MCP tools
-            mcp_tools = await load_mcp_tools_as_agent_tools(
+            # Load MCP tools. ``reauth_failures`` is intentionally not
+            # re-raised here: this is the batch loader feeding a user's full
+            # set of active MCP connections (via the ``create_mcp_tools``
+            # registered creator), and one dead connector must not prevent
+            # the tools from this call's OTHER, healthy servers from being
+            # returned. Surface each failure to the owning config's
+            # ``on_mcp_reauthorization_required`` hook here (when present),
+            # mirroring the pattern used at the registry level.
+            mcp_tools, reauth_failures = await load_mcp_tools_as_agent_tools(
                 connections,
                 sandbox=sandbox,
             )  # type: ignore[arg-type]
+            if reauth_failures:
+                hook = getattr(tool_config, "on_mcp_reauthorization_required", None)
+                for reauth in reauth_failures:
+                    logger.warning(
+                        "MCP server '%s' needs reconnection: %s",
+                        reauth.server_name,
+                        reauth,
+                    )
+                    if hook is not None:
+                        await hook(reauth.mcpserver_id)
             return mcp_tools if mcp_tools else []  # type: ignore[return-value]
+        except MCPReauthorizationRequired:
+            raise
         except Exception as e:
             logger.warning(f"Failed to create MCP tools: {e}")
             return []
@@ -575,12 +616,23 @@ class ToolFactory:
             for name, config in all_connections.items():
                 connections[name] = config
 
-            # Load MCP tools
-            mcp_tools = (
-                await load_mcp_tools_as_agent_tools(connections) if connections else []
-            )
+            # Load MCP tools. This classmethod has no owning ``BaseToolConfig``
+            # to invoke an ``on_mcp_reauthorization_required`` hook on, so —
+            # unlike the batch path in ``_create_mcp_tools_from_configs`` —
+            # preserve this method's existing contract of propagating the
+            # first reauthorization failure as a raised exception.
+            if connections:
+                mcp_tools, reauth_failures = await load_mcp_tools_as_agent_tools(
+                    connections
+                )
+                if reauth_failures:
+                    raise reauth_failures[0]
+            else:
+                mcp_tools = []
 
             return mcp_tools
+        except MCPReauthorizationRequired:
+            raise
         except Exception as e:
             logger.warning(f"Failed to create MCP tools from database: {e}")
             return []
@@ -632,6 +684,8 @@ class ToolFactory:
             else:
                 # If no event loop is running, use the current one
                 return loop.run_until_complete(cls.create_mcp_tools(db, user_id))
+        except MCPReauthorizationRequired:
+            raise
         except Exception as e:
             logger.warning(f"Failed to create MCP tools (sync wrapper): {e}")
             return []

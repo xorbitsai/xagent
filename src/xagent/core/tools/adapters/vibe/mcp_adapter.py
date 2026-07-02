@@ -13,6 +13,7 @@ from mcp.types import Tool as MCPTool
 from pydantic import BaseModel, Field, create_model
 
 from .....sandbox.base import Sandbox
+from ...core.mcp.oauth.errors import MCPReauthorizationRequired
 from ...core.mcp.sessions import Connection, create_session
 from ...core.mcp.tools import load_mcp_tools
 from .base import AbstractBaseTool, ToolVisibility
@@ -27,6 +28,19 @@ class EmptyArgsModel(BaseModel):
 
 
 logger = logging.getLogger(__name__)
+
+
+def _find_reauthorization_required(
+    exc: BaseException,
+) -> MCPReauthorizationRequired | None:
+    if isinstance(exc, MCPReauthorizationRequired):
+        return exc
+    if isinstance(exc, BaseExceptionGroup):
+        for sub_exc in exc.exceptions:
+            found = _find_reauthorization_required(sub_exc)
+            if found is not None:
+                return found
+    return None
 
 
 def _format_exception_group_messages(exc: BaseExceptionGroup) -> str:
@@ -436,7 +450,13 @@ class MCPToolAdapter(AbstractBaseTool):
                         else False,
                     }
 
+        except MCPReauthorizationRequired:
+            raise
+
         except BaseExceptionGroup as e:
+            reauth = _find_reauthorization_required(e)
+            if reauth is not None:
+                raise reauth
             logger.error(
                 f"MCP tool {self.mcp_tool.name} execution failed with exception group: {e}"
             )
@@ -447,6 +467,9 @@ class MCPToolAdapter(AbstractBaseTool):
             }
 
         except Exception as e:
+            reauth = _find_reauthorization_required(e)
+            if reauth is not None:
+                raise reauth
             logger.error(f"MCP tool {self.mcp_tool.name} execution failed: {e}")
             return {
                 "content": [{"text": f"Error executing MCP tool: {e}"}],
@@ -572,6 +595,9 @@ async def _load_direct_mcp_tools(
                 mcp_tools = await load_mcp_tools(session)
             break
         except Exception as e:
+            reauth = _find_reauthorization_required(e)
+            if reauth is not None:
+                raise reauth
             last_error = e
             if attempt < max_attempts - 1:
                 logger.warning(
@@ -598,6 +624,9 @@ async def _load_direct_mcp_tools(
             logger.debug(f"Created adapter for tool: {adapter.name}")
 
         except Exception as e:
+            reauth = _find_reauthorization_required(e)
+            if reauth is not None:
+                raise reauth
             logger.error(f"Failed to create adapter for tool {mcp_tool.name}: {e}")
             continue
 
@@ -611,7 +640,7 @@ async def load_mcp_tools_as_agent_tools(
     visibility: Optional[ToolVisibility] = None,
     allow_users: Optional[List[str]] = None,
     sandbox: Sandbox | None = None,
-) -> List[AbstractBaseTool]:
+) -> tuple[List[AbstractBaseTool], List[MCPReauthorizationRequired]]:
     """Load MCP tools from multiple servers and convert to Agent tools.
 
     Args:
@@ -623,13 +652,24 @@ async def load_mcp_tools_as_agent_tools(
             using npx/uvx will be routed through the sandbox for isolation.
 
     Returns:
-        List of MCP-backed agent tools, including sandboxed wrappers when needed
+        A tuple of ``(agent_tools, reauth_failures)``:
+            - ``agent_tools``: MCP-backed agent tools successfully loaded,
+              including sandboxed wrappers when needed.
+            - ``reauth_failures``: one ``MCPReauthorizationRequired`` per
+              server whose token could not be used/refreshed (empty list
+              when none). Never raised from here.
 
     Notes:
-        Failures loading tools from individual MCP servers are logged and skipped.
-        The function continues processing remaining servers instead of raising.
+        Failures loading tools from individual MCP servers (including
+        reauthorization failures) are logged and skipped. The function
+        continues processing remaining servers instead of raising, so one
+        dead connector never prevents other, healthy servers' tools from
+        loading. Callers that need to act on a reauthorization failure
+        (e.g. marking the connection for reconnect) should inspect
+        ``reauth_failures``.
     """
     agent_tools: List[AbstractBaseTool] = []
+    reauth_failures: List[MCPReauthorizationRequired] = []
 
     for server_name, connection in connection_map.items():
         try:
@@ -675,9 +715,19 @@ async def load_mcp_tools_as_agent_tools(
             logger.info(f"Found {len(server_tools)} tools from server {server_name}")
 
         except Exception as e:
+            reauth = _find_reauthorization_required(e)
+            if reauth is not None:
+                logger.warning(
+                    "MCP server '%s' requires reauthorization; skipping this "
+                    "server and continuing with the rest of the batch: %s",
+                    server_name,
+                    reauth,
+                )
+                reauth_failures.append(reauth)
+                continue
             logger.error(f"Failed to load tools from MCP server {server_name}: {e}")
             # Continue with other servers rather than failing completely
             continue
 
     logger.info(f"Successfully loaded {len(agent_tools)} MCP tools as Agent tools")
-    return agent_tools
+    return agent_tools, reauth_failures

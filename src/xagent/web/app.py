@@ -38,6 +38,7 @@ from .api.files import file_router
 from .api.jobs import jobs_router
 from .api.kb import kb_router
 from .api.mcp import mcp_router
+from .api.mcp_oauth import router as mcp_oauth_router
 from .api.me import router as me_router
 from .api.memory import MemoryManagementRouter
 from .api.model import model_router
@@ -547,6 +548,7 @@ app.include_router(monitor_router)
 app.include_router(progress_ws_router)
 app.include_router(memory_router)
 app.include_router(mcp_router)
+app.include_router(mcp_oauth_router)
 app.include_router(custom_api_router)
 app.include_router(tools_router)
 app.include_router(admin_users_router)

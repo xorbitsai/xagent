@@ -1,6 +1,6 @@
 "use client"
 
-import { useState, useEffect } from "react"
+import { memo, useCallback, useState, useEffect, type ReactNode } from "react"
 import { Card, CardContent } from "@/components/ui/card"
 import { Button } from "@/components/ui/button"
 import { Badge } from "@/components/ui/badge"
@@ -78,6 +78,61 @@ export interface MCPServer {
   app_id?: string
   provider?: string
 }
+
+interface MCPServerCardProps {
+  server: MCPServer
+  onEdit: (server: MCPServer) => void
+  getToolIcon: (name: string, type: string, category?: string) => ReactNode
+  mcpBadgeLabel: string
+  noDescriptionLabel: string
+  transportLabel: string
+}
+
+const MCPServerCard = memo(function MCPServerCard({
+  server,
+  onEdit,
+  getToolIcon,
+  mcpBadgeLabel,
+  noDescriptionLabel,
+  transportLabel,
+}: MCPServerCardProps) {
+  const isOAuthMcp = server.config?.auth?.type === "oauth_mcp" &&
+    (server.transport === "sse" || server.transport === "streamable_http")
+
+  return (
+    <Card className="hover:shadow-md cursor-pointer transition-all duration-300 border-border/50 hover:border-primary hover:-translate-y-1" onClick={() => onEdit(server)}>
+      <CardContent className="p-6">
+        <div className="flex items-start justify-between mb-4">
+          <div className="flex gap-4">
+            <div className="mt-1 bg-muted/50 p-3 rounded-lg h-fit">
+              {getToolIcon(server.name, 'mcp', 'mcp')}
+            </div>
+            <div>
+              <h3 className="font-semibold text-base mb-1">{server.name}</h3>
+              <Badge variant="secondary" className="font-normal text-xs bg-muted text-muted-foreground hover:bg-muted">
+                {mcpBadgeLabel}
+              </Badge>
+            </div>
+          </div>
+        </div>
+
+        <p className="text-sm text-muted-foreground mb-6 line-clamp-2 h-10">
+          {server.description || noDescriptionLabel}
+        </p>
+
+        <div className="flex items-center justify-between text-xs text-muted-foreground mb-3">
+          <span className="capitalize">{server.transport} {transportLabel}</span>
+        </div>
+
+        {isOAuthMcp && (
+          <div className="pt-3 border-t border-border/60">
+            <McpOAuthConnectControl serverId={server.id} />
+          </div>
+        )}
+      </CardContent>
+    </Card>
+  )
+})
 
 interface TransportConfig {
   value: string
@@ -465,7 +520,7 @@ export default function ToolsPage() {
     }
   }
 
-  const handleEditMcpServer = (server: MCPServer) => {
+  const handleEditMcpServer = useCallback((server: MCPServer) => {
     // Check if this is an official integration (from library)
     const isOfficial = server.transport === 'oauth'
 
@@ -524,7 +579,7 @@ export default function ToolsPage() {
       })
       setIsMcpDialogOpen(true)
     }
-  }
+  }, [getAppIcon])
 
   const handleSaveMcpServer = async () => {
     if (!mcpFormData.name.trim()) {
@@ -644,7 +699,7 @@ export default function ToolsPage() {
     return translated
   }
 
-  const getToolIcon = (name: string, type: string, category?: string) => {
+  const getToolIcon = useCallback((name: string, type: string, category?: string) => {
     const lowerName = name.toLowerCase()
     const lowerCategory = (category || "").toLowerCase()
     if (type === 'mcp') {
@@ -666,7 +721,7 @@ export default function ToolsPage() {
     if (type === 'builtin' || lowerCategory === 'basic') return <Wrench className="h-6 w-6 text-slate-500" />
 
     return <Code className="h-6 w-6 text-slate-500" />
-  }
+  }, [getAppIcon])
 
   const getBadgeInfo = (tool: Tool) => {
     // Use display_category if available, otherwise fallback to category
@@ -887,44 +942,6 @@ export default function ToolsPage() {
     )
   }
 
-  const MCPServerCard = ({ server }: { server: MCPServer }) => {
-    const isOAuthMcp = server.config?.auth?.type === "oauth_mcp"
-
-    return (
-      <Card className="hover:shadow-md cursor-pointer transition-all duration-300 border-border/50 hover:border-primary hover:-translate-y-1" onClick={() => handleEditMcpServer(server)}>
-        <CardContent className="p-6">
-          <div className="flex items-start justify-between mb-4">
-            <div className="flex gap-4">
-              <div className="mt-1 bg-muted/50 p-3 rounded-lg h-fit">
-                {getToolIcon(server.name, 'mcp', 'mcp')}
-              </div>
-              <div>
-                <h3 className="font-semibold text-base mb-1">{server.name}</h3>
-                <Badge variant="secondary" className="font-normal text-xs bg-muted text-muted-foreground hover:bg-muted">
-                  {t('tools.mcp.badge')}
-                </Badge>
-              </div>
-            </div>
-          </div>
-
-          <p className="text-sm text-muted-foreground mb-6 line-clamp-2 h-10">
-            {server.description || t('tools.list.noDescription')}
-          </p>
-
-          <div className="flex items-center justify-between text-xs text-muted-foreground mb-3">
-            <span className="capitalize">{server.transport} {t('tools.list.transport')}</span>
-          </div>
-
-          {isOAuthMcp && (
-            <div className="pt-3 border-t border-border/60">
-              <McpOAuthConnectControl serverId={server.id} />
-            </div>
-          )}
-        </CardContent>
-      </Card>
-    )
-  }
-
   return (
     <div className="w-full p-6 space-y-8 overflow-y-auto h-[calc(100vh-2rem)]">
       {/* Header */}
@@ -1056,7 +1073,15 @@ export default function ToolsPage() {
 
               {/* Show MCP servers only in 'all' or 'mcp' tab */}
               {(activeTab === 'all' || activeTab === 'mcp') && filteredMcpServers.map(server => (
-                <MCPServerCard key={`mcp-${server.id}`} server={server} />
+                <MCPServerCard
+                  key={`mcp-${server.id}`}
+                  server={server}
+                  onEdit={handleEditMcpServer}
+                  getToolIcon={getToolIcon}
+                  mcpBadgeLabel={t('tools.mcp.badge')}
+                  noDescriptionLabel={t('tools.list.noDescription')}
+                  transportLabel={t('tools.list.transport')}
+                />
               ))}
 
               {/* Empty State */}

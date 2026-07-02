@@ -101,7 +101,13 @@ export function CustomMcpForm({
               key={t}
               type="button"
               className={`flex-1 py-1.5 text-sm font-medium rounded-md transition-colors ${transport === t ? "bg-blue-600 text-white shadow" : "text-slate-600 hover:text-slate-900 hover:bg-slate-200"}`}
-              onClick={() => setMcpFormData((prev: MCPServerFormData) => ({ ...prev, transport: t }))}
+              onClick={() => setMcpFormData((prev: MCPServerFormData) => {
+                const config = { ...(prev.config || {}) }
+                if ((t === "stdio" || t === "websocket") && config.auth?.type === "oauth_mcp") {
+                  config.auth = { type: "none" }
+                }
+                return { ...prev, transport: t, config }
+              })}
             >
               {t === "sse" ? "SSE" : t === "streamable_http" ? "HTTP" : t === "stdio" ? "STDIO" : "WebSocket"}
             </button>

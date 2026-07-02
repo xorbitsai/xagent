@@ -34,6 +34,7 @@ from xagent.config import (
     LANCEDB_PATH,
     MAX_TRACE_PAYLOAD_BYTES,
     MAX_UPLOAD_SIZE,
+    OAUTH_CALLBACK_BASE_URL_ENV,
     OPENROUTER_OFFICIAL_PROVIDERS_ONLY,
     PASSWORD_RESET_EXPIRE_MINUTES,
     PREVIEW_TMP_DIR,
@@ -92,6 +93,7 @@ from xagent.config import (
     get_lancedb_path,
     get_max_trace_payload_bytes,
     get_max_upload_size_bytes,
+    get_oauth_callback_base_url,
     get_openrouter_official_providers_only,
     get_password_reset_expire_minutes,
     get_preview_tmp_dir,
@@ -314,6 +316,16 @@ class TestAuthEmailConfig:
 
         monkeypatch.setenv(SMTP_FROM_NAME, " Support Team ")
         assert get_smtp_from_name("Xagent") == "Support Team"
+
+
+class TestOAuthCallbackBaseUrl:
+    def test_defaults_to_localhost_when_unset(self, monkeypatch):
+        monkeypatch.delenv(OAUTH_CALLBACK_BASE_URL_ENV, raising=False)
+        assert get_oauth_callback_base_url() == "http://localhost:8000"
+
+    def test_returns_env_override(self, monkeypatch):
+        monkeypatch.setenv(OAUTH_CALLBACK_BASE_URL_ENV, "https://app.example.com")
+        assert get_oauth_callback_base_url() == "https://app.example.com"
 
 
 class TestOpenRouterConfig:

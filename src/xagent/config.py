@@ -98,6 +98,7 @@ GOOGLE_OIDC_CLIENT_ID = "XAGENT_GOOGLE_OIDC_CLIENT_ID"
 GOOGLE_OIDC_CLIENT_SECRET = "XAGENT_GOOGLE_OIDC_CLIENT_SECRET"
 GOOGLE_OIDC_REDIRECT_URI = "XAGENT_GOOGLE_OIDC_REDIRECT_URI"
 FRONTEND_URL = "XAGENT_FRONTEND_URL"
+OAUTH_CALLBACK_BASE_URL_ENV = "XAGENT_OAUTH_CALLBACK_BASE_URL"
 OIDC_LOGIN_TTL_SECONDS = "XAGENT_OIDC_LOGIN_TTL_SECONDS"
 OIDC_EXCHANGE_TTL_SECONDS = "XAGENT_OIDC_EXCHANGE_TTL_SECONDS"
 SESSION_SECRET = "XAGENT_SESSION_SECRET"
@@ -525,6 +526,19 @@ def get_frontend_url() -> str:
     if value and value.strip():
         return value.strip().rstrip("/")
     return "http://localhost:3000"
+
+
+def get_oauth_callback_base_url() -> str:
+    """Get the public base URL used to build the OAuth redirect URI.
+
+    Priority:
+        1. XAGENT_OAUTH_CALLBACK_BASE_URL environment variable
+        2. http://localhost:8000
+    """
+    value = os.getenv(OAUTH_CALLBACK_BASE_URL_ENV)
+    if value and value.strip():
+        return value.strip().rstrip("/")
+    return "http://localhost:8000"
 
 
 def get_oidc_login_ttl_seconds() -> int:

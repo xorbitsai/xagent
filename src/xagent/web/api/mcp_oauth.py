@@ -1,17 +1,20 @@
 """Interactive OAuth connect/callback endpoints for remote MCP connectors."""
 
 import logging
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
+from html import escape
+from typing import Any, cast
 
 import httpx
 from fastapi import APIRouter, Depends, HTTPException, Query
 from fastapi.responses import HTMLResponse
-from mcp.shared.auth import OAuthClientInformationFull
+from mcp.shared.auth import OAuthClientInformationFull, OAuthToken
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
-from ...config import get_oauth_callback_base_url
 from ...core.tools.core.mcp.oauth.flow import (
     build_authorization_url,
+    code_challenge_for_verifier,
     decode_state,
     discover_auth_server,
     encode_state,
@@ -19,20 +22,86 @@ from ...core.tools.core.mcp.oauth.flow import (
     new_pkce,
     register_client_dcr,
 )
+from ...core.tools.core.mcp.oauth.provider import (
+    get_oauth_redirect_uri,
+    oauth_client_metadata_dict,
+)
+from ...core.tools.core.mcp.oauth.ssrf_guard import UnsafeOAuthEndpointError
 from ...core.utils.encryption import decrypt_value, encrypt_value
 from ..auth_dependencies import get_current_user
 from ..models.database import get_db
 from ..models.mcp import MCPServer, UserMCPServer
 from ..models.mcp_oauth import MCPUserOAuthToken
 from ..models.user import User
+from ..services.mcp_oauth_token_storage import DBTokenStorage
+from .mcp import _can_edit_server_config
 
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api/mcp", tags=["mcp-oauth"])
+OAUTH_MCP_TRANSPORTS = {"sse", "streamable_http"}
 
 
 def _redirect_uri() -> str:
-    return f"{get_oauth_callback_base_url().rstrip('/')}/api/mcp/oauth/callback"
+    try:
+        return get_oauth_redirect_uri()
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+
+def _oauth_client_metadata_dict() -> dict[str, Any]:
+    try:
+        return oauth_client_metadata_dict()
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+
+def _is_oauth_mcp_server(server: MCPServer) -> bool:
+    auth = getattr(server, "auth", None)
+    return isinstance(auth, dict) and auth.get("type") == "oauth_mcp"
+
+
+def _supports_oauth_mcp_transport(server: MCPServer) -> bool:
+    return cast(str, getattr(server, "transport", "")) in OAUTH_MCP_TRANSPORTS
+
+
+def _client_info_from_registration(reg: dict) -> OAuthClientInformationFull:
+    data = _oauth_client_metadata_dict()
+    data.update(
+        client_id=reg["client_id"],
+        client_secret=reg.get("client_secret"),
+        client_id_issued_at=reg.get("client_id_issued_at"),
+        client_secret_expires_at=reg.get("client_secret_expires_at"),
+    )
+    return OAuthClientInformationFull.model_validate(data)
+
+
+def _authorization_url(
+    as_meta: dict, oauth_client: dict, state: str, code_challenge: str
+) -> str:
+    client_id = oauth_client.get("client_id")
+    if not client_id:
+        raise HTTPException(status_code=422, detail="OAuth client is missing client_id")
+    scopes_supported = as_meta.get("scopes_supported")
+    scope = " ".join(scopes_supported) if scopes_supported else None
+    try:
+        return build_authorization_url(
+            as_meta,
+            client_id=str(client_id),
+            redirect_uri=_redirect_uri(),
+            code_challenge=code_challenge,
+            state=state,
+            scope=scope,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+
+def _callback_html(message: str, status_code: int = 200) -> HTMLResponse:
+    return HTMLResponse(
+        f"<html><body><p>{escape(message)}</p></body></html>",
+        status_code=status_code,
+    )
 
 
 def _get_authorized_server(db: Session, user_id: int, server_id: int) -> MCPServer:
@@ -40,6 +109,15 @@ def _get_authorized_server(db: Session, user_id: int, server_id: int) -> MCPServ
 
     Mirrors the ownership check in ``mcp.py``'s ``get_mcp_server``: server
     access is scoped via the ``UserMCPServer`` join table, not by id alone.
+    """
+    return _get_authorized_server_with_link(db, user_id, server_id)[1]
+
+
+def _get_authorized_server_with_link(
+    db: Session, user_id: int, server_id: int
+) -> tuple[UserMCPServer, MCPServer]:
+    """Like ``_get_authorized_server``, but also returns the ``UserMCPServer``
+    link row so callers can additionally check edit/ownership permissions.
     """
     result = (
         db.query(UserMCPServer, MCPServer)
@@ -49,7 +127,7 @@ def _get_authorized_server(db: Session, user_id: int, server_id: int) -> MCPServ
     )
     if not result:
         raise HTTPException(status_code=404, detail="MCP server not found")
-    return result[1]
+    return cast(UserMCPServer, result[0]), cast(MCPServer, result[1])
 
 
 @router.post("/{server_id}/connect")
@@ -58,22 +136,64 @@ async def connect(
     user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ) -> dict:
-    server = _get_authorized_server(db, user.id, server_id)
-    if not server.url:
-        raise HTTPException(status_code=404, detail="MCP server not found")
+    user_id = int(cast(Any, user.id))
+    user_mcp, server = _get_authorized_server_with_link(db, user_id, server_id)
+    if not _is_oauth_mcp_server(server):
+        raise HTTPException(
+            status_code=400, detail="MCP server is not configured for OAuth"
+        )
+    if not _supports_oauth_mcp_transport(server):
+        raise HTTPException(
+            status_code=400,
+            detail="OAuth MCP is only supported for SSE and Streamable HTTP transports",
+        )
+    server_data = cast(Any, server)
+    if not server_data.url:
+        raise HTTPException(status_code=400, detail="OAuth MCP server has no URL")
+    client_metadata = _oauth_client_metadata_dict()
 
-    async with httpx.AsyncClient(timeout=30) as client:
-        as_meta = server.auth_server_metadata
+    async with httpx.AsyncClient(timeout=30, trust_env=False) as client:
+        as_meta = server_data.auth_server_metadata
         if not as_meta:
-            as_meta = await discover_auth_server(server.url, client=client)
-            server.auth_server_metadata = as_meta
-
-        oauth_client = server.oauth_client
-        if not oauth_client:
             try:
-                reg = await register_client_dcr(
-                    as_meta, [_redirect_uri()], client=client
+                as_meta = await discover_auth_server(server_data.url, client=client)
+            except UnsafeOAuthEndpointError as exc:
+                raise HTTPException(
+                    status_code=422,
+                    detail=(
+                        "This server's OAuth configuration points to a "
+                        "disallowed address."
+                    ),
+                ) from exc
+            except ValueError as exc:
+                raise HTTPException(
+                    status_code=422,
+                    detail=f"Authorization server discovery failed: {exc}",
+                ) from exc
+            except httpx.HTTPError as exc:
+                raise HTTPException(
+                    status_code=502,
+                    detail="Authorization server discovery failed",
+                ) from exc
+            server_data.auth_server_metadata = as_meta
+
+        oauth_client = server_data.oauth_client
+        if not oauth_client:
+            if not _can_edit_server_config(user, user_mcp):
+                raise HTTPException(
+                    status_code=403,
+                    detail="You do not have permission to configure this connector",
                 )
+            try:
+                reg = await register_client_dcr(as_meta, client_metadata, client=client)
+            except UnsafeOAuthEndpointError as exc:
+                raise HTTPException(
+                    status_code=422,
+                    detail=(
+                        "This server's OAuth configuration points to a "
+                        "disallowed address."
+                    ),
+                ) from exc
             except ValueError as exc:
                 raise HTTPException(
                     status_code=422,
@@ -82,53 +202,92 @@ async def connect(
                         "Ask an admin to configure a client for this server."
                     ),
                 ) from exc
-            client_info = OAuthClientInformationFull(
-                client_id=reg["client_id"],
-                client_secret=reg.get("client_secret"),
-                redirect_uris=[_redirect_uri()],
-                grant_types=["authorization_code", "refresh_token"],
-                response_types=["code"],
-                token_endpoint_auth_method="client_secret_post",
-            )
+            except httpx.HTTPError as exc:
+                raise HTTPException(
+                    status_code=502, detail="Automatic client registration failed"
+                ) from exc
+            client_info = _client_info_from_registration(reg)
             oauth_client = client_info.model_dump(mode="json", exclude_none=True)
             if oauth_client.get("client_secret"):
                 oauth_client["client_secret"] = encrypt_value(
                     oauth_client["client_secret"]
                 )
             oauth_client["source"] = "dcr"
-            server.oauth_client = oauth_client
+            server_data.oauth_client = oauth_client
         db.commit()
-
-    verifier, challenge = new_pkce()
-    state = encode_state(user_id=user.id, mcpserver_id=server_id)
 
     row = (
         db.query(MCPUserOAuthToken)
-        .filter_by(user_id=user.id, mcpserver_id=server_id)
+        .filter_by(user_id=user_id, mcpserver_id=server_id)
         .one_or_none()
     )
-    if row is None:
-        row = MCPUserOAuthToken(user_id=user.id, mcpserver_id=server_id)
-        db.add(row)
-    row.status = "pending"
-    row.pkce_verifier = encrypt_value(verifier)
-    row.state = state
-    db.commit()
+    row_data = cast(Any, row)
+    if (
+        row
+        and row_data.status == "pending"
+        and row_data.state
+        and row_data.pkce_verifier
+    ):
+        verifier = decrypt_value(row_data.pkce_verifier)
+        return {
+            "authorization_url": _authorization_url(
+                as_meta,
+                oauth_client,
+                row_data.state,
+                code_challenge_for_verifier(verifier),
+            )
+        }
 
-    auth_url = build_authorization_url(
-        as_meta,
-        client_id=oauth_client["client_id"],
-        redirect_uri=_redirect_uri(),
-        code_challenge=challenge,
-        state=state,
-    )
-    return {"authorization_url": auth_url}
+    verifier, challenge = new_pkce()
+    state = encode_state(user_id=user_id, mcpserver_id=server_id)
+
+    if row is None:
+        row = MCPUserOAuthToken(user_id=user_id, mcpserver_id=server_id)
+        db.add(row)
+        row_data = cast(Any, row)
+    row_data.status = "pending"
+    row_data.pkce_verifier = encrypt_value(verifier)
+    row_data.state = state
+    try:
+        db.commit()
+    except IntegrityError as exc:
+        db.rollback()
+        row = (
+            db.query(MCPUserOAuthToken)
+            .filter_by(user_id=user_id, mcpserver_id=server_id)
+            .one_or_none()
+        )
+        row_data = cast(Any, row)
+        if (
+            row
+            and row_data.status == "pending"
+            and row_data.state
+            and row_data.pkce_verifier
+        ):
+            verifier = decrypt_value(row_data.pkce_verifier)
+            return {
+                "authorization_url": _authorization_url(
+                    as_meta,
+                    oauth_client,
+                    row_data.state,
+                    code_challenge_for_verifier(verifier),
+                )
+            }
+        raise HTTPException(
+            status_code=409, detail="Authorization is already in progress"
+        ) from exc
+
+    return {
+        "authorization_url": _authorization_url(as_meta, oauth_client, state, challenge)
+    }
 
 
 @router.get("/oauth/callback")
 async def callback(
-    code: str = Query(...),
+    code: str | None = Query(None),
     state: str = Query(...),
+    error: str | None = Query(None),
+    error_description: str | None = Query(None),
     db: Session = Depends(get_db),
 ) -> HTMLResponse:
     try:
@@ -141,15 +300,31 @@ async def callback(
         .filter_by(user_id=user_id, mcpserver_id=server_id, state=state)
         .one_or_none()
     )
-    if row is None or not row.pkce_verifier:
+    row_data = cast(Any, row)
+    if row is None or not row_data.pkce_verifier:
         raise HTTPException(status_code=400, detail="No pending authorization")
 
+    if error:
+        row_data.status = "error"
+        row_data.pkce_verifier = None
+        row_data.state = None
+        db.commit()
+        detail = error_description or error
+        return _callback_html(
+            f"Authorization failed: {detail}. Please try connecting again.",
+            status_code=400,
+        )
+
+    if not code:
+        raise HTTPException(status_code=400, detail="Missing authorization code")
+
     server = db.query(MCPServer).filter_by(id=server_id).one()
-    oc = server.oauth_client or {}
+    server_data = cast(Any, server)
+    oc = server_data.oauth_client or {}
     try:
-        async with httpx.AsyncClient(timeout=30) as client:
+        async with httpx.AsyncClient(timeout=30, trust_env=False) as client:
             tokens = await exchange_code_for_tokens(
-                server.auth_server_metadata,
+                server_data.auth_server_metadata,
                 client_id=oc["client_id"],
                 client_secret=(
                     decrypt_value(oc["client_secret"])
@@ -157,33 +332,47 @@ async def callback(
                     else None
                 ),
                 code=code,
-                code_verifier=decrypt_value(row.pkce_verifier),
+                code_verifier=decrypt_value(row_data.pkce_verifier),
                 redirect_uri=_redirect_uri(),
                 client=client,
             )
-    except httpx.HTTPError:
-        logger.warning("OAuth token exchange failed for server %s", server_id)
-        row.status = "error"
+        oauth_token = OAuthToken.model_validate(tokens)
+    except UnsafeOAuthEndpointError as exc:
+        logger.warning(
+            "OAuth token exchange blocked by SSRF guard for server %s: %s",
+            server_id,
+            exc,
+        )
+        row_data.status = "error"
+        row_data.pkce_verifier = None
+        row_data.state = None
         db.commit()
-        return HTMLResponse(
-            "<html><body><p>Authorization failed. Please try connecting again.</p>"
-            "</body></html>",
+        return _callback_html(
+            "This server's OAuth configuration points to a disallowed address.",
             status_code=400,
         )
-
-    row.access_token = encrypt_value(tokens["access_token"])
-    row.refresh_token = (
-        encrypt_value(tokens["refresh_token"]) if tokens.get("refresh_token") else None
-    )
-    row.token_type = tokens.get("token_type", "Bearer")
-    row.scope = tokens.get("scope")
-    if tokens.get("expires_in"):
-        row.expires_at = datetime.now(timezone.utc) + timedelta(
-            seconds=int(tokens["expires_in"])
+    except (httpx.HTTPError, ValueError) as exc:
+        # ValueError also covers json.JSONDecodeError (raised inside
+        # exchange_code_for_tokens's resp.json()) and pydantic's
+        # ValidationError, both of which can occur on a 200 response with a
+        # malformed/incomplete token body -- treat that the same as a
+        # transport-level failure rather than leaking an unhandled 500.
+        logger.warning("OAuth token exchange failed for server %s: %s", server_id, exc)
+        row_data.status = "error"
+        row_data.pkce_verifier = None
+        row_data.state = None
+        db.commit()
+        return _callback_html(
+            "Authorization failed. Please try connecting again.", status_code=400
         )
-    row.status = "connected"
-    row.pkce_verifier = None
-    row.state = None
+
+    if not await DBTokenStorage(user_id, server_id, db).set_tokens_if_row_exists(
+        oauth_token
+    ):
+        return _callback_html(
+            "Authorization was canceled or expired. Please connect again.",
+            status_code=400,
+        )
     db.commit()
 
     return HTMLResponse(
@@ -198,13 +387,25 @@ async def connection_status(
     user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ) -> dict:
-    _get_authorized_server(db, user.id, server_id)
+    _get_authorized_server(db, int(cast(Any, user.id)), server_id)
     row = (
         db.query(MCPUserOAuthToken)
-        .filter_by(user_id=user.id, mcpserver_id=server_id)
+        .filter_by(user_id=int(cast(Any, user.id)), mcpserver_id=server_id)
         .one_or_none()
     )
-    return {"status": row.status if row else "not_connected"}
+    if not row:
+        return {"status": "not_connected"}
+
+    row_data = cast(Any, row)
+    if row_data.status == "connected" and not row_data.refresh_token:
+        expires_at = row_data.expires_at
+        if isinstance(expires_at, datetime):
+            if expires_at.tzinfo is None:
+                expires_at = expires_at.replace(tzinfo=timezone.utc)
+            if expires_at <= datetime.now(timezone.utc):
+                return {"status": "expired"}
+
+    return {"status": row_data.status}
 
 
 @router.delete("/{server_id}/connection")
@@ -213,10 +414,11 @@ async def disconnect(
     user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ) -> dict:
-    _get_authorized_server(db, user.id, server_id)
+    user_id = int(cast(Any, user.id))
+    _get_authorized_server(db, user_id, server_id)
     row = (
         db.query(MCPUserOAuthToken)
-        .filter_by(user_id=user.id, mcpserver_id=server_id)
+        .filter_by(user_id=user_id, mcpserver_id=server_id)
         .one_or_none()
     )
     if row:

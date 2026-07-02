@@ -18,10 +18,12 @@ from sqlalchemy.orm import Session
 from ...core.tools.core.mcp.data_config import MCPServerConfig
 from ...core.tools.core.mcp.manager.db import DatabaseMCPServerManager
 from ...core.tools.core.mcp.model import SENSITIVE_AUTH_FIELDS
+from ...core.tools.core.mcp.oauth.errors import MCPReauthorizationRequired
 from ..auth_dependencies import get_current_user
 from ..mcp_apps import get_all_mcp_apps, get_app_by_name
 from ..models.database import get_db
 from ..models.mcp import MCPServer, UserMCPServer
+from ..models.mcp_oauth import MCPUserOAuthToken
 from ..models.user import User
 
 logger = logging.getLogger(__name__)
@@ -178,6 +180,43 @@ class ConfigFieldParser:
 def _format_optional_datetime(value: object) -> Optional[str]:
     """Serialize datetimes while tolerating ORM attributes without DB timestamps."""
     return value.isoformat() if isinstance(value, datetime) else None
+
+
+def _can_edit_server_config(user: User, user_mcp: UserMCPServer) -> bool:
+    return bool(
+        getattr(user, "is_admin", False)
+        or getattr(user_mcp, "is_owner", False)
+        or getattr(user_mcp, "can_edit", False)
+    )
+
+
+def _updates_sensitive_server_config(server_data: MCPServerUpdate) -> bool:
+    return (
+        server_data.name is not None
+        or server_data.description is not None
+        or server_data.transport is not None
+        or server_data.config is not None
+    )
+
+
+def _clear_mcp_oauth_binding(db: Session, server: MCPServer) -> None:
+    server.oauth_client = None
+    server.auth_server_metadata = None
+    db.query(MCPUserOAuthToken).filter_by(mcpserver_id=server.id).delete(
+        synchronize_session=False
+    )
+
+
+def _reauth_required_http_exception(exc: MCPReauthorizationRequired) -> HTTPException:
+    return HTTPException(
+        status_code=status.HTTP_409_CONFLICT,
+        detail={
+            "code": "mcp_reauthorization_required",
+            "message": str(exc),
+            "server_name": exc.server_name,
+            "mcpserver_id": exc.mcpserver_id,
+        },
+    )
 
 
 class MCPConfigFieldRegistry:
@@ -772,7 +811,7 @@ def get_mcp_servers(
     """List MCP servers for the current user."""
     try:
         manager = DatabaseMCPServerManager(db)
-        user_id = current_user.id
+        user_id = int(cast(Any, current_user.id))
 
         # Get user's MCP servers
         user_mcps = (
@@ -867,7 +906,7 @@ def get_mcp_server(
     """Get a specific MCP server."""
     try:
         manager = DatabaseMCPServerManager(db)
-        user_id = current_user.id
+        user_id = int(cast(Any, current_user.id))
 
         # Check user has access to this server
         result = (
@@ -955,7 +994,12 @@ def create_mcp_server(
 
         # Create user-server association
         user_mcp = UserMCPServer(
-            user_id=user_id, mcpserver_id=server.id, is_active=server_data.is_active
+            user_id=user_id,
+            mcpserver_id=server.id,
+            is_owner=True,
+            can_edit=True,
+            can_delete=True,
+            is_active=server_data.is_active,
         )
         db.add(user_mcp)
         db.commit()
@@ -1002,6 +1046,14 @@ def update_mcp_server(
 
         user_mcp, server = result
 
+        if _updates_sensitive_server_config(
+            server_data
+        ) and not _can_edit_server_config(current_user, user_mcp):
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="You do not have permission to edit this MCP server",
+            )
+
         # Check for name conflicts if updating name
         if server_data.name and server_data.name != server.name:
             existing = (
@@ -1037,8 +1089,16 @@ def update_mcp_server(
                 detail=f"Invalid configuration: {str(e)}",
             )
 
+        before_config = server.to_config_dict()
+
         # Update server fields
         _update_server_from_config(server, config)
+
+        after_config = server.to_config_dict()
+        if before_config.get("url") != after_config.get("url") or before_config.get(
+            "auth"
+        ) != after_config.get("auth"):
+            _clear_mcp_oauth_binding(db, server)
 
         # Update user association if needed
         if server_data.is_active is not None:
@@ -1257,9 +1317,16 @@ async def test_mcp_connection(
 
         try:
             connections_dict: Dict[str, Any] = {"test": connection}
-            tools = await load_mcp_tools_as_agent_tools(
+            tools, reauth_failures = await load_mcp_tools_as_agent_tools(
                 connections_dict, name_prefix="test_"
             )
+            if reauth_failures:
+                # Single-server caller: re-raise the (only) failure ourselves
+                # so the existing except-clause below still produces the same
+                # structured error response. ``load_mcp_tools_as_agent_tools``
+                # no longer raises this internally now that it isolates
+                # per-server failures for its batch callers.
+                raise reauth_failures[0]
 
             if tools:
                 return MCPConnectionTestResponse(
@@ -1274,6 +1341,16 @@ async def test_mcp_connection(
                     details={"tool_count": 0},
                 )
 
+        except MCPReauthorizationRequired as conn_error:
+            return MCPConnectionTestResponse(
+                success=False,
+                message=str(conn_error),
+                details={
+                    "error": "mcp_reauthorization_required",
+                    "server_name": conn_error.server_name,
+                    "mcpserver_id": conn_error.mcpserver_id,
+                },
+            )
         except Exception as conn_error:
             return MCPConnectionTestResponse(
                 success=False,
@@ -1395,7 +1472,7 @@ async def get_mcp_server_tools(
 ) -> dict:
     """Get tools available from a specific MCP server."""
     try:
-        user_id = current_user.id
+        user_id = int(cast(Any, current_user.id))
 
         # Check user has access to this server
         result = (
@@ -1430,9 +1507,16 @@ async def get_mcp_server_tools(
         server_name = server.name
         if isinstance(server_name, str):
             connections_dict: Dict[str, Any] = {server_name: connection}
-            tools = await load_mcp_tools_as_agent_tools(
+            tools, reauth_failures = await load_mcp_tools_as_agent_tools(
                 connections_dict, name_prefix=f"server_{server_id}_"
             )
+            if reauth_failures:
+                # Single-server caller: re-raise the (only) failure ourselves
+                # so the except-clause below still produces the same 409
+                # response. ``load_mcp_tools_as_agent_tools`` no longer
+                # raises this internally now that it isolates per-server
+                # failures for its batch callers.
+                raise reauth_failures[0]
 
         tools_list: List[Any] = tools if isinstance(tools, list) else []
 
@@ -1452,6 +1536,8 @@ async def get_mcp_server_tools(
 
     except HTTPException:
         raise
+    except MCPReauthorizationRequired as e:
+        raise _reauth_required_http_exception(e) from e
     except Exception as e:
         logger.error(f"Failed to get MCP server tools: {e}")
         raise HTTPException(

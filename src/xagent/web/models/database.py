@@ -49,6 +49,7 @@ def init_db(db_url: str | None = None) -> None:
         GmailWatchState,
         KBIngestTarget,
         MCPServer,
+        MCPUserOAuthToken,
         Model,
         OAuthProvider,
         OidcConsumedToken,

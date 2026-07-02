@@ -47,6 +47,12 @@ def create_mcp_server_table(Base: Type[Any]) -> Type[Any]:
         headers = Column(JSON, nullable=True)  # Dict[str, Any]
         timeout = Column(Integer, nullable=True)
         auth = Column(JSON, nullable=True)  # Dict[str, Any]
+        # OAuth-MCP connector (server-level, shared across users):
+        # {"client_id","client_secret"(enc),"authorization_endpoint",
+        #  "token_endpoint","registration_endpoint","source":"dcr"|"manual"}
+        oauth_client = Column(JSON, nullable=True)
+        # Cached protected-resource / authorization-server metadata
+        auth_server_metadata = Column(JSON, nullable=True)
         concurrency_safe = Column(Boolean, nullable=False, default=False)
         concurrent_tools = Column(JSON, nullable=True)  # List[str]
 
@@ -116,6 +122,11 @@ def create_mcp_server_table(Base: Type[Any]) -> Type[Any]:
             }
             auth_type = auth_value.get("type")
 
+            if auth_type == "oauth_mcp":
+                # Per-user OAuth: token is injected at load time via an
+                # OAuthClientProvider, not as a static header here.
+                return merged_headers or None
+
             if auth_type == "bearer":
                 bearer_token = auth_value.get("bearer_token")
                 if bearer_token and "authorization" not in existing_headers:
@@ -179,6 +190,11 @@ def create_mcp_server_table(Base: Type[Any]) -> Type[Any]:
                 merged_headers = self._merge_auth_headers(typed_headers, decrypted_auth)
                 if merged_headers:
                     connection["headers"] = merged_headers
+                if (
+                    isinstance(decrypted_auth, dict)
+                    and decrypted_auth.get("type") == "oauth_mcp"
+                ):
+                    connection["oauth_mcp"] = True
 
             if getattr(self, "timeout", None) is not None:
                 connection["timeout"] = self.timeout

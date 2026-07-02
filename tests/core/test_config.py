@@ -28,6 +28,7 @@ from xagent.config import (
     FILE_STORAGE_OPTIONS,
     FILE_STORAGE_STARTUP_SYNC_ENABLED,
     FILE_STORAGE_URI,
+    FRONTEND_DIST_DIR,
     HOT_PATH_CACHE_ENABLED,
     HOT_PATH_CACHE_TTL_SECONDS,
     HOT_PATH_TASK_CACHE_TTL_SECONDS,
@@ -86,6 +87,7 @@ from xagent.config import (
     get_file_storage_options,
     get_file_storage_startup_sync_enabled,
     get_file_storage_uri,
+    get_frontend_dist_dir,
     get_hot_path_cache_enabled,
     get_hot_path_cache_ttl_seconds,
     get_hot_path_task_cache_ttl_seconds,
@@ -130,6 +132,9 @@ class TestEnvironmentVariableConstants:
 
     def test_web_dir_constant(self):
         assert WEB_DIR == "XAGENT_WEB_DIR"
+
+    def test_frontend_dist_dir_constant(self):
+        assert FRONTEND_DIST_DIR == "XAGENT_FRONTEND_DIST_DIR"
 
     def test_external_upload_dirs_constant(self):
         assert EXTERNAL_UPLOAD_DIRS == "XAGENT_EXTERNAL_UPLOAD_DIRS"
@@ -745,6 +750,31 @@ class TestGetWebDir:
         monkeypatch.setenv(WEB_DIR, "/custom/web")
         result = get_web_dir()
         assert result == Path("/custom/web")
+
+
+class TestGetFrontendDistDir:
+    """Test get_frontend_dist_dir() function."""
+
+    def test_default_frontend_dist_dir(self, monkeypatch):
+        """Defaults to WEB_DIR/frontend_dist."""
+        monkeypatch.delenv(FRONTEND_DIST_DIR, raising=False)
+        monkeypatch.delenv(WEB_DIR, raising=False)
+        result = get_frontend_dist_dir()
+        assert result.name == "frontend_dist"
+        assert result.parent.name == "web"
+
+    def test_frontend_dist_dir_with_env_var(self, monkeypatch):
+        """Environment variable overrides the default."""
+        monkeypatch.setenv(FRONTEND_DIST_DIR, "/custom/dist")
+        result = get_frontend_dist_dir()
+        assert result == Path("/custom/dist")
+
+    def test_frontend_dist_dir_follows_web_dir_default(self, monkeypatch):
+        """Default is computed under the configured WEB_DIR."""
+        monkeypatch.delenv(FRONTEND_DIST_DIR, raising=False)
+        monkeypatch.setenv(WEB_DIR, "/custom/web")
+        result = get_frontend_dist_dir()
+        assert result == Path("/custom/web/frontend_dist")
 
 
 class TestGetAgentRuntime:

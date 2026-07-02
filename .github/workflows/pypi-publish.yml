@@ -19,6 +19,23 @@ jobs:
         with:
           python-version: "3.11"
 
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Build frontend static export
+        working-directory: frontend
+        env:
+          NEXT_TELEMETRY_DISABLED: "1"
+        run: |
+          npm ci
+          npm run build
+
+      - name: Stage frontend into the package
+        run: |
+          rm -rf src/xagent/web/frontend_dist
+          cp -r frontend/out src/xagent/web/frontend_dist
+
       - name: Build distributions
         run: |
           python -m pip install build

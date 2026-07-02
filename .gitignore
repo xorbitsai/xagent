@@ -221,6 +221,9 @@ node_modules/
 # xagent web uploads directory
 src/xagent/web/uploads/
 
+# Built frontend static export, bundled into the wheel at publish time
+src/xagent/web/frontend_dist/
+
 # test data
 examples/test_data.*
 examples/*.html

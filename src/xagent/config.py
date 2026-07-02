@@ -32,6 +32,7 @@ logger = logging.getLogger(__name__)
 # Environment variable names
 UPLOADS_DIR = "XAGENT_UPLOADS_DIR"
 WEB_DIR = "XAGENT_WEB_DIR"
+FRONTEND_DIST_DIR = "XAGENT_FRONTEND_DIST_DIR"
 EXTERNAL_UPLOAD_DIRS = "XAGENT_EXTERNAL_UPLOAD_DIRS"
 EXTERNAL_SKILLS_LIBRARY_DIRS = "XAGENT_EXTERNAL_SKILLS_LIBRARY_DIRS"
 AGENT_RUNTIME = "XAGENT_AGENT_RUNTIME"
@@ -582,6 +583,28 @@ def get_uploads_dir() -> Path:
     # Default: web/uploads
     web_dir = get_web_dir()
     return web_dir / "uploads"
+
+
+def get_frontend_dist_dir() -> Path:
+    """Get the directory holding the built frontend static export.
+
+    Priority:
+        1. XAGENT_FRONTEND_DIST_DIR environment variable
+        2. Default to WEB_DIR/frontend_dist (where the wheel bundles the export)
+
+    The directory may not exist (e.g. an editable install without a frontend
+    build, or the multi-container Docker deployment where Next.js serves the
+    frontend). Callers must handle a missing directory by falling back to
+    API-only serving.
+
+    Returns:
+        Path object for the bundled frontend static export directory
+    """
+    env_dir = os.getenv(FRONTEND_DIST_DIR)
+    if env_dir:
+        return Path(env_dir)
+
+    return get_web_dir() / "frontend_dist"
 
 
 def get_max_upload_size_bytes() -> int:

@@ -326,6 +326,11 @@ include = [
   "src/xagent/templates/built_in/**",
   "src/xagent/web/README.md",
 ]
+# The built frontend static export is .gitignore'd (it is a build output staged
+# by the release workflow), so it must be listed as an artifact for hatchling to
+# include it. This lets the single-process (pip / uvx) deployment serve the UI
+# without a Node runtime.
+artifacts = ["src/xagent/web/frontend_dist/**"]
 
 [tool.hatch.build.targets.sdist]
 include = [
@@ -333,6 +338,7 @@ include = [
   "src/xagent/templates/built_in/**",
   "src/xagent/web/README.md",
 ]
+artifacts = ["src/xagent/web/frontend_dist/**"]
 
 [tool.hatch.metadata]
 allow-direct-references = true

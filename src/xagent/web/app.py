@@ -1060,8 +1060,15 @@ async def shutdown_event() -> None:
         await sandbox_mgr.cleanup()
 
 
-# Frontend is now served by Next.js at http://localhost:3000
-# This backend only provides API endpoints
+from ..config import get_frontend_dist_dir  # noqa: E402
+
+# Serve the built frontend static export (single-process / pip deployment).
+# Registered last so the SPA catch-all only receives paths unmatched by the API
+# routers above. If the export is absent (e.g. the multi-container Docker
+# deployment where Next.js serves the frontend), the backend stays API-only.
+from .frontend_static import mount_frontend  # noqa: E402
+
+mount_frontend(app, get_frontend_dist_dir())
 
 
 if __name__ == "__main__":

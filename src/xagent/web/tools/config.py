@@ -156,15 +156,22 @@ def attach_oauth_provider_if_needed(
     """
     if not connection.pop("oauth_mcp", False):
         return connection
+    if connection.get("transport") not in ["sse", "streamable_http"]:
+        return connection
 
     from ...core.tools.core.mcp.oauth.provider import build_execution_oauth_provider
+    from ..services.mcp_oauth_token_storage import DBTokenStorage
 
+    server_url = connection.get("url")
+    if not isinstance(server_url, str) or not server_url.strip():
+        raise ValueError("OAuth MCP connection requires a URL")
+
+    storage = DBTokenStorage(user_id=user_id, mcpserver_id=mcpserver_id, db=db)
     connection["auth"] = build_execution_oauth_provider(
-        server_url=connection["url"],
+        server_url=server_url.strip(),
         server_name=connection.get("name", "mcp"),
-        user_id=user_id,
         mcpserver_id=mcpserver_id,
-        db=db,
+        storage=storage,
     )
     return connection
 

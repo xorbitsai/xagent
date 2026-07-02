@@ -46,9 +46,7 @@ def upgrade() -> None:
         sa.ForeignKeyConstraint(
             ["mcpserver_id"], ["mcp_servers.id"], ondelete="CASCADE"
         ),
-        sa.UniqueConstraint(
-            "user_id", "mcpserver_id", name="uq_mcp_user_server_token"
-        ),
+        sa.UniqueConstraint("user_id", "mcpserver_id", name="uq_mcp_user_server_token"),
     )
     op.create_index(
         "ix_mcp_user_oauth_tokens_user_id", "mcp_user_oauth_tokens", ["user_id"]
@@ -64,9 +62,7 @@ def upgrade() -> None:
 
 
 def downgrade() -> None:
-    op.drop_index(
-        "ix_mcp_user_oauth_tokens_state", table_name="mcp_user_oauth_tokens"
-    )
+    op.drop_index("ix_mcp_user_oauth_tokens_state", table_name="mcp_user_oauth_tokens")
     op.drop_index(
         "ix_mcp_user_oauth_tokens_mcpserver_id", table_name="mcp_user_oauth_tokens"
     )

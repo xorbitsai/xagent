@@ -75,8 +75,7 @@ def test_upgrade_creates_table_and_adds_columns(tmp_path):
         assert "mcp_user_oauth_tokens" in inspector.get_table_names()
 
         token_columns = {
-            column["name"]
-            for column in inspector.get_columns("mcp_user_oauth_tokens")
+            column["name"] for column in inspector.get_columns("mcp_user_oauth_tokens")
         }
         assert token_columns == {
             "id",

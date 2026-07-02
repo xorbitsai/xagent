@@ -1,5 +1,7 @@
 """End-to-end integration test for the OAuth remote-MCP connector.
 
+codespell:ignore asend
+
 Exercises the seam that matters at execution time: a connected user's token
 is attached to outbound requests by the real SDK ``OAuthClientProvider``
 (backed by the real ``DBTokenStorage``), and when no usable token exists the
@@ -25,14 +27,15 @@ that exact, real, un-mocked-provider behavior.
 
 from __future__ import annotations
 
+from urllib.parse import parse_qs
+
 import httpx
 import pytest
-
-from mcp.shared.auth import OAuthToken
+from mcp.shared.auth import OAuthClientInformationFull, OAuthToken
 
 from xagent.core.tools.core.mcp.oauth.errors import MCPReauthorizationRequired
 from xagent.core.tools.core.mcp.oauth.provider import build_execution_oauth_provider
-from xagent.core.tools.core.mcp.oauth.token_storage import DBTokenStorage
+from xagent.web.services.mcp_oauth_token_storage import DBTokenStorage
 
 SERVER_URL = "https://mcp.example/notion"
 
@@ -61,15 +64,16 @@ async def test_connected_token_is_used_without_interactive_auth(
     and the provider never needs to touch the redirect/callback handlers."""
     user_id, server_id = seed_user_and_server
 
-    storage = DBTokenStorage(user_id=user_id, mcpserver_id=server_id, db=db_session)
+    storage = DBTokenStorage(
+        user_id=user_id, mcpserver_id=server_id, db=db_session, create_missing=True
+    )
     await storage.set_tokens(OAuthToken(access_token="AT", token_type="Bearer"))
 
     provider = build_execution_oauth_provider(
         server_url=SERVER_URL,
         server_name="notion",
-        user_id=user_id,
         mcpserver_id=server_id,
-        db=db_session,
+        storage=storage,
     )
 
     def handler(request: httpx.Request) -> httpx.Response:
@@ -102,12 +106,14 @@ async def test_reauth_required_when_no_connected_token(
     user_id, server_id = seed_user_and_server
 
     # No DBTokenStorage.set_tokens() call: get_tokens() will return None.
+    storage = DBTokenStorage(
+        user_id=user_id, mcpserver_id=server_id, db=db_session, create_missing=True
+    )
     provider = build_execution_oauth_provider(
         server_url=SERVER_URL,
         server_name="notion",
-        user_id=user_id,
         mcpserver_id=server_id,
-        db=db_session,
+        storage=storage,
     )
 
     def handler(request: httpx.Request) -> httpx.Response:
@@ -154,5 +160,60 @@ async def test_reauth_required_when_no_connected_token(
 
     # Confirm the seam directly: the storage the provider reads from has no
     # usable token for this (user, server) pair.
-    storage = DBTokenStorage(user_id=user_id, mcpserver_id=server_id, db=db_session)
     assert await storage.get_tokens() is None
+
+
+@pytest.mark.asyncio
+async def test_expired_connected_token_refreshes_before_resource_request(
+    db_session, seed_user_and_server
+):
+    user_id, server_id = seed_user_and_server
+    storage = DBTokenStorage(
+        user_id=user_id, mcpserver_id=server_id, db=db_session, create_missing=True
+    )
+    await storage.set_client_info(
+        OAuthClientInformationFull(
+            client_id="client-id",
+            client_secret="client-secret",
+            redirect_uris=["https://localhost/callback"],
+        )
+    )
+    await storage.set_tokens(
+        OAuthToken(
+            access_token="OLD",
+            token_type="Bearer",
+            refresh_token="RT",
+            expires_in=-60,
+        )
+    )
+
+    provider = build_execution_oauth_provider(
+        server_url=SERVER_URL,
+        server_name="notion",
+        mcpserver_id=server_id,
+        storage=storage,
+    )
+    flow = provider.async_auth_flow(httpx.Request("GET", SERVER_URL))
+
+    refresh_request = await flow.__anext__()
+    assert refresh_request.url.path == "/token"
+    body = parse_qs(refresh_request.content.decode())
+    assert body["grant_type"] == ["refresh_token"]
+    assert body["refresh_token"] == ["RT"]
+
+    refreshed_resource_request = await flow.asend(
+        httpx.Response(
+            200,
+            json={
+                "access_token": "NEW",
+                "token_type": "Bearer",
+                "refresh_token": "RT2",
+                "expires_in": 3600,
+            },
+            request=refresh_request,
+        )
+    )
+    assert refreshed_resource_request.headers.get("authorization") == "Bearer NEW"
+
+    with pytest.raises(StopAsyncIteration):
+        await flow.asend(httpx.Response(200, request=refreshed_resource_request))

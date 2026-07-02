@@ -15,16 +15,6 @@ from ..init_tool_configs import get_default_tool_configs
 from ..models.database import get_db
 from ..models.tool_config import ToolConfig, ToolUsage
 from ..models.user import User
-from ..services.tool_credentials import (
-    TOOL_CREDENTIAL_SPECS,
-    clear_tool_credential,
-    delete_sql_connection,
-    get_tool_credential_view,
-    list_configurable_tool_names,
-    list_sql_connections,
-    set_sql_connection,
-    set_tool_credentials,
-)
 from ..tools.config import WebToolConfig
 
 logger = logging.getLogger(__name__)
@@ -58,20 +48,8 @@ CATEGORY_DISPLAY_NAMES = {
 tools_router = APIRouter(prefix="/api/tools", tags=["tools"])
 
 
-class CredentialFieldUpdate(BaseModel):
-    value: str
-
-
-class ToolCredentialUpdateRequest(BaseModel):
-    credentials: dict[str, CredentialFieldUpdate]
-
-
 class ToolEnableUpdateRequest(BaseModel):
     enabled: bool
-
-
-class SqlConnectionUpsertRequest(BaseModel):
-    connection_url: str
 
 
 def _create_tool_info(
@@ -96,10 +74,7 @@ def _create_tool_info(
         # vision tool depends on vision model
         if not vision_model:
             status = "missing_model"
-            status_reason = (
-                "Vision model not configured, "
-                "please add a vision model in model management page"
-            )
+            status_reason = "Vision model not configured, please add a vision model in model management page"
             enabled = False
 
     elif category == "image":
@@ -355,75 +330,6 @@ async def get_available_tools(
     }
 
 
-@tools_router.get("/configurable")
-async def get_configurable_tools(
-    current_user: User = Depends(get_current_user),
-    db: Session = Depends(get_db),
-) -> dict[str, Any]:
-    if not bool(current_user.is_admin):
-        raise HTTPException(status_code=403, detail="Admin privileges required")
-
-    items: list[dict[str, Any]] = []
-    for tool_name in list_configurable_tool_names():
-        view = get_tool_credential_view(db, tool_name)
-        items.append(
-            {
-                "tool_name": tool_name,
-                "display_name": view.get("display_name", tool_name),
-                "configured": view["configured"],
-                "fields": view["fields"],
-            }
-        )
-
-    return {
-        "tools": items,
-        "count": len(items),
-    }
-
-
-@tools_router.get("/sql-connections")
-async def get_sql_connections(
-    current_user: User = Depends(get_current_user),
-    db: Session = Depends(get_db),
-) -> dict[str, Any]:
-    items = list_sql_connections(db, _require_user_id(current_user))
-    return {
-        "connections": items,
-        "count": len(items),
-    }
-
-
-@tools_router.put("/sql-connections/{name}")
-async def upsert_sql_connection(
-    name: str,
-    payload: SqlConnectionUpsertRequest,
-    current_user: User = Depends(get_current_user),
-    db: Session = Depends(get_db),
-) -> dict[str, Any]:
-    current_user_id = _require_user_id(current_user)
-    try:
-        set_sql_connection(db, current_user_id, name, payload.connection_url)
-    except ValueError as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
-
-    return {
-        "connections": list_sql_connections(db, current_user_id),
-    }
-
-
-@tools_router.delete("/sql-connections/{name}")
-async def remove_sql_connection(
-    name: str,
-    current_user: User = Depends(get_current_user),
-    db: Session = Depends(get_db),
-) -> dict[str, Any]:
-    current_user_id = _require_user_id(current_user)
-    delete_sql_connection(db, current_user_id, name)
-    return {
-        "connections": list_sql_connections(db, current_user_id),
-    }
-
-
 @tools_router.put("/{tool_name}/enabled")
 async def update_tool_enabled(
     tool_name: str,
@@ -461,75 +367,6 @@ async def update_tool_enabled(
         "tool_name": tool_name,
         "enabled": bool(cast(Any, config_row).enabled),
     }
-
-
-@tools_router.get("/{tool_name}/credentials")
-async def get_tool_credentials(
-    tool_name: str,
-    current_user: User = Depends(get_current_user),
-    db: Session = Depends(get_db),
-) -> dict[str, Any]:
-    if not bool(current_user.is_admin):
-        raise HTTPException(status_code=403, detail="Admin privileges required")
-
-    if tool_name not in TOOL_CREDENTIAL_SPECS:
-        raise HTTPException(
-            status_code=404, detail=f"Tool '{tool_name}' is not configurable"
-        )
-
-    return get_tool_credential_view(db, tool_name)
-
-
-@tools_router.put("/{tool_name}/credentials")
-async def update_tool_credentials(
-    tool_name: str,
-    payload: ToolCredentialUpdateRequest,
-    current_user: User = Depends(get_current_user),
-    db: Session = Depends(get_db),
-) -> dict[str, Any]:
-    if not bool(current_user.is_admin):
-        raise HTTPException(status_code=403, detail="Admin privileges required")
-
-    if tool_name not in TOOL_CREDENTIAL_SPECS:
-        raise HTTPException(
-            status_code=404, detail=f"Tool '{tool_name}' is not configurable"
-        )
-
-    updates = {
-        field_name: field_update.value
-        for field_name, field_update in payload.credentials.items()
-    }
-
-    try:
-        set_tool_credentials(db, tool_name, updates)
-    except ValueError as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
-
-    return get_tool_credential_view(db, tool_name)
-
-
-@tools_router.delete("/{tool_name}/credentials/{field_name}")
-async def delete_tool_credential(
-    tool_name: str,
-    field_name: str,
-    current_user: User = Depends(get_current_user),
-    db: Session = Depends(get_db),
-) -> dict[str, Any]:
-    if not bool(current_user.is_admin):
-        raise HTTPException(status_code=403, detail="Admin privileges required")
-
-    if tool_name not in TOOL_CREDENTIAL_SPECS:
-        raise HTTPException(
-            status_code=404, detail=f"Tool '{tool_name}' is not configurable"
-        )
-
-    if field_name not in TOOL_CREDENTIAL_SPECS[tool_name]:
-        raise HTTPException(
-            status_code=404, detail=f"Field '{field_name}' is not configurable"
-        )
-
-    clear_tool_credential(db, tool_name, field_name)
-    return get_tool_credential_view(db, tool_name)
 
 
 @tools_router.get("/usage")

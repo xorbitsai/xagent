@@ -3,25 +3,42 @@ from __future__ import annotations
 import base64
 import hashlib
 import os
-from collections.abc import Iterable
-from datetime import datetime, timezone
-from typing import Any, Callable, cast
+from collections.abc import Callable, Iterable
+from dataclasses import dataclass
+from datetime import UTC, datetime
+from typing import Any, Literal
 
 from cryptography.fernet import Fernet, InvalidToken
 from sqlalchemy.engine import make_url
 from sqlalchemy.orm import Session
-from sqlalchemy.orm.attributes import flag_modified
 
 from ..init_tool_configs import get_default_tool_configs
-from ..models.tool_config import ToolConfig, UserToolConfig
+from ..models.tool_config import ScopedToolCredential, ToolConfig
 
+ScopeType = str
+ApiScopeType = Literal["user", "instance"]
 ToolFieldSpec = dict[str, Any]
 
 # Hook signature: (db: Session, user: Any) -> dict[str, {"enabled": bool|None}]
 # Returns per-user overrides for tool enable/disable.
-# Application layers can inject per-user tool policies via set_user_tool_overrides_hook().
-# NOTE: "config" override is reserved for future use and not yet implemented.
 _get_user_tool_overrides_hook: Callable[[Session, Any], dict] | None = None
+
+
+@dataclass(frozen=True)
+class CredentialScopeRef:
+    """A non-core credential fallback scope supplied by an embedding app."""
+
+    scope_type: str
+    scope_id: int
+    source_label: str | None = None
+
+
+# Hook signature: (db: Session, user: Any) -> Iterable[CredentialScopeRef].
+# Embedding apps install this so core xagent can resolve shared credentials
+# without importing application-specific tenancy concepts.
+_credential_fallback_scopes_hook: (
+    Callable[[Session, Any], Iterable[CredentialScopeRef]] | None
+) = None
 
 
 def set_user_tool_overrides_hook(hook: Callable[[Session, Any], dict] | None) -> None:
@@ -33,6 +50,42 @@ def get_user_tool_overrides(db: Session, user: Any) -> dict:
     if _get_user_tool_overrides_hook is not None:
         return _get_user_tool_overrides_hook(db, user)
     return {}
+
+
+def set_credential_fallback_scopes_hook(
+    hook: Callable[[Session, Any], Iterable[CredentialScopeRef]] | None,
+) -> None:
+    global _credential_fallback_scopes_hook
+    _credential_fallback_scopes_hook = hook
+
+
+def get_credential_fallback_scopes(db: Session, user: Any) -> list[CredentialScopeRef]:
+    if _credential_fallback_scopes_hook is None:
+        return []
+    scopes: list[CredentialScopeRef] = []
+    for scope in _credential_fallback_scopes_hook(db, user):
+        if scope.scope_id is None:
+            continue
+        scopes.append(
+            CredentialScopeRef(
+                scope_type=str(scope.scope_type),
+                scope_id=int(scope.scope_id),
+                source_label=scope.source_label,
+            )
+        )
+    return scopes
+
+
+def set_instance_credentials_enabled(enabled: bool) -> None:
+    """Deprecated compatibility shim.
+
+    Instance credentials are a core standalone scope. SaaS should control
+    runtime fallback order by installing credential fallback scopes instead.
+    """
+
+
+def instance_credentials_enabled() -> bool:
+    return True
 
 
 TOOL_CREDENTIAL_SPECS: dict[str, dict[str, ToolFieldSpec]] = {
@@ -82,13 +135,13 @@ TOOL_CREDENTIAL_SPECS: dict[str, dict[str, ToolFieldSpec]] = {
     },
 }
 
+SQL_TOOL_NAME = "sql_query"
+SQL_CONNECTION_ENV_PREFIX = "XAGENT_EXTERNAL_DB_"
+ALLOWED_SQL_SCHEMES = {"duckdb", "postgresql", "mysql", "mariadb", "mssql", "sqlite"}
+
 
 def list_configurable_tool_names() -> list[str]:
-    return list(TOOL_CREDENTIAL_SPECS.keys())
-
-
-SQL_CONNECTION_ENV_PREFIX = "XAGENT_EXTERNAL_DB_"
-ALLOWED_SQL_SCHEMES = {"postgresql", "mysql", "mariadb", "mssql", "sqlite"}
+    return [*TOOL_CREDENTIAL_SPECS.keys(), SQL_TOOL_NAME]
 
 
 def _build_fernet_key() -> bytes:
@@ -124,78 +177,6 @@ def _mask_value(value: str) -> str:
     return f"{'*' * (len(value) - 4)}{value[-4:]}"
 
 
-def _get_or_create_tool_config(db: Session, tool_name: str) -> ToolConfig:
-    config = db.query(ToolConfig).filter(ToolConfig.tool_name == tool_name).first()
-    if config:
-        return config
-
-    defaults = {item["tool_name"]: item for item in get_default_tool_configs()}
-    default_data = defaults.get(tool_name)
-    if default_data:
-        config = ToolConfig(**default_data)
-        db.add(config)
-        db.flush()
-        return config
-
-    config = ToolConfig(
-        tool_name=tool_name,
-        tool_type="builtin",
-        category="search",
-        display_name=tool_name,
-        description="",
-        enabled=True,
-        config={},
-        dependencies=[],
-    )
-    db.add(config)
-    db.flush()
-    return config
-
-
-def _get_or_create_user_tool_config(
-    db: Session, user_id: int, tool_name: str
-) -> UserToolConfig:
-    config = (
-        db.query(UserToolConfig)
-        .filter(
-            UserToolConfig.user_id == user_id,
-            UserToolConfig.tool_name == tool_name,
-        )
-        .first()
-    )
-    if config:
-        return config
-
-    config = UserToolConfig(user_id=user_id, tool_name=tool_name, config={})
-    db.add(config)
-    db.flush()
-    return config
-
-
-def _get_storage(config: ToolConfig) -> dict[str, Any]:
-    raw_config = cast(Any, getattr(config, "config", None))
-    payload: dict[str, Any] = {}
-    if isinstance(raw_config, dict):
-        for key, value in raw_config.items():
-            payload[str(key)] = value
-    credentials = payload.get("credentials")
-    if not isinstance(credentials, dict):
-        credentials = {}
-    payload["credentials"] = credentials
-    cast(Any, config).config = payload
-    return credentials
-
-
-def _get_user_tool_payload(config: UserToolConfig) -> dict[str, Any]:
-    raw_config = cast(Any, getattr(config, "config", None))
-    payload: dict[str, Any] = {}
-    if isinstance(raw_config, dict):
-        for key, value in raw_config.items():
-            payload[str(key)] = value
-    cast(Any, config).config = payload
-    return payload
-
-
 def _read_env(env_names: Iterable[str]) -> str | None:
     for name in env_names:
         value = os.getenv(name)
@@ -208,16 +189,6 @@ def _sanitize_sql_connection_name(name: str) -> str:
     return name.strip().upper()
 
 
-def _get_user_sql_connection_store(config: UserToolConfig) -> dict[str, Any]:
-    payload = _get_user_tool_payload(config)
-    sql_connections = payload.get("sql_connections")
-    if not isinstance(sql_connections, dict):
-        sql_connections = {}
-    payload["sql_connections"] = sql_connections
-    cast(Any, config).config = payload
-    return sql_connections
-
-
 def _sql_url_mask(url: str) -> str:
     try:
         parsed = make_url(url)
@@ -226,21 +197,242 @@ def _sql_url_mask(url: str) -> str:
         return _mask_value(url)
 
 
-def _get_user_sql_tool_config(db: Session, user_id: int) -> UserToolConfig:
-    return _get_or_create_user_tool_config(db, user_id, "sql_query")
+def _validate_scope(scope_type: str, scope_id: int | None) -> ScopeType:
+    if not scope_type:
+        raise ValueError("Credential scope is required")
+    if scope_type == "instance" and scope_id is not None:
+        raise ValueError("Instance credential scope must not have a scope id")
+    if scope_type != "instance" and scope_id is None:
+        raise ValueError(f"{scope_type.title()} credential scope requires a scope id")
+    return scope_type
 
 
-def set_sql_connection(
-    db: Session, user_id: int, name: str, connection_url: str
+def _runtime_scope_entries(
+    *,
+    user_id: int | None,
+    user: Any | None,
+    db: Session,
+    include_instance: bool,
+) -> tuple[tuple[ScopeType, int | None], ...]:
+    entries: list[tuple[ScopeType, int | None]] = []
+    if user_id is not None:
+        entries.append(("user", user_id))
+    shared_scopes: list[CredentialScopeRef] = []
+    if user is not None:
+        shared_scopes = get_credential_fallback_scopes(db, user)
+        entries.extend((scope.scope_type, scope.scope_id) for scope in shared_scopes)
+    if include_instance:
+        entries.append(("instance", None))
+    return tuple(entries)
+
+
+def _query_scoped_credential(
+    db: Session,
+    *,
+    scope_type: ScopeType,
+    scope_id: int | None,
+    tool_name: str,
+    field_name: str,
+) -> ScopedToolCredential | None:
+    query = db.query(ScopedToolCredential).filter(
+        ScopedToolCredential.scope_type == scope_type,
+        ScopedToolCredential.tool_name == tool_name,
+        ScopedToolCredential.field_name == field_name,
+    )
+    if scope_id is None:
+        query = query.filter(ScopedToolCredential.scope_id.is_(None))
+    else:
+        query = query.filter(ScopedToolCredential.scope_id == scope_id)
+    return query.first()
+
+
+def _row_field_name(row: ScopedToolCredential) -> str:
+    return str(row.field_name)
+
+
+def _get_display_name(db: Session, tool_name: str) -> str:
+    if tool_name == SQL_TOOL_NAME:
+        return "SQL Query"
+    config = db.query(ToolConfig).filter(ToolConfig.tool_name == tool_name).first()
+    if config is not None and isinstance(getattr(config, "display_name", None), str):
+        return str(config.display_name)
+    defaults = {item["tool_name"]: item for item in get_default_tool_configs()}
+    return str(defaults.get(tool_name, {}).get("display_name") or tool_name)
+
+
+def _credential_specs_for_tool(tool_name: str) -> dict[str, ToolFieldSpec]:
+    specs = TOOL_CREDENTIAL_SPECS.get(tool_name)
+    if specs is None:
+        raise ValueError(f"Tool '{tool_name}' is not configurable")
+    return specs
+
+
+def _resolve_plain_field(
+    db: Session,
+    *,
+    tool_name: str,
+    field_name: str,
+    user_id: int | None,
+    user: Any | None,
+    include_instance: bool,
+) -> tuple[str | None, str]:
+    scope_entries = _runtime_scope_entries(
+        user_id=user_id,
+        user=user,
+        db=db,
+        include_instance=include_instance,
+    )
+    for scope_type, scope_id in scope_entries:
+        if scope_type == "instance":
+            if not include_instance:
+                continue
+            credential_scope_id = None
+        else:
+            if scope_id is None:
+                continue
+            credential_scope_id = scope_id
+        row = _query_scoped_credential(
+            db,
+            scope_type=scope_type,
+            scope_id=credential_scope_id,
+            tool_name=tool_name,
+            field_name=field_name,
+        )
+        if row is None:
+            continue
+        decrypted = _decrypt(str(row.encrypted_value))
+        if decrypted:
+            return decrypted, scope_type
+
+    spec = TOOL_CREDENTIAL_SPECS.get(tool_name, {}).get(field_name)
+    env_names = spec.get("env", []) if spec else []
+    if isinstance(env_names, list):
+        env_value = _read_env(env_names)
+        if env_value:
+            return env_value, "env"
+    return None, "none"
+
+
+def resolve_tool_credential(
+    db: Session,
+    tool_name: str,
+    field_name: str,
+    *,
+    user_id: int | None = None,
+    user: Any | None = None,
+    include_instance: bool | None = None,
+) -> str | None:
+    if tool_name == SQL_TOOL_NAME:
+        return resolve_sql_connection(
+            db,
+            field_name,
+            user_id=user_id,
+            user=user,
+            include_instance=include_instance,
+        )
+    if field_name not in TOOL_CREDENTIAL_SPECS.get(tool_name, {}):
+        return None
+    resolved_include_instance = (
+        instance_credentials_enabled() if include_instance is None else include_instance
+    )
+    value, _source = _resolve_plain_field(
+        db,
+        tool_name=tool_name,
+        field_name=field_name,
+        user_id=user_id,
+        user=user,
+        include_instance=resolved_include_instance,
+    )
+    return value
+
+
+def set_scoped_tool_credentials(
+    db: Session,
+    *,
+    scope_type: str,
+    scope_id: int | None,
+    tool_name: str,
+    values: dict[str, str],
 ) -> None:
-    normalized_name = _sanitize_sql_connection_name(name)
-    if not normalized_name:
-        raise ValueError("Connection name is required")
-    normalized_url = connection_url.strip()
-    if not normalized_url:
-        raise ValueError("Connection URL is required")
+    normalized_scope = _validate_scope(scope_type, scope_id)
+    if tool_name != SQL_TOOL_NAME:
+        specs = _credential_specs_for_tool(tool_name)
+        allowed_fields = set(specs)
+    else:
+        allowed_fields = set(values)
+
+    now = datetime.now(UTC)
+    for raw_field_name, raw_value in values.items():
+        field_name = (
+            _sanitize_sql_connection_name(raw_field_name)
+            if tool_name == SQL_TOOL_NAME
+            else raw_field_name
+        )
+        if field_name not in allowed_fields and tool_name != SQL_TOOL_NAME:
+            continue
+        normalized = raw_value.strip()
+        if not normalized:
+            continue
+        if tool_name == SQL_TOOL_NAME:
+            _validate_sql_connection_url(normalized)
+            masked = _sql_url_mask(normalized)
+        else:
+            masked = _mask_value(normalized)
+
+        row = _query_scoped_credential(
+            db,
+            scope_type=normalized_scope,
+            scope_id=scope_id,
+            tool_name=tool_name,
+            field_name=field_name,
+        )
+        if row is None:
+            row = ScopedToolCredential(
+                scope_type=normalized_scope,
+                scope_id=scope_id,
+                tool_name=tool_name,
+                field_name=field_name,
+                encrypted_value=_encrypt(normalized),
+                masked_value=masked,
+            )
+            db.add(row)
+        else:
+            row.encrypted_value = _encrypt(normalized)  # type: ignore[assignment]
+            row.masked_value = masked  # type: ignore[assignment]
+            row.updated_at = now  # type: ignore[assignment]
+            db.add(row)
+    db.commit()
+
+
+def clear_scoped_tool_credential(
+    db: Session,
+    *,
+    scope_type: str,
+    scope_id: int | None,
+    tool_name: str,
+    field_name: str,
+) -> None:
+    normalized_scope = _validate_scope(scope_type, scope_id)
+    normalized_field = (
+        _sanitize_sql_connection_name(field_name)
+        if tool_name == SQL_TOOL_NAME
+        else field_name
+    )
+    row = _query_scoped_credential(
+        db,
+        scope_type=normalized_scope,
+        scope_id=scope_id,
+        tool_name=tool_name,
+        field_name=normalized_field,
+    )
+    if row is not None:
+        db.delete(row)
+        db.commit()
+
+
+def _validate_sql_connection_url(connection_url: str) -> None:
     try:
-        parsed = make_url(normalized_url)
+        parsed = make_url(connection_url)
     except Exception as exc:
         raise ValueError("Invalid SQLAlchemy connection URL") from exc
 
@@ -252,272 +444,79 @@ def set_sql_connection(
             f"Allowed schemes: {allowed_schemes_text}"
         )
 
-    config = _get_user_sql_tool_config(db, user_id)
-    storage = _get_user_sql_connection_store(config)
-    now = datetime.now(timezone.utc).isoformat()
-    storage[normalized_name] = {
-        "ciphertext": _encrypt(normalized_url),
-        "masked": _sql_url_mask(normalized_url),
-        "updated_at": now,
-    }
-    db.add(config)
-    flag_modified(config, "config")
-    db.commit()
 
-
-def delete_sql_connection(db: Session, user_id: int, name: str) -> None:
-    normalized_name = _sanitize_sql_connection_name(name)
-    config = (
-        db.query(UserToolConfig)
-        .filter(
-            UserToolConfig.user_id == user_id,
-            UserToolConfig.tool_name == "sql_query",
-        )
-        .first()
+def _rows_for_scope(
+    db: Session,
+    *,
+    scope_type: ScopeType,
+    scope_id: int | None,
+    tool_name: str,
+) -> list[ScopedToolCredential]:
+    query = db.query(ScopedToolCredential).filter(
+        ScopedToolCredential.scope_type == scope_type,
+        ScopedToolCredential.tool_name == tool_name,
     )
-    if not config:
-        return
-    payload = cast(Any, getattr(config, "config", None))
-    if not isinstance(payload, dict):
-        return
-    sql_connections = payload.get("sql_connections")
-    if not isinstance(sql_connections, dict):
-        return
-    removed = False
-    for key in list(sql_connections.keys()):
-        if (
-            isinstance(key, str)
-            and _sanitize_sql_connection_name(key) == normalized_name
-        ):
-            del sql_connections[key]
-            removed = True
-
-    if removed:
-        cast(Any, config).config = payload
-        db.add(config)
-        flag_modified(config, "config")
-        db.commit()
-
-
-def resolve_sql_connection(db: Session, user_id: int | None, name: str) -> str | None:
-    normalized_name = _sanitize_sql_connection_name(name)
-    config = None
-    if user_id is not None:
-        config = (
-            db.query(UserToolConfig)
-            .filter(
-                UserToolConfig.user_id == user_id,
-                UserToolConfig.tool_name == "sql_query",
-            )
-            .first()
-        )
-    if config and isinstance(config.config, dict):
-        sql_connections = config.config.get("sql_connections")
-        if isinstance(sql_connections, dict):
-            item = sql_connections.get(normalized_name)
-            if isinstance(item, dict) and isinstance(item.get("ciphertext"), str):
-                decrypted = _decrypt(item["ciphertext"])
-                if decrypted:
-                    return decrypted
-
-    return os.getenv(f"{SQL_CONNECTION_ENV_PREFIX}{normalized_name}")
-
-
-def get_sql_connection_map(db: Session, user_id: int | None) -> dict[str, str]:
-    result: dict[str, str] = {}
-
-    for key, value in os.environ.items():
-        if key.startswith(SQL_CONNECTION_ENV_PREFIX) and value:
-            name = key[len(SQL_CONNECTION_ENV_PREFIX) :]
-            if name:
-                result[name] = value
-
-    if user_id is None:
-        return result
-
-    config = (
-        db.query(UserToolConfig)
-        .filter(
-            UserToolConfig.user_id == user_id,
-            UserToolConfig.tool_name == "sql_query",
-        )
-        .first()
-    )
-    if config and isinstance(config.config, dict):
-        sql_connections = config.config.get("sql_connections")
-        if isinstance(sql_connections, dict):
-            for raw_name, item in sql_connections.items():
-                if not isinstance(raw_name, str) or not isinstance(item, dict):
-                    continue
-                ciphertext = item.get("ciphertext")
-                if isinstance(ciphertext, str):
-                    decrypted = _decrypt(ciphertext)
-                    if decrypted:
-                        result[_sanitize_sql_connection_name(raw_name)] = decrypted
-
-    return result
-
-
-def list_sql_connections(db: Session, user_id: int | None) -> list[dict[str, Any]]:
-    env_names = {
-        key[len(SQL_CONNECTION_ENV_PREFIX) :]: value
-        for key, value in os.environ.items()
-        if key.startswith(SQL_CONNECTION_ENV_PREFIX) and value
-    }
-
-    db_entries: dict[str, dict[str, Any]] = {}
-    config = None
-    if user_id is not None:
-        config = (
-            db.query(UserToolConfig)
-            .filter(
-                UserToolConfig.user_id == user_id,
-                UserToolConfig.tool_name == "sql_query",
-            )
-            .first()
-        )
-    if config and isinstance(config.config, dict):
-        sql_connections = config.config.get("sql_connections")
-        if isinstance(sql_connections, dict):
-            for raw_name, item in sql_connections.items():
-                if isinstance(raw_name, str) and isinstance(item, dict):
-                    db_entries[_sanitize_sql_connection_name(raw_name)] = item
-
-    all_names = sorted(set(env_names.keys()) | set(db_entries.keys()))
-    output: list[dict[str, Any]] = []
-    for name in all_names:
-        db_item = db_entries.get(name)
-        if db_item:
-            masked = str(db_item.get("masked") or "")
-            source = "db"
-        else:
-            env_value = env_names.get(name, "")
-            masked = _sql_url_mask(env_value)
-            source = "env" if env_value else "none"
-
-        output.append(
-            {
-                "name": name,
-                "source": source,
-                "masked": masked,
-                "configured": bool(masked),
-            }
-        )
-
-    return output
-
-
-def resolve_tool_credential(db: Session, tool_name: str, field_name: str) -> str | None:
-    spec = TOOL_CREDENTIAL_SPECS.get(tool_name, {}).get(field_name)
-    if not spec:
-        return None
-
-    config = db.query(ToolConfig).filter(ToolConfig.tool_name == tool_name).first()
-    if config and isinstance(config.config, dict):
-        credentials = config.config.get("credentials")
-        if isinstance(credentials, dict):
-            stored = credentials.get(field_name)
-            if isinstance(stored, dict):
-                if stored.get("secret") and isinstance(stored.get("ciphertext"), str):
-                    decrypted = _decrypt(stored["ciphertext"])
-                    if decrypted:
-                        return decrypted
-                if not stored.get("secret") and isinstance(stored.get("value"), str):
-                    return stored["value"]
-
-    env_names = spec.get("env", [])
-    if isinstance(env_names, list):
-        return _read_env(env_names)
-    return None
-
-
-def set_tool_credentials(db: Session, tool_name: str, values: dict[str, str]) -> None:
-    specs = TOOL_CREDENTIAL_SPECS.get(tool_name)
-    if not specs:
-        raise ValueError(f"Tool '{tool_name}' is not configurable")
-
-    config = _get_or_create_tool_config(db, tool_name)
-    credentials = _get_storage(config)
-    now = datetime.now(timezone.utc).isoformat()
-
-    for field_name, raw_value in values.items():
-        if field_name not in specs:
-            continue
-        normalized = raw_value.strip()
-        if not normalized:
-            continue
-        is_secret = bool(specs[field_name].get("secret", False))
-        if is_secret:
-            credentials[field_name] = {
-                "secret": True,
-                "ciphertext": _encrypt(normalized),
-                "masked": _mask_value(normalized),
-                "updated_at": now,
-            }
-        else:
-            credentials[field_name] = {
-                "secret": False,
-                "value": normalized,
-                "updated_at": now,
-            }
-
-    db.add(config)
-    flag_modified(config, "config")
-    db.commit()
-
-
-def clear_tool_credential(db: Session, tool_name: str, field_name: str) -> None:
-    config = db.query(ToolConfig).filter(ToolConfig.tool_name == tool_name).first()
-    if not config or not isinstance(config.config, dict):
-        return
-    credentials = config.config.get("credentials")
-    if not isinstance(credentials, dict):
-        return
-    if field_name in credentials:
-        del credentials[field_name]
-        db.add(config)
-        flag_modified(config, "config")
-        db.commit()
-
-
-def get_tool_credential_view(db: Session, tool_name: str) -> dict[str, Any]:
-    specs = TOOL_CREDENTIAL_SPECS.get(tool_name)
-    if not specs:
-        raise ValueError(f"Tool '{tool_name}' is not configurable")
-
-    config = db.query(ToolConfig).filter(ToolConfig.tool_name == tool_name).first()
-    display_name = tool_name
-    if config is not None and isinstance(getattr(config, "display_name", None), str):
-        display_name = str(config.display_name)
+    if scope_id is None:
+        query = query.filter(ScopedToolCredential.scope_id.is_(None))
     else:
-        defaults = {item["tool_name"]: item for item in get_default_tool_configs()}
-        display_name = str(defaults.get(tool_name, {}).get("display_name") or tool_name)
-    credentials_store: dict[str, Any] = {}
-    if config and isinstance(config.config, dict):
-        maybe = config.config.get("credentials")
-        if isinstance(maybe, dict):
-            credentials_store = maybe
+        query = query.filter(ScopedToolCredential.scope_id == scope_id)
+    return list(query.all())
+
+
+def get_tool_credential_view(
+    db: Session,
+    tool_name: str,
+    *,
+    scope_type: str,
+    scope_id: int | None,
+    user_id: int | None = None,
+    user: Any | None = None,
+    include_instance: bool | None = None,
+) -> dict[str, Any]:
+    normalized_scope = _validate_scope(scope_type, scope_id)
+    if tool_name == SQL_TOOL_NAME:
+        return get_sql_credential_view(
+            db,
+            scope_type=normalized_scope,
+            scope_id=scope_id,
+            user_id=user_id,
+            user=user,
+            include_instance=include_instance,
+        )
+
+    specs = _credential_specs_for_tool(tool_name)
+    scoped_rows = {
+        _row_field_name(row): row
+        for row in _rows_for_scope(
+            db,
+            scope_type=normalized_scope,
+            scope_id=scope_id,
+            tool_name=tool_name,
+        )
+    }
+    resolved_include_instance = (
+        instance_credentials_enabled() if include_instance is None else include_instance
+    )
 
     fields: dict[str, Any] = {}
     all_required_ok = True
     for field_name, spec in specs.items():
-        stored = credentials_store.get(field_name)
-        stored_dict = stored if isinstance(stored, dict) else None
-        db_set = stored_dict is not None
-        db_masked = ""
-        if stored_dict is not None:
-            if stored_dict.get("secret"):
-                db_masked = str(stored_dict.get("masked") or "")
-            else:
-                db_masked = str(stored_dict.get("value") or "")
-
+        scoped_row = scoped_rows.get(field_name)
         env_value = (
             _read_env(spec.get("env", []))
             if isinstance(spec.get("env"), list)
             else None
         )
-        source = "db" if db_set else ("env" if env_value else "none")
-        resolved = resolve_tool_credential(db, tool_name, field_name)
+        resolved, source = _resolve_plain_field(
+            db,
+            tool_name=tool_name,
+            field_name=field_name,
+            user_id=user_id,
+            user=user,
+            include_instance=resolved_include_instance,
+        )
+        if scoped_row is not None:
+            source = normalized_scope
         required = bool(spec.get("required", False))
         is_configured = bool(resolved)
         if required and not is_configured:
@@ -529,15 +528,262 @@ def get_tool_credential_view(db: Session, tool_name: str) -> dict[str, Any]:
             "secret": bool(spec.get("secret", False)),
             "source": source,
             "is_configured": is_configured,
-            "masked": db_masked
-            if db_set
+            "masked": str(scoped_row.masked_value)
+            if scoped_row is not None
             else (_mask_value(env_value) if env_value else ""),
             "env_names": spec.get("env", []),
         }
 
     return {
         "tool_name": tool_name,
-        "display_name": display_name,
+        "display_name": _get_display_name(db, tool_name),
         "configured": all_required_ok,
+        "fields": fields,
+    }
+
+
+def list_tool_credential_views(
+    db: Session,
+    *,
+    scope_type: str,
+    scope_id: int | None,
+    user_id: int | None = None,
+    user: Any | None = None,
+    include_instance: bool | None = None,
+) -> list[dict[str, Any]]:
+    return [
+        get_tool_credential_view(
+            db,
+            tool_name,
+            scope_type=scope_type,
+            scope_id=scope_id,
+            user_id=user_id,
+            user=user,
+            include_instance=include_instance,
+        )
+        for tool_name in list_configurable_tool_names()
+    ]
+
+
+def resolve_sql_connection(
+    db: Session,
+    name: str,
+    *,
+    user_id: int | None = None,
+    user: Any | None = None,
+    include_instance: bool | None = None,
+) -> str | None:
+    normalized_name = _sanitize_sql_connection_name(name)
+    resolved_include_instance = (
+        instance_credentials_enabled() if include_instance is None else include_instance
+    )
+    value, _source = _resolve_sql_field(
+        db,
+        normalized_name,
+        user_id=user_id,
+        user=user,
+        include_instance=resolved_include_instance,
+    )
+    return value
+
+
+def _resolve_sql_field(
+    db: Session,
+    normalized_name: str,
+    *,
+    user_id: int | None,
+    user: Any | None,
+    include_instance: bool,
+) -> tuple[str | None, str]:
+    scope_entries = _runtime_scope_entries(
+        user_id=user_id,
+        user=user,
+        db=db,
+        include_instance=include_instance,
+    )
+    for scope_type, scope_id in scope_entries:
+        if scope_type == "instance":
+            if not include_instance:
+                continue
+            credential_scope_id = None
+        else:
+            if scope_id is None:
+                continue
+            credential_scope_id = scope_id
+        row = _query_scoped_credential(
+            db,
+            scope_type=scope_type,
+            scope_id=credential_scope_id,
+            tool_name=SQL_TOOL_NAME,
+            field_name=normalized_name,
+        )
+        if row is None:
+            continue
+        decrypted = _decrypt(str(row.encrypted_value))
+        if decrypted:
+            return decrypted, scope_type
+
+    env_value = os.getenv(f"{SQL_CONNECTION_ENV_PREFIX}{normalized_name}")
+    if env_value:
+        return env_value, "env"
+    return None, "none"
+
+
+def get_sql_connection_map(
+    db: Session,
+    user_id: int | None,
+    *,
+    user: Any | None = None,
+    include_instance: bool | None = None,
+) -> dict[str, str]:
+    result: dict[str, str] = {}
+    names = {
+        key[len(SQL_CONNECTION_ENV_PREFIX) :]
+        for key, value in os.environ.items()
+        if key.startswith(SQL_CONNECTION_ENV_PREFIX) and value
+    }
+    if user_id is not None:
+        names.update(
+            _sanitize_sql_connection_name(_row_field_name(row))
+            for row in _rows_for_scope(
+                db,
+                scope_type="user",
+                scope_id=user_id,
+                tool_name=SQL_TOOL_NAME,
+            )
+        )
+    shared_scopes = get_credential_fallback_scopes(db, user) if user is not None else []
+    for scope in shared_scopes:
+        names.update(
+            _sanitize_sql_connection_name(_row_field_name(row))
+            for row in _rows_for_scope(
+                db,
+                scope_type=scope.scope_type,
+                scope_id=scope.scope_id,
+                tool_name=SQL_TOOL_NAME,
+            )
+        )
+    resolved_include_instance = (
+        instance_credentials_enabled() if include_instance is None else include_instance
+    )
+    if resolved_include_instance:
+        names.update(
+            _sanitize_sql_connection_name(_row_field_name(row))
+            for row in _rows_for_scope(
+                db,
+                scope_type="instance",
+                scope_id=None,
+                tool_name=SQL_TOOL_NAME,
+            )
+        )
+
+    for name in sorted(names):
+        value = resolve_sql_connection(
+            db,
+            name,
+            user_id=user_id,
+            user=user,
+            include_instance=resolved_include_instance,
+        )
+        if value:
+            result[name] = value
+    return result
+
+
+def get_sql_credential_view(
+    db: Session,
+    *,
+    scope_type: ScopeType,
+    scope_id: int | None,
+    user_id: int | None,
+    user: Any | None,
+    include_instance: bool | None,
+) -> dict[str, Any]:
+    scoped_rows = {
+        _sanitize_sql_connection_name(_row_field_name(row)): row
+        for row in _rows_for_scope(
+            db,
+            scope_type=scope_type,
+            scope_id=scope_id,
+            tool_name=SQL_TOOL_NAME,
+        )
+    }
+    names = set(scoped_rows)
+    env_values = {
+        key[len(SQL_CONNECTION_ENV_PREFIX) :]: value
+        for key, value in os.environ.items()
+        if key.startswith(SQL_CONNECTION_ENV_PREFIX) and value
+    }
+    names.update(env_values)
+    resolved_include_instance = (
+        instance_credentials_enabled() if include_instance is None else include_instance
+    )
+    if user_id is not None:
+        names.update(
+            _sanitize_sql_connection_name(_row_field_name(row))
+            for row in _rows_for_scope(
+                db,
+                scope_type="user",
+                scope_id=user_id,
+                tool_name=SQL_TOOL_NAME,
+            )
+        )
+    shared_scopes = get_credential_fallback_scopes(db, user) if user is not None else []
+    for scope in shared_scopes:
+        names.update(
+            _sanitize_sql_connection_name(_row_field_name(row))
+            for row in _rows_for_scope(
+                db,
+                scope_type=scope.scope_type,
+                scope_id=scope.scope_id,
+                tool_name=SQL_TOOL_NAME,
+            )
+        )
+    if resolved_include_instance:
+        names.update(
+            _sanitize_sql_connection_name(_row_field_name(row))
+            for row in _rows_for_scope(
+                db,
+                scope_type="instance",
+                scope_id=None,
+                tool_name=SQL_TOOL_NAME,
+            )
+        )
+    fields: dict[str, Any] = {}
+    for name in sorted(names):
+        scoped_row = scoped_rows.get(name)
+        resolved, source = _resolve_sql_field(
+            db,
+            name,
+            user_id=user_id,
+            user=user,
+            include_instance=resolved_include_instance,
+        )
+        if scoped_row is not None:
+            source = scope_type
+        env_value = env_values.get(name)
+        fields[name] = {
+            "label": name,
+            "required": False,
+            "secret": True,
+            "source": source,
+            "is_configured": bool(resolved),
+            "masked": str(scoped_row.masked_value)
+            if scoped_row is not None
+            else (_sql_url_mask(env_value) if env_value else ""),
+            "env_names": [f"{SQL_CONNECTION_ENV_PREFIX}{name}"],
+        }
+
+    return {
+        "tool_name": SQL_TOOL_NAME,
+        "display_name": _get_display_name(db, SQL_TOOL_NAME),
+        "configured": bool(
+            get_sql_connection_map(
+                db,
+                user_id,
+                user=user,
+                include_instance=resolved_include_instance,
+            )
+        ),
         "fields": fields,
     }

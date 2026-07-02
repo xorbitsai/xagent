@@ -1,7 +1,7 @@
 """Initialize tool configurations in database."""
 
 import logging
-from typing import Any, Dict
+from typing import Any
 
 from sqlalchemy.orm import Session
 
@@ -11,7 +11,7 @@ from .models.tool_config import ToolConfig
 logger = logging.getLogger(__name__)
 
 
-def get_default_tool_configs() -> list[Dict[str, Any]]:
+def get_default_tool_configs() -> list[dict[str, Any]]:
     """Get default tool configurations."""
     return [
         {
@@ -68,7 +68,9 @@ def get_default_tool_configs() -> list[Dict[str, Any]]:
             "tool_type": "builtin",
             "category": "search",
             "display_name": "Exa AI Search",
-            "description": "AI-powered web search using Exa, with content extraction and category filtering",
+            "description": (
+                "AI-powered web search using Exa, with content extraction and category filtering"
+            ),
             "enabled": True,
             "requires_configuration": True,
             "config": {

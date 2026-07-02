@@ -46,6 +46,13 @@ const baseMoreResourceItems: NavigationItem[] = [
         color: "text-blue-400"
     },
     {
+        name: "Tool Credentials",
+        nameKey: "nav.toolCredentials",
+        href: "/tool-credentials",
+        icon: Wrench,
+        color: "text-blue-400"
+    },
+    {
         name: "Files",
         nameKey: "nav.files",
         href: "/files",

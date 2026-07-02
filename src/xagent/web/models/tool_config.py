@@ -6,6 +6,7 @@ from sqlalchemy import (
     Column,
     DateTime,
     ForeignKey,
+    Index,
     Integer,
     String,
     Text,
@@ -71,3 +72,40 @@ class UserToolConfig(Base):  # type: ignore
     updated_at = Column(DateTime(timezone=True), onupdate=func.now())
 
     user = relationship("User", back_populates="tool_configs")
+
+
+class ScopedToolCredential(Base):  # type: ignore
+    """Encrypted credentials for env-backed tools at user, instance, or extension scope."""
+
+    __tablename__ = "scoped_tool_credentials"
+
+    id = Column(Integer, primary_key=True, index=True)
+    scope_type = Column(String(20), nullable=False, index=True)
+    scope_id = Column(Integer, nullable=True, index=True)
+    tool_name = Column(String(100), nullable=False, index=True)
+    field_name = Column(String(100), nullable=False, index=True)
+    encrypted_value = Column(Text, nullable=False)
+    masked_value = Column(String(500), nullable=False, default="")
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+    updated_at = Column(DateTime(timezone=True), onupdate=func.now())
+
+    __table_args__ = (
+        Index(
+            "uq_scoped_tool_credential_scoped",
+            "scope_type",
+            "scope_id",
+            "tool_name",
+            "field_name",
+            unique=True,
+            sqlite_where=scope_id.is_not(None),
+            postgresql_where=scope_id.is_not(None),
+        ),
+        Index(
+            "uq_scoped_tool_credential_instance",
+            "tool_name",
+            "field_name",
+            unique=True,
+            sqlite_where=(scope_type == "instance") & scope_id.is_(None),
+            postgresql_where=(scope_type == "instance") & scope_id.is_(None),
+        ),
+    )

@@ -516,10 +516,20 @@ class WebToolConfig(BaseToolConfig):
         return self._sandbox
 
     def get_tool_credential(self, tool_name: str, field_name: str) -> Optional[str]:
-        return resolve_tool_credential(self.db, tool_name, field_name)
+        return resolve_tool_credential(
+            self.db,
+            tool_name,
+            field_name,
+            user_id=self._user_id,
+            user=self._user,
+        )
 
     def get_sql_connections(self) -> Dict[str, str]:
-        return get_sql_connection_map(self.db, self._user_id)
+        return get_sql_connection_map(
+            self.db,
+            self._user_id,
+            user=self._user,
+        )
 
     def set_sandbox(self, sandbox: Any) -> None:
         """Set sandbox instance for this config."""

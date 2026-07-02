@@ -5,6 +5,8 @@ This module tests the /api/tools endpoints, including the /available endpoint
 which lists all tools that can be used by agents.
 """
 
+import os
+import shutil
 import tempfile
 
 import pytest
@@ -12,8 +14,13 @@ from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
 from xagent.web.api.auth import auth_router
+from xagent.web.api.tool_credentials import tool_credentials_router
 from xagent.web.api.tools import tools_router
 from xagent.web.models.database import Base, get_db, get_engine, init_db
+from xagent.web.services.tool_credentials import (
+    set_credential_fallback_scopes_hook,
+    set_instance_credentials_enabled,
+)
 
 
 def override_get_db():
@@ -30,6 +37,7 @@ def override_get_db():
 test_app = FastAPI()
 test_app.include_router(auth_router)
 test_app.include_router(tools_router)
+test_app.include_router(tool_credentials_router)
 test_app.dependency_overrides[get_db] = override_get_db
 
 # Create test client
@@ -80,21 +88,39 @@ class TestToolsAvailableAPI:
     @pytest.fixture(autouse=True)
     def setup(self, test_db):
         """Setup system initialization before each test."""
+        set_instance_credentials_enabled(True)
         ensure_system_initialized()
         yield
+        set_instance_credentials_enabled(True)
 
-    def test_get_available_tools_without_workspace(self):
+    def test_get_available_tools_without_workspace(self, monkeypatch):
         """Test that /api/tools/available works without a real workspace.
 
         This endpoint is used to list available tools for the UI.
         It should work even when there's no active task/workspace.
         """
+        monkeypatch.setenv("XAGENT_WEB_SEARCH_PROVIDER", "google")
+        monkeypatch.delenv("GOOGLE_API_KEY", raising=False)
+        monkeypatch.delenv("GOOGLE_CSE_ID", raising=False)
+
         # Login to get token
         login_response = client.post(
             "/api/auth/login", json={"username": "admin", "password": "admin123"}
         )
         assert login_response.status_code == 200
         token = login_response.json()["access_token"]
+
+        credential_response = client.put(
+            "/api/tool-credentials/web_search?scope=user",
+            headers={"Authorization": f"Bearer {token}"},
+            json={
+                "credentials": {
+                    "api_key": {"value": "user-google-key"},
+                    "cse_id": {"value": "user-google-cse"},
+                }
+            },
+        )
+        assert credential_response.status_code == 200
 
         # Make request to /api/tools/available
         response = client.get(
@@ -128,11 +154,9 @@ class TestToolsAvailableAPI:
         assert "browser_navigate" in tool_names
         assert "browser_click" in tool_names
 
-        # Basic tools - web search depends on API keys being set
-        has_web_search = "web_search" in tool_names or "zhipu_web_search" in tool_names
-        if has_web_search:
-            # At least one web search tool is present (if API keys configured)
-            pass
+        assert "web_search" in tool_names
+        web_search_tool = next(tool for tool in tools if tool["name"] == "web_search")
+        assert web_search_tool["requires_configuration"] is True
 
         # Code execution tools should now be present (workspace is created)
         assert "execute_python_code" in tool_names, "Should have python executor"
@@ -422,8 +446,12 @@ class TestToolsAvailableAPI:
 class TestToolsGovernanceAPI:
     @pytest.fixture(autouse=True)
     def setup(self, test_db):
+        set_instance_credentials_enabled(True)
+        set_credential_fallback_scopes_hook(None)
         ensure_system_initialized()
         yield
+        set_credential_fallback_scopes_hook(None)
+        set_instance_credentials_enabled(True)
 
     def _admin_headers(self) -> dict[str, str]:
         login_response = client.post(
@@ -465,11 +493,11 @@ class TestToolsGovernanceAPI:
         assert data["tool_name"] == "custom_runtime_tool"
         assert data["enabled"] is False
 
-    def test_configurable_credentials_put_and_get_masked(self):
-        headers = self._admin_headers()
+    def test_user_scoped_credentials_put_and_get_masked(self):
+        headers = self._user_headers("credential-user")
 
         put_resp = client.put(
-            "/api/tools/zhipu_web_search/credentials",
+            "/api/tool-credentials/zhipu_web_search?scope=user",
             headers=headers,
             json={
                 "credentials": {
@@ -481,7 +509,7 @@ class TestToolsGovernanceAPI:
         assert put_resp.status_code == 200
 
         get_resp = client.get(
-            "/api/tools/zhipu_web_search/credentials",
+            "/api/tool-credentials/zhipu_web_search?scope=user",
             headers=headers,
         )
         assert get_resp.status_code == 200
@@ -489,18 +517,111 @@ class TestToolsGovernanceAPI:
 
         assert payload["tool_name"] == "zhipu_web_search"
         assert payload["configured"] is True
-        assert payload["fields"]["api_key"]["source"] == "db"
+        assert payload["fields"]["api_key"]["source"] == "user"
         assert payload["fields"]["api_key"]["is_configured"] is True
         assert "1234" in payload["fields"]["api_key"]["masked"]
         assert (
             "test-secret-zhipu-key-1234" not in payload["fields"]["api_key"]["masked"]
         )
 
+    def test_instance_scoped_credentials_require_admin(self):
+        headers = self._admin_headers()
+        user_headers = self._user_headers("credential-nonadmin")
+
+        put_resp = client.put(
+            "/api/tool-credentials/zhipu_web_search?scope=instance",
+            headers=headers,
+            json={"credentials": {"api_key": {"value": "instance-secret"}}},
+        )
+        assert put_resp.status_code == 200
+
+        denied = client.put(
+            "/api/tool-credentials/zhipu_web_search?scope=instance",
+            headers=user_headers,
+            json={"credentials": {"api_key": {"value": "user-should-not-set"}}},
+        )
+        assert denied.status_code == 403
+
+    def test_standalone_resolver_precedence_user_instance_env(self, monkeypatch):
+        from xagent.web.models.database import get_session_local
+        from xagent.web.services.tool_credentials import (
+            clear_scoped_tool_credential,
+            resolve_tool_credential,
+            set_scoped_tool_credentials,
+        )
+
+        headers = self._admin_headers()
+        monkeypatch.setenv("TAVILY_API_KEY", "env-tavily-key")
+
+        put_resp = client.put(
+            "/api/tool-credentials/tavily_web_search?scope=instance",
+            headers=headers,
+            json={"credentials": {"api_key": {"value": "instance-tavily-key"}}},
+        )
+        assert put_resp.status_code == 200
+
+        SessionLocal = get_session_local()
+        db = SessionLocal()
+        try:
+            set_scoped_tool_credentials(
+                db,
+                scope_type="user",
+                scope_id=42,
+                tool_name="tavily_web_search",
+                values={"api_key": "user-tavily-key"},
+            )
+            assert (
+                resolve_tool_credential(
+                    db,
+                    "tavily_web_search",
+                    "api_key",
+                    user_id=42,
+                )
+                == "user-tavily-key"
+            )
+            clear_scoped_tool_credential(
+                db,
+                scope_type="user",
+                scope_id=42,
+                tool_name="tavily_web_search",
+                field_name="api_key",
+            )
+            assert (
+                resolve_tool_credential(
+                    db,
+                    "tavily_web_search",
+                    "api_key",
+                    user_id=42,
+                )
+                == "instance-tavily-key"
+            )
+            clear_scoped_tool_credential(
+                db,
+                scope_type="instance",
+                scope_id=None,
+                tool_name="tavily_web_search",
+                field_name="api_key",
+            )
+            assert (
+                resolve_tool_credential(
+                    db,
+                    "tavily_web_search",
+                    "api_key",
+                    user_id=42,
+                )
+                == "env-tavily-key"
+            )
+        finally:
+            db.close()
+
     def test_configurable_credentials_env_source_when_not_stored(self, monkeypatch):
         headers = self._admin_headers()
         monkeypatch.setenv("TAVILY_API_KEY", "env-only-tavily-key-5678")
 
-        resp = client.get("/api/tools/tavily_web_search/credentials", headers=headers)
+        resp = client.get(
+            "/api/tool-credentials/tavily_web_search?scope=instance",
+            headers=headers,
+        )
         assert resp.status_code == 200
         payload = resp.json()
 
@@ -508,118 +629,150 @@ class TestToolsGovernanceAPI:
         assert payload["fields"]["api_key"]["is_configured"] is True
         assert "5678" in payload["fields"]["api_key"]["masked"]
 
-    def test_sql_connections_crud_and_db_priority_over_env(self, monkeypatch):
+    def test_scoped_sql_connections_crud_and_precedence(self, monkeypatch):
         headers = self._admin_headers()
         monkeypatch.setenv(
             "XAGENT_EXTERNAL_DB_ANALYTICS",
             "postgresql://env_user:env_pass@localhost:5432/env_db",
         )
 
-        initial = client.get("/api/tools/sql-connections", headers=headers)
+        initial = client.get(
+            "/api/tool-credentials/sql_query?scope=instance",
+            headers=headers,
+        )
         assert initial.status_code == 200
-        initial_items = {item["name"]: item for item in initial.json()["connections"]}
-        assert initial_items["ANALYTICS"]["source"] == "env"
+        assert initial.json()["fields"]["ANALYTICS"]["source"] == "env"
 
         upsert = client.put(
-            "/api/tools/sql-connections/analytics",
+            "/api/tool-credentials/sql_query?scope=instance",
             headers=headers,
             json={
-                "connection_url": "postgresql://db_user:db_pass@localhost:5432/db_db"
+                "credentials": {
+                    "analytics": {
+                        "value": "postgresql://db_user:db_pass@localhost:5432/db_db"
+                    }
+                }
             },
         )
         assert upsert.status_code == 200
 
-        after_upsert = client.get("/api/tools/sql-connections", headers=headers)
+        after_upsert = client.get(
+            "/api/tool-credentials/sql_query?scope=instance",
+            headers=headers,
+        )
         assert after_upsert.status_code == 200
-        upsert_items = {
-            item["name"]: item for item in after_upsert.json()["connections"]
-        }
-        assert upsert_items["ANALYTICS"]["source"] == "db"
-        assert "db_pass" not in upsert_items["ANALYTICS"]["masked"]
+        field = after_upsert.json()["fields"]["ANALYTICS"]
+        assert field["source"] == "instance"
+        assert "db_pass" not in field["masked"]
 
         delete_resp = client.delete(
-            "/api/tools/sql-connections/analytics", headers=headers
+            "/api/tool-credentials/sql_query/analytics?scope=instance",
+            headers=headers,
         )
         assert delete_resp.status_code == 200
-
-        after_delete = client.get("/api/tools/sql-connections", headers=headers)
-        assert after_delete.status_code == 200
-        delete_items = {
-            item["name"]: item for item in after_delete.json()["connections"]
-        }
-        assert delete_items["ANALYTICS"]["source"] == "env"
+        assert delete_resp.json()["fields"]["ANALYTICS"]["source"] == "env"
 
     def test_sql_connection_rejects_unsupported_scheme(self):
         headers = self._admin_headers()
 
         upsert = client.put(
-            "/api/tools/sql-connections/analytics",
+            "/api/tool-credentials/sql_query?scope=user",
             headers=headers,
-            json={"connection_url": "redis://localhost:6379/0"},
+            json={"credentials": {"analytics": {"value": "redis://localhost:6379/0"}}},
         )
 
         assert upsert.status_code == 400
         assert "Unsupported SQLAlchemy URL scheme" in upsert.json()["detail"]
+
+    def test_sql_connection_accepts_duckdb_scheme(self):
+        headers = self._admin_headers()
+
+        upsert = client.put(
+            "/api/tool-credentials/sql_query?scope=user",
+            headers=headers,
+            json={
+                "credentials": {
+                    "local_warehouse": {"value": "duckdb:///tmp/warehouse.duckdb"}
+                }
+            },
+        )
+
+        assert upsert.status_code == 200
+        fields = upsert.json()["fields"]
+        assert fields["LOCAL_WAREHOUSE"]["source"] == "user"
+        assert fields["LOCAL_WAREHOUSE"]["is_configured"] is True
 
     def test_sql_connections_are_user_scoped(self):
         user1_headers = self._user_headers("user1")
         user2_headers = self._user_headers("user2")
 
         user1_upsert = client.put(
-            "/api/tools/sql-connections/analytics",
+            "/api/tool-credentials/sql_query?scope=user",
             headers=user1_headers,
-            json={"connection_url": "postgresql://user1:pass1@localhost:5432/user1_db"},
+            json={
+                "credentials": {
+                    "analytics": {
+                        "value": "postgresql://user1:pass1@localhost:5432/user1_db"
+                    }
+                }
+            },
         )
         assert user1_upsert.status_code == 200
 
-        user2_initial = client.get("/api/tools/sql-connections", headers=user2_headers)
+        user2_initial = client.get(
+            "/api/tool-credentials/sql_query?scope=user",
+            headers=user2_headers,
+        )
         assert user2_initial.status_code == 200
-        assert user2_initial.json()["connections"] == []
+        assert user2_initial.json()["fields"] == {}
 
         user2_upsert = client.put(
-            "/api/tools/sql-connections/analytics",
+            "/api/tool-credentials/sql_query?scope=user",
             headers=user2_headers,
-            json={"connection_url": "postgresql://user2:pass2@localhost:5432/user2_db"},
+            json={
+                "credentials": {
+                    "analytics": {
+                        "value": "postgresql://user2:pass2@localhost:5432/user2_db"
+                    }
+                }
+            },
         )
         assert user2_upsert.status_code == 200
 
-        user1_items = {
-            item["name"]: item
-            for item in client.get(
-                "/api/tools/sql-connections", headers=user1_headers
-            ).json()["connections"]
-        }
-        user2_items = {
-            item["name"]: item
-            for item in client.get(
-                "/api/tools/sql-connections", headers=user2_headers
-            ).json()["connections"]
-        }
+        user1_items = client.get(
+            "/api/tool-credentials/sql_query?scope=user",
+            headers=user1_headers,
+        ).json()["fields"]
+        user2_items = client.get(
+            "/api/tool-credentials/sql_query?scope=user",
+            headers=user2_headers,
+        ).json()["fields"]
 
-        assert user1_items["ANALYTICS"]["source"] == "db"
-        assert user2_items["ANALYTICS"]["source"] == "db"
+        assert user1_items["ANALYTICS"]["source"] == "user"
+        assert user2_items["ANALYTICS"]["source"] == "user"
         assert user1_items["ANALYTICS"]["masked"] != user2_items["ANALYTICS"]["masked"]
 
         user1_delete = client.delete(
-            "/api/tools/sql-connections/analytics", headers=user1_headers
+            "/api/tool-credentials/sql_query/analytics?scope=user",
+            headers=user1_headers,
         )
         assert user1_delete.status_code == 200
 
         user1_after_delete = client.get(
-            "/api/tools/sql-connections", headers=user1_headers
+            "/api/tool-credentials/sql_query?scope=user",
+            headers=user1_headers,
         )
         user2_after_delete = client.get(
-            "/api/tools/sql-connections", headers=user2_headers
+            "/api/tool-credentials/sql_query?scope=user",
+            headers=user2_headers,
         )
         assert user1_after_delete.status_code == 200
         assert user2_after_delete.status_code == 200
-        assert user1_after_delete.json()["connections"] == []
-        remaining_user2 = {
-            item["name"]: item for item in user2_after_delete.json()["connections"]
-        }
-        assert remaining_user2["ANALYTICS"]["source"] == "db"
+        assert user1_after_delete.json()["fields"] == {}
+        remaining_user2 = user2_after_delete.json()["fields"]
+        assert remaining_user2["ANALYTICS"]["source"] == "user"
 
-    def test_non_admin_cannot_access_global_credentials(self):
+    def test_old_credential_endpoints_are_removed(self):
         user_headers = self._user_headers("nonadmin")
 
         configurable_resp = client.get("/api/tools/configurable", headers=user_headers)
@@ -627,8 +780,50 @@ class TestToolsGovernanceAPI:
             "/api/tools/zhipu_web_search/credentials", headers=user_headers
         )
 
-        assert configurable_resp.status_code == 403
-        assert credential_resp.status_code == 403
+        assert configurable_resp.status_code == 404
+        assert credential_resp.status_code == 404
+
+    def test_instance_scoped_credentials_upsert_single_row(self):
+        from xagent.web.models.database import get_session_local
+        from xagent.web.models.tool_config import ScopedToolCredential
+
+        headers = self._admin_headers()
+
+        for value in ("first-instance-secret", "second-instance-secret"):
+            response = client.put(
+                "/api/tool-credentials/tavily_web_search?scope=instance",
+                headers=headers,
+                json={"credentials": {"api_key": {"value": value}}},
+            )
+            assert response.status_code == 200
+
+        SessionLocal = get_session_local()
+        db = SessionLocal()
+        try:
+            rows = (
+                db.query(ScopedToolCredential)
+                .filter(
+                    ScopedToolCredential.scope_type == "instance",
+                    ScopedToolCredential.scope_id.is_(None),
+                    ScopedToolCredential.tool_name == "tavily_web_search",
+                    ScopedToolCredential.field_name == "api_key",
+                )
+                .all()
+            )
+        finally:
+            db.close()
+
+        assert len(rows) == 1
+
+    def test_core_tool_credentials_reject_team_scope(self):
+        headers = self._admin_headers()
+
+        response = client.get(
+            "/api/tool-credentials/tavily_web_search?scope=team",
+            headers=headers,
+        )
+
+        assert response.status_code == 422
 
 
 def test_user_tool_overrides_hook_noop_by_default():
@@ -677,6 +872,192 @@ def test_user_tool_overrides_hook_reset_to_none():
 
 class TestWebToolConfigUserOverride:
     """Verify WebToolConfig.get_user_tool_overrides() resolves user correctly."""
+
+    def test_get_tool_credential_uses_current_user_scope(self):
+        """Personal tool credentials must be visible when creating runtime tools."""
+        from unittest.mock import MagicMock
+
+        from xagent.web.models.database import get_engine, get_session_local, init_db
+        from xagent.web.services.tool_credentials import (
+            set_scoped_tool_credentials,
+        )
+        from xagent.web.tools.config import WebToolConfig
+
+        temp_dir = tempfile.mkdtemp()
+        temp_db_path = os.path.join(temp_dir, "test.db")
+        init_db(db_url=f"sqlite:///{temp_db_path}")
+        engine = get_engine()
+        SessionLocal = get_session_local()
+        db = SessionLocal()
+        try:
+            set_scoped_tool_credentials(
+                db,
+                scope_type="user",
+                scope_id=42,
+                tool_name="web_search",
+                values={"api_key": "user-google-key", "cse_id": "user-google-cse"},
+            )
+
+            cfg = WebToolConfig(
+                db=db,
+                request=MagicMock(user=MagicMock(id=42)),
+                user_id=42,
+                workspace_config={"base_dir": "/tmp", "task_id": "test"},
+            )
+
+            assert cfg.get_tool_credential("web_search", "api_key") == "user-google-key"
+            assert cfg.get_tool_credential("web_search", "cse_id") == "user-google-cse"
+        finally:
+            db.close()
+            Base.metadata.drop_all(bind=engine)
+            shutil.rmtree(temp_dir)
+
+    def test_get_sql_connections_uses_registered_fallback_scope(self):
+        """Shared credentials from a registered scope must be visible at runtime."""
+        from unittest.mock import MagicMock
+
+        from xagent.web.models.database import get_engine, get_session_local, init_db
+        from xagent.web.services.tool_credentials import (
+            CredentialScopeRef,
+            set_credential_fallback_scopes_hook,
+            set_scoped_tool_credentials,
+        )
+        from xagent.web.tools.config import WebToolConfig
+
+        temp_dir = tempfile.mkdtemp()
+        temp_db_path = os.path.join(temp_dir, "test.db")
+        init_db(db_url=f"sqlite:///{temp_db_path}")
+        engine = get_engine()
+        SessionLocal = get_session_local()
+        db = SessionLocal()
+        set_credential_fallback_scopes_hook(
+            lambda _db, user: [
+                CredentialScopeRef(
+                    "shared", getattr(user, "shared_scope_id", None), "Shared"
+                )
+            ]
+        )
+        try:
+            set_scoped_tool_credentials(
+                db,
+                scope_type="shared",
+                scope_id=7,
+                tool_name="sql_query",
+                values={"analytics": "sqlite:///analytics.db"},
+            )
+
+            cfg = WebToolConfig(
+                db=db,
+                request=MagicMock(user=MagicMock(id=42, shared_scope_id=7)),
+                user_id=42,
+                workspace_config={"base_dir": "/tmp", "task_id": "test"},
+            )
+
+            assert cfg.get_sql_connections()["ANALYTICS"] == "sqlite:///analytics.db"
+        finally:
+            set_credential_fallback_scopes_hook(None)
+            db.close()
+            Base.metadata.drop_all(bind=engine)
+            shutil.rmtree(temp_dir)
+
+    def test_registered_fallback_scope_preserves_instance_credential_fallback(self):
+        """Shared scopes should precede, not replace, instance fallback credentials."""
+        from unittest.mock import MagicMock
+
+        from xagent.web.models.database import get_engine, get_session_local, init_db
+        from xagent.web.services.tool_credentials import (
+            CredentialScopeRef,
+            resolve_tool_credential,
+            set_credential_fallback_scopes_hook,
+            set_scoped_tool_credentials,
+        )
+
+        temp_dir = tempfile.mkdtemp()
+        temp_db_path = os.path.join(temp_dir, "test.db")
+        init_db(db_url=f"sqlite:///{temp_db_path}")
+        engine = get_engine()
+        SessionLocal = get_session_local()
+        db = SessionLocal()
+        set_credential_fallback_scopes_hook(
+            lambda _db, user: [
+                CredentialScopeRef(
+                    "shared", getattr(user, "shared_scope_id", None), "Shared"
+                )
+            ]
+        )
+        try:
+            set_scoped_tool_credentials(
+                db,
+                scope_type="instance",
+                scope_id=None,
+                tool_name="tavily_web_search",
+                values={"api_key": "instance-tavily-key"},
+            )
+
+            assert (
+                resolve_tool_credential(
+                    db,
+                    "tavily_web_search",
+                    "api_key",
+                    user_id=42,
+                    user=MagicMock(id=42, shared_scope_id=7),
+                )
+                == "instance-tavily-key"
+            )
+        finally:
+            set_credential_fallback_scopes_hook(None)
+            db.close()
+            Base.metadata.drop_all(bind=engine)
+            shutil.rmtree(temp_dir)
+
+    def test_sql_connection_map_preserves_instance_entries_with_registered_fallback_scope(
+        self,
+    ):
+        """Instance SQL connections remain visible when shared scopes have no matching row."""
+        from unittest.mock import MagicMock
+
+        from xagent.web.models.database import get_engine, get_session_local, init_db
+        from xagent.web.services.tool_credentials import (
+            CredentialScopeRef,
+            get_sql_connection_map,
+            set_credential_fallback_scopes_hook,
+            set_scoped_tool_credentials,
+        )
+
+        temp_dir = tempfile.mkdtemp()
+        temp_db_path = os.path.join(temp_dir, "test.db")
+        init_db(db_url=f"sqlite:///{temp_db_path}")
+        engine = get_engine()
+        SessionLocal = get_session_local()
+        db = SessionLocal()
+        set_credential_fallback_scopes_hook(
+            lambda _db, user: [
+                CredentialScopeRef(
+                    "shared", getattr(user, "shared_scope_id", None), "Shared"
+                )
+            ]
+        )
+        try:
+            set_scoped_tool_credentials(
+                db,
+                scope_type="instance",
+                scope_id=None,
+                tool_name="sql_query",
+                values={"analytics": "sqlite:///instance-analytics.db"},
+            )
+
+            connections = get_sql_connection_map(
+                db,
+                42,
+                user=MagicMock(id=42, shared_scope_id=7),
+            )
+
+            assert connections["ANALYTICS"] == "sqlite:///instance-analytics.db"
+        finally:
+            set_credential_fallback_scopes_hook(None)
+            db.close()
+            Base.metadata.drop_all(bind=engine)
+            shutil.rmtree(temp_dir)
 
     def test_explicit_user_param_takes_priority(self):
         """When user keyword arg is passed, it is used even when request has no .user."""

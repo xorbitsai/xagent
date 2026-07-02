@@ -17,6 +17,7 @@ import { useAuth } from "@/contexts/auth-context"
 import { useI18n } from "@/contexts/i18n-context"
 import { Select } from "@/components/ui/select"
 import { AUTH_CACHE_KEY, AUTH_TOKEN_UPDATED_EVENT } from "@/lib/auth-cache"
+import { ToolCredentialsPanel } from "@/components/tools/tool-credentials-panel"
 
 export default function SettingsPage() {
   const { user } = useAuth()
@@ -214,6 +215,19 @@ export default function SettingsPage() {
             >
               {isChangingPassword ? t("settings.password.submitting") : t("settings.password.submit")}
             </Button>
+          </CardContent>
+        </Card>
+
+        <Card>
+          <CardHeader>
+            <CardTitle className="flex items-center gap-2">
+              <Settings className="h-5 w-5" />
+              {t("tools.configHeader.title")}
+            </CardTitle>
+            <CardDescription>{t("tools.configHeader.description")}</CardDescription>
+          </CardHeader>
+          <CardContent>
+            <ToolCredentialsPanel scope="user" showTitle={false} />
           </CardContent>
         </Card>
       </div>

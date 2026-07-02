@@ -202,13 +202,13 @@ function ChineseContent() {
       </Ul>
       <P>我们不会使用您提供的信息（包括 Google 用户数据）用于投放广告，也不会将您的数据出售给第三方。</P>
 
-      <H2>三、Google 用户数据与"有限使用"声明</H2>
+      <H2>三、Google 用户数据与&quot;有限使用&quot;声明</H2>
       <P>
         {branding.appName} 对通过 Google API 获取的信息的使用及向其他应用的转移，将遵循{" "}
         <A href="https://developers.google.com/terms/api-services-user-data-policy">
           Google API 服务用户数据政策
         </A>
-        ，包括其中的"有限使用"（Limited Use）要求。
+        ，包括其中的&quot;有限使用&quot;（Limited Use）要求。
       </P>
       <P>具体而言：</P>
       <Ul>
@@ -241,7 +241,7 @@ function ChineseContent() {
       <P>本服务不面向 16 周岁以下的未成年人，我们不会在知情的情况下收集儿童的个人信息。</P>
 
       <H2>七、本政策的变更</H2>
-      <P>我们可能不时更新本隐私政策。如有重大变更，我们会在本页面发布更新后的政策并更新"最后更新日期"。</P>
+      <P>我们可能不时更新本隐私政策。如有重大变更，我们会在本页面发布更新后的政策并更新&quot;最后更新日期&quot;。</P>
 
       <H2>八、联系我们</H2>
       <P>如您对本隐私政策有任何疑问，请通过 <MailA>{CONTACT_EMAIL}</MailA> 与我们联系。</P>
@@ -263,7 +263,7 @@ export default function PrivacyPolicyPage() {
           {t("common.back")}
         </Link>
 
-        <h1 className="text-3xl font-bold mb-2">{locale === "zh" ? "隐私政策" : "Privacy Policy"}</h1>
+        <h1 className="text-3xl font-bold mb-2">{t("footer.privacyPolicy")}</h1>
         <p className="text-sm text-muted-foreground mb-10">
           {locale === "zh" ? `最后更新日期：${LAST_UPDATED}` : `Last updated: ${LAST_UPDATED}`}
         </p>

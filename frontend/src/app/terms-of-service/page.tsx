@@ -216,7 +216,7 @@ export default function TermsOfServicePage() {
           {t("common.back")}
         </Link>
 
-        <h1 className="text-3xl font-bold mb-2">{locale === "zh" ? "服务条款" : "Terms of Service"}</h1>
+        <h1 className="text-3xl font-bold mb-2">{t("footer.termsOfService")}</h1>
         <p className="text-sm text-muted-foreground mb-10">
           {locale === "zh" ? `最后更新日期：${LAST_UPDATED}` : `Last updated: ${LAST_UPDATED}`}
         </p>

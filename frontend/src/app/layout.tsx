@@ -1,6 +1,5 @@
 import type { Metadata } from "next";
 import type { CSSProperties } from "react";
-import { cookies, headers } from "next/headers";
 import Script from "next/script";
 import "./globals.css";
 import { AuthProvider } from "@/contexts/auth-context";
@@ -26,21 +25,10 @@ export const metadata: Metadata = {
 
 type Locale = "en" | "zh";
 
-const resolveInitialLocale = async (): Promise<Locale> => {
-  try {
-    const cookieStore = await cookies();
-    const cookieLocale = cookieStore.get("app_locale")?.value;
-    if (cookieLocale === "en" || cookieLocale === "zh") {
-      return cookieLocale;
-    }
-
-    const headerStore = await headers();
-    const acceptLanguage = headerStore.get("accept-language")?.toLowerCase() || "";
-    return acceptLanguage.includes("zh") ? "zh" : "en";
-  } catch {
-    return "en";
-  }
-};
+// Static export cannot read cookies/headers at request time, so the shell is
+// rendered with a fixed initial locale. I18nProvider corrects it from
+// localStorage on the client immediately after hydration.
+const resolveInitialLocale = (): Locale => "en";
 
 const buildThemeStyle = (themeName: string): CSSProperties => {
   const theme = themes[themeName] || themes.dark;
@@ -103,12 +91,12 @@ const buildThemeStyle = (themeName: string): CSSProperties => {
   return styleVars as CSSProperties;
 };
 
-export default async function RootLayout({
+export default function RootLayout({
   children,
 }: Readonly<{
   children: React.ReactNode;
 }>) {
-  const initialLocale = await resolveInitialLocale();
+  const initialLocale = resolveInitialLocale();
   const themeName = getThemeFromEnv();
   const theme = themes[themeName] || themes.dark;
   const themeMode = theme.mode === "light" ? "light" : "dark";

@@ -1,19 +1,13 @@
-"use client"
+import React from "react"
+import PageClient from "./page-client"
 
-import { useParams, useSearchParams } from "next/navigation"
-import { PublicAgentChatPage } from "@/components/widget/public-agent-chat-page"
+// Server wrapper for static export: provides a placeholder param so a shell
+// HTML is emitted for this dynamic route. FastAPI serves the shell for any real
+// token; the client component reads the actual value from the URL via useParams().
+export function generateStaticParams() {
+  return [{ token: "__shell__" }]
+}
 
-export default function WidgetChatPage() {
-  const params = useParams()
-  const searchParams = useSearchParams()
-  const token = params.token as string
-
-  return (
-    <PublicAgentChatPage
-      authMode="widget"
-      routeToken={token}
-      guestId={searchParams.get("guest_id")}
-      searchAgentId={searchParams.get("agent_id") ? parseInt(searchParams.get("agent_id") as string, 10) : null}
-    />
-  )
+export default function Page() {
+  return <PageClient />
 }

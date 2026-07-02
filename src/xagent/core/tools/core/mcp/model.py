@@ -193,6 +193,7 @@ def create_mcp_server_table(Base: Type[Any]) -> Type[Any]:
                 if (
                     isinstance(decrypted_auth, dict)
                     and decrypted_auth.get("type") == "oauth_mcp"
+                    and self.transport in ["sse", "streamable_http"]
                 ):
                     connection["oauth_mcp"] = True
 

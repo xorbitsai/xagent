@@ -9,7 +9,7 @@ import logging
 import os
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Set
 
 import httpx
 
@@ -284,7 +284,14 @@ class WebToolConfig(BaseToolConfig):
         self._cached_asr_model: Optional[Any] = None
         self._cached_tts_models: Optional[Dict[str, Any]] = None
         self._cached_tts_model: Optional[Any] = None
-        self._cached_mcp_configs: Optional[List[Dict[str, Any]]] = None
+        # Per-server MCP config cache: server.id -> built connection config.
+        # A single permanently-broken server must not prevent healthy
+        # servers' (expensive: decrypt + OAuth provider construction) work
+        # from being cached and reused across calls. Servers that failed to
+        # build on the last attempt are tracked separately so they are
+        # always retried (never cached-as-failed).
+        self._cached_mcp_configs: Optional[Dict[int, Dict[str, Any]]] = None
+        self._mcp_load_errored_server_ids: Set[int] = set()
         self._cached_embedding_model: Optional[str] = None
         self._cached_rerank_model: Optional[str] = None
 
@@ -388,13 +395,23 @@ class WebToolConfig(BaseToolConfig):
         return self._cached_image_edit_model
 
     async def get_mcp_server_configs(self) -> List[Dict[str, Any]]:
-        """Load MCP server configurations from database."""
+        """Load MCP server configurations from database.
+
+        Healthy servers' built configs are cached per-server (keyed by
+        ``server.id``) and reused on subsequent calls; only servers that are
+        new or that errored on the previous attempt are rebuilt. This keeps
+        one permanently-broken server from forcing a full rebuild (DB query,
+        decrypt, OAuth provider construction) for every server on every call.
+        """
         if not self._include_mcp_tools:
             return []
 
-        if self._cached_mcp_configs is None:
-            self._cached_mcp_configs = await self._load_mcp_server_configs()
-        return self._cached_mcp_configs
+        configs = await self._load_mcp_server_configs()
+        if configs is None:
+            # Hard DB-query failure: unchanged behavior, return [] and cache
+            # nothing.
+            return []
+        return configs
 
     def get_embedding_model(self) -> Optional[str]:
         """Load default embedding model ID from database."""
@@ -693,10 +710,24 @@ class WebToolConfig(BaseToolConfig):
             logger.warning(f"Failed to load default TTS model: {e}")
             return None
 
-    async def _load_mcp_server_configs(self) -> List[Dict[str, Any]]:
-        """Load MCP server configurations from database with user context."""
+    async def _load_mcp_server_configs(self) -> Optional[List[Dict[str, Any]]]:
+        """Load MCP server configurations from database with user context.
+
+        The server list itself is always re-queried (so added/removed/changed
+        servers are detected every call), but a server whose config was
+        already built successfully on a previous call -- and did not error
+        last time -- is reused from ``self._cached_mcp_configs`` instead of
+        being rebuilt (re-decrypted, re-wrapped with an OAuth provider,
+        etc.). Servers that errored are always retried. Returns ``None`` on a
+        hard query failure (as opposed to ``[]`` for "no servers"), so the
+        caller knows not to treat it as a cacheable empty result.
+        """
         logger = logging.getLogger(__name__)
         configs = []
+        previous_cache = self._cached_mcp_configs or {}
+        previously_errored = self._mcp_load_errored_server_ids
+        new_cache: Dict[int, Dict[str, Any]] = {}
+        new_errored: Set[int] = set()
 
         try:
             from ...web.models.mcp import MCPServer, UserMCPServer
@@ -713,7 +744,28 @@ class WebToolConfig(BaseToolConfig):
                 f"Found {len(servers)} active MCP servers for user {self._user_id}"
             )
 
-            for server in servers:
+        except Exception as e:
+            logger.warning(f"Failed to load MCP server configs: {e}", exc_info=True)
+            return None
+
+        for server in servers:
+            server_id = getattr(server, "id", None)
+
+            # Reuse the previously-built config for this server if it
+            # succeeded last time -- skip the expensive rebuild (decrypt,
+            # header merge, OAuth provider construction) entirely. Servers
+            # that errored last time are always retried below.
+            if (
+                server_id is not None
+                and server_id in previous_cache
+                and server_id not in previously_errored
+            ):
+                cached_config = previous_cache[server_id]
+                new_cache[server_id] = cached_config
+                configs.append(cached_config)
+                continue
+
+            try:
                 # Build config dict from server model
                 config: Dict[str, Any] = {
                     "name": server.name,
@@ -876,10 +928,22 @@ class WebToolConfig(BaseToolConfig):
                     if (
                         isinstance(decrypted_auth, dict)
                         and decrypted_auth.get("type") == "oauth_mcp"
+                        and server.transport in ["sse", "streamable_http"]
                     ):
                         transport_config["oauth_mcp"] = True
 
-                    if transport_config.get("oauth_mcp") and self._user_id is not None:
+                    if transport_config.get("oauth_mcp") and self._user_id is None:
+                        # No user context to bind a per-user token store to --
+                        # never include an oauth_mcp server with no way to
+                        # authenticate it. Currently unreachable (user_id
+                        # always resolves to an int today), but cheap and
+                        # correct to guard against a future change.
+                        logger.warning(
+                            "Skipping oauth_mcp server %s: no user context available",
+                            getattr(server, "name", "<unknown>"),
+                        )
+                        continue
+                    if transport_config.get("oauth_mcp"):
                         transport_config = attach_oauth_provider_if_needed(
                             transport_config,
                             user_id=int(self._user_id),
@@ -926,15 +990,50 @@ class WebToolConfig(BaseToolConfig):
                 config["allow_users"] = [str(self._user_id)]  # Only allow current user
 
                 configs.append(config)
+                if server_id is not None:
+                    new_cache[server_id] = config
                 logger.debug(
                     f"Loaded MCP server config: {server.name} ({server.transport})"
                 )
 
-        except Exception as e:
-            logger.warning(f"Failed to load MCP server configs: {e}", exc_info=True)
+            except Exception as e:
+                if server_id is not None:
+                    new_errored.add(server_id)
+                server_name = getattr(server, "name", "<unknown>")
+                logger.warning(
+                    f"Failed to load MCP server config {server_name}: {e}",
+                    exc_info=True,
+                )
+                continue
+
+        # Replace the cache wholesale with only what's present in this
+        # query's results, so a removed/unlinked server doesn't linger.
+        # Servers that errored this round are excluded from the cache (so
+        # they're retried next call); servers reused or freshly built above
+        # are already in ``new_cache``.
+        self._cached_mcp_configs = new_cache
+        self._mcp_load_errored_server_ids = new_errored
 
         logger.info(f"Loaded {len(configs)} MCP server configurations")
         return configs
+
+    async def on_mcp_reauthorization_required(
+        self, mcpserver_id: Optional[int]
+    ) -> None:
+        """Called when an execution-time OAuth connector needs reconnecting.
+
+        Marks the stored connection as errored so the existing Connect UI
+        (polling GET /api/mcp/{id}/connection) surfaces a Reconnect prompt.
+        """
+        if mcpserver_id is None or self._user_id is None:
+            return
+
+        from ..services.mcp_oauth_token_storage import DBTokenStorage
+
+        storage = DBTokenStorage(
+            user_id=int(self._user_id), mcpserver_id=int(mcpserver_id), db=self.db
+        )
+        await storage.mark_error()
 
     def get_custom_api_configs(self) -> List[Dict[str, Any]]:
         """Get custom API configurations."""

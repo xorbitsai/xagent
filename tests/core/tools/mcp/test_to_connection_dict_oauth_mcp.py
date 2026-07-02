@@ -16,6 +16,19 @@ def test_oauth_mcp_does_not_bake_authorization_header():
     assert conn.get("oauth_mcp") is True
 
 
+def test_oauth_mcp_websocket_does_not_mark_provider():
+    s = MCPServer(
+        name="ws",
+        managed="external",
+        transport="websocket",
+        url="ws://mcp.example/ws",
+        auth={"type": "oauth_mcp"},
+    )
+    conn = s.to_connection_dict()
+    assert "oauth_mcp" not in conn
+    assert "auth" not in conn
+
+
 def test_bearer_still_bakes_header():
     # regression guard: existing bearer behavior unchanged
     s = MCPServer(

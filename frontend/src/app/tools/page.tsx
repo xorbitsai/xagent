@@ -45,6 +45,7 @@ import { useAuth } from "@/contexts/auth-context"
 import { useMcpApps } from "@/contexts/mcp-apps-context"
 import { toast } from "@/components/ui/sonner"
 import { isValidMcpName, buildCustomApiPayload } from "@/lib/mcp-utils"
+import { McpOAuthConnectControl } from "@/components/mcp/mcp-oauth-connect-control"
 
 interface Tool {
   name: string
@@ -887,6 +888,8 @@ export default function ToolsPage() {
   }
 
   const MCPServerCard = ({ server }: { server: MCPServer }) => {
+    const isOAuthMcp = server.config?.auth?.type === "oauth_mcp"
+
     return (
       <Card className="hover:shadow-md cursor-pointer transition-all duration-300 border-border/50 hover:border-primary hover:-translate-y-1" onClick={() => handleEditMcpServer(server)}>
         <CardContent className="p-6">
@@ -908,9 +911,15 @@ export default function ToolsPage() {
             {server.description || t('tools.list.noDescription')}
           </p>
 
-          <div className="flex items-center justify-between text-xs text-muted-foreground">
+          <div className="flex items-center justify-between text-xs text-muted-foreground mb-3">
             <span className="capitalize">{server.transport} {t('tools.list.transport')}</span>
           </div>
+
+          {isOAuthMcp && (
+            <div className="pt-3 border-t border-border/60">
+              <McpOAuthConnectControl serverId={server.id} />
+            </div>
+          )}
         </CardContent>
       </Card>
     )

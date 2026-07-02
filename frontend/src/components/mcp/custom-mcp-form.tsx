@@ -158,7 +158,15 @@ export function CustomMcpForm({
             </Label>
             <Select
               value={mcpFormData.config?.auth?.type || "none"}
-              onValueChange={(val) => updateAuth("type", val)}
+              onValueChange={(val) => {
+                if (val === "oauth_mcp") {
+                  // oauth_mcp needs no token/secret fields; drop any leftover
+                  // values from a previously selected auth type.
+                  updateConfig("auth", { type: val })
+                } else {
+                  updateAuth("type", val)
+                }
+              }}
             >
               <SelectTrigger>
                 <SelectValue />
@@ -168,6 +176,9 @@ export function CustomMcpForm({
                 <SelectItem value="bearer">{t('tools.mcp.dialog.authTypes.bearer')}</SelectItem>
                 <SelectItem value="api_key">{t('tools.mcp.dialog.authTypes.apiKey')}</SelectItem>
                 <SelectItem value="oauth2">{t('tools.mcp.dialog.authTypes.oauth2')}</SelectItem>
+                {(transport === "sse" || transport === "streamable_http") && (
+                  <SelectItem value="oauth_mcp">{t('tools.mcp.dialog.authTypes.oauthMcp')}</SelectItem>
+                )}
               </SelectContent>
             </Select>
           </div>
@@ -270,6 +281,15 @@ export function CustomMcpForm({
                 />
               </div>
             </>
+          )}
+
+          {mcpFormData.config?.auth?.type === "oauth_mcp" && (
+            <Alert className="border-blue-200 bg-blue-50 text-blue-900">
+              <Info className="h-4 w-4 text-blue-700" />
+              <AlertDescription className="text-blue-800">
+                {t('tools.mcp.dialog.oauthMcpHint')}
+              </AlertDescription>
+            </Alert>
           )}
         </>
       )}

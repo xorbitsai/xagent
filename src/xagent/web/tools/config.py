@@ -145,6 +145,30 @@ async def refresh_oauth_token_if_needed(
     return False
 
 
+def attach_oauth_provider_if_needed(
+    connection: Dict[str, Any], user_id: int, mcpserver_id: int, db: Any
+) -> Dict[str, Any]:
+    """If a connection is flagged ``oauth_mcp``, replace the marker with a live
+    ``OAuthClientProvider`` bound to this user's DB token store.
+
+    The marker is consumed (popped) whether or not it is truthy, so it never
+    leaks into the connection dict handed to ``create_session``.
+    """
+    if not connection.pop("oauth_mcp", False):
+        return connection
+
+    from ...core.tools.core.mcp.oauth.provider import build_execution_oauth_provider
+
+    connection["auth"] = build_execution_oauth_provider(
+        server_url=connection["url"],
+        server_name=connection.get("name", "mcp"),
+        user_id=user_id,
+        mcpserver_id=mcpserver_id,
+        db=db,
+    )
+    return connection
+
+
 class WebToolConfig(BaseToolConfig):
     """Web-specific tool configuration that loads from database."""
 
@@ -842,6 +866,21 @@ class WebToolConfig(BaseToolConfig):
                     )
                     if merged_headers:
                         transport_config["headers"] = merged_headers
+                    if (
+                        isinstance(decrypted_auth, dict)
+                        and decrypted_auth.get("type") == "oauth_mcp"
+                    ):
+                        transport_config["oauth_mcp"] = True
+
+                    if transport_config.get("oauth_mcp") and self._user_id is not None:
+                        transport_config = attach_oauth_provider_if_needed(
+                            transport_config,
+                            user_id=int(self._user_id),
+                            mcpserver_id=server.id,
+                            db=self.db,
+                        )
+                    else:
+                        transport_config.pop("oauth_mcp", None)
 
                 transport_config["concurrency_safe"] = bool(
                     getattr(server, "concurrency_safe", False)

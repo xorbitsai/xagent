@@ -1416,6 +1416,12 @@ async def get_mcp_server_tools(
         # Get connection from server
         connection = server.to_connection_dict()
 
+        from ..tools.config import attach_oauth_provider_if_needed
+
+        connection = attach_oauth_provider_if_needed(
+            connection, user_id=user_id, mcpserver_id=server_id, db=db
+        )
+
         # Try to load tools
         from ...core.tools.adapters.vibe.mcp_adapter import (
             load_mcp_tools_as_agent_tools,

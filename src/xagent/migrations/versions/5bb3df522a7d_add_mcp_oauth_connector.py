@@ -10,6 +10,7 @@ from typing import Sequence, Union
 
 import sqlalchemy as sa
 from alembic import op
+from sqlalchemy.engine.reflection import Inspector
 
 revision: str = "5bb3df522a7d"
 down_revision: Union[str, None] = "20260629_add_gmail_watch_states"
@@ -18,6 +19,15 @@ depends_on: Union[str, Sequence[str], None] = None
 
 
 def upgrade() -> None:
+    bind = op.get_bind()
+    inspector = Inspector.from_engine(bind)
+
+    # Check if prerequisite tables exist
+    tables = inspector.get_table_names()
+    if "users" not in tables or "mcp_servers" not in tables:
+        # Tables don't exist yet, will be created by SQLAlchemy
+        return
+
     op.add_column("mcp_servers", sa.Column("oauth_client", sa.JSON(), nullable=True))
     op.add_column(
         "mcp_servers", sa.Column("auth_server_metadata", sa.JSON(), nullable=True)
@@ -62,13 +72,26 @@ def upgrade() -> None:
 
 
 def downgrade() -> None:
-    op.drop_index("ix_mcp_user_oauth_tokens_state", table_name="mcp_user_oauth_tokens")
-    op.drop_index(
-        "ix_mcp_user_oauth_tokens_mcpserver_id", table_name="mcp_user_oauth_tokens"
-    )
-    op.drop_index(
-        "ix_mcp_user_oauth_tokens_user_id", table_name="mcp_user_oauth_tokens"
-    )
-    op.drop_table("mcp_user_oauth_tokens")
-    op.drop_column("mcp_servers", "auth_server_metadata")
-    op.drop_column("mcp_servers", "oauth_client")
+    bind = op.get_bind()
+    inspector = Inspector.from_engine(bind)
+
+    tables = inspector.get_table_names()
+    if "mcp_user_oauth_tokens" in tables:
+        op.drop_index(
+            "ix_mcp_user_oauth_tokens_state", table_name="mcp_user_oauth_tokens"
+        )
+        op.drop_index(
+            "ix_mcp_user_oauth_tokens_mcpserver_id",
+            table_name="mcp_user_oauth_tokens",
+        )
+        op.drop_index(
+            "ix_mcp_user_oauth_tokens_user_id", table_name="mcp_user_oauth_tokens"
+        )
+        op.drop_table("mcp_user_oauth_tokens")
+
+    if "mcp_servers" in tables:
+        columns = [col["name"] for col in inspector.get_columns("mcp_servers")]
+        if "auth_server_metadata" in columns:
+            op.drop_column("mcp_servers", "auth_server_metadata")
+        if "oauth_client" in columns:
+            op.drop_column("mcp_servers", "oauth_client")

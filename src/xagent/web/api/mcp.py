@@ -1192,6 +1192,45 @@ def _merge_masked_env(new_env: dict, old_env: dict) -> dict:
     return merged
 
 
+def _check_mcp_permission(
+    user_mcp: UserMCPServer, is_admin: bool, require: str = "edit"
+) -> bool:
+    """Whether the user may mutate shared MCP config.
+
+    ``edit`` gates changes to the shared global config; ``delete`` gates
+    removing the shared server. Admins bypass both.
+    """
+    if is_admin:
+        return True
+    if require == "delete":
+        return bool(getattr(user_mcp, "can_delete", False))
+    return bool(getattr(user_mcp, "is_owner", False))
+
+
+# Owner-only global fields that are safe to compare (non-secret; secrets like
+# env/auth/headers round-trip as masks and can't be diffed reliably).
+_GLOBAL_CONFIG_KEYS = ("command", "args", "url")
+
+
+def _global_config_tampered(server_data: MCPServerUpdate, server: MCPServer) -> bool:
+    """True if a payload changes owner-only global fields (non-secret ones)."""
+    if server_data.name is not None and server_data.name != server.name:
+        return True
+    if server_data.transport is not None and server_data.transport != server.transport:
+        return True
+    if (
+        server_data.description is not None
+        and server_data.description != server.description
+    ):
+        return True
+    incoming = server_data.config or {}
+    current = server.to_config_dict()
+    return any(
+        key in incoming and incoming[key] != current.get(key)
+        for key in _GLOBAL_CONFIG_KEYS
+    )
+
+
 def _db_server_to_response(
     server: MCPServer,
     user_mcp: UserMCPServer,
@@ -1228,7 +1267,7 @@ def _db_server_to_response(
         is_active=user_mcp.is_active,
         is_default=user_mcp.is_default,
         user_env=_mask_env(getattr(user_mcp, "env", None)) if user_mcp.env else None,
-        can_edit_global=bool(getattr(user_mcp, "is_owner", False)) or is_admin,
+        can_edit_global=_check_mcp_permission(user_mcp, is_admin, require="edit"),
         transport_display=server.transport_display,
         created_at=_format_optional_datetime(server.created_at),
         updated_at=_format_optional_datetime(server.updated_at),
@@ -1858,14 +1897,21 @@ def update_mcp_server(
             )
 
         user_mcp, server = result
-        can_edit_global = bool(getattr(user_mcp, "is_owner", False)) or getattr(
-            current_user, "is_admin", False
+        can_edit_global = _check_mcp_permission(
+            user_mcp, getattr(current_user, "is_admin", False), require="edit"
         )
 
         # Non-owners may not touch the shared global config (env, command, etc.);
-        # they only get to set their own per-user env override below.
+        # they only get to set their own per-user env override below. Reject a
+        # tampered payload outright (defense-in-depth for direct/stale-UI calls)
+        # rather than silently normalizing it back to a 200.
         incoming_config = dict(server_data.config or {})
         if not can_edit_global:
+            if _global_config_tampered(server_data, server):
+                raise HTTPException(
+                    status_code=status.HTTP_403_FORBIDDEN,
+                    detail="Only the server owner can change the shared configuration",
+                )
             incoming_config = {}
 
         # Check for name conflicts if updating name
@@ -1966,6 +2012,17 @@ def delete_mcp_server(
             )
 
         user_mcp, server = result
+
+        # Deleting cascades to the shared config once no associations remain;
+        # gate it on ownership, consistent with the update handler.
+        if not _check_mcp_permission(
+            user_mcp, getattr(current_user, "is_admin", False), require="delete"
+        ):
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="You do not have permission to delete this MCP server",
+            )
+
         server_name = server.name
 
         # If it's an OAuth server, also delete the corresponding OAuth tokens

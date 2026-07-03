@@ -530,6 +530,7 @@ export function CustomMcpForm({
         <Input
           id="name"
           value={mcpFormData.name || ""}
+          disabled={!canEditGlobal}
           onChange={(e) => setMcpFormData((prev: MCPServerFormData) => ({ ...prev, name: e.target.value }))}
           placeholder={t('tools.mcp.form.namePlaceholder')}
         />
@@ -541,6 +542,7 @@ export function CustomMcpForm({
           id="description"
           className="flex min-h-[80px] w-full rounded-md border border-input bg-background px-3 py-2 text-sm ring-offset-background placeholder:text-muted-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 disabled:cursor-not-allowed disabled:opacity-50"
           value={mcpFormData.description || ""}
+          disabled={!canEditGlobal}
           onChange={(e) => setMcpFormData((prev: MCPServerFormData) => ({ ...prev, description: e.target.value }))}
           placeholder={t('tools.mcp.form.descriptionPlaceholder')}
         />
@@ -552,7 +554,8 @@ export function CustomMcpForm({
             <button
               key={t}
               type="button"
-              className={`flex-1 py-1.5 text-sm font-medium rounded-md transition-colors ${transport === t ? "bg-blue-600 text-white shadow" : "text-slate-600 hover:text-slate-900 hover:bg-slate-200"}`}
+              disabled={!canEditGlobal}
+              className={`flex-1 py-1.5 text-sm font-medium rounded-md transition-colors disabled:cursor-not-allowed disabled:opacity-50 ${transport === t ? "bg-blue-600 text-white shadow" : "text-slate-600 hover:text-slate-900 hover:bg-slate-200"}`}
               onClick={() => setMcpFormData((prev: MCPServerFormData) => ({ ...prev, transport: t }))}
             >
               {t === "sse" ? "SSE" : t === "streamable_http" ? "HTTP" : t === "stdio" ? "STDIO" : "WebSocket"}
@@ -568,6 +571,7 @@ export function CustomMcpForm({
             <Input
               id="command"
               value={mcpFormData.config?.command || ""}
+              disabled={!canEditGlobal}
               onChange={(e) => updateConfig("command", e.target.value)}
               placeholder={t('tools.mcp.dialog.commandPlaceholder')}
             />
@@ -583,6 +587,7 @@ export function CustomMcpForm({
             <Input
               id="args"
               value={Array.isArray(mcpFormData.config?.args) ? mcpFormData.config.args.join(" ") : (mcpFormData.config?.args || "")}
+              disabled={!canEditGlobal}
               onChange={(e) => {
                 // Split by space for simple arg passing (in a real app, might want a better parser)
                 const argsArr = e.target.value.split(" ").filter(Boolean)
@@ -620,6 +625,7 @@ export function CustomMcpForm({
             <Input
               id="url"
               value={mcpFormData.config?.url || ""}
+              disabled={!canEditGlobal}
               onChange={(e) => updateConfig("url", e.target.value)}
               placeholder={transport === "websocket" ? "wss://mcp.example.com/ws" : transport === "streamable_http" ? "https://mcp.example.com/mcp" : "https://mcp.example.com/sse"}
             />

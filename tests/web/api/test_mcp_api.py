@@ -8,8 +8,11 @@ import pytest
 
 from xagent.web.api.mcp import (
     MCPServerCreate,
+    MCPServerUpdate,
     _build_server_config,
+    _check_mcp_permission,
     _db_server_to_response,
+    _global_config_tampered,
     _mask_env,
     _merge_masked_env,
     get_supported_transports,
@@ -422,6 +425,38 @@ class TestMCPApiFunctions:
         merged = _merge_masked_env({"NEW": "********"}, {"OLD": "secret"})
         assert merged == {}
         assert None not in merged.values()
+
+    def test_check_mcp_permission(self):
+        """Owner gates edit; can_delete gates delete; admin bypasses both."""
+        owner = MagicMock(is_owner=True, can_delete=True)
+        guest = MagicMock(is_owner=False, can_delete=False)
+        assert _check_mcp_permission(owner, is_admin=False, require="edit") is True
+        assert _check_mcp_permission(owner, is_admin=False, require="delete") is True
+        assert _check_mcp_permission(guest, is_admin=False, require="edit") is False
+        assert _check_mcp_permission(guest, is_admin=False, require="delete") is False
+        # Admin bypasses the per-row flags
+        assert _check_mcp_permission(guest, is_admin=True, require="delete") is True
+
+    def test_global_config_tampered(self):
+        """Non-secret global fields are diffed; unchanged payloads pass."""
+        server = MCPServer.from_config(
+            {
+                "name": "svc",
+                "managed": "external",
+                "transport": "stdio",
+                "command": "python",
+                "args": ["-m", "svc"],
+            }
+        )
+        # Same values (what a non-owner's disabled-but-submitted form sends) -> ok
+        unchanged = MCPServerUpdate(config={"command": "python", "args": ["-m", "svc"]})
+        assert _global_config_tampered(unchanged, server) is False
+        # Changed command -> tampered
+        assert _global_config_tampered(
+            MCPServerUpdate(config={"command": "sh"}), server
+        )
+        # Changed top-level name -> tampered
+        assert _global_config_tampered(MCPServerUpdate(name="other"), server)
 
     def test_mask_env_keeps_keys(self):
         assert _mask_env({"A": "1", "B": ""}) == {"A": "********", "B": ""}

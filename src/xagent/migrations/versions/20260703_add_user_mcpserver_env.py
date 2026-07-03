@@ -12,7 +12,7 @@ import sqlalchemy as sa
 from alembic import op
 
 revision: str = "20260703_add_user_mcpserver_env"
-down_revision: Union[str, None] = "20260702_add_mcp_oauth_tables"
+down_revision: Union[str, None] = "20260625_add_user_skills_tables"
 branch_labels: Union[str, Sequence[str], None] = None
 depends_on: Union[str, Sequence[str], None] = None
 

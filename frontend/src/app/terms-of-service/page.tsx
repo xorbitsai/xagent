@@ -5,10 +5,11 @@ import type { ReactNode } from "react";
 import { ArrowLeft } from "lucide-react";
 import { useI18n } from "@/contexts/i18n-context";
 import { getBrandingFromEnv } from "@/lib/branding";
+import { LEGAL_CONTACT_EMAIL } from "@/lib/legal";
 
 const branding = getBrandingFromEnv();
 
-const CONTACT_EMAIL = "support@xagent.co";
+const CONTACT_EMAIL = LEGAL_CONTACT_EMAIL;
 const LAST_UPDATED = "2026-07-02";
 
 function H2({ children }: { children: ReactNode }) {

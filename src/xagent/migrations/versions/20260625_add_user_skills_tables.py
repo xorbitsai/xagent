@@ -1,7 +1,7 @@
 """add user_skills and user_skill_files tables
 
 Revision ID: 20260625_add_user_skills_tables
-Revises: 20260629_add_gmail_watch_states
+Revises: 20260702_add_mcp_oauth_tables, 20260702_add_trigger_provider_foundation
 Create Date: 2026-06-25 00:00:00.000000
 
 """
@@ -13,7 +13,10 @@ from alembic import op
 from sqlalchemy.engine.reflection import Inspector
 
 revision: str = "20260625_add_user_skills_tables"
-down_revision: Union[str, None] = "20260629_add_gmail_watch_states"
+down_revision: Union[str, Sequence[str], None] = (
+    "20260702_add_mcp_oauth_tables",
+    "20260702_add_trigger_provider_foundation",
+)
 branch_labels: Union[str, Sequence[str], None] = None
 depends_on: Union[str, Sequence[str], None] = None
 

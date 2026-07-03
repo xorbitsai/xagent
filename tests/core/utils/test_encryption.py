@@ -23,6 +23,25 @@ def test_encrypt_empty_value():
     assert encrypt_value(None) is None
 
 
+def test_encrypt_value_idempotent():
+    """Re-encrypting an already-encrypted value is a no-op (no double-encryption)."""
+    once = encrypt_value("secret")
+    assert encrypt_value(once) == once
+    assert decrypt_value(encrypt_value(once)) == "secret"
+
+
+def test_encrypt_value_encrypts_fake_ciphertext_prefix():
+    """A plaintext that merely looks like a Fernet token is still encrypted.
+
+    Guards against the old prefix-only heuristic that would store such a value
+    in plaintext at rest.
+    """
+    looks_like_token = "gAAAAABnot-a-real-token"
+    encrypted = encrypt_value(looks_like_token)
+    assert encrypted != looks_like_token
+    assert decrypt_value(encrypted) == looks_like_token
+
+
 def test_decrypt_empty_value():
     assert decrypt_value("") == ""
     assert decrypt_value(None) is None

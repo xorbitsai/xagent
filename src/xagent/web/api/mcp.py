@@ -1120,8 +1120,8 @@ def _update_server_from_config(server: MCPServer, config: MCPServerConfig) -> No
                         if encrypted_auth[key] == MASKED_SECRET_VALUE:
                             existing_auth: Any = server.auth or {}
                             encrypted_auth[key] = existing_auth.get(key)
-                        # Otherwise encrypt it if it isn't already encrypted
-                        elif not encrypted_auth[key].startswith("gAAAAAB"):
+                        else:
+                            # encrypt_value is idempotent (skips already-encrypted)
                             encrypted_auth[key] = encrypt_value(encrypted_auth[key])
                 value = encrypted_auth
             setattr(server, db_field, value)

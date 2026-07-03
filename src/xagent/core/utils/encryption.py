@@ -30,9 +30,23 @@ def get_cipher() -> Fernet:
     )
 
 
+def _is_encrypted(value: str) -> bool:
+    """True if value is one of our Fernet tokens (decrypts cleanly).
+
+    Makes encryption idempotent without a brittle prefix check: a plaintext
+    value that merely looks like a token fails the HMAC and is treated as
+    plaintext, so it still gets encrypted at rest.
+    """
+    try:
+        get_cipher().decrypt(value.encode())
+        return True
+    except Exception:
+        return False
+
+
 def encrypt_value(value: str) -> str:
-    """Encrypt a string value."""
-    if not value:
+    """Encrypt a string value. Idempotent: an already-encrypted value is returned as-is."""
+    if not value or _is_encrypted(value):
         return value
     cipher = get_cipher()
     return cipher.encrypt(value.encode()).decode()
@@ -53,22 +67,11 @@ def decrypt_value(encrypted_value: str) -> str:
         return encrypted_value
 
 
-# Fernet tokens always start with this prefix; used to skip double-encryption.
-_FERNET_PREFIX = "gAAAAAB"
-
-
 def encrypt_env_dict(env: dict | None) -> dict | None:
-    """Encrypt env var values at rest (skips empty and already-encrypted values)."""
+    """Encrypt env var values at rest (encrypt_value skips empty/already-encrypted)."""
     if not env:
         return env
-    return {
-        k: (
-            encrypt_value(v)
-            if isinstance(v, str) and v and not v.startswith(_FERNET_PREFIX)
-            else v
-        )
-        for k, v in env.items()
-    }
+    return {k: (encrypt_value(v) if isinstance(v, str) else v) for k, v in env.items()}
 
 
 def decrypt_env_dict(env: dict | None) -> dict | None:

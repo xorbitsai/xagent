@@ -275,16 +275,14 @@ def create_mcp_server_table(Base: Type[Any]) -> Type[Any]:
                 from xagent.core.utils.encryption import encrypt_value
 
                 encrypted_auth = auth_config.copy()
-                # Check if it's already encrypted (starts with gAAAAAB...) to avoid double encryption
-                # (Fernet tokens always start with gAAAAAB)
+                # encrypt_value is idempotent, so already-encrypted values are
+                # left untouched (no double-encryption).
                 for key in SENSITIVE_AUTH_FIELDS:
                     if key in encrypted_auth and encrypted_auth[key]:
                         if encrypted_auth[key] == MASKED_SECRET_VALUE:
                             raise ValueError(
                                 f"Masked auth value for '{key}' cannot be stored"
                             )
-                        if encrypted_auth[key].startswith("gAAAAAB"):
-                            continue
                         encrypted_auth[key] = encrypt_value(encrypted_auth[key])
                 auth_config = encrypted_auth
 

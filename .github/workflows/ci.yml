@@ -618,21 +618,70 @@ jobs:
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # full history + tags so hatch-vcs can derive the version
 
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
-          node-version: '20'
+          node-version: '22'
           cache: 'npm'
           cache-dependency-path: frontend/package-lock.json
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
 
       - name: Install dependencies
         working-directory: ./frontend
         run: npm ci
 
-      - name: Build frontend
+      # Static export is the default build (served by FastAPI in the pip/uvx
+      # deployment). Verify it produces a servable bundle: index shell plus the
+      # dynamic-route __shell__ pages the SPA fallback depends on.
+      - name: Build frontend (static export)
         working-directory: ./frontend
+        env:
+          NEXT_TELEMETRY_DISABLED: '1'
         run: npm run build
+      - name: Verify static export output
+        working-directory: ./frontend
+        run: |
+          set -e
+          test -f out/index.html || { echo "::error::static export missing out/index.html"; exit 1; }
+          shells=$(find out -name '__shell__*.html' | wc -l)
+          test "$shells" -gt 0 || { echo "::error::static export produced no dynamic-route shells"; exit 1; }
+          echo "Static export OK ($shells dynamic-route shells)."
+
+      # The multi-container Docker image serves the frontend via a Node server,
+      # so the standalone build must keep working too.
+      - name: Build frontend (standalone / Docker)
+        working-directory: ./frontend
+        env:
+          NEXT_TELEMETRY_DISABLED: '1'
+          NEXT_OUTPUT: standalone
+        run: |
+          set -e
+          npm run build
+          test -f .next/standalone/server.js || { echo "::error::standalone build missing server.js"; exit 1; }
+          echo "Standalone build OK."
+
+      # Guard the export -> wheel packaging path (runs only at release otherwise),
+      # so a broken bundling glob or a dropped Python package is caught on the PR.
+      - name: Verify package bundles the frontend
+        run: |
+          set -e
+          rm -rf frontend/.next frontend/out src/xagent/web/frontend_dist
+          ( cd frontend && NEXT_TELEMETRY_DISABLED=1 npm run build )
+          cp -r frontend/out src/xagent/web/frontend_dist
+          python -m pip install --quiet build
+          python -m build --wheel
+          python -m zipfile -l dist/*.whl | grep -q "xagent/web/frontend_dist/index.html" \
+            || { echo "::error::wheel is missing the bundled frontend (frontend_dist)"; exit 1; }
+          python -m zipfile -l dist/*.whl | grep -q "xagent/web/__main__.py" \
+            || { echo "::error::wheel is missing the Python package (xagent/web/__main__.py)"; exit 1; }
+          echo "Wheel bundles the frontend and the full Python package."
 
   ci-summary:
     name: CI Summary

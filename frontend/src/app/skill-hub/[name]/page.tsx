@@ -41,6 +41,10 @@ import type {
 
 type ViewMode = "installed" | "registry";
 
+export function generateStaticParams() {
+  return [{ name: "__shell__" }];
+}
+
 export default function SkillDetailPage() {
   const params = useParams<{ name: string }>();
   const router = useRouter();

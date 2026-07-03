@@ -40,10 +40,14 @@ jobs:
           rm -rf src/xagent/web/frontend_dist
           cp -r frontend/out src/xagent/web/frontend_dist
 
-      - name: Build distributions
+      - name: Build distribution (wheel only)
         run: |
           python -m pip install build
-          python -m build
+          # Wheel only: the wheel is a universal py3-none-any build, so pip never
+          # needs the sdist to install on any platform. An sdist would also drag
+          # in large repo assets (README GIFs, tutorial videos) and exceed PyPI's
+          # 100 MB per-file limit for this project.
+          python -m build --wheel
 
       - name: Verify the bundled frontend is in the artifacts
         run: |

@@ -49,7 +49,7 @@ from ...services.task_orchestrator import (
     TurnKind,
 )
 from ._step_mapping import map_trace_events_to_public_steps
-from .deps import get_agent_from_api_key
+from .deps import get_agent_from_api_key, record_key_usage
 from .errors import V1ApiError, V1ErrorCode
 
 router = APIRouter()
@@ -121,6 +121,11 @@ async def create_chat_task(
     # observable to this caller.
     if request.agent_id != agent.id:
         raise V1ApiError(V1ErrorCode.AGENT_NOT_FOUND, 404)
+
+    # Record usage here (not in the shared auth dependency) so read-only
+    # status/steps polling below doesn't count as a "call" -- only actual
+    # task-creating/message-appending requests do.
+    record_key_usage(str(_key.key_prefix))
 
     # title is what the web UI shows in its task list. Truncate to
     # 50 chars (matches the WS handler convention) so very long
@@ -301,6 +306,10 @@ async def append_message_to_task(
     # POST /v1/chat/tasks behavior for the same condition.
     if request.agent_id != agent.id:
         raise V1ApiError(V1ErrorCode.AGENT_NOT_FOUND, 404)
+
+    # See the matching comment in create_chat_task: recorded here, not in
+    # the shared auth dependency, so status polling elsewhere never counts.
+    record_key_usage(str(_key.key_prefix))
 
     # Orchestrator does the atomic claim (status must be terminal --
     # COMPLETED or FAILED -- to be appendable, so PENDING/RUNNING both

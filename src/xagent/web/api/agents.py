@@ -948,18 +948,24 @@ async def generate_agent_api_key(
         HTTPException 401: missing or invalid JWT.
         HTTPException 404: agent does not exist or does not belong to the
             caller (deliberate to avoid leaking agent existence).
-        HTTPException 500: any unexpected error; transaction rolled back.
-            The most plausible internal failure is a partial-unique index
-            violation from a concurrent POST race, which the DB enforces.
+        HTTPException 409: ``rotation_conflict`` -- a ``key_prefix``
+            collision on insert (astronomically rare; the prefix
+            keyspace is large, this is defense-in-depth).
+        HTTPException 500: any other unexpected error; transaction
+            rolled back.
 
     Notes:
         - Transactional shape mirrors ``auth.setup_admin`` and
           ``custom_api.create_custom_api`` -- we collect all writes in the
-          session and commit once. There is no ``SELECT ... FOR UPDATE``;
-          concurrent rotations are caught by the
-          ``uq_agent_api_keys_agent_active`` partial unique index and
-          surfaced as a 500. Two clients racing to rotate the same key is
-          a corner case; a 500 is acceptable.
+          session and commit once. There is no ``SELECT ... FOR UPDATE``:
+          an agent may hold multiple simultaneously-active keys (the
+          ``uq_agent_api_keys_agent_active`` partial unique index that
+          used to enforce "at most one" was dropped for multi-key
+          support), so two clients racing to POST this endpoint for the
+          same agent no longer conflict at the DB level -- each
+          independently revokes whatever was active and inserts its own
+          new row; both succeed, and whichever committed last leaves its
+          key as the sole non-revoked one.
         - Logs include the ``key_prefix`` only -- never the ``full_key``,
           the secret half, or the bcrypt hash.
     """
@@ -973,10 +979,11 @@ async def generate_agent_api_key(
     except HTTPException:
         raise
     except KeyRotationConflict as e:
-        # Partial unique constraint hit -- another POST won the race
-        # between our SELECT and our COMMIT. Surface this as 409 rather
-        # than a generic 500 so the client can retry without alarm.
-        # Internal SQL message stays in the log only.
+        # key_prefix collision on insert -- the only remaining trigger
+        # now that the partial unique index this used to also catch is
+        # gone. Surface as 409 rather than a generic 500 so the client
+        # can retry without alarm. Internal SQL message stays in the log
+        # only.
         logger.warning(f"Concurrent API key rotation race for agent {agent_id}: {e}")
         raise HTTPException(status_code=409, detail="rotation_conflict")
     except Exception as e:

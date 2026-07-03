@@ -153,8 +153,10 @@ class AgentManagementService:
         failure.
 
         Conflict contract: the only IntegrityError this path can raise
-        comes from the runtime key's unique constraints (``key_prefix``
-        / ``uq_agent_api_keys_agent_active``); the agent table has no
+        comes from the runtime key's ``key_prefix`` unique constraint
+        (the ``uq_agent_api_keys_agent_active`` partial index that used
+        to also live here was dropped for multi-key support -- an agent
+        may hold more than one active key now); the agent table has no
         unique constraint and therefore does not contribute one. If a
         ``(user_id, name)`` unique constraint is ever added to agents,
         the conflict translation here must be split by source (agent ->

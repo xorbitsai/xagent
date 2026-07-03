@@ -1,7 +1,7 @@
 """add_multi_key_support_to_agent_api_keys
 
 Revision ID: 20260703_add_multi_key_support_to_agent_api_keys
-Revises: 20260629_add_gmail_watch_states
+Revises: 20260702_add_mcp_oauth_tables, 20260702_add_trigger_provider_foundation
 Create Date: 2026-07-03 00:00:00.000000
 
 """
@@ -14,7 +14,14 @@ from sqlalchemy import inspect
 
 # revision identifiers, used by Alembic.
 revision: str = "20260703_add_multi_key_support_to_agent_api_keys"
-down_revision: Union[str, None] = "20260629_add_gmail_watch_states"
+# Both of these already branch from 20260629_add_gmail_watch_states without
+# being reconciled -- listing them both here (instead of the older single
+# parent) merges the two stray heads into this revision rather than adding
+# a separate no-op merge migration.
+down_revision: Union[str, tuple[str, str], None] = (
+    "20260702_add_mcp_oauth_tables",
+    "20260702_add_trigger_provider_foundation",
+)
 branch_labels: Union[str, Sequence[str], None] = None
 depends_on: Union[str, Sequence[str], None] = None
 

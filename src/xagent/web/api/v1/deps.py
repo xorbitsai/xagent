@@ -92,12 +92,14 @@ async def get_agent_from_api_key(
 
     prefix = parsed.prefix
 
-    # Index lookup is O(1) on ix_agent_api_keys_key_prefix and excludes
-    # revoked rows via the partial unique index path. ``joinedload``
-    # pulls the bound Agent row in the same SELECT so we don't pay a
-    # second round-trip on the success path (the relationship defaults
-    # to lazy='select', which would otherwise emit a separate query
-    # when we access ``key_row.agent`` below).
+    # Index lookup is O(1) on ix_agent_api_keys_key_prefix; revoked (and,
+    # below, paused) rows are excluded by the filter, not by any DB
+    # constraint -- an agent can hold multiple simultaneously-active
+    # keys, so uniqueness is no longer enforced at the schema level.
+    # ``joinedload`` pulls the bound Agent row in the same SELECT so we
+    # don't pay a second round-trip on the success path (the relationship
+    # defaults to lazy='select', which would otherwise emit a separate
+    # query when we access ``key_row.agent`` below).
     key_row = (
         db.query(AgentApiKey)
         .options(joinedload(AgentApiKey.agent))
@@ -134,13 +136,20 @@ async def get_agent_from_api_key(
     if agent is None or is_workforce_generated_manager_agent(agent):
         raise V1ApiError(V1ErrorCode.INVALID_API_KEY, 401)
 
-    _record_key_usage(key_row.key_prefix)  # type: ignore[arg-type]
-
     return agent, key_row
 
 
-def _record_key_usage(key_prefix: str) -> None:
+def record_key_usage(key_prefix: str) -> None:
     """Best-effort usage tracking for the API Keys page's stat cards.
+
+    Deliberately NOT called from :func:`get_agent_from_api_key` itself --
+    that dependency backs every ``/v1/chat/tasks/*`` route including the
+    read-only status/steps polling endpoints SDK clients hit repeatedly,
+    and recording a write there would (a) put a DB write+commit on the
+    busiest possible request path and (b) conflate polling with real
+    invocations in the "calls this month" stat. Callers should invoke
+    this only from endpoints that represent an actual SDK-visible call
+    (e.g. creating a task or appending a message), not from polling GETs.
 
     Runs on its own DB session -- deliberately isolated from the
     request-scoped ``db`` session used for auth -- and issues a single
@@ -151,7 +160,7 @@ def _record_key_usage(key_prefix: str) -> None:
     rolling back on failure would poison that session for the rest of
     the request; and incrementing ``usage_month_calls`` in Python is
     subject to lost updates under concurrent calls with the same key.
-    Never allowed to fail the auth path -- errors are logged and
+    Never allowed to fail the request -- errors are logged and
     swallowed, not raised.
     """
     now = datetime.now(timezone.utc)

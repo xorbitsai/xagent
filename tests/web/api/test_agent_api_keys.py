@@ -554,3 +554,97 @@ class TestRegenerateAndDelete:
         headers = _headers()
         resp = client.delete("/api/agent-api-keys/9999999", headers=headers)
         assert resp.status_code == 404
+
+    def test_regenerate_preserves_paused_status(self):
+        """Regenerating a paused key must not silently resume it."""
+        headers = _headers()
+        agent_id = _create_agent(headers)
+        client.post("/api/agent-api-keys", headers=headers, json={"agent_id": agent_id})
+        key_id = client.get("/api/agent-api-keys", headers=headers).json()[0]["id"]
+        client.post(f"/api/agent-api-keys/{key_id}/pause", headers=headers)
+
+        resp = client.post(f"/api/agent-api-keys/{key_id}/regenerate", headers=headers)
+        assert resp.status_code == 200, resp.text
+
+        listed = client.get("/api/agent-api-keys", headers=headers).json()[0]
+        assert listed["status"] == "paused"
+
+    def test_regenerate_revoked_key_returns_404(self):
+        headers = _headers()
+        agent_id = _create_agent(headers)
+        client.post("/api/agent-api-keys", headers=headers, json={"agent_id": agent_id})
+        key_id = client.get("/api/agent-api-keys", headers=headers).json()[0]["id"]
+        client.delete(f"/api/agent-api-keys/{key_id}", headers=headers)
+
+        resp = client.post(f"/api/agent-api-keys/{key_id}/regenerate", headers=headers)
+        assert resp.status_code == 404
+
+
+class TestLegacyMultiKeyInteraction:
+    """The legacy single-key endpoints (/api/agents/{id}/api-key) once an
+    agent has multiple keys via the new admin surface.
+    """
+
+    def test_legacy_get_returns_most_recent_non_paused_key(self):
+        headers = _headers()
+        agent_id = _create_agent(headers)
+        client.post(
+            "/api/agent-api-keys",
+            headers=headers,
+            json={"agent_id": agent_id, "label": "older"},
+        )
+        newer = client.post(
+            "/api/agent-api-keys",
+            headers=headers,
+            json={"agent_id": agent_id, "label": "newer"},
+        ).json()
+
+        resp = client.get(f"/api/agents/{agent_id}/api-key", headers=headers)
+        assert resp.status_code == 200, resp.text
+        assert resp.json()["key_prefix"] == newer["key_prefix"]
+
+    def test_legacy_get_skips_paused_most_recent_key(self):
+        """A paused key must never be surfaced by the legacy GET as active."""
+        headers = _headers()
+        agent_id = _create_agent(headers)
+        older = client.post(
+            "/api/agent-api-keys",
+            headers=headers,
+            json={"agent_id": agent_id, "label": "older"},
+        ).json()
+        client.post(
+            "/api/agent-api-keys",
+            headers=headers,
+            json={"agent_id": agent_id, "label": "newer-but-paused"},
+        )
+        # The list is ordered created_at desc, so the just-created key is first.
+        newest_key_id = client.get(
+            f"/api/agent-api-keys?agent_id={agent_id}", headers=headers
+        ).json()[0]["id"]
+        client.post(f"/api/agent-api-keys/{newest_key_id}/pause", headers=headers)
+
+        resp = client.get(f"/api/agents/{agent_id}/api-key", headers=headers)
+        assert resp.status_code == 200, resp.text
+        assert resp.json()["key_prefix"] == older["key_prefix"]
+
+    def test_legacy_rotate_revokes_every_multi_created_key(self):
+        """Documents intended (if surprising) behavior: legacy POST rotate
+        is a blunt instrument that invalidates every active key on the
+        agent, not just "the" legacy one.
+        """
+        headers = _headers()
+        agent_id = _create_agent(headers)
+        client.post("/api/agent-api-keys", headers=headers, json={"agent_id": agent_id})
+        client.post("/api/agent-api-keys", headers=headers, json={"agent_id": agent_id})
+
+        rotate_resp = client.post(f"/api/agents/{agent_id}/api-key", headers=headers)
+        assert rotate_resp.status_code == 200, rotate_resp.text
+
+        listed = client.get(
+            f"/api/agent-api-keys?agent_id={agent_id}", headers=headers
+        ).json()
+        # The two pre-existing keys plus the legacy endpoint's new one.
+        assert len(listed) == 3
+        active = [k for k in listed if k["status"] == "active"]
+        assert len(active) == 1
+        assert active[0]["key_prefix"] == rotate_resp.json()["key_prefix"]

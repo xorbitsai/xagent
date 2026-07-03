@@ -107,9 +107,14 @@ class AgentApiKeyService:
         transaction: returns a one-shot key, commits itself, and maps a
         unique-index race to :class:`KeyRotationConflict`.
 
-        Staging and commit share one ``try`` so the
-        ``uq_agent_api_keys_agent_active`` / ``key_prefix`` conflict is
+        Staging and commit share one ``try`` so an IntegrityError is
         translated whether it surfaces at the staging flush or at commit.
+        The only remaining trigger is a ``key_prefix`` collision (the
+        old ``uq_agent_api_keys_agent_active`` partial unique index this
+        used to also catch was dropped when multi-key support landed --
+        an agent may now hold more than one active key, so concurrent
+        rotations of the *same* agent no longer race on that constraint;
+        each just revokes-then-inserts independently).
         """
         try:
             new_row, full_key = self.stage_rotated_key(agent_id)
@@ -126,12 +131,19 @@ class AgentApiKeyService:
         )
 
     def get_metadata(self, agent_id: int) -> APIKeyMetadataResponse | None:
+        # An agent can now have more than one active key (via the
+        # multi-key admin endpoints), so this legacy "the active key"
+        # view needs its own tiebreak: most-recently-created wins, and a
+        # paused key is excluded so it's never surfaced here as "active"
+        # (mirrors the auth dependency's paused == invalid treatment).
         row = (
             self.db.query(AgentApiKey)
             .filter(
                 AgentApiKey.agent_id == agent_id,
                 AgentApiKey.revoked_at.is_(None),
+                AgentApiKey.paused_at.is_(None),
             )
+            .order_by(AgentApiKey.created_at.desc(), AgentApiKey.id.desc())
             .first()
         )
         if row is None:
@@ -245,7 +257,9 @@ class AgentApiKeyService:
         )
         if agent_id is not None:
             query = query.filter(AgentApiKey.agent_id == agent_id)
-        rows = query.order_by(AgentApiKey.created_at.desc()).all()
+        rows = query.order_by(
+            AgentApiKey.created_at.desc(), AgentApiKey.id.desc()
+        ).all()
         return [self._to_list_item(row, agent_name) for row, agent_name in rows]
 
     def get_stats_for_user(self, user_id: int) -> AgentApiKeyStats:
@@ -322,22 +336,25 @@ class AgentApiKeyService:
     def regenerate_key(
         self, user_id: int, key_id: int
     ) -> tuple[AgentApiKeyListItem, str] | None:
-        """Issue a new secret for an existing key row, keeping id/label.
+        """Issue a new secret for an existing key row, keeping id/label/status.
 
         Returns ``(list_item, full_key)`` where ``full_key`` is the
-        one-shot plaintext, or ``None`` if the key doesn't exist / isn't
-        owned by ``user_id``.
+        one-shot plaintext, or ``None`` if the key doesn't exist, isn't
+        owned by ``user_id``, or has been revoked (a revoked key is a
+        dead row -- regenerating it would hand back a secret that the
+        auth dependency, which excludes revoked keys, would still 401 on).
         """
         row = self._find_owned_key(user_id, key_id)
-        if row is None:
+        if row is None or row.revoked_at is not None:
             return None
 
         full_key, key_prefix, key_hash = generate_api_key(
             self.db, kind=ApiKeyKind.AGENT
         )
-        row.key_prefix = key_prefix  # type: ignore[assignment]
-        row.key_hash = key_hash  # type: ignore[assignment]
-        row.paused_at = None  # type: ignore[assignment]
+        row.key_prefix = key_prefix
+        row.key_hash = key_hash
+        # Deliberately NOT touching paused_at -- regenerate swaps the
+        # secret only, it doesn't implicitly resume a paused key.
         try:
             self.db.commit()
         except IntegrityError as exc:

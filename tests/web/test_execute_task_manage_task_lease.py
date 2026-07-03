@@ -7,10 +7,13 @@ from unittest.mock import AsyncMock, patch
 import pytest
 
 from xagent.web.api.chat import AgentServiceManager
+from xagent.web.models.agent import Agent, AgentStatus
 from xagent.web.models.database import Base, get_db, get_engine, init_db
 from xagent.web.models.task import Task, TaskStatus
 from xagent.web.models.user import User
+from xagent.web.models.workforce import Workforce, WorkforceRun
 from xagent.web.services.task_lease_service import TaskLease
+from xagent.web.services.workforce_runtime import sync_workforce_run_status
 
 
 @pytest.fixture()
@@ -148,3 +151,64 @@ async def test_execute_task_skips_lease_but_syncs_running_when_manage_false(
     mock_release.assert_not_called()
     mock_sync.assert_called_once()
     mock_stop_hb.assert_awaited_once_with(None, None)
+
+
+def test_sync_workforce_run_status_running_is_idempotent(db_session) -> None:
+    """Repeat RUNNING sync is a no-op when WorkforceRun is already running."""
+    user = User(username="sync-user", password_hash="hash", is_admin=False)
+    db_session.add(user)
+    db_session.flush()
+    manager = Agent(
+        user_id=user.id,
+        name="Manager",
+        description="desc",
+        instructions="instr",
+        execution_mode="balanced",
+        models={"general": "test-model"},
+        knowledge_bases=[],
+        skills=[],
+        tool_categories=[],
+        suggested_prompts=[],
+        status=AgentStatus.PUBLISHED,
+    )
+    db_session.add(manager)
+    db_session.flush()
+    workforce = Workforce(
+        owner_user_id=user.id,
+        scope_type="user",
+        scope_id=str(user.id),
+        name="Team",
+        description="desc",
+        manager_agent_id=manager.id,
+        status="active",
+    )
+    db_session.add(workforce)
+    db_session.flush()
+    task = Task(
+        user_id=user.id,
+        title="sync test",
+        description="test",
+        status=TaskStatus.RUNNING,
+        agent_id=manager.id,
+        agent_config={},
+        execution_mode="auto",
+    )
+    db_session.add(task)
+    db_session.flush()
+    run = WorkforceRun(
+        workforce_id=workforce.id,
+        task_id=task.id,
+        user_id=user.id,
+        status="running",
+        snapshot={"version": 1},
+    )
+    db_session.add(run)
+    db_session.flush()
+    task.agent_config = {"workforce_run_id": run.id}
+    db_session.commit()
+
+    assert sync_workforce_run_status(db_session, task, TaskStatus.RUNNING) is False
+    assert sync_workforce_run_status(db_session, task, TaskStatus.RUNNING) is False
+    db_session.refresh(run)
+    assert run.status == "running"
+    assert run.completed_at is None

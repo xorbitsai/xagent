@@ -48,9 +48,12 @@ access; no Tool type import required.
 
 from __future__ import annotations
 
+import logging
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from typing import Any, List, Optional, Set
+
+logger = logging.getLogger(__name__)
 
 
 def normalize_mcp_server_name(name: str) -> str:
@@ -293,6 +296,19 @@ class ToolSelectionSpec(ABC):
                 server_name = normalize_mcp_server_name(entry.split(":", 1)[1])
                 derived_mcp_servers.add(server_name)
             elif entry == "other":
+                # Legacy-only entry, no longer assignable (see module
+                # docstring). No built-in tool carries this category, so
+                # dropping it just prunes stale data -- except a legacy
+                # agent persisted with exactly ["other"] (no mcp_servers),
+                # which loses its only tool access. Warn so those agents
+                # are traceable instead of silently degraded.
+                logger.warning(
+                    "Dropping non-assignable 'other' tool category from "
+                    "tool_categories=%r; if 'other' was the only entry, "
+                    "this agent now gets zero tools instead of its "
+                    "previous (leaky) Custom API access",
+                    tool_categories,
+                )
                 continue
             else:
                 plain_cats.add(entry)

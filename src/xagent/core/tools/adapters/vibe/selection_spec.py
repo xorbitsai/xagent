@@ -300,8 +300,10 @@ class ToolSelectionSpec(ABC):
                 # docstring). No built-in tool carries this category, so
                 # dropping it just prunes stale data -- except a legacy
                 # agent persisted with exactly ["other"] (no mcp_servers),
-                # which loses its only tool access. Warn so those agents
-                # are traceable instead of silently degraded.
+                # which loses its only tool access. Warn so this is
+                # visible in logs; from_raw() has no agent id, so
+                # per-agent traceability comes from the backfill
+                # migration's logging instead.
                 logger.warning(
                     "Dropping non-assignable 'other' tool category from "
                     "tool_categories=%r; if 'other' was the only entry, "

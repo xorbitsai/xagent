@@ -1693,13 +1693,15 @@ def test_from_raw_warns_when_dropping_other(caplog):
     with caplog.at_level("WARNING"):
         spec = ToolSelectionSpec.from_raw(tool_categories=["other"])
     assert spec.is_none()
-    assert any("other" in record.message for record in caplog.records)
+    assert any(repr(["other"]) in record.getMessage() for record in caplog.records)
 
     caplog.clear()
     with caplog.at_level("WARNING"):
         spec = ToolSelectionSpec.from_raw(tool_categories=["basic", "other"])
     assert spec.categories == frozenset({"basic"})
-    assert any("other" in record.message for record in caplog.records)
+    assert any(
+        repr(["basic", "other"]) in record.getMessage() for record in caplog.records
+    )
 
 
 def test_compute_allowed_names_mcp_server_does_not_broaden_to_all_mcp():

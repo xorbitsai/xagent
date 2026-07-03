@@ -55,3 +55,34 @@ def test_upgrade_strips_other_from_existing_agents() -> None:
         (3, ["basic"]),
         (4, None),
     ]
+
+
+def test_upgrade_is_noop_when_agents_table_missing() -> None:
+    migration = _load_migration_module()
+    engine = sa.create_engine("sqlite:///:memory:")
+
+    with engine.begin() as conn:
+        with patch.object(migration.op, "get_bind", return_value=conn):
+            migration.upgrade()  # must not raise
+
+
+def test_upgrade_is_noop_when_tool_categories_column_missing() -> None:
+    migration = _load_migration_module()
+    engine = sa.create_engine("sqlite:///:memory:")
+    metadata = sa.MetaData()
+    agents = sa.Table(
+        "agents",
+        metadata,
+        sa.Column("id", sa.Integer, primary_key=True),
+    )
+    metadata.create_all(engine)
+
+    with engine.begin() as conn:
+        conn.execute(agents.insert(), [{"id": 1}])
+
+        with patch.object(migration.op, "get_bind", return_value=conn):
+            migration.upgrade()  # must not raise
+
+        rows = conn.execute(sa.select(agents.c.id)).all()
+
+    assert rows == [(1,)]

@@ -10,6 +10,8 @@ from xagent.web.api.mcp import (
     MCPServerCreate,
     _build_server_config,
     _db_server_to_response,
+    _mask_env,
+    _merge_masked_env,
     get_supported_transports,
 )
 from xagent.web.models.mcp import MCPServer
@@ -187,7 +189,9 @@ class TestMCPServerModel:
         assert server.transport == "stdio"
         assert server.command == "python"
         assert server.args == ["server.py"]
-        assert server.env == {"KEY": "value"}
+        # env is encrypted at rest but decrypts back for consumption
+        assert server.env["KEY"].startswith("gAAAAAB")
+        assert server.to_connection_dict()["env"] == {"KEY": "value"}
         assert server.cwd == "/app"
         assert server.concurrency_safe is False
         assert server.concurrent_tools == []
@@ -361,6 +365,8 @@ class TestMCPApiFunctions:
         user_mcp.user_id = 1
         user_mcp.is_active = True
         user_mcp.is_default = False
+        user_mcp.is_owner = True
+        user_mcp.env = None
 
         response = _db_server_to_response(
             server=server,
@@ -371,6 +377,65 @@ class TestMCPApiFunctions:
         assert response.config["auth"]["type"] == "oauth2"
         assert response.config["auth"]["token_type"] == "Bearer"
         assert response.config["auth"]["access_token"] == "********"
+
+    def test_db_server_to_response_masks_env_and_returns_user_env(self):
+        """Env values are masked (keys kept); per-user env is returned masked too."""
+        server = MCPServer.from_config(
+            {
+                "name": "envy",
+                "managed": "external",
+                "transport": "stdio",
+                "command": "python",
+                "env": {"API_KEY": "global-secret", "REGION": "us"},
+            }
+        )
+        server.id = 1
+
+        user_mcp = MagicMock()
+        user_mcp.user_id = 1
+        user_mcp.is_active = True
+        user_mcp.is_default = False
+        user_mcp.is_owner = False
+        user_mcp.env = {"API_KEY": "my-secret"}
+
+        response = _db_server_to_response(
+            server=server, user_mcp=user_mcp, manager=MagicMock()
+        )
+
+        # Keys visible, values masked
+        assert set(response.config["env"]) == {"API_KEY", "REGION"}
+        assert response.config["env"]["API_KEY"] == "********"
+        assert response.user_env == {"API_KEY": "********"}
+        # Non-owner cannot edit the global fallback
+        assert response.can_edit_global is False
+
+    def test_merge_masked_env_preserves_stored_secrets(self):
+        """Masked values keep the stored secret; real values overwrite; new keys added."""
+        merged = _merge_masked_env(
+            {"API_KEY": "********", "TOKEN": "new", "EXTRA": "x"},
+            {"API_KEY": "old-secret", "TOKEN": "old"},
+        )
+        assert merged == {"API_KEY": "old-secret", "TOKEN": "new", "EXTRA": "x"}
+
+    def test_merge_masked_env_drops_masked_key_without_stored_value(self):
+        """A masked key with no stored value (e.g. renamed) is dropped, never None."""
+        merged = _merge_masked_env({"NEW": "********"}, {"OLD": "secret"})
+        assert merged == {}
+        assert None not in merged.values()
+
+    def test_mask_env_keeps_keys(self):
+        assert _mask_env({"A": "1", "B": ""}) == {"A": "********", "B": ""}
+
+    def test_env_dict_encryption_roundtrip_and_no_double_encrypt(self):
+        """env values encrypt at rest, decrypt back, and never double-encrypt."""
+        from xagent.core.utils.encryption import decrypt_env_dict, encrypt_env_dict
+
+        enc = encrypt_env_dict({"API_KEY": "secret", "EMPTY": ""})
+        assert enc["API_KEY"].startswith("gAAAAAB")
+        assert enc["EMPTY"] == ""  # empty values are not secrets
+        # Re-encrypting an already-encrypted value is a no-op
+        assert encrypt_env_dict(enc)["API_KEY"] == enc["API_KEY"]
+        assert decrypt_env_dict(enc) == {"API_KEY": "secret", "EMPTY": ""}
 
     def test_build_server_config_parses_mcp_concurrency_config(self):
         """API request config accepts the explicit MCP concurrency opt-in."""

@@ -51,3 +51,28 @@ def decrypt_value(encrypted_value: str) -> str:
     except Exception as e:
         logger.debug(f"Failed to decrypt value: {e} (might be plain text)")
         return encrypted_value
+
+
+# Fernet tokens always start with this prefix; used to skip double-encryption.
+_FERNET_PREFIX = "gAAAAAB"
+
+
+def encrypt_env_dict(env: dict | None) -> dict | None:
+    """Encrypt env var values at rest (skips empty and already-encrypted values)."""
+    if not env:
+        return env
+    return {
+        k: (
+            encrypt_value(v)
+            if isinstance(v, str) and v and not v.startswith(_FERNET_PREFIX)
+            else v
+        )
+        for k, v in env.items()
+    }
+
+
+def decrypt_env_dict(env: dict | None) -> dict | None:
+    """Decrypt env var values for runtime/consumption."""
+    if not env:
+        return env
+    return {k: (decrypt_value(v) if isinstance(v, str) else v) for k, v in env.items()}

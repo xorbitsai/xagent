@@ -2,7 +2,15 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, Any, Type
 
-from sqlalchemy import Boolean, Column, DateTime, ForeignKey, Integer, UniqueConstraint
+from sqlalchemy import (
+    JSON,
+    Boolean,
+    Column,
+    DateTime,
+    ForeignKey,
+    Integer,
+    UniqueConstraint,
+)
 from sqlalchemy.orm import relationship
 from sqlalchemy.sql import func
 
@@ -99,6 +107,9 @@ class UserMCPServer(Base):  # type: ignore
     )  # True if model is shared by admin
     is_active = Column(Boolean, default=True, nullable=False)
     is_default = Column(Boolean, default=False, nullable=False)
+    # Per-user env overrides, merged over the global MCPServer.env at runtime
+    # (global env acts as fallback). Dict[str, str].
+    env = Column(JSON, nullable=True)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
     updated_at = Column(DateTime(timezone=True), onupdate=func.now())
 

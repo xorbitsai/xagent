@@ -708,6 +708,12 @@ class WebToolConfig(BaseToolConfig):
                 f"Found {len(servers)} active MCP servers for user {self._user_id}"
             )
 
+            # Per-user env overrides (decrypted), merged over each server's global
+            # env at runtime. Prefetched once to avoid an N+1 per-server lookup.
+            from ..services.mcp_runtime import load_user_env_overrides
+
+            user_env_by_id = load_user_env_overrides(self.db, self._user_id)
+
             for server in servers:
                 # Build config dict from server model
                 config: Dict[str, Any] = {
@@ -848,8 +854,16 @@ class WebToolConfig(BaseToolConfig):
                         transport_config["command"] = server.command
                     if server.args:
                         transport_config["args"] = server.args
-                    if server.env:
-                        transport_config["env"] = server.env
+                    # Decrypt global env and merge per-user override (user wins).
+                    from ...core.utils.encryption import decrypt_env_dict
+                    from ..services.mcp_runtime import merge_stdio_env
+
+                    merged_env = merge_stdio_env(
+                        decrypt_env_dict(getattr(server, "env", None)),
+                        user_env_by_id.get(server.id),
+                    )
+                    if merged_env:
+                        transport_config["env"] = merged_env
                     if server.cwd:
                         transport_config["cwd"] = server.cwd
 

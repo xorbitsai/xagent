@@ -550,7 +550,10 @@ class ToolFactory:
         """
         try:
             from .....web.models.mcp import MCPServer, UserMCPServer
-            from .....web.services.mcp_runtime import build_mcp_runtime_connection
+            from .....web.services.mcp_runtime import (
+                build_mcp_runtime_connection,
+                load_user_env_overrides,
+            )
             from .mcp_adapter import load_mcp_tools_as_agent_tools
 
             query = db.query(MCPServer)
@@ -558,6 +561,8 @@ class ToolFactory:
                 query = query.join(
                     UserMCPServer, MCPServer.id == UserMCPServer.mcpserver_id
                 ).filter(UserMCPServer.user_id == user_id, UserMCPServer.is_active)
+
+            user_env_overrides = load_user_env_overrides(db, user_id)
 
             connections = {}
             for server in query.all():
@@ -567,6 +572,7 @@ class ToolFactory:
                     db,
                     server,
                     user_id=user_id,
+                    user_env_overrides=user_env_overrides,
                 )
                 if build.connection is not None:
                     connections[str(server.name)] = build.connection

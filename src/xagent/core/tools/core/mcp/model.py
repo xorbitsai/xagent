@@ -175,7 +175,9 @@ def create_mcp_server_table(Base: Type[Any]) -> Type[Any]:
                 if self.args:
                     connection["args"] = self.args
                 if self.env:
-                    connection["env"] = self.env
+                    from xagent.core.utils.encryption import decrypt_env_dict
+
+                    connection["env"] = decrypt_env_dict(getattr(self, "env", None))
                 if self.cwd:
                     connection["cwd"] = self.cwd
             elif self.transport in ["sse", "websocket", "streamable_http"]:
@@ -226,7 +228,9 @@ def create_mcp_server_table(Base: Type[Any]) -> Type[Any]:
             if self.url:
                 config["url"] = self.url
             if self.env:
-                config["env"] = self.env
+                from xagent.core.utils.encryption import decrypt_env_dict
+
+                config["env"] = decrypt_env_dict(getattr(self, "env", None))
             if self.cwd:
                 config["cwd"] = self.cwd
             if self.headers:
@@ -284,6 +288,8 @@ def create_mcp_server_table(Base: Type[Any]) -> Type[Any]:
                         encrypted_auth[key] = encrypt_value(encrypted_auth[key])
                 auth_config = encrypted_auth
 
+            from xagent.core.utils.encryption import encrypt_env_dict
+
             return cls(
                 name=config["name"],
                 description=config.get("description"),
@@ -292,7 +298,7 @@ def create_mcp_server_table(Base: Type[Any]) -> Type[Any]:
                 command=config.get("command"),
                 args=config.get("args"),
                 url=config.get("url"),
-                env=config.get("env"),
+                env=encrypt_env_dict(config.get("env")),
                 cwd=str(config["cwd"])
                 if isinstance(config.get("cwd"), Path)
                 else config.get("cwd"),

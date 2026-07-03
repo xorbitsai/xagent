@@ -82,6 +82,9 @@ class MCPServerCreate(BaseModel):
     description: Optional[str] = Field(None, description="Server description")
     config: dict = Field(..., description="Transport-specific configuration")
     is_active: bool = Field(True, description="Whether the server is active")
+    user_env: Optional[dict] = Field(
+        None, description="Per-user env overrides (merged over global env at runtime)"
+    )
 
 
 class MCPServerUpdate(BaseModel):
@@ -94,6 +97,9 @@ class MCPServerUpdate(BaseModel):
     description: Optional[str] = Field(None, description="Server description")
     config: Optional[dict] = Field(None, description="Transport-specific configuration")
     is_active: Optional[bool] = Field(None, description="Whether the server is active")
+    user_env: Optional[dict] = Field(
+        None, description="Per-user env overrides (merged over global env at runtime)"
+    )
 
 
 class MCPServerResponse(BaseModel):
@@ -107,6 +113,8 @@ class MCPServerResponse(BaseModel):
     config: dict
     is_active: bool
     is_default: bool
+    user_env: Optional[dict] = None
+    can_edit_global: bool = False
     transport_display: str
     created_at: Optional[str]
     updated_at: Optional[str]
@@ -1095,7 +1103,14 @@ def _update_server_from_config(server: MCPServer, config: MCPServerConfig) -> No
     for config_field, db_field in field_mapping.items():
         if hasattr(config, config_field) and hasattr(server, db_field):
             value = getattr(config, config_field)
-            if config_field == "auth" and value and isinstance(value, dict):
+            if config_field == "env" and value and isinstance(value, dict):
+                from xagent.core.utils.encryption import encrypt_env_dict
+
+                # Masked values ("********") mean "keep the stored secret".
+                value = encrypt_env_dict(
+                    _merge_masked_env(value, getattr(server, "env", None) or {})
+                )
+            elif config_field == "auth" and value and isinstance(value, dict):
                 from xagent.core.utils.encryption import encrypt_value
 
                 encrypted_auth = value.copy()
@@ -1156,6 +1171,27 @@ def _parse_config_field(
     return value
 
 
+def _mask_env(env: Any) -> dict:
+    """Mask env values for API responses (keys stay visible for editing)."""
+    return {k: (MASKED_SECRET_VALUE if v else v) for k, v in env.items()}
+
+
+def _merge_masked_env(new_env: dict, old_env: dict) -> dict:
+    """Apply an incoming env dict, restoring the stored value for masked entries.
+
+    A masked entry with no stored value (e.g. a renamed key) is dropped rather
+    than persisted as None, which would crash stdio subprocess launch.
+    """
+    merged = {}
+    for k, v in new_env.items():
+        if v == MASKED_SECRET_VALUE:
+            if k in old_env and old_env[k] is not None:
+                merged[k] = old_env[k]
+        else:
+            merged[k] = v
+    return merged
+
+
 def _db_server_to_response(
     server: MCPServer,
     user_mcp: UserMCPServer,
@@ -1163,6 +1199,7 @@ def _db_server_to_response(
     connected_account: Optional[str] = None,
     app_id: Optional[str] = None,
     provider: Optional[str] = None,
+    is_admin: bool = False,
 ) -> MCPServerResponse:
     """Convert database MCPServer to response model."""
     # Get status from manager if available
@@ -1174,8 +1211,12 @@ def _db_server_to_response(
         masked_auth = auth_config.copy()
         for key in SENSITIVE_AUTH_FIELDS:
             if key in masked_auth and masked_auth[key]:
-                masked_auth[key] = "********"
+                masked_auth[key] = MASKED_SECRET_VALUE
         config["auth"] = masked_auth
+
+    # Env values are secrets: mask them (keys stay visible so the UI can edit them).
+    if isinstance(config.get("env"), dict):
+        config["env"] = _mask_env(config["env"])
 
     return MCPServerResponse(
         id=server.id,
@@ -1186,6 +1227,8 @@ def _db_server_to_response(
         config=config,
         is_active=user_mcp.is_active,
         is_default=user_mcp.is_default,
+        user_env=_mask_env(getattr(user_mcp, "env", None)) if user_mcp.env else None,
+        can_edit_global=bool(getattr(user_mcp, "is_owner", False)) or is_admin,
         transport_display=server.transport_display,
         created_at=_format_optional_datetime(server.created_at),
         updated_at=_format_optional_datetime(server.updated_at),
@@ -1580,6 +1623,7 @@ def get_mcp_servers(
             if oauth.email
         }
 
+        is_admin = getattr(current_user, "is_admin", False)
         responses = []
         for user_mcp, server in user_mcps:
             app_id, provider, connected_account = _enrich_oauth_server_info(
@@ -1587,7 +1631,13 @@ def get_mcp_servers(
             )
             responses.append(
                 _db_server_to_response(
-                    server, user_mcp, manager, connected_account, app_id, provider
+                    server,
+                    user_mcp,
+                    manager,
+                    connected_account,
+                    app_id,
+                    provider,
+                    is_admin=is_admin,
                 )
             )
 
@@ -1682,7 +1732,13 @@ def get_mcp_server(
         )
 
         return _db_server_to_response(
-            server, user_mcp, manager, connected_account, app_id, provider
+            server,
+            user_mcp,
+            manager,
+            connected_account,
+            app_id,
+            provider,
+            is_admin=getattr(current_user, "is_admin", False),
         )
 
     except HTTPException:
@@ -1738,16 +1794,32 @@ def create_mcp_server(
                 detail="Failed to create server",
             )
 
-        # Create user-server association
+        # Create user-server association. The creator owns the global config.
+        from xagent.core.utils.encryption import encrypt_env_dict
+
+        created_user_env = None
+        if server_data.user_env:
+            # No stored values yet: drop masked entries, then encrypt at rest.
+            created_user_env = (
+                encrypt_env_dict(_merge_masked_env(server_data.user_env, {})) or None
+            )
         user_mcp = UserMCPServer(
-            user_id=user_id, mcpserver_id=server.id, is_active=server_data.is_active
+            user_id=user_id,
+            mcpserver_id=server.id,
+            is_active=server_data.is_active,
+            is_owner=True,
+            can_edit=True,
+            can_delete=True,
+            env=created_user_env,
         )
         db.add(user_mcp)
         db.commit()
         db.refresh(user_mcp)
 
         logger.info(f"Created MCP server '{server_data.name}' for user {user_id}")
-        return _db_server_to_response(server, user_mcp, manager)
+        return _db_server_to_response(
+            server, user_mcp, manager, is_admin=getattr(current_user, "is_admin", False)
+        )
 
     except HTTPException:
         raise
@@ -1786,9 +1858,18 @@ def update_mcp_server(
             )
 
         user_mcp, server = result
+        can_edit_global = bool(getattr(user_mcp, "is_owner", False)) or getattr(
+            current_user, "is_admin", False
+        )
+
+        # Non-owners may not touch the shared global config (env, command, etc.);
+        # they only get to set their own per-user env override below.
+        incoming_config = dict(server_data.config or {})
+        if not can_edit_global:
+            incoming_config = {}
 
         # Check for name conflicts if updating name
-        if server_data.name and server_data.name != server.name:
+        if can_edit_global and server_data.name and server_data.name != server.name:
             existing = (
                 db.query(MCPServer)
                 .filter(MCPServer.name == server_data.name, MCPServer.id != server_id)
@@ -1800,14 +1881,16 @@ def update_mcp_server(
                     detail=f"MCP server '{server_data.name}' already exists",
                 )
 
-        # Build update config - only include provided fields
+        # Build update config - only include provided fields. Non-owners keep the
+        # existing global config untouched.
         update_data = MCPServerCreate(
-            name=server_data.name or server.name,
-            transport=server_data.transport or server.transport,
+            name=(server_data.name if can_edit_global else None) or server.name,
+            transport=(server_data.transport if can_edit_global else None)
+            or server.transport,
             description=server_data.description
-            if server_data.description is not None
+            if can_edit_global and server_data.description is not None
             else server.description,
-            config=server_data.config or {},
+            config=incoming_config,
             is_active=server_data.is_active
             if server_data.is_active is not None
             else user_mcp.is_active,
@@ -1822,8 +1905,17 @@ def update_mcp_server(
                 detail=f"Invalid configuration: {str(e)}",
             )
 
-        # Update server fields
+        # Update server fields (global config; no-op values for non-owners)
         _update_server_from_config(server, config)
+
+        # Store this user's per-user env override (masked values keep stored secrets)
+        if server_data.user_env is not None:
+            from xagent.core.utils.encryption import encrypt_env_dict
+
+            merged_user_env = _merge_masked_env(
+                server_data.user_env, getattr(user_mcp, "env", None) or {}
+            )
+            user_mcp.env = encrypt_env_dict(merged_user_env) or None
 
         # Update user association if needed
         if server_data.is_active is not None:
@@ -1834,7 +1926,9 @@ def update_mcp_server(
         db.refresh(user_mcp)
 
         logger.info(f"Updated MCP server '{server.name}' for user {user_id}")
-        return _db_server_to_response(server, user_mcp, manager)
+        return _db_server_to_response(
+            server, user_mcp, manager, is_admin=getattr(current_user, "is_admin", False)
+        )
 
     except HTTPException:
         raise
@@ -1958,7 +2052,9 @@ async def toggle_mcp_server(
             f"{status_text.capitalize()} MCP server '{server.name}' for user {user_id}"
         )
 
-        return _db_server_to_response(server, user_mcp, manager)
+        return _db_server_to_response(
+            server, user_mcp, manager, is_admin=getattr(current_user, "is_admin", False)
+        )
 
     except HTTPException:
         raise

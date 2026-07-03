@@ -105,6 +105,49 @@ def sample_streamable_http_api_key_auth_config():
     }
 
 
+class TestUserEnvOverrides:
+    """Per-user env override loading (batched + decrypted) and merge semantics."""
+
+    def test_load_user_env_overrides_decrypts_and_keys_by_server(self, test_db):
+        from xagent.core.utils.encryption import encrypt_env_dict
+        from xagent.web.services.mcp_runtime import (
+            load_user_env_overrides,
+            merge_stdio_env,
+        )
+
+        manager = DatabaseMCPServerManager(test_db)
+        manager.add_server(
+            manager.create_config(
+                name="srv", transport="stdio", managed="external", command="python"
+            )
+        )
+        server = test_db.query(MCPServer).filter(MCPServer.name == "srv").first()
+        test_db.add(
+            UserMCPServer(
+                user_id=1,
+                mcpserver_id=server.id,
+                is_active=True,
+                env=encrypt_env_dict({"API_KEY": "mine"}),
+            )
+        )
+        test_db.commit()
+
+        overrides = load_user_env_overrides(test_db, 1)
+        assert overrides == {server.id: {"API_KEY": "mine"}}  # decrypted, keyed by id
+        # user override wins; global env is the fallback
+        assert merge_stdio_env(
+            {"API_KEY": "global", "REGION": "us"}, overrides[server.id]
+        ) == {
+            "API_KEY": "mine",
+            "REGION": "us",
+        }
+
+    def test_load_user_env_overrides_empty_without_user(self, test_db):
+        from xagent.web.services.mcp_runtime import load_user_env_overrides
+
+        assert load_user_env_overrides(test_db, None) == {}
+
+
 class TestDatabaseMCPServerManager:
     """Test DatabaseMCPServerManager functionality."""
 
@@ -684,6 +727,8 @@ class TestMCPServerModel:
         assert server.transport == "stdio"
         assert server.command == "python"
         assert server.args == ["server.py"]
-        assert server.env == {"API_KEY": "secret"}
+        # env is encrypted at rest but decrypts back for consumption
+        assert server.env["API_KEY"].startswith("gAAAAAB")
+        assert server.to_connection_dict()["env"] == {"API_KEY": "secret"}
         assert server.managed == "external"
         assert server.description == "Test server"

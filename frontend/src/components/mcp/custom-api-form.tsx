@@ -16,6 +16,8 @@ export interface MCPServerFormData {
     headers?: Record<string, string>;
     body?: string;
     config?: Record<string, any>;
+    user_env?: Record<string, string>;
+    can_edit_global?: boolean;
     [key: string]: any;
 }
 

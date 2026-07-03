@@ -16,12 +16,50 @@ class MCPRuntimeConnectionBuild:
     diagnostic: dict[str, Any] | None = None
 
 
+def load_user_env_overrides(db: Any, user_id: int | None) -> dict[int, dict]:
+    """Batch-load a user's decrypted per-user env overrides, keyed by server id.
+
+    One query for all of a user's active overrides, so callers building many
+    connections in a loop avoid an N+1 per-server lookup.
+    """
+    if not isinstance(user_id, int) or db is None:
+        return {}
+    from ...core.utils.encryption import decrypt_env_dict
+    from ..models.mcp import UserMCPServer
+
+    rows = (
+        db.query(UserMCPServer.mcpserver_id, UserMCPServer.env)
+        .filter(
+            UserMCPServer.user_id == user_id,
+            UserMCPServer.is_active,
+            UserMCPServer.env.isnot(None),
+        )
+        .all()
+    )
+    overrides: dict[int, dict] = {}
+    for mcpserver_id, env in rows:
+        decrypted = decrypt_env_dict(env)
+        if decrypted:
+            overrides[mcpserver_id] = decrypted
+    return overrides
+
+
+def merge_stdio_env(
+    global_env: dict[str, Any] | None, user_env: dict[str, Any] | None
+) -> dict[str, Any] | None:
+    """Merge a user's per-user env over the global env (global = fallback, user wins)."""
+    if not user_env:
+        return global_env
+    return {**(global_env or {}), **user_env}
+
+
 async def build_mcp_runtime_connection(
     db: Any,
     server: Any,
     *,
     user_id: int | None,
     mcp_auth_context: dict[str, Any] | None = None,
+    user_env_overrides: dict[int, dict] | None = None,
 ) -> MCPRuntimeConnectionBuild:
     """Build an executable MCP connection for a specific user runtime.
 
@@ -29,6 +67,19 @@ async def build_mcp_runtime_connection(
     MCP OAuth grant selection belongs here, at the web runtime boundary.
     """
     connection = server.to_connection_dict()
+
+    # Merge this user's per-user env override on top of the global env (stdio
+    # only; global env acts as the fallback, user values win). Overrides are
+    # prefetched by the caller (see load_user_env_overrides) to avoid N+1.
+    if connection.get("transport") == "stdio" and user_env_overrides:
+        server_id = getattr(server, "id", None)
+        if isinstance(server_id, int):
+            merged = merge_stdio_env(
+                connection.get("env"), user_env_overrides.get(server_id)
+            )
+            if merged:
+                connection["env"] = merged
+
     auth_config = server._decrypt_auth_config(getattr(server, "auth", None))
     if not _is_mcp_oauth_http_server(server, auth_config):
         return MCPRuntimeConnectionBuild(connection=connection)

@@ -149,19 +149,10 @@ async def test_execute_task_background_reuses_task_id_for_terminal_tasks(
             captured["agent_db"] = db
             return AgentService()
 
-        async def execute_task(
-            self,
-            *,
-            agent_service,
-            task,
-            context,
-            task_id,
-            tracking_task_id,
-            db_session,
-        ):
-            captured["agent_task"] = task
-            captured["agent_task_id"] = task_id
-            captured["tracking_task_id"] = tracking_task_id
+        async def execute_task(self, **kwargs):
+            captured["agent_task"] = kwargs.get("task")
+            captured["agent_task_id"] = kwargs.get("task_id")
+            captured["tracking_task_id"] = kwargs.get("tracking_task_id")
             return {"success": True, "output": "ok", "file_outputs": []}
 
     def fake_get_db():

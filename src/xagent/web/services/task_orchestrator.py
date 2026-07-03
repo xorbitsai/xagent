@@ -418,6 +418,16 @@ def _begin_turn_atomic_sync(
                     Task.input: payload.transcript_message,
                     Task.output: None,
                     Task.error_message: None,
+                    # A new turn owns the lifecycle from this claim forward.
+                    # Stale runner_id / lease columns left by a crashed worker
+                    # or a release that failed to clear would otherwise make
+                    # acquire_task_lease deny this worker even though no live
+                    # runner is executing -- leaving the SDK row stuck RUNNING
+                    # (GET /v1/chat/tasks/{id} never reaches completed; append
+                    # returns task_busy). Reset here atomically with the claim.
+                    Task.runner_id: None,
+                    Task.lease_expires_at: None,
+                    Task.last_heartbeat_at: None,
                 },
                 synchronize_session=False,
             )

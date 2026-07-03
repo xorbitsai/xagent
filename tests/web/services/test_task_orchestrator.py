@@ -162,6 +162,43 @@ async def test_begin_turn_create_clears_no_terminal_fields_when_pending(
     assert task.input == "first turn"
     assert task.output is None
     assert task.error_message is None
+    assert task.runner_id is None
+    assert task.lease_expires_at is None
+
+
+@pytest.mark.asyncio
+async def test_begin_turn_claim_clears_stale_lease_columns(
+    db_session,
+    mock_schedule_bg,
+) -> None:
+    """Append claim must reset stale lease columns so the bg runner can
+    acquire after a crashed worker left runner_id behind."""
+    from xagent.web.services.task_lease_service import utc_now
+
+    user = _create_user(db_session)
+    task = _create_task(
+        db_session,
+        user.id,
+        status=TaskStatus.COMPLETED,
+        input_="done",
+        output="answer",
+    )
+    task.runner_id = "dead-runner-from-crash"
+    task.lease_expires_at = utc_now() + timedelta(hours=1)
+    db_session.commit()
+
+    await TaskTurnOrchestrator.begin_turn(
+        task_id=int(task.id),
+        payload=TaskTurnPayload("follow up"),
+        task_owner_user_id=int(user.id),
+        kind=TurnKind.APPEND,
+        force_fresh=False,
+    )
+
+    db_session.refresh(task)
+    assert task.status == TaskStatus.RUNNING
+    assert task.runner_id is None
+    assert task.lease_expires_at is None
 
 
 @pytest.mark.asyncio
@@ -855,6 +892,58 @@ async def test_schedule_bg_forwards_execution_message_to_execute_task_background
     ), "execution_message must reach execute_task_background.llm_user_message"
     assert kwargs["context"]["turn_id"] == payload.turn_id
     assert kwargs["context"]["existing"] == "value"
+
+
+@pytest.mark.asyncio
+async def test_schedule_bg_acquires_expired_lease_on_first_try(db_session) -> None:
+    """Expired lease columns are granted by acquire_task_lease's atomic WHERE."""
+    from xagent.web.api.websocket import background_task_manager
+    from xagent.web.services.task_lease_service import utc_now
+
+    user = _create_user(db_session)
+    task = _create_task(db_session, user.id, status=TaskStatus.RUNNING)
+    task.runner_id = "dead-runner"
+    task.lease_expires_at = utc_now() - timedelta(seconds=5)
+    db_session.commit()
+
+    fake_snapshot = MagicMock()
+
+    with (
+        patch(
+            "xagent.web.services.task_orchestrator.run_task_lease_heartbeat",
+            new=AsyncMock(),
+        ),
+        patch(
+            "xagent.web.services.task_orchestrator.load_task_setup_snapshot_sync",
+            return_value=fake_snapshot,
+        ),
+        patch(
+            "xagent.web.api.websocket.execute_task_background",
+            new=AsyncMock(),
+        ) as mock_exec,
+        patch(
+            "xagent.web.services.task_orchestrator.release_current_runner_task_lease_with_workforce_sync",
+        ),
+        patch(
+            "xagent.web.services.task_orchestrator.finish_turn",
+        ),
+        patch.object(background_task_manager, "register_task"),
+        patch(
+            "xagent.web.services.task_orchestrator._get_agent_manager",
+            return_value=MagicMock(),
+        ),
+    ):
+        bg_task = _schedule_bg(
+            task_id=int(task.id),
+            task_owner_user_id=int(user.id),
+            task_source=task.source,
+            payload=TaskTurnPayload("hello"),
+            force_fresh=False,
+            context=None,
+        )
+        await bg_task
+
+    mock_exec.assert_awaited_once()
 
 
 # ---------------------------------------------------------------------------

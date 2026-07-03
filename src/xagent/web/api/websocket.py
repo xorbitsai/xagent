@@ -1378,6 +1378,7 @@ async def execute_task_background(
                 task_id=actual_task_id,
                 tracking_task_id=str(task_id),
                 db_session=db,
+                manage_task_lease=False,
             )
 
         normalized_outputs, path_to_file_id = _normalize_task_file_outputs(

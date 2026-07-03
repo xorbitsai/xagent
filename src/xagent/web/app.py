@@ -27,6 +27,7 @@ from ..config import (
 from ..core.tracing.langfuse import flush_langfuse, initialize_langfuse
 from .api.admin_mcp import admin_mcp_router
 from .api.admin_users import router as admin_users_router
+from .api.agent_api_keys import router as agent_api_keys_router
 from .api.agents import router as agents_router
 from .api.auth import auth_router
 from .api.channel import router as channel_router
@@ -576,6 +577,7 @@ app.include_router(skill_hub_router)
 app.include_router(system_router)
 app.include_router(templates_router)
 app.include_router(agents_router)
+app.include_router(agent_api_keys_router)
 app.include_router(triggers_router)
 app.include_router(workforces_router)
 app.include_router(channel_router, prefix="/api/channels", tags=["Channels"])

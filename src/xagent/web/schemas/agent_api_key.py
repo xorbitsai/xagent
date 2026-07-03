@@ -29,6 +29,44 @@ from typing import Optional
 
 from pydantic import BaseModel, Field
 
+# ===== Multi-key admin schemas (``/api/agent-api-keys``) =====
+#
+# These back the centralized "API Keys" page, which lists and manages
+# keys across every agent the caller owns -- unlike the three models
+# above, which are scoped to the legacy single-key-per-agent endpoints.
+
+
+class AgentApiKeyCreateRequest(BaseModel):
+    """Request body for ``POST /api/agent-api-keys``."""
+
+    agent_id: int = Field(..., description="Agent to create a new key for.")
+    label: Optional[str] = Field(
+        None, max_length=100, description="Owner-facing display name for the key."
+    )
+
+
+class AgentApiKeyListItem(BaseModel):
+    """One row in the centralized API Keys table."""
+
+    id: int
+    agent_id: int
+    agent_name: str
+    label: Optional[str] = None
+    key_prefix: str
+    masked_key: str
+    status: str = Field(..., description="One of: active, paused, revoked.")
+    last_used_at: Optional[datetime] = None
+    created_at: datetime
+
+
+class AgentApiKeyStats(BaseModel):
+    """Aggregate counters for the API Keys page's stat cards."""
+
+    total_keys: int
+    active_keys: int
+    calls_this_month: int
+    last_api_call: Optional[datetime] = None
+
 
 class APIKeyGenerateResponse(BaseModel):
     """Response model for ``POST /api/agents/{agent_id}/api-key``.

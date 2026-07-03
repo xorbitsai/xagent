@@ -8,7 +8,6 @@ import { Popover, PopoverTrigger, PopoverContent } from "@/components/ui/popover
 import { Dialog, DialogContent, DialogHeader, DialogTitle } from "@/components/ui/dialog"
 import { Textarea } from "@/components/ui/textarea"
 import { DeployAgentDialog, Agent } from "@/components/build/deploy-agent-dialog"
-import { AgentApiKeyDialog } from "@/components/build/agent-api-key-dialog"
 import { AgentTriggersDialog } from "@/components/build/agent-triggers-dialog"
 import { FeatureEmptyState } from "@/components/ui/feature-empty-state"
 import { useI18n } from "@/contexts/i18n-context"
@@ -77,7 +76,6 @@ export default function BuildsPage() {
 
   // Deploy Dialog State
   const [deployAgent, setDeployAgent] = useState<Agent | null>(null)
-  const [apiKeyAgent, setApiKeyAgent] = useState<Agent | null>(null)
   const [triggersAgent, setTriggersAgent] = useState<Agent | null>(null)
 
   // Check for template parameter and redirect to create page
@@ -413,7 +411,7 @@ export default function BuildsPage() {
                                       className="justify-start px-2 py-1.5 h-auto font-normal text-sm"
                                       onClick={(e) => {
                                         e.stopPropagation()
-                                        setApiKeyAgent(agent)
+                                        router.push(`/api-keys?agent=${agent.id}`)
                                       }}
                                     >
                                       <KeyRound className="mr-2 h-4 w-4" />
@@ -584,15 +582,8 @@ export default function BuildsPage() {
           setDeployAgent(updatedAgent)
           setAgents(agents.map(a => a.id === updatedAgent.id ? updatedAgent : a))
         }}
-        onManageApiKey={() => { if (deployAgent) setApiKeyAgent(deployAgent) }}
+        onManageApiKey={() => { if (deployAgent) router.push(`/api-keys?agent=${deployAgent.id}`) }}
         onManageTriggers={() => { if (deployAgent) setTriggersAgent(deployAgent) }}
-      />
-
-      <AgentApiKeyDialog
-        agentId={apiKeyAgent?.id ?? null}
-        agentName={apiKeyAgent?.name}
-        open={apiKeyAgent !== null}
-        onOpenChange={(open) => { if (!open) setApiKeyAgent(null) }}
       />
 
       <AgentTriggersDialog

@@ -16,6 +16,7 @@ import {
     ClipboardList,
     LayoutTemplate,
     Globe,
+    Key,
 } from "lucide-react"
 
 interface SidebarUser {
@@ -165,6 +166,13 @@ export const getNavigationGroupsForUser = (user?: SidebarUser | null): Navigatio
                 href: "/skill-hub",
                 icon: Library,
                 color: "text-emerald-400"
+            },
+            {
+                name: "API Keys",
+                nameKey: "nav.apiKeys",
+                href: "/api-keys",
+                icon: Key,
+                color: "text-gray-500"
             },
             {
                 name: "More",

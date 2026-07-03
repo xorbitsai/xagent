@@ -32,6 +32,7 @@ from fastapi.responses import JSONResponse
 from fastapi.testclient import TestClient
 from sqlalchemy.orm import Session
 
+from xagent.web.api.agent_api_keys import router as agent_api_keys_router
 from xagent.web.api.agents import router as agents_router
 from xagent.web.api.auth import auth_router
 from xagent.web.api.conversation_logs import router as conversation_logs_router
@@ -67,6 +68,7 @@ app_for_tests.include_router(auth_router)
 app_for_tests.include_router(me_router)
 app_for_tests.include_router(conversation_logs_router)
 app_for_tests.include_router(agents_router)
+app_for_tests.include_router(agent_api_keys_router)
 app_for_tests.include_router(workforces_router)
 app_for_tests.include_router(file_router)
 app_for_tests.include_router(widget_router)

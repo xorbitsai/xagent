@@ -158,6 +158,48 @@ def test_create_task_happy_path(mock_start_task):
     assert kwargs["payload"].transcript_message == "first user message"
 
 
+def test_create_task_records_key_usage(mock_start_task):
+    """Each authenticated call bumps the key's last_used_at / this-month tally."""
+    from xagent.web.models.agent_api_key import AgentApiKey
+
+    agent_id, full_key = _create_agent_with_key()
+
+    resp = client.post(
+        "/v1/chat/tasks",
+        headers=_bearer(full_key),
+        json={
+            "agent_id": agent_id,
+            "message": {"role": "user", "content": "hello"},
+        },
+    )
+    assert resp.status_code == 202, resp.text
+
+    db = _direct_db_session()
+    try:
+        row = db.query(AgentApiKey).filter(AgentApiKey.agent_id == agent_id).first()
+        assert row is not None
+        assert row.last_used_at is not None
+        assert row.usage_month == datetime.now(UTC).strftime("%Y-%m")
+        assert row.usage_month_calls == 1
+    finally:
+        db.close()
+
+    # A second authenticated call in the same month increments rather
+    # than resetting the tally (GET, since the task is still RUNNING and
+    # a second POST message would 409 -- irrelevant to what's under test).
+    second = client.get(
+        f"/v1/chat/tasks/{resp.json()['task_id']}", headers=_bearer(full_key)
+    )
+    assert second.status_code == 200, second.text
+
+    db = _direct_db_session()
+    try:
+        row = db.query(AgentApiKey).filter(AgentApiKey.agent_id == agent_id).first()
+        assert row.usage_month_calls == 2
+    finally:
+        db.close()
+
+
 def test_create_task_missing_authorization_returns_401(mock_start_task):
     """No Authorization header -> 401 invalid_api_key envelope."""
     agent_id, _key = _create_agent_with_key()

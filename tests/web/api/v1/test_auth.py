@@ -221,6 +221,38 @@ def test_generated_manager_key_returns_401():
     _assert_invalid_api_key(resp)
 
 
+def test_paused_key_returns_401():
+    """A paused (not revoked) key is rejected identically to a revoked one.
+
+    Pausing goes through the multi-key admin service directly here (no
+    HTTP endpoint under test) -- the point is that ``get_agent_from_api_key``
+    treats ``paused_at`` the same as ``revoked_at``, with the same opaque
+    401 envelope.
+    """
+    agent_id, full_key, prefix = _create_agent_and_key()
+    db = _direct_db_session()
+    try:
+        from xagent.web.models.agent_api_key import AgentApiKey
+
+        db.query(AgentApiKey).filter(AgentApiKey.key_prefix == prefix).update(
+            {"paused_at": datetime.now(timezone.utc)}
+        )
+        db.commit()
+    finally:
+        db.close()
+
+    resp = client.post(
+        "/v1/chat/tasks",
+        headers={"Authorization": f"Bearer {full_key}"},
+        json={
+            "agent_id": agent_id,
+            "message": {"role": "user", "content": "hello"},
+        },
+    )
+
+    _assert_invalid_api_key(resp)
+
+
 # ===== timing oracle defense =====
 
 

@@ -383,3 +383,174 @@ class TestDeleteApiKey:
             assert row.revoked_at is None
         finally:
             db.close()
+
+
+# ===== /api/agent-api-keys (multi-key admin surface) =====
+
+
+class TestCreateMultipleKeys:
+    """POST /api/agent-api-keys — unlike the legacy endpoint, does not revoke."""
+
+    def test_second_create_does_not_revoke_first(self):
+        headers = _headers()
+        agent_id = _create_agent(headers)
+
+        first = client.post(
+            "/api/agent-api-keys",
+            headers=headers,
+            json={"agent_id": agent_id, "label": "prod"},
+        ).json()
+        second = client.post(
+            "/api/agent-api-keys",
+            headers=headers,
+            json={"agent_id": agent_id, "label": "staging"},
+        ).json()
+        assert first["full_key"] != second["full_key"]
+
+        db = _direct_db_session()
+        try:
+            rows = (
+                db.query(AgentApiKey)
+                .filter(AgentApiKey.agent_id == agent_id)
+                .order_by(AgentApiKey.id)
+                .all()
+            )
+            assert len(rows) == 2
+            assert all(r.revoked_at is None for r in rows)
+            assert rows[0].label == "prod"
+            assert rows[1].label == "staging"
+        finally:
+            db.close()
+
+    def test_other_users_agent_returns_404(self):
+        admin_headers = _headers()
+        admin_agent_id = _create_agent(admin_headers)
+
+        bob_headers = _register_second_user()
+        resp = client.post(
+            "/api/agent-api-keys",
+            headers=bob_headers,
+            json={"agent_id": admin_agent_id, "label": "x"},
+        )
+        assert resp.status_code == 404
+
+
+class TestListAndStats:
+    """GET /api/agent-api-keys and /api/agent-api-keys/stats."""
+
+    def test_list_scoped_to_caller_and_optional_agent_filter(self):
+        admin_headers = _headers()
+        agent_a = _create_agent(admin_headers, name="agent a")
+        agent_b = _create_agent(admin_headers, name="agent b")
+        client.post(
+            "/api/agent-api-keys", headers=admin_headers, json={"agent_id": agent_a}
+        )
+        client.post(
+            "/api/agent-api-keys", headers=admin_headers, json={"agent_id": agent_b}
+        )
+
+        bob_headers = _register_second_user()
+        bob_agent = _create_agent(bob_headers, name="bob agent")
+        client.post(
+            "/api/agent-api-keys", headers=bob_headers, json={"agent_id": bob_agent}
+        )
+
+        all_admin_keys = client.get("/api/agent-api-keys", headers=admin_headers).json()
+        assert len(all_admin_keys) == 2
+        assert {k["agent_id"] for k in all_admin_keys} == {agent_a, agent_b}
+
+        scoped = client.get(
+            f"/api/agent-api-keys?agent_id={agent_a}", headers=admin_headers
+        ).json()
+        assert len(scoped) == 1
+        assert scoped[0]["agent_id"] == agent_a
+
+        bob_keys = client.get("/api/agent-api-keys", headers=bob_headers).json()
+        assert len(bob_keys) == 1
+        assert bob_keys[0]["agent_id"] == bob_agent
+
+    def test_stats_counts_active_and_this_months_calls(self):
+        headers = _headers()
+        agent_id = _create_agent(headers)
+        created = client.post(
+            "/api/agent-api-keys", headers=headers, json={"agent_id": agent_id}
+        ).json()
+        key_id = client.get("/api/agent-api-keys", headers=headers).json()[0]["id"]
+        client.post(f"/api/agent-api-keys/{key_id}/pause", headers=headers)
+
+        stats = client.get("/api/agent-api-keys/stats", headers=headers).json()
+        assert stats["total_keys"] == 1
+        assert stats["active_keys"] == 0  # paused, not active
+        assert stats["calls_this_month"] == 0
+        assert stats["last_api_call"] is None
+        assert created["full_key"]  # sanity: creation itself succeeded
+
+
+class TestPauseResume:
+    def test_pause_then_resume_round_trips_status(self):
+        headers = _headers()
+        agent_id = _create_agent(headers)
+        client.post("/api/agent-api-keys", headers=headers, json={"agent_id": agent_id})
+        key_id = client.get("/api/agent-api-keys", headers=headers).json()[0]["id"]
+
+        paused = client.post(f"/api/agent-api-keys/{key_id}/pause", headers=headers)
+        assert paused.status_code == 200
+        assert paused.json()["status"] == "paused"
+
+        resumed = client.post(f"/api/agent-api-keys/{key_id}/resume", headers=headers)
+        assert resumed.status_code == 200
+        assert resumed.json()["status"] == "active"
+
+    def test_pause_someone_elses_key_returns_404(self):
+        admin_headers = _headers()
+        agent_id = _create_agent(admin_headers)
+        client.post(
+            "/api/agent-api-keys", headers=admin_headers, json={"agent_id": agent_id}
+        )
+        key_id = client.get("/api/agent-api-keys", headers=admin_headers).json()[0][
+            "id"
+        ]
+
+        bob_headers = _register_second_user()
+        resp = client.post(f"/api/agent-api-keys/{key_id}/pause", headers=bob_headers)
+        assert resp.status_code == 404
+
+
+class TestRegenerateAndDelete:
+    def test_regenerate_preserves_id_and_label_but_changes_secret(self):
+        headers = _headers()
+        agent_id = _create_agent(headers)
+        created = client.post(
+            "/api/agent-api-keys",
+            headers=headers,
+            json={"agent_id": agent_id, "label": "keep-me"},
+        ).json()
+        key_id = client.get("/api/agent-api-keys", headers=headers).json()[0]["id"]
+
+        regenerated = client.post(
+            f"/api/agent-api-keys/{key_id}/regenerate", headers=headers
+        ).json()
+        assert regenerated["full_key"] != created["full_key"]
+        assert regenerated["key_prefix"] != created["key_prefix"]
+
+        listed = client.get("/api/agent-api-keys", headers=headers).json()[0]
+        assert listed["id"] == key_id
+        assert listed["label"] == "keep-me"
+        assert listed["status"] == "active"
+
+    def test_delete_marks_revoked_and_hides_from_active_count(self):
+        headers = _headers()
+        agent_id = _create_agent(headers)
+        client.post("/api/agent-api-keys", headers=headers, json={"agent_id": agent_id})
+        key_id = client.get("/api/agent-api-keys", headers=headers).json()[0]["id"]
+
+        resp = client.delete(f"/api/agent-api-keys/{key_id}", headers=headers)
+        assert resp.status_code == 200
+
+        listed = client.get("/api/agent-api-keys", headers=headers).json()[0]
+        assert listed["status"] == "revoked"
+
+    def test_delete_nonexistent_returns_404(self):
+        headers = _headers()
+        resp = client.delete("/api/agent-api-keys/9999999", headers=headers)
+        assert resp.status_code == 404

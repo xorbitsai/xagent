@@ -49,6 +49,7 @@ const zh = {
     files: "文件",
     memory: "记忆",
     skillHub: "Skill 中心",
+    apiKeys: "API 密钥",
     monitoring: "监控",
     knowledgeBase: "知识库",
     knowledgeBaseDetail: "知识库详情",
@@ -3199,6 +3200,74 @@ Build when you need.`,
       updated: "Widget 配置已更新",
       updateFailed: "更新 Widget 配置失败",
       copyFailed: "复制 Widget 代码失败"
+    }
+  },
+  apiKeysPage: {
+    title: "API Keys",
+    subtitle: "管理用于以编程方式访问您的 Agent 的 API 密钥。",
+    newKey: "新建 API Key",
+    newKeyDescription: "为某个 Agent 创建新的 SDK / REST API 凭证。",
+    allKeys: "所有密钥",
+    searchPlaceholder: "搜索密钥或 Agent...",
+    noData: "暂无 API Key。",
+    never: "从未使用",
+    stats: {
+      totalKeys: "密钥总数",
+      totalKeysHint: "覆盖所有 Agent",
+      activeKeys: "生效密钥",
+      activeKeysHint: "可接受请求",
+      callsThisMonth: "本月调用次数",
+      lastApiCall: "最近一次调用",
+      noActivity: "暂无调用记录"
+    },
+    columns: {
+      label: "密钥标签",
+      agent: "Agent",
+      secretKey: "密钥",
+      status: "状态",
+      lastUsed: "最近使用",
+      created: "创建时间"
+    },
+    status: {
+      active: "生效中",
+      paused: "已暂停",
+      revoked: "已撤销"
+    },
+    actions: {
+      copy: "复制",
+      pause: "暂停",
+      resume: "恢复",
+      regenerate: "重新生成",
+      delete: "删除"
+    },
+    form: {
+      agent: "Agent",
+      selectAgent: "选择一个 Agent",
+      label: "标签",
+      labelPlaceholder: "例如：生产环境",
+      create: "创建"
+    },
+    reveal: {
+      title: "API Key 已创建",
+      warning: "请立即复制此 Key —— 它只显示一次。"
+    },
+    confirm: {
+      regenerateTitle: "重新生成 API Key？",
+      regenerateDescription: "重新生成会立即使当前密钥失效，正在使用它的应用将停止工作，直到更新为新密钥。",
+      deleteTitle: "删除 API Key？",
+      deleteDescription: "删除会立即使此密钥失效，正在使用它的应用将停止工作。"
+    },
+    messages: {
+      loadFailed: "加载 API Key 失败",
+      created: "API Key 已创建",
+      createFailed: "创建 API Key 失败",
+      paused: "API Key 已暂停",
+      resumed: "API Key 已恢复",
+      regenerated: "API Key 已重新生成",
+      deleted: "API Key 已删除",
+      actionFailed: "操作失败",
+      copied: "已复制到剪贴板",
+      copyFailed: "复制到剪贴板失败"
     }
   },
   triggers: {

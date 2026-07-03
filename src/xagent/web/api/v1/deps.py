@@ -21,6 +21,7 @@ miss = prefix doesn't exist). See SDK design doc §7 (key format and
 auth flow) and §10 (security considerations).
 """
 
+import logging
 from datetime import datetime, timezone
 from typing import Tuple
 
@@ -102,11 +103,15 @@ async def get_agent_from_api_key(
         .filter(
             AgentApiKey.key_prefix == prefix,
             AgentApiKey.revoked_at.is_(None),
+            # A paused key is treated identically to a missing/revoked one
+            # -- same opaque 401, same verify_dummy timing -- so a caller
+            # can't distinguish "paused" from "never existed" below.
+            AgentApiKey.paused_at.is_(None),
         )
         .first()
     )
 
-    # Prefix missing or revoked. verify_dummy to keep timing
+    # Prefix missing, revoked, or paused. verify_dummy to keep timing
     # indistinguishable from the "secret wrong" branch below.
     if key_row is None:
         verify_dummy()
@@ -128,7 +133,33 @@ async def get_agent_from_api_key(
     if agent is None or is_workforce_generated_manager_agent(agent):
         raise V1ApiError(V1ErrorCode.INVALID_API_KEY, 401)
 
+    _record_key_usage(db, key_row)
+
     return agent, key_row
+
+
+def _record_key_usage(db: Session, key_row: AgentApiKey) -> None:
+    """Best-effort usage tracking for the API Keys page's stat cards.
+
+    Updates ``last_used_at`` and the lazily-reset ``usage_month`` /
+    ``usage_month_calls`` bucket. Never allowed to fail the auth path --
+    a tracking error is logged and swallowed, not raised.
+    """
+    try:
+        now = datetime.now(timezone.utc)
+        current_month = now.strftime("%Y-%m")
+        key_row.last_used_at = now  # type: ignore[assignment]
+        if key_row.usage_month != current_month:
+            key_row.usage_month = current_month  # type: ignore[assignment]
+            key_row.usage_month_calls = 1  # type: ignore[assignment]
+        else:
+            key_row.usage_month_calls = (key_row.usage_month_calls or 0) + 1  # type: ignore[assignment]
+        db.commit()
+    except Exception:
+        db.rollback()
+        logging.getLogger(__name__).warning(
+            "Failed to record API key usage for key_prefix=%s", key_row.key_prefix
+        )
 
 
 async def get_user_from_personal_key(

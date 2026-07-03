@@ -6,8 +6,9 @@ import logging
 from datetime import datetime, timezone
 from typing import Any, NamedTuple
 
+from sqlalchemy import func
 from sqlalchemy.exc import IntegrityError
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, joinedload
 
 from ...core.utils.api_key import ApiKeyKind, generate_api_key
 from ..models.agent import Agent, AgentOrigin
@@ -248,16 +249,37 @@ class AgentApiKeyService:
         return [self._to_list_item(row, agent_name) for row, agent_name in rows]
 
     def get_stats_for_user(self, user_id: int) -> AgentApiKeyStats:
+        # Aggregate in SQL rather than loading every row into memory --
+        # revoked keys are kept forever as an audit trail, so this table
+        # only grows for an active user.
         owned = self._owned_agents_query(user_id)
-        keys = self.db.query(AgentApiKey).filter(AgentApiKey.agent_id.in_(owned)).all()
         current_month = datetime.now(timezone.utc).strftime("%Y-%m")
-        total_keys = len(keys)
-        active_keys = sum(1 for k in keys if _key_status(k) == "active")
-        calls_this_month = sum(
-            k.usage_month_calls for k in keys if k.usage_month == current_month
+        base_filter = AgentApiKey.agent_id.in_(owned)
+
+        total_keys = (
+            self.db.query(func.count(AgentApiKey.id)).filter(base_filter).scalar() or 0
         )
-        last_used_values = [k.last_used_at for k in keys if k.last_used_at is not None]
-        last_api_call = max(last_used_values) if last_used_values else None
+        active_keys = (
+            self.db.query(func.count(AgentApiKey.id))
+            .filter(
+                base_filter,
+                AgentApiKey.revoked_at.is_(None),
+                AgentApiKey.paused_at.is_(None),
+            )
+            .scalar()
+            or 0
+        )
+        calls_this_month = (
+            self.db.query(func.sum(AgentApiKey.usage_month_calls))
+            .filter(base_filter, AgentApiKey.usage_month == current_month)
+            .scalar()
+            or 0
+        )
+        last_api_call = (
+            self.db.query(func.max(AgentApiKey.last_used_at))
+            .filter(base_filter)
+            .scalar()
+        )
         return AgentApiKeyStats(
             total_keys=total_keys,
             active_keys=active_keys,
@@ -266,8 +288,12 @@ class AgentApiKeyService:
         )
 
     def _find_owned_key(self, user_id: int, key_id: int) -> AgentApiKey | None:
+        # joinedload avoids an N+1 lazy-load: every caller of this method
+        # (pause_key/resume_key/regenerate_key) reads ``row.agent.name``
+        # to build the response.
         return (
             self.db.query(AgentApiKey)
+            .options(joinedload(AgentApiKey.agent))
             .filter(AgentApiKey.id == key_id)
             .filter(AgentApiKey.agent_id.in_(self._owned_agents_query(user_id)))
             .first()

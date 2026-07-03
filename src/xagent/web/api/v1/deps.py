@@ -27,6 +27,7 @@ from typing import Tuple
 
 from fastapi import Depends
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
+from sqlalchemy import case
 from sqlalchemy.orm import Session, joinedload
 
 from ....core.utils.api_key import (
@@ -37,7 +38,7 @@ from ....core.utils.api_key import (
 )
 from ...models.agent import Agent, is_workforce_generated_manager_agent
 from ...models.agent_api_key import AgentApiKey
-from ...models.database import get_db
+from ...models.database import get_db, get_session_local
 from ...models.user import User
 from ...models.user_api_key import UserApiKey
 from ...utils.db_timezone import normalize_datetime_from_db
@@ -133,33 +134,53 @@ async def get_agent_from_api_key(
     if agent is None or is_workforce_generated_manager_agent(agent):
         raise V1ApiError(V1ErrorCode.INVALID_API_KEY, 401)
 
-    _record_key_usage(db, key_row)
+    _record_key_usage(key_row.key_prefix)  # type: ignore[arg-type]
 
     return agent, key_row
 
 
-def _record_key_usage(db: Session, key_row: AgentApiKey) -> None:
+def _record_key_usage(key_prefix: str) -> None:
     """Best-effort usage tracking for the API Keys page's stat cards.
 
-    Updates ``last_used_at`` and the lazily-reset ``usage_month`` /
-    ``usage_month_calls`` bucket. Never allowed to fail the auth path --
-    a tracking error is logged and swallowed, not raised.
+    Runs on its own DB session -- deliberately isolated from the
+    request-scoped ``db`` session used for auth -- and issues a single
+    atomic UPDATE (month rollover included via ``case()``) rather than a
+    Python-side read-modify-write. This avoids three problems a shared
+    session would have: committing here would prematurely flush/commit
+    whatever the caller's endpoint later stages on the same session;
+    rolling back on failure would poison that session for the rest of
+    the request; and incrementing ``usage_month_calls`` in Python is
+    subject to lost updates under concurrent calls with the same key.
+    Never allowed to fail the auth path -- errors are logged and
+    swallowed, not raised.
     """
+    now = datetime.now(timezone.utc)
+    current_month = now.strftime("%Y-%m")
+    session_local = get_session_local()
+    local_db = session_local()
     try:
-        now = datetime.now(timezone.utc)
-        current_month = now.strftime("%Y-%m")
-        key_row.last_used_at = now  # type: ignore[assignment]
-        if key_row.usage_month != current_month:
-            key_row.usage_month = current_month  # type: ignore[assignment]
-            key_row.usage_month_calls = 1  # type: ignore[assignment]
-        else:
-            key_row.usage_month_calls = (key_row.usage_month_calls or 0) + 1  # type: ignore[assignment]
-        db.commit()
-    except Exception:
-        db.rollback()
-        logging.getLogger(__name__).warning(
-            "Failed to record API key usage for key_prefix=%s", key_row.key_prefix
+        local_db.query(AgentApiKey).filter(AgentApiKey.key_prefix == key_prefix).update(
+            {
+                AgentApiKey.last_used_at: now,
+                AgentApiKey.usage_month: current_month,
+                AgentApiKey.usage_month_calls: case(
+                    (
+                        AgentApiKey.usage_month == current_month,
+                        AgentApiKey.usage_month_calls + 1,
+                    ),
+                    else_=1,
+                ),
+            },
+            synchronize_session=False,
         )
+        local_db.commit()
+    except Exception:
+        local_db.rollback()
+        logging.getLogger(__name__).warning(
+            "Failed to record API key usage for key_prefix=%s", key_prefix
+        )
+    finally:
+        local_db.close()
 
 
 async def get_user_from_personal_key(

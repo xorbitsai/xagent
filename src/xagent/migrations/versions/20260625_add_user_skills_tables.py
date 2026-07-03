@@ -1,7 +1,7 @@
 """add user_skills and user_skill_files tables
 
 Revision ID: 20260625_add_user_skills_tables
-Revises: 20260624_add_mcp_concurrency_config
+Revises: 20260629_add_gmail_watch_states
 Create Date: 2026-06-25 00:00:00.000000
 
 """
@@ -13,7 +13,7 @@ from alembic import op
 from sqlalchemy.engine.reflection import Inspector
 
 revision: str = "20260625_add_user_skills_tables"
-down_revision: Union[str, None] = "20260624_add_mcp_concurrency_config"
+down_revision: Union[str, None] = "20260629_add_gmail_watch_states"
 branch_labels: Union[str, Sequence[str], None] = None
 depends_on: Union[str, Sequence[str], None] = None
 
@@ -25,7 +25,7 @@ def upgrade() -> None:
     inspector = Inspector.from_engine(bind)
     existing_tables = inspector.get_table_names()
 
-    if "user_skills" not in existing_tables:
+    if "user_skills" not in existing_tables and "users" in existing_tables:
         op.create_table(
             "user_skills",
             sa.Column("id", sa.Integer(), nullable=False),
@@ -62,7 +62,7 @@ def upgrade() -> None:
             "ix_user_skills_user_id", "user_skills", ["user_id"], unique=False
         )
 
-    if "user_skill_files" not in existing_tables:
+    if "user_skill_files" not in existing_tables and "user_skills" in existing_tables:
         op.create_table(
             "user_skill_files",
             sa.Column("id", sa.Integer(), nullable=False),

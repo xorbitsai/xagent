@@ -712,7 +712,6 @@ async def create_skill(
         )
 
     mgr = await _get_scoped_manager(request, _user, db)
-    await mgr.reload()
     skill = await mgr.get_skill(body.name)
     if skill is None:
         # Most likely cause: malformed YAML frontmatter that the parser
@@ -778,7 +777,6 @@ async def edit_installed(
     else:
         _update_personal_skill_md(db=db, user=_user, name=name, skill_md=body.skill_md)
     mgr = await _get_scoped_manager(request, _user, db)
-    await mgr.reload()
     reloaded = await mgr.get_skill(name)
     if reloaded is None:
         raise HTTPException(
@@ -953,9 +951,7 @@ async def install_skill(
             clawhub_version=body.version,
         )
 
-    # --- Reload + return -----------------------------------------
     mgr = await _get_scoped_manager(request, _user, db)
-    await mgr.reload()
     skill = await mgr.get_skill(body.slug)
     if skill is None:
         raise HTTPException(

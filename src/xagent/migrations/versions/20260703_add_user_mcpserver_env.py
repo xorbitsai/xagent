@@ -1,7 +1,7 @@
 """add per-user env overrides to user_mcpservers
 
 Revision ID: 20260703_add_user_mcpserver_env
-Revises: 20260702_add_mcp_oauth_tables
+Revises: 20260625_add_user_skills_tables
 Create Date: 2026-07-03 00:00:00.000000
 
 """

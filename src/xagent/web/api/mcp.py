@@ -1202,14 +1202,30 @@ def _check_mcp_permission(
     """
     if is_admin:
         return True
+    is_owner = bool(getattr(user_mcp, "is_owner", False))
     if require == "delete":
-        return bool(getattr(user_mcp, "can_delete", False))
-    return bool(getattr(user_mcp, "is_owner", False))
+        # The owner can always delete; can_delete additionally grants it to a
+        # non-owner. Checking is_owner too covers rows created before can_delete
+        # was set (e.g. OAuth provisioning, migration-skipped is_owner rows).
+        return is_owner or bool(getattr(user_mcp, "can_delete", False))
+    return is_owner
 
 
-# Owner-only global fields that are safe to compare (non-secret; secrets like
-# env/auth/headers round-trip as masks and can't be diffed reliably).
+# Owner-only global fields that are safe to compare (non-secret; secret values
+# like env/headers and auth's SENSITIVE_AUTH_FIELDS round-trip as masks and
+# can't be diffed reliably, so they keep the silent-preserve behavior).
 _GLOBAL_CONFIG_KEYS = ("command", "args", "url")
+
+
+def _auth_metadata_tampered(incoming_auth: Any, current_auth: Any) -> bool:
+    """True if a payload changes non-secret auth metadata (client_id, issuer …)."""
+    if not isinstance(incoming_auth, dict):
+        return False
+    current = current_auth if isinstance(current_auth, dict) else {}
+    return any(
+        key not in SENSITIVE_AUTH_FIELDS and value != current.get(key)
+        for key, value in incoming_auth.items()
+    )
 
 
 def _global_config_tampered(server_data: MCPServerUpdate, server: MCPServer) -> bool:
@@ -1225,10 +1241,12 @@ def _global_config_tampered(server_data: MCPServerUpdate, server: MCPServer) -> 
         return True
     incoming = server_data.config or {}
     current = server.to_config_dict()
-    return any(
+    if any(
         key in incoming and incoming[key] != current.get(key)
         for key in _GLOBAL_CONFIG_KEYS
-    )
+    ):
+        return True
+    return _auth_metadata_tampered(incoming.get("auth"), current.get("auth"))
 
 
 def _db_server_to_response(

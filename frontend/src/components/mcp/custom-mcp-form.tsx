@@ -631,6 +631,9 @@ export function CustomMcpForm({
             />
           </div>
 
+          {/* Auth config is shared/global; non-owners see it read-only. The OAuth
+              status/actions below stay enabled so they can connect their own account. */}
+          <fieldset disabled={!canEditGlobal} className="contents">
           <div className="space-y-2">
             <Label className="flex items-center gap-1">
               {t('tools.mcp.dialog.authentication')} <span className="text-slate-400 text-xs">(?)</span>
@@ -741,9 +744,11 @@ export function CustomMcpForm({
               </div>
             </>
           )}
+          </fieldset>
 
           {isMcpOAuth && (
             <>
+              <fieldset disabled={!canEditGlobal} className="contents">
               <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
                 <div className="space-y-2">
                   <Label htmlFor="mcp_oauth_resource">{t('tools.mcp.dialog.oauthResource')}</Label>
@@ -840,6 +845,7 @@ export function CustomMcpForm({
                   </SelectContent>
                 </Select>
               </div>
+              </fieldset>
 
               <div className="rounded-md border border-slate-200 bg-slate-50 p-3 space-y-3">
                 <div className="flex items-center justify-between gap-3">

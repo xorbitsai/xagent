@@ -9,6 +9,7 @@ import pytest
 from xagent.web.api.mcp import (
     MCPServerCreate,
     MCPServerUpdate,
+    _auth_metadata_tampered,
     _build_server_config,
     _check_mcp_permission,
     _db_server_to_response,
@@ -427,7 +428,7 @@ class TestMCPApiFunctions:
         assert None not in merged.values()
 
     def test_check_mcp_permission(self):
-        """Owner gates edit; can_delete gates delete; admin bypasses both."""
+        """Owner gates edit; owner-or-can_delete gates delete; admin bypasses."""
         owner = MagicMock(is_owner=True, can_delete=True)
         guest = MagicMock(is_owner=False, can_delete=False)
         assert _check_mcp_permission(owner, is_admin=False, require="edit") is True
@@ -436,6 +437,13 @@ class TestMCPApiFunctions:
         assert _check_mcp_permission(guest, is_admin=False, require="delete") is False
         # Admin bypasses the per-row flags
         assert _check_mcp_permission(guest, is_admin=True, require="delete") is True
+        # Regression: an owner whose can_delete was never set (OAuth provisioning,
+        # migration-skipped rows) must still be able to delete their own server.
+        legacy_owner = MagicMock(is_owner=True, can_delete=False)
+        assert _check_mcp_permission(legacy_owner, is_admin=False, require="delete")
+        # A non-owner explicitly granted can_delete may delete.
+        grantee = MagicMock(is_owner=False, can_delete=True)
+        assert _check_mcp_permission(grantee, is_admin=False, require="delete")
 
     def test_global_config_tampered(self):
         """Non-secret global fields are diffed; unchanged payloads pass."""
@@ -457,6 +465,21 @@ class TestMCPApiFunctions:
         )
         # Changed top-level name -> tampered
         assert _global_config_tampered(MCPServerUpdate(name="other"), server)
+
+    def test_auth_metadata_tampered(self):
+        """Non-secret auth metadata is diffed; secrets/masked values are ignored."""
+        current = {"type": "oauth2", "client_id": "abc", "client_secret": "enc"}
+        # Unchanged metadata (masked secret) -> not tampered
+        assert not _auth_metadata_tampered(
+            {"type": "oauth2", "client_id": "abc", "client_secret": "********"},
+            current,
+        )
+        # Changed non-secret metadata -> tampered
+        assert _auth_metadata_tampered({"client_id": "hijacked"}, current)
+        assert _auth_metadata_tampered({"issuer": "https://evil"}, current)
+        # Only a (masked) secret changed -> secrets can't be diffed, not tampered
+        assert not _auth_metadata_tampered({"client_secret": "********"}, current)
+        assert not _auth_metadata_tampered(None, current)
 
     def test_mask_env_keeps_keys(self):
         assert _mask_env({"A": "1", "B": ""}) == {"A": "********", "B": ""}

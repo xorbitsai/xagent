@@ -60,14 +60,14 @@ Or in one line:
 curl -fsSL https://get.xagent.co | sh
 ```
 
-Set at least one LLM API key (e.g. `OPENAI_API_KEY`) via a `.env` file or your environment, then create your admin account at `/setup`.
+Create your admin account at `/setup`; Xagent then guides you to the Models page to connect a provider.
 
 ### Run with Docker (teams / self-hosting)
 
 ```bash
 git clone https://github.com/xorbitsai/xagent.git
 cd xagent
-cp example.env .env        # configure at least one LLM API key
+cp example.env .env        # optional: review settings
 docker compose up -d       # then open http://localhost:80
 ```
 

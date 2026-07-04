@@ -3,7 +3,7 @@ services:
     environment:
       - SANDBOX_ENABLED=true
       - SANDBOX_IMPLEMENTATION=boxlite
-      - SANDBOX_IMAGE=xprobe/xagent-sandbox:0.5.1
+      - SANDBOX_IMAGE=xprobe/xagent-sandbox:0.6.0
       - SANDBOX_CPUS=1
       - SANDBOX_MEMORY=512
       - BOXLITE_HOME_DIR=/root/.xagent/boxlite

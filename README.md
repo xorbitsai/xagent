@@ -8,6 +8,7 @@
 
 [![Documentation](https://img.shields.io/badge/docs-docs.xagent.co-blue?style=for-the-badge&logo=gitbook)](https://docs.xagent.co/)
 [![GitHub Release](https://img.shields.io/github/v/release/xorbitsai/xagent?logo=github&style=for-the-badge)](https://github.com/xorbitsai/xagent/releases)
+[![PyPI](https://img.shields.io/pypi/v/xagent-ai?style=for-the-badge&logo=pypi&logoColor=white)](https://pypi.org/project/xagent-ai/)
 [![Docker Pulls](https://img.shields.io/docker/pulls/xprobe/xagent-backend?style=for-the-badge&logo=docker)](https://hub.docker.com/r/xprobe/xagent-backend)
 
 </div>
@@ -44,40 +45,37 @@ Join [Telegram](https://t.me/+2_-SAVLtuJNkNWFl) | [Discord](https://discord.gg/R
 
 ## Quick Start
 
-**Get started in 3 minutes**
+### Run on your machine
 
-### 1️⃣ Clone and configure
+The published package bundles the web UI — no Docker or Node required (Python 3.11+):
+
+```bash
+uv tool install xagent-ai   # or: pip install xagent-ai  (use a virtualenv)
+xagent                      # then open http://127.0.0.1:8000
+```
+
+Or in one line:
+
+```bash
+curl -fsSL https://get.xagent.co | sh
+```
+
+Set at least one LLM API key (e.g. `OPENAI_API_KEY`) via a `.env` file or your environment, then create your admin account at `/setup`.
+
+### Run with Docker (teams / self-hosting)
 
 ```bash
 git clone https://github.com/xorbitsai/xagent.git
 cd xagent
-cp example.env .env
-# Edit .env to configure at least one LLM API key.
+cp example.env .env        # configure at least one LLM API key
+docker compose up -d       # then open http://localhost:80
 ```
 
-### 2️⃣ Start with Docker
-
-```bash
-docker compose up -d
-```
-
-### 3️⃣ Open in browser
-
-```
-http://localhost:80
-```
-
-On first startup, Xagent redirects to `/setup`.
-
-Create the first administrator account to complete initialization.
-
-If the admin password is forgotten, reset it via CLI:
+On first startup, Xagent redirects to `/setup` to create the first administrator account. Forgot the admin password? Reset it:
 
 ```bash
 docker compose exec backend python -m xagent.web.reset_admin_password --username <admin_username>
 ```
-
-That's it. Xagent is now running.
 
 ---
 

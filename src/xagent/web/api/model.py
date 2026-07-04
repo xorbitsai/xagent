@@ -16,6 +16,7 @@ from xagent.core.model.model import (
     ImageModelConfig,
     ModelConfig,
     RerankModelConfig,
+    VideoModelConfig,
 )
 from xagent.core.model.providers import (
     canonical_provider_name,
@@ -229,6 +230,7 @@ def _is_default_config_type_compatible(model: Any, config_type: str) -> bool:
         "embedding": "embedding",
         "image": "image",
         "image_edit": "image",
+        "video": "video",
         "asr": "speech",
         "tts": "speech",
         "speech": "speech",
@@ -249,6 +251,7 @@ def _is_default_config_type_compatible(model: Any, config_type: str) -> bool:
     required_abilities_by_config_type = {
         "visual": {"vision"},
         "image_edit": {"edit"},
+        "video": {"generate"},
         "asr": {"asr"},
         "tts": {"tts"},
         "speech": {"asr", "tts"},
@@ -293,6 +296,15 @@ async def create_model(
 
     model_provider = canonical_provider_name(model.model_provider)
     base_url = model.base_url or default_base_url_for_provider(model_provider)
+    if (
+        model.category == "video"
+        and model_provider == "volcengine-ark"
+        and not model.base_url
+        and model.model_name.startswith("dreamina-")
+    ):
+        from xagent.core.model.video.ark import ARK_BYTEPLUS_BASE_URL
+
+        base_url = ARK_BYTEPLUS_BASE_URL
     _validate_provider_model_name(model_provider, model.model_name)
 
     if model.category == "llm":
@@ -329,6 +341,17 @@ async def create_model(
             default_temperature=model.temperature,
             timeout=180.0,
             abilities=model.abilities,
+            description=model.description,
+        )
+    elif model.category == "video":
+        config = VideoModelConfig(
+            id=model.model_id,
+            model_name=model.model_name,
+            model_provider=model_provider,
+            base_url=base_url,
+            api_key=model.api_key or "",
+            timeout=1800.0,
+            abilities=model.abilities or ["generate"],
             description=model.description,
         )
     elif model.category == "speech":
@@ -499,6 +522,15 @@ async def test_model_connection(
     try:
         provider = canonical_provider_name(request.model_provider)
         base_url = request.base_url or default_base_url_for_provider(provider)
+        if (
+            request.category == "video"
+            and provider == "volcengine-ark"
+            and not request.base_url
+            and request.model_name.startswith("dreamina-")
+        ):
+            from xagent.core.model.video.ark import ARK_BYTEPLUS_BASE_URL
+
+            base_url = ARK_BYTEPLUS_BASE_URL
 
         if request.category == "llm":
             # For some reasoning models (like o1, o3, claude reasoning variants), temperature might be deprecated
@@ -586,6 +618,23 @@ async def test_model_connection(
                 ),
                 timeout=timeout_seconds,
             )
+
+        elif request.category == "video":
+            from xagent.core.model.video.adapter import create_video_model
+
+            video_config = VideoModelConfig(
+                id="test-model",
+                model_name=request.model_name,
+                model_provider=provider,
+                api_key=request.api_key,
+                base_url=base_url,
+                abilities=request.abilities or ["generate"],
+                timeout=1800.0,
+            )
+            video_model = create_video_model(video_config)
+            validator = getattr(video_model, "validate_configuration", None)
+            if callable(validator):
+                validator()
 
         elif request.category == "speech":
             if provider != "xinference":
@@ -965,6 +1014,13 @@ async def get_default_model(
     config_type_map = {
         "llm": "general",
         "embedding": "embedding",
+        "image": "image",
+        "image_edit": "image_edit",
+        "video": "video",
+        "asr": "asr",
+        "tts": "tts",
+        "speech": "speech",
+        "rerank": "rerank",
     }
 
     config_type = config_type_map.get(model_provider, "general")
@@ -1711,7 +1767,7 @@ async def get_public_summary(
 
     # Count by category
     category_counts = {}
-    for cat in ["llm", "embedding", "rerank", "image"]:
+    for cat in ["llm", "embedding", "rerank", "image", "video", "speech"]:
         count = (
             db.query(DBModel)
             .filter(DBModel.category == cat)

@@ -41,6 +41,7 @@ def _require_user_id(current_user: User) -> int:
 CATEGORY_DISPLAY_NAMES = {
     "vision": "Vision",
     "image": "Image",
+    "video": "Video",
     "audio": "Audio",
     "knowledge": "Knowledge",
     "file": "File",
@@ -79,6 +80,7 @@ def _create_tool_info(
     category: str,
     vision_model: Any = None,
     image_models: Any = None,
+    video_models: Any = None,
     asr_models: Any = None,
     tts_models: Any = None,
 ) -> dict[str, Any]:
@@ -124,6 +126,16 @@ def _create_tool_info(
                     "please add an image model with editing support"
                 )
                 enabled = False
+
+    elif category == "video":
+        tool_type = "video"
+        if not video_models:
+            status = "missing_model"
+            status_reason = (
+                "Video model not configured, please add a "
+                "video generation model in model management page"
+            )
+            enabled = False
 
     elif category == "audio":
         tool_type = "audio"
@@ -272,6 +284,7 @@ async def get_available_tools(
     # Get models for tool status checking
     vision_model = tool_config.get_vision_model()
     image_models = tool_config.get_image_models()
+    video_models = tool_config.get_video_models()
     asr_models = tool_config.get_asr_models()
     tts_models = tool_config.get_tts_models()
 
@@ -285,6 +298,7 @@ async def get_available_tools(
                 category,
                 vision_model,
                 image_models,
+                video_models,
                 asr_models,
                 tts_models,
             )

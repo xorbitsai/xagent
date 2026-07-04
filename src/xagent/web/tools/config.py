@@ -257,8 +257,10 @@ class WebToolConfig(BaseToolConfig):
         # Cache for loaded configurations
         self._cached_vision_config: Optional[Any] = None
         self._cached_image_configs: Optional[Dict[str, Any]] = None
+        self._cached_video_configs: Optional[Dict[str, Any]] = None
         self._cached_image_generate_model: Optional[Any] = None
         self._cached_image_edit_model: Optional[Any] = None
+        self._cached_video_model: Optional[Any] = None
         self._cached_asr_models: Optional[Dict[str, Any]] = None
         self._cached_asr_model: Optional[Any] = None
         self._cached_tts_models: Optional[Dict[str, Any]] = None
@@ -354,6 +356,12 @@ class WebToolConfig(BaseToolConfig):
             self._cached_image_configs = self._load_image_models()
         return self._cached_image_configs
 
+    def get_video_models(self) -> Dict[str, Any]:
+        """Load video models from database."""
+        if self._cached_video_configs is None:
+            self._cached_video_configs = self._load_video_models()
+        return self._cached_video_configs
+
     def get_image_generate_model(self) -> Optional[Any]:
         """Get default image generation model from database."""
         if self._cached_image_generate_model is None:
@@ -365,6 +373,12 @@ class WebToolConfig(BaseToolConfig):
         if self._cached_image_edit_model is None:
             self._cached_image_edit_model = self._load_image_edit_model()
         return self._cached_image_edit_model
+
+    def get_video_model(self) -> Optional[Any]:
+        """Get default video generation model from database."""
+        if self._cached_video_model is None:
+            self._cached_video_model = self._load_video_model()
+        return self._cached_video_model
 
     async def get_mcp_server_configs(self) -> List[Dict[str, Any]]:
         """Load MCP server configurations from database."""
@@ -587,6 +601,19 @@ class WebToolConfig(BaseToolConfig):
 
             return {}
 
+    def _load_video_models(self) -> Dict[str, Any]:
+        """Load video models from database via model service."""
+        try:
+            from ...web.services.model_service import get_video_models
+
+            return get_video_models(self.db, self._user_id)
+
+        except Exception as e:
+            logger = logging.getLogger(__name__)
+            logger.warning(f"Failed to load video models: {e}")
+
+            return {}
+
     def _load_image_generate_model(self) -> Optional[Any]:
         """Load default image generation model from database via model service."""
         try:
@@ -609,6 +636,18 @@ class WebToolConfig(BaseToolConfig):
         except Exception as e:
             logger = logging.getLogger(__name__)
             logger.warning(f"Failed to load default image editing model: {e}")
+            return None
+
+    def _load_video_model(self) -> Optional[Any]:
+        """Load default video generation model from database via model service."""
+        try:
+            from ...web.services.model_service import get_default_video_model
+
+            return get_default_video_model(self._user_id)
+
+        except Exception as e:
+            logger = logging.getLogger(__name__)
+            logger.warning(f"Failed to load default video model: {e}")
             return None
 
     def get_asr_models(self) -> Dict[str, Any]:

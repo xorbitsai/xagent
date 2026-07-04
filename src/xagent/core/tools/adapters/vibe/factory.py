@@ -118,6 +118,7 @@ class ToolRegistry:
                 special_image_tools,
                 sql_tool,
                 translate_json,
+                video_tool,
                 vision_tool,
                 web_ingestion_tool,
                 workspace_file_tool,
@@ -201,13 +202,14 @@ class ToolRegistry:
         4. FILE - File operations
         5. VISION - Vision understanding
         6. IMAGE - Image generation
-        7. BROWSER - Browser automation
-        8. PPT - PPT tools
-        9. DATABASE - Database tools (SQL query)
-        10. MCP - MCP tools
-        11. SKILL - Skill documentation access tools
-        12. AGENT - Agent tools (delegation)
-        13. OTHER - Other tools
+        7. VIDEO - Video generation
+        8. BROWSER - Browser automation
+        9. PPT - PPT tools
+        10. DATABASE - Database tools (SQL query)
+        11. MCP - MCP tools
+        12. SKILL - Skill documentation access tools
+        13. AGENT - Agent tools (delegation)
+        14. OTHER - Other tools
         """
         from .base import ToolCategory
 
@@ -219,13 +221,14 @@ class ToolRegistry:
             ToolCategory.FILE: 3,
             ToolCategory.VISION: 4,
             ToolCategory.IMAGE: 5,
-            ToolCategory.BROWSER: 6,
-            ToolCategory.PPT: 7,
-            ToolCategory.DATABASE: 8,
-            ToolCategory.MCP: 9,
-            ToolCategory.SKILL: 10,
-            ToolCategory.AGENT: 11,
-            ToolCategory.OTHER: 12,
+            ToolCategory.VIDEO: 6,
+            ToolCategory.BROWSER: 7,
+            ToolCategory.PPT: 8,
+            ToolCategory.DATABASE: 9,
+            ToolCategory.MCP: 10,
+            ToolCategory.SKILL: 11,
+            ToolCategory.AGENT: 12,
+            ToolCategory.OTHER: 13,
         }
 
         def get_tool_priority(tool: Tool) -> int:

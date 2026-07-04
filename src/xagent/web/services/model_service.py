@@ -19,6 +19,7 @@ from ...core.model.image.dashscope import DashScopeImageModel
 from ...core.model.image.gemini import GeminiImageModel
 from ...core.model.image.openai import OpenAIImageModel
 from ...core.model.image.xinference import XinferenceImageModel
+from ...core.model.video.base import BaseVideoModel
 
 logger = logging.getLogger(__name__)
 
@@ -578,6 +579,49 @@ def get_image_models(db: Session, user_id: Optional[int] = None) -> Dict[str, An
     return image_models
 
 
+def get_video_models(db: Session, user_id: Optional[int] = None) -> Dict[str, Any]:
+    """Get video models from database filtered by current user visibility."""
+    video_models: dict[str, Any] = {}
+    try:
+        from ...core.model.video.adapter import get_video_model_instance
+        from ..models.model import Model as DBModel
+
+        db_models = (
+            db.query(DBModel)
+            .filter(
+                DBModel.category == "video",
+                DBModel.is_active,
+            )
+            .all()
+        )
+
+        for db_model in db_models:
+            if user_id is not None and not _is_model_visible_to_user(
+                db, db_model.id, user_id
+            ):
+                continue
+            try:
+                video_model = get_video_model_instance(db_model)
+                setattr(video_model, "model_id", str(db_model.model_id))
+                video_models[str(db_model.model_id)] = video_model
+                logger.info(
+                    "Added video model: model_id=%s, model_name=%s",
+                    db_model.model_id,
+                    db_model.model_name,
+                )
+            except Exception as e:
+                logger.warning(
+                    "Failed to create video model %s: %s",
+                    db_model.model_name,
+                    e,
+                )
+    except Exception as e:
+        logger.error(f"Failed to load video models: {e}")
+        db.rollback()
+
+    return video_models
+
+
 def get_models_by_category(category: str, db: Session) -> list:
     """
     Get models by category from database.
@@ -771,6 +815,94 @@ def get_default_image_edit_model(
             logger.warning(
                 f"Failed to get default image editing model from database: {e}"
             )
+            pass
+
+    except ImportError:
+        pass
+
+    return None
+
+
+def get_default_video_model(
+    user_id: Optional[int] = None,
+) -> Optional[BaseVideoModel]:
+    """
+    Get the default video generation model for a specific user.
+
+    Args:
+        user_id: User ID for multi-tenant model resolution. If None, uses admin defaults.
+
+    Returns:
+        The default video generation model or None if not available
+    """
+    try:
+        from sqlalchemy import String, cast
+
+        from ...core.model.video.adapter import get_video_model_instance
+        from ..models.database import get_db
+        from ..models.model import Model as DBModel
+        from ..models.user import UserDefaultModel, UserModel
+
+        try:
+            db = next(get_db())
+
+            if user_id:
+                video_default = (
+                    db.query(UserDefaultModel)
+                    .join(DBModel, UserDefaultModel.model_id == DBModel.id)
+                    .filter(
+                        UserDefaultModel.user_id == user_id,
+                        UserDefaultModel.config_type == "video",
+                        DBModel.category == "video",
+                        DBModel.is_active,
+                        cast(DBModel.abilities, String).contains('"generate"'),
+                    )
+                    .first()
+                )
+
+                if video_default and video_default.model:
+                    if _is_model_visible_to_user(db, video_default.model.id, user_id):
+                        try:
+                            instance = get_video_model_instance(video_default.model)
+                            setattr(
+                                instance, "model_id", str(video_default.model.model_id)
+                            )
+                            return instance
+                        except Exception as e:
+                            logger.warning(
+                                f"Failed to create video model instance: {e}"
+                            )
+
+            shared_video_defaults = (
+                db.query(UserDefaultModel)
+                .join(UserModel, UserDefaultModel.model_id == UserModel.model_id)
+                .join(DBModel, UserModel.model_id == DBModel.id)
+                .filter(
+                    UserDefaultModel.config_type == "video",
+                    DBModel.category == "video",
+                    DBModel.is_active,
+                    UserModel.is_shared.is_(True),
+                    UserDefaultModel.user_id.in_(_get_visible_user_ids(db, user_id)),
+                    cast(DBModel.abilities, String).contains('"generate"'),
+                )
+                .limit(1)
+                .all()
+            )
+
+            if shared_video_defaults:
+                try:
+                    instance = get_video_model_instance(shared_video_defaults[0].model)
+                    setattr(
+                        instance,
+                        "model_id",
+                        str(shared_video_defaults[0].model.model_id),
+                    )
+                    return instance
+                except Exception as e:
+                    logger.warning(f"Failed to create video model instance: {e}")
+
+        except Exception as e:
+            logger.warning(f"Failed to get default video model from database: {e}")
             pass
 
     except ImportError:

@@ -529,6 +529,21 @@ wheels = [
 ]
 
 [[package]]
+name = "byteplus-python-sdk-v2"
+version = "3.0.52"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "certifi" },
+    { name = "python-dateutil" },
+    { name = "six" },
+    { name = "urllib3" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/01/e9/b48ad2d9d3e97d2f09a90615dafbf3ba2ee456a71239cea6c0bed96e168b/byteplus_python_sdk_v2-3.0.52.tar.gz", hash = "sha256:efe51c35ec46e387ca398da9f1af26b574dfb3164006ca5e9d7bc8635d317c79", size = 3830993, upload-time = "2026-07-02T12:08:35.48Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/6a/45/5e46955d954bae0e6d013c8cd623256fb10a57a427a44c6ef5b940369a58/byteplus_python_sdk_v2-3.0.52-py2.py3-none-any.whl", hash = "sha256:3c0226fbe5613ae04c9c751b2d3ac2ce91ee1ffde2800ff0d6933717080ccc79", size = 14934122, upload-time = "2026-07-02T12:08:31.69Z" },
+]
+
+[[package]]
 name = "cachetools"
 version = "5.3.3"
 source = { registry = "https://pypi.org/simple" }
@@ -7338,6 +7353,29 @@ wheels = [
 ]
 
 [[package]]
+name = "volcengine-python-sdk"
+version = "5.0.37"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "certifi" },
+    { name = "python-dateutil" },
+    { name = "six" },
+    { name = "urllib3" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/9d/f7/c302efcea7686d6c5bf02952ecb9dd54c92abb9628af4aa6b637d4b32c02/volcengine_python_sdk-5.0.37.tar.gz", hash = "sha256:1ed5676db2297f84c0da17d82eda9ca99b4c34fe2eb47cc8d798e40bb8e496fd", size = 9709945, upload-time = "2026-07-02T12:08:37.542Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/a5/d6/af02ffd9d9441727064db4929896410c6f15b967f3337ae05064165258c7/volcengine_python_sdk-5.0.37-py2.py3-none-any.whl", hash = "sha256:7a8f29932e73125c95af02341d06b9eb97d96f76d2acb3a8f359559da337377a", size = 38940489, upload-time = "2026-07-02T12:08:31.342Z" },
+]
+
+[package.optional-dependencies]
+ark = [
+    { name = "anyio" },
+    { name = "cryptography" },
+    { name = "httpx" },
+    { name = "pydantic" },
+]
+
+[[package]]
 name = "watchfiles"
 version = "1.1.1"
 source = { registry = "https://pypi.org/simple" }
@@ -7583,6 +7621,7 @@ dependencies = [
     { name = "beartype" },
     { name = "beautifulsoup4" },
     { name = "boxlite", marker = "(platform_machine == 'arm64' and sys_platform == 'darwin') or (platform_machine == 'x86_64' and sys_platform == 'linux')" },
+    { name = "byteplus-python-sdk-v2" },
     { name = "celery", extra = ["redis"] },
     { name = "cloudpickle" },
     { name = "cryptography" },
@@ -7629,6 +7668,7 @@ dependencies = [
     { name = "tiktoken" },
     { name = "tqdm" },
     { name = "uvicorn" },
+    { name = "volcengine-python-sdk", extra = ["ark"] },
     { name = "websockets" },
     { name = "xinference-client" },
     { name = "zai-sdk" },
@@ -7779,6 +7819,7 @@ requires-dist = [
     { name = "beautifulsoup4", specifier = ">=4.12.3" },
     { name = "boxlite", marker = "platform_machine == 'arm64' and sys_platform == 'darwin'", specifier = ">=0.6.0" },
     { name = "boxlite", marker = "platform_machine == 'x86_64' and sys_platform == 'linux'", specifier = ">=0.6.0" },
+    { name = "byteplus-python-sdk-v2", specifier = ">=3.0.52" },
     { name = "celery", extras = ["redis"], specifier = ">=5.4.0,<6.0.0" },
     { name = "chromadb", marker = "extra == 'all'" },
     { name = "chromadb", marker = "extra == 'chromadb'" },
@@ -7860,6 +7901,7 @@ requires-dist = [
     { name = "unstructured", marker = "extra == 'all'", specifier = ">=0.15.0" },
     { name = "unstructured", marker = "extra == 'document-processing'", specifier = ">=0.15.0" },
     { name = "uvicorn", specifier = ">=0.35.0" },
+    { name = "volcengine-python-sdk", extras = ["ark"], specifier = ">=5.0.37" },
     { name = "websockets", specifier = ">=15.0.1" },
     { name = "xinference-client", specifier = ">=2.3.0" },
     { name = "xrouter-llm", marker = "extra == 'all'", specifier = ">=0.1.2" },

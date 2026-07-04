@@ -30,6 +30,10 @@ class BaseToolConfig(ABC):
         """Get image models."""
         pass
 
+    def get_video_models(self) -> Dict[str, Any]:
+        """Get video models."""
+        return {}
+
     @abstractmethod
     def get_asr_models(self) -> Dict[str, Any]:
         """Get ASR (speech-to-text) models."""
@@ -117,6 +121,10 @@ class BaseToolConfig(ABC):
     def get_image_edit_model(self) -> Optional[Any]:
         """Get default image editing model."""
         pass
+
+    def get_video_model(self) -> Optional[Any]:
+        """Get default video generation model."""
+        return None
 
     @abstractmethod
     def get_sandbox(self) -> Optional[Any]:
@@ -214,6 +222,7 @@ class ToolConfig(BaseToolConfig):
         workspace_config = config_dict.get("workspace")
         config_dict.get("vision_model")  # Unused in base config
         config_dict.get("image_models", [])  # Unused in base config
+        config_dict.get("video_models", [])  # Unused in base config
         config_dict.get("asr_models", [])  # Unused in base config
         config_dict.get("tts_models", [])  # Unused in base config
         mcp_server_configs = config_dict.get("mcp_servers", [])
@@ -269,6 +278,9 @@ class ToolConfig(BaseToolConfig):
         self.image_models: Dict[
             str, Any
         ] = {}  # Standalone usage typically doesn't have web context
+        self.video_models: Dict[
+            str, Any
+        ] = {}  # Standalone usage typically doesn't have web context
         self.asr_models: Dict[
             str, Any
         ] = {}  # Standalone usage typically doesn't have web context
@@ -305,6 +317,9 @@ class ToolConfig(BaseToolConfig):
 
     def get_image_models(self) -> Dict[str, Any]:
         return self.image_models
+
+    def get_video_models(self) -> Dict[str, Any]:
+        return self.video_models
 
     def get_asr_models(self) -> Dict[str, Any]:
         return self.asr_models
@@ -352,6 +367,9 @@ class ToolConfig(BaseToolConfig):
         return []  # Standalone config doesn't have web context for custom APIs by default
 
     def get_image_edit_model(self) -> Optional[Any]:
+        return None  # Standalone config doesn't have web context
+
+    def get_video_model(self) -> Optional[Any]:
         return None  # Standalone config doesn't have web context
 
     def get_asr_model(self) -> Optional[Any]:

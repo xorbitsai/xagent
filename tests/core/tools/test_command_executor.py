@@ -5,6 +5,7 @@ Tests for CommandExecutor tool
 import os
 import shlex
 import sys
+from unittest.mock import Mock
 
 import pytest
 
@@ -41,6 +42,19 @@ class TestCommandExecutorTool:
         assert "shell" in command_executor.tags or "command" in command_executor.tags
         assert command_executor.args_type() == CommandExecutorArgs
         assert command_executor.return_type() == CommandExecutorResult
+
+    def test_description_includes_workspace_cwd_and_search_scope(self, tmp_path):
+        """Test that shell guidance exposes cwd and discourages broad searches."""
+        workspace = Mock()
+        workspace.resolve_path.return_value = tmp_path
+        tool = CommandExecutorTool(workspace=workspace)
+
+        description = tool.description
+
+        assert f"current working directory: {tmp_path}" in description
+        assert "Use concrete paths" in description
+        assert "Only search for files when no usable path was provided" in description
+        assert "Do not run broad recursive searches from `/`" in description
 
     def test_simple_echo_command(self, command_executor):
         """Test simple echo command"""

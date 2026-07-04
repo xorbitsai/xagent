@@ -451,6 +451,17 @@ class TestImageGenerationTool:
         assert "Test model 1 description" in description
         assert "Test model 2 description" in description
 
+    def test_generate_image_tool_schema_includes_reference_images(self, image_tool):
+        """Test that generate_image exposes reference images to the model."""
+        tools = image_tool.get_tools()
+        generate_tool = next(
+            tool for tool in tools if tool.metadata.name == "generate_image"
+        )
+
+        schema = generate_tool.args_type().model_json_schema()
+        assert "images" in schema["properties"]
+        assert "images (optional): source/reference image" in generate_tool.description
+
     def test_generate_image_tool_description_without_models(self, mock_workspace):
         """Test that generate_image tool description handles no models gracefully"""
         # Create tool with no models

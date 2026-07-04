@@ -35,7 +35,8 @@ import {
   RefreshCw,
   X,
   ChevronRight,
-  Check
+  Check,
+  Video
 } from "lucide-react"
 import { useI18n } from "@/contexts/i18n-context"
 import { ScrollArea } from "@/components/ui/scroll-area"
@@ -96,6 +97,7 @@ export function ModelManagementDialog({
     if (category === 'llm') return ['chat']
     if (category === 'embedding') return ['embedding']
     if (category === 'image') return ['generate']
+    if (category === 'video') return ['generate']
     if (category === 'speech') return ['asr']
     if (category === 'rerank') return ['rerank']
     return []
@@ -122,6 +124,9 @@ export function ModelManagementDialog({
       ...(category === 'image' ? [
         { value: "image", label: t('models.defaults.image') },
         ...(abilities?.includes('edit') ? [{ value: "image_edit", label: t('models.defaults.image_edit') }] : [])
+      ] : []),
+      ...(category === 'video' ? [
+        { value: "video", label: t('models.defaults.video') }
       ] : []),
       ...(category === 'speech' ? [
         ...(abilities?.includes('asr') ? [{ value: "asr", label: t('models.defaults.asr') }] : []),
@@ -174,6 +179,8 @@ export function ModelManagementDialog({
     if (!initialProviderId) {
       if (activeTab === "image" || activeTab === "embedding") {
         defaultProvider = "dashscope";
+      } else if (activeTab === "video") {
+        defaultProvider = "volcengine-ark";
       } else if (activeTab === "speech") {
         defaultProvider = "xinference";
       }
@@ -210,6 +217,10 @@ export function ModelManagementDialog({
     { value: "edit", label: t('models.abilities.edit') }
   ], [t])
 
+  const videoAbilityOptions = useMemo(() => [
+    { value: "generate", label: t('models.abilities.generate') }
+  ], [t])
+
   const speechAbilityOptions = useMemo(() => [
     { value: "asr", label: t('models.abilities.asr') },
     { value: "tts", label: t('models.abilities.tts') }
@@ -223,6 +234,7 @@ export function ModelManagementDialog({
     if (category === 'llm') return abilityOptions
     if (category === 'embedding') return embeddingAbilityOptions
     if (category === 'image') return imageAbilityOptions
+    if (category === 'video') return videoAbilityOptions
     if (category === 'speech') return speechAbilityOptions
     if (category === 'rerank') return rerankAbilityOptions
     return []
@@ -393,6 +405,23 @@ export function ModelManagementDialog({
     } finally {
       setIsFetchingModels(false)
     }
+  }
+
+  const applyFetchedModelSelection = (modelName: string) => {
+    const selected = fetchedModels.find(model => model.id === modelName)
+    const suggestedBaseUrl = selected?.default_base_url || selected?.base_url
+    const suggestedAbilities = selected?.abilities?.length
+      ? selected.abilities
+      : selected?.model_ability
+
+    setFormData(prev => ({
+      ...prev,
+      model_name: modelName,
+      base_url: suggestedBaseUrl || prev.base_url,
+      abilities: suggestedAbilities?.length ? suggestedAbilities : prev.abilities
+    }))
+    setTestConnectionStatus('idle')
+    setTestConnectionError(null)
   }
 
   const submitModelData = async (data: ModelCreate) => {
@@ -625,6 +654,7 @@ export function ModelManagementDialog({
                             { value: "llm", label: t('models.tabs.llm') },
                             { value: "embedding", label: t('models.tabs.embedding') },
                             { value: "image", label: t('models.tabs.image') },
+                            { value: "video", label: t('models.tabs.video') },
                             { value: "speech", label: t('models.tabs.speech') },
                             { value: "rerank", label: t('models.tabs.rerank') }
                           ]}
@@ -774,9 +804,7 @@ export function ModelManagementDialog({
                         <Select
                           value={formData.model_name}
                           onValueChange={(val) => {
-                            setFormData({ ...formData, model_name: val })
-                            setTestConnectionStatus('idle')
-                            setTestConnectionError(null)
+                            applyFetchedModelSelection(val)
                           }}
                           options={fetchedModels.map(m => ({ value: m.id, label: m.id }))}
                           placeholder={fetchedModels.length > 0 ? t('models.form.selectModel') : t('models.form.enterModelName')}
@@ -788,7 +816,7 @@ export function ModelManagementDialog({
                               ? prev
                               : [...prev, { id: val, object: "model", created: Date.now(), owned_by: formData.model_provider }]
                             )
-                            setFormData({ ...formData, model_name: val })
+                            applyFetchedModelSelection(val)
                             setTestConnectionStatus('idle')
                             setTestConnectionError(null)
                           }}
@@ -835,7 +863,7 @@ export function ModelManagementDialog({
                               thinking_mode: <Box className="w-4 h-4 mr-1" />,
                               tool_calling: <Zap className="w-4 h-4 mr-1" />,
                               embedding: <Box className="w-4 h-4 mr-1" />,
-                              generate: <ImageIcon className="w-4 h-4 mr-1" />,
+                              generate: formData.category === 'video' ? <Video className="w-4 h-4 mr-1" /> : <ImageIcon className="w-4 h-4 mr-1" />,
                               edit: <Edit className="w-4 h-4 mr-1" />,
                               asr: <Brain className="w-4 h-4 mr-1" />,
                               tts: <Star className="w-4 h-4 mr-1" />,
@@ -877,7 +905,7 @@ export function ModelManagementDialog({
                             // Initialize default logic based on whether they have one
                             // only do this once per session so we don't overwrite if they remove it
                             if (!hasInitializedDefaults) {
-                              const targetType = formData.category === 'llm' ? 'general' : formData.category === 'embedding' ? 'embedding' : formData.category === 'image' ? 'image' : formData.category === 'speech' ? 'asr' : formData.category === 'rerank' ? 'rerank' : null;
+                              const targetType = formData.category === 'llm' ? 'general' : formData.category === 'embedding' ? 'embedding' : formData.category === 'image' ? 'image' : formData.category === 'video' ? 'video' : formData.category === 'speech' ? 'asr' : formData.category === 'rerank' ? 'rerank' : null;
                               if (targetType) {
                                 const hasDefault = (defaultModels as any)[targetType];
                                 if (!hasDefault) {
@@ -925,6 +953,9 @@ export function ModelManagementDialog({
                               { value: "image", label: t('models.defaults.image') },
                               ...(formData.abilities?.includes('edit') ? [{ value: "image_edit", label: t('models.defaults.image_edit') }] : [])
                             ] : []),
+                            ...(formData.category === 'video' ? [
+                              { value: "video", label: t('models.defaults.video') }
+                            ] : []),
                             ...(formData.category === 'speech' ? [
                               ...(formData.abilities?.includes('asr') ? [{ value: "asr", label: t('models.defaults.asr') }] : []),
                               ...(formData.abilities?.includes('tts') ? [{ value: "tts", label: t('models.defaults.tts') }] : [])
@@ -941,6 +972,7 @@ export function ModelManagementDialog({
                             if (formData.category === 'llm') return ['general', 'small_fast', 'visual', 'compact'];
                             if (formData.category === 'embedding') return ['embedding'];
                             if (formData.category === 'image') return ['image', 'image_edit'];
+                            if (formData.category === 'video') return ['video'];
                             if (formData.category === 'speech') return ['asr', 'tts'];
                             if (formData.category === 'rerank') return ['rerank'];
                             return [];
@@ -1160,6 +1192,7 @@ export function ModelManagementDialog({
                       { value: "llm", label: t('models.tabs.llm') },
                       { value: "embedding", label: t('models.tabs.embedding') },
                       { value: "image", label: t('models.tabs.image') },
+                      { value: "video", label: t('models.tabs.video') },
                       { value: "speech", label: t('models.tabs.speech') },
                       { value: "rerank", label: t('models.tabs.rerank') }
                     ]}
@@ -1256,7 +1289,7 @@ export function ModelManagementDialog({
                 ) : (
                   <Select
                     value={formData.model_name}
-                    onValueChange={(value) => setFormData({ ...formData, model_name: value })}
+                    onValueChange={(value) => applyFetchedModelSelection(value)}
                     options={fetchedModels.map(m => ({ value: m.id, label: m.id }))}
                     placeholder={t('models.form.selectModel')}
                     allowCustom={formData.model_provider !== 'deepseek'}
@@ -1266,7 +1299,7 @@ export function ModelManagementDialog({
                       if (!fetchedModels.find(m => m.id === value)) {
                         setFetchedModels([...fetchedModels, { id: value, object: "model", created: Date.now(), owned_by: formData.model_provider }])
                       }
-                      setFormData({ ...formData, model_name: value })
+                      applyFetchedModelSelection(value)
                     }}
                   />
                 )}
@@ -1281,7 +1314,9 @@ export function ModelManagementDialog({
                     formData.category === 'llm' ? abilityOptions :
                       formData.category === 'embedding' ? embeddingAbilityOptions :
                         formData.category === 'image' ? imageAbilityOptions :
-                          speechAbilityOptions
+                          formData.category === 'video' ? videoAbilityOptions :
+                            formData.category === 'speech' ? speechAbilityOptions :
+                              rerankAbilityOptions
                   }
                   placeholder={t('models.form.abilitiesPlaceholder')}
                 />

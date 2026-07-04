@@ -32,6 +32,7 @@ import {
   Book,
   Loader2,
   Mic,
+  Video,
   Database,
   Trash2,
 } from "lucide-react"
@@ -50,7 +51,7 @@ import { isValidMcpName, buildCustomApiPayload } from "@/lib/mcp-utils"
 interface Tool {
   name: string
   description: string
-  type: 'builtin' | 'mcp' | 'image' | 'vision' | 'audio'
+  type: 'builtin' | 'mcp' | 'image' | 'vision' | 'audio' | 'video'
   category: string
   display_category?: string  // Add display_category field
   enabled: boolean
@@ -621,6 +622,7 @@ function ToolsPageContent() {
     if (lowerCategory === 'file') return <FileText className="h-6 w-6 text-amber-500" />
     if (lowerCategory === 'knowledge') return <Book className="h-6 w-6 text-indigo-500" />
     if (lowerCategory === 'audio') return <Mic className="h-6 w-6 text-green-500" />
+    if (lowerCategory === 'video') return <Video className="h-6 w-6 text-rose-500" />
     if (type === 'builtin' || lowerCategory === 'basic') return <Wrench className="h-6 w-6 text-slate-500" />
 
     return <Code className="h-6 w-6 text-slate-500" />

@@ -149,6 +149,24 @@ def test_auto_is_curated_under_openrouter():
     assert "auto" in curated_models_for_provider("openrouter")
 
 
+def test_ark_aliases_route_to_public_seedance_providers():
+    from xagent.core.model.providers import (
+        canonical_provider_name,
+        default_base_url_for_provider,
+    )
+
+    assert canonical_provider_name("ark") == "volcengine-ark"
+    assert canonical_provider_name("volcengine") == "volcengine-ark"
+    assert canonical_provider_name("byteplus") == "byteplus-ark"
+    assert canonical_provider_name("modelark") == "volcengine-ark"
+    assert default_base_url_for_provider("volcengine") == (
+        "https://ark.cn-beijing.volces.com/api/v3"
+    )
+    assert default_base_url_for_provider("byteplus") == (
+        "https://ark.ap-southeast.bytepluses.com/api/v3"
+    )
+
+
 def test_router_does_not_advertise_unrouted_capabilities():
     llm = RouterLLM(
         model_name="auto",

@@ -205,6 +205,21 @@ def sample_image_model_data():
     }
 
 
+@pytest.fixture(scope="function")
+def sample_video_model_data():
+    return {
+        "model_id": "test-video-model",
+        "category": "video",
+        "model_provider": "volcengine-ark",
+        "model_name": "doubao-seedance-2-0-fast-260128",
+        "api_key": "test-api-key",
+        "base_url": "https://ark.cn-beijing.volces.com/api/v3",
+        "abilities": ["generate"],
+        "description": "Test Seedance video model",
+        "share_with_users": False,
+    }
+
+
 class TestModelAPI:
     """Test model management API endpoints"""
 
@@ -744,6 +759,57 @@ class TestModelAPI:
         assert default_response.status_code == 400
         assert "incompatible" in default_response.json()["detail"]
 
+    def test_create_video_model_and_set_default(
+        self,
+        test_db,
+        regular_user,
+        regular_headers,
+        sample_video_model_data,
+    ):
+        create_response = client.post(
+            "/api/models/",
+            json=sample_video_model_data,
+            headers=regular_headers,
+        )
+        assert create_response.status_code == 200
+        video_model = create_response.json()
+        assert video_model["category"] == "video"
+        assert video_model["model_provider"] == "volcengine-ark"
+        assert video_model["abilities"] == ["generate"]
+
+        default_response = client.post(
+            "/api/models/user-default",
+            json={"model_id": video_model["id"], "config_type": "video"},
+            headers=regular_headers,
+        )
+
+        assert default_response.status_code == 200
+        assert default_response.json()["config_type"] == "video"
+
+    def test_dreamina_video_model_defaults_to_byteplus_base_url(
+        self,
+        test_db,
+        regular_user,
+        regular_headers,
+        sample_video_model_data,
+    ):
+        sample_video_model_data["model_id"] = "test-dreamina-video-model"
+        sample_video_model_data["model_provider"] = "byteplus-ark"
+        sample_video_model_data["model_name"] = "dreamina-seedance-2-0-fast-260128"
+        sample_video_model_data.pop("base_url")
+
+        create_response = client.post(
+            "/api/models/",
+            json=sample_video_model_data,
+            headers=regular_headers,
+        )
+
+        assert create_response.status_code == 200
+        assert (
+            create_response.json()["base_url"]
+            == "https://ark.ap-southeast.bytepluses.com/api/v3"
+        )
+
     def test_list_supported_providers_includes_deepseek(
         self, test_db, regular_user, regular_headers
     ):
@@ -761,6 +827,36 @@ class TestModelAPI:
         assert deepseek is not None
         assert deepseek["name"] == "DeepSeek"
         assert deepseek["default_base_url"] == "https://api.deepseek.com"
+
+    def test_list_supported_providers_includes_ark_platforms(
+        self, test_db, regular_user, regular_headers
+    ):
+        response = client.get(
+            "/api/models/providers/supported",
+            headers=regular_headers,
+        )
+
+        assert response.status_code == 200
+        providers = response.json()["providers"]
+        volcengine = next(
+            (provider for provider in providers if provider["id"] == "volcengine-ark"),
+            None,
+        )
+        byteplus = next(
+            (provider for provider in providers if provider["id"] == "byteplus-ark"),
+            None,
+        )
+        assert volcengine is not None
+        assert volcengine["name"] == "Volcengine Ark"
+        assert (
+            volcengine["default_base_url"] == "https://ark.cn-beijing.volces.com/api/v3"
+        )
+        assert byteplus is not None
+        assert byteplus["name"] == "BytePlus Ark"
+        assert (
+            byteplus["default_base_url"]
+            == "https://ark.ap-southeast.bytepluses.com/api/v3"
+        )
 
     def test_fetch_deepseek_provider_models_returns_curated_v4_models(
         self, test_db, regular_user, regular_headers
@@ -783,6 +879,196 @@ class TestModelAPI:
             "tool_calling",
             "thinking_mode",
         ]
+
+    def test_fetch_ark_provider_models_returns_platform_scoped_seedance(
+        self, test_db, regular_user, regular_headers, monkeypatch
+    ):
+        async def fake_fetch_openai_models(api_key, base_url):
+            if "bytepluses.com" in base_url:
+                return [
+                    {"id": "dreamina-seedance-2-0-fast-260128"},
+                    {"id": "dreamina-seedream-4-0"},
+                ]
+            return [
+                {"id": "doubao-seedance-1-5-pro-251215"},
+                {"id": "doubao-seedance-2-0-fast-260128"},
+                {"id": "doubao-1-5-pro-32k-250115"},
+            ]
+
+        monkeypatch.setattr(
+            "xagent.web.services.model_list_service.fetch_openai_models",
+            fake_fetch_openai_models,
+        )
+
+        domestic_response = client.post(
+            "/api/models/providers/volcengine-ark/models",
+            json={"api_key": "test-api-key", "category": "video"},
+            headers=regular_headers,
+        )
+
+        assert domestic_response.status_code == 200
+        domestic_data = domestic_response.json()
+        domestic_models = {model["id"]: model for model in domestic_data["models"]}
+        assert "doubao-seedance-1-5-pro-251215" in domestic_models
+        assert "doubao-seedance-2-0-fast-260128" in domestic_models
+        assert "doubao-1-5-pro-32k-250115" not in domestic_models
+        assert "dreamina-seedance-2-0-fast-260128" not in domestic_models
+        assert (
+            domestic_models["doubao-seedance-2-0-fast-260128"]["default_base_url"]
+            == "https://ark.cn-beijing.volces.com/api/v3"
+        )
+
+        byteplus_response = client.post(
+            "/api/models/providers/byteplus-ark/models",
+            json={"api_key": "test-api-key", "category": "video"},
+            headers=regular_headers,
+        )
+
+        assert byteplus_response.status_code == 200
+        byteplus_data = byteplus_response.json()
+        byteplus_models = {model["id"]: model for model in byteplus_data["models"]}
+        assert "dreamina-seedance-2-0-fast-260128" in byteplus_models
+        assert "dreamina-seedream-4-0" not in byteplus_models
+        assert "doubao-seedance-2-0-fast-260128" not in byteplus_models
+        assert (
+            byteplus_models["dreamina-seedance-2-0-fast-260128"]["default_base_url"]
+            == "https://ark.ap-southeast.bytepluses.com/api/v3"
+        )
+        assert (
+            byteplus_models["dreamina-seedance-2-0-fast-260128"]["category"] == "video"
+        )
+        assert byteplus_models["dreamina-seedance-2-0-fast-260128"]["abilities"] == [
+            "generate"
+        ]
+
+    def test_fetch_xinference_video_provider_models(
+        self, test_db, regular_user, regular_headers, monkeypatch
+    ):
+        class FakeResponse:
+            status = 200
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, exc_type, exc, tb):
+                return None
+
+            async def json(self):
+                return {
+                    "data": [
+                        {
+                            "id": "wan-video",
+                            "model_name": "Wan2.1-1.3B",
+                            "model_type": "video",
+                            "model_ability": ["text_to_video"],
+                        },
+                        {
+                            "id": "chat-model",
+                            "model_name": "qwen",
+                            "model_type": "LLM",
+                            "model_ability": ["chat"],
+                        },
+                    ]
+                }
+
+        class FakeClientSession:
+            created_timeouts = []
+
+            def __init__(self, *args, **kwargs):
+                _ = args
+                self.created_timeouts.append(kwargs.get("timeout"))
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, exc_type, exc, tb):
+                return None
+
+            def get(self, url, headers=None):
+                assert url == "http://localhost:9997/v1/models"
+                assert headers == {}
+                return FakeResponse()
+
+        monkeypatch.setattr(
+            "xagent.web.services.model_list_service.aiohttp.ClientSession",
+            FakeClientSession,
+        )
+
+        response = client.post(
+            "/api/models/providers/xinference/models",
+            json={
+                "api_key": "",
+                "base_url": "http://localhost:9997",
+                "category": "video",
+            },
+            headers=regular_headers,
+        )
+
+        assert response.status_code == 200
+        data = response.json()
+        assert data["count"] == 1
+        assert data["models"] == [
+            {
+                "id": "Wan2.1-1.3B",
+                "model_uid": "wan-video",
+                "model_type": "video",
+                "category": "video",
+                "model_ability": ["generate"],
+                "abilities": ["generate"],
+                "description": "",
+            }
+        ]
+        assert FakeClientSession.created_timeouts[0].total == 30.0
+
+    def test_fetch_xinference_video_provider_models_handles_unexpected_response(
+        self, test_db, regular_user, regular_headers, monkeypatch
+    ):
+        class FakeResponse:
+            status = 200
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, exc_type, exc, tb):
+                return None
+
+            async def json(self):
+                return []
+
+        class FakeClientSession:
+            def __init__(self, *args, **kwargs):
+                _ = args, kwargs
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, exc_type, exc, tb):
+                return None
+
+            def get(self, url, headers=None):
+                assert url == "http://localhost:9997/v1/models"
+                assert headers == {}
+                return FakeResponse()
+
+        monkeypatch.setattr(
+            "xagent.web.services.model_list_service.aiohttp.ClientSession",
+            FakeClientSession,
+        )
+
+        response = client.post(
+            "/api/models/providers/xinference/models",
+            json={
+                "api_key": "",
+                "base_url": "http://localhost:9997",
+                "category": "video",
+            },
+            headers=regular_headers,
+        )
+
+        assert response.status_code == 200
+        data = response.json()
+        assert data["count"] == 0
+        assert data["models"] == []
 
     def test_create_deepseek_rejects_legacy_alias(
         self, test_db, regular_user, regular_headers

@@ -32,6 +32,10 @@ class ImageGenerationToolCore:
     GENERATE_IMAGE_DESCRIPTION = """
 Generate high-quality images from text prompts.
 
+If the user provides source/reference images or asks to preserve the style,
+composition, identity, or layout from an existing image, use edit_image directly.
+If generate_image is called with images, it will delegate to edit_image automatically.
+
 When given a user request, rewrite and enrich the prompt into a **professional image generation prompt**:
 - Expand with **visual details** (style, composition, lighting, colors, textures, atmosphere)
 - Transform abstract concepts into **concrete visual scenes**
@@ -58,6 +62,7 @@ Parameters:
 - height (optional): image height in pixels (use with width for desired dimensions)
 - resolution (optional): image resolution in "WIDTHxHEIGHT" format (e.g. "1920x1080")
 - aspect_ratio (optional): aspect ratio (e.g. "1:1", "3:2", "16:9", "21:9") - overrides calculated aspect ratio from size
+- images (optional): source/reference image path/URL/file_id or list of images. If provided, this request is handled as image editing instead of pure text-to-image generation.
 - negative_prompt (optional): undesired elements, auto-generated if empty
 - model_id (optional): model name from the list above. Omit to use the default model marked with ⭐[DEFAULT].
 
@@ -477,6 +482,7 @@ Images are automatically saved to workspace.
         height: Optional[int] = None,
         resolution: Optional[str] = None,
         aspect_ratio: Optional[str] = None,
+        images: str | list[str] | None = None,
         **kwargs: Any,
     ) -> Dict[str, Any]:
         """
@@ -491,12 +497,27 @@ Images are automatically saved to workspace.
             height: Image height in pixels (alternative to size)
             resolution: Image resolution (e.g., "1920x1080")
             aspect_ratio: Aspect ratio (e.g., "3:2", "16:9")
+            images: Optional source/reference image(s). When provided, delegate to edit_image.
             **kwargs: Additional model-specific parameters
 
         Returns:
             Dictionary with image generation result
         """
         try:
+            if images is not None:
+                return await self.edit_image(
+                    prompt=prompt,
+                    image_url=images,
+                    negative_prompt=negative_prompt,
+                    model_id=model_id,
+                    size=size,
+                    width=width,
+                    height=height,
+                    resolution=resolution,
+                    aspect_ratio=aspect_ratio,
+                    **kwargs,
+                )
+
             # Get the image model to use
             image_model = self._get_model(model_id)
 

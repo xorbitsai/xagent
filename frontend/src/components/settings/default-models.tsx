@@ -14,6 +14,7 @@ import {
   FileText,
   Search,
   Image as ImageIcon,
+  Video,
   Mic,
   Volume2,
   Loader2,
@@ -61,6 +62,10 @@ const modelTypeConfig = {
     icon: ImageIcon,
     color: "bg-fuchsia-500",
   },
+  video: {
+    icon: Video,
+    color: "bg-rose-500",
+  },
   asr: {
     icon: Mic,
     color: "bg-cyan-500",
@@ -104,6 +109,9 @@ const getCompatibleModels = (models: Model[], configType: DefaultModelType): Mod
   }
   if (configType === 'image_edit') {
     return models.filter((model) => getModelCategory(model) === 'image' && getModelAbilities(model).includes('edit'))
+  }
+  if (configType === 'video') {
+    return models.filter((model) => getModelCategory(model) === 'video' && getModelAbilities(model).includes('generate'))
   }
   if (configType === 'asr') {
     return models.filter((model) => getModelCategory(model) === 'speech' && getModelAbilities(model).includes('asr'))

@@ -47,6 +47,10 @@ class ImageModelConfig(ModelConfig):
     default_max_tokens: Optional[int] = None
 
 
+class VideoModelConfig(ModelConfig):
+    model_provider: str = "volcengine-ark"  # Volcengine/BytePlus ModelArk video
+
+
 class EmbeddingModelConfig(ModelConfig):
     model_provider: str = "dashscope"  # openai, zhipu, dashscope, etc.
     dimension: Optional[int] = None

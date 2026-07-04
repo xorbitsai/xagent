@@ -3,7 +3,10 @@
 import logging
 from typing import Any, Dict, List, Optional
 
+import aiohttp
+
 from ...core.model.providers import (
+    canonical_provider_name,
     curated_models_for_provider,
     default_base_url_for_provider,
     get_supported_provider_metadata,
@@ -135,6 +138,61 @@ async def fetch_xinference_rerank_models(
     return XinferenceRerank.list_available_models(base_url=base_url, api_key=api_key)
 
 
+async def fetch_xinference_video_models(
+    api_key: str, base_url: Optional[str] = None
+) -> List[Dict[str, Any]]:
+    """Fetch available video models from a Xinference server."""
+    if not base_url:
+        raise ValueError("base_url is required for Xinference video")
+
+    from ...core.model.chat.basic.xinference import _normalize_model_list_response
+
+    headers = {"Authorization": f"Bearer {api_key}"} if api_key else {}
+    timeout = aiohttp.ClientTimeout(total=30.0)
+    async with aiohttp.ClientSession(timeout=timeout) as session:
+        async with session.get(
+            f"{base_url.rstrip('/')}/v1/models", headers=headers
+        ) as response:
+            if response.status != 200:
+                try:
+                    detail = await response.json()
+                except Exception:
+                    detail = await response.text()
+                raise RuntimeError(
+                    f"Failed to list Xinference video models: HTTP {response.status}, detail: {detail}"
+                )
+            response_data = await response.json()
+    data_list = response_data.get("data", []) if isinstance(response_data, dict) else []
+    models_list = {
+        str(item["id"]): item
+        for item in data_list
+        if isinstance(item, dict) and item.get("id")
+    }
+    normalized_models = _normalize_model_list_response(models_list)
+
+    result: List[Dict[str, Any]] = []
+    for model_uid, model_info in normalized_models:
+        abilities = [str(item) for item in model_info.get("model_ability", [])]
+        model_type = str(model_info.get("model_type", ""))
+        is_video = model_type == "video" or any(
+            "video" in ability.lower() for ability in abilities
+        )
+        if not is_video:
+            continue
+        result.append(
+            {
+                "id": model_info.get("model_name", model_uid),
+                "model_uid": model_uid,
+                "model_type": model_type,
+                "category": "video",
+                "model_ability": ["generate"],
+                "abilities": ["generate"],
+                "description": model_info.get("model_description", ""),
+            }
+        )
+    return result
+
+
 async def fetch_dashscope_rerank_models(
     api_key: str, base_url: Optional[str] = None
 ) -> List[Dict[str, Any]]:
@@ -214,6 +272,66 @@ async def fetch_kimi_for_coding_models(
     return await fetch_claude_models(api_key, base_url)
 
 
+async def _fetch_openai_compatible_video_models(
+    api_key: str,
+    base_url: Optional[str],
+    *,
+    owned_by: str,
+    default_base_url: str,
+) -> List[Dict[str, Any]]:
+    if not api_key or not base_url:
+        return []
+
+    provider_models = await fetch_openai_models(api_key, base_url)
+    dynamic_models: List[Dict[str, Any]] = []
+    for model in provider_models:
+        model_id = str(model.get("id") or "")
+        if not model_id or "seedance" not in model_id.lower():
+            continue
+        dynamic_models.append(
+            {
+                **model,
+                "owned_by": model.get("owned_by") or owned_by,
+                "category": "video",
+                "abilities": ["generate"],
+                "model_ability": ["generate"],
+                "base_url": base_url,
+                "default_base_url": default_base_url,
+            }
+        )
+    return dynamic_models
+
+
+async def fetch_volcengine_ark_video_models(
+    api_key: str, base_url: Optional[str] = None
+) -> List[Dict[str, Any]]:
+    """Fetch Volcengine Ark video models from the live model list endpoint."""
+    from xagent.core.model.video.ark import ARK_DOMESTIC_BASE_URL
+
+    resolved_base_url = base_url or ARK_DOMESTIC_BASE_URL
+    return await _fetch_openai_compatible_video_models(
+        api_key,
+        resolved_base_url,
+        owned_by="volcengine-ark",
+        default_base_url=ARK_DOMESTIC_BASE_URL,
+    )
+
+
+async def fetch_byteplus_ark_video_models(
+    api_key: str, base_url: Optional[str] = None
+) -> List[Dict[str, Any]]:
+    """Fetch BytePlus Ark video models from the live model list endpoint."""
+    from xagent.core.model.video.ark import ARK_BYTEPLUS_BASE_URL
+
+    resolved_base_url = base_url or ARK_BYTEPLUS_BASE_URL
+    return await _fetch_openai_compatible_video_models(
+        api_key,
+        resolved_base_url,
+        owned_by="byteplus-ark",
+        default_base_url=ARK_BYTEPLUS_BASE_URL,
+    )
+
+
 # Provider registry mapping provider names to their fetch functions
 PROVIDER_FETCHERS: Dict[str, Any] = {
     "openai": fetch_openai_models,
@@ -227,6 +345,7 @@ PROVIDER_FETCHERS: Dict[str, Any] = {
     "google": fetch_gemini_models,
     "xinference": fetch_xinference_models,
     "xinference-rerank": fetch_xinference_rerank_models,
+    "xinference-video": fetch_xinference_video_models,
     "dashscope-rerank": fetch_dashscope_rerank_models,
     "zai-coding-plan": fetch_openai_models,
     "zhipuai-coding-plan": fetch_openai_models,
@@ -235,6 +354,10 @@ PROVIDER_FETCHERS: Dict[str, Any] = {
     "minimax-coding-plan": fetch_minimax_coding_plan_models,
     "minimax-cn-coding-plan": fetch_minimax_cn_coding_plan_models,
     "kimi-for-coding": fetch_kimi_for_coding_models,
+    "volcengine-ark": fetch_volcengine_ark_video_models,
+    "byteplus-ark": fetch_byteplus_ark_video_models,
+    "ark": fetch_volcengine_ark_video_models,
+    "ark-video": fetch_volcengine_ark_video_models,
 }
 
 
@@ -253,7 +376,7 @@ async def fetch_models_from_provider(
     Returns:
         List of available models
     """
-    provider_id = provider.lower()
+    provider_id = canonical_provider_name(provider)
     fetcher = PROVIDER_FETCHERS.get(provider_id)
 
     if not fetcher:

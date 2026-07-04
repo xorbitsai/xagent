@@ -16,11 +16,16 @@ GENERATED_ARTIFACT_EXTENSIONS = {
     ".gif",
     ".jpeg",
     ".jpg",
+    ".mov",
+    ".mp4",
+    ".mpeg",
+    ".mpg",
     ".pdf",
     ".png",
     ".pptx",
     ".svg",
     ".webp",
+    ".webm",
     ".xls",
     ".xlsx",
 }
@@ -51,6 +56,8 @@ def artifact_type_for_filename(filename: str) -> str:
     suffix = Path(filename).suffix.lower()
     if suffix in {".jpg", ".jpeg", ".png", ".gif", ".webp", ".svg"}:
         return "image"
+    if suffix in {".mp4", ".mov", ".mpeg", ".mpg", ".webm"}:
+        return "video"
     # Only OOXML .pptx maps to ``presentation`` — the frontend's inline
     # ``PptxPreviewRenderer`` (pptxviewjs) cannot render legacy binary
     # .ppt, so emitting ``presentation`` for .ppt would let an artifact

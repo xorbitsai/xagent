@@ -218,6 +218,53 @@ class TestImageGenerationToolCore:
 
     @pytest.mark.asyncio
     @patch("aiohttp.ClientSession.get")
+    async def test_generate_image_with_images_delegates_to_edit_image(
+        self, mock_get, mock_image_models, mock_workspace
+    ):
+        """Reference images sent to generate_image should use edit_image."""
+        mock_image_models["model1"].edit_image = AsyncMock(
+            return_value={
+                "image_url": "https://example.com/edited_image.jpg",
+                "usage": {"input_tokens": 15, "output_tokens": 25},
+                "request_id": "edit_req1",
+            }
+        )
+        mock_image_models["model1"].has_ability = Mock(
+            side_effect=lambda ability: ability in {"generate", "edit"}
+        )
+        _setup_edit_http_mock(mock_get)
+
+        tool = ImageGenerationToolCore(
+            mock_image_models, {"model1": "Test model 1"}, mock_workspace
+        )
+
+        result = await tool.generate_image(
+            "Keep the same cabin composition, but make it a night scene",
+            images=[
+                "https://example.com/source.jpg",
+                "https://example.com/style.jpg",
+            ],
+            size="1024*576",
+            aspect_ratio="16:9",
+            negative_prompt="blurry",
+        )
+
+        assert result["success"] is True
+        assert result["model_used"] == "default_edit_model"
+        mock_image_models["model1"].generate_image.assert_not_called()
+        mock_image_models["model1"].edit_image.assert_called_once_with(
+            prompt="Keep the same cabin composition, but make it a night scene",
+            image_url=[
+                "https://example.com/source.jpg",
+                "https://example.com/style.jpg",
+            ],
+            size="1024*576",
+            negative_prompt="blurry",
+            aspect_ratio="16:9",
+        )
+
+    @pytest.mark.asyncio
+    @patch("aiohttp.ClientSession.get")
     async def test_generate_image_with_workspace(
         self, mock_get, mock_image_models, mock_workspace
     ):

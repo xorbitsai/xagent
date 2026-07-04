@@ -19,6 +19,7 @@ from ...core.model.model import (
     EmbeddingModelConfig,
     ModelConfig,
     RerankModelConfig,
+    VideoModelConfig,
 )
 from ...core.model.providers import (
     is_auto_router_model,
@@ -113,6 +114,11 @@ class CoreStorage:
                 model_provider=db_model.model_provider,
                 default_max_tokens=db_model.max_tokens,
             )
+        elif db_model.category == "video":
+            return VideoModelConfig(
+                **common,
+                model_provider=db_model.model_provider,
+            )
         elif db_model.category == "embedding":
             return EmbeddingModelConfig(
                 **common,
@@ -186,7 +192,11 @@ class CoreStorage:
             )
         else:
             # Try ImageModelConfig or SpeechModelConfig
-            from ...core.model.model import ImageModelConfig, SpeechModelConfig
+            from ...core.model.model import (
+                ImageModelConfig,
+                SpeechModelConfig,
+                VideoModelConfig,
+            )
 
             if isinstance(model, ImageModelConfig):
                 db_data.update(
@@ -194,6 +204,13 @@ class CoreStorage:
                         "model_provider": model.model_provider,
                         "max_tokens": model.default_max_tokens,
                         "category": "image",
+                    }
+                )
+            elif isinstance(model, VideoModelConfig):
+                db_data.update(
+                    {
+                        "model_provider": model.model_provider,
+                        "category": "video",
                     }
                 )
             elif isinstance(model, SpeechModelConfig):
@@ -331,6 +348,16 @@ class CoreStorage:
                 api_key=api_key,
                 base_url=base_url,
                 abilities=abilities,
+                description=description,
+            )
+        elif category == "video":
+            model_config = VideoModelConfig(
+                id=model_id,
+                model_name=model_name,
+                model_provider=model_provider,
+                api_key=api_key,
+                base_url=base_url,
+                abilities=abilities or ["generate"],
                 description=description,
             )
         else:

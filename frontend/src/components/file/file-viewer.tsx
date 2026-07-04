@@ -15,6 +15,15 @@ import {
   withPublicAccessToken,
 } from "@/lib/utils"
 
+const VIDEO_EXTENSION_MIME_TYPES: Record<string, string> = {
+  mp4: "video/mp4",
+  m4v: "video/mp4",
+  mov: "video/quicktime",
+  webm: "video/webm",
+  mpeg: "video/mpeg",
+  mpg: "video/mpeg",
+}
+
 interface FileViewerProps {
   fileName: string
   fileId: string
@@ -23,6 +32,18 @@ interface FileViewerProps {
   isLoading: boolean
   error: string | null
   viewMode: 'preview' | 'code'
+}
+
+function getFileExtension(fileName: string): string {
+  return fileName.split('.').pop()?.toLowerCase() || ''
+}
+
+function getVideoMimeType(fileName: string, mimeType: string | undefined): string | null {
+  if (mimeType?.startsWith("video/")) {
+    return mimeType
+  }
+
+  return VIDEO_EXTENSION_MIME_TYPES[getFileExtension(fileName)] || null
 }
 
 export function FileViewer({
@@ -35,6 +56,41 @@ export function FileViewer({
   viewMode
 }: FileViewerProps) {
   const { t } = useI18n()
+  const videoMimeType = getVideoMimeType(fileName, mimeType)
+  const [videoObjectUrl, setVideoObjectUrl] = React.useState<string | null>(null)
+
+  React.useEffect(() => {
+    if (!videoMimeType || !content) {
+      setVideoObjectUrl(null)
+      return
+    }
+
+    let active = true
+    let objectUrl: string | null = null
+
+    fetch(`data:${videoMimeType};base64,${content.replace(/\s/g, "")}`)
+      .then((response) => response.blob())
+      .then((blob) => {
+        objectUrl = URL.createObjectURL(blob)
+        if (!active) {
+          URL.revokeObjectURL(objectUrl)
+          return
+        }
+        setVideoObjectUrl(objectUrl)
+      })
+      .catch((error) => {
+        if (!active) return
+        console.error("Video preview decode error:", error)
+        setVideoObjectUrl(null)
+      })
+
+    return () => {
+      active = false
+      if (objectUrl) {
+        URL.revokeObjectURL(objectUrl)
+      }
+    }
+  }, [content, videoMimeType])
 
   const processHtmlContent = (htmlContent: string, fileId: string) => {
     if (!htmlContent || !fileId) return htmlContent
@@ -107,6 +163,18 @@ export function FileViewer({
           <iframe
             src={`data:application/pdf;base64,${content || ''}`}
             className="w-full h-full border-0"
+            title={fileName}
+          />
+        </div>
+      ) : videoMimeType ? (
+        <div className="flex h-full items-center justify-center bg-black/95 p-4">
+          <video
+            controls
+            playsInline
+            preload="metadata"
+            src={videoObjectUrl || undefined}
+            className="max-h-full max-w-full rounded border border-border/30 bg-black shadow-sm"
+            aria-label={fileName}
             title={fileName}
           />
         </div>

@@ -7,7 +7,7 @@ import uuid
 from typing import Any, AsyncIterator, Dict, List, Optional, Union
 
 from google import genai  # type: ignore[import-untyped,unused-ignore]
-from google.genai import errors as genai_errors  # type: ignore[import-untyped]
+from google.genai import errors as genai_errors
 
 from ....utils.security import redact_sensitive_text
 from ..exceptions import (
@@ -459,7 +459,7 @@ class GeminiLLM(BaseLLM):
                     contents.append(parts)
 
             # Make API call using SDK (async)
-            api_params = {
+            api_params: dict[str, Any] = {
                 "model": self._model_name,
                 "contents": contents,
             }
@@ -653,7 +653,7 @@ class GeminiLLM(BaseLLM):
             # Make streaming API call using SDK (async)
             # Note: Gemini streaming doesn't support tools directly
             # Tools need to be passed through config
-            api_params = {
+            api_params: dict[str, Any] = {
                 "model": self._model_name,
                 "contents": contents,
             }

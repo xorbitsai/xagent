@@ -6,6 +6,14 @@ from typing import Any, Optional
 AUTO_MODEL_NAME = "auto"
 
 _PROVIDER_ALIASES: dict[str, str] = {
+    "ark": "volcengine-ark",
+    "ark-video": "volcengine-ark",
+    "modelark": "volcengine-ark",
+    "model_ark": "volcengine-ark",
+    "volcengine": "volcengine-ark",
+    "volcengine_ark": "volcengine-ark",
+    "byteplus": "byteplus-ark",
+    "byteplus_ark": "byteplus-ark",
     "zai_coding_plan": "zai-coding-plan",
     "zhipuai_coding_plan": "zhipuai-coding-plan",
     "alibaba_coding_plan": "alibaba-coding-plan",
@@ -22,6 +30,8 @@ _DEFAULT_BASE_URL_BY_PROVIDER: dict[str, str] = {
     "deepseek": "https://api.deepseek.com",
     "dashscope": "https://dashscope.aliyuncs.com/compatible-mode/v1",
     "zhipu": "https://open.bigmodel.cn/api/paas/v4",
+    "volcengine-ark": "https://ark.cn-beijing.volces.com/api/v3",
+    "byteplus-ark": "https://ark.ap-southeast.bytepluses.com/api/v3",
     # Opencode / models.dev naming
     "zai-coding-plan": "https://api.z.ai/api/coding/paas/v4",
     "zhipuai-coding-plan": "https://open.bigmodel.cn/api/coding/paas/v4",
@@ -38,6 +48,8 @@ _DEFAULT_BASE_URL_BY_PROVIDER: dict[str, str] = {
 _BASE_URL_ENV_BY_PROVIDER: dict[str, str] = {
     "deepseek": "DEEPSEEK_BASE_URL",
     "dashscope": "DASHSCOPE_BASE_URL",
+    "volcengine-ark": "ARK_BASE_URL",
+    "byteplus-ark": "BYTEPLUS_ARK_BASE_URL",
 }
 
 _CURATED_MODELS_BY_PROVIDER: dict[str, tuple[str, ...]] = {
@@ -126,6 +138,20 @@ _SUPPORTED_PROVIDER_METADATA: tuple[dict[str, Any], ...] = (
         "description": "Alibaba Cloud's DashScope models",
         "requires_base_url": False,
         "compatibility": "openai_compatible",
+    },
+    {
+        "id": "volcengine-ark",
+        "name": "Volcengine Ark",
+        "description": "Volcengine ModelArk provider for Seedance video generation",
+        "requires_base_url": False,
+        "default_base_url": "https://ark.cn-beijing.volces.com/api/v3",
+    },
+    {
+        "id": "byteplus-ark",
+        "name": "BytePlus Ark",
+        "description": "BytePlus ModelArk provider for Seedance video generation",
+        "requires_base_url": False,
+        "default_base_url": "https://ark.ap-southeast.bytepluses.com/api/v3",
     },
     {
         "id": "alibaba-coding-plan",

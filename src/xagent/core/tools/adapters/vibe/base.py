@@ -20,6 +20,7 @@ class ToolCategory(str, Enum):
 
     VISION = "vision"
     IMAGE = "image"
+    VIDEO = "video"
     AUDIO = "audio"
     KNOWLEDGE = "knowledge"
     FILE = "file"

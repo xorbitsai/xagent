@@ -1,6 +1,6 @@
 /// <reference types="@testing-library/jest-dom/vitest" />
 import React from "react"
-import { cleanup, render, screen } from "@testing-library/react"
+import { cleanup, render, screen, waitFor } from "@testing-library/react"
 import { afterEach, describe, expect, it, vi } from "vitest"
 
 vi.mock("@/lib/utils", async () => {
@@ -22,6 +22,7 @@ import { FileViewer } from "./file-viewer"
 describe("FileViewer HTML preview", () => {
   afterEach(() => {
     cleanup()
+    vi.clearAllMocks()
   })
 
   it("rewrites file id image sources to public preview URLs", () => {
@@ -84,5 +85,57 @@ describe("FileViewer HTML preview", () => {
       "srcdoc",
       '<img src="http://api.local/api/files/public/preview/html-file-id?relative_path=.%2Fassets%2Fimage.png">',
     )
+  })
+})
+
+describe("FileViewer video preview", () => {
+  afterEach(() => {
+    cleanup()
+    vi.clearAllMocks()
+  })
+
+  it("renders video controls with a blob URL for video mime types", async () => {
+    const view = render(
+      <FileViewer
+        fileName="generated"
+        fileId="video-file-id"
+        content="AAAAIGZ0eXA="
+        mimeType="video/mp4"
+        isLoading={false}
+        error={null}
+        viewMode="preview"
+      />,
+    )
+
+    const video = screen.getByLabelText("generated")
+    expect(video.tagName).toBe("VIDEO")
+    expect(video).toHaveAttribute("controls")
+    expect(video).toHaveAttribute("playsinline")
+    await waitFor(() => expect(video).toHaveAttribute("src", "blob:mock-8"))
+    const blobArg = vi.mocked(URL.createObjectURL).mock.calls[0]?.[0]
+    expect(blobArg).toMatchObject({ size: 8, type: "video/mp4" })
+
+    view.unmount()
+
+    expect(URL.revokeObjectURL).toHaveBeenCalledWith("blob:mock-8")
+  })
+
+  it("infers video mime type from generated mp4 filenames", async () => {
+    render(
+      <FileViewer
+        fileName="generated_video_e0f58746.mp4"
+        fileId="video-file-id"
+        content="AAAAIGZ0eXA="
+        mimeType="application/octet-stream"
+        isLoading={false}
+        error={null}
+        viewMode="preview"
+      />,
+    )
+
+    const video = screen.getByLabelText("generated_video_e0f58746.mp4")
+    expect(video.tagName).toBe("VIDEO")
+    await waitFor(() => expect(video).toHaveAttribute("src", "blob:mock-8"))
+    expect(screen.queryByText("AAAAIGZ0eXA=")).not.toBeInTheDocument()
   })
 })

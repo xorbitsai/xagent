@@ -10,6 +10,7 @@ from xagent.core.model.model import (
     RerankModelConfig,
     VectorDBConfig,
     VectorDBType,
+    VideoModelConfig,
 )
 from xagent.core.model.storage.error import (
     ModelNotFoundError,
@@ -98,6 +99,13 @@ class SQLAlchemyModelHub:
                     "category": "image",
                 }
             )
+        elif isinstance(model, VideoModelConfig):
+            db_data.update(
+                {
+                    "model_provider": model.model_provider,
+                    "category": "video",
+                }
+            )
         elif isinstance(model, EmbeddingModelConfig):
             db_data.update(
                 {
@@ -173,6 +181,11 @@ class SQLAlchemyModelHub:
                 model_provider=db_model.model_provider,
                 default_max_tokens=db_model.max_tokens,
             )
+        elif db_model.category == "video":
+            return VideoModelConfig(
+                **common,
+                model_provider=db_model.model_provider,
+            )
         elif db_model.category == "embedding":
             return EmbeddingModelConfig(
                 **common,
@@ -218,6 +231,11 @@ class SQLAlchemyModelHub:
                 )
             elif db_model.category == "image":
                 config = ImageModelConfig(
+                    **common_fields,
+                    model_provider=db_model.model_provider,
+                )
+            elif db_model.category == "video":
+                config = VideoModelConfig(
                     **common_fields,
                     model_provider=db_model.model_provider,
                 )

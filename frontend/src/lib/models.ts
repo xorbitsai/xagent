@@ -13,6 +13,7 @@ export type DefaultModelType =
   | 'embedding'
   | 'image'
   | 'image_edit'
+  | 'video'
   | 'asr'
   | 'tts'
   | 'speech';
@@ -24,7 +25,7 @@ export interface Model {
   model_name?: string;
   provider: string;
   model_provider: string;
-  category?: 'llm' | 'embedding' | 'image' | 'speech';
+  category?: 'llm' | 'embedding' | 'image' | 'video' | 'speech' | 'rerank';
   api_key?: string;
   base_url?: string;
   max_tokens?: number;
@@ -59,6 +60,7 @@ export interface DefaultModelConfig {
   embedding?: ModelConfig;
   image?: ModelConfig;
   image_edit?: ModelConfig;
+  video?: ModelConfig;
   asr?: ModelConfig;
   tts?: ModelConfig;
   speech?: ModelConfig;
@@ -139,7 +141,7 @@ export async function removeUserDefaultModel(
  */
 export async function getSystemDefaultModels(_token: string): Promise<DefaultModelConfig> {
   const apiUrl = getApiUrl()
-  const [general, smallFast, visual, compact, embedding] = await Promise.all([
+  const [general, smallFast, visual, compact, embedding, video] = await Promise.all([
     apiRequest(`${apiUrl}/api/models/default/general`)
       .then(res => res.json().catch(() => null)),
     apiRequest(`${apiUrl}/api/models/default/small-fast`)
@@ -150,6 +152,8 @@ export async function getSystemDefaultModels(_token: string): Promise<DefaultMod
       .then(res => res.json().catch(() => null)),
     apiRequest(`${apiUrl}/api/models/default/embedding`)
       .then(res => res.json().catch(() => null)),
+    apiRequest(`${apiUrl}/api/models/default/video`)
+      .then(res => res.json().catch(() => null)),
   ]);
 
   return {
@@ -158,6 +162,7 @@ export async function getSystemDefaultModels(_token: string): Promise<DefaultMod
     visual,
     compact,
     embedding,
+    video,
   };
 }
 
@@ -181,6 +186,8 @@ export interface ProviderModel {
   category?: string;
   model_provider?: string;
   description?: string;
+  base_url?: string;
+  default_base_url?: string;
 }
 
 /**

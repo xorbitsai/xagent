@@ -82,6 +82,8 @@ dependencies = [
   "s3fs>=2026.2.0",
   "authlib>=1.7.2",
   "itsdangerous>=2.2.0",
+  "volcengine-python-sdk[ark]>=5.0.37",
+  "byteplus-python-sdk-v2>=3.0.52",
 ]
 
 [project.optional-dependencies]

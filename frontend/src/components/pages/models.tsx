@@ -18,6 +18,7 @@ import {
   Box,
   Settings,
   CheckCircle2,
+  Video,
 } from "lucide-react"
 import { useI18n } from "@/contexts/i18n-context"
 import { ModelManagementDialog } from "./model-management-dialog"
@@ -174,8 +175,18 @@ const LOCAL_PROVIDER_CONFIGS: Record<string, Partial<ProviderConfig>> = {
   },
   xinference: {
     icon: <img src="/xagent_logo.png" alt="Xinference" className="w-6 h-6" />,
-    category: ["llm", "embedding", "image", "speech", "rerank"],
+    category: ["llm", "embedding", "image", "video", "speech", "rerank"],
     defaultBaseUrl: "http://localhost:9997",
+  },
+  "volcengine-ark": {
+    icon: <img src="/volcengine.png" alt="Volcengine" className="w-6 h-6" />,
+    category: ["video"],
+    defaultBaseUrl: "https://ark.cn-beijing.volces.com/api/v3",
+  },
+  "byteplus-ark": {
+    icon: <img src="/byteplus.png" alt="BytePlus" className="w-6 h-6" />,
+    category: ["video"],
+    defaultBaseUrl: "https://ark.ap-southeast.bytepluses.com/api/v3",
   },
   ollama: {
     icon: <Box className="w-6 h-6" />,
@@ -212,6 +223,13 @@ export function ModelsPage() {
     visual?: Model
     compact?: Model
     embedding?: Model
+    image?: Model
+    image_edit?: Model
+    video?: Model
+    asr?: Model
+    tts?: Model
+    speech?: Model
+    rerank?: Model
   }>({})
 
   useEffect(() => {
@@ -298,6 +316,7 @@ export function ModelsPage() {
       embedding: models.filter(m => m.category === 'embedding').length,
       rerank: models.filter(m => m.category === 'rerank').length,
       image: models.filter(m => m.category === 'image').length,
+      video: models.filter(m => m.category === 'video').length,
       speech: models.filter(m => m.category === 'speech').length
     }
   }, [models])
@@ -420,6 +439,12 @@ export function ModelsPage() {
               {t('models.tabs.image')} <Badge variant="secondary" className="ml-2 rounded-full px-2 py-0.5 bg-slate-100 text-slate-600 hover:bg-slate-100 border-none font-normal">{modelCounts.image}</Badge>
             </TabsTrigger>
             <TabsTrigger
+              value="video"
+              className="data-[state=active]:border-primary data-[state=active]:text-primary data-[state=active]:bg-transparent border border-transparent rounded-md px-4 py-2 shadow-none data-[state=active]:shadow-none text-slate-700 font-normal"
+            >
+              {t('models.tabs.video')} <Badge variant="secondary" className="ml-2 rounded-full px-2 py-0.5 bg-slate-100 text-slate-600 hover:bg-slate-100 border-none font-normal">{modelCounts.video}</Badge>
+            </TabsTrigger>
+            <TabsTrigger
               value="speech"
               className="data-[state=active]:border-primary data-[state=active]:text-primary data-[state=active]:bg-transparent border border-transparent rounded-md px-4 py-2 shadow-none data-[state=active]:shadow-none text-slate-700 font-normal"
             >
@@ -448,7 +473,7 @@ export function ModelsPage() {
                   name: providerId.charAt(0).toUpperCase() + providerId.slice(1),
                   description: "",
                   icon: <Brain className="w-6 h-6" />,
-                  category: ["llm"] as any,
+                  category: ["llm", "video"] as any,
                   defaultBaseUrl: "",
                   models: [],
                 }
@@ -484,7 +509,7 @@ export function ModelsPage() {
                   thinking_mode: <Box className="w-3 h-3 mr-1" />,
                   tool_calling: <Zap className="w-3 h-3 mr-1" />,
                   embedding: <Box className="w-3 h-3 mr-1" />,
-                  generate: <ImageIcon className="w-3 h-3 mr-1" />,
+                  generate: activeTab === 'video' ? <Video className="w-3 h-3 mr-1" /> : <ImageIcon className="w-3 h-3 mr-1" />,
                   edit: <Box className="w-3 h-3 mr-1" />,
                   asr: <Brain className="w-3 h-3 mr-1" />,
                   tts: <Star className="w-3 h-3 mr-1" />

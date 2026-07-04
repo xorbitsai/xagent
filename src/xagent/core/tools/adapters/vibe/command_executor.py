@@ -51,9 +51,18 @@ class CommandExecutorTool(AbstractBaseTool):
 
     @property
     def description(self) -> str:
-        return """Execute shell commands and scripts.
-        Supports any shell command including system commands, scripts, pipes, and redirects.
-        Examples: ls -la, grep -r 'pattern' /path, ./deploy.sh, cat file.txt | grep error"""
+        working_directory = self._get_working_directory()
+        workspace_line = (
+            f"Commands run with current working directory: {working_directory}."
+            if working_directory
+            else "Commands run in the current process working directory."
+        )
+        return f"""Execute shell commands and scripts.
+Supports any shell command including system commands, scripts, pipes, and redirects.
+{workspace_line}
+Use concrete paths, URLs, or file identifiers already returned by previous tool results directly. If a tool returned an absolute path or a path relative to the command working directory, pass that path to the next command instead of rediscovering it.
+Only search for files when no usable path was provided, and keep searches scoped to the command working directory or another explicitly relevant directory. Do not run broad recursive searches from `/` or the user's home directory unless the user explicitly asks for that scope.
+Examples: ls -la output, grep -r 'pattern' ./output, ./deploy.sh, cat file.txt | grep error"""
 
     @property
     def tags(self) -> list[str]:

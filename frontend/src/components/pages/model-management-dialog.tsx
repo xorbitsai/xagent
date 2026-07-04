@@ -107,7 +107,24 @@ export function ModelManagementDialog({
     if (category === 'llm' && providerId === 'deepseek') {
       return ['chat', 'tool_calling', 'thinking_mode']
     }
+    if (category === 'speech' && providerId === 'elevenlabs') {
+      return ['tts']
+    }
     return getDefaultAbilitiesForCategory(category)
+  }
+
+  const getPrimaryDefaultType = (category: string, abilities?: string[]): string | null => {
+    if (category === 'llm') return 'general'
+    if (category === 'embedding') return 'embedding'
+    if (category === 'image') return 'image'
+    if (category === 'video') return 'video'
+    if (category === 'rerank') return 'rerank'
+    if (category === 'speech') {
+      if (abilities?.includes('asr')) return 'asr'
+      if (abilities?.includes('tts')) return 'tts'
+      return 'asr'
+    }
+    return null
   }
 
   const getDefaultOptionsForModel = (category: string, abilities?: string[]) => {
@@ -418,8 +435,12 @@ export function ModelManagementDialog({
       ...prev,
       model_name: modelName,
       base_url: suggestedBaseUrl || prev.base_url,
-      abilities: suggestedAbilities?.length ? suggestedAbilities : prev.abilities
+      abilities: suggestedAbilities?.length
+        ? suggestedAbilities
+        : getDefaultAbilitiesForProvider(prev.category, prev.model_provider),
+      default_config_types: [],
     }))
+    setHasInitializedDefaults(false)
     setTestConnectionStatus('idle')
     setTestConnectionError(null)
   }
@@ -905,9 +926,9 @@ export function ModelManagementDialog({
                             // Initialize default logic based on whether they have one
                             // only do this once per session so we don't overwrite if they remove it
                             if (!hasInitializedDefaults) {
-                              const targetType = formData.category === 'llm' ? 'general' : formData.category === 'embedding' ? 'embedding' : formData.category === 'image' ? 'image' : formData.category === 'video' ? 'video' : formData.category === 'speech' ? 'asr' : formData.category === 'rerank' ? 'rerank' : null;
+                              const targetType = getPrimaryDefaultType(formData.category, formData.abilities)
                               if (targetType) {
-                                const hasDefault = (defaultModels as any)[targetType];
+                                const hasDefault = (defaultModels as any)[targetType]
                                 if (!hasDefault) {
                                   setFormData(prev => ({
                                     ...prev,

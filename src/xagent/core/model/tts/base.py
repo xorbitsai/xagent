@@ -30,6 +30,8 @@ class TTSResult:
 class BaseTTS(ABC):
     """Abstract base class for Text-to-Speech (TTS) models."""
 
+    provider_name = "unknown"
+
     @abstractmethod
     async def synthesize(
         self,
@@ -75,3 +77,29 @@ class BaseTTS(ABC):
     def supports_voice_cloning(self) -> bool:
         """Check if model supports voice cloning."""
         return "voice_cloning" in self.abilities
+
+    @property
+    def supports_voice_listing(self) -> bool:
+        """Check if model can list available voices dynamically."""
+        return "voice_listing" in self.abilities
+
+    @property
+    def supports_voice_settings(self) -> bool:
+        """Check if model accepts structured voice settings."""
+        return "voice_settings" in self.abilities
+
+    @property
+    def supported_voice_settings(self) -> list[str]:
+        """Provider-specific voice setting keys accepted by this model."""
+        return []
+
+    @property
+    def supported_provider_options(self) -> list[str]:
+        """Provider-specific synthesis option keys accepted by this model."""
+        return []
+
+    async def list_available_voices(self) -> list[dict[str, Any]]:
+        """List available voices for providers that support dynamic voice lookup."""
+        raise NotImplementedError(
+            f"{self.provider_name} TTS does not support dynamic voice listing"
+        )

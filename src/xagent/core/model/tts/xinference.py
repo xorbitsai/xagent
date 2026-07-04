@@ -26,6 +26,8 @@ class XinferenceTTS(BaseTTS, BaseXinferenceModel):
     Models include chat-tts, edge-tts, and other text-to-speech models.
     """
 
+    provider_name = "xinference"
+
     def __init__(
         self,
         model: str = "chat-tts",

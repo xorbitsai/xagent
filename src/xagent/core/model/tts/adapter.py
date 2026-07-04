@@ -5,6 +5,7 @@ from __future__ import annotations
 from typing import Any, Optional
 
 from .base import BaseTTS
+from .elevenlabs import ElevenLabsTTS
 from .xinference import XinferenceTTS
 
 
@@ -34,10 +35,16 @@ def get_tts_model_instance(db_model: Any) -> BaseTTS:
             base_url=base_url,
             api_key=api_key,
         )
+    elif provider == "elevenlabs":
+        return ElevenLabsTTS(
+            model=model_name,
+            base_url=base_url,
+            api_key=api_key,
+        )
     else:
         raise ValueError(
             f"Unsupported TTS provider: {provider}. "
-            "Currently only 'xinference' is supported."
+            "Supported providers: xinference, elevenlabs."
         )
 
 
@@ -50,7 +57,7 @@ def get_tts_model(
     Get a TTS model instance by provider.
 
     Args:
-        provider: TTS provider name ('xinference')
+        provider: TTS provider name ('xinference', 'elevenlabs')
         model: Model name (provider-specific)
         **kwargs: Additional provider-specific parameters
 
@@ -69,11 +76,15 @@ def get_tts_model(
         ... )
         >>> audio = tts.synthesize("Hello, world!")
     """
-    if provider == "xinference":
+    normalized_provider = provider.lower().strip()
+    if normalized_provider == "xinference":
         return XinferenceTTS(model=model or "chat-tts", **kwargs)
+    elif normalized_provider == "elevenlabs":
+        return ElevenLabsTTS(model=model or "eleven_v3", **kwargs)
     else:
         raise ValueError(
-            f"Unsupported TTS provider: {provider}. Supported providers: xinference"
+            f"Unsupported TTS provider: {provider}. "
+            "Supported providers: xinference, elevenlabs"
         )
 
 
@@ -81,4 +92,5 @@ __all__ = [
     "get_tts_model_instance",
     "get_tts_model",
     "XinferenceTTS",
+    "ElevenLabsTTS",
 ]

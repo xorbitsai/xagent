@@ -334,6 +334,38 @@ class TestModelAPI:
         data = response.json()
         assert data["status"] == "passed"
 
+    def test_test_connection_speech_elevenlabs_uses_model_listing(
+        self, test_db, regular_user, regular_headers
+    ):
+        """ElevenLabs TTS connection checks should not synthesize paid audio."""
+        with patch(
+            "xagent.web.services.model_list_service.fetch_models_from_provider",
+            new=AsyncMock(
+                return_value=[
+                    {
+                        "id": "eleven_v3",
+                        "abilities": ["tts"],
+                    }
+                ]
+            ),
+        ) as mock_fetch:
+            response = client.post(
+                "/api/models/test-connection",
+                json={
+                    "model_provider": "elevenlabs",
+                    "model_name": "eleven_v3",
+                    "api_key": "test-api-key",
+                    "category": "speech",
+                    "abilities": ["tts"],
+                },
+                headers=regular_headers,
+            )
+
+        assert response.status_code == 200
+        data = response.json()
+        assert data["status"] == "passed"
+        mock_fetch.assert_awaited_once()
+
     def test_create_model_as_admin(
         self, test_db, admin_user, admin_headers, sample_model_data
     ):

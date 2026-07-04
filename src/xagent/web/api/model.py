@@ -637,12 +637,22 @@ async def test_model_connection(
                 validator()
 
         elif request.category == "speech":
-            if provider != "xinference":
+            if provider not in {"xinference", "elevenlabs"}:
                 raise ValueError(
                     f"Unsupported speech provider for testing: {request.model_provider}"
                 )
 
-            requested_abilities = request.abilities or ["asr"]
+            if provider == "elevenlabs":
+                requested_abilities = request.abilities or ["tts"]
+                unsupported_abilities = sorted(set(requested_abilities) - {"tts"})
+                if unsupported_abilities:
+                    raise ValueError(
+                        "ElevenLabs speech connection test only supports TTS abilities: "
+                        + ", ".join(unsupported_abilities)
+                    )
+            else:
+                requested_abilities = request.abilities or ["asr"]
+
             await asyncio.wait_for(
                 _validate_provider_model_listing(
                     provider=provider,
@@ -653,6 +663,16 @@ async def test_model_connection(
                 ),
                 timeout=timeout_seconds,
             )
+
+            if provider == "elevenlabs":
+                response_time = time.time() - start_time
+                return ModelTestResponse(
+                    model_id=request.model_name,
+                    status="passed",
+                    response_time=response_time,
+                    message="Connection successful",
+                    error=None,
+                )
 
             probe_model = BaseXinferenceModel(
                 model=request.model_name,

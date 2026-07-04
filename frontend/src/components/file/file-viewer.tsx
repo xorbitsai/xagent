@@ -24,6 +24,18 @@ const VIDEO_EXTENSION_MIME_TYPES: Record<string, string> = {
   mpg: "video/mpeg",
 }
 
+const AUDIO_EXTENSION_MIME_TYPES: Record<string, string> = {
+  mp3: "audio/mpeg",
+  wav: "audio/wav",
+  ogg: "audio/ogg",
+  opus: "audio/ogg",
+  flac: "audio/flac",
+  m4a: "audio/mp4",
+  mp4: "audio/mp4",
+  aac: "audio/aac",
+  webm: "audio/webm",
+}
+
 interface FileViewerProps {
   fileName: string
   fileId: string
@@ -46,6 +58,105 @@ function getVideoMimeType(fileName: string, mimeType: string | undefined): strin
   return VIDEO_EXTENSION_MIME_TYPES[getFileExtension(fileName)] || null
 }
 
+function getBase64HeaderBytes(content: string | null, byteCount = 16): number[] {
+  if (!content) return []
+
+  const prefixMatch = content.match(/^data:[^,]+,/)
+  const prefixLength = prefixMatch ? prefixMatch[0].length : 0
+  const compact = content
+    .slice(prefixLength, prefixLength + byteCount * 8)
+    .replace(/\s/g, '')
+  if (!compact) return []
+
+  try {
+    const binary = atob(compact.slice(0, Math.ceil(byteCount / 3) * 4))
+    return Array.from(binary.slice(0, byteCount), char => char.charCodeAt(0))
+  } catch {
+    return []
+  }
+}
+
+function getBase64Payload(content: string | null): string {
+  if (!content) return ''
+
+  const prefixMatch = content.match(/^data:[^,]+,/)
+  return prefixMatch ? content.slice(prefixMatch[0].length) : content
+}
+
+function inferAudioMimeTypeFromBase64(content: string | null): string | null {
+  const bytes = getBase64HeaderBytes(content)
+  if (bytes.length < 4) return null
+
+  if (
+    bytes[0] === 0x49
+    && bytes[1] === 0x44
+    && bytes[2] === 0x33
+  ) {
+    return "audio/mpeg"
+  }
+
+  if (bytes[0] === 0xff && (bytes[1] & 0xe0) === 0xe0) {
+    return "audio/mpeg"
+  }
+
+  if (
+    bytes.length >= 12
+    && bytes[0] === 0x52
+    && bytes[1] === 0x49
+    && bytes[2] === 0x46
+    && bytes[3] === 0x46
+    && bytes[8] === 0x57
+    && bytes[9] === 0x41
+    && bytes[10] === 0x56
+    && bytes[11] === 0x45
+  ) {
+    return "audio/wav"
+  }
+
+  if (
+    bytes[0] === 0x4f
+    && bytes[1] === 0x67
+    && bytes[2] === 0x67
+    && bytes[3] === 0x53
+  ) {
+    return "audio/ogg"
+  }
+
+  if (
+    bytes[0] === 0x66
+    && bytes[1] === 0x4c
+    && bytes[2] === 0x61
+    && bytes[3] === 0x43
+  ) {
+    return "audio/flac"
+  }
+
+  if (
+    bytes.length >= 8
+    && bytes[4] === 0x66
+    && bytes[5] === 0x74
+    && bytes[6] === 0x79
+    && bytes[7] === 0x70
+  ) {
+    return "audio/mp4"
+  }
+
+  return null
+}
+
+function getAudioMimeType(fileName: string, mimeType: string | undefined, content: string | null): string | null {
+  if (mimeType?.startsWith("audio/")) {
+    return mimeType
+  }
+
+  const extensionMimeType = AUDIO_EXTENSION_MIME_TYPES[getFileExtension(fileName)]
+  if (extensionMimeType) {
+    return extensionMimeType
+  }
+
+  return inferAudioMimeTypeFromBase64(content)
+}
+
 export function FileViewer({
   fileName,
   fileId,
@@ -57,10 +168,12 @@ export function FileViewer({
 }: FileViewerProps) {
   const { t } = useI18n()
   const videoMimeType = getVideoMimeType(fileName, mimeType)
+  const audioMimeType = getAudioMimeType(fileName, mimeType, content)
+  const base64Content = getBase64Payload(content)
   const [videoObjectUrl, setVideoObjectUrl] = React.useState<string | null>(null)
 
   React.useEffect(() => {
-    if (!videoMimeType || !content) {
+    if (!videoMimeType || !base64Content) {
       setVideoObjectUrl(null)
       return
     }
@@ -68,7 +181,7 @@ export function FileViewer({
     let active = true
     let objectUrl: string | null = null
 
-    fetch(`data:${videoMimeType};base64,${content.replace(/\s/g, "")}`)
+    fetch(`data:${videoMimeType};base64,${base64Content.replace(/\s/g, "")}`)
       .then((response) => response.blob())
       .then((blob) => {
         objectUrl = URL.createObjectURL(blob)
@@ -90,7 +203,7 @@ export function FileViewer({
         URL.revokeObjectURL(objectUrl)
       }
     }
-  }, [content, videoMimeType])
+  }, [base64Content, videoMimeType])
 
   const processHtmlContent = (htmlContent: string, fileId: string) => {
     if (!htmlContent || !fileId) return htmlContent
@@ -139,11 +252,11 @@ export function FileViewer({
   return (
     <div className="flex-1 overflow-auto bg-muted/30 rounded border h-full">
       {fileName.toLowerCase().endsWith('.pptx') ? (
-        <PptxPreviewRenderer base64Content={content || ''} fileId={fileId} />
+        <PptxPreviewRenderer base64Content={base64Content} fileId={fileId} />
       ) : mimeType?.startsWith('image/') || fileName.match(/\.(jpg|jpeg|png|gif|webp|svg)$/i) ? (
         <div className="flex items-center justify-center h-full p-4">
           <img
-            src={`data:${mimeType || 'image/png'};base64,${content || ''}`}
+            src={`data:${mimeType || 'image/png'};base64,${base64Content}`}
             alt={fileName}
             className="max-w-full max-h-full object-contain"
             onError={(e) => {
@@ -161,7 +274,7 @@ export function FileViewer({
       ) : mimeType === 'application/pdf' || fileName.toLowerCase().endsWith('.pdf') ? (
         <div className="flex items-center justify-center h-full p-4">
           <iframe
-            src={`data:application/pdf;base64,${content || ''}`}
+            src={`data:application/pdf;base64,${base64Content}`}
             className="w-full h-full border-0"
             title={fileName}
           />
@@ -178,13 +291,29 @@ export function FileViewer({
             title={fileName}
           />
         </div>
+      ) : audioMimeType ? (
+        <div className="flex h-full items-center justify-center p-6">
+          <div className="w-full max-w-2xl rounded-lg border bg-background p-6 shadow-sm">
+            <div className="mb-4 truncate text-sm font-medium text-foreground" title={fileName}>
+              {fileName}
+            </div>
+            <audio
+              controls
+              preload="metadata"
+              src={`data:${audioMimeType};base64,${base64Content}`}
+              className="w-full"
+              aria-label={fileName}
+              title={fileName}
+            />
+          </div>
+        </div>
       ) : mimeType?.includes('wordprocessingml') || fileName.toLowerCase().endsWith('.docx') ? (
-        <DocxPreviewRenderer base64Content={content || ''} />
+        <DocxPreviewRenderer base64Content={base64Content} />
       ) : mimeType?.includes('spreadsheetml') || fileName.toLowerCase().endsWith('.xlsx') || fileName.toLowerCase().endsWith('.csv') ? (
         viewMode === 'code' && isCsvFile(fileName) ? (
           <pre className="p-4 text-sm font-mono whitespace-pre-wrap break-words">
             {(() => {
-              const c = content || '';
+              const c = base64Content;
               if (!c) return t('files.previewDialog.emptyContent');
               if (/^[A-Za-z0-9+/=]+$/.test(c.replace(/\s/g, ''))) {
                 try {
@@ -197,7 +326,7 @@ export function FileViewer({
             })()}
           </pre>
         ) : (
-          <ExcelPreviewRenderer base64Content={content || ''} />
+          <ExcelPreviewRenderer base64Content={base64Content} />
         )
       ) : isHtmlFile(fileName) ? (
         viewMode === 'code' ? (

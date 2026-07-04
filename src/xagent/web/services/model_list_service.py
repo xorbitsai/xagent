@@ -193,6 +193,18 @@ async def fetch_xinference_video_models(
     return result
 
 
+async def fetch_elevenlabs_models(
+    api_key: str, base_url: Optional[str] = None
+) -> List[Dict[str, Any]]:
+    """Fetch available ElevenLabs TTS models using the official SDK."""
+
+    from ...core.model.tts.elevenlabs import ElevenLabsTTS
+
+    return await ElevenLabsTTS.async_list_available_models(
+        api_key=api_key, base_url=base_url
+    )
+
+
 async def fetch_dashscope_rerank_models(
     api_key: str, base_url: Optional[str] = None
 ) -> List[Dict[str, Any]]:
@@ -346,6 +358,7 @@ PROVIDER_FETCHERS: Dict[str, Any] = {
     "xinference": fetch_xinference_models,
     "xinference-rerank": fetch_xinference_rerank_models,
     "xinference-video": fetch_xinference_video_models,
+    "elevenlabs": fetch_elevenlabs_models,
     "dashscope-rerank": fetch_dashscope_rerank_models,
     "zai-coding-plan": fetch_openai_models,
     "zhipuai-coding-plan": fetch_openai_models,

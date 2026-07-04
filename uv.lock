@@ -1546,6 +1546,23 @@ wheels = [
 ]
 
 [[package]]
+name = "elevenlabs"
+version = "2.56.0"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "httpx" },
+    { name = "pydantic" },
+    { name = "pydantic-core" },
+    { name = "requests" },
+    { name = "typing-extensions" },
+    { name = "websockets" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/e1/8e/76738671e856bde505218e4ef00ed391d82632c9d8480c1e6425d3fb4160/elevenlabs-2.56.0.tar.gz", hash = "sha256:ed7b15af50e95e2b4a6bc91ac33a59af12c7e6a02c002d75921ffd867b7562b8", size = 660828, upload-time = "2026-07-01T15:01:51.02Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/96/68/6f69cc905e821174961f1e617c7b778878ea210aa3332979f2a8734bd80b/elevenlabs-2.56.0-py3-none-any.whl", hash = "sha256:45192dd89047470895a7aad8df0cebb776a337af14b3f426ddb86fd65cfcc31a", size = 1783648, upload-time = "2026-07-01T15:01:49.177Z" },
+]
+
+[[package]]
 name = "emoji"
 version = "2.15.0"
 source = { registry = "https://pypi.org/simple" }
@@ -7627,6 +7644,7 @@ dependencies = [
     { name = "cryptography" },
     { name = "deepdoc-lib" },
     { name = "docker" },
+    { name = "elevenlabs" },
     { name = "exa-py" },
     { name = "fastapi" },
     { name = "filelock" },
@@ -7833,6 +7851,7 @@ requires-dist = [
     { name = "docling", marker = "extra == 'all'", specifier = ">=2.68.0" },
     { name = "duckdb", marker = "extra == 'duckdb'", specifier = ">=1.0.0,<2.0" },
     { name = "duckdb-engine", marker = "extra == 'duckdb'", specifier = ">=0.10.0,<1.0" },
+    { name = "elevenlabs", specifier = ">=2.0.0" },
     { name = "exa-py", specifier = ">=2.0.0" },
     { name = "fastapi", specifier = ">=0.35.0" },
     { name = "filelock", specifier = ">=3.0.0" },

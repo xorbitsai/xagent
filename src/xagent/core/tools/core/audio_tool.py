@@ -11,6 +11,7 @@ Uses pre-configured ASR and TTS models passed from the web layer.
 import json
 import logging
 import uuid
+from inspect import isawaitable
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -19,6 +20,7 @@ from ...model.asr.base import ASRResult, BaseASR
 from ...model.tts.base import BaseTTS, TTSResult
 from ...workspace import TaskWorkspace
 from .audio_tool_descriptions import (
+    LIST_TTS_VOICES_DESCRIPTION,
     SYNTHESIZE_SPEECH_DESCRIPTION,
     SYNTHESIZE_SPEECH_JSON_DESCRIPTION,
     TRANSCRIBE_AUDIO_DESCRIPTION,
@@ -38,6 +40,7 @@ class AudioToolCore:
     TRANSCRIBE_AUDIO_DESCRIPTION = TRANSCRIBE_AUDIO_DESCRIPTION
     SYNTHESIZE_SPEECH_DESCRIPTION = SYNTHESIZE_SPEECH_DESCRIPTION
     SYNTHESIZE_SPEECH_JSON_DESCRIPTION = SYNTHESIZE_SPEECH_JSON_DESCRIPTION
+    LIST_TTS_VOICES_DESCRIPTION = LIST_TTS_VOICES_DESCRIPTION
 
     def __init__(
         self,
@@ -65,7 +68,50 @@ class AudioToolCore:
         self._workspace = workspace
         self._default_asr_model = default_asr_model
         self._default_tts_model = default_tts_model
+        self._last_teardown_task_id: Optional[str] = None
         self._generate_model_info_text()
+
+    @staticmethod
+    async def _close_model_client(model: Any) -> None:
+        close = getattr(model, "aclose", None) or getattr(model, "close", None)
+        if callable(close):
+            result = close()
+            if isawaitable(result):
+                await result
+
+    async def aclose(self) -> None:
+        """Close any configured model clients that expose close hooks."""
+        models: list[Any] = [
+            self._default_asr_model,
+            self._default_tts_model,
+            *self._asr_models.values(),
+            *self._tts_models.values(),
+        ]
+        seen_model_ids: set[int] = set()
+        for model in models:
+            if model is None:
+                continue
+            model_id = id(model)
+            if model_id in seen_model_ids:
+                continue
+            seen_model_ids.add(model_id)
+            await self._close_model_client(model)
+
+    async def teardown(self, task_id: Optional[str] = None) -> None:
+        # AgentRunner tears down each tool wrapper for one execution; a new task_id
+        # must still close any model clients lazily recreated by a later run.
+        if task_id is not None and task_id == self._last_teardown_task_id:
+            return
+
+        await self.aclose()
+        if task_id is not None:
+            self._last_teardown_task_id = task_id
+
+    async def __aenter__(self) -> "AudioToolCore":
+        return self
+
+    async def __aexit__(self, *exc_info: object) -> None:
+        await self.aclose()
 
     def _generate_model_info_text(self) -> None:
         """Generate formatted text with available models and descriptions."""
@@ -220,6 +266,194 @@ class AudioToolCore:
     def _get_tts_model(self, model_id: Optional[str] = None) -> Optional[BaseTTS]:
         """Get TTS model by ID or default model."""
         return self._get_model(self._tts_models, self._default_tts_model, model_id)
+
+    @staticmethod
+    def _coerce_option_dict(
+        value: Optional[Dict[str, Any]],
+        field_name: str,
+        reserved_keys: Optional[set[str]] = None,
+    ) -> Dict[str, Any]:
+        if value is None:
+            return {}
+        if not isinstance(value, dict):
+            raise ValueError(f"{field_name} must be an object")
+
+        reserved = reserved_keys or set()
+        unsupported_keys = set(value) & reserved
+        if unsupported_keys:
+            unsupported = ", ".join(sorted(unsupported_keys))
+            raise ValueError(
+                f"{field_name} must not include standard TTS parameters: {unsupported}"
+            )
+
+        return {str(k): v for k, v in value.items() if v is not None}
+
+    def _build_tts_provider_kwargs(
+        self,
+        *,
+        tts_model: BaseTTS,
+        voice_settings: Optional[Dict[str, Any]] = None,
+        provider_options: Optional[Dict[str, Any]] = None,
+        extra_options: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        reserved_keys = {"text", "voice", "language", "format", "sample_rate"}
+        options = self._coerce_option_dict(
+            provider_options, "provider_options", reserved_keys
+        )
+
+        if voice_settings is not None:
+            options["voice_settings"] = self._coerce_option_dict(
+                voice_settings, "voice_settings"
+            )
+
+        if extra_options:
+            options.update(
+                self._coerce_option_dict(extra_options, "extra_options", reserved_keys)
+            )
+
+        self._validate_tts_provider_kwargs(
+            tts_model=tts_model,
+            voice_settings=options.get("voice_settings"),
+            provider_options={
+                k: v for k, v in options.items() if k != "voice_settings"
+            },
+        )
+        return options
+
+    def _merge_option_dicts(
+        self,
+        *,
+        default_options: Optional[Dict[str, Any]],
+        override_options: Optional[Dict[str, Any]],
+        default_field_name: str,
+        override_field_name: str,
+        reserved_keys: Optional[set[str]] = None,
+    ) -> Dict[str, Any]:
+        merged = self._coerce_option_dict(
+            default_options, default_field_name, reserved_keys
+        )
+        merged.update(
+            self._coerce_option_dict(
+                override_options, override_field_name, reserved_keys
+            )
+        )
+        return merged
+
+    @staticmethod
+    def _get_tts_provider_name(tts_model: BaseTTS) -> str:
+        return str(getattr(tts_model, "provider_name", type(tts_model).__name__))
+
+    def _get_voice_listing_supported_providers(self) -> list[str]:
+        providers: list[str] = []
+        seen: set[str] = set()
+        candidates: list[BaseTTS] = []
+        if self._default_tts_model is not None:
+            candidates.append(self._default_tts_model)
+        candidates.extend(self._tts_models.values())
+
+        for candidate in candidates:
+            if not getattr(candidate, "supports_voice_listing", False):
+                continue
+            provider_name = self._get_tts_provider_name(candidate)
+            if provider_name not in seen:
+                seen.add(provider_name)
+                providers.append(provider_name)
+
+        return providers
+
+    def _validate_tts_provider_kwargs(
+        self,
+        *,
+        tts_model: BaseTTS,
+        voice_settings: Optional[Dict[str, Any]],
+        provider_options: Dict[str, Any],
+    ) -> None:
+        provider_name = self._get_tts_provider_name(tts_model)
+
+        if voice_settings:
+            supported_voice_settings = list(
+                getattr(tts_model, "supported_voice_settings", [])
+            )
+            if (
+                not getattr(tts_model, "supports_voice_settings", False)
+                and not supported_voice_settings
+            ):
+                raise ValueError(
+                    f"Provider '{provider_name}' does not support voice_settings"
+                )
+            if supported_voice_settings:
+                unsupported_keys = set(voice_settings) - set(supported_voice_settings)
+                if unsupported_keys:
+                    unsupported = ", ".join(sorted(unsupported_keys))
+                    supported = ", ".join(supported_voice_settings)
+                    raise ValueError(
+                        f"Unsupported voice_settings keys for provider '{provider_name}': "
+                        f"{unsupported}. Supported keys: {supported}."
+                    )
+
+        if provider_options:
+            supported_provider_options = list(
+                getattr(tts_model, "supported_provider_options", [])
+            )
+            if not supported_provider_options:
+                unsupported = ", ".join(sorted(provider_options))
+                raise ValueError(
+                    f"Provider '{provider_name}' does not support provider_options: "
+                    f"{unsupported}"
+                )
+            unsupported_keys = set(provider_options) - set(supported_provider_options)
+            if unsupported_keys:
+                unsupported = ", ".join(sorted(unsupported_keys))
+                supported = ", ".join(supported_provider_options)
+                raise ValueError(
+                    f"Unsupported provider_options keys for provider '{provider_name}': "
+                    f"{unsupported}. Supported keys: {supported}."
+                )
+
+    def _validate_tts_reference_audio(
+        self,
+        *,
+        tts_model: BaseTTS,
+        reference_audio: Optional[str],
+    ) -> None:
+        if not reference_audio:
+            return
+        if getattr(tts_model, "supports_voice_cloning", False):
+            return
+
+        provider_name = self._get_tts_provider_name(tts_model)
+        raise ValueError(
+            f"Provider '{provider_name}' does not support reference_audio voice cloning"
+        )
+
+    def _get_tts_model_id(self, tts_model: BaseTTS) -> str:
+        for model_id, configured_model in self._tts_models.items():
+            if configured_model is tts_model:
+                return model_id
+        return "default"
+
+    def _get_voice_listing_tts_model(
+        self, model_id: Optional[str] = None
+    ) -> tuple[Optional[BaseTTS], str]:
+        if model_id:
+            tts_model = self._get_tts_model(model_id)
+            actual_model_id = (
+                model_id if model_id and model_id in self._tts_models else "default"
+            )
+            return tts_model, actual_model_id
+
+        candidates: list[BaseTTS] = []
+        if self._default_tts_model is not None:
+            candidates.append(self._default_tts_model)
+        candidates.extend(self._tts_models.values())
+
+        for candidate in candidates:
+            if getattr(candidate, "supports_voice_listing", False):
+                return candidate, self._get_tts_model_id(candidate)
+
+        tts_model = self._get_tts_model()
+        actual_model_id = self._get_tts_model_id(tts_model) if tts_model else "default"
+        return tts_model, actual_model_id
 
     def _resolve_audio_path(self, audio_input: str) -> str:
         """
@@ -453,6 +687,10 @@ class AudioToolCore:
         voice: Optional[str] = None,
         language: Optional[str] = None,
         audio_format: str = "mp3",
+        sample_rate: Optional[int] = None,
+        reference_audio: Optional[str] = None,
+        voice_settings: Optional[Dict[str, Any]] = None,
+        provider_options: Optional[Dict[str, Any]] = None,
         model_id: Optional[str] = None,
         **kwargs: Any,
     ) -> Dict[str, Any]:
@@ -464,6 +702,10 @@ class AudioToolCore:
             voice: Voice ID or name (optional)
             language: Language code (optional)
             audio_format: Output audio format (default: 'mp3')
+            sample_rate: Sample rate in Hz (optional)
+            reference_audio: Reference audio path or file ID for voice cloning (optional)
+            voice_settings: Provider-specific voice shaping settings
+            provider_options: Provider-specific synthesis parameters
             model_id: Specific TTS model to use (optional, uses default if not provided)
             **kwargs: Additional model-specific parameters
 
@@ -490,13 +732,28 @@ class AudioToolCore:
                     "audio_path": None,
                 }
 
+            self._validate_tts_reference_audio(
+                tts_model=tts_model,
+                reference_audio=reference_audio,
+            )
+            synthesis_kwargs = self._build_tts_provider_kwargs(
+                tts_model=tts_model,
+                voice_settings=voice_settings,
+                provider_options=provider_options,
+                extra_options=kwargs,
+            )
+            if sample_rate is not None:
+                synthesis_kwargs["sample_rate"] = sample_rate
+            if reference_audio:
+                synthesis_kwargs["reference_audio"] = reference_audio
+
             # Synthesize the speech (async)
             result = await tts_model.synthesize(
                 text=text,
                 voice=voice,
                 language=language,
                 format=audio_format,
-                **kwargs,
+                **synthesis_kwargs,
             )
 
             # Determine the actual model used
@@ -506,7 +763,7 @@ class AudioToolCore:
 
             audio_data: Optional[bytes] = None
             result_audio_format: Optional[str] = None
-            sample_rate: Optional[int] = None
+            result_sample_rate: Optional[int] = None
             language_detected: Optional[str] = None
 
             # Handle different result types
@@ -516,7 +773,7 @@ class AudioToolCore:
             elif isinstance(result, TTSResult):
                 audio_data = result.audio
                 result_audio_format = result.format
-                sample_rate = result.sample_rate
+                result_sample_rate = result.sample_rate
                 language_detected = result.language
 
             # Save audio file to workspace if available
@@ -560,7 +817,7 @@ class AudioToolCore:
                 "file_id": audio_file_id,
                 "file_ref": file_ref,
                 "format": result_audio_format,
-                "sample_rate": sample_rate,
+                "sample_rate": result_sample_rate,
                 "language": language_detected,
                 "model_used": actual_model_id,
                 "saved_to_workspace": audio_path is not None,
@@ -604,12 +861,33 @@ class AudioToolCore:
                 asr_models_info.append(model_info)
 
             tts_models_info = []
-            for model_id in self._tts_models.keys():
+            for model_id, tts_model in self._tts_models.items():
+                provider_name = self._get_tts_provider_name(tts_model)
                 model_info = {
                     "type": "tts",
                     "model_id": model_id,
+                    "provider": provider_name,
                     "available": True,
                     "description": self._model_descriptions.get(model_id, ""),
+                    "abilities": list(getattr(tts_model, "abilities", [])),
+                    "supports_multiple_voices": bool(
+                        getattr(tts_model, "supports_multiple_voices", False)
+                    ),
+                    "supports_voice_listing": bool(
+                        getattr(tts_model, "supports_voice_listing", False)
+                    ),
+                    "supports_voice_settings": bool(
+                        getattr(tts_model, "supports_voice_settings", False)
+                    ),
+                    "supports_voice_cloning": bool(
+                        getattr(tts_model, "supports_voice_cloning", False)
+                    ),
+                    "supported_voice_settings": list(
+                        getattr(tts_model, "supported_voice_settings", [])
+                    ),
+                    "supported_provider_options": list(
+                        getattr(tts_model, "supported_provider_options", [])
+                    ),
                 }
                 tts_models_info.append(model_info)
 
@@ -634,6 +912,83 @@ class AudioToolCore:
                 "total_count": 0,
             }
 
+    async def list_tts_voices(
+        self,
+        model_id: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """
+        List available TTS voices for providers that support dynamic voice lookup.
+
+        Args:
+            model_id: Specific TTS model to use. Omit to use the default model.
+
+        Returns:
+            Dictionary containing:
+            - success (bool): Whether voice listing succeeded
+            - supported (bool): Whether the selected provider supports voice listing
+            - voices (list): Normalized voice metadata
+            - count (int): Number of voices returned
+            - provider (str): Selected provider name
+            - supported_providers (list): Providers that currently support this API
+        """
+        supported_providers = self._get_voice_listing_supported_providers()
+        try:
+            tts_model, actual_model_id = self._get_voice_listing_tts_model(model_id)
+
+            if not tts_model:
+                return {
+                    "success": False,
+                    "supported": False,
+                    "error": "No available TTS models configured",
+                    "voices": [],
+                    "count": 0,
+                    "model_used": actual_model_id,
+                    "supported_providers": supported_providers,
+                }
+
+            provider_name = self._get_tts_provider_name(tts_model)
+            if not getattr(tts_model, "supports_voice_listing", False):
+                return {
+                    "success": False,
+                    "supported": False,
+                    "error": (
+                        "Dynamic TTS voice listing is not supported for provider "
+                        f"'{provider_name}'. Currently supported providers: "
+                        f"{', '.join(supported_providers)}."
+                    ),
+                    "voices": [],
+                    "count": 0,
+                    "provider": provider_name,
+                    "model_used": actual_model_id,
+                    "supported_providers": supported_providers,
+                }
+
+            voices = await tts_model.list_available_voices()
+            return {
+                "success": True,
+                "supported": True,
+                "voices": voices,
+                "count": len(voices),
+                "provider": provider_name,
+                "model_used": actual_model_id,
+                "supported_providers": supported_providers,
+            }
+
+        except Exception as e:
+            logger.error(f"Failed to list TTS voices: {e}")
+            actual_model_id = (
+                model_id if model_id and model_id in self._tts_models else "default"
+            )
+            return {
+                "success": False,
+                "supported": False,
+                "error": str(e),
+                "voices": [],
+                "count": 0,
+                "model_used": actual_model_id,
+                "supported_providers": supported_providers,
+            }
+
     async def synthesize_speech_json(
         self,
         json_data: Optional[str | Dict[str, Any]] = None,
@@ -642,8 +997,12 @@ class AudioToolCore:
         text_field: str = "text",
         voice_field: str = "voice",
         reference_field: str = "reference_audio",
+        voice_settings_field: str = "voice_settings",
+        provider_options_field: str = "provider_options",
         default_voice: Optional[str] = None,
         default_language: Optional[str] = None,
+        default_voice_settings: Optional[Dict[str, Any]] = None,
+        default_provider_options: Optional[Dict[str, Any]] = None,
         audio_format: str = "mp3",
         sample_rate: Optional[int] = None,
         model_id: Optional[str] = None,
@@ -661,8 +1020,12 @@ class AudioToolCore:
             text_field: Field name containing text within each segment (default: "text")
             voice_field: Field name containing voice within each segment (default: "voice")
             reference_field: Field name containing reference audio ID (default: "reference_audio_id")
+            voice_settings_field: Field name containing provider voice settings
+            provider_options_field: Field name containing provider synthesis options
             default_voice: Default voice for segments without voice specified
             default_language: Default language code (auto-detect if None)
+            default_voice_settings: Default provider voice settings for all segments
+            default_provider_options: Default provider synthesis options for all segments
             audio_format: Output audio format (default: 'mp3')
             sample_rate: Sample rate in Hz (default: model-specific)
             model_id: Specific TTS model to use
@@ -836,6 +1199,70 @@ class AudioToolCore:
                     "errors": [str(e)],
                 }
 
+        if not isinstance(data, dict):
+            return {
+                "success": False,
+                "error": "JSON data must be an object",
+                "results": [],
+                "total": 0,
+                "successful": 0,
+                "failed": 0,
+                "errors": ["JSON data must be an object"],
+            }
+
+        if default_voice_settings is None:
+            root_voice_settings = data.get("default_voice_settings")
+            if root_voice_settings is not None:
+                if not isinstance(root_voice_settings, dict):
+                    return {
+                        "success": False,
+                        "error": "default_voice_settings must be an object",
+                        "results": [],
+                        "total": 0,
+                        "successful": 0,
+                        "failed": 0,
+                        "errors": ["default_voice_settings must be an object"],
+                    }
+                default_voice_settings = root_voice_settings
+
+        if default_provider_options is None:
+            root_provider_options = data.get("default_provider_options")
+            if root_provider_options is not None:
+                if not isinstance(root_provider_options, dict):
+                    return {
+                        "success": False,
+                        "error": "default_provider_options must be an object",
+                        "results": [],
+                        "total": 0,
+                        "successful": 0,
+                        "failed": 0,
+                        "errors": ["default_provider_options must be an object"],
+                    }
+                default_provider_options = root_provider_options
+
+        if default_voice is None and data.get("default_voice") is not None:
+            default_voice = str(data["default_voice"])
+
+        if default_language is None and data.get("default_language") is not None:
+            default_language = str(data["default_language"])
+
+        if audio_format == "mp3" and data.get("output_format") is not None:
+            audio_format = str(data["output_format"])
+
+        if sample_rate is None and data.get("sample_rate") is not None:
+            try:
+                sample_rate = int(data["sample_rate"])
+            except (TypeError, ValueError):
+                return {
+                    "success": False,
+                    "error": "sample_rate must be an integer",
+                    "results": [],
+                    "total": 0,
+                    "successful": 0,
+                    "failed": 0,
+                    "errors": ["sample_rate must be an integer"],
+                }
+
         # Extract segments from JSON
         segments = data.get(segments_field, [])
         if not segments:
@@ -885,8 +1312,12 @@ class AudioToolCore:
                     text_field,
                     voice_field,
                     reference_field,
+                    voice_settings_field,
+                    provider_options_field,
                     default_voice,
                     default_language,
+                    default_voice_settings,
+                    default_provider_options,
                     audio_format,
                     sample_rate,
                     tts_model,
@@ -918,8 +1349,12 @@ class AudioToolCore:
                         text_field,
                         voice_field,
                         reference_field,
+                        voice_settings_field,
+                        provider_options_field,
                         default_voice,
                         default_language,
+                        default_voice_settings,
+                        default_provider_options,
                         audio_format,
                         sample_rate,
                         tts_model,
@@ -979,8 +1414,12 @@ class AudioToolCore:
         text_field: str,
         voice_field: str,
         reference_field: str,
+        voice_settings_field: str,
+        provider_options_field: str,
         default_voice: Optional[str],
         default_language: Optional[str],
+        default_voice_settings: Optional[Dict[str, Any]],
+        default_provider_options: Optional[Dict[str, Any]],
         audio_format: str,
         sample_rate: Optional[int],
         tts_model: Any,
@@ -994,8 +1433,12 @@ class AudioToolCore:
             text_field: Field name for text content
             voice_field: Field name for voice
             reference_field: Field name for reference audio ID
+            voice_settings_field: Field name for provider voice settings
+            provider_options_field: Field name for provider synthesis options
             default_voice: Default voice if not specified in segment
             default_language: Default language if not specified
+            default_voice_settings: Default provider voice settings
+            default_provider_options: Default provider synthesis options
             audio_format: Audio format
             sample_rate: Sample rate
             tts_model: TTS model instance
@@ -1016,6 +1459,19 @@ class AudioToolCore:
 
             voice = segment.get(voice_field, default_voice)
             language = segment.get("language", default_language)
+            voice_settings = self._merge_option_dicts(
+                default_options=default_voice_settings,
+                override_options=segment.get(voice_settings_field),
+                default_field_name="default_voice_settings",
+                override_field_name=voice_settings_field,
+            )
+            provider_options = self._merge_option_dicts(
+                default_options=default_provider_options,
+                override_options=segment.get(provider_options_field),
+                default_field_name="default_provider_options",
+                override_field_name=provider_options_field,
+                reserved_keys={"text", "voice", "language", "format", "sample_rate"},
+            )
 
             # Validate reference audio field names
             # Check if user provided common alternative field names
@@ -1030,9 +1486,18 @@ class AudioToolCore:
                 }
 
             ref_audio_id = segment.get(reference_field)
+            self._validate_tts_reference_audio(
+                tts_model=tts_model,
+                reference_audio=ref_audio_id,
+            )
 
             # Build synthesis parameters
-            kwargs: Dict[str, Any] = {"format": audio_format}
+            kwargs = self._build_tts_provider_kwargs(
+                tts_model=tts_model,
+                voice_settings=voice_settings or None,
+                provider_options=provider_options or None,
+            )
+            kwargs["format"] = audio_format
             if sample_rate:
                 kwargs["sample_rate"] = sample_rate
 

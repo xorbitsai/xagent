@@ -26,6 +26,19 @@ class AudioFunctionTool(FunctionTool):
 
     category = ToolCategory.AUDIO
 
+    def __init__(
+        self,
+        *args: Any,
+        owner: Optional[AudioToolCore] = None,
+        **kwargs: Any,
+    ) -> None:
+        super().__init__(*args, **kwargs)
+        self._owner = owner
+
+    async def teardown(self, task_id: Optional[str] = None) -> None:
+        if self._owner is not None:
+            await self._owner.teardown(task_id=task_id)
+
 
 class AudioTool(AudioToolCore):
     """
@@ -76,29 +89,51 @@ class AudioTool(AudioToolCore):
         json_description = self.SYNTHESIZE_SPEECH_JSON_DESCRIPTION.format(
             self._tts_model_info_text
         )
-
         tools = [
             AudioFunctionTool(
                 self.transcribe_audio,
                 name="transcribe_audio",
                 description=transcribe_description,
+                owner=self,
             ),
             AudioFunctionTool(
                 self.synthesize_speech,
                 name="synthesize_speech",
                 description=synthesize_description,
+                owner=self,
             ),
             AudioFunctionTool(
                 self.synthesize_speech_json,
                 name="synthesize_speech_json",
                 description=json_description,
+                owner=self,
             ),
             AudioFunctionTool(
                 self.list_available_models,
                 name="list_audio_models",
                 description="List all available audio models (ASR and TTS), including model ID, availability status, and detailed description information (Note: model information is already provided in the transcribe_audio and synthesize_speech tool descriptions)",
+                owner=self,
             ),
         ]
+
+        voice_listing_models = list(self._tts_models.values())
+        if self._default_tts_model is not None:
+            voice_listing_models.append(self._default_tts_model)
+        if any(
+            getattr(model, "supports_voice_listing", False)
+            for model in voice_listing_models
+        ):
+            list_tts_voices_description = self.LIST_TTS_VOICES_DESCRIPTION.format(
+                ", ".join(self._get_voice_listing_supported_providers())
+            )
+            tools.append(
+                AudioFunctionTool(
+                    self.list_tts_voices,
+                    name="list_tts_voices",
+                    description=list_tts_voices_description,
+                    owner=self,
+                )
+            )
 
         return tools
 

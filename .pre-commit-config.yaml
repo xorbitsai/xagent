@@ -57,6 +57,7 @@ repos:
           - exa-py
           - limits
           - google-genai==1.66.0
+          - elevenlabs==2.56.0
           # Pin google-auth/google-api-core to versions that ship py.typed;
           # older releases resolved transitively lack the marker and fail
           # import-untyped under disallow_any_unimported.

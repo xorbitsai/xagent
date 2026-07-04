@@ -139,3 +139,114 @@ describe("FileViewer video preview", () => {
     expect(screen.queryByText("AAAAIGZ0eXA=")).not.toBeInTheDocument()
   })
 })
+
+describe("FileViewer audio preview", () => {
+  afterEach(() => {
+    cleanup()
+    vi.restoreAllMocks()
+  })
+
+  it("renders audio controls for audio mime types", () => {
+    render(
+      <FileViewer
+        fileName="speech.mp3"
+        fileId="audio-file-id"
+        content="SUQzZmFrZQ=="
+        mimeType="audio/mpeg"
+        isLoading={false}
+        error={null}
+        viewMode="preview"
+      />,
+    )
+
+    const audio = screen.getByLabelText("speech.mp3")
+    expect(audio.tagName).toBe("AUDIO")
+    expect(audio).toHaveAttribute("controls")
+    expect(audio).toHaveAttribute("src", "data:audio/mpeg;base64,SUQzZmFrZQ==")
+  })
+
+  it("infers mp3 audio from base64 content when mime and extension are missing", () => {
+    render(
+      <FileViewer
+        fileName="generated-speech"
+        fileId="audio-file-id"
+        content="SUQzZmFrZQ=="
+        mimeType="application/octet-stream"
+        isLoading={false}
+        error={null}
+        viewMode="preview"
+      />,
+    )
+
+    const audio = screen.getByLabelText("generated-speech")
+    expect(audio.tagName).toBe("AUDIO")
+    expect(audio).toHaveAttribute("src", "data:audio/mpeg;base64,SUQzZmFrZQ==")
+  })
+
+  it("decodes only a short base64 prefix while inferring audio", () => {
+    const originalAtob = globalThis.atob.bind(globalThis)
+    const atobSpy = vi.spyOn(globalThis, "atob").mockImplementation((value) => (
+      originalAtob(value)
+    ))
+    const payload = `${"SUQz"}${"QUFB".repeat(10000)}`
+    const content = `data:application/octet-stream;base64,${payload}`
+
+    render(
+      <FileViewer
+        fileName="generated"
+        fileId="large-audio-file-id"
+        content={content}
+        mimeType="application/octet-stream"
+        isLoading={false}
+        error={null}
+        viewMode="preview"
+      />,
+    )
+
+    expect(screen.getByLabelText("generated")).toHaveAttribute(
+      "src",
+      `data:audio/mpeg;base64,${payload}`,
+    )
+    expect(atobSpy).toHaveBeenCalledOnce()
+    expect(atobSpy.mock.calls[0][0].length).toBeLessThanOrEqual(24)
+  })
+
+  it("does not infer wav audio from an incomplete RIFF header", () => {
+    render(
+      <FileViewer
+        fileName="generated"
+        fileId="short-header-file-id"
+        content="UklGRg=="
+        mimeType="application/octet-stream"
+        isLoading={false}
+        error={null}
+        viewMode="preview"
+      />,
+    )
+
+    expect(screen.queryByLabelText("generated")).not.toBeInTheDocument()
+    expect(screen.getByText("UklGRg==")).toBeInTheDocument()
+  })
+})
+
+describe("FileViewer spreadsheet preview", () => {
+  afterEach(() => {
+    cleanup()
+  })
+
+  it("decodes CSV code view from prefixed base64 content", () => {
+    const { container } = render(
+      <FileViewer
+        fileName="data.csv"
+        fileId="csv-file-id"
+        content="data:text/csv;base64,YSxiCjEsMg=="
+        mimeType="text/csv"
+        isLoading={false}
+        error={null}
+        viewMode="code"
+      />,
+    )
+
+    expect(container.querySelector("pre")?.textContent).toBe("a,b\n1,2")
+  })
+})

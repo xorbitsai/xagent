@@ -1058,22 +1058,19 @@ def _get_models_by_category(
             ):
                 continue
 
+            model_provider = str(db_model.model_provider).strip().lower()
             # api_key may be empty for self-hosted Xinference (no auth);
             # the adapter handles that gracefully so we don't pre-validate
-            # it here. Skip the model only when base_url is missing —
-            # without that there's no way to reach the service. Raising
-            # here would abort loading ALL models of this category in one
-            # go (the outer try/except returns {}), so any per-model issue
-            # is downgraded to a per-model warning + skip.
+            # it here. Xinference still requires a base URL, but cloud speech
+            # providers such as ElevenLabs can use their SDK defaults.
             base_url = cast(Optional[str], getattr(db_model, "base_url", None))
-            if not base_url:
+            if model_provider == "xinference" and not base_url:
                 logger.warning(
                     f"Skipping {model_type} model {db_model.model_name}: "
                     "base_url is empty"
                 )
                 continue
 
-            model_provider = str(db_model.model_provider).strip().lower()
             try:
                 model: Any = None
                 if model_provider == "xinference":
@@ -1089,6 +1086,12 @@ def _get_models_by_category(
                     else:
                         raise ValueError(f"Unsupported model ability: {ability}")
 
+                    models[str(db_model.model_name)] = model
+                    logger.info(f"Added {model_type} model: {db_model.model_name}")
+                elif model_provider == "elevenlabs" and ability == "tts":
+                    from ...core.model.tts.adapter import get_tts_model_instance
+
+                    model = get_tts_model_instance(db_model)
                     models[str(db_model.model_name)] = model
                     logger.info(f"Added {model_type} model: {db_model.model_name}")
                 else:

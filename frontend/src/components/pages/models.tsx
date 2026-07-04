@@ -1,6 +1,7 @@
 "use client"
 
 import { useState, useEffect, useMemo, ReactNode } from "react"
+import { usePathname, useRouter, useSearchParams } from "next/navigation"
 import { Button } from "@/components/ui/button"
 import { Badge } from "@/components/ui/badge"
 import { Card } from "@/components/ui/card"
@@ -23,6 +24,17 @@ import {
 import { useI18n } from "@/contexts/i18n-context"
 import { ModelManagementDialog } from "./model-management-dialog"
 import { toast } from "@/components/ui/sonner"
+
+const MODEL_TABS = ["llm", "embedding", "rerank", "image", "video", "speech"] as const
+const DEFAULT_MODEL_TAB = "llm"
+type ModelTab = (typeof MODEL_TABS)[number]
+
+function getValidModelTab(value: string | null): ModelTab {
+  if (value && (MODEL_TABS as readonly string[]).includes(value)) {
+    return value as ModelTab
+  }
+  return DEFAULT_MODEL_TAB
+}
 
 export function getModelDetailUrl(modelId: string): string {
   return `${getApiUrl()}/api/models/by-id/${encodeURIComponent(modelId)}`
@@ -188,6 +200,11 @@ const LOCAL_PROVIDER_CONFIGS: Record<string, Partial<ProviderConfig>> = {
     category: ["video"],
     defaultBaseUrl: "https://ark.ap-southeast.bytepluses.com/api/v3",
   },
+  elevenlabs: {
+    icon: <img src="/elevenlabs.svg" alt="ElevenLabs" className="h-6 w-24 object-contain object-left" />,
+    category: ["speech"],
+    defaultBaseUrl: "https://api.elevenlabs.io",
+  },
   ollama: {
     icon: <Box className="w-6 h-6" />,
     category: ["llm", "embedding"],
@@ -196,11 +213,17 @@ const LOCAL_PROVIDER_CONFIGS: Record<string, Partial<ProviderConfig>> = {
 }
 
 export function ModelsPage() {
+  const router = useRouter()
+  const pathname = usePathname()
+  const searchParams = useSearchParams()
+  const tabParam = searchParams.get("tab")
   const { token } = useAuth()
   const { t } = useI18n()
   const [models, setModels] = useState<Model[]>([])
   const [loading, setLoading] = useState(true)
-  const [activeTab, setActiveTab] = useState("llm")
+  const [activeTab, setActiveTab] = useState<ModelTab>(() =>
+    getValidModelTab(tabParam),
+  )
   const [dialogState, setDialogState] = useState<{
     isOpen: boolean;
     viewMode: 'list' | 'connect' | 'form';
@@ -237,6 +260,25 @@ export function ModelsPage() {
     loadDefaultModels()
     fetchProviders()
   }, [])
+
+  useEffect(() => {
+    setActiveTab(getValidModelTab(tabParam))
+  }, [tabParam])
+
+  const handleTabChange = (value: string) => {
+    const nextTab = getValidModelTab(value)
+    setActiveTab(nextTab)
+
+    const nextParams = new URLSearchParams(searchParams.toString())
+    if (nextTab === DEFAULT_MODEL_TAB) {
+      nextParams.delete("tab")
+    } else {
+      nextParams.set("tab", nextTab)
+    }
+
+    const nextQuery = nextParams.toString()
+    router.replace(nextQuery ? `${pathname}?${nextQuery}` : pathname, { scroll: false })
+  }
 
   const fetchProviders = async () => {
     try {
@@ -412,7 +454,7 @@ export function ModelsPage() {
           </Button>
         </div>
 
-        <Tabs value={activeTab} onValueChange={setActiveTab} className="w-full mb-8">
+        <Tabs value={activeTab} onValueChange={handleTabChange} className="w-full mb-8">
           <TabsList className="bg-transparent h-12 p-0 space-x-6 justify-start border-b w-full rounded-none">
             <TabsTrigger
               value="llm"

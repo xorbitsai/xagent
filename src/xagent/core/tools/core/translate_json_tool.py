@@ -7,6 +7,7 @@ Supports nested structures and batch translation.
 
 import json
 import logging
+import re
 import uuid
 from typing import Any, Dict, List, Optional
 
@@ -16,6 +17,8 @@ from tqdm.asyncio import tqdm as tqdm_async  # type: ignore[import-untyped]
 from ...file_ref import build_workspace_file_ref
 
 logger = logging.getLogger(__name__)
+
+NUMBERED_TRANSLATION_RE = re.compile(r"^\s*\d+\.\s*")
 
 
 class TranslateJSONToolCore:
@@ -33,6 +36,11 @@ class TranslateJSONToolCore:
         """
         self._llm = llm
         self._workspace = workspace
+
+    @staticmethod
+    def _strip_translation_numbering(text: str) -> str:
+        """Remove a leading list number from an LLM translation response."""
+        return NUMBERED_TRANSLATION_RE.sub("", text.strip(), count=1)
 
     def _get_field_value(self, data: Dict[str, Any], field_path: str) -> List[Any]:
         """
@@ -168,19 +176,22 @@ Translations:"""
                     raise RuntimeError(f"Translation error: {chunk.delta}")
 
             # Parse translations
-            lines = content.strip().split("\n")
+            stripped_content = content.strip()
+            lines = stripped_content.split("\n")
             translations = []
 
             for line in lines:
                 line = line.strip()
                 # Remove numbering if present
-                if line and line[0].isdigit() and line[1] == ".":
-                    translations.append(line.split(".", 1)[1].strip())
+                if line and NUMBERED_TRANSLATION_RE.match(line):
+                    translations.append(self._strip_translation_numbering(line))
                 elif line:
                     translations.append(line)
 
             # Ensure we have the right number of translations
             if len(translations) != len(batch_texts):
+                if len(batch_texts) == 1 and stripped_content:
+                    return [self._strip_translation_numbering(stripped_content)]
                 raise ValueError(
                     f"Batch {batch_index}: Translation count mismatch: expected {len(batch_texts)}, got {len(translations)}. "
                     f"LLM response:\n{content}"

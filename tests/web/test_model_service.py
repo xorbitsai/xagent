@@ -537,6 +537,38 @@ class TestModelService:
             assert "visible-tts" in result
             assert "invisible-tts" not in result
 
+    def test_get_tts_models_loads_elevenlabs_without_base_url(self):
+        """ElevenLabs TTS models use SDK defaults and should not require base_url."""
+        with (
+            patch(
+                "xagent.web.services.model_service._is_model_visible_to_user"
+            ) as mock_visibility,
+            patch(
+                "xagent.core.model.tts.adapter.get_tts_model_instance"
+            ) as mock_tts_instance,
+        ):
+            mock_db = MagicMock()
+
+            visible_model = MagicMock()
+            visible_model.id = 1
+            visible_model.abilities = ["tts"]
+            visible_model.api_key = "key1"
+            visible_model.base_url = None
+            visible_model.model_provider = "elevenlabs"
+            visible_model.model_name = "eleven_v3"
+
+            mock_db.query.return_value.filter.return_value.all.return_value = [
+                visible_model
+            ]
+
+            mock_visibility.return_value = True
+            mock_instance = MagicMock()
+            mock_tts_instance.return_value = mock_instance
+
+            result = get_tts_models(mock_db, user_id=42)
+
+            assert result == {"eleven_v3": mock_instance}
+
     def test_embedding_fallback_skips_invisible_returns_none(self, monkeypatch):
         """System fallback returns None when no visible embedding model exists."""
         from contextvars import copy_context

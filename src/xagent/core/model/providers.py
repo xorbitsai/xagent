@@ -32,6 +32,7 @@ _DEFAULT_BASE_URL_BY_PROVIDER: dict[str, str] = {
     "zhipu": "https://open.bigmodel.cn/api/paas/v4",
     "volcengine-ark": "https://ark.cn-beijing.volces.com/api/v3",
     "byteplus-ark": "https://ark.ap-southeast.bytepluses.com/api/v3",
+    "elevenlabs": "https://api.elevenlabs.io",
     # Opencode / models.dev naming
     "zai-coding-plan": "https://api.z.ai/api/coding/paas/v4",
     "zhipuai-coding-plan": "https://open.bigmodel.cn/api/coding/paas/v4",
@@ -114,6 +115,12 @@ _SUPPORTED_PROVIDER_METADATA: tuple[dict[str, Any], ...] = (
         "name": "Xinference",
         "description": "Xinference models for local inference",
         "requires_base_url": True,
+    },
+    {
+        "id": "elevenlabs",
+        "name": "ElevenLabs",
+        "description": "ElevenLabs speech models for text-to-speech",
+        "requires_base_url": False,
     },
     {
         "id": "deepseek",

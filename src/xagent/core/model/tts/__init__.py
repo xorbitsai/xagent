@@ -1,6 +1,6 @@
 """Text-to-Speech (TTS) model implementations."""
 
-from .adapter import XinferenceTTS, get_tts_model
+from .adapter import ElevenLabsTTS, XinferenceTTS, get_tts_model
 from .base import BaseTTS, TTSResult
 
 __all__ = [
@@ -8,4 +8,5 @@ __all__ = [
     "BaseTTS",
     "TTSResult",
     "XinferenceTTS",
+    "ElevenLabsTTS",
 ]

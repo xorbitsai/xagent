@@ -176,6 +176,39 @@ async def test_translate_values_batch(translate_tool, mock_llm):
 
 
 @pytest.mark.asyncio
+async def test_translate_single_json_field_accepts_multiline_translation():
+    """Test single-field translations can contain line breaks."""
+    from xagent.core.model.chat.types import ChunkType, StreamChunk
+
+    response = (
+        "Hills upon hills, towers upon towers;\n"
+        "when will the West Lake's song and dance ever cease?"
+    )
+
+    async def mock_stream_chat(messages):
+        yield StreamChunk(
+            type=ChunkType.TOKEN,
+            content=response,
+            delta=response,
+        )
+
+    llm = AsyncMock()
+    llm.stream_chat = mock_stream_chat
+    tool = TranslateJSONToolCore(llm=llm)
+
+    result = await tool.translate_json(
+        json_data={"text": "山外青山楼外楼，西湖歌舞几时休。"},
+        target_fields=["text"],
+        target_lang="en",
+        source_lang="zh",
+    )
+
+    assert result["success"] is True
+    result_json = json.loads(result["result"])
+    assert result_json["text_translated_text"] == response
+
+
+@pytest.mark.asyncio
 async def test_translate_json_string_input(translate_tool):
     """Test translating when input is JSON string instead of dict"""
     json_str = '{"text": "你好"}'

@@ -336,6 +336,51 @@ class TestGeminiImageModel:
             assert parts[0]["inlineData"]["mimeType"] == "image/jpeg"
 
     @pytest.mark.asyncio
+    async def test_edit_image_uses_aspect_ratio_config(self):
+        """Test edit_image forwards aspect_ratio to Gemini imageConfig."""
+        model = GeminiImageModel(
+            model_name="gemini-3-pro-image-preview-2k",
+            api_key="test_key",
+            abilities=["generate", "edit"],
+        )
+
+        with patch("httpx.AsyncClient") as mock_client_class:
+            mock_client = MagicMock()
+            mock_client_class.return_value.__aenter__.return_value = mock_client
+
+            mock_response = MagicMock()
+            mock_response.status_code = 200
+            mock_response.json.return_value = {
+                "candidates": [
+                    {
+                        "content": {
+                            "parts": [
+                                {"text": "![Image](https://example.com/edited.webp)"}
+                            ]
+                        },
+                        "finishReason": "STOP",
+                    }
+                ],
+                "usageMetadata": {
+                    "promptTokenCount": 100,
+                    "candidatesTokenCount": 50,
+                    "totalTokenCount": 150,
+                },
+            }
+            mock_client.post = AsyncMock(return_value=mock_response)
+
+            result = await model.edit_image(
+                image_url="data:image/jpeg;base64,/9j/4AAQSkZJRg==",
+                prompt="Edit the image",
+                aspect_ratio="16:9",
+            )
+
+            assert result["image_url"] == "https://example.com/edited.webp"
+            request_body = mock_client.post.call_args.kwargs["json"]
+            image_config = request_body["generationConfig"]["imageConfig"]
+            assert image_config["aspectRatio"] == "16:9"
+
+    @pytest.mark.asyncio
     async def test_edit_image_with_multiple_images(self):
         """Test edit_image with multiple image URLs."""
         model = GeminiImageModel(

@@ -472,7 +472,7 @@ class GeminiImageModel(BaseImageModel):
                       Supports http/https URLs and data URLs.
             prompt: Text prompt describing the desired edits
             negative_prompt: Negative prompt for image generation (currently not used by Gemini)
-            **kwargs: Additional parameters like size
+            **kwargs: Additional parameters like size or aspect_ratio
 
         Returns:
             dict with image editing result containing:
@@ -597,6 +597,9 @@ class GeminiImageModel(BaseImageModel):
         # Optionally add size config if provided
         size = kwargs.get("size", "1024*1024")
         image_config = _parse_size_to_gemini_config(size, self.model_name)
+        aspect_ratio = kwargs.get("aspect_ratio")
+        if aspect_ratio:
+            image_config["aspectRatio"] = str(aspect_ratio)
         if image_config:
             gen_config["imageConfig"] = image_config
 

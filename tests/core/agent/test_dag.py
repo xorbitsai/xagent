@@ -1591,6 +1591,61 @@ async def test_llm_plan_generator_retries_missing_required_tool_call() -> None:
 
 
 @pytest.mark.asyncio
+async def test_llm_plan_generator_retries_invalid_tool_arguments() -> None:
+    generator = LLMPlanGenerator()
+    context = ExecutionContext(execution_id="dag-llm-plan-invalid-json")
+    context.add_user_message("Create a short plan")
+    llm = SequenceLLM(
+        [
+            {
+                "tool_calls": [
+                    {
+                        "id": "call_generate_execution_plan",
+                        "type": "function",
+                        "function": {
+                            "name": "generate_execution_plan",
+                            "arguments": "not json at all",
+                        },
+                    }
+                ]
+            },
+            plan_tool_response(
+                [
+                    {
+                        "id": "final",
+                        "task": "Finalize answer",
+                        "dependencies": [],
+                        "termination_condition": (
+                            "Stop after final_answer returns the answer."
+                        ),
+                        "completion_evidence": (
+                            "The final answer has been returned successfully."
+                        ),
+                        "tool_names": [],
+                    }
+                ]
+            ),
+        ]
+    )
+
+    plan = await generator.generate_plan(
+        request=PlanGenerationRequest(
+            context=context,
+            execution_id="dag-llm-plan-invalid-json",
+            available_tool_names=[],
+        ),
+        llm=llm,
+    )
+
+    assert [step.id for step in plan.steps] == ["final"]
+    assert llm.calls == 2
+    retry_message = llm.seen_messages[1][-1]["content"]
+    assert "invalid JSON" in retry_message
+    assert "not json at all" in retry_message
+    assert "one complete valid JSON object" in retry_message
+
+
+@pytest.mark.asyncio
 async def test_llm_plan_generator_reports_missing_required_tool_call() -> None:
     generator = LLMPlanGenerator()
     context = ExecutionContext(execution_id="dag-llm-plan-missing")

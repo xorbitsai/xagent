@@ -17,6 +17,7 @@ from ..base import (
     RequiredToolCallError,
     append_user_message_preserving_turns,
     extract_required_tool_arguments,
+    truncate_prompt_preview,
 )
 
 logger = logging.getLogger(__name__)
@@ -30,6 +31,14 @@ PLAN_GENERATION_REQUIRED_TOOL_MESSAGE = (
 
 class PlanValidationError(ValueError):
     """Raised when a DAG execution plan is structurally invalid."""
+
+
+class PlanToolArgumentsError(ValueError):
+    """Raised when the required plan tool call has unusable arguments."""
+
+    def __init__(self, message: str, *, arguments: str | None = None) -> None:
+        self.arguments = arguments
+        super().__init__(message)
 
 
 @dataclass
@@ -328,6 +337,18 @@ class LLMPlanGenerator(PlanGenerator):
                     attempt + 1,
                 )
                 continue
+            except PlanToolArgumentsError as exc:
+                if attempt + 1 >= MAX_PLAN_TOOL_CALL_ATTEMPTS:
+                    raise
+                retry_feedback = self._invalid_tool_arguments_retry_feedback(exc)
+                logger.warning(
+                    "LLMPlanGenerator response included invalid %s arguments; "
+                    "retrying plan generation. execution_id=%s error=%s",
+                    self.PLAN_TOOL_NAME,
+                    request.execution_id,
+                    exc,
+                )
+                continue
             self._apply_response_language(request.context, plan_arguments)
             plan = coerce_execution_plan(plan_arguments)
             return self._filter_suggested_tools(
@@ -506,6 +527,27 @@ class LLMPlanGenerator(PlanGenerator):
             "Do not answer in natural language."
         )
 
+    def _invalid_tool_arguments_retry_feedback(
+        self, error: PlanToolArgumentsError
+    ) -> str:
+        argument_preview = (
+            truncate_prompt_preview(error.arguments, limit=1200)
+            if error.arguments
+            else ""
+        )
+        return (
+            f"The previous {self.PLAN_TOOL_NAME} tool call could not be used "
+            f"because its arguments were invalid JSON: {error}. Call "
+            f"{self.PLAN_TOOL_NAME} again exactly once. The tool arguments must "
+            "be one complete valid JSON object matching the tool schema. Do not "
+            "truncate string values or split the JSON across multiple tool calls."
+            + (
+                f"\nInvalid arguments preview:\n```json\n{argument_preview}\n```"
+                if argument_preview
+                else ""
+            )
+        )
+
     def _extract_tool_arguments(
         self,
         response: Any,
@@ -526,13 +568,21 @@ class LLMPlanGenerator(PlanGenerator):
         if isinstance(arguments, dict):
             return arguments
         if not isinstance(arguments, str):
-            raise TypeError("Tool call arguments must be an object or JSON string.")
+            raise PlanToolArgumentsError(
+                "Tool call arguments must be an object or JSON string."
+            )
         try:
             payload = json.loads(arguments)
         except json.JSONDecodeError as exc:
-            raise ValueError("Tool call arguments must be valid JSON.") from exc
+            raise PlanToolArgumentsError(
+                "Tool call arguments must be valid JSON.",
+                arguments=arguments,
+            ) from exc
         if not isinstance(payload, dict):
-            raise TypeError("Tool call arguments must decode to an object.")
+            raise PlanToolArgumentsError(
+                "Tool call arguments must decode to an object.",
+                arguments=arguments,
+            )
         return payload
 
 

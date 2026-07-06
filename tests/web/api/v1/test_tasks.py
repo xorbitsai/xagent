@@ -228,7 +228,10 @@ def test_create_task_records_key_usage_but_polling_does_not(mock_start_task):
     appended = client.post(
         f"/v1/chat/tasks/{task_id}/messages",
         headers=_bearer(full_key),
-        json={"role": "user", "content": "second turn"},
+        json={
+            "agent_id": agent_id,
+            "message": {"role": "user", "content": "second turn"},
+        },
     )
     assert appended.status_code == 202, appended.text
 

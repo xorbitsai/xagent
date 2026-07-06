@@ -63,6 +63,7 @@ repos:
           # import-untyped under disallow_any_unimported.
           - google-auth==2.48.0
           - google-api-core==2.25.2
+          - google-genai==1.66.0
 
   - repo: https://github.com/pre-commit/pre-commit-hooks
     rev: v5.0.0

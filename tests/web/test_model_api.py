@@ -858,7 +858,45 @@ class TestModelAPI:
         )
         assert deepseek is not None
         assert deepseek["name"] == "DeepSeek"
+        assert deepseek["category"] == ["llm"]
         assert deepseek["default_base_url"] == "https://api.deepseek.com"
+
+    def test_list_supported_providers_includes_multi_category_provider(
+        self, test_db, regular_user, regular_headers
+    ):
+        response = client.get(
+            "/api/models/providers/supported",
+            headers=regular_headers,
+        )
+
+        assert response.status_code == 200
+        providers = response.json()["providers"]
+        openai = next(
+            (provider for provider in providers if provider["id"] == "openai"),
+            None,
+        )
+        assert openai is not None
+        assert openai["name"] == "OpenAI"
+        assert openai["category"] == ["llm", "embedding"]
+        assert openai["default_base_url"] == "https://api.openai.com/v1"
+
+    def test_list_supported_providers_scopes_elevenlabs_to_speech(
+        self, test_db, regular_user, regular_headers
+    ):
+        response = client.get(
+            "/api/models/providers/supported",
+            headers=regular_headers,
+        )
+
+        assert response.status_code == 200
+        providers = response.json()["providers"]
+        elevenlabs = next(
+            (provider for provider in providers if provider["id"] == "elevenlabs"),
+            None,
+        )
+        assert elevenlabs is not None
+        assert elevenlabs["name"] == "ElevenLabs"
+        assert elevenlabs["category"] == ["speech"]
 
     def test_list_supported_providers_includes_ark_platforms(
         self, test_db, regular_user, regular_headers
@@ -880,11 +918,13 @@ class TestModelAPI:
         )
         assert volcengine is not None
         assert volcengine["name"] == "Volcengine Ark"
+        assert volcengine["category"] == ["video"]
         assert (
             volcengine["default_base_url"] == "https://ark.cn-beijing.volces.com/api/v3"
         )
         assert byteplus is not None
         assert byteplus["name"] == "BytePlus Ark"
+        assert byteplus["category"] == ["video"]
         assert (
             byteplus["default_base_url"]
             == "https://ark.ap-southeast.bytepluses.com/api/v3"

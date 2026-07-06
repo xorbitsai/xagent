@@ -96,6 +96,7 @@ _SUPPORTED_PROVIDER_METADATA: tuple[dict[str, Any], ...] = (
         "description": "OpenAI API compatible models",
         "requires_base_url": False,
         "compatibility": "openai_compatible",
+        "category": ["llm", "embedding"],
     },
     {
         "id": "claude",
@@ -103,30 +104,35 @@ _SUPPORTED_PROVIDER_METADATA: tuple[dict[str, Any], ...] = (
         "description": "Anthropic's Claude models",
         "requires_base_url": False,
         "compatibility": "claude_compatible",
+        "category": ["llm"],
     },
     {
         "id": "gemini",
         "name": "Google Gemini",
         "description": "Google's Gemini models",
         "requires_base_url": False,
+        "category": ["llm", "image"],
     },
     {
         "id": "xinference",
         "name": "Xinference",
         "description": "Xinference models for local inference",
         "requires_base_url": True,
+        "category": ["llm", "embedding", "image", "video", "speech", "rerank"],
     },
     {
         "id": "elevenlabs",
         "name": "ElevenLabs",
         "description": "ElevenLabs speech models for text-to-speech",
         "requires_base_url": False,
+        "category": ["speech"],
     },
     {
         "id": "deepseek",
         "name": "DeepSeek",
         "description": "DeepSeek v4 models with tool calling and thinking mode",
         "requires_base_url": False,
+        "category": ["llm"],
     },
     {
         "id": "openrouter",
@@ -138,6 +144,7 @@ _SUPPORTED_PROVIDER_METADATA: tuple[dict[str, Any], ...] = (
         ),
         "requires_base_url": False,
         "compatibility": "openai_compatible",
+        "category": ["llm"],
     },
     {
         "id": "dashscope",
@@ -145,6 +152,7 @@ _SUPPORTED_PROVIDER_METADATA: tuple[dict[str, Any], ...] = (
         "description": "Alibaba Cloud's DashScope models",
         "requires_base_url": False,
         "compatibility": "openai_compatible",
+        "category": ["llm", "embedding", "image", "rerank"],
     },
     {
         "id": "volcengine-ark",
@@ -152,6 +160,7 @@ _SUPPORTED_PROVIDER_METADATA: tuple[dict[str, Any], ...] = (
         "description": "Volcengine ModelArk provider for Seedance video generation",
         "requires_base_url": False,
         "default_base_url": "https://ark.cn-beijing.volces.com/api/v3",
+        "category": ["video"],
     },
     {
         "id": "byteplus-ark",
@@ -159,6 +168,7 @@ _SUPPORTED_PROVIDER_METADATA: tuple[dict[str, Any], ...] = (
         "description": "BytePlus ModelArk provider for Seedance video generation",
         "requires_base_url": False,
         "default_base_url": "https://ark.ap-southeast.bytepluses.com/api/v3",
+        "category": ["video"],
     },
     {
         "id": "alibaba-coding-plan",
@@ -166,6 +176,7 @@ _SUPPORTED_PROVIDER_METADATA: tuple[dict[str, Any], ...] = (
         "description": "Alibaba Bailian (Model Studio) coding plan",
         "requires_base_url": False,
         "compatibility": "openai_compatible",
+        "category": ["llm"],
     },
     {
         "id": "alibaba-coding-plan-cn",
@@ -173,12 +184,14 @@ _SUPPORTED_PROVIDER_METADATA: tuple[dict[str, Any], ...] = (
         "description": "Alibaba Bailian (Model Studio) coding plan (China)",
         "requires_base_url": False,
         "compatibility": "openai_compatible",
+        "category": ["llm"],
     },
     {
         "id": "zhipu",
         "name": "Zhipu AI",
         "description": "Zhipu AI models (GLM series) using zai SDK",
         "requires_base_url": False,
+        "category": ["llm"],
     },
     {
         "id": "zai-coding-plan",
@@ -186,6 +199,7 @@ _SUPPORTED_PROVIDER_METADATA: tuple[dict[str, Any], ...] = (
         "description": "GLM coding plan via Z.AI",
         "requires_base_url": False,
         "compatibility": "openai_compatible",
+        "category": ["llm"],
     },
     {
         "id": "zhipuai-coding-plan",
@@ -193,6 +207,7 @@ _SUPPORTED_PROVIDER_METADATA: tuple[dict[str, Any], ...] = (
         "description": "GLM coding plan via Zhipu AI",
         "requires_base_url": False,
         "compatibility": "openai_compatible",
+        "category": ["llm"],
     },
     {
         "id": "minimax-coding-plan",
@@ -201,6 +216,7 @@ _SUPPORTED_PROVIDER_METADATA: tuple[dict[str, Any], ...] = (
         "requires_base_url": False,
         "compatibility": "claude_compatible",
         "default_base_url": "https://api.minimax.io/anthropic",
+        "category": ["llm"],
     },
     {
         "id": "minimax-cn-coding-plan",
@@ -209,6 +225,7 @@ _SUPPORTED_PROVIDER_METADATA: tuple[dict[str, Any], ...] = (
         "requires_base_url": False,
         "compatibility": "claude_compatible",
         "default_base_url": "https://api.minimaxi.com/anthropic",
+        "category": ["llm"],
     },
     {
         "id": "kimi-for-coding",
@@ -217,6 +234,7 @@ _SUPPORTED_PROVIDER_METADATA: tuple[dict[str, Any], ...] = (
         "requires_base_url": False,
         "compatibility": "claude_compatible",
         "default_base_url": "https://api.kimi.com/coding",
+        "category": ["llm"],
     },
 )
 

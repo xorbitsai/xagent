@@ -107,67 +107,54 @@ export interface ProviderConfig {
 const LOCAL_PROVIDER_CONFIGS: Record<string, Partial<ProviderConfig>> = {
   openai: {
     icon: <img src="/openai.svg" alt="OpenAI" className="w-6 h-6" />,
-    category: ["llm", "embedding"],
     defaultBaseUrl: "https://api.openai.com/v1",
   },
   openrouter: {
     icon: <img src="/openrouter.jpg" alt="OpenRouter" className="w-6 h-6" />,
-    category: ["llm"],
     defaultBaseUrl: "https://openrouter.ai/api/v1",
   },
   deepseek: {
     icon: <img src="/deepseek.svg" alt="DeepSeek" className="w-6 h-6" />,
-    category: ["llm"],
     defaultBaseUrl: "https://api.deepseek.com",
   },
   "minimax-coding-plan": {
     icon: <img src="/minimax.svg" alt="MiniMax" className="w-6 h-6" />,
-    category: ["llm"],
     defaultBaseUrl: "https://api.minimax.io/anthropic"
   },
   "minimax-cn-coding-plan": {
     icon: <img src="/minimax.svg" alt="MiniMax" className="w-6 h-6" />,
-    category: ["llm"],
     defaultBaseUrl: "https://api.minimaxi.com/anthropic"
   },
   "kimi-for-coding": {
     icon: <img src="/kimi.svg" alt="Kimi" className="w-6 h-6" />,
-    category: ["llm"],
     defaultBaseUrl: "https://api.kimi.com/coding"
   },
   "zai-coding-plan": {
     icon: <img src="/zhipu.svg" alt="Z.AI" className="w-6 h-6" />,
-    category: ["llm"],
     defaultBaseUrl: "https://api.z.ai/api/coding/paas/v4"
   },
   "zhipuai-coding-plan": {
     icon: <img src="/zhipu.svg" alt="Zhipu" className="w-6 h-6" />,
-    category: ["llm"],
     defaultBaseUrl: "https://open.bigmodel.cn/api/coding/paas/v4"
   },
   "alibaba-coding-plan": {
     icon: <img src="/dashscope.png" alt="Alibaba Bailian" className="w-6 h-6" />,
-    category: ["llm"],
     defaultBaseUrl: "https://coding-intl.dashscope.aliyuncs.com/v1"
   },
   "alibaba-coding-plan-cn": {
     icon: <img src="/dashscope.png" alt="Alibaba Bailian" className="w-6 h-6" />,
-    category: ["llm"],
     defaultBaseUrl: "https://coding.dashscope.aliyuncs.com/v1"
   },
   azure_openai: {
     icon: <Zap className="w-6 h-6 text-blue-500" />,
-    category: ["llm"]
     // No default base url for Azure, user must provide
   },
   zhipu: {
     icon: <img src="/zhipu.svg" alt="Zhipu" className="w-6 h-6" />,
-    category: ["llm"],
     defaultBaseUrl: "https://open.bigmodel.cn/api/paas/v4",
   },
   dashscope: {
     icon: <img src="/dashscope.png" alt="DashScope" className="w-6 h-6" />,
-    category: ["llm", "embedding", "image", "rerank"],
     defaultBaseUrl: "https://dashscope.aliyuncs.com/compatible-mode/v1",
     categoryBaseUrls: {
       embedding: "https://dashscope.aliyuncs.com/api/v1/services/embeddings/text-embedding/text-embedding",
@@ -177,37 +164,30 @@ const LOCAL_PROVIDER_CONFIGS: Record<string, Partial<ProviderConfig>> = {
   },
   gemini: {
     icon: <img src="/gemini.svg" alt="Gemini" className="w-6 h-6" />,
-    category: ["llm", "image"],
     defaultBaseUrl: "https://generativelanguage.googleapis.com/v1beta",
   },
   claude: {
     icon: <img src="/claude.svg" alt="Claude" className="w-6 h-6" />,
-    category: ["llm"],
     defaultBaseUrl: "https://api.anthropic.com/v1",
   },
   xinference: {
     icon: <img src="/xagent_logo.png" alt="Xinference" className="w-6 h-6" />,
-    category: ["llm", "embedding", "image", "video", "speech", "rerank"],
     defaultBaseUrl: "http://localhost:9997",
   },
   "volcengine-ark": {
     icon: <img src="/volcengine.png" alt="Volcengine" className="w-6 h-6" />,
-    category: ["video"],
     defaultBaseUrl: "https://ark.cn-beijing.volces.com/api/v3",
   },
   "byteplus-ark": {
     icon: <img src="/byteplus.png" alt="BytePlus" className="w-6 h-6" />,
-    category: ["video"],
     defaultBaseUrl: "https://ark.ap-southeast.bytepluses.com/api/v3",
   },
   elevenlabs: {
     icon: <img src="/elevenlabs.svg" alt="ElevenLabs" className="h-6 w-24 object-contain object-left" />,
-    category: ["speech"],
     defaultBaseUrl: "https://api.elevenlabs.io",
   },
   ollama: {
     icon: <Box className="w-6 h-6" />,
-    category: ["llm", "embedding"],
     defaultBaseUrl: "http://localhost:11434"
   }
 }
@@ -292,7 +272,7 @@ export function ModelsPage() {
           icon: localConfig.icon || <Brain className="w-6 h-6" />,
           defaultBaseUrl: p.default_base_url || localConfig.defaultBaseUrl,
           categoryBaseUrls: localConfig.categoryBaseUrls,
-          category: localConfig.category || ["llm", "embedding", "image", "speech"],
+          category: p.category || ["llm"],
           requires_base_url: p.requires_base_url
         }
       })
@@ -311,13 +291,25 @@ export function ModelsPage() {
       })
 
       if (response.ok) {
-        const defaults = await response.json()
+        const defaults: unknown = await response.json()
         const defaultModelMap: Record<string, Model> = {}
 
         if (Array.isArray(defaults)) {
-          defaults.forEach((defaultConfig: any) => {
-            if (defaultConfig && defaultConfig.config_type && defaultConfig.model) {
-              defaultModelMap[defaultConfig.config_type] = defaultConfig.model
+          defaults.forEach((defaultConfig: unknown) => {
+            if (typeof defaultConfig !== "object" || defaultConfig === null) {
+              return
+            }
+
+            const candidate = defaultConfig as {
+              config_type?: unknown
+              model?: Model
+            }
+
+            if (
+              typeof candidate.config_type === "string" &&
+              candidate.model
+            ) {
+              defaultModelMap[candidate.config_type] = candidate.model
             }
           })
         }
@@ -426,7 +418,7 @@ export function ModelsPage() {
 
   // Filter explore providers by active tab
   const exploreProviders = useMemo(() => {
-    return providers.filter(p => p.category.includes(activeTab as any))
+    return providers.filter(p => p.category.includes(activeTab))
   }, [activeTab, providers])
 
   if (loading && models.length === 0) {
@@ -510,14 +502,13 @@ export function ModelsPage() {
               {Object.entries(enabledProviders).map(([providerId, providerModels]) => {
                 const knownConfig = providers.find(p => p.id === providerId)
                 const hasKnownProvider = knownConfig !== undefined
-                const providerConfig = knownConfig || {
+                const providerConfig: ProviderConfig = knownConfig || {
                   id: providerId,
                   name: providerId.charAt(0).toUpperCase() + providerId.slice(1),
                   description: "",
                   icon: <Brain className="w-6 h-6" />,
-                  category: ["llm", "video"] as any,
+                  category: ["llm", "video"],
                   defaultBaseUrl: "",
-                  models: [],
                 }
                 // Surface a real model label for the unknown-provider fallback
                 // so a stale or unrecognized provider id does not render
@@ -545,7 +536,7 @@ export function ModelsPage() {
                   asr: t('models.abilities.asr'),
                   tts: t('models.abilities.tts')
                 }
-                const icons: Record<string, any> = {
+                const icons: Record<string, ReactNode> = {
                   chat: <Brain className="w-3 h-3 mr-1" />,
                   vision: <ImageIcon className="w-3 h-3 mr-1" />,
                   thinking_mode: <Box className="w-3 h-3 mr-1" />,

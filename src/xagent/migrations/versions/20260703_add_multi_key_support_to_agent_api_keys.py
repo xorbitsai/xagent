@@ -1,7 +1,7 @@
 """add_multi_key_support_to_agent_api_keys
 
 Revision ID: 20260703_add_multi_key_support_to_agent_api_keys
-Revises: 20260625_add_user_skills_tables
+Revises: 20260704_merge_alembic_heads
 Create Date: 2026-07-03 00:00:00.000000
 
 """
@@ -14,13 +14,18 @@ from sqlalchemy import inspect
 
 # revision identifiers, used by Alembic.
 revision: str = "20260703_add_multi_key_support_to_agent_api_keys"
-# 20260702_add_mcp_oauth_tables and 20260702_add_trigger_provider_foundation
-# both branched from 20260629_add_gmail_watch_states without being
-# reconciled. This used to list both of them directly as a merge point,
-# but 20260625_add_user_skills_tables (added to main afterwards) already
-# merges that same pair -- chaining onto it instead keeps a single linear
-# history rather than each new migration re-merging the same two heads.
-down_revision: Union[str, None] = "20260625_add_user_skills_tables"
+# This has been re-chained twice now as main kept growing new siblings off
+# the same ancestor before this PR landed:
+#   1. Originally based on 20260629_add_gmail_watch_states.
+#   2. Rebased onto 20260625_add_user_skills_tables once that revision
+#      merged two other stray heads off the same gmail-watch-states parent.
+#   3. Rebased onto 20260704_merge_alembic_heads (this PR's current base)
+#      once THAT revision merged two more heads
+#      (20260703_add_user_mcpserver_env,
+#      20260703_backfill_strip_other_tool_category) off
+#      20260625_add_user_skills_tables. Chaining onto the latest merge
+#      point keeps a single linear history instead of re-merging.
+down_revision: Union[str, None] = "20260704_merge_alembic_heads"
 branch_labels: Union[str, Sequence[str], None] = None
 depends_on: Union[str, Sequence[str], None] = None
 

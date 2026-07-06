@@ -11,6 +11,7 @@ Test plumbing (TestClient, _test_db fixture, auth helpers) is shared
 via ``tests/web/api/conftest.py``.
 """
 
+from datetime import datetime, timezone
 from unittest.mock import patch
 
 import pytest
@@ -434,6 +435,43 @@ class TestCreateMultipleKeys:
         )
         assert resp.status_code == 404
 
+    def test_key_prefix_collision_returns_409(self):
+        """Mirrors the legacy endpoint's IntegrityError -> 409 mapping."""
+        headers = _headers()
+        agent_id = _create_agent(headers)
+
+        fake_error = IntegrityError(
+            "UNIQUE constraint failed: agent_api_keys.key_prefix",
+            params=None,
+            orig=Exception("simulated race"),
+        )
+        with patch.object(Session, "commit", side_effect=fake_error):
+            resp = client.post(
+                "/api/agent-api-keys",
+                headers=headers,
+                json={"agent_id": agent_id, "label": "x"},
+            )
+
+        assert resp.status_code == 409
+        assert resp.json()["detail"] == "rotation_conflict"
+        assert "UNIQUE constraint failed" not in resp.text
+
+    def test_internal_error_does_not_leak_str_e(self):
+        headers = _headers()
+        agent_id = _create_agent(headers)
+
+        secret_message = "secret-internal-detail-do-not-leak"
+        with patch.object(Session, "commit", side_effect=RuntimeError(secret_message)):
+            resp = client.post(
+                "/api/agent-api-keys",
+                headers=headers,
+                json={"agent_id": agent_id, "label": "x"},
+            )
+
+        assert resp.status_code == 500
+        assert resp.json()["detail"] == "Internal server error"
+        assert secret_message not in resp.text
+
 
 class TestListAndStats:
     """GET /api/agent-api-keys and /api/agent-api-keys/stats."""
@@ -484,6 +522,36 @@ class TestListAndStats:
         assert stats["calls_this_month"] == 0
         assert stats["last_api_call"] is None
         assert created["full_key"]  # sanity: creation itself succeeded
+
+    def test_calls_this_month_survives_revocation(self):
+        """Historical usage counts toward the stat even after the key that
+        made those calls is revoked -- revoked keys are kept forever as an
+        audit trail, so their usage shouldn't vanish from "calls this
+        month" the instant they're deactivated. Deliberately pins this so
+        an accidental future ``revoked_at IS NULL`` filter on the calls
+        aggregate (unlike the intentional one on ``active_keys``) would
+        fail this test instead of silently changing behavior.
+        """
+        headers = _headers()
+        agent_id = _create_agent(headers)
+        client.post("/api/agent-api-keys", headers=headers, json={"agent_id": agent_id})
+        key_id = client.get("/api/agent-api-keys", headers=headers).json()[0]["id"]
+
+        current_month = datetime.now(timezone.utc).strftime("%Y-%m")
+        db = _direct_db_session()
+        try:
+            db.query(AgentApiKey).filter(AgentApiKey.id == key_id).update(
+                {"usage_month": current_month, "usage_month_calls": 5}
+            )
+            db.commit()
+        finally:
+            db.close()
+
+        client.delete(f"/api/agent-api-keys/{key_id}", headers=headers)
+
+        stats = client.get("/api/agent-api-keys/stats", headers=headers).json()
+        assert stats["active_keys"] == 0
+        assert stats["calls_this_month"] == 5
 
 
 class TestPauseResume:
@@ -537,6 +605,42 @@ class TestRegenerateAndDelete:
         assert listed["id"] == key_id
         assert listed["label"] == "keep-me"
         assert listed["status"] == "active"
+
+    def test_regenerate_key_prefix_collision_returns_409(self):
+        headers = _headers()
+        agent_id = _create_agent(headers)
+        client.post("/api/agent-api-keys", headers=headers, json={"agent_id": agent_id})
+        key_id = client.get("/api/agent-api-keys", headers=headers).json()[0]["id"]
+
+        fake_error = IntegrityError(
+            "UNIQUE constraint failed: agent_api_keys.key_prefix",
+            params=None,
+            orig=Exception("simulated race"),
+        )
+        with patch.object(Session, "commit", side_effect=fake_error):
+            resp = client.post(
+                f"/api/agent-api-keys/{key_id}/regenerate", headers=headers
+            )
+
+        assert resp.status_code == 409
+        assert resp.json()["detail"] == "rotation_conflict"
+        assert "UNIQUE constraint failed" not in resp.text
+
+    def test_regenerate_internal_error_does_not_leak_str_e(self):
+        headers = _headers()
+        agent_id = _create_agent(headers)
+        client.post("/api/agent-api-keys", headers=headers, json={"agent_id": agent_id})
+        key_id = client.get("/api/agent-api-keys", headers=headers).json()[0]["id"]
+
+        secret_message = "secret-internal-detail-do-not-leak"
+        with patch.object(Session, "commit", side_effect=RuntimeError(secret_message)):
+            resp = client.post(
+                f"/api/agent-api-keys/{key_id}/regenerate", headers=headers
+            )
+
+        assert resp.status_code == 500
+        assert resp.json()["detail"] == "Internal server error"
+        assert secret_message not in resp.text
 
     def test_delete_marks_revoked_and_hides_from_active_count(self):
         headers = _headers()

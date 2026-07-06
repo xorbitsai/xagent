@@ -168,7 +168,16 @@ def record_key_usage(key_prefix: str) -> None:
     session_local = get_session_local()
     local_db = session_local()
     try:
-        local_db.query(AgentApiKey).filter(AgentApiKey.key_prefix == key_prefix).update(
+        local_db.query(AgentApiKey).filter(
+            AgentApiKey.key_prefix == key_prefix,
+            # Belt-and-suspenders: today both call sites are gated by
+            # get_agent_from_api_key, which already excludes revoked/paused
+            # keys before the endpoint body runs. Repeating the guard here
+            # means a future caller that forgets that gate can't silently
+            # bump usage on a dead key.
+            AgentApiKey.revoked_at.is_(None),
+            AgentApiKey.paused_at.is_(None),
+        ).update(
             {
                 AgentApiKey.last_used_at: now,
                 AgentApiKey.usage_month: current_month,

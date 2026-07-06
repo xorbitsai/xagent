@@ -13,6 +13,7 @@ import {
   RefreshCw,
   Search,
   Trash2,
+  X,
 } from "lucide-react"
 import { Button } from "@/components/ui/button"
 import { Input } from "@/components/ui/input"
@@ -82,6 +83,11 @@ export function ApiKeysPage() {
   const [agents, setAgents] = useState<AgentOption[]>([])
   const [loading, setLoading] = useState(true)
   const [searchQuery, setSearchQuery] = useState("")
+  // Exact agent_id filter from the ?agent=<id> jump-link, kept separate
+  // from the free-text searchQuery -- matching by agent *name* substring
+  // would wrongly mix in another agent whose name happens to contain
+  // this one's (e.g. "Bot" vs. "Support Bot").
+  const [agentFilterId, setAgentFilterId] = useState<number | null>(null)
   const [busyKeyId, setBusyKeyId] = useState<number | null>(null)
 
   const [isCreateOpen, setIsCreateOpen] = useState(false)
@@ -129,23 +135,29 @@ export function ApiKeysPage() {
     fetchAgents()
   }, [fetchAll, fetchAgents])
 
-  // Jump-link from an agent card / deploy dialog: pre-filter to that agent.
+  // Jump-link from an agent card / deploy dialog: pre-filter to that agent
+  // by id (exact), independent of whether the agents list has loaded yet.
   useEffect(() => {
     const agentId = searchParams.get("agent")
-    if (!agentId || agents.length === 0) return
-    const agent = agents.find((a) => String(a.id) === agentId)
-    if (agent) setSearchQuery(agent.name)
-  }, [searchParams, agents])
+    const parsed = agentId ? Number(agentId) : NaN
+    if (!Number.isNaN(parsed)) setAgentFilterId(parsed)
+  }, [searchParams])
+
+  const agentFilterName = agentFilterId
+    ? agents.find((a) => a.id === agentFilterId)?.name
+    : undefined
 
   const normalizedQuery = searchQuery.trim().toLowerCase()
-  const filteredKeys = normalizedQuery
-    ? keys.filter((k) =>
+  const filteredKeys = keys
+    .filter((k) => agentFilterId === null || k.agent_id === agentFilterId)
+    .filter(
+      (k) =>
+        !normalizedQuery ||
         [k.label ?? "", k.agent_name, k.key_prefix]
           .join(" ")
           .toLowerCase()
           .includes(normalizedQuery)
-      )
-    : keys
+    )
 
   const openCreateDialog = () => {
     const preselected = searchParams.get("agent")
@@ -223,12 +235,6 @@ export function ApiKeysPage() {
     }
   }
 
-  const handleCopyMasked = async (masked: string) => {
-    if (await copyToClipboard(masked)) {
-      toast.success(t("apiKeysPage.messages.copied") || "Copied to clipboard")
-    }
-  }
-
   const formatDate = (value: string | null) =>
     value ? new Date(value).toLocaleString() : "—"
 
@@ -272,6 +278,9 @@ export function ApiKeysPage() {
           <CardContent className="pt-6">
             <p className="text-xs text-muted-foreground">{t("apiKeysPage.stats.callsThisMonth") || "Calls This Month"}</p>
             <p className="text-2xl font-bold mt-1">{stats?.calls_this_month ?? "—"}</p>
+            <p className="text-xs text-muted-foreground mt-1">
+              {t("apiKeysPage.stats.callsThisMonthHint") || "includes now-inactive keys"}
+            </p>
           </CardContent>
         </Card>
         <Card>
@@ -293,14 +302,28 @@ export function ApiKeysPage() {
         <Card className="shadow-sm">
           <CardHeader className="pb-3 border-b flex flex-col sm:flex-row items-start sm:items-center justify-between gap-4 space-y-0">
             <h2 className="text-lg font-semibold">{t("apiKeysPage.allKeys") || "All Keys"}</h2>
-            <div className="relative w-full sm:w-64">
-              <Search className="w-4 h-4 absolute left-3 top-1/2 -translate-y-1/2 text-muted-foreground" />
-              <Input
-                placeholder={t("apiKeysPage.searchPlaceholder") || "Search keys or agents..."}
-                className="pl-9 h-9"
-                value={searchQuery}
-                onChange={(e) => setSearchQuery(e.target.value)}
-              />
+            <div className="flex items-center gap-2 w-full sm:w-auto">
+              {agentFilterId !== null && (
+                <span className="inline-flex items-center gap-1.5 text-xs bg-indigo-50 text-indigo-700 dark:bg-indigo-900/20 dark:text-indigo-300 rounded-full px-2.5 py-1 shrink-0">
+                  {agentFilterName || t("apiKeysPage.filteredByAgent") || "Filtered agent"}
+                  <button
+                    type="button"
+                    onClick={() => setAgentFilterId(null)}
+                    title={t("apiKeysPage.clearFilter") || "Clear filter"}
+                  >
+                    <X className="w-3 h-3" />
+                  </button>
+                </span>
+              )}
+              <div className="relative w-full sm:w-64">
+                <Search className="w-4 h-4 absolute left-3 top-1/2 -translate-y-1/2 text-muted-foreground" />
+                <Input
+                  placeholder={t("apiKeysPage.searchPlaceholder") || "Search keys or agents..."}
+                  className="pl-9 h-9"
+                  value={searchQuery}
+                  onChange={(e) => setSearchQuery(e.target.value)}
+                />
+              </div>
             </div>
           </CardHeader>
           <CardContent className="p-0">
@@ -341,15 +364,9 @@ export function ApiKeysPage() {
                       </span>
                     </TableCell>
                     <TableCell>
-                      <button
-                        type="button"
-                        className="font-mono text-xs text-muted-foreground hover:text-foreground flex items-center gap-1.5"
-                        onClick={() => handleCopyMasked(key.masked_key)}
-                        title={t("apiKeysPage.actions.copy") || "Copy"}
-                      >
+                      <span className="font-mono text-xs text-muted-foreground">
                         {key.masked_key}
-                        <Copy className="w-3 h-3" />
-                      </button>
+                      </span>
                     </TableCell>
                     <TableCell>
                       <span

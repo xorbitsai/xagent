@@ -910,7 +910,7 @@ async def upload_agent_logo(
         raise HTTPException(status_code=500, detail=str(e))
 
 
-# ===== API Key Endpoints =====
+# ===== API Key Endpoints (legacy single-key surface, compat-only) =====
 #
 # Three sibling endpoints (POST/GET/DELETE) at /api/agents/{agent_id}/api-key
 # let the agent owner manage the SDK key. All three share JWT auth via
@@ -918,6 +918,16 @@ async def upload_agent_logo(
 # the unsuccessful-ownership path returns 404 (not 403) so the existence of
 # another user's agent is not leaked. See the SDK design doc §5 for the
 # product-level contract and §10 for the security rationale.
+#
+# Deliberately parallel, not stale: the frontend dashboard manages keys
+# exclusively through the multi-key admin surface at
+# ``/api/agent-api-keys`` (see ``api/agent_api_keys.py``) and has zero
+# callers left for this trio -- but this one remains the stable, versioned
+# contract external SDK/REST callers are pinned to, so it can't be removed
+# just because the UI moved on. Semantics here are intentionally still
+# "one key" flavored under the hood (POST revokes *every* active key on
+# the agent, GET returns the most-recently-created non-paused one) even
+# though the underlying table now allows multiple simultaneous keys.
 
 
 @router.post("/{agent_id}/api-key", response_model=APIKeyGenerateResponse)

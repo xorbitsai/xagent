@@ -1,7 +1,7 @@
 "use client"
 
 import { useCallback, useEffect, useState } from "react"
-import { useSearchParams } from "next/navigation"
+import { useRouter, useSearchParams } from "next/navigation"
 import {
   AlertTriangle,
   Check,
@@ -76,6 +76,7 @@ function statusPillClass(status: AgentApiKeyListItem["status"]): string {
 
 export function ApiKeysPage() {
   const { t } = useI18n()
+  const router = useRouter()
   const searchParams = useSearchParams()
 
   const [keys, setKeys] = useState<AgentApiKeyListItem[]>([])
@@ -146,6 +147,14 @@ export function ApiKeysPage() {
   const agentFilterName = agentFilterId
     ? agents.find((a) => a.id === agentFilterId)?.name
     : undefined
+
+  // Also strips ?agent=<id> from the URL -- otherwise it lingers and
+  // openCreateDialog (which reads searchParams directly) would keep
+  // preselecting the agent the user just cleared the filter for.
+  const clearAgentFilter = () => {
+    setAgentFilterId(null)
+    router.replace("/api-keys")
+  }
 
   const normalizedQuery = searchQuery.trim().toLowerCase()
   const filteredKeys = keys
@@ -308,7 +317,7 @@ export function ApiKeysPage() {
                   {agentFilterName || t("apiKeysPage.filteredByAgent") || "Filtered agent"}
                   <button
                     type="button"
-                    onClick={() => setAgentFilterId(null)}
+                    onClick={clearAgentFilter}
                     title={t("apiKeysPage.clearFilter") || "Clear filter"}
                   >
                     <X className="w-3 h-3" />

@@ -10,7 +10,7 @@ from sqlalchemy import event
 from xagent.web.models.agent import Agent, AgentStatus
 from xagent.web.models.chat_message import TaskChatMessage
 from xagent.web.models.database import get_engine
-from xagent.web.models.task import Task, TaskStatus
+from xagent.web.models.task import Task, TaskStatus, TraceEvent
 from xagent.web.models.trigger import AgentTrigger, TriggerRun, TriggerRunStatus
 from xagent.web.models.user import User
 
@@ -701,3 +701,40 @@ def test_conversation_logs_list_batches_trigger_type_lookup() -> None:
         if "FROM trigger_runs" in statement or "FROM agent_triggers" in statement
     ]
     assert len(trigger_lookup_queries) <= 2
+
+
+def test_detail_returns_trace_events() -> None:
+    admin = _admin_headers()
+    admin_id = _user_id("admin")
+    agent_id = _create_agent_row(user_id=admin_id, name="Trace Agent")
+    task_id = _create_task_row(
+        user_id=admin_id,
+        title="Trace REST task",
+        source="sdk",
+        is_visible=False,
+        agent_id=agent_id,
+        input_text="hi",
+        output_text="done",
+    )
+
+    db = _direct_db_session()
+    try:
+        db.add(
+            TraceEvent(
+                task_id=task_id,
+                event_id="evt-1",
+                event_type="tool_call_start",
+                timestamp=datetime.now(timezone.utc),
+                data={"tool_name": "search", "tool_args": {"q": "x"}},
+            )
+        )
+        db.commit()
+    finally:
+        db.close()
+
+    resp = client.get(f"/api/conversation-logs/{task_id}", headers=admin)
+    assert resp.status_code == 200, resp.text
+    events = resp.json()["trace_events"]
+    assert len(events) == 1
+    assert events[0]["event_type"] == "tool_call_start"
+    assert events[0]["data"]["tool_name"] == "search"

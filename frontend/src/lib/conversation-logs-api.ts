@@ -60,9 +60,19 @@ export interface ConversationLogTranscriptMessage {
   created_at?: string | null
 }
 
+export interface ConversationLogTraceEvent {
+  event_id?: string
+  event_type?: string
+  step_id?: string | null
+  timestamp?: number | null
+  data?: Record<string, unknown>
+  parent_event_id?: string | null
+}
+
 export interface ConversationLogDetailResponse {
   log: ConversationLogSummary
   transcript: ConversationLogTranscriptMessage[]
+  trace_events?: ConversationLogTraceEvent[]
   metadata: {
     task?: {
       task_id: number

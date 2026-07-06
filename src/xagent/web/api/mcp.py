@@ -28,7 +28,7 @@ from ...core.tools.core.mcp.data_config import MCPServerConfig
 from ...core.tools.core.mcp.manager.db import DatabaseMCPServerManager
 from ...core.tools.core.mcp.model import MASKED_SECRET_VALUE, SENSITIVE_AUTH_FIELDS
 from ...core.utils.encryption import decrypt_value, encrypt_value
-from ..auth_dependencies import get_current_user
+from ..auth_dependencies import get_current_user, is_admin_user
 from ..mcp_apps import get_all_mcp_apps, get_app_by_name
 from ..models.database import get_db
 from ..models.mcp import MCPServer, UserMCPServer
@@ -1817,29 +1817,35 @@ def list_mcp_apps(
 
 @mcp_router.get("/servers", response_model=List[MCPServerResponse])
 def get_mcp_servers(
+    user_id: Optional[int] = None,
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ) -> List[MCPServerResponse]:
-    """List MCP servers for the current user."""
+    """List MCP servers for the current user (admins may pass user_id to inspect another user)."""
     try:
         manager = DatabaseMCPServerManager(db)
-        user_id = current_user.id
+        if user_id is not None and user_id != current_user.id:
+            if not is_admin_user(current_user):
+                raise HTTPException(status_code=403, detail="Admin required")
+            effective_user_id = int(user_id)
+        else:
+            effective_user_id = int(current_user.id)
 
         # Get user's MCP servers
         user_mcps = (
             db.query(UserMCPServer, MCPServer)
             .join(MCPServer, UserMCPServer.mcpserver_id == MCPServer.id)
-            .filter(UserMCPServer.user_id == user_id)
+            .filter(UserMCPServer.user_id == effective_user_id)
             .order_by(MCPServer.created_at.desc())
             .all()
         )
 
-        logger.info(f"user_mcps: {user_mcps}")
-
         # Fetch oauth emails
         from ..models.user_oauth import UserOAuth
 
-        oauth_accounts = db.query(UserOAuth).filter(UserOAuth.user_id == user_id).all()
+        oauth_accounts = (
+            db.query(UserOAuth).filter(UserOAuth.user_id == effective_user_id).all()
+        )
         oauth_emails = {
             str(oauth.provider): str(oauth.email)
             for oauth in oauth_accounts
@@ -1870,7 +1876,7 @@ def get_mcp_servers(
         user_custom_apis = (
             db.query(UserCustomApi, CustomApi)
             .join(CustomApi, UserCustomApi.custom_api_id == CustomApi.id)
-            .filter(UserCustomApi.user_id == user_id)
+            .filter(UserCustomApi.user_id == effective_user_id)
             .all()
         )
 
@@ -1908,6 +1914,8 @@ def get_mcp_servers(
 
         return responses
 
+    except HTTPException:
+        raise
     except Exception as e:
         logger.error(f"Failed to list MCP servers: {e}")
         raise HTTPException(

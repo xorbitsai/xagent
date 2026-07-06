@@ -5,6 +5,8 @@ import { Bot, ChevronLeft, ChevronRight, Inbox } from "lucide-react"
 
 import { Badge } from "@/components/ui/badge"
 import { Button } from "@/components/ui/button"
+import { TraceEventRenderer } from "@/components/chat/TraceEventRenderer"
+import { MarkdownRenderer } from "@/components/ui/markdown-renderer"
 import { SearchInput } from "@/components/ui/search-input"
 import { useI18n } from "@/contexts/i18n-context"
 import {
@@ -421,7 +423,14 @@ function ConversationLogDetail({ detail }: { detail: ConversationLogDetailRespon
                       : "rounded-bl-sm border border-slate-200 bg-white text-slate-900"
                   )}
                 >
-                  <p className="whitespace-pre-wrap break-words">{message.content}</p>
+                  {message.role === "user" ? (
+                    <p className="whitespace-pre-wrap break-words">{message.content}</p>
+                  ) : (
+                    <MarkdownRenderer
+                      content={message.content}
+                      className="prose-sm break-words [overflow-wrap:anywhere]"
+                    />
+                  )}
                 </div>
                 {message.role === "user" ? (
                   <div className="mt-1 flex h-7 w-7 shrink-0 items-center justify-center rounded-md bg-slate-100 text-xs font-semibold text-slate-500">
@@ -432,6 +441,11 @@ function ConversationLogDetail({ detail }: { detail: ConversationLogDetailRespon
             ))}
           </div>
         )}
+        {detail.trace_events && detail.trace_events.length > 0 ? (
+          <div className="mt-6 border-t border-slate-200 pt-4">
+            <TraceEventRenderer events={detail.trace_events as any} taskStatus={log.status} />
+          </div>
+        ) : null}
       </section>
     </div>
   )

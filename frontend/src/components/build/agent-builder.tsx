@@ -14,6 +14,7 @@ import { PlusCircle, MessageSquare, Upload, Settings2, Check, Zap, BookOpen, Che
 import { ConnectMcpDialog } from "@/components/mcp/connect-mcp-dialog"
 import { useI18n } from "@/contexts/i18n-context"
 import { useApp } from "@/contexts/app-context-chat"
+import { useAuth } from "@/contexts/auth-context"
 import { useMcpApps } from "@/contexts/mcp-apps-context"
 import { createFileChipHTML } from "@/components/chat/FileChip"
 import { MultiSelect } from "@/components/ui/multi-select"
@@ -108,6 +109,10 @@ export function AgentBuilder({ agentId }: AgentBuilderProps) {
   const { state, setTaskId, sendMessage, dispatch, closeFilePreview } = useApp()
   const { t, locale } = useI18n()
   const { apps: officialApps, getAppIcon, refresh: refreshMcpApps } = useMcpApps()
+  const { user } = useAuth()
+  // Set once loadAgent decides to load an owner-scoped MCP list for an admin
+  // cross-user view, so the mount-time self-scoped fetch won't clobber it.
+  const ownerScopedMcpRef = useRef(false)
   const router = useRouter()
   const searchParams = useSearchParams()
   const templateId = searchParams.get("template")
@@ -494,9 +499,14 @@ export function AgentBuilder({ agentId }: AgentBuilderProps) {
           setTools((toolsData.tools || []).filter((t: Tool) => t.enabled))
         }
 
-        if (mcpRes.ok) {
+        if (mcpRes.ok && !ownerScopedMcpRef.current) {
+          // Skip when an admin cross-user view has taken over the MCP list
+          // (loadAgent fetches the owner's servers); otherwise this mount fetch
+          // could resolve last and clobber the owner list with the admin's own.
           const mcpData = await mcpRes.json()
-          setMcpServers(mcpData || [])
+          // Re-check after the await: loadAgent may have claimed the owner-scoped
+          // list during the JSON parse, and we must not clobber it.
+          if (!ownerScopedMcpRef.current) setMcpServers(mcpData || [])
         }
 
         let availableModels: Model[] = []
@@ -562,12 +572,19 @@ export function AgentBuilder({ agentId }: AgentBuilderProps) {
   useEffect(() => {
     if (!isEditMode || !localAgentId) return
 
+    // Discard results of a stale load if the effect re-runs (e.g. switching
+    // agents) before its async fetches resolve, so a late response can't
+    // clobber the current agent's state.
+    let active = true
+
     const loadAgent = async () => {
       try {
         setLoadingAgent(true)
         const response = await apiRequest(`${getApiUrl()}/api/agents/${localAgentId}`)
+        if (!active) return
         if (response.ok) {
           const agent = await response.json()
+          if (!active) return
           setOriginalData(agent)
           setName(agent.name || "")
           setDescription(agent.description || "")
@@ -580,6 +597,28 @@ export function AgentBuilder({ agentId }: AgentBuilderProps) {
           const rawToolCategories = agent.tool_categories || []
           setSelectedToolCategories(rawToolCategories.filter((c: string) => !c.startsWith('mcp:')))
           setSelectedMcpServers(rawToolCategories.filter((c: string) => c.startsWith('mcp:')).map((c: string) => c.replace('mcp:', '')))
+
+          // Admin inspecting someone else's agent: the mount-time /api/mcp/servers
+          // fetch returned the admin's own servers, so the owner's mcp: entries have
+          // no matching row to render. Re-fetch scoped to the owner.
+          if (user?.is_admin && agent.user_id != null && String(agent.user_id) !== String(user.id)) {
+            ownerScopedMcpRef.current = true
+            const ownerMcpRes = await apiRequest(`${getApiUrl()}/api/mcp/servers?user_id=${agent.user_id}`)
+            if (!active) return
+            if (ownerMcpRes.ok) {
+              setMcpServers((await ownerMcpRes.json()) || [])
+            }
+          } else if (ownerScopedMcpRef.current) {
+            // Switching back to a self-owned agent after an admin cross-user view:
+            // reset the guard and reload the admin's own servers, since the
+            // mount-time fetch runs only once and won't re-populate them.
+            ownerScopedMcpRef.current = false
+            const selfMcpRes = await apiRequest(`${getApiUrl()}/api/mcp/servers`)
+            if (!active) return
+            if (selfMcpRes.ok) {
+              setMcpServers((await selfMcpRes.json()) || [])
+            }
+          }
 
           setLogoUrl(agent.logo_url || null)
 
@@ -598,12 +637,15 @@ export function AgentBuilder({ agentId }: AgentBuilderProps) {
       } catch (error) {
         console.error("Failed to load agent:", error)
       } finally {
-        setLoadingAgent(false)
+        if (active) setLoadingAgent(false)
       }
     }
 
     loadAgent()
-  }, [isEditMode, localAgentId])
+    return () => {
+      active = false
+    }
+  }, [isEditMode, localAgentId, user?.id, user?.is_admin])
 
   // Load template data when template parameter is present
   useEffect(() => {

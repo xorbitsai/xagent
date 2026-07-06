@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import logging
 import math
+from datetime import timezone
 from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException, Query
@@ -11,10 +13,12 @@ from ..auth_dependencies import get_current_user
 from ..models.agent import Agent
 from ..models.chat_message import TaskChatMessage
 from ..models.database import get_db
-from ..models.task import Task
+from ..models.task import Task, TraceEvent
 from ..models.trigger import AgentTrigger, TriggerRun
 from ..models.user import User
 from ..utils.db_timezone import format_datetime_for_api
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api/conversation-logs", tags=["conversation-logs"])
 
@@ -234,6 +238,54 @@ def _serialize_transcript(messages: list[TaskChatMessage]) -> list[dict[str, Any
     ]
 
 
+def _event_epoch(dt: Any) -> float | None:
+    """Epoch seconds for a trace timestamp. Trace events are stored UTC, but
+    SQLite hands them back naive; treat naive as UTC so the epoch is correct
+    regardless of the server's local timezone."""
+    if dt is None:
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return float(dt.timestamp())
+
+
+def _serialize_trace_events(db: Session, task_id: int) -> list[dict[str, Any]]:
+    """Historical trace events for a task, decoded and shaped for the frontend
+    TraceEventRenderer (event_id / event_type / step_id / timestamp / data)."""
+    from ..services.trace_message_storage import decode_trace_events_data
+
+    events = (
+        db.query(TraceEvent)
+        .filter(TraceEvent.task_id == task_id, TraceEvent.build_id.is_(None))
+        .order_by(TraceEvent.id.asc())
+        .all()
+    )
+    if not events:
+        return []
+    # Trace rendering is a non-essential enrichment: a blob-load / decode failure
+    # must not 500 the whole detail page (transcript + metadata), so fail soft.
+    try:
+        decoded = decode_trace_events_data(
+            db, task_id=task_id, data_items=[e.data for e in events], strict=False
+        )
+    except Exception:
+        logger.warning(
+            "Failed to decode trace events for task %s", task_id, exc_info=True
+        )
+        return []
+    return [
+        {
+            "event_id": e.event_id,
+            "event_type": e.event_type,
+            "step_id": e.step_id,
+            "timestamp": _event_epoch(e.timestamp),
+            "data": data,
+            "parent_event_id": e.parent_event_id,
+        }
+        for e, data in zip(events, decoded)
+    ]
+
+
 def _serialize_trigger_metadata(
     db: Session,
     task: Task,
@@ -428,6 +480,7 @@ async def get_conversation_log_detail(
     return {
         "log": _serialize_log_summary(task, ui_source),
         "transcript": _serialize_transcript(messages),
+        "trace_events": _serialize_trace_events(db, int(task.id)),
         "metadata": {
             "task": {
                 "task_id": int(task.id),

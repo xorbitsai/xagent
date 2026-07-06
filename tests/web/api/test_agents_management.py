@@ -1149,3 +1149,40 @@ class TestDeleteAgent:
             )
         finally:
             db.close()
+
+
+def test_admin_can_read_other_users_agent_detail():
+    """管理员只读查看普通用户的 agent 详情。"""
+    admin = _admin_headers()
+    bob = _register_second_user("bob", "bobpass1")
+
+    created = client.post(
+        "/api/agents",
+        headers=bob,
+        json={
+            "name": "Bob Agent",
+            "instructions": "hi",
+            "tool_categories": ["mcp:foo"],
+        },
+    )
+    assert created.status_code == 200, created.text
+    agent_id = created.json()["id"]
+
+    resp = client.get(f"/api/agents/{agent_id}", headers=admin)
+    assert resp.status_code == 200, resp.text
+    assert "mcp:foo" in resp.json()["tool_categories"]
+
+
+def test_non_admin_cannot_read_other_users_agent_detail():
+    """普通用户读别人 agent 仍 404，不泄露存在性。"""
+    _admin_headers()
+    bob = _register_second_user("bob", "bobpass1")
+    carol = _register_second_user("carol", "carolpass1")
+
+    created = client.post(
+        "/api/agents", headers=bob, json={"name": "Bob Agent", "instructions": "hi"}
+    )
+    agent_id = created.json()["id"]
+
+    resp = client.get(f"/api/agents/{agent_id}", headers=carol)
+    assert resp.status_code == 404

@@ -27,7 +27,7 @@ from ...config import (
 from ...core.file_storage.factory import get_file_storage
 from ...core.tools.adapters.vibe.file_tool import read_file
 from ...core.tools.core.file_analysis import collect_pptx_slide_blocks
-from ..auth_dependencies import get_current_user
+from ..auth_dependencies import get_current_user, is_admin_user
 from ..config import (
     BINARY_EXTENSIONS,
     MAX_FILE_SIZE,
@@ -361,7 +361,7 @@ def _file_user_id_value(file_record: UploadedFile) -> int:
 
 
 def _is_admin_user(user: User) -> bool:
-    return bool(getattr(user, "is_admin", False))
+    return is_admin_user(user)
 
 
 def _parse_task_id(task_id: Optional[str]) -> Optional[int]:

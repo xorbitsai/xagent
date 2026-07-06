@@ -177,6 +177,15 @@ def require_user(user: User = Depends(get_current_user)) -> User:
     return user
 
 
+def is_admin_user(user: User) -> bool:
+    """Whether the user has platform-admin privileges.
+
+    Centralizes the ``is_admin`` check so cross-user authorization gates read
+    consistently instead of re-deriving ``getattr(user, "is_admin", False)``.
+    """
+    return bool(getattr(user, "is_admin", False))
+
+
 def get_user_from_websocket_token(token: str, db: Session) -> Optional[User]:
     """
     Get user from WebSocket authentication token

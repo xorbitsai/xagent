@@ -37,6 +37,7 @@ from xagent.web.api.agents import router as agents_router
 from xagent.web.api.auth import auth_router
 from xagent.web.api.conversation_logs import router as conversation_logs_router
 from xagent.web.api.files import file_router
+from xagent.web.api.mcp import mcp_router
 from xagent.web.api.me import router as me_router
 from xagent.web.api.share import share_router
 from xagent.web.api.triggers import router as triggers_router
@@ -71,6 +72,7 @@ app_for_tests.include_router(agents_router)
 app_for_tests.include_router(agent_api_keys_router)
 app_for_tests.include_router(workforces_router)
 app_for_tests.include_router(file_router)
+app_for_tests.include_router(mcp_router)
 app_for_tests.include_router(widget_router)
 app_for_tests.include_router(share_router)
 app_for_tests.include_router(triggers_router)

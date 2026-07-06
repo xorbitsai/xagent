@@ -16,7 +16,7 @@ from ...core.agent.service import AgentService
 from ...core.memory.in_memory import InMemoryMemoryStore
 from ...core.tools.core.document_search import find_missing_knowledge_bases
 from ...core.tracing import create_agent_tracer
-from ..auth_dependencies import get_current_user
+from ..auth_dependencies import get_current_user, is_admin_user
 from ..models.agent import Agent, AgentOrigin
 from ..models.database import get_db
 from ..models.model import Model as DBModel
@@ -556,7 +556,10 @@ async def get_agent(
 ) -> AgentResponse:
     """Get agent details."""
     try:
-        response = AgentStore(db).get_agent_response(int(current_user.id), agent_id)
+        store = AgentStore(db)
+        response = store.get_agent_response(int(current_user.id), agent_id)
+        if response is None and is_admin_user(current_user):
+            response = store.get_agent_response_for_admin(agent_id)
         if response is None:
             raise HTTPException(status_code=404, detail="Agent not found")
         return AgentResponse.model_validate(response)

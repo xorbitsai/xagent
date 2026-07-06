@@ -393,6 +393,45 @@ def test_decode_trace_events_data_batches_blob_queries() -> None:
         db.close()
 
 
+def test_decode_trace_events_data_degrades_when_bulk_lookup_fails() -> None:
+    from unittest.mock import patch
+
+    import xagent.web.services.trace_message_storage as tms
+
+    SessionLocal = _session_factory()
+    db = SessionLocal()
+    try:
+        task = _create_task(db)
+        task_id = int(task.id)
+        messages = [{"role": "user", "content": "hello"}]
+        item = encode_checkpoint_data_for_storage(
+            db,
+            task_id=task_id,
+            data=_checkpoint_data_with_large_fields("exec-degrade", messages),
+        )
+        db.flush()
+
+        boom = RuntimeError("bulk lookup boom")
+
+        # Non-strict: a failed bulk lookup must not drop the event; it degrades to
+        # per-ref blob queries and still resolves the messages.
+        with patch.object(tms, "_load_trace_blob_lookup", side_effect=boom):
+            decoded = decode_trace_events_data(
+                db, task_id=task_id, data_items=[item], strict=False
+            )
+        assert len(decoded) == 1
+        assert decoded[0]["snapshot"]["context"]["messages"] == messages
+
+        # Strict: the failure surfaces instead of being swallowed.
+        with patch.object(tms, "_load_trace_blob_lookup", side_effect=boom):
+            with pytest.raises(RuntimeError):
+                decode_trace_events_data(
+                    db, task_id=task_id, data_items=[item], strict=True
+                )
+    finally:
+        db.close()
+
+
 def test_blob_lookups_respect_sqlite_bind_parameter_limit() -> None:
     SessionLocal = _session_factory()
     db = SessionLocal()

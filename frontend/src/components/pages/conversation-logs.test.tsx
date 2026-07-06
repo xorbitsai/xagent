@@ -4,6 +4,20 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest"
 
 const apiRequestMock = vi.hoisted(() => vi.fn())
 
+// TraceEventRenderer (reused for tool-call display) pulls in next/navigation
+// useRouter() and the app-context useApp(); both need providers that aren't
+// mounted when rendering in isolation under jsdom, so stub them.
+vi.mock("next/navigation", () => ({
+  useRouter: () => ({ push: vi.fn() }),
+}))
+
+vi.mock("@/contexts/app-context-chat", () => ({
+  useApp: () => ({
+    openFilePreview: vi.fn(),
+    dispatch: vi.fn(),
+  }),
+}))
+
 vi.mock("@/lib/api-wrapper", async () => {
   const actual = await vi.importActual<typeof import("@/lib/api-wrapper")>(
     "@/lib/api-wrapper"
@@ -26,7 +40,10 @@ vi.mock("@/contexts/i18n-context", () => ({
   useI18n: () => ({
     locale: "zh",
     setLocale: vi.fn(),
-    t: (key: string) => {
+    t: (key: string, vars?: Record<string, string | number>) => {
+      // TraceEventRenderer labels the tool button via t(key, { tool }); mirror
+      // the interpolation so the tool name is assertable.
+      if (vars?.tool) return `${key}:${vars.tool}`
       const labels: Record<string, string> = {
         "conversationLogs.title": "Conversation Logs",
         "conversationLogs.searchPlaceholder": "Search conversations",
@@ -44,17 +61,6 @@ vi.mock("@/contexts/i18n-context", () => ({
     },
   }),
 }))
-
-vi.mock("lucide-react", () => {
-  const Icon = (props: React.SVGProps<SVGSVGElement>) => <svg {...props} />
-  return {
-    Bot: Icon,
-    ChevronLeft: Icon,
-    ChevronRight: Icon,
-    Inbox: Icon,
-    Search: Icon,
-  }
-})
 
 import { ConversationLogsPage } from "./conversation-logs"
 
@@ -128,7 +134,7 @@ const detailPayload = {
     {
       id: 2,
       role: "assistant",
-      content: "Lead qualified",
+      content: "**Lead** qualified",
       message_type: "chat",
       created_at: "2026-06-29T01:00:20Z",
     },
@@ -145,6 +151,29 @@ const detailPayload = {
     trigger: null,
     public_context: null,
   },
+  trace_events: [
+    {
+      event_id: "step-1",
+      event_type: "react_task_start",
+      step_id: "step-1",
+      timestamp: 1750000000,
+      data: { step_name: "Search", description: "Search" },
+    },
+    {
+      event_id: "tool-start",
+      event_type: "tool_execution_start",
+      step_id: "step-1",
+      timestamp: 1750000001,
+      data: { tool_name: "web_search", tool_args: { q: "x" } },
+    },
+    {
+      event_id: "tool-end",
+      event_type: "tool_execution_end",
+      step_id: "step-1",
+      timestamp: 1750000002,
+      data: { result: { success: true } },
+    },
+  ],
   read_only: true,
 }
 
@@ -207,10 +236,25 @@ describe("ConversationLogsPage", () => {
     expect(screen.getByText("REST API 1")).toBeInTheDocument()
     expect(screen.getByText("Webhook 1")).toBeInTheDocument()
     expect(await screen.findByText("Qualify this lead")).toBeInTheDocument()
-    expect(screen.getByText("Lead qualified")).toBeInTheDocument()
+    expect(await screen.findByText("Lead", { selector: "strong" })).toBeInTheDocument()
     expect(screen.getByText("Read-only")).toBeInTheDocument()
     expect(screen.queryByText("Upload")).not.toBeInTheDocument()
     expect(screen.queryByText("Send")).not.toBeInTheDocument()
+  })
+
+  it("renders assistant markdown as formatted html", async () => {
+    render(<ConversationLogsPage />)
+    const strong = await screen.findByText("Lead", { selector: "strong" })
+    expect(strong).toBeInTheDocument()
+  })
+
+  it("renders tool calls from trace events", async () => {
+    render(<ConversationLogsPage />)
+    // A completed task's trace is collapsed behind a toggle; expand it first.
+    fireEvent.click(await screen.findByRole("button", { name: /showProcess/ }))
+    expect(
+      await screen.findByRole("button", { name: /web_search/ })
+    ).toBeInTheDocument()
   })
 
   it("formats relative times with the app locale", async () => {

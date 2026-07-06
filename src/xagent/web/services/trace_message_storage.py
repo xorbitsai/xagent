@@ -9,6 +9,7 @@ from __future__ import annotations
 import copy
 import hashlib
 import json
+import logging
 from collections.abc import Iterator
 from dataclasses import dataclass
 from typing import Any, Literal
@@ -17,6 +18,8 @@ from sqlalchemy.orm import Session
 
 from ...core.agent.checkpoint import READABLE_CHECKPOINT_TYPES
 from ..models.task import TraceCheckpointBlob, TraceMessageBlob
+
+logger = logging.getLogger(__name__)
 
 MESSAGE_REFS_ENCODING = "xagent.message_refs_v1"
 CHECKPOINT_BLOB_REF_ENCODING = "xagent.checkpoint_blob_ref_v1"
@@ -351,7 +354,20 @@ def decode_trace_events_data(
     if verify_blob_hashes is None:
         verify_blob_hashes = strict
 
-    lookup = _load_trace_blob_lookup(db, task_id=task_id, data_items=data_items)
+    # A failed bulk blob lookup must not drop the whole task's events: under
+    # strict mode surface it, otherwise degrade to no-lookup so each item still
+    # decodes (blob-backed ones fall back per-item below).
+    try:
+        lookup = _load_trace_blob_lookup(db, task_id=task_id, data_items=data_items)
+    except Exception:
+        if strict:
+            raise
+        logger.warning(
+            "Bulk trace-blob lookup failed for task %s; decoding without blobs",
+            task_id,
+            exc_info=True,
+        )
+        lookup = None
     decoded_items: list[Any] = []
     for data in data_items:
         try:

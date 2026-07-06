@@ -138,6 +138,25 @@ class AgentStore:
             .first()
         )
 
+    def get_agent_response_for_admin(self, agent_id: int) -> dict[str, Any] | None:
+        """Read any agent's detail regardless of owner (admin-only path).
+
+        Deliberately bypasses the hot-path cache: the detail cache is keyed by
+        (viewer_user_id, agent_id) and only invalidated for the owner on write,
+        so caching an admin's cross-user read would go stale on owner edits.
+        """
+        agent = (
+            self.db.query(Agent)
+            .filter(
+                Agent.id == agent_id,
+                Agent.origin != AgentOrigin.WORKFORCE_GENERATED_MANAGER.value,
+            )
+            .first()
+        )
+        if agent is None:
+            return None
+        return self.agent_to_response_dict(agent)
+
     def agent_name_exists(
         self, user_id: int, name: str, *, exclude_agent_id: int | None = None
     ) -> bool:

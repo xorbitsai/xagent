@@ -315,7 +315,8 @@ class ArkVideoModel(BaseVideoModel):
             or kwargs.pop("image_url", None)
             or kwargs.pop("image", None)
         )
-        negative_prompt = kwargs.pop("negative_prompt", None)
+        if kwargs.pop("negative_prompt", None):
+            logger.debug("Ark video generation does not support negative_prompt")
         n = kwargs.pop("n", 1)
         if n not in (None, 1, "1"):
             raise ValueError("Seedance video generation supports one video per request")
@@ -331,8 +332,6 @@ class ArkVideoModel(BaseVideoModel):
                 kwargs["resolution"] = resolution
         if input_reference and not first_frame_image_url:
             first_frame_image_url = str(input_reference)
-        if negative_prompt:
-            kwargs["negative_prompt"] = negative_prompt
 
         request_content = content or self._build_content(
             prompt=prompt,

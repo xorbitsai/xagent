@@ -421,6 +421,11 @@ class XinferenceVideoModel(BaseVideoModel):
         data = _to_plain_data(result)
         item = _first_video_item(data)
         video_url = _video_url_from_item(item)
+        if not video_url:
+            raise RuntimeError(
+                "Xinference video generation response did not include "
+                "url, video_url, or b64_json"
+            )
         return {
             "task_id": item.get("id") or item.get("task_id"),
             "model": self.model_name,

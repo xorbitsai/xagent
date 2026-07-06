@@ -242,6 +242,7 @@ async def test_openai_compatible_params_are_translated_for_seedance():
         seconds=5,
         size="720x1280",
         input_reference="https://example.com/frame.png",
+        negative_prompt="blur",
         n=1,
         poll_interval=0.01,
     )

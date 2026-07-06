@@ -579,7 +579,7 @@ The generated video URL is temporary on the provider side, so completed videos a
         image: Optional[str] = None,
         negative_prompt: Optional[str] = None,
         n: int = 1,
-        ratio: str = "16:9",
+        ratio: Optional[str] = None,
         duration: _CoercedOptionalString = None,
         resolution: Optional[str] = None,
         generate_audio: bool = True,
@@ -600,6 +600,9 @@ The generated video URL is temporary on the provider side, so completed videos a
         try:
             kwargs = self._normalize_extra_kwargs(kwargs)
             kwargs.pop("allowed_local_media_roots", None)
+            if not _has_value(ratio):
+                ratio = None
+            explicit_ratio = ratio is not None
             if "seconds" in kwargs:
                 seconds = kwargs.pop("seconds")
             if "duration" in kwargs:
@@ -607,7 +610,9 @@ The generated video URL is temporary on the provider side, so completed videos a
             if "size" in kwargs:
                 size = kwargs.pop("size")
             if "ratio" in kwargs:
-                ratio = str(kwargs.pop("ratio"))
+                ratio_value = kwargs.pop("ratio")
+                ratio = str(ratio_value) if _has_value(ratio_value) else None
+                explicit_ratio = ratio is not None
             if "resolution" in kwargs:
                 resolution = str(kwargs.pop("resolution"))
             if "generate_audio" in kwargs:
@@ -638,11 +643,12 @@ The generated video URL is temporary on the provider side, so completed videos a
                     "model_used": actual_model_id,
                 }
             actual_model_id = self._model_id_for_model(video_model)
+            effective_ratio = ratio or "16:9"
 
             generate_params: dict[str, Any] = {
                 "prompt": prompt,
                 "n": n,
-                "ratio": ratio,
+                "ratio": effective_ratio,
                 "generate_audio": generate_audio,
                 "watermark": watermark,
                 "return_last_frame": return_last_frame,
@@ -655,12 +661,14 @@ The generated video URL is temporary on the provider side, so completed videos a
             if effective_seconds is not None:
                 generate_params["seconds"] = effective_seconds
                 generate_params["duration"] = effective_seconds
-            effective_size = size or self._size_from_resolution_ratio(resolution, ratio)
+            effective_size = size or self._size_from_resolution_ratio(
+                resolution, effective_ratio
+            )
             if effective_size:
                 generate_params["size"] = effective_size
                 derived_ratio = self._ratio_from_size(effective_size)
                 derived_resolution = self._resolution_from_size(effective_size)
-                if derived_ratio and ratio == "16:9":
+                if derived_ratio and not explicit_ratio:
                     generate_params["ratio"] = derived_ratio
                 if resolution is None and derived_resolution:
                     generate_params["resolution"] = derived_resolution

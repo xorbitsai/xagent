@@ -141,6 +141,29 @@ async def test_xinference_text_to_video_uses_openai_compatible_params(
 
 
 @pytest.mark.asyncio
+async def test_xinference_generate_video_rejects_response_without_video_url(
+    monkeypatch,
+):
+    async def post_json(model, session, path, body):
+        _ = model, session, path, body
+        return {"data": [{"id": "task-no-video"}]}
+
+    monkeypatch.setattr(
+        "xagent.core.model.video.xinference.aiohttp.ClientSession",
+        FakeClientSession,
+    )
+    monkeypatch.setattr(XinferenceVideoModel, "_post_video_json", post_json)
+
+    model = XinferenceVideoModel(
+        model_name="Wan2.1-1.3B",
+        base_url="http://localhost:9997",
+    )
+
+    with pytest.raises(RuntimeError, match="did not include"):
+        await model.generate_video(prompt="A camera push through a city")
+
+
+@pytest.mark.asyncio
 async def test_xinference_image_to_video_accepts_reference_file(
     tmp_path, fake_video_transport
 ):

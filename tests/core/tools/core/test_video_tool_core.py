@@ -387,6 +387,31 @@ async def test_generate_video_supports_openai_compatible_parameters(
 
 
 @pytest.mark.asyncio
+async def test_generate_video_preserves_explicit_ratio_with_size(
+    mock_video_model, mock_workspace
+):
+    tool = VideoGenerationToolCore(
+        {"video-model": mock_video_model},
+        workspace=mock_workspace,
+        default_video_model=mock_video_model,
+    )
+
+    result = await tool.generate_video(
+        "A landscape clip",
+        seconds=5,
+        size="720x1280",
+        ratio="16:9",
+    )
+
+    assert result["success"] is True
+    mock_video_model.generate_video.assert_awaited_once()
+    generate_kwargs = mock_video_model.generate_video.await_args.kwargs
+    assert generate_kwargs["ratio"] == "16:9"
+    assert generate_kwargs["size"] == "720x1280"
+    assert generate_kwargs["resolution"] == "720p"
+
+
+@pytest.mark.asyncio
 async def test_generate_video_saves_base64_video(mock_video_model, mock_workspace):
     video_payload = base64.b64encode(b"video bytes").decode()
     mock_video_model.generate_video.return_value["video_url"] = (

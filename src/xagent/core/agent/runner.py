@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from typing import Any, cast
 from uuid import uuid4
 
+from ...config import get_compact_threshold_default, get_compact_threshold_ratio
 from ..model.intent import enter_goal, exit_goal
 from ..workspace import WorkspaceManager
 from .context import ContextManager, ExecutionContext
@@ -528,6 +529,7 @@ class AgentRunner:
             cwd=str(workspace.workspace_dir),
             workspace_state=self._workspace_state(workspace),
         )
+        context.compact_config.threshold = self._resolve_compact_threshold()
         if metadata:
             context.metadata.update(metadata)
         if task:
@@ -548,6 +550,19 @@ class AgentRunner:
             context.attach_memory_session(memory_id, snapshot)
 
         return context
+
+    def _resolve_compact_threshold(self) -> int:
+        """Derive the context-compaction threshold from the model's context window.
+
+        When the model declares a context window, compact at
+        ``context_window * ratio`` tokens; otherwise fall back to the configured
+        default (preserving the historical 32000 behaviour).
+        """
+        llm = getattr(self.agent, "llm", None)
+        context_window = getattr(llm, "context_window", None)
+        if context_window and context_window > 0:
+            return max(1, int(context_window * get_compact_threshold_ratio()))
+        return get_compact_threshold_default()
 
     def _initial_user_message_metadata(
         self, context: ExecutionContext

@@ -40,6 +40,7 @@ def _create_llm_instance(db_model: Model) -> BaseLLM:
             api_key=db_model.api_key,
             base_url=db_model.base_url,
             default_temperature=db_model.temperature,
+            context_window=db_model.context_window,
             abilities=db_model.abilities,
             description=db_model.description,
         )
@@ -105,6 +106,7 @@ class CoreStorage:
                 model_provider=db_model.model_provider,
                 default_temperature=db_model.temperature,
                 default_max_tokens=db_model.max_tokens,
+                context_window=db_model.context_window,
             )
         elif db_model.category == "image":
             from ...core.model.model import ImageModelConfig
@@ -172,6 +174,7 @@ class CoreStorage:
                     "model_provider": model.model_provider,
                     "temperature": model.default_temperature,
                     "max_tokens": model.default_max_tokens,
+                    "context_window": model.context_window,
                     "category": "llm",
                 }
             )

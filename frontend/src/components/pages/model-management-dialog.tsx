@@ -184,6 +184,7 @@ export function ModelManagementDialog({
         api_key: "",
         base_url: initialEditingModel.base_url || "",
         temperature: initialEditingModel.temperature,
+        context_window: initialEditingModel.context_window,
         dimension: initialEditingModel.dimension,
         abilities: initialEditingModel.abilities || [],
         default_config_types: currentDefaults,
@@ -297,6 +298,7 @@ export function ModelManagementDialog({
       api_key: "",
       base_url: model.base_url || "",
       temperature: model.temperature,
+      context_window: model.context_window,
       dimension: model.dimension,
       abilities: model.abilities || [],
       default_config_types: currentDefaults,
@@ -909,6 +911,21 @@ export function ModelManagementDialog({
                         </div>
                       </div>
 
+                      {formData.category === 'llm' && (
+                        <div className="space-y-2">
+                          <Label htmlFor="connect_context_window" className="text-base font-medium">{t('models.form.contextWindow')}</Label>
+                          <Input
+                            id="connect_context_window"
+                            type="number"
+                            min="1"
+                            value={formData.context_window ?? ""}
+                            onChange={(e) => setFormData({ ...formData, context_window: e.target.value ? parseInt(e.target.value) : undefined })}
+                            placeholder={t('models.form.contextWindowPlaceholder')}
+                          />
+                          <p className="text-xs text-muted-foreground">{t('models.form.contextWindowHint')}</p>
+                        </div>
+                      )}
+
                       <div className="flex justify-between mt-4">
                         <Button variant="outline" onClick={() => setConnectStep(2)}>&larr; {t('common.back')}</Button>
                         <Button
@@ -1267,6 +1284,21 @@ export function ModelManagementDialog({
                   placeholder={t('models.form.baseUrlPlaceholder')}
                 />
               </div>
+
+              {formData.category === 'llm' && (
+                <div>
+                  <Label htmlFor="context_window">{t('models.form.contextWindow')}</Label>
+                  <Input
+                    id="context_window"
+                    type="number"
+                    min="1"
+                    value={formData.context_window ?? ""}
+                    onChange={(e) => setFormData({ ...formData, context_window: e.target.value ? parseInt(e.target.value) : undefined })}
+                    placeholder={t('models.form.contextWindowPlaceholder')}
+                  />
+                  <p className="text-xs text-muted-foreground mt-1">{t('models.form.contextWindowHint')}</p>
+                </div>
+              )}
 
               {editingModel && (
                 <div>

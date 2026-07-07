@@ -38,6 +38,7 @@ class ChatModelConfig(ModelConfig):
     model_provider: str = "openai"  # openai, zhipu, dashscope, etc.
     default_temperature: Optional[float] = None
     default_max_tokens: Optional[int] = None
+    context_window: Optional[int] = None  # Total context window in tokens
     thinking_mode: bool = False
 
 

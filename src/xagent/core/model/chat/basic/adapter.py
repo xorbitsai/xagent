@@ -45,7 +45,7 @@ def create_base_llm(
     if is_auto_router_model(provider, model.model_name):
         # OpenRouter model named "auto": pick a concrete model via xrouter-llm,
         # then dispatch it through this same OpenRouter config.
-        return RouterLLM(
+        router = RouterLLM(
             model_name=AUTO_MODEL_NAME,
             api_key=model.api_key,
             base_url=model.base_url,
@@ -55,6 +55,8 @@ def create_base_llm(
             abilities=model.abilities,
             downstream_resolver=downstream_resolver,
         )
+        router.context_window = model.context_window
+        return router
     elif provider == "deepseek":
         llm = DeepSeekLLM(
             model_name=model.model_name,
@@ -153,6 +155,7 @@ def create_base_llm(
     else:
         raise TypeError(f"Unsupported LLM model type: {model.model_provider}")
 
+    llm.context_window = model.context_window
     return create_retry_wrapper(
         llm,
         BaseLLM,  # type: ignore[type-abstract]

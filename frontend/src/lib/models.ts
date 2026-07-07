@@ -30,6 +30,7 @@ export interface Model {
   base_url?: string;
   max_tokens?: number;
   temperature?: number;
+  context_window?: number;
   dimension?: number;
   abilities?: string[];
   is_shared: boolean;

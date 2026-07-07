@@ -71,6 +71,8 @@ WEB_SEARCH_PROVIDER = "XAGENT_WEB_SEARCH_PROVIDER"
 WEB_CRAWL_TLS_IMPERSONATE = "XAGENT_WEB_CRAWL_TLS_IMPERSONATE"
 TOOL_PARALLEL_ENABLED = "XAGENT_TOOL_PARALLEL_ENABLED"
 TOOL_MAX_CONCURRENCY = "XAGENT_TOOL_MAX_CONCURRENCY"
+COMPACT_THRESHOLD_RATIO = "XAGENT_COMPACT_THRESHOLD_RATIO"
+COMPACT_THRESHOLD_DEFAULT = "XAGENT_COMPACT_THRESHOLD_DEFAULT"
 REDIS_URL = "XAGENT_REDIS_URL"
 HOT_PATH_CACHE_ENABLED = "XAGENT_HOT_PATH_CACHE_ENABLED"
 HOT_PATH_CACHE_TTL_SECONDS = "XAGENT_HOT_PATH_CACHE_TTL_SECONDS"
@@ -421,6 +423,39 @@ def get_tool_max_concurrency() -> int:
         The per-batch concurrency cap (>= 1).
     """
     return _get_positive_int_env(TOOL_MAX_CONCURRENCY, 3)
+
+
+def get_compact_threshold_ratio() -> float:
+    """Fraction of a model's context window at which to trigger compaction.
+
+    Priority:
+        1. XAGENT_COMPACT_THRESHOLD_RATIO environment variable
+        2. Default ``0.75``
+
+    Values outside ``(0, 1]`` fall back to the default.
+
+    Returns:
+        The compaction trigger ratio.
+    """
+    raw = os.getenv(COMPACT_THRESHOLD_RATIO)
+    if raw:
+        try:
+            value = float(raw)
+        except ValueError:
+            return 0.75
+        if 0.0 < value <= 1.0:
+            return value
+    return 0.75
+
+
+def get_compact_threshold_default() -> int:
+    """Fallback compaction threshold (tokens) when a model has no context window set.
+
+    Priority:
+        1. XAGENT_COMPACT_THRESHOLD_DEFAULT environment variable
+        2. Default ``32000``
+    """
+    return _get_positive_int_env(COMPACT_THRESHOLD_DEFAULT, 32000)
 
 
 def get_celery_broker_url() -> str | None:

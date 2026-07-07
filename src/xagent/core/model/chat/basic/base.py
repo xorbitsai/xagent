@@ -15,6 +15,10 @@ class BaseLLM(ABC):
     Implementations must define the supported abilities and implement corresponding methods.
     """
 
+    # Total context window in tokens, set from model config by create_base_llm.
+    # None means unknown; consumers fall back to their own default.
+    context_window: int | None = None
+
     @property
     @abstractmethod
     def abilities(self) -> List[str]:

@@ -96,6 +96,7 @@ class ModelCreate(BaseModel):
     api_key: Optional[str] = None
     base_url: Optional[str] = None
     temperature: Optional[float] = None
+    context_window: Optional[int] = None  # LLM total context window in tokens
     dimension: Optional[int] = None
     abilities: Optional[List[str]] = None
     description: Optional[str] = None
@@ -139,6 +140,7 @@ class ModelUpdate(BaseModel):
     api_key: Optional[str] = None
     base_url: Optional[str] = None
     temperature: Optional[float] = None
+    context_window: Optional[int] = None  # LLM total context window in tokens
     dimension: Optional[int] = None
     description: Optional[str] = None
     abilities: Optional[List[str]] = None
@@ -184,6 +186,7 @@ class ModelResponse(BaseModel):
     model_name: str
     base_url: Optional[str]
     temperature: Optional[float]
+    context_window: Optional[int] = None
     dimension: Optional[int]
     is_default: bool
     is_small_fast: bool
@@ -328,6 +331,7 @@ class ModelWithAccessInfo(BaseModel):
     model_name: str
     base_url: Optional[str]
     temperature: Optional[float]
+    context_window: Optional[int] = None
     dimension: Optional[int]
     abilities: Optional[List[str]]
     description: Optional[str]

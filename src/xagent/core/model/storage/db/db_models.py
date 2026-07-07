@@ -36,6 +36,9 @@ def create_model_table(Base: Type[Any]) -> Type[Any]:
         base_url = Column(String(500), nullable=True)
         temperature = Column(Float, nullable=True)
         max_tokens = Column(Integer, nullable=True)
+        context_window = Column(
+            Integer, nullable=True
+        )  # Total context window in tokens
         dimension = Column(
             Integer, nullable=True
         )  # Vector dimension for embedding models

@@ -66,6 +66,7 @@ export interface Model {
   model_name: string
   base_url?: string
   temperature?: number
+  context_window?: number
   dimension?: number
   abilities?: string[]
   description?: string
@@ -86,6 +87,7 @@ export interface ModelCreate {
   api_key: string
   base_url?: string
   temperature?: number
+  context_window?: number
   dimension?: number
   abilities?: string[]
   share_with_users?: boolean

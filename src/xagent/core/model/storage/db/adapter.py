@@ -88,6 +88,7 @@ class SQLAlchemyModelHub:
                     "model_provider": model.model_provider,
                     "temperature": model.default_temperature,
                     "max_tokens": model.default_max_tokens,
+                    "context_window": model.context_window,
                     "category": "llm",
                 }
             )
@@ -174,6 +175,7 @@ class SQLAlchemyModelHub:
                 model_provider=db_model.model_provider,
                 default_temperature=db_model.temperature,
                 default_max_tokens=db_model.max_tokens,
+                context_window=db_model.context_window,
             )
         elif db_model.category == "image":
             return ImageModelConfig(
@@ -228,6 +230,7 @@ class SQLAlchemyModelHub:
                     model_provider=db_model.model_provider,
                     default_temperature=db_model.temperature,
                     default_max_tokens=db_model.max_tokens,
+                    context_window=db_model.context_window,
                 )
             elif db_model.category == "image":
                 config = ImageModelConfig(

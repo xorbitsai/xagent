@@ -315,6 +315,7 @@ async def create_model(
             base_url=base_url,
             api_key=model.api_key or "",
             default_temperature=model.temperature,
+            context_window=model.context_window,
             timeout=180.0,
             abilities=model.abilities,
             description=model.description,
@@ -421,6 +422,7 @@ async def create_model(
         "model_name": db_model.model_name,
         "base_url": db_model.base_url,
         "temperature": db_model.temperature,
+        "context_window": db_model.context_window,
         "dimension": db_model.dimension,
         "abilities": db_model.abilities,
         "description": db_model.description,
@@ -1738,6 +1740,7 @@ async def list_public_models(
         if model.category == "llm":
             model_data["temperature"] = model.temperature
             model_data["max_tokens"] = model.max_tokens
+            model_data["context_window"] = model.context_window
         elif model.category == "embedding":
             model_data["dimension"] = model.dimension
 

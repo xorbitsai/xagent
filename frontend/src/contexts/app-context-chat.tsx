@@ -493,6 +493,8 @@ interface AppState {
   } | null
   lastTaskUpdate?: number
   isHistoryLoading: boolean
+  // Current context-window usage from the latest LLM call, for the usage gauge.
+  contextUsage: { tokens: number; threshold: number } | null
 }
 
 type AppAction =
@@ -503,6 +505,7 @@ type AppAction =
   | { type: "UPDATE_TASK_STATUS"; payload: { status: Task["status"]; waitingQuestion?: string; waitingInteractions?: Interaction[] } }
   | { type: "TRIGGER_TASK_UPDATE" }
   | { type: "SET_DAG_EXECUTION"; payload: DAGExecution | null }
+  | { type: "SET_CONTEXT_USAGE"; payload: { tokens: number; threshold: number } | null }
   | { type: "ADD_STEP"; payload: StepExecution }
   | { type: "UPDATE_STEP"; payload: { stepId: string; updates: Partial<StepExecution> } }
   | { type: "SET_STEPS"; payload: StepExecution[] }
@@ -569,6 +572,7 @@ const initialState: AppState = {
   planMemoryInfo: null,
   lastTaskUpdate: Date.now(),
   isHistoryLoading: false,
+  contextUsage: null,
 }
 
 function appReducer(state: AppState, action: AppAction): AppState {
@@ -594,8 +598,10 @@ function appReducer(state: AppState, action: AppAction): AppState {
         payloadType: typeof action.payload
       })
       // Clear messages if task ID changes
-      const messages = state.taskId !== action.payload ? [] : state.messages
-      const newState = { ...state, taskId: action.payload, messages }
+      const taskChanged = state.taskId !== action.payload
+      const messages = taskChanged ? [] : state.messages
+      const contextUsage = taskChanged ? null : state.contextUsage
+      const newState = { ...state, taskId: action.payload, messages, contextUsage }
       console.log('🔄 Reducer returning new state:', newState)
       return newState
 
@@ -756,6 +762,9 @@ function appReducer(state: AppState, action: AppAction): AppState {
 
     case "SET_DAG_EXECUTION":
       return { ...state, dagExecution: action.payload }
+
+    case "SET_CONTEXT_USAGE":
+      return { ...state, contextUsage: action.payload }
 
     case "ADD_STEP":
       const newStep = action.payload
@@ -2253,6 +2262,12 @@ export function AppProvider({
           else if (eventType === "llm_call_start") {
             dispatch({ type: "UPDATE_TASK_STATUS", payload: { status: "running" } })
             dispatch({ type: "SET_PROCESSING", payload: true })
+            if (typeof eventData.context_tokens === "number" && typeof eventData.context_threshold === "number" && eventData.context_threshold > 0) {
+              dispatch({
+                type: "SET_CONTEXT_USAGE",
+                payload: { tokens: eventData.context_tokens, threshold: eventData.context_threshold },
+              })
+            }
             if (message.step_id) {
               const modelName = eventData.model_name || "LLM"
               const taskType = eventData.task_type || "LLM Call"

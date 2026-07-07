@@ -1032,6 +1032,14 @@ class ExecutionContext:
             return str(content)
         return str(response) if response is not None else ""
 
+    def estimate_context_tokens(self) -> int:
+        """Public estimate of the current context size in tokens.
+
+        Uses the same accounting as the compaction decision so a UI gauge fed
+        by this value reaches its threshold exactly when compaction triggers.
+        """
+        return self._get_total_tokens()
+
     def _get_total_tokens(self) -> int:
         if self.llm_calls:
             latest_call = self.llm_calls[-1]

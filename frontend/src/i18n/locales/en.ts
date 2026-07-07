@@ -259,6 +259,10 @@ const en = {
       input: "Input tokens",
       output: "Output tokens",
     },
+    contextUsage: {
+      tooltip: "Context window {pct}% ({used}/{total} tokens)",
+      full: "Context full — compacting",
+    },
     fileUpload: {
       dropHere: "Drop files here",
       uploadDocs: "Upload documents",

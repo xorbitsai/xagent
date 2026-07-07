@@ -259,6 +259,10 @@ const zh = {
       input: "输入tokens",
       output: "输出tokens",
     },
+    contextUsage: {
+      tooltip: "上下文窗口 {pct}%（{used}/{total} tokens）",
+      full: "上下文已满，开始压缩",
+    },
     fileUpload: {
       dropHere: "将文件拖拽到此处",
       uploadDocs: "上传文档",

@@ -5,6 +5,7 @@ import { FolderOpen, GitMerge, Loader2, Shrink } from "lucide-react"
 import dagre from "dagre"
 import { ChatInput } from "@/components/chat/ChatInput"
 import { ChatMessage } from "@/components/chat/ChatMessage"
+import { ContextUsageRing } from "@/components/chat/ContextUsageRing"
 import { TokenUsageDisplay } from "@/components/chat/TokenUsageDisplay"
 import { FilePreviewActionButtons } from "@/components/file/file-preview-action-buttons"
 import { FilePreviewContent } from "@/components/file/file-preview-content"
@@ -702,7 +703,15 @@ export function TaskConversationPanel({
                 </div>
 
                 {showTokenUsage && (
-                  <div className="sm:ml-auto">
+                  <div className="sm:ml-auto flex items-center gap-3">
+                    {state.contextUsage && (
+                      <div className="inline-flex items-center rounded-xl border bg-card/80 px-3 py-2 text-xs sm:text-sm">
+                        <ContextUsageRing
+                          tokens={state.contextUsage.tokens}
+                          threshold={state.contextUsage.threshold}
+                        />
+                      </div>
+                    )}
                     <TokenUsageDisplay taskId={state.taskId} isRunning={state.currentTask?.status === "running"} />
                   </div>
                 )}

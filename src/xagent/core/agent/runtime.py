@@ -703,16 +703,30 @@ class PatternRuntime:
         metadata: dict[str, Any] | None = None,
     ) -> None:
         event_metadata = metadata or {}
+        context_data: dict[str, Any] = {
+            "context_messages_count": len(messages),
+            "tools_count": len(tools or []),
+            "context_preview": messages[-5:],
+            **event_metadata,
+        }
+        # Surface current context size vs. the compaction threshold so the UI
+        # can show a context-usage gauge. Uses the same estimate that drives the
+        # compaction decision, so the gauge fills exactly when compaction fires.
+        estimate = getattr(context, "estimate_context_tokens", None)
+        if callable(estimate):
+            try:
+                context_data["context_tokens"] = estimate()
+            except Exception:  # noqa: BLE001 - gauge metadata must never break the call
+                pass
+        compact_config = getattr(context, "compact_config", None)
+        threshold = getattr(compact_config, "threshold", None)
+        if isinstance(threshold, int) and threshold > 0:
+            context_data["context_threshold"] = threshold
         await self._emit_trace_event(
             TraceEventType(TraceScope.ACTION, TraceAction.START, TraceCategory.LLM),
             task_id=str(event_metadata.get("task_id") or self._task_id(context)),
             step_id=str(event_metadata.get("step_id") or self._step_id(context)),
-            data={
-                "context_messages_count": len(messages),
-                "tools_count": len(tools or []),
-                "context_preview": messages[-5:],
-                **event_metadata,
-            },
+            data=context_data,
         )
 
     async def on_llm_end(

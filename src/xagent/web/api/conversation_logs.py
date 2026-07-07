@@ -222,20 +222,73 @@ def _serialize_log_summary(task: Task, ui_source: str) -> dict[str, Any]:
     }
 
 
-def _serialize_transcript(messages: list[TaskChatMessage]) -> list[dict[str, Any]]:
-    return [
-        {
-            "id": int(message.id),
-            "role": message.role,
-            "content": message.content,
-            "message_type": message.message_type,
-            "interactions": message.interactions,
-            "turn_id": message.turn_id,
-            "attachments": message.attachments or [],
-            "created_at": format_datetime_for_api(message.created_at),
-        }
-        for message in sorted(messages, key=_message_sort_key)
-    ]
+def _serialize_transcript_with_events(
+    db: Session, task: Task, messages: list[TaskChatMessage]
+) -> list[dict[str, Any]]:
+    """Transcript with successful context-compaction notices interleaved.
+
+    Compaction events are not persisted chat messages, so we pull the
+    ``action_end_compact`` trace events and merge them in by timestamp to
+    surface the same "context compacted" notice the live chat shows.
+    """
+
+    def _epoch(dt: Any) -> float:
+        return dt.timestamp() if dt is not None else 0.0
+
+    # (sort_epoch, kind, payload); kind keeps messages before events on ties.
+    rows: list[tuple[float, int, dict[str, Any]]] = []
+    for message in sorted(messages, key=_message_sort_key):
+        rows.append(
+            (
+                _epoch(message.created_at),
+                0,
+                {
+                    "id": int(message.id),
+                    "role": message.role,
+                    "content": message.content,
+                    "message_type": message.message_type,
+                    "interactions": message.interactions,
+                    "turn_id": message.turn_id,
+                    "attachments": message.attachments or [],
+                    "created_at": format_datetime_for_api(message.created_at),
+                },
+            )
+        )
+
+    events = (
+        db.query(TraceEvent)
+        .filter(
+            TraceEvent.task_id == int(task.id),
+            TraceEvent.event_type == "action_end_compact",
+            TraceEvent.build_id.is_(None),
+        )
+        .all()
+    )
+    for event in events:
+        data: dict[str, Any] = event.data if isinstance(event.data, dict) else {}
+        if data.get("error"):
+            continue
+        rows.append(
+            (
+                _epoch(event.timestamp),
+                1,
+                {
+                    "id": f"compact-{int(event.id)}",
+                    "role": "system",
+                    "message_type": "compaction",
+                    "content": "",
+                    "compaction": {
+                        "original_tokens": data.get("original_tokens"),
+                        "compacted_tokens": data.get("compacted_tokens"),
+                        "compression_ratio": data.get("compression_ratio"),
+                    },
+                    "created_at": format_datetime_for_api(event.timestamp),
+                },
+            )
+        )
+
+    rows.sort(key=lambda row: (row[0], row[1]))
+    return [payload for _, _, payload in rows]
 
 
 def _event_epoch(dt: Any) -> float | None:
@@ -479,7 +532,7 @@ async def get_conversation_log_detail(
     messages = list(task.chat_messages or [])
     return {
         "log": _serialize_log_summary(task, ui_source),
-        "transcript": _serialize_transcript(messages),
+        "transcript": _serialize_transcript_with_events(db, task, messages),
         "trace_events": _serialize_trace_events(db, int(task.id)),
         "metadata": {
             "task": {

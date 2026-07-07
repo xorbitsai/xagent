@@ -50,7 +50,7 @@ export interface ConversationLogListResponse {
 }
 
 export interface ConversationLogTranscriptMessage {
-  id: number
+  id: number | string
   role: string
   content: string
   message_type?: string | null
@@ -58,6 +58,11 @@ export interface ConversationLogTranscriptMessage {
   turn_id?: string | null
   attachments?: unknown[]
   created_at?: string | null
+  compaction?: {
+    original_tokens?: number | null
+    compacted_tokens?: number | null
+    compression_ratio?: string | null
+  } | null
 }
 
 export interface ConversationLogTraceEvent {

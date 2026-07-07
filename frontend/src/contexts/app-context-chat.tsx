@@ -1922,11 +1922,15 @@ export function AppProvider({
                   original: eventData.original_tokens ?? '?',
                   compacted: eventData.compacted_tokens ?? '?',
                 })
-                if (!isDuplicateMessage(noticeText, 'compact-notice')) {
+                // Key by step + event timestamp so distinct compactions (even
+                // in the same step, or with identical token counts) each show,
+                // while a re-dispatched same event is still deduped.
+                const noticeKey = `compact-notice-${stepId}-${message.timestamp}`
+                if (!isDuplicateMessage(noticeText, noticeKey)) {
                   dispatch({
                     type: "ADD_MESSAGE",
                     payload: {
-                      id: generateMessageId(`compact-notice-${stepId}`),
+                      id: generateMessageId(noticeKey),
                       role: "assistant",
                       content: noticeText,
                       timestamp: message.timestamp,

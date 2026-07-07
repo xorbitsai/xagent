@@ -235,13 +235,14 @@ def _serialize_transcript_with_events(
     def _epoch(dt: Any) -> float:
         return dt.timestamp() if dt is not None else 0.0
 
-    # (sort_epoch, kind, payload); kind keeps messages before events on ties.
+    # (sort_epoch, kind, payload); on ties order user (0) -> compaction (1) ->
+    # assistant (2), since compaction happens before the assistant reply.
     rows: list[tuple[float, int, dict[str, Any]]] = []
     for message in sorted(messages, key=_message_sort_key):
         rows.append(
             (
                 _epoch(message.created_at),
-                0,
+                0 if message.role == "user" else 2,
                 {
                     "id": int(message.id),
                     "role": message.role,

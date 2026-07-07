@@ -560,7 +560,11 @@ class AgentRunner:
         """
         llm = getattr(self.agent, "llm", None)
         context_window = getattr(llm, "context_window", None)
-        if context_window and context_window > 0:
+        if (
+            isinstance(context_window, (int, float))
+            and not isinstance(context_window, bool)
+            and context_window > 0
+        ):
             return max(1, int(context_window * get_compact_threshold_ratio()))
         return get_compact_threshold_default()
 

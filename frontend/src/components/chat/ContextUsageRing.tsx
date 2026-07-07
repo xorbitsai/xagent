@@ -21,7 +21,9 @@ export function ContextUsageRing({ tokens, threshold, className }: ContextUsageR
   const ratio = Math.max(0, tokens / threshold)
   const clamped = Math.min(1, ratio)
   const pct = Math.round(clamped * 100)
-  const isFull = ratio >= 1
+  // Backend compacts strictly above the threshold (tokens > threshold), so only
+  // flag "full/compacting" past 100%, not at exactly 100%.
+  const isFull = ratio > 1
 
   // 70% amber, full red, otherwise the theme accent.
   const color = isFull

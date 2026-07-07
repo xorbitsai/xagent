@@ -899,3 +899,41 @@ async def test_trace_callback_unwraps_final_answer_and_omits_success_context(
     )
     assert ai_event["data"]["content"] == "Done cleanly."
     assert "context" not in ai_event["data"]
+
+
+class _FakeLLM:
+    def __init__(self, context_window: Any) -> None:
+        self.context_window = context_window
+
+
+def _threshold_runner(context_window: Any) -> AgentRunner:
+    agent = Agent(name="t", patterns=[FakePattern({})], llm=_FakeLLM(context_window))
+    return AgentRunner(agent=agent)
+
+
+def test_resolve_compact_threshold_uses_window_ratio(monkeypatch) -> None:
+    monkeypatch.delenv("XAGENT_COMPACT_THRESHOLD_RATIO", raising=False)
+    # 128000 * 0.75
+    assert _threshold_runner(128000)._resolve_compact_threshold() == 96000
+
+
+def test_resolve_compact_threshold_respects_ratio_env(monkeypatch) -> None:
+    monkeypatch.setenv("XAGENT_COMPACT_THRESHOLD_RATIO", "0.8")
+    assert _threshold_runner(200000)._resolve_compact_threshold() == 160000
+
+
+@pytest.mark.parametrize("window", [None, 0, -1, "128000"])
+def test_resolve_compact_threshold_falls_back_to_default(monkeypatch, window) -> None:
+    monkeypatch.delenv("XAGENT_COMPACT_THRESHOLD_DEFAULT", raising=False)
+    # None / non-positive / non-int all fall back to the global default.
+    assert _threshold_runner(window)._resolve_compact_threshold() == 32000
+
+
+def test_resolve_compact_threshold_default_env_override(monkeypatch) -> None:
+    monkeypatch.setenv("XAGENT_COMPACT_THRESHOLD_DEFAULT", "50000")
+    assert _threshold_runner(None)._resolve_compact_threshold() == 50000
+
+
+def test_resolve_compact_threshold_missing_llm() -> None:
+    agent = Agent(name="t", patterns=[FakePattern({})], llm=None)
+    assert AgentRunner(agent=agent)._resolve_compact_threshold() == 32000

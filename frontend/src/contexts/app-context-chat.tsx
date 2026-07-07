@@ -2266,7 +2266,7 @@ export function AppProvider({
           else if (eventType === "llm_call_start") {
             dispatch({ type: "UPDATE_TASK_STATUS", payload: { status: "running" } })
             dispatch({ type: "SET_PROCESSING", payload: true })
-            if (typeof eventData.context_tokens === "number" && typeof eventData.context_threshold === "number" && eventData.context_threshold > 0) {
+            if (Number.isFinite(eventData.context_tokens) && Number.isFinite(eventData.context_threshold) && eventData.context_threshold > 0) {
               dispatch({
                 type: "SET_CONTEXT_USAGE",
                 payload: { tokens: eventData.context_tokens, threshold: eventData.context_threshold },

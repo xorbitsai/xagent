@@ -442,9 +442,19 @@ def get_compact_threshold_ratio() -> float:
         try:
             value = float(raw)
         except ValueError:
+            logger.warning(
+                "Invalid %s=%r (not a float); using default 0.75",
+                COMPACT_THRESHOLD_RATIO,
+                raw,
+            )
             return 0.75
         if 0.0 < value <= 1.0:
             return value
+        logger.warning(
+            "%s=%r is outside (0, 1]; using default 0.75",
+            COMPACT_THRESHOLD_RATIO,
+            raw,
+        )
     return 0.75
 
 

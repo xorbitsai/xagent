@@ -560,11 +560,9 @@ class AgentRunner:
         """
         llm = getattr(self.agent, "llm", None)
         context_window = getattr(llm, "context_window", None)
-        if (
-            isinstance(context_window, (int, float))
-            and not isinstance(context_window, bool)
-            and context_window > 0
-        ):
+        # context_window is typed int | None end to end (DB Integer -> Pydantic
+        # Optional[int]); bool is not a valid value, so a plain int check suffices.
+        if isinstance(context_window, int) and context_window > 0:
             return max(1, int(context_window * get_compact_threshold_ratio()))
         return get_compact_threshold_default()
 

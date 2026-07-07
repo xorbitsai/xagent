@@ -1296,7 +1296,10 @@ export function ModelManagementDialog({
                     type="number"
                     min="1"
                     value={formData.context_window ?? ""}
-                    onChange={(e) => setFormData({ ...formData, context_window: e.target.value ? parseInt(e.target.value) : undefined })}
+                    onChange={(e) => {
+                      const val = parseInt(e.target.value, 10)
+                      setFormData({ ...formData, context_window: Number.isNaN(val) ? undefined : val })
+                    }}
                     placeholder={t('models.form.contextWindowPlaceholder')}
                   />
                   <p className="text-xs text-muted-foreground mt-1">{t('models.form.contextWindowHint')}</p>

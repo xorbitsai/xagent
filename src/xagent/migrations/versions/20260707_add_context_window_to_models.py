@@ -1,7 +1,7 @@
 """add context_window field to models
 
 Revision ID: 20260707_add_context_window
-Revises: 20260703_add_multi_key_support_to_agent_api_keys
+Revises: 20260707_merge_alembic_heads
 Create Date: 2026-07-07
 
 """

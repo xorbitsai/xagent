@@ -1577,3 +1577,54 @@ class TestGetSandboxAllowLocalFallbackOnCapacity:
         for value in ("0", "false", "off", "junk"):
             monkeypatch.setenv(SANDBOX_ALLOW_LOCAL_FALLBACK_ON_CAPACITY, value)
             assert get_sandbox_allow_local_fallback_on_capacity() is False
+
+
+class TestCompactThresholdConfig:
+    """Config for context-compaction threshold derivation."""
+
+    def test_ratio_defaults_to_075(self, monkeypatch):
+        from xagent.config import COMPACT_THRESHOLD_RATIO, get_compact_threshold_ratio
+
+        monkeypatch.delenv(COMPACT_THRESHOLD_RATIO, raising=False)
+        assert get_compact_threshold_ratio() == 0.75
+
+    def test_ratio_env_override(self, monkeypatch):
+        from xagent.config import COMPACT_THRESHOLD_RATIO, get_compact_threshold_ratio
+
+        monkeypatch.setenv(COMPACT_THRESHOLD_RATIO, "0.8")
+        assert get_compact_threshold_ratio() == 0.8
+
+    @pytest.mark.parametrize("value", ["abc", "0", "-0.5", "1.5", "0.0"])
+    def test_ratio_invalid_or_out_of_range_falls_back(self, monkeypatch, value):
+        from xagent.config import COMPACT_THRESHOLD_RATIO, get_compact_threshold_ratio
+
+        monkeypatch.setenv(COMPACT_THRESHOLD_RATIO, value)
+        assert get_compact_threshold_ratio() == 0.75
+
+    def test_default_defaults_to_32000(self, monkeypatch):
+        from xagent.config import (
+            COMPACT_THRESHOLD_DEFAULT,
+            get_compact_threshold_default,
+        )
+
+        monkeypatch.delenv(COMPACT_THRESHOLD_DEFAULT, raising=False)
+        assert get_compact_threshold_default() == 32000
+
+    def test_default_env_override(self, monkeypatch):
+        from xagent.config import (
+            COMPACT_THRESHOLD_DEFAULT,
+            get_compact_threshold_default,
+        )
+
+        monkeypatch.setenv(COMPACT_THRESHOLD_DEFAULT, "64000")
+        assert get_compact_threshold_default() == 64000
+
+    @pytest.mark.parametrize("value", ["abc", "0", "-1"])
+    def test_default_invalid_or_non_positive_falls_back(self, monkeypatch, value):
+        from xagent.config import (
+            COMPACT_THRESHOLD_DEFAULT,
+            get_compact_threshold_default,
+        )
+
+        monkeypatch.setenv(COMPACT_THRESHOLD_DEFAULT, value)
+        assert get_compact_threshold_default() == 32000

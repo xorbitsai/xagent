@@ -232,16 +232,13 @@ def _serialize_transcript_with_events(
     surface the same "context compacted" notice the live chat shows.
     """
 
-    def _epoch(dt: Any) -> float:
-        return dt.timestamp() if dt is not None else 0.0
-
     # (sort_epoch, kind, payload); on ties order user (0) -> compaction (1) ->
     # assistant (2), since compaction happens before the assistant reply.
     rows: list[tuple[float, int, dict[str, Any]]] = []
     for message in sorted(messages, key=_message_sort_key):
         rows.append(
             (
-                _epoch(message.created_at),
+                _event_epoch(message.created_at) or 0.0,
                 0 if message.role == "user" else 2,
                 {
                     "id": int(message.id),
@@ -271,7 +268,7 @@ def _serialize_transcript_with_events(
             continue
         rows.append(
             (
-                _epoch(event.timestamp),
+                _event_epoch(event.timestamp) or 0.0,
                 1,
                 {
                     "id": f"compact-{int(event.id)}",

@@ -388,6 +388,13 @@ def _build_unique_file_path(path: Path) -> Path:
 
 
 def _ensure_under_uploads(path: Path, user_id: int) -> None:
+    if _is_under_uploads(path, user_id):
+        return
+
+    raise HTTPException(status_code=403, detail="Access denied")
+
+
+def _is_under_uploads(path: Path, user_id: int) -> bool:
     resolved_path = path.resolve()
     uploads_dir = get_uploads_dir()
     uploads_root = uploads_dir.resolve()
@@ -395,8 +402,9 @@ def _ensure_under_uploads(path: Path, user_id: int) -> None:
     try:
         resolved_path.relative_to(uploads_root)
         resolved_path.relative_to(user_root)
-    except ValueError as exc:
-        raise HTTPException(status_code=403, detail="Access denied") from exc
+    except ValueError:
+        return False
+    return True
 
 
 def _resolve_public_preview_target(
@@ -1079,7 +1087,7 @@ async def download_file(
         file_ref = ManagedFileRef(file_record)
         file_name = str(file_record.filename)
         media_type = guess_media_type(file_name)
-        _ensure_under_uploads(full_path, owner_user_id)
+        local_path_is_trusted = _is_under_uploads(full_path, owner_user_id)
         content_disposition = _inline_download_disposition(media_type)
         redirect_response = _durable_redirect_response(
             file_ref,
@@ -1089,7 +1097,7 @@ async def download_file(
         )
         if redirect_response is not None:
             return redirect_response
-        if full_path.exists() and full_path.is_file():
+        if local_path_is_trusted and full_path.exists() and full_path.is_file():
             accel_response = _accel_redirect_response(
                 full_path,
                 owner_user_id=owner_user_id,
@@ -1111,16 +1119,19 @@ async def download_file(
             )
         if file_ref.has_durable_object:
             try:
-                restored_path = file_ref.ensure_local()
-                accel_response = _accel_redirect_response(
-                    restored_path,
-                    owner_user_id=owner_user_id,
-                    filename=file_name,
-                    media_type=media_type,
-                    disposition=content_disposition,
-                )
-                if accel_response is not None:
-                    return accel_response
+                if local_path_is_trusted:
+                    restored_path = file_ref.ensure_local()
+                    accel_response = _accel_redirect_response(
+                        restored_path,
+                        owner_user_id=owner_user_id,
+                        filename=file_name,
+                        media_type=media_type,
+                        disposition=content_disposition,
+                    )
+                    if accel_response is not None:
+                        return accel_response
+                else:
+                    restored_path = file_ref.materialize(allow_existing_local=False)
                 return FileResponse(
                     path=str(restored_path),
                     filename=file_name,
@@ -1133,6 +1144,19 @@ async def download_file(
                 )
             except DurableObjectIntegrityError as exc:
                 raise _file_integrity_failed() from exc
+            except DurableObjectMissingError:
+                restored_path = file_ref.local_path
+                _ensure_under_uploads(restored_path, owner_user_id)
+                return FileResponse(
+                    path=str(restored_path),
+                    filename=file_name,
+                    media_type=media_type,
+                    headers={
+                        "Content-Disposition": _content_disposition_header(
+                            content_disposition, file_name
+                        )
+                    },
+                )
             except DurableStorageOperationError as exc:
                 raise _durable_storage_unavailable() from exc
     else:
@@ -1189,7 +1213,7 @@ async def preview_file(
         file_ref = ManagedFileRef(file_record)
         file_name = str(file_record.filename)
         media_type = guess_media_type(file_name)
-        _ensure_under_uploads(full_path, owner_user_id)
+        local_path_is_trusted = _is_under_uploads(full_path, owner_user_id)
         if _preview_can_redirect(full_path, media_type):
             redirect_response = _durable_redirect_response(
                 file_ref,
@@ -1199,24 +1223,28 @@ async def preview_file(
             )
             if redirect_response is not None:
                 return redirect_response
-            accel_response = _accel_redirect_response(
-                full_path,
-                owner_user_id=owner_user_id,
-                filename=file_name,
-                media_type=media_type,
-                disposition="inline",
-            )
-            if accel_response is not None:
-                return accel_response
+            if local_path_is_trusted:
+                accel_response = _accel_redirect_response(
+                    full_path,
+                    owner_user_id=owner_user_id,
+                    filename=file_name,
+                    media_type=media_type,
+                    disposition="inline",
+                )
+                if accel_response is not None:
+                    return accel_response
         if file_ref.has_durable_object:
             try:
-                materialized_path = file_ref.materialize()
+                materialized_path = file_ref.materialize(
+                    allow_existing_local=local_path_is_trusted
+                )
             except DurableObjectIntegrityError as exc:
                 raise _file_integrity_failed() from exc
             except DurableStorageOperationError as exc:
                 raise _durable_storage_unavailable() from exc
             except DurableObjectMissingError:
                 materialized_path = file_ref.local_path
+                _ensure_under_uploads(materialized_path, owner_user_id)
             return FileResponse(
                 path=str(materialized_path),
                 filename=file_name,
@@ -1287,11 +1315,13 @@ async def preview_pptx_as_pdf(
     if file_record:
         _check_file_access(file_record, user)
         file_name = str(file_record.filename)
-        _ensure_under_uploads(full_path, owner_user_id)
         file_ref = ManagedFileRef(file_record)
+        local_path_is_trusted = _is_under_uploads(full_path, owner_user_id)
         if file_ref.has_durable_object:
             try:
-                pptx_path = file_ref.materialize()
+                pptx_path = file_ref.materialize(
+                    allow_existing_local=local_path_is_trusted
+                )
             except DurableObjectIntegrityError as exc:
                 raise _file_integrity_failed() from exc
             except DurableStorageOperationError as exc:
@@ -1300,6 +1330,9 @@ async def preview_pptx_as_pdf(
                 # Durable record points at nothing; fall back to whatever
                 # is on disk (or 404 below if it's gone too).
                 pptx_path = file_ref.local_path
+                _ensure_under_uploads(pptx_path, owner_user_id)
+        else:
+            _ensure_under_uploads(full_path, owner_user_id)
     else:
         if owner_user_id != _user_id_value(user) and not _is_admin_user(user):
             raise HTTPException(status_code=403, detail="Access denied")
@@ -1361,6 +1394,7 @@ async def public_download_file(
     """
     file_record: Optional[UploadedFile] = None
     target_path: Optional[Path] = None
+    target_is_durable = False
     file_name: str
 
     if is_valid_uuid(file_id):
@@ -1372,11 +1406,14 @@ async def public_download_file(
         _validate_public_task_file_access(db, file_record, token)
         file_ref = ManagedFileRef(file_record)
         owner_user_id = _file_user_id_value(file_record)
-        _ensure_under_uploads(file_ref.local_path, owner_user_id)
         file_name = str(file_record.filename)
+        local_path_is_trusted = _is_under_uploads(file_ref.local_path, owner_user_id)
         if file_ref.has_durable_object:
             try:
-                target_path = file_ref.ensure_local()
+                target_path = file_ref.materialize(
+                    allow_existing_local=local_path_is_trusted
+                )
+                target_is_durable = True
             except DurableObjectIntegrityError as exc:
                 raise _file_integrity_failed() from exc
             except DurableStorageOperationError as exc:
@@ -1394,6 +1431,9 @@ async def public_download_file(
         target_path, owner_user_id = result
         _ensure_under_uploads(target_path, owner_user_id)
         file_name = target_path.name
+
+    if not target_is_durable:
+        _ensure_under_uploads(target_path, owner_user_id)
 
     if not target_path.exists() or not target_path.is_file():
         raise HTTPException(status_code=404, detail="File not found")
@@ -1435,16 +1475,18 @@ async def public_preview_file(
         file_ref = ManagedFileRef(file_record)
         base_path = file_ref.local_path
         owner_user_id = _file_user_id_value(file_record)
-        _ensure_under_uploads(base_path, owner_user_id)
         if file_ref.has_durable_object and not relative_path:
             try:
-                target_path = file_ref.materialize()
+                target_path = file_ref.materialize(
+                    allow_existing_local=_is_under_uploads(base_path, owner_user_id)
+                )
             except DurableObjectIntegrityError as exc:
                 raise _file_integrity_failed() from exc
             except DurableStorageOperationError as exc:
                 raise _durable_storage_unavailable() from exc
             except DurableObjectMissingError:
                 target_path = file_ref.local_path
+                _ensure_under_uploads(target_path, owner_user_id)
             return FileResponse(
                 path=str(target_path),
                 filename=str(file_record.filename),

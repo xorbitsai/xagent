@@ -86,6 +86,31 @@ def test_materialize_uses_temp_dir_when_original_path_is_missing(monkeypatch, tm
     assert not local_path.exists()
 
 
+def test_materialize_can_ignore_existing_local_path(monkeypatch, tmp_path):
+    _configure_storage(monkeypatch, tmp_path)
+    storage = get_unscoped_file_storage()
+    stored = storage.put_bytes(
+        b"durable content", "users/7/uploads/file-123/preview.txt"
+    )
+    local_path = tmp_path / "stale-worktree" / "preview.txt"
+    local_path.parent.mkdir()
+    local_path.write_text("stale local content", encoding="utf-8")
+    record = _record(
+        local_path,
+        storage_backend=stored.backend,
+        storage_key=stored.key,
+        storage_uri=stored.uri,
+        storage_status="available",
+        checksum=stored.checksum,
+    )
+
+    materialized = ManagedFileRef(record).materialize(allow_existing_local=False)
+
+    assert materialized.is_relative_to(tmp_path / "materialized")
+    assert materialized.read_text(encoding="utf-8") == "durable content"
+    assert local_path.read_text(encoding="utf-8") == "stale local content"
+
+
 def test_ensure_local_rejects_restored_checksum_mismatch(monkeypatch, tmp_path):
     _configure_storage(monkeypatch, tmp_path)
     storage = get_unscoped_file_storage()

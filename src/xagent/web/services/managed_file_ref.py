@@ -186,9 +186,9 @@ class ManagedFileRef:
                 f"Failed to restore durable object: {self.storage_key}"
             ) from exc
 
-    def materialize(self) -> Path:
+    def materialize(self, *, allow_existing_local: bool = True) -> Path:
         path = self.local_path
-        if path.exists() and path.is_file():
+        if allow_existing_local and path.exists() and path.is_file():
             return path
 
         if not self.has_durable_object:

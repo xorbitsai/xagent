@@ -155,6 +155,18 @@ def _corrupt_durable_copy_and_remove_local(
             path.unlink()
 
 
+def _replace_uploaded_file_storage_path(test_app: FastAPI, file_id: str, path: Path):
+    db = next(test_app.dependency_overrides[get_db]())
+    try:
+        file_record = (
+            db.query(UploadedFile).filter(UploadedFile.file_id == file_id).one()
+        )
+        file_record.storage_path = str(path)
+        db.commit()
+    finally:
+        db.close()
+
+
 class TestFileUpload:
     """Test file upload functionality"""
 
@@ -215,6 +227,103 @@ class TestFileUpload:
 
         assert download.status_code == 200
         assert download.content == b"durable content"
+
+    def test_registered_file_uses_durable_storage_when_storage_path_is_stale(
+        self, client, test_db, temp_uploads_dir, auth_headers, monkeypatch, tmp_path
+    ):
+        """A stale worktree storage_path must not block durable file access."""
+        _, test_app = test_db
+        monkeypatch.setenv(
+            "XAGENT_FILE_MATERIALIZE_DIR", str(tmp_path / "materialized")
+        )
+        get_unscoped_file_storage.cache_clear()
+
+        response = client.post(
+            "/api/files/upload",
+            files={"file": ("stale.txt", b"durable bytes", "text/plain")},
+            data={"task_type": "general"},
+            headers=auth_headers,
+        )
+        assert response.status_code == 200
+        file_id = response.json()["file_id"]
+
+        stale_path = (
+            tmp_path
+            / "deleted-worktree"
+            / "src"
+            / "xagent"
+            / "web"
+            / "uploads"
+            / "user_1"
+            / "web_task_99"
+            / "output"
+            / "stale.txt"
+        )
+        stale_path.parent.mkdir(parents=True)
+        stale_path.write_bytes(b"wrong local bytes")
+        _replace_uploaded_file_storage_path(test_app, file_id, stale_path)
+
+        for endpoint, headers in [
+            (f"/api/files/preview/{file_id}", auth_headers),
+            (f"/api/files/download/{file_id}", auth_headers),
+            (f"/api/files/public/preview/{file_id}", {}),
+            (f"/api/files/public/download/{file_id}", {}),
+        ]:
+            result = client.get(endpoint, headers=headers)
+            assert result.status_code == 200
+            assert result.content == b"durable bytes"
+
+        assert stale_path.read_bytes() == b"wrong local bytes"
+
+    def test_durable_missing_fallback_rejects_untrusted_storage_path(
+        self, client, test_db, temp_uploads_dir, auth_headers, monkeypatch, tmp_path
+    ):
+        """Durable fallback must not serve an untrusted local storage_path."""
+        from xagent.web.services.managed_file_ref import (
+            DurableObjectMissingError,
+            ManagedFileRef,
+        )
+
+        _, test_app = test_db
+        response = client.post(
+            "/api/files/upload",
+            files={
+                "file": (
+                    "missing.pptx",
+                    b"durable bytes",
+                    "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+                )
+            },
+            data={"task_type": "general"},
+            headers=auth_headers,
+        )
+        assert response.status_code == 200
+        file_id = response.json()["file_id"]
+
+        stale_path = tmp_path / "outside-uploads" / "missing.txt"
+        stale_path.parent.mkdir()
+        stale_path.write_bytes(b"wrong local bytes")
+        _replace_uploaded_file_storage_path(test_app, file_id, stale_path)
+
+        def missing_durable_object(
+            self: ManagedFileRef, *, allow_existing_local: bool = True
+        ):
+            del allow_existing_local
+            raise DurableObjectMissingError(self.local_path)
+
+        monkeypatch.setattr(ManagedFileRef, "materialize", missing_durable_object)
+
+        for endpoint, headers in [
+            (f"/api/files/download/{file_id}", auth_headers),
+            (f"/api/files/preview/{file_id}", auth_headers),
+            (f"/api/files/preview-pdf/{file_id}", auth_headers),
+            (f"/api/files/public/download/{file_id}", {}),
+            (f"/api/files/public/preview/{file_id}", {}),
+        ]:
+            result = client.get(endpoint, headers=headers)
+            assert result.status_code == 403
+
+        assert stale_path.read_bytes() == b"wrong local bytes"
 
     def test_download_redirects_to_signed_durable_url_when_enabled(
         self, client, temp_uploads_dir, auth_headers, monkeypatch

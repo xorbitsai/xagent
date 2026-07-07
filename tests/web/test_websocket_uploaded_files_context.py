@@ -17,6 +17,7 @@ from xagent.web.api.websocket import (
     _normalize_file_outputs,
     _normalize_task_file_outputs,
     _register_uploaded_files_for_agent,
+    _rewrite_file_links_to_file_id,
     _selected_file_refs_from_task,
     execute_task_background,
     handle_file_upload_for_task,
@@ -712,7 +713,103 @@ def test_normalize_file_outputs_accepts_registered_agent_workspace_output(
     )
     assert path_to_file_id[str(worker_path)] == "delegated-output"
     assert path_to_file_id["output/report.txt"] == "delegated-output"
+    assert path_to_file_id["report.txt"] == "delegated-output"
+    assert (
+        _rewrite_file_links_to_file_id(
+            "Final file: [report.txt](file:report.txt)", path_to_file_id
+        )
+        == "Final file: [report.txt](file:delegated-output)"
+    )
     assert db_session.query(UploadedFile).count() == 1
+
+
+def test_normalize_file_outputs_does_not_rewrite_ambiguous_basename(
+    db_session,
+    tmp_path,
+    monkeypatch,
+):
+    uploads_dir = tmp_path / "uploads"
+    monkeypatch.setenv("XAGENT_UPLOADS_DIR", str(uploads_dir))
+    _create_user(db_session, 1, "owner")
+    _create_task(db_session, task_id=20, user_id=1)
+
+    first_path = uploads_dir / "agent_2_abcd1234" / "output" / "first" / "report.txt"
+    second_path = uploads_dir / "agent_2_abcd1234" / "output" / "second" / "report.txt"
+    exact_path = uploads_dir / "agent_2_abcd1234" / "output" / "report.txt"
+    first_path.parent.mkdir(parents=True)
+    second_path.parent.mkdir(parents=True)
+    exact_path.parent.mkdir(parents=True, exist_ok=True)
+    first_path.write_text("first")
+    second_path.write_text("second")
+    exact_path.write_text("exact")
+    db_session.add_all(
+        [
+            UploadedFile(
+                file_id="first-output",
+                user_id=1,
+                task_id=20,
+                filename="report.txt",
+                storage_path=str(first_path),
+                mime_type="text/plain",
+                file_size=len("first"),
+                workspace_relative_path="output/first/report.txt",
+                workspace_category="output",
+            ),
+            UploadedFile(
+                file_id="second-output",
+                user_id=1,
+                task_id=20,
+                filename="report.txt",
+                storage_path=str(second_path),
+                mime_type="text/plain",
+                file_size=len("second"),
+                workspace_relative_path="output/second/report.txt",
+                workspace_category="output",
+            ),
+            UploadedFile(
+                file_id="exact-output",
+                user_id=1,
+                task_id=20,
+                filename="report.txt",
+                storage_path=str(exact_path),
+                mime_type="text/plain",
+                file_size=len("exact"),
+                workspace_relative_path="report.txt",
+                workspace_category="output",
+            ),
+        ]
+    )
+    db_session.flush()
+
+    normalized_outputs, path_to_file_id = _normalize_file_outputs(
+        db_session,
+        task_id=20,
+        task_user_id=1,
+        file_outputs=[{"path": str(first_path)}, {"path": str(second_path)}],
+    )
+
+    assert len(normalized_outputs) == 2
+    assert path_to_file_id["output/first/report.txt"] == "first-output"
+    assert path_to_file_id["output/second/report.txt"] == "second-output"
+    assert path_to_file_id["report.txt"] == ""
+    assert (
+        _rewrite_file_links_to_file_id(
+            "Ambiguous file: [report.txt](file:report.txt)", path_to_file_id
+        )
+        == "Ambiguous file: [report.txt](file:report.txt)"
+    )
+
+    normalized_outputs, path_to_file_id = _normalize_file_outputs(
+        db_session,
+        task_id=20,
+        task_user_id=1,
+        file_outputs=[{"path": str(first_path)}, {"path": str(exact_path)}],
+    )
+
+    assert len(normalized_outputs) == 2
+    assert path_to_file_id["output/first/report.txt"] == "first-output"
+    assert path_to_file_id["preview/report.txt"] == "exact-output"
+    assert path_to_file_id["report.txt"] == ""
 
 
 def test_normalize_file_outputs_rejects_registered_non_output_agent_file(

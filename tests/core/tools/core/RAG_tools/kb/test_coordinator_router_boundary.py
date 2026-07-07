@@ -16,14 +16,11 @@ import xagent.core.tools.core.RAG_tools.kb.coordinator as coordinator_module
 # ponytail: hardcoded list with a known ceiling — a NEW backend store impl
 # (e.g. qdrant_stores.py) is NOT auto-detected and must be appended here.
 FORBIDDEN_SUBSTRINGS = (
-    "lancedb_stores",
-    "lancedb_filter_utils",
-    "lancedb_query_utils",
+    "lancedb",
     "schema_manager",
     "fastapi",
     "starlette",
 )
-FORBIDDEN_ROOT_PACKAGES = ("lancedb",)
 FORBIDDEN_PREFIXES = ("xagent.web",)
 
 
@@ -40,9 +37,6 @@ def _imported_modules(source: str):
 def _is_forbidden(module: str) -> bool:
     if not module:
         return False
-    root = module.lstrip(".").split(".")[0]
-    if root in FORBIDDEN_ROOT_PACKAGES:
-        return True
     if any(sub in module for sub in FORBIDDEN_SUBSTRINGS):
         return True
     if any(module == p or module.startswith(p + ".") for p in FORBIDDEN_PREFIXES):

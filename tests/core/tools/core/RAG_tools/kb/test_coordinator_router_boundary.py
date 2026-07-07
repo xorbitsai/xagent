@@ -31,7 +31,10 @@ def _imported_modules(source: str):
             for alias in node.names:
                 yield node.lineno, alias.name
         elif isinstance(node, ast.ImportFrom):
-            yield node.lineno, node.module or ""
+            module = node.module or ""
+            yield node.lineno, module
+            for alias in node.names:
+                yield node.lineno, f"{module}.{alias.name}" if module else alias.name
 
 
 def _is_forbidden(module: str) -> bool:
@@ -58,8 +61,14 @@ def test_coordinator_imports_no_backend_or_web_modules() -> None:
 def test_guard_flags_forbidden_imports() -> None:
     # Positive control: the checker must actually fire, so a future refactor
     # that neuters it is caught.
-    snippet = "from fastapi import APIRouter\nimport lancedb\nfrom x.lancedb_stores import Y\n"
+    snippet = (
+        "from fastapi import APIRouter\n"
+        "import lancedb\n"
+        "from x.lancedb_stores import Y\n"
+        "from xagent.core.tools.core.RAG_tools.storage import lancedb_stores\n"
+    )
     flagged = [mod for _, mod in _imported_modules(snippet) if _is_forbidden(mod)]
     assert "fastapi" in flagged
     assert "lancedb" in flagged
     assert "x.lancedb_stores" in flagged
+    assert "xagent.core.tools.core.RAG_tools.storage.lancedb_stores" in flagged

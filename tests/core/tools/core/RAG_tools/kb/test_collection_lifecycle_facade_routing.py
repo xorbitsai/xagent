@@ -844,3 +844,43 @@ class TestRollbackRestoreRouting:
         handle.restore_main_pointer_snapshot.assert_called_once_with(
             snapshot, operator="bob"
         )
+
+
+class TestCrossOwnerRollbackRouting:
+    """#514: multi-owner rollback opens the handle with the snapshot's OWN
+    owner identity, not the caller's — orchestration stays coordinator-owned."""
+
+    def test_restore_candidate_cleanup_uses_snapshot_owner(self) -> None:
+        handle = _make_mock_handle()
+        handle.restore_candidate_cleanup_snapshot = MagicMock(
+            return_value={"rolled_back": True}
+        )
+        coordinator = _make_coordinator_with_mock_handle(handle)
+
+        captured: list = []
+
+        async def _spy_open(request):
+            captured.append(request)
+            return handle
+
+        coordinator.open_collection = _spy_open
+
+        snapshot = MagicMock()
+        snapshot.collection = "docs"
+        snapshot.user_id = 42
+        snapshot.is_admin = False
+
+        result = asyncio.run(
+            coordinator.restore_candidate_cleanup_snapshot(
+                snapshot, cleanup_executed=True
+            )
+        )
+
+        assert result == {"rolled_back": True}
+        assert len(captured) == 1
+        assert captured[0].collection == "docs"
+        assert captured[0].user_id == 42
+        assert captured[0].is_admin is False
+        handle.restore_candidate_cleanup_snapshot.assert_called_once_with(
+            snapshot, cleanup_executed=True
+        )

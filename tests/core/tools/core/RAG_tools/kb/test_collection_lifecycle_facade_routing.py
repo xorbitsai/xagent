@@ -815,9 +815,7 @@ class TestVersionPromotionRouting:
         handle.list_candidates = MagicMock(return_value={"candidates": []})
         coordinator = _make_coordinator_with_mock_handle(handle)
 
-        result = asyncio.run(
-            coordinator.list_candidates("docs", "doc-1", "parse")
-        )
+        result = asyncio.run(coordinator.list_candidates("docs", "doc-1", "parse"))
 
         assert result == {"candidates": []}
         handle.list_candidates.assert_called_once_with(

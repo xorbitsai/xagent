@@ -1917,28 +1917,26 @@ export function AppProvider({
 
               // Surface a standalone system notice in the conversation so the
               // user sees that context was compacted without expanding the process.
-              if (!eventData.error) {
-                const noticeText = t('agent.logs.event.messages.compactNotice', {
-                  original: eventData.original_tokens ?? '?',
-                  compacted: eventData.compacted_tokens ?? '?',
+              const noticeText = t('agent.logs.event.messages.compactNotice', {
+                original: eventData.original_tokens ?? '?',
+                compacted: eventData.compacted_tokens ?? '?',
+              })
+              // Key by step + event timestamp so distinct compactions (even in
+              // the same step, or with identical token counts) each show, while
+              // a re-dispatched same event is still deduped.
+              const noticeKey = `compact-notice-${stepId}-${message.timestamp}`
+              if (!isDuplicateMessage(noticeText, noticeKey)) {
+                dispatch({
+                  type: "ADD_MESSAGE",
+                  payload: {
+                    id: generateMessageId(noticeKey),
+                    role: "assistant",
+                    content: noticeText,
+                    timestamp: message.timestamp,
+                    status: "completed",
+                    isSystemNotice: true,
+                  }
                 })
-                // Key by step + event timestamp so distinct compactions (even
-                // in the same step, or with identical token counts) each show,
-                // while a re-dispatched same event is still deduped.
-                const noticeKey = `compact-notice-${stepId}-${message.timestamp}`
-                if (!isDuplicateMessage(noticeText, noticeKey)) {
-                  dispatch({
-                    type: "ADD_MESSAGE",
-                    payload: {
-                      id: generateMessageId(noticeKey),
-                      role: "assistant",
-                      content: noticeText,
-                      timestamp: message.timestamp,
-                      status: "completed",
-                      isSystemNotice: true,
-                    }
-                  })
-                }
               }
             }
           }

@@ -264,8 +264,6 @@ def _serialize_transcript_with_events(
     )
     for event in events:
         data: dict[str, Any] = event.data if isinstance(event.data, dict) else {}
-        if data.get("error"):
-            continue
         rows.append(
             (
                 _event_epoch(event.timestamp) or 0.0,

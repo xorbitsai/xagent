@@ -1,10 +1,11 @@
 "use client"
 
 import React, { useCallback, useEffect, useMemo, useRef, useState } from "react"
-import { Bot, ChevronLeft, ChevronRight, Inbox, Shrink } from "lucide-react"
+import { Bot, ChevronLeft, ChevronRight, Inbox } from "lucide-react"
 
 import { Badge } from "@/components/ui/badge"
 import { Button } from "@/components/ui/button"
+import { CompactionNotice } from "@/components/chat/CompactionNotice"
 import { TraceEventRenderer } from "@/components/chat/TraceEventRenderer"
 import { MarkdownRenderer } from "@/components/ui/markdown-renderer"
 import { SearchInput } from "@/components/ui/search-input"
@@ -404,15 +405,13 @@ function ConversationLogDetail({ detail }: { detail: ConversationLogDetailRespon
           <div className="space-y-4">
             {detail.transcript.map((message) => (
               message.message_type === "compaction" ? (
-                <div key={message.id} className="flex justify-center py-1">
-                  <span className="inline-flex items-center gap-1.5 text-xs text-slate-500">
-                    <Shrink className="h-3.5 w-3.5" />
-                    {t("agent.logs.event.messages.compactNotice", {
-                      original: message.compaction?.original_tokens ?? "?",
-                      compacted: message.compaction?.compacted_tokens ?? "?",
-                    })}
-                  </span>
-                </div>
+                <CompactionNotice
+                  key={message.id}
+                  text={t("agent.logs.event.messages.compactNotice", {
+                    original: message.compaction?.original_tokens ?? "?",
+                    compacted: message.compaction?.compacted_tokens ?? "?",
+                  })}
+                />
               ) : (
               <div
                 key={message.id}

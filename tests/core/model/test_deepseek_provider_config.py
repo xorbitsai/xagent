@@ -65,3 +65,33 @@ def test_deepseek_curated_models_are_limited_to_v4():
         "deepseek-v4-flash",
         "deepseek-v4-pro",
     )
+
+
+def test_create_base_llm_forwards_context_window_through_wrapper():
+    """context_window set on the inner LLM must proxy through the retry wrapper
+    (it is a BaseLLM class attribute, so it takes the forwarding-property path)."""
+    config = ChatModelConfig(
+        id="deepseek-model",
+        model_provider="deepseek",
+        model_name="deepseek-v4-flash",
+        api_key="test-api-key",
+        context_window=128000,
+    )
+
+    llm = create_base_llm(config)
+
+    assert llm.context_window == 128000
+    assert llm._inner.context_window == 128000
+
+
+def test_create_base_llm_context_window_defaults_to_none():
+    config = ChatModelConfig(
+        id="deepseek-model",
+        model_provider="deepseek",
+        model_name="deepseek-v4-flash",
+        api_key="test-api-key",
+    )
+
+    llm = create_base_llm(config)
+
+    assert llm.context_window is None

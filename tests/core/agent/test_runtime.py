@@ -602,3 +602,38 @@ async def test_runtime_trace_events_are_best_effort() -> None:
     )
 
     await runtime.on_llm_start(context=ExecutionContext(), messages=[], tools=[])
+
+
+@pytest.mark.asyncio
+async def test_on_llm_start_emits_context_usage_fields() -> None:
+    """The LLM-start event must carry context_tokens + context_threshold so the
+    frontend usage gauge has data; the tokens come from the same estimate that
+    drives compaction."""
+
+    class CapturingTracer:
+        def __init__(self) -> None:
+            self.events: list[dict[str, Any]] = []
+
+        async def trace_event(self, event_type: Any, **kwargs: Any) -> None:
+            self.events.append(
+                {
+                    "type": getattr(event_type, "value", str(event_type)),
+                    "data": kwargs.get("data") or {},
+                }
+            )
+
+    tracer = CapturingTracer()
+    runtime = PatternRuntime(tracer=tracer, execution_id="task-1")
+    ctx = ExecutionContext()
+    ctx.compact_config.threshold = 96000
+    ctx.add_message("user", "x" * 400)
+
+    await runtime.on_llm_start(
+        context=ctx, messages=[{"role": "user", "content": "x" * 400}]
+    )
+
+    usage = [e["data"] for e in tracer.events if "context_threshold" in e["data"]]
+    assert usage, tracer.events
+    assert usage[0]["context_threshold"] == 96000
+    assert isinstance(usage[0]["context_tokens"], int)
+    assert usage[0]["context_tokens"] > 0

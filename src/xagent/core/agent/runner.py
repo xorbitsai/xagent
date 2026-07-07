@@ -529,6 +529,9 @@ class AgentRunner:
             cwd=str(workspace.workspace_dir),
             workspace_state=self._workspace_state(workspace),
         )
+        # Snapshotted at task start. On resume the context (and this threshold)
+        # is restored verbatim from the checkpoint, so a context-window or ratio
+        # change made after checkpointing only affects newly started tasks.
         context.compact_config.threshold = self._resolve_compact_threshold()
         if metadata:
             context.metadata.update(metadata)

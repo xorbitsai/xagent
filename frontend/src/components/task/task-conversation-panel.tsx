@@ -1,10 +1,11 @@
 "use client"
 
 import React, { useCallback, useEffect, useMemo, useRef, useState } from "react"
-import { FolderOpen, GitMerge, Loader2, Shrink } from "lucide-react"
+import { FolderOpen, GitMerge, Loader2 } from "lucide-react"
 import dagre from "dagre"
 import { ChatInput } from "@/components/chat/ChatInput"
 import { ChatMessage } from "@/components/chat/ChatMessage"
+import { CompactionNotice } from "@/components/chat/CompactionNotice"
 import { ContextUsageRing } from "@/components/chat/ContextUsageRing"
 import { TokenUsageDisplay } from "@/components/chat/TokenUsageDisplay"
 import { FilePreviewActionButtons } from "@/components/file/file-preview-action-buttons"
@@ -613,17 +614,7 @@ export function TaskConversationPanel({
                 <>
                   {timelineItems.map((item) => {
                     if (item.isSystemNotice) {
-                      return (
-                        <div
-                          key={item.id}
-                          className="flex justify-center py-1"
-                        >
-                          <span className="inline-flex items-center gap-1.5 text-xs text-muted-foreground">
-                            <Shrink className="w-3.5 h-3.5" />
-                            {item.content}
-                          </span>
-                        </div>
-                      )
+                      return <CompactionNotice key={item.id} text={item.content as string} />
                     }
                     const isFailedFinalAnswerStream =
                       item.isStreamingFinalAnswer && item.status === "failed"

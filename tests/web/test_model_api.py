@@ -366,6 +366,68 @@ class TestModelAPI:
         assert data["status"] == "passed"
         mock_fetch.assert_awaited_once()
 
+    def test_test_connection_speech_elevenlabs_uses_listing_for_custom_asr(
+        self, test_db, regular_user, regular_headers
+    ):
+        """ElevenLabs speech checks should not infer abilities from name prefixes."""
+        with patch(
+            "xagent.web.services.model_list_service.fetch_models_from_provider",
+            new=AsyncMock(
+                return_value=[
+                    {
+                        "id": "custom_transcriber",
+                        "abilities": ["asr"],
+                    }
+                ]
+            ),
+        ) as mock_fetch:
+            response = client.post(
+                "/api/models/test-connection",
+                json={
+                    "model_provider": "elevenlabs",
+                    "model_name": "custom_transcriber",
+                    "api_key": "test-api-key",
+                    "category": "speech",
+                },
+                headers=regular_headers,
+            )
+
+        assert response.status_code == 200
+        data = response.json()
+        assert data["status"] == "passed"
+        mock_fetch.assert_awaited_once()
+
+    def test_test_connection_speech_elevenlabs_asr_uses_model_listing(
+        self, test_db, regular_user, regular_headers
+    ):
+        """ElevenLabs ASR connection checks should not transcribe paid audio."""
+        with patch(
+            "xagent.web.services.model_list_service.fetch_models_from_provider",
+            new=AsyncMock(
+                return_value=[
+                    {
+                        "id": "scribe_v2",
+                        "abilities": ["asr"],
+                    }
+                ]
+            ),
+        ) as mock_fetch:
+            response = client.post(
+                "/api/models/test-connection",
+                json={
+                    "model_provider": "elevenlabs",
+                    "model_name": "scribe_v2",
+                    "api_key": "test-api-key",
+                    "category": "speech",
+                },
+                headers=regular_headers,
+            )
+
+        assert response.status_code == 200
+        data = response.json()
+        assert data["status"] == "passed"
+        mock_fetch.assert_awaited_once()
+
     def test_create_model_as_admin(
         self, test_db, admin_user, admin_headers, sample_model_data
     ):
@@ -741,6 +803,116 @@ class TestModelAPI:
         }
         assert defaults["asr"] == sample_speech_model_data["model_id"]
         assert defaults["tts"] == sample_speech_model_data["model_id"]
+
+    def test_transcribe_speech_requires_asr_model(
+        self,
+        test_db,
+        regular_user,
+        regular_headers,
+    ):
+        response = client.post(
+            "/api/models/speech/transcribe",
+            files={"file": ("voice.webm", b"audio-bytes", "audio/webm")},
+            headers=regular_headers,
+        )
+
+        assert response.status_code == 404
+        assert response.json()["detail"] == "No ASR model is configured"
+
+    def test_transcribe_speech_rejects_oversized_audio(
+        self,
+        test_db,
+        regular_user,
+        regular_headers,
+    ):
+        with patch("xagent.web.api.model.MAX_TRANSCRIBE_UPLOAD_BYTES", 4):
+            response = client.post(
+                "/api/models/speech/transcribe",
+                files={"file": ("voice.webm", b"audio", "audio/webm")},
+                headers=regular_headers,
+            )
+
+        assert response.status_code == 413
+        assert response.json()["detail"] == "Audio file is too large"
+
+    def test_transcribe_speech_uses_user_default_asr_model(
+        self,
+        test_db,
+        regular_user,
+        regular_headers,
+        sample_speech_model_data,
+    ):
+        first_model = dict(sample_speech_model_data)
+        first_model["model_id"] = "test-asr-first"
+        first_model["model_name"] = "asr-first"
+        first_model["abilities"] = ["asr"]
+        second_model = dict(sample_speech_model_data)
+        second_model["model_id"] = "test-asr-second"
+        second_model["model_name"] = "asr-second"
+        second_model["abilities"] = ["asr"]
+
+        first_response = client.post(
+            "/api/models/",
+            json=first_model,
+            headers=regular_headers,
+        )
+        assert first_response.status_code == 200
+        second_response = client.post(
+            "/api/models/",
+            json=second_model,
+            headers=regular_headers,
+        )
+        assert second_response.status_code == 200
+
+        default_response = client.post(
+            "/api/models/user-default",
+            json={"model_id": second_response.json()["id"], "config_type": "asr"},
+            headers=regular_headers,
+        )
+        assert default_response.status_code == 200
+
+        class FakeASR:
+            def __init__(self, model_name: str):
+                self.model_name = model_name
+                self.calls = []
+                self.closed = False
+
+            async def transcribe(self, audio, language=None, format=None):
+                self.calls.append(
+                    {"audio": audio, "language": language, "format": format}
+                )
+                return f"text from {self.model_name}"
+
+            async def aclose(self):
+                self.closed = True
+
+        created_models = []
+
+        def create_fake_asr(db_model):
+            fake_asr = FakeASR(db_model.model_name)
+            created_models.append(fake_asr)
+            return fake_asr
+
+        with patch(
+            "xagent.core.model.asr.adapter.get_asr_model_instance",
+            side_effect=create_fake_asr,
+        ):
+            response = client.post(
+                "/api/models/speech/transcribe",
+                files={"file": ("voice.webm", b"audio-bytes", "audio/webm")},
+                data={"language": "en"},
+                headers=regular_headers,
+            )
+
+        assert response.status_code == 200
+        data = response.json()
+        assert data["text"] == "text from asr-second"
+        assert data["model_id"] == "test-asr-second"
+        assert len(created_models) == 1
+        assert created_models[0].calls == [
+            {"audio": b"audio-bytes", "language": "en", "format": "webm"}
+        ]
+        assert created_models[0].closed is True
 
     def test_reject_asr_only_speech_model_as_tts_default(
         self,

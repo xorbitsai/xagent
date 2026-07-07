@@ -152,6 +152,32 @@ describe("ChatInput", () => {
     expect(container.querySelector('button[type="submit"]')).not.toBeDisabled()
   })
 
+  it("renders voice input as an inline toolbar action when ASR is configured", async () => {
+    apiRequestMock.mockImplementation((url: string) => {
+      if (url === "http://api.local/api/models/?category=speech&limit=1000") {
+        return Promise.resolve(
+          new Response(JSON.stringify([{ abilities: ["asr"] }]), {
+            status: 200,
+            headers: { "Content-Type": "application/json" },
+          })
+        )
+      }
+      return Promise.resolve(emptyJsonResponse())
+    })
+
+    render(
+      <ChatInput
+        hideConfig
+        hideFileUpload
+        inputValue=""
+        onInputChange={vi.fn()}
+        onSend={vi.fn()}
+      />
+    )
+
+    expect(await screen.findByLabelText("voiceInput.start")).toBeInTheDocument()
+  })
+
   it("allows live guidance while a task is running", async () => {
     const onSend = vi.fn()
     const onPause = vi.fn()

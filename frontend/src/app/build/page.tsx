@@ -3,7 +3,7 @@
 import React, { useState, useEffect, useRef } from "react"
 import { SearchInput } from "@/components/ui/search-input"
 import { Button } from "@/components/ui/button"
-import { Plus, Bot, Trash2, MessageSquare, Edit, MoreVertical, Globe, Calendar, Clock, Rocket, Sparkles, Settings2, ArrowRight, FileText, Wrench, Database, Plug, KeyRound, Webhook } from "lucide-react"
+import { Plus, Bot, Trash2, MessageSquare, Edit, MoreVertical, Globe, Calendar, Clock, Rocket, Sparkles, Settings2, ArrowRight, FileText, Wrench, Database, Plug, KeyRound, Webhook, Mic, Square, Loader2 } from "lucide-react"
 import { Popover, PopoverTrigger, PopoverContent } from "@/components/ui/popover"
 import { Dialog, DialogContent, DialogHeader, DialogTitle } from "@/components/ui/dialog"
 import { Textarea } from "@/components/ui/textarea"
@@ -25,6 +25,7 @@ import {
 import { ConfirmDialog } from "@/components/ui/confirm-dialog"
 import { toast } from "@/components/ui/sonner"
 import { getBrandingFromEnv } from "@/lib/branding"
+import { useVoiceInputControls } from "@/components/voice-input-controller"
 
 interface LlmModel {
   model_id: string
@@ -69,6 +70,7 @@ export default function BuildsPage() {
   const router = useRouter()
   const searchParams = useSearchParams()
   const hasAutoOpenedCreateRef = useRef(false)
+  const createPromptRef = useRef<HTMLTextAreaElement | null>(null)
   const [searchTerm, setSearchTerm] = useState("")
   const [agents, setAgents] = useState<Agent[]>([])
   const [loading, setLoading] = useState(true)
@@ -184,6 +186,7 @@ export default function BuildsPage() {
   const [isCreateModalOpen, setIsCreateModalOpen] = useState(false)
   const [createPrompt, setCreatePrompt] = useState("")
   const [isStartingTask, setIsStartingTask] = useState(false)
+  const createPromptVoiceInput = useVoiceInputControls()
 
   const handleCreate = () => {
     setIsCreateModalOpen(true)
@@ -289,6 +292,25 @@ export default function BuildsPage() {
   const handleManualCreate = () => {
     router.push("/build/new")
     setIsCreateModalOpen(false)
+  }
+
+  const createPromptVoiceInputLabel =
+    createPromptVoiceInput.status === "recording"
+      ? t("voiceInput.stop")
+      : createPromptVoiceInput.status === "transcribing"
+        ? t("voiceInput.transcribing")
+        : t("voiceInput.start")
+  const createPromptVoiceInputDisabled =
+    createPromptVoiceInput.status === "transcribing" ||
+    (createPromptVoiceInput.status === "idle" && isStartingTask)
+  const handleCreatePromptVoiceInputClick = () => {
+    if (createPromptVoiceInput.status === "recording") {
+      createPromptVoiceInput.stopRecording()
+      return
+    }
+    if (createPromptVoiceInput.status === "idle") {
+      createPromptVoiceInput.startRecording(createPromptRef.current)
+    }
   }
 
   const formatDate = (dateString: string) => {
@@ -621,6 +643,8 @@ export default function BuildsPage() {
 
               <div className="relative flex-1 w-full rounded-lg border border-input bg-background focus-within:ring-1 focus-within:ring-ring flex flex-col">
                 <Textarea
+                  ref={createPromptRef}
+                  data-voice-input="false"
                   value={createPrompt}
                   onChange={(e) => setCreatePrompt(e.target.value)}
                   placeholder={t("builds.list.createModal.placeholder")}
@@ -632,7 +656,32 @@ export default function BuildsPage() {
                     }
                   }}
                 />
-                <div className="p-2 flex justify-end">
+                <div className="p-2 flex justify-end gap-2">
+                  {createPromptVoiceInput.hasAsrModel && (
+                    <Button
+                      type="button"
+                      variant="ghost"
+                      size="icon"
+                      aria-label={createPromptVoiceInputLabel}
+                      title={createPromptVoiceInputLabel}
+                      className={
+                        createPromptVoiceInput.status === "recording"
+                          ? "h-9 w-9 rounded-full bg-red-500 text-white hover:bg-red-600 hover:text-white"
+                          : "h-9 w-9 rounded-full text-muted-foreground hover:text-foreground"
+                      }
+                      disabled={createPromptVoiceInputDisabled}
+                      onMouseDown={(event) => event.preventDefault()}
+                      onClick={handleCreatePromptVoiceInputClick}
+                    >
+                      {createPromptVoiceInput.status === "recording" ? (
+                        <Square className="h-3.5 w-3.5 fill-current" />
+                      ) : createPromptVoiceInput.status === "transcribing" ? (
+                        <Loader2 className="h-4 w-4 animate-spin" />
+                      ) : (
+                        <Mic className="h-4 w-4" />
+                      )}
+                    </Button>
+                  )}
                   <Button
                     onClick={handleBuildWithPrompt}
                     disabled={!createPrompt.trim() || isStartingTask}

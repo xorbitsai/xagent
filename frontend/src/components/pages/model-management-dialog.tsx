@@ -45,6 +45,53 @@ import { Model, ModelCreate, ProviderConfig, generateModelId, getModelDetailUrl 
 import { ConfirmDialog } from "@/components/ui/confirm-dialog"
 import { Stepper } from "@/components/ui/stepper"
 
+const SPEECH_ABILITY_VALUES = new Set(["asr", "tts"])
+
+function getProviderModelAbilities(model?: ProviderModel): string[] {
+  const abilities = model?.abilities?.length
+    ? model.abilities
+    : model?.model_ability
+  return Array.isArray(abilities) ? abilities.map(String) : []
+}
+
+function modelSupportsAbilities(
+  model: ProviderModel | undefined,
+  requiredAbilities: string[] = []
+): boolean {
+  const required = requiredAbilities.filter((ability) =>
+    SPEECH_ABILITY_VALUES.has(ability)
+  )
+  if (required.length === 0 || !model) return true
+
+  const available = getProviderModelAbilities(model)
+  if (available.length === 0) return true
+
+  return required.every((ability) => available.includes(ability))
+}
+
+function filterModelsForAbilities(
+  models: ProviderModel[],
+  category: string,
+  abilities: string[] = []
+): ProviderModel[] {
+  if (category !== "speech") return models
+  return models.filter((model) => modelSupportsAbilities(model, abilities))
+}
+
+function normalizeAbilitiesForProvider(
+  category: string,
+  providerId: string,
+  abilities: string[]
+): string[] {
+  if (category === "speech" && providerId === "elevenlabs") {
+    const selectedSpeechAbility = [...abilities]
+      .reverse()
+      .find((ability) => SPEECH_ABILITY_VALUES.has(ability))
+    return selectedSpeechAbility ? [selectedSpeechAbility] : []
+  }
+  return abilities
+}
+
 export interface ModelManagementDialogProps {
   isOpen: boolean
   onOpenChange: (open: boolean) => void
@@ -155,9 +202,13 @@ export function ModelManagementDialog({
     ]
   }
 
-  const resetConnectionState = () => {
+  const resetTestConnectionState = () => {
     setTestConnectionStatus('idle')
     setTestConnectionError(null)
+  }
+
+  const resetConnectionState = () => {
+    resetTestConnectionState()
     setFetchedModels([])
   }
 
@@ -262,6 +313,16 @@ export function ModelManagementDialog({
     if (!managingProviderId) return []
     return enabledModels.filter(m => m.model_provider === managingProviderId && m.category === activeTab)
   }, [enabledModels, managingProviderId, activeTab])
+
+  const filteredFetchedModels = useMemo(
+    () =>
+      filterModelsForAbilities(
+        fetchedModels,
+        formData.category,
+        formData.abilities || []
+      ),
+    [fetchedModels, formData.category, formData.abilities]
+  )
 
   function getModelDefaultTypes(modelId: number) {
     const types: string[] = []
@@ -429,9 +490,7 @@ export function ModelManagementDialog({
   const applyFetchedModelSelection = (modelName: string) => {
     const selected = fetchedModels.find(model => model.id === modelName)
     const suggestedBaseUrl = selected?.default_base_url || selected?.base_url
-    const suggestedAbilities = selected?.abilities?.length
-      ? selected.abilities
-      : selected?.model_ability
+    const suggestedAbilities = getProviderModelAbilities(selected)
 
     setFormData(prev => ({
       ...prev,
@@ -439,12 +498,36 @@ export function ModelManagementDialog({
       base_url: suggestedBaseUrl || prev.base_url,
       abilities: suggestedAbilities?.length
         ? suggestedAbilities
-        : getDefaultAbilitiesForProvider(prev.category, prev.model_provider),
+        : prev.abilities?.length
+          ? prev.abilities
+          : getDefaultAbilitiesForProvider(prev.category, prev.model_provider),
       default_config_types: [],
     }))
     setHasInitializedDefaults(false)
     setTestConnectionStatus('idle')
     setTestConnectionError(null)
+  }
+
+  const updateModelAbilities = (abilities: string[]) => {
+    resetTestConnectionState()
+    setFormData(prev => {
+      const nextAbilities = normalizeAbilitiesForProvider(
+        prev.category,
+        prev.model_provider,
+        abilities
+      )
+      const selectedModel = fetchedModels.find(model => model.id === prev.model_name)
+      const nextModelName = modelSupportsAbilities(selectedModel, nextAbilities)
+        ? prev.model_name
+        : ""
+
+      return {
+        ...prev,
+        model_name: nextModelName,
+        abilities: nextAbilities,
+        default_config_types: [],
+      }
+    })
   }
 
   const submitModelData = async (data: ModelCreate) => {
@@ -696,7 +779,7 @@ export function ModelManagementDialog({
                       <ScrollArea className="flex-1 border rounded-md overflow-y-scroll">
                         <div className="flex flex-col divide-y">
                           {providers
-                            .filter(p => p.category.includes(formData.category as any))
+                            .filter(p => p.category.includes(formData.category))
                             .filter(p => p.name.toLowerCase().includes(connectSearchQuery.toLowerCase()))
                             .map(provider => (
                               <div
@@ -792,7 +875,7 @@ export function ModelManagementDialog({
                             setTestConnectionStatus('testing')
                             try {
                               await handleFetchModels()
-                            } catch (err) {
+                            } catch {
                               // error handled in handleFetchModels
                             } finally {
                               setTestConnectionStatus('idle')
@@ -829,8 +912,8 @@ export function ModelManagementDialog({
                           onValueChange={(val) => {
                             applyFetchedModelSelection(val)
                           }}
-                          options={fetchedModels.map(m => ({ value: m.id, label: m.id }))}
-                          placeholder={fetchedModels.length > 0 ? t('models.form.selectModel') : t('models.form.enterModelName')}
+                          options={filteredFetchedModels.map(m => ({ value: m.id, label: m.id }))}
+                          placeholder={filteredFetchedModels.length > 0 ? t('models.form.selectModel') : t('models.form.enterModelName')}
                           allowCustom={formData.model_provider !== 'deepseek'}
                           customPlaceholder={t('models.form.customModel')}
                           customButtonText={t('models.form.addCustom')}
@@ -898,9 +981,16 @@ export function ModelManagementDialog({
                                 className={`rounded-full ${isSelected ? 'bg-primary text-primary-foreground border-primary hover:bg-primary/90' : ''}`}
                                 onClick={() => {
                                   const abilities = formData.abilities || []
-                                  resetConnectionState()
-                                  if (isSelected) setFormData({ ...formData, abilities: abilities.filter(a => a !== cap) })
-                                  else setFormData({ ...formData, abilities: [...abilities, cap] })
+                                  const isExclusiveSpeechProvider =
+                                    formData.category === "speech" &&
+                                    formData.model_provider === "elevenlabs"
+                                  if (isExclusiveSpeechProvider) {
+                                    updateModelAbilities([cap])
+                                  } else if (isSelected) {
+                                    updateModelAbilities(abilities.filter(a => a !== cap))
+                                  } else {
+                                    updateModelAbilities([...abilities, cap])
+                                  }
                                 }}
                               >
                                 {icons[cap]}
@@ -948,7 +1038,7 @@ export function ModelManagementDialog({
                             if (!hasInitializedDefaults) {
                               const targetType = getPrimaryDefaultType(formData.category, formData.abilities)
                               if (targetType) {
-                                const hasDefault = (defaultModels as any)[targetType]
+                                const hasDefault = defaultModels[targetType]
                                 if (!hasDefault) {
                                   setFormData(prev => ({
                                     ...prev,
@@ -1020,7 +1110,7 @@ export function ModelManagementDialog({
                           })();
 
                           const existingDefaults = relevantTypes
-                            .map(type => ({ type, model: (defaultModels as any)[type] }))
+                            .map(type => ({ type, model: defaultModels[type] }))
                             .filter(item => item.model);
 
                           if (existingDefaults.length === 0) return null;
@@ -1150,7 +1240,7 @@ export function ModelManagementDialog({
                   {(() => {
                     const defaultOptions = getDefaultOptionsForModel(defaultTargetModel.category, defaultTargetModel.abilities)
                     const existingDefaults = defaultOptions
-                      .map(option => ({ type: option.value, model: (defaultModels as any)[option.value] }))
+                      .map(option => ({ type: option.value, model: defaultModels[option.value] }))
                       .filter(item => item.model)
 
                     if (existingDefaults.length === 0) return null
@@ -1257,7 +1347,7 @@ export function ModelManagementDialog({
                     }}
                     disabled={!!editingModel}
                     options={providers
-                      .filter(p => p.category.includes(formData.category as any))
+                      .filter(p => p.category.includes(formData.category))
                       .map((provider) => ({
                         value: provider.id,
                         label: provider.name
@@ -1349,7 +1439,7 @@ export function ModelManagementDialog({
                   <Select
                     value={formData.model_name}
                     onValueChange={(value) => applyFetchedModelSelection(value)}
-                    options={fetchedModels.map(m => ({ value: m.id, label: m.id }))}
+                    options={filteredFetchedModels.map(m => ({ value: m.id, label: m.id }))}
                     placeholder={t('models.form.selectModel')}
                     allowCustom={formData.model_provider !== 'deepseek'}
                     customPlaceholder={t('models.form.enterModelName')}
@@ -1368,7 +1458,7 @@ export function ModelManagementDialog({
                 <Label className="mb-2 block">{t('models.form.abilities')}</Label>
                 <MultiSelect
                   values={formData.abilities || []}
-                  onValuesChange={(values) => setFormData({ ...formData, abilities: values })}
+                  onValuesChange={updateModelAbilities}
                   options={
                     formData.category === 'llm' ? abilityOptions :
                       formData.category === 'embedding' ? embeddingAbilityOptions :

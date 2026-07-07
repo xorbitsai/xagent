@@ -123,7 +123,7 @@ _SUPPORTED_PROVIDER_METADATA: tuple[dict[str, Any], ...] = (
     {
         "id": "elevenlabs",
         "name": "ElevenLabs",
-        "description": "ElevenLabs speech models for text-to-speech",
+        "description": "ElevenLabs speech models for transcription and text-to-speech",
         "requires_base_url": False,
         "category": ["speech"],
     },

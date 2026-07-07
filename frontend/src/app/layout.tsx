@@ -11,6 +11,7 @@ import { I18nProvider } from "@/contexts/i18n-context";
 import { getThemeFromEnv, themes } from "@/lib/theme";
 import { Toaster } from "@/components/ui/sonner";
 import { McpAppsProvider } from "@/contexts/mcp-apps-context";
+import { VoiceInputController } from "@/components/voice-input-controller";
 
 const branding = getBrandingFromEnv();
 
@@ -120,6 +121,7 @@ export default function RootLayout({
               <McpAppsProvider>
                 <AuthGuard>
                   <LayoutContent>{children}</LayoutContent>
+                  <VoiceInputController />
                   <Toaster />
                 </AuthGuard>
               </McpAppsProvider>

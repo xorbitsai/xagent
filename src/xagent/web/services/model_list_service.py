@@ -196,13 +196,27 @@ async def fetch_xinference_video_models(
 async def fetch_elevenlabs_models(
     api_key: str, base_url: Optional[str] = None
 ) -> List[Dict[str, Any]]:
-    """Fetch available ElevenLabs TTS models using the official SDK."""
+    """Fetch available ElevenLabs speech models.
 
+    ElevenLabs exposes Scribe ASR model ids through the speech-to-text API, not
+    the models list response. We use the TTS models.list call as the non-billed
+    account-level auth probe, then append curated Scribe ids so connection tests
+    do not need to run a paid transcription request.
+    """
+
+    from ...core.model.asr.elevenlabs import ElevenLabsASR
     from ...core.model.tts.elevenlabs import ElevenLabsTTS
 
-    return await ElevenLabsTTS.async_list_available_models(
+    tts_models = await ElevenLabsTTS.async_list_available_models(
         api_key=api_key, base_url=base_url
     )
+    asr_models = await ElevenLabsASR.async_list_available_models(
+        api_key=api_key, base_url=base_url
+    )
+    seen_model_ids = {str(model.get("id")) for model in tts_models}
+    return tts_models + [
+        model for model in asr_models if str(model.get("id")) not in seen_model_ids
+    ]
 
 
 async def fetch_dashscope_rerank_models(

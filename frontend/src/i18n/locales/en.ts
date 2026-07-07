@@ -39,6 +39,18 @@ const en = {
       unknown: "Unknown error",
     },
   },
+  voiceInput: {
+    start: "Voice input",
+    stop: "Stop recording",
+    transcribing: "Transcribing voice",
+    errors: {
+      emptyAudio: "No usable audio was recorded",
+      failed: "Voice transcription failed",
+      noText: "No text was recognized",
+      permissionDenied: "Microphone access was denied",
+      unsupported: "This browser does not support recording",
+    },
+  },
   nav: {
     home: "Home",
     settings: "Settings",

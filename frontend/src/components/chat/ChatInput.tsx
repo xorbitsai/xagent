@@ -1,7 +1,7 @@
 import React, { useState, useRef, useEffect } from "react";
 import { createFileChipHTML } from "./FileChip";
 import { useRouter } from "next/navigation";
-import { Paperclip, X, File as FileIcon, Sparkles, Pause, Play, Loader2, ArrowUp, Globe } from "lucide-react";
+import { Paperclip, X, File as FileIcon, Sparkles, Pause, Play, Loader2, ArrowUp, Globe, Mic, Square } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { cn, getApiUrl, getUploadApiUrl } from "@/lib/utils";
 import { useI18n } from "@/contexts/i18n-context";
@@ -12,6 +12,7 @@ import { isPausableTaskStatus, isStoppedTaskStatus, normalizeTaskStatus, type Ta
 import { useFileMention, FileItem } from "@/hooks/use-file-mention";
 import { FileMentionDropdown } from "./FileMentionDropdown";
 import { toast } from "@/components/ui/sonner";
+import { useVoiceInputControls } from "@/components/voice-input-controller";
 import {
   AlertDialog,
   AlertDialogAction,
@@ -24,7 +25,7 @@ import {
 } from "@/components/ui/alert-dialog";
 
 interface ChatInputProps {
-  onSend: (message: string, config?: any) => void | Promise<void>;
+  onSend: (message: string, config?: AgentConfig) => void | Promise<void>;
   isLoading?: boolean;
   files?: File[];
   onFilesChange?: (files: File[]) => void;
@@ -36,13 +37,7 @@ interface ChatInputProps {
   taskStatus?: TaskStatus | string;
   onPause?: () => void;
   onResume?: () => void;
-  taskConfig?: {
-    model?: string;
-    smallFastModel?: string;
-    visualModel?: string;
-    compactModel?: string;
-    executionMode?: "flash" | "balanced" | "think";
-  };
+  taskConfig?: Partial<AgentConfig>;
   hideConfig?: boolean;
   readOnlyConfig?: boolean;
   hideFileUpload?: boolean;
@@ -57,6 +52,30 @@ interface ChatInputProps {
   onRemoveSelectedAgent?: (agentId: number | string) => void;
   uploadFile?: (file: File, params: { taskType: string }) => Promise<{ file_id: string }>;
   deferFileUpload?: boolean;
+}
+
+type ExecutionMode = "flash" | "balanced" | "think";
+type ExecutionModeConfig = ExecutionMode | { mode: ExecutionMode };
+
+interface AgentConfig {
+  model: string;
+  smallFastModel?: string;
+  visualModel?: string;
+  compactModel?: string;
+  memorySimilarityThreshold?: number;
+  executionMode?: ExecutionModeConfig;
+}
+
+interface ModelRecord {
+  id?: number | string;
+  model_id?: string;
+  model_name?: string;
+  is_default?: boolean;
+}
+
+interface DefaultModelRecord {
+  config_type?: string;
+  model?: ModelRecord | null;
 }
 
 export function ChatInput({
@@ -96,6 +115,7 @@ export function ChatInput({
   const dragDepthRef = useRef(0);
   const { t } = useI18n();
   const { openFilePreview } = useApp();
+  const voiceInput = useVoiceInputControls();
 
   useEffect(() => {
     if (!autoFocus || !editorRef.current) return;
@@ -238,21 +258,17 @@ export function ChatInput({
     editor.addEventListener('click', handleClick);
     return () => editor.removeEventListener('click', handleClick);
   }, [fileMention.fileList, openFilePreview]);
-  const [agentConfig, setAgentConfig] = useState<{
-    model: string;
-    smallFastModel?: string;
-    visualModel?: string;
-    compactModel?: string;
-    memorySimilarityThreshold?: number;
-    executionMode?: "flash" | "balanced" | "think";
-  }>({ model: "", memorySimilarityThreshold: 1.5 });
+  const [agentConfig, setAgentConfig] = useState<AgentConfig>({
+    model: "",
+    memorySimilarityThreshold: 1.5,
+  });
   const [defaultAgentConfig, setDefaultAgentConfig] = useState<{
     model: string;
     smallFastModel?: string;
     visualModel?: string;
     compactModel?: string;
   }>({ model: "" });
-  const [models, setModels] = useState<any[]>([]);
+  const [models, setModels] = useState<ModelRecord[]>([]);
 
   // State to track files currently being uploaded
   const [uploadingFiles, setUploadingFiles] = useState<Set<string>>(new Set());
@@ -335,8 +351,8 @@ export function ChatInput({
             });
           }
         }
-      } catch (error: any) {
-        if (error.name === 'AbortError') {
+      } catch (error) {
+        if (error instanceof DOMException && error.name === 'AbortError') {
           // Upload cancelled, do nothing
         } else {
           console.error("Error uploading file:", error);
@@ -385,7 +401,7 @@ export function ChatInput({
           headers: {}
         });
 
-        let allModels: any[] = [];
+        let allModels: ModelRecord[] = [];
         if (modelsResponse.ok) {
           allModels = await modelsResponse.json();
           if (Array.isArray(allModels)) {
@@ -398,11 +414,11 @@ export function ChatInput({
           headers: {}
         });
 
-        let defaultModels: Record<string, any> = {};
+        const defaultModels: Record<string, ModelRecord | undefined> = {};
         if (defaultResponse.ok) {
           const defaults = await defaultResponse.json();
           if (Array.isArray(defaults)) {
-            defaults.forEach((defaultConfig: any) => {
+            defaults.forEach((defaultConfig: DefaultModelRecord) => {
               if (defaultConfig && defaultConfig.config_type && defaultConfig.model) {
                 defaultModels[defaultConfig.config_type] = defaultConfig.model;
               }
@@ -412,7 +428,7 @@ export function ChatInput({
 
         // Find default if no user preference
         if (!defaultModels.general && allModels.length > 0) {
-          const defaultModel = allModels.find((m: any) => m.is_default) || allModels[0];
+          const defaultModel = allModels.find((m) => m.is_default) || allModels[0];
           if (defaultModel) {
             defaultModels.general = { model_id: defaultModel.model_id };
           }
@@ -465,14 +481,7 @@ export function ChatInput({
     }
   }, [taskConfig, readOnlyConfig, defaultAgentConfig]);
 
-  const handleConfigChange = (config: {
-    model: string;
-    smallFastModel?: string;
-    visualModel?: string;
-    compactModel?: string;
-    memorySimilarityThreshold?: number;
-    executionMode?: "flash" | "balanced" | "think";
-  }) => {
+  const handleConfigChange = (config: AgentConfig) => {
     setAgentConfig(config);
   };
 
@@ -485,6 +494,24 @@ export function ChatInput({
     !!isLoading &&
     !allowsLiveGuidanceInput &&
     !isStoppedTaskStatus(normalizedTaskStatus);
+  const voiceInputLabel =
+    voiceInput.status === "recording"
+      ? t("voiceInput.stop")
+      : voiceInput.status === "transcribing"
+        ? t("voiceInput.transcribing")
+        : t("voiceInput.start");
+  const voiceInputDisabled =
+    voiceInput.status === "transcribing" ||
+    (voiceInput.status === "idle" && isInputBusy);
+  const handleVoiceInputClick = () => {
+    if (voiceInput.status === "recording") {
+      voiceInput.stopRecording();
+      return;
+    }
+    if (voiceInput.status === "idle") {
+      voiceInput.startRecording(editorRef.current);
+    }
+  };
 
   const hasDraft = message.trim().length > 0 || files.length > 0;
   const canSubmit = () => {
@@ -534,7 +561,7 @@ export function ChatInput({
     appendFiles(droppedFiles);
   };
 
-  const handleSubmit = async (e: React.FormEvent) => {
+  const handleSubmit = async (e: React.SyntheticEvent) => {
     e.preventDefault();
 
     if (!canSubmit() || isSubmittingRef.current) return;
@@ -550,10 +577,18 @@ export function ChatInput({
       isSubmittingRef.current = true;
       const trimmed = message.trim();
       const messageToSend = trimmed;
+      const executionMode = taskConfig?.executionMode;
 
       const configToSend = {
         ...agentConfig,
-        ...(taskConfig?.executionMode ? { executionMode: { mode: taskConfig.executionMode } } : {}),
+        ...(executionMode
+          ? {
+              executionMode:
+                typeof executionMode === "string"
+                  ? { mode: executionMode }
+                  : executionMode,
+            }
+          : {}),
       };
 
       await onSend(messageToSend, configToSend);
@@ -583,7 +618,7 @@ export function ChatInput({
         return;
       }
       e.preventDefault();
-      handleSubmit(e as any);
+      handleSubmit(e);
     }
   };
 
@@ -598,7 +633,7 @@ export function ChatInput({
       fileItems.forEach((item, index) => {
         const file = item.getAsFile();
         if (file) {
-          const hasName = typeof (file as any).name === 'string' && (file as any).name.length > 0;
+          const hasName = file.name.length > 0;
           // Handle default "image.png" name which causes conflicts when pasting multiple images
           if (hasName && file.name !== 'image.png') {
             pastedFiles.push(file);
@@ -795,6 +830,7 @@ export function ChatInput({
             <div
               ref={editorRef}
               contentEditable
+              data-voice-input="false"
               className={cn(
                 "w-full rounded-md border-0 bg-transparent text-[15px] outline-none placeholder:text-muted-foreground/60 overflow-y-auto resize-none focus-visible:ring-0 focus-visible:ring-offset-0 whitespace-pre-wrap break-words text-left",
                 compact ? "min-h-[44px] px-3 py-3 pr-12 max-h-[150px]" : cn(minHeightClass, "px-4 py-3 pb-16 max-h-[400px]"),
@@ -802,7 +838,7 @@ export function ChatInput({
               )}
               onInput={handleInput}
               onKeyDown={handleKeyDown}
-              onPaste={handlePaste as any}
+              onPaste={handlePaste}
               onFocus={() => setIsFocused(true)}
               onBlur={() => setIsFocused(false)}
               role="textbox"
@@ -840,6 +876,33 @@ export function ChatInput({
                     <Paperclip className="h-4 w-4" />
                   </Button>
                 </>
+              )}
+              {voiceInput.hasAsrModel && (
+                <Button
+                  type="button"
+                  variant="ghost"
+                  size="sm"
+                  aria-label={voiceInputLabel}
+                  title={voiceInputLabel}
+                  className={cn(
+                    "h-8 w-8 p-0 rounded-full transition-colors",
+                    voiceInput.status === "recording"
+                      ? "bg-red-500 text-white hover:bg-red-600 hover:text-white"
+                      : "text-muted-foreground hover:text-foreground hover:bg-secondary/80",
+                    voiceInput.status === "transcribing" && "cursor-wait opacity-80"
+                  )}
+                  disabled={voiceInputDisabled}
+                  onMouseDown={(event) => event.preventDefault()}
+                  onClick={handleVoiceInputClick}
+                >
+                  {voiceInput.status === "recording" ? (
+                    <Square className="h-3.5 w-3.5 fill-current" />
+                  ) : voiceInput.status === "transcribing" ? (
+                    <Loader2 className="h-4 w-4 animate-spin" />
+                  ) : (
+                    <Mic className="h-4 w-4" />
+                  )}
+                </Button>
               )}
               <Button
                 type="submit"
@@ -941,6 +1004,33 @@ export function ChatInput({
                 <span className="text-[13px] font-medium text-muted-foreground/50 select-none mr-1">
                   ⏎ {t("common.send")}
                 </span>
+                {voiceInput.hasAsrModel && (
+                  <Button
+                    type="button"
+                    variant="ghost"
+                    size="sm"
+                    aria-label={voiceInputLabel}
+                    title={voiceInputLabel}
+                    className={cn(
+                      "h-8 w-8 p-0 rounded-full transition-colors",
+                      voiceInput.status === "recording"
+                        ? "bg-red-500 text-white hover:bg-red-600 hover:text-white"
+                        : "text-muted-foreground hover:text-foreground hover:bg-secondary/80",
+                      voiceInput.status === "transcribing" && "cursor-wait opacity-80"
+                    )}
+                    disabled={voiceInputDisabled}
+                    onMouseDown={(event) => event.preventDefault()}
+                    onClick={handleVoiceInputClick}
+                  >
+                    {voiceInput.status === "recording" ? (
+                      <Square className="h-3.5 w-3.5 fill-current" />
+                    ) : voiceInput.status === "transcribing" ? (
+                      <Loader2 className="h-4 w-4 animate-spin" />
+                    ) : (
+                      <Mic className="h-4 w-4" />
+                    )}
+                  </Button>
+                )}
                 <Button
                   type="submit"
                   size="icon"

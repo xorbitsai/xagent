@@ -39,6 +39,18 @@ const zh = {
       unknown: "未知错误",
     },
   },
+  voiceInput: {
+    start: "语音输入",
+    stop: "停止录音",
+    transcribing: "正在识别语音",
+    errors: {
+      emptyAudio: "没有录到可识别的音频",
+      failed: "语音识别失败",
+      noText: "没有识别到文字",
+      permissionDenied: "无法访问麦克风，请检查浏览器权限",
+      unsupported: "当前浏览器不支持录音",
+    },
+  },
   nav: {
     home: "首页",
     settings: "系统设置",

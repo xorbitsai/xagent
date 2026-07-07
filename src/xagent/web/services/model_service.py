@@ -1088,10 +1088,15 @@ def _get_models_by_category(
 
                     models[str(db_model.model_name)] = model
                     logger.info(f"Added {model_type} model: {db_model.model_name}")
-                elif model_provider == "elevenlabs" and ability == "tts":
-                    from ...core.model.tts.adapter import get_tts_model_instance
+                elif model_provider == "elevenlabs" and ability in {"asr", "tts"}:
+                    if ability == "asr":
+                        from ...core.model.asr.adapter import get_asr_model_instance
 
-                    model = get_tts_model_instance(db_model)
+                        model = get_asr_model_instance(db_model)
+                    else:
+                        from ...core.model.tts.adapter import get_tts_model_instance
+
+                        model = get_tts_model_instance(db_model)
                     models[str(db_model.model_name)] = model
                     logger.info(f"Added {model_type} model: {db_model.model_name}")
                 else:

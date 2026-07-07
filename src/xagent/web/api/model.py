@@ -4,9 +4,19 @@ import asyncio
 import logging
 import time
 import urllib.parse
-from typing import Any, List, Optional
+from inspect import isawaitable
+from typing import Any, List, Optional, cast
 
-from fastapi import APIRouter, Body, Depends, HTTPException, Query
+from fastapi import (
+    APIRouter,
+    Body,
+    Depends,
+    File,
+    Form,
+    HTTPException,
+    Query,
+    UploadFile,
+)
 from sqlalchemy.orm import Session
 
 from xagent.core.model.chat.basic.deepseek import DEEPSEEK_SUPPORTED_MODELS
@@ -69,6 +79,8 @@ def _can_user_share(user: User) -> bool:
 
 
 model_router = APIRouter(prefix="/api/models", tags=["models"])
+
+MAX_TRANSCRIBE_UPLOAD_BYTES = 25 * 1024 * 1024
 
 
 def _decode_model_identifier(model_id: str) -> str:
@@ -167,6 +179,123 @@ def _validate_requested_abilities(
         raise ValueError(
             f"Model '{provider_model.get('id', '')}' does not support abilities: {', '.join(missing)}"
         )
+
+
+def _model_has_ability(model: Any, ability: str) -> bool:
+    abilities = getattr(model, "abilities", None) or []
+    if isinstance(abilities, str):
+        return ability in abilities
+    if not isinstance(abilities, (list, tuple, set)):
+        return False
+    return ability in {str(item) for item in abilities}
+
+
+def _iter_accessible_asr_models(db: Session, user: User) -> list[DBModel]:
+    from ..services.model_service import (
+        _get_visible_user_ids,
+        build_user_model_visibility_filter,
+    )
+
+    user_id = int(user.id)
+    visible_ids = _get_visible_user_ids(db, user_id)
+    rows = (
+        db.query(DBModel, UserModel)
+        .join(UserModel, DBModel.id == UserModel.model_id)
+        .filter(
+            DBModel.category == "speech",
+            DBModel.is_active,
+            build_user_model_visibility_filter(user_id, visible_ids),
+        )
+        .order_by(
+            (UserModel.user_id == user_id).desc(),
+            UserModel.is_owner.desc(),
+            DBModel.id.asc(),
+        )
+        .all()
+    )
+
+    models: list[DBModel] = []
+    seen_model_ids: set[int] = set()
+    for db_model, _user_model in rows:
+        model_pk = int(db_model.id)
+        if model_pk in seen_model_ids or not _model_has_ability(db_model, "asr"):
+            continue
+        seen_model_ids.add(model_pk)
+        models.append(db_model)
+    return models
+
+
+def _resolve_asr_model_for_transcription(
+    db: Session,
+    user: User,
+    requested_model_id: Optional[str] = None,
+) -> DBModel:
+    if requested_model_id:
+        _, db_model, _user_model = _resolve_accessible_model(
+            db, user, requested_model_id
+        )
+        if db_model.category != "speech" or not _model_has_ability(db_model, "asr"):
+            raise HTTPException(
+                status_code=400,
+                detail="Selected model does not support ASR transcription",
+            )
+        return db_model
+
+    user_id = int(user.id)
+    asr_default = (
+        db.query(UserDefaultModel)
+        .join(DBModel, UserDefaultModel.model_id == DBModel.id)
+        .filter(
+            UserDefaultModel.user_id == user_id,
+            UserDefaultModel.config_type == "asr",
+            DBModel.is_active,
+        )
+        .first()
+    )
+    default_model: Optional[DBModel] = None
+    if asr_default and asr_default.model:
+        default_model = cast(DBModel, asr_default.model)
+        if not _model_has_ability(default_model, "asr"):
+            default_model = None
+
+    if default_model:
+        try:
+            _resolve_accessible_model(db, user, str(default_model.model_id))
+            return default_model
+        except HTTPException:
+            logger.warning(
+                "Ignoring invisible default ASR model %s for user %s",
+                default_model.model_id,
+                user_id,
+            )
+
+    accessible_models = _iter_accessible_asr_models(db, user)
+    if accessible_models:
+        return accessible_models[0]
+
+    raise HTTPException(status_code=404, detail="No ASR model is configured")
+
+
+def _format_from_upload(file: UploadFile) -> Optional[str]:
+    filename = file.filename or ""
+    if "." in filename:
+        suffix = filename.rsplit(".", 1)[-1].strip().lower()
+        if suffix:
+            return suffix
+
+    content_type = (file.content_type or "").lower()
+    if "/" in content_type:
+        subtype = content_type.split("/", 1)[1].split(";", 1)[0].strip()
+        if subtype:
+            return "mp3" if subtype == "mpeg" else subtype
+    return None
+
+
+async def _read_transcribe_upload_with_size_limit(file: UploadFile) -> bytes:
+    audio_bytes = await file.read(MAX_TRANSCRIBE_UPLOAD_BYTES + 1)
+    if len(audio_bytes) > MAX_TRANSCRIBE_UPLOAD_BYTES:
+        raise HTTPException(status_code=413, detail="Audio file is too large")
+    return audio_bytes
 
 
 def _validate_provider_model_name(provider: str, model_name: str) -> None:
@@ -645,11 +774,13 @@ async def test_model_connection(
                 )
 
             if provider == "elevenlabs":
-                requested_abilities = request.abilities or ["tts"]
-                unsupported_abilities = sorted(set(requested_abilities) - {"tts"})
+                requested_abilities = request.abilities
+                unsupported_abilities = sorted(
+                    set(requested_abilities or []) - {"asr", "tts"}
+                )
                 if unsupported_abilities:
                     raise ValueError(
-                        "ElevenLabs speech connection test only supports TTS abilities: "
+                        "ElevenLabs speech connection test only supports ASR/TTS abilities: "
                         + ", ".join(unsupported_abilities)
                     )
             else:
@@ -759,6 +890,64 @@ async def test_model_connection(
             message="Connection failed",
             error=safe_error,
         )
+
+
+@model_router.post("/speech/transcribe")
+async def transcribe_speech_input(
+    file: UploadFile = File(...),
+    model_id: Optional[str] = Form(None),
+    language: Optional[str] = Form(None),
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+) -> dict[str, Any]:
+    """Transcribe a short UI voice input clip with an accessible ASR model."""
+
+    from xagent.core.model.asr.adapter import get_asr_model_instance
+
+    try:
+        audio_bytes = await _read_transcribe_upload_with_size_limit(file)
+    finally:
+        await file.close()
+    if not audio_bytes:
+        raise HTTPException(status_code=400, detail="Audio file is empty")
+
+    db_model = _resolve_asr_model_for_transcription(db, user, model_id)
+    asr_model = get_asr_model_instance(db_model)
+    try:
+        result = await asyncio.wait_for(
+            asr_model.transcribe(
+                audio_bytes,
+                language=language,
+                format=_format_from_upload(file),
+            ),
+            timeout=180.0,
+        )
+    except asyncio.TimeoutError as exc:
+        raise HTTPException(status_code=504, detail="Transcription timed out") from exc
+    except Exception as exc:
+        safe_error = redact_sensitive_text(str(exc))
+        logger.error(
+            "Speech transcription failed for model %s: %s",
+            db_model.model_id,
+            safe_error,
+        )
+        raise HTTPException(
+            status_code=500,
+            detail=f"Speech transcription failed: {safe_error}",
+        ) from exc
+    finally:
+        close = getattr(asr_model, "aclose", None)
+        if callable(close):
+            result_to_close = close()
+            if isawaitable(result_to_close):
+                await result_to_close
+
+    text = getattr(result, "text", result)
+    return {
+        "text": str(text or ""),
+        "model_id": db_model.model_id,
+        "model_name": db_model.model_name,
+    }
 
 
 @model_router.post("/test", response_model=List[ModelTestResponse])

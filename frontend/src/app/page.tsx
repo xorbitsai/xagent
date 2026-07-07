@@ -3,7 +3,7 @@
 import { useRouter } from "next/navigation";
 import {
   ChevronRight, Layers, Bot, Database,
-  Sparkles, Play, Heart, Clock, Send, ListChecks, Loader2
+  Sparkles, Play, Heart, Clock, Send, ListChecks, Loader2, Mic, Square
 } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent } from "@/components/ui/card";
@@ -21,11 +21,12 @@ import Link from "next/link";
 import { useState, useEffect, useRef } from "react";
 import { apiRequest } from "@/lib/api-wrapper";
 import { getApiUrl } from "@/lib/utils";
-import type { Template } from "@/types/template";
+import type { ConnectionInfo, Template } from "@/types/template";
 import { useI18n } from "@/contexts/i18n-context";
 import { useApp } from "@/contexts/app-context-chat";
 import { WelcomeModal } from "@/components/welcome-modal";
 import { getBrandingFromEnv } from "@/lib/branding";
+import { useVoiceInputControls } from "@/components/voice-input-controller";
 
 interface RecentTask {
   task_id: number | string;
@@ -59,6 +60,7 @@ export default function Home() {
   const [visibleGetStartedVideos, setVisibleGetStartedVideos] = useState<Set<number>>(new Set());
   const getStartedSectionRef = useRef<HTMLDivElement | null>(null);
   const homeChatInputRef = useRef<HTMLTextAreaElement | null>(null);
+  const homeVoiceInput = useVoiceInputControls();
 
   useEffect(() => {
     const fetchData = async () => {
@@ -230,6 +232,25 @@ export default function Home() {
     }
   };
 
+  const homeVoiceInputLabel =
+    homeVoiceInput.status === "recording"
+      ? t("voiceInput.stop")
+      : homeVoiceInput.status === "transcribing"
+        ? t("voiceInput.transcribing")
+        : t("voiceInput.start");
+  const homeVoiceInputDisabled =
+    homeVoiceInput.status === "transcribing" ||
+    (homeVoiceInput.status === "idle" && isCreating);
+  const handleHomeVoiceInputClick = () => {
+    if (homeVoiceInput.status === "recording") {
+      homeVoiceInput.stopRecording();
+      return;
+    }
+    if (homeVoiceInput.status === "idle") {
+      homeVoiceInput.startRecording(homeChatInputRef.current);
+    }
+  };
+
   return (
     <div className="h-full flex flex-col overflow-hidden bg-[#FAFAFA] dark:bg-background overflow-y-auto">
       <WelcomeModal />
@@ -268,6 +289,7 @@ export default function Home() {
           <div className="w-full max-w-2xl bg-[hsl(234_30%_25%/0.4)] border border-[hsl(234_30%_35%)] rounded-[18px] p-3 flex items-end shadow-[0_12px_40px_rgba(0,0,0,0.25)] backdrop-blur-md focus-within:border-[hsl(234_50%_50%)] focus-within:shadow-[0_0_0_4px_hsl(234_50%_50%/0.2),0_12px_40px_rgba(0,0,0,0.25)] transition-all duration-200">
             <textarea
               ref={homeChatInputRef}
+              data-voice-input="false"
               placeholder={t("home.hero.searchPlaceholder")}
               className="border-0 bg-transparent text-white text-[16px] leading-relaxed placeholder:text-[hsl(240_5%_60%)] focus-visible:ring-0 focus-visible:outline-none flex-1 resize-none overflow-hidden min-h-[28px] max-h-[120px] py-1 px-2"
               rows={1}
@@ -285,6 +307,31 @@ export default function Home() {
                 }
               }}
             />
+            {homeVoiceInput.hasAsrModel && (
+              <Button
+                type="button"
+                size="icon"
+                variant="ghost"
+                aria-label={homeVoiceInputLabel}
+                title={homeVoiceInputLabel}
+                className={`shrink-0 w-9 h-9 ml-2 rounded-full transition-colors ${
+                  homeVoiceInput.status === "recording"
+                    ? "bg-red-500 text-white hover:bg-red-600 hover:text-white"
+                    : "text-white/70 hover:bg-[hsl(234_30%_35%)] hover:text-white"
+                } ${homeVoiceInput.status === "transcribing" ? "cursor-wait opacity-80" : ""}`}
+                disabled={homeVoiceInputDisabled}
+                onMouseDown={(event) => event.preventDefault()}
+                onClick={handleHomeVoiceInputClick}
+              >
+                {homeVoiceInput.status === "recording" ? (
+                  <Square className="w-3.5 h-3.5 fill-current" />
+                ) : homeVoiceInput.status === "transcribing" ? (
+                  <Loader2 className="w-4 h-4 animate-spin" />
+                ) : (
+                  <Mic className="w-4 h-4" />
+                )}
+              </Button>
+            )}
             <Button
               size="icon"
               className="bg-[hsl(234_40%_40%)] hover:bg-[hsl(234_40%_45%)] text-white rounded-[12px] shrink-0 w-9 h-9 ml-3 transition-colors shadow-none disabled:opacity-50"
@@ -424,7 +471,7 @@ export default function Home() {
                         <div className="flex items-center">
                           {template.connections && template.connections.length > 0 ? (
                             <div className="flex gap-1.5">
-                              {template.connections.slice(0, 4).map((conn: any, idx: number) => (
+                              {template.connections.slice(0, 4).map((conn: ConnectionInfo, idx: number) => (
                                 <div key={idx} className="w-8 h-8 rounded-lg bg-background border border-border flex items-center justify-center overflow-hidden shadow-sm">
                                   {conn.logo ? <img src={conn.logo} alt={conn.name} className="w-5 h-5 object-contain" /> : <span className="text-[10px] font-bold text-primary/70">{(conn.name || "").substring(0, 2).toUpperCase()}</span>}
                                 </div>

@@ -3,6 +3,7 @@ from __future__ import annotations
 from typing import Any, Optional
 
 from .base import ASRResult, ASRSegment, BaseASR
+from .elevenlabs import ElevenLabsASR
 from .xinference import XinferenceASR
 
 
@@ -32,10 +33,16 @@ def get_asr_model_instance(db_model: Any) -> BaseASR:
             base_url=base_url,
             api_key=api_key,
         )
+    elif provider == "elevenlabs":
+        return ElevenLabsASR(
+            model=model_name,
+            base_url=base_url,
+            api_key=api_key,
+        )
     else:
         raise ValueError(
             f"Unsupported ASR provider: {provider}. "
-            "Currently only 'xinference' is supported."
+            "Supported providers: xinference, elevenlabs."
         )
 
 
@@ -49,7 +56,7 @@ def get_asr_model(
     Factory function to get ASR model instance by provider.
 
     Args:
-        provider: Model provider name (e.g., 'xinference')
+        provider: Model provider name (e.g., 'xinference', 'elevenlabs')
         model: Model name/identifier
         api_key: API key for the provider
         **kwargs: Additional provider-specific parameters
@@ -60,16 +67,26 @@ def get_asr_model(
     Raises:
         ValueError: If provider is not supported
     """
-    if provider == "xinference":
+    if provider is None:
+        raise ValueError("ASR provider cannot be None.")
+
+    normalized_provider = provider.lower().strip()
+    if normalized_provider == "xinference":
         return XinferenceASR(
             model=model or "whisper-base",
+            api_key=api_key,
+            **kwargs,
+        )
+    elif normalized_provider == "elevenlabs":
+        return ElevenLabsASR(
+            model=model or "scribe_v2",
             api_key=api_key,
             **kwargs,
         )
     else:
         raise ValueError(
             f"Unsupported ASR provider: {provider}. "
-            "Currently only 'xinference' is supported."
+            "Supported providers: xinference, elevenlabs"
         )
 
 
@@ -80,4 +97,5 @@ __all__ = [
     "ASRResult",
     "ASRSegment",
     "XinferenceASR",
+    "ElevenLabsASR",
 ]

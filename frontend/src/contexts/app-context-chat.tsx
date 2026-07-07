@@ -331,6 +331,7 @@ interface Message {
   streamMessageId?: string
   traceEvents?: TraceEvent[]
   interactions?: Interaction[]
+  isSystemNotice?: boolean
 }
 
 export interface Task {
@@ -1883,24 +1884,6 @@ export function AppProvider({
                 }
               }
               dispatch({ type: "ADD_TRACE_EVENT", payload: traceEvent })
-
-              // Also surface a lightweight inline notice in the conversation so the
-              // user understands the brief pause while context is compacted.
-              const noticeText = t('agent.logs.event.messages.compactNotice')
-              if (!isDuplicateMessage(noticeText, `compact-notice-${stepId}`)) {
-                dispatch({
-                  type: "ADD_MESSAGE",
-                  payload: {
-                    id: generateMessageId(`compact-notice-${stepId}`),
-                    role: "assistant",
-                    content: (
-                      <span className="text-sm text-muted-foreground italic">{noticeText}</span>
-                    ),
-                    timestamp: message.timestamp,
-                    status: "completed",
-                  }
-                })
-              }
             }
           } else if (eventType === "action_end_compact") {
             const stepId = eventData.step_id
@@ -1922,6 +1905,28 @@ export function AppProvider({
                 }
               }
               dispatch({ type: "ADD_TRACE_EVENT", payload: traceEvent })
+
+              // Surface a standalone system notice in the conversation so the
+              // user sees that context was compacted without expanding the process.
+              if (!eventData.error) {
+                const noticeText = t('agent.logs.event.messages.compactNotice', {
+                  original: eventData.original_tokens ?? '?',
+                  compacted: eventData.compacted_tokens ?? '?',
+                })
+                if (!isDuplicateMessage(noticeText, 'compact-notice')) {
+                  dispatch({
+                    type: "ADD_MESSAGE",
+                    payload: {
+                      id: generateMessageId(`compact-notice-${stepId}`),
+                      role: "assistant",
+                      content: noticeText,
+                      timestamp: message.timestamp,
+                      status: "completed",
+                      isSystemNotice: true,
+                    }
+                  })
+                }
+              }
             }
           }
 

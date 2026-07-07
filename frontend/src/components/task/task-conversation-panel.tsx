@@ -1,7 +1,7 @@
 "use client"
 
 import React, { useCallback, useEffect, useMemo, useRef, useState } from "react"
-import { FolderOpen, GitMerge, Loader2 } from "lucide-react"
+import { FolderOpen, GitMerge, Loader2, Shrink } from "lucide-react"
 import dagre from "dagre"
 import { ChatInput } from "@/components/chat/ChatInput"
 import { ChatMessage } from "@/components/chat/ChatMessage"
@@ -51,6 +51,7 @@ type CombinedItem = {
   showEmptyStatus?: boolean
   processStatus?: string
   timelineOrder?: number
+  isSystemNotice?: boolean
 }
 
 const toTimestampMs = (timestamp: unknown): number => {
@@ -164,7 +165,7 @@ export function TaskConversationPanel({
 
   const messageItems = useMemo<CombinedItem[]>(() => {
     const items = state.messages
-      .filter((message: any) => message.role === "user" || message.isResult)
+      .filter((message: any) => message.role === "user" || message.isResult || message.isSystemNotice)
       .map((message: any) => {
         const id = message.id || `${message.role}-${toTimestampMs(message.timestamp)}`
         return {
@@ -181,6 +182,7 @@ export function TaskConversationPanel({
           }),
           traceEvents: message.traceEvents,
           interactions: message.interactions,
+          isSystemNotice: message.isSystemNotice,
         }
       })
 
@@ -188,7 +190,9 @@ export function TaskConversationPanel({
     return items
   }, [state.messages])
 
-  const lastMessageItem = messageItems[messageItems.length - 1]
+  const lastMessageItem = [...messageItems]
+    .reverse()
+    .find((item) => !item.isSystemNotice)
   const hasFinalAssistantMessage =
     !!lastMessageItem &&
     lastMessageItem.role === "assistant" &&
@@ -249,7 +253,12 @@ export function TaskConversationPanel({
     const processGroups = new Map<number, TimelineProcessEvent[]>()
     processEvents.forEach((event) => {
       const eventTime = toTimestampMs(event.timestamp)
-      const groupIndex = getProcessGroupIndex(userTurnAnchors, eventTime)
+      // Events with a missing/invalid timestamp (eventTime === 0) must not be
+      // grouped ahead of the first user turn; attach them to the current turn.
+      const groupIndex =
+        eventTime > 0
+          ? getProcessGroupIndex(userTurnAnchors, eventTime)
+          : userTurnCount
       const group = processGroups.get(groupIndex) || []
       group.push(event)
       processGroups.set(groupIndex, group)
@@ -264,9 +273,20 @@ export function TaskConversationPanel({
         return
       }
 
-      const groupTimestamp = Math.min(
-        ...events.map((event) => toTimestampMs(event.timestamp))
-      )
+      // Use only valid (>0) event timestamps; a missing/zero timestamp on any
+      // event would otherwise drag the whole group to the top of the timeline.
+      const validEventTimes = events
+        .map((event) => toTimestampMs(event.timestamp))
+        .filter((ts) => ts > 0)
+      let groupTimestamp = validEventTimes.length
+        ? Math.min(...validEventTimes)
+        : 0
+      // A process group belongs after the user turn it was anchored to; never
+      // let it sort above that turn's message (fixes replay ordering).
+      const anchor = userTurnAnchors[groupIndex - 1]
+      if (anchor && groupTimestamp <= anchor.timestamp) {
+        groupTimestamp = anchor.timestamp + 1
+      }
       const firstEvent = events[0]
       const shouldShowEmptyStatus =
         !hasFinalAssistantMessage &&
@@ -591,6 +611,19 @@ export function TaskConversationPanel({
               ) : (
                 <>
                   {timelineItems.map((item) => {
+                    if (item.isSystemNotice) {
+                      return (
+                        <div
+                          key={item.id}
+                          className="flex justify-center py-1"
+                        >
+                          <span className="inline-flex items-center gap-1.5 text-xs text-muted-foreground">
+                            <Shrink className="w-3.5 h-3.5" />
+                            {item.content}
+                          </span>
+                        </div>
+                      )
+                    }
                     const isFailedFinalAnswerStream =
                       item.isStreamingFinalAnswer && item.status === "failed"
                     return (

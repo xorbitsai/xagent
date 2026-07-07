@@ -466,6 +466,91 @@ describe("TaskConversationPanel", () => {
     expect(renderedMessages[1]).toHaveTextContent("Valid timestamp")
   })
 
+  it("keeps a process event with a missing timestamp after the user message", () => {
+    appState.messages = [
+      {
+        id: "msg-user",
+        role: "user",
+        content: "Ask something",
+        timestamp: "1000",
+      },
+      {
+        id: "msg-result",
+        role: "assistant",
+        content: "Answer",
+        timestamp: "3000",
+        isResult: true,
+      },
+    ] as any
+    appState.traceEvents = [
+      {
+        event_id: "trace-no-ts",
+        event_type: "tool_call",
+        // No timestamp: must not drag the process group above the user message.
+        data: { message: "Untimed work" },
+      },
+    ] as any
+    appState.currentTask = {
+      id: "42",
+      title: "Task",
+      description: "Task",
+      status: "completed",
+      createdAt: "2026-01-01T00:00:00Z",
+      updatedAt: "2026-01-01T00:00:00Z",
+    } as any
+    appState.isHistoryLoading = false
+
+    render(<TaskConversationPanel mode="page" />)
+
+    const renderedMessages = screen.getAllByTestId("chat-message")
+    expect(renderedMessages).toHaveLength(3)
+    expect(renderedMessages[0]).toHaveTextContent("Ask something")
+    expect(renderedMessages[1]).toHaveAttribute("data-trace-count", "1")
+    expect(renderedMessages[2]).toHaveTextContent("Answer")
+  })
+
+  it("renders a system notice as an inline line between messages", () => {
+    appState.messages = [
+      {
+        id: "msg-user",
+        role: "user",
+        content: "Long task",
+        timestamp: "1000",
+      },
+      {
+        id: "compact-notice",
+        role: "assistant",
+        content: "Context compacted (56860→449 tokens)",
+        timestamp: "2000",
+        isSystemNotice: true,
+      },
+      {
+        id: "msg-result",
+        role: "assistant",
+        content: "Answer",
+        timestamp: "3000",
+        isResult: true,
+      },
+    ] as any
+    appState.traceEvents = []
+    appState.currentTask = {
+      id: "42",
+      title: "Task",
+      description: "Task",
+      status: "completed",
+      createdAt: "2026-01-01T00:00:00Z",
+      updatedAt: "2026-01-01T00:00:00Z",
+    } as any
+    appState.isHistoryLoading = false
+
+    render(<TaskConversationPanel mode="page" />)
+
+    // The notice is a plain inline line, not a ChatMessage bubble.
+    const renderedMessages = screen.getAllByTestId("chat-message")
+    expect(renderedMessages).toHaveLength(2)
+    expect(screen.getByText("Context compacted (56860→449 tokens)")).toBeInTheDocument()
+  })
+
   it("ignores malformed DAG layout failures without throwing", async () => {
     appState.messages = []
     appState.traceEvents = []

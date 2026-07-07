@@ -43,6 +43,8 @@ def _make_mock_handle() -> MagicMock:
     handle.count_documents = MagicMock(return_value=0)
     handle.load_ingestion_status = MagicMock(return_value=[{"doc_id": "d1"}])
     handle.load_ingestion_status_async = AsyncMock(return_value=[{"doc_id": "d2"}])
+    handle.promote_version_main = MagicMock(return_value={"promoted": True})
+    handle.list_candidates = MagicMock(return_value={"candidates": []})
     return handle
 
 
@@ -781,3 +783,64 @@ class TestIngestionStatusReadRouting:
             doc_id="d2", user_id=None, is_admin=True
         )
         coordinator._storage_shim.get_ingestion_status_store.assert_not_called()
+
+
+class TestVersionPromotionRouting:
+    """#514: version promotion/listing must route through the handle."""
+
+    def test_promote_version_main_routes_through_handle(self) -> None:
+        handle = _make_mock_handle()
+        handle.promote_version_main = MagicMock(return_value={"promoted": True})
+        coordinator = _make_coordinator_with_mock_handle(handle)
+
+        result = asyncio.run(
+            coordinator.promote_version_main(
+                "docs", "doc-1", "parse", "cand-9", operator="alice", confirm=True
+            )
+        )
+
+        assert result == {"promoted": True}
+        handle.promote_version_main.assert_called_once_with(
+            "doc-1",
+            "parse",
+            "cand-9",
+            operator="alice",
+            preview_only=False,
+            confirm=True,
+            model_tag=None,
+        )
+
+    def test_list_candidates_routes_through_handle(self) -> None:
+        handle = _make_mock_handle()
+        handle.list_candidates = MagicMock(return_value={"candidates": []})
+        coordinator = _make_coordinator_with_mock_handle(handle)
+
+        result = asyncio.run(
+            coordinator.list_candidates("docs", "doc-1", "parse")
+        )
+
+        assert result == {"candidates": []}
+        handle.list_candidates.assert_called_once_with(
+            "doc-1", "parse", None, None, 50, "created_at desc"
+        )
+
+
+class TestRollbackRestoreRouting:
+    """#514 rollback additions: rollback data-plane restore routes through the handle."""
+
+    def test_restore_main_pointer_snapshot_routes_through_handle(self) -> None:
+        handle = _make_mock_handle()
+        handle.restore_main_pointer_snapshot = MagicMock(return_value=True)
+        coordinator = _make_coordinator_with_mock_handle(handle)
+
+        snapshot = MagicMock()
+        snapshot.collection = "docs"
+
+        result = asyncio.run(
+            coordinator.restore_main_pointer_snapshot(snapshot, operator="bob")
+        )
+
+        assert result is True
+        handle.restore_main_pointer_snapshot.assert_called_once_with(
+            snapshot, operator="bob"
+        )

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import inspect
 from typing import Any, Optional, cast
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
@@ -259,6 +260,21 @@ def test_nested_management_facade_rebinds_inner_coordinator_storage() -> None:
 
         def get_ingestion_status_store(self) -> IngestionStatusStore:
             return self.status_store
+
+        def get_metadata_store(self):
+            metadata = MagicMock()
+            # hide_missing=True swallows this; _is_missing_collection_error matches
+            # exactly "Collection 'docs' not found" (coordinator.py:1558-1561).
+            metadata.get_collection = AsyncMock(
+                side_effect=ValueError("Collection 'docs' not found")
+            )
+            return metadata
+
+        def get_vector_index_store(self):
+            return MagicMock()
+
+        def get_main_pointer_store(self):
+            return MagicMock()
 
     outer_store = IngestionStatusStore("outer-store")
     inner_store = IngestionStatusStore("inner-store")

@@ -41,6 +41,8 @@ def _make_mock_handle() -> MagicMock:
     # H05 additions
     handle.list_collection_documents = MagicMock(return_value=[])
     handle.count_documents = MagicMock(return_value=0)
+    handle.load_ingestion_status = MagicMock(return_value=[{"doc_id": "d1"}])
+    handle.load_ingestion_status_async = AsyncMock(return_value=[{"doc_id": "d2"}])
     return handle
 
 
@@ -740,3 +742,42 @@ class TestRenameFacadeCoordinatorEarlyReturn:
 
         mock_store.rename_collection_status.assert_called_once()
         assert isinstance(result, list)
+
+
+class TestIngestionStatusReadRouting:
+    """#514: load_ingestion_status(_async) must route through the handle,
+    not the injected storage shim."""
+
+    def test_load_ingestion_status_routes_through_handle(self) -> None:
+        handle = _make_mock_handle()
+        handle.load_ingestion_status = MagicMock(return_value=[{"doc_id": "d1"}])
+        coordinator = _make_coordinator_with_mock_handle(handle)
+
+        result = asyncio.run(
+            coordinator.load_ingestion_status(
+                "docs", doc_id="d1", user_id=7, is_admin=False
+            )
+        )
+
+        assert result == [{"doc_id": "d1"}]
+        handle.load_ingestion_status.assert_called_once_with(
+            doc_id="d1", user_id=7, is_admin=False
+        )
+        coordinator._storage_shim.get_ingestion_status_store.assert_not_called()
+
+    def test_load_ingestion_status_async_routes_through_handle(self) -> None:
+        handle = _make_mock_handle()
+        handle.load_ingestion_status_async = AsyncMock(return_value=[{"doc_id": "d2"}])
+        coordinator = _make_coordinator_with_mock_handle(handle)
+
+        result = asyncio.run(
+            coordinator.load_ingestion_status_async(
+                "docs", doc_id="d2", user_id=None, is_admin=True
+            )
+        )
+
+        assert result == [{"doc_id": "d2"}]
+        handle.load_ingestion_status_async.assert_awaited_once_with(
+            doc_id="d2", user_id=None, is_admin=True
+        )
+        coordinator._storage_shim.get_ingestion_status_store.assert_not_called()

@@ -551,16 +551,17 @@ class KBCoordinator:
         user_id: Optional[int] = None,
         is_admin: bool = False,
     ) -> list:
-        """Delegate to the ingestion status store (async, collection-scoped).
-
-        # Status reads need no metadata/collection resolution; going direct keeps
-        # the nested-storage rebind test working and avoids an unnecessary collection
-        # lookup.
-        """
-        store = self._storage_shim.get_ingestion_status_store()
+        """Open the collection handle and load ingestion status (async)."""
+        handle = await self.open_collection(
+            KBContextRequest(
+                collection=collection,
+                user_id=user_id,
+                is_admin=is_admin,
+                hide_missing=True,
+            )
+        )
         return await asyncio.to_thread(
-            store.load_ingestion_status,
-            collection=collection,
+            handle.load_ingestion_status,
             doc_id=doc_id,
             user_id=user_id,
             is_admin=is_admin,
@@ -589,15 +590,16 @@ class KBCoordinator:
         user_id: Optional[int] = None,
         is_admin: bool = False,
     ) -> list:
-        """Delegate to the ingestion status store (direct async, collection-scoped).
-
-        # Status reads need no metadata/collection resolution; going direct keeps
-        # the nested-storage rebind test working and avoids an unnecessary collection
-        # lookup.
-        """
-        store = self._storage_shim.get_ingestion_status_store()
-        return await store.load_ingestion_status_async(
-            collection=collection,
+        """Open the collection handle and load ingestion status (direct async)."""
+        handle = await self.open_collection(
+            KBContextRequest(
+                collection=collection,
+                user_id=user_id,
+                is_admin=is_admin,
+                hide_missing=True,
+            )
+        )
+        return await handle.load_ingestion_status_async(
             doc_id=doc_id,
             user_id=user_id,
             is_admin=is_admin,

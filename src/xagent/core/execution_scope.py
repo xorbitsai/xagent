@@ -91,6 +91,17 @@ class ExecutionScope:
             (``user:{owner_id}`` becomes ``user:{owner_id}:{suffix}``).
         workspace_segments: Extra path segments inserted after the user root
             in workspace paths and storage keys.
+        sandbox_mount_segments: When set, the sandbox bind-mount root covers
+            only this **prefix** of ``workspace_segments`` instead of the full
+            tuple. Two scopes that share ``sandbox_key_suffix`` and this prefix
+            then produce an identical mount and can share one container, while
+            their deeper ``workspace_segments`` keep them in disjoint subtrees
+            of that shared mount (isolation stays at the tool/path-check
+            layer). Must be a prefix of ``workspace_segments``. ``None`` (the
+            default) means the mount covers the full ``workspace_segments`` —
+            byte-identical to pre-existing behavior. Consumed only by the
+            sandbox-mount composition; workspace paths and storage keys always
+            use the full ``workspace_segments``.
         memory_dimensions: Extra metadata stamped on memory notes on add and
             filtered on scoped search.
         strict_memory_isolation: When True, unscoped searches also exclude
@@ -104,9 +115,24 @@ class ExecutionScope:
 
     sandbox_key_suffix: Optional[str] = None
     workspace_segments: tuple[str, ...] = ()
+    sandbox_mount_segments: Optional[tuple[str, ...]] = None
     memory_dimensions: Mapping[str, str] = field(default_factory=dict)
     strict_memory_isolation: bool = False
     isolate_external_dirs: bool = False
+
+    @property
+    def effective_mount_segments(self) -> tuple[str, ...]:
+        """Segments the sandbox bind-mount root covers.
+
+        Defaults to the full ``workspace_segments`` (mount root == workspace
+        root), so an unset prefix reproduces today's behavior exactly. When
+        ``sandbox_mount_segments`` is set, the mount root covers only that
+        prefix and scopes sharing ``sandbox_key_suffix`` + this prefix share
+        one container.
+        """
+        if self.sandbox_mount_segments is None:
+            return self.workspace_segments
+        return self.sandbox_mount_segments
 
     def to_dict(self) -> dict[str, Any]:
         """JSON-serializable snapshot (see :func:`ExecutionScope.from_dict`).
@@ -118,6 +144,11 @@ class ExecutionScope:
         return {
             "sandbox_key_suffix": self.sandbox_key_suffix,
             "workspace_segments": list(self.workspace_segments),
+            "sandbox_mount_segments": (
+                None
+                if self.sandbox_mount_segments is None
+                else list(self.sandbox_mount_segments)
+            ),
             "memory_dimensions": dict(self.memory_dimensions),
             "strict_memory_isolation": self.strict_memory_isolation,
             "isolate_external_dirs": self.isolate_external_dirs,
@@ -126,9 +157,11 @@ class ExecutionScope:
     @classmethod
     def from_dict(cls, data: Mapping[str, Any]) -> "ExecutionScope":
         """Rebuild a scope from :meth:`to_dict` output (re-validated)."""
+        raw_mount = data.get("sandbox_mount_segments")
         return cls(
             sandbox_key_suffix=data.get("sandbox_key_suffix"),
             workspace_segments=tuple(data.get("workspace_segments") or ()),
+            sandbox_mount_segments=(None if raw_mount is None else tuple(raw_mount)),
             memory_dimensions=dict(data.get("memory_dimensions") or {}),
             strict_memory_isolation=bool(data.get("strict_memory_isolation", False)),
             isolate_external_dirs=bool(data.get("isolate_external_dirs", False)),
@@ -155,6 +188,29 @@ class ExecutionScope:
         for segment in segments:
             validate_scope_component(segment, field_name="workspace_segments entry")
         object.__setattr__(self, "workspace_segments", segments)
+
+        if self.sandbox_mount_segments is not None:
+            mount_segments = tuple(self.sandbox_mount_segments)
+            for segment in mount_segments:
+                validate_scope_component(
+                    segment, field_name="sandbox_mount_segments entry"
+                )
+            # The mount root must be a prefix of the workspace root: the
+            # workspace subtree (full segments) has to live *inside* the
+            # mounted directory to be visible in the container, and a
+            # non-prefix mount could expose an unrelated subtree.
+            if mount_segments != segments[: len(mount_segments)]:
+                logger.error(
+                    "sandbox_mount_segments %r is not a prefix of "
+                    "workspace_segments %r",
+                    mount_segments,
+                    segments,
+                )
+                raise InvalidScopeComponentError(
+                    f"sandbox_mount_segments {mount_segments!r} must be a "
+                    f"prefix of workspace_segments {segments!r}"
+                )
+            object.__setattr__(self, "sandbox_mount_segments", mount_segments)
 
         dimensions = dict(self.memory_dimensions)
         for key, dim_value in dimensions.items():

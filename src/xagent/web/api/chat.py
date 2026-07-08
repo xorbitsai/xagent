@@ -1233,9 +1233,14 @@ class AgentServiceManager:
         )
         workspace_owner_id = int(task.user_id)
         scope_segments = scope.workspace_segments if scope is not None else ()
+        # The sandbox bind mount covers the scope's mount prefix (the full
+        # workspace_segments when no prefix is declared); the deeper
+        # workspace subtree lives inside it and stays confined by the
+        # tool/path-check layer, not by a per-subtree mount.
+        mount_segments = scope.effective_mount_segments if scope is not None else ()
         sandbox_workspace_config = {
             "base_dir": str(
-                scoped_user_root(get_uploads_dir(), workspace_owner_id, scope_segments)
+                scoped_user_root(get_uploads_dir(), workspace_owner_id, mount_segments)
             ),
             "task_id": f"web_task_{task_id}",
             "user_id": workspace_owner_id,
@@ -1758,10 +1763,16 @@ class AgentServiceManager:
                     else int(runtime_user.id)
                 )
                 scope_segments = scope.workspace_segments if scope is not None else ()
+                # Sandbox mount covers the scope's mount prefix (full
+                # workspace_segments when no prefix is declared); the deeper
+                # workspace subtree is confined at the tool/path-check layer.
+                mount_segments = (
+                    scope.effective_mount_segments if scope is not None else ()
+                )
                 sandbox_workspace_config = {
                     "base_dir": str(
                         scoped_user_root(
-                            get_uploads_dir(), workspace_owner_id, scope_segments
+                            get_uploads_dir(), workspace_owner_id, mount_segments
                         )
                     ),
                     "task_id": f"web_task_{task_id}",

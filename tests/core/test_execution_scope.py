@@ -137,6 +137,100 @@ class TestExecutionScope:
         assert scope.workspace_segments == ()
 
 
+class TestSandboxMountSegments:
+    """The mount-prefix field (#79-01): decouples the sandbox mount root from
+    the full workspace_segments so scopes sharing a suffix + prefix share one
+    container while deeper segments stay in disjoint subtrees."""
+
+    def test_default_mount_covers_full_workspace_segments(self):
+        """Unset prefix => mount root == workspace root (byte-identical)."""
+        scope = ExecutionScope(
+            sandbox_key_suffix="client-3",
+            workspace_segments=("clients", "3", "end_users", "7"),
+        )
+        assert scope.sandbox_mount_segments is None
+        assert scope.effective_mount_segments == ("clients", "3", "end_users", "7")
+
+    def test_unscoped_scope_has_empty_effective_mount(self):
+        assert ExecutionScope().effective_mount_segments == ()
+
+    def test_prefix_mount_shared_across_deeper_segments(self):
+        """Two end users of one CA share a mount prefix; only deeper differs."""
+        a = ExecutionScope(
+            sandbox_key_suffix="client-3",
+            workspace_segments=("clients", "3", "end_users", "7"),
+            sandbox_mount_segments=("clients", "3"),
+        )
+        b = ExecutionScope(
+            sandbox_key_suffix="client-3",
+            workspace_segments=("clients", "3", "end_users", "8"),
+            sandbox_mount_segments=("clients", "3"),
+        )
+        assert a.effective_mount_segments == ("clients", "3")
+        assert b.effective_mount_segments == ("clients", "3")
+        assert a.workspace_segments != b.workspace_segments
+
+    def test_mount_segments_normalized_to_tuple(self):
+        scope = ExecutionScope(
+            workspace_segments=["clients", "3", "end_users", "7"],
+            sandbox_mount_segments=["clients", "3"],
+        )
+        assert scope.sandbox_mount_segments == ("clients", "3")
+
+    def test_empty_prefix_mounts_at_user_root(self):
+        """() is a valid prefix of any segments — mount at the user root."""
+        scope = ExecutionScope(
+            workspace_segments=("clients", "3"),
+            sandbox_mount_segments=(),
+        )
+        assert scope.effective_mount_segments == ()
+
+    def test_rejects_non_prefix_mount_segments(self):
+        with pytest.raises(InvalidScopeComponentError, match="must be a prefix"):
+            ExecutionScope(
+                workspace_segments=("clients", "3", "end_users", "7"),
+                sandbox_mount_segments=("clients", "4"),
+            )
+
+    def test_rejects_mount_longer_than_workspace_segments(self):
+        with pytest.raises(InvalidScopeComponentError, match="must be a prefix"):
+            ExecutionScope(
+                workspace_segments=("clients", "3"),
+                sandbox_mount_segments=("clients", "3", "end_users", "7"),
+            )
+
+    def test_rejects_invalid_mount_segment_component(self):
+        with pytest.raises(InvalidScopeComponentError):
+            ExecutionScope(
+                workspace_segments=("clients", "3"),
+                sandbox_mount_segments=("clients", "../escape"),
+            )
+
+    def test_to_dict_from_dict_round_trips_prefix(self):
+        scope = ExecutionScope(
+            sandbox_key_suffix="client-3",
+            workspace_segments=("clients", "3", "end_users", "7"),
+            sandbox_mount_segments=("clients", "3"),
+        )
+        assert ExecutionScope.from_dict(scope.to_dict()) == scope
+        assert scope.to_dict()["sandbox_mount_segments"] == ["clients", "3"]
+
+    def test_to_dict_preserves_none_vs_empty_distinction(self):
+        """None (mount == full segments) must not collapse into () (mount at
+        user root) across a serialization round-trip."""
+        default = ExecutionScope(workspace_segments=("clients", "3"))
+        assert default.to_dict()["sandbox_mount_segments"] is None
+        restored_default = ExecutionScope.from_dict(default.to_dict())
+        assert restored_default.sandbox_mount_segments is None
+
+        rooted = ExecutionScope(
+            workspace_segments=("clients", "3"), sandbox_mount_segments=()
+        )
+        assert rooted.to_dict()["sandbox_mount_segments"] == []
+        restored_rooted = ExecutionScope.from_dict(rooted.to_dict())
+        assert restored_rooted.sandbox_mount_segments == ()
+
+
 class TestContextvarHelpers:
     def test_default_is_none(self):
         assert get_execution_scope() is None

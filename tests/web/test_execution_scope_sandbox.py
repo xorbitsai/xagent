@@ -353,3 +353,46 @@ class TestSandboxManagerScopedKeys:
 
         unscoped = SandboxManager._workspace_mount_paths("user", "7", None)
         assert unscoped == [(tmp_path / "user_7", True)]
+
+    def test_ca_prefix_mount_is_shared_across_end_users(self, tmp_path) -> None:
+        """#79-01: two end users of one client application supply a
+        workspace_config whose ``base_dir`` is the CA-level mount prefix, so
+        both produce the identical mount root — the prerequisite for sharing
+        one container without tripping config-equivalence."""
+        ca_root = tmp_path / "user_5" / "clients" / "3"
+        cfg_eu7 = {"base_dir": str(ca_root)}
+        cfg_eu8 = {"base_dir": str(ca_root)}
+
+        paths_eu7 = SandboxManager._workspace_mount_paths(
+            "user", "5:client-3", cfg_eu7
+        )
+        paths_eu8 = SandboxManager._workspace_mount_paths(
+            "user", "5:client-3", cfg_eu8
+        )
+        assert paths_eu7 == paths_eu8 == [(ca_root, True)]
+
+    def test_full_segment_mounts_would_differ_between_end_users(
+        self, tmp_path
+    ) -> None:
+        """Guard: had the mount stayed at the *full* workspace_segments, the
+        two end users' mount roots would differ — which is exactly the
+        config-equivalence rejection #79-01 removes by mounting the prefix."""
+        eu7_root = tmp_path / "user_5" / "clients" / "3" / "end_users" / "7"
+        eu8_root = tmp_path / "user_5" / "clients" / "3" / "end_users" / "8"
+        paths_eu7 = SandboxManager._workspace_mount_paths(
+            "user", "5:client-3", {"base_dir": str(eu7_root)}
+        )
+        paths_eu8 = SandboxManager._workspace_mount_paths(
+            "user", "5:client-3", {"base_dir": str(eu8_root)}
+        )
+        assert paths_eu7 != paths_eu8
+
+    def test_prefix_and_full_configs_config_equivalent_for_shared_ca(self) -> None:
+        """The two end users' sandbox configs are config-equivalent once the
+        mount is the shared CA prefix, so the manager reuses one container."""
+        from xagent.web.sandbox_manager import SandboxConfig
+
+        ca_volume = ("/host/user_5/clients/3", "/sandbox/workspace", "rw")
+        left = SandboxConfig(volumes=[ca_volume])
+        right = SandboxConfig(volumes=[ca_volume])
+        assert SandboxManager._config_equivalent(left, right)

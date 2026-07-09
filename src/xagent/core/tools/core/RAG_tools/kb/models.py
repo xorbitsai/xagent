@@ -155,3 +155,17 @@ class RollbackFailedIngestionResult:
     first_error: Optional[str] = None
     boundary_errors: Mapping[str, tuple[str, ...]] = field(default_factory=dict)
     warnings: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
+class KBVectorStorageCleanupResult:
+    """Outcome for vector-storage rollback cleanup actions."""
+
+    collection: str
+    status: str
+    deleted_count: int = 0
+    table_counts: dict[str, int] = field(default_factory=dict)
+    model_tag: Optional[str] = None
+    preview_only: bool = True
+    warnings: tuple[str, ...] = ()
+    side_effects_may_remain: bool = False

@@ -15,7 +15,7 @@ import numbers
 import os
 import uuid
 from abc import ABC, abstractmethod
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Sequence
 from dataclasses import dataclass
 from datetime import timezone
 from pathlib import Path
@@ -23,6 +23,7 @@ from typing import TYPE_CHECKING, Any, Dict, Iterable, List, Optional, Set, cast
 
 if TYPE_CHECKING:
     from .maintenance_compatibility import CollectionConfigSnapshot
+    from .models import KBVectorStorageCleanupResult
 
 import pandas as pd
 
@@ -891,6 +892,27 @@ class KBCollectionHandle(ABC):
         filesystem; physical file cleanup is the caller's responsibility.
 
         Returns a ``dict[str, int]`` mapping table names to deleted row counts.
+        """
+
+    @abstractmethod
+    def cleanup_embeddings_for_operation(
+        self,
+        *,
+        doc_id: Optional[str] = None,
+        parse_hash: Optional[str] = None,
+        chunk_ids: Optional[Sequence[str]] = None,
+        model_tag: Optional[str] = None,
+        preview_only: bool = True,
+        confirm: bool = False,
+    ) -> "KBVectorStorageCleanupResult":
+        """Delete or preview embedding rows created by a failed operation.
+
+        The cleanup scope is bound to this handle's collection + user scope;
+        rollback callers pass the operation's known document/parse/chunk/
+        model-tag identity. Per-table failures never raise - they are folded
+        into the result (``status="incomplete"``,
+        ``side_effects_may_remain=True``). ``status="skipped"`` on an empty
+        filter set; ``"planned"`` for previews; ``"complete"`` after deletes.
         """
 
     # --- Collection-level statistics (#H05 Phase 3) ---
@@ -3829,6 +3851,92 @@ class LanceDBCollectionHandle(KBCollectionHandle):
         Returns a ``dict[str, int]`` mapping table names to deleted row counts.
         """
         return self.delete_collection_data(user_id=user_id, is_admin=is_admin)
+
+    def cleanup_embeddings_for_operation(
+        self,
+        *,
+        doc_id: Optional[str] = None,
+        parse_hash: Optional[str] = None,
+        chunk_ids: Optional[Sequence[str]] = None,
+        model_tag: Optional[str] = None,
+        preview_only: bool = True,
+        confirm: bool = False,
+    ) -> "KBVectorStorageCleanupResult":
+        """Delete or preview embedding rows for a failed operation (#515).
+
+        Ports the former facade ``_cleanup_vectors_for_operation_impl``: builds
+        per-table predicates via ``kb/cleanup_filters`` (relocation tracked in
+        #821), counts/deletes through this handle's raw store connection, and
+        derives status / side_effects_may_remain exactly as before.
+        """
+        from ..utils.lancedb_query_utils import _safe_count_rows
+        from .cleanup_filters import KBCleanupScope, build_embedding_cleanup_filters
+        from .models import KBVectorStorageCleanupResult
+
+        scope = KBCleanupScope(
+            collection=self.context.collection,
+            user_id=self.context.user_scope.user_id,
+            is_admin=self.context.user_scope.is_admin,
+            doc_id=doc_id,
+            parse_hash=parse_hash,
+            chunk_ids=tuple(chunk_ids or ()),
+            model_tag=model_tag,
+        )
+        conn = self.vector_index_store.get_raw_connection()
+
+        table_counts: dict[str, int] = {}
+        warnings: list[str] = []
+        side_effects_may_remain = False
+        should_delete = bool(confirm and not preview_only)
+        table_filters = build_embedding_cleanup_filters(conn, scope)
+
+        if not table_filters:
+            return KBVectorStorageCleanupResult(
+                collection=scope.collection,
+                status="skipped",
+                deleted_count=0,
+                table_counts={},
+                model_tag=scope.model_tag,
+                preview_only=preview_only,
+            )
+
+        for table_name, filter_exprs in table_filters.items():
+            table = None
+            try:
+                table = conn.open_table(table_name)
+                count = 0
+                for filter_expr in filter_exprs:
+                    matched = _safe_count_rows(table, filter_expr, on_error="raise")
+                    if should_delete and matched > 0:
+                        table.delete(filter_expr)
+                    count += matched
+                table_counts[table_name] = count
+            except Exception as exc:  # noqa: BLE001 - report rollback cleanup state
+                side_effects_may_remain = True
+                message = f"{table_name}: {exc}"
+                warnings.append(message)
+                logger.warning("Vector cleanup failed for %s: %s", table_name, exc)
+            finally:
+                _safe_close_table(table)
+
+        deleted_count = sum(table_counts.values())
+        if warnings:
+            status = "incomplete"
+        elif should_delete:
+            status = "complete"
+        else:
+            status = "planned"
+
+        return KBVectorStorageCleanupResult(
+            collection=scope.collection,
+            status=status,
+            deleted_count=deleted_count,
+            table_counts=table_counts,
+            model_tag=scope.model_tag,
+            preview_only=preview_only,
+            warnings=tuple(warnings),
+            side_effects_may_remain=side_effects_may_remain,
+        )
 
     # --- Rollback snapshot/restore/clear primitives (#513 Task 7) ---
 

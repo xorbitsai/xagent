@@ -20,6 +20,19 @@ from xagent.core.tools.core.RAG_tools.utils.user_scope import user_scope_context
 from xagent.core.tools.core.RAG_tools.vector_storage import vector_manager
 
 
+def _cleanup_shim(conn: MagicMock) -> MagicMock:
+    """Shim whose handle path reaches *conn* (coordinator -> handle route)."""
+    storage_shim = MagicMock()
+    storage_shim.get_vector_store_raw_connection.return_value = conn
+    storage_shim.get_vector_index_store.return_value.get_raw_connection.return_value = (
+        conn
+    )
+    metadata_store = MagicMock()
+    metadata_store.get_collection = AsyncMock(return_value=None)
+    storage_shim.get_metadata_store.return_value = metadata_store
+    return storage_shim
+
+
 def test_public_vector_storage_functions_route_through_facade(monkeypatch):
     facade = MagicMock()
     read_response = EmbeddingReadResponse(chunks=[], total_count=0, pending_count=0)
@@ -139,8 +152,7 @@ def test_cleanup_vectors_for_chunks_uses_model_tag_table_and_reports_counts(
     conn = MagicMock()
     conn.list_tables.return_value = ["embeddings_model_a", "embeddings_model_b"]
     conn.open_table.return_value = table
-    storage_shim = MagicMock()
-    storage_shim.get_vector_store_raw_connection.return_value = conn
+    storage_shim = _cleanup_shim(conn)
     facade = KBVectorStorageCompatibilityFacade(storage_shim=storage_shim)
 
     monkeypatch.setattr(
@@ -187,8 +199,7 @@ def test_cleanup_vectors_for_chunks_batches_chunk_ids_with_in_filter(monkeypatch
     conn = MagicMock()
     conn.list_tables.return_value = ["embeddings_model_a"]
     conn.open_table.return_value = table
-    storage_shim = MagicMock()
-    storage_shim.get_vector_store_raw_connection.return_value = conn
+    storage_shim = _cleanup_shim(conn)
     facade = KBVectorStorageCompatibilityFacade(storage_shim=storage_shim)
 
     monkeypatch.setattr(
@@ -225,8 +236,7 @@ def test_cleanup_vectors_for_operation_uses_request_user_scope(monkeypatch):
     conn = MagicMock()
     conn.list_tables.return_value = ["embeddings_model_a"]
     conn.open_table.return_value = table
-    storage_shim = MagicMock()
-    storage_shim.get_vector_store_raw_connection.return_value = conn
+    storage_shim = _cleanup_shim(conn)
     facade = KBVectorStorageCompatibilityFacade(storage_shim=storage_shim)
 
     monkeypatch.setattr(
@@ -256,8 +266,7 @@ def test_cleanup_vectors_for_operation_without_user_scope_fails_closed(monkeypat
     conn = MagicMock()
     conn.list_tables.return_value = ["embeddings_model_a"]
     conn.open_table.return_value = table
-    storage_shim = MagicMock()
-    storage_shim.get_vector_store_raw_connection.return_value = conn
+    storage_shim = _cleanup_shim(conn)
     facade = KBVectorStorageCompatibilityFacade(storage_shim=storage_shim)
 
     monkeypatch.setattr(
@@ -300,8 +309,7 @@ def test_cleanup_vectors_for_operation_preview_does_not_delete(monkeypatch):
     conn = MagicMock()
     conn.list_tables.return_value = ["embeddings_model_a"]
     conn.open_table.return_value = table
-    storage_shim = MagicMock()
-    storage_shim.get_vector_store_raw_connection.return_value = conn
+    storage_shim = _cleanup_shim(conn)
     facade = KBVectorStorageCompatibilityFacade(storage_shim=storage_shim)
 
     monkeypatch.setattr(
@@ -329,8 +337,7 @@ def test_cleanup_vectors_for_operation_reports_partial_cleanup_failure(monkeypat
     conn = MagicMock()
     conn.list_tables.return_value = ["embeddings_model_a"]
     conn.open_table.return_value = table
-    storage_shim = MagicMock()
-    storage_shim.get_vector_store_raw_connection.return_value = conn
+    storage_shim = _cleanup_shim(conn)
     facade = KBVectorStorageCompatibilityFacade(storage_shim=storage_shim)
 
     monkeypatch.setattr(
@@ -363,3 +370,77 @@ def _table_with_user_id(count: int) -> MagicMock:
     table.schema = schema
     table.count_rows.return_value = count
     return table
+
+
+def test_cleanup_facade_delegates_to_coordinator_and_never_opens_raw_connection(
+    monkeypatch,
+) -> None:
+    """#515 thinness: the facade normalizes and delegates; the raw LanceDB
+    connection is opened by the handle, never by the facade."""
+    from xagent.core.tools.core.RAG_tools.storage import factory as storage_factory
+
+    def _forbidden() -> None:
+        raise AssertionError("facade must not open a raw vector connection")
+
+    monkeypatch.setattr(storage_factory, "get_vector_store_raw_connection", _forbidden)
+
+    coordinator = MagicMock()
+    expected = KBVectorStorageCleanupResult(collection="c", status="planned")
+    coordinator.cleanup_vectors_for_operation_sync.return_value = expected
+    facade = KBVectorStorageCompatibilityFacade(coordinator=coordinator)
+
+    result = facade.cleanup_vectors_for_operation(
+        collection="c",
+        doc_id="d",
+        model_tag="model_a",
+        user_id=7,
+        is_admin=False,
+        preview_only=True,
+        confirm=False,
+    )
+
+    assert result is expected
+    coordinator.cleanup_vectors_for_operation_sync.assert_called_once_with(
+        "c",
+        doc_id="d",
+        parse_hash=None,
+        chunk_ids=(),
+        model_tag="model_a",
+        user_id=7,
+        is_admin=False,
+        preview_only=True,
+        confirm=False,
+    )
+
+
+def test_vector_storage_facade_binds_storage_shim_for_write_vectors():
+    # #514-deferred embedding-WRITE routing proof: an injected shim (no
+    # coordinator) must land writes on that shim's vector store through the
+    # handle write path (handle.write_embeddings), never a real backend.
+    from xagent.core.tools.core.RAG_tools.core.schemas import ChunkEmbeddingData
+
+    vector_store = MagicMock()
+    metadata_store = MagicMock()
+    metadata_store.get_collection = AsyncMock(return_value=None)
+    storage_shim = MagicMock()
+    storage_shim.get_vector_index_store.return_value = vector_store
+    storage_shim.get_metadata_store.return_value = metadata_store
+    facade = KBVectorStorageCompatibilityFacade(storage_shim=storage_shim)
+
+    embedding = ChunkEmbeddingData(
+        doc_id="d",
+        chunk_id="ch1",
+        parse_hash="p",
+        model="m",
+        vector=[0.1, 0.2],
+        text="t",
+        chunk_hash="h",
+    )
+    result = facade.write_vectors_to_db("c", [embedding], create_index=False, user_id=7)
+
+    assert result.upsert_count == 1
+    vector_store.upsert_embeddings.assert_called_once()
+    _model_tag, records = vector_store.upsert_embeddings.call_args.args
+    assert records[0]["collection"] == "c"
+    assert records[0]["doc_id"] == "d"
+    assert records[0]["user_id"] == 7

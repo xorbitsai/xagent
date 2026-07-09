@@ -6,7 +6,7 @@ import asyncio
 import inspect
 import logging
 import threading
-from collections.abc import Coroutine
+from collections.abc import Coroutine, Sequence
 from contextvars import copy_context
 from typing import Any, Callable, Dict, List, Optional, TypeVar, cast
 
@@ -45,6 +45,7 @@ from .models import (
     KBContextRequest,
     KBStorageBackend,
     KBUserScope,
+    KBVectorStorageCleanupResult,
     RollbackFailedIngestionRequest,
     RollbackFailedIngestionResult,
 )
@@ -2199,6 +2200,69 @@ class KBCoordinator:
             first_error=first_error,
             boundary_errors=boundary_errors,
             warnings=tuple(warnings),
+        )
+
+    # --- Rollback vector cleanup router (#515) ---
+
+    async def cleanup_vectors_for_operation(
+        self,
+        collection: str,
+        *,
+        doc_id: Optional[str] = None,
+        parse_hash: Optional[str] = None,
+        chunk_ids: Optional[Sequence[str]] = None,
+        model_tag: Optional[str] = None,
+        user_id: Optional[int] = None,
+        is_admin: bool = False,
+        preview_only: bool = True,
+        confirm: bool = False,
+    ) -> KBVectorStorageCleanupResult:
+        """Open the collection handle and run rollback vector cleanup (async)."""
+        handle = await self.open_collection(
+            KBContextRequest(
+                collection=collection,
+                user_id=user_id,
+                is_admin=is_admin,
+                access_mode=KBAccessMode.WRITE,
+                hide_missing=True,
+            )
+        )
+        return await asyncio.to_thread(
+            handle.cleanup_embeddings_for_operation,
+            doc_id=doc_id,
+            parse_hash=parse_hash,
+            chunk_ids=chunk_ids,
+            model_tag=model_tag,
+            preview_only=preview_only,
+            confirm=confirm,
+        )
+
+    def cleanup_vectors_for_operation_sync(
+        self,
+        collection: str,
+        *,
+        doc_id: Optional[str] = None,
+        parse_hash: Optional[str] = None,
+        chunk_ids: Optional[Sequence[str]] = None,
+        model_tag: Optional[str] = None,
+        user_id: Optional[int] = None,
+        is_admin: bool = False,
+        preview_only: bool = True,
+        confirm: bool = False,
+    ) -> KBVectorStorageCleanupResult:
+        """Synchronous wrapper for :meth:`cleanup_vectors_for_operation`."""
+        return _run_in_separate_loop(
+            self.cleanup_vectors_for_operation(
+                collection,
+                doc_id=doc_id,
+                parse_hash=parse_hash,
+                chunk_ids=chunk_ids,
+                model_tag=model_tag,
+                user_id=user_id,
+                is_admin=is_admin,
+                preview_only=preview_only,
+                confirm=confirm,
+            )
         )
 
     def reset_compatibility_caches(self) -> None:

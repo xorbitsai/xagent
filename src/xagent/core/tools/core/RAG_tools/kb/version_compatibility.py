@@ -75,6 +75,7 @@ class KBVersionCompatibilityFacade:
     ) -> None:
         self._coordinator = coordinator
         self._storage_shim = storage_shim
+        self._shim_coordinator: KBCoordinator | None = None
 
     def _active_storage_shim(self) -> KBStorageShimCompatibilityFacade | None:
         if self._storage_shim is not None:
@@ -95,6 +96,21 @@ class KBVersionCompatibilityFacade:
         with bind_storage_shim_for_current_context(storage_shim):
             yield
 
+    def _active_coordinator(self) -> KBCoordinator:
+        if self._coordinator is not None:
+            return self._coordinator
+
+        from .coordinator import KBCoordinator, get_kb_coordinator
+
+        # An injected shim without a coordinator must stay bound to that shim
+        # (mirrors vector_storage_compatibility._active_coordinator).
+        if self._storage_shim is not None:
+            if self._shim_coordinator is None:
+                self._shim_coordinator = KBCoordinator(storage_shim=self._storage_shim)
+            return self._shim_coordinator
+
+        return get_kb_coordinator()
+
     def list_candidates(
         self,
         collection: str,
@@ -105,31 +121,18 @@ class KBVersionCompatibilityFacade:
         limit: int = 50,
         order_by: str = "created_at desc",
     ) -> Dict[str, Any]:
-        if self._coordinator is not None:
-            step_type_str = (
-                step_type.value if isinstance(step_type, StepType) else step_type
-            )
-            return self._coordinator.list_candidates_sync(
-                collection,
-                doc_id,
-                step_type_str,
-                model_tag=model_tag,
-                state=state,
-                limit=limit,
-                order_by=order_by,
-            )
-        from ..version_management.list_candidates import _list_candidates_impl
-
-        with self._storage_context():
-            return _list_candidates_impl(
-                collection=collection,
-                doc_id=doc_id,
-                step_type=step_type,
-                model_tag=model_tag,
-                state=state,
-                limit=limit,
-                order_by=order_by,
-            )
+        step_type_str = (
+            step_type.value if isinstance(step_type, StepType) else step_type
+        )
+        return self._active_coordinator().list_candidates_sync(
+            collection,
+            doc_id,
+            step_type_str,
+            model_tag=model_tag,
+            state=state,
+            limit=limit,
+            order_by=order_by,
+        )
 
     def promote_version_main(
         self,
@@ -142,33 +145,19 @@ class KBVersionCompatibilityFacade:
         confirm: bool = False,
         model_tag: Optional[str] = None,
     ) -> Dict[str, Any]:
-        if self._coordinator is not None:
-            step_type_str = (
-                step_type.value if isinstance(step_type, StepType) else step_type
-            )
-            return self._coordinator.promote_version_main_sync(
-                collection,
-                doc_id,
-                step_type_str,
-                selected_id,
-                operator=operator,
-                preview_only=preview_only,
-                confirm=confirm,
-                model_tag=model_tag,
-            )
-        from ..version_management.promote_version_main import _promote_version_main_impl
-
-        with self._storage_context():
-            return _promote_version_main_impl(
-                collection=collection,
-                doc_id=doc_id,
-                step_type=step_type,
-                selected_id=selected_id,
-                operator=operator,
-                preview_only=preview_only,
-                confirm=confirm,
-                model_tag=model_tag,
-            )
+        step_type_str = (
+            step_type.value if isinstance(step_type, StepType) else step_type
+        )
+        return self._active_coordinator().promote_version_main_sync(
+            collection,
+            doc_id,
+            step_type_str,
+            selected_id,
+            operator=operator,
+            preview_only=preview_only,
+            confirm=confirm,
+            model_tag=model_tag,
+        )
 
     def get_main_pointer(
         self,
@@ -374,37 +363,9 @@ class KBVersionCompatibilityFacade:
         *,
         cleanup_executed: bool = False,
     ) -> KBVersionCandidateRollbackResult:
-        if self._coordinator is not None:
-            return self._coordinator.restore_candidate_cleanup_snapshot_sync(
-                snapshot,
-                cleanup_executed=cleanup_executed,
-            )
-        cleanup_counts = dict(snapshot.cleanup_counts)
-        has_candidate_side_effects = any(
-            int(count) > 0 for count in cleanup_counts.values()
-        )
-        if not cleanup_executed or not has_candidate_side_effects:
-            return KBVersionCandidateRollbackResult(
-                collection=snapshot.collection,
-                doc_id=snapshot.doc_id,
-                status="not_needed",
-                restorable=True,
-                cleanup_counts=cleanup_counts,
-            )
-
-        return KBVersionCandidateRollbackResult(
-            collection=snapshot.collection,
-            doc_id=snapshot.doc_id,
-            status="incomplete",
-            skipped=True,
-            restorable=False,
-            reason="candidate_cleanup_not_restorable",
-            cleanup_counts=cleanup_counts,
-            warnings=(
-                "Version candidate cleanup cannot be restored from the compatibility facade; "
-                "preserve visible rollback state and report remaining side effects.",
-            ),
-            side_effects_may_remain=True,
+        return self._active_coordinator().restore_candidate_cleanup_snapshot_sync(
+            snapshot,
+            cleanup_executed=cleanup_executed,
         )
 
     def cascade_delete(

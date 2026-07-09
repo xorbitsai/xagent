@@ -432,31 +432,6 @@ class TestManagementFacadeDeleteRoutingSwitch:
         coordinator.delete_collection.assert_called_once()
         assert result.status == "success"
 
-    def test_management_facade_delete_collection_falls_back_to_impl_when_no_coordinator(
-        self,
-    ) -> None:
-        """Sync delete_collection falls back to _delete_collection_impl when no coordinator."""
-        facade = KBCoreManagementCompatibilityFacade(coordinator=None)
-
-        expected = CollectionOperationResult(
-            status="success",
-            collection="c",
-            message="ok",
-        )
-
-        with patch(
-            "xagent.core.tools.core.RAG_tools.management.collections._delete_collection_impl",
-            return_value=expected,
-        ) as mock_impl:
-            result = facade.delete_collection(
-                collection="c",
-                user_id=None,
-                is_admin=True,
-            )
-
-        mock_impl.assert_called_once()
-        assert result.status == "success"
-
 
 # ---------------------------------------------------------------------------
 # Cycle 5.4 – config-only invariant

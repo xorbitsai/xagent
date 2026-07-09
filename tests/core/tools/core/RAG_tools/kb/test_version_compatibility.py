@@ -100,6 +100,23 @@ class _FakeStorageShim:
         return self.main_pointer_store
 
 
+def _handle_backed_version_coordinator() -> MagicMock:
+    """Coordinator mock that answers restore via the real handle logic."""
+    from xagent.core.tools.core.RAG_tools.kb.collection_handle import (
+        LanceDBCollectionHandle,
+    )
+
+    coordinator = MagicMock()
+    coordinator.restore_candidate_cleanup_snapshot_sync.side_effect = (
+        lambda snapshot, cleanup_executed=False: (
+            LanceDBCollectionHandle.restore_candidate_cleanup_snapshot(
+                MagicMock(), snapshot, cleanup_executed=cleanup_executed
+            )
+        )
+    )
+    return coordinator
+
+
 def _signature_shape(callable_obj: Any) -> inspect.Signature:
     return inspect.signature(callable_obj)
 
@@ -525,9 +542,9 @@ def test_candidate_cleanup_restore_marks_remaining_side_effects() -> None:
         old_parse_hash="old-hash",
     )
 
-    result = KBVersionCompatibilityFacade().restore_candidate_cleanup_snapshot(
-        snapshot, cleanup_executed=True
-    )
+    result = KBVersionCompatibilityFacade(
+        coordinator=_handle_backed_version_coordinator()
+    ).restore_candidate_cleanup_snapshot(snapshot, cleanup_executed=True)
 
     assert result.status == "incomplete"
     assert result.skipped
@@ -568,9 +585,9 @@ def test_candidate_cleanup_restore_does_not_delete_active_artifacts(
         scope="parse",
         cleanup_counts={"parses": 1, "chunks": 2},
     )
-    result = KBVersionCompatibilityFacade().restore_candidate_cleanup_snapshot(
-        snapshot, cleanup_executed=True
-    )
+    result = KBVersionCompatibilityFacade(
+        coordinator=_handle_backed_version_coordinator()
+    ).restore_candidate_cleanup_snapshot(snapshot, cleanup_executed=True)
 
     assert result.status == "incomplete"
     assert result.side_effects_may_remain
@@ -591,7 +608,9 @@ def test_candidate_cleanup_restore_not_needed_when_cleanup_was_not_executed() ->
         cleanup_counts={"chunks": 2},
     )
 
-    result = KBVersionCompatibilityFacade().restore_candidate_cleanup_snapshot(snapshot)
+    result = KBVersionCompatibilityFacade(
+        coordinator=_handle_backed_version_coordinator()
+    ).restore_candidate_cleanup_snapshot(snapshot)
 
     assert result.status == "not_needed"
     assert result.restorable

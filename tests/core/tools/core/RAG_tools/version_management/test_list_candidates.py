@@ -38,10 +38,6 @@ class TestListCandidates:
         ineffective here.  Instead we patch
         ``LanceDBVectorIndexStore._get_connection`` **at the class level** —
         class-attribute patches are visible in any thread that uses the class.
-
-        The legacy ``get_vector_store_raw_connection`` patch is kept so that the
-        fallback path (coordinator is None → ``_list_candidates_impl``) still
-        works for tests that exercise error handling before any DB call.
         """
         from contextlib import ExitStack
         from unittest.mock import patch
@@ -61,19 +57,6 @@ class TestListCandidates:
             patch.object(
                 LanceDBVectorIndexStore,
                 "_get_connection",
-                return_value=mock_conn,
-            )
-        )
-        # Keep legacy path patched for fallback / error-handling tests.
-        import importlib
-
-        list_candidates_module = importlib.import_module(
-            "xagent.core.tools.core.RAG_tools.version_management.list_candidates"
-        )
-        stack.enter_context(
-            patch.object(
-                list_candidates_module,
-                "get_vector_store_raw_connection",
                 return_value=mock_conn,
             )
         )

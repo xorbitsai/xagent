@@ -34,6 +34,9 @@ class KBCoreManagementCompatibilityFacade:
     ) -> None:
         self._coordinator = coordinator
         self._storage_shim = storage_shim
+        # Lazily-built coordinator bound to an injected shim (see
+        # _active_coordinator); cached so repeated calls reuse one instance.
+        self._shim_coordinator: KBCoordinator | None = None
 
     def _active_storage_shim(self) -> KBStorageShimCompatibilityFacade | None:
         if self._storage_shim is not None:
@@ -53,6 +56,21 @@ class KBCoreManagementCompatibilityFacade:
 
         with bind_storage_shim_for_current_context(storage_shim):
             yield
+
+    def _active_coordinator(self) -> KBCoordinator:
+        if self._coordinator is not None:
+            return self._coordinator
+
+        from .coordinator import KBCoordinator, get_kb_coordinator
+
+        # An injected shim without a coordinator must stay bound to that shim
+        # (mirrors vector_storage_compatibility._active_coordinator).
+        if self._storage_shim is not None:
+            if self._shim_coordinator is None:
+                self._shim_coordinator = KBCoordinator(storage_shim=self._storage_shim)
+            return self._shim_coordinator
+
+        return get_kb_coordinator()
 
     async def list_collections(
         self,
@@ -126,25 +144,15 @@ class KBCoreManagementCompatibilityFacade:
         user_id: Optional[int] = None,
         is_admin: bool = False,
     ) -> CollectionOperationResult:
-        if self._coordinator is not None:
-            from .coordinator import _run_in_separate_loop
+        from .coordinator import _run_in_separate_loop
 
-            return _run_in_separate_loop(
-                self.delete_collection_async(
-                    collection=collection,
-                    user_id=user_id,
-                    is_admin=is_admin,
-                )
-            )
-
-        from ..management import collections as management_collections
-
-        with self._storage_context():
-            return management_collections._delete_collection_impl(
+        return _run_in_separate_loop(
+            self.delete_collection_async(
                 collection=collection,
                 user_id=user_id,
                 is_admin=is_admin,
             )
+        )
 
     async def delete_collection_async(
         self,
@@ -154,33 +162,14 @@ class KBCoreManagementCompatibilityFacade:
         doc_ids: Optional[List[str]] = None,
         delete_orphaned_metadata: bool = True,
     ) -> CollectionOperationResult:
-        """Async delete routed through coordinator when available.
-
-        When a coordinator is present, delegates to
-        :meth:`KBCoordinator.delete_collection` so the operation goes through
-        the handle boundary. Falls back to :func:`_delete_collection_impl` for
-        legacy callers without a coordinator.
-        """
-        if self._coordinator is not None:
-            return await self._coordinator.delete_collection(
-                collection=collection,
-                user_id=user_id,
-                is_admin=is_admin,
-                doc_ids=doc_ids,
-                delete_orphaned_metadata=delete_orphaned_metadata,
-            )
-
-        import asyncio
-
-        from ..management import collections as management_collections
-
-        with self._storage_context():
-            return await asyncio.to_thread(
-                management_collections._delete_collection_impl,
-                collection=collection,
-                user_id=user_id,
-                is_admin=is_admin,
-            )
+        """Delete a collection through the coordinator handle boundary."""
+        return await self._active_coordinator().delete_collection(
+            collection=collection,
+            user_id=user_id,
+            is_admin=is_admin,
+            doc_ids=doc_ids,
+            delete_orphaned_metadata=delete_orphaned_metadata,
+        )
 
     def retry_document(
         self,

@@ -22,7 +22,6 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, Dict, Iterable, List, Optional, Set, cast
 
 if TYPE_CHECKING:
-    from .maintenance_compatibility import CollectionConfigSnapshot
     from .models import KBVectorStorageCleanupResult
 
 import pandas as pd
@@ -835,34 +834,6 @@ class KBCollectionHandle(ABC):
         """
 
     # --- Collection-level rollback config primitives (#H05 Phase 4) ---
-
-    @abstractmethod
-    async def capture_collection_config_snapshot(
-        self,
-    ) -> "CollectionConfigSnapshot":
-        """Capture the collection_config row for this collection before mutation.
-
-        Returns a :class:`CollectionConfigSnapshot` whose ``existed`` flag is
-        ``True`` when a config row was present and ``False`` otherwise.  A
-        snapshot with ``existed=False`` is safe to pass to
-        :meth:`restore_collection_config_snapshot` – the restore is a no-op.
-        """
-
-    @abstractmethod
-    async def restore_collection_config_snapshot(
-        self,
-        snapshot: "CollectionConfigSnapshot",
-    ) -> None:
-        """Restore or remove a collection_config row from a snapshot.
-
-        When ``snapshot.existed`` is ``True`` the original config JSON is
-        written back via :meth:`MetadataStore.save_collection_config`.  When
-        ``snapshot.existed`` is ``False`` this is a no-op (the config row did
-        not exist before the mutation so there is nothing to restore).
-
-        The rollback-complete / side-effects-may-remain guard logic lives in
-        the coordinator/policy layer, not here.
-        """
 
     @abstractmethod
     async def delete_collection_config(self, *, tenant_only: bool = False) -> int:
@@ -3751,59 +3722,6 @@ class LanceDBCollectionHandle(KBCollectionHandle):
         return sorted({r.doc_id for r in records})
 
     # --- Collection-level rollback config primitives (#H05 Phase 4) ---
-
-    async def capture_collection_config_snapshot(
-        self,
-    ) -> "CollectionConfigSnapshot":
-        """Capture the collection_config row for this collection (metadata read only).
-
-        Reads the config row via the metadata store and wraps it in a
-        :class:`CollectionConfigSnapshot`.  ``config_user_id`` is normalized to
-        0 when ``user_id`` is ``None``, matching legacy ownership convention.
-        """
-        from .maintenance_compatibility import CollectionConfigSnapshot
-
-        collection = self.context.collection
-        # Normalize: None user_id maps to 0 (legacy convention).
-        user_id = self.context.user_scope.user_id
-        config_user_id: int = 0 if user_id is None else int(user_id)
-
-        config_json = await self.metadata_store.get_collection_config(
-            collection,
-            config_user_id,
-            is_admin=False,
-        )
-        return CollectionConfigSnapshot(
-            collection_name=collection,
-            user_id=user_id,
-            config_user_id=config_user_id,
-            config_json=config_json,
-            existed=config_json is not None,
-        )
-
-    async def restore_collection_config_snapshot(
-        self,
-        snapshot: "CollectionConfigSnapshot",
-    ) -> None:
-        """Restore a collection_config row from snapshot (metadata write only).
-
-        When ``snapshot.existed`` is ``True`` the config JSON is written back
-        via :meth:`MetadataStore.save_collection_config`.  When
-        ``snapshot.existed`` is ``False`` this is a no-op.
-
-        The rollback-complete / side-effects-may-remain guard lives in the
-        coordinator/policy layer and is intentionally absent here.
-        """
-        if not snapshot.existed:
-            return
-        assert (
-            snapshot.config_json is not None
-        )  # invariant: existed ↔ config_json is not None
-        await self.metadata_store.save_collection_config(
-            snapshot.collection_name,
-            snapshot.config_json,
-            snapshot.config_user_id,
-        )
 
     async def delete_collection_config(self, *, tenant_only: bool = False) -> int:
         """Delete the collection_config row(s) for this collection (idempotent).

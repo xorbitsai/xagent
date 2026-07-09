@@ -103,11 +103,26 @@
   var panel = document.createElement('div');
   panel.className = 'xagent-widget-panel';
 
-  // Generate guest_id if not exists
-  var guestId = localStorage.getItem('xagent_guest_id');
-  if (!guestId) {
-    guestId = 'guest_' + Math.random().toString(36).substring(2, 15) + Math.random().toString(36).substring(2, 15);
-    localStorage.setItem('xagent_guest_id', guestId);
+  // Identify the guest. If the embedding page knows who the visitor is
+  // (e.g. it renders the snippet server-side for a logged-in user), it can
+  // pass that identity via data-end-user-id so the widget session is scoped
+  // to that specific user instead of an anonymous per-browser id. This value
+  // is supplied by the embedding page on every load, so it is not cached.
+  var endUserId = (scriptTag.getAttribute('data-end-user-id') || '').trim();
+  var guestId;
+  if (endUserId) {
+    // Match the backend's guest_id length cap (see WidgetAuthRequest) so an
+    // oversized value fails fast client-side instead of a 422 from /auth.
+    guestId = endUserId.substring(0, 256);
+  } else {
+    // No end-user identity provided: fall back to an anonymous per-browser
+    // id, generated once and cached so the same browser resumes the same
+    // conversation across page loads.
+    guestId = localStorage.getItem('xagent_guest_id');
+    if (!guestId) {
+      guestId = 'guest_' + Math.random().toString(36).substring(2, 15) + Math.random().toString(36).substring(2, 15);
+      localStorage.setItem('xagent_guest_id', guestId);
+    }
   }
 
   // Iframe

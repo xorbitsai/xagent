@@ -27,8 +27,10 @@ from .operation_compatibility import (
     KBOperation,
     KBOperationCompatibilityFacade,
     PersistencePolicy,
-    RollbackStatus,
-    SideEffectPlane,
+    finish_owned_operation,
+    record_chunk_side_effect,
+    record_document_registration_side_effect,
+    record_parse_side_effect,
 )
 
 if TYPE_CHECKING:
@@ -493,28 +495,17 @@ class KBLegacyStepCompatibilityFacade:
         user_id: Optional[int],
         result: Dict[str, Any],
     ) -> None:
-        if operation is None:
-            return
         doc_id = result.get("doc_id")
-        if not doc_id:
+        if operation is None or not doc_id:
             return
-        operation.record_side_effect(
-            name="remove_registered_document",
-            plane=SideEffectPlane.DOCUMENT,
-            payload={
-                "collection": collection,
-                "doc_id": doc_id,
-                "created": result.get("created"),
-                "source_path": source_path,
-                "file_id": file_id,
-            },
-            idempotency_key=f"document:{collection}:{doc_id}",
-        )
-        operation.record_side_effect(
-            name="clear_ingestion_status",
-            plane=SideEffectPlane.STATUS,
-            payload={"collection": collection, "doc_id": doc_id, "user_id": user_id},
-            idempotency_key=f"status:{collection}:{doc_id}",
+        record_document_registration_side_effect(
+            operation,
+            collection=collection,
+            doc_id=doc_id,
+            created=result.get("created"),
+            source_path=source_path,
+            file_id=file_id,
+            user_id=user_id,
         )
 
     def _record_parse_side_effect(
@@ -530,15 +521,8 @@ class KBLegacyStepCompatibilityFacade:
         parse_hash = result.get("parse_hash")
         if not parse_hash:
             return
-        operation.record_side_effect(
-            name="remove_parse_record",
-            plane=SideEffectPlane.PARSE,
-            payload={
-                "collection": collection,
-                "doc_id": doc_id,
-                "parse_hash": parse_hash,
-            },
-            idempotency_key=f"parse:{collection}:{doc_id}:{parse_hash}",
+        record_parse_side_effect(
+            operation, collection=collection, doc_id=doc_id, parse_hash=parse_hash
         )
 
     def _record_chunk_side_effect(
@@ -555,16 +539,12 @@ class KBLegacyStepCompatibilityFacade:
         chunk_count = int(result.get("chunk_count", 0) or 0)
         if chunk_count <= 0:
             return
-        operation.record_side_effect(
-            name="remove_chunk_records",
-            plane=SideEffectPlane.CHUNK,
-            payload={
-                "collection": collection,
-                "doc_id": doc_id,
-                "parse_hash": parse_hash,
-                "chunk_count": chunk_count,
-            },
-            idempotency_key=f"chunk:{collection}:{doc_id}:{parse_hash}",
+        record_chunk_side_effect(
+            operation,
+            collection=collection,
+            doc_id=doc_id,
+            parse_hash=parse_hash,
+            chunk_count=chunk_count,
         )
 
     @staticmethod
@@ -574,13 +554,7 @@ class KBLegacyStepCompatibilityFacade:
         *,
         status: str,
     ) -> None:
-        if operation is None or not owns_operation or operation.outcome is not None:
-            return
-        operation.finish(
-            status=status,
-            rollback_status=RollbackStatus.NOT_NEEDED,
-            side_effects_may_remain=False,
-        )
+        finish_owned_operation(operation, owns_operation, status=status)
 
     def search_dense(
         self,

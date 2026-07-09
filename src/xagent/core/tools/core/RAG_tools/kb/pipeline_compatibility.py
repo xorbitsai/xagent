@@ -22,6 +22,11 @@ from .operation_compatibility import (
     KBOperationOutcome,
     PersistencePolicy,
     SideEffectPlane,
+    finish_ingestion_outcome,
+    finish_web_ingestion_outcome,
+    record_document_ingestion_side_effects,
+    should_finish_document_ingestion_operation,
+    step_metadata,
 )
 
 if TYPE_CHECKING:
@@ -226,8 +231,10 @@ class KBPipelineCompatibilityFacade:
                     is_admin=is_admin,
                 )
                 self.ensure_collection_backend_binding(collection)
-                if self._should_finish_document_ingestion_operation(operation):
-                    self._finish_document_ingestion_outcome(operation, result)
+                if should_finish_document_ingestion_operation(operation):
+                    finish_ingestion_outcome(
+                        operation, status=result.status, message=result.message
+                    )
                 return result
 
     def run_document_ingestion(
@@ -278,8 +285,10 @@ class KBPipelineCompatibilityFacade:
                         is_admin=is_admin,
                     )
                     self.ensure_collection_backend_binding(collection)
-                    if self._should_finish_document_ingestion_operation(operation):
-                        self._finish_document_ingestion_outcome(operation, result)
+                    if should_finish_document_ingestion_operation(operation):
+                        finish_ingestion_outcome(
+                            operation, status=result.status, message=result.message
+                        )
                 elif operation is None:
                     self.ensure_collection_backend_binding(collection)
                 return result
@@ -359,7 +368,15 @@ class KBPipelineCompatibilityFacade:
                     pipeline_facade=self,
                 )
                 await self.ensure_collection_backend_binding_async(collection)
-                outcome = self._record_web_ingestion_outcome(operation, result)
+                outcome = finish_web_ingestion_outcome(
+                    operation,
+                    status=result.status,
+                    documents_created=result.documents_created,
+                    pages_crawled=result.pages_crawled,
+                    pages_failed=result.pages_failed,
+                    failed_urls=result.failed_urls,
+                    message=result.message,
+                )
                 if (
                     outcome is not None
                     and result.side_effects_may_remain
@@ -480,174 +497,19 @@ class KBPipelineCompatibilityFacade:
         user_id: Optional[int],
         is_admin: Optional[bool],
     ) -> None:
-        if operation is None or operation.outcome is not None:
-            return
-
-        operation.update_details(
-            source_path=source_path,
-            file_id=file_id,
+        record_document_ingestion_side_effects(
+            operation,
+            collection=collection,
             doc_id=result.doc_id,
             parse_hash=result.parse_hash,
+            completed_steps=result.completed_steps,
+            chunk_count=result.chunk_count,
+            vector_count=result.vector_count,
             failed_step=result.failed_step,
+            source_path=source_path,
+            file_id=file_id,
             user_id=user_id,
             is_admin=is_admin,
-        )
-
-        initialize_step = self._step_metadata(
-            result.completed_steps, "initialize_collection"
-        )
-        if initialize_step is not None:
-            operation.record_side_effect(
-                name="restore_collection_initialization",
-                plane=SideEffectPlane.COLLECTION,
-                payload={
-                    "collection": collection,
-                    "embedding_model_id": initialize_step.get("embedding_model_id"),
-                },
-                idempotency_key=f"collection:{collection}:initialize",
-            )
-
-        register_step = self._step_metadata(result.completed_steps, "register_document")
-        if result.doc_id and register_step is not None:
-            operation.record_side_effect(
-                name="remove_registered_document",
-                plane=SideEffectPlane.DOCUMENT,
-                payload={
-                    "collection": collection,
-                    "doc_id": result.doc_id,
-                    "created": register_step.get("created"),
-                    "source_path": source_path,
-                    "file_id": file_id,
-                },
-                idempotency_key=f"document:{collection}:{result.doc_id}",
-            )
-            operation.record_side_effect(
-                name="clear_ingestion_status",
-                plane=SideEffectPlane.STATUS,
-                payload={
-                    "collection": collection,
-                    "doc_id": result.doc_id,
-                    "user_id": user_id,
-                },
-                idempotency_key=f"status:{collection}:{result.doc_id}",
-            )
-
-        parse_step = self._step_metadata(result.completed_steps, "parse_document")
-        if result.doc_id and result.parse_hash and parse_step is not None:
-            if parse_step.get("written") is not False:
-                operation.record_side_effect(
-                    name="remove_parse_record",
-                    plane=SideEffectPlane.PARSE,
-                    payload={
-                        "collection": collection,
-                        "doc_id": result.doc_id,
-                        "parse_hash": result.parse_hash,
-                    },
-                    idempotency_key=(
-                        f"parse:{collection}:{result.doc_id}:{result.parse_hash}"
-                    ),
-                )
-
-        chunk_step = self._step_metadata(result.completed_steps, "chunk_document")
-        if result.doc_id and result.parse_hash and chunk_step is not None:
-            if result.chunk_count > 0 and chunk_step.get("created") is not False:
-                operation.record_side_effect(
-                    name="remove_chunk_records",
-                    plane=SideEffectPlane.CHUNK,
-                    payload={
-                        "collection": collection,
-                        "doc_id": result.doc_id,
-                        "parse_hash": result.parse_hash,
-                        "chunk_count": result.chunk_count,
-                    },
-                    idempotency_key=(
-                        f"chunk:{collection}:{result.doc_id}:{result.parse_hash}"
-                    ),
-                )
-
-        write_step = self._step_metadata(result.completed_steps, "write_vectors_to_db")
-        if result.doc_id and result.vector_count > 0 and write_step is not None:
-            operation.record_side_effect(
-                name="remove_embedding_vectors",
-                plane=SideEffectPlane.EMBEDDING,
-                payload={
-                    "collection": collection,
-                    "doc_id": result.doc_id,
-                    "parse_hash": result.parse_hash,
-                    "vector_count": result.vector_count,
-                },
-                idempotency_key=f"embedding:{collection}:{result.doc_id}:{result.parse_hash}",
-            )
-
-    @staticmethod
-    def _should_finish_document_ingestion_operation(
-        operation: KBOperation | None,
-    ) -> bool:
-        if operation is None:
-            return False
-        if operation.operation_type == "document_ingestion":
-            return True
-        return (
-            operation.operation_type == "web_page_ingestion"
-            and "url" not in operation.details
-        )
-
-    @staticmethod
-    def _finish_document_ingestion_outcome(
-        operation: KBOperation | None,
-        result: IngestionResult,
-    ) -> None:
-        if operation is None or operation.outcome is not None:
-            return
-        side_effects_may_remain = (
-            result.status != "success" and operation.has_side_effects()
-        )
-        operation.finish(
-            status=result.status,
-            rollback_status=operation.infer_rollback_status(
-                result.status,
-                side_effects_may_remain=side_effects_may_remain,
-            ),
-            side_effects_may_remain=side_effects_may_remain,
-            details={"message": result.message},
-        )
-
-    def _record_web_ingestion_outcome(
-        self,
-        operation: KBOperation | None,
-        result: WebIngestionResult,
-    ) -> KBOperationOutcome | None:
-        if operation is None:
-            return None
-        if operation.outcome is not None:
-            return operation.outcome
-
-        child_side_effects_may_remain = any(
-            child.side_effects_may_remain for child in operation.child_outcomes
-        )
-        own_side_effects_may_remain = bool(operation.uncompensated_steps())
-
-        if result.status == "success":
-            side_effects_may_remain = False
-        else:
-            side_effects_may_remain = (
-                child_side_effects_may_remain or own_side_effects_may_remain
-            )
-
-        return operation.finish(
-            status=result.status,
-            rollback_status=operation.infer_rollback_status(
-                result.status,
-                side_effects_may_remain=side_effects_may_remain,
-            ),
-            side_effects_may_remain=side_effects_may_remain,
-            details={
-                "documents_created": result.documents_created,
-                "pages_crawled": result.pages_crawled,
-                "pages_failed": result.pages_failed,
-                "failed_urls": dict(result.failed_urls),
-                "message": result.message,
-            },
         )
 
     @staticmethod
@@ -655,7 +517,30 @@ class KBPipelineCompatibilityFacade:
         completed_steps: list[IngestionStepResult],
         name: str,
     ) -> dict[str, Any] | None:
-        for step in completed_steps:
-            if step.name == name:
-                return dict(step.metadata or {})
-        return None
+        return step_metadata(completed_steps, name)
+
+    @staticmethod
+    def _finish_document_ingestion_outcome(
+        operation: KBOperation | None,
+        result: IngestionResult,
+    ) -> None:
+        # Thin delegator kept for an existing test's monkeypatch target (#515).
+        finish_ingestion_outcome(
+            operation, status=result.status, message=result.message
+        )
+
+    @staticmethod
+    def _record_web_ingestion_outcome(
+        operation: KBOperation | None,
+        result: WebIngestionResult,
+    ) -> KBOperationOutcome | None:
+        # Thin delegator kept for an existing test's direct call (#515).
+        return finish_web_ingestion_outcome(
+            operation,
+            status=result.status,
+            documents_created=result.documents_created,
+            pages_crawled=result.pages_crawled,
+            pages_failed=result.pages_failed,
+            failed_urls=result.failed_urls,
+            message=result.message,
+        )

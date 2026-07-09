@@ -12,6 +12,14 @@ from xagent.core.tools.core.RAG_tools.kb import (
     RollbackStatus,
     SideEffectPlane,
 )
+from xagent.core.tools.core.RAG_tools.kb.operation_compatibility import (
+    KBOperation,
+    PersistencePolicy,
+    finish_ingestion_outcome,
+    record_chunk_side_effect,
+    record_document_registration_side_effect,
+    record_parse_side_effect,
+)
 
 
 def test_operation_compensation_steps_are_idempotent_and_lifo() -> None:
@@ -321,3 +329,115 @@ def test_snapshot_plane_mark_and_uncompensated_tracking() -> None:
 
         operation.mark_compensated_steps(planes={SideEffectPlane.SNAPSHOT})
         assert operation.has_uncompensated_side_effects() is False
+
+
+def _engine_test_operation() -> KBOperation:
+    return KBOperation(
+        operation_type="document_ingestion",
+        collection="demo",
+        persistence_policy=PersistencePolicy.PRESERVE_SUCCESSFUL_CHILDREN,
+    )
+
+
+def test_engine_recording_helpers_use_canonical_keys_and_payloads() -> None:
+    operation = _engine_test_operation()
+
+    record_document_registration_side_effect(
+        operation,
+        collection="demo",
+        doc_id="doc-1",
+        created=True,
+        source_path="/tmp/a.md",
+        file_id="file-1",
+        user_id=7,
+    )
+    record_parse_side_effect(
+        operation, collection="demo", doc_id="doc-1", parse_hash="hash-1"
+    )
+    record_chunk_side_effect(
+        operation,
+        collection="demo",
+        doc_id="doc-1",
+        parse_hash="hash-1",
+        chunk_count=3,
+    )
+
+    by_key = {step.idempotency_key: step for step in operation.compensation_steps}
+    assert set(by_key) == {
+        "document:demo:doc-1",
+        "status:demo:doc-1",
+        "parse:demo:doc-1:hash-1",
+        "chunk:demo:doc-1:hash-1",
+    }
+    assert by_key["document:demo:doc-1"].name == "remove_registered_document"
+    assert by_key["document:demo:doc-1"].plane is SideEffectPlane.DOCUMENT
+    assert by_key["document:demo:doc-1"].payload == {
+        "collection": "demo",
+        "doc_id": "doc-1",
+        "created": True,
+        "source_path": "/tmp/a.md",
+        "file_id": "file-1",
+    }
+    assert by_key["status:demo:doc-1"].name == "clear_ingestion_status"
+    assert by_key["status:demo:doc-1"].plane is SideEffectPlane.STATUS
+    assert by_key["status:demo:doc-1"].payload == {
+        "collection": "demo",
+        "doc_id": "doc-1",
+        "user_id": 7,
+    }
+    assert by_key["parse:demo:doc-1:hash-1"].plane is SideEffectPlane.PARSE
+    assert by_key["chunk:demo:doc-1:hash-1"].payload["chunk_count"] == 3
+
+
+def test_engine_recording_helpers_are_none_safe() -> None:
+    # operation=None is a no-op for every recording helper.
+    record_document_registration_side_effect(
+        None,
+        collection="demo",
+        doc_id="doc-1",
+        created=True,
+        source_path="/tmp/a.md",
+        file_id=None,
+        user_id=None,
+    )
+    record_parse_side_effect(None, collection="demo", doc_id="d", parse_hash="h")
+    record_chunk_side_effect(
+        None, collection="demo", doc_id="d", parse_hash="h", chunk_count=1
+    )
+
+
+def test_finish_ingestion_outcome_preserves_recorded_side_effect_semantics() -> None:
+    """#515 risk 6.3 pin: with the default flag, recorded-but-COMPENSATED side
+    effects still report side_effects_may_remain=True on failure (the
+    historical has_side_effects() facade semantics, not the engine default)."""
+    operation = _engine_test_operation()
+    operation.record_side_effect(
+        name="remove_registered_document",
+        plane=SideEffectPlane.DOCUMENT,
+        payload={"collection": "demo"},
+        idempotency_key="document:demo:doc-1",
+        compensation=lambda: None,
+    )
+    errors = operation.execute_compensations(
+        step_names={"remove_registered_document"},
+        planes={SideEffectPlane.DOCUMENT},
+    )
+    assert errors == ()
+    assert operation.has_uncompensated_side_effects() is False
+
+    outcome = finish_ingestion_outcome(operation, status="error", message="failed")
+
+    assert outcome is not None
+    assert outcome.side_effects_may_remain is True
+    assert outcome.rollback_status is RollbackStatus.INCOMPLETE
+
+
+def test_finish_ingestion_outcome_success_clears_flag() -> None:
+    operation = _engine_test_operation()
+    record_parse_side_effect(operation, collection="demo", doc_id="d", parse_hash="h")
+
+    outcome = finish_ingestion_outcome(operation, status="success", message="ok")
+
+    assert outcome is not None
+    assert outcome.side_effects_may_remain is False
+    assert outcome.rollback_status is RollbackStatus.NOT_NEEDED

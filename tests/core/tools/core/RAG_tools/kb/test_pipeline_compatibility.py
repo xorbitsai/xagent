@@ -1421,3 +1421,76 @@ def test_run_per_boundary_compensation_delegates_to_coordinator() -> None:
     assert request.rollback_context["rollback_kind"] == "new_web_file"
     assert request.rollback_context["file_id"] == "file-1"
     assert request.rollback_context["file_path"] == "/tmp/page.md"
+
+
+def test_pipeline_and_legacy_step_share_one_recording_implementation() -> None:
+    """Both facades must produce byte-identical registration metadata for the
+    same document/parse/chunk identity - the #515 dedup proof. If either route
+    re-derives keys or payloads locally, the step tuples diverge."""
+    from xagent.core.tools.core.RAG_tools.kb.legacy_step_compatibility import (
+        KBLegacyStepCompatibilityFacade,
+    )
+    from xagent.core.tools.core.RAG_tools.kb.operation_compatibility import (
+        KBOperation,
+        PersistencePolicy,
+    )
+
+    def _operation() -> KBOperation:
+        return KBOperation(
+            operation_type="test",
+            collection="demo",
+            persistence_policy=PersistencePolicy.PRESERVE_SUCCESSFUL_CHILDREN,
+        )
+
+    pipeline_operation = _operation()
+    pipeline_facade = KBPipelineCompatibilityFacade()
+    pipeline_result = IngestionResult(
+        status="partial",
+        doc_id="doc-1",
+        parse_hash="hash-1",
+        chunk_count=3,
+        completed_steps=[
+            _ingestion_step("register_document", doc_id="doc-1", created=True),
+            _ingestion_step("parse_document", parse_hash="hash-1"),
+            _ingestion_step("chunk_document", chunk_count=3, created=True),
+        ],
+        failed_step="write_vectors_to_db",
+        message="failed",
+    )
+    pipeline_facade._record_document_ingestion_side_effects(
+        pipeline_operation,
+        pipeline_result,
+        collection="demo",
+        source_path="/tmp/a.md",
+        file_id="file-1",
+        user_id=7,
+        is_admin=False,
+    )
+
+    legacy_operation = _operation()
+    legacy_facade = KBLegacyStepCompatibilityFacade()
+    legacy_facade._record_document_side_effect(
+        legacy_operation,
+        collection="demo",
+        source_path="/tmp/a.md",
+        file_id="file-1",
+        user_id=7,
+        result={"doc_id": "doc-1", "created": True},
+    )
+    legacy_facade._record_parse_side_effect(
+        legacy_operation,
+        collection="demo",
+        doc_id="doc-1",
+        result={"parse_hash": "hash-1", "written": True},
+    )
+    legacy_facade._record_chunk_side_effect(
+        legacy_operation,
+        collection="demo",
+        doc_id="doc-1",
+        parse_hash="hash-1",
+        result={"chunk_count": 3, "created": True},
+    )
+
+    assert tuple(pipeline_operation.compensation_steps) == tuple(
+        legacy_operation.compensation_steps
+    )

@@ -119,7 +119,16 @@ Examples:
 
 
 def main() -> None:
-    """Main function"""
+    """Main function.
+
+    ``xagent migrate ...`` dispatches to the migration CLI; every other
+    invocation starts the web service (the historical behavior).
+    """
+    if len(sys.argv) > 1 and sys.argv[1] == "migrate":
+        from ..migration.cli import main as migrate_main
+
+        raise SystemExit(migrate_main(sys.argv[2:]))
+
     args = parse_args()
 
     # Configure logging BEFORE importing app

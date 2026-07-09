@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 import asyncio
+import inspect
+import logging
 import threading
 from collections.abc import Coroutine
 from contextvars import copy_context
-from typing import Any, Dict, List, Optional, TypeVar
+from typing import Any, Callable, Dict, List, Optional, TypeVar, cast
 
 from ..core.exceptions import (
     CascadeCleanupError,
@@ -43,8 +45,15 @@ from .models import (
     KBContextRequest,
     KBStorageBackend,
     KBUserScope,
+    RollbackFailedIngestionRequest,
+    RollbackFailedIngestionResult,
 )
-from .operation_compatibility import KBOperationCompatibilityFacade
+from .operation_compatibility import (
+    KBOperationCompatibilityFacade,
+    RollbackStatus,
+    SideEffectPlane,
+    _close_awaitable_if_possible,
+)
 from .parse_display_compatibility import KBParseDisplayCompatibilityFacade
 from .pipeline_compatibility import KBPipelineCompatibilityFacade
 from .retrieval_compatibility import KBRetrievalHelperCompatibilityFacade
@@ -56,6 +65,8 @@ from .version_compatibility import KBVersionCompatibilityFacade
 T = TypeVar("T")
 
 KB_STORAGE_METADATA_KEY = "kb_storage"
+
+logger = logging.getLogger(__name__)
 
 
 def _normalize_user_id(user_id: str | int | None) -> int | None:
@@ -1885,6 +1896,309 @@ class KBCoordinator:
             self.restore_candidate_cleanup_snapshot(
                 snapshot, cleanup_executed=cleanup_executed
             )
+        )
+
+    # --- Failed-ingest rollback orchestration (#515) ---
+
+    def rollback_failed_ingestion_sync(
+        self, request: RollbackFailedIngestionRequest
+    ) -> RollbackFailedIngestionResult:
+        """Run failed-ingest compensation in DOCUMENT->FILE->STATUS->SNAPSHOT order.
+
+        Single owner of the orchestration formerly duplicated in
+        ``pipelines/web_ingestion.py`` (with-operation and callbacks-only
+        copies). Orchestration only: per-plane compensation mechanics arrive
+        as request callbacks or saga steps already registered on
+        ``request.operation``. Compensation failures are folded into the
+        result; this method never raises for a failing callback.
+
+        Sync-first by design (spec §3.1.2): the one #515 consumer,
+        web_ingestion, runs its compensation callbacks synchronously on the
+        pipeline thread.
+        """
+        if request.operation is not None:
+            return self._rollback_boundaries_with_operation(request)
+        return self._rollback_boundaries_callbacks_only(request)
+
+    async def rollback_failed_ingestion(
+        self, request: RollbackFailedIngestionRequest
+    ) -> RollbackFailedIngestionResult:
+        """Async twin (coordinator convention; first awaited in #795)."""
+        return await asyncio.to_thread(self.rollback_failed_ingestion_sync, request)
+
+    def _rollback_boundaries_with_operation(
+        self, request: RollbackFailedIngestionRequest
+    ) -> RollbackFailedIngestionResult:
+        operation = request.operation
+        assert operation is not None
+        context = dict(request.rollback_context or {})
+        warnings: list[str] = []
+        boundary_errors: dict[str, tuple[str, ...]] = {}
+        first_error: Optional[str] = None
+        attempted = False
+        collection = request.collection
+        source = request.source
+        doc_id = request.doc_id
+        key_fallback = context.get("file_id") or context.get("file_path") or source
+
+        def _fold(boundary: str, errors: tuple[BaseException, ...]) -> None:
+            nonlocal first_error
+            if not errors:
+                return
+            boundary_errors[boundary] = tuple(str(exc) for exc in errors)
+            for exc in errors:
+                message = (
+                    f"Web rollback {boundary} compensation failed for {source}: {exc}"
+                )
+                logger.warning(message)
+                warnings.append(message)
+            if first_error is None:
+                first_error = f"{boundary} boundary compensation failed: {errors[0]}"
+
+        # DOCUMENT boundary. A successful document compensation covers the
+        # cascade planes: delete_document cascades to parse/chunk/embedding,
+        # and collection initialization is shared (not rolled back per page).
+        document_compensation = request.document_compensation
+        if document_compensation is not None:
+            attempted = True
+
+            def _compensate_document() -> None:
+                callback = document_compensation(request.ingestion_result)
+                result = callback()
+                if inspect.isawaitable(result):
+                    _close_awaitable_if_possible(result)
+                    raise TypeError(
+                        "Async DOCUMENT compensation callback is not supported "
+                        f"for {source}"
+                    )
+                operation.mark_compensated_steps(
+                    planes={
+                        SideEffectPlane.COLLECTION,
+                        SideEffectPlane.DOCUMENT,
+                        SideEffectPlane.PARSE,
+                        SideEffectPlane.CHUNK,
+                        SideEffectPlane.EMBEDDING,
+                    }
+                )
+
+            operation.record_side_effect(
+                name="remove_registered_document",
+                plane=SideEffectPlane.DOCUMENT,
+                payload={
+                    "collection": collection,
+                    "url": source,
+                    "doc_id": doc_id,
+                    "file_id": context.get("file_id"),
+                    "rollback_kind": context.get("rollback_kind"),
+                },
+                idempotency_key=(
+                    f"document:{collection}:{doc_id}"
+                    if doc_id
+                    else f"document:{collection}:{key_fallback}"
+                ),
+                compensation=_compensate_document,
+            )
+            _fold(
+                "DOCUMENT",
+                operation.execute_compensations(
+                    step_names={"remove_registered_document"},
+                    planes={SideEffectPlane.DOCUMENT},
+                ),
+            )
+
+        # FILE boundary. The key must match web_ingestion's ingest-time
+        # registration (file:{collection}:{file_id or file_path or url}) so
+        # re-registration dedupes instead of double-running the callback.
+        file_compensation = request.file_compensation
+        file_succeeded = file_compensation is None
+        if file_compensation is not None:
+            attempted = True
+            operation.record_side_effect(
+                name="cleanup_web_page_persistence",
+                plane=SideEffectPlane.FILE,
+                payload={
+                    "collection": collection,
+                    "url": source,
+                    "file_path": context.get("file_path"),
+                    "file_id": context.get("file_id"),
+                    "reason": "file_compensation",
+                    **context,
+                },
+                idempotency_key=f"file:{collection}:{key_fallback}",
+                compensation=cast(Callable[[], None], file_compensation),
+            )
+            file_errors = operation.execute_compensations(
+                step_names={"cleanup_web_page_persistence"},
+                planes={SideEffectPlane.FILE},
+            )
+            file_succeeded = not file_errors
+            _fold("FILE", file_errors)
+
+        # STATUS boundary.
+        status_compensation = request.status_compensation
+        if status_compensation is not None:
+            attempted = True
+
+            def _compensate_status() -> None:
+                callback = status_compensation(request.ingestion_result)
+                result = callback()
+                if inspect.isawaitable(result):
+                    _close_awaitable_if_possible(result)
+                    raise TypeError(
+                        "Async STATUS compensation callback is not supported "
+                        f"for {source}"
+                    )
+
+            operation.record_side_effect(
+                name="clear_ingestion_status",
+                plane=SideEffectPlane.STATUS,
+                payload={
+                    "collection": collection,
+                    "url": source,
+                    "doc_id": doc_id,
+                    "file_id": context.get("file_id"),
+                    "rollback_kind": context.get("rollback_kind"),
+                },
+                idempotency_key=(
+                    f"status:{collection}:{doc_id}"
+                    if doc_id
+                    else f"status:{collection}:{key_fallback}"
+                ),
+                compensation=_compensate_status,
+            )
+            _fold(
+                "STATUS",
+                operation.execute_compensations(
+                    step_names={"clear_ingestion_status"},
+                    planes={SideEffectPlane.STATUS},
+                ),
+            )
+
+        # SNAPSHOT boundary - only clean the backup when no prior boundary
+        # errored AND (no FILE compensation was registered OR it succeeded).
+        snapshot_compensation = request.snapshot_compensation
+        if snapshot_compensation is not None:
+            attempted = True
+            backup_path = context.get("backup_path")
+            operation.record_side_effect(
+                name="cleanup_web_page_snapshot",
+                plane=SideEffectPlane.SNAPSHOT,
+                payload={
+                    "collection": collection,
+                    "url": source,
+                    "backup_path": backup_path,
+                    "file_id": context.get("file_id"),
+                    "rollback_kind": context.get("rollback_kind"),
+                },
+                idempotency_key=(
+                    f"snapshot:{collection}:{backup_path or key_fallback}"
+                ),
+                compensation=cast(Callable[[], None], snapshot_compensation),
+            )
+            file_registered = file_compensation is not None
+            if first_error is None and (not file_registered or file_succeeded):
+                _fold(
+                    "SNAPSHOT",
+                    operation.execute_compensations(
+                        step_names={"cleanup_web_page_snapshot"},
+                        planes={SideEffectPlane.SNAPSHOT},
+                    ),
+                )
+
+        side_effects_may_remain = (
+            bool(boundary_errors) or operation.has_uncompensated_side_effects()
+        )
+        ingest_status = "error"
+        if request.ingestion_result is not None and request.ingestion_result.status:
+            ingest_status = request.ingestion_result.status
+        rollback_status = operation.infer_rollback_status(
+            ingest_status,
+            side_effects_may_remain=side_effects_may_remain,
+        )
+        if boundary_errors:
+            status = "incomplete"
+        elif attempted:
+            status = "complete"
+        else:
+            status = "not_needed"
+        return RollbackFailedIngestionResult(
+            status=status,
+            rollback_status=rollback_status,
+            rollback_complete=first_error is None,
+            side_effects_may_remain=side_effects_may_remain,
+            first_error=first_error,
+            boundary_errors=boundary_errors,
+            warnings=tuple(warnings),
+        )
+
+    def _rollback_boundaries_callbacks_only(
+        self, request: RollbackFailedIngestionRequest
+    ) -> RollbackFailedIngestionResult:
+        """Callback-only path (no saga): same order and SNAPSHOT gate."""
+        warnings: list[str] = []
+        boundary_errors: dict[str, tuple[str, ...]] = {}
+        first_error: Optional[str] = None
+        attempted = False
+        source = request.source
+
+        def _fold(boundary: str, exc: BaseException) -> None:
+            nonlocal first_error
+            boundary_errors[boundary] = boundary_errors.get(boundary, ()) + (str(exc),)
+            message = f"Web rollback {boundary} compensation failed for {source}: {exc}"
+            logger.warning(message)
+            warnings.append(message)
+            if first_error is None:
+                first_error = f"{boundary} boundary compensation failed: {exc}"
+
+        if request.document_compensation is not None:
+            attempted = True
+            try:
+                callback = request.document_compensation(request.ingestion_result)
+                callback()
+            except Exception as exc:  # noqa: BLE001 - fold into the result
+                _fold("DOCUMENT", exc)
+
+        file_succeeded = False
+        if request.file_compensation is not None:
+            attempted = True
+            try:
+                request.file_compensation()
+            except Exception as exc:  # noqa: BLE001 - fold into the result
+                _fold("FILE", exc)
+            else:
+                file_succeeded = True
+
+        if request.status_compensation is not None:
+            attempted = True
+            try:
+                callback = request.status_compensation(request.ingestion_result)
+                callback()
+            except Exception as exc:  # noqa: BLE001 - fold into the result
+                _fold("STATUS", exc)
+
+        if request.snapshot_compensation is not None:
+            attempted = True
+            file_registered = request.file_compensation is not None
+            if first_error is None and (not file_registered or file_succeeded):
+                try:
+                    request.snapshot_compensation()
+                except Exception as exc:  # noqa: BLE001 - fold into the result
+                    _fold("SNAPSHOT", exc)
+
+        if boundary_errors:
+            status, rollback_status = "incomplete", RollbackStatus.INCOMPLETE
+        elif attempted:
+            status, rollback_status = "complete", RollbackStatus.COMPLETE
+        else:
+            status, rollback_status = "not_needed", RollbackStatus.NOT_NEEDED
+        return RollbackFailedIngestionResult(
+            status=status,
+            rollback_status=rollback_status,
+            rollback_complete=first_error is None,
+            side_effects_may_remain=bool(boundary_errors),
+            first_error=first_error,
+            boundary_errors=boundary_errors,
+            warnings=tuple(warnings),
         )
 
     def reset_compatibility_caches(self) -> None:

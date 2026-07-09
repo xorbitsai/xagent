@@ -6,17 +6,19 @@ storage, API, pipeline, or tool behavior into the coordinator.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from collections.abc import Callable, Mapping
+from dataclasses import dataclass, field
 from enum import StrEnum
-from typing import Optional
+from typing import Any, Optional
 
-from ..core.schemas import CollectionInfo
+from ..core.schemas import CollectionInfo, IngestionResult
 from ..storage.contracts import (
     IngestionStatusStore,
     MainPointerStore,
     MetadataStore,
     VectorIndexStore,
 )
+from .operation_compatibility import KBOperation, RollbackStatus
 
 
 class KBAccessMode(StrEnum):
@@ -108,3 +110,48 @@ class KBCollectionContext:
     backend: KBStorageBackend
     capabilities: KBBackendCapabilities
     collection_info: Optional[CollectionInfo] = None
+
+
+@dataclass(frozen=True)
+class RollbackFailedIngestionRequest:
+    """Request for coordinator-owned failed-ingest rollback orchestration (#515).
+
+    ``document_compensation`` / ``status_compensation`` are factories invoked
+    as ``factory(ingestion_result)`` returning the zero-arg callback;
+    ``file_compensation`` / ``snapshot_compensation`` are plain zero-arg
+    callables (mirrors the web pipeline's ``FileHandlerResult`` contract).
+
+    ``rollback_context`` may carry web-file identity used for payload metadata
+    and idempotency-key derivation. Reserved keys: ``rollback_kind``,
+    ``backup_path``, ``file_id``, ``file_path``.
+
+    ``operation=None`` selects the callback-only path (no saga engine).
+    Additive-by-design: #795 may extend, but must not mutate, these fields.
+    """
+
+    collection: str
+    user_id: Optional[int]
+    is_admin: bool
+    # Saga to compensate. None -> callback-only path.
+    operation: Optional[KBOperation] = None
+    ingestion_result: Optional[IngestionResult] = None
+    doc_id: Optional[str] = None
+    source: Optional[str] = None  # URL or source path, for warning text
+    document_compensation: Optional[Callable[..., Any]] = None
+    file_compensation: Optional[Callable[[], Any]] = None
+    status_compensation: Optional[Callable[..., Any]] = None
+    snapshot_compensation: Optional[Callable[[], Any]] = None
+    rollback_context: Mapping[str, Any] = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
+class RollbackFailedIngestionResult:
+    """Outcome of coordinator-owned failed-ingest rollback orchestration."""
+
+    status: str  # "complete" | "incomplete" | "not_needed"
+    rollback_status: RollbackStatus
+    rollback_complete: bool
+    side_effects_may_remain: bool
+    first_error: Optional[str] = None
+    boundary_errors: Mapping[str, tuple[str, ...]] = field(default_factory=dict)
+    warnings: tuple[str, ...] = ()

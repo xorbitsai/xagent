@@ -27,6 +27,7 @@ from .operation_compatibility import (
 if TYPE_CHECKING:
     from ..core.schemas import CollectionInfo
     from .coordinator import KBCoordinator
+    from .models import RollbackFailedIngestionRequest, RollbackFailedIngestionResult
     from .storage_shim import KBStorageShimCompatibilityFacade
 
 KB_STORAGE_METADATA_KEY = "kb_storage"
@@ -50,6 +51,9 @@ class KBPipelineCompatibilityFacade:
         self._coordinator = coordinator
         self._storage_shim = storage_shim
         self._operation_compatibility = operation_compatibility
+        # Lazily-built coordinator bound to an injected shim (see
+        # _active_coordinator); cached so repeated calls reuse one instance.
+        self._shim_coordinator: KBCoordinator | None = None
 
     def _active_storage_shim(self) -> KBStorageShimCompatibilityFacade | None:
         if self._storage_shim is not None:
@@ -64,6 +68,28 @@ class KBPipelineCompatibilityFacade:
         if self._coordinator is not None:
             return self._coordinator.operation_compatibility
         return None
+
+    def _active_coordinator(self) -> KBCoordinator:
+        if self._coordinator is not None:
+            return self._coordinator
+
+        from .coordinator import KBCoordinator, get_kb_coordinator
+
+        # An injected shim without a coordinator must stay bound to that shim
+        # (mirrors the legacy-step facade pattern, legacy_step_compatibility
+        # _active_coordinator).
+        if self._storage_shim is not None:
+            if self._shim_coordinator is None:
+                self._shim_coordinator = KBCoordinator(storage_shim=self._storage_shim)
+            return self._shim_coordinator
+
+        return get_kb_coordinator()
+
+    def rollback_failed_ingestion_sync(
+        self, request: "RollbackFailedIngestionRequest"
+    ) -> "RollbackFailedIngestionResult":
+        """Delegate failed-ingest rollback orchestration to the coordinator."""
+        return self._active_coordinator().rollback_failed_ingestion_sync(request)
 
     @contextmanager
     def _storage_context(self) -> Iterator[None]:

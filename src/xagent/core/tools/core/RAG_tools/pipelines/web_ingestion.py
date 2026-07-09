@@ -192,22 +192,6 @@ def _ingestion_doc_id(ingestion_result: Optional[IngestionResult]) -> Optional[s
     return _string_or_none(ingestion_result.doc_id)
 
 
-def _boundary_idempotency_key(
-    *,
-    boundary: str,
-    collection: str,
-    file_info: FileHandlerResult,
-    url: str,
-    doc_id: Optional[str] = None,
-) -> str:
-    if doc_id:
-        return f"{boundary}:{collection}:{doc_id}"
-    return (
-        f"{boundary}:{collection}:"
-        f"{file_info.get('file_id') or file_info.get('file_path') or url}"
-    )
-
-
 def _run_file_handler_compensation(
     *,
     pipeline_facade: "KBPipelineCompatibilityFacade",
@@ -263,350 +247,45 @@ def _run_per_boundary_compensation(
     warnings: list[str],
     ingestion_result: Optional[IngestionResult] = None,
 ) -> Optional[str]:
-    from ..kb.operation_compatibility import SideEffectPlane
+    """Delegate per-boundary rollback orchestration to the coordinator (#515).
 
-    if page_operation is None:
-        return _run_per_boundary_callbacks_without_operation(
-            file_info=file_info,
-            url=url,
-            warnings=warnings,
-            ingestion_result=ingestion_result,
-        )
+    Boundary ordering, the SNAPSHOT-after-FILE gate, and error folding are
+    owned by KBCoordinator.rollback_failed_ingestion_sync. ``operation=None``
+    (no active page operation) selects the coordinator's callback-only path,
+    which absorbed the former _run_per_boundary_callbacks_without_operation
+    duplicate.
+    """
+    from ..kb.models import RollbackFailedIngestionRequest
 
-    rollback_context = _rollback_context_payload(file_info)
-    first_error: Optional[str] = None
-    doc_id = _ingestion_doc_id(ingestion_result)
+    rollback_context = dict(_rollback_context_payload(file_info) or {})
+    rollback_context.setdefault("file_id", file_info.get("file_id"))
+    rollback_context.setdefault("file_path", file_info.get("file_path"))
 
-    # DOCUMENT boundary
-    document_compensation = cast(
-        Optional[FileHandlerCallback], file_info.get("document_compensation")
-    )
-    if document_compensation is not None:
-        _record_document_boundary_compensation(
-            page_operation=page_operation,
-            file_info=file_info,
-            collection=collection,
-            url=url,
-            document_compensation=document_compensation,
-            ingestion_result=ingestion_result,
-            doc_id=doc_id,
-        )
-        document_errors = page_operation.execute_compensations(
-            step_names={"remove_registered_document"},
-            planes={SideEffectPlane.DOCUMENT},
-        )
-        first_error = _record_boundary_errors(
-            warnings=warnings,
-            url=url,
-            boundary="DOCUMENT",
-            errors=document_errors,
-            rollback_context=rollback_context,
-            first_error=first_error,
-        )
-
-    # FILE boundary
-    file_compensation = cast(
-        Optional[FileHandlerCallback], file_info.get("file_compensation")
-    )
-    file_succeeded = file_compensation is None
-    if file_compensation is not None:
-        pipeline_facade.record_web_page_file_side_effect(
-            page_operation,
-            collection=collection,
-            url=url,
-            file_path=cast(Optional[str], file_info.get("file_path")),
-            file_id=cast(Optional[str], file_info.get("file_id")),
-            reason="file_compensation",
-            extra_payload=rollback_context,
-            compensation=cast(Callable[[], None], file_compensation),
-        )
-        file_errors = pipeline_facade.compensate_web_page_file_side_effect(
-            page_operation
-        )
-        file_succeeded = not file_errors
-        first_error = _record_boundary_errors(
-            warnings=warnings,
-            url=url,
-            boundary="FILE",
-            errors=file_errors,
-            rollback_context=rollback_context,
-            first_error=first_error,
-        )
-
-    # STATUS boundary
-    status_compensation = cast(
-        Optional[FileHandlerCallback], file_info.get("status_compensation")
-    )
-    if status_compensation is not None:
-        _record_status_boundary_compensation(
-            page_operation=page_operation,
-            file_info=file_info,
-            collection=collection,
-            url=url,
-            status_compensation=status_compensation,
-            ingestion_result=ingestion_result,
-            doc_id=doc_id,
-        )
-        status_errors = page_operation.execute_compensations(
-            step_names={"clear_ingestion_status"},
-            planes={SideEffectPlane.STATUS},
-        )
-        first_error = _record_boundary_errors(
-            warnings=warnings,
-            url=url,
-            boundary="STATUS",
-            errors=status_errors,
-            rollback_context=rollback_context,
-            first_error=first_error,
-        )
-
-    # SNAPSHOT boundary - only cleanup backup if FILE restoration succeeded
-    snapshot_compensation = cast(
-        Optional[FileHandlerCallback], file_info.get("snapshot_compensation")
-    )
-    if snapshot_compensation is not None:
-        _record_snapshot_boundary_compensation(
-            page_operation=page_operation,
-            file_info=file_info,
-            collection=collection,
-            url=url,
-            snapshot_compensation=snapshot_compensation,
-            rollback_context=rollback_context,
-        )
-        file_registered = file_compensation is not None
-        if first_error is None and (not file_registered or file_succeeded):
-            snapshot_errors = page_operation.execute_compensations(
-                step_names={"cleanup_web_page_snapshot"},
-                planes={SideEffectPlane.SNAPSHOT},
-            )
-            first_error = _record_boundary_errors(
-                warnings=warnings,
-                url=url,
-                boundary="SNAPSHOT",
-                errors=snapshot_errors,
-                rollback_context=rollback_context,
-                first_error=first_error,
-            )
-
-    return first_error
-
-
-def _run_per_boundary_callbacks_without_operation(
-    *,
-    file_info: FileHandlerResult,
-    url: str,
-    warnings: list[str],
-    ingestion_result: Optional[IngestionResult] = None,
-) -> Optional[str]:
-    from ..kb.operation_compatibility import SideEffectPlane
-
-    rollback_context = _rollback_context_payload(file_info)
-    succeeded: set[Any] = set()
-    first_error: Optional[str] = None
-
-    document_compensation = cast(
-        Optional[FileHandlerCallback], file_info.get("document_compensation")
-    )
-    if document_compensation is not None:
-        try:
-            callback = document_compensation(ingestion_result)
-            callback()
-        except Exception as exc:  # noqa: BLE001
-            _handle_boundary_failure(warnings, url, "DOCUMENT", exc, rollback_context)
-            first_error = first_error or f"DOCUMENT boundary compensation failed: {exc}"
-
-    file_compensation = cast(
-        Optional[FileHandlerCallback], file_info.get("file_compensation")
-    )
-    if file_compensation is not None:
-        try:
-            file_compensation()
-        except Exception as exc:  # noqa: BLE001
-            _handle_boundary_failure(warnings, url, "FILE", exc, rollback_context)
-            first_error = first_error or f"FILE boundary compensation failed: {exc}"
-        else:
-            succeeded.add(SideEffectPlane.FILE)
-
-    status_compensation = cast(
-        Optional[FileHandlerCallback], file_info.get("status_compensation")
-    )
-    if status_compensation is not None:
-        try:
-            callback = status_compensation(ingestion_result)
-            callback()
-        except Exception as exc:  # noqa: BLE001
-            _handle_boundary_failure(warnings, url, "STATUS", exc, rollback_context)
-            first_error = first_error or f"STATUS boundary compensation failed: {exc}"
-
-    snapshot_compensation = cast(
-        Optional[FileHandlerCallback], file_info.get("snapshot_compensation")
-    )
-    if snapshot_compensation is not None:
-        file_registered = file_compensation is not None
-        file_succeeded = SideEffectPlane.FILE in succeeded
-        if first_error is None and (not file_registered or file_succeeded):
-            try:
-                snapshot_compensation()
-            except Exception as exc:  # noqa: BLE001
-                _handle_boundary_failure(
-                    warnings, url, "SNAPSHOT", exc, rollback_context
-                )
-                first_error = (
-                    first_error or f"SNAPSHOT boundary compensation failed: {exc}"
-                )
-
-    return first_error
-
-
-def _record_document_boundary_compensation(
-    *,
-    page_operation: Any,
-    file_info: FileHandlerResult,
-    collection: str,
-    url: str,
-    document_compensation: FileHandlerCallback,
-    ingestion_result: Optional[IngestionResult],
-    doc_id: Optional[str],
-) -> None:
-    from ..kb.operation_compatibility import SideEffectPlane
-
-    def _compensate() -> None:
-        callback = document_compensation(ingestion_result)
-        result = callback()
-        if inspect.isawaitable(result):
-            _close_awaitable_if_possible(result)
-            raise TypeError(
-                f"Async DOCUMENT compensation callback is not supported for {url}"
-            )
-        # delete_document() cascades to parse, chunk, and embedding. Collection
-        # initialization is shared and not rolled back at the page level, so a
-        # successful document compensation covers that page-level plane too.
-        page_operation.mark_compensated_steps(
-            planes={
-                SideEffectPlane.COLLECTION,
-                SideEffectPlane.DOCUMENT,
-                SideEffectPlane.PARSE,
-                SideEffectPlane.CHUNK,
-                SideEffectPlane.EMBEDDING,
-            }
-        )
-
-    page_operation.record_side_effect(
-        name="remove_registered_document",
-        plane=SideEffectPlane.DOCUMENT,
-        payload={
-            "collection": collection,
-            "url": url,
-            "doc_id": doc_id,
-            "file_id": file_info.get("file_id"),
-            "rollback_kind": (_rollback_context_payload(file_info) or {}).get(
-                "rollback_kind"
-            ),
-        },
-        idempotency_key=_boundary_idempotency_key(
-            boundary="document",
-            collection=collection,
-            file_info=file_info,
-            url=url,
-            doc_id=doc_id,
+    request = RollbackFailedIngestionRequest(
+        collection=collection,
+        user_id=None,
+        is_admin=False,
+        operation=page_operation,
+        ingestion_result=ingestion_result,
+        doc_id=_ingestion_doc_id(ingestion_result),
+        source=url,
+        document_compensation=cast(
+            Optional[FileHandlerCallback], file_info.get("document_compensation")
         ),
-        compensation=_compensate,
-    )
-
-
-def _record_status_boundary_compensation(
-    *,
-    page_operation: Any,
-    file_info: FileHandlerResult,
-    collection: str,
-    url: str,
-    status_compensation: FileHandlerCallback,
-    ingestion_result: Optional[IngestionResult],
-    doc_id: Optional[str],
-) -> None:
-    from ..kb.operation_compatibility import SideEffectPlane
-
-    def _compensate() -> None:
-        callback = status_compensation(ingestion_result)
-        result = callback()
-        if inspect.isawaitable(result):
-            _close_awaitable_if_possible(result)
-            raise TypeError(
-                f"Async STATUS compensation callback is not supported for {url}"
-            )
-
-    page_operation.record_side_effect(
-        name="clear_ingestion_status",
-        plane=SideEffectPlane.STATUS,
-        payload={
-            "collection": collection,
-            "url": url,
-            "doc_id": doc_id,
-            "file_id": file_info.get("file_id"),
-            "rollback_kind": (_rollback_context_payload(file_info) or {}).get(
-                "rollback_kind"
-            ),
-        },
-        idempotency_key=_boundary_idempotency_key(
-            boundary="status",
-            collection=collection,
-            file_info=file_info,
-            url=url,
-            doc_id=doc_id,
+        file_compensation=cast(
+            Optional[FileHandlerCallback], file_info.get("file_compensation")
         ),
-        compensation=_compensate,
+        status_compensation=cast(
+            Optional[FileHandlerCallback], file_info.get("status_compensation")
+        ),
+        snapshot_compensation=cast(
+            Optional[FileHandlerCallback], file_info.get("snapshot_compensation")
+        ),
+        rollback_context=rollback_context,
     )
-
-
-def _record_snapshot_boundary_compensation(
-    *,
-    page_operation: Any,
-    file_info: FileHandlerResult,
-    collection: str,
-    url: str,
-    snapshot_compensation: FileHandlerCallback,
-    rollback_context: Optional[dict[str, object]],
-) -> None:
-    from ..kb.operation_compatibility import SideEffectPlane
-
-    backup_path = None
-    if rollback_context is not None:
-        backup_path = rollback_context.get("backup_path")
-    key_source = (
-        backup_path or file_info.get("file_id") or file_info.get("file_path") or url
-    )
-
-    page_operation.record_side_effect(
-        name="cleanup_web_page_snapshot",
-        plane=SideEffectPlane.SNAPSHOT,
-        payload={
-            "collection": collection,
-            "url": url,
-            "backup_path": backup_path,
-            "file_id": file_info.get("file_id"),
-            "rollback_kind": (rollback_context or {}).get("rollback_kind"),
-        },
-        idempotency_key=f"snapshot:{collection}:{key_source}",
-        compensation=cast(Callable[[], None], snapshot_compensation),
-    )
-
-
-def _record_boundary_errors(
-    *,
-    warnings: list[str],
-    url: str,
-    boundary: str,
-    errors: tuple[BaseException, ...],
-    rollback_context: Optional[dict[str, object]],
-    first_error: Optional[str],
-) -> Optional[str]:
-    if not errors:
-        return first_error
-    for exc in errors:
-        _handle_boundary_failure(warnings, url, boundary, exc, rollback_context)
-    if first_error is not None:
-        return first_error
-    return f"{boundary} boundary compensation failed: {errors[0]}"
+    result = pipeline_facade.rollback_failed_ingestion_sync(request)
+    warnings.extend(result.warnings)
+    return result.first_error
 
 
 def _run_legacy_rollback_compensation(
@@ -662,19 +341,6 @@ def _run_legacy_rollback_compensation(
     logger.warning(message)
     warnings.append(message)
     return cleanup_reason
-
-
-def _handle_boundary_failure(
-    warnings: list[str],
-    url: str,
-    boundary: str,
-    exc: BaseException,
-    rollback_context: Optional[dict[str, object]],
-) -> None:
-    """Log and record a per-boundary compensation failure."""
-    message = f"Web rollback {boundary} compensation failed for {url}: {exc}"
-    logger.warning(message)
-    warnings.append(message)
 
 
 def _run_legacy_persistent_file_compensation(
@@ -984,7 +650,6 @@ async def _run_web_ingestion_impl(
                                 page_operation,
                                 status="error",
                                 message=failure_message,
-                                side_effects_may_remain=True,
                             )
                             continue
 

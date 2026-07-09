@@ -5,6 +5,7 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Optional
+from unittest.mock import MagicMock
 
 import pytest
 
@@ -21,6 +22,10 @@ from xagent.core.tools.core.RAG_tools.kb import (
     KBPipelineCompatibilityFacade,
     RollbackStatus,
     SideEffectPlane,
+)
+from xagent.core.tools.core.RAG_tools.kb.models import (
+    RollbackFailedIngestionRequest,
+    RollbackFailedIngestionResult,
 )
 
 
@@ -1344,3 +1349,75 @@ def test_rollback_on_failure_compat_wrapper_delegates_to_per_boundary(
 
     _rollback_compat(None)
     assert calls == ["called", "file", "snapshot"]
+
+
+def test_pipeline_facade_rollback_delegates_to_coordinator() -> None:
+    coordinator = MagicMock()
+    expected = RollbackFailedIngestionResult(
+        status="complete",
+        rollback_status=RollbackStatus.COMPLETE,
+        rollback_complete=True,
+        side_effects_may_remain=False,
+    )
+    coordinator.rollback_failed_ingestion_sync.return_value = expected
+    facade = KBPipelineCompatibilityFacade(coordinator=coordinator)
+    request = RollbackFailedIngestionRequest(
+        collection="demo", user_id=None, is_admin=False
+    )
+
+    result = facade.rollback_failed_ingestion_sync(request)
+
+    assert result is expected
+    coordinator.rollback_failed_ingestion_sync.assert_called_once_with(request)
+
+
+def test_run_per_boundary_compensation_delegates_to_coordinator() -> None:
+    from xagent.core.tools.core.RAG_tools.pipelines import web_ingestion
+
+    facade = MagicMock()
+    facade.rollback_failed_ingestion_sync.return_value = RollbackFailedIngestionResult(
+        status="incomplete",
+        rollback_status=RollbackStatus.INCOMPLETE,
+        rollback_complete=False,
+        side_effects_may_remain=True,
+        first_error="FILE boundary compensation failed: boom",
+        warnings=("w1", "w2"),
+    )
+    page_operation = object()
+    warnings: list[str] = []
+
+    def _file_cb() -> None:
+        return None
+
+    def _document_factory(result: object = None) -> object:
+        return lambda: None
+
+    first_error = web_ingestion._run_per_boundary_compensation(
+        pipeline_facade=facade,
+        page_operation=page_operation,
+        file_info={
+            "file_path": "/tmp/page.md",
+            "file_id": "file-1",
+            "file_compensation": _file_cb,
+            "document_compensation": _document_factory,
+            "rollback_context": {"rollback_kind": "new_web_file"},
+        },
+        collection="demo",
+        url="https://example.com/a",
+        warnings=warnings,
+        ingestion_result=None,
+    )
+
+    assert first_error == "FILE boundary compensation failed: boom"
+    assert warnings == ["w1", "w2"]
+    facade.rollback_failed_ingestion_sync.assert_called_once()
+    request = facade.rollback_failed_ingestion_sync.call_args.args[0]
+    assert isinstance(request, RollbackFailedIngestionRequest)
+    assert request.collection == "demo"
+    assert request.source == "https://example.com/a"
+    assert request.operation is page_operation
+    assert request.file_compensation is _file_cb
+    assert request.document_compensation is _document_factory
+    assert request.rollback_context["rollback_kind"] == "new_web_file"
+    assert request.rollback_context["file_id"] == "file-1"
+    assert request.rollback_context["file_path"] == "/tmp/page.md"

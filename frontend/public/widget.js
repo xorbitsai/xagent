@@ -134,7 +134,7 @@
     // The widget key is deliberately NOT placed in the iframe URL: the ticket
     // is sufficient to authenticate, and keeping the key out of the frame
     // means the embedded widget has no credential to fall back on.
-    var url = host + '/widget/chat/' + token + '?guest_id=' + guestId;
+    var url = host + '/widget/chat/' + token + '?guest_id=' + encodeURIComponent(guestId);
     if (agentId) {
       url += '&agent_id=' + encodeURIComponent(agentId);
     }

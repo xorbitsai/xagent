@@ -14,6 +14,8 @@ function WidgetChatInner() {
       authMode="widget"
       routeToken={token}
       guestId={searchParams.get("guest_id")}
+      endUserId={searchParams.get("end_user_id")}
+      endUserSignature={searchParams.get("end_user_signature")}
       searchAgentId={searchParams.get("agent_id") ? parseInt(searchParams.get("agent_id") as string, 10) : null}
       embedTicket={searchParams.get("embed_ticket")}
       widgetKey={searchParams.get("widget_key")}

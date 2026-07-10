@@ -35,6 +35,7 @@ _AGENT_UPDATE_FIELDS = {
     "widget_enabled",
     "allowed_domains",
     "widget_key",
+    "widget_end_user_secret",
     "share_enabled",
     "share_token",
     "share_updated_at",
@@ -47,6 +48,12 @@ def clean_tool_categories(categories: Any) -> list[str]:
 
 def new_widget_key() -> str:
     """Generate an unguessable widget embed credential for an agent."""
+    return secrets.token_urlsafe(32)
+
+
+def new_widget_end_user_secret() -> str:
+    """Generate the HMAC secret used to verify signed end-user identity
+    claims. Owner-only: never returned by the embed-ticket/auth flow."""
     return secrets.token_urlsafe(32)
 
 

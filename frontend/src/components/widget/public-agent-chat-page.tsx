@@ -18,6 +18,8 @@ interface PublicAgentChatPageProps {
   authMode: "widget" | "share"
   routeToken: string
   guestId?: string | null
+  endUserId?: string | null
+  endUserSignature?: string | null
   searchAgentId?: number | null
   embedTicket?: string | null
   widgetKey?: string | null
@@ -295,12 +297,17 @@ export function PublicAgentChatPage({
   authMode,
   routeToken,
   guestId,
+  endUserId,
+  endUserSignature,
   searchAgentId = null,
   embedTicket = null,
   widgetKey = null,
 }: PublicAgentChatPageProps) {
   const { t } = useI18n()
-  const normalizedGuestId = authMode === "widget" ? (guestId || "anonymous") : null
+  // A verified end-user identity takes precedence over the anonymous
+  // per-browser guest_id for cache-key purposes too, so the same person
+  // resumes their conversation across devices/browsers.
+  const normalizedGuestId = authMode === "widget" ? (endUserId || guestId || "anonymous") : null
   const [isInitializing, setIsInitializing] = useState(true)
   const [errorMessage, setErrorMessage] = useState<string | null>(null)
   const [authResult, setAuthResult] = useState<PublicAuthResult | null>(null)
@@ -312,7 +319,11 @@ export function PublicAgentChatPage({
         const authPayload = authMode === "share"
           ? { share_token: routeToken }
           : {
-              guest_id: normalizedGuestId,
+              // end_user_id/end_user_signature identify a specific, signed
+              // user; guest_id is only sent for the anonymous fallback.
+              ...(endUserId
+                ? { end_user_id: endUserId, end_user_signature: endUserSignature }
+                : { guest_id: normalizedGuestId }),
               agent_id: searchAgentId,
               embed_ticket: embedTicket || undefined,
               // Direct visits (no embed ticket) authenticate with the widget

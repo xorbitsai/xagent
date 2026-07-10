@@ -1,5 +1,7 @@
 """Web Widget API route handlers."""
 
+import hashlib
+import hmac
 from datetime import timedelta
 from typing import Any, Optional
 from urllib.parse import urlparse
@@ -16,7 +18,7 @@ from fastapi import (
     WebSocket,
 )
 from jose import JWTError, jwt
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 from sqlalchemy.orm import Session
 
 from ..auth_config import JWT_ALGORITHM, JWT_SECRET_KEY
@@ -52,9 +54,32 @@ WIDGET_CREDENTIAL_REQUIRED_DETAIL = (
     "Re-copy the embed snippet from the agent's App Widget settings."
 )
 
+# Namespace for guest_ids backed by a verified end-user identity (see
+# _resolve_verified_guest_id). Reserved so a client can never forge a
+# "verified" guest_id for someone else's end_user_id without producing a
+# valid HMAC signature for it -- request validation rejects any
+# client-supplied guest_id that starts with this prefix outright.
+VERIFIED_END_USER_GUEST_ID_PREFIX = "verified_end_user:"
+
 
 class WidgetAuthRequest(BaseModel):
-    guest_id: str = Field(max_length=256)
+    # Opaque, unauthenticated per-browser session id (the widget's own random
+    # anonymous fallback). Not used to assert a real identity, so it needs no
+    # verification -- knowledge of this high-entropy value is itself the only
+    # "credential" it ever carried. Reserved-prefix values are rejected below
+    # since only a verified end_user_id may produce one (see
+    # _resolve_verified_guest_id).
+    guest_id: Optional[str] = Field(default=None, max_length=256)
+    # A real end-user identity from the embedding page (data-end-user-id),
+    # scoped to a specific user/tenant rather than an anonymous browser. Must
+    # be accompanied by end_user_signature: an unverified identity claim is a
+    # BOLA/IDOR risk (anyone could claim to be any user), unlike guest_id
+    # which was never meant to assert who someone is.
+    end_user_id: Optional[str] = Field(default=None, max_length=256)
+    # hex-encoded HMAC-SHA256(agent.widget_end_user_secret, end_user_id),
+    # computed server-side by the embedding site and never exposed to the
+    # browser it's minted for.
+    end_user_signature: Optional[str] = Field(default=None, max_length=128)
     # Retained for backward compatibility with older embed pages; the agent is
     # authoritatively resolved from the embed ticket or widget key, never from
     # this client-supplied id.
@@ -64,6 +89,14 @@ class WidgetAuthRequest(BaseModel):
     embed_ticket: Optional[str] = Field(default=None, max_length=4096)
     # Direct (non-embedded) visits carry the widget key instead of a ticket.
     widget_key: Optional[str] = Field(default=None, max_length=512)
+
+    @model_validator(mode="after")
+    def _require_an_identity(self) -> "WidgetAuthRequest":
+        if not self.guest_id and not self.end_user_id:
+            raise ValueError("Either guest_id or end_user_id is required")
+        if self.end_user_id and not self.end_user_signature:
+            raise ValueError("end_user_signature is required when end_user_id is set")
+        return self
 
 
 class EmbedTicketRequest(BaseModel):
@@ -239,6 +272,46 @@ def _resolve_widget_auth_agent(db: Session, request: WidgetAuthRequest) -> Agent
     raise HTTPException(status_code=403, detail=WIDGET_CREDENTIAL_REQUIRED_DETAIL)
 
 
+def _resolve_authenticated_guest_id(agent: Agent, request: WidgetAuthRequest) -> str:
+    """Resolve the guest_id to embed in the guest token.
+
+    An end_user_id claim only becomes a guest_id if it carries a valid HMAC
+    signature (proving the embedding site's own server vouched for it, not
+    just whatever the browser sent) -- otherwise anyone could claim to be any
+    user and read their conversation history via /tasks/latest. A bare
+    guest_id is left as an opaque, unauthenticated per-browser id exactly as
+    before, except it may never itself forge into the reserved "verified"
+    namespace: that would let a request skip signing by simply omitting
+    end_user_id and passing the target guest_id directly.
+    """
+    if request.end_user_id:
+        secret = agent.widget_end_user_secret
+        if not secret:
+            raise HTTPException(
+                status_code=403,
+                detail=(
+                    "This agent has no end-user signing secret configured; "
+                    "generate one from the agent's App Widget settings before "
+                    "sending data-end-user-id."
+                ),
+            )
+        expected_signature = hmac.new(
+            secret.encode("utf-8"),
+            request.end_user_id.encode("utf-8"),
+            hashlib.sha256,
+        ).hexdigest()
+        if not hmac.compare_digest(
+            expected_signature, request.end_user_signature or ""
+        ):
+            raise HTTPException(status_code=403, detail="Invalid end-user signature")
+        return f"{VERIFIED_END_USER_GUEST_ID_PREFIX}{request.end_user_id}"
+
+    guest_id = request.guest_id or ""
+    if guest_id.startswith(VERIFIED_END_USER_GUEST_ID_PREFIX):
+        raise HTTPException(status_code=403, detail="Invalid guest_id")
+    return guest_id
+
+
 @widget_router.post("/auth", response_model=WidgetAuthResponse)
 async def authenticate_widget(
     request: WidgetAuthRequest,
@@ -253,12 +326,14 @@ async def authenticate_widget(
             status_code=401, detail="Widget owner not found or invalid agent_id"
         )
 
+    guest_id = _resolve_authenticated_guest_id(agent, request)
+
     access_token = create_public_chat_access_token(
         {
             "sub": user.username,
             "user_id": user.id,
             "channel_id": None,
-            "guest_id": request.guest_id,
+            "guest_id": guest_id,
             "auth_mode": "widget",
             "widget_agent_id": int(agent.id),
         }

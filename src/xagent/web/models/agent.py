@@ -74,6 +74,12 @@ class Agent(Base):  # type: ignore
     # real access gate for widget guest tokens (allowed_domains is only a
     # browser-level restriction). Owner-visible, rotatable.
     widget_key = Column(String(255), nullable=True, unique=True, index=True)
+    # Secret used to verify HMAC-signed data-end-user-id claims (see
+    # /api/widget/auth). Unlike widget_key, this must never be returned by any
+    # endpoint reachable from the embed snippet or the widget iframe -- it is
+    # owner-only, fetched from the agent builder and used server-side by the
+    # embedding site to sign end-user ids, never shipped to a browser.
+    widget_end_user_secret = Column(String(255), nullable=True)
     share_enabled = Column(Boolean, default=False, nullable=False)
     share_token = Column(String(255), nullable=True, index=True)
     share_updated_at = Column(DateTime(timezone=True), nullable=True)

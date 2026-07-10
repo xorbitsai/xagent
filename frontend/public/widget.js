@@ -108,14 +108,23 @@
   // pass that identity via data-end-user-id so the widget session is scoped
   // to that specific user instead of an anonymous per-browser id. This value
   // is supplied by the embedding page on every load, so it is not cached.
+  //
+  // An identity claim is only trustworthy if it's signed: without
+  // data-end-user-signature, anyone viewing this page's source (or calling
+  // /api/widget/auth directly) could claim to be any other user and read
+  // their conversation history. The signature must be computed server-side
+  // by the embedding site using the agent's widget_end_user_secret (from
+  // App Widget settings) -- never compute it in browser JS, which would
+  // expose the secret to the same visitors it's meant to authenticate.
   var endUserId = (scriptTag.getAttribute('data-end-user-id') || '').trim();
-  var guestId;
-  if (endUserId) {
-    // Match the backend's guest_id length cap (see WidgetAuthRequest) so an
-    // oversized value fails fast client-side instead of a 422 from /auth.
-    guestId = endUserId.substring(0, 256);
-  } else {
-    // No end-user identity provided: fall back to an anonymous per-browser
+  var endUserSignature = (scriptTag.getAttribute('data-end-user-signature') || '').trim();
+  var guestId = null;
+  if (endUserId && !endUserSignature) {
+    console.error('Xagent Widget: data-end-user-id was provided without data-end-user-signature; ignoring it and falling back to an anonymous session. Sign end_user_id server-side with the agent\'s end-user secret (see App Widget settings).');
+    endUserId = '';
+  }
+  if (!endUserId) {
+    // No verified end-user identity: fall back to an anonymous per-browser
     // id, generated once and cached so the same browser resumes the same
     // conversation across page loads.
     guestId = localStorage.getItem('xagent_guest_id');
@@ -134,7 +143,13 @@
     // The widget key is deliberately NOT placed in the iframe URL: the ticket
     // is sufficient to authenticate, and keeping the key out of the frame
     // means the embedded widget has no credential to fall back on.
-    var url = host + '/widget/chat/' + token + '?guest_id=' + encodeURIComponent(guestId);
+    var url = host + '/widget/chat/' + token;
+    if (endUserId) {
+      url += '?end_user_id=' + encodeURIComponent(endUserId.substring(0, 256))
+        + '&end_user_signature=' + encodeURIComponent(endUserSignature);
+    } else {
+      url += '?guest_id=' + encodeURIComponent(guestId);
+    }
     if (agentId) {
       url += '&agent_id=' + encodeURIComponent(agentId);
     }

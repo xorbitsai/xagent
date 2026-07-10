@@ -36,7 +36,11 @@ from ..services.agent_management import (
     DuplicateAgentNameError,
     TemplateNotFoundError,
 )
-from ..services.agent_store import AgentStore, new_widget_key
+from ..services.agent_store import (
+    AgentStore,
+    new_widget_end_user_secret,
+    new_widget_key,
+)
 from ..services.api_keys import AgentApiKeyService, KeyRotationConflict
 from ..services.llm_utils import UserAwareModelStorage
 from ..tools.config import WebToolConfig
@@ -159,6 +163,17 @@ class AgentWidgetKeyResponse(BaseModel):
     agent_id: int
     widget_enabled: bool
     widget_key: str
+
+
+class AgentWidgetEndUserSecretResponse(BaseModel):
+    """Owner-only HMAC secret for signing data-end-user-id claims.
+
+    Never returned by any endpoint reachable from the embed snippet or the
+    widget iframe -- only from this owner-authenticated route.
+    """
+
+    agent_id: int
+    widget_end_user_secret: str
 
 
 class PublishResponse(BaseModel):
@@ -946,6 +961,82 @@ async def rotate_agent_widget_key(
         raise
     except Exception as e:
         logger.error(f"Failed to rotate widget key for agent {agent_id}: {e}")
+        db.rollback()
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.get(
+    "/{agent_id}/widget-end-user-secret",
+    response_model=AgentWidgetEndUserSecretResponse,
+)
+async def get_agent_widget_end_user_secret(
+    agent_id: int,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> AgentWidgetEndUserSecretResponse:
+    """Return the owner-only HMAC secret for signing data-end-user-id claims,
+    generating one if missing. Use this secret server-side, on the embedding
+    site, to sign each end user's id -- never expose it in the embed snippet
+    or any client-side code."""
+    try:
+        store = AgentStore(db)
+        user_id = int(current_user.id)
+        agent = store.get_owned_agent(user_id, agent_id)
+        if agent is None:
+            raise HTTPException(status_code=404, detail="Agent not found")
+        if not agent.widget_end_user_secret:
+            agent = store.update_agent_fields(
+                user_id,
+                agent_id,
+                {"widget_end_user_secret": new_widget_end_user_secret()},
+            )
+            if agent is None:
+                raise HTTPException(status_code=404, detail="Agent not found")
+        return AgentWidgetEndUserSecretResponse(
+            agent_id=int(agent.id),
+            widget_end_user_secret=str(agent.widget_end_user_secret),
+        )
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Failed to get widget end-user secret for agent {agent_id}: {e}")
+        db.rollback()
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.post(
+    "/{agent_id}/widget-end-user-secret/rotate",
+    response_model=AgentWidgetEndUserSecretResponse,
+)
+async def rotate_agent_widget_end_user_secret(
+    agent_id: int,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> AgentWidgetEndUserSecretResponse:
+    """Rotate the end-user signing secret, invalidating signatures computed
+    with the previous value."""
+    try:
+        store = AgentStore(db)
+        user_id = int(current_user.id)
+        if store.get_owned_agent(user_id, agent_id) is None:
+            raise HTTPException(status_code=404, detail="Agent not found")
+        agent = store.update_agent_fields(
+            user_id,
+            agent_id,
+            {"widget_end_user_secret": new_widget_end_user_secret()},
+        )
+        if agent is None:
+            raise HTTPException(status_code=404, detail="Agent not found")
+        return AgentWidgetEndUserSecretResponse(
+            agent_id=int(agent.id),
+            widget_end_user_secret=str(agent.widget_end_user_secret),
+        )
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(
+            f"Failed to rotate widget end-user secret for agent {agent_id}: {e}"
+        )
         db.rollback()
         raise HTTPException(status_code=500, detail=str(e))
 

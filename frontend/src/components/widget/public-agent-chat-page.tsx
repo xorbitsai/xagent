@@ -34,6 +34,24 @@ type PublicAuthResult = {
   suggested_prompts?: string[] | null
 }
 
+// This route is normally only reached via widget.js, which always supplies
+// either end_user_id or a random per-browser guest_id in the query string.
+// A visitor who reaches it directly (or an embed that omits both) has
+// neither -- falling back to a shared literal like "anonymous" would let
+// unrelated direct visitors collide on the same auto-resumed conversation
+// (see /tasks/latest), so generate a real per-browser random id instead,
+// exactly like widget.js does for its own anonymous fallback.
+function getOrCreateDirectFallbackGuestId(): string {
+  if (typeof window === "undefined") return "anonymous"
+  const STORAGE_KEY = "xagent_direct_guest_id"
+  let stored = window.localStorage.getItem(STORAGE_KEY)
+  if (!stored) {
+    stored = "direct_" + Math.random().toString(36).substring(2, 15) + Math.random().toString(36).substring(2, 15)
+    window.localStorage.setItem(STORAGE_KEY, stored)
+  }
+  return stored
+}
+
 interface PublicConversationContentProps {
   authMode: "widget" | "share"
   routeToken: string
@@ -306,8 +324,12 @@ export function PublicAgentChatPage({
   const { t } = useI18n()
   // A verified end-user identity takes precedence over the anonymous
   // per-browser guest_id for cache-key purposes too, so the same person
-  // resumes their conversation across devices/browsers.
-  const normalizedGuestId = authMode === "widget" ? (endUserId || guestId || "anonymous") : null
+  // resumes their conversation across devices/browsers. Neither present
+  // means this route was reached without going through widget.js -- fall
+  // back to a real per-browser random id, never a shared literal.
+  const normalizedGuestId = authMode === "widget"
+    ? (endUserId || guestId || getOrCreateDirectFallbackGuestId())
+    : null
   const [isInitializing, setIsInitializing] = useState(true)
   const [errorMessage, setErrorMessage] = useState<string | null>(null)
   const [authResult, setAuthResult] = useState<PublicAuthResult | null>(null)

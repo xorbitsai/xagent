@@ -103,6 +103,11 @@ class TaskTracker:
         )
         set_token_usage(initial_usage)
 
+        # Snapshot the seeded totals so complete_tracking can meter only this
+        # turn's delta (start_tracking seeds from prior turns for multi-turn tasks).
+        self._initial_total_tokens = initial_usage.total_tokens
+        self._initial_llm_calls = initial_usage.llm_calls
+
         logger.info(f"Started token tracking for task {self.task_id}")
 
         # Automatically start periodic updates (this will set _is_tracking)
@@ -304,6 +309,16 @@ class TaskTracker:
             f"input={usage.input_tokens}, output={usage.output_tokens}, "
             f"total={usage.total_tokens}, calls={usage.llm_calls}"
         )
+
+        # Best-effort quota metering: record only this turn's delta.
+        try:
+            from ..services.quota_hooks import record_usage
+
+            delta_tokens = max(0, usage.total_tokens - getattr(self, "_initial_total_tokens", 0))
+            delta_calls = max(0, usage.llm_calls - getattr(self, "_initial_llm_calls", 0))
+            record_usage(self.db_session, getattr(self.task, "user_id", None), delta_tokens, delta_calls)
+        except Exception as e:  # noqa: BLE001
+            logger.warning(f"Quota usage recording failed for task {self.task_id}: {e}")
 
         return usage
 

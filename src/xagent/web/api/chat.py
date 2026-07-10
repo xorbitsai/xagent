@@ -2123,6 +2123,29 @@ class AgentServiceManager:
         lease_heartbeat_task = None
         result: Dict[str, Any] | None = None
         sandbox_task_key = None
+
+        # Quota gate: refuse to start a run when the team is out of monthly
+        # quota. Fails open if the check itself errors, so quota infra problems
+        # never block execution.
+        if db_session and tracker_task_id:
+            try:
+                from ..services.quota_hooks import check_run_gate
+
+                gate_task = (
+                    db_session.query(Task).filter(Task.id == int(tracker_task_id)).first()
+                )
+                gate_reason = check_run_gate(
+                    db_session, getattr(gate_task, "user_id", None)
+                )
+                if gate_reason:
+                    return {
+                        "success": False,
+                        "status": "quota_exceeded",
+                        "error": gate_reason,
+                    }
+            except Exception:
+                logger.debug("Quota gate check failed open", exc_info=True)
+
         if manage_task_lease and db_session and tracker_task_id:
             lease = acquire_task_lease(db_session, int(tracker_task_id))
             if lease is None:

@@ -3776,6 +3776,18 @@ async def ingest(
     except ValueError:
         collection_existed_before = False
 
+    # Storage quota gate: block ingest when the team is already at its KB
+    # storage limit. Coarse (allows one file to push slightly over) to avoid
+    # cleaning up an already-written file; fails open on check errors.
+    try:
+        from ..services.quota_hooks import check_storage_gate
+
+        storage_reason = check_storage_gate(db, getattr(_user, "id", None))
+    except Exception:
+        storage_reason = None
+    if storage_reason:
+        raise HTTPException(status_code=402, detail=storage_reason)
+
     existing_file_record = (
         db.query(UploadedFile)
         .filter(UploadedFile.storage_path == str(file_path))

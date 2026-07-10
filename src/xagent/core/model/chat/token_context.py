@@ -179,6 +179,16 @@ def get_token_usage() -> TokenUsage:
     return usage
 
 
+def _coerce_int(value: Any) -> int:
+    """Best-effort int; 0 if the value isn't a usable number (e.g. None/mock)."""
+    if isinstance(value, bool):
+        return int(value)
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return 0
+
+
 def add_token_usage(
     input_tokens: int = 0,
     output_tokens: int = 0,
@@ -193,6 +203,11 @@ def add_token_usage(
         model: Model name for tracking
         call_type: Type of call (chat, stream_chat, vision_chat, etc.)
     """
+    # Coerce defensively: a provider/response that yields a non-int token count
+    # (or a mock in tests) must never crash the LLM call over accounting.
+    input_tokens = _coerce_int(input_tokens)
+    output_tokens = _coerce_int(output_tokens)
+
     usage = get_token_usage()
     if input_tokens or output_tokens:
         # Increment LLM call counter for each API call

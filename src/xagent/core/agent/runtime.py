@@ -584,8 +584,14 @@ class PatternRuntime:
             )
 
     async def on_tool_start(self, *, tool_call: dict[str, Any]) -> None:
-        # Count one billable action per tool invocation (fires once per tool,
-        # including each tool in a concurrent batch).
+        # Count one billable action per tool invocation, at invocation time.
+        # Deliberately NOT gated on tool success: success is derived from the
+        # tool's own return value, and custom MCP tools are user-controlled, so
+        # billing on self-reported success is trivially gamed (wrap real output
+        # in {"success": false}). An invocation consumes real resources
+        # (the MCP/compute round + the LLM turn that chose it) regardless of
+        # outcome, so the non-gameable, resource-aligned signal is "it ran".
+        # Fires once per tool, including each tool in a concurrent batch.
         try:
             from ..model.chat.token_context import add_tool_call_usage
 

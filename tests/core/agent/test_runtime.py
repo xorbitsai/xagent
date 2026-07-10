@@ -640,8 +640,13 @@ async def test_on_llm_start_emits_context_usage_fields() -> None:
 
 
 @pytest.mark.asyncio
-async def test_on_tool_start_counts_one_action_per_tool() -> None:
-    """Each tool invocation increments the token-context tool_calls counter."""
+async def test_tool_invocation_counts_one_action_each() -> None:
+    """Each tool invocation increments tool_calls at start time.
+
+    Billing on invocation (not self-reported success) is intentional: success
+    comes from the tool's own return value, and user-controlled MCP tools could
+    otherwise dodge billing by wrapping real output in {"success": false}.
+    """
     from xagent.core.model.chat.token_context import (
         TokenUsage,
         get_token_usage,
@@ -653,5 +658,10 @@ async def test_on_tool_start_counts_one_action_per_tool() -> None:
 
     await runtime.on_tool_start(tool_call={"name": "calc", "args": {}, "id": "t1"})
     await runtime.on_tool_start(tool_call={"name": "search", "args": {}, "id": "t2"})
+    assert get_token_usage().tool_calls == 2
 
+    # Even a tool that will report failure was still invoked → billed.
+    await runtime.on_tool_end(
+        tool_call={"name": "search", "id": "t2"}, result={"success": False, "error": "boom"}
+    )
     assert get_token_usage().tool_calls == 2

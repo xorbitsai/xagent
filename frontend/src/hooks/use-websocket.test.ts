@@ -178,6 +178,39 @@ describe("useWebSocket message delivery", () => {
     })
   })
 
+  it("allows the same text to be sent again after the first ack", async () => {
+    const { result } = renderHook(() => useWebSocket({
+      url: "ws://localhost",
+      taskId: 1,
+    }))
+
+    await waitFor(() => expect(MockWebSocket.instances).toHaveLength(1))
+    const socket = MockWebSocket.instances[0]
+    act(() => socket.open())
+
+    const first = result.current.sendChatMessage("ok")
+    const firstPayload = JSON.parse(socket.send.mock.calls[0][0])
+    act(() => {
+      socket.receive({
+        type: "message_accepted",
+        client_message_id: firstPayload.client_message_id,
+      })
+    })
+    await first
+
+    const second = result.current.sendChatMessage("ok")
+    expect(socket.send).toHaveBeenCalledTimes(2)
+    const secondPayload = JSON.parse(socket.send.mock.calls[1][0])
+    expect(secondPayload.client_message_id).not.toBe(firstPayload.client_message_id)
+    act(() => {
+      socket.receive({
+        type: "message_accepted",
+        client_message_id: secondPayload.client_message_id,
+      })
+    })
+    await second
+  })
+
   it("rejects a pending delivery when the socket closes", async () => {
     const { result } = renderHook(() => useWebSocket({
       url: "ws://localhost",

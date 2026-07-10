@@ -443,7 +443,10 @@ export function useWebSocket(options: UseWebSocketOptions = {}) {
         && (timestamp - msg.timestamp) < MESSAGE_DUPLICATE_THRESHOLD
       )
     )
-    if (!force && duplicateMessage) {
+    const duplicateIsPending = duplicateMessage
+      ? pendingDeliveriesRef.current.has(duplicateMessage.clientMessageId)
+      : false
+    if (!force && duplicateIsPending) {
       throw new Error('Duplicate message ignored while the previous send is pending.')
     }
 

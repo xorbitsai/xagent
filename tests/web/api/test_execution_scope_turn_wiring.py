@@ -267,6 +267,9 @@ async def test_resumed_turn_re_resolves_scope() -> None:
                 "xagent.web.api.websocket.manager",
                 MagicMock(broadcast_to_task=AsyncMock()),
             ),
+            patch(
+                "xagent.web.api.websocket.background_task_manager.promote_resume_task"
+            ),
         ]
     ):
         await execute_resume_background(

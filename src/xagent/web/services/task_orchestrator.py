@@ -53,6 +53,7 @@ from typing import Any, Dict, List, Optional
 from uuid import uuid4
 
 from ..models.task import Task, TaskStatus
+from .chat_history_service import mark_user_message_delivery_sync
 from .hot_path_cache import invalidate_task_cache
 from .task_lease_service import (
     acquire_task_lease_isolated,
@@ -324,7 +325,7 @@ class TaskTurnOrchestrator:
                 )
                 try:
                     await asyncio.to_thread(
-                        _mark_turn_delivery_status_sync,
+                        mark_user_message_delivery_sync,
                         task_id,
                         payload.turn_id,
                         "failed",
@@ -337,7 +338,7 @@ class TaskTurnOrchestrator:
                     )
                 raise
             await asyncio.to_thread(
-                _mark_turn_delivery_status_sync,
+                mark_user_message_delivery_sync,
                 task_id,
                 payload.turn_id,
                 "dispatched",
@@ -590,22 +591,6 @@ def _mark_task_failed_if_running(task_id: int, error_message: str) -> None:
             task_id,
             e,
             exc_info=True,
-        )
-
-
-def _mark_turn_delivery_status_sync(task_id: int, turn_id: str, status: str) -> None:
-    """Advance the user-message handoff after scheduling succeeds or fails."""
-
-    from ..models.database import get_session_local
-    from .chat_history_service import mark_user_message_delivery
-
-    SessionLocal = get_session_local()
-    with SessionLocal() as db:
-        mark_user_message_delivery(
-            db,
-            task_id=task_id,
-            turn_id=turn_id,
-            status=status,
         )
 
 

@@ -80,3 +80,15 @@ async def test_resume_coordinator_does_not_replace_task_that_it_waits_for() -> N
     allow_original_to_check.set()
     await asyncio.wait_for(asyncio.gather(original, resume), timeout=1)
     assert manager.running_tasks[7] is resume
+
+
+@pytest.mark.asyncio
+async def test_unregistered_resume_coordinator_cannot_promote_itself() -> None:
+    manager = BackgroundTaskManager()
+    current = asyncio.current_task()
+    assert current is not None
+
+    with pytest.raises(RuntimeError, match="not registered"):
+        manager.promote_resume_task(7, current)
+
+    assert 7 not in manager.running_tasks

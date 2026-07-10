@@ -12,12 +12,12 @@ from xagent.web.services.chat_history_service import (
     DELIVERY_FAILED,
     claim_user_message_delivery,
     get_latest_waiting_question,
+    inspect_user_message_delivery,
     load_task_transcript,
     persist_assistant_message,
     persist_assistant_message_no_commit,
     persist_user_message,
     persist_user_message_no_commit,
-    persist_user_message_once,
 )
 
 
@@ -203,33 +203,6 @@ def test_persist_user_message_stores_attachments_for_chip_replay():
         db_session.close()
 
 
-def test_persist_user_message_once_reuses_durable_turn() -> None:
-    db_session = _create_db_session()
-    try:
-        task = _create_task(db_session)
-        first = persist_user_message_once(
-            db_session,
-            int(task.id),
-            int(task.user_id),
-            "Apply this guidance",
-            turn_id="client-turn-1",
-        )
-        retried = persist_user_message_once(
-            db_session,
-            int(task.id),
-            int(task.user_id),
-            "Apply this guidance",
-            turn_id="client-turn-1",
-        )
-
-        assert first is not None
-        assert retried is not None
-        assert retried.id == first.id
-        assert db_session.query(TaskChatMessage).count() == 1
-    finally:
-        db_session.close()
-
-
 def test_delivery_claim_rejects_same_turn_with_different_attachments() -> None:
     db_session = _create_db_session()
     try:
@@ -288,6 +261,47 @@ def test_database_rejects_duplicate_user_turn_claims() -> None:
         db_session.close()
 
 
+def test_delivery_claim_recovers_from_unique_constraint_race(monkeypatch) -> None:
+    db_session = _create_db_session()
+    try:
+        task = _create_task(db_session)
+        winner = claim_user_message_delivery(
+            db_session,
+            int(task.id),
+            int(task.user_id),
+            "Concurrent guidance",
+            turn_id="raced-turn",
+        )
+        inspection_count = 0
+
+        def hide_winner_on_initial_inspection(*args, **kwargs):
+            nonlocal inspection_count
+            inspection_count += 1
+            if inspection_count == 1:
+                return None
+            return inspect_user_message_delivery(*args, **kwargs)
+
+        monkeypatch.setattr(
+            "xagent.web.services.chat_history_service.inspect_user_message_delivery",
+            hide_winner_on_initial_inspection,
+        )
+
+        loser = claim_user_message_delivery(
+            db_session,
+            int(task.id),
+            int(task.user_id),
+            "Concurrent guidance",
+            turn_id="raced-turn",
+        )
+
+        assert loser.claimed is False
+        assert loser.message.id == winner.message.id
+        assert inspection_count == 2
+        assert db_session.query(TaskChatMessage).count() == 1
+    finally:
+        db_session.close()
+
+
 def test_delivery_claim_surfaces_failed_handoff() -> None:
     db_session = _create_db_session()
     try:
@@ -311,7 +325,6 @@ def test_delivery_claim_surfaces_failed_handoff() -> None:
         )
         assert retried.claimed is False
         assert retried.failed is True
-        assert retried.can_acknowledge is False
     finally:
         db_session.close()
 

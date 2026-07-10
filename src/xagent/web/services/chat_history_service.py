@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import json
 import logging
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional
@@ -40,10 +39,6 @@ class UserMessageDeliveryClaim:
     def pending(self) -> bool:
         return str(self.message.delivery_status) == DELIVERY_PENDING
 
-    @property
-    def can_acknowledge(self) -> bool:
-        return self.payload_matches and not self.failed and not self.pending
-
 
 def _attachment_identity(
     attachments: Optional[List[Dict[str, Any]]],
@@ -51,15 +46,10 @@ def _attachment_identity(
     identities: list[str] = []
     for attachment in attachments or []:
         file_id = str(attachment.get("file_id") or "").strip()
-        if file_id:
-            identity: Dict[str, Any] = {"file_id": file_id}
-        else:
-            identity = {
-                key: attachment.get(key)
-                for key in ("name", "size", "type")
-                if attachment.get(key) is not None
-            }
-        identities.append(json.dumps(identity, sort_keys=True, default=str))
+        fallback = "\x1f".join(
+            str(attachment.get(key) or "") for key in ("name", "size", "type")
+        )
+        identities.append(file_id or f"legacy:{fallback}")
     return tuple(sorted(identities))
 
 
@@ -193,6 +183,25 @@ def mark_user_message_delivery(
     db.commit()
 
 
+def mark_user_message_delivery_sync(
+    task_id: int,
+    turn_id: str,
+    status: str,
+) -> None:
+    """Update one delivery from synchronous or ``asyncio.to_thread`` callers."""
+
+    from ..models.database import get_session_local
+
+    SessionLocal = get_session_local()
+    with SessionLocal() as db:
+        mark_user_message_delivery(
+            db,
+            task_id=task_id,
+            turn_id=turn_id,
+            status=status,
+        )
+
+
 def persist_user_message(
     db: Session,
     task_id: int,
@@ -212,33 +221,6 @@ def persist_user_message(
         attachments=attachments,
         turn_id=turn_id,
     )
-
-
-def persist_user_message_once(
-    db: Session,
-    task_id: int,
-    user_id: int,
-    content: str,
-    *,
-    attachments: Optional[List[Dict[str, Any]]] = None,
-    turn_id: str,
-) -> Optional[TaskChatMessage]:
-    """Persist a user turn once for retry-safe live-control delivery.
-
-    WebSocket clients reuse ``turn_id`` while awaiting delivery acceptance. A
-    reconnect or an acknowledgement timeout may therefore submit the same turn
-    again. Reuse the durable transcript row instead of rendering/executing a
-    duplicate turn.
-    """
-
-    return claim_user_message_delivery(
-        db,
-        task_id=task_id,
-        user_id=user_id,
-        content=content,
-        attachments=attachments,
-        turn_id=turn_id,
-    ).message
 
 
 def persist_user_message_no_commit(

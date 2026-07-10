@@ -53,6 +53,7 @@ from ..services.chat_history_service import (
     get_latest_waiting_question,
     inspect_user_message_delivery,
     mark_user_message_delivery,
+    mark_user_message_delivery_sync,
 )
 from ..services.hot_path_cache import (
     cache_get,
@@ -1864,20 +1865,6 @@ def _latest_result_user_turn_id(result: Dict[str, Any]) -> str | None:
     return None
 
 
-def _mark_user_message_delivery_sync(task_id: int, turn_id: str, status: str) -> None:
-    SessionLocal = get_session_local()
-    db = SessionLocal()
-    try:
-        mark_user_message_delivery(
-            db,
-            task_id=task_id,
-            turn_id=turn_id,
-            status=status,
-        )
-    finally:
-        db.close()
-
-
 async def execute_resume_background(
     task_id: int,
     agent_service: Any,
@@ -1885,6 +1872,9 @@ async def execute_resume_background(
     previous_task: Optional[asyncio.Task] = None,
     pending_user_message: Optional[Dict[str, Any]] = None,
     delivery_turn_id: str | None = None,
+    delivery_already_dispatched: bool = False,
+    delivery_websocket: WebSocket | None = None,
+    delivery_client_message_id: str | None = None,
 ) -> None:
     """Resume an agent execution after an interrupt/user-message checkpoint.
 
@@ -1910,7 +1900,34 @@ async def execute_resume_background(
     task_agent_id: int | None = None
     agent_name: str | None = None
     agent_logo_url: str | None = None
-    delivery_completed = False
+    delivery_was_dispatched = delivery_already_dispatched
+
+    async def notify_deferred_delivery(
+        accepted: bool,
+        message: str | None = None,
+        *,
+        retry_with_new_id: bool = False,
+    ) -> None:
+        if delivery_websocket is None or delivery_client_message_id is None:
+            return
+        try:
+            await _send_message_delivery(
+                delivery_websocket,
+                client_message_id=delivery_client_message_id,
+                turn_id=delivery_turn_id or delivery_client_message_id,
+                accepted=accepted,
+                message=message,
+                retry_with_new_id=retry_with_new_id,
+            )
+        except Exception:
+            # Delivery state is durable; a disconnected client will retry the
+            # same id and recover the result from that state.
+            logger.warning(
+                "Could not send deferred delivery acknowledgement for task %s",
+                task_id,
+                exc_info=True,
+            )
+
     try:
         if previous_task is not None and not previous_task.done():
             try:
@@ -1943,13 +1960,15 @@ async def execute_resume_background(
                     "The user message was saved, but no resumable execution "
                     "checkpoint became available."
                 )
+            delivery_was_dispatched = True
             if delivery_turn_id is not None:
                 await asyncio.to_thread(
-                    _mark_user_message_delivery_sync,
+                    mark_user_message_delivery_sync,
                     task_id,
                     delivery_turn_id,
                     DELIVERY_DISPATCHED,
                 )
+            await notify_deferred_delivery(True)
 
         db_gen = get_db()
         db_lease = next(db_gen)
@@ -1984,12 +2003,17 @@ async def execute_resume_background(
             logger.info(
                 "Task %s resume skipped; another runner owns the lease", task_id
             )
-            if delivery_turn_id is not None:
+            if delivery_turn_id is not None and not delivery_was_dispatched:
                 await asyncio.to_thread(
-                    _mark_user_message_delivery_sync,
+                    mark_user_message_delivery_sync,
                     task_id,
                     delivery_turn_id,
                     DELIVERY_FAILED,
+                )
+                await notify_deferred_delivery(
+                    False,
+                    "The deferred message could not be delivered. Please retry.",
+                    retry_with_new_id=True,
                 )
             await manager.broadcast_to_task(
                 {
@@ -2106,12 +2130,11 @@ async def execute_resume_background(
 
         if delivery_turn_id is not None:
             await asyncio.to_thread(
-                _mark_user_message_delivery_sync,
+                mark_user_message_delivery_sync,
                 task_id,
                 delivery_turn_id,
                 DELIVERY_COMPLETED,
             )
-            delivery_completed = True
 
         if status in {"interrupted", "waiting_for_user"}:
             await manager.broadcast_to_task(
@@ -2153,23 +2176,33 @@ async def execute_resume_background(
         )
     except asyncio.CancelledError:
         logger.info(f"V2 resume background task {task_id} cancelled")
-        if delivery_turn_id is not None and not delivery_completed:
+        if delivery_turn_id is not None and not delivery_was_dispatched:
             await asyncio.to_thread(
-                _mark_user_message_delivery_sync,
+                mark_user_message_delivery_sync,
                 task_id,
                 delivery_turn_id,
                 DELIVERY_FAILED,
+            )
+            await notify_deferred_delivery(
+                False,
+                "The deferred message was cancelled. Please retry.",
+                retry_with_new_id=True,
             )
         raise
     except Exception as e:
         logger.error(f"V2 resume background task {task_id} failed: {e}", exc_info=True)
         error_message = str(e)
-        if delivery_turn_id is not None and not delivery_completed:
+        if delivery_turn_id is not None and not delivery_was_dispatched:
             await asyncio.to_thread(
-                _mark_user_message_delivery_sync,
+                mark_user_message_delivery_sync,
                 task_id,
                 delivery_turn_id,
                 DELIVERY_FAILED,
+            )
+            await notify_deferred_delivery(
+                False,
+                error_message,
+                retry_with_new_id=True,
             )
         await manager.broadcast_to_task(
             {
@@ -2262,11 +2295,10 @@ class BackgroundTaskManager:
 
     def promote_resume_task(self, task_id: int, task: asyncio.Task) -> None:
         existing = self.resume_tasks.get(task_id)
-        if existing is not None and existing is not task:
+        if existing is not task:
             raise RuntimeError(
-                f"Task {task_id} resume coordinator is no longer current"
+                f"Task {task_id} resume coordinator is not registered or no longer current"
             )
-        self.resume_tasks[task_id] = task
         self.running_tasks[task_id] = task
         logger.info("Promoted resume coordinator for task %s", task_id)
 
@@ -2798,7 +2830,7 @@ async def handle_chat_message(
             return
         if delivery_claimed and not delivery_dispatched:
             await asyncio.to_thread(
-                _mark_user_message_delivery_sync,
+                mark_user_message_delivery_sync,
                 task_id,
                 turn_id,
                 DELIVERY_FAILED,
@@ -3247,6 +3279,10 @@ async def handle_chat_message(
                         turn_id=turn_id,
                         status=DELIVERY_DISPATCHED,
                     )
+                    # The existing DAG worker owns terminal execution and has
+                    # no per-continuation completion callback. For this path,
+                    # DISPATCHED is the terminal delivery state: it means the
+                    # continuation was accepted, not that the whole DAG ended.
                     delivery_dispatched = True
 
                     # If previously PAUSED/WAITING_FOR_USER, update status to RUNNING
@@ -3390,19 +3426,25 @@ async def handle_chat_message(
                                     }
                                 ),
                                 delivery_turn_id=turn_id,
+                                delivery_already_dispatched=posted,
+                                delivery_websocket=None if posted else websocket,
+                                delivery_client_message_id=(
+                                    None if posted else client_message_id
+                                ),
                             )
                         )
                         background_task_manager.register_reserved_resume(
                             task_id, bg_task
                         )
-                        delivery_dispatched = True
+                        delivery_dispatched = posted
                     except BaseException:
                         if bg_task is not None:
                             bg_task.cancel()
                         background_task_manager.release_resume_reservation(task_id)
                         raise
 
-                    await finish_delivery(True)
+                    if posted:
+                        await finish_delivery(True)
                     return
                 elif task_uses_live_control and not has_continuation:
                     # Task is running but doesn't support continuation (shouldn't happen)
@@ -4685,7 +4727,10 @@ async def handle_pause_task(
             logger.info("Agent pause_execution completed")
             _mark_task_pause_accepted(task_id)
 
-            # Send pause confirmation
+            # This confirms only that the control request was accepted. The
+            # frontend deliberately waits for the later durable ``task_info``
+            # PAUSED state before changing its pause UI; treating this event
+            # as ``task_paused`` would reintroduce the optimistic-state bug.
             await manager.broadcast_to_task(
                 {
                     "type": "task_pause_requested",
@@ -4808,6 +4853,7 @@ async def handle_resume_task(
                 )
                 return
             previous_task = background_task_manager.running_tasks.get(task_id)
+            bg_task: asyncio.Task[None] | None = None
             try:
                 bg_task = asyncio.create_task(
                     execute_resume_background(
@@ -4819,6 +4865,8 @@ async def handle_resume_task(
                 )
                 background_task_manager.register_reserved_resume(task_id, bg_task)
             except BaseException:
+                if bg_task is not None:
+                    bg_task.cancel()
                 background_task_manager.release_resume_reservation(task_id)
                 raise
             logger.info(f"Task {task_id} v2 resume scheduled")

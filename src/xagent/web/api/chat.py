@@ -1341,7 +1341,10 @@ class AgentServiceManager:
         task_owner_user_id: Optional[int] = None,
         connector_runtime_turn_id: Optional[str] = None,
     ) -> AgentService:
-        lock = self._agent_build_locks.setdefault(task_id, asyncio.Lock())
+        lock = self._agent_build_locks.get(task_id)
+        if lock is None:
+            lock = asyncio.Lock()
+            self._agent_build_locks[task_id] = lock
         async with lock:
             return await self._get_agent_for_task_unlocked(
                 task_id,
@@ -2103,9 +2106,11 @@ class AgentServiceManager:
             # If agent is not in memory, clean up workspace directory directly
             self._cleanup_workspace_directory(task_id, user_id)
 
-        # The per-task lock has no purpose after eviction. Keeping it forever
-        # makes the manager grow with every task ever opened.
-        self._agent_build_locks.pop(task_id, None)
+        # Do not replace a lock held by an in-flight builder: a fresh lock would
+        # let a second caller bypass single-flight and race the existing build.
+        build_lock = self._agent_build_locks.get(task_id)
+        if build_lock is not None and not build_lock.locked():
+            self._agent_build_locks.pop(task_id, None)
 
         # LLM configuration is now stored in Task table, no need to clean up memory storage
 

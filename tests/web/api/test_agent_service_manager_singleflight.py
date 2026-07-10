@@ -68,3 +68,17 @@ def test_remove_agent_releases_per_task_build_lock() -> None:
     manager.remove_agent(42)
 
     assert 42 not in manager._agent_build_locks
+
+
+@pytest.mark.asyncio
+async def test_remove_agent_keeps_inflight_build_lock() -> None:
+    manager = AgentServiceManager()
+    lock = asyncio.Lock()
+    await lock.acquire()
+    manager._agent_build_locks[42] = lock
+    manager._cleanup_workspace_directory = MagicMock()
+
+    manager.remove_agent(42)
+
+    assert manager._agent_build_locks[42] is lock
+    lock.release()

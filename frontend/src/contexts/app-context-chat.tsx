@@ -516,7 +516,6 @@ type AppAction =
   | {
     type: "CLEAR_MESSAGES";
     payload?: {
-      keepMessageId?: string | null;
       preserveUserMessages?: boolean;
       preserveStreamingFinalAnswers?: boolean;
     };
@@ -849,14 +848,10 @@ function appReducer(state: AppState, action: AppAction): AppState {
     case "CLEAR_MESSAGES":
       if (action.payload) {
         const {
-          keepMessageId,
           preserveUserMessages,
           preserveStreamingFinalAnswers,
         } = action.payload
         const messagesToKeep = state.messages.filter(message => {
-          if (keepMessageId && message.id === keepMessageId) {
-            return true
-          }
           if (preserveUserMessages && message.role === "user") {
             return true
           }

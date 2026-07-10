@@ -36,6 +36,10 @@ from xagent.web.services.connector_runtime import (
     pop_ephemeral_runtime_values,
     store_ephemeral_runtime_values,
 )
+from xagent.web.services.task_execution_controller import (
+    TaskCommand,
+    task_execution_controller,
+)
 from xagent.web.services.task_lease_service import get_runner_id
 from xagent.web.services.task_orchestrator import (
     TaskTurnError,
@@ -548,6 +552,71 @@ async def test_begin_turn_schedules_even_when_caller_cancelled(db_session) -> No
         await asyncio.sleep(0.3)
 
     sched.assert_called_once()  # scheduled despite the cancellation
+
+
+@pytest.mark.asyncio
+async def test_repeated_cancellation_keeps_turn_command_gate_until_claim_settles(
+    db_session,
+) -> None:
+    """A second cancellation cannot release the per-task command gate while
+    the shielded claim is still committing in its worker thread."""
+    import threading
+
+    user = _create_user(db_session)
+    task = _create_task(db_session, user.id, status=TaskStatus.PENDING)
+    claim_started = threading.Event()
+    release_claim = threading.Event()
+    contender_entered = asyncio.Event()
+
+    def blocked_claim(task_id, task_owner_user_id, *, payload, kind):
+        claim_started.set()
+        assert release_claim.wait(timeout=2)
+        return _ClaimedTurn(
+            status=TaskStatus.RUNNING,
+            updated_at=datetime.now(timezone.utc),
+            before_message_id=1,
+            task_source="sdk",
+        )
+
+    async def contender() -> None:
+        async with task_execution_controller.command(int(task.id), TaskCommand.MESSAGE):
+            contender_entered.set()
+
+    sched = MagicMock(return_value=MagicMock())
+    with (
+        patch(
+            "xagent.web.services.task_orchestrator._begin_turn_atomic_sync",
+            new=blocked_claim,
+        ),
+        patch("xagent.web.services.task_orchestrator._schedule_bg", new=sched),
+    ):
+        turn = asyncio.create_task(
+            TaskTurnOrchestrator.begin_turn(
+                task_id=int(task.id),
+                task_owner_user_id=int(user.id),
+                payload=TaskTurnPayload("x"),
+                kind=TurnKind.CREATE,
+            )
+        )
+        while not claim_started.is_set():
+            await asyncio.sleep(0)
+
+        turn.cancel()
+        await asyncio.sleep(0.01)
+        turn.cancel()
+        contender_task = asyncio.create_task(contender())
+        await asyncio.sleep(0.05)
+
+        assert not turn.done()
+        assert not contender_entered.is_set()
+
+        release_claim.set()
+        with pytest.raises(asyncio.CancelledError):
+            await turn
+        await asyncio.wait_for(contender_task, timeout=1)
+
+    assert contender_entered.is_set()
+    sched.assert_called_once()
 
 
 @pytest.mark.asyncio

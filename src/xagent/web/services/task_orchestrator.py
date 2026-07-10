@@ -243,13 +243,27 @@ class TaskTurnOrchestrator:
                 # may still be running under its own shield. Keep the command
                 # gate until it settles so a replacement message cannot enter
                 # the task while that claim is committing in the background.
-                try:
-                    await operation
-                except Exception:
-                    logger.exception(
-                        "Turn start failed while cancelled caller waited for task %s",
-                        task_id,
-                    )
+                while not operation.done():
+                    try:
+                        await asyncio.shield(operation)
+                    except asyncio.CancelledError:
+                        # Repeated cancellation must not release the command
+                        # gate while the atomic claim is still in flight.
+                        continue
+                    except Exception:
+                        break
+                if not operation.cancelled():
+                    operation_error = operation.exception()
+                    if operation_error is not None:
+                        logger.error(
+                            "Turn start failed while cancelled caller waited for task %s",
+                            task_id,
+                            exc_info=(
+                                type(operation_error),
+                                operation_error,
+                                operation_error.__traceback__,
+                            ),
+                        )
                 raise
 
     @staticmethod

@@ -18,7 +18,7 @@ from fastapi import (
     WebSocket,
 )
 from jose import JWTError, jwt
-from pydantic import BaseModel, Field, model_validator
+from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
 
 from ..auth_config import JWT_ALGORITHM, JWT_SECRET_KEY
@@ -89,14 +89,6 @@ class WidgetAuthRequest(BaseModel):
     embed_ticket: Optional[str] = Field(default=None, max_length=4096)
     # Direct (non-embedded) visits carry the widget key instead of a ticket.
     widget_key: Optional[str] = Field(default=None, max_length=512)
-
-    @model_validator(mode="after")
-    def _require_an_identity(self) -> "WidgetAuthRequest":
-        if not self.guest_id and not self.end_user_id:
-            raise ValueError("Either guest_id or end_user_id is required")
-        if self.end_user_id and not self.end_user_signature:
-            raise ValueError("end_user_signature is required when end_user_id is set")
-        return self
 
 
 class EmbedTicketRequest(BaseModel):
@@ -284,6 +276,11 @@ def _resolve_authenticated_guest_id(agent: Agent, request: WidgetAuthRequest) ->
     namespace: that would let a request skip signing by simply omitting
     end_user_id and passing the target guest_id directly.
     """
+    if not request.guest_id and not request.end_user_id:
+        raise HTTPException(
+            status_code=422, detail="Either guest_id or end_user_id is required"
+        )
+
     if request.end_user_id:
         secret = agent.widget_end_user_secret
         if not secret:

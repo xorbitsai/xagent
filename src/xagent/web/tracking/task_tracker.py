@@ -60,6 +60,9 @@ class TaskTracker:
         self._is_tracking = False
         self._update_task: Optional[asyncio.Task] = None
         self._last_reported_usage: Optional[TokenUsage] = None
+        # Per-turn baselines captured in start_tracking; used to meter deltas.
+        self._initial_total_tokens = 0
+        self._initial_tool_calls = 0
 
         # Load the task model
         from ..models.task import Task as TaskModel
@@ -274,6 +277,23 @@ class TaskTracker:
         logger.info(f"Force updating token usage for task {self.task_id}")
         usage = get_token_usage()
 
+        # Meter quota FIRST — on the still-clean session, from in-memory
+        # counters — so a transient commit failure below cannot zero-bill a
+        # token/tool-heavy turn. actions = tool calls; credits derive from tokens.
+        try:
+            from ..services.quota_hooks import record_usage
+
+            delta_tokens = max(0, usage.total_tokens - self._initial_total_tokens)
+            delta_actions = max(0, usage.tool_calls - self._initial_tool_calls)
+            record_usage(
+                self.db_session,
+                getattr(self.task, "user_id", None),
+                delta_tokens,
+                delta_actions,
+            )
+        except Exception as e:  # noqa: BLE001
+            logger.warning(f"Quota usage recording failed for task {self.task_id}: {e}")
+
         # Update database with final statistics
         self.task.input_tokens = usage.input_tokens
         self.task.output_tokens = usage.output_tokens
@@ -310,22 +330,6 @@ class TaskTracker:
             f"input={usage.input_tokens}, output={usage.output_tokens}, "
             f"total={usage.total_tokens}, calls={usage.llm_calls}"
         )
-
-        # Best-effort quota metering: record only this turn's delta. actions are
-        # tool calls (one per tool invocation); credits derive from tokens.
-        try:
-            from ..services.quota_hooks import record_usage
-
-            delta_tokens = max(0, usage.total_tokens - getattr(self, "_initial_total_tokens", 0))
-            delta_actions = max(0, usage.tool_calls - getattr(self, "_initial_tool_calls", 0))
-            record_usage(
-                self.db_session,
-                getattr(self.task, "user_id", None),
-                delta_tokens,
-                delta_actions,
-            )
-        except Exception as e:  # noqa: BLE001
-            logger.warning(f"Quota usage recording failed for task {self.task_id}: {e}")
 
         return usage
 

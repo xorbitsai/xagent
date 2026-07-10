@@ -2138,13 +2138,17 @@ class AgentServiceManager:
                     db_session, getattr(gate_task, "user_id", None)
                 )
                 if gate_reason:
+                    # `output` is what every result consumer surfaces as the
+                    # assistant message; set it so the quota reason reaches the
+                    # user instead of a misleading "Task completed".
                     return {
                         "success": False,
                         "status": "quota_exceeded",
+                        "output": gate_reason,
                         "error": gate_reason,
                     }
             except Exception:
-                logger.debug("Quota gate check failed open", exc_info=True)
+                logger.warning("Quota gate check failed open", exc_info=True)
 
         if manage_task_lease and db_session and tracker_task_id:
             lease = acquire_task_lease(db_session, int(tracker_task_id))

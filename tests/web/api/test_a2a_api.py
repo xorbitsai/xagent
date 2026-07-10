@@ -1,7 +1,7 @@
 import json
 from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
-from unittest.mock import MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
@@ -235,6 +235,20 @@ def test_message_send_requires_supported_a2a_version() -> None:
     assert error["message"] == "A2A-Version header or query parameter is required."
     assert error["details"][0]["reason"] == "VERSION_NOT_SUPPORTED"
     assert error["details"][0]["metadata"]["supportedVersions"] == "1.0"
+
+    incompatible = client.post(
+        f"/api/a2a/agents/{agent_id}/message:send",
+        headers={
+            "Authorization": f"Bearer {full_key}",
+            "A2A-Version": "2.0",
+        },
+        json=payload,
+    )
+
+    assert incompatible.status_code == 400
+    incompatible_error = incompatible.json()["error"]
+    assert incompatible_error["details"][0]["reason"] == "VERSION_NOT_SUPPORTED"
+    assert incompatible_error["details"][0]["metadata"]["supportedVersions"] == ("1.0")
 
 
 def test_message_send_rejects_oversized_content() -> None:
@@ -497,9 +511,21 @@ def test_follow_up_infers_context_for_input_required_task() -> None:
     finally:
         db.close()
 
-    with patch(
-        "xagent.web.services.task_orchestrator._schedule_bg",
-        new=MagicMock(),
+    agent_service = MagicMock()
+    agent_service.post_user_message = AsyncMock(return_value=True)
+    agent_manager = MagicMock()
+    agent_manager.get_agent_for_task = AsyncMock(return_value=agent_service)
+    begin_turn = AsyncMock()
+    with (
+        patch(
+            "xagent.web.api.chat.get_agent_manager",
+            return_value=agent_manager,
+        ),
+        patch("xagent.web.api.a2a._schedule_waiting_a2a_resume") as schedule_resume,
+        patch(
+            "xagent.web.api.a2a.TaskTurnOrchestrator.begin_turn",
+            new=begin_turn,
+        ),
     ):
         response = client.post(
             f"/api/a2a/agents/{agent_id}/message:send",
@@ -518,6 +544,22 @@ def test_follow_up_infers_context_for_input_required_task() -> None:
     assert response.status_code == 200, response.text
     assert response.json()["task"]["contextId"] == "ctx-follow-up"
     assert response.json()["task"]["status"]["state"] == "TASK_STATE_WORKING"
+    agent_service.post_user_message.assert_awaited_once_with(
+        task_id,
+        execution_message="follow up",
+        display_message="follow up",
+        request_interrupt=False,
+        reason="A2A input-required response",
+    )
+    begin_turn.assert_not_awaited()
+    schedule_resume.assert_called_once()
+    db = _direct_db_session()
+    try:
+        resumed = db.query(Task).filter(Task.id == int(task_id)).one()
+        assert resumed.status == TaskStatus.RUNNING
+        assert resumed.input == "follow up"
+    finally:
+        db.close()
 
 
 def test_failed_follow_up_restores_input_required_status() -> None:
@@ -541,9 +583,19 @@ def test_failed_follow_up_restores_input_required_status() -> None:
     finally:
         db.close()
 
-    with patch(
-        "xagent.web.api.a2a.TaskTurnOrchestrator.begin_turn",
-        side_effect=TaskTurnError("busy"),
+    agent_service = MagicMock()
+    agent_service.post_user_message = AsyncMock(return_value=False)
+    agent_manager = MagicMock()
+    agent_manager.get_agent_for_task = AsyncMock(return_value=agent_service)
+    with (
+        patch(
+            "xagent.web.api.chat.get_agent_manager",
+            return_value=agent_manager,
+        ),
+        patch(
+            "xagent.web.api.a2a.TaskTurnOrchestrator.begin_turn",
+            side_effect=TaskTurnError("busy"),
+        ),
     ):
         response = client.post(
             f"/api/a2a/agents/{agent_id}/message:send",

@@ -109,6 +109,119 @@ def _require_bound_agent(path_agent_id: int, agent: Agent) -> None:
         raise a2a_error("agent_not_found", "Agent not found.", status_code=404)
 
 
+def _schedule_waiting_a2a_resume(
+    *,
+    task_id: int,
+    agent_service: Any,
+    task_owner_user_id: int,
+) -> None:
+    from .websocket import background_task_manager, execute_resume_background
+
+    previous_task = background_task_manager.running_tasks.get(task_id)
+    bg_task = asyncio.create_task(
+        execute_resume_background(
+            task_id=task_id,
+            agent_service=agent_service,
+            task_owner_user_id=task_owner_user_id,
+            previous_task=previous_task,
+        )
+    )
+    background_task_manager.register_task(task_id, bg_task)
+
+
+def _restore_waiting_resume_claim(db: Session, task_id: int) -> None:
+    db.rollback()
+    (
+        db.query(Task)
+        .filter(
+            Task.id == task_id,
+            Task.status == TaskStatus.RUNNING,
+            Task.runner_id.is_(None),
+        )
+        .update({Task.status: TaskStatus.WAITING_FOR_USER}, synchronize_session=False)
+    )
+    db.commit()
+    db.expire_all()
+
+
+async def _resume_waiting_a2a_task(
+    *,
+    db: Session,
+    agent: Agent,
+    task: Task,
+    text: str,
+) -> bool:
+    task_id = int(task.id)
+    claimed = (
+        db.query(Task)
+        .filter(
+            Task.id == task_id,
+            Task.agent_id == int(agent.id),
+            Task.source == "a2a",
+            Task.status == TaskStatus.WAITING_FOR_USER,
+        )
+        .update(
+            {
+                Task.status: TaskStatus.RUNNING,
+                Task.runner_id: None,
+                Task.lease_expires_at: None,
+                Task.last_heartbeat_at: None,
+            },
+            synchronize_session=False,
+        )
+    )
+    db.commit()
+    if claimed != 1:
+        db.expire_all()
+        raise a2a_error(
+            "unsupported_operation",
+            "Task is currently running and cannot accept a new message.",
+            status_code=400,
+            details={"taskId": task_id},
+        )
+    db.refresh(task)
+
+    try:
+        from .chat import get_agent_manager
+
+        agent_service = await get_agent_manager().get_agent_for_task(
+            task_id,
+            db,
+            task_owner_user_id=int(agent.user_id),
+        )
+        posted = await agent_service.post_user_message(
+            str(task_id),
+            execution_message=text,
+            display_message=text,
+            request_interrupt=False,
+            reason="A2A input-required response",
+        )
+    except Exception:
+        _restore_waiting_resume_claim(db, task_id)
+        raise
+
+    if not posted:
+        # A WAITING_FOR_USER checkpoint should normally be durable. If it is
+        # unavailable, retain the previous restart-safe behavior by starting a
+        # new turn from transcript history instead of leaving the task stuck.
+        task.status = TaskStatus.PAUSED
+        db.commit()
+        db.refresh(task)
+        return False
+
+    setattr(task, "input", text)
+    setattr(task, "output", None)
+    setattr(task, "error_message", None)
+    db.commit()
+    db.refresh(task)
+    _schedule_waiting_a2a_resume(
+        task_id=task_id,
+        agent_service=agent_service,
+        task_owner_user_id=int(agent.user_id),
+    )
+    return True
+
+
 def _validate_a2a_version(request: Request) -> None:
     requested = request.headers.get("A2A-Version")
     if requested is None:
@@ -237,12 +350,16 @@ async def _start_a2a_turn(
             db.commit()
             db.refresh(task)
         if task.status == TaskStatus.WAITING_FOR_USER:
-            # The web runtime's new-message path resumes PAUSED tasks as a new
-            # turn. Normalize WAITING_FOR_USER to that same durable path so an
-            # A2A follow-up does not depend on an in-memory WebSocket session.
-            task.status = TaskStatus.PAUSED
-            db.commit()
-            db.refresh(task)
+            # Resume the trace-backed checkpoint so DAG/React step state is
+            # preserved across workers and restarts. Only a missing checkpoint
+            # falls back to the durable APPEND/replan path.
+            if await _resume_waiting_a2a_task(
+                db=db,
+                agent=agent,
+                task=task,
+                text=text,
+            ):
+                return task
             normalized_waiting_task = True
         kind = TurnKind.APPEND
 

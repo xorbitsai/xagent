@@ -310,9 +310,9 @@ def create_a2a_agent_tools_from_configs(
             continue
         timeout_seconds = item.get("timeout_seconds", 60.0)
         try:
-            timeout = float(str(timeout_seconds))
+            request_timeout_seconds = float(str(timeout_seconds))
         except (TypeError, ValueError):
-            timeout = 60.0
+            request_timeout_seconds = 60.0
         tool = A2AAgentTool(
             name=raw_name,
             description=_optional_str(item.get("description")),
@@ -322,7 +322,7 @@ def create_a2a_agent_tools_from_configs(
             if isinstance(item.get("headers"), dict)
             else {},
             auth_token=_optional_str(item.get("auth_token")),
-            timeout_seconds=timeout,
+            timeout_seconds=request_timeout_seconds,
             allow_private_networks=item.get("allow_private_networks") is True,
         )
         tools.append(tool)

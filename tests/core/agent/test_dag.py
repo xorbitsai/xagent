@@ -363,6 +363,52 @@ def build_plan(*steps: PlanStep) -> ExecutionPlan:
     return ExecutionPlan(steps=list(steps))
 
 
+def test_dag_waiting_response_preserves_active_step_state() -> None:
+    completed_step = PlanStep(id="collect", task="Collect inputs")
+    completed_step.status = "completed"
+    active_step = PlanStep(
+        id="confirm",
+        task="Confirm the selected option",
+        dependencies=["collect"],
+    )
+    active_step.status = "running"
+    pattern = DAGPattern(lambda **_: build_plan(completed_step, active_step))
+    pattern.status = "waiting_for_user"
+    pattern.plan = build_plan(completed_step, active_step)
+    pattern.step_results = {"collect": "Options A and B collected"}
+    pattern.active_step_id = "confirm"
+    pattern.active_step_ids = ["confirm"]
+    pattern.active_step_pattern_states = {
+        "confirm": {
+            "status": "waiting_for_user",
+            "waiting_for_user_request": {"message": "Choose A or B"},
+        }
+    }
+    child_context = ExecutionContext(execution_id="dag-waiting:confirm")
+    child_context.add_user_message("Compare A and B")
+    pattern.active_step_contexts = {"confirm": child_context.to_dict()}
+    pattern.planned_user_message_count = 1
+
+    root_context = ExecutionContext(execution_id="dag-waiting")
+    root_context.add_user_message("Help me choose")
+    root_context.add_user_message("Choose B")
+
+    forwarded = pattern._forward_user_response_to_waiting_step(root_context)
+
+    assert forwarded is True
+    assert pattern.status == "running"
+    assert pattern.step_results == {"collect": "Options A and B collected"}
+    assert [step.id for step in pattern.plan.steps] == ["collect", "confirm"]
+    restored_child = ExecutionContext.from_dict(pattern.active_step_contexts["confirm"])
+    forwarded_message = restored_child.messages[-1]
+    assert forwarded_message.content == "Choose B"
+    assert forwarded_message.metadata == {
+        "kind": "dag_waiting_user_response",
+        "forwarded_from_root": True,
+        "dag_step_id": "confirm",
+    }
+
+
 async def run_invalid_plan(plan: ExecutionPlan) -> dict[str, Any]:
     pattern = DAGPattern(lambda **_: plan)
     return await pattern.run(

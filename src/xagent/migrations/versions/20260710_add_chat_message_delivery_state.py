@@ -1,7 +1,7 @@
 """add retry-safe chat message delivery state
 
 Revision ID: 20260710_add_chat_delivery_state
-Revises: 1c2ae61b5a6d
+Revises: 20260710_a2a_task_index
 Create Date: 2026-07-10 00:00:00.000000
 
 """
@@ -12,7 +12,7 @@ import sqlalchemy as sa
 from alembic import op
 
 revision: str = "20260710_add_chat_delivery_state"
-down_revision: Union[str, None] = "1c2ae61b5a6d"
+down_revision: Union[str, None] = "20260710_a2a_task_index"
 branch_labels: Union[str, Sequence[str], None] = None
 depends_on: Union[str, Sequence[str], None] = None
 

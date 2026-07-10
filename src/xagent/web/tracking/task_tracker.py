@@ -61,7 +61,7 @@ class TaskTracker:
         self._update_task: Optional[asyncio.Task] = None
         self._last_reported_usage: Optional[TokenUsage] = None
         # Per-turn baselines captured in start_tracking; used to meter deltas.
-        self._initial_total_tokens = 0
+        self._initial_details_len = 0
         self._initial_tool_calls = 0
 
         # Load the task model
@@ -106,10 +106,11 @@ class TaskTracker:
         )
         set_token_usage(initial_usage)
 
-        # Snapshot the seeded totals so complete_tracking can meter only this
-        # turn's delta (start_tracking seeds from prior turns for multi-turn tasks).
-        # tool_calls is not persisted to the task, so it counts per turn from 0.
-        self._initial_total_tokens = initial_usage.total_tokens
+        # Snapshot the seeded baselines so complete_tracking can meter only this
+        # turn's delta (start_tracking seeds from prior turns for multi-turn
+        # tasks). The new per-model detail entries appended during this turn are
+        # everything past _initial_details_len.
+        self._initial_details_len = len(initial_usage.details)
         self._initial_tool_calls = initial_usage.tool_calls
 
         logger.info(f"Started token tracking for task {self.task_id}")
@@ -283,12 +284,12 @@ class TaskTracker:
         try:
             from ..services.quota_hooks import record_usage
 
-            delta_tokens = max(0, usage.total_tokens - self._initial_total_tokens)
+            delta_details = usage.details[self._initial_details_len :]
             delta_actions = max(0, usage.tool_calls - self._initial_tool_calls)
             record_usage(
                 self.db_session,
                 getattr(self.task, "user_id", None),
-                delta_tokens,
+                delta_details,
                 delta_actions,
             )
         except Exception as e:  # noqa: BLE001

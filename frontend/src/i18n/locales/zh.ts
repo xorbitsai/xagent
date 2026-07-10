@@ -3208,7 +3208,8 @@ Build when you need.`,
     embed_snippet: {
       title: "引入代码",
       desc: "复制此 script 标签并将其粘贴到网站的 <body> 标签中。",
-      copy_btn: "复制代码"
+      copy_btn: "复制代码",
+      advanced_toggle: "高级选项(自定义身份、密钥轮换)"
     },
     share_link: {
       title: "分享链接",
@@ -3270,39 +3271,27 @@ Build when you need.`,
     }
   },
   appWidget: {
-    builder: {
-      title: "App Widget",
-      description: "将此 Agent 作为聊天气泡嵌入网站",
-      saveFirst: "请先保存 Agent，再配置 App Widget",
-      configure: "配置 App Widget",
-      toggle: "切换 App Widget"
-    },
     dialog: {
-      title: "App Widget",
-      enabledLabel: "开启 Widget",
-      allowedDomains: "允许的域名",
-      domainPlaceholder: "例如 example.com",
-      addDomain: "添加",
       invalidDomain: "请输入 example.com 或 localhost:3000 这样的域名（不含协议、路径或通配符），或输入 * 允许任意域名。",
-      removeDomain: "移除域名",
-      noDomains: "尚未配置域名。添加域名或 * 前，Widget 请求会被拦截。",
-      allowedDomainsSecurityNote: "允许的域名仅为浏览器层面的限制，并不能防御非浏览器客户端。真正的访问凭证是 Widget 密钥——请妥善保管，泄露后请重新生成。",
-      embedTitle: "嵌入代码",
-      embedDescription: "将这段 script 复制到需要显示聊天气泡的页面。",
-      copySnippet: "复制代码",
       widgetKeyTitle: "Widget 密钥",
       widgetKeyDescription: "授权此 Widget 的凭证，会包含在嵌入代码中；持有它的人即可访问该智能体，若泄露请重新生成。",
       copyWidgetKey: "复制 Widget 密钥",
       rotateWidgetKey: "重新生成",
-      rotateWidgetKeyConfirm: "重新生成 Widget 密钥？所有已部署的嵌入代码都会失效，需替换为新代码。"
+      rotateWidgetKeyConfirm: "重新生成 Widget 密钥？所有已部署的嵌入代码都会失效，需替换为新代码。",
+      endUserSecretTitle: "终端用户签名密钥",
+      endUserSecretDescription: "在你自己的服务端使用这个密钥,对每个访客的身份签名后再通过 data-end-user-id 传入,这样 widget 会话就能绑定到具体的用户,而不是匿名访客。切勿把这个密钥放进嵌入代码或任何浏览器端代码——应在服务端计算签名(对 end-user-id 做 HMAC-SHA256),再把结果通过 data-end-user-signature 传入。",
+      copyEndUserSecret: "复制签名密钥",
+      rotateEndUserSecret: "重新生成",
+      rotateEndUserSecretConfirm: "重新生成终端用户签名密钥？用旧密钥算出的签名会立即失效,需要让你的服务端切换到新密钥。"
     },
     messages: {
-      updated: "Widget 配置已更新",
-      updateFailed: "更新 Widget 配置失败",
       copyFailed: "复制 Widget 代码失败",
       widgetKeyLoadFailed: "加载 Widget 密钥失败",
       widgetKeyRotated: "Widget 密钥已重新生成，请更新已部署的嵌入代码。",
-      widgetKeyRotateFailed: "重新生成 Widget 密钥失败"
+      widgetKeyRotateFailed: "重新生成 Widget 密钥失败",
+      endUserSecretLoadFailed: "加载终端用户签名密钥失败",
+      endUserSecretRotated: "签名密钥已重新生成，请在为新会话签名前更新你服务端的密钥。",
+      endUserSecretRotateFailed: "重新生成终端用户签名密钥失败"
     }
   },
   apiKeysPage: {

@@ -94,3 +94,39 @@ export async function rotateAgentWidgetKey(
   }
   return response.json()
 }
+
+export interface AgentWidgetEndUserSecretState {
+  agent_id: number
+  widget_end_user_secret: string
+}
+
+// Unlike widget_key, this secret must never appear in the embed snippet or
+// any client-side code -- it signs data-end-user-id server-side, on the
+// embedding site's own backend, so the widget can trust which end user a
+// session claims to be.
+export async function fetchAgentWidgetEndUserSecret(
+  agentId: number | string,
+  fallbackErrorMessage: string,
+): Promise<AgentWidgetEndUserSecretState> {
+  const response = await apiRequest(
+    `${getApiUrl()}/api/agents/${agentId}/widget-end-user-secret`,
+  )
+  if (!response.ok) {
+    throw await parseAgentUpdateError(response, fallbackErrorMessage)
+  }
+  return response.json()
+}
+
+export async function rotateAgentWidgetEndUserSecret(
+  agentId: number | string,
+  fallbackErrorMessage: string,
+): Promise<AgentWidgetEndUserSecretState> {
+  const response = await apiRequest(
+    `${getApiUrl()}/api/agents/${agentId}/widget-end-user-secret/rotate`,
+    { method: "POST" },
+  )
+  if (!response.ok) {
+    throw await parseAgentUpdateError(response, fallbackErrorMessage)
+  }
+  return response.json()
+}

@@ -3208,7 +3208,8 @@ Build when you need.`,
     embed_snippet: {
       title: "Embed Snippet",
       desc: "Copy and paste this script tag into the <body> of your website.",
-      copy_btn: "Copy Snippet"
+      copy_btn: "Copy Snippet",
+      advanced_toggle: "Advanced options (custom identity, key rotation)"
     },
     share_link: {
       title: "Share Link",
@@ -3270,39 +3271,27 @@ Build when you need.`,
     }
   },
   appWidget: {
-    builder: {
-      title: "App Widget",
-      description: "Embed this agent as a chat bubble on a website",
-      saveFirst: "Save the agent before configuring the app widget",
-      configure: "Configure app widget",
-      toggle: "Toggle app widget"
-    },
     dialog: {
-      title: "App Widget",
-      enabledLabel: "Widget enabled",
-      allowedDomains: "Allowed domains",
-      domainPlaceholder: "e.g. example.com",
-      addDomain: "Add",
       invalidDomain: "Enter a domain like example.com or localhost:3000 (no scheme, path, or wildcard), or * to allow any domain.",
-      removeDomain: "Remove domain",
-      noDomains: "No domains configured. Widget requests are blocked until a domain or * is added.",
-      allowedDomainsSecurityNote: "Allowed domains are a browser-level restriction only, not a security boundary against non-browser clients. The widget key is the real access gate — keep it private and regenerate it if it leaks.",
-      embedTitle: "Embed snippet",
-      embedDescription: "Copy this script into the page where the chat bubble should appear.",
-      copySnippet: "Copy snippet",
       widgetKeyTitle: "Widget key",
       widgetKeyDescription: "The credential that authorizes this widget. It is included in the embed snippet; anyone holding it can reach the agent, so rotate it if it leaks.",
       copyWidgetKey: "Copy widget key",
       rotateWidgetKey: "Regenerate",
-      rotateWidgetKeyConfirm: "Regenerate the widget key? Every already-deployed embed snippet stops working until it is replaced with the new one."
+      rotateWidgetKeyConfirm: "Regenerate the widget key? Every already-deployed embed snippet stops working until it is replaced with the new one.",
+      endUserSecretTitle: "End-user signing secret",
+      endUserSecretDescription: "Use this secret on your own server to sign each visitor's identity before passing data-end-user-id, so the widget session is scoped to that specific user instead of an anonymous visitor. Never put this secret in the embed snippet or any browser-side code — compute the signature (HMAC-SHA256 of the end-user id) server-side and pass the result as data-end-user-signature.",
+      copyEndUserSecret: "Copy signing secret",
+      rotateEndUserSecret: "Regenerate",
+      rotateEndUserSecretConfirm: "Regenerate the end-user signing secret? Any signature already computed with the current secret stops verifying until your server switches to the new one."
     },
     messages: {
-      updated: "Widget configuration updated",
-      updateFailed: "Failed to update widget configuration",
       copyFailed: "Failed to copy widget snippet",
       widgetKeyLoadFailed: "Failed to load widget key",
       widgetKeyRotated: "Widget key regenerated. Update deployed embed snippets.",
-      widgetKeyRotateFailed: "Failed to regenerate widget key"
+      widgetKeyRotateFailed: "Failed to regenerate widget key",
+      endUserSecretLoadFailed: "Failed to load end-user signing secret",
+      endUserSecretRotated: "Signing secret regenerated. Update the secret on your server before signing new sessions.",
+      endUserSecretRotateFailed: "Failed to regenerate end-user signing secret"
     }
   },
   apiKeysPage: {

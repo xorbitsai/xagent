@@ -10,7 +10,7 @@ import { Label } from "@/components/ui/label"
 import { Switch } from "@/components/ui/switch"
 import { apiRequest } from "@/lib/api-wrapper"
 import { getApiUrl } from "@/lib/utils"
-import { PlusCircle, MessageSquare, Upload, Settings2, Check, Zap, BookOpen, ChevronLeft, Gauge, Sparkles, Loader2, X, XCircle, Trash2, Bot, Brain, Webhook, CalendarClock, Mail, Code2 } from "lucide-react"
+import { PlusCircle, MessageSquare, Upload, Settings2, Check, Zap, BookOpen, ChevronLeft, Gauge, Sparkles, Loader2, X, XCircle, Trash2, Bot, Brain, Webhook, CalendarClock, Mail } from "lucide-react"
 import { ConnectMcpDialog } from "@/components/mcp/connect-mcp-dialog"
 import { useI18n } from "@/contexts/i18n-context"
 import { useApp } from "@/contexts/app-context-chat"
@@ -42,8 +42,6 @@ import { BuildFilePreviewSheet } from "./build-file-preview-sheet"
 import { TaskConversationPanel } from "@/components/task/task-conversation-panel"
 import { AgentTriggersDialog } from "./agent-triggers-dialog"
 import { AgentTrigger, AgentTriggerType, listAgentTriggers } from "@/lib/agent-triggers-api"
-import { AgentWidgetSettingsDialog } from "./agent-widget-settings-dialog"
-import { updateAgentWidgetConfig } from "@/lib/agent-widget-config"
 
 interface KnowledgeBase {
   name: string
@@ -145,8 +143,6 @@ export function AgentBuilder({ agentId }: AgentBuilderProps) {
   const [isKbModalOpen, setIsKbModalOpen] = useState(false)
   const [isModelConfigOpen, setIsModelConfigOpen] = useState(false)
   const [isTriggersDialogOpen, setIsTriggersDialogOpen] = useState(false)
-  const [isWidgetSettingsOpen, setIsWidgetSettingsOpen] = useState(false)
-  const [isWidgetUpdating, setIsWidgetUpdating] = useState(false)
   const [triggerDialogInitialType, setTriggerDialogInitialType] = useState<AgentTriggerType | null>(null)
   const [triggerSummary, setTriggerSummary] = useState<AgentTrigger[]>([])
   const [triggerSummaryLoading, setTriggerSummaryLoading] = useState(false)
@@ -215,37 +211,6 @@ export function AgentBuilder({ agentId }: AgentBuilderProps) {
     })
     return stats
   }, [triggerSummary])
-
-  const appWidgetConfig = useMemo(() => {
-    const source = originalData ?? createdAgent
-    return {
-      widget_enabled: Boolean(source?.widget_enabled),
-      allowed_domains: Array.isArray(source?.allowed_domains) ? source.allowed_domains : [],
-    }
-  }, [createdAgent, originalData])
-
-  const mergeWidgetAgentData = useCallback((updatedAgent: Record<string, unknown>) => {
-    setOriginalData((current: any) => current ? { ...current, ...updatedAgent } : updatedAgent)
-    setCreatedAgent((current: any) => current ? { ...current, ...updatedAgent } : current)
-  }, [])
-
-  const handleWidgetEnabledChange = useCallback(async (checked: boolean) => {
-    if (!localAgentId) return
-    setIsWidgetUpdating(true)
-    try {
-      const updatedAgent = await updateAgentWidgetConfig(
-        localAgentId,
-        { widget_enabled: checked },
-        t("appWidget.messages.updateFailed"),
-      )
-      mergeWidgetAgentData(updatedAgent)
-      toast.success(t("appWidget.messages.updated"))
-    } catch (error) {
-      toast.error(error instanceof Error ? error.message : t("appWidget.messages.updateFailed"))
-    } finally {
-      setIsWidgetUpdating(false)
-    }
-  }, [localAgentId, mergeWidgetAgentData, t])
 
   const gmailConnection = useMemo(() => {
     const gmailApp = findMatchingMcpApp(officialApps, "gmail")
@@ -1869,7 +1834,7 @@ export function AgentBuilder({ agentId }: AgentBuilderProps) {
 
         <div className={cn(
           "space-y-2 rounded-lg border bg-card/40 p-2.5",
-          (triggerSummary.some((trigger) => trigger.enabled) || appWidgetConfig.widget_enabled) && "border-primary/70",
+          triggerSummary.some((trigger) => trigger.enabled) && "border-primary/70",
         )}>
           <div className="flex flex-wrap items-center justify-between gap-3 px-0.5">
             <div className="flex items-center gap-1.5">
@@ -1981,50 +1946,6 @@ export function AgentBuilder({ agentId }: AgentBuilderProps) {
                 </div>
               )
             })}
-            <div
-              className={cn(
-                "flex min-w-0 items-center gap-2 rounded-md border bg-background px-2.5 py-2 text-left transition-colors",
-                appWidgetConfig.widget_enabled && "border-primary/40 bg-primary/[0.03]",
-                !localAgentId && "opacity-60",
-              )}
-            >
-              <button
-                type="button"
-                disabled={!localAgentId}
-                onClick={() => setIsWidgetSettingsOpen(true)}
-                className="flex min-w-0 flex-1 items-center gap-2 text-left disabled:cursor-not-allowed"
-              >
-                <div className="flex h-6 w-6 shrink-0 items-center justify-center rounded bg-sky-50 text-sky-700 dark:bg-sky-950/40 dark:text-sky-300">
-                  <Code2 className="h-4 w-4" />
-                </div>
-                <div className="min-w-0 flex-1">
-                  <div className="flex items-center gap-2">
-                    <span className="truncate text-sm font-medium">{t("appWidget.builder.title")}</span>
-                  </div>
-                  <div className="mt-0.5 truncate text-xs text-muted-foreground">
-                    {localAgentId ? t("appWidget.builder.description") : t("appWidget.builder.saveFirst")}
-                  </div>
-                </div>
-              </button>
-              <Switch
-                aria-label={t("appWidget.builder.toggle")}
-                checked={appWidgetConfig.widget_enabled}
-                disabled={!localAgentId || isWidgetUpdating}
-                onCheckedChange={(checked) => void handleWidgetEnabledChange(checked)}
-                className="scale-75"
-              />
-              <Button
-                type="button"
-                variant="ghost"
-                size="icon"
-                disabled={!localAgentId}
-                onClick={() => setIsWidgetSettingsOpen(true)}
-                className="h-7 w-7 text-muted-foreground hover:text-foreground"
-                title={t("appWidget.builder.configure")}
-              >
-                <Settings2 className="h-3.5 w-3.5" />
-              </Button>
-            </div>
           </div>
         </div>
 
@@ -2296,15 +2217,6 @@ export function AgentBuilder({ agentId }: AgentBuilderProps) {
           setIsTriggersDialogOpen(false)
           setIsConnectMcpOpen(true)
         }}
-      />
-
-      <AgentWidgetSettingsDialog
-        agentId={localAgentId ? Number(localAgentId) : null}
-        agentName={name}
-        open={isWidgetSettingsOpen}
-        onOpenChange={setIsWidgetSettingsOpen}
-        widgetConfig={appWidgetConfig}
-        onWidgetConfigUpdated={mergeWidgetAgentData}
       />
 
       {state.filePreview.isOpen && (

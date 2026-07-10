@@ -269,7 +269,9 @@ def get_latest_public_chat_task(
         .filter(
             Task.user_id == access_context.user.id,
             Task.agent_id == access_context.widget_agent_id,
-            Task.channel_id.is_(access_context.channel_id),
+            Task.channel_id.is_(access_context.channel_id)
+            if access_context.channel_id is None
+            else Task.channel_id == access_context.channel_id,
             Task.source == "widget",
             Task.agent_config["guest_id"].as_string() == access_context.guest_id,
         )

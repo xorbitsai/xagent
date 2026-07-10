@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 import sqlite3
 from collections.abc import Iterator
 from datetime import datetime, timedelta, timezone
@@ -34,8 +35,10 @@ from xagent.web.models.task import (
 from xagent.web.models.user import User
 from xagent.web.services.trace_message_storage import (
     CHECKPOINT_BLOB_REF_ENCODING,
+    LEDGER_REFS_ENCODING,
     MESSAGE_REFS_DECODE_ERROR_KEY,
     MESSAGE_REFS_ENCODING,
+    TOOL_LEDGER_RECORD_KIND,
     CheckpointMessageDecodeError,
     canonical_json_hash,
     decode_trace_event_data,
@@ -296,9 +299,9 @@ def test_checkpoint_blob_refs_round_trip_and_dedupe() -> None:
         stored_metadata = encoded["snapshot"]["context"]["metadata"]
         assert stored_messages["__encoding"] == MESSAGE_REFS_ENCODING
         assert stored_tool_ledger == {
-            "__encoding": CHECKPOINT_BLOB_REF_ENCODING,
-            "kind": "pattern_state.tool_ledger",
-            "hash": canonical_json_hash(tool_ledger),
+            "__encoding": LEDGER_REFS_ENCODING,
+            "count": 1,
+            "records": [["call-1", canonical_json_hash(tool_ledger["call-1"])]],
         }
         assert stored_metadata == {
             "__encoding": CHECKPOINT_BLOB_REF_ENCODING,
@@ -625,7 +628,7 @@ def test_database_trace_handler_stores_checkpoint_messages_as_refs(
         stored_messages = row.data["snapshot"]["context"]["messages"]
         stored_tool_ledger = row.data["snapshot"]["pattern_state"]["tool_ledger"]
         assert stored_messages["__encoding"] == MESSAGE_REFS_ENCODING
-        assert stored_tool_ledger["__encoding"] == CHECKPOINT_BLOB_REF_ENCODING
+        assert stored_tool_ledger["__encoding"] == LEDGER_REFS_ENCODING
         assert db.query(TraceMessageBlob).count() == 2
         assert db.query(TraceCheckpointBlob).count() == 2
 
@@ -821,6 +824,368 @@ def test_database_trace_handler_falls_back_when_latest_refs_are_unreadable(
         db.close()
 
 
+def _context_payload(
+    execution_id: str,
+    messages: list[dict[str, Any]],
+    system_prompt: str,
+) -> dict[str, Any]:
+    return {
+        "execution_id": execution_id,
+        "messages": messages,
+        "system_prompt": system_prompt,
+        "metadata": {},
+    }
+
+
+def _dag_checkpoint_data(
+    execution_id: str,
+    messages: list[dict[str, Any]],
+    system_prompt: str,
+    tool_ledger: dict[str, Any],
+) -> dict[str, Any]:
+    root_context = _context_payload(execution_id, messages, system_prompt)
+    child_context = _context_payload(f"{execution_id}_child", messages, system_prompt)
+    return {
+        "checkpoint_type": CHECKPOINT_TYPE,
+        "root_execution_id": execution_id,
+        "execution_id": execution_id,
+        "label": "dag_step_completed",
+        "snapshot": {
+            "type": "checkpoint",
+            "label": "dag_step_completed",
+            "execution_id": execution_id,
+            "context": root_context,
+            "pattern": "DAGPlanExecutePattern",
+            "pattern_state": {
+                "status": "running",
+                "active_step_contexts": {"step-1": dict(child_context)},
+                "active_step_pattern_states": {"step-1": {"tool_ledger": tool_ledger}},
+                "step_results": {},
+            },
+            "execution_snapshot": {
+                "root_execution_id": execution_id,
+                "frames": {
+                    "root:dag": {
+                        "frame_id": "root:dag",
+                        "pattern_type": "dag",
+                        "context": dict(root_context),
+                        "pattern_state": {},
+                    },
+                    "child:react": {
+                        "frame_id": "child:react",
+                        "pattern_type": "react",
+                        "context": dict(child_context),
+                        "pattern_state": {"tool_ledger": tool_ledger},
+                    },
+                },
+            },
+        },
+    }
+
+
+def test_v2_ledger_records_dedupe_across_growing_checkpoints() -> None:
+    SessionLocal = _session_factory()
+    db = SessionLocal()
+    try:
+        task = _create_task(db)
+        task_id = int(task.id)
+        record_one = {
+            "tool_call_id": "call-1",
+            "tool_name": "web_search",
+            "args": {"query": "growth"},
+            "status": "completed",
+            "result": "large tool output " * 10,
+        }
+        record_two = {
+            "tool_call_id": "call-2",
+            "tool_name": "calculator",
+            "args": {"expression": "1+1"},
+            "status": "completed",
+            "result": "2",
+        }
+        first = _checkpoint_data_with_large_fields(
+            "exec-ledger",
+            [{"role": "user", "content": "task"}],
+            tool_ledger={"call-1": record_one},
+        )
+        second = _checkpoint_data_with_large_fields(
+            "exec-ledger",
+            [{"role": "user", "content": "task"}],
+            tool_ledger={"call-1": record_one, "call-2": record_two},
+        )
+
+        encoded_first = encode_checkpoint_data_for_storage(
+            db, task_id=task_id, data=first
+        )
+        encoded_second = encode_checkpoint_data_for_storage(
+            db, task_id=task_id, data=second
+        )
+        db.flush()
+
+        # The unchanged record is shared: two checkpoints with a growing
+        # ledger store 2 record blobs, not 3.
+        record_blobs = (
+            db.query(TraceCheckpointBlob)
+            .filter(TraceCheckpointBlob.blob_kind == TOOL_LEDGER_RECORD_KIND)
+            .all()
+        )
+        assert len(record_blobs) == 2
+
+        decoded_second = decode_trace_event_data(
+            db, task_id=task_id, data=encoded_second, strict=True
+        )
+        assert decoded_second["snapshot"]["pattern_state"]["tool_ledger"] == {
+            "call-1": record_one,
+            "call-2": record_two,
+        }
+        assert list(decoded_second["snapshot"]["pattern_state"]["tool_ledger"]) == [
+            "call-1",
+            "call-2",
+        ]
+
+        decoded_first = decode_trace_event_data(
+            db, task_id=task_id, data=encoded_first, strict=True
+        )
+        assert decoded_first["snapshot"]["pattern_state"]["tool_ledger"] == {
+            "call-1": record_one
+        }
+    finally:
+        db.close()
+
+
+def test_v2_encodes_nested_contexts_system_prompt_and_frame_ledgers() -> None:
+    SessionLocal = _session_factory()
+    db = SessionLocal()
+    try:
+        task = _create_task(db)
+        task_id = int(task.id)
+        messages = [
+            {"role": "user", "content": "build a report"},
+            {"role": "assistant", "content": "planning"},
+        ]
+        system_prompt = "You are a meticulous data analyst. " * 20
+        tool_ledger = {"call-1": {"tool_call_id": "call-1", "result": "step output"}}
+        data = _dag_checkpoint_data("exec-dag", messages, system_prompt, tool_ledger)
+        original = copy.deepcopy(data)
+
+        encoded = encode_checkpoint_data_for_storage(db, task_id=task_id, data=data)
+        db.flush()
+
+        snapshot = encoded["snapshot"]
+        # Root context, both frames, and the active step context all encode
+        # their messages as refs against the same shared blobs.
+        assert snapshot["context"]["messages"]["__encoding"] == MESSAGE_REFS_ENCODING
+        for frame in snapshot["execution_snapshot"]["frames"].values():
+            assert frame["context"]["messages"]["__encoding"] == MESSAGE_REFS_ENCODING
+        step_context = snapshot["pattern_state"]["active_step_contexts"]["step-1"]
+        assert step_context["messages"]["__encoding"] == MESSAGE_REFS_ENCODING
+        assert db.query(TraceMessageBlob).count() == len(messages)
+
+        # The large system prompt is stored once and referenced everywhere.
+        assert (
+            snapshot["context"]["system_prompt"]["__encoding"]
+            == CHECKPOINT_BLOB_REF_ENCODING
+        )
+        prompt_blobs = (
+            db.query(TraceCheckpointBlob)
+            .filter(TraceCheckpointBlob.blob_kind == "context.system_prompt")
+            .all()
+        )
+        assert len(prompt_blobs) == 1
+        assert prompt_blobs[0].blob_data == system_prompt
+
+        # Nested ledgers (active step pattern state + react frame) encode
+        # per record and share the same record blob.
+        assert (
+            snapshot["pattern_state"]["active_step_pattern_states"]["step-1"][
+                "tool_ledger"
+            ]["__encoding"]
+            == LEDGER_REFS_ENCODING
+        )
+        assert (
+            snapshot["execution_snapshot"]["frames"]["child:react"]["pattern_state"][
+                "tool_ledger"
+            ]["__encoding"]
+            == LEDGER_REFS_ENCODING
+        )
+        record_blobs = (
+            db.query(TraceCheckpointBlob)
+            .filter(TraceCheckpointBlob.blob_kind == TOOL_LEDGER_RECORD_KIND)
+            .all()
+        )
+        assert len(record_blobs) == 1
+
+        decoded = decode_trace_event_data(
+            db, task_id=task_id, data=encoded, strict=True
+        )
+        assert decoded == original
+    finally:
+        db.close()
+
+
+def test_v2_small_system_prompt_and_empty_metadata_stay_inline() -> None:
+    SessionLocal = _session_factory()
+    db = SessionLocal()
+    try:
+        task = _create_task(db)
+        task_id = int(task.id)
+        data = _checkpoint_data("exec-small", [{"role": "user", "content": "hi"}])
+        data["snapshot"]["context"]["execution_id"] = "exec-small"
+        data["snapshot"]["context"]["system_prompt"] = "short prompt"
+        data["snapshot"]["context"]["metadata"] = {}
+
+        encoded = encode_checkpoint_data_for_storage(db, task_id=task_id, data=data)
+        db.flush()
+
+        assert encoded["snapshot"]["context"]["system_prompt"] == "short prompt"
+        assert encoded["snapshot"]["context"]["metadata"] == {}
+        assert db.query(TraceCheckpointBlob).count() == 0
+    finally:
+        db.close()
+
+
+def test_v1_flag_still_writes_whole_ledger_blob_and_v2_decodes_it() -> None:
+    SessionLocal = _session_factory()
+    db = SessionLocal()
+    try:
+        task = _create_task(db)
+        task_id = int(task.id)
+        tool_ledger = {"call-1": {"result": "legacy output"}}
+        data = _checkpoint_data_with_large_fields(
+            "exec-v1",
+            [{"role": "user", "content": "hello"}],
+            tool_ledger=tool_ledger,
+        )
+
+        encoded = encode_checkpoint_data_for_storage(
+            db, task_id=task_id, data=data, use_v2=False
+        )
+        db.flush()
+
+        assert encoded["snapshot"]["pattern_state"]["tool_ledger"] == {
+            "__encoding": CHECKPOINT_BLOB_REF_ENCODING,
+            "kind": "pattern_state.tool_ledger",
+            "hash": canonical_json_hash(tool_ledger),
+        }
+
+        decoded = decode_trace_event_data(
+            db, task_id=task_id, data=encoded, strict=True
+        )
+        assert decoded["snapshot"]["pattern_state"]["tool_ledger"] == tool_ledger
+    finally:
+        db.close()
+
+
+def test_database_trace_handler_prunes_checkpoint_history(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    SessionLocal = _session_factory()
+    db = SessionLocal()
+    try:
+        task = _create_task(db)
+        task_id = int(task.id)
+        handler = DatabaseTraceHandler(task_id)
+        monkeypatch.setattr(
+            "xagent.web.api.trace_handlers.get_checkpoint_history_limit",
+            lambda: 3,
+        )
+
+        # A non-checkpoint system event and another execution's checkpoint
+        # must both survive pruning.
+        db.add(
+            DatabaseTraceEvent(
+                task_id=task_id,
+                event_id="other-system",
+                event_type="system_update_general",
+                timestamp=datetime.now(timezone.utc),
+                data={"note": "not a checkpoint"},
+            )
+        )
+        db.commit()
+        handler._save_trace_event(
+            db,
+            TraceEvent(
+                CHECKPOINT_EVENT_TYPE,
+                task_id=str(task_id),
+                data=_checkpoint_data(
+                    "exec-other", [{"role": "user", "content": "other"}]
+                ),
+            ),
+        )
+
+        for index in range(5):
+            handler._save_trace_event(
+                db,
+                TraceEvent(
+                    CHECKPOINT_EVENT_TYPE,
+                    task_id=str(task_id),
+                    data=_checkpoint_data(
+                        "exec-prune",
+                        [{"role": "user", "content": f"turn-{index}"}],
+                    ),
+                ),
+            )
+
+        rows = (
+            db.query(DatabaseTraceEvent)
+            .filter(DatabaseTraceEvent.task_id == task_id)
+            .order_by(DatabaseTraceEvent.id)
+            .all()
+        )
+        prune_rows = [
+            row for row in rows if row.data.get("execution_id") == "exec-prune"
+        ]
+        assert len(prune_rows) == 3
+        # The most recent checkpoints are the ones kept.
+        latest = decode_trace_event_data(
+            db, task_id=task_id, data=prune_rows[-1].data, strict=True
+        )
+        assert latest["snapshot"]["context"]["messages"] == [
+            {"role": "user", "content": "turn-4"}
+        ]
+        assert any(row.event_id == "other-system" for row in rows)
+        assert any(row.data.get("execution_id") == "exec-other" for row in rows)
+    finally:
+        db.close()
+
+
+def test_database_trace_handler_prune_disabled_keeps_all_checkpoints(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    SessionLocal = _session_factory()
+    db = SessionLocal()
+    try:
+        task = _create_task(db)
+        task_id = int(task.id)
+        handler = DatabaseTraceHandler(task_id)
+        monkeypatch.setattr(
+            "xagent.web.api.trace_handlers.get_checkpoint_history_limit",
+            lambda: 0,
+        )
+
+        for index in range(4):
+            handler._save_trace_event(
+                db,
+                TraceEvent(
+                    CHECKPOINT_EVENT_TYPE,
+                    task_id=str(task_id),
+                    data=_checkpoint_data(
+                        "exec-keep",
+                        [{"role": "user", "content": f"turn-{index}"}],
+                    ),
+                ),
+            )
+
+        assert (
+            db.query(DatabaseTraceEvent)
+            .filter(DatabaseTraceEvent.task_id == task_id)
+            .count()
+            == 4
+        )
+    finally:
+        db.close()
+
+
 def test_convert_trace_checkpoint_messages_script_dry_run_and_execute() -> None:
     SessionLocal = _session_factory()
     db = SessionLocal()
@@ -899,7 +1264,7 @@ def test_convert_trace_checkpoint_messages_script_dry_run_and_execute() -> None:
         mixed_row = db.query(DatabaseTraceEvent).filter_by(event_id="mixed").one()
         assert (
             mixed_row.data["snapshot"]["pattern_state"]["tool_ledger"]["__encoding"]
-            == CHECKPOINT_BLOB_REF_ENCODING
+            == LEDGER_REFS_ENCODING
         )
         assert db.query(TraceMessageBlob).count() == 1
         assert db.query(TraceCheckpointBlob).count() == 2

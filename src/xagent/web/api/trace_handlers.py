@@ -8,6 +8,7 @@ from typing import Any, Dict, Optional
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
+from ...config import get_checkpoint_history_limit
 from ...core.agent.checkpoint import CHECKPOINT_TYPE, READABLE_CHECKPOINT_TYPES
 from ...core.agent.trace import BaseTraceHandler
 from ...core.agent.trace import TraceEvent as CoreTraceEvent
@@ -260,6 +261,13 @@ class DatabaseTraceHandler(BaseTraceHandler):
 
             db.commit()
 
+            if (
+                event_type_str == "system_update_general"
+                and isinstance(data, dict)
+                and data.get("checkpoint_type") == CHECKPOINT_TYPE
+            ):
+                self._prune_checkpoint_history(db, data)
+
             logger.debug(
                 f"Saved trace event {event.id} of type {event_type_str} to database"
             )
@@ -288,6 +296,69 @@ class DatabaseTraceHandler(BaseTraceHandler):
             logger.error(f"Failed to save trace event to database: {e}")
             db.rollback()
             raise
+
+    def _prune_checkpoint_history(self, db: Session, data: Dict[str, Any]) -> None:
+        """Drop checkpoint rows beyond the retention limit for one execution.
+
+        Resume only reads the most recent readable checkpoint; a few older
+        rows are kept so an unreadable latest can fall back. Runs in its own
+        transaction after the checkpoint commit so a prune failure can never
+        take the checkpoint write down with it. Blobs are left in place:
+        they are content-deduplicated, so the surviving checkpoints keep
+        referencing them.
+        """
+        limit = get_checkpoint_history_limit()
+        if limit <= 0:
+            return
+        execution_id = str(
+            data.get("execution_id") or data.get("root_execution_id") or ""
+        )
+        if not execution_id:
+            return
+        try:
+            build_filter = (
+                DatabaseTraceEvent.build_id == self.build_id
+                if self.build_id is not None
+                else DatabaseTraceEvent.build_id.is_(None)
+            )
+            stale_rows = (
+                db.query(DatabaseTraceEvent.id)
+                .filter(
+                    DatabaseTraceEvent.task_id == self.task_id,
+                    build_filter,
+                    DatabaseTraceEvent.event_type == "system_update_general",
+                    DatabaseTraceEvent.data["checkpoint_type"]
+                    .as_string()
+                    .in_(sorted(READABLE_CHECKPOINT_TYPES)),
+                    DatabaseTraceEvent.data["execution_id"].as_string() == execution_id,
+                )
+                .order_by(
+                    DatabaseTraceEvent.timestamp.desc(),
+                    DatabaseTraceEvent.id.desc(),
+                )
+                .offset(limit)
+                .all()
+            )
+            if not stale_rows:
+                return
+            stale_ids = [row_id for (row_id,) in stale_rows]
+            db.query(DatabaseTraceEvent).filter(
+                DatabaseTraceEvent.id.in_(stale_ids)
+            ).delete(synchronize_session=False)
+            db.commit()
+            logger.debug(
+                "Pruned %d checkpoint rows for task %s execution %s",
+                len(stale_ids),
+                self.task_id,
+                execution_id,
+            )
+        except Exception:
+            db.rollback()
+            logger.warning(
+                "Failed to prune checkpoint history for task %s",
+                self.task_id,
+                exc_info=True,
+            )
 
     def _is_duplicate_user_message_turn(
         self,

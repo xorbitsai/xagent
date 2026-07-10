@@ -1324,6 +1324,46 @@ class TestToolConcurrencyConfig:
         assert get_tool_max_concurrency() == 3
 
 
+class TestCheckpointStorageConfig:
+    """Config for checkpoint trace-event storage encoding and retention."""
+
+    def test_encoding_v2_default_is_true(self, monkeypatch):
+        from xagent.config import get_checkpoint_encoding_v2_enabled
+
+        monkeypatch.delenv("XAGENT_CHECKPOINT_ENCODING_V2", raising=False)
+        assert get_checkpoint_encoding_v2_enabled() is True
+
+    def test_encoding_v2_env_override(self, monkeypatch):
+        from xagent.config import get_checkpoint_encoding_v2_enabled
+
+        monkeypatch.setenv("XAGENT_CHECKPOINT_ENCODING_V2", "false")
+        assert get_checkpoint_encoding_v2_enabled() is False
+        monkeypatch.setenv("XAGENT_CHECKPOINT_ENCODING_V2", "1")
+        assert get_checkpoint_encoding_v2_enabled() is True
+
+    def test_history_limit_default_is_eight(self, monkeypatch):
+        from xagent.config import get_checkpoint_history_limit
+
+        monkeypatch.delenv("XAGENT_CHECKPOINT_HISTORY_LIMIT", raising=False)
+        assert get_checkpoint_history_limit() == 8
+
+    def test_history_limit_env_override_and_zero_disables(self, monkeypatch):
+        from xagent.config import get_checkpoint_history_limit
+
+        monkeypatch.setenv("XAGENT_CHECKPOINT_HISTORY_LIMIT", "20")
+        assert get_checkpoint_history_limit() == 20
+        monkeypatch.setenv("XAGENT_CHECKPOINT_HISTORY_LIMIT", "0")
+        assert get_checkpoint_history_limit() == 0
+
+    def test_history_limit_invalid_falls_back_to_default(self, monkeypatch):
+        from xagent.config import get_checkpoint_history_limit
+
+        monkeypatch.setenv("XAGENT_CHECKPOINT_HISTORY_LIMIT", "not-a-number")
+        assert get_checkpoint_history_limit() == 8
+        monkeypatch.setenv("XAGENT_CHECKPOINT_HISTORY_LIMIT", "-1")
+        assert get_checkpoint_history_limit() == 8
+
+
 class TestSandboxConcurrencyConfig:
     """Config for sandbox worker concurrency."""
 

@@ -30,6 +30,7 @@ from __future__ import annotations
 
 import asyncio
 import copy
+import hashlib
 import inspect
 import json
 from dataclasses import dataclass, replace
@@ -2082,9 +2083,12 @@ class ReActPattern(AgentPattern):
 
     def _args_hash(self, args: dict[str, Any]) -> str:
         try:
-            return json.dumps(args, sort_keys=True, default=str)
+            canonical = json.dumps(args, sort_keys=True, default=str)
         except TypeError:
-            return str(args)
+            canonical = str(args)
+        # Digest instead of the raw JSON: the hash is persisted in every
+        # ledger record, so large args would otherwise be stored twice.
+        return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
     def _tool_call_args_dict(
         self, tool_call: dict[str, Any], *, require_mapping: bool = False

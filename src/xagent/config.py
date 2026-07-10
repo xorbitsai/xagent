@@ -71,6 +71,8 @@ WEB_SEARCH_PROVIDER = "XAGENT_WEB_SEARCH_PROVIDER"
 WEB_CRAWL_TLS_IMPERSONATE = "XAGENT_WEB_CRAWL_TLS_IMPERSONATE"
 TOOL_PARALLEL_ENABLED = "XAGENT_TOOL_PARALLEL_ENABLED"
 TOOL_MAX_CONCURRENCY = "XAGENT_TOOL_MAX_CONCURRENCY"
+CHECKPOINT_ENCODING_V2 = "XAGENT_CHECKPOINT_ENCODING_V2"
+CHECKPOINT_HISTORY_LIMIT = "XAGENT_CHECKPOINT_HISTORY_LIMIT"
 COMPACT_THRESHOLD_RATIO = "XAGENT_COMPACT_THRESHOLD_RATIO"
 COMPACT_THRESHOLD_DEFAULT = "XAGENT_COMPACT_THRESHOLD_DEFAULT"
 REDIS_URL = "XAGENT_REDIS_URL"
@@ -423,6 +425,46 @@ def get_tool_max_concurrency() -> int:
         The per-batch concurrency cap (>= 1).
     """
     return _get_positive_int_env(TOOL_MAX_CONCURRENCY, 3)
+
+
+def get_checkpoint_encoding_v2_enabled() -> bool:
+    """Whether checkpoint trace events use the v2 storage encoding.
+
+    v2 extends the v1 refs/blob encoding to nested DAG/auto contexts,
+    per-record tool-ledger dedup, and system-prompt blobs. Decode support
+    for v2 is unconditional; this flag only gates NEW writes so a fleet can
+    be rolled out in two phases (deploy with ``0`` first so every instance
+    can read v2, then remove the override to start writing it).
+
+    Priority:
+        1. XAGENT_CHECKPOINT_ENCODING_V2 environment variable
+        2. Default ``True``
+
+    Returns:
+        True if new checkpoints are written with the v2 encoding.
+    """
+    return _get_bool_env(CHECKPOINT_ENCODING_V2, True)
+
+
+def get_checkpoint_history_limit() -> int:
+    """How many checkpoint trace events to retain per task execution.
+
+    Older checkpoint rows beyond this limit are deleted when a new
+    checkpoint is persisted (resume only ever reads the most recent
+    readable checkpoint; a few older rows are kept as a fallback for
+    unreadable-latest recovery and debugging).
+
+    Priority:
+        1. XAGENT_CHECKPOINT_HISTORY_LIMIT environment variable
+        2. Default ``8``
+
+    ``0`` disables pruning entirely. Invalid values fall back to the
+    default.
+
+    Returns:
+        The number of checkpoint rows to keep per execution (>= 0).
+    """
+    return _get_positive_int_env(CHECKPOINT_HISTORY_LIMIT, 8, minimum=0)
 
 
 def get_compact_threshold_ratio() -> float:

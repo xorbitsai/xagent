@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+import asyncio
 import json
+import logging
 import re
+import socket
 import time
 from asyncio import sleep, timeout
 from typing import Any, Mapping, Optional, Type
@@ -11,12 +14,14 @@ from uuid import uuid4
 import httpx
 from pydantic import BaseModel, Field
 
+from ....utils.security import reject_private_network_host
 from .base import AbstractBaseTool, ToolCategory, ToolVisibility
 from .config import BaseToolConfig
 from .factory import register_tool
 
 A2A_MEDIA_TYPE = "application/a2a+json"
 A2A_VERSION = "1.0"
+A2A_TOOL_ERROR_MESSAGE = "Remote A2A agent call failed."
 _TERMINAL_STATES = {
     "TASK_STATE_COMPLETED",
     "TASK_STATE_FAILED",
@@ -35,6 +40,8 @@ _FAILURE_STATES = {
     "TASK_STATE_CANCELLED",
     "TASK_STATE_REJECTED",
 }
+
+logger = logging.getLogger(__name__)
 
 
 class A2AAgentToolArgs(BaseModel):
@@ -86,13 +93,21 @@ class A2AAgentTool(AbstractBaseTool):
         headers: Mapping[str, Any] | None = None,
         auth_token: str | None = None,
         timeout_seconds: float = 60.0,
+        allow_private_networks: bool = False,
     ):
         self._name = _tool_name(name)
         self._description = description or (
             "Call a remote A2A agent and return its response."
         )
-        self._endpoint_url = _clean_url(endpoint_url)
-        self._agent_card_url = _clean_url(agent_card_url)
+        self._allow_private_networks = allow_private_networks is True
+        self._endpoint_url = _clean_url(
+            endpoint_url,
+            allow_private_networks=self._allow_private_networks,
+        )
+        self._agent_card_url = _clean_url(
+            agent_card_url,
+            allow_private_networks=self._allow_private_networks,
+        )
         self._headers = _string_headers(headers)
         self._auth_token = auth_token.strip() if isinstance(auth_token, str) else None
         self._timeout_seconds = max(float(timeout_seconds or 60.0), 1.0)
@@ -131,7 +146,13 @@ class A2AAgentTool(AbstractBaseTool):
 
         try:
             async with timeout(self._timeout_seconds):
-                async with httpx.AsyncClient(timeout=self._timeout_seconds) as client:
+                async with httpx.AsyncClient(
+                    timeout=self._timeout_seconds,
+                    transport=_PinnedA2ATransport(
+                        allow_private_networks=self._allow_private_networks
+                    ),
+                    follow_redirects=False,
+                ) as client:
                     deadline = time.monotonic() + self._timeout_seconds
                     endpoint_url = await self._resolve_endpoint_url(client)
                     response = await client.post(
@@ -156,11 +177,12 @@ class A2AAgentTool(AbstractBaseTool):
                 response="",
                 error=f"A2A call timed out after {self._timeout_seconds:g}s.",
             ).model_dump()
-        except Exception as exc:  # noqa: BLE001
+        except Exception:  # noqa: BLE001
+            logger.exception("A2A agent tool %s call failed", self._name)
             return A2AAgentToolResult(
                 success=False,
                 response="",
-                error=str(exc),
+                error=A2A_TOOL_ERROR_MESSAGE,
             ).model_dump()
 
         task = _extract_task_payload(payload)
@@ -248,7 +270,10 @@ class A2AAgentTool(AbstractBaseTool):
         endpoint_url = _endpoint_from_card(card)
         if not endpoint_url:
             raise ValueError("A2A agent card does not expose an HTTP+JSON endpoint.")
-        endpoint_url = _clean_url(endpoint_url)
+        endpoint_url = _clean_url(
+            endpoint_url,
+            allow_private_networks=self._allow_private_networks,
+        )
         if endpoint_url is None:
             raise ValueError("A2A agent card does not expose a valid endpoint URL.")
         if not _same_origin(self._agent_card_url, endpoint_url):
@@ -298,6 +323,7 @@ def create_a2a_agent_tools_from_configs(
             else {},
             auth_token=_optional_str(item.get("auth_token")),
             timeout_seconds=timeout,
+            allow_private_networks=item.get("allow_private_networks") is True,
         )
         tools.append(tool)
     return tools
@@ -479,7 +505,107 @@ def _tool_name(value: str) -> str:
     return normalized
 
 
-def _clean_url(value: str | None) -> str | None:
+class _PinnedA2ATransport(httpx.AsyncBaseTransport):
+    """Resolve, validate, and pin A2A hosts before opening a connection."""
+
+    def __init__(self, *, allow_private_networks: bool):
+        self._allow_private_networks = allow_private_networks
+        self._transport = httpx.AsyncHTTPTransport(trust_env=False, http2=False)
+
+    async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
+        if self._allow_private_networks:
+            return await self._transport.handle_async_request(request)
+
+        original_url = request.url
+        original_host = request.headers.get("Host")
+        addresses = await _resolve_public_addresses(str(original_url))
+        last_error: httpx.TransportError | None = None
+        for index, address in enumerate(addresses):
+            request.url = original_url.copy_with(host=address)
+            request.headers["Host"] = _host_header_value(str(original_url))
+            if original_url.scheme == "https":
+                request.extensions["sni_hostname"] = _hostname_for_url(
+                    str(original_url)
+                )
+            try:
+                return await self._transport.handle_async_request(request)
+            except (httpx.ConnectError, httpx.ConnectTimeout) as exc:
+                last_error = exc
+                if index == len(addresses) - 1:
+                    raise
+            finally:
+                request.url = original_url
+                if original_host is None:
+                    request.headers.pop("Host", None)
+                else:
+                    request.headers["Host"] = original_host
+        if last_error is not None:
+            raise last_error
+        raise httpx.ConnectError(
+            "A2A endpoint host could not be resolved.", request=request
+        )
+
+    async def aclose(self) -> None:
+        await self._transport.aclose()
+
+
+async def _resolve_public_addresses(value: str) -> list[str]:
+    parsed = urlsplit(value)
+    hostname = (parsed.hostname or "").rstrip(".").lower()
+    reject_private_network_host(hostname)
+    port = parsed.port or (443 if parsed.scheme.lower() == "https" else 80)
+    try:
+        loop = asyncio.get_running_loop()
+        records = await loop.run_in_executor(
+            None,
+            socket.getaddrinfo,
+            hostname,
+            port,
+            socket.AF_UNSPEC,
+            socket.SOCK_STREAM,
+        )
+    except OSError as exc:
+        raise httpx.ConnectError("A2A endpoint host could not be resolved.") from exc
+
+    addresses: list[str] = []
+    for record in records:
+        sockaddr = record[4]
+        if not sockaddr:
+            continue
+        address = str(sockaddr[0])
+        reject_private_network_host(address)
+        if address not in addresses:
+            addresses.append(address)
+    if not addresses:
+        raise httpx.ConnectError("A2A endpoint host could not be resolved.")
+    return addresses
+
+
+def _hostname_for_url(value: str) -> str:
+    hostname = urlsplit(value).hostname
+    if not hostname:
+        raise ValueError("A2A URL must include a hostname.")
+    return hostname.rstrip(".").lower()
+
+
+def _host_header_value(value: str) -> str:
+    parsed = urlsplit(value)
+    hostname = _hostname_for_url(value)
+    host = f"[{hostname}]" if ":" in hostname else hostname
+    port = parsed.port
+    if port and not (
+        (parsed.scheme.lower() == "http" and port == 80)
+        or (parsed.scheme.lower() == "https" and port == 443)
+    ):
+        return f"{host}:{port}"
+    return host
+
+
+def _clean_url(
+    value: str | None,
+    *,
+    allow_private_networks: bool = False,
+) -> str | None:
     if not isinstance(value, str):
         return None
     value = value.strip()
@@ -498,6 +624,8 @@ def _clean_url(value: str | None) -> str | None:
         parsed.port
     except ValueError as exc:
         raise ValueError("A2A URLs must contain a valid port.") from exc
+    if not allow_private_networks:
+        reject_private_network_host(parsed.hostname)
     return value
 
 

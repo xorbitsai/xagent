@@ -1,5 +1,6 @@
 """Security helpers for redacting sensitive data from logs and errors."""
 
+import ipaddress
 import re
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
@@ -22,6 +23,35 @@ HEADER_KEY_PATTERNS = [
     re.compile(r"(?i)(x-goog-api-key\s*[:=]\s*)([^\s,;]+)"),
     re.compile(r"(?i)(x-api-key\s*[:=]\s*)([^\s,;]+)"),
 ]
+
+
+class PrivateNetworkHostError(ValueError):
+    """Raised when an outbound host targets a non-public network range."""
+
+
+def reject_private_network_host(hostname: str) -> None:
+    """Reject localhost and non-public literal IP address ranges."""
+
+    normalized = hostname.rstrip(".").lower()
+    if normalized in {"localhost", "ip6-localhost"}:
+        raise PrivateNetworkHostError("Host must not resolve to a private network.")
+    if "%" in normalized:
+        normalized = normalized.split("%", 1)[0]
+    try:
+        address = ipaddress.ip_address(normalized)
+    except ValueError:
+        return
+    if isinstance(address, ipaddress.IPv6Address) and address.ipv4_mapped:
+        address = address.ipv4_mapped
+    if (
+        address.is_private
+        or address.is_loopback
+        or address.is_link_local
+        or address.is_multicast
+        or address.is_reserved
+        or address.is_unspecified
+    ):
+        raise PrivateNetworkHostError("Host must not resolve to a private network.")
 
 
 def _mask_secret(value: str) -> str:

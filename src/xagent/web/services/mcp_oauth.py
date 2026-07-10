@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import asyncio
-import ipaddress
 import json
 import logging
 import re
@@ -17,6 +16,10 @@ import httpx
 from sqlalchemy.orm import sessionmaker
 
 from ...config import get_mcp_oauth_allow_private_hosts, get_mcp_oauth_proxy_url
+from ...core.utils.security import (
+    PrivateNetworkHostError,
+    reject_private_network_host,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -1481,33 +1484,10 @@ def _truncate(value: str, max_length: int) -> str:
 def _reject_blocked_host(hostname: str) -> None:
     if get_mcp_oauth_allow_private_hosts():
         return
-    if hostname in {"localhost", "ip6-localhost"}:
-        raise MCPOAuthDiscoveryError(
-            "invalid_resource",
-            "OAuth metadata host must not resolve to local addresses",
-        )
-    hostname = _strip_ipv6_zone_id(hostname)
     try:
-        ip_address = ipaddress.ip_address(hostname)
-    except ValueError:
-        return
-    if isinstance(ip_address, ipaddress.IPv6Address) and ip_address.ipv4_mapped:
-        ip_address = ip_address.ipv4_mapped
-    if (
-        ip_address.is_private
-        or ip_address.is_loopback
-        or ip_address.is_link_local
-        or ip_address.is_multicast
-        or ip_address.is_reserved
-        or ip_address.is_unspecified
-    ):
+        reject_private_network_host(hostname)
+    except PrivateNetworkHostError as exc:
         raise MCPOAuthDiscoveryError(
             "invalid_resource",
             "OAuth metadata host must not resolve to local addresses",
-        )
-
-
-def _strip_ipv6_zone_id(hostname: str) -> str:
-    if "%" not in hostname:
-        return hostname
-    return hostname.split("%", 1)[0]
+        ) from exc

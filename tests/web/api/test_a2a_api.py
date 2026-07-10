@@ -1,5 +1,6 @@
 import json
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -517,6 +518,199 @@ def test_follow_up_infers_context_for_input_required_task() -> None:
     assert response.status_code == 200, response.text
     assert response.json()["task"]["contextId"] == "ctx-follow-up"
     assert response.json()["task"]["status"]["state"] == "TASK_STATE_WORKING"
+
+
+def test_failed_follow_up_restores_input_required_status() -> None:
+    agent_id, full_key = _create_published_agent_with_key()
+    db = _direct_db_session()
+    try:
+        owner_id = int(db.query(Agent).filter(Agent.id == agent_id).one().user_id)
+        task = Task(
+            user_id=owner_id,
+            title="waiting",
+            status=TaskStatus.WAITING_FOR_USER,
+            agent_id=agent_id,
+            source="a2a",
+            is_visible=False,
+            agent_config={"a2a_context_id": "ctx-recover"},
+        )
+        db.add(task)
+        db.commit()
+        db.refresh(task)
+        task_id = int(task.id)
+    finally:
+        db.close()
+
+    with patch(
+        "xagent.web.api.a2a.TaskTurnOrchestrator.begin_turn",
+        side_effect=TaskTurnError("busy"),
+    ):
+        response = client.post(
+            f"/api/a2a/agents/{agent_id}/message:send",
+            headers=_bearer(full_key),
+            json={
+                "message": {
+                    "messageId": "msg-recover",
+                    "taskId": task_id,
+                    "role": "ROLE_USER",
+                    "parts": [{"text": "retry"}],
+                },
+                "configuration": {"returnImmediately": True},
+            },
+        )
+
+    assert response.status_code == 400, response.text
+    db = _direct_db_session()
+    try:
+        recovered = db.query(Task).filter(Task.id == task_id).one()
+        assert recovered.status == TaskStatus.WAITING_FOR_USER
+    finally:
+        db.close()
+
+
+def test_list_tasks_uses_database_filters_and_pagination() -> None:
+    agent_id, full_key = _create_published_agent_with_key()
+    base_time = datetime.now(UTC) - timedelta(minutes=10)
+    db = _direct_db_session()
+    try:
+        owner_id = int(db.query(Agent).filter(Agent.id == agent_id).one().user_id)
+        task_specs = [
+            (TaskStatus.PENDING, "ctx-a", {}, 0),
+            (TaskStatus.RUNNING, "ctx-b", {}, 1),
+            (TaskStatus.FAILED, "ctx-a", {"a2a_state": "TASK_STATE_CANCELED"}, 2),
+            (TaskStatus.FAILED, "ctx-b", {}, 3),
+            (TaskStatus.COMPLETED, "ctx-a", {}, 4),
+        ]
+        tasks: list[Task] = []
+        for status, context_id, extra_config, minute in task_specs:
+            task = Task(
+                user_id=owner_id,
+                title=f"task-{minute}",
+                status=status,
+                updated_at=base_time + timedelta(minutes=minute),
+                agent_id=agent_id,
+                source="a2a",
+                is_visible=False,
+                agent_config={"a2a_context_id": context_id, **extra_config},
+            )
+            db.add(task)
+            tasks.append(task)
+        db.commit()
+        task_ids = [int(task.id) for task in tasks]
+    finally:
+        db.close()
+
+    first = client.get(
+        f"/api/a2a/agents/{agent_id}/tasks",
+        headers=_bearer(full_key),
+        params={"pageSize": 2},
+    )
+    second = client.get(
+        f"/api/a2a/agents/{agent_id}/tasks",
+        headers=_bearer(full_key),
+        params={"pageSize": 2, "pageToken": first.json()["nextPageToken"]},
+    )
+    canceled = client.get(
+        f"/api/a2a/agents/{agent_id}/tasks",
+        headers=_bearer(full_key),
+        params={"status": "TASK_STATE_CANCELED"},
+    )
+    failed = client.get(
+        f"/api/a2a/agents/{agent_id}/tasks",
+        headers=_bearer(full_key),
+        params={"status": "TASK_STATE_FAILED"},
+    )
+    context = client.get(
+        f"/api/a2a/agents/{agent_id}/tasks",
+        headers=_bearer(full_key),
+        params={"contextId": "ctx-a"},
+    )
+    recent = client.get(
+        f"/api/a2a/agents/{agent_id}/tasks",
+        headers=_bearer(full_key),
+        params={"statusTimestampAfter": (base_time + timedelta(minutes=2)).isoformat()},
+    )
+
+    assert first.status_code == 200, first.text
+    assert first.json()["totalSize"] == 5
+    assert [item["id"] for item in first.json()["tasks"]] == [
+        str(task_ids[4]),
+        str(task_ids[3]),
+    ]
+    assert first.json()["nextPageToken"] == "2"
+    assert [item["id"] for item in second.json()["tasks"]] == [
+        str(task_ids[2]),
+        str(task_ids[1]),
+    ]
+    assert canceled.json()["totalSize"] == 1
+    assert canceled.json()["tasks"][0]["id"] == str(task_ids[2])
+    assert failed.json()["totalSize"] == 1
+    assert failed.json()["tasks"][0]["id"] == str(task_ids[3])
+    assert context.json()["totalSize"] == 3
+    assert recent.json()["totalSize"] == 2
+
+
+@pytest.mark.asyncio
+async def test_stream_artifact_updates_are_incremental_and_finalize(
+    monkeypatch,
+) -> None:
+    task = Task(
+        id=101,
+        user_id=1,
+        title="stream",
+        status=TaskStatus.RUNNING,
+        output="part",
+        agent_id=7,
+        source="a2a",
+        agent_config={"a2a_context_id": "ctx-artifact"},
+    )
+    running = Task(
+        id=101,
+        user_id=1,
+        title="stream",
+        status=TaskStatus.RUNNING,
+        output="partial",
+        agent_id=7,
+        source="a2a",
+        agent_config={"a2a_context_id": "ctx-artifact"},
+    )
+    completed = Task(
+        id=101,
+        user_id=1,
+        title="stream",
+        status=TaskStatus.COMPLETED,
+        output="partial",
+        agent_id=7,
+        source="a2a",
+        agent_config={"a2a_context_id": "ctx-artifact"},
+    )
+    fresh_tasks = iter([running, completed])
+
+    async def no_sleep(_seconds: float) -> None:
+        return None
+
+    monkeypatch.setattr(a2a_api.asyncio, "sleep", no_sleep)
+    monkeypatch.setattr(
+        a2a_api,
+        "_fetch_fresh_a2a_task",
+        lambda _agent_id, _task_id: next(fresh_tasks),
+    )
+
+    response = a2a_api._task_stream_response(SimpleNamespace(id=7), task)
+    events = [
+        json.loads(chunk.removeprefix("data: "))
+        async for chunk in response.body_iterator
+    ]
+    artifact_updates = [
+        event["artifactUpdate"] for event in events if "artifactUpdate" in event
+    ]
+
+    assert artifact_updates[0]["artifact"]["parts"] == [{"text": "ial"}]
+    assert artifact_updates[0]["append"] is True
+    assert artifact_updates[0]["lastChunk"] is False
+    assert artifact_updates[1]["artifact"]["parts"] == [{"text": "partial"}]
+    assert artifact_updates[1]["append"] is False
+    assert artifact_updates[1]["lastChunk"] is True
 
 
 def test_cancel_is_idempotent_and_subscribe_rejects_terminal_task() -> None:

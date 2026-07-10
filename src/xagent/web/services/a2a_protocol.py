@@ -390,17 +390,28 @@ def sse_task_update(task: Task) -> str:
     )
 
 
-def sse_task_artifacts(task: Task) -> str | None:
-    artifacts = task_to_a2a(task).get("artifacts")
-    if not artifacts:
+def sse_task_artifacts(
+    task: Task,
+    *,
+    text: str | None = None,
+    append: bool = False,
+    last_chunk: bool = True,
+) -> str | None:
+    output = str(task.output or "") if text is None else text
+    if not output or task_state(task) == "TASK_STATE_CANCELED":
         return None
     return _sse_event(
         {
             "artifactUpdate": {
                 "taskId": str(task.id),
                 "contextId": task_context_id(task),
-                "artifact": artifacts[0],
-                "lastChunk": True,
+                "artifact": {
+                    "artifactId": f"task-{task.id}-output",
+                    "name": "final_output",
+                    "parts": [{"text": output}],
+                },
+                "append": append,
+                "lastChunk": last_chunk,
             }
         }
     )

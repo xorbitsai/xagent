@@ -2,10 +2,12 @@ from __future__ import annotations
 
 from typing import Any
 
+import httpx
 import pytest
 
 from xagent.core.tools.adapters.vibe import a2a_agent_tool
 from xagent.core.tools.adapters.vibe.a2a_agent_tool import (
+    A2A_TOOL_ERROR_MESSAGE,
     A2AAgentTool,
     create_a2a_agent_tools,
 )
@@ -141,6 +143,13 @@ class _WorkingAsyncClient(_FakeAsyncClient):
         )
 
 
+class _LeakyErrorAsyncClient(_FakeAsyncClient):
+    async def post(self, url: str, **kwargs: Any) -> _FakeResponse:
+        raise httpx.ConnectError(
+            "connection failed for http://127.0.0.1/private?token=secret"
+        )
+
+
 class _CrossOriginCardAsyncClient(_FakeAsyncClient):
     async def get(self, url: str, **kwargs: Any) -> _FakeResponse:
         self.calls.append(("GET", url, kwargs))
@@ -198,6 +207,7 @@ async def test_create_a2a_agent_tools_from_tool_config() -> None:
                     "description": "Use for remote research tasks.",
                     "endpoint_url": "https://remote.example/a2a",
                     "headers": {"X-Remote": "1"},
+                    "allow_private_networks": True,
                 }
             ]
         }
@@ -209,6 +219,7 @@ async def test_create_a2a_agent_tools_from_tool_config() -> None:
     assert tools[0].name == "a2a_remote_researcher"
     assert tools[0].metadata.category == "agent"
     assert tools[0].description == "Use for remote research tasks."
+    assert tools[0]._allow_private_networks is True
 
 
 @pytest.mark.asyncio
@@ -274,7 +285,7 @@ async def test_a2a_agent_tool_rejects_cross_origin_card_endpoint(monkeypatch) ->
     result = await tool.run_json_async({"task": "do work"})
 
     assert result["success"] is False
-    assert "same origin" in result["error"]
+    assert result["error"] == A2A_TOOL_ERROR_MESSAGE
     assert [call[0] for call in _CrossOriginCardAsyncClient.calls] == ["GET"]
 
 
@@ -295,17 +306,68 @@ async def test_a2a_agent_tool_revalidates_discovered_endpoint(monkeypatch) -> No
     result = await tool.run_json_async({"task": "do work"})
 
     assert result["success"] is False
-    assert "embedded credentials" in result["error"]
+    assert result["error"] == A2A_TOOL_ERROR_MESSAGE
     assert [call[0] for call in _FakeAsyncClient.calls] == ["GET"]
 
 
-def test_a2a_agent_tool_allows_explicit_private_endpoint() -> None:
+def test_a2a_agent_tool_rejects_private_endpoint_by_default() -> None:
+    with pytest.raises(ValueError, match="private network"):
+        A2AAgentTool(
+            name="Internal Agent",
+            endpoint_url="http://127.0.0.1:8000/a2a",
+        )
+
+
+def test_a2a_agent_tool_allows_explicit_private_network_opt_in() -> None:
     tool = A2AAgentTool(
         name="Internal Agent",
         endpoint_url="http://127.0.0.1:8000/a2a",
+        allow_private_networks=True,
     )
 
     assert tool._endpoint_url == "http://127.0.0.1:8000/a2a"
+
+
+@pytest.mark.asyncio
+async def test_a2a_agent_tool_rejects_hostname_resolving_to_private_ip(
+    monkeypatch,
+) -> None:
+    monkeypatch.setattr(
+        a2a_agent_tool.socket,
+        "getaddrinfo",
+        lambda *_args, **_kwargs: [
+            (
+                a2a_agent_tool.socket.AF_INET,
+                a2a_agent_tool.socket.SOCK_STREAM,
+                6,
+                "",
+                ("127.0.0.1", 443),
+            )
+        ],
+    )
+
+    with pytest.raises(ValueError, match="private network"):
+        await a2a_agent_tool._resolve_public_addresses("https://remote.example/a2a")
+
+
+@pytest.mark.asyncio
+async def test_a2a_agent_tool_sanitizes_unexpected_errors(monkeypatch) -> None:
+    monkeypatch.setattr(
+        a2a_agent_tool.httpx,
+        "AsyncClient",
+        _LeakyErrorAsyncClient,
+    )
+    tool = A2AAgentTool(
+        name="Remote Agent",
+        endpoint_url="https://remote.example/a2a",
+    )
+
+    result = await tool.run_json_async({"task": "do work"})
+
+    assert result["success"] is False
+    assert result["error"] == A2A_TOOL_ERROR_MESSAGE
+    assert "127.0.0.1" not in result["error"]
+    assert "secret" not in result["error"]
 
 
 @pytest.mark.asyncio

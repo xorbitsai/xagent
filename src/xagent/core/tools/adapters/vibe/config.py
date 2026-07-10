@@ -146,7 +146,11 @@ class BaseToolConfig(ABC):
         return {}
 
     def get_a2a_agent_configs(self) -> List[Dict[str, Any]]:
-        """Get remote A2A agent tool configurations."""
+        """Get remote A2A agent tool configurations.
+
+        Private endpoints are rejected unless an entry explicitly sets
+        ``allow_private_networks`` to ``True``.
+        """
         return []
 
     def get_enable_global_agent_tools(self) -> bool:

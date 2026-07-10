@@ -1,13 +1,14 @@
 from __future__ import annotations
 
 import asyncio
-from datetime import datetime, timezone
+from datetime import datetime
 from time import monotonic
 from typing import Any, Mapping, Tuple
 
 from fastapi import APIRouter, Depends, Query, Request
 from fastapi.responses import StreamingResponse
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
+from sqlalchemy import String, and_, cast, false, or_
 from sqlalchemy.orm import Session
 
 from ..models.agent import Agent
@@ -51,6 +52,18 @@ _STREAM_END_STATUSES = _TERMINAL_STATUSES | {
 }
 A2A_BLOCKING_WAIT_TIMEOUT_SECONDS = 60.0
 A2A_STREAM_MAX_DURATION_SECONDS = 60.0 * 60.0
+_A2A_OVERRIDE_STATES = (
+    "TASK_STATE_CANCELED",
+    "TASK_STATE_REJECTED",
+    "TASK_STATE_AUTH_REQUIRED",
+)
+_A2A_TASK_STATUS_MAP: dict[str, tuple[TaskStatus, ...]] = {
+    "TASK_STATE_SUBMITTED": (TaskStatus.PENDING,),
+    "TASK_STATE_WORKING": (TaskStatus.RUNNING,),
+    "TASK_STATE_INPUT_REQUIRED": (TaskStatus.PAUSED, TaskStatus.WAITING_FOR_USER),
+    "TASK_STATE_COMPLETED": (TaskStatus.COMPLETED,),
+    "TASK_STATE_FAILED": (TaskStatus.FAILED,),
+}
 
 
 async def _get_a2a_agent_from_api_key(
@@ -355,6 +368,9 @@ def _task_stream_response(agent: Agent, task: Task) -> StreamingResponse:
         previous_state = task_state(task)
         previous_output = str(task.output or "")
         previous_error = str(task.error_message or "")
+        artifact_finalized = (
+            bool(previous_output) and task.status in _STREAM_END_STATUSES
+        )
         while True:
             remaining = deadline - monotonic()
             if remaining <= 0:
@@ -366,16 +382,37 @@ def _task_stream_response(agent: Agent, task: Task) -> StreamingResponse:
             fresh_output = str(fresh.output or "")
             fresh_state = task_state(fresh)
             fresh_error = str(fresh.error_message or "")
+            stream_ended = fresh.status in _STREAM_END_STATUSES
             if fresh_output and fresh_output != previous_output:
-                artifacts = sse_task_artifacts(fresh)
+                append = bool(previous_output) and fresh_output.startswith(
+                    previous_output
+                )
+                chunk = fresh_output[len(previous_output) :] if append else fresh_output
+                artifacts = sse_task_artifacts(
+                    fresh,
+                    text=chunk,
+                    append=append,
+                    last_chunk=stream_ended,
+                )
                 if artifacts:
                     yield artifacts
+                artifact_finalized = stream_ended
+            elif stream_ended and fresh_output and not artifact_finalized:
+                artifacts = sse_task_artifacts(
+                    fresh,
+                    text=fresh_output,
+                    append=False,
+                    last_chunk=True,
+                )
+                if artifacts:
+                    yield artifacts
+                artifact_finalized = True
             if fresh_state != previous_state or fresh_error != previous_error:
                 yield sse_task_update(fresh)
             previous_state = fresh_state
             previous_output = fresh_output
             previous_error = fresh_error
-            if fresh.status in _STREAM_END_STATUSES:
+            if stream_ended:
                 return
 
     return StreamingResponse(
@@ -415,17 +452,6 @@ def _page_offset(page_token: str | None) -> int:
         status_code=400,
         details={"field": "pageToken"},
     )
-
-
-def _is_after(value: Any, threshold: datetime) -> bool:
-    if not isinstance(value, datetime):
-        return False
-    timestamp: datetime = value
-    if timestamp.tzinfo is None:
-        timestamp = timestamp.replace(tzinfo=timezone.utc)
-    if threshold.tzinfo is None:
-        threshold = threshold.replace(tzinfo=timezone.utc)
-    return timestamp.astimezone(timezone.utc) > threshold.astimezone(timezone.utc)
 
 
 @router.get("/agents/{agent_id}/.well-known/agent-card.json")
@@ -514,21 +540,33 @@ async def list_tasks(
     page_token: str | None = Query(default=None, alias="pageToken"),
     include_artifacts: bool = Query(default=False, alias="includeArtifacts"),
     status_timestamp_after: datetime | None = Query(
-        default=None, alias="statusTimestampAfter"
+        default=None,
+        alias="statusTimestampAfter",
+        description=(
+            "Filter by the timestamp exposed in each A2A task status; "
+            "this is backed by Task.updated_at."
+        ),
     ),
     authed: Tuple[Agent, AgentApiKey] = Depends(_get_a2a_agent_from_api_key),
     db: Session = Depends(get_db),
 ) -> Any:
     agent, _key = authed
     _require_bound_agent(agent_id, agent)
-    tasks = (
-        db.query(Task)
-        .filter(Task.agent_id == int(agent.id), Task.source == "a2a")
-        .order_by(Task.id.desc())
-        .all()
+    query = db.query(Task).filter(
+        Task.agent_id == int(agent.id),
+        Task.source == "a2a",
     )
     if context_id is not None:
-        tasks = [task for task in tasks if task_context_id(task) == context_id]
+        stored_context_id = Task.agent_config["a2a_context_id"].as_string()
+        query = query.filter(
+            or_(
+                stored_context_id == context_id,
+                and_(
+                    stored_context_id.is_(None),
+                    cast(Task.id, String) == context_id,
+                ),
+            )
+        )
     if status is not None:
         if status not in ALL_TASK_STATES:
             raise a2a_error(
@@ -537,15 +575,28 @@ async def list_tasks(
                 status_code=400,
                 details={"field": "status"},
             )
-        tasks = [task for task in tasks if task_state(task) == status]
+        stored_a2a_state = Task.agent_config["a2a_state"].as_string()
+        state_filters: list[Any] = []
+        if status in _A2A_OVERRIDE_STATES:
+            state_filters.append(stored_a2a_state == status)
+        task_statuses = _A2A_TASK_STATUS_MAP.get(status)
+        if task_statuses:
+            state_filters.append(
+                and_(
+                    or_(
+                        stored_a2a_state.is_(None),
+                        ~stored_a2a_state.in_(_A2A_OVERRIDE_STATES),
+                    ),
+                    Task.status.in_(task_statuses),
+                )
+            )
+        query = query.filter(or_(*state_filters) if state_filters else false())
     if status_timestamp_after is not None:
-        tasks = [
-            task for task in tasks if _is_after(task.updated_at, status_timestamp_after)
-        ]
+        query = query.filter(Task.updated_at > status_timestamp_after)
 
     offset = _page_offset(page_token)
-    total_size = len(tasks)
-    page = tasks[offset : offset + page_size]
+    total_size = query.count()
+    page = query.order_by(Task.id.desc()).offset(offset).limit(page_size).all()
     next_offset = offset + len(page)
     next_page_token = str(next_offset) if next_offset < total_size else ""
     return a2a_json_response(

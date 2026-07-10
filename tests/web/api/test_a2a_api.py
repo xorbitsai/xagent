@@ -4,9 +4,12 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
+from xagent.web.api import a2a as a2a_api
 from xagent.web.models.agent import Agent
 from xagent.web.models.agent_api_key import AgentApiKey
 from xagent.web.models.task import Task, TaskStatus
+from xagent.web.services.a2a_protocol import A2A_MAX_MESSAGE_TEXT_LENGTH
+from xagent.web.services.task_orchestrator import TaskTurnError
 
 from .conftest import _admin_headers, _direct_db_session, client
 
@@ -228,8 +231,33 @@ def test_message_send_requires_supported_a2a_version() -> None:
 
     assert response.status_code == 400
     error = response.json()["error"]
+    assert error["message"] == "A2A-Version header or query parameter is required."
     assert error["details"][0]["reason"] == "VERSION_NOT_SUPPORTED"
     assert error["details"][0]["metadata"]["supportedVersions"] == "1.0"
+
+
+def test_message_send_rejects_oversized_content() -> None:
+    agent_id, full_key = _create_published_agent_with_key()
+
+    response = client.post(
+        f"/api/a2a/agents/{agent_id}/message:send",
+        headers=_bearer(full_key),
+        json={
+            "message": {
+                "messageId": "msg-too-large",
+                "role": "ROLE_USER",
+                "parts": [{"text": "x" * (A2A_MAX_MESSAGE_TEXT_LENGTH + 1)}],
+            },
+            "configuration": {"returnImmediately": True},
+        },
+    )
+
+    assert response.status_code == 413
+    error = response.json()["error"]
+    assert error["status"] == "RESOURCE_EXHAUSTED"
+    assert error["details"][0]["metadata"]["maxLength"] == str(
+        A2A_MAX_MESSAGE_TEXT_LENGTH
+    )
 
 
 def test_a2a_fastapi_validation_uses_protocol_error_shape() -> None:
@@ -298,6 +326,60 @@ def test_message_send_blocks_by_default_until_task_finishes() -> None:
     assert task["artifacts"][0]["parts"] == [{"text": "blocking response"}]
 
 
+def test_message_send_returns_working_task_when_wait_deadline_expires(
+    monkeypatch,
+) -> None:
+    agent_id, full_key = _create_published_agent_with_key()
+    monkeypatch.setattr(a2a_api, "A2A_BLOCKING_WAIT_TIMEOUT_SECONDS", 0.0)
+
+    with patch(
+        "xagent.web.services.task_orchestrator._schedule_bg",
+        new=MagicMock(),
+    ):
+        response = client.post(
+            f"/api/a2a/agents/{agent_id}/message:send",
+            headers=_bearer(full_key),
+            json={
+                "message": {
+                    "messageId": "msg-wait-timeout",
+                    "role": "ROLE_USER",
+                    "parts": [{"text": "keep working"}],
+                }
+            },
+        )
+
+    assert response.status_code == 200, response.text
+    assert response.json()["task"]["status"]["state"] == "TASK_STATE_WORKING"
+
+
+def test_failed_create_does_not_leave_pending_a2a_task() -> None:
+    agent_id, full_key = _create_published_agent_with_key()
+
+    with patch(
+        "xagent.web.api.a2a.TaskTurnOrchestrator.begin_turn",
+        side_effect=TaskTurnError("busy"),
+    ):
+        response = client.post(
+            f"/api/a2a/agents/{agent_id}/message:send",
+            headers=_bearer(full_key),
+            json={
+                "message": {
+                    "messageId": "msg-failed-create",
+                    "role": "ROLE_USER",
+                    "parts": [{"text": "fail before scheduling"}],
+                },
+                "configuration": {"returnImmediately": True},
+            },
+        )
+
+    assert response.status_code == 400, response.text
+    db = _direct_db_session()
+    try:
+        assert db.query(Task).filter(Task.source == "a2a").count() == 0
+    finally:
+        db.close()
+
+
 def test_unexpected_a2a_error_uses_internal_protocol_envelope() -> None:
     agent_id, full_key = _create_published_agent_with_key()
 
@@ -323,6 +405,11 @@ def test_unexpected_a2a_error_uses_internal_protocol_envelope() -> None:
     assert error["status"] == "INTERNAL"
     assert error["details"][0]["reason"] == "INTERNAL"
     assert "sensitive implementation detail" not in response.text
+    db = _direct_db_session()
+    try:
+        assert db.query(Task).filter(Task.source == "a2a").count() == 0
+    finally:
+        db.close()
 
 
 def test_get_and_list_tasks_use_rest_binding_shapes() -> None:
@@ -509,3 +596,39 @@ def test_subscribe_stream_starts_with_wrapped_task_snapshot() -> None:
     event = json.loads(data_lines[0])
     assert event["task"]["id"] == str(task_id)
     assert event["task"]["status"]["state"] == "TASK_STATE_INPUT_REQUIRED"
+
+
+def test_subscribe_stream_ends_at_server_lifetime_limit(monkeypatch) -> None:
+    agent_id, full_key = _create_published_agent_with_key()
+    db = _direct_db_session()
+    try:
+        owner_id = int(db.query(Agent).filter(Agent.id == agent_id).one().user_id)
+        task = Task(
+            user_id=owner_id,
+            title="running",
+            status=TaskStatus.RUNNING,
+            agent_id=agent_id,
+            source="a2a",
+            is_visible=False,
+            agent_config={"a2a_context_id": "ctx-stream-limit"},
+        )
+        db.add(task)
+        db.commit()
+        db.refresh(task)
+        task_id = int(task.id)
+    finally:
+        db.close()
+    monkeypatch.setattr(a2a_api, "A2A_STREAM_MAX_DURATION_SECONDS", 0.0)
+
+    response = client.post(
+        f"/api/a2a/agents/{agent_id}/tasks/{task_id}:subscribe",
+        headers=_bearer(full_key),
+    )
+
+    assert response.status_code == 200, response.text
+    data_lines = [
+        line for line in response.text.splitlines() if line.startswith("data: ")
+    ]
+    assert len(data_lines) == 1
+    event = json.loads(data_lines[0].removeprefix("data: "))
+    assert event["task"]["status"]["state"] == "TASK_STATE_WORKING"

@@ -141,6 +141,28 @@ class _WorkingAsyncClient(_FakeAsyncClient):
         )
 
 
+class _CrossOriginCardAsyncClient(_FakeAsyncClient):
+    async def get(self, url: str, **kwargs: Any) -> _FakeResponse:
+        self.calls.append(("GET", url, kwargs))
+        assert url == "https://remote.example/.well-known/agent-card.json"
+        return _FakeResponse(
+            {
+                "supportedInterfaces": [
+                    {
+                        "url": "http://169.254.169.254/latest/meta-data",
+                        "protocolBinding": "HTTP+JSON",
+                        "protocolVersion": "1.0",
+                    }
+                ]
+            }
+        )
+
+    async def post(self, url: str, **kwargs: Any) -> _FakeResponse:
+        raise AssertionError(
+            f"Cross-origin discovered endpoint must not be called: {url}"
+        )
+
+
 @pytest.mark.asyncio
 async def test_a2a_agent_tool_fetches_card_sends_and_polls(monkeypatch) -> None:
     _FakeAsyncClient.calls = []
@@ -233,6 +255,57 @@ def test_a2a_agent_tool_rejects_url_with_embedded_credentials() -> None:
             name="Remote Agent",
             endpoint_url="https://user:secret@remote.example/a2a",
         )
+
+
+@pytest.mark.asyncio
+async def test_a2a_agent_tool_rejects_cross_origin_card_endpoint(monkeypatch) -> None:
+    _CrossOriginCardAsyncClient.calls = []
+    monkeypatch.setattr(
+        a2a_agent_tool.httpx,
+        "AsyncClient",
+        _CrossOriginCardAsyncClient,
+    )
+    tool = A2AAgentTool(
+        name="Remote Agent",
+        agent_card_url="https://remote.example/.well-known/agent-card.json",
+        auth_token="secret",
+    )
+
+    result = await tool.run_json_async({"task": "do work"})
+
+    assert result["success"] is False
+    assert "same origin" in result["error"]
+    assert [call[0] for call in _CrossOriginCardAsyncClient.calls] == ["GET"]
+
+
+@pytest.mark.asyncio
+async def test_a2a_agent_tool_revalidates_discovered_endpoint(monkeypatch) -> None:
+    _FakeAsyncClient.calls = []
+    monkeypatch.setattr(a2a_agent_tool.httpx, "AsyncClient", _FakeAsyncClient)
+    monkeypatch.setattr(
+        a2a_agent_tool,
+        "_endpoint_from_card",
+        lambda _card: "https://user:secret@remote.example/a2a",
+    )
+    tool = A2AAgentTool(
+        name="Remote Agent",
+        agent_card_url="https://remote.example/.well-known/agent-card.json",
+    )
+
+    result = await tool.run_json_async({"task": "do work"})
+
+    assert result["success"] is False
+    assert "embedded credentials" in result["error"]
+    assert [call[0] for call in _FakeAsyncClient.calls] == ["GET"]
+
+
+def test_a2a_agent_tool_allows_explicit_private_endpoint() -> None:
+    tool = A2AAgentTool(
+        name="Internal Agent",
+        endpoint_url="http://127.0.0.1:8000/a2a",
+    )
+
+    assert tool._endpoint_url == "http://127.0.0.1:8000/a2a"
 
 
 @pytest.mark.asyncio

@@ -308,6 +308,53 @@ async def test_completion_broadcast_failure_keeps_task_completed(
 
 
 @pytest.mark.asyncio
+async def test_late_execution_result_does_not_resurrect_canceled_a2a_task(
+    db_session, monkeypatch
+):
+    user = _create_user(db_session, 1, "owner")
+    _create_task(db_session, task_id=14, user_id=1, status=TaskStatus.RUNNING)
+    db_session.commit()
+
+    class BroadcastManager:
+        async def broadcast_to_task(self, event, task_id):
+            pass
+
+    class AgentManager:
+        async def get_agent_for_task(self, task_id, db, **kwargs):
+            return _NoopAgentService()
+
+        async def execute_task(self, **kwargs):
+            SessionLocal = sessionmaker(bind=db_session.get_bind())
+            with SessionLocal() as cancel_db:
+                task = cancel_db.query(Task).filter(Task.id == 14).one()
+                task.status = TaskStatus.FAILED
+                task.agent_config = {"a2a_state": "TASK_STATE_CANCELED"}
+                task.output = None
+                task.error_message = "Task canceled by A2A client."
+                cancel_db.commit()
+            db_session.expire_all()
+            return {"success": True, "output": "late result", "file_outputs": []}
+
+    _wire_execute_task_background(monkeypatch, db_session, BroadcastManager())
+
+    await execute_task_background(
+        task_id=14,
+        user_message="hi",
+        context={},
+        agent_manager=AgentManager(),
+        task_owner_user_id=int(user.id),
+        llm_user_message="hi",
+    )
+
+    db_session.expire_all()
+    task = db_session.query(Task).filter(Task.id == 14).one()
+    assert task.status == TaskStatus.FAILED
+    assert task.agent_config == {"a2a_state": "TASK_STATE_CANCELED"}
+    assert task.output is None
+    assert task.error_message == "Task canceled by A2A client."
+
+
+@pytest.mark.asyncio
 async def test_execution_failure_routes_real_error_to_terminal_payload(
     db_session, monkeypatch
 ):

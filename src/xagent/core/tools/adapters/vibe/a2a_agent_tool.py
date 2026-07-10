@@ -17,7 +17,6 @@ from .factory import register_tool
 
 A2A_MEDIA_TYPE = "application/a2a+json"
 A2A_VERSION = "1.0"
-_HTTP_JSON_BINDINGS = {"HTTP+JSON", "HTTP_JSON", "http+json", "http_json"}
 _TERMINAL_STATES = {
     "TASK_STATE_COMPLETED",
     "TASK_STATE_FAILED",
@@ -249,6 +248,14 @@ class A2AAgentTool(AbstractBaseTool):
         endpoint_url = _endpoint_from_card(card)
         if not endpoint_url:
             raise ValueError("A2A agent card does not expose an HTTP+JSON endpoint.")
+        endpoint_url = _clean_url(endpoint_url)
+        if endpoint_url is None:
+            raise ValueError("A2A agent card does not expose a valid endpoint URL.")
+        if not _same_origin(self._agent_card_url, endpoint_url):
+            raise ValueError(
+                "A2A agent card endpoint must use the same origin as the card URL; "
+                "configure endpoint_url explicitly for a cross-origin endpoint."
+            )
         self._endpoint_url = endpoint_url
         if self._description == "Call a remote A2A agent and return its response.":
             description = card.get("description")
@@ -273,10 +280,10 @@ def create_a2a_agent_tools_from_configs(
     for item in configs:
         if not isinstance(item, dict):
             continue
-        raw_name = item.get("name") or item.get("tool_name") or item.get("id")
+        raw_name = item.get("name")
         if not isinstance(raw_name, str) or not raw_name.strip():
             continue
-        timeout_seconds = item.get("timeout_seconds", item.get("timeout", 60.0))
+        timeout_seconds = item.get("timeout_seconds", 60.0)
         try:
             timeout = float(str(timeout_seconds))
         except (TypeError, ValueError):
@@ -284,14 +291,12 @@ def create_a2a_agent_tools_from_configs(
         tool = A2AAgentTool(
             name=raw_name,
             description=_optional_str(item.get("description")),
-            endpoint_url=_optional_str(item.get("endpoint_url") or item.get("url")),
-            agent_card_url=_optional_str(
-                item.get("agent_card_url") or item.get("card_url")
-            ),
+            endpoint_url=_optional_str(item.get("endpoint_url")),
+            agent_card_url=_optional_str(item.get("agent_card_url")),
             headers=item.get("headers")
             if isinstance(item.get("headers"), dict)
             else {},
-            auth_token=_optional_str(item.get("auth_token") or item.get("api_key")),
+            auth_token=_optional_str(item.get("auth_token")),
             timeout_seconds=timeout,
         )
         tools.append(tool)
@@ -355,7 +360,8 @@ def _endpoint_from_card(card: Mapping[str, Any]) -> str | None:
             binding = _optional_str(item.get("protocolBinding"))
             protocol_version = _optional_str(item.get("protocolVersion"))
             if (
-                binding in _HTTP_JSON_BINDINGS
+                binding is not None
+                and binding.upper().replace("_", "+") == "HTTP+JSON"
                 and protocol_version is not None
                 and protocol_version.split(".", maxsplit=1)[0] == "1"
             ):
@@ -480,11 +486,33 @@ def _clean_url(value: str | None) -> str | None:
     if not value:
         return None
     parsed = urlsplit(value)
-    if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+    if (
+        parsed.scheme not in {"http", "https"}
+        or not parsed.netloc
+        or not parsed.hostname
+    ):
         raise ValueError("A2A URLs must be absolute HTTP(S) URLs.")
     if parsed.username is not None or parsed.password is not None:
         raise ValueError("A2A URLs must not contain embedded credentials.")
+    try:
+        parsed.port
+    except ValueError as exc:
+        raise ValueError("A2A URLs must contain a valid port.") from exc
     return value
+
+
+def _same_origin(left: str, right: str) -> bool:
+    return _url_origin(left) == _url_origin(right)
+
+
+def _url_origin(value: str) -> tuple[str, str, int]:
+    parsed = urlsplit(value)
+    default_port = 443 if parsed.scheme.lower() == "https" else 80
+    return (
+        parsed.scheme.lower(),
+        str(parsed.hostname).lower(),
+        parsed.port or default_port,
+    )
 
 
 def _optional_str(value: Any) -> str | None:

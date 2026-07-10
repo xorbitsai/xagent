@@ -1512,7 +1512,21 @@ async def execute_task_background(
                 # bug for callers that never acquired the lease: the
                 # filter didn't match, so status was silently never
                 # written either (a quiet "stuck RUNNING" outcome).
-                if result.get("status") == "waiting_for_user":
+                task_agent_config: dict[str, Any] = (
+                    task_updated.agent_config
+                    if isinstance(task_updated.agent_config, dict)
+                    else {}
+                )
+                # A2A cancellation is durable even when the cancelled coroutine
+                # ignores cancellation and produces a result after the timeout.
+                if task_agent_config.get("a2a_state") == "TASK_STATE_CANCELED":
+                    waiting_for_control = True
+                    logger.info(
+                        "Task %s was canceled while execution was in flight; "
+                        "ignoring the late result",
+                        task_id,
+                    )
+                elif result.get("status") == "waiting_for_user":
                     task_updated.status = TaskStatus.WAITING_FOR_USER
                     sync_workforce_run_status(db_new, task_updated, task_updated.status)
                     db_new.commit()
@@ -1551,6 +1565,7 @@ async def execute_task_background(
                         "(pending commit with assistant message)"
                     )
                 else:
+                    waiting_for_control = True
                     logger.info(
                         f"Task {task_id} is paused, not updating status to {result.get('success')}"
                     )

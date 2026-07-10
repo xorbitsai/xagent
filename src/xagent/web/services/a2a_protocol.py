@@ -15,6 +15,20 @@ from ..models.task import Task, TaskStatus
 
 A2A_MEDIA_TYPE = "application/a2a+json"
 A2A_VERSION = "1.0"
+A2A_MAX_MESSAGE_TEXT_LENGTH = 200_000
+ALL_TASK_STATES = frozenset(
+    {
+        "TASK_STATE_UNSPECIFIED",
+        "TASK_STATE_SUBMITTED",
+        "TASK_STATE_WORKING",
+        "TASK_STATE_COMPLETED",
+        "TASK_STATE_FAILED",
+        "TASK_STATE_CANCELED",
+        "TASK_STATE_INPUT_REQUIRED",
+        "TASK_STATE_REJECTED",
+        "TASK_STATE_AUTH_REQUIRED",
+    }
+)
 
 
 class A2AApiError(Exception):
@@ -179,6 +193,24 @@ def extract_message_text(message: Mapping[str, Any]) -> str:
         )
 
     texts: list[str] = []
+    total_length = 0
+
+    def append_text(value: str, field: str) -> None:
+        nonlocal total_length
+        projected_length = total_length + (2 if texts else 0) + len(value)
+        if projected_length > A2A_MAX_MESSAGE_TEXT_LENGTH:
+            raise a2a_error(
+                "resource_exhausted",
+                "A2A message content exceeds the supported length limit.",
+                status_code=413,
+                details={
+                    "field": field,
+                    "maxLength": A2A_MAX_MESSAGE_TEXT_LENGTH,
+                },
+            )
+        texts.append(value)
+        total_length = projected_length
+
     for index, part in enumerate(parts):
         if not isinstance(part, Mapping):
             raise a2a_error(
@@ -215,7 +247,7 @@ def extract_message_text(message: Mapping[str, Any]) -> str:
                     status_code=400,
                     details={"mediaType": media_type},
                 )
-            texts.append(text.strip())
+            append_text(text.strip(), f"message.parts[{index}].text")
             continue
         if field == "data":
             if media_type and str(media_type).lower() != "application/json":
@@ -225,7 +257,10 @@ def extract_message_text(message: Mapping[str, Any]) -> str:
                     status_code=400,
                     details={"mediaType": media_type},
                 )
-            texts.append(json.dumps(part.get("data"), ensure_ascii=False))
+            append_text(
+                json.dumps(part.get("data"), ensure_ascii=False),
+                f"message.parts[{index}].data",
+            )
             continue
         raise a2a_error(
             "content_type_not_supported",
@@ -416,6 +451,7 @@ def _rpc_status(status_code: int, reason: str) -> str:
         403: "PERMISSION_DENIED",
         404: "NOT_FOUND",
         409: "ABORTED",
+        413: "RESOURCE_EXHAUSTED",
         429: "RESOURCE_EXHAUSTED",
         500: "INTERNAL",
         503: "UNAVAILABLE",

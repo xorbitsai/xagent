@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 from datetime import datetime, timezone
+from time import monotonic
 from typing import Any, Mapping, Tuple
 
 from fastapi import APIRouter, Depends, Query, Request
@@ -15,6 +16,7 @@ from ..models.database import get_db, get_session_local
 from ..models.task import Task, TaskStatus
 from ..services.a2a_protocol import (
     A2A_VERSION,
+    ALL_TASK_STATES,
     a2a_error,
     a2a_json_response,
     build_agent_card,
@@ -47,6 +49,8 @@ _STREAM_END_STATUSES = _TERMINAL_STATUSES | {
     TaskStatus.PAUSED,
     TaskStatus.WAITING_FOR_USER,
 }
+A2A_BLOCKING_WAIT_TIMEOUT_SECONDS = 60.0
+A2A_STREAM_MAX_DURATION_SECONDS = 60.0 * 60.0
 
 
 async def _get_a2a_agent_from_api_key(
@@ -96,7 +100,14 @@ def _validate_a2a_version(request: Request) -> None:
     requested = request.headers.get("A2A-Version")
     if requested is None:
         requested = request.query_params.get("A2A-Version")
-    requested = (requested or "0.3").strip()
+    if requested is None or not requested.strip():
+        raise a2a_error(
+            "version_not_supported",
+            "A2A-Version header or query parameter is required.",
+            status_code=400,
+            details={"supportedVersions": A2A_VERSION},
+        )
+    requested = requested.strip()
     version_parts = requested.split(".")
     compatible = (
         len(version_parts) in {2, 3}
@@ -166,6 +177,7 @@ async def _start_a2a_turn(
     context_id: str | None,
     task_id: int | None,
 ) -> Task:
+    created_task = task_id is None
     normalized_waiting_task = False
     if task_id is None:
         context_id = context_id or new_context_id()
@@ -232,27 +244,55 @@ async def _start_a2a_turn(
             force_fresh=False,
         )
     except TaskTurnNotFoundError as exc:
-        _restore_waiting_status(db, int(task.id), normalized_waiting_task)
+        _recover_failed_turn_start(
+            db,
+            int(task.id),
+            created_task=created_task,
+            restore_waiting=normalized_waiting_task,
+        )
         raise a2a_error("task_not_found", "Task not found.", status_code=404) from exc
     except TaskTurnError as exc:
-        _restore_waiting_status(db, int(task.id), normalized_waiting_task)
+        _recover_failed_turn_start(
+            db,
+            int(task.id),
+            created_task=created_task,
+            restore_waiting=normalized_waiting_task,
+        )
         raise a2a_error(
             "unsupported_operation",
             "Task is currently running and cannot accept a new message.",
             status_code=400,
             details={"taskId": task.id},
         ) from exc
+    except Exception:
+        _recover_failed_turn_start(
+            db,
+            int(task.id),
+            created_task=created_task,
+            restore_waiting=normalized_waiting_task,
+        )
+        raise
 
     db.expire_all()
     return _resolve_a2a_task(db, int(task.id), agent)
 
 
-def _restore_waiting_status(db: Session, task_id: int, restore: bool) -> None:
-    if not restore:
-        return
+def _recover_failed_turn_start(
+    db: Session,
+    task_id: int,
+    *,
+    created_task: bool,
+    restore_waiting: bool,
+) -> None:
     db.expire_all()
     task = db.query(Task).filter(Task.id == task_id).first()
-    if task is not None and task.status == TaskStatus.PAUSED:
+    if task is None:
+        return
+    if created_task and task.status == TaskStatus.PENDING:
+        db.delete(task)
+        db.commit()
+        return
+    if restore_waiting and task.status == TaskStatus.PAUSED:
         task.status = TaskStatus.WAITING_FOR_USER
         db.commit()
 
@@ -284,10 +324,31 @@ def _message_payload(body: Mapping[str, Any]) -> Mapping[str, Any]:
     return message
 
 
+def _fetch_fresh_a2a_task(agent_id: int, task_id: int) -> Task | None:
+    session_local = get_session_local()
+    local_db = session_local()
+    try:
+        fresh = (
+            local_db.query(Task)
+            .filter(
+                Task.id == task_id,
+                Task.agent_id == agent_id,
+                Task.source == "a2a",
+            )
+            .first()
+        )
+        if fresh is not None:
+            local_db.expunge(fresh)
+        return fresh
+    finally:
+        local_db.close()
+
+
 def _task_stream_response(agent: Agent, task: Task) -> StreamingResponse:
     started_task_id = int(task.id)
 
     async def _events() -> Any:
+        deadline = monotonic() + A2A_STREAM_MAX_DURATION_SECONDS
         yield sse_task_snapshot(task)
         if task.status in _STREAM_END_STATUSES:
             return
@@ -295,37 +356,27 @@ def _task_stream_response(agent: Agent, task: Task) -> StreamingResponse:
         previous_output = str(task.output or "")
         previous_error = str(task.error_message or "")
         while True:
-            await asyncio.sleep(0.5)
-            session_local = get_session_local()
-            local_db = session_local()
-            try:
-                fresh = (
-                    local_db.query(Task)
-                    .filter(
-                        Task.id == started_task_id,
-                        Task.agent_id == int(agent.id),
-                        Task.source == "a2a",
-                    )
-                    .first()
-                )
-                if fresh is None:
-                    return
-                fresh_output = str(fresh.output or "")
-                fresh_state = task_state(fresh)
-                fresh_error = str(fresh.error_message or "")
-                if fresh_output and fresh_output != previous_output:
-                    artifacts = sse_task_artifacts(fresh)
-                    if artifacts:
-                        yield artifacts
-                if fresh_state != previous_state or fresh_error != previous_error:
-                    yield sse_task_update(fresh)
-                previous_state = fresh_state
-                previous_output = fresh_output
-                previous_error = fresh_error
-                if fresh.status in _STREAM_END_STATUSES:
-                    return
-            finally:
-                local_db.close()
+            remaining = deadline - monotonic()
+            if remaining <= 0:
+                return
+            await asyncio.sleep(min(0.5, remaining))
+            fresh = _fetch_fresh_a2a_task(int(agent.id), started_task_id)
+            if fresh is None:
+                return
+            fresh_output = str(fresh.output or "")
+            fresh_state = task_state(fresh)
+            fresh_error = str(fresh.error_message or "")
+            if fresh_output and fresh_output != previous_output:
+                artifacts = sse_task_artifacts(fresh)
+                if artifacts:
+                    yield artifacts
+            if fresh_state != previous_state or fresh_error != previous_error:
+                yield sse_task_update(fresh)
+            previous_state = fresh_state
+            previous_output = fresh_output
+            previous_error = fresh_error
+            if fresh.status in _STREAM_END_STATUSES:
+                return
 
     return StreamingResponse(
         _events(),
@@ -338,27 +389,19 @@ async def _wait_for_task(agent: Agent, task: Task) -> Task:
     if task.status in _STREAM_END_STATUSES:
         return task
     task_id = int(task.id)
+    deadline = monotonic() + A2A_BLOCKING_WAIT_TIMEOUT_SECONDS
+    fresh = task
     while True:
-        await asyncio.sleep(0.25)
-        session_local = get_session_local()
-        local_db = session_local()
-        try:
-            fresh = (
-                local_db.query(Task)
-                .filter(
-                    Task.id == task_id,
-                    Task.agent_id == int(agent.id),
-                    Task.source == "a2a",
-                )
-                .first()
-            )
-            if fresh is None:
-                raise a2a_error("task_not_found", "Task not found.", status_code=404)
-            if fresh.status in _STREAM_END_STATUSES:
-                local_db.expunge(fresh)
-                return fresh
-        finally:
-            local_db.close()
+        remaining = deadline - monotonic()
+        if remaining <= 0:
+            return fresh
+        await asyncio.sleep(min(0.25, remaining))
+        fetched = _fetch_fresh_a2a_task(int(agent.id), task_id)
+        if fetched is None:
+            raise a2a_error("task_not_found", "Task not found.", status_code=404)
+        fresh = fetched
+        if fresh.status in _STREAM_END_STATUSES:
+            return fresh
 
 
 def _page_offset(page_token: str | None) -> int:
@@ -387,16 +430,6 @@ def _is_after(value: Any, threshold: datetime) -> bool:
 
 @router.get("/agents/{agent_id}/.well-known/agent-card.json")
 async def get_agent_card_well_known(
-    agent_id: int,
-    request: Request,
-    db: Session = Depends(get_db),
-) -> Any:
-    agent = _resolve_published_agent(db, agent_id)
-    return a2a_json_response(build_agent_card(agent, request))
-
-
-@router.get("/agents/{agent_id}/agent-card")
-async def get_agent_card(
     agent_id: int,
     request: Request,
     db: Session = Depends(get_db),
@@ -497,18 +530,7 @@ async def list_tasks(
     if context_id is not None:
         tasks = [task for task in tasks if task_context_id(task) == context_id]
     if status is not None:
-        allowed_states = {
-            "TASK_STATE_UNSPECIFIED",
-            "TASK_STATE_SUBMITTED",
-            "TASK_STATE_WORKING",
-            "TASK_STATE_COMPLETED",
-            "TASK_STATE_FAILED",
-            "TASK_STATE_CANCELED",
-            "TASK_STATE_INPUT_REQUIRED",
-            "TASK_STATE_REJECTED",
-            "TASK_STATE_AUTH_REQUIRED",
-        }
-        if status not in allowed_states:
+        if status not in ALL_TASK_STATES:
             raise a2a_error(
                 "invalid_argument",
                 f"Unknown A2A task status: {status}",

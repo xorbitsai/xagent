@@ -584,7 +584,7 @@ def _begin_turn_atomic_sync(
         updated_at=updated_at,
         before_message_id=before_message_id,
         task_source=source,
-        run_id=str(stored_run_id),
+        run_id=str(stored_run_id) if stored_run_id is not None else "",
         state_version=int(state_version),
         control_state=str(control_state),
     )

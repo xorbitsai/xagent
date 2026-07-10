@@ -57,7 +57,13 @@ vi.mock("sonner", () => ({
   },
 }))
 
-import { AppProvider, useApp } from "./app-context-chat"
+import {
+  AppProvider,
+  extractTaskControlEnvelope,
+  useApp,
+} from "./app-context-chat"
+
+type TaskControlMessage = Parameters<typeof extractTaskControlEnvelope>[0]
 
 function StateProbe() {
   const { state } = useApp()
@@ -113,6 +119,40 @@ function SeedRunningTask() {
 
   return null
 }
+
+describe("task control envelope parsing", () => {
+  it("does not coerce null, boolean, or empty identifiers to integers", () => {
+    const nullEnvelope = extractTaskControlEnvelope({
+      type: "task_paused",
+      timestamp: "2026-05-27T05:00:00Z",
+      task_id: null,
+      state_version: null,
+    } as unknown as TaskControlMessage)
+    const coercedEnvelope = extractTaskControlEnvelope({
+      type: "task_paused",
+      timestamp: "2026-05-27T05:00:00Z",
+      task_id: true,
+      state_version: "",
+    } as unknown as TaskControlMessage)
+
+    expect(nullEnvelope.taskId).toBeUndefined()
+    expect(nullEnvelope.stateVersion).toBeUndefined()
+    expect(coercedEnvelope.taskId).toBeUndefined()
+    expect(coercedEnvelope.stateVersion).toBeUndefined()
+  })
+
+  it("accepts positive task IDs and non-negative versions", () => {
+    const envelope = extractTaskControlEnvelope({
+      type: "task_paused",
+      timestamp: "2026-05-27T05:00:00Z",
+      task_id: "12",
+      state_version: "0",
+    } as unknown as TaskControlMessage)
+
+    expect(envelope.taskId).toBe(12)
+    expect(envelope.stateVersion).toBe(0)
+  })
+})
 
 describe("AppProvider websocket message routing", () => {
   beforeEach(() => {

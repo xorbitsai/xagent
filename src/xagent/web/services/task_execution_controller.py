@@ -78,8 +78,11 @@ def task_control_snapshot(task: Task) -> TaskControlSnapshot:
         control_state = TaskControlState(raw_state)
     except ValueError:
         control_state = control_state_for_status(task.status)
+    task_id = getattr(task, "id", None)
+    if task_id is None:
+        raise ValueError("Cannot create a task control snapshot for a task with no ID")
     return TaskControlSnapshot(
-        task_id=int(task.id),
+        task_id=int(task_id),
         run_id=getattr(task, "run_id", None),
         state_version=int(getattr(task, "state_version", 0) or 0),
         control_state=control_state,
@@ -121,7 +124,7 @@ def apply_task_control_transition(
     if session is not None and task_id is not None:
         # Preserve caller-owned pending fields (for example A2A cancellation
         # metadata) before the Core UPDATE + refresh below.
-        session.flush()
+        session.flush([task])
         values: dict[Any, Any] = {
             Task.control_state: control_state.value,
             Task.state_version: func.coalesce(Task.state_version, 0) + 1,
@@ -134,14 +137,18 @@ def apply_task_control_transition(
         statement = update(Task).where(Task.id == int(task_id))
         if expected_run_id is not None:
             statement = statement.where(Task.run_id == expected_run_id)
-        result = session.execute(
-            statement.values(values).execution_options(synchronize_session=False)
-        )
-        if int(getattr(result, "rowcount", 0) or 0) != 1:
-            raise StaleTaskRunError(
-                f"task {task_id} no longer belongs to run {expected_run_id}"
+        # Keep unrelated caller-owned pending objects out of this helper's
+        # atomic UPDATE and refresh. ``Session.execute`` and ``refresh`` can
+        # otherwise trigger another session-wide autoflush.
+        with session.no_autoflush:
+            result = session.execute(
+                statement.values(values).execution_options(synchronize_session=False)
             )
-        session.refresh(task)
+            if int(getattr(result, "rowcount", 0) or 0) != 1:
+                raise StaleTaskRunError(
+                    f"task {task_id} no longer belongs to run {expected_run_id}"
+                )
+            session.refresh(task)
         return task_control_snapshot(task)
 
     # Fallback for detached/transient objects. Persistent task rows use the

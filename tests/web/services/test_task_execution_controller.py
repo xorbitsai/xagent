@@ -13,6 +13,8 @@ from xagent.web.services.task_execution_controller import (
     TaskCommand,
     TaskControlState,
     TaskExecutionController,
+    apply_task_control_transition,
+    task_control_snapshot,
     transition_task_control_state_sync,
 )
 
@@ -43,6 +45,43 @@ def _create_task(db) -> Task:
     db.commit()
     db.refresh(task)
     return task
+
+
+def test_snapshot_requires_a_persisted_task_id() -> None:
+    task = Task(
+        user_id=1,
+        title="Transient task",
+        description="Transient task",
+        status=TaskStatus.PENDING,
+        execution_mode="auto",
+    )
+
+    with pytest.raises(ValueError, match="task with no ID"):
+        task_control_snapshot(task)
+
+
+def test_transition_does_not_flush_unrelated_pending_objects(db_session) -> None:
+    task = _create_task(db_session)
+    unrelated = Task(
+        user_id=task.user_id,
+        title="Unrelated task",
+        description="Unrelated task",
+        status=TaskStatus.PENDING,
+        execution_mode="auto",
+    )
+    db_session.add(unrelated)
+    db_session.commit()
+    unrelated.title = "Still pending"
+
+    snapshot = apply_task_control_transition(
+        task,
+        TaskControlState.RUNNING,
+        status=TaskStatus.RUNNING,
+        new_run=True,
+    )
+
+    assert snapshot.control_state == TaskControlState.RUNNING
+    assert unrelated in db_session.dirty
 
 
 @pytest.mark.asyncio

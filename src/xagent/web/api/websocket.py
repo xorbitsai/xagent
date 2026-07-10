@@ -2724,6 +2724,7 @@ def _event_task_control_state(message: dict[str, Any]) -> dict[str, Any] | None:
         status = source.get("status")
         if (
             isinstance(version, int)
+            and not isinstance(version, bool)
             and version >= 0
             and isinstance(control_state, str)
             and isinstance(status, str)

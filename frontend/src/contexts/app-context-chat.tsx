@@ -59,7 +59,14 @@ const VERSIONED_TASK_EVENT_TYPES = new Set([
 const asMessageRecord = (value: unknown): Record<string, unknown> =>
   value && typeof value === "object" ? value as Record<string, unknown> : {}
 
-const extractTaskControlEnvelope = (message: WebSocketMessage): TaskControlEnvelope => {
+const parseInteger = (value: unknown): number | undefined => {
+  if (typeof value === "number") return Number.isInteger(value) ? value : undefined
+  if (typeof value !== "string" || value.trim() === "") return undefined
+  const parsed = Number(value)
+  return Number.isInteger(parsed) ? parsed : undefined
+}
+
+export const extractTaskControlEnvelope = (message: WebSocketMessage): TaskControlEnvelope => {
   const root = message as unknown as Record<string, unknown>
   const data = asMessageRecord(root.data)
   const nestedData = asMessageRecord(data.data)
@@ -70,18 +77,18 @@ const extractTaskControlEnvelope = (message: WebSocketMessage): TaskControlEnvel
   if (!isStateEvent) return { isStateEvent: false }
 
   const rawTaskId = root.task_id ?? task.id ?? task.task_id ?? data.id ?? data.task_id ?? nestedData.id ?? nestedData.task_id
-  const parsedTaskId = Number(rawTaskId)
+  const parsedTaskId = parseInteger(rawTaskId)
   const rawVersion = root.state_version ?? task.state_version ?? data.state_version ?? nestedData.state_version
-  const parsedVersion = Number(rawVersion)
+  const parsedVersion = parseInteger(rawVersion)
   const rawRunId = root.run_id ?? task.run_id ?? data.run_id ?? nestedData.run_id
   const rawControlState = root.control_state ?? task.control_state ?? data.control_state ?? nestedData.control_state
   const rawStatus = root.status ?? task.status ?? data.status ?? nestedData.status
 
   return {
     isStateEvent: true,
-    taskId: Number.isFinite(parsedTaskId) ? parsedTaskId : undefined,
+    taskId: parsedTaskId !== undefined && parsedTaskId > 0 ? parsedTaskId : undefined,
     runId: typeof rawRunId === "string" || rawRunId === null ? rawRunId : undefined,
-    stateVersion: Number.isInteger(parsedVersion) && parsedVersion >= 0 ? parsedVersion : undefined,
+    stateVersion: parsedVersion !== undefined && parsedVersion >= 0 ? parsedVersion : undefined,
     controlState: typeof rawControlState === "string" ? rawControlState as TaskControlState : undefined,
     status: normalizeTaskStatus(rawStatus) || undefined,
   }

@@ -92,3 +92,24 @@ async def test_producer_snapshot_is_not_relabelled_as_a_newer_run(current_task) 
     assert event["state_version"] == 5
     assert event["control_state"] == "completed"
     assert event["status"] == "completed"
+
+
+@pytest.mark.asyncio
+async def test_boolean_state_version_is_replaced_with_current_snapshot(
+    current_task,
+) -> None:
+    event = await _with_current_task_control_state(
+        {
+            "type": "task_completed",
+            "task_id": int(current_task.id),
+            "run_id": "run-old",
+            "state_version": True,
+            "control_state": "completed",
+            "status": "completed",
+        }
+    )
+
+    assert event["run_id"] == "run-current"
+    assert event["state_version"] == 7
+    assert event["control_state"] == "running"
+    assert event["status"] == "running"

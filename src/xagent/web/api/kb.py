@@ -3654,6 +3654,23 @@ async def set_collection_rerank_model(
     )
 
 
+def _enforce_storage_gate(db: Session, user: Any) -> None:
+    """Refuse ingest when the team is at its KB storage limit (fails open).
+
+    Shared by every direct-ingestion endpoint so none silently bypasses the
+    storage quota. Coarse: allows one file to push slightly over, to avoid
+    cleaning up an already-written file.
+    """
+    try:
+        from ..services.quota_hooks import check_storage_gate
+
+        reason = check_storage_gate(db, getattr(user, "id", None))
+    except Exception:
+        reason = None
+    if reason:
+        raise HTTPException(status_code=402, detail=reason)
+
+
 @kb_router.post(
     "/ingest",
     response_model=IngestionResult,
@@ -3776,17 +3793,7 @@ async def ingest(
     except ValueError:
         collection_existed_before = False
 
-    # Storage quota gate: block ingest when the team is already at its KB
-    # storage limit. Coarse (allows one file to push slightly over) to avoid
-    # cleaning up an already-written file; fails open on check errors.
-    try:
-        from ..services.quota_hooks import check_storage_gate
-
-        storage_reason = check_storage_gate(db, getattr(_user, "id", None))
-    except Exception:
-        storage_reason = None
-    if storage_reason:
-        raise HTTPException(status_code=402, detail=storage_reason)
+    _enforce_storage_gate(db, _user)
 
     existing_file_record = (
         db.query(UploadedFile)
@@ -4284,6 +4291,8 @@ async def ingest_cloud(
     _user: User = Depends(get_current_user),
 ) -> List[IngestionResult]:
     """Ingest files from cloud storage."""
+    _enforce_storage_gate(db, _user)
+
     try:
         safe_collection = sanitize_path_component(request.collection, "collection")
     except ValueError as e:

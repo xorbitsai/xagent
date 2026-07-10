@@ -18,6 +18,15 @@ _run_gate_hook: Callable[[Any, Any], str | None] | None = None
 # metering. delta_details is this turn's per-model token breakdown (list of
 # {"type","tokens","model"}) for cost-based credits; delta_actions counts tool
 # calls (one billable action per tool invocation).
+#
+# TRANSACTION CONTRACT: the hook is invoked from TaskTracker.complete_tracking
+# BEFORE that method commits the token-usage row on the SAME `db` session, and
+# a later commit failure there rolls the session back. The hook therefore MUST
+# manage its own durability — either persist through an independent
+# session/transaction, or accumulate in a store that doesn't depend on this
+# session's commit. It must NOT leave writes pending on `db` expecting the
+# caller to commit them (they may be rolled back), and must NOT commit `db`
+# itself (that would prematurely persist the caller's unrelated pending state).
 _usage_record_hook: Callable[[Any, Any, list, int], None] | None = None
 # (db, user_id) -> reason str if the team is out of storage quota, else None
 _storage_gate_hook: Callable[[Any, Any], str | None] | None = None

@@ -142,12 +142,13 @@ class TokenContextManager:
         return self
 
     def __exit__(self, exc_type: Any, exc_val: Any, exc_tb: Any) -> None:
-        """Exit the context and restore previous state."""
-        if self._previous_token is not None:
-            token_context.set(self._previous_token)
-        else:
-            # Clear the context
-            token_context.set(TokenUsage())
+        """Exit the context and restore the previous state.
+
+        Restores whatever was there before (``None`` when nothing was set), so
+        leaving a manager block doesn't reintroduce a lingering shared
+        TokenUsage instance — matching the None default on the ContextVar.
+        """
+        token_context.set(self._previous_token)
 
     def get_usage(self) -> TokenUsage:
         """Get the current token usage."""

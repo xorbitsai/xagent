@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import inspect
+import logging
 from dataclasses import dataclass, field
 from typing import Any, Callable
 from uuid import uuid4
@@ -16,6 +17,8 @@ from ..agent.trace import (
 from ..model.chat.basic.base import BaseLLM
 from ..model.chat.types import ChunkType
 from .streaming import merge_streamed_tool_call_arguments
+
+logger = logging.getLogger(__name__)
 
 
 class LLMCallInterrupted(Exception):
@@ -597,7 +600,7 @@ class PatternRuntime:
 
             add_tool_call_usage(1)
         except Exception:
-            pass
+            logger.debug("tool-call metering failed", exc_info=True)
         data = {
             "tool_name": tool_call.get("name"),
             "tool_params": tool_call.get("args", {}),

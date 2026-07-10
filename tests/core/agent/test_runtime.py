@@ -665,3 +665,29 @@ async def test_tool_invocation_counts_one_action_each() -> None:
         tool_call={"name": "search", "id": "t2"}, result={"success": False, "error": "boom"}
     )
     assert get_token_usage().tool_calls == 2
+
+
+@pytest.mark.asyncio
+async def test_concurrent_tool_calls_all_count() -> None:
+    """A concurrent batch (asyncio.gather) increments the shared counter once per tool.
+
+    Covers the PR's claim that counting is safe when react runs tools
+    concurrently via _run_concurrent_batch.
+    """
+    from xagent.core.model.chat.token_context import (
+        TokenUsage,
+        get_token_usage,
+        set_token_usage,
+    )
+
+    set_token_usage(TokenUsage())
+    runtime = PatternRuntime(execution_id="task-batch")
+
+    await asyncio.gather(
+        *[
+            runtime.on_tool_start(tool_call={"name": f"t{i}", "args": {}, "id": f"t{i}"})
+            for i in range(8)
+        ]
+    )
+
+    assert get_token_usage().tool_calls == 8

@@ -2123,6 +2123,8 @@ class AgentServiceManager:
         lease_heartbeat_task = None
         result: Dict[str, Any] | None = None
         sandbox_task_key = None
+        # Reused below for the workforce-status sync so we don't re-query the row.
+        gate_task = None
 
         # Quota gate: refuse to start a run when the team is out of monthly
         # quota. Fails open if the check itself errors, so quota infra problems
@@ -2165,11 +2167,15 @@ class AgentServiceManager:
 
         if db_session and tracker_task_id:
             try:
-                task_for_sync = (
-                    db_session.query(Task)
-                    .filter(Task.id == int(tracker_task_id))
-                    .first()
-                )
+                # Reuse the row already fetched for the quota gate; only re-query
+                # if the gate path didn't run or errored before assigning it.
+                task_for_sync = gate_task
+                if task_for_sync is None:
+                    task_for_sync = (
+                        db_session.query(Task)
+                        .filter(Task.id == int(tracker_task_id))
+                        .first()
+                    )
                 if task_for_sync is not None and sync_workforce_run_status(
                     db_session, task_for_sync, TaskStatus.RUNNING
                 ):

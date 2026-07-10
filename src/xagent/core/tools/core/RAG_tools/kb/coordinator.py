@@ -2116,16 +2116,19 @@ class KBCoordinator:
             ingest_status,
             side_effects_may_remain=side_effects_may_remain,
         )
-        if boundary_errors:
+        if side_effects_may_remain:
             status = "incomplete"
         elif attempted:
             status = "complete"
         else:
             status = "not_needed"
+        rollback_complete = first_error is None and not side_effects_may_remain
+        assert not (side_effects_may_remain and status in ("not_needed", "complete"))
+        assert not (side_effects_may_remain and rollback_complete)
         return RollbackFailedIngestionResult(
             status=status,
             rollback_status=rollback_status,
-            rollback_complete=first_error is None,
+            rollback_complete=rollback_complete,
             side_effects_may_remain=side_effects_may_remain,
             first_error=first_error,
             boundary_errors=boundary_errors,
@@ -2155,7 +2158,13 @@ class KBCoordinator:
             attempted = True
             try:
                 callback = request.document_compensation(request.ingestion_result)
-                callback()
+                result = callback()
+                if inspect.isawaitable(result):
+                    _close_awaitable_if_possible(result)
+                    raise TypeError(
+                        "Async DOCUMENT compensation callback is not supported "
+                        f"for {source}"
+                    )
             except Exception as exc:  # noqa: BLE001 - fold into the result
                 _fold("DOCUMENT", exc)
 
@@ -2163,7 +2172,13 @@ class KBCoordinator:
         if request.file_compensation is not None:
             attempted = True
             try:
-                request.file_compensation()
+                result = request.file_compensation()
+                if inspect.isawaitable(result):
+                    _close_awaitable_if_possible(result)
+                    raise TypeError(
+                        "Async FILE compensation callback is not supported "
+                        f"for {source}"
+                    )
             except Exception as exc:  # noqa: BLE001 - fold into the result
                 _fold("FILE", exc)
             else:
@@ -2173,7 +2188,13 @@ class KBCoordinator:
             attempted = True
             try:
                 callback = request.status_compensation(request.ingestion_result)
-                callback()
+                result = callback()
+                if inspect.isawaitable(result):
+                    _close_awaitable_if_possible(result)
+                    raise TypeError(
+                        "Async STATUS compensation callback is not supported "
+                        f"for {source}"
+                    )
             except Exception as exc:  # noqa: BLE001 - fold into the result
                 _fold("STATUS", exc)
 
@@ -2182,7 +2203,13 @@ class KBCoordinator:
             file_registered = request.file_compensation is not None
             if first_error is None and (not file_registered or file_succeeded):
                 try:
-                    request.snapshot_compensation()
+                    result = request.snapshot_compensation()
+                    if inspect.isawaitable(result):
+                        _close_awaitable_if_possible(result)
+                        raise TypeError(
+                            "Async SNAPSHOT compensation callback is not supported "
+                            f"for {source}"
+                        )
                 except Exception as exc:  # noqa: BLE001 - fold into the result
                     _fold("SNAPSHOT", exc)
 

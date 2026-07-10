@@ -208,6 +208,10 @@ class TestInference:
         # No callbacks ran, but the saga still holds uncompensated steps.
         assert result.side_effects_may_remain is True
         assert result.rollback_status is RollbackStatus.INCOMPLETE
+        # Regression (#515 review): status/rollback_complete must not
+        # contradict side_effects_may_remain by claiming "not_needed"/complete.
+        assert result.status == "incomplete"
+        assert result.rollback_complete is False
 
     def test_document_compensation_marks_cascade_planes(self) -> None:
         coordinator = _make_coordinator()
@@ -280,6 +284,35 @@ class TestInference:
         ]
         assert len(file_steps) == 1
         assert result.status == "complete"
+
+
+class TestCallbacksOnlyAsyncCompensationRejected:
+    """Regression (#515 review): an async compensation callback must fold
+    into an error, not be silently discarded as a false "complete" success.
+    """
+
+    def test_async_document_compensation_folds_into_error(self) -> None:
+        coordinator = _make_coordinator()
+
+        async def _async_document_cb() -> None:
+            pass
+
+        request = RollbackFailedIngestionRequest(
+            collection="demo",
+            user_id=None,
+            is_admin=False,
+            operation=None,
+            source="https://example.com/a",
+            document_compensation=lambda _result: _async_document_cb,
+        )
+
+        result = coordinator.rollback_failed_ingestion_sync(request)
+
+        assert result.status == "incomplete"
+        assert result.rollback_complete is False
+        assert result.side_effects_may_remain is True
+        assert result.first_error is not None
+        assert "DOCUMENT" in result.boundary_errors
 
 
 class TestAsyncTwin:

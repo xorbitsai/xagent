@@ -3,12 +3,16 @@
 import { useEffect, useRef, useState, useCallback } from "react"
 import { useAuth } from "@/contexts/auth-context"
 import { apiRequest, getUploadErrorMessage, isJsonRecord, parseApiResponse, UPLOAD_ERROR_MESSAGES } from "@/lib/api-wrapper"
-import { toast } from "@/components/ui/sonner"
 import { getWsUrl, getUploadApiUrl } from "@/lib/utils"
 import { isFinalAnswerStreamEventType } from "@/lib/streaming-final-answer"
 
 // Duplicate message detection: record recently sent messages
-const recentMessages: Array<{ message: string; timestamp: number; taskId: number }> = []
+const recentMessages: Array<{
+  message: string
+  timestamp: number
+  taskId: number
+  clientMessageId: string
+}> = []
 const MESSAGE_DUPLICATE_THRESHOLD = 2000 // Same message within 2 seconds is considered duplicate
 
 interface WebSocketMessage {
@@ -22,6 +26,11 @@ interface WebSocketMessage {
   message_id?: string
   delta?: string
   content?: string
+}
+
+interface MessageDeliveryAck {
+  client_message_id: string
+  turn_id: string
 }
 
 interface UseWebSocketOptions {
@@ -64,7 +73,20 @@ export function useWebSocket(options: UseWebSocketOptions = {}) {
   const reconnectAttemptsRef = useRef(0)
   const taskIdRef = useRef(taskId)
   const tokenRef = useRef(token || authToken) // Prioritize passed token, otherwise use auth token
+  const pendingDeliveriesRef = useRef(new Map<string, {
+    resolve: (ack: MessageDeliveryAck) => void
+    reject: (error: Error) => void
+    timeout: ReturnType<typeof setTimeout>
+  }>())
   const maxReconnectAttempts = 3
+
+  const rejectPendingDeliveries = useCallback((error: Error) => {
+    for (const pending of pendingDeliveriesRef.current.values()) {
+      clearTimeout(pending.timeout)
+      pending.reject(error)
+    }
+    pendingDeliveriesRef.current.clear()
+  }, [])
 
   // Update token ref when token changes
   useEffect(() => {
@@ -122,6 +144,7 @@ export function useWebSocket(options: UseWebSocketOptions = {}) {
       }
 
       socket.onclose = (event) => {
+        rejectPendingDeliveries(new Error('Connection closed before the message was accepted.'))
         setIsConnected(false)
         isConnectingRef.current = false
         onDisconnect?.()
@@ -208,6 +231,26 @@ export function useWebSocket(options: UseWebSocketOptions = {}) {
       socket.onmessage = (event) => {
         try {
           const data = JSON.parse(event.data)
+
+          if (data.type === 'message_accepted' || data.type === 'message_rejected') {
+            const clientMessageId = data.client_message_id
+            const pending = typeof clientMessageId === 'string'
+              ? pendingDeliveriesRef.current.get(clientMessageId)
+              : undefined
+            if (pending) {
+              clearTimeout(pending.timeout)
+              pendingDeliveriesRef.current.delete(clientMessageId)
+              if (data.type === 'message_accepted') {
+                pending.resolve({
+                  client_message_id: clientMessageId,
+                  turn_id: typeof data.turn_id === 'string' ? data.turn_id : clientMessageId,
+                })
+              } else {
+                pending.reject(new Error(data.message || 'Message was rejected.'))
+              }
+            }
+            return
+          }
 
           // Handle different message types from the backend
           let message: WebSocketMessage
@@ -335,7 +378,7 @@ export function useWebSocket(options: UseWebSocketOptions = {}) {
       setConnectionError(connectionError)
       onError?.(connectionError)
     }
-  }, [url, taskId, token, authToken, onConnect, onDisconnect, onError])
+  }, [url, taskId, token, authToken, onConnect, onDisconnect, onError, rejectPendingDeliveries])
 
   const disconnect = useCallback(() => {
     if (reconnectTimeoutRef.current) {
@@ -347,9 +390,10 @@ export function useWebSocket(options: UseWebSocketOptions = {}) {
       socketRef.current.close()
       socketRef.current = null
     }
+    rejectPendingDeliveries(new Error('Disconnected before the message was accepted.'))
     setIsConnected(false)
     isConnectingRef.current = false
-  }, [])
+  }, [rejectPendingDeliveries])
 
   // Update taskId ref when taskId changes
   useEffect(() => {
@@ -373,136 +417,134 @@ export function useWebSocket(options: UseWebSocketOptions = {}) {
     }
   }, [])
 
-  const sendChatMessage = useCallback((message: string, files?: File[], force: boolean = false) => {
+  const sendChatMessage = useCallback(async (
+    message: string,
+    files?: File[],
+    force: boolean = false,
+    requestedClientMessageId?: string,
+  ): Promise<MessageDeliveryAck> => {
     const timestamp = Date.now()
-
-    // Brute force duplicate message detection
     const currentTaskId = taskIdRef.current
-    const duplicateMessage = recentMessages.find(
-      msg => msg.taskId === currentTaskId && msg.message === message && (timestamp - msg.timestamp) < MESSAGE_DUPLICATE_THRESHOLD
+    const socket = socketRef.current
+    if (!currentTaskId || socket?.readyState !== WebSocket.OPEN) {
+      throw new Error('Message not sent: the task connection is not ready.')
+    }
+
+    const clientMessageId = requestedClientMessageId || (
+      typeof crypto !== 'undefined' && crypto.randomUUID
+        ? crypto.randomUUID()
+        : `msg-${timestamp}-${Math.random().toString(36).slice(2)}`
     )
-
+    const duplicateMessage = recentMessages.find(
+      msg => (
+        msg.taskId === currentTaskId
+        && msg.message === message
+        && msg.clientMessageId !== clientMessageId
+        && (timestamp - msg.timestamp) < MESSAGE_DUPLICATE_THRESHOLD
+      )
+    )
     if (!force && duplicateMessage) {
-      console.warn("Duplicate WebSocket chat message ignored")
-      return
+      throw new Error('Duplicate message ignored while the previous send is pending.')
     }
 
-    if (socketRef.current?.readyState === WebSocket.OPEN && taskIdRef.current) {
-      const messageData: any = {
-        type: "chat",
-        message,
-        task_id: taskIdRef.current,
-      }
+    const messageData: Record<string, unknown> = {
+      type: 'chat',
+      message,
+      task_id: currentTaskId,
+      client_message_id: clientMessageId,
+    }
 
-      // If there are files, upload them first via API, then send file_ids
-      if (files && files.length > 0) {
-        const filesToUpload = files.filter(f => !(f as any).file_id)
-        const preUploadedFiles = files.filter(f => (f as any).file_id).map(f => ({
-          file_id: (f as any).file_id,
-          name: f.name,
-          size: f.size,
-          type: f.type || ''
+    if (files && files.length > 0) {
+      type FileWithUploadId = File & { file_id?: string }
+      const filesWithUploadIds = files as FileWithUploadId[]
+      const filesToUpload = filesWithUploadIds.filter(file => !file.file_id)
+      const preUploadedFiles = filesWithUploadIds
+        .filter((file): file is FileWithUploadId & { file_id: string } => Boolean(file.file_id))
+        .map(file => ({
+          file_id: file.file_id,
+          name: file.name,
+          size: file.size,
+          type: file.type || '',
         }))
+      let uploadedFiles: Array<{ file_id: string; name?: string; size?: number; type?: string }> = []
 
-        if (filesToUpload.length > 0) {
-          const handleUploadedFiles = (uploadedFiles: Array<{ file_id: string; name?: string; size?: number; type?: string }>) => {
-            messageData.files = [...preUploadedFiles, ...uploadedFiles]
-            socketRef.current?.send(JSON.stringify(messageData))
-
-            recentMessages.push({ message, timestamp, taskId: currentTaskId! })
-            const cutoffTime = timestamp - 5000
-            const firstKeepIndex = recentMessages.findIndex(msg => msg.timestamp >= cutoffTime)
-            if (firstKeepIndex === -1) {
-              recentMessages.splice(0, recentMessages.length)
-            } else if (firstKeepIndex > 0) {
-              recentMessages.splice(0, firstKeepIndex)
-            }
-          }
-
-          if (uploadFiles) {
-            uploadFiles(filesToUpload, { taskId: taskIdRef.current, taskType: 'task' })
-              .then(handleUploadedFiles)
-              .catch(err => {
-                console.error('Failed to upload files:', err)
-                toast.error(err instanceof Error ? err.message : 'Upload failed')
-              })
-            return
-          }
-
-          const formData = new FormData()
-          filesToUpload.forEach(f => formData.append('files', f))
-          formData.append('task_type', 'task')
-          if (taskIdRef.current) {
-            formData.append('task_id', taskIdRef.current.toString())
-          }
-
-          apiRequest(`${getUploadApiUrl()}/api/files/upload`, {
-            method: 'POST',
-            headers: {
-              'Authorization': `Bearer ${token || localStorage.getItem('token') || ''}`
-            },
-            body: formData
-          })
-            .then(async res => ({ response: res, parsed: await parseApiResponse(res) }))
-            .then(({ response, parsed }) => {
-              if (!response.ok || !isJsonRecord(parsed.data)) {
-                throw new Error(getUploadErrorMessage(response, parsed, {
-                  generic: 'Upload failed',
-                  ...UPLOAD_ERROR_MESSAGES,
-                }))
-              }
-
-              const data = parsed.data
-              const newUploadedFiles = data.success && Array.isArray(data.files)
-                ? data.files
-                  .filter((f): f is { file_id: string; filename?: string; file_size?: number; mime_type?: string } => (
-                    isJsonRecord(f) && typeof f.file_id === 'string'
-                  ))
-                  .map((f) => ({
-                    file_id: f.file_id,
-                    name: typeof f.filename === 'string' ? f.filename : '',
-                    size: typeof f.file_size === 'number' ? f.file_size : 0,
-                    type: typeof f.mime_type === 'string' ? f.mime_type : ''
-                  }))
-                : []
-
-              handleUploadedFiles(newUploadedFiles)
-            })
-            .catch(err => {
-              console.error('Failed to upload files:', err)
-              toast.error(err instanceof Error ? err.message : 'Upload failed')
-            })
-        } else {
-          messageData.files = preUploadedFiles;
-          socketRef.current?.send(JSON.stringify(messageData))
-
-          // Record sent message
-          recentMessages.push({ message, timestamp, taskId: currentTaskId! })
-          // Clear records older than 5 seconds
-          const cutoffTime = timestamp - 5000
-          const firstKeepIndex = recentMessages.findIndex(msg => msg.timestamp >= cutoffTime)
-          if (firstKeepIndex === -1) {
-            recentMessages.splice(0, recentMessages.length)
-          } else if (firstKeepIndex > 0) {
-            recentMessages.splice(0, firstKeepIndex)
-          }
+      if (filesToUpload.length > 0 && uploadFiles) {
+        uploadedFiles = await uploadFiles(filesToUpload, {
+          taskId: currentTaskId,
+          taskType: 'task',
+        })
+      } else if (filesToUpload.length > 0) {
+        const formData = new FormData()
+        filesToUpload.forEach(file => formData.append('files', file))
+        formData.append('task_type', 'task')
+        formData.append('task_id', currentTaskId.toString())
+        const response = await apiRequest(`${getUploadApiUrl()}/api/files/upload`, {
+          method: 'POST',
+          headers: {
+            'Authorization': `Bearer ${tokenRef.current || localStorage.getItem('token') || ''}`,
+          },
+          body: formData,
+        })
+        const parsed = await parseApiResponse(response)
+        if (!response.ok || !isJsonRecord(parsed.data)) {
+          throw new Error(getUploadErrorMessage(response, parsed, {
+            generic: 'Upload failed',
+            ...UPLOAD_ERROR_MESSAGES,
+          }))
         }
-      } else {
-        socketRef.current?.send(JSON.stringify(messageData))
-
-        // Record sent message
-        recentMessages.push({ message, timestamp, taskId: currentTaskId! })
-        // Clear records older than 5 seconds
-        const cutoffTime = timestamp - 5000
-        const firstKeepIndex = recentMessages.findIndex(msg => msg.timestamp >= cutoffTime)
-        if (firstKeepIndex === -1) {
-          recentMessages.splice(0, recentMessages.length)
-        } else if (firstKeepIndex > 0) {
-          recentMessages.splice(0, firstKeepIndex)
-        }
+        const data = parsed.data
+        uploadedFiles = data.success && Array.isArray(data.files)
+          ? data.files
+            .filter((file): file is { file_id: string; filename?: string; file_size?: number; mime_type?: string } => (
+              isJsonRecord(file) && typeof file.file_id === 'string'
+            ))
+            .map(file => ({
+              file_id: file.file_id,
+              name: typeof file.filename === 'string' ? file.filename : '',
+              size: typeof file.file_size === 'number' ? file.file_size : 0,
+              type: typeof file.mime_type === 'string' ? file.mime_type : '',
+            }))
+          : []
       }
+      messageData.files = [...preUploadedFiles, ...uploadedFiles]
     }
-  }, [taskId])
+
+    const delivery = new Promise<MessageDeliveryAck>((resolve, reject) => {
+      const timeout = setTimeout(() => {
+        pendingDeliveriesRef.current.delete(clientMessageId)
+        reject(new Error('Message delivery was not acknowledged. Your draft was kept.'))
+      }, 30000)
+      pendingDeliveriesRef.current.set(clientMessageId, { resolve, reject, timeout })
+    })
+
+    try {
+      socket.send(JSON.stringify(messageData))
+    } catch (error) {
+      const pending = pendingDeliveriesRef.current.get(clientMessageId)
+      if (pending) {
+        clearTimeout(pending.timeout)
+        pendingDeliveriesRef.current.delete(clientMessageId)
+        pending.reject(error instanceof Error ? error : new Error(String(error)))
+      }
+      return delivery
+    }
+
+    recentMessages.push({
+      message,
+      timestamp,
+      taskId: currentTaskId,
+      clientMessageId,
+    })
+    const cutoffTime = timestamp - 5000
+    const firstKeepIndex = recentMessages.findIndex(item => item.timestamp >= cutoffTime)
+    if (firstKeepIndex === -1) {
+      recentMessages.splice(0, recentMessages.length)
+    } else if (firstKeepIndex > 0) {
+      recentMessages.splice(0, firstKeepIndex)
+    }
+
+    return delivery
+  }, [uploadFiles])
 
   const executeTask = useCallback((taskDescription: string, files?: Array<{ name: string; type: string; size: number; content?: string }>) => {
     if (socketRef.current?.readyState === WebSocket.OPEN && taskIdRef.current) {

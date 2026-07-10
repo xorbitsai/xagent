@@ -626,6 +626,12 @@ class AgentServiceManager:
 
     def __init__(self, request: Optional[Any] = None) -> None:
         self._agents: Dict[int, AgentService] = {}
+        # Building an AgentService performs multiple awaits (snapshot/tool/
+        # sandbox setup). Two WebSocket connections can otherwise both observe
+        # a cache miss, build different execution registries for the same task,
+        # and leave pause/message control attached to the instance that loses
+        # the final cache assignment.
+        self._agent_build_locks: Dict[int, asyncio.Lock] = {}
         # Owner (runtime identity) each cached AgentService was built for. A
         # task_id-keyed cache must not silently hand back an instance built
         # under a different user (e.g. once built with the wrong identity).
@@ -1327,6 +1333,26 @@ class AgentServiceManager:
         )
 
     async def get_agent_for_task(
+        self,
+        task_id: int,
+        db: Optional[Session] = None,
+        user: Optional[User] = None,
+        task_setup_snapshot: Optional[TaskSetupSnapshot] = None,
+        task_owner_user_id: Optional[int] = None,
+        connector_runtime_turn_id: Optional[str] = None,
+    ) -> AgentService:
+        lock = self._agent_build_locks.setdefault(task_id, asyncio.Lock())
+        async with lock:
+            return await self._get_agent_for_task_unlocked(
+                task_id,
+                db=db,
+                user=user,
+                task_setup_snapshot=task_setup_snapshot,
+                task_owner_user_id=task_owner_user_id,
+                connector_runtime_turn_id=connector_runtime_turn_id,
+            )
+
+    async def _get_agent_for_task_unlocked(
         self,
         task_id: int,
         db: Optional[Session] = None,

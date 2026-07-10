@@ -9,6 +9,7 @@ isolation; here we exercise the handlers end to end).
 
 from __future__ import annotations
 
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -19,6 +20,7 @@ from xagent.web.api.websocket import (
     handle_pause_task,
     handle_resume_task,
 )
+from xagent.web.models.chat_message import TaskChatMessage
 from xagent.web.models.database import Base, get_db, get_engine, init_db
 from xagent.web.models.task import Task, TaskStatus
 from xagent.web.models.user import User
@@ -110,11 +112,137 @@ async def test_chat_admin_append_to_other_users_task_claims_as_owner(
         await handle_chat_message(
             MagicMock(),
             int(task.id),
-            {"message": "follow-up", "user": admin, "files": []},
+            {
+                "message": "follow-up",
+                "client_message_id": "client-turn-1",
+                "user": admin,
+                "files": [],
+            },
         )
 
     begin_turn.assert_awaited_once()
     assert begin_turn.await_args.kwargs["task_owner_user_id"] == int(owner.id)
+    assert begin_turn.await_args.kwargs["payload"].turn_id == "client-turn-1"
+    accepted = [
+        call.args[0]
+        for call in ws_manager.send_personal_message.call_args_list
+        if call.args[0].get("type") == "message_accepted"
+    ]
+    assert len(accepted) == 1
+    assert accepted[0]["client_message_id"] == "client-turn-1"
+    assert accepted[0]["turn_id"] == "client-turn-1"
+
+
+@pytest.mark.asyncio
+async def test_running_chat_message_is_persisted_before_resume(db_session) -> None:
+    owner = _user(db_session, "owner")
+    task = _task(db_session, owner.id, status=TaskStatus.RUNNING)
+    agent = MagicMock()
+    agent.supports_live_control.return_value = True
+    agent.get_dag_pattern.return_value = None
+    agent.post_user_message = AsyncMock(return_value=True)
+    mgr = MagicMock(get_agent_for_task=AsyncMock(return_value=agent))
+    ws_manager = MagicMock(
+        broadcast_to_task=AsyncMock(),
+        send_personal_message=AsyncMock(),
+    )
+    resume_bg = AsyncMock()
+    bg_mgr = MagicMock()
+    bg_mgr.reserve_resume.return_value = True
+    bg_mgr.running_tasks.get.return_value = None
+
+    with (
+        patch("xagent.web.api.chat.get_agent_manager", return_value=mgr),
+        patch("xagent.web.api.websocket.manager", ws_manager),
+        patch("xagent.web.api.websocket.execute_resume_background", resume_bg),
+        patch("xagent.web.api.websocket.background_task_manager", bg_mgr),
+    ):
+        await handle_chat_message(
+            MagicMock(),
+            int(task.id),
+            {
+                "message": "Use the audio tool",
+                "client_message_id": "live-turn-1",
+                "user": owner,
+                "files": [],
+            },
+        )
+
+    stored = (
+        db_session.query(TaskChatMessage)
+        .filter(
+            TaskChatMessage.task_id == int(task.id),
+            TaskChatMessage.role == "user",
+        )
+        .one()
+    )
+    assert stored.content == "Use the audio tool"
+    assert stored.turn_id == "live-turn-1"
+    assert agent.post_user_message.await_args.kwargs["turn_id"] == "live-turn-1"
+    bg_mgr.register_reserved_resume.assert_called_once()
+    accepted = [
+        call.args[0]
+        for call in ws_manager.send_personal_message.call_args_list
+        if call.args[0].get("type") == "message_accepted"
+    ]
+    assert len(accepted) == 1
+    assert accepted[0]["client_message_id"] == "live-turn-1"
+
+
+@pytest.mark.asyncio
+async def test_retried_durable_message_is_accepted_without_reexecution(
+    db_session,
+) -> None:
+    owner = _user(db_session, "owner")
+    task = _task(db_session, owner.id, status=TaskStatus.COMPLETED)
+    db_session.add(
+        TaskChatMessage(
+            task_id=int(task.id),
+            user_id=int(owner.id),
+            role="user",
+            content="Already delivered",
+            message_type="user_message",
+            turn_id="stable-turn-1",
+        )
+    )
+    db_session.commit()
+    agent_manager = MagicMock()
+    ws_manager = MagicMock(
+        broadcast_to_task=AsyncMock(),
+        send_personal_message=AsyncMock(),
+    )
+
+    with (
+        patch("xagent.web.api.chat.get_agent_manager", return_value=agent_manager),
+        patch("xagent.web.api.websocket.manager", ws_manager),
+    ):
+        await handle_chat_message(
+            MagicMock(),
+            int(task.id),
+            {
+                "message": "Already delivered",
+                "client_message_id": "stable-turn-1",
+                "user": owner,
+                "files": [],
+            },
+        )
+
+    agent_manager.get_agent_for_task.assert_not_called()
+    stored = (
+        db_session.query(TaskChatMessage)
+        .filter(
+            TaskChatMessage.task_id == int(task.id),
+            TaskChatMessage.turn_id == "stable-turn-1",
+        )
+        .all()
+    )
+    assert len(stored) == 1
+    accepted = [
+        call.args[0]
+        for call in ws_manager.send_personal_message.call_args_list
+        if call.args[0].get("type") == "message_accepted"
+    ]
+    assert len(accepted) == 1
 
 
 @pytest.mark.asyncio
@@ -177,7 +305,7 @@ async def test_resume_live_control_admin_runs_background_as_owner(db_session) ->
     UserContext, i.e. ``task_owner_user_id`` is the owner, not the admin."""
     owner = _user(db_session, "owner")
     admin = _user(db_session, "admin", is_admin=True)
-    task = _task(db_session, owner.id)
+    task = _task(db_session, owner.id, status=TaskStatus.PAUSED)
     captured, agent, mgr, ws_manager = _patched_manager_and_agent()
     agent.supports_live_control = MagicMock(return_value=True)
 
@@ -197,6 +325,8 @@ async def test_resume_live_control_admin_runs_background_as_owner(db_session) ->
     assert captured["task_owner_user_id"] == int(owner.id)
     resume_bg.assert_called_once()
     assert resume_bg.call_args.kwargs["task_owner_user_id"] == int(owner.id)
+    bg_mgr.reserve_resume.assert_called_once_with(int(task.id))
+    bg_mgr.register_reserved_resume.assert_called_once()
 
 
 @pytest.mark.asyncio
@@ -236,6 +366,85 @@ async def test_execute_resume_background_rejects_owner_mismatch(db_session) -> N
         if isinstance(msg, dict)
     }
     assert "task_error" in error_types
+
+
+@pytest.mark.asyncio
+async def test_execute_resume_background_persists_assistant_for_live_turn(
+    db_session,
+) -> None:
+    owner = _user(db_session, "owner")
+    task = _task(db_session, owner.id, status=TaskStatus.PAUSED)
+    agent = MagicMock()
+    context = SimpleNamespace(
+        messages=[
+            SimpleNamespace(
+                role="user",
+                metadata={"turn_id": "live-turn-1"},
+            )
+        ]
+    )
+    agent.resume_execution_by_id = AsyncMock(
+        return_value={
+            "status": "completed",
+            "success": True,
+            "output": "Guidance applied",
+            "agent_result": {"context": context},
+        }
+    )
+    ws_manager = MagicMock(broadcast_to_task=AsyncMock())
+
+    with patch("xagent.web.api.websocket.manager", ws_manager):
+        await execute_resume_background(
+            task_id=int(task.id),
+            agent_service=agent,
+            task_owner_user_id=int(owner.id),
+        )
+
+    db_session.expire_all()
+    stored = (
+        db_session.query(TaskChatMessage)
+        .filter(
+            TaskChatMessage.task_id == int(task.id),
+            TaskChatMessage.role == "assistant",
+        )
+        .one()
+    )
+    assert stored.content == "Guidance applied"
+    assert stored.turn_id == "live-turn-1"
+    db_session.refresh(task)
+    assert task.status == TaskStatus.COMPLETED
+    assert task.output == "Guidance applied"
+
+
+@pytest.mark.asyncio
+async def test_execute_resume_background_persists_missing_checkpoint_failure(
+    db_session,
+) -> None:
+    owner = _user(db_session, "owner")
+    task = _task(db_session, owner.id, status=TaskStatus.PAUSED)
+    agent = MagicMock(
+        resume_execution_by_id=AsyncMock(return_value=None),
+    )
+    ws_manager = MagicMock(broadcast_to_task=AsyncMock())
+
+    with patch("xagent.web.api.websocket.manager", ws_manager):
+        await execute_resume_background(
+            task_id=int(task.id),
+            agent_service=agent,
+            task_owner_user_id=int(owner.id),
+        )
+
+    db_session.expire_all()
+    db_session.refresh(task)
+    assert task.status == TaskStatus.FAILED
+    assert "No resumable execution checkpoint" in str(task.error_message)
+    failures = [
+        call.args[0]
+        for call in ws_manager.broadcast_to_task.call_args_list
+        if call.args[0].get("type") == "task_error"
+    ]
+    assert len(failures) == 1
+    assert failures[0]["task"]["status"] == TaskStatus.FAILED.value
 
 
 @pytest.mark.asyncio

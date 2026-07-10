@@ -64,6 +64,7 @@ interface AgentConfig {
   compactModel?: string;
   memorySimilarityThreshold?: number;
   executionMode?: ExecutionModeConfig;
+  clientMessageId?: string;
 }
 
 interface ModelRecord {
@@ -112,6 +113,7 @@ export function ChatInput({
   const editorRef = useRef<HTMLDivElement>(null);
   const containerRef = useRef<HTMLDivElement>(null);
   const isSubmittingRef = useRef(false);
+  const deliveryAttemptRef = useRef<{ key: string; clientMessageId: string } | null>(null);
   const dragDepthRef = useRef(0);
   const { t } = useI18n();
   const { openFilePreview } = useApp();
@@ -578,9 +580,20 @@ export function ChatInput({
       const trimmed = message.trim();
       const messageToSend = trimmed;
       const executionMode = taskConfig?.executionMode;
+      const deliveryKey = JSON.stringify([
+        messageToSend,
+        files.map((file) => [file.name, file.size, file.lastModified]),
+      ]);
+      const previousAttempt = deliveryAttemptRef.current;
+      const clientMessageId = previousAttempt?.key === deliveryKey
+        ? previousAttempt.clientMessageId
+        : globalThis.crypto?.randomUUID?.()
+          ?? `msg-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+      deliveryAttemptRef.current = { key: deliveryKey, clientMessageId };
 
       const configToSend = {
         ...agentConfig,
+        clientMessageId,
         ...(executionMode
           ? {
               executionMode:
@@ -592,6 +605,7 @@ export function ChatInput({
       };
 
       await onSend(messageToSend, configToSend);
+      deliveryAttemptRef.current = null;
       fileMention.resetMention();
 
       if (isControlled) {
@@ -599,6 +613,12 @@ export function ChatInput({
       } else {
         setInternalMessage("");
       }
+    } catch (error) {
+      toast.error(
+        error instanceof Error
+          ? error.message
+          : t("builds.list.chat.sendFailed") || "Message was not sent"
+      );
     } finally {
       // Small delay to prevent double submission
       setTimeout(() => {

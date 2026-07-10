@@ -37,6 +37,44 @@ def persist_user_message(
     )
 
 
+def persist_user_message_once(
+    db: Session,
+    task_id: int,
+    user_id: int,
+    content: str,
+    *,
+    attachments: Optional[List[Dict[str, Any]]] = None,
+    turn_id: str,
+) -> Optional[TaskChatMessage]:
+    """Persist a user turn once for retry-safe live-control delivery.
+
+    WebSocket clients reuse ``turn_id`` while awaiting delivery acceptance. A
+    reconnect or an acknowledgement timeout may therefore submit the same turn
+    again. Reuse the durable transcript row instead of rendering/executing a
+    duplicate turn.
+    """
+
+    existing = (
+        db.query(TaskChatMessage)
+        .filter(
+            TaskChatMessage.task_id == task_id,
+            TaskChatMessage.role == "user",
+            TaskChatMessage.turn_id == turn_id,
+        )
+        .first()
+    )
+    if existing is not None:
+        return existing
+    return persist_user_message(
+        db,
+        task_id=task_id,
+        user_id=user_id,
+        content=content,
+        attachments=attachments,
+        turn_id=turn_id,
+    )
+
+
 def persist_user_message_no_commit(
     db: Session,
     task_id: int,
@@ -87,6 +125,7 @@ def persist_assistant_message(
     *,
     message_type: str = "assistant_message",
     interactions: Optional[List[Dict[str, Any]]] = None,
+    turn_id: Optional[str] = None,
 ) -> Optional[TaskChatMessage]:
     transcript_content = build_assistant_transcript_content(content, interactions)
     return _persist_message(
@@ -97,7 +136,38 @@ def persist_assistant_message(
         content=transcript_content,
         message_type=message_type,
         interactions=interactions,
+        turn_id=turn_id,
     )
+
+
+def persist_assistant_message_no_commit(
+    db: Session,
+    task_id: int,
+    user_id: int,
+    content: str,
+    *,
+    message_type: str = "assistant_message",
+    interactions: Optional[List[Dict[str, Any]]] = None,
+    turn_id: Optional[str] = None,
+) -> Optional[TaskChatMessage]:
+    """Stage an assistant transcript row for an atomic caller-owned commit."""
+
+    transcript_content = build_assistant_transcript_content(content, interactions)
+    normalized_content = transcript_content.strip()
+    if not normalized_content:
+        return None
+    message = TaskChatMessage(
+        task_id=task_id,
+        user_id=user_id,
+        role="assistant",
+        content=normalized_content,
+        message_type=message_type,
+        interactions=interactions,
+        turn_id=turn_id,
+        attachments=None,
+    )
+    db.add(message)
+    return message
 
 
 def load_task_transcript(

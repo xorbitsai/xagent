@@ -10,8 +10,10 @@ from xagent.web.services.chat_history_service import (
     get_latest_waiting_question,
     load_task_transcript,
     persist_assistant_message,
+    persist_assistant_message_no_commit,
     persist_user_message,
     persist_user_message_no_commit,
+    persist_user_message_once,
 )
 
 
@@ -193,6 +195,55 @@ def test_persist_user_message_stores_attachments_for_chip_replay():
         assert row is not None
         assert row.turn_id == "turn-attachments"
         assert row.attachments == attachments
+    finally:
+        db_session.close()
+
+
+def test_persist_user_message_once_reuses_durable_turn() -> None:
+    db_session = _create_db_session()
+    try:
+        task = _create_task(db_session)
+        first = persist_user_message_once(
+            db_session,
+            int(task.id),
+            int(task.user_id),
+            "Apply this guidance",
+            turn_id="client-turn-1",
+        )
+        retried = persist_user_message_once(
+            db_session,
+            int(task.id),
+            int(task.user_id),
+            "Apply this guidance",
+            turn_id="client-turn-1",
+        )
+
+        assert first is not None
+        assert retried is not None
+        assert retried.id == first.id
+        assert db_session.query(TaskChatMessage).count() == 1
+    finally:
+        db_session.close()
+
+
+def test_persist_assistant_message_no_commit_keeps_turn_id() -> None:
+    db_session = _create_db_session()
+    try:
+        task = _create_task(db_session)
+        row = persist_assistant_message_no_commit(
+            db_session,
+            int(task.id),
+            int(task.user_id),
+            "Guidance applied",
+            message_type="final_answer",
+            turn_id="client-turn-1",
+        )
+        assert row is not None
+        assert db_session.query(TaskChatMessage).count() == 0
+
+        db_session.commit()
+        stored = db_session.query(TaskChatMessage).one()
+        assert stored.turn_id == "client-turn-1"
     finally:
         db_session.close()
 

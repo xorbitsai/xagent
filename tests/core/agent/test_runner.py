@@ -830,6 +830,7 @@ async def test_runner_post_user_message_preserves_display_and_execution_contract
         execution_message=execution_message,
         display_message="Read file",
         files=files,
+        turn_id="client-turn-123",
         request_interrupt=False,
     )
 
@@ -841,7 +842,7 @@ async def test_runner_post_user_message_preserves_display_and_execution_contract
     assert latest_user.metadata["display_message"] == "Read file"
     assert latest_user.metadata["files"] == files
     turn_id = latest_user.metadata.get("turn_id")
-    assert isinstance(turn_id, str) and turn_id
+    assert turn_id == "client-turn-123"
 
     checkpoint_messages = tracer.by_execution_id["exec-display-contract"]["context"][
         "messages"

@@ -24,6 +24,11 @@ class BaseLLM(ABC):
     _model_id: str | None = None
 
     @property
+    def model_id(self) -> str:
+        """Unique model id (``""`` when unset), for token-usage attribution."""
+        return self._model_id or ""
+
+    @property
     @abstractmethod
     def abilities(self) -> List[str]:
         """

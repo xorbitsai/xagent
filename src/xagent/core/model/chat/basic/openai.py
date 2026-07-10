@@ -373,7 +373,7 @@ class OpenAICompatibleLLM(BaseLLM):
                     input_tokens=resp.usage.prompt_tokens,
                     output_tokens=resp.usage.completion_tokens,
                     model=self._model_name,
-                    model_id=getattr(self, "_model_id", "") or "",
+                    model_id=self.model_id,
                     call_type="chat",
                 )
 
@@ -696,7 +696,7 @@ class OpenAICompatibleLLM(BaseLLM):
                     input_tokens=response.usage.prompt_tokens,
                     output_tokens=response.usage.completion_tokens,
                     model=self._model_name,
-                    model_id=getattr(self, "_model_id", "") or "",
+                    model_id=self.model_id,
                     call_type="chat",
                 )
 
@@ -1032,7 +1032,7 @@ class OpenAICompatibleLLM(BaseLLM):
                             input_tokens=input_tokens,
                             output_tokens=output_tokens,
                             model=self._model_name,
-                            model_id=getattr(self, "_model_id", "") or "",
+                            model_id=self.model_id,
                             call_type="stream_chat",
                         )
 
@@ -1122,7 +1122,7 @@ class OpenAICompatibleLLM(BaseLLM):
                     input_tokens=raw_chunk.usage.prompt_tokens,
                     output_tokens=raw_chunk.usage.completion_tokens,
                     model=self._model_name,
-                    model_id=getattr(self, "_model_id", "") or "",
+                    model_id=self.model_id,
                     call_type="stream_chat",
                 )
 

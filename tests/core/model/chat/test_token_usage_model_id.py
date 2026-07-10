@@ -1,6 +1,22 @@
 """Token-usage details carry model_id, disambiguating identically-named models."""
 
+from xagent.core.model import ChatModelConfig
+from xagent.core.model.chat.basic.adapter import create_base_llm
 from xagent.core.model.chat.token_context import TokenContextManager, add_token_usage
+
+
+def test_create_base_llm_stamps_model_id():
+    """create_base_llm stamps ChatModelConfig.id so adapters report it."""
+    config = ChatModelConfig(
+        id="deepseek-plat-abc",
+        model_provider="deepseek",
+        model_name="deepseek-v4-flash",
+        api_key="test-api-key",
+    )
+    llm = create_base_llm(config)
+    # The retry wrapper delegates attribute access to the inner LLM.
+    assert llm._inner.model_id == "deepseek-plat-abc"
+    assert llm.model_id == "deepseek-plat-abc"
 
 
 def test_add_token_usage_records_model_id():

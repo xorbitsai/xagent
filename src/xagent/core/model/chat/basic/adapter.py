@@ -56,7 +56,9 @@ def create_base_llm(
             downstream_resolver=downstream_resolver,
         )
         router.context_window = model.context_window
-        router._model_id = model.id
+        # No _model_id stamp here: RouterLLM delegates every call to a resolved
+        # downstream LLM (which carries its own id), so a value set here would
+        # never reach token-usage details.
         return router
     elif provider == "deepseek":
         llm = DeepSeekLLM(

@@ -228,7 +228,7 @@ def add_token_usage(
 
     logger.debug(
         f"Token usage added: input={input_tokens}, output={output_tokens}, "
-        f"model={model}, call_type={call_type}, "
+        f"model={model}, model_id={model_id}, call_type={call_type}, "
         f"total_input={usage.input_tokens}, total_output={usage.output_tokens}, "
         f"total_calls={usage.llm_calls}"
     )

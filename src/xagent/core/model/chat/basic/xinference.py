@@ -246,7 +246,7 @@ class XinferenceLLM(BaseLLM):
                 input_tokens=usage.get("prompt_tokens", 0),
                 output_tokens=usage.get("completion_tokens", 0),
                 model=self._model_name,
-                model_id=getattr(self, "_model_id", "") or "",
+                model_id=self.model_id,
                 call_type="chat",
             )
 
@@ -506,7 +506,7 @@ class XinferenceLLM(BaseLLM):
                 input_tokens=usage.get("prompt_tokens", 0),
                 output_tokens=usage.get("completion_tokens", 0),
                 model=self._model_name,
-                model_id=getattr(self, "_model_id", "") or "",
+                model_id=self.model_id,
                 call_type="stream_chat",
             )
 

@@ -282,7 +282,9 @@ async def test_completion_broadcast_failure_keeps_task_completed(
         async def execute_task(self, **kwargs):
             return {"success": True, "output": "ok", "file_outputs": []}
 
-    def fake_payload(task_id, message, *, event_type="agent_error"):
+    def fake_payload(
+        task_id, message, *, event_type="agent_error", expected_run_id=None
+    ):
         payload_calls.append((task_id, message, event_type))
         return {"type": event_type, "task_id": task_id}
 
@@ -379,7 +381,9 @@ async def test_execution_failure_routes_real_error_to_terminal_payload(
         async def execute_task(self, **kwargs):
             raise RuntimeError("agent boom xyz")
 
-    def fake_payload(task_id, message, *, event_type="agent_error"):
+    def fake_payload(
+        task_id, message, *, event_type="agent_error", expected_run_id=None
+    ):
         payload_calls.append((task_id, message, event_type))
         return {"type": event_type, "task_id": task_id}
 
@@ -428,7 +432,9 @@ async def test_assistant_persist_failure_surfaces_as_task_failure(
     def boom(*args, **kwargs):
         raise RuntimeError("durable persist failed")
 
-    def fake_payload(task_id, message, *, event_type="agent_error"):
+    def fake_payload(
+        task_id, message, *, event_type="agent_error", expected_run_id=None
+    ):
         payload_calls.append((task_id, event_type))
         return {"type": event_type, "task_id": task_id}
 
@@ -477,7 +483,9 @@ async def test_empty_reply_turn_still_completes(db_session, monkeypatch):
         async def execute_task(self, **kwargs):
             return {"success": True, "output": "ok", "file_outputs": []}
 
-    def fake_payload(task_id, message, *, event_type="agent_error"):
+    def fake_payload(
+        task_id, message, *, event_type="agent_error", expected_run_id=None
+    ):
         payload_calls.append((task_id, event_type))
         return {"type": event_type, "task_id": task_id}
 

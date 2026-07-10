@@ -26,7 +26,11 @@ from xagent.web.models.chat_message import TaskChatMessage
 from xagent.web.models.database import Base, get_db, get_engine, init_db
 from xagent.web.models.task import Task, TaskStatus
 from xagent.web.models.user import User
-from xagent.web.services.chat_history_service import DELIVERY_FAILED, DELIVERY_PENDING
+from xagent.web.services.chat_history_service import (
+    DELIVERY_DISPATCHED,
+    DELIVERY_FAILED,
+    DELIVERY_PENDING,
+)
 
 
 @pytest.fixture()
@@ -247,7 +251,7 @@ async def test_deferred_chat_message_waits_for_real_injection_before_ack(
 
 
 @pytest.mark.asyncio
-async def test_resume_registration_failure_cancels_created_coordinator(
+async def test_resume_registration_failure_preserves_dispatched_delivery(
     db_session,
 ) -> None:
     owner = _user(db_session, "owner")
@@ -295,13 +299,13 @@ async def test_resume_registration_failure_cancels_created_coordinator(
         .filter(TaskChatMessage.turn_id == "registration-failure-turn")
         .one()
     )
-    assert stored.delivery_status == DELIVERY_FAILED
-    rejected = [
+    assert stored.delivery_status == DELIVERY_DISPATCHED
+    accepted = [
         call.args[0]
         for call in ws_manager.send_personal_message.call_args_list
-        if call.args[0].get("type") == "message_rejected"
+        if call.args[0].get("type") == "message_accepted"
     ]
-    assert len(rejected) == 1
+    assert len(accepted) == 1
 
 
 @pytest.mark.asyncio
@@ -769,6 +773,70 @@ async def test_deferred_injection_failure_rejects_before_any_acceptance(
     delivery = (
         db_session.query(TaskChatMessage)
         .filter(TaskChatMessage.turn_id == "deferred-injection-failure")
+        .one()
+    )
+    assert delivery.delivery_status == DELIVERY_FAILED
+
+
+@pytest.mark.asyncio
+async def test_deferred_injection_rejects_before_post_when_lease_is_denied(
+    db_session,
+) -> None:
+    owner = _user(db_session, "owner")
+    task = _task(db_session, owner.id, status=TaskStatus.RUNNING)
+    db_session.add(
+        TaskChatMessage(
+            task_id=int(task.id),
+            user_id=int(owner.id),
+            role="user",
+            content="Deferred guidance",
+            message_type="user_message",
+            turn_id="deferred-lease-denied",
+            delivery_status=DELIVERY_PENDING,
+        )
+    )
+    db_session.commit()
+    agent = MagicMock(
+        post_user_message=AsyncMock(return_value=True),
+        resume_execution_by_id=AsyncMock(),
+    )
+    ws_manager = MagicMock(
+        broadcast_to_task=AsyncMock(),
+        send_personal_message=AsyncMock(),
+    )
+
+    with (
+        patch("xagent.web.api.websocket.acquire_task_lease", return_value=None),
+        patch("xagent.web.api.websocket.manager", ws_manager),
+        patch("xagent.web.api.websocket.background_task_manager.promote_resume_task"),
+    ):
+        await execute_resume_background(
+            task_id=int(task.id),
+            agent_service=agent,
+            task_owner_user_id=int(owner.id),
+            pending_user_message={
+                "execution_message": "Deferred guidance",
+                "display_message": "Deferred guidance",
+                "files": [],
+                "turn_id": "deferred-lease-denied",
+            },
+            delivery_turn_id="deferred-lease-denied",
+            delivery_websocket=MagicMock(),
+            delivery_client_message_id="deferred-lease-denied",
+        )
+
+    agent.post_user_message.assert_not_awaited()
+    delivery_events = [
+        call.args[0]
+        for call in ws_manager.send_personal_message.call_args_list
+        if call.args[0].get("type") in {"message_accepted", "message_rejected"}
+    ]
+    assert [event["type"] for event in delivery_events] == ["message_rejected"]
+    assert delivery_events[0]["retry_with_new_id"] is True
+    db_session.expire_all()
+    delivery = (
+        db_session.query(TaskChatMessage)
+        .filter(TaskChatMessage.turn_id == "deferred-lease-denied")
         .one()
     )
     assert delivery.delivery_status == DELIVERY_FAILED

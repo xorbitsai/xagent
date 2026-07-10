@@ -1942,34 +1942,6 @@ async def execute_resume_background(
             raise RuntimeError(f"Task {task_id} resume has no asyncio task")
         background_task_manager.promote_resume_task(task_id, current_task)
 
-        # The task row can become RUNNING before the original AgentRunner has
-        # created a context/checkpoint. Retry an early failed injection only
-        # after that original execution has settled and persisted its state.
-        if pending_user_message is not None:
-            posted = await agent_service.post_user_message(
-                str(task_id),
-                execution_message=pending_user_message.get("execution_message"),
-                display_message=pending_user_message.get("display_message"),
-                files=pending_user_message.get("files"),
-                turn_id=pending_user_message.get("turn_id"),
-                request_interrupt=False,
-                reason="deferred websocket user message",
-            )
-            if not posted:
-                raise RuntimeError(
-                    "The user message was saved, but no resumable execution "
-                    "checkpoint became available."
-                )
-            delivery_was_dispatched = True
-            if delivery_turn_id is not None:
-                await asyncio.to_thread(
-                    mark_user_message_delivery_sync,
-                    task_id,
-                    delivery_turn_id,
-                    DELIVERY_DISPATCHED,
-                )
-            await notify_deferred_delivery(True)
-
         db_gen = get_db()
         db_lease = next(db_gen)
         try:
@@ -2029,6 +2001,37 @@ async def execute_resume_background(
         lease_heartbeat_task = asyncio.create_task(
             run_task_lease_heartbeat(lease, lease_stop_event)
         )
+
+        # The task row can become RUNNING before the original AgentRunner has
+        # created a context/checkpoint. Retry an early failed injection only
+        # after that original execution has settled and persisted its state.
+        # Acquire the execution lease first: otherwise a non-owner worker could
+        # persist the injection and acknowledge it, then discover that it is
+        # not allowed to run the resume.
+        if pending_user_message is not None:
+            posted = await agent_service.post_user_message(
+                str(task_id),
+                execution_message=pending_user_message.get("execution_message"),
+                display_message=pending_user_message.get("display_message"),
+                files=pending_user_message.get("files"),
+                turn_id=pending_user_message.get("turn_id"),
+                request_interrupt=False,
+                reason="deferred websocket user message",
+            )
+            if not posted:
+                raise RuntimeError(
+                    "The user message was saved, but no resumable execution "
+                    "checkpoint became available."
+                )
+            delivery_was_dispatched = True
+            if delivery_turn_id is not None:
+                await asyncio.to_thread(
+                    mark_user_message_delivery_sync,
+                    task_id,
+                    delivery_turn_id,
+                    DELIVERY_DISPATCHED,
+                )
+            await notify_deferred_delivery(True)
 
         # Resume is now durable: lease acquisition committed RUNNING. Do not
         # announce it earlier from the WebSocket request handler.
@@ -3405,6 +3408,11 @@ async def handle_chat_message(
                                 turn_id=turn_id,
                                 status=DELIVERY_DISPATCHED,
                             )
+                        # ``post_user_message`` has already durably injected the
+                        # turn when it returns True. Preserve that fact even if
+                        # the resume reservation is concurrently withdrawn
+                        # before the coordinator can be registered.
+                        delivery_dispatched = posted
 
                         previous_task = background_task_manager.running_tasks.get(
                             task_id
@@ -3436,7 +3444,6 @@ async def handle_chat_message(
                         background_task_manager.register_reserved_resume(
                             task_id, bg_task
                         )
-                        delivery_dispatched = posted
                     except BaseException:
                         if bg_task is not None:
                             bg_task.cancel()

@@ -32,6 +32,7 @@ from fastapi.responses import JSONResponse
 from fastapi.testclient import TestClient
 from sqlalchemy.orm import Session
 
+from xagent.web.api.a2a import router as a2a_router
 from xagent.web.api.agent_api_keys import router as agent_api_keys_router
 from xagent.web.api.agents import router as agents_router
 from xagent.web.api.auth import auth_router
@@ -46,6 +47,11 @@ from xagent.web.api.v1.errors import V1ApiError, v1_api_error_handler
 from xagent.web.api.widget import widget_router
 from xagent.web.api.workforces import router as workforces_router
 from xagent.web.models.database import Base, get_db, get_engine
+from xagent.web.services.a2a_protocol import (
+    A2AApiError,
+    a2a_api_error_handler,
+    a2a_error,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -70,6 +76,7 @@ app_for_tests.include_router(me_router)
 app_for_tests.include_router(conversation_logs_router)
 app_for_tests.include_router(agents_router)
 app_for_tests.include_router(agent_api_keys_router)
+app_for_tests.include_router(a2a_router)
 app_for_tests.include_router(workforces_router)
 app_for_tests.include_router(file_router)
 app_for_tests.include_router(mcp_router)
@@ -78,6 +85,7 @@ app_for_tests.include_router(share_router)
 app_for_tests.include_router(triggers_router)
 app_for_tests.include_router(v1_router)
 app_for_tests.add_exception_handler(V1ApiError, v1_api_error_handler)  # type: ignore[arg-type]
+app_for_tests.add_exception_handler(A2AApiError, a2a_api_error_handler)  # type: ignore[arg-type]
 
 
 # Mirror production's /v1/* envelope guarantee in tests: any non-V1ApiError
@@ -90,6 +98,11 @@ app_for_tests.add_exception_handler(V1ApiError, v1_api_error_handler)  # type: i
 @app_for_tests.exception_handler(Exception)
 async def _v1_internal_error_handler(request: Request, exc: Exception):
     logger.error(f"Unhandled exception in {request.url}: {exc}", exc_info=True)
+    if request.url.path.startswith("/api/a2a/"):
+        return await a2a_api_error_handler(
+            request,
+            a2a_error("internal", "Internal server error.", status_code=500),
+        )
     if request.url.path.startswith("/v1/"):
         return JSONResponse(
             status_code=500,
@@ -110,6 +123,20 @@ async def _v1_internal_error_handler(request: Request, exc: Exception):
 # /api/* falls through to FastAPI's default {"detail": [...]}.
 @app_for_tests.exception_handler(RequestValidationError)
 async def _v1_validation_error_handler(request: Request, exc: RequestValidationError):
+    if request.url.path.startswith("/api/a2a/"):
+        errors = exc.errors()
+        first = errors[0] if errors else {}
+        msg = first.get("msg") or "Invalid A2A request"
+        loc = ".".join(str(part) for part in first.get("loc", []))
+        return await a2a_api_error_handler(
+            request,
+            a2a_error(
+                "invalid_argument",
+                f"{msg} ({loc})" if loc else str(msg),
+                status_code=400,
+                details={"field": loc},
+            ),
+        )
     if request.url.path.startswith("/v1/"):
         errors = exc.errors()
         first = errors[0] if errors else {}

@@ -104,6 +104,7 @@ class ToolRegistry:
         try:
             # Import tool modules in priority order - these imports trigger @register_tool decorators
             from . import (  # noqa: F401 - imports trigger @register_tool decorators
+                a2a_agent_tool,
                 agent_tool,
                 ask_user_tool,
                 audio_tool,

@@ -1,0 +1,511 @@
+import json
+from datetime import UTC, datetime
+from unittest.mock import MagicMock, patch
+
+import pytest
+
+from xagent.web.models.agent import Agent
+from xagent.web.models.agent_api_key import AgentApiKey
+from xagent.web.models.task import Task, TaskStatus
+
+from .conftest import _admin_headers, _direct_db_session, client
+
+pytestmark = pytest.mark.usefixtures("_test_db")
+
+
+def _bearer(full_key: str) -> dict[str, str]:
+    return {
+        "Authorization": f"Bearer {full_key}",
+        "A2A-Version": "1.0",
+    }
+
+
+def _create_agent(headers: dict[str, str], name: str = "A2A Test Agent") -> int:
+    response = client.post(
+        "/api/agents",
+        headers=headers,
+        json={
+            "name": name,
+            "description": "A2A test agent",
+            "instructions": "You are an A2A test agent.",
+            "execution_mode": "balanced",
+            "suggested_prompts": ["Summarize this"],
+        },
+    )
+    assert response.status_code == 200, response.text
+    return int(response.json()["id"])
+
+
+def _publish_agent(headers: dict[str, str], agent_id: int) -> None:
+    response = client.post(f"/api/agents/{agent_id}/publish", headers=headers)
+    assert response.status_code == 200, response.text
+
+
+def _create_published_agent_with_key() -> tuple[int, str]:
+    headers = _admin_headers()
+    agent_id = _create_agent(headers)
+    _publish_agent(headers, agent_id)
+    key_response = client.post(f"/api/agents/{agent_id}/api-key", headers=headers)
+    assert key_response.status_code == 200, key_response.text
+    return agent_id, key_response.json()["full_key"]
+
+
+def test_agent_card_exposes_published_agent() -> None:
+    headers = _admin_headers()
+    agent_id = _create_agent(headers)
+    _publish_agent(headers, agent_id)
+
+    response = client.get(f"/api/a2a/agents/{agent_id}/.well-known/agent-card.json")
+
+    assert response.status_code == 200, response.text
+    assert response.headers["a2a-version"] == "1.0"
+    assert response.headers["content-type"].startswith("application/a2a+json")
+    body = response.json()
+    assert body["name"] == "A2A Test Agent"
+    assert body["defaultInputModes"] == ["text/plain", "application/json"]
+    assert body["defaultOutputModes"] == ["text/plain"]
+    assert body["supportedInterfaces"] == [
+        {
+            "url": f"http://testserver/api/a2a/agents/{agent_id}",
+            "protocolBinding": "HTTP+JSON",
+            "protocolVersion": "1.0",
+        }
+    ]
+    assert body["securitySchemes"]["xagentAgentApiKey"] == {
+        "httpAuthSecurityScheme": {
+            "scheme": "Bearer",
+            "description": "Xagent agent API key",
+        }
+    }
+    assert body["securityRequirements"] == [{"schemes": {"xagentAgentApiKey": {}}}]
+    assert body["skills"][0]["examples"] == ["Summarize this"]
+
+
+def test_agent_card_hides_draft_agent() -> None:
+    headers = _admin_headers()
+    agent_id = _create_agent(headers)
+
+    response = client.get(f"/api/a2a/agents/{agent_id}/.well-known/agent-card.json")
+
+    assert response.status_code == 404
+    error = response.json()["error"]
+    assert error["code"] == 404
+    assert error["status"] == "NOT_FOUND"
+    assert error["details"][0]["reason"] == "AGENT_NOT_FOUND"
+
+
+def test_agent_card_does_not_expose_private_instructions() -> None:
+    headers = _admin_headers()
+    response = client.post(
+        "/api/agents",
+        headers=headers,
+        json={
+            "name": "Private Prompt Agent",
+            "instructions": "secret system prompt",
+            "execution_mode": "balanced",
+        },
+    )
+    assert response.status_code == 200, response.text
+    agent_id = int(response.json()["id"])
+    _publish_agent(headers, agent_id)
+
+    card = client.get(f"/api/a2a/agents/{agent_id}/.well-known/agent-card.json").json()
+
+    assert card["description"] == "Private Prompt Agent"
+    assert "secret system prompt" not in json.dumps(card)
+
+
+def test_message_send_creates_hidden_a2a_task() -> None:
+    agent_id, full_key = _create_published_agent_with_key()
+
+    with patch(
+        "xagent.web.services.task_orchestrator._schedule_bg",
+        new=MagicMock(),
+    ) as schedule_bg:
+        response = client.post(
+            f"/api/a2a/agents/{agent_id}/message:send",
+            headers=_bearer(full_key),
+            json={
+                "message": {
+                    "messageId": "msg-1",
+                    "contextId": "ctx-1",
+                    "role": "ROLE_USER",
+                    "parts": [{"text": "hello from a2a"}],
+                },
+                "configuration": {"returnImmediately": True},
+            },
+        )
+
+    assert response.status_code == 200, response.text
+    body = response.json()
+    task = body["task"]
+    assert task["contextId"] == "ctx-1"
+    assert task["status"]["state"] == "TASK_STATE_WORKING"
+
+    db = _direct_db_session()
+    try:
+        row = db.query(Task).filter(Task.id == int(task["id"])).one()
+        assert row.agent_id == agent_id
+        assert row.source == "a2a"
+        assert row.is_visible is False
+        assert row.input == "hello from a2a"
+        assert row.agent_config == {"a2a_context_id": "ctx-1"}
+        assert row.status == TaskStatus.RUNNING
+
+        key = db.query(AgentApiKey).filter(AgentApiKey.agent_id == agent_id).one()
+        assert key.usage_month == datetime.now(UTC).strftime("%Y-%m")
+        assert key.usage_month_calls == 1
+    finally:
+        db.close()
+
+    assert schedule_bg.call_count == 1
+    assert schedule_bg.call_args.kwargs["task_id"] == int(task["id"])
+
+
+def test_message_send_rejects_key_bound_to_different_agent() -> None:
+    agent_id, full_key = _create_published_agent_with_key()
+    headers = _admin_headers()
+    other_agent_id = _create_agent(headers, name="Other A2A Agent")
+    _publish_agent(headers, other_agent_id)
+
+    response = client.post(
+        f"/api/a2a/agents/{other_agent_id}/message:send",
+        headers=_bearer(full_key),
+        json={
+            "message": {
+                "messageId": "msg-1",
+                "role": "ROLE_USER",
+                "parts": [{"text": "wrong target"}],
+            },
+            "configuration": {"returnImmediately": True},
+        },
+    )
+
+    assert other_agent_id != agent_id
+    assert response.status_code == 404
+    assert response.json()["error"]["details"][0]["reason"] == "AGENT_NOT_FOUND"
+
+
+def test_message_send_rejects_draft_agent_key() -> None:
+    headers = _admin_headers()
+    agent_id = _create_agent(headers)
+    key_response = client.post(f"/api/agents/{agent_id}/api-key", headers=headers)
+    assert key_response.status_code == 200, key_response.text
+
+    response = client.post(
+        f"/api/a2a/agents/{agent_id}/message:send",
+        headers=_bearer(key_response.json()["full_key"]),
+        json={
+            "message": {
+                "messageId": "msg-1",
+                "role": "ROLE_USER",
+                "parts": [{"text": "draft should not run"}],
+            },
+            "configuration": {"returnImmediately": True},
+        },
+    )
+
+    assert response.status_code == 404
+    assert response.json()["error"]["details"][0]["reason"] == "AGENT_NOT_FOUND"
+
+
+def test_message_send_requires_supported_a2a_version() -> None:
+    agent_id, full_key = _create_published_agent_with_key()
+    payload = {
+        "message": {
+            "messageId": "msg-version",
+            "role": "ROLE_USER",
+            "parts": [{"text": "hello"}],
+        },
+        "configuration": {"returnImmediately": True},
+    }
+
+    response = client.post(
+        f"/api/a2a/agents/{agent_id}/message:send",
+        headers={"Authorization": f"Bearer {full_key}"},
+        json=payload,
+    )
+
+    assert response.status_code == 400
+    error = response.json()["error"]
+    assert error["details"][0]["reason"] == "VERSION_NOT_SUPPORTED"
+    assert error["details"][0]["metadata"]["supportedVersions"] == "1.0"
+
+
+def test_a2a_fastapi_validation_uses_protocol_error_shape() -> None:
+    agent_id, full_key = _create_published_agent_with_key()
+
+    response = client.get(
+        f"/api/a2a/agents/{agent_id}/tasks",
+        headers=_bearer(full_key),
+        params={"pageSize": 0},
+    )
+
+    assert response.status_code == 400
+    error = response.json()["error"]
+    assert error["status"] == "INVALID_ARGUMENT"
+    assert error["details"][0]["reason"] == "INVALID_ARGUMENT"
+
+
+def test_a2a_auth_error_includes_bearer_challenge() -> None:
+    headers = _admin_headers()
+    agent_id = _create_agent(headers)
+    _publish_agent(headers, agent_id)
+
+    response = client.get(
+        f"/api/a2a/agents/{agent_id}/tasks",
+        headers={"A2A-Version": "1.0"},
+    )
+
+    assert response.status_code == 401
+    assert response.headers["www-authenticate"] == "Bearer"
+    assert response.json()["error"]["status"] == "UNAUTHENTICATED"
+
+
+def test_message_send_blocks_by_default_until_task_finishes() -> None:
+    agent_id, full_key = _create_published_agent_with_key()
+
+    async def _complete_turn(**kwargs: object) -> object:
+        db = _direct_db_session()
+        try:
+            row = db.query(Task).filter(Task.id == int(kwargs["task_id"])).one()
+            row.status = TaskStatus.COMPLETED
+            row.output = "blocking response"
+            db.commit()
+        finally:
+            db.close()
+        return object()
+
+    with patch(
+        "xagent.web.api.a2a.TaskTurnOrchestrator.begin_turn",
+        new=_complete_turn,
+    ):
+        response = client.post(
+            f"/api/a2a/agents/{agent_id}/message:send",
+            headers=_bearer(full_key),
+            json={
+                "message": {
+                    "messageId": "msg-blocking",
+                    "role": "ROLE_USER",
+                    "parts": [{"text": "wait for me"}],
+                }
+            },
+        )
+
+    assert response.status_code == 200, response.text
+    task = response.json()["task"]
+    assert task["status"]["state"] == "TASK_STATE_COMPLETED"
+    assert task["artifacts"][0]["parts"] == [{"text": "blocking response"}]
+
+
+def test_unexpected_a2a_error_uses_internal_protocol_envelope() -> None:
+    agent_id, full_key = _create_published_agent_with_key()
+
+    with patch(
+        "xagent.web.api.a2a.TaskTurnOrchestrator.begin_turn",
+        side_effect=RuntimeError("sensitive implementation detail"),
+    ):
+        response = client.post(
+            f"/api/a2a/agents/{agent_id}/message:send",
+            headers=_bearer(full_key),
+            json={
+                "message": {
+                    "messageId": "msg-error",
+                    "role": "ROLE_USER",
+                    "parts": [{"text": "fail"}],
+                },
+                "configuration": {"returnImmediately": True},
+            },
+        )
+
+    assert response.status_code == 500
+    error = response.json()["error"]
+    assert error["status"] == "INTERNAL"
+    assert error["details"][0]["reason"] == "INTERNAL"
+    assert "sensitive implementation detail" not in response.text
+
+
+def test_get_and_list_tasks_use_rest_binding_shapes() -> None:
+    agent_id, full_key = _create_published_agent_with_key()
+    with patch(
+        "xagent.web.services.task_orchestrator._schedule_bg",
+        new=MagicMock(),
+    ):
+        created = client.post(
+            f"/api/a2a/agents/{agent_id}/message:send",
+            headers=_bearer(full_key),
+            json={
+                "message": {
+                    "messageId": "msg-list",
+                    "contextId": "ctx-list",
+                    "role": "ROLE_USER",
+                    "parts": [{"text": "list me"}],
+                },
+                "configuration": {"returnImmediately": True},
+            },
+        )
+    task_id = created.json()["task"]["id"]
+
+    db = _direct_db_session()
+    try:
+        row = db.query(Task).filter(Task.id == int(task_id)).one()
+        row.status = TaskStatus.COMPLETED
+        row.output = "listed output"
+        db.commit()
+    finally:
+        db.close()
+
+    fetched = client.get(
+        f"/api/a2a/agents/{agent_id}/tasks/{task_id}",
+        headers=_bearer(full_key),
+    )
+    listed = client.get(
+        f"/api/a2a/agents/{agent_id}/tasks",
+        headers=_bearer(full_key),
+        params={"contextId": "ctx-list"},
+    )
+    listed_with_artifacts = client.get(
+        f"/api/a2a/agents/{agent_id}/tasks",
+        headers=_bearer(full_key),
+        params={"includeArtifacts": "true"},
+    )
+
+    assert fetched.status_code == 200, fetched.text
+    assert fetched.json()["id"] == task_id
+    assert "task" not in fetched.json()
+    assert fetched.json()["artifacts"][0]["parts"] == [{"text": "listed output"}]
+    assert listed.json()["totalSize"] == 1
+    assert "artifacts" not in listed.json()["tasks"][0]
+    assert listed_with_artifacts.json()["tasks"][0]["artifacts"][0]["parts"] == [
+        {"text": "listed output"}
+    ]
+
+
+def test_follow_up_infers_context_for_input_required_task() -> None:
+    agent_id, full_key = _create_published_agent_with_key()
+    with patch(
+        "xagent.web.services.task_orchestrator._schedule_bg",
+        new=MagicMock(),
+    ):
+        created = client.post(
+            f"/api/a2a/agents/{agent_id}/message:send",
+            headers=_bearer(full_key),
+            json={
+                "message": {
+                    "messageId": "msg-initial",
+                    "contextId": "ctx-follow-up",
+                    "role": "ROLE_USER",
+                    "parts": [{"text": "initial"}],
+                },
+                "configuration": {"returnImmediately": True},
+            },
+        )
+    task_id = created.json()["task"]["id"]
+    db = _direct_db_session()
+    try:
+        row = db.query(Task).filter(Task.id == int(task_id)).one()
+        row.status = TaskStatus.WAITING_FOR_USER
+        db.commit()
+    finally:
+        db.close()
+
+    with patch(
+        "xagent.web.services.task_orchestrator._schedule_bg",
+        new=MagicMock(),
+    ):
+        response = client.post(
+            f"/api/a2a/agents/{agent_id}/message:send",
+            headers=_bearer(full_key),
+            json={
+                "message": {
+                    "messageId": "msg-follow-up",
+                    "taskId": task_id,
+                    "role": "ROLE_USER",
+                    "parts": [{"text": "follow up"}],
+                },
+                "configuration": {"returnImmediately": True},
+            },
+        )
+
+    assert response.status_code == 200, response.text
+    assert response.json()["task"]["contextId"] == "ctx-follow-up"
+    assert response.json()["task"]["status"]["state"] == "TASK_STATE_WORKING"
+
+
+def test_cancel_is_idempotent_and_subscribe_rejects_terminal_task() -> None:
+    agent_id, full_key = _create_published_agent_with_key()
+    with patch(
+        "xagent.web.services.task_orchestrator._schedule_bg",
+        new=MagicMock(),
+    ):
+        created = client.post(
+            f"/api/a2a/agents/{agent_id}/message:send",
+            headers=_bearer(full_key),
+            json={
+                "message": {
+                    "messageId": "msg-cancel",
+                    "role": "ROLE_USER",
+                    "parts": [{"text": "cancel me"}],
+                },
+                "configuration": {"returnImmediately": True},
+            },
+        )
+    task_id = created.json()["task"]["id"]
+
+    first = client.post(
+        f"/api/a2a/agents/{agent_id}/tasks/{task_id}:cancel",
+        headers=_bearer(full_key),
+    )
+    second = client.post(
+        f"/api/a2a/agents/{agent_id}/tasks/{task_id}:cancel",
+        headers=_bearer(full_key),
+    )
+    subscribed = client.post(
+        f"/api/a2a/agents/{agent_id}/tasks/{task_id}:subscribe",
+        headers=_bearer(full_key),
+    )
+
+    assert first.status_code == 200, first.text
+    assert first.json()["status"]["state"] == "TASK_STATE_CANCELED"
+    assert second.status_code == 200, second.text
+    assert second.json()["status"]["state"] == "TASK_STATE_CANCELED"
+    assert subscribed.status_code == 400
+    assert subscribed.json()["error"]["details"][0]["reason"] == "UNSUPPORTED_OPERATION"
+
+
+def test_subscribe_stream_starts_with_wrapped_task_snapshot() -> None:
+    agent_id, full_key = _create_published_agent_with_key()
+    db = _direct_db_session()
+    try:
+        owner_id = int(db.query(Agent).filter(Agent.id == agent_id).one().user_id)
+        task = Task(
+            user_id=owner_id,
+            title="paused",
+            status=TaskStatus.PAUSED,
+            agent_id=agent_id,
+            source="a2a",
+            is_visible=False,
+            agent_config={"a2a_context_id": "ctx-stream"},
+        )
+        db.add(task)
+        db.commit()
+        db.refresh(task)
+        task_id = int(task.id)
+    finally:
+        db.close()
+
+    response = client.post(
+        f"/api/a2a/agents/{agent_id}/tasks/{task_id}:subscribe",
+        headers=_bearer(full_key),
+    )
+
+    assert response.status_code == 200, response.text
+    data_lines = [
+        line.removeprefix("data: ")
+        for line in response.text.splitlines()
+        if line.startswith("data: ")
+    ]
+    assert len(data_lines) == 1
+    event = json.loads(data_lines[0])
+    assert event["task"]["id"] == str(task_id)
+    assert event["task"]["status"]["state"] == "TASK_STATE_INPUT_REQUIRED"

@@ -383,6 +383,7 @@ class WebToolConfig(BaseToolConfig):
         allowed_skills: Optional[List[str]] = None,
         allowed_agent_ids: Optional[List[int]] = None,
         agent_tool_overrides: Optional[Dict[int, Dict[str, Any]]] = None,
+        a2a_agent_configs: Optional[List[Dict[str, Any]]] = None,
         enable_global_agent_tools: bool = True,
         allow_cross_user_agent_ids: bool = False,
         parent_task_id: Optional[str] = None,
@@ -464,6 +465,9 @@ class WebToolConfig(BaseToolConfig):
         self._allowed_agent_ids = allowed_agent_ids
         self._agent_tool_overrides = (
             agent_tool_overrides if isinstance(agent_tool_overrides, dict) else {}
+        )
+        self._a2a_agent_configs = (
+            a2a_agent_configs if isinstance(a2a_agent_configs, list) else []
         )
         self._enable_global_agent_tools = bool(enable_global_agent_tools)
         self._allow_cross_user_agent_ids = bool(allow_cross_user_agent_ids)
@@ -884,6 +888,10 @@ class WebToolConfig(BaseToolConfig):
     def get_agent_tool_overrides(self) -> Dict[int, Dict[str, Any]]:
         """Get per-agent tool metadata/runtime overrides for delegation."""
         return self._agent_tool_overrides
+
+    def get_a2a_agent_configs(self) -> List[Dict[str, Any]]:
+        """Get remote A2A agent tool configurations."""
+        return self._a2a_agent_configs
 
     def get_enable_global_agent_tools(self) -> bool:
         """Whether to include globally visible published agents as tools."""

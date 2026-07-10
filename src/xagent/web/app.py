@@ -25,6 +25,7 @@ from ..config import (
     get_uploads_dir,
 )
 from ..core.tracing.langfuse import flush_langfuse, initialize_langfuse
+from .api.a2a import router as a2a_router
 from .api.admin_mcp import admin_mcp_router
 from .api.admin_users import router as admin_users_router
 from .api.agent_api_keys import router as agent_api_keys_router
@@ -59,6 +60,7 @@ from .api.workforces import router as workforces_router
 from .dynamic_memory_store import get_memory_store
 from .logging_config import setup_logging
 from .models.database import init_db
+from .services.a2a_protocol import A2AApiError, a2a_api_error_handler, a2a_error
 
 # Configure logging when running under gunicorn/uwsgi (no __main__.py)
 setup_logging()  # Uses XAGENT_LOG_LEVEL env var or defaults to INFO
@@ -465,6 +467,21 @@ async def validation_exception_handler(
     logger.error(f"Validation error in {request.url}: {str(exc)}")
     logger.error(f"Traceback: {traceback.format_exc()}")
 
+    if request.url.path.startswith("/api/a2a/"):
+        errors = exc.errors()
+        first = errors[0] if errors else {}
+        msg = first.get("msg") or "Invalid A2A request"
+        loc = ".".join(str(part) for part in first.get("loc", []))
+        return await a2a_api_error_handler(
+            request,
+            a2a_error(
+                "invalid_argument",
+                f"{msg} ({loc})" if loc else str(msg),
+                status_code=400,
+                details={"field": loc},
+            ),
+        )
+
     if request.url.path.startswith("/v1/"):
         # Take the first validation error as the human message; full
         # list isn't echoed to keep the response surface small and
@@ -534,6 +551,17 @@ async def global_exception_handler(request: Request, exc: Exception) -> Any:
     logger.error(f"Unhandled exception in {request.url}: {exc}")
     logger.error(f"Traceback: {traceback.format_exc()}")
 
+    if request.url.path.startswith("/api/a2a/"):
+        logger.error("Unhandled A2A API error", exc_info=exc)
+        return await a2a_api_error_handler(
+            request,
+            a2a_error(
+                "internal",
+                "Internal server error.",
+                status_code=500,
+            ),
+        )
+
     if request.url.path.startswith("/v1/"):
         # Sanitize: never echo str(exc) -- it can leak SQL error
         # wording, table names, or storage backend identity. The full
@@ -562,6 +590,7 @@ async def global_exception_handler(request: Request, exc: Exception) -> Any:
 # choose their own HTTP status (401 / 404 / 409 / 429).
 # See web/api/v1/errors.py for the contract.
 app.add_exception_handler(V1ApiError, v1_api_error_handler)  # type: ignore[arg-type]
+app.add_exception_handler(A2AApiError, a2a_api_error_handler)  # type: ignore[arg-type]
 
 
 # Add CORS middleware
@@ -612,6 +641,7 @@ app.include_router(system_router)
 app.include_router(templates_router)
 app.include_router(agents_router)
 app.include_router(agent_api_keys_router)
+app.include_router(a2a_router)
 app.include_router(triggers_router)
 app.include_router(workforces_router)
 app.include_router(channel_router, prefix="/api/channels", tags=["Channels"])

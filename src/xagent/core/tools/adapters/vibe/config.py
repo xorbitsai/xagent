@@ -145,6 +145,10 @@ class BaseToolConfig(ABC):
         """Get per-agent tool metadata/runtime overrides for delegation."""
         return {}
 
+    def get_a2a_agent_configs(self) -> List[Dict[str, Any]]:
+        """Get remote A2A agent tool configurations."""
+        return []
+
     def get_enable_global_agent_tools(self) -> bool:
         """Whether to include globally visible published agents as tools."""
         return True
@@ -236,6 +240,7 @@ class ToolConfig(BaseToolConfig):
         allowed_tools = config_dict.get("allowed_tools")
         allowed_agent_ids = config_dict.get("allowed_agent_ids")
         agent_tool_overrides = config_dict.get("agent_tool_overrides") or {}
+        a2a_agent_configs = config_dict.get("a2a_agent_configs") or []
         enable_global_agent_tools = config_dict.get("enable_global_agent_tools", True)
         allow_cross_user_agent_ids = config_dict.get(
             "allow_cross_user_agent_ids", False
@@ -299,6 +304,9 @@ class ToolConfig(BaseToolConfig):
         self.allowed_agent_ids: Optional[List[int]] = allowed_agent_ids
         self.agent_tool_overrides: Dict[int, Dict[str, Any]] = (
             agent_tool_overrides if isinstance(agent_tool_overrides, dict) else {}
+        )
+        self.a2a_agent_configs: List[Dict[str, Any]] = (
+            a2a_agent_configs if isinstance(a2a_agent_configs, list) else []
         )
         self.enable_global_agent_tools: bool = bool(enable_global_agent_tools)
         self.allow_cross_user_agent_ids: bool = bool(allow_cross_user_agent_ids)
@@ -408,6 +416,9 @@ class ToolConfig(BaseToolConfig):
 
     def get_agent_tool_overrides(self) -> Dict[int, Dict[str, Any]]:
         return self.agent_tool_overrides
+
+    def get_a2a_agent_configs(self) -> List[Dict[str, Any]]:
+        return self.a2a_agent_configs
 
     def get_enable_global_agent_tools(self) -> bool:
         return self.enable_global_agent_tools

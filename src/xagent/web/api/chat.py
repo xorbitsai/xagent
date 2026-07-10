@@ -1405,8 +1405,7 @@ class AgentServiceManager:
             and self._agent_owner_ids.get(task_id) != runtime_user_id
         ):
             logger.warning(
-                "Evicting cached AgentService for task %s: built for owner %s, "
-                "requested %s",
+                "Evicting cached AgentService for task %s: built for owner %s, requested %s",
                 task_id,
                 self._agent_owner_ids.get(task_id),
                 runtime_user_id,
@@ -1638,8 +1637,7 @@ class AgentServiceManager:
 
                     if snapshot.agent is not None:
                         logger.info(
-                            f"Task {task_id} using Agent Builder config: "
-                            f"{snapshot.agent.name}"
+                            f"Task {task_id} using Agent Builder config: {snapshot.agent.name}"
                         )
                         if agent_config is not None:
                             logger.info(
@@ -2021,8 +2019,7 @@ class AgentServiceManager:
         agent = self._agents.get(task_id)
         if agent is None:
             logger.debug(
-                "Skipping connector runtime turn sync for task %s turn %s: "
-                "agent is not cached",
+                "Skipping connector runtime turn sync for task %s turn %s: agent is not cached",
                 task_id,
                 connector_runtime_turn_id,
             )
@@ -2134,8 +2131,16 @@ class AgentServiceManager:
                 from ..services.quota_hooks import check_run_gate
 
                 gate_task = (
-                    db_session.query(Task).filter(Task.id == int(tracker_task_id)).first()
+                    db_session.query(Task)
+                    .filter(Task.id == int(tracker_task_id))
+                    .first()
                 )
+                if gate_task is None:
+                    # Fail open (a delete-race can legitimately leave no row),
+                    # but surface it rather than silently allowing the run.
+                    logger.warning(
+                        "Quota gate: task %s not found; allowing run", tracker_task_id
+                    )
                 gate_reason = check_run_gate(
                     db_session, getattr(gate_task, "user_id", None)
                 )
@@ -2464,13 +2469,11 @@ class AgentServiceManager:
                         )
                     else:
                         raise ValueError(
-                            f"Task {task_id} not found in database during "
-                            "agent reconstruction"
+                            f"Task {task_id} not found in database during agent reconstruction"
                         )
                 except Exception as e:
                     logger.error(
-                        f"Failed to rebuild runtime configuration for task "
-                        f"{task_id}: {e}"
+                        f"Failed to rebuild runtime configuration for task {task_id}: {e}"
                     )
                     raise
 

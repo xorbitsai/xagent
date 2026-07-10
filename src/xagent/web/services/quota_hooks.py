@@ -61,7 +61,9 @@ def check_run_gate(db: Any, user_id: Any) -> str | None:
     return _run_gate_hook(db, user_id)
 
 
-def record_usage(db: Any, user_id: Any, delta_details: list, delta_actions: int) -> None:
+def record_usage(
+    db: Any, user_id: Any, delta_details: list, delta_actions: int
+) -> None:
     if _usage_record_hook is None or user_id is None:
         return
     _usage_record_hook(db, user_id, delta_details, delta_actions)

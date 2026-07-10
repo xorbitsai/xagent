@@ -662,7 +662,8 @@ async def test_tool_invocation_counts_one_action_each() -> None:
 
     # Even a tool that will report failure was still invoked → billed.
     await runtime.on_tool_end(
-        tool_call={"name": "search", "id": "t2"}, result={"success": False, "error": "boom"}
+        tool_call={"name": "search", "id": "t2"},
+        result={"success": False, "error": "boom"},
     )
     assert get_token_usage().tool_calls == 2
 
@@ -685,7 +686,9 @@ async def test_concurrent_tool_calls_all_count() -> None:
 
     await asyncio.gather(
         *[
-            runtime.on_tool_start(tool_call={"name": f"t{i}", "args": {}, "id": f"t{i}"})
+            runtime.on_tool_start(
+                tool_call={"name": f"t{i}", "args": {}, "id": f"t{i}"}
+            )
             for i in range(8)
         ]
     )

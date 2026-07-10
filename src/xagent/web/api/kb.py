@@ -1217,8 +1217,7 @@ async def _rollback_failed_ingestion(
                     physical_cleanup.error or "unknown physical cleanup failure"
                 )
                 raise RuntimeError(
-                    "delete collection physical directory during rollback failed: "
-                    f"{error_detail}"
+                    f"delete collection physical directory during rollback failed: {error_detail}"
                 )
             remaining_records = vector_store.list_document_records(
                 collection_name=None,
@@ -1449,10 +1448,7 @@ async def _rollback_failed_cloud_ingestion(
             file_path.name,
             exc,
         )
-        message = (
-            "Failed to fully roll back cloud ingest for "
-            f"{collection_name}/{file_path.name}: {exc}"
-        )
+        message = f"Failed to fully roll back cloud ingest for {collection_name}/{file_path.name}: {exc}"
         original_error_message = _build_user_actionable_ingestion_message(
             result.message,
             embedding_model_id=embedding_model_id,
@@ -1905,8 +1901,7 @@ def _snapshot_rag_documents_for_uploaded_file(
         return _RagDocumentSnapshot(doc_refs=doc_refs, rows_by_table=rows_by_table)
     except Exception as exc:  # noqa: BLE001
         logger.warning(
-            "Failed to snapshot RAG document rows before web file refresh: "
-            "file_id=%s, error=%s",
+            "Failed to snapshot RAG document rows before web file refresh: file_id=%s, error=%s",
             file_id,
             exc,
             exc_info=True,
@@ -2179,8 +2174,7 @@ def _snapshot_ingestion_runs_for_uploaded_file(
             _safe_close_table(ingestion_runs_table)
     except Exception as exc:  # noqa: BLE001
         logger.warning(
-            "Failed to snapshot ingestion runs before web file refresh: "
-            "file_id=%s, error=%s",
+            "Failed to snapshot ingestion runs before web file refresh: file_id=%s, error=%s",
             file_id,
             exc,
             exc_info=True,
@@ -2500,8 +2494,7 @@ def _create_new_web_file_handler_result(
                 if rollback_error is None:
                     rollback_error = exc
                 logger.warning(
-                    "Failed to clean RAG rows during new web file rollback: "
-                    "file_id=%s, error=%s",
+                    "Failed to clean RAG rows during new web file rollback: file_id=%s, error=%s",
                     file_record_id,
                     exc,
                     exc_info=True,
@@ -2512,8 +2505,7 @@ def _create_new_web_file_handler_result(
                 if rollback_error is None:
                     rollback_error = exc
                 logger.warning(
-                    "Failed to clean file during new web file rollback: "
-                    "file_id=%s, error=%s",
+                    "Failed to clean file during new web file rollback: file_id=%s, error=%s",
                     file_record_id,
                     exc,
                     exc_info=True,
@@ -2763,8 +2755,7 @@ def _refresh_existing_file_if_changed(
             if rollback_error is None:
                 rollback_error = exc
             logger.warning(
-                "Failed to restore RAG rows during web file refresh rollback: "
-                "file_id=%s, error=%s",
+                "Failed to restore RAG rows during web file refresh rollback: file_id=%s, error=%s",
                 file_record_id,
                 exc,
                 exc_info=True,
@@ -2776,8 +2767,7 @@ def _refresh_existing_file_if_changed(
             if rollback_error is None:
                 rollback_error = exc
             logger.warning(
-                "Failed to restore file during web file refresh rollback: "
-                "file_id=%s, error=%s",
+                "Failed to restore file during web file refresh rollback: file_id=%s, error=%s",
                 file_record_id,
                 exc,
                 exc_info=True,
@@ -3013,8 +3003,7 @@ def _recreate_missing_existing_file(
             if rollback_error is None:
                 rollback_error = exc
             logger.warning(
-                "Failed to restore file during recreated web file rollback: "
-                "file_id=%s, error=%s",
+                "Failed to restore file during recreated web file rollback: file_id=%s, error=%s",
                 file_record_id,
                 exc,
                 exc_info=True,
@@ -7415,8 +7404,7 @@ async def rename_collection_api(
             )
             if rollback.status != "success":
                 logger.error(
-                    "Failed to roll back physical collection rename for user_%s "
-                    "%s -> %s: %s",
+                    "Failed to roll back physical collection rename for user_%s %s -> %s: %s",
                     rollback_owner_id,
                     safe_new_collection,
                     safe_old_collection,
@@ -7511,10 +7499,7 @@ async def rename_collection_api(
             rename_info_messages.append(rename_info)
         elif physical_rename_status == "failed" and physical_rename_error:
             has_physical_rename_issue = True
-            rename_info = (
-                f"Physical directory rename for user_{owner_id}: Failed - "
-                f"{physical_rename_error}"
-            )
+            rename_info = f"Physical directory rename for user_{owner_id}: Failed - {physical_rename_error}"
             warnings.append(rename_info)
             rename_info_messages.append(rename_info)
 

@@ -74,6 +74,27 @@ async def test_synthesize_uses_sdk_convert_and_joins_chunks(
     assert call["voice_settings"].stability == 0.5
 
 
+async def test_synthesize_supports_direct_async_generator_sdk_response(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def convert(**kwargs: object):
+        yield b"direct "
+        yield b"stream"
+
+    fake_client = SimpleNamespace(text_to_speech=SimpleNamespace(convert=convert))
+    monkeypatch.setattr(
+        ElevenLabsTTS,
+        "_create_async_client",
+        staticmethod(lambda api_key, base_url=None: fake_client),
+    )
+
+    tts = ElevenLabsTTS(api_key="test-key")
+
+    result = await tts.synthesize("Hello")
+
+    assert result == b"direct stream"
+
+
 async def test_synthesize_maps_pcm_sample_rate(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

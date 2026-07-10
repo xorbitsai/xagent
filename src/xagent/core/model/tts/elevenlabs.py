@@ -374,13 +374,19 @@ class ElevenLabsTTS(BaseTTS):
 
         client = self._ensure_async_client()
         try:
-            response = await client.text_to_speech.convert(
+            response = client.text_to_speech.convert(
                 text=text,
                 voice_id=voice_id,
                 model_id=self.model,
                 output_format=final_output_format,
                 **request_kwargs,
             )
+            # ElevenLabs SDK 2.56+ exposes ``convert`` as an async generator,
+            # while older releases returned a coroutine that resolved to an
+            # async iterator. Support both contracts without awaiting a
+            # generator object directly.
+            if isawaitable(response):
+                response = await response
             chunks: list[bytes] = []
             async for chunk in response:
                 chunks.append(self._coerce_audio_bytes(chunk))

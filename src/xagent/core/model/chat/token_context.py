@@ -36,7 +36,7 @@ class TokenUsage:
         return self.input_tokens + self.output_tokens
 
     def add_input_tokens(
-        self, tokens: int, model: str = "", call_type: str = ""
+        self, tokens: int, model: str = "", call_type: str = "", model_id: str = ""
     ) -> None:
         """Add input tokens from a prompt."""
         self.input_tokens += tokens
@@ -46,12 +46,13 @@ class TokenUsage:
                     "type": "input",
                     "tokens": tokens,
                     "model": model,
+                    "model_id": model_id,
                     "call_type": call_type,
                 }
             )
 
     def add_output_tokens(
-        self, tokens: int, model: str = "", call_type: str = ""
+        self, tokens: int, model: str = "", call_type: str = "", model_id: str = ""
     ) -> None:
         """Add output tokens from a completion."""
         self.output_tokens += tokens
@@ -61,6 +62,7 @@ class TokenUsage:
                     "type": "output",
                     "tokens": tokens,
                     "model": model,
+                    "model_id": model_id,
                     "call_type": call_type,
                 }
             )
@@ -199,6 +201,7 @@ def add_token_usage(
     output_tokens: int = 0,
     model: str = "",
     call_type: str = "",
+    model_id: str = "",
 ) -> None:
     """Add token usage to the current context.
 
@@ -207,6 +210,7 @@ def add_token_usage(
         output_tokens: Number of output tokens
         model: Model name for tracking
         call_type: Type of call (chat, stream_chat, vision_chat, etc.)
+        model_id: Unique model id (disambiguates identically-named models)
     """
     # Coerce defensively: a provider/response that yields a non-int token count
     # (or a mock in tests) must never crash the LLM call over accounting.
@@ -218,9 +222,9 @@ def add_token_usage(
         # Increment LLM call counter for each API call
         usage.increment_llm_calls()
     if input_tokens:
-        usage.add_input_tokens(input_tokens, model, call_type)
+        usage.add_input_tokens(input_tokens, model, call_type, model_id)
     if output_tokens:
-        usage.add_output_tokens(output_tokens, model, call_type)
+        usage.add_output_tokens(output_tokens, model, call_type, model_id)
 
     logger.debug(
         f"Token usage added: input={input_tokens}, output={output_tokens}, "

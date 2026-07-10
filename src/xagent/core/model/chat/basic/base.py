@@ -19,6 +19,10 @@ class BaseLLM(ABC):
     # None means unknown; consumers fall back to their own default.
     context_window: int | None = None
 
+    # Unique model id, set from model config by create_base_llm. Threaded into
+    # token-usage details so identically-named models can be told apart.
+    _model_id: str | None = None
+
     @property
     @abstractmethod
     def abilities(self) -> List[str]:

@@ -56,6 +56,7 @@ def create_base_llm(
             downstream_resolver=downstream_resolver,
         )
         router.context_window = model.context_window
+        router._model_id = model.id
         return router
     elif provider == "deepseek":
         llm = DeepSeekLLM(
@@ -156,6 +157,9 @@ def create_base_llm(
         raise TypeError(f"Unsupported LLM model type: {model.model_provider}")
 
     llm.context_window = model.context_window
+    # Stamp the unique model id so token-usage details can disambiguate models
+    # that share a model_name (e.g. a platform model vs a user's own).
+    llm._model_id = model.id
     return create_retry_wrapper(
         llm,
         BaseLLM,  # type: ignore[type-abstract]

@@ -36,15 +36,25 @@ class TokenUsage:
         return self.input_tokens + self.output_tokens
 
     def add_input_tokens(
-        self, tokens: int, model: str = "", call_type: str = "", model_id: str = ""
+        self,
+        tokens: int,
+        model: str = "",
+        call_type: str = "",
+        model_id: str = "",
+        cached_tokens: int = 0,
     ) -> None:
-        """Add input tokens from a prompt."""
+        """Add input tokens from a prompt.
+
+        ``cached_tokens`` is the subset of ``tokens`` served from the provider's
+        prompt cache (usually billed cheaper); 0 when unknown/unsupported.
+        """
         self.input_tokens += tokens
         if model or call_type:
             self.details.append(
                 {
                     "type": "input",
                     "tokens": tokens,
+                    "cached_tokens": cached_tokens,
                     "model": model,
                     "model_id": model_id,
                     "call_type": call_type,
@@ -202,6 +212,7 @@ def add_token_usage(
     model: str = "",
     call_type: str = "",
     model_id: str = "",
+    cached_input_tokens: int = 0,
 ) -> None:
     """Add token usage to the current context.
 
@@ -211,18 +222,22 @@ def add_token_usage(
         model: Model name for tracking
         call_type: Type of call (chat, stream_chat, vision_chat, etc.)
         model_id: Unique model id (disambiguates identically-named models)
+        cached_input_tokens: Subset of input_tokens served from prompt cache
     """
     # Coerce defensively: a provider/response that yields a non-int token count
     # (or a mock in tests) must never crash the LLM call over accounting.
     input_tokens = _coerce_int(input_tokens)
     output_tokens = _coerce_int(output_tokens)
+    cached_input_tokens = _coerce_int(cached_input_tokens)
 
     usage = get_token_usage()
     if input_tokens or output_tokens:
         # Increment LLM call counter for each API call
         usage.increment_llm_calls()
     if input_tokens:
-        usage.add_input_tokens(input_tokens, model, call_type, model_id)
+        usage.add_input_tokens(
+            input_tokens, model, call_type, model_id, cached_input_tokens
+        )
     if output_tokens:
         usage.add_output_tokens(output_tokens, model, call_type, model_id)
 

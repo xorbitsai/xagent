@@ -637,3 +637,21 @@ async def test_on_llm_start_emits_context_usage_fields() -> None:
     assert usage[0]["context_threshold"] == 96000
     assert isinstance(usage[0]["context_tokens"], int)
     assert usage[0]["context_tokens"] > 0
+
+
+@pytest.mark.asyncio
+async def test_on_tool_start_counts_one_action_per_tool() -> None:
+    """Each tool invocation increments the token-context tool_calls counter."""
+    from xagent.core.model.chat.token_context import (
+        TokenUsage,
+        get_token_usage,
+        set_token_usage,
+    )
+
+    set_token_usage(TokenUsage())
+    runtime = PatternRuntime(execution_id="task-actions")
+
+    await runtime.on_tool_start(tool_call={"name": "calc", "args": {}, "id": "t1"})
+    await runtime.on_tool_start(tool_call={"name": "search", "args": {}, "id": "t2"})
+
+    assert get_token_usage().tool_calls == 2

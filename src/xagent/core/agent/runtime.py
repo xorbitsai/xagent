@@ -584,6 +584,14 @@ class PatternRuntime:
             )
 
     async def on_tool_start(self, *, tool_call: dict[str, Any]) -> None:
+        # Count one billable action per tool invocation (fires once per tool,
+        # including each tool in a concurrent batch).
+        try:
+            from ..model.chat.token_context import add_tool_call_usage
+
+            add_tool_call_usage(1)
+        except Exception:
+            pass
         data = {
             "tool_name": tool_call.get("name"),
             "tool_params": tool_call.get("args", {}),

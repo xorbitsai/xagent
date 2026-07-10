@@ -27,6 +27,7 @@ class TokenUsage:
     input_tokens: int = 0
     output_tokens: int = 0
     llm_calls: int = 0
+    tool_calls: int = 0
     details: List[Dict] = field(default_factory=list)
 
     @property
@@ -68,11 +69,16 @@ class TokenUsage:
         """Increment the LLM call counter."""
         self.llm_calls += 1
 
+    def increment_tool_calls(self, count: int = 1) -> None:
+        """Increment the tool-call counter (one per tool invocation)."""
+        self.tool_calls += count
+
     def merge(self, other: "TokenUsage") -> None:
         """Merge another TokenUsage into this one."""
         self.input_tokens += other.input_tokens
         self.output_tokens += other.output_tokens
         self.llm_calls += other.llm_calls
+        self.tool_calls += other.tool_calls
         self.details.extend(other.details)
 
     def to_dict(self) -> Dict:
@@ -82,6 +88,7 @@ class TokenUsage:
             "output_tokens": self.output_tokens,
             "total_tokens": self.total_tokens,
             "llm_calls": self.llm_calls,
+            "tool_calls": self.tool_calls,
             "details": self.details,
         }
 
@@ -92,6 +99,7 @@ class TokenUsage:
             input_tokens=data.get("input_tokens", 0),
             output_tokens=data.get("output_tokens", 0),
             llm_calls=data.get("llm_calls", 0),
+            tool_calls=data.get("tool_calls", 0),
             details=data.get("details", []),
         )
 
@@ -192,6 +200,11 @@ def add_token_usage(
         f"total_input={usage.input_tokens}, total_output={usage.output_tokens}, "
         f"total_calls={usage.llm_calls}"
     )
+
+
+def add_tool_call_usage(count: int = 1) -> None:
+    """Record one (or more) tool invocations on the current context."""
+    token_context.get().increment_tool_calls(count)
 
 
 def reset_token_usage() -> TokenUsage:

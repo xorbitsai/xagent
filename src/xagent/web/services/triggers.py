@@ -1093,6 +1093,15 @@ async def _start_prepared_trigger_run_id(
 
     await asyncio.to_thread(_mark_trigger_run_started, start)
 
+    # Count one billable action for the trigger firing itself (webhook /
+    # scheduled). Best-effort; never let metering break a trigger run.
+    try:
+        from .quota_hooks import record_trigger
+
+        record_trigger(start.task_owner_user_id)
+    except Exception:
+        logger.debug("Trigger quota record failed", exc_info=True)
+
     if wait_for_completion and asyncio.isfuture(started.background_task):
         await started.background_task
         await asyncio.to_thread(_finish_trigger_run_after_task, start)

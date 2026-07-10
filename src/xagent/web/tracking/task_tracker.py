@@ -105,8 +105,9 @@ class TaskTracker:
 
         # Snapshot the seeded totals so complete_tracking can meter only this
         # turn's delta (start_tracking seeds from prior turns for multi-turn tasks).
+        # tool_calls is not persisted to the task, so it counts per turn from 0.
         self._initial_total_tokens = initial_usage.total_tokens
-        self._initial_llm_calls = initial_usage.llm_calls
+        self._initial_tool_calls = initial_usage.tool_calls
 
         logger.info(f"Started token tracking for task {self.task_id}")
 
@@ -310,13 +311,19 @@ class TaskTracker:
             f"total={usage.total_tokens}, calls={usage.llm_calls}"
         )
 
-        # Best-effort quota metering: record only this turn's delta.
+        # Best-effort quota metering: record only this turn's delta. actions are
+        # tool calls (one per tool invocation); credits derive from tokens.
         try:
             from ..services.quota_hooks import record_usage
 
             delta_tokens = max(0, usage.total_tokens - getattr(self, "_initial_total_tokens", 0))
-            delta_calls = max(0, usage.llm_calls - getattr(self, "_initial_llm_calls", 0))
-            record_usage(self.db_session, getattr(self.task, "user_id", None), delta_tokens, delta_calls)
+            delta_actions = max(0, usage.tool_calls - getattr(self, "_initial_tool_calls", 0))
+            record_usage(
+                self.db_session,
+                getattr(self.task, "user_id", None),
+                delta_tokens,
+                delta_actions,
+            )
         except Exception as e:  # noqa: BLE001
             logger.warning(f"Quota usage recording failed for task {self.task_id}: {e}")
 

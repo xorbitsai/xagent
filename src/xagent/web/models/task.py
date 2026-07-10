@@ -86,6 +86,14 @@ class Task(Base):  # type: ignore
     lease_expires_at = Column(DateTime(timezone=True), nullable=True)
     last_heartbeat_at = Column(DateTime(timezone=True), nullable=True)
     last_checkpoint_event_id = Column(String(255), nullable=True)
+    # Monotonic task-control identity. ``run_id`` changes for each new turn,
+    # while pause/resume transitions retain it and advance ``state_version``.
+    # Clients use the version to ignore stale WebSocket status events.
+    run_id = Column(String(64), nullable=True, index=True)
+    state_version = Column(Integer, nullable=False, default=0, server_default="0")
+    control_state = Column(
+        String(32), nullable=False, default="idle", server_default="idle"
+    )
 
     # Model configuration
     model_name = Column(String(255), nullable=True)  # Main model used for the task

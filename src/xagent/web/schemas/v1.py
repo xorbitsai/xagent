@@ -226,6 +226,13 @@ class CreateTaskResponse(BaseModel):
         ),
     )
     created_at: datetime = Field(..., description="UTC creation timestamp.")
+    run_id: str = Field(..., description="Identity of the accepted execution run.")
+    state_version: int = Field(
+        ..., description="Monotonic version of the task control state."
+    )
+    control_state: str = Field(
+        ..., description="Detailed control state, such as running or pause_requested."
+    )
 
 
 class AppendMessageRequest(BaseModel):
@@ -284,6 +291,11 @@ class AppendMessageResponse(BaseModel):
             "created_at (which may differ slightly due to DB clock)."
         ),
     )
+    run_id: str = Field(..., description="Identity of the accepted execution run.")
+    state_version: int = Field(
+        ..., description="Monotonic version of the task control state."
+    )
+    control_state: str = Field(..., description="Detailed task control state.")
 
 
 class TaskInfoResponse(BaseModel):
@@ -301,6 +313,11 @@ class TaskInfoResponse(BaseModel):
         ...,
         description="One of: pending / running / paused / completed / failed.",
     )
+    run_id: Optional[str] = Field(None, description="Current execution run identity.")
+    state_version: int = Field(
+        0, description="Monotonic version of the task control state."
+    )
+    control_state: str = Field("idle", description="Detailed task control state.")
     input: Optional[str] = Field(
         None,
         description="Latest-turn user input. Null if no message yet recorded.",

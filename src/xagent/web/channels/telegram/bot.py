@@ -25,6 +25,13 @@ from ...models.uploaded_file import UploadedFile
 from ...models.user import User
 from ...services.chat_history_service import persist_user_message
 from ...services.execution_result_projection import project_execution_result_for_channel
+from ...services.task_execution_controller import (
+    TaskCommand,
+    TaskControlState,
+    apply_task_control_transition,
+    control_state_for_status,
+    task_execution_controller,
+)
 from .handler import TelegramTraceHandler
 from .utils import (
     TelegramFileRef,
@@ -463,6 +470,8 @@ class TelegramBotInstance:
 
         self.user_preparing_executions.add(user_id)
         self._clear_user_stop_request(user_id)
+        claimed_task_id: int | None = None
+        claimed_run_id: str | None = None
         try:
             db_gen = get_db()
             db = next(db_gen)
@@ -531,8 +540,27 @@ class TelegramBotInstance:
                     self._save_active_tasks()
                     is_new_task = True
                 else:
-                    task.status = TaskStatus.PENDING
+                    db.refresh(task)
+
+                async with task_execution_controller.command(
+                    int(task.id), TaskCommand.CHANNEL_MESSAGE
+                ):
+                    db.refresh(task)
+                    if task.status == TaskStatus.RUNNING:
+                        await last_message.answer(
+                            "I'm still working on the previous message. "
+                            "Please wait for it to finish."
+                        )
+                        return
+                    run_snapshot = apply_task_control_transition(
+                        task,
+                        TaskControlState.RUNNING,
+                        status=TaskStatus.RUNNING,
+                        new_run=True,
+                    )
                     db.commit()
+                    claimed_task_id = int(task.id)
+                    claimed_run_id = run_snapshot.run_id
 
                 agent_manager = get_agent_manager()
                 agent_service = await agent_manager.get_agent_for_task(
@@ -547,7 +575,12 @@ class TelegramBotInstance:
                 context: dict = {"turn_id": message_turn_id}
 
                 if self._consume_user_stop_request(user_id):
-                    task.status = TaskStatus.PAUSED
+                    apply_task_control_transition(
+                        task,
+                        TaskControlState.PAUSED,
+                        status=TaskStatus.PAUSED,
+                        expected_run_id=run_snapshot.run_id,
+                    )
                     db.commit()
                     return
 
@@ -581,7 +614,12 @@ class TelegramBotInstance:
                         context["state"]["file_info"] = uploaded_info
 
                 if self._consume_user_stop_request(user_id):
-                    task.status = TaskStatus.PAUSED
+                    apply_task_control_transition(
+                        task,
+                        TaskControlState.PAUSED,
+                        status=TaskStatus.PAUSED,
+                        expected_run_id=run_snapshot.run_id,
+                    )
                     db.commit()
                     return
 
@@ -615,7 +653,12 @@ class TelegramBotInstance:
 
                 try:
                     if self._consume_user_stop_request(user_id):
-                        task.status = TaskStatus.PAUSED
+                        apply_task_control_transition(
+                            task,
+                            TaskControlState.PAUSED,
+                            status=TaskStatus.PAUSED,
+                            expected_run_id=run_snapshot.run_id,
+                        )
                         db.commit()
                         return
 
@@ -639,8 +682,21 @@ class TelegramBotInstance:
                         agent_service.tracer.handlers.remove(tg_handler)
 
                 projection = project_execution_result_for_channel(result)
-                task.status = projection.task_status
-                db.commit()
+                db.refresh(task)
+                projected_control_state = control_state_for_status(
+                    projection.task_status
+                )
+                if (
+                    task.status != projection.task_status
+                    or task.control_state != projected_control_state.value
+                ):
+                    apply_task_control_transition(
+                        task,
+                        projected_control_state,
+                        status=projection.task_status,
+                        expected_run_id=run_snapshot.run_id,
+                    )
+                    db.commit()
 
                 persist_telegram_assistant_turn(
                     db=db,
@@ -714,6 +770,26 @@ class TelegramBotInstance:
                     pass
         except Exception as e:
             logger.error(f"Error processing Telegram message: {e}")
+            if claimed_task_id is not None and claimed_run_id is not None:
+                try:
+                    snapshot = await task_execution_controller.snapshot(claimed_task_id)
+                    if (
+                        snapshot is not None
+                        and snapshot.run_id == claimed_run_id
+                        and snapshot.status == TaskStatus.RUNNING
+                    ):
+                        await task_execution_controller.transition(
+                            claimed_task_id,
+                            TaskControlState.FAILED,
+                            status=TaskStatus.FAILED,
+                            expected_run_id=claimed_run_id,
+                        )
+                except Exception:
+                    logger.warning(
+                        "Failed to finalize Telegram task %s after channel error",
+                        claimed_task_id,
+                        exc_info=True,
+                    )
             await last_message.answer(
                 "Sorry, an error occurred while processing your request."
             )

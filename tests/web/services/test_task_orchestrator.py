@@ -171,7 +171,7 @@ async def test_begin_turn_create_clears_no_terminal_fields_when_pending(
     task = _create_task(db_session, user.id, status=TaskStatus.PENDING)
     payload = TaskTurnPayload("first turn")
 
-    await TaskTurnOrchestrator.begin_turn(
+    started = await TaskTurnOrchestrator.begin_turn(
         task_id=int(task.id),
         payload=payload,
         task_owner_user_id=int(user.id),
@@ -186,6 +186,9 @@ async def test_begin_turn_create_clears_no_terminal_fields_when_pending(
     assert task.error_message is None
     assert task.runner_id is None
     assert task.lease_expires_at is None
+    assert task.run_id == started.run_id
+    assert task.state_version == started.state_version == 1
+    assert task.control_state == started.control_state == "running"
     delivery = (
         db_session.query(TaskChatMessage)
         .filter(TaskChatMessage.turn_id == payload.turn_id)

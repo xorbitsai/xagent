@@ -52,9 +52,17 @@ from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 from uuid import uuid4
 
+from sqlalchemy import func
+
 from ..models.task import Task, TaskStatus
 from .chat_history_service import mark_user_message_delivery_sync
 from .hot_path_cache import invalidate_task_cache
+from .task_execution_controller import (
+    TaskCommand,
+    TaskControlState,
+    apply_task_control_transition,
+    task_execution_controller,
+)
 from .task_lease_service import (
     acquire_task_lease_isolated,
     get_runner_id,
@@ -190,6 +198,9 @@ class TurnStarted:
     before_message_id: Optional[int]
     task_source: Optional[str]
     background_task: "asyncio.Task[None]"
+    run_id: str = ""
+    state_version: int = 0
+    control_state: str = TaskControlState.RUNNING.value
 
 
 class TaskTurnOrchestrator:
@@ -202,6 +213,47 @@ class TaskTurnOrchestrator:
 
     @staticmethod
     async def begin_turn(
+        *,
+        task_id: int,
+        task_owner_user_id: int,
+        payload: TaskTurnPayload,
+        kind: TurnKind,
+        force_fresh: bool = False,
+        context: Optional[Dict[str, Any]] = None,
+        actor_user_id: Optional[int] = None,
+    ) -> TurnStarted:
+        """Serialize every transport's new-turn command for one task."""
+
+        async with task_execution_controller.command(task_id, TaskCommand.START_TURN):
+            operation = asyncio.create_task(
+                TaskTurnOrchestrator._begin_turn_unserialized(
+                    task_id=task_id,
+                    task_owner_user_id=task_owner_user_id,
+                    payload=payload,
+                    kind=kind,
+                    force_fresh=force_fresh,
+                    context=context,
+                    actor_user_id=actor_user_id,
+                )
+            )
+            try:
+                return await asyncio.shield(operation)
+            except asyncio.CancelledError:
+                # The atomic claim/schedule contract is cancellation-safe and
+                # may still be running under its own shield. Keep the command
+                # gate until it settles so a replacement message cannot enter
+                # the task while that claim is committing in the background.
+                try:
+                    await operation
+                except Exception:
+                    logger.exception(
+                        "Turn start failed while cancelled caller waited for task %s",
+                        task_id,
+                    )
+                raise
+
+    @staticmethod
+    async def _begin_turn_unserialized(
         *,
         task_id: int,
         task_owner_user_id: int,
@@ -225,10 +277,10 @@ class TaskTurnOrchestrator:
 
           1. ``_refuse_if_bg_inflight`` — reject if a bg coroutine is still
              running for this task (``TaskTurnError("bg_inflight")``). Pure
-             in-memory dict check. NOTE: it now sits before the
-             ``await asyncio.to_thread`` below, so two concurrent new turns
-             can both pass it; the authoritative serializer is the DB atomic
-             claim (the status-filter rowcount), which lets exactly one win.
+             in-memory dict check. The process-local task controller serializes
+             callers in this worker; callers in different workers can still
+             both pass, so the DB atomic claim remains the authoritative
+             cross-worker guard and lets exactly one win.
           2. ``_begin_turn_atomic_sync`` (off-loop): atomic claim
              (``id == task_id AND user_id == task_owner_user_id AND
              <status_filter>``) + persist + snapshot SELECT + single commit.
@@ -309,6 +361,7 @@ class TaskTurnOrchestrator:
                     task_id=task_id,
                     task_owner_user_id=task_owner_user_id,
                     task_source=res.task_source,
+                    run_id=res.run_id,
                     payload=payload,
                     force_fresh=force_fresh,
                     context=context,
@@ -322,6 +375,7 @@ class TaskTurnOrchestrator:
                     _mark_task_failed_if_running,
                     task_id,
                     "turn scheduling failed after claim commit",
+                    res.run_id,
                 )
                 try:
                     await asyncio.to_thread(
@@ -365,6 +419,9 @@ class TaskTurnOrchestrator:
             updated_at=claimed.updated_at,
             before_message_id=claimed.before_message_id,
             task_source=claimed.task_source,
+            run_id=claimed.run_id,
+            state_version=claimed.state_version,
+            control_state=claimed.control_state,
             background_task=bg_task,
         )
 
@@ -382,6 +439,9 @@ class _ClaimedTurn:
     updated_at: Optional[datetime]
     before_message_id: Optional[int]
     task_source: Optional[str]
+    run_id: str = ""
+    state_version: int = 0
+    control_state: str = TaskControlState.RUNNING.value
 
 
 def _begin_turn_atomic_sync(
@@ -424,6 +484,7 @@ def _begin_turn_atomic_sync(
 
     SessionLocal = get_session_local()
     db = SessionLocal()
+    run_id = str(uuid4())
     try:
         claimed = (
             db.query(Task)
@@ -448,6 +509,9 @@ def _begin_turn_atomic_sync(
                     Task.runner_id: None,
                     Task.lease_expires_at: None,
                     Task.last_heartbeat_at: None,
+                    Task.run_id: run_id,
+                    Task.state_version: func.coalesce(Task.state_version, 0) + 1,
+                    Task.control_state: TaskControlState.RUNNING.value,
                 },
                 synchronize_session=False,
             )
@@ -482,8 +546,15 @@ def _begin_turn_atomic_sync(
         # in the same transaction). Keeps commit as the last fallible DB op,
         # so there is no post-commit window where the row is RUNNING but this
         # helper still raises.
-        status, updated_at, source = (
-            db.query(Task.status, Task.updated_at, Task.source)
+        status, updated_at, source, stored_run_id, state_version, control_state = (
+            db.query(
+                Task.status,
+                Task.updated_at,
+                Task.source,
+                Task.run_id,
+                Task.state_version,
+                Task.control_state,
+            )
             .filter(Task.id == task_id)
             .one()
         )
@@ -513,6 +584,9 @@ def _begin_turn_atomic_sync(
         updated_at=updated_at,
         before_message_id=before_message_id,
         task_source=source,
+        run_id=str(stored_run_id),
+        state_version=int(state_version),
+        control_state=str(control_state),
     )
 
 
@@ -552,7 +626,11 @@ def _get_agent_manager() -> Any:
     return get_agent_manager()
 
 
-def _mark_task_failed_if_running(task_id: int, error_message: str) -> None:
+def _mark_task_failed_if_running(
+    task_id: int,
+    error_message: str,
+    expected_run_id: str | None = None,
+) -> None:
     """Setup/run-error sentinel for ``_schedule_bg._runner``.
 
     ``acquire_task_lease_isolated`` sets ``task.status = RUNNING`` as
@@ -577,9 +655,17 @@ def _mark_task_failed_if_running(task_id: int, error_message: str) -> None:
     try:
         with SessionLocal() as db:
             task = db.query(Task).filter(Task.id == task_id).first()
-            if task is None or task.status != TaskStatus.RUNNING:
+            if (
+                task is None
+                or task.status != TaskStatus.RUNNING
+                or (expected_run_id is not None and task.run_id != expected_run_id)
+            ):
                 return
-            task.status = TaskStatus.FAILED
+            apply_task_control_transition(
+                task,
+                TaskControlState.FAILED,
+                status=TaskStatus.FAILED,
+            )
             task.error_message = error_message  # type: ignore[assignment]
             db.commit()
     except Exception as e:
@@ -730,7 +816,11 @@ def finish_turn(bg_db: Any, task_id: int) -> None:
             )
             return
         # Genuinely stuck: our bg coroutine returned, no live lease elsewhere.
-        fresh.status = TaskStatus.FAILED
+        apply_task_control_transition(
+            fresh,
+            TaskControlState.FAILED,
+            status=TaskStatus.FAILED,
+        )
         fresh.error_message = "Task execution failed without status update; see /steps."
         fresh.output = None  # latest-turn snapshot invariant
         sync_workforce_run_status(bg_db, fresh, TaskStatus.FAILED)
@@ -795,6 +885,7 @@ def _schedule_bg(
     task_id: int,
     task_owner_user_id: int,
     task_source: Optional[str],
+    run_id: str | None = None,
     payload: TaskTurnPayload,
     force_fresh: bool,
     context: Optional[Dict[str, Any]],
@@ -853,7 +944,11 @@ def _schedule_bg(
             # event loop (issue #427). ``acquire_task_lease_isolated``
             # wraps the existing helper with its own SessionLocal so
             # the work runs on a worker thread.
-            lease = await asyncio.to_thread(acquire_task_lease_isolated, task_id)
+            lease = await asyncio.to_thread(
+                acquire_task_lease_isolated,
+                task_id,
+                expected_run_id=run_id,
+            )
             if lease is None:
                 logger.info(
                     "task %s acquired by another worker; skipping "
@@ -902,7 +997,9 @@ def _schedule_bg(
                             task_id,
                         )
                         _mark_task_failed_if_running(
-                            task_id, "task vanished before snapshot load"
+                            task_id,
+                            "task vanished before snapshot load",
+                            run_id,
                         )
                         return
 
@@ -917,6 +1014,7 @@ def _schedule_bg(
                         before_message_id=before_message_id,
                         llm_user_message=payload.execution_message,
                         task_setup_snapshot=snapshot,
+                        expected_run_id=run_id,
                     )
                 except Exception as setup_or_run_err:
                     logger.error(
@@ -929,6 +1027,7 @@ def _schedule_bg(
                         task_id,
                         f"setup/run error: "
                         f"{type(setup_or_run_err).__name__}: {setup_or_run_err}",
+                        run_id,
                     )
                     # Do not re-raise: ``finish_turn`` + release below
                     # must run so the lease is freed and the row is
@@ -990,7 +1089,10 @@ def _schedule_bg(
                     # cleanly here -- decorator-style, no perf regression.
                     try:
                         release_current_runner_task_lease_with_workforce_sync(
-                            release_db, task_id, status=final_status
+                            release_db,
+                            task_id,
+                            status=final_status,
+                            expected_run_id=run_id,
                         )
                     except Exception as e:
                         logger.warning(

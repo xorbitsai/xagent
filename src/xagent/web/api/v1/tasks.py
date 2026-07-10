@@ -50,6 +50,10 @@ from ...services.hot_path_cache import (
     task_snapshot_key,
     task_steps_key,
 )
+from ...services.task_execution_controller import (
+    TaskControlState,
+    apply_task_control_transition,
+)
 from ...services.task_orchestrator import (
     TaskTurnError,
     TaskTurnNotFoundError,
@@ -99,7 +103,11 @@ def _mark_task_failed_after_runtime_setup_error(db: Session, task_id: int) -> No
         task = db.query(Task).filter(Task.id == task_id).first()
         if task is not None:
             orm_task = cast(Any, task)
-            orm_task.status = TaskStatus.FAILED
+            apply_task_control_transition(
+                task,
+                TaskControlState.FAILED,
+                status=TaskStatus.FAILED,
+            )
             orm_task.error_message = _CONNECTOR_RUNTIME_SETUP_FAILED_MESSAGE
             db.commit()
     except Exception:
@@ -297,6 +305,9 @@ async def create_chat_task(
         agent_id=int(agent.id),
         status=started.status.value,
         created_at=task.created_at,
+        run_id=started.run_id,
+        state_version=started.state_version,
+        control_state=started.control_state,
     )
 
 
@@ -475,6 +486,9 @@ async def append_message_to_task(
         agent_id=int(agent.id),
         status=started.status.value,
         accepted_at=started.updated_at,
+        run_id=started.run_id,
+        state_version=started.state_version,
+        control_state=started.control_state,
     )
 
 
@@ -524,6 +538,9 @@ async def get_chat_task(
         task_id=int(task.id),
         agent_id=int(task.agent_id),
         status=task.status.value,
+        run_id=task.run_id,
+        state_version=int(task.state_version or 0),
+        control_state=str(task.control_state or "idle"),
         input=task.input,
         output=task.output,
         error=task.error_message,

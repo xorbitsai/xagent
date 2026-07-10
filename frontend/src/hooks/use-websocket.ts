@@ -26,6 +26,11 @@ interface WebSocketMessage {
   message_id?: string
   delta?: string
   content?: string
+  run_id?: string | null
+  state_version?: number
+  control_state?: "idle" | "running" | "pause_requested" | "paused" | "resume_requested" | "waiting_for_user" | "completed" | "failed"
+  status?: unknown
+  task?: Record<string, unknown>
 }
 
 interface MessageDeliveryAck {
@@ -368,6 +373,14 @@ export function useWebSocket(options: UseWebSocketOptions = {}) {
               step_id: data.step_id,
             }
           }
+
+          // Preserve the canonical task-control envelope even when a message
+          // type normalizes its payload into ``data`` above.
+          message.run_id = data.run_id
+          message.state_version = data.state_version
+          message.control_state = data.control_state
+          message.status = data.status
+          message.task = data.task
 
           setLastMessage(message)
           onMessage?.(message)

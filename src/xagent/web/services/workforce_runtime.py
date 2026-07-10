@@ -200,9 +200,19 @@ def mark_workforce_task_status(
     clear_output: bool = False,
 ) -> bool:
     """Update the task lifecycle source of truth and project it to WorkforceRun."""
+    from .task_execution_controller import (
+        apply_task_control_transition,
+        control_state_for_status,
+    )
+
     changed = False
-    if task.status != status:
-        task.status = status
+    expected_control_state = control_state_for_status(status)
+    if task.status != status or task.control_state != expected_control_state.value:
+        apply_task_control_transition(
+            task,
+            expected_control_state,
+            status=status,
+        )
         changed = True
     if error_message is not None and task.error_message != error_message:
         setattr(task, "error_message", error_message)
@@ -257,12 +267,14 @@ def release_current_runner_task_lease_with_workforce_sync(
     *,
     status: TaskStatus,
     runner_id: str | None = None,
+    expected_run_id: str | None = None,
 ) -> bool:
     released = release_current_runner_task_lease(
         db,
         task_id,
         status=status,
         runner_id=runner_id,
+        expected_run_id=expected_run_id,
     )
     if not released:
         return released

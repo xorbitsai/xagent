@@ -12,7 +12,7 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Any, cast
 
-from sqlalchemy import or_, update
+from sqlalchemy import case, func, or_, update
 from sqlalchemy.orm import Session
 
 from ...config import (
@@ -36,6 +36,7 @@ def _rowcount(result: Any) -> int:
 class TaskLease:
     task_id: int
     runner_id: str
+    run_id: str | None = None
 
 
 def get_runner_id() -> str:
@@ -78,11 +79,14 @@ def acquire_task_lease(
     task_id: int,
     *,
     runner_id: str | None = None,
+    expected_run_id: str | None = None,
 ) -> TaskLease | None:
     """Acquire the task execution lease if no live runner owns it."""
     runner = runner_id or get_runner_id()
     now = utc_now()
     expires_at = _expires_at(now)
+    candidate_run_id = expected_run_id or str(uuid.uuid4())
+    current_version = func.coalesce(Task.state_version, 0)
     stmt = (
         update(Task)
         .where(Task.id == task_id)
@@ -100,26 +104,49 @@ def acquire_task_lease(
             runner_id=runner,
             last_heartbeat_at=now,
             lease_expires_at=expires_at,
+            run_id=case(
+                (Task.status != TaskStatus.RUNNING, candidate_run_id),
+                else_=func.coalesce(Task.run_id, candidate_run_id),
+            ),
+            control_state="running",
+            state_version=case(
+                (
+                    or_(
+                        Task.status != TaskStatus.RUNNING,
+                        Task.control_state != "running",
+                    ),
+                    current_version + 1,
+                ),
+                else_=current_version,
+            ),
         )
     )
+    if expected_run_id is not None:
+        stmt = stmt.where(Task.run_id == expected_run_id)
     result = db.execute(stmt.execution_options(synchronize_session=False))
     db.commit()
     if _rowcount(result) != 1:
         logger.info("Task %s lease acquisition denied for runner %s", task_id, runner)
         return None
+    stored_run_id = db.query(Task.run_id).filter(Task.id == task_id).scalar()
     logger.info(
         "Task %s lease acquired by runner %s until %s",
         task_id,
         runner,
         expires_at.isoformat(),
     )
-    return TaskLease(task_id=task_id, runner_id=runner)
+    return TaskLease(
+        task_id=task_id,
+        runner_id=runner,
+        run_id=str(stored_run_id) if stored_run_id is not None else None,
+    )
 
 
 def acquire_task_lease_isolated(
     task_id: int,
     *,
     runner_id: str | None = None,
+    expected_run_id: str | None = None,
 ) -> TaskLease | None:
     """Same semantics as :func:`acquire_task_lease` but opens, commits,
     and closes its own ``SessionLocal``.
@@ -135,7 +162,12 @@ def acquire_task_lease_isolated(
     SessionLocal = get_session_local()
     db = SessionLocal()
     try:
-        return acquire_task_lease(db, task_id, runner_id=runner_id)
+        return acquire_task_lease(
+            db,
+            task_id,
+            runner_id=runner_id,
+            expected_run_id=expected_run_id,
+        )
     finally:
         db.close()
 
@@ -151,6 +183,8 @@ def refresh_task_lease(db: Session, lease: TaskLease) -> bool:
         .where(Task.status == TaskStatus.RUNNING)
         .values(last_heartbeat_at=now, lease_expires_at=expires_at)
     )
+    if lease.run_id is not None:
+        stmt = stmt.where(Task.run_id == lease.run_id)
     result = db.execute(stmt.execution_options(synchronize_session=False))
     db.commit()
     return _rowcount(result) == 1
@@ -165,6 +199,8 @@ def release_task_lease(
     """Release a task lease and set its final visible status."""
     if lease is None:
         return False
+    control_state = _control_state_value(status)
+    current_version = func.coalesce(Task.state_version, 0)
     stmt = (
         update(Task)
         .where(Task.id == lease.task_id)
@@ -174,8 +210,18 @@ def release_task_lease(
             runner_id=None,
             lease_expires_at=None,
             last_heartbeat_at=utc_now(),
+            control_state=control_state,
+            state_version=case(
+                (
+                    or_(Task.status != status, Task.control_state != control_state),
+                    current_version + 1,
+                ),
+                else_=current_version,
+            ),
         )
     )
+    if lease.run_id is not None:
+        stmt = stmt.where(Task.run_id == lease.run_id)
     result = db.execute(stmt.execution_options(synchronize_session=False))
     db.commit()
     return _rowcount(result) == 1
@@ -187,9 +233,12 @@ def release_current_runner_task_lease(
     *,
     status: TaskStatus,
     runner_id: str | None = None,
+    expected_run_id: str | None = None,
 ) -> bool:
     """Release the current runner's lease for a task."""
     runner = runner_id or get_runner_id()
+    control_state = _control_state_value(status)
+    current_version = func.coalesce(Task.state_version, 0)
     stmt = (
         update(Task)
         .where(Task.id == task_id)
@@ -199,11 +248,32 @@ def release_current_runner_task_lease(
             runner_id=None,
             lease_expires_at=None,
             last_heartbeat_at=utc_now(),
+            control_state=control_state,
+            state_version=case(
+                (
+                    or_(Task.status != status, Task.control_state != control_state),
+                    current_version + 1,
+                ),
+                else_=current_version,
+            ),
         )
     )
+    if expected_run_id is not None:
+        stmt = stmt.where(Task.run_id == expected_run_id)
     result = db.execute(stmt.execution_options(synchronize_session=False))
     db.commit()
     return _rowcount(result) == 1
+
+
+def _control_state_value(status: TaskStatus) -> str:
+    return {
+        TaskStatus.PENDING: "idle",
+        TaskStatus.RUNNING: "running",
+        TaskStatus.PAUSED: "paused",
+        TaskStatus.WAITING_FOR_USER: "waiting_for_user",
+        TaskStatus.COMPLETED: "completed",
+        TaskStatus.FAILED: "failed",
+    }[status]
 
 
 def mark_task_paused_if_stale(db: Session, task: Task) -> bool:
@@ -219,12 +289,24 @@ def mark_task_paused_if_stale(db: Session, task: Task) -> bool:
     if lease_expires_at is not None and lease_expires_at >= now:
         return False
 
-    setattr(
-        task,
-        "status",
+    from .task_execution_controller import (
+        TaskControlState,
+        apply_task_control_transition,
+    )
+
+    next_status = (
         TaskStatus.PAUSED
         if has_agent_checkpoint(db, int(task.id))
-        else TaskStatus.FAILED,
+        else TaskStatus.FAILED
+    )
+    apply_task_control_transition(
+        task,
+        (
+            TaskControlState.PAUSED
+            if next_status == TaskStatus.PAUSED
+            else TaskControlState.FAILED
+        ),
+        status=next_status,
     )
     setattr(task, "runner_id", None)
     setattr(task, "lease_expires_at", None)

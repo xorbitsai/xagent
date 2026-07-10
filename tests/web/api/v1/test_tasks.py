@@ -229,6 +229,9 @@ def test_create_task_happy_path(mock_start_task):
     # POST atomically claims RUNNING before returning 202, so the
     # response body reports the post-claim state, not 'pending'.
     assert body["status"] == "running"
+    assert body["run_id"]
+    assert body["state_version"] == 1
+    assert body["control_state"] == "running"
     assert "task_id" in body
     assert "created_at" in body
     task_id = body["task_id"]
@@ -261,6 +264,9 @@ def test_create_task_happy_path(mock_start_task):
     sdk_task = client.get(f"/v1/chat/tasks/{task_id}", headers=_bearer(full_key))
     assert sdk_task.status_code == 200, sdk_task.text
     assert sdk_task.json()["task_id"] == task_id
+    assert sdk_task.json()["run_id"] == body["run_id"]
+    assert sdk_task.json()["state_version"] == body["state_version"]
+    assert sdk_task.json()["control_state"] == "running"
 
     # Background kickoff was called exactly once for this task. The
     # scheduler receives a ``TaskTurnPayload`` carrying both transcript

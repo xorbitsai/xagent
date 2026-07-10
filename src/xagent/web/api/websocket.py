@@ -66,6 +66,12 @@ from ..services.managed_file_ref import (
     DurableStorageOperationError,
     ensure_uploaded_file_local_path,
 )
+from ..services.task_execution_controller import (
+    TaskCommand,
+    TaskControlState,
+    apply_task_control_transition,
+    task_execution_controller,
+)
 from ..services.task_lease_service import (
     acquire_task_lease,
     mark_task_paused_if_stale,
@@ -104,12 +110,17 @@ def _is_task_pause_accepted(task_id: int) -> bool:
 
 
 def _task_status_uses_live_control(
-    status: TaskStatus, *, pause_accepted: bool = False
+    status: TaskStatus,
+    *,
+    control_state: str | None = None,
+    pause_accepted: bool = False,
 ) -> bool:
     """Return True when a user message should be delivered to an active run."""
 
-    if pause_accepted:
+    if pause_accepted or control_state == TaskControlState.PAUSE_REQUESTED.value:
         return False
+    if control_state == TaskControlState.RESUME_REQUESTED.value:
+        return True
     return status in {TaskStatus.WAITING_FOR_USER, TaskStatus.RUNNING}
 
 
@@ -178,12 +189,29 @@ def _terminal_task_error_payload(
     message: str,
     *,
     event_type: str = "agent_error",
+    expected_run_id: str | None = None,
 ) -> dict[str, Any]:
     SessionLocal = get_session_local()
     db = SessionLocal()
     try:
+        current_task = db.query(Task).filter(Task.id == task_id).first()
+        if (
+            current_task is not None
+            and expected_run_id is not None
+            and current_task.run_id != expected_run_id
+        ):
+            logger.info(
+                "Ignoring late terminal error for task %s run %s; current run is %s",
+                task_id,
+                expected_run_id,
+                current_task.run_id,
+            )
+            return _task_error_payload(db, task_id, message, event_type=event_type)
         released = release_current_runner_task_lease_with_workforce_sync(
-            db, task_id, status=TaskStatus.FAILED
+            db,
+            task_id,
+            status=TaskStatus.FAILED,
+            expected_run_id=expected_run_id,
         )
         task = db.query(Task).filter(Task.id == task_id).first()
         if task is not None:
@@ -1363,6 +1391,16 @@ def _task_user_id(task: Any) -> int | None:
     return int(cast(Any, user_id))
 
 
+def _task_run_id(task: Any) -> str | None:
+    run_id = getattr(task, "run_id", None)
+    return str(run_id) if run_id is not None else None
+
+
+def _task_control_state_value(task: Any) -> str | None:
+    control_state = getattr(task, "control_state", None)
+    return str(control_state) if control_state is not None else None
+
+
 async def execute_task_background(
     task_id: int,
     user_message: str,
@@ -1372,6 +1410,7 @@ async def execute_task_background(
     before_message_id: int | None = None,
     llm_user_message: Optional[str] = None,
     task_setup_snapshot: Optional["TaskSetupSnapshot"] = None,
+    expected_run_id: str | None = None,
 ) -> None:
     """Execute task in background without blocking WebSocket message loop.
 
@@ -1525,6 +1564,7 @@ async def execute_task_background(
         # Task execution result is logged by ConsoleTraceHandler, no need for duplicate logs
 
         db_new_gen = get_db()
+        final_control_snapshot = None
         try:
             db_new = next(db_new_gen)
             waiting_for_control = False
@@ -1542,6 +1582,18 @@ async def execute_task_background(
                 final_task_status = TaskStatus.PENDING.value
             task_updated = db_new.query(Task).filter(Task.id == task_id).first()
             if task_updated:
+                if (
+                    expected_run_id is not None
+                    and task_updated.run_id != expected_run_id
+                ):
+                    logger.info(
+                        "Ignoring late task result for task %s run %s; "
+                        "current run is %s",
+                        task_id,
+                        expected_run_id,
+                        task_updated.run_id,
+                    )
+                    return
                 # Caller is responsible for the lease lifecycle (acquire +
                 # release); this function only writes ``status``. The
                 # orchestrator's ``_schedule_bg`` wraps the call in
@@ -1570,7 +1622,18 @@ async def execute_task_background(
                         task_id,
                     )
                 elif result.get("status") == "waiting_for_user":
-                    task_updated.status = TaskStatus.WAITING_FOR_USER
+                    next_control_state = (
+                        TaskControlState.RESUME_REQUESTED
+                        if task_updated.control_state
+                        == TaskControlState.RESUME_REQUESTED.value
+                        else TaskControlState.WAITING_FOR_USER
+                    )
+                    final_control_snapshot = apply_task_control_transition(
+                        task_updated,
+                        next_control_state,
+                        status=TaskStatus.WAITING_FOR_USER,
+                        expected_run_id=expected_run_id,
+                    )
                     sync_workforce_run_status(db_new, task_updated, task_updated.status)
                     db_new.commit()
                     waiting_for_control = True
@@ -1578,7 +1641,18 @@ async def execute_task_background(
                         f"Updated task {task_id} status to WAITING_FOR_USER for v2 control state"
                     )
                 elif result.get("status") == "interrupted":
-                    task_updated.status = TaskStatus.PAUSED
+                    next_control_state = (
+                        TaskControlState.RESUME_REQUESTED
+                        if task_updated.control_state
+                        == TaskControlState.RESUME_REQUESTED.value
+                        else TaskControlState.PAUSED
+                    )
+                    final_control_snapshot = apply_task_control_transition(
+                        task_updated,
+                        next_control_state,
+                        status=TaskStatus.PAUSED,
+                        expected_run_id=expected_run_id,
+                    )
                     sync_workforce_run_status(db_new, task_updated, task_updated.status)
                     db_new.commit()
                     waiting_for_control = True
@@ -1589,10 +1663,22 @@ async def execute_task_background(
                     TaskStatus.PAUSED,
                     TaskStatus.WAITING_FOR_USER,
                 }:
-                    if result.get("success", False):
-                        task_updated.status = TaskStatus.COMPLETED
-                    else:
-                        task_updated.status = TaskStatus.FAILED
+                    final_control_state = (
+                        TaskControlState.COMPLETED
+                        if result.get("success", False)
+                        else TaskControlState.FAILED
+                    )
+                    final_status = (
+                        TaskStatus.COMPLETED
+                        if result.get("success", False)
+                        else TaskStatus.FAILED
+                    )
+                    final_control_snapshot = apply_task_control_transition(
+                        task_updated,
+                        final_control_state,
+                        status=final_status,
+                        expected_run_id=expected_run_id,
+                    )
                     sync_workforce_run_status(db_new, task_updated, task_updated.status)
                     # Do NOT commit the terminal status here. Leave it
                     # pending so the assistant-message persistence below
@@ -1723,6 +1809,12 @@ async def execute_task_background(
 
         # Note: trace_task_completion is handled by the agent execution logic (e.g., dag_plan_execute.py)
 
+        control_event_state = (
+            final_control_snapshot.as_dict()
+            if final_control_snapshot is not None
+            else {}
+        )
+
         if waiting_for_control:
             await manager.broadcast_to_task(
                 create_stream_event(
@@ -1737,6 +1829,7 @@ async def execute_task_background(
                         "agent_id": broadcast_agent_meta["agent_id"],
                         "agent_name": broadcast_agent_meta["agent_name"],
                         "agent_logo_url": broadcast_agent_meta["agent_logo_url"],
+                        **control_event_state,
                     },
                     broadcast_meta["updated_at"] or None,
                 ),
@@ -1759,6 +1852,7 @@ async def execute_task_background(
                 "output": ai_response,
                 "file_outputs": normalized_outputs,
                 "success": result.get("success", False),
+                **control_event_state,
                 "chat_response": chat_response
                 if isinstance(chat_response, dict)
                 else None,
@@ -1783,6 +1877,7 @@ async def execute_task_background(
             current = status_db.query(Task).filter(Task.id == task_id).first()
             still_running = current is not None and (
                 current.status == TaskStatus.RUNNING
+                and (expected_run_id is None or current.run_id == expected_run_id)
             )
         finally:
             status_db.close()
@@ -1811,6 +1906,7 @@ async def execute_task_background(
                             task_id,
                             message,
                             event_type="task_error",
+                            expected_run_id=expected_run_id,
                         ),
                         "task_id": task_id,
                         "error": message,
@@ -1875,6 +1971,7 @@ async def execute_resume_background(
     delivery_already_dispatched: bool = False,
     delivery_websocket: WebSocket | None = None,
     delivery_client_message_id: str | None = None,
+    expected_run_id: str | None = None,
 ) -> None:
     """Resume an agent execution after an interrupt/user-message checkpoint.
 
@@ -1901,6 +1998,7 @@ async def execute_resume_background(
     agent_name: str | None = None
     agent_logo_url: str | None = None
     delivery_was_dispatched = delivery_already_dispatched
+    final_control_snapshot = None
 
     async def notify_deferred_delivery(
         accepted: bool,
@@ -1945,7 +2043,11 @@ async def execute_resume_background(
         db_gen = get_db()
         db_lease = next(db_gen)
         try:
-            lease = acquire_task_lease(db_lease, task_id)
+            lease = acquire_task_lease(
+                db_lease,
+                task_id,
+                expected_run_id=expected_run_id,
+            )
             if lease is not None:
                 task_for_sync = db_lease.query(Task).filter(Task.id == task_id).first()
                 # Same owner guard as ``execute_task_background``: the resume
@@ -1968,6 +2070,8 @@ async def execute_resume_background(
                 if task_for_sync is not None and sync_workforce_run_status(
                     db_lease, task_for_sync, TaskStatus.RUNNING
                 ):
+                    db_lease.commit()
+                elif task_for_sync is not None:
                     db_lease.commit()
         finally:
             db_lease.close()
@@ -2103,6 +2207,18 @@ async def execute_resume_background(
                 else:
                     final_task_status = TaskStatus.FAILED
 
+                final_control_snapshot = apply_task_control_transition(
+                    task_updated,
+                    {
+                        TaskStatus.WAITING_FOR_USER: TaskControlState.WAITING_FOR_USER,
+                        TaskStatus.PAUSED: TaskControlState.PAUSED,
+                        TaskStatus.COMPLETED: TaskControlState.COMPLETED,
+                        TaskStatus.FAILED: TaskControlState.FAILED,
+                    }[final_task_status],
+                    status=final_task_status,
+                    expected_run_id=expected_run_id,
+                )
+
                 if success and output.strip() and task_owner_user_id is not None:
                     from ..services.chat_history_service import (
                         persist_assistant_message_no_commit,
@@ -2124,7 +2240,10 @@ async def execute_resume_background(
                     orm_task_updated.output = None
                     orm_task_updated.error_message = output or "Task execution failed."
                 lease_released = release_current_runner_task_lease_with_workforce_sync(
-                    db_new, task_id, status=final_task_status
+                    db_new,
+                    task_id,
+                    status=final_task_status,
+                    expected_run_id=expected_run_id,
                 )
                 db_new.refresh(task_updated)
                 final_status = task_updated.status.value
@@ -2138,6 +2257,12 @@ async def execute_resume_background(
                 delivery_turn_id,
                 DELIVERY_COMPLETED,
             )
+
+        control_event_state = (
+            final_control_snapshot.as_dict()
+            if final_control_snapshot is not None
+            else {}
+        )
 
         if status in {"interrupted", "waiting_for_user"}:
             await manager.broadcast_to_task(
@@ -2153,6 +2278,7 @@ async def execute_resume_background(
                         "agent_id": task_agent_id,
                         "agent_name": agent_name,
                         "agent_logo_url": agent_logo_url,
+                        **control_event_state,
                     },
                 ),
                 task_id,
@@ -2172,6 +2298,7 @@ async def execute_resume_background(
                 "output": output,
                 "file_outputs": normalized_outputs,
                 "success": success,
+                **control_event_state,
                 "metadata": result.get("metadata", {}),
                 "timestamp": datetime.now(timezone.utc).timestamp(),
             },
@@ -2207,12 +2334,26 @@ async def execute_resume_background(
                 error_message,
                 retry_with_new_id=True,
             )
+        current_snapshot = (
+            await task_execution_controller.snapshot(task_id)
+            if expected_run_id is not None
+            else None
+        )
+        if current_snapshot is not None and current_snapshot.run_id != expected_run_id:
+            logger.info(
+                "Suppressing late resume error for task %s run %s; current run is %s",
+                task_id,
+                expected_run_id,
+                current_snapshot.run_id,
+            )
+            return
         await manager.broadcast_to_task(
             {
                 **_terminal_task_error_payload(
                     task_id,
                     error_message,
                     event_type="task_error",
+                    expected_run_id=expected_run_id,
                 ),
                 "task_id": task_id,
                 "error": error_message,
@@ -2517,6 +2658,124 @@ async def redirect_legacy_preview(
     )
 
 
+_VERSIONED_TASK_EVENT_TYPES = {
+    "agent_error",
+    "error",
+    "task_completed",
+    "task_error",
+    "task_pause_requested",
+    "task_paused",
+    "task_resumed",
+    "task_started",
+    "task_waiting_for_user",
+}
+
+
+def _is_versioned_task_event(message: dict[str, Any]) -> bool:
+    message_type = str(message.get("type") or "")
+    if message_type in _VERSIONED_TASK_EVENT_TYPES:
+        return True
+    return (
+        message_type == "trace_event"
+        and str(
+            message.get("event_type")
+            or (
+                message.get("data", {}).get("event_type")
+                if isinstance(message.get("data"), dict)
+                else ""
+            )
+        )
+        == "task_info"
+    )
+
+
+def _event_task_id(message: dict[str, Any]) -> int | None:
+    candidates = [message.get("task_id")]
+    task_data = message.get("task")
+    if isinstance(task_data, dict):
+        candidates.append(task_data.get("id"))
+        candidates.append(task_data.get("task_id"))
+    data = message.get("data")
+    if isinstance(data, dict):
+        candidates.append(data.get("id"))
+        candidates.append(data.get("task_id"))
+    for candidate in candidates:
+        if candidate is None:
+            continue
+        try:
+            return int(candidate)
+        except (TypeError, ValueError):
+            continue
+    return None
+
+
+def _event_task_control_state(message: dict[str, Any]) -> dict[str, Any] | None:
+    sources = [message]
+    task_data = message.get("task")
+    if isinstance(task_data, dict):
+        sources.append(task_data)
+    data = message.get("data")
+    if isinstance(data, dict):
+        sources.append(data)
+
+    for source in sources:
+        version = source.get("state_version")
+        control_state = source.get("control_state")
+        status = source.get("status")
+        if (
+            isinstance(version, int)
+            and version >= 0
+            and isinstance(control_state, str)
+            and isinstance(status, str)
+            and (isinstance(source.get("run_id"), str) or source.get("run_id") is None)
+        ):
+            return {
+                "run_id": source.get("run_id"),
+                "state_version": version,
+                "control_state": control_state,
+                "status": status,
+            }
+    return None
+
+
+async def _with_current_task_control_state(
+    message: dict[str, Any],
+    *,
+    fallback_task_id: int | None = None,
+) -> dict[str, Any]:
+    """Attach one canonical DB state tuple to a state-bearing event.
+
+    Event producers can finish out of order. Preserve a producer-captured
+    state tuple when present; otherwise attach the current row snapshot.
+    Clients compare the resulting ``run_id`` / ``state_version`` before
+    applying the event.
+    """
+
+    if not _is_versioned_task_event(message):
+        return message
+    task_id = _event_task_id(message) or fallback_task_id
+    if task_id is None:
+        return message
+    state = _event_task_control_state(message)
+    if state is None:
+        snapshot = await task_execution_controller.snapshot(task_id)
+        if snapshot is None:
+            return message
+        state = snapshot.as_dict()
+    enriched = dict(message)
+    enriched.update(state)
+    enriched["task_id"] = task_id
+
+    if enriched.get("type") == "trace_event":
+        data = enriched.get("data")
+        enriched["data"] = {**(data if isinstance(data, dict) else {}), **state}
+
+    task_data = enriched.get("task")
+    if isinstance(task_data, dict):
+        enriched["task"] = {**task_data, **state, "id": task_id}
+    return enriched
+
+
 # Connection manager
 class ConnectionManager:
     def __init__(self) -> None:
@@ -2563,13 +2822,18 @@ class ConnectionManager:
         )
 
     async def send_personal_message(self, message: dict, websocket: WebSocket) -> None:
-        await websocket.send_text(json.dumps(message))
+        versioned_message = await _with_current_task_control_state(message)
+        await websocket.send_text(json.dumps(versioned_message))
 
     async def broadcast_to_task(self, message: dict, task_id: int) -> None:
         if task_id in self.active_connections:
+            versioned_message = await _with_current_task_control_state(
+                message,
+                fallback_task_id=task_id,
+            )
             for connection in self.active_connections[task_id].copy():
                 try:
-                    await connection.send_text(json.dumps(message))
+                    await connection.send_text(json.dumps(versioned_message))
                 except (ConnectionError, WebSocketDisconnect, RuntimeError) as e:
                     # Network connection error, remove disconnected connection
                     logger.warning(f"Connection error for task {task_id}: {e}")
@@ -2798,6 +3062,15 @@ async def get_authenticated_user(
 
 
 async def handle_chat_message(
+    websocket: WebSocket, task_id: int, message_data: dict
+) -> None:
+    """Serialize one inbound WebSocket message against task control commands."""
+
+    async with task_execution_controller.command(task_id, TaskCommand.MESSAGE):
+        await _handle_chat_message_unserialized(websocket, task_id, message_data)
+
+
+async def _handle_chat_message_unserialized(
     websocket: WebSocket, task_id: int, message_data: dict
 ) -> None:
     """Handle chat message"""
@@ -3197,6 +3470,7 @@ async def handle_chat_message(
                 pause_accepted = _is_task_pause_accepted(task_id)
                 task_uses_live_control = _task_status_uses_live_control(
                     task.status,
+                    control_state=_task_control_state_value(task),
                     pause_accepted=pause_accepted,
                 )
                 agent_service = None
@@ -3414,6 +3688,12 @@ async def handle_chat_message(
                         # before the coordinator can be registered.
                         delivery_dispatched = posted
 
+                        await task_execution_controller.transition(
+                            task_id,
+                            TaskControlState.RESUME_REQUESTED,
+                            expected_run_id=_task_run_id(task),
+                        )
+
                         previous_task = background_task_manager.running_tasks.get(
                             task_id
                         )
@@ -3422,6 +3702,7 @@ async def handle_chat_message(
                                 task_id=task_id,
                                 agent_service=agent_service,
                                 task_owner_user_id=int(task.user_id),
+                                expected_run_id=_task_run_id(task),
                                 previous_task=previous_task,
                                 pending_user_message=(
                                     None
@@ -3971,6 +4252,10 @@ async def handle_execute_task(
                         "description": task.description,
                     },
                     "success": result.get("success", False),
+                    "run_id": _task_run_id(task),
+                    "state_version": int(task.state_version or 0),
+                    "control_state": _task_control_state_value(task) or "idle",
+                    "status": task.status.value,
                     "result": result.get("output", ""),
                     "output": result.get("output", ""),
                     "chat_response": result.get("chat_response"),
@@ -4670,6 +4955,15 @@ async def handle_intervention(
 async def handle_pause_task(
     websocket: WebSocket, task_id: int, message_data: dict
 ) -> None:
+    """Serialize pause against messages and resume requests for this task."""
+
+    async with task_execution_controller.command(task_id, TaskCommand.PAUSE):
+        await _handle_pause_task_unserialized(websocket, task_id, message_data)
+
+
+async def _handle_pause_task_unserialized(
+    websocket: WebSocket, task_id: int, message_data: dict
+) -> None:
     """Handle task pause request"""
     db: Session | None = None
     try:
@@ -4732,6 +5026,23 @@ async def handle_pause_task(
                 logger.warning(f"No live execution found to pause for task {task_id}")
                 return
             logger.info("Agent pause_execution completed")
+            db.refresh(task)
+            if task.status != TaskStatus.RUNNING:
+                await manager.send_personal_message(
+                    _task_error_payload(
+                        db,
+                        task_id,
+                        "Task finished before the pause request was applied",
+                    ),
+                    websocket,
+                )
+                return
+            apply_task_control_transition(
+                task,
+                TaskControlState.PAUSE_REQUESTED,
+                expected_run_id=_task_run_id(task),
+            )
+            db.commit()
             _mark_task_pause_accepted(task_id)
 
             # This confirms only that the control request was accepted. The
@@ -4784,6 +5095,15 @@ async def handle_pause_task(
 
 
 async def handle_resume_task(
+    websocket: WebSocket, task_id: int, message_data: dict
+) -> None:
+    """Serialize resume against messages and pause requests for this task."""
+
+    async with task_execution_controller.command(task_id, TaskCommand.RESUME):
+        await _handle_resume_task_unserialized(websocket, task_id, message_data)
+
+
+async def _handle_resume_task_unserialized(
     websocket: WebSocket, task_id: int, message_data: dict
 ) -> None:
     """Handle task resume request"""
@@ -4859,6 +5179,11 @@ async def handle_resume_task(
                     websocket,
                 )
                 return
+            await task_execution_controller.transition(
+                task_id,
+                TaskControlState.RESUME_REQUESTED,
+                expected_run_id=_task_run_id(task),
+            )
             previous_task = background_task_manager.running_tasks.get(task_id)
             bg_task: asyncio.Task[None] | None = None
             try:
@@ -4867,6 +5192,7 @@ async def handle_resume_task(
                         task_id=task_id,
                         agent_service=agent_service,
                         task_owner_user_id=int(task.user_id),
+                        expected_run_id=_task_run_id(task),
                         previous_task=previous_task,
                     )
                 )
@@ -4875,13 +5201,35 @@ async def handle_resume_task(
                 if bg_task is not None:
                     bg_task.cancel()
                 background_task_manager.release_resume_reservation(task_id)
+                await asyncio.shield(
+                    task_execution_controller.transition(
+                        task_id,
+                        (
+                            TaskControlState.WAITING_FOR_USER
+                            if task.status == TaskStatus.WAITING_FOR_USER
+                            else TaskControlState.PAUSED
+                        ),
+                        expected_run_id=_task_run_id(task),
+                    )
+                )
                 raise
             logger.info(f"Task {task_id} v2 resume scheduled")
             return
 
         # Check if agent supports resume functionality
         if hasattr(agent_service, "resume_execution"):
+            await task_execution_controller.transition(
+                task_id,
+                TaskControlState.RESUME_REQUESTED,
+                expected_run_id=_task_run_id(task),
+            )
             await agent_service.resume_execution()
+            await task_execution_controller.transition(
+                task_id,
+                TaskControlState.RUNNING,
+                status=TaskStatus.RUNNING,
+                expected_run_id=_task_run_id(task),
+            )
 
             # Send resume confirmation
             await manager.broadcast_to_task(

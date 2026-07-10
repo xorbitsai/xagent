@@ -2193,7 +2193,15 @@ class AgentServiceManager:
                 logger.warning("Quota gate check failed open", exc_info=True)
 
         if manage_task_lease and db_session and tracker_task_id:
-            lease = acquire_task_lease(db_session, int(tracker_task_id))
+            from ..services.task_execution_controller import (
+                TaskCommand,
+                task_execution_controller,
+            )
+
+            async with task_execution_controller.command(
+                int(tracker_task_id), TaskCommand.START_TURN
+            ):
+                lease = acquire_task_lease(db_session, int(tracker_task_id))
             if lease is None:
                 return {
                     "success": False,
@@ -3009,6 +3017,9 @@ async def create_task(
             agent_id=task.agent_id,
             agent_name=task.agent.name if task.agent else None,
             agent_logo_url=task.agent.logo_url if task.agent else None,
+            run_id=task.run_id,
+            state_version=int(task.state_version or 0),
+            control_state=str(task.control_state or "idle"),
         )
 
     except HTTPException:
@@ -3130,6 +3141,9 @@ async def get_tasks(
                         "task_id": task.id,
                         "title": task.title,
                         "status": status_value,
+                        "run_id": task.run_id,
+                        "state_version": int(task.state_version or 0),
+                        "control_state": str(task.control_state or "idle"),
                         "created_at": format_datetime_for_api(task.created_at),
                         "updated_at": format_datetime_for_api(task.updated_at),
                         "model_id": task.model_id,
@@ -3284,6 +3298,9 @@ async def get_task(
                 "title": task.title,
                 "description": task.description,
                 "status": status_value,
+                "run_id": task.run_id,
+                "state_version": int(task.state_version or 0),
+                "control_state": str(task.control_state or "idle"),
                 "created_at": format_datetime_for_api(task.created_at),
                 "updated_at": format_datetime_for_api(task.updated_at),
                 "model_id": model_id,
@@ -3396,6 +3413,9 @@ async def get_task_status(
                 "task_id": task.id,
                 "title": task.title,
                 "status": status_value,
+                "run_id": task.run_id,
+                "state_version": int(task.state_version or 0),
+                "control_state": str(task.control_state or "idle"),
                 "created_at": format_datetime_for_api(task.created_at),
                 "updated_at": format_datetime_for_api(task.updated_at),
                 "model_id": model_id,

@@ -6,6 +6,12 @@ type TestWebSocketMessage = {
   type: string
   timestamp: string
   data?: unknown
+  task_id?: number
+  task?: Record<string, unknown>
+  status?: string
+  run_id?: string | null
+  state_version?: number
+  control_state?: string
 }
 
 const webSocketOptions = vi.hoisted(() => ({
@@ -209,6 +215,72 @@ describe("AppProvider websocket message routing", () => {
     await waitFor(() => {
       expect(screen.getByTestId("task-status").textContent).toBe("failed")
       expect(screen.getByTestId("processing").textContent).toBe("false")
+    })
+  })
+
+  it("ignores out-of-order and semantically stale task state events", async () => {
+    render(
+      <AppProvider token="token">
+        <SeedRunningTask />
+        <StateProbe />
+      </AppProvider>
+    )
+
+    const onMessage = webSocketOptions.current?.onMessage
+    expect(onMessage).toBeDefined()
+
+    act(() => {
+      onMessage?.({
+        type: "task_paused",
+        timestamp: "2026-05-27T05:00:01Z",
+        task_id: 1,
+        status: "paused",
+        run_id: "run-1",
+        state_version: 4,
+        control_state: "paused",
+      })
+    })
+    await waitFor(() => {
+      expect(screen.getByTestId("task-status").textContent).toBe("paused")
+    })
+
+    act(() => {
+      onMessage?.({
+        type: "task_resumed",
+        timestamp: "2026-05-27T05:00:02Z",
+        task_id: 1,
+        status: "running",
+        run_id: "run-1",
+        state_version: 5,
+        control_state: "running",
+      })
+      onMessage?.({
+        type: "task_paused",
+        timestamp: "2026-05-27T05:00:03Z",
+        task_id: 1,
+        status: "paused",
+        run_id: "run-1",
+        state_version: 4,
+        control_state: "paused",
+      })
+    })
+    await waitFor(() => {
+      expect(screen.getByTestId("task-status").textContent).toBe("running")
+    })
+
+    act(() => {
+      onMessage?.({
+        type: "task_paused",
+        timestamp: "2026-05-27T05:00:04Z",
+        task_id: 1,
+        status: "running",
+        run_id: "run-1",
+        state_version: 6,
+        control_state: "running",
+      })
+    })
+    await waitFor(() => {
+      expect(screen.getByTestId("task-status").textContent).toBe("running")
     })
   })
 

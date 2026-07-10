@@ -8,7 +8,7 @@ from typing import Any, Mapping, Tuple
 from fastapi import APIRouter, Depends, Query, Request
 from fastapi.responses import StreamingResponse
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
-from sqlalchemy import String, and_, cast, false, or_
+from sqlalchemy import String, and_, cast, false, func, or_
 from sqlalchemy.orm import Session
 
 from ..models.agent import Agent
@@ -32,6 +32,12 @@ from ..services.a2a_protocol import (
     task_context_id,
     task_state,
     task_to_a2a,
+)
+from ..services.task_execution_controller import (
+    TaskCommand,
+    TaskControlState,
+    apply_task_control_transition,
+    task_execution_controller,
 )
 from ..services.task_orchestrator import (
     TaskTurnError,
@@ -104,6 +110,11 @@ def _resolve_a2a_task(db: Session, task_id: int, agent: Agent) -> Task:
     return task
 
 
+def _task_run_id(task: Task) -> str | None:
+    run_id = getattr(task, "run_id", None)
+    return str(run_id) if run_id is not None else None
+
+
 def _require_bound_agent(path_agent_id: int, agent: Agent) -> None:
     if int(agent.id) != int(path_agent_id) or not is_published_agent(agent):
         raise a2a_error("agent_not_found", "Agent not found.", status_code=404)
@@ -114,19 +125,30 @@ def _schedule_waiting_a2a_resume(
     task_id: int,
     agent_service: Any,
     task_owner_user_id: int,
+    run_id: str | None,
 ) -> None:
     from .websocket import background_task_manager, execute_resume_background
 
+    if not background_task_manager.reserve_resume(task_id):
+        raise RuntimeError(f"Task {task_id} already has a resume in progress")
     previous_task = background_task_manager.running_tasks.get(task_id)
-    bg_task = asyncio.create_task(
-        execute_resume_background(
-            task_id=task_id,
-            agent_service=agent_service,
-            task_owner_user_id=task_owner_user_id,
-            previous_task=previous_task,
+    bg_task: asyncio.Task[None] | None = None
+    try:
+        bg_task = asyncio.create_task(
+            execute_resume_background(
+                task_id=task_id,
+                agent_service=agent_service,
+                task_owner_user_id=task_owner_user_id,
+                expected_run_id=run_id,
+                previous_task=previous_task,
+            )
         )
-    )
-    background_task_manager.register_task(task_id, bg_task)
+        background_task_manager.register_reserved_resume(task_id, bg_task)
+    except BaseException:
+        if bg_task is not None:
+            bg_task.cancel()
+        background_task_manager.release_resume_reservation(task_id)
+        raise
 
 
 def _restore_waiting_resume_claim(db: Session, task_id: int) -> None:
@@ -138,7 +160,14 @@ def _restore_waiting_resume_claim(db: Session, task_id: int) -> None:
             Task.status == TaskStatus.RUNNING,
             Task.runner_id.is_(None),
         )
-        .update({Task.status: TaskStatus.WAITING_FOR_USER}, synchronize_session=False)
+        .update(
+            {
+                Task.status: TaskStatus.WAITING_FOR_USER,
+                Task.control_state: TaskControlState.WAITING_FOR_USER.value,
+                Task.state_version: func.coalesce(Task.state_version, 0) + 1,
+            },
+            synchronize_session=False,
+        )
     )
     db.commit()
     db.expire_all()
@@ -167,6 +196,8 @@ async def _resume_waiting_a2a_task(
                 Task.runner_id: None,
                 Task.lease_expires_at: None,
                 Task.last_heartbeat_at: None,
+                Task.control_state: TaskControlState.RESUME_REQUESTED.value,
+                Task.state_version: func.coalesce(Task.state_version, 0) + 1,
             },
             synchronize_session=False,
         )
@@ -206,7 +237,12 @@ async def _resume_waiting_a2a_task(
         # A WAITING_FOR_USER checkpoint should normally be durable. If it is
         # unavailable, retain the previous restart-safe behavior by starting a
         # new turn from transcript history instead of leaving the task stuck.
-        task.status = TaskStatus.PAUSED
+        apply_task_control_transition(
+            task,
+            TaskControlState.PAUSED,
+            status=TaskStatus.PAUSED,
+            expected_run_id=_task_run_id(task),
+        )
         db.commit()
         db.refresh(task)
         return False
@@ -220,6 +256,7 @@ async def _resume_waiting_a2a_task(
         task_id=task_id,
         agent_service=agent_service,
         task_owner_user_id=int(agent.user_id),
+        run_id=_task_run_id(task),
     )
     return True
 
@@ -298,6 +335,35 @@ def _validate_send_configuration(body: Mapping[str, Any]) -> bool:
 
 
 async def _start_a2a_turn(
+    *,
+    db: Session,
+    agent: Agent,
+    text: str,
+    message_id: str,
+    context_id: str | None,
+    task_id: int | None,
+) -> Task:
+    if task_id is not None:
+        async with task_execution_controller.command(task_id, TaskCommand.MESSAGE):
+            return await _start_a2a_turn_unserialized(
+                db=db,
+                agent=agent,
+                text=text,
+                message_id=message_id,
+                context_id=context_id,
+                task_id=task_id,
+            )
+    return await _start_a2a_turn_unserialized(
+        db=db,
+        agent=agent,
+        text=text,
+        message_id=message_id,
+        context_id=context_id,
+        task_id=task_id,
+    )
+
+
+async def _start_a2a_turn_unserialized(
     *,
     db: Session,
     agent: Agent,
@@ -427,7 +493,12 @@ def _recover_failed_turn_start(
         db.commit()
         return
     if restore_waiting and task.status == TaskStatus.PAUSED:
-        task.status = TaskStatus.WAITING_FOR_USER
+        apply_task_control_transition(
+            task,
+            TaskControlState.WAITING_FOR_USER,
+            status=TaskStatus.WAITING_FOR_USER,
+            expected_run_id=_task_run_id(task),
+        )
         db.commit()
 
 
@@ -779,6 +850,16 @@ async def cancel_task(
 ) -> Any:
     agent, _key = authed
     _require_bound_agent(agent_id, agent)
+    async with task_execution_controller.command(task_id, TaskCommand.CANCEL):
+        return await _cancel_task_unserialized(task_id=task_id, agent=agent, db=db)
+
+
+async def _cancel_task_unserialized(
+    *,
+    task_id: int,
+    agent: Agent,
+    db: Session,
+) -> Any:
     task = _resolve_a2a_task(db, task_id, agent)
     agent_config: dict[str, Any] = (
         dict(task.agent_config) if isinstance(task.agent_config, dict) else {}
@@ -798,7 +879,12 @@ async def cancel_task(
     await background_task_manager.cancel_task(int(task.id))
     agent_config["a2a_state"] = "TASK_STATE_CANCELED"
     setattr(task, "agent_config", agent_config)
-    task.status = TaskStatus.FAILED
+    apply_task_control_transition(
+        task,
+        TaskControlState.FAILED,
+        status=TaskStatus.FAILED,
+        expected_run_id=_task_run_id(task),
+    )
     setattr(task, "output", None)
     setattr(task, "error_message", "Task canceled by A2A client.")
     db.commit()

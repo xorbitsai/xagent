@@ -21,6 +21,17 @@ def test_active_task_user_messages_stay_live_control() -> None:
     assert _task_status_uses_live_control(TaskStatus.WAITING_FOR_USER)
 
 
+def test_requested_control_states_route_messages_consistently() -> None:
+    assert _task_status_uses_live_control(
+        TaskStatus.PAUSED,
+        control_state="resume_requested",
+    )
+    assert not _task_status_uses_live_control(
+        TaskStatus.RUNNING,
+        control_state="pause_requested",
+    )
+
+
 def test_accepted_pause_routes_active_task_out_of_live_control() -> None:
     assert not _task_status_uses_live_control(
         TaskStatus.RUNNING,

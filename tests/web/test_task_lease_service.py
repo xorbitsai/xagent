@@ -76,14 +76,58 @@ def test_task_lease_acquire_refresh_and_release(db_session) -> None:
     assert task.status == TaskStatus.RUNNING
     assert task.runner_id == "runner-a"
     assert task.lease_expires_at is not None
+    assert task.run_id == lease.run_id
+    assert task.state_version == 1
+    assert task.control_state == "running"
 
     assert acquire_task_lease(db_session, int(task.id), runner_id="runner-b") is None
     assert refresh_task_lease(db_session, lease) is True
     assert release_task_lease(db_session, lease, status=TaskStatus.COMPLETED) is True
     db_session.refresh(task)
     assert task.status == TaskStatus.COMPLETED
+    assert task.state_version == 2
+    assert task.control_state == "completed"
     assert task.runner_id is None
     assert task.lease_expires_at is None
+
+
+def test_lease_acquire_rejects_a_superseded_run(db_session) -> None:
+    task = _create_task(db_session, status=TaskStatus.RUNNING)
+    task.run_id = "current-run"
+    task.control_state = "running"
+    task.state_version = 3
+    db_session.commit()
+
+    assert (
+        acquire_task_lease(
+            db_session,
+            int(task.id),
+            runner_id="runner-a",
+            expected_run_id="old-run",
+        )
+        is None
+    )
+    db_session.refresh(task)
+    assert task.run_id == "current-run"
+    assert task.state_version == 3
+
+
+def test_old_lease_cannot_refresh_or_release_a_new_run(db_session) -> None:
+    task = _create_task(db_session)
+    old_lease = acquire_task_lease(db_session, int(task.id), runner_id="runner-a")
+    assert old_lease is not None
+
+    task.run_id = "new-run"
+    task.status = TaskStatus.RUNNING
+    task.control_state = "running"
+    task.runner_id = "runner-a"
+    db_session.commit()
+
+    assert refresh_task_lease(db_session, old_lease) is False
+    assert release_task_lease(db_session, old_lease, status=TaskStatus.FAILED) is False
+    db_session.refresh(task)
+    assert task.run_id == "new-run"
+    assert task.status == TaskStatus.RUNNING
 
 
 def test_stale_running_task_with_checkpoint_becomes_paused(db_session) -> None:

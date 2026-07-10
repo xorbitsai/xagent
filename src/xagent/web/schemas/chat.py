@@ -105,6 +105,9 @@ class TaskCreateResponse(BaseModel):
     agent_id: Optional[int] = None
     agent_name: Optional[str] = None
     agent_logo_url: Optional[str] = None
+    run_id: Optional[str] = None
+    state_version: int = 0
+    control_state: str = "idle"
 
 
 class ExecutionStatus(BaseModel):

@@ -18,6 +18,89 @@ interface WebSocketMessage {
   step_id?: string
   event_type?: string
   event_id?: string
+  run_id?: string | null
+  state_version?: number
+  control_state?: TaskControlState
+  status?: unknown
+  task?: Record<string, unknown>
+}
+
+type TaskControlState =
+  | "idle"
+  | "running"
+  | "pause_requested"
+  | "paused"
+  | "resume_requested"
+  | "waiting_for_user"
+  | "completed"
+  | "failed"
+
+type TaskControlEnvelope = {
+  isStateEvent: boolean
+  taskId?: number
+  runId?: string | null
+  stateVersion?: number
+  controlState?: TaskControlState
+  status?: TaskStatus
+}
+
+const VERSIONED_TASK_EVENT_TYPES = new Set([
+  "agent_error",
+  "error",
+  "task_completed",
+  "task_error",
+  "task_pause_requested",
+  "task_paused",
+  "task_resumed",
+  "task_started",
+  "task_waiting_for_user",
+])
+
+const asMessageRecord = (value: unknown): Record<string, unknown> =>
+  value && typeof value === "object" ? value as Record<string, unknown> : {}
+
+const extractTaskControlEnvelope = (message: WebSocketMessage): TaskControlEnvelope => {
+  const root = message as unknown as Record<string, unknown>
+  const data = asMessageRecord(root.data)
+  const nestedData = asMessageRecord(data.data)
+  const task = asMessageRecord(root.task)
+  const eventType = String(root.event_type || data.event_type || "")
+  const isStateEvent = VERSIONED_TASK_EVENT_TYPES.has(message.type)
+    || (message.type === "trace_event" && eventType === "task_info")
+  if (!isStateEvent) return { isStateEvent: false }
+
+  const rawTaskId = root.task_id ?? task.id ?? task.task_id ?? data.id ?? data.task_id ?? nestedData.id ?? nestedData.task_id
+  const parsedTaskId = Number(rawTaskId)
+  const rawVersion = root.state_version ?? task.state_version ?? data.state_version ?? nestedData.state_version
+  const parsedVersion = Number(rawVersion)
+  const rawRunId = root.run_id ?? task.run_id ?? data.run_id ?? nestedData.run_id
+  const rawControlState = root.control_state ?? task.control_state ?? data.control_state ?? nestedData.control_state
+  const rawStatus = root.status ?? task.status ?? data.status ?? nestedData.status
+
+  return {
+    isStateEvent: true,
+    taskId: Number.isFinite(parsedTaskId) ? parsedTaskId : undefined,
+    runId: typeof rawRunId === "string" || rawRunId === null ? rawRunId : undefined,
+    stateVersion: Number.isInteger(parsedVersion) && parsedVersion >= 0 ? parsedVersion : undefined,
+    controlState: typeof rawControlState === "string" ? rawControlState as TaskControlState : undefined,
+    status: normalizeTaskStatus(rawStatus) || undefined,
+  }
+}
+
+const taskEventMatchesControlState = (
+  message: WebSocketMessage,
+  envelope: TaskControlEnvelope,
+): boolean => {
+  const expected: Partial<Record<string, TaskControlState[]>> = {
+    task_completed: ["completed", "failed"],
+    task_pause_requested: ["pause_requested"],
+    task_paused: ["paused"],
+    task_resumed: ["running"],
+    task_started: ["running"],
+    task_waiting_for_user: ["waiting_for_user"],
+  }
+  const allowed = expected[message.type]
+  return !allowed || !envelope.controlState || allowed.includes(envelope.controlState)
 }
 export interface Interaction {
   type: "select_one" | "select_multiple" | "text_input" | "file_upload" | "confirm" | "number_input" | "action_cards";
@@ -357,6 +440,9 @@ export interface Task {
   agentLogoUrl?: string
   waitingQuestion?: string
   waitingInteractions?: Interaction[]
+  runId?: string | null
+  stateVersion?: number
+  controlState?: TaskControlState
 }
 
 interface StepExecution {
@@ -502,7 +588,7 @@ type AppAction =
   | { type: "ADD_MESSAGE"; payload: Message }
   | { type: "UPSERT_STREAMING_FINAL_ANSWER"; payload: { messageId: string; delta?: string; content?: string; status?: Message["status"]; timestamp: string } }
   | { type: "SET_CURRENT_TASK"; payload: Task | null }
-  | { type: "UPDATE_TASK_STATUS"; payload: { status: Task["status"]; waitingQuestion?: string; waitingInteractions?: Interaction[] } }
+  | { type: "UPDATE_TASK_STATUS"; payload: { status: Task["status"]; waitingQuestion?: string; waitingInteractions?: Interaction[]; runId?: string | null; stateVersion?: number; controlState?: TaskControlState } }
   | { type: "TRIGGER_TASK_UPDATE" }
   | { type: "SET_DAG_EXECUTION"; payload: DAGExecution | null }
   | { type: "SET_CONTEXT_USAGE"; payload: { tokens: number; threshold: number } | null }
@@ -755,6 +841,9 @@ function appReducer(state: AppState, action: AppAction): AppState {
           waitingInteractions: isWaitingForUser
             ? action.payload.waitingInteractions ?? state.currentTask.waitingInteractions
             : undefined,
+          runId: action.payload.runId ?? state.currentTask.runId,
+          stateVersion: action.payload.stateVersion ?? state.currentTask.stateVersion,
+          controlState: action.payload.controlState ?? state.currentTask.controlState,
         },
       }
     }
@@ -1101,6 +1190,9 @@ export function AppProvider({
   const { t } = useI18n()
   const router = useRouter()
   const lastConnectedTaskId = useRef<number | null>(null)
+  const taskStateVersionsRef = useRef(
+    new Map<number, { version: number; runId?: string | null }>()
+  )
 
   // Ref to track current state for WebSocket message handler
   const stateRef = useRef(state)
@@ -1315,6 +1407,48 @@ export function AppProvider({
       return
     }
 
+    const controlEnvelope = extractTaskControlEnvelope(message)
+    if (controlEnvelope.isStateEvent && controlEnvelope.taskId !== undefined) {
+      const knownState = taskStateVersionsRef.current.get(controlEnvelope.taskId)
+      if (controlEnvelope.stateVersion === undefined) {
+        // Once the server has established the versioned protocol for a task,
+        // legacy/unversioned replay events must not be allowed to roll it back.
+        if (knownState) return
+      } else {
+        const isOlderVersion = knownState
+          && controlEnvelope.stateVersion < knownState.version
+        const isDifferentRunAtSameVersion = knownState
+          && controlEnvelope.stateVersion === knownState.version
+          && knownState.runId !== undefined
+          && controlEnvelope.runId !== undefined
+          && knownState.runId !== controlEnvelope.runId
+        if (isOlderVersion || isDifferentRunAtSameVersion) return
+        taskStateVersionsRef.current.set(controlEnvelope.taskId, {
+          version: controlEnvelope.stateVersion,
+          runId: controlEnvelope.runId,
+        })
+      }
+
+      // A late event may have an old semantic type (for example
+      // ``task_paused``) after a newer run is already RUNNING. The backend
+      // rewrites its state tuple to the canonical row; apply only that tuple
+      // and skip the stale event-specific side effects.
+      if (!taskEventMatchesControlState(message, controlEnvelope)) {
+        if (controlEnvelope.status) {
+          dispatch({
+            type: "UPDATE_TASK_STATUS",
+            payload: {
+              status: controlEnvelope.status,
+              runId: controlEnvelope.runId,
+              stateVersion: controlEnvelope.stateVersion,
+              controlState: controlEnvelope.controlState,
+            },
+          })
+        }
+        return
+      }
+    }
+
     // Normal message processing when not in replay mode
     if (isFinalAnswerStreamEventType(message.type)) {
       const payload = getFinalAnswerStreamActionPayload({
@@ -1326,17 +1460,6 @@ export function AppProvider({
       })
       if (payload) {
         dispatch({ type: "UPSERT_STREAMING_FINAL_ANSWER", payload })
-        if (message.type === "final_answer_start") {
-          dispatch({ type: "SET_PROCESSING", payload: true })
-        } else if (message.type === "final_answer_end") {
-          dispatch({ type: "UPDATE_TASK_STATUS", payload: { status: "completed" } })
-          dispatch({ type: "TRIGGER_TASK_UPDATE" })
-          dispatch({ type: "SET_PROCESSING", payload: false })
-        } else if (message.type === "final_answer_error") {
-          dispatch({ type: "UPDATE_TASK_STATUS", payload: { status: "failed" } })
-          dispatch({ type: "TRIGGER_TASK_UPDATE" })
-          dispatch({ type: "SET_PROCESSING", payload: false })
-        }
       }
       return
     }
@@ -1419,6 +1542,9 @@ export function AppProvider({
                 agentLogoUrl: taskData.agent_logo_url,
                 waitingQuestion: taskData.waiting_question,
                 waitingInteractions: normalizeInteractions(taskData.waiting_interactions),
+                runId: taskData.run_id,
+                stateVersion: taskData.state_version,
+                controlState: taskData.control_state,
               }
             })
 
@@ -1574,17 +1700,6 @@ export function AppProvider({
               return
             }
             dispatch({ type: "UPSERT_STREAMING_FINAL_ANSWER", payload })
-            if (eventType === "final_answer_start") {
-              dispatch({ type: "SET_PROCESSING", payload: true })
-            } else if (eventType === "final_answer_end") {
-              dispatch({ type: "UPDATE_TASK_STATUS", payload: { status: "completed" } })
-              dispatch({ type: "TRIGGER_TASK_UPDATE" })
-              dispatch({ type: "SET_PROCESSING", payload: false })
-            } else if (eventType === "final_answer_error") {
-              dispatch({ type: "UPDATE_TASK_STATUS", payload: { status: "failed" } })
-              dispatch({ type: "TRIGGER_TASK_UPDATE" })
-              dispatch({ type: "SET_PROCESSING", payload: false })
-            }
           }
 
           // Agent progress messages belong in the execution timeline, not the chat transcript.
@@ -3773,7 +3888,12 @@ export function AppProvider({
         const taskData = normalizeTaskCompletedMessage(message)
         dispatch({
           type: "UPDATE_TASK_STATUS",
-          payload: { status: taskData.status }
+          payload: {
+            status: taskData.status,
+            runId: controlEnvelope.runId,
+            stateVersion: controlEnvelope.stateVersion,
+            controlState: controlEnvelope.controlState,
+          }
         })
         dispatch({ type: "TRIGGER_TASK_UPDATE" })
         dispatch({ type: "SET_PROCESSING", payload: false })  // Stop processing on task completion
@@ -3942,8 +4062,30 @@ export function AppProvider({
 
       case "task_paused":
         console.trace('Original message:', JSON.stringify(message), 'Handler: handleMessage (task_paused)')
-        dispatch({ type: "UPDATE_TASK_STATUS", payload: { status: "paused" } })
+        dispatch({
+          type: "UPDATE_TASK_STATUS",
+          payload: {
+            status: controlEnvelope.status || "paused",
+            runId: controlEnvelope.runId,
+            stateVersion: controlEnvelope.stateVersion,
+            controlState: controlEnvelope.controlState || "paused",
+          },
+        })
         dispatch({ type: "SET_PROCESSING", payload: false })
+        break
+
+      case "task_pause_requested":
+        if (controlEnvelope.status) {
+          dispatch({
+            type: "UPDATE_TASK_STATUS",
+            payload: {
+              status: controlEnvelope.status,
+              runId: controlEnvelope.runId,
+              stateVersion: controlEnvelope.stateVersion,
+              controlState: controlEnvelope.controlState || "pause_requested",
+            },
+          })
+        }
         break
 
       case "task_waiting_for_user":
@@ -3954,9 +4096,12 @@ export function AppProvider({
         dispatch({
           type: "UPDATE_TASK_STATUS",
           payload: {
-            status: "waiting_for_user",
+            status: controlEnvelope.status || "waiting_for_user",
             waitingQuestion: waitingMessage && waitingMessage !== "Task waiting for user response" ? waitingMessage : undefined,
             waitingInteractions: interactions.length > 0 ? interactions : undefined,
+            runId: controlEnvelope.runId,
+            stateVersion: controlEnvelope.stateVersion,
+            controlState: controlEnvelope.controlState || "waiting_for_user",
           }
         })
         dispatch({ type: "SET_PROCESSING", payload: false })
@@ -3983,7 +4128,15 @@ export function AppProvider({
 
       case "task_resumed":
         console.trace('Original message:', JSON.stringify(message), 'Handler: handleMessage (task_resumed)')
-        dispatch({ type: "UPDATE_TASK_STATUS", payload: { status: "running" } })
+        dispatch({
+          type: "UPDATE_TASK_STATUS",
+          payload: {
+            status: controlEnvelope.status || "running",
+            runId: controlEnvelope.runId,
+            stateVersion: controlEnvelope.stateVersion,
+            controlState: controlEnvelope.controlState || "running",
+          },
+        })
         break
 
       case "agent_error":
@@ -3994,7 +4147,12 @@ export function AppProvider({
         if (agentErrorTaskStatus) {
           dispatch({
             type: "UPDATE_TASK_STATUS",
-            payload: { status: agentErrorTaskStatus },
+            payload: {
+              status: agentErrorTaskStatus,
+              runId: controlEnvelope.runId,
+              stateVersion: controlEnvelope.stateVersion,
+              controlState: controlEnvelope.controlState,
+            },
           })
           dispatch({ type: "TRIGGER_TASK_UPDATE" })
         }
@@ -4239,6 +4397,9 @@ export function AppProvider({
             agentLogoUrl: taskData.agent_logo_url,
             waitingQuestion: taskData.waiting_question,
             waitingInteractions: normalizeInteractions(taskData.waiting_interactions),
+            runId: taskData.run_id,
+            stateVersion: taskData.state_version,
+            controlState: taskData.control_state,
           }
           dispatch({ type: "SET_CURRENT_TASK", payload: newTask })
           dispatch({ type: "TRIGGER_TASK_UPDATE" })

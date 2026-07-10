@@ -19,6 +19,13 @@ from ...models.task import Task, TaskStatus
 from ...models.user import User
 from ...models.user_channel import UserChannel
 from ...services.execution_result_projection import project_execution_result_for_channel
+from ...services.task_execution_controller import (
+    TaskCommand,
+    TaskControlState,
+    apply_task_control_transition,
+    control_state_for_status,
+    task_execution_controller,
+)
 from .trace_handler import FeishuTraceHandler
 
 logger = logging.getLogger(__name__)
@@ -121,6 +128,8 @@ class FeishuBotInstance:
 
         db_gen = get_db()
         db = next(db_gen)
+        claimed_task_id: int | None = None
+        claimed_run_id: str | None = None
         try:
             user = None
             if self.channel_id:
@@ -246,8 +255,27 @@ class FeishuBotInstance:
                 self._save_active_tasks()
             else:
                 is_new_task = False
-                task.status = TaskStatus.PENDING
+
+            async with task_execution_controller.command(
+                int(task.id), TaskCommand.CHANNEL_MESSAGE
+            ):
+                db.refresh(task)
+                if task.status == TaskStatus.RUNNING:
+                    await self._send_text(
+                        chat_id,
+                        "I'm still working on the previous message. "
+                        "Please wait for it to finish.",
+                    )
+                    return
+                run_snapshot = apply_task_control_transition(
+                    task,
+                    TaskControlState.RUNNING,
+                    status=TaskStatus.RUNNING,
+                    new_run=True,
+                )
                 db.commit()
+                claimed_task_id = int(task.id)
+                claimed_run_id = run_snapshot.run_id
 
             agent_manager = get_agent_manager()
             agent_service = await agent_manager.get_agent_for_task(
@@ -320,8 +348,19 @@ class FeishuBotInstance:
                 )
 
             projection = project_execution_result_for_channel(result)
-            task.status = projection.task_status
-            db.commit()
+            db.refresh(task)
+            projected_control_state = control_state_for_status(projection.task_status)
+            if (
+                task.status != projection.task_status
+                or task.control_state != projected_control_state.value
+            ):
+                apply_task_control_transition(
+                    task,
+                    projected_control_state,
+                    status=projection.task_status,
+                    expected_run_id=run_snapshot.run_id,
+                )
+                db.commit()
 
             output = projection.visible_text
 
@@ -340,6 +379,26 @@ class FeishuBotInstance:
 
         except Exception as e:
             logger.error(f"Error processing Feishu message: {e}", exc_info=True)
+            if claimed_task_id is not None and claimed_run_id is not None:
+                try:
+                    snapshot = await task_execution_controller.snapshot(claimed_task_id)
+                    if (
+                        snapshot is not None
+                        and snapshot.run_id == claimed_run_id
+                        and snapshot.status == TaskStatus.RUNNING
+                    ):
+                        await task_execution_controller.transition(
+                            claimed_task_id,
+                            TaskControlState.FAILED,
+                            status=TaskStatus.FAILED,
+                            expected_run_id=claimed_run_id,
+                        )
+                except Exception:
+                    logger.warning(
+                        "Failed to finalize Feishu task %s after channel error",
+                        claimed_task_id,
+                        exc_info=True,
+                    )
             await self._send_text(
                 chat_id, "Sorry, an error occurred while processing your request."
             )

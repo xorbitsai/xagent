@@ -1089,6 +1089,11 @@ def test_database_trace_handler_prunes_checkpoint_history(
             "xagent.web.api.trace_handlers.get_checkpoint_history_limit",
             lambda: 3,
         )
+        # Force the batched-delete loop to run multiple chunks.
+        monkeypatch.setattr(
+            "xagent.web.api.trace_handlers.PRUNE_DELETE_CHUNK_SIZE",
+            1,
+        )
 
         # A non-checkpoint system event and another execution's checkpoint
         # must both survive pruning.

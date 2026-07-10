@@ -2084,7 +2084,7 @@ class ReActPattern(AgentPattern):
     def _args_hash(self, args: dict[str, Any]) -> str:
         try:
             canonical = json.dumps(args, sort_keys=True, default=str)
-        except TypeError:
+        except (TypeError, ValueError):
             canonical = str(args)
         # Digest instead of the raw JSON: the hash is persisted in every
         # ledger record, so large args would otherwise be stored twice.

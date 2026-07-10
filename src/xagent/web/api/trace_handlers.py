@@ -27,6 +27,10 @@ from ...web.services.trace_message_storage import (
 
 logger = logging.getLogger(__name__)
 
+# Keep IN-clause deletes under SQLite's bind-parameter limit (commonly 999);
+# matches SQL_IN_CLAUSE_CHUNK_SIZE in trace_message_storage.
+PRUNE_DELETE_CHUNK_SIZE = 900
+
 
 def _convert_float_to_datetime(timestamp: Any) -> datetime:
     """Convert float timestamp to datetime for database storage."""
@@ -342,9 +346,13 @@ class DatabaseTraceHandler(BaseTraceHandler):
             if not stale_rows:
                 return
             stale_ids = [row_id for (row_id,) in stale_rows]
-            db.query(DatabaseTraceEvent).filter(
-                DatabaseTraceEvent.id.in_(stale_ids)
-            ).delete(synchronize_session=False)
+            # Chunk the IN clause: a backlog from previously-disabled pruning
+            # can exceed SQLite's bind-parameter limit in one statement.
+            for start in range(0, len(stale_ids), PRUNE_DELETE_CHUNK_SIZE):
+                chunk = stale_ids[start : start + PRUNE_DELETE_CHUNK_SIZE]
+                db.query(DatabaseTraceEvent).filter(
+                    DatabaseTraceEvent.id.in_(chunk)
+                ).delete(synchronize_session=False)
             db.commit()
             logger.debug(
                 "Pruned %d checkpoint rows for task %s execution %s",

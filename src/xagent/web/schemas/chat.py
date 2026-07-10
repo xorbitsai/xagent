@@ -110,6 +110,12 @@ class TaskCreateResponse(BaseModel):
     control_state: str = "idle"
 
 
+class LatestTaskResponse(BaseModel):
+    """Most recent task for a guest identity, if one exists"""
+
+    task_id: Optional[int] = None
+
+
 class ExecutionStatus(BaseModel):
     """Execution status model"""
 

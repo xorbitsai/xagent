@@ -68,24 +68,59 @@ function PublicConversationContent({
   const publicApiPrefix = authMode === "share" ? "/api/share" : "/api/widget"
 
   useEffect(() => {
+    let cancelled = false
     setHasResolvedStoredTask(false)
-    const savedTaskId = localStorage.getItem(storageKey)
-    if (!savedTaskId) {
-      setTaskId(null, { navigate: false })
-      setHasResolvedStoredTask(true)
-      return
+
+    const readStoredTaskId = () => {
+      const savedTaskId = localStorage.getItem(storageKey)
+      if (!savedTaskId) return null
+      const parsedTaskId = parseInt(savedTaskId, 10)
+      return Number.isNaN(parsedTaskId) ? null : parsedTaskId
     }
 
-    const parsedTaskId = parseInt(savedTaskId, 10)
-    if (Number.isNaN(parsedTaskId)) {
-      setTaskId(null, { navigate: false })
-      setHasResolvedStoredTask(true)
-      return
+    const resolveTaskId = async () => {
+      const storedTaskId = readStoredTaskId()
+      if (storedTaskId !== null) {
+        if (!cancelled) {
+          setTaskId(storedTaskId, { navigate: false })
+          setHasResolvedStoredTask(true)
+        }
+        return
+      }
+
+      // Nothing cached on this browser. Widget guests may carry a stable
+      // end-user identity (data-end-user-id) rather than a per-browser
+      // random id, so check whether this guest already has a conversation
+      // from another device/browser before starting a new one.
+      if (authMode === "widget") {
+        try {
+          const response = await fetch(`${getApiUrl()}${publicApiPrefix}/tasks/latest`, {
+            headers: { "Authorization": `Bearer ${accessToken}` },
+          })
+          if (response.ok) {
+            const data = await response.json()
+            if (!cancelled && typeof data.task_id === "number") {
+              setTaskId(data.task_id, { navigate: false })
+              setHasResolvedStoredTask(true)
+              return
+            }
+          }
+        } catch {
+          // Fall through to a fresh conversation if the lookup fails.
+        }
+      }
+
+      if (!cancelled) {
+        setTaskId(null, { navigate: false })
+        setHasResolvedStoredTask(true)
+      }
     }
 
-    setTaskId(parsedTaskId, { navigate: false })
-    setHasResolvedStoredTask(true)
-  }, [setTaskId, storageKey])
+    resolveTaskId()
+    return () => {
+      cancelled = true
+    }
+  }, [accessToken, authMode, publicApiPrefix, setTaskId, storageKey])
 
   useEffect(() => {
     if (!hasResolvedStoredTask) {

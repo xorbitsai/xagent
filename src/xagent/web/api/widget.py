@@ -23,7 +23,7 @@ from ..auth_config import JWT_ALGORITHM, JWT_SECRET_KEY
 from ..models.agent import Agent, is_workforce_generated_manager_agent
 from ..models.database import get_db
 from ..models.user import User
-from ..schemas.chat import TaskCreateRequest, TaskCreateResponse
+from ..schemas.chat import LatestTaskResponse, TaskCreateRequest, TaskCreateResponse
 from .auth import create_access_token
 from .public_chat_access import (
     PublicChatAccessContext,
@@ -31,6 +31,7 @@ from .public_chat_access import (
     build_public_chat_dependency,
     create_public_chat_access_token,
     create_public_chat_task,
+    get_latest_public_chat_task,
     public_chat_websocket_endpoint,
     upload_public_chat_files,
 )
@@ -297,6 +298,18 @@ async def upload_widget_file(
         access_context=widget_info,
         db=db,
     )
+
+
+@widget_router.get("/tasks/latest", response_model=LatestTaskResponse)
+async def get_latest_widget_task(
+    widget_info: PublicChatAccessContext = Depends(get_current_widget_user_dep),
+    db: Session = Depends(get_db),
+) -> Any:
+    """Look up the guest's most recent task, so a returning guest with a
+    stable end-user identity (data-end-user-id) can resume it on a new
+    browser/device instead of local storage forcing a fresh conversation."""
+    task = get_latest_public_chat_task(db, widget_info)
+    return LatestTaskResponse(task_id=int(task.id) if task else None)
 
 
 @widget_router.post("/chat/task/create", response_model=TaskCreateResponse)

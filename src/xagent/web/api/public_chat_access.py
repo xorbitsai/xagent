@@ -250,6 +250,34 @@ def get_task_for_public_context(
     return task
 
 
+def get_latest_public_chat_task(
+    db: Session, access_context: PublicChatAccessContext
+) -> Task | None:
+    """Find the most recent widget task for this guest identity.
+
+    A guest_id derived from a random per-browser id (the default when the
+    embedding page passes no end-user identity) is only ever seen from one
+    browser, so this naturally returns nothing for it. A guest_id supplied by
+    the embedding page via data-end-user-id is stable across devices, so a
+    returning guest can resume their prior conversation instead of starting a
+    new one just because local storage is empty on this browser.
+    """
+    if access_context.widget_agent_id is None:
+        return None
+    return (
+        db.query(Task)
+        .filter(
+            Task.user_id == access_context.user.id,
+            Task.agent_id == access_context.widget_agent_id,
+            Task.channel_id.is_(access_context.channel_id),
+            Task.source == "widget",
+            Task.agent_config["guest_id"].as_string() == access_context.guest_id,
+        )
+        .order_by(Task.id.desc())
+        .first()
+    )
+
+
 def get_task_for_share_context(
     db: Session, task_id: int, access_context: ShareChatAccessContext
 ) -> Task:

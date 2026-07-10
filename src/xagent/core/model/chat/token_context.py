@@ -104,9 +104,12 @@ class TokenUsage:
         )
 
 
-# ContextVar for thread-local token tracking
-token_context: contextvars.ContextVar[TokenUsage] = contextvars.ContextVar(
-    "token_context", default=TokenUsage()
+# ContextVar for thread-local token tracking. Default is None (not a shared
+# TokenUsage instance): a single shared default would accumulate forever for
+# untracked paths (preview/builder that never call set_token_usage), leaking
+# memory. get_token_usage() lazily creates a per-context instance instead.
+token_context: contextvars.ContextVar[Optional[TokenUsage]] = contextvars.ContextVar(
+    "token_context", default=None
 )
 
 
@@ -167,8 +170,12 @@ class TokenContextManager:
 
 
 def get_token_usage() -> TokenUsage:
-    """Get the current token usage from context."""
-    return token_context.get()
+    """Get the current token usage, lazily creating a per-context instance."""
+    usage = token_context.get()
+    if usage is None:
+        usage = TokenUsage()
+        token_context.set(usage)
+    return usage
 
 
 def add_token_usage(
@@ -185,7 +192,7 @@ def add_token_usage(
         model: Model name for tracking
         call_type: Type of call (chat, stream_chat, vision_chat, etc.)
     """
-    usage = token_context.get()
+    usage = get_token_usage()
     if input_tokens or output_tokens:
         # Increment LLM call counter for each API call
         usage.increment_llm_calls()
@@ -204,7 +211,7 @@ def add_token_usage(
 
 def add_tool_call_usage(count: int = 1) -> None:
     """Record one (or more) tool invocations on the current context."""
-    token_context.get().increment_tool_calls(count)
+    get_token_usage().increment_tool_calls(count)
 
 
 def reset_token_usage() -> TokenUsage:
@@ -221,6 +228,6 @@ def set_token_usage(usage: TokenUsage) -> TokenUsage:
 
 def get_and_reset_token_usage() -> TokenUsage:
     """Get current usage and reset the context."""
-    usage = token_context.get()
+    usage = get_token_usage()
     reset_token_usage()
     return usage

@@ -322,7 +322,26 @@ class TaskTurnOrchestrator:
                     task_id,
                     "turn scheduling failed after claim commit",
                 )
+                try:
+                    await asyncio.to_thread(
+                        _mark_turn_delivery_status_sync,
+                        task_id,
+                        payload.turn_id,
+                        "failed",
+                    )
+                except Exception:
+                    logger.exception(
+                        "Could not mark failed delivery for task=%s turn=%s",
+                        task_id,
+                        payload.turn_id,
+                    )
                 raise
+            await asyncio.to_thread(
+                _mark_turn_delivery_status_sync,
+                task_id,
+                payload.turn_id,
+                "dispatched",
+            )
             return res, handle
 
         claimed, bg_task = await asyncio.shield(_claim_and_schedule())
@@ -395,7 +414,7 @@ def _begin_turn_atomic_sync(
     RUNNING, and any exception means it is not.
     """
     from ..models.database import get_session_local
-    from .chat_history_service import persist_user_message_no_commit
+    from .chat_history_service import DELIVERY_PENDING, persist_user_message_no_commit
 
     if kind == TurnKind.CREATE:
         status_filter = Task.status == TaskStatus.PENDING
@@ -450,6 +469,7 @@ def _begin_turn_atomic_sync(
             content=payload.transcript_message,
             attachments=payload.attachments,
             turn_id=payload.turn_id,
+            delivery_status=DELIVERY_PENDING,
         )
         if persisted_message is not None:
             db.flush()
@@ -570,6 +590,22 @@ def _mark_task_failed_if_running(task_id: int, error_message: str) -> None:
             task_id,
             e,
             exc_info=True,
+        )
+
+
+def _mark_turn_delivery_status_sync(task_id: int, turn_id: str, status: str) -> None:
+    """Advance the user-message handoff after scheduling succeeds or fails."""
+
+    from ..models.database import get_session_local
+    from .chat_history_service import mark_user_message_delivery
+
+    SessionLocal = get_session_local()
+    with SessionLocal() as db:
+        mark_user_message_delivery(
+            db,
+            task_id=task_id,
+            turn_id=turn_id,
+            status=status,
         )
 
 

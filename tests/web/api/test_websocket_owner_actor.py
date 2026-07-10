@@ -24,6 +24,7 @@ from xagent.web.models.chat_message import TaskChatMessage
 from xagent.web.models.database import Base, get_db, get_engine, init_db
 from xagent.web.models.task import Task, TaskStatus
 from xagent.web.models.user import User
+from xagent.web.services.chat_history_service import DELIVERY_FAILED, DELIVERY_PENDING
 
 
 @pytest.fixture()
@@ -190,6 +191,64 @@ async def test_running_chat_message_is_persisted_before_resume(db_session) -> No
 
 
 @pytest.mark.asyncio
+async def test_resume_registration_failure_cancels_created_coordinator(
+    db_session,
+) -> None:
+    owner = _user(db_session, "owner")
+    task = _task(db_session, owner.id, status=TaskStatus.RUNNING)
+    agent = MagicMock()
+    agent.supports_live_control.return_value = True
+    agent.get_dag_pattern.return_value = None
+    agent.post_user_message = AsyncMock(return_value=True)
+    mgr = MagicMock(get_agent_for_task=AsyncMock(return_value=agent))
+    ws_manager = MagicMock(
+        broadcast_to_task=AsyncMock(),
+        send_personal_message=AsyncMock(),
+    )
+    bg_mgr = MagicMock()
+    bg_mgr.reserve_resume.return_value = True
+    bg_mgr.running_tasks.get.return_value = None
+    bg_mgr.register_reserved_resume.side_effect = RuntimeError("reservation lost")
+    bg_handle = MagicMock()
+
+    with (
+        patch("xagent.web.api.chat.get_agent_manager", return_value=mgr),
+        patch("xagent.web.api.websocket.manager", ws_manager),
+        patch("xagent.web.api.websocket.execute_resume_background", MagicMock()),
+        patch(
+            "xagent.web.api.websocket.asyncio.create_task",
+            return_value=bg_handle,
+        ),
+        patch("xagent.web.api.websocket.background_task_manager", bg_mgr),
+    ):
+        await handle_chat_message(
+            MagicMock(),
+            int(task.id),
+            {
+                "message": "Apply this safely",
+                "client_message_id": "registration-failure-turn",
+                "user": owner,
+                "files": [],
+            },
+        )
+
+    bg_handle.cancel.assert_called_once()
+    db_session.expire_all()
+    stored = (
+        db_session.query(TaskChatMessage)
+        .filter(TaskChatMessage.turn_id == "registration-failure-turn")
+        .one()
+    )
+    assert stored.delivery_status == DELIVERY_FAILED
+    rejected = [
+        call.args[0]
+        for call in ws_manager.send_personal_message.call_args_list
+        if call.args[0].get("type") == "message_rejected"
+    ]
+    assert len(rejected) == 1
+
+
+@pytest.mark.asyncio
 async def test_retried_durable_message_is_accepted_without_reexecution(
     db_session,
 ) -> None:
@@ -243,6 +302,107 @@ async def test_retried_durable_message_is_accepted_without_reexecution(
         if call.args[0].get("type") == "message_accepted"
     ]
     assert len(accepted) == 1
+
+
+@pytest.mark.asyncio
+async def test_reusing_client_id_with_different_content_is_rejected(
+    db_session,
+) -> None:
+    owner = _user(db_session, "owner")
+    task = _task(db_session, owner.id, status=TaskStatus.COMPLETED)
+    db_session.add(
+        TaskChatMessage(
+            task_id=int(task.id),
+            user_id=int(owner.id),
+            role="user",
+            content="Original content",
+            message_type="user_message",
+            turn_id="stable-turn-1",
+        )
+    )
+    db_session.commit()
+    ws_manager = MagicMock(
+        broadcast_to_task=AsyncMock(),
+        send_personal_message=AsyncMock(),
+    )
+    begin_turn = AsyncMock()
+
+    with (
+        patch("xagent.web.api.websocket.manager", ws_manager),
+        patch(
+            "xagent.web.services.task_orchestrator.TaskTurnOrchestrator.begin_turn",
+            new=begin_turn,
+        ),
+    ):
+        await handle_chat_message(
+            MagicMock(),
+            int(task.id),
+            {
+                "message": "Different content",
+                "client_message_id": "stable-turn-1",
+                "user": owner,
+                "files": [],
+            },
+        )
+
+    begin_turn.assert_not_awaited()
+    rejected = [
+        call.args[0]
+        for call in ws_manager.send_personal_message.call_args_list
+        if call.args[0].get("type") == "message_rejected"
+    ]
+    assert len(rejected) == 1
+    assert rejected[0]["retry_with_new_id"] is True
+
+
+@pytest.mark.asyncio
+async def test_failed_durable_delivery_is_not_silently_accepted(db_session) -> None:
+    owner = _user(db_session, "owner")
+    task = _task(db_session, owner.id, status=TaskStatus.FAILED)
+    db_session.add(
+        TaskChatMessage(
+            task_id=int(task.id),
+            user_id=int(owner.id),
+            role="user",
+            content="Retry after checkpoint failure",
+            message_type="user_message",
+            turn_id="failed-turn-1",
+            delivery_status=DELIVERY_FAILED,
+        )
+    )
+    db_session.commit()
+    ws_manager = MagicMock(
+        broadcast_to_task=AsyncMock(),
+        send_personal_message=AsyncMock(),
+    )
+    begin_turn = AsyncMock()
+
+    with (
+        patch("xagent.web.api.websocket.manager", ws_manager),
+        patch(
+            "xagent.web.services.task_orchestrator.TaskTurnOrchestrator.begin_turn",
+            new=begin_turn,
+        ),
+    ):
+        await handle_chat_message(
+            MagicMock(),
+            int(task.id),
+            {
+                "message": "Retry after checkpoint failure",
+                "client_message_id": "failed-turn-1",
+                "user": owner,
+                "files": [],
+            },
+        )
+
+    begin_turn.assert_not_awaited()
+    rejected = [
+        call.args[0]
+        for call in ws_manager.send_personal_message.call_args_list
+        if call.args[0].get("type") == "message_rejected"
+    ]
+    assert len(rejected) == 1
+    assert rejected[0]["retry_with_new_id"] is True
 
 
 @pytest.mark.asyncio
@@ -425,6 +585,18 @@ async def test_execute_resume_background_persists_missing_checkpoint_failure(
     agent = MagicMock(
         resume_execution_by_id=AsyncMock(return_value=None),
     )
+    db_session.add(
+        TaskChatMessage(
+            task_id=int(task.id),
+            user_id=int(owner.id),
+            role="user",
+            content="Deferred guidance",
+            message_type="user_message",
+            turn_id="deferred-failure-turn",
+            delivery_status=DELIVERY_PENDING,
+        )
+    )
+    db_session.commit()
     ws_manager = MagicMock(broadcast_to_task=AsyncMock())
 
     with patch("xagent.web.api.websocket.manager", ws_manager):
@@ -432,12 +604,19 @@ async def test_execute_resume_background_persists_missing_checkpoint_failure(
             task_id=int(task.id),
             agent_service=agent,
             task_owner_user_id=int(owner.id),
+            delivery_turn_id="deferred-failure-turn",
         )
 
     db_session.expire_all()
     db_session.refresh(task)
     assert task.status == TaskStatus.FAILED
     assert "No resumable execution checkpoint" in str(task.error_message)
+    delivery = (
+        db_session.query(TaskChatMessage)
+        .filter(TaskChatMessage.turn_id == "deferred-failure-turn")
+        .one()
+    )
+    assert delivery.delivery_status == DELIVERY_FAILED
     failures = [
         call.args[0]
         for call in ws_manager.broadcast_to_task.call_args_list

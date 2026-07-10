@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import asyncio
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
@@ -58,3 +58,13 @@ async def test_get_agent_for_task_allows_different_tasks_to_build_concurrently()
     )
 
     assert started == {42, 43}
+
+
+def test_remove_agent_releases_per_task_build_lock() -> None:
+    manager = AgentServiceManager()
+    manager._agent_build_locks[42] = asyncio.Lock()
+    manager._cleanup_workspace_directory = MagicMock()
+
+    manager.remove_agent(42)
+
+    assert 42 not in manager._agent_build_locks

@@ -3,7 +3,7 @@ import { createFileChipHTML } from "./FileChip";
 import { useRouter } from "next/navigation";
 import { Paperclip, X, File as FileIcon, Sparkles, Pause, Play, Loader2, ArrowUp, Globe, Mic, Square } from "lucide-react";
 import { Button } from "@/components/ui/button";
-import { cn, getApiUrl, getUploadApiUrl } from "@/lib/utils";
+import { cn, generateClientMessageId, getApiUrl, getUploadApiUrl } from "@/lib/utils";
 import { useI18n } from "@/contexts/i18n-context";
 import { useApp } from "@/contexts/app-context-chat";
 import { ConfigDialog } from "@/components/config-dialog";
@@ -587,8 +587,7 @@ export function ChatInput({
       const previousAttempt = deliveryAttemptRef.current;
       const clientMessageId = previousAttempt?.key === deliveryKey
         ? previousAttempt.clientMessageId
-        : globalThis.crypto?.randomUUID?.()
-          ?? `msg-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+        : generateClientMessageId();
       deliveryAttemptRef.current = { key: deliveryKey, clientMessageId };
 
       const configToSend = {
@@ -614,6 +613,12 @@ export function ChatInput({
         setInternalMessage("");
       }
     } catch (error) {
+      if (
+        error instanceof Error
+        && (error as Error & { retryWithNewId?: boolean }).retryWithNewId === true
+      ) {
+        deliveryAttemptRef.current = null;
+      }
       toast.error(
         error instanceof Error
           ? error.message

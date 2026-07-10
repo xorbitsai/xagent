@@ -34,6 +34,11 @@ class MockWebSocket {
   close() {
     this.readyState = 3
   }
+
+  triggerClose(code = 1006, reason = "network lost") {
+    this.readyState = 3
+    this.onclose?.({ code, reason } as CloseEvent)
+  }
 }
 
 describe("useWebSocket message delivery", () => {
@@ -140,5 +145,75 @@ describe("useWebSocket message delivery", () => {
       client_message_id: "stable-turn-1",
       turn_id: "stable-turn-1",
     })
+  })
+
+  it("marks definitive rejections so the composer can use a fresh id", async () => {
+    const { result } = renderHook(() => useWebSocket({
+      url: "ws://localhost",
+      taskId: 1,
+    }))
+
+    await waitFor(() => expect(MockWebSocket.instances).toHaveLength(1))
+    const socket = MockWebSocket.instances[0]
+    act(() => socket.open())
+
+    const delivery = result.current.sendChatMessage(
+      "retry with a new id",
+      undefined,
+      false,
+      "failed-turn-1",
+    )
+    act(() => {
+      socket.receive({
+        type: "message_rejected",
+        client_message_id: "failed-turn-1",
+        message: "previous delivery failed",
+        retry_with_new_id: true,
+      })
+    })
+
+    await expect(delivery).rejects.toMatchObject({
+      message: "previous delivery failed",
+      retryWithNewId: true,
+    })
+  })
+
+  it("rejects a pending delivery when the socket closes", async () => {
+    const { result } = renderHook(() => useWebSocket({
+      url: "ws://localhost",
+      taskId: 1,
+    }))
+
+    await waitFor(() => expect(MockWebSocket.instances).toHaveLength(1))
+    const socket = MockWebSocket.instances[0]
+    act(() => socket.open())
+
+    const delivery = result.current.sendChatMessage("keep after disconnect")
+    act(() => socket.triggerClose())
+
+    await expect(delivery).rejects.toThrow("Connection closed")
+  })
+
+  it("rejects an unacknowledged delivery after 30 seconds", async () => {
+    const { result } = renderHook(() => useWebSocket({
+      url: "ws://localhost",
+      taskId: 1,
+    }))
+
+    await waitFor(() => expect(MockWebSocket.instances).toHaveLength(1))
+    const socket = MockWebSocket.instances[0]
+    act(() => socket.open())
+    vi.useFakeTimers()
+
+    try {
+      const delivery = result.current.sendChatMessage("timeout draft")
+      const rejection = expect(delivery).rejects.toThrow("not acknowledged")
+      await act(async () => {
+        vi.advanceTimersByTime(30000)
+      })
+      await rejection
+    } finally {
+      vi.useRealTimers()
+    }
   })
 })

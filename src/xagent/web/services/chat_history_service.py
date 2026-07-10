@@ -2,9 +2,12 @@
 
 from __future__ import annotations
 
+import json
 import logging
+from dataclasses import dataclass
 from typing import Any, Dict, List, Optional
 
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from ...core.agent.transcript import (
@@ -14,6 +17,180 @@ from ...core.agent.transcript import (
 from ..models.chat_message import TaskChatMessage
 
 logger = logging.getLogger(__name__)
+
+DELIVERY_PENDING = "pending"
+DELIVERY_DISPATCHED = "dispatched"
+DELIVERY_COMPLETED = "completed"
+DELIVERY_FAILED = "failed"
+
+
+@dataclass(frozen=True)
+class UserMessageDeliveryClaim:
+    """Result of inspecting or atomically claiming a client turn id."""
+
+    message: TaskChatMessage
+    claimed: bool
+    payload_matches: bool
+
+    @property
+    def failed(self) -> bool:
+        return str(self.message.delivery_status) == DELIVERY_FAILED
+
+    @property
+    def pending(self) -> bool:
+        return str(self.message.delivery_status) == DELIVERY_PENDING
+
+    @property
+    def can_acknowledge(self) -> bool:
+        return self.payload_matches and not self.failed and not self.pending
+
+
+def _attachment_identity(
+    attachments: Optional[List[Dict[str, Any]]],
+) -> tuple[str, ...]:
+    identities: list[str] = []
+    for attachment in attachments or []:
+        file_id = str(attachment.get("file_id") or "").strip()
+        if file_id:
+            identity: Dict[str, Any] = {"file_id": file_id}
+        else:
+            identity = {
+                key: attachment.get(key)
+                for key in ("name", "size", "type")
+                if attachment.get(key) is not None
+            }
+        identities.append(json.dumps(identity, sort_keys=True, default=str))
+    return tuple(sorted(identities))
+
+
+def _delivery_payload_matches(
+    message: TaskChatMessage,
+    *,
+    content: str,
+    attachments: Optional[List[Dict[str, Any]]],
+) -> bool:
+    stored_attachments = (
+        message.attachments if isinstance(message.attachments, list) else None
+    )
+    return str(message.content) == content.strip() and _attachment_identity(
+        stored_attachments
+    ) == _attachment_identity(attachments)
+
+
+def inspect_user_message_delivery(
+    db: Session,
+    task_id: int,
+    content: str,
+    *,
+    attachments: Optional[List[Dict[str, Any]]],
+    turn_id: str,
+) -> Optional[UserMessageDeliveryClaim]:
+    """Return the durable outcome for ``turn_id`` without creating a row."""
+
+    existing = (
+        db.query(TaskChatMessage)
+        .filter(
+            TaskChatMessage.task_id == task_id,
+            TaskChatMessage.role == "user",
+            TaskChatMessage.turn_id == turn_id,
+        )
+        .first()
+    )
+    if existing is None:
+        return None
+    return UserMessageDeliveryClaim(
+        message=existing,
+        claimed=False,
+        payload_matches=_delivery_payload_matches(
+            existing,
+            content=content,
+            attachments=attachments,
+        ),
+    )
+
+
+def claim_user_message_delivery(
+    db: Session,
+    task_id: int,
+    user_id: int,
+    content: str,
+    *,
+    attachments: Optional[List[Dict[str, Any]]] = None,
+    turn_id: str,
+) -> UserMessageDeliveryClaim:
+    """Atomically claim a live-control turn before dispatching it.
+
+    The unique database index is the cross-worker serializer. A concurrent
+    loser rolls back its insert and returns the winner's durable row, so only
+    the claimant may inject the message into an active runtime.
+    """
+
+    existing = inspect_user_message_delivery(
+        db,
+        task_id,
+        content,
+        attachments=attachments,
+        turn_id=turn_id,
+    )
+    if existing is not None:
+        return existing
+
+    message = TaskChatMessage(
+        task_id=task_id,
+        user_id=user_id,
+        role="user",
+        content=content.strip(),
+        message_type="user_message",
+        interactions=None,
+        turn_id=turn_id,
+        delivery_status=DELIVERY_PENDING,
+        attachments=attachments,
+    )
+    db.add(message)
+    try:
+        db.commit()
+        db.refresh(message)
+        return UserMessageDeliveryClaim(
+            message=message,
+            claimed=True,
+            payload_matches=True,
+        )
+    except IntegrityError:
+        db.rollback()
+        raced = inspect_user_message_delivery(
+            db,
+            task_id,
+            content,
+            attachments=attachments,
+            turn_id=turn_id,
+        )
+        if raced is None:
+            raise
+        return raced
+
+
+def mark_user_message_delivery(
+    db: Session,
+    *,
+    task_id: int,
+    turn_id: str,
+    status: str,
+) -> None:
+    """Persist a delivery transition for a claimed user turn."""
+
+    if status not in {
+        DELIVERY_PENDING,
+        DELIVERY_DISPATCHED,
+        DELIVERY_COMPLETED,
+        DELIVERY_FAILED,
+    }:
+        raise ValueError(f"Unknown delivery status: {status}")
+    db.query(TaskChatMessage).filter(
+        TaskChatMessage.task_id == task_id,
+        TaskChatMessage.role == "user",
+        TaskChatMessage.turn_id == turn_id,
+    ).update({TaskChatMessage.delivery_status: status}, synchronize_session=False)
+    db.commit()
 
 
 def persist_user_message(
@@ -54,25 +231,14 @@ def persist_user_message_once(
     duplicate turn.
     """
 
-    existing = (
-        db.query(TaskChatMessage)
-        .filter(
-            TaskChatMessage.task_id == task_id,
-            TaskChatMessage.role == "user",
-            TaskChatMessage.turn_id == turn_id,
-        )
-        .first()
-    )
-    if existing is not None:
-        return existing
-    return persist_user_message(
+    return claim_user_message_delivery(
         db,
         task_id=task_id,
         user_id=user_id,
         content=content,
         attachments=attachments,
         turn_id=turn_id,
-    )
+    ).message
 
 
 def persist_user_message_no_commit(
@@ -83,6 +249,7 @@ def persist_user_message_no_commit(
     *,
     attachments: Optional[List[Dict[str, Any]]] = None,
     turn_id: Optional[str] = None,
+    delivery_status: Optional[str] = None,
 ) -> Optional[TaskChatMessage]:
     """``persist_user_message`` variant that stages the row but does NOT commit.
 
@@ -107,6 +274,7 @@ def persist_user_message_no_commit(
         message_type="user_message",
         interactions=None,
         turn_id=turn_id,
+        delivery_status=delivery_status,
         # Pass through ``attachments`` directly so an explicit empty list
         # round-trips as ``[]`` rather than being coerced to ``NULL`` —
         # callers may want to distinguish "no attachments specified" from
@@ -238,6 +406,7 @@ def _persist_message(
     interactions: Optional[List[Dict[str, Any]]] = None,
     attachments: Optional[List[Dict[str, Any]]] = None,
     turn_id: Optional[str] = None,
+    delivery_status: Optional[str] = None,
 ) -> Optional[TaskChatMessage]:
     normalized_content = content.strip()
     if not normalized_content and not attachments:
@@ -251,6 +420,7 @@ def _persist_message(
         message_type=message_type,
         interactions=interactions,
         turn_id=turn_id,
+        delivery_status=delivery_status,
         # Pass through ``attachments`` directly so an explicit empty list
         # round-trips as ``[]`` rather than being coerced to ``NULL``.
         attachments=attachments,

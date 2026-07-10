@@ -1,4 +1,6 @@
+import pytest
 from sqlalchemy import create_engine
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import sessionmaker
 
 from xagent.core.agent.transcript import build_assistant_transcript_content
@@ -7,6 +9,8 @@ from xagent.web.models.database import Base
 from xagent.web.models.task import Task, TaskStatus
 from xagent.web.models.user import User
 from xagent.web.services.chat_history_service import (
+    DELIVERY_FAILED,
+    claim_user_message_delivery,
     get_latest_waiting_question,
     load_task_transcript,
     persist_assistant_message,
@@ -222,6 +226,92 @@ def test_persist_user_message_once_reuses_durable_turn() -> None:
         assert retried is not None
         assert retried.id == first.id
         assert db_session.query(TaskChatMessage).count() == 1
+    finally:
+        db_session.close()
+
+
+def test_delivery_claim_rejects_same_turn_with_different_attachments() -> None:
+    db_session = _create_db_session()
+    try:
+        task = _create_task(db_session)
+        first = claim_user_message_delivery(
+            db_session,
+            int(task.id),
+            int(task.user_id),
+            "Analyze this",
+            attachments=[{"file_id": "file-a", "name": "a.pdf"}],
+            turn_id="client-turn-files",
+        )
+        retried = claim_user_message_delivery(
+            db_session,
+            int(task.id),
+            int(task.user_id),
+            "Analyze this",
+            attachments=[{"file_id": "file-b", "name": "b.pdf"}],
+            turn_id="client-turn-files",
+        )
+
+        assert first.claimed is True
+        assert retried.claimed is False
+        assert retried.payload_matches is False
+        assert db_session.query(TaskChatMessage).count() == 1
+    finally:
+        db_session.close()
+
+
+def test_database_rejects_duplicate_user_turn_claims() -> None:
+    db_session = _create_db_session()
+    try:
+        task = _create_task(db_session)
+        claim_user_message_delivery(
+            db_session,
+            int(task.id),
+            int(task.user_id),
+            "First claimant",
+            turn_id="atomic-turn",
+        )
+        db_session.add(
+            TaskChatMessage(
+                task_id=int(task.id),
+                user_id=int(task.user_id),
+                role="user",
+                content="Racing claimant",
+                message_type="user_message",
+                turn_id="atomic-turn",
+            )
+        )
+        with pytest.raises(IntegrityError):
+            db_session.commit()
+        db_session.rollback()
+        assert db_session.query(TaskChatMessage).count() == 1
+    finally:
+        db_session.close()
+
+
+def test_delivery_claim_surfaces_failed_handoff() -> None:
+    db_session = _create_db_session()
+    try:
+        task = _create_task(db_session)
+        first = claim_user_message_delivery(
+            db_session,
+            int(task.id),
+            int(task.user_id),
+            "Apply guidance",
+            turn_id="failed-turn",
+        )
+        first.message.delivery_status = DELIVERY_FAILED
+        db_session.commit()
+
+        retried = claim_user_message_delivery(
+            db_session,
+            int(task.id),
+            int(task.user_id),
+            "Apply guidance",
+            turn_id="failed-turn",
+        )
+        assert retried.claimed is False
+        assert retried.failed is True
+        assert retried.can_acknowledge is False
     finally:
         db_session.close()
 

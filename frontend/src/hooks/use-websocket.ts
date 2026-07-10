@@ -3,7 +3,7 @@
 import { useEffect, useRef, useState, useCallback } from "react"
 import { useAuth } from "@/contexts/auth-context"
 import { apiRequest, getUploadErrorMessage, isJsonRecord, parseApiResponse, UPLOAD_ERROR_MESSAGES } from "@/lib/api-wrapper"
-import { getWsUrl, getUploadApiUrl } from "@/lib/utils"
+import { generateClientMessageId, getWsUrl, getUploadApiUrl } from "@/lib/utils"
 import { isFinalAnswerStreamEventType } from "@/lib/streaming-final-answer"
 
 // Duplicate message detection: record recently sent messages
@@ -246,7 +246,11 @@ export function useWebSocket(options: UseWebSocketOptions = {}) {
                   turn_id: typeof data.turn_id === 'string' ? data.turn_id : clientMessageId,
                 })
               } else {
-                pending.reject(new Error(data.message || 'Message was rejected.'))
+                const error = new Error(data.message || 'Message was rejected.')
+                Object.assign(error, {
+                  retryWithNewId: data.retry_with_new_id === true,
+                })
+                pending.reject(error)
               }
             }
             return
@@ -430,11 +434,7 @@ export function useWebSocket(options: UseWebSocketOptions = {}) {
       throw new Error('Message not sent: the task connection is not ready.')
     }
 
-    const clientMessageId = requestedClientMessageId || (
-      typeof crypto !== 'undefined' && crypto.randomUUID
-        ? crypto.randomUUID()
-        : `msg-${timestamp}-${Math.random().toString(36).slice(2)}`
-    )
+    const clientMessageId = requestedClientMessageId || generateClientMessageId()
     const duplicateMessage = recentMessages.find(
       msg => (
         msg.taskId === currentTaskId

@@ -20,6 +20,10 @@ vi.mock("@/lib/api-wrapper", async () => {
 vi.mock("@/lib/utils", () => ({
   cn: (...classes: Array<string | false | null | undefined>) =>
     classes.filter(Boolean).join(" "),
+  generateClientMessageId: vi.fn()
+    .mockReturnValueOnce("client-message-1")
+    .mockReturnValueOnce("client-message-2")
+    .mockReturnValue("client-message-next"),
   getApiUrl: () => "http://api.local",
   getUploadApiUrl: () => "http://upload.local",
 }))

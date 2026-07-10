@@ -44,7 +44,16 @@ if TYPE_CHECKING:
     from ..services.task_setup_snapshot import TaskSetupSnapshot
 
 from ...core.file_storage.keys import build_task_output_storage_key
-from ..services.chat_history_service import get_latest_waiting_question
+from ..services.chat_history_service import (
+    DELIVERY_COMPLETED,
+    DELIVERY_DISPATCHED,
+    DELIVERY_FAILED,
+    UserMessageDeliveryClaim,
+    claim_user_message_delivery,
+    get_latest_waiting_question,
+    inspect_user_message_delivery,
+    mark_user_message_delivery,
+)
 from ..services.hot_path_cache import (
     cache_get,
     cache_set,
@@ -146,6 +155,7 @@ async def _send_message_delivery(
     turn_id: str,
     accepted: bool,
     message: str | None = None,
+    retry_with_new_id: bool = False,
 ) -> None:
     if client_message_id is None:
         return
@@ -157,6 +167,8 @@ async def _send_message_delivery(
     }
     if message:
         payload["message"] = message
+    if retry_with_new_id:
+        payload["retry_with_new_id"] = True
     await manager.send_personal_message(payload, websocket)
 
 
@@ -1852,12 +1864,27 @@ def _latest_result_user_turn_id(result: Dict[str, Any]) -> str | None:
     return None
 
 
+def _mark_user_message_delivery_sync(task_id: int, turn_id: str, status: str) -> None:
+    SessionLocal = get_session_local()
+    db = SessionLocal()
+    try:
+        mark_user_message_delivery(
+            db,
+            task_id=task_id,
+            turn_id=turn_id,
+            status=status,
+        )
+    finally:
+        db.close()
+
+
 async def execute_resume_background(
     task_id: int,
     agent_service: Any,
     task_owner_user_id: int | None,
     previous_task: Optional[asyncio.Task] = None,
     pending_user_message: Optional[Dict[str, Any]] = None,
+    delivery_turn_id: str | None = None,
 ) -> None:
     """Resume an agent execution after an interrupt/user-message checkpoint.
 
@@ -1883,6 +1910,7 @@ async def execute_resume_background(
     task_agent_id: int | None = None
     agent_name: str | None = None
     agent_logo_url: str | None = None
+    delivery_completed = False
     try:
         if previous_task is not None and not previous_task.done():
             try:
@@ -1914,6 +1942,13 @@ async def execute_resume_background(
                 raise RuntimeError(
                     "The user message was saved, but no resumable execution "
                     "checkpoint became available."
+                )
+            if delivery_turn_id is not None:
+                await asyncio.to_thread(
+                    _mark_user_message_delivery_sync,
+                    task_id,
+                    delivery_turn_id,
+                    DELIVERY_DISPATCHED,
                 )
 
         db_gen = get_db()
@@ -1949,6 +1984,13 @@ async def execute_resume_background(
             logger.info(
                 "Task %s resume skipped; another runner owns the lease", task_id
             )
+            if delivery_turn_id is not None:
+                await asyncio.to_thread(
+                    _mark_user_message_delivery_sync,
+                    task_id,
+                    delivery_turn_id,
+                    DELIVERY_FAILED,
+                )
             await manager.broadcast_to_task(
                 {
                     "type": "agent_error",
@@ -2062,6 +2104,15 @@ async def execute_resume_background(
         finally:
             db_new.close()
 
+        if delivery_turn_id is not None:
+            await asyncio.to_thread(
+                _mark_user_message_delivery_sync,
+                task_id,
+                delivery_turn_id,
+                DELIVERY_COMPLETED,
+            )
+            delivery_completed = True
+
         if status in {"interrupted", "waiting_for_user"}:
             await manager.broadcast_to_task(
                 create_stream_event(
@@ -2102,10 +2153,24 @@ async def execute_resume_background(
         )
     except asyncio.CancelledError:
         logger.info(f"V2 resume background task {task_id} cancelled")
+        if delivery_turn_id is not None and not delivery_completed:
+            await asyncio.to_thread(
+                _mark_user_message_delivery_sync,
+                task_id,
+                delivery_turn_id,
+                DELIVERY_FAILED,
+            )
         raise
     except Exception as e:
         logger.error(f"V2 resume background task {task_id} failed: {e}", exc_info=True)
         error_message = str(e)
+        if delivery_turn_id is not None and not delivery_completed:
+            await asyncio.to_thread(
+                _mark_user_message_delivery_sync,
+                task_id,
+                delivery_turn_id,
+                DELIVERY_FAILED,
+            )
         await manager.broadcast_to_task(
             {
                 **_terminal_task_error_payload(
@@ -2175,6 +2240,8 @@ class BackgroundTaskManager:
     def reserve_resume(self, task_id: int) -> bool:
         """Atomically reserve the single live-control resume slot."""
 
+        # Keep this check-and-add block synchronous: asyncio task switches can
+        # only happen at ``await``, so it is the in-process atomic guard.
         existing = self.resume_tasks.get(task_id)
         if task_id in self._resume_reservations or (
             existing is not None and not existing.done()
@@ -2702,9 +2769,15 @@ async def handle_chat_message(
     client_message_id = _client_message_id(message_data.get("client_message_id"))
     turn_id = client_message_id or str(uuid.uuid4())
     delivery_finished = False
-    delivery_persisted = False
+    delivery_dispatched = False
+    delivery_claimed = False
 
-    async def finish_delivery(accepted: bool, message: str | None = None) -> None:
+    async def finish_delivery(
+        accepted: bool,
+        message: str | None = None,
+        *,
+        retry_with_new_id: bool = False,
+    ) -> None:
         nonlocal delivery_finished
         if delivery_finished:
             return
@@ -2715,7 +2788,48 @@ async def handle_chat_message(
             turn_id=turn_id,
             accepted=accepted,
             message=message,
+            retry_with_new_id=retry_with_new_id,
         )
+
+    async def finish_delivery_failure(message: str) -> None:
+        """Reject pre-dispatch failures; never confuse persistence with delivery."""
+
+        if delivery_finished:
+            return
+        if delivery_claimed and not delivery_dispatched:
+            await asyncio.to_thread(
+                _mark_user_message_delivery_sync,
+                task_id,
+                turn_id,
+                DELIVERY_FAILED,
+            )
+        await finish_delivery(
+            delivery_dispatched,
+            None if delivery_dispatched else message,
+        )
+
+    async def finish_existing_delivery(
+        claim: UserMessageDeliveryClaim,
+    ) -> None:
+        if not claim.payload_matches:
+            await finish_delivery(
+                False,
+                "Message id was already used for different content or files.",
+                retry_with_new_id=True,
+            )
+        elif claim.failed:
+            await finish_delivery(
+                False,
+                "The previous delivery attempt failed. Please retry the draft.",
+                retry_with_new_id=True,
+            )
+        elif claim.pending:
+            await finish_delivery(
+                False,
+                "The message is still being applied. Please retry shortly.",
+            )
+        else:
+            await finish_delivery(True)
 
     try:
         user_message = message_data.get("message", "")
@@ -2910,36 +3024,6 @@ async def handle_chat_message(
 
                 authorized_task_id = int(task.id)
 
-                # A client retries with the same id when the socket closes or
-                # the acknowledgement is lost. If that turn is already in the
-                # durable transcript, acknowledge it without executing it a
-                # second time. Reject id reuse with different text so a stale
-                # composer attempt cannot silently alias a new message.
-                if client_message_id is not None:
-                    from ..models.chat_message import TaskChatMessage
-
-                    existing_delivery = (
-                        db.query(TaskChatMessage)
-                        .filter(
-                            TaskChatMessage.task_id == task_id,
-                            TaskChatMessage.role == "user",
-                            TaskChatMessage.turn_id == turn_id,
-                        )
-                        .first()
-                    )
-                    if existing_delivery is not None:
-                        expected_content = _display_message_for_user(
-                            str(user_message), bool(files)
-                        ).strip()
-                        if str(existing_delivery.content) != expected_content:
-                            await finish_delivery(
-                                False,
-                                "Message id was already used for different content.",
-                            )
-                        else:
-                            await finish_delivery(True)
-                        return
-
                 if not files and task.status == TaskStatus.PENDING:
                     files = _selected_file_refs_from_task(task, db)
                     if files:
@@ -3044,6 +3128,27 @@ async def handle_chat_message(
                 context["display_message"] = display_user_message
                 context["files"] = display_file_refs
 
+                persisted_attachments = _normalize_attachments_for_persistence(
+                    file_info_list
+                )
+
+                # Retry inspection happens after file normalization so the
+                # same text with different attachments cannot alias an older
+                # durable turn. Legacy rows with no delivery status are
+                # treated as delivered; failed handoffs are explicitly
+                # rejected so the frontend can retry with a fresh id.
+                if client_message_id is not None:
+                    existing_delivery = inspect_user_message_delivery(
+                        db,
+                        task_id,
+                        display_user_message,
+                        attachments=persisted_attachments or None,
+                        turn_id=turn_id,
+                    )
+                    if existing_delivery is not None:
+                        await finish_existing_delivery(existing_delivery)
+                        return
+
                 # DAG plan-execute will automatically send user_message trace event
 
                 # The user message is persisted inside
@@ -3095,22 +3200,18 @@ async def handle_chat_message(
                     logger.info(f"Using continuation for running task {task_id}")
                     assert dag_pattern is not None  # for mypy type checking
 
-                    from ..services.chat_history_service import (
-                        persist_user_message_once,
-                    )
-
-                    persisted_delivery_message = persist_user_message_once(
+                    delivery_claim = claim_user_message_delivery(
                         db,
                         task_id=task_id,
                         user_id=int(task.user_id),
                         content=display_user_message,
-                        attachments=_normalize_attachments_for_persistence(
-                            file_info_list
-                        )
-                        or None,
+                        attachments=persisted_attachments or None,
                         turn_id=turn_id,
                     )
-                    delivery_persisted = persisted_delivery_message is not None
+                    if not delivery_claim.claimed:
+                        await finish_existing_delivery(delivery_claim)
+                        return
+                    delivery_claimed = True
 
                     # Immediately send trace_user_message to display user message on interface
                     if hasattr(dag_pattern, "tracer") and hasattr(
@@ -3140,6 +3241,13 @@ async def handle_chat_message(
                         )
 
                     dag_pattern.request_continuation(user_message_for_llm, context)
+                    mark_user_message_delivery(
+                        db,
+                        task_id=task_id,
+                        turn_id=turn_id,
+                        status=DELIVERY_DISPATCHED,
+                    )
+                    delivery_dispatched = True
 
                     # If previously PAUSED/WAITING_FOR_USER, update status to RUNNING
                     if task.status in {TaskStatus.PAUSED, TaskStatus.WAITING_FOR_USER}:
@@ -3223,23 +3331,21 @@ async def handle_chat_message(
                     # bubble twice in the live UI. The DAG Plan-Execute
                     # continuation path above is a separate code path and
                     # keeps its own immediate trace.
+                    bg_task: asyncio.Task[None] | None = None
                     try:
-                        from ..services.chat_history_service import (
-                            persist_user_message_once,
-                        )
-
-                        persisted_delivery_message = persist_user_message_once(
+                        delivery_claim = claim_user_message_delivery(
                             db,
                             task_id=task_id,
                             user_id=int(task.user_id),
                             content=display_user_message,
-                            attachments=_normalize_attachments_for_persistence(
-                                file_info_list
-                            )
-                            or None,
+                            attachments=persisted_attachments or None,
                             turn_id=turn_id,
                         )
-                        delivery_persisted = persisted_delivery_message is not None
+                        if not delivery_claim.claimed:
+                            background_task_manager.release_resume_reservation(task_id)
+                            await finish_existing_delivery(delivery_claim)
+                            return
+                        delivery_claimed = True
 
                         posted = await agent_service.post_user_message(
                             str(task_id),
@@ -3255,6 +3361,13 @@ async def handle_chat_message(
                                 "Agent execution %s was not live; deferring the "
                                 "durable user message until its checkpoint is ready",
                                 task_id,
+                            )
+                        else:
+                            mark_user_message_delivery(
+                                db,
+                                task_id=task_id,
+                                turn_id=turn_id,
+                                status=DELIVERY_DISPATCHED,
                             )
 
                         previous_task = background_task_manager.running_tasks.get(
@@ -3276,12 +3389,16 @@ async def handle_chat_message(
                                         "turn_id": turn_id,
                                     }
                                 ),
+                                delivery_turn_id=turn_id,
                             )
                         )
                         background_task_manager.register_reserved_resume(
                             task_id, bg_task
                         )
+                        delivery_dispatched = True
                     except BaseException:
+                        if bg_task is not None:
+                            bg_task.cancel()
                         background_task_manager.release_resume_reservation(task_id)
                         raise
 
@@ -3440,9 +3557,6 @@ async def handle_chat_message(
                     # Strip absolute filesystem paths before the row hits
                     # disk — the attachments column is exposed to historical-
                     # replay clients, so paths must not leak.
-                    persisted_attachments = _normalize_attachments_for_persistence(
-                        file_info_list
-                    )
                     payload = TaskTurnPayload(
                         transcript_message=display_user_message,
                         execution_message=user_message_for_llm,
@@ -3573,10 +3687,7 @@ async def handle_chat_message(
             # Data validation and format error
             message = f"Data validation error: {str(e)}"
             logger.error(f"Data validation error in agent execution: {e}")
-            await finish_delivery(
-                delivery_persisted,
-                None if delivery_persisted else message,
-            )
+            await finish_delivery_failure(message)
             timestamp = datetime.now(timezone.utc).timestamp()
             if authorized_task_id is not None:
                 await manager.broadcast_to_task(
@@ -3599,10 +3710,7 @@ async def handle_chat_message(
             # Runtime error
             message = f"Runtime error: {str(e)}"
             logger.error(f"Runtime error in agent execution: {e}")
-            await finish_delivery(
-                delivery_persisted,
-                None if delivery_persisted else message,
-            )
+            await finish_delivery_failure(message)
             timestamp = datetime.now(timezone.utc).timestamp()
             if authorized_task_id is not None:
                 await manager.broadcast_to_task(
@@ -3624,19 +3732,13 @@ async def handle_chat_message(
         except Exception as e:
             # Other unknown errors, re-raise
             logger.error(f"Unexpected error in agent execution: {e}")
-            await finish_delivery(
-                delivery_persisted,
-                None if delivery_persisted else str(e),
-            )
+            await finish_delivery_failure(str(e))
             raise
 
     except (ValueError, KeyError, TypeError) as e:
         # Message format error
         logger.error(f"Message format error: {e}")
-        await finish_delivery(
-            delivery_persisted,
-            None if delivery_persisted else f"Message format error: {str(e)}",
-        )
+        await finish_delivery_failure(f"Message format error: {str(e)}")
         await manager.send_personal_message(
             {"type": "error", "message": f"Message format error: {str(e)}"}, websocket
         )
@@ -3647,10 +3749,7 @@ async def handle_chat_message(
     except Exception as e:
         # Other errors, re-raise
         logger.error(f"Unexpected error handling chat message: {e}")
-        await finish_delivery(
-            delivery_persisted,
-            None if delivery_persisted else str(e),
-        )
+        await finish_delivery_failure(str(e))
         raise
 
 

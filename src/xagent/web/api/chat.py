@@ -2103,6 +2103,10 @@ class AgentServiceManager:
             # If agent is not in memory, clean up workspace directory directly
             self._cleanup_workspace_directory(task_id, user_id)
 
+        # The per-task lock has no purpose after eviction. Keeping it forever
+        # makes the manager grow with every task ever opened.
+        self._agent_build_locks.pop(task_id, None)
+
         # LLM configuration is now stored in Task table, no need to clean up memory storage
 
     async def execute_task(

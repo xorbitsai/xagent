@@ -1,4 +1,4 @@
-from sqlalchemy import JSON, Column, DateTime, ForeignKey, Integer, String, Text
+from sqlalchemy import JSON, Column, DateTime, ForeignKey, Index, Integer, String, Text
 from sqlalchemy.orm import relationship
 from sqlalchemy.sql import func
 
@@ -9,6 +9,15 @@ class TaskChatMessage(Base):  # type: ignore
     """Persisted transcript message for a task chat session."""
 
     __tablename__ = "task_chat_messages"
+    __table_args__ = (
+        Index(
+            "uq_task_chat_messages_task_role_turn_id",
+            "task_id",
+            "role",
+            "turn_id",
+            unique=True,
+        ),
+    )
 
     id = Column(Integer, primary_key=True, index=True)
     task_id = Column(
@@ -25,6 +34,9 @@ class TaskChatMessage(Base):  # type: ignore
     # by historical replay to reconcile trace rows with transcript rows without
     # collapsing distinct turns that happen to share text/attachments.
     turn_id = Column(String(64), nullable=True, index=True)
+    # Durable handoff outcome for retry-safe user-message delivery. Legacy
+    # rows remain NULL and are treated as already delivered.
+    delivery_status = Column(String(32), nullable=True)
     # Per-message attachments (uploaded files). For user messages this is the
     # list of files the user attached when sending this turn. Stored as JSON so
     # the original file metadata (file_id, name, size, type) is available for

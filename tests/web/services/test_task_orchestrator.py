@@ -27,6 +27,10 @@ from xagent.web.models.chat_message import TaskChatMessage
 from xagent.web.models.database import Base, get_db, get_engine, init_db
 from xagent.web.models.task import Task, TaskStatus
 from xagent.web.models.user import User
+from xagent.web.services.chat_history_service import (
+    DELIVERY_DISPATCHED,
+    DELIVERY_FAILED,
+)
 from xagent.web.services.connector_runtime import (
     get_ephemeral_runtime_values,
     pop_ephemeral_runtime_values,
@@ -165,10 +169,11 @@ async def test_begin_turn_create_clears_no_terminal_fields_when_pending(
 ) -> None:
     user = _create_user(db_session)
     task = _create_task(db_session, user.id, status=TaskStatus.PENDING)
+    payload = TaskTurnPayload("first turn")
 
     await TaskTurnOrchestrator.begin_turn(
         task_id=int(task.id),
-        payload=TaskTurnPayload("first turn"),
+        payload=payload,
         task_owner_user_id=int(user.id),
         kind=TurnKind.CREATE,
         force_fresh=False,
@@ -181,6 +186,12 @@ async def test_begin_turn_create_clears_no_terminal_fields_when_pending(
     assert task.error_message is None
     assert task.runner_id is None
     assert task.lease_expires_at is None
+    delivery = (
+        db_session.query(TaskChatMessage)
+        .filter(TaskChatMessage.turn_id == payload.turn_id)
+        .one()
+    )
+    assert delivery.delivery_status == DELIVERY_DISPATCHED
 
 
 @pytest.mark.asyncio
@@ -463,6 +474,7 @@ async def test_begin_turn_marks_failed_when_schedule_raises(
     left RUNNING with no bg worker (zombie)."""
     user = _create_user(db_session)
     task = _create_task(db_session, user.id, status=TaskStatus.PENDING)
+    payload = TaskTurnPayload("x")
 
     with patch(
         "xagent.web.services.task_orchestrator._schedule_bg",
@@ -472,12 +484,18 @@ async def test_begin_turn_marks_failed_when_schedule_raises(
             await TaskTurnOrchestrator.begin_turn(
                 task_id=int(task.id),
                 task_owner_user_id=int(user.id),
-                payload=TaskTurnPayload("x"),
+                payload=payload,
                 kind=TurnKind.CREATE,
             )
 
     db_session.refresh(task)
     assert task.status == TaskStatus.FAILED
+    delivery = (
+        db_session.query(TaskChatMessage)
+        .filter(TaskChatMessage.turn_id == payload.turn_id)
+        .one()
+    )
+    assert delivery.delivery_status == DELIVERY_FAILED
 
 
 @pytest.mark.asyncio

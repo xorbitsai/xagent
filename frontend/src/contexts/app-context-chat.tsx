@@ -35,7 +35,7 @@ export interface Interaction {
 }
 import { useWebSocket } from "@/hooks/use-websocket"
 import { useAuth } from "@/contexts/auth-context"
-import { getApiUrl, getUploadApiUrl, shouldAutoOpenTaskPreview } from "@/lib/utils"
+import { generateClientMessageId, getApiUrl, getUploadApiUrl, shouldAutoOpenTaskPreview } from "@/lib/utils"
 import { apiRequest, getApiErrorMessage, getUploadErrorMessage, isJsonRecord, parseApiResponse, UPLOAD_ERROR_MESSAGES } from "@/lib/api-wrapper"
 import { useI18n } from "@/contexts/i18n-context"
 import { normalizeTimestampMs } from "@/lib/time-utils"
@@ -4102,8 +4102,7 @@ export function AppProvider({
 
     const clientMessageId = typeof config?.clientMessageId === 'string'
       ? config.clientMessageId
-      : globalThis.crypto?.randomUUID?.()
-        ?? `msg-${Date.now()}-${Math.random().toString(36).slice(2)}`
+      : generateClientMessageId()
     const targetTaskId = typeof config?.targetTaskId === 'number' ? config.targetTaskId : null
     if (targetTaskId !== null && state.taskId !== targetTaskId) {
       await queuePendingMessage({

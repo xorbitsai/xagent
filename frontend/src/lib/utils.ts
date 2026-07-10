@@ -5,6 +5,11 @@ export function cn(...inputs: ClassValue[]) {
   return twMerge(clsx(inputs))
 }
 
+export function generateClientMessageId(): string {
+  return globalThis.crypto?.randomUUID?.()
+    ?? `msg-${Date.now()}-${Math.random().toString(36).slice(2)}`
+}
+
 export function getApiUrl(): string {
   // Client-side: use environment variable or fallback to relative path
   const apiUrl = process.env.NEXT_PUBLIC_API_URL || ''

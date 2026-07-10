@@ -275,6 +275,27 @@ def test_message_send_rejects_oversized_content() -> None:
     )
 
 
+def test_message_send_requires_message_id() -> None:
+    agent_id, full_key = _create_published_agent_with_key()
+
+    response = client.post(
+        f"/api/a2a/agents/{agent_id}/message:send",
+        headers=_bearer(full_key),
+        json={
+            "message": {
+                "role": "ROLE_USER",
+                "parts": [{"text": "missing id"}],
+            },
+            "configuration": {"returnImmediately": True},
+        },
+    )
+
+    assert response.status_code == 400
+    error = response.json()["error"]
+    assert error["details"][0]["reason"] == "INVALID_ARGUMENT"
+    assert error["details"][0]["metadata"]["field"] == "message.messageId"
+
+
 def test_a2a_fastapi_validation_uses_protocol_error_shape() -> None:
     agent_id, full_key = _create_published_agent_with_key()
 
@@ -548,6 +569,7 @@ def test_follow_up_infers_context_for_input_required_task() -> None:
         task_id,
         execution_message="follow up",
         display_message="follow up",
+        turn_id=f"a2a:{task_id}:msg-follow-up",
         request_interrupt=False,
         reason="A2A input-required response",
     )
@@ -612,6 +634,68 @@ def test_failed_follow_up_restores_input_required_status() -> None:
         )
 
     assert response.status_code == 400, response.text
+    db = _direct_db_session()
+    try:
+        recovered = db.query(Task).filter(Task.id == task_id).one()
+        assert recovered.status == TaskStatus.WAITING_FOR_USER
+    finally:
+        db.close()
+
+
+def test_checkpoint_resume_exception_restores_input_required_status() -> None:
+    agent_id, full_key = _create_published_agent_with_key()
+    db = _direct_db_session()
+    try:
+        owner_id = int(db.query(Agent).filter(Agent.id == agent_id).one().user_id)
+        task = Task(
+            user_id=owner_id,
+            title="waiting",
+            status=TaskStatus.WAITING_FOR_USER,
+            agent_id=agent_id,
+            source="a2a",
+            is_visible=False,
+            agent_config={"a2a_context_id": "ctx-resume-error"},
+        )
+        db.add(task)
+        db.commit()
+        db.refresh(task)
+        task_id = int(task.id)
+    finally:
+        db.close()
+
+    agent_service = MagicMock()
+    agent_service.post_user_message = AsyncMock(
+        side_effect=RuntimeError("checkpoint callback failed")
+    )
+    agent_manager = MagicMock()
+    agent_manager.get_agent_for_task = AsyncMock(return_value=agent_service)
+    with patch(
+        "xagent.web.api.chat.get_agent_manager",
+        return_value=agent_manager,
+    ):
+        response = client.post(
+            f"/api/a2a/agents/{agent_id}/message:send",
+            headers=_bearer(full_key),
+            json={
+                "message": {
+                    "messageId": "msg-resume-error",
+                    "taskId": task_id,
+                    "role": "ROLE_USER",
+                    "parts": [{"text": "retry safely"}],
+                },
+                "configuration": {"returnImmediately": True},
+            },
+        )
+
+    assert response.status_code == 500
+    agent_service.post_user_message.assert_awaited_once_with(
+        str(task_id),
+        execution_message="retry safely",
+        display_message="retry safely",
+        turn_id=f"a2a:{task_id}:msg-resume-error",
+        request_interrupt=False,
+        reason="A2A input-required response",
+    )
     db = _direct_db_session()
     try:
         recovered = db.query(Task).filter(Task.id == task_id).one()

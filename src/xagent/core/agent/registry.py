@@ -209,6 +209,7 @@ class ExecutionRegistry:
         execution_message: str | None = None,
         display_message: str | None = None,
         files: list[dict[str, Any]] | None = None,
+        turn_id: str | None = None,
         request_interrupt: bool = True,
         reason: str | None = None,
     ) -> ExecutionContext | None:
@@ -222,6 +223,7 @@ class ExecutionRegistry:
             execution_message=execution_message,
             display_message=display_message,
             files=files,
+            turn_id=turn_id,
             request_interrupt=request_interrupt,
             reason=reason,
         )
@@ -234,6 +236,7 @@ class ExecutionRegistry:
         execution_message: str | None = None,
         display_message: str | None = None,
         files: list[dict[str, Any]] | None = None,
+        turn_id: str | None = None,
         request_interrupt: bool = True,
         reason: str | None = None,
     ) -> ExecutionContext | None:
@@ -243,6 +246,7 @@ class ExecutionRegistry:
             execution_message=execution_message,
             display_message=display_message,
             files=files,
+            turn_id=turn_id,
             request_interrupt=request_interrupt,
             reason=reason,
         )
@@ -262,6 +266,7 @@ class ExecutionRegistry:
                     "display_message": resolved_display_message,
                     "execution_message": resolved_execution_message,
                     "files": files,
+                    "turn_id": turn_id,
                     "request_interrupt": request_interrupt,
                 },
             )

@@ -175,6 +175,11 @@ class TrackingCallback:
         self.events.append(("end", context.execution_id))
 
 
+class FailingUserMessageCallback:
+    async def on_user_message_posted(self, **_: Any) -> None:
+        raise RuntimeError("trace callback failed")
+
+
 class RecordingTraceEventTracer:
     def __init__(self) -> None:
         self.events: list[dict[str, Any]] = []
@@ -700,6 +705,98 @@ async def test_runner_post_user_message_alias_matches_inject_behavior(
         message.content for message in context.messages if message.role == "user"
     ]
     assert user_messages == ["Original task", "Follow-up from user."]
+
+
+@pytest.mark.asyncio
+async def test_runner_post_user_message_deduplicates_explicit_turn_id_after_failure(
+    tmp_path: Path,
+) -> None:
+    tracer = TracerCheckpointStore()
+    execution_id = "exec-idempotent-message"
+    checkpoint_context = ExecutionContext(execution_id=execution_id)
+    checkpoint_context.add_user_message("Original task")
+    await tracer.checkpoint(
+        type="checkpoint",
+        execution_id=execution_id,
+        pattern="FakePattern",
+        label="waiting_for_user",
+        status="waiting_for_user",
+        context=checkpoint_context.to_dict(),
+        pattern_state={},
+        metadata={},
+    )
+    failing_runner = AgentRunner(
+        agent=Agent(name="writer", patterns=[FakePattern({"success": True})]),
+        tracer=tracer,
+        callbacks=[FailingUserMessageCallback()],
+        workspace_manager=FakeWorkspaceManager(tmp_path),
+    )
+
+    with pytest.raises(RuntimeError, match="trace callback failed"):
+        await failing_runner.post_user_message(
+            execution_id,
+            "Choose B",
+            turn_id="a2a:42:msg-1",
+            request_interrupt=False,
+        )
+
+    failing_runner.context_manager.remove_context(execution_id)
+    retry_runner = AgentRunner(
+        agent=Agent(name="writer", patterns=[FakePattern({"success": True})]),
+        tracer=tracer,
+        workspace_manager=FakeWorkspaceManager(tmp_path),
+    )
+    context = await retry_runner.post_user_message(
+        execution_id,
+        "Choose B",
+        turn_id="a2a:42:msg-1",
+        request_interrupt=False,
+    )
+
+    assert context is not None
+    retried_messages = [
+        message
+        for message in context.messages
+        if message.role == "user" and message.metadata.get("turn_id") == "a2a:42:msg-1"
+    ]
+    assert len(retried_messages) == 1
+    assert retried_messages[0].content == "Choose B"
+
+
+@pytest.mark.asyncio
+async def test_runner_rejects_reused_turn_id_with_different_content(
+    tmp_path: Path,
+) -> None:
+    tracer = TracerCheckpointStore()
+    execution_id = "exec-conflicting-message"
+    checkpoint_context = ExecutionContext(execution_id=execution_id)
+    checkpoint_context.add_user_message(
+        "Choose A",
+        metadata={"turn_id": "a2a:42:msg-1"},
+    )
+    await tracer.checkpoint(
+        type="checkpoint",
+        execution_id=execution_id,
+        pattern="FakePattern",
+        label="waiting_for_user",
+        status="waiting_for_user",
+        context=checkpoint_context.to_dict(),
+        pattern_state={},
+        metadata={},
+    )
+    runner = AgentRunner(
+        agent=Agent(name="writer", patterns=[FakePattern({"success": True})]),
+        tracer=tracer,
+        workspace_manager=FakeWorkspaceManager(tmp_path),
+    )
+
+    with pytest.raises(ValueError, match="different user message"):
+        await runner.post_user_message(
+            execution_id,
+            "Choose B",
+            turn_id="a2a:42:msg-1",
+            request_interrupt=False,
+        )
 
 
 @pytest.mark.asyncio

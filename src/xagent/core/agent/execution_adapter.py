@@ -169,6 +169,7 @@ class AgentExecutionAdapter:
         execution_message: str | None = None,
         display_message: str | None = None,
         files: list[dict[str, Any]] | None = None,
+        turn_id: str | None = None,
         request_interrupt: bool = True,
         reason: str | None = None,
     ) -> bool:
@@ -188,6 +189,7 @@ class AgentExecutionAdapter:
             execution_message=execution_message,
             display_message=display_message,
             files=files,
+            turn_id=turn_id,
             request_interrupt=request_interrupt,
             reason=reason,
         )

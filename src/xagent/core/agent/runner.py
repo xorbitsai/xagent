@@ -307,6 +307,7 @@ class AgentRunner:
         execution_message: str | None = None,
         display_message: str | None = None,
         files: list[dict[str, Any]] | None = None,
+        turn_id: str | None = None,
         request_interrupt: bool = True,
         reason: str | None = None,
     ) -> ExecutionContext | None:
@@ -340,6 +341,24 @@ class AgentRunner:
         resolved_display_message = (
             display_message if display_message is not None else message
         )
+        requested_turn_id = turn_id.strip() if turn_id and turn_id.strip() else None
+        if requested_turn_id is not None:
+            for existing in context.messages:
+                existing_metadata = getattr(existing, "metadata", None)
+                if (
+                    getattr(existing, "role", None) != "user"
+                    or not isinstance(existing_metadata, dict)
+                    or existing_metadata.get("turn_id") != requested_turn_id
+                ):
+                    continue
+                if existing.content != resolved_execution_message:
+                    raise ValueError(
+                        "turn_id is already associated with a different user message"
+                    )
+                if request_interrupt:
+                    self.pause(execution_id, reason=reason or "new user message")
+                return context
+
         # Attach files + display text to the new Message so they survive
         # checkpoint round-trips: Message.metadata is serialized by
         # ExecutionContext. The on_user_message_posted callback reads
@@ -348,6 +367,8 @@ class AgentRunner:
         metadata: dict[str, Any] = {"display_message": resolved_display_message}
         if files is not None:
             metadata["files"] = files
+        if requested_turn_id is not None:
+            metadata["turn_id"] = requested_turn_id
         self._ensure_user_message_turn_id(metadata)
 
         added = context.add_user_message(resolved_execution_message, metadata=metadata)
@@ -484,6 +505,7 @@ class AgentRunner:
         execution_message: str | None = None,
         display_message: str | None = None,
         files: list[dict[str, Any]] | None = None,
+        turn_id: str | None = None,
         request_interrupt: bool = True,
         reason: str | None = None,
     ) -> ExecutionContext | None:
@@ -498,6 +520,7 @@ class AgentRunner:
             execution_message=execution_message,
             display_message=display_message,
             files=files,
+            turn_id=turn_id,
             request_interrupt=request_interrupt,
             reason=reason,
         )

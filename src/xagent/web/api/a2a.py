@@ -150,6 +150,7 @@ async def _resume_waiting_a2a_task(
     agent: Agent,
     task: Task,
     text: str,
+    message_id: str,
 ) -> bool:
     task_id = int(task.id)
     claimed = (
@@ -193,6 +194,7 @@ async def _resume_waiting_a2a_task(
             str(task_id),
             execution_message=text,
             display_message=text,
+            turn_id=f"a2a:{task_id}:{message_id}",
             request_interrupt=False,
             reason="A2A input-required response",
         )
@@ -300,6 +302,7 @@ async def _start_a2a_turn(
     db: Session,
     agent: Agent,
     text: str,
+    message_id: str,
     context_id: str | None,
     task_id: int | None,
 ) -> Task:
@@ -358,6 +361,7 @@ async def _start_a2a_turn(
                 agent=agent,
                 task=task,
                 text=text,
+                message_id=message_id,
             ):
                 return task
             normalized_waiting_task = True
@@ -452,6 +456,18 @@ def _message_payload(body: Mapping[str, Any]) -> Mapping[str, Any]:
             status_code=400,
         )
     return message
+
+
+def _message_id(message: Mapping[str, Any]) -> str:
+    value = message.get("messageId")
+    if isinstance(value, str) and value.strip():
+        return value.strip()
+    raise a2a_error(
+        "invalid_argument",
+        "message.messageId must be a non-empty string.",
+        status_code=400,
+        details={"field": "message.messageId"},
+    )
 
 
 def _fetch_fresh_a2a_task(agent_id: int, task_id: int) -> Task | None:
@@ -594,12 +610,14 @@ async def send_message(
     return_immediately = _validate_send_configuration(body)
     message = _message_payload(body)
     text = extract_message_text(message)
+    message_id = _message_id(message)
     context_id = message_context_id(message, body)
     task_id = message_task_id(message, body)
     task = await _start_a2a_turn(
         db=db,
         agent=agent,
         text=text,
+        message_id=message_id,
         context_id=context_id,
         task_id=task_id,
     )
@@ -622,12 +640,14 @@ async def stream_message(
     _validate_send_configuration(body)
     message = _message_payload(body)
     text = extract_message_text(message)
+    message_id = _message_id(message)
     context_id = message_context_id(message, body)
     task_id = message_task_id(message, body)
     task = await _start_a2a_turn(
         db=db,
         agent=agent,
         text=text,
+        message_id=message_id,
         context_id=context_id,
         task_id=task_id,
     )

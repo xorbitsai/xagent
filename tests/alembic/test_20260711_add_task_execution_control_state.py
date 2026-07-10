@@ -61,3 +61,28 @@ def test_upgrade_adds_and_backfills_task_control_state() -> None:
         assert "run_id" not in downgraded_columns
         assert "state_version" not in downgraded_columns
         assert "control_state" not in downgraded_columns
+
+
+def test_upgrade_defaults_control_state_when_legacy_tasks_lack_status() -> None:
+    engine = create_engine("sqlite:///:memory:")
+    config = create_alembic_config(engine)
+
+    with engine.begin() as connection:
+        connection.execute(
+            text("CREATE TABLE alembic_version (version_num VARCHAR(255) NOT NULL)")
+        )
+        connection.execute(
+            text("INSERT INTO alembic_version (version_num) VALUES (:revision)"),
+            {"revision": DOWN_REVISION},
+        )
+        connection.execute(text("CREATE TABLE tasks (id INTEGER PRIMARY KEY)"))
+        connection.execute(text("INSERT INTO tasks (id) VALUES (1)"))
+
+        config.attributes["connection"] = connection
+        command.upgrade(config, REVISION)
+
+        row = connection.execute(
+            text("SELECT run_id, state_version, control_state FROM tasks")
+        ).one()
+
+        assert row == (None, 0, "idle")

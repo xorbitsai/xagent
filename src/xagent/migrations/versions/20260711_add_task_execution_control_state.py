@@ -35,11 +35,12 @@ def _indexes() -> set[str]:
 
 
 def upgrade() -> None:
-    if not _columns():
+    columns = _columns()
+    if not columns:
         return
-    if "run_id" not in _columns():
+    if "run_id" not in columns:
         op.add_column(TABLE, sa.Column("run_id", sa.String(64), nullable=True))
-    if "state_version" not in _columns():
+    if "state_version" not in columns:
         op.add_column(
             TABLE,
             sa.Column(
@@ -49,7 +50,7 @@ def upgrade() -> None:
                 server_default="0",
             ),
         )
-    if "control_state" not in _columns():
+    if "control_state" not in columns:
         op.add_column(
             TABLE,
             sa.Column(
@@ -59,18 +60,20 @@ def upgrade() -> None:
                 server_default="idle",
             ),
         )
-        op.execute(
-            sa.text(
-                "UPDATE tasks SET control_state = CASE "
-                "WHEN LOWER(CAST(status AS VARCHAR)) = 'running' THEN 'running' "
-                "WHEN LOWER(CAST(status AS VARCHAR)) = 'paused' THEN 'paused' "
-                "WHEN LOWER(CAST(status AS VARCHAR)) = 'waiting_for_user' "
-                "THEN 'waiting_for_user' "
-                "WHEN LOWER(CAST(status AS VARCHAR)) = 'completed' THEN 'completed' "
-                "WHEN LOWER(CAST(status AS VARCHAR)) = 'failed' THEN 'failed' "
-                "ELSE 'idle' END"
+        if "status" in columns:
+            op.execute(
+                sa.text(
+                    "UPDATE tasks SET control_state = CASE "
+                    "WHEN LOWER(CAST(status AS VARCHAR)) = 'running' THEN 'running' "
+                    "WHEN LOWER(CAST(status AS VARCHAR)) = 'paused' THEN 'paused' "
+                    "WHEN LOWER(CAST(status AS VARCHAR)) = 'waiting_for_user' "
+                    "THEN 'waiting_for_user' "
+                    "WHEN LOWER(CAST(status AS VARCHAR)) = 'completed' "
+                    "THEN 'completed' "
+                    "WHEN LOWER(CAST(status AS VARCHAR)) = 'failed' THEN 'failed' "
+                    "ELSE 'idle' END"
+                )
             )
-        )
     if RUN_ID_INDEX not in _indexes():
         op.create_index(RUN_ID_INDEX, TABLE, ["run_id"])
 

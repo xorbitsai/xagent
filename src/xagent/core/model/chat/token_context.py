@@ -186,6 +186,11 @@ def _coerce_int(value: Any) -> int:
     try:
         return int(value)
     except (TypeError, ValueError):
+        # None/absent is expected (provider omitted the field) — stay quiet.
+        # A present-but-malformed value signals a provider-adapter bug worth
+        # surfacing rather than silently billing it as zero.
+        if value is not None:
+            logger.warning("Discarding non-numeric token count: %r", value)
         return 0
 
 

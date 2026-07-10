@@ -48,6 +48,50 @@ class TestTaskTracker:
         assert not tracker.is_tracking
 
     @pytest.mark.asyncio
+    async def test_complete_tracking_reports_only_current_turn_delta(self, db_session):
+        """The usage-record hook must receive only this turn's delta, not the
+        re-seeded prior-turn baseline (multi-turn tasks seed from the DB)."""
+        from xagent.core.model.chat.token_context import add_tool_call_usage
+        from xagent.web.services import quota_hooks
+
+        task = db_session.query.return_value.filter.return_value.first.return_value
+        task.user_id = 42
+        # Prior-turn state seeded from the DB row.
+        task.input_tokens = 100
+        task.output_tokens = 50
+        task.llm_calls = 1
+        task.token_usage_details = [
+            {"type": "input", "tokens": 100, "model": "m", "call_type": "chat"},
+            {"type": "output", "tokens": 50, "model": "m", "call_type": "chat"},
+        ]
+
+        captured = {}
+
+        def _hook(db, user_id, delta_details, delta_actions):
+            captured.update(
+                user_id=user_id, details=delta_details, actions=delta_actions
+            )
+
+        quota_hooks.set_usage_record_hook(_hook)
+        try:
+            tracker = TaskTracker(task_id=123, db_session=db_session)
+            await tracker.start_tracking()
+            # This turn's usage, appended on top of the seeded baseline.
+            add_token_usage(
+                input_tokens=10, output_tokens=5, model="m", call_type="chat"
+            )
+            add_tool_call_usage(3)
+            await tracker.complete_tracking()
+        finally:
+            quota_hooks.set_usage_record_hook(None)
+
+        assert captured["user_id"] == 42
+        assert captured["actions"] == 3  # only this turn's tool calls (baseline was 0)
+        # Only the two entries appended this turn, not the two seeded ones.
+        assert len(captured["details"]) == 2
+        assert sorted(d["tokens"] for d in captured["details"]) == [5, 10]
+
+    @pytest.mark.asyncio
     async def test_init_task_tracker_with_custom_interval(self, db_session):
         """Test TaskTracker with custom update interval."""
         tracker = TaskTracker(

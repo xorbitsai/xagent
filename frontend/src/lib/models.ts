@@ -17,7 +17,8 @@ export type DefaultModelType =
   | 'asr'
   | 'tts'
   | 'speech'
-  | 'sound_effect';
+  | 'sound_effect'
+  | 'music';
 
 export interface Model {
   id: number;
@@ -26,7 +27,7 @@ export interface Model {
   model_name?: string;
   provider: string;
   model_provider: string;
-  category?: 'llm' | 'embedding' | 'image' | 'video' | 'speech' | 'sound_effect' | 'rerank';
+  category?: 'llm' | 'embedding' | 'image' | 'video' | 'speech' | 'sound_effect' | 'music' | 'rerank';
   api_key?: string;
   base_url?: string;
   max_tokens?: number;
@@ -67,6 +68,7 @@ export interface DefaultModelConfig {
   tts?: ModelConfig;
   speech?: ModelConfig;
   sound_effect?: ModelConfig;
+  music?: ModelConfig;
 }
 
 /**
@@ -144,7 +146,7 @@ export async function removeUserDefaultModel(
  */
 export async function getSystemDefaultModels(_token: string): Promise<DefaultModelConfig> {
   const apiUrl = getApiUrl()
-  const [general, smallFast, visual, compact, embedding, video, soundEffect] = await Promise.all([
+  const [general, smallFast, visual, compact, embedding, video, soundEffect, music] = await Promise.all([
     apiRequest(`${apiUrl}/api/models/default/general`)
       .then(res => res.json().catch(() => null)),
     apiRequest(`${apiUrl}/api/models/default/small-fast`)
@@ -159,6 +161,8 @@ export async function getSystemDefaultModels(_token: string): Promise<DefaultMod
       .then(res => res.json().catch(() => null)),
     apiRequest(`${apiUrl}/api/models/default/sound_effect`)
       .then(res => res.json().catch(() => null)),
+    apiRequest(`${apiUrl}/api/models/default/music`)
+      .then(res => res.json().catch(() => null)),
   ]);
 
   return {
@@ -169,6 +173,7 @@ export async function getSystemDefaultModels(_token: string): Promise<DefaultMod
     embedding,
     video,
     sound_effect: soundEffect,
+    music,
   };
 }
 

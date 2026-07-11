@@ -30,7 +30,7 @@ const MODEL_TABS = ["llm", "embedding", "rerank", "image", "video", "audio"] as 
 const DEFAULT_MODEL_TAB = "llm"
 type ModelTab = (typeof MODEL_TABS)[number]
 
-const AUDIO_MODEL_CATEGORIES = new Set(["speech", "sound_effect"])
+const AUDIO_MODEL_CATEGORIES = new Set(["speech", "sound_effect", "music"])
 
 function modelMatchesTab(category: string, tab: ModelTab): boolean {
   return tab === "audio" ? AUDIO_MODEL_CATEGORIES.has(category) : category === tab
@@ -38,7 +38,7 @@ function modelMatchesTab(category: string, tab: ModelTab): boolean {
 
 function getValidModelTab(value: string | null): ModelTab {
   // Keep old bookmarked URLs working after merging speech and sound effects.
-  if (value === "speech" || value === "sound_effect") return "audio"
+  if (value === "speech" || value === "sound_effect" || value === "music") return "audio"
   if (value && (MODEL_TABS as readonly string[]).includes(value)) {
     return value as ModelTab
   }
@@ -244,6 +244,7 @@ export function ModelsPage() {
     tts?: Model
     speech?: Model
     sound_effect?: Model
+    music?: Model
     rerank?: Model
   }>({})
 

@@ -115,6 +115,7 @@ class ToolRegistry:
                 image_tool,
                 knowledge_tools,
                 mcp_tools,
+                music_tool,
                 pptx_tool,
                 skill_tools,
                 sound_effect_tool,

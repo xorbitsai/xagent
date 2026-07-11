@@ -92,6 +92,16 @@ def _validate_abilities_for_category(abilities: List[str], category: str) -> Lis
             )
         if not abilities:
             raise ValueError("Sound effect model must have at least one ability")
+    elif category == "music":
+        valid_music_abilities: Set[str] = {"generate"}
+        invalid_abilities = set(abilities) - valid_music_abilities
+        if invalid_abilities:
+            raise ValueError(
+                f"Invalid abilities for music model: {invalid_abilities}. "
+                f"Valid abilities are: {valid_music_abilities}"
+            )
+        if not abilities:
+            raise ValueError("Music model must have at least one ability")
 
     return abilities
 
@@ -274,6 +284,7 @@ class UserDefaultModelCreate(BaseModel):
             "tts",
             "speech",
             "sound_effect",
+            "music",
             "rerank",
         }
         if v not in valid_types:

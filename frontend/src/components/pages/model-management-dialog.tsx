@@ -37,7 +37,8 @@ import {
   ChevronRight,
   Check,
   Video,
-  Volume2
+  Volume2,
+  Music
 } from "lucide-react"
 import { useI18n } from "@/contexts/i18n-context"
 import { ScrollArea } from "@/components/ui/scroll-area"
@@ -146,6 +147,7 @@ export function ModelManagementDialog({
     const provider = providers.find(p => p.id === providerId)
     if (provider?.category.includes('speech')) return 'speech'
     if (provider?.category.includes('sound_effect')) return 'sound_effect'
+    if (provider?.category.includes('music')) return 'music'
     return 'speech'
   }
 
@@ -156,6 +158,7 @@ export function ModelManagementDialog({
     if (category === 'video') return ['generate']
     if (category === 'speech') return ['asr']
     if (category === 'sound_effect') return ['generate']
+    if (category === 'music') return ['generate']
     if (category === 'rerank') return ['rerank']
     return []
   }
@@ -177,6 +180,7 @@ export function ModelManagementDialog({
     if (category === 'video') return 'video'
     if (category === 'rerank') return 'rerank'
     if (category === 'sound_effect') return 'sound_effect'
+    if (category === 'music') return 'music'
     if (category === 'speech') {
       if (abilities?.includes('asr')) return 'asr'
       if (abilities?.includes('tts')) return 'tts'
@@ -212,12 +216,16 @@ export function ModelManagementDialog({
       ] : []),
       ...(category === 'sound_effect' ? [
         { value: "sound_effect", label: t('models.defaults.sound_effect') }
+      ] : []),
+      ...(category === 'music' ? [
+        { value: "music", label: t('models.defaults.music') }
       ] : [])
     ]
   }
 
   const getAudioTypeLabels = (model: Model): string[] => {
     if (model.category === 'sound_effect') return ['sound_effect']
+    if (model.category === 'music') return ['music']
     if (model.category !== 'speech') return []
     return [
       ...(model.abilities?.includes('asr') ? ['asr'] : []),
@@ -327,6 +335,7 @@ export function ModelManagementDialog({
     { value: "asr", label: t('models.abilities.asr') },
     { value: "tts", label: t('models.abilities.tts') },
     { value: "sound_effect", label: t('models.abilities.sound_effect') },
+    { value: "music", label: t('models.abilities.music') },
   ], [t])
 
   const rerankAbilityOptions = useMemo(() => [
@@ -334,7 +343,7 @@ export function ModelManagementDialog({
   ], [t])
 
   const getAbilityOptionsForCategory = (category: string) => {
-    if (activeTab === 'audio' && (category === 'speech' || category === 'sound_effect')) {
+    if (activeTab === 'audio' && (category === 'speech' || category === 'sound_effect' || category === 'music')) {
       return audioAbilityOptions
     }
     if (category === 'llm') return abilityOptions
@@ -343,6 +352,7 @@ export function ModelManagementDialog({
     if (category === 'video') return videoAbilityOptions
     if (category === 'speech') return speechAbilityOptions
     if (category === 'sound_effect') return videoAbilityOptions
+    if (category === 'music') return videoAbilityOptions
     if (category === 'rerank') return rerankAbilityOptions
     return []
   }
@@ -352,7 +362,7 @@ export function ModelManagementDialog({
     return enabledModels.filter(m =>
       m.model_provider === managingProviderId &&
       (activeTab === 'audio'
-        ? m.category === 'speech' || m.category === 'sound_effect'
+        ? m.category === 'speech' || m.category === 'sound_effect' || m.category === 'music'
         : m.category === activeTab)
     )
   }, [enabledModels, managingProviderId, activeTab])
@@ -534,8 +544,12 @@ export function ModelManagementDialog({
   const handleFetchModels = async () => fetchModelsForCategory(formData.category)
 
   const updateAudioCapability = async (capability: string) => {
-    const category = capability === 'sound_effect' ? 'sound_effect' : 'speech'
-    const abilities = capability === 'sound_effect' ? ['generate'] : [capability]
+    const category = capability === 'sound_effect'
+      ? 'sound_effect'
+      : capability === 'music'
+        ? 'music'
+        : 'speech'
+    const abilities = category === 'speech' ? [capability] : ['generate']
 
     resetTestConnectionState()
     setHasInitializedDefaults(false)
@@ -838,6 +852,7 @@ export function ModelManagementDialog({
                             { value: "video", label: t('models.tabs.video') },
                             { value: "speech", label: t('models.tabs.speech') },
                             { value: "sound_effect", label: t('models.tabs.sound_effect') },
+                            { value: "music", label: t('models.tabs.music') },
                             { value: "rerank", label: t('models.tabs.rerank') }
                           ]}
                           className="w-full sm:w-[180px]"
@@ -1039,8 +1054,8 @@ export function ModelManagementDialog({
                           {getAbilityOptionsForCategory(formData.category).map(({ value, label }) => {
                             const cap = value
                             const isSelected = activeTab === 'audio'
-                              ? cap === 'sound_effect'
-                                ? formData.category === 'sound_effect'
+                              ? cap === 'sound_effect' || cap === 'music'
+                                ? formData.category === cap
                                 : formData.category === 'speech' && formData.abilities?.includes(cap)
                               : formData.abilities?.includes(cap)
                             const icons: Record<string, JSX.Element> = {
@@ -1053,11 +1068,14 @@ export function ModelManagementDialog({
                                 ? <Video className="w-4 h-4 mr-1" />
                                 : formData.category === 'sound_effect'
                                   ? <Volume2 className="w-4 h-4 mr-1" />
-                                  : <ImageIcon className="w-4 h-4 mr-1" />,
+                                  : formData.category === 'music'
+                                    ? <Music className="w-4 h-4 mr-1" />
+                                    : <ImageIcon className="w-4 h-4 mr-1" />,
                               edit: <Edit className="w-4 h-4 mr-1" />,
                               asr: <Brain className="w-4 h-4 mr-1" />,
                               tts: <Star className="w-4 h-4 mr-1" />,
                               sound_effect: <Volume2 className="w-4 h-4 mr-1" />,
+                              music: <Music className="w-4 h-4 mr-1" />,
                             }
                             return (
                               <Button
@@ -1185,6 +1203,9 @@ export function ModelManagementDialog({
                             ] : []),
                             ...(formData.category === 'sound_effect' ? [
                               { value: "sound_effect", label: t('models.defaults.sound_effect') }
+                            ] : []),
+                            ...(formData.category === 'music' ? [
+                              { value: "music", label: t('models.defaults.music') }
                             ] : [])
                           ]}
                           placeholder={t('models.form.defaultPlaceholder')}
@@ -1199,6 +1220,7 @@ export function ModelManagementDialog({
                             if (formData.category === 'speech') return ['asr', 'tts'];
                             if (formData.category === 'rerank') return ['rerank'];
                             if (formData.category === 'sound_effect') return ['sound_effect'];
+                            if (formData.category === 'music') return ['music'];
                             return [];
                           })();
 
@@ -1423,6 +1445,7 @@ export function ModelManagementDialog({
                       { value: "video", label: t('models.tabs.video') },
                       { value: "speech", label: t('models.tabs.speech') },
                       { value: "sound_effect", label: t('models.tabs.sound_effect') },
+                      { value: "music", label: t('models.tabs.music') },
                       { value: "rerank", label: t('models.tabs.rerank') }
                     ]}
                   />
@@ -1564,6 +1587,7 @@ export function ModelManagementDialog({
                           formData.category === 'video' ? videoAbilityOptions :
                             formData.category === 'speech' ? speechAbilityOptions :
                               formData.category === 'sound_effect' ? videoAbilityOptions :
+                                formData.category === 'music' ? videoAbilityOptions :
                               rerankAbilityOptions
                   }
                   placeholder={t('models.form.abilitiesPlaceholder')}

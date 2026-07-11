@@ -48,6 +48,10 @@ class BaseToolConfig(ABC):
         """Get sound effect generation models."""
         return {}
 
+    def get_music_models(self) -> Dict[str, Any]:
+        """Get music generation models."""
+        return {}
+
     @abstractmethod
     async def get_mcp_server_configs(self) -> List[Dict[str, Any]]:
         """Get MCP server configurations."""
@@ -132,6 +136,10 @@ class BaseToolConfig(ABC):
 
     def get_sound_effect_model(self) -> Optional[Any]:
         """Get default sound effect generation model."""
+        return None
+
+    def get_music_model(self) -> Optional[Any]:
+        """Get default music generation model."""
         return None
 
     @abstractmethod
@@ -243,6 +251,8 @@ class ToolConfig(BaseToolConfig):
         config_dict.get("tts_models", [])  # Unused in base config
         sound_effect_models = config_dict.get("sound_effect_models") or {}
         sound_effect_model = config_dict.get("sound_effect_model")
+        music_models = config_dict.get("music_models") or {}
+        music_model = config_dict.get("music_model")
         mcp_server_configs = config_dict.get("mcp_servers", [])
         file_tools_enabled = config_dict.get("file_tools_enabled", True)
         basic_tools_enabled = config_dict.get("basic_tools_enabled", True)
@@ -310,6 +320,10 @@ class ToolConfig(BaseToolConfig):
             sound_effect_models if isinstance(sound_effect_models, dict) else {}
         )
         self.sound_effect_model: Optional[Any] = sound_effect_model
+        self.music_models: Dict[str, Any] = (
+            music_models if isinstance(music_models, dict) else {}
+        )
+        self.music_model: Optional[Any] = music_model
         self.mcp_server_configs: List[Dict[str, Any]] = mcp_server_configs
         self.file_tools_enabled: bool = bool(file_tools_enabled)
         self.basic_tools_enabled: bool = bool(basic_tools_enabled)
@@ -355,6 +369,9 @@ class ToolConfig(BaseToolConfig):
 
     def get_sound_effect_models(self) -> Dict[str, Any]:
         return self.sound_effect_models
+
+    def get_music_models(self) -> Dict[str, Any]:
+        return self.music_models
 
     async def get_mcp_server_configs(self) -> List[Dict[str, Any]]:
         return self.mcp_server_configs
@@ -403,6 +420,9 @@ class ToolConfig(BaseToolConfig):
 
     def get_sound_effect_model(self) -> Optional[Any]:
         return self.sound_effect_model
+
+    def get_music_model(self) -> Optional[Any]:
+        return self.music_model
 
     def get_asr_model(self) -> Optional[Any]:
         return None  # Standalone config doesn't have web context

@@ -43,12 +43,30 @@ def test_sound_effect_tool_requires_sound_effect_model() -> None:
 
     unavailable = _create_tool_info(
         Tool(),
-        "sound_effect",
+        "audio",
     )
     available = _create_tool_info(
         Tool(),
-        "sound_effect",
+        "audio",
         sound_effect_models={"sfx": object()},
+    )
+
+    assert unavailable["enabled"] is False
+    assert unavailable["status"] == "missing_model"
+    assert available["enabled"] is True
+    assert available["status"] == "available"
+
+
+def test_music_tool_requires_music_model() -> None:
+    class Tool:
+        name = "generate_music"
+        description = ""
+
+    unavailable = _create_tool_info(Tool(), "audio")
+    available = _create_tool_info(
+        Tool(),
+        "audio",
+        music_models={"music": object()},
     )
 
     assert unavailable["enabled"] is False

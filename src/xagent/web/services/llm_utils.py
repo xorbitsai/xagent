@@ -18,6 +18,7 @@ from ...core.model.model import (
     ChatModelConfig,
     EmbeddingModelConfig,
     ModelConfig,
+    MusicModelConfig,
     RerankModelConfig,
     SoundEffectModelConfig,
     VideoModelConfig,
@@ -145,6 +146,11 @@ class CoreStorage:
                 **common,
                 model_provider=db_model.model_provider,
             )
+        elif db_model.category == "music":
+            return MusicModelConfig(
+                **common,
+                model_provider=db_model.model_provider,
+            )
         else:
             raise ValueError(f"Unknown model category: {db_model.category}")
 
@@ -203,6 +209,7 @@ class CoreStorage:
             # Try ImageModelConfig or SpeechModelConfig
             from ...core.model.model import (
                 ImageModelConfig,
+                MusicModelConfig,
                 SoundEffectModelConfig,
                 SpeechModelConfig,
                 VideoModelConfig,
@@ -235,6 +242,13 @@ class CoreStorage:
                     {
                         "model_provider": model.model_provider,
                         "category": "sound_effect",
+                    }
+                )
+            elif isinstance(model, MusicModelConfig):
+                db_data.update(
+                    {
+                        "model_provider": model.model_provider,
+                        "category": "music",
                     }
                 )
             else:

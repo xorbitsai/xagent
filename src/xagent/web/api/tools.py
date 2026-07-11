@@ -43,7 +43,6 @@ CATEGORY_DISPLAY_NAMES = {
     "image": "Image",
     "video": "Video",
     "audio": "Audio",
-    "sound_effect": "Sound Effects",
     "knowledge": "Knowledge",
     "file": "File",
     "web_search": "Web Search",
@@ -85,6 +84,7 @@ def _create_tool_info(
     asr_models: Any = None,
     tts_models: Any = None,
     sound_effect_models: Any = None,
+    music_models: Any = None,
 ) -> dict[str, Any]:
     """Create tool information based on category instead of hardcoded names"""
     tool_name = getattr(tool, "name", tool.__class__.__name__)
@@ -141,8 +141,25 @@ def _create_tool_info(
 
     elif category == "audio":
         tool_type = "audio"
-        # audio tool depends on ASR/TTS models
-        if not asr_models and not tts_models:
+        if tool_name == "generate_sound_effect" and not sound_effect_models:
+            status = "missing_model"
+            status_reason = (
+                "Sound effect model not configured, please add a sound effect model"
+            )
+            enabled = False
+        elif tool_name == "generate_music" and not music_models:
+            status = "missing_model"
+            status_reason = "Music model not configured, please add a music model"
+            enabled = False
+        elif (
+            not asr_models
+            and not tts_models
+            and tool_name
+            not in {
+                "generate_sound_effect",
+                "generate_music",
+            }
+        ):
             status = "missing_model"
             status_reason = (
                 "Audio model not configured, please add an "
@@ -161,15 +178,6 @@ def _create_tool_info(
             status_reason = (
                 "TTS model not configured, please add a "
                 "text-to-speech model in model management page"
-            )
-            enabled = False
-
-    elif category == "sound_effect":
-        tool_type = "audio"
-        if not sound_effect_models:
-            status = "missing_model"
-            status_reason = (
-                "Sound effect model not configured, please add a sound effect model"
             )
             enabled = False
 
@@ -327,6 +335,7 @@ async def get_available_tools(
     asr_models = tool_config.get_asr_models()
     tts_models = tool_config.get_tts_models()
     sound_effect_models = tool_config.get_sound_effect_models()
+    music_models = tool_config.get_music_models()
 
     # Convert tools to API format with category information
     tools: list[dict[str, Any]] = []
@@ -342,6 +351,7 @@ async def get_available_tools(
                 asr_models,
                 tts_models,
                 sound_effect_models,
+                music_models,
             )
         )
 

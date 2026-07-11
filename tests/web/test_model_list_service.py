@@ -5,10 +5,12 @@ from __future__ import annotations
 import pytest
 
 from xagent.core.model.asr.elevenlabs import ElevenLabsASR
+from xagent.core.model.music.elevenlabs import ElevenLabsMusicModel
 from xagent.core.model.sound_effect.elevenlabs import ElevenLabsSoundEffectModel
 from xagent.core.model.tts.elevenlabs import ElevenLabsTTS
 from xagent.web.services.model_list_service import (
     fetch_elevenlabs_models,
+    fetch_elevenlabs_music_models,
     fetch_elevenlabs_sound_effect_models,
 )
 
@@ -65,6 +67,37 @@ async def test_fetch_elevenlabs_models_combines_tts_and_stt(
             "owned_by": "elevenlabs",
             "abilities": ["asr"],
         },
+    ]
+
+
+async def test_fetch_elevenlabs_music_models_is_separate(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def list_models(api_key=None, base_url=None):
+        return [
+            {
+                "id": "music_v2",
+                "category": "music",
+                "abilities": ["generate"],
+            }
+        ]
+
+    monkeypatch.setattr(
+        ElevenLabsMusicModel,
+        "async_list_available_models",
+        classmethod(
+            lambda cls, api_key=None, base_url=None: list_models(api_key, base_url)
+        ),
+    )
+
+    models = await fetch_elevenlabs_music_models("test-key")
+
+    assert models == [
+        {
+            "id": "music_v2",
+            "category": "music",
+            "abilities": ["generate"],
+        }
     ]
 
 

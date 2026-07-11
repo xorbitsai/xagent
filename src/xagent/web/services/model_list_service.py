@@ -231,6 +231,18 @@ async def fetch_elevenlabs_sound_effect_models(
     )
 
 
+async def fetch_elevenlabs_music_models(
+    api_key: str, base_url: Optional[str] = None
+) -> List[Dict[str, Any]]:
+    """Discover ElevenLabs music models with SDK/documented fallbacks."""
+    from ...core.model.music.elevenlabs import ElevenLabsMusicModel
+
+    return await ElevenLabsMusicModel.async_list_available_models(
+        api_key=api_key,
+        base_url=base_url,
+    )
+
+
 async def fetch_dashscope_rerank_models(
     api_key: str, base_url: Optional[str] = None
 ) -> List[Dict[str, Any]]:
@@ -386,6 +398,7 @@ PROVIDER_FETCHERS: Dict[str, Any] = {
     "xinference-video": fetch_xinference_video_models,
     "elevenlabs": fetch_elevenlabs_models,
     "elevenlabs-sound_effect": fetch_elevenlabs_sound_effect_models,
+    "elevenlabs-music": fetch_elevenlabs_music_models,
     "dashscope-rerank": fetch_dashscope_rerank_models,
     "zai-coding-plan": fetch_openai_models,
     "zhipuai-coding-plan": fetch_openai_models,

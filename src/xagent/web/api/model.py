@@ -25,6 +25,7 @@ from xagent.core.model.model import (
     EmbeddingModelConfig,
     ImageModelConfig,
     ModelConfig,
+    MusicModelConfig,
     RerankModelConfig,
     SoundEffectModelConfig,
     VideoModelConfig,
@@ -365,6 +366,7 @@ def _is_default_config_type_compatible(model: Any, config_type: str) -> bool:
         "tts": "speech",
         "speech": "speech",
         "sound_effect": "sound_effect",
+        "music": "music",
         "rerank": "rerank",
     }
 
@@ -387,6 +389,7 @@ def _is_default_config_type_compatible(model: Any, config_type: str) -> bool:
         "tts": {"tts"},
         "speech": {"asr", "tts"},
         "sound_effect": {"generate"},
+        "music": {"generate"},
     }
 
     required_abilities = required_abilities_by_config_type.get(config_type)
@@ -512,6 +515,17 @@ async def create_model(
             base_url=base_url,
             api_key=model.api_key or "",
             timeout=180.0,
+            abilities=model.abilities or ["generate"],
+            description=model.description,
+        )
+    elif model.category == "music":
+        config = MusicModelConfig(
+            id=model.model_id,
+            model_name=model.model_name,
+            model_provider=model_provider,
+            base_url=base_url,
+            api_key=model.api_key or "",
+            timeout=600.0,
             abilities=model.abilities or ["generate"],
             description=model.description,
         )
@@ -849,6 +863,30 @@ async def test_model_connection(
                 ),
                 timeout=timeout_seconds,
             )
+
+        elif request.category == "music":
+            if provider != "elevenlabs":
+                raise ValueError(
+                    "Music connection testing currently supports ElevenLabs"
+                )
+            from xagent.core.model.music import create_music_model
+
+            music_model = create_music_model(
+                MusicModelConfig(
+                    id="test-model",
+                    model_name=request.model_name,
+                    model_provider=provider,
+                    api_key=request.api_key,
+                    base_url=base_url,
+                    abilities=request.abilities or ["generate"],
+                )
+            )
+            try:
+                await asyncio.wait_for(
+                    music_model.validate_connection(), timeout=timeout_seconds
+                )
+            finally:
+                await music_model.aclose()
 
         elif request.category == "rerank":
             from xagent.core.model.rerank.adapter import _create_rerank_model
@@ -1262,6 +1300,7 @@ async def get_default_model(
         "tts": "tts",
         "speech": "speech",
         "sound_effect": "sound_effect",
+        "music": "music",
         "rerank": "rerank",
     }
 
@@ -2018,6 +2057,7 @@ async def get_public_summary(
         "video",
         "speech",
         "sound_effect",
+        "music",
     ]:
         count = (
             db.query(DBModel)

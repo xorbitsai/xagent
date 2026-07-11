@@ -83,6 +83,12 @@ class SoundEffectModelConfig(ModelConfig):
     model_provider: str = "elevenlabs"
 
 
+class MusicModelConfig(ModelConfig):
+    """Configuration for prompt-to-music models."""
+
+    model_provider: str = "elevenlabs"
+
+
 class VectorDBConfig(ModelConfig):
     """Configuration for vector database backend (e.g. LanceDB, Weaviate).
 

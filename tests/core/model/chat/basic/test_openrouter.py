@@ -5,6 +5,66 @@ from types import SimpleNamespace
 import pytest
 
 from xagent.core.model.chat.basic.openrouter import OpenRouterLLM
+from xagent.core.model.chat.tool_protocol import get_tool_protocol_error
+
+
+@pytest.mark.parametrize(
+    ("model_name", "expected"),
+    [
+        ("deepseek/deepseek-v4-flash", True),
+        ("openrouter/deepseek/deepseek-v4-flash", True),
+        ("anthropic/claude-sonnet-4.6", False),
+    ],
+)
+def test_openrouter_uses_deepseek_tool_protocol_only_for_deepseek_models(
+    model_name, expected
+):
+    llm = OpenRouterLLM(model_name=model_name, api_key="test-key")
+
+    assert llm._uses_deepseek_tool_protocol is expected
+
+
+@pytest.mark.asyncio
+async def test_openrouter_deepseek_rejects_serialized_tool_protocol_content(
+    mocker,
+):
+    message = SimpleNamespace(
+        content="<｜｜DSML｜｜tool_calls>",
+        tool_calls=None,
+        reasoning_content=None,
+    )
+    response = SimpleNamespace(
+        choices=[SimpleNamespace(message=message)],
+        usage=None,
+        model_dump=lambda: {"id": "openrouter-deepseek-invalid-protocol"},
+    )
+    mock_client = mocker.AsyncMock()
+    mock_client.chat.completions.create.return_value = response
+    mocker.patch(
+        "xagent.core.model.chat.basic.openai.AsyncOpenAI",
+        return_value=mock_client,
+    )
+    llm = OpenRouterLLM(
+        model_name="deepseek/deepseek-v4-flash",
+        api_key="test-key",
+    )
+
+    result = await llm.chat(
+        [{"role": "user", "content": "Use a tool"}],
+        tools=[
+            {
+                "type": "function",
+                "function": {
+                    "name": "search",
+                    "parameters": {"type": "object", "properties": {}},
+                },
+            }
+        ],
+    )
+
+    error = get_tool_protocol_error(result)
+    assert error is not None
+    assert error["code"] == "serialized_tool_call_content"
 
 
 @pytest.mark.asyncio

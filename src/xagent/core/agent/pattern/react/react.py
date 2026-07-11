@@ -38,6 +38,7 @@ from datetime import timezone
 from enum import Enum
 from typing import Any, cast
 
+from ....model.chat.tool_protocol import get_tool_protocol_error
 from ...context.enrichment import (
     enrich_context_with_memory,
     enrich_context_with_skill,
@@ -48,9 +49,7 @@ from ...language import final_answer_language_rule
 from ...result import unwrap_final_answer_content
 from ...runtime import LLMCallInterrupted, PatternRuntime
 from ..base import AgentPattern, PatternResult, truncate_prompt_preview
-from ..final_answer_stream import (
-    ReActFinalAnswerStreamer,
-)
+from ..final_answer_stream import ReActFinalAnswerStreamer
 
 
 class ReActReasoningMode(str, Enum):
@@ -352,7 +351,11 @@ class ReActPattern(AgentPattern):
                 and not self.pending_tool_calls
                 and self._latest_tool_result_success(context)
             )
-            tool_schemas = [] if force_final_answer_now else base_tool_schemas
+            tool_schemas = (
+                [self._final_answer_tool_schema()]
+                if force_final_answer_now
+                else base_tool_schemas
+            )
             interrupted = await self._interrupt_if_requested(
                 runtime=runtime,
                 context=context,
@@ -382,10 +385,17 @@ class ReActPattern(AgentPattern):
             )
             answer_streamer: ReActFinalAnswerStreamer | None = None
             try:
+                effective_tool_choice = (
+                    "required"
+                    if force_final_answer_now
+                    else self.tool_choice
+                    if tool_schemas
+                    else None
+                )
                 llm_kwargs = {
                     "messages": messages,
                     "tools": tool_schemas or None,
-                    "tool_choice": self.tool_choice if tool_schemas else None,
+                    "tool_choice": effective_tool_choice,
                 }
                 if tool_schemas:
                     answer_streamer = ReActFinalAnswerStreamer(runtime)
@@ -411,14 +421,73 @@ class ReActPattern(AgentPattern):
                 if answer_streamer is not None:
                     await answer_streamer.fail(str(exc))
                 raise
-            await runtime.on_llm_end(
-                context=context,
-                response=response,
-                metadata={"iteration": iteration},
-            )
             self.repeated_tool_decision = None
             self.last_response = response
             normalized = self._normalize_llm_response(response)
+            requires_protocol_retry = self._response_requires_tool_protocol_retry(
+                normalized,
+                force_final_answer=force_final_answer_now,
+            )
+            end_metadata: dict[str, Any] = {"iteration": iteration}
+            if requires_protocol_retry:
+                end_metadata.update(
+                    success=False,
+                    phase="discarded_invalid_tool_protocol",
+                )
+            await runtime.on_llm_end(
+                context=context,
+                response=response,
+                metadata=end_metadata,
+            )
+            if requires_protocol_retry:
+                if answer_streamer is not None:
+                    await answer_streamer.fail("invalid tool protocol, retrying")
+                try:
+                    (
+                        response,
+                        answer_streamer,
+                    ) = await self._retry_tool_protocol_response(
+                        context=context,
+                        llm=llm,
+                        runtime=runtime,
+                        iteration=iteration,
+                        tool_schemas=tool_schemas,
+                        force_final_answer=force_final_answer_now,
+                    )
+                except LLMCallInterrupted:
+                    interrupted = await self._interrupt_if_requested(
+                        runtime=runtime,
+                        context=context,
+                        label="during_llm",
+                    )
+                    if interrupted is not None:
+                        return interrupted
+                    raise
+                self.last_response = response
+                normalized = self._normalize_llm_response(response)
+                if self._response_requires_tool_protocol_retry(
+                    normalized,
+                    force_final_answer=force_final_answer_now,
+                ):
+                    if answer_streamer is not None:
+                        await answer_streamer.fail("invalid tool protocol after retry")
+                    await runtime.checkpoint(
+                        "invalid_tool_protocol",
+                        context=context,
+                        pattern=self,
+                        metadata={"iteration": iteration},
+                    )
+                    return PatternResult(
+                        success=False,
+                        error=(
+                            "The model returned an invalid tool protocol response "
+                            "after one repair attempt."
+                        ),
+                        metadata={
+                            "iterations": iteration + 1,
+                            "status": "invalid_tool_protocol",
+                        },
+                    ).to_dict()
             if force_final_answer_now and not normalized.get("tool_calls"):
                 normalized["done"] = True
 
@@ -516,9 +585,10 @@ class ReActPattern(AgentPattern):
         messages = list(context.get_messages_for_llm())
         if force_final_answer:
             instruction = (
-                "You have already received the tool result needed for the current "
-                "step. Do not call tools again. Produce the final answer for this "
-                "step using the latest tool result. "
+                "Produce the final user-facing answer by calling the final_answer "
+                "control tool exactly once using the accumulated conversation and "
+                "tool results. Do not call any other tool and do not output "
+                "tool-call markup as plain text. "
                 f"{final_answer_language_rule()}"
             )
         elif has_tools:
@@ -577,6 +647,112 @@ class ReActPattern(AgentPattern):
                 *messages[1:],
             ]
         return [{"role": "system", "content": instruction}, *messages]
+
+    async def _retry_tool_protocol_response(
+        self,
+        *,
+        context: Any,
+        llm: Any,
+        runtime: PatternRuntime,
+        iteration: int,
+        tool_schemas: list[dict[str, Any]],
+        force_final_answer: bool,
+    ) -> tuple[Any, ReActFinalAnswerStreamer]:
+        tools = (
+            [self._final_answer_tool_schema()] if force_final_answer else tool_schemas
+        )
+        messages = self._messages_for_llm(
+            context,
+            has_tools=True,
+            force_final_answer=force_final_answer,
+            tool_names=self._schema_tool_names(tools),
+        )
+        retry_instruction = (
+            "The previous response used an invalid tool protocol. Retry the same "
+            "turn using native structured tool calls only. Never place one tool "
+            "invocation or its arguments inside another tool's arguments. If work "
+            "remains, call the appropriate available work tool directly; call "
+            "final_answer only when the task is actually complete."
+        )
+        messages[0] = {
+            **messages[0],
+            "content": f"{messages[0].get('content', '')}\n\n{retry_instruction}",
+        }
+        metadata = {
+            "iteration": iteration,
+            "phase": "tool_protocol_retry",
+        }
+        await runtime.checkpoint(
+            "tool_protocol_retry",
+            context=context,
+            pattern=self,
+            metadata=metadata,
+        )
+        await runtime.on_llm_start(
+            context=context,
+            messages=messages,
+            tools=tools,
+            metadata=metadata,
+        )
+        answer_streamer = ReActFinalAnswerStreamer(runtime)
+        try:
+            response = await runtime.run_streaming_llm_call(
+                llm,
+                messages=messages,
+                tools=tools,
+                tool_choice="required",
+                on_chunk=answer_streamer.handle_chunk,
+            )
+        except LLMCallInterrupted:
+            await answer_streamer.fail("interrupted during LLM stream")
+            raise
+        except Exception as exc:
+            await answer_streamer.fail(str(exc))
+            await runtime.on_llm_error(
+                context=context,
+                error=exc,
+                metadata=metadata,
+            )
+            raise
+        normalized = self._normalize_llm_response(response)
+        retry_is_invalid = self._response_requires_tool_protocol_retry(
+            normalized,
+            force_final_answer=force_final_answer,
+        )
+        end_metadata = dict(metadata)
+        if retry_is_invalid:
+            end_metadata.update(
+                success=False,
+                phase="discarded_invalid_tool_protocol_retry",
+            )
+        await runtime.on_llm_end(
+            context=context,
+            response=response,
+            metadata=end_metadata,
+        )
+        return response, answer_streamer
+
+    def _response_requires_tool_protocol_retry(
+        self,
+        normalized: dict[str, Any],
+        *,
+        force_final_answer: bool,
+    ) -> bool:
+        if get_tool_protocol_error(normalized.get("raw")) is not None:
+            return True
+        for tool_call in normalized.get("tool_calls") or []:
+            if not isinstance(tool_call, dict):
+                continue
+            if force_final_answer and tool_call.get("name") != "final_answer":
+                return True
+        return False
+
+    def _final_answer_tool_schema(self) -> dict[str, Any]:
+        for schema in self._builtin_tool_schemas():
+            function = schema.get("function")
+            if isinstance(function, dict) and function.get("name") == "final_answer":
+                return schema
+        raise RuntimeError("final_answer control tool schema is unavailable")
 
     def _schema_tool_names(self, tool_schemas: list[dict[str, Any]]) -> list[str]:
         names: list[str] = []
@@ -936,6 +1112,7 @@ class ReActPattern(AgentPattern):
                     ),
                     "parameters": {
                         "type": "object",
+                        "additionalProperties": False,
                         "properties": {
                             "response_language": {
                                 "type": "string",

@@ -544,8 +544,24 @@ async def test_dag_child_react_repeated_decision_can_finalize() -> None:
                         }
                     ],
                 }
-            if not kwargs.get("tools"):
-                return "DAG child answer."
+            if len(kwargs.get("tools") or []) == 1 and has_tool(kwargs, "final_answer"):
+                return {
+                    "content": "",
+                    "tool_calls": [
+                        {
+                            "id": "final_1",
+                            "function": {
+                                "name": "final_answer",
+                                "arguments": json.dumps(
+                                    {
+                                        "response_language": "English",
+                                        "answer": "DAG child answer.",
+                                    }
+                                ),
+                            },
+                        }
+                    ],
+                }
 
             self.tool_call_count += 1
             if self.tool_call_count > 4:
@@ -596,7 +612,10 @@ async def test_dag_child_react_repeated_decision_can_finalize() -> None:
     assert [schema["function"]["name"] for schema in llm.calls[4]["tools"]] == [
         "react_decision"
     ]
-    assert llm.calls[5]["tools"] is None
+    assert [schema["function"]["name"] for schema in llm.calls[5]["tools"]] == [
+        "final_answer"
+    ]
+    assert llm.calls[5]["tool_choice"] == "required"
     assert [event["type"] for event in outbound.events] == [
         "final_answer_start",
         "final_answer_delta",

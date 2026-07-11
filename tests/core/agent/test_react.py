@@ -17,6 +17,10 @@ from xagent.core.agent import (
     ReActReasoningMode,
     ToolCallRecord,
 )
+from xagent.core.model.chat.tool_protocol import (
+    ToolProtocolViolation,
+    tool_protocol_error_response,
+)
 from xagent.core.model.chat.types import ChunkType, StreamChunk
 
 react_module = importlib.import_module("xagent.core.agent.pattern.react.react")
@@ -279,7 +283,28 @@ class StreamingFinalAnswerLLM:
 
     async def stream_chat(self, **kwargs: Any) -> Any:
         self.stream_calls.append(kwargs)
-        if kwargs.get("tools"):
+        tool_names = [
+            tool["function"]["name"] for tool in list(kwargs.get("tools") or [])
+        ]
+        if tool_names == ["final_answer"]:
+            yield StreamChunk(
+                type=ChunkType.TOOL_CALL,
+                tool_calls=[
+                    {
+                        "id": "call_final",
+                        "function": {
+                            "name": "final_answer",
+                            "arguments": (
+                                '{"response_language":"English",'
+                                '"answer":"The result is 4."}'
+                            ),
+                        },
+                    }
+                ],
+            )
+            yield StreamChunk(type=ChunkType.END)
+            return
+        if tool_names:
             yield StreamChunk(
                 type=ChunkType.TOOL_CALL,
                 tool_calls=[
@@ -296,6 +321,142 @@ class StreamingFinalAnswerLLM:
             return
         yield StreamChunk(type=ChunkType.TOKEN, delta="The result")
         yield StreamChunk(type=ChunkType.TOKEN, delta=" is 4.")
+        yield StreamChunk(type=ChunkType.END)
+
+
+class StreamingInvalidToolProtocolFinalAnswerLLM:
+    def __init__(
+        self,
+        *,
+        structured_work_tool: bool = False,
+        partial_final_before_work_tool: bool = False,
+        invalid_retry: bool = False,
+    ) -> None:
+        self.structured_work_tool = structured_work_tool
+        self.partial_final_before_work_tool = partial_final_before_work_tool
+        self.invalid_retry = invalid_retry
+        self.stream_calls: list[dict[str, Any]] = []
+
+    async def chat(self, **kwargs: Any) -> Any:
+        raise AssertionError("invalid tool protocol path should stay streaming")
+
+    async def stream_chat(self, **kwargs: Any) -> Any:
+        self.stream_calls.append(kwargs)
+        call_index = len(self.stream_calls) - 1
+        if call_index == 0:
+            yield StreamChunk(
+                type=ChunkType.TOOL_CALL,
+                tool_calls=[
+                    {
+                        "id": "call_1",
+                        "function": {
+                            "name": "calculator",
+                            "arguments": '{"expression":"2+2"}',
+                        },
+                    }
+                ],
+            )
+        elif call_index == 1:
+            if self.partial_final_before_work_tool:
+                yield StreamChunk(
+                    type=ChunkType.TOOL_CALL,
+                    tool_calls=[
+                        {
+                            "index": 0,
+                            "id": "call_partial_final",
+                            "function": {
+                                "name": "final_answer",
+                                "arguments": (
+                                    '{"response_language":"English",'
+                                    '"answer":"Draft answer"}'
+                                ),
+                            },
+                        }
+                    ],
+                )
+                yield StreamChunk(
+                    type=ChunkType.TOOL_CALL,
+                    tool_calls=[
+                        {
+                            "index": 1,
+                            "id": "call_unavailable_work_tool",
+                            "function": {
+                                "name": "calculator",
+                                "arguments": '{"expression":"3+3"}',
+                            },
+                        }
+                    ],
+                )
+            elif self.structured_work_tool:
+                yield StreamChunk(
+                    type=ChunkType.TOOL_CALL,
+                    tool_calls=[
+                        {
+                            "id": "call_unavailable_work_tool",
+                            "function": {
+                                "name": "calculator",
+                                "arguments": '{"expression":"3+3"}',
+                            },
+                        }
+                    ],
+                )
+            else:
+                yield StreamChunk(
+                    type=ChunkType.PROTOCOL_ERROR,
+                    protocol_error={
+                        "provider": "deepseek",
+                        "code": "serialized_tool_call_content",
+                        "message": "Invalid provider tool protocol.",
+                    },
+                )
+        elif self.invalid_retry:
+            yield StreamChunk(
+                type=ChunkType.TOOL_CALL,
+                tool_calls=[
+                    {
+                        "index": 0,
+                        "id": "call_retry_partial_final",
+                        "function": {
+                            "name": "final_answer",
+                            "arguments": (
+                                '{"response_language":"English","answer":"Retry draft"}'
+                            ),
+                        },
+                    }
+                ],
+            )
+            yield StreamChunk(
+                type=ChunkType.TOOL_CALL,
+                tool_calls=[
+                    {
+                        "index": 1,
+                        "id": "call_retry_unavailable_work_tool",
+                        "function": {
+                            "name": "calculator",
+                            "arguments": '{"expression":"4+4"}',
+                        },
+                    }
+                ],
+            )
+        else:
+            yield StreamChunk(
+                type=ChunkType.TOOL_CALL,
+                tool_calls=[
+                    {
+                        "id": "call_final",
+                        "function": {
+                            "name": "final_answer",
+                            "arguments": json.dumps(
+                                {
+                                    "response_language": "Simplified Chinese",
+                                    "answer": "目前没有找到可直接下载的音频片段。",
+                                },
+                                ensure_ascii=False,
+                            ),
+                        },
+                    }
+                ],
+            )
         yield StreamChunk(type=ChunkType.END)
 
 
@@ -450,7 +611,21 @@ class StreamingRepeatedGuardFinalAnswerLLM:
                 ],
             )
         else:
-            yield StreamChunk(type=ChunkType.TOKEN, delta="Fallback answer.")
+            yield StreamChunk(
+                type=ChunkType.TOOL_CALL,
+                tool_calls=[
+                    {
+                        "id": "call_final",
+                        "function": {
+                            "name": "final_answer",
+                            "arguments": (
+                                '{"response_language":"English",'
+                                '"answer":"Fallback answer."}'
+                            ),
+                        },
+                    }
+                ],
+            )
         yield StreamChunk(type=ChunkType.END)
 
 
@@ -470,6 +645,31 @@ class BlockingLLM:
     async def chat(self, **kwargs: Any) -> Any:
         del kwargs
         self.started.set()
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            self.cancelled = True
+            raise
+
+
+class BlockingProtocolRetryLLM:
+    def __init__(self) -> None:
+        self.calls = 0
+        self.retry_started = asyncio.Event()
+        self.cancelled = False
+
+    async def chat(self, **kwargs: Any) -> Any:
+        del kwargs
+        self.calls += 1
+        if self.calls == 1:
+            return tool_protocol_error_response(
+                ToolProtocolViolation(
+                    provider="deepseek",
+                    code="serialized_tool_call_content",
+                    message="Invalid provider tool protocol.",
+                )
+            )
+        self.retry_started.set()
         try:
             await asyncio.Event().wait()
         except asyncio.CancelledError:
@@ -728,12 +928,236 @@ async def test_react_pattern_streams_only_final_answer_after_tool_call() -> None
     assert len(llm.calls) == 0
     assert len(llm.stream_calls) == 2
     assert llm.stream_calls[0]["tools"][0]["function"]["name"] == "calculator"
-    assert llm.stream_calls[1]["tools"] is None
+    assert [tool["function"]["name"] for tool in llm.stream_calls[1]["tools"]] == [
+        "final_answer"
+    ]
+    assert llm.stream_calls[1]["tool_choice"] == "required"
     assert [event["type"] for event in outbound.events] == [
         "final_answer_start",
         "final_answer_delta",
+        "final_answer_end",
+    ]
+
+
+@pytest.mark.parametrize("structured_work_tool", [False, True])
+@pytest.mark.asyncio
+async def test_react_retries_invalid_forced_final_as_final_answer_tool(
+    structured_work_tool: bool,
+) -> None:
+    llm = StreamingInvalidToolProtocolFinalAnswerLLM(
+        structured_work_tool=structured_work_tool
+    )
+    pattern = ReActPattern(max_iterations=3, finalize_after_tool_result=True)
+    tool = FakeTool()
+    context = ExecutionContext(system_prompt="You are helpful.", execution_id="task-1")
+    context.add_user_message("Find an audio clip")
+    outbound = OutboundCollector()
+    runtime = PatternRuntime(execution_id="task-1", outbound_message_handler=outbound)
+
+    result = await pattern.run(
+        context=context,
+        tools=[tool],
+        llm=llm,
+        runtime=runtime,
+    )
+
+    assert result["success"] is True
+    assert result["response"] == "目前没有找到可直接下载的音频片段。"
+    assert tool.calls == [{"expression": "2+2"}]
+    assert len(llm.stream_calls) == 3
+    assert [tool["function"]["name"] for tool in llm.stream_calls[1]["tools"]] == [
+        "final_answer"
+    ]
+    assert llm.stream_calls[1]["tool_choice"] == "required"
+    retry_tools = llm.stream_calls[2]["tools"]
+    assert [tool["function"]["name"] for tool in retry_tools] == ["final_answer"]
+    assert llm.stream_calls[2]["tool_choice"] == "required"
+    assert (
+        "calling the final_answer control tool exactly once"
+        in (llm.stream_calls[2]["messages"][0]["content"])
+    )
+    outbound_text = "".join(
+        str(event.get("delta", "")) + str(event.get("content", ""))
+        for event in outbound.events
+    )
+    assert "DSML" not in outbound_text
+    assert [event["type"] for event in outbound.events] == [
+        "final_answer_start",
         "final_answer_delta",
         "final_answer_end",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_react_retries_provider_tool_protocol_error_with_work_tools() -> None:
+    llm = FakeLLM(
+        responses=[
+            tool_protocol_error_response(
+                ToolProtocolViolation(
+                    provider="deepseek",
+                    code="nested_serialized_tool_call",
+                    message="Invalid provider tool protocol.",
+                )
+            ),
+            {
+                "content": "",
+                "tool_calls": [
+                    {
+                        "id": "call_write",
+                        "function": {
+                            "name": "write_file",
+                            "arguments": json.dumps(
+                                {
+                                    "file_path": "podcast.md",
+                                    "content": "# Podcast script\nComplete script body.",
+                                }
+                            ),
+                        },
+                    }
+                ],
+            },
+            {
+                "content": "",
+                "tool_calls": [
+                    {
+                        "id": "call_final",
+                        "function": {
+                            "name": "final_answer",
+                            "arguments": json.dumps(
+                                {
+                                    "response_language": "English",
+                                    "answer": "The podcast script is ready.",
+                                }
+                            ),
+                        },
+                    }
+                ],
+            },
+        ]
+    )
+    pattern = ReActPattern(max_iterations=2)
+    tool = FakeWriteFileTool()
+    context = ExecutionContext()
+    context.add_user_message("Create a podcast script and synthesize it.")
+    tracer = TraceEventRecorder()
+    runtime = PatternRuntime(tracer=tracer)
+
+    result = await pattern.run(context=context, tools=[tool], llm=llm, runtime=runtime)
+
+    assert result["success"] is True
+    assert result["response"] == "The podcast script is ready."
+    assert tool.calls == [
+        {
+            "file_path": "podcast.md",
+            "content": "# Podcast script\nComplete script body.",
+        }
+    ]
+    assert len(llm.calls) == 3
+    retry_tool_names = [schema["function"]["name"] for schema in llm.calls[1]["tools"]]
+    assert "write_file" in retry_tool_names
+    assert "final_answer" in retry_tool_names
+    assert (
+        "If work remains, call the appropriate available work tool directly"
+        in llm.calls[1]["messages"][0]["content"]
+    )
+    assert all(
+        message.content != "Invalid provider tool protocol."
+        for message in context.messages
+        if isinstance(message.content, str)
+    )
+    llm_end_events = [
+        event for event in tracer.events if event["event_type"] == "action_end_llm"
+    ]
+    assert llm_end_events[0]["data"]["success"] is False
+    assert llm_end_events[0]["data"]["phase"] == ("discarded_invalid_tool_protocol")
+    assert llm_end_events[1]["data"]["success"] is True
+
+
+def test_react_accepts_null_tool_calls_in_forced_final_response() -> None:
+    pattern = ReActPattern()
+
+    assert not pattern._response_requires_tool_protocol_retry(
+        {"content": "Done.", "tool_calls": None},
+        force_final_answer=True,
+    )
+
+
+@pytest.mark.asyncio
+async def test_react_closes_invalid_initial_final_answer_stream_before_retry() -> None:
+    llm = StreamingInvalidToolProtocolFinalAnswerLLM(
+        partial_final_before_work_tool=True
+    )
+    pattern = ReActPattern(max_iterations=3, finalize_after_tool_result=True)
+    tool = FakeTool()
+    context = ExecutionContext(system_prompt="You are helpful.", execution_id="task-1")
+    context.add_user_message("Find an audio clip")
+    outbound = OutboundCollector()
+    runtime = PatternRuntime(execution_id="task-1", outbound_message_handler=outbound)
+
+    result = await pattern.run(
+        context=context,
+        tools=[tool],
+        llm=llm,
+        runtime=runtime,
+    )
+
+    assert result["success"] is True
+    assert result["response"] == "目前没有找到可直接下载的音频片段。"
+    assert tool.calls == [{"expression": "2+2"}]
+    assert [event["type"] for event in outbound.events] == [
+        "final_answer_start",
+        "final_answer_delta",
+        "final_answer_error",
+        "final_answer_start",
+        "final_answer_delta",
+        "final_answer_end",
+    ]
+    assert outbound.events[2]["error"] == "invalid tool protocol, retrying"
+
+
+@pytest.mark.asyncio
+async def test_react_closes_invalid_retry_final_answer_stream_before_failure() -> None:
+    llm = StreamingInvalidToolProtocolFinalAnswerLLM(
+        structured_work_tool=True,
+        invalid_retry=True,
+    )
+    pattern = ReActPattern(max_iterations=3, finalize_after_tool_result=True)
+    tool = FakeTool()
+    context = ExecutionContext(system_prompt="You are helpful.", execution_id="task-1")
+    context.add_user_message("Find an audio clip")
+    outbound = OutboundCollector()
+    tracer = TraceEventRecorder()
+    runtime = PatternRuntime(
+        execution_id="task-1",
+        tracer=tracer,
+        outbound_message_handler=outbound,
+    )
+
+    result = await pattern.run(
+        context=context,
+        tools=[tool],
+        llm=llm,
+        runtime=runtime,
+    )
+
+    assert result["success"] is False
+    assert result["status"] == "invalid_tool_protocol"
+    assert tool.calls == [{"expression": "2+2"}]
+    assert [event["type"] for event in outbound.events] == [
+        "final_answer_start",
+        "final_answer_delta",
+        "final_answer_error",
+    ]
+    assert outbound.events[2]["error"] == "invalid tool protocol after retry"
+    invalid_end_events = [
+        event
+        for event in tracer.events
+        if event["event_type"] == "action_end_llm"
+        and event["data"].get("success") is False
+    ]
+    assert [event["data"]["phase"] for event in invalid_end_events] == [
+        "discarded_invalid_tool_protocol",
+        "discarded_invalid_tool_protocol_retry",
     ]
 
 
@@ -1038,7 +1462,10 @@ async def test_react_pattern_finalizes_with_completion_evidence() -> None:
     assert result["success"] is True
     assert result["response"] == "Created output/en_poster.html."
     assert tool.calls == [{"file_path": "en_poster.html", "content": "<html></html>"}]
-    assert llm.calls[1]["tools"] is None
+    assert [schema["function"]["name"] for schema in llm.calls[1]["tools"]] == [
+        "final_answer"
+    ]
+    assert llm.calls[1]["tool_choice"] == "required"
     assert (
         "Step completion evidence: The writer returned success=true"
         in (llm.calls[1]["messages"][0]["content"])
@@ -1119,7 +1546,9 @@ async def test_react_pattern_uses_decision_for_repeated_tools() -> None:
     decision_schema = llm.calls[2]["tools"][0]["function"]["parameters"]
     assert "response_language" not in decision_schema["properties"]
     assert "response_language" not in decision_schema["required"]
-    assert llm.calls[3]["tools"] is None
+    assert [schema["function"]["name"] for schema in llm.calls[3]["tools"]] == [
+        "final_answer"
+    ]
     assert pattern.pending_tool_calls == []
 
 
@@ -1215,7 +1644,9 @@ async def test_react_repeated_decision_drains_current_tool_call_batch() -> None:
     assert tool_result_ids[-2:] == ["search_1", "search_2"]
     tool_names = [schema["function"]["name"] for schema in llm.calls[1]["tools"]]
     assert tool_names == ["react_decision"]
-    assert llm.calls[2]["tools"] is None
+    assert [schema["function"]["name"] for schema in llm.calls[2]["tools"]] == [
+        "final_answer"
+    ]
     assert pattern.pending_tool_calls == []
 
 
@@ -1303,7 +1734,9 @@ async def test_react_pattern_uses_decision_after_cross_tool_attempts() -> None:
     decision_prompt = llm.calls[3]["messages"][-1]["content"]
     assert "3 consecutive work-tool calls without a final answer" in decision_prompt
     assert "latest work tool was browser_navigate" in decision_prompt
-    assert llm.calls[4]["tools"] is None
+    assert [schema["function"]["name"] for schema in llm.calls[4]["tools"]] == [
+        "final_answer"
+    ]
 
 
 @pytest.mark.asyncio
@@ -1392,7 +1825,9 @@ async def test_react_pattern_uses_decision_after_tool_group_successes() -> None:
         "3 consecutive successful calls in the research tool group" in decision_prompt
     )
     assert "latest tool was search_source" in decision_prompt
-    assert llm.calls[4]["tools"] is None
+    assert [schema["function"]["name"] for schema in llm.calls[4]["tools"]] == [
+        "final_answer"
+    ]
     assert pattern.pending_tool_calls == []
 
 
@@ -1470,7 +1905,9 @@ async def test_react_pattern_accepts_legacy_auto_reroute_kwarg() -> None:
         in (llm.calls[2]["messages"][-1]["content"])
     )
     assert llm.calls[2]["tool_choice"] == "required"
-    assert llm.calls[3]["tools"] is None
+    assert [schema["function"]["name"] for schema in llm.calls[3]["tools"]] == [
+        "final_answer"
+    ]
     assert pattern.repeated_tool_decision is None
 
 
@@ -1684,7 +2121,9 @@ async def test_react_pattern_repeated_guard_can_fire_twice_in_single_run() -> No
     assert [schema["function"]["name"] for schema in llm.calls[4]["tools"]] == [
         "react_decision"
     ]
-    assert llm.calls[5]["tools"] is None
+    assert [schema["function"]["name"] for schema in llm.calls[5]["tools"]] == [
+        "final_answer"
+    ]
 
 
 @pytest.mark.asyncio
@@ -3115,6 +3554,38 @@ async def test_react_pattern_pause_cancels_active_llm_call() -> None:
     assert runtime.last_checkpoint["metadata"] == {
         "safe_point": "during_llm",
         "reason": "paused by test",
+    }
+
+
+@pytest.mark.asyncio
+async def test_react_pattern_pause_during_tool_protocol_retry_is_during_llm() -> None:
+    llm = BlockingProtocolRetryLLM()
+    runtime = PatternRuntime()
+    pattern = ReActPattern(max_iterations=3)
+    context = ExecutionContext()
+    context.add_user_message("Retry the model")
+
+    task = asyncio.create_task(
+        pattern.run(
+            context=context,
+            tools=[FakeTool()],
+            llm=llm,
+            runtime=runtime,
+        )
+    )
+    await asyncio.wait_for(llm.retry_started.wait(), timeout=1)
+
+    runtime.request_interrupt("paused during retry")
+    result = await asyncio.wait_for(task, timeout=1)
+
+    assert llm.cancelled is True
+    assert result["success"] is False
+    assert result["status"] == "interrupted"
+    assert result["interrupt_reason"] == "paused during retry"
+    assert runtime.last_checkpoint["label"] == "interrupted"
+    assert runtime.last_checkpoint["metadata"] == {
+        "safe_point": "during_llm",
+        "reason": "paused during retry",
     }
 
 

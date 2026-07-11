@@ -4,6 +4,10 @@ from typing import Any, AsyncIterator, Dict, List, Optional
 
 from ...providers import is_placeholder_api_key
 from .base import StreamChunk
+from .deepseek_tool_protocol import (
+    adapt_deepseek_stream,
+    normalize_deepseek_response,
+)
 from .openai import PROVIDER_STATE_METADATA_KEY, OpenAICompatibleLLM
 
 logger = logging.getLogger(__name__)
@@ -236,7 +240,7 @@ class DeepSeekLLM(OpenAICompatibleLLM):
             output_config=output_config,
         )
         kwargs = self._prepare_deepseek_kwargs(kwargs=kwargs)
-        return await super().chat(
+        response = await super().chat(
             messages=messages,
             temperature=temperature,
             max_tokens=max_tokens,
@@ -247,6 +251,7 @@ class DeepSeekLLM(OpenAICompatibleLLM):
             output_config=output_config,
             **kwargs,
         )
+        return normalize_deepseek_response(response, tools=tools)
 
     async def stream_chat(
         self,
@@ -265,7 +270,7 @@ class DeepSeekLLM(OpenAICompatibleLLM):
             output_config=output_config,
         )
         kwargs = self._prepare_deepseek_kwargs(kwargs=kwargs)
-        async for chunk in super().stream_chat(
+        stream = super().stream_chat(
             messages=messages,
             temperature=temperature,
             max_tokens=max_tokens,
@@ -275,7 +280,8 @@ class DeepSeekLLM(OpenAICompatibleLLM):
             thinking=thinking,
             output_config=output_config,
             **kwargs,
-        ):
+        )
+        async for chunk in adapt_deepseek_stream(stream, tools=tools):
             yield chunk
 
     @staticmethod

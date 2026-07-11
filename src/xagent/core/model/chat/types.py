@@ -12,6 +12,7 @@ class ChunkType(Enum):
     TOOL_CALL = "tool_call"  # Tool call
     USAGE = "usage"  # Token usage statistics
     ERROR = "error"  # Error
+    PROTOCOL_ERROR = "protocol_error"  # Provider tool-protocol violation
     END = "end"  # End
 
 
@@ -36,6 +37,7 @@ class StreamChunk:
     usage: Dict[str, int] = field(default_factory=dict)
     finish_reason: str = ""
     raw: Any = None
+    protocol_error: Dict[str, Any] = field(default_factory=dict)
 
     def is_token(self) -> bool:
         """Check if this is a token type"""
@@ -52,6 +54,10 @@ class StreamChunk:
     def is_error(self) -> bool:
         """Check if this is an error type"""
         return self.type == ChunkType.ERROR
+
+    def is_protocol_error(self) -> bool:
+        """Check if this is a provider tool-protocol error."""
+        return self.type == ChunkType.PROTOCOL_ERROR
 
     def is_end(self) -> bool:
         """Check if this is an end type"""

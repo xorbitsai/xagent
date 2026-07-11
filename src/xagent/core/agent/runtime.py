@@ -15,6 +15,7 @@ from ..agent.trace import (
     normalize_llm_trace_payload,
 )
 from ..model.chat.basic.base import BaseLLM
+from ..model.chat.tool_protocol import TOOL_PROTOCOL_ERROR_KEY
 from ..model.chat.types import ChunkType
 from .streaming import merge_streamed_tool_call_arguments
 
@@ -147,10 +148,26 @@ class PatternRuntime:
             tool_call_chunks: dict[int, dict[str, Any]] = {}
             usage_payload: dict[str, Any] = {}
             provider_payload: dict[str, Any] = {}
+            protocol_error_payload: dict[str, Any] = {}
             saw_payload_chunk = False
             async for chunk in stream_chat(**kwargs):
                 await self._raise_if_interrupted("interrupted during LLM stream")
                 self._raise_for_stream_error(chunk)
+                is_protocol_error = (
+                    callable(getattr(chunk, "is_protocol_error", None))
+                    and chunk.is_protocol_error()
+                )
+                if (
+                    getattr(chunk, "type", None) == ChunkType.PROTOCOL_ERROR
+                    or is_protocol_error
+                ):
+                    payload = getattr(chunk, "protocol_error", None)
+                    if isinstance(payload, dict):
+                        protocol_error_payload.update(payload)
+                    saw_payload_chunk = True
+                    if on_chunk is not None:
+                        await self._maybe_await(on_chunk(chunk))
+                    continue
                 text_delta = self._chunk_text_delta(chunk)
                 if text_delta:
                     saw_payload_chunk = True
@@ -170,6 +187,16 @@ class PatternRuntime:
             tool_calls = [
                 tool_call_chunks[index] for index in sorted(tool_call_chunks.keys())
             ]
+            if protocol_error_payload:
+                protocol_response = {
+                    "type": "tool_protocol_error",
+                    "content": "",
+                    "tool_calls": [],
+                    TOOL_PROTOCOL_ERROR_KEY: protocol_error_payload,
+                }
+                if usage_payload:
+                    protocol_response["usage"] = usage_payload
+                return protocol_response
             if tool_calls:
                 response: dict[str, Any] = {
                     "content": content,

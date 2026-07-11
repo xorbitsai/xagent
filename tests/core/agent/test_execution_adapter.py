@@ -242,8 +242,10 @@ async def test_execution_adapter_routes_single_call_to_one_tool_then_final_answe
     assert tool.calls == [{"value": "from tool"}]
     assert llm.calls[0]["tools"][0]["function"]["name"] == "noop"
     assert llm.calls[0]["tool_choice"] == "required"
-    assert llm.calls[1]["tools"] is None
-    assert llm.calls[1]["tool_choice"] is None
+    assert [schema["function"]["name"] for schema in llm.calls[1]["tools"]] == [
+        "final_answer"
+    ]
+    assert llm.calls[1]["tool_choice"] == "required"
 
 
 @pytest.mark.asyncio

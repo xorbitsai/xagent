@@ -1,7 +1,12 @@
-from typing import Any, Dict, List, Optional
+from typing import Any, AsyncIterator, Dict, List, Optional
 
 from .....config import get_openrouter_official_providers_only
 from ..timeout_config import TimeoutConfig
+from ..types import StreamChunk
+from .deepseek_tool_protocol import (
+    adapt_deepseek_stream,
+    normalize_deepseek_response,
+)
 from .openai import OpenAILLM
 
 OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
@@ -50,6 +55,67 @@ class OpenRouterLLM(OpenAILLM):
             abilities=abilities,
             timeout_config=timeout_config,
         )
+
+    @property
+    def _uses_deepseek_tool_protocol(self) -> bool:
+        return _openrouter_model_author(self._model_name) == "deepseek"
+
+    async def chat(
+        self,
+        messages: List[Dict[str, str]],
+        temperature: Optional[float] = None,
+        max_tokens: Optional[int] = None,
+        tools: Optional[List[Dict[str, Any]]] = None,
+        tool_choice: Optional[str | Dict[str, Any]] = None,
+        response_format: Optional[Dict[str, Any]] = None,
+        thinking: Optional[Dict[str, Any]] = None,
+        output_config: Optional[Dict[str, Any]] = None,
+        **kwargs: Any,
+    ) -> Any:
+        response = await super().chat(
+            messages=messages,
+            temperature=temperature,
+            max_tokens=max_tokens,
+            tools=tools,
+            tool_choice=tool_choice,
+            response_format=response_format,
+            thinking=thinking,
+            output_config=output_config,
+            **kwargs,
+        )
+        if not self._uses_deepseek_tool_protocol:
+            return response
+        return normalize_deepseek_response(response, tools=tools)
+
+    async def stream_chat(
+        self,
+        messages: List[Dict[str, str]],
+        temperature: Optional[float] = None,
+        max_tokens: Optional[int] = None,
+        tools: Optional[List[Dict[str, Any]]] = None,
+        tool_choice: Optional[str | Dict[str, Any]] = None,
+        response_format: Optional[Dict[str, Any]] = None,
+        thinking: Optional[Dict[str, Any]] = None,
+        output_config: Optional[Dict[str, Any]] = None,
+        **kwargs: Any,
+    ) -> AsyncIterator[StreamChunk]:
+        stream = super().stream_chat(
+            messages=messages,
+            temperature=temperature,
+            max_tokens=max_tokens,
+            tools=tools,
+            tool_choice=tool_choice,
+            response_format=response_format,
+            thinking=thinking,
+            output_config=output_config,
+            **kwargs,
+        )
+        if not self._uses_deepseek_tool_protocol:
+            async for chunk in stream:
+                yield chunk
+            return
+        async for chunk in adapt_deepseek_stream(stream, tools=tools):
+            yield chunk
 
     def _is_official_openrouter_client(self) -> bool:
         return self.base_url.rstrip("/") == OPENROUTER_BASE_URL

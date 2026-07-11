@@ -9,6 +9,7 @@ from xagent.core.model.chat.basic.deepseek import (
     DeepSeekLLM,
 )
 from xagent.core.model.chat.basic.openai import PROVIDER_STATE_METADATA_KEY, OpenAILLM
+from xagent.core.model.chat.tool_protocol import get_tool_protocol_error
 from xagent.core.model.chat.types import ChunkType
 
 
@@ -68,6 +69,42 @@ class TestDeepSeekLLM:
 
     def test_deepseek_is_not_openai_subclass(self):
         assert not issubclass(DeepSeekLLM, OpenAILLM)
+
+    @pytest.mark.asyncio
+    async def test_chat_rejects_serialized_tool_protocol_content(self, llm, mocker):
+        message = SimpleNamespace(
+            content="<｜｜DSML｜｜tool_calls>",
+            tool_calls=None,
+            reasoning_content=None,
+        )
+        response = SimpleNamespace(
+            choices=[SimpleNamespace(message=message)],
+            usage=None,
+            model_dump=lambda: {"id": "deepseek-invalid-protocol"},
+        )
+        mock_client = mocker.AsyncMock()
+        mock_client.chat.completions.create.return_value = response
+        mocker.patch(
+            "xagent.core.model.chat.basic.openai.AsyncOpenAI",
+            return_value=mock_client,
+        )
+
+        result = await llm.chat(
+            [{"role": "user", "content": "Use a tool"}],
+            tools=[
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "search",
+                        "parameters": {"type": "object", "properties": {}},
+                    },
+                }
+            ],
+        )
+
+        error = get_tool_protocol_error(result)
+        assert error is not None
+        assert error["code"] == "serialized_tool_call_content"
 
     def test_provider_reasoning_hook_disables_deepseek_thinking(self, llm):
         assert llm._prepare_provider_reasoning_extra_body(

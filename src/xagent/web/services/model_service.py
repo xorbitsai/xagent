@@ -1143,6 +1143,44 @@ def get_tts_models(db: Session, user_id: Optional[int] = None) -> Dict[str, Any]
     return _get_models_by_category(db, "tts", "TTS", user_id=user_id)
 
 
+def get_sound_effect_models(
+    db: Session, user_id: Optional[int] = None
+) -> Dict[str, Any]:
+    """Load models from the independent sound_effect category."""
+    models: dict[str, Any] = {}
+    try:
+        from ...core.model.sound_effect import get_sound_effect_model_instance
+        from ..models.model import Model as DBModel
+
+        db_models = (
+            db.query(DBModel)
+            .filter(
+                DBModel.category == "sound_effect",
+                DBModel.is_active,
+            )
+            .all()
+        )
+        for db_model in db_models:
+            if user_id is not None and not _is_model_visible_to_user(
+                db, db_model.id, user_id
+            ):
+                continue
+            try:
+                model = get_sound_effect_model_instance(db_model)
+                setattr(model, "model_id", str(db_model.model_id))
+                models[str(db_model.model_id)] = model
+            except Exception as exc:
+                logger.warning(
+                    "Failed to create sound effect model %s: %s",
+                    db_model.model_name,
+                    exc,
+                )
+    except Exception as exc:
+        logger.error("Failed to load sound effect models: %s", exc)
+        db.rollback()
+    return models
+
+
 def get_default_asr_model(user_id: Optional[int] = None) -> Optional[Any]:
     """
     Get the default ASR model for a specific user.
@@ -1276,4 +1314,55 @@ def get_default_tts_model(user_id: Optional[int] = None) -> Optional[Any]:
     except Exception as e:
         logger.error(f"Failed to get default TTS model: {e}")
 
+    return None
+
+
+def get_default_sound_effect_model(user_id: Optional[int] = None) -> Optional[Any]:
+    """Get the user or shared default sound effect model."""
+    try:
+        from ...core.model.sound_effect import get_sound_effect_model_instance
+        from ..models.database import get_db
+        from ..models.model import Model as DBModel
+        from ..models.user import UserDefaultModel, UserModel
+
+        try:
+            db = next(get_db())
+            if user_id:
+                user_default = (
+                    db.query(UserDefaultModel)
+                    .join(DBModel, UserDefaultModel.model_id == DBModel.id)
+                    .filter(
+                        UserDefaultModel.user_id == user_id,
+                        UserDefaultModel.config_type == "sound_effect",
+                        DBModel.category == "sound_effect",
+                        DBModel.is_active,
+                    )
+                    .first()
+                )
+                if (
+                    user_default
+                    and user_default.model
+                    and _is_model_visible_to_user(db, user_default.model.id, user_id)
+                ):
+                    return get_sound_effect_model_instance(user_default.model)
+
+            shared_defaults = (
+                db.query(UserDefaultModel)
+                .join(UserModel, UserDefaultModel.model_id == UserModel.model_id)
+                .join(DBModel, UserModel.model_id == DBModel.id)
+                .filter(
+                    UserDefaultModel.config_type == "sound_effect",
+                    DBModel.category == "sound_effect",
+                    UserModel.is_shared.is_(True),
+                    UserDefaultModel.user_id.in_(_get_visible_user_ids(db, user_id)),
+                )
+                .limit(1)
+                .all()
+            )
+            if shared_defaults:
+                return get_sound_effect_model_instance(shared_defaults[0].model)
+        except Exception as exc:
+            logger.warning("Database query failed for sound effect model: %s", exc)
+    except Exception as exc:
+        logger.error("Failed to get default sound effect model: %s", exc)
     return None

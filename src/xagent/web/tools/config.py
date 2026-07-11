@@ -495,6 +495,8 @@ class WebToolConfig(BaseToolConfig):
         self._cached_asr_model: Optional[Any] = None
         self._cached_tts_models: Optional[Dict[str, Any]] = None
         self._cached_tts_model: Optional[Any] = None
+        self._cached_sound_effect_models: Optional[Dict[str, Any]] = None
+        self._cached_sound_effect_model: Optional[Any] = None
         self._cached_mcp_configs: Optional[List[Dict[str, Any]]] = None
         self._mcp_hook_token_cache_expires_at: datetime | None = None
         self._mcp_hook_token_cache_uncacheable = False
@@ -1151,6 +1153,38 @@ class WebToolConfig(BaseToolConfig):
         if self._cached_tts_model is None:
             self._cached_tts_model = self._load_tts_model()
         return self._cached_tts_model
+
+    def get_sound_effect_models(self) -> Dict[str, Any]:
+        """Load sound effect models from the independent model category."""
+        if self._cached_sound_effect_models is None:
+            self._cached_sound_effect_models = self._load_sound_effect_models()
+        return self._cached_sound_effect_models
+
+    def _load_sound_effect_models(self) -> Dict[str, Any]:
+        try:
+            from ...web.services.model_service import get_sound_effect_models
+
+            return get_sound_effect_models(self.db, self._user_id)
+        except Exception as exc:
+            logger = logging.getLogger(__name__)
+            logger.warning("Failed to load sound effect models: %s", exc)
+            return {}
+
+    def get_sound_effect_model(self) -> Optional[Any]:
+        """Get the user's default sound effect model."""
+        if self._cached_sound_effect_model is None:
+            self._cached_sound_effect_model = self._load_sound_effect_model()
+        return self._cached_sound_effect_model
+
+    def _load_sound_effect_model(self) -> Optional[Any]:
+        try:
+            from ...web.services.model_service import get_default_sound_effect_model
+
+            return get_default_sound_effect_model(self._user_id)
+        except Exception as exc:
+            logger = logging.getLogger(__name__)
+            logger.warning("Failed to load default sound effect model: %s", exc)
+            return None
 
     def get_llm(self) -> Optional[Any]:
         """Get LLM from constructor parameter."""

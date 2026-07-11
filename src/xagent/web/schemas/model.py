@@ -82,6 +82,16 @@ def _validate_abilities_for_category(abilities: List[str], category: str) -> Lis
 
         if not abilities:
             raise ValueError("Video model must have at least one ability")
+    elif category == "sound_effect":
+        valid_sound_effect_abilities: Set[str] = {"generate"}
+        invalid_abilities = set(abilities) - valid_sound_effect_abilities
+        if invalid_abilities:
+            raise ValueError(
+                f"Invalid abilities for sound effect model: {invalid_abilities}. "
+                f"Valid abilities are: {valid_sound_effect_abilities}"
+            )
+        if not abilities:
+            raise ValueError("Sound effect model must have at least one ability")
 
     return abilities
 
@@ -246,7 +256,7 @@ class UserDefaultModelCreate(BaseModel):
     """User default model configuration creation schema"""
 
     model_id: int
-    config_type: str  # 'general', 'small_fast', 'visual', 'compact', 'embedding', 'image', 'image_edit', 'video', 'asr', 'tts', 'speech'
+    config_type: str  # Includes model categories and specialized default roles.
 
     @field_validator("config_type")
     @classmethod
@@ -263,6 +273,7 @@ class UserDefaultModelCreate(BaseModel):
             "asr",
             "tts",
             "speech",
+            "sound_effect",
             "rerank",
         }
         if v not in valid_types:

@@ -8,6 +8,7 @@ from xagent.core.model.model import (
     ImageModelConfig,
     ModelConfig,
     RerankModelConfig,
+    SoundEffectModelConfig,
     VectorDBConfig,
     VectorDBType,
     VideoModelConfig,
@@ -122,6 +123,13 @@ class SQLAlchemyModelHub:
                     "category": "rerank",
                 }
             )
+        elif isinstance(model, SoundEffectModelConfig):
+            db_data.update(
+                {
+                    "model_provider": model.model_provider,
+                    "category": "sound_effect",
+                }
+            )
         elif isinstance(model, VectorDBConfig):
             # VectorDBConfig repurposes abilities column for config dict (ModelConfig.abilities is List[str] elsewhere).
             db_data.update(
@@ -199,6 +207,11 @@ class SQLAlchemyModelHub:
                 **common,
                 model_provider=db_model.model_provider,
             )
+        elif db_model.category == "sound_effect":
+            return SoundEffectModelConfig(
+                **common,
+                model_provider=db_model.model_provider,
+            )
         elif db_model.category == "vector_db":
             return self._load_vector_db_config(db_model, common)
         else:
@@ -250,6 +263,11 @@ class SQLAlchemyModelHub:
                 )
             elif db_model.category == "rerank":
                 config = RerankModelConfig(
+                    **common_fields,
+                    model_provider=db_model.model_provider,
+                )
+            elif db_model.category == "sound_effect":
+                config = SoundEffectModelConfig(
                     **common_fields,
                     model_provider=db_model.model_provider,
                 )

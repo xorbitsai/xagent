@@ -26,6 +26,7 @@ from xagent.core.model.model import (
     ImageModelConfig,
     ModelConfig,
     RerankModelConfig,
+    SoundEffectModelConfig,
     VideoModelConfig,
 )
 from xagent.core.model.providers import (
@@ -363,6 +364,7 @@ def _is_default_config_type_compatible(model: Any, config_type: str) -> bool:
         "asr": "speech",
         "tts": "speech",
         "speech": "speech",
+        "sound_effect": "sound_effect",
         "rerank": "rerank",
     }
 
@@ -384,6 +386,7 @@ def _is_default_config_type_compatible(model: Any, config_type: str) -> bool:
         "asr": {"asr"},
         "tts": {"tts"},
         "speech": {"asr", "tts"},
+        "sound_effect": {"generate"},
     }
 
     required_abilities = required_abilities_by_config_type.get(config_type)
@@ -500,6 +503,17 @@ async def create_model(
             voice=model.voice,
             format=model.format,
             sample_rate=model.sample_rate,
+        )
+    elif model.category == "sound_effect":
+        config = SoundEffectModelConfig(
+            id=model.model_id,
+            model_name=model.model_name,
+            model_provider=model_provider,
+            base_url=base_url,
+            api_key=model.api_key or "",
+            timeout=180.0,
+            abilities=model.abilities or ["generate"],
+            description=model.description,
         )
     elif model.category == "rerank":
         # DashScope rerank has model-family-specific endpoints; let the
@@ -819,6 +833,22 @@ async def test_model_connection(
                 )
             finally:
                 await probe_model.aclose()
+
+        elif request.category == "sound_effect":
+            if provider != "elevenlabs":
+                raise ValueError(
+                    "Sound effect connection testing currently supports ElevenLabs"
+                )
+            await asyncio.wait_for(
+                _validate_provider_model_listing(
+                    provider="elevenlabs-sound_effect",
+                    model_name=request.model_name,
+                    api_key=request.api_key,
+                    base_url=base_url,
+                    requested_abilities=request.abilities or ["generate"],
+                ),
+                timeout=timeout_seconds,
+            )
 
         elif request.category == "rerank":
             from xagent.core.model.rerank.adapter import _create_rerank_model
@@ -1231,6 +1261,7 @@ async def get_default_model(
         "asr": "asr",
         "tts": "tts",
         "speech": "speech",
+        "sound_effect": "sound_effect",
         "rerank": "rerank",
     }
 
@@ -1979,7 +2010,15 @@ async def get_public_summary(
 
     # Count by category
     category_counts = {}
-    for cat in ["llm", "embedding", "rerank", "image", "video", "speech"]:
+    for cat in [
+        "llm",
+        "embedding",
+        "rerank",
+        "image",
+        "video",
+        "speech",
+        "sound_effect",
+    ]:
         count = (
             db.query(DBModel)
             .filter(DBModel.category == cat)

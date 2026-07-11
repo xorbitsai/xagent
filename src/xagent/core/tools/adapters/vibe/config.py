@@ -44,6 +44,10 @@ class BaseToolConfig(ABC):
         """Get TTS (text-to-speech) models."""
         pass
 
+    def get_sound_effect_models(self) -> Dict[str, Any]:
+        """Get sound effect generation models."""
+        return {}
+
     @abstractmethod
     async def get_mcp_server_configs(self) -> List[Dict[str, Any]]:
         """Get MCP server configurations."""
@@ -124,6 +128,10 @@ class BaseToolConfig(ABC):
 
     def get_video_model(self) -> Optional[Any]:
         """Get default video generation model."""
+        return None
+
+    def get_sound_effect_model(self) -> Optional[Any]:
+        """Get default sound effect generation model."""
         return None
 
     @abstractmethod
@@ -233,6 +241,8 @@ class ToolConfig(BaseToolConfig):
         config_dict.get("video_models", [])  # Unused in base config
         config_dict.get("asr_models", [])  # Unused in base config
         config_dict.get("tts_models", [])  # Unused in base config
+        sound_effect_models = config_dict.get("sound_effect_models") or {}
+        sound_effect_model = config_dict.get("sound_effect_model")
         mcp_server_configs = config_dict.get("mcp_servers", [])
         file_tools_enabled = config_dict.get("file_tools_enabled", True)
         basic_tools_enabled = config_dict.get("basic_tools_enabled", True)
@@ -296,6 +306,10 @@ class ToolConfig(BaseToolConfig):
         self.tts_models: Dict[
             str, Any
         ] = {}  # Standalone usage typically doesn't have web context
+        self.sound_effect_models: Dict[str, Any] = (
+            sound_effect_models if isinstance(sound_effect_models, dict) else {}
+        )
+        self.sound_effect_model: Optional[Any] = sound_effect_model
         self.mcp_server_configs: List[Dict[str, Any]] = mcp_server_configs
         self.file_tools_enabled: bool = bool(file_tools_enabled)
         self.basic_tools_enabled: bool = bool(basic_tools_enabled)
@@ -338,6 +352,9 @@ class ToolConfig(BaseToolConfig):
 
     def get_tts_models(self) -> Dict[str, Any]:
         return self.tts_models
+
+    def get_sound_effect_models(self) -> Dict[str, Any]:
+        return self.sound_effect_models
 
     async def get_mcp_server_configs(self) -> List[Dict[str, Any]]:
         return self.mcp_server_configs
@@ -383,6 +400,9 @@ class ToolConfig(BaseToolConfig):
 
     def get_video_model(self) -> Optional[Any]:
         return None  # Standalone config doesn't have web context
+
+    def get_sound_effect_model(self) -> Optional[Any]:
+        return self.sound_effect_model
 
     def get_asr_model(self) -> Optional[Any]:
         return None  # Standalone config doesn't have web context

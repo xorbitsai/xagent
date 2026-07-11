@@ -20,16 +20,25 @@ import {
   Settings,
   CheckCircle2,
   Video,
+  Volume2,
 } from "lucide-react"
 import { useI18n } from "@/contexts/i18n-context"
 import { ModelManagementDialog } from "./model-management-dialog"
 import { toast } from "@/components/ui/sonner"
 
-const MODEL_TABS = ["llm", "embedding", "rerank", "image", "video", "speech"] as const
+const MODEL_TABS = ["llm", "embedding", "rerank", "image", "video", "audio"] as const
 const DEFAULT_MODEL_TAB = "llm"
 type ModelTab = (typeof MODEL_TABS)[number]
 
+const AUDIO_MODEL_CATEGORIES = new Set(["speech", "sound_effect"])
+
+function modelMatchesTab(category: string, tab: ModelTab): boolean {
+  return tab === "audio" ? AUDIO_MODEL_CATEGORIES.has(category) : category === tab
+}
+
 function getValidModelTab(value: string | null): ModelTab {
+  // Keep old bookmarked URLs working after merging speech and sound effects.
+  if (value === "speech" || value === "sound_effect") return "audio"
   if (value && (MODEL_TABS as readonly string[]).includes(value)) {
     return value as ModelTab
   }
@@ -234,6 +243,7 @@ export function ModelsPage() {
     asr?: Model
     tts?: Model
     speech?: Model
+    sound_effect?: Model
     rerank?: Model
   }>({})
 
@@ -353,12 +363,12 @@ export function ModelsPage() {
       rerank: models.filter(m => m.category === 'rerank').length,
       image: models.filter(m => m.category === 'image').length,
       video: models.filter(m => m.category === 'video').length,
-      speech: models.filter(m => m.category === 'speech').length
+      audio: models.filter(m => AUDIO_MODEL_CATEGORIES.has(m.category)).length
     }
   }, [models])
 
   const filteredModels = useMemo(() => {
-    return models.filter(m => m.category === activeTab)
+    return models.filter(m => modelMatchesTab(m.category, activeTab))
   }, [models, activeTab])
 
   const enabledProviders = useMemo(() => {
@@ -420,7 +430,7 @@ export function ModelsPage() {
 
   // Filter explore providers by active tab
   const exploreProviders = useMemo(() => {
-    return providers.filter(p => p.category.includes(activeTab))
+    return providers.filter(p => p.category.some(category => modelMatchesTab(category, activeTab)))
   }, [activeTab, providers])
 
   if (loading && models.length === 0) {
@@ -481,10 +491,10 @@ export function ModelsPage() {
               {t('models.tabs.video')} <Badge variant="secondary" className="ml-2 rounded-full px-2 py-0.5 bg-slate-100 text-slate-600 hover:bg-slate-100 border-none font-normal">{modelCounts.video}</Badge>
             </TabsTrigger>
             <TabsTrigger
-              value="speech"
+              value="audio"
               className="data-[state=active]:border-primary data-[state=active]:text-primary data-[state=active]:bg-transparent border border-transparent rounded-md px-4 py-2 shadow-none data-[state=active]:shadow-none text-slate-700 font-normal"
             >
-              {t('models.tabs.speech')} <Badge variant="secondary" className="ml-2 rounded-full px-2 py-0.5 bg-slate-100 text-slate-600 hover:bg-slate-100 border-none font-normal">{modelCounts.speech}</Badge>
+              {t('models.tabs.audio')} <Badge variant="secondary" className="ml-2 rounded-full px-2 py-0.5 bg-slate-100 text-slate-600 hover:bg-slate-100 border-none font-normal">{modelCounts.audio}</Badge>
             </TabsTrigger>
           </TabsList>
         </Tabs>
@@ -544,7 +554,11 @@ export function ModelsPage() {
                   thinking_mode: <Box className="w-3 h-3 mr-1" />,
                   tool_calling: <Zap className="w-3 h-3 mr-1" />,
                   embedding: <Box className="w-3 h-3 mr-1" />,
-                  generate: activeTab === 'video' ? <Video className="w-3 h-3 mr-1" /> : <ImageIcon className="w-3 h-3 mr-1" />,
+                  generate: activeTab === 'video'
+                    ? <Video className="w-3 h-3 mr-1" />
+                    : activeTab === 'audio'
+                      ? <Volume2 className="w-3 h-3 mr-1" />
+                      : <ImageIcon className="w-3 h-3 mr-1" />,
                   edit: <Box className="w-3 h-3 mr-1" />,
                   asr: <Brain className="w-3 h-3 mr-1" />,
                   tts: <Star className="w-3 h-3 mr-1" />

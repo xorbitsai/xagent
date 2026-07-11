@@ -14,6 +14,7 @@ from xagent.web.services.model_service import (
     get_asr_models,
     get_default_model,
     get_image_models,
+    get_sound_effect_models,
     get_tts_models,
     get_vision_model,
 )
@@ -600,6 +601,32 @@ class TestModelService:
             result = get_asr_models(mock_db, user_id=42)
 
             assert result == {"scribe_v2": mock_instance}
+
+    def test_get_sound_effect_models_uses_independent_category(self):
+        with (
+            patch(
+                "xagent.web.services.model_service._is_model_visible_to_user",
+                return_value=True,
+            ),
+            patch(
+                "xagent.core.model.sound_effect.get_sound_effect_model_instance"
+            ) as mock_instance_factory,
+        ):
+            mock_db = MagicMock()
+            db_model = MagicMock()
+            db_model.id = 1
+            db_model.model_id = "sound-effect-default"
+            db_model.model_name = "eleven_text_to_sound_v2"
+            db_model.category = "sound_effect"
+            db_model.is_active = True
+            mock_db.query.return_value.filter.return_value.all.return_value = [db_model]
+            model = MagicMock()
+            mock_instance_factory.return_value = model
+
+            result = get_sound_effect_models(mock_db, user_id=42)
+
+            assert result == {"sound-effect-default": model}
+            mock_instance_factory.assert_called_once_with(db_model)
 
     def test_embedding_fallback_skips_invisible_returns_none(self, monkeypatch):
         """System fallback returns None when no visible embedding model exists."""

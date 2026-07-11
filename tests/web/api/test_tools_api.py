@@ -12,7 +12,7 @@ from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
 from xagent.web.api.auth import auth_router
-from xagent.web.api.tools import tools_router
+from xagent.web.api.tools import _create_tool_info, tools_router
 from xagent.web.models.database import Base, get_db, get_engine, init_db
 
 
@@ -34,6 +34,27 @@ test_app.dependency_overrides[get_db] = override_get_db
 
 # Create test client
 client = TestClient(test_app)
+
+
+def test_sound_effect_tool_requires_sound_effect_model() -> None:
+    class Tool:
+        name = "generate_sound_effect"
+        description = ""
+
+    unavailable = _create_tool_info(
+        Tool(),
+        "sound_effect",
+    )
+    available = _create_tool_info(
+        Tool(),
+        "sound_effect",
+        sound_effect_models={"sfx": object()},
+    )
+
+    assert unavailable["enabled"] is False
+    assert unavailable["status"] == "missing_model"
+    assert available["enabled"] is True
+    assert available["status"] == "available"
 
 
 def ensure_system_initialized() -> None:

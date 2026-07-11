@@ -804,6 +804,38 @@ class TestModelAPI:
         assert defaults["asr"] == sample_speech_model_data["model_id"]
         assert defaults["tts"] == sample_speech_model_data["model_id"]
 
+    def test_create_sound_effect_model_and_set_default(
+        self,
+        test_db,
+        regular_user,
+        regular_headers,
+    ):
+        create_response = client.post(
+            "/api/models/",
+            json={
+                "model_id": "sound-effect-default",
+                "category": "sound_effect",
+                "model_provider": "elevenlabs",
+                "model_name": "eleven_text_to_sound_v2",
+                "api_key": "test-key",
+                "abilities": ["generate"],
+            },
+            headers=regular_headers,
+        )
+        assert create_response.status_code == 200
+        assert create_response.json()["category"] == "sound_effect"
+
+        default_response = client.post(
+            "/api/models/user-default",
+            json={
+                "model_id": create_response.json()["id"],
+                "config_type": "sound_effect",
+            },
+            headers=regular_headers,
+        )
+        assert default_response.status_code == 200
+        assert default_response.json()["config_type"] == "sound_effect"
+
     def test_transcribe_speech_requires_asr_model(
         self,
         test_db,
@@ -1052,7 +1084,7 @@ class TestModelAPI:
         assert openai["category"] == ["llm", "embedding"]
         assert openai["default_base_url"] == "https://api.openai.com/v1"
 
-    def test_list_supported_providers_scopes_elevenlabs_to_speech(
+    def test_list_supported_providers_includes_elevenlabs_sound_effects(
         self, test_db, regular_user, regular_headers
     ):
         response = client.get(
@@ -1068,7 +1100,7 @@ class TestModelAPI:
         )
         assert elevenlabs is not None
         assert elevenlabs["name"] == "ElevenLabs"
-        assert elevenlabs["category"] == ["speech"]
+        assert elevenlabs["category"] == ["speech", "sound_effect"]
 
     def test_list_supported_providers_includes_ark_platforms(
         self, test_db, regular_user, regular_headers

@@ -33,6 +33,7 @@ _DEFAULT_BASE_URL_BY_PROVIDER: dict[str, str] = {
     "volcengine-ark": "https://ark.cn-beijing.volces.com/api/v3",
     "byteplus-ark": "https://ark.ap-southeast.bytepluses.com/api/v3",
     "elevenlabs": "https://api.elevenlabs.io",
+    "elevenlabs-sound_effect": "https://api.elevenlabs.io",
     # Opencode / models.dev naming
     "zai-coding-plan": "https://api.z.ai/api/coding/paas/v4",
     "zhipuai-coding-plan": "https://open.bigmodel.cn/api/coding/paas/v4",
@@ -123,9 +124,9 @@ _SUPPORTED_PROVIDER_METADATA: tuple[dict[str, Any], ...] = (
     {
         "id": "elevenlabs",
         "name": "ElevenLabs",
-        "description": "ElevenLabs speech models for transcription and text-to-speech",
+        "description": "ElevenLabs models for speech and sound effect generation",
         "requires_base_url": False,
-        "category": ["speech"],
+        "category": ["speech", "sound_effect"],
     },
     {
         "id": "deepseek",

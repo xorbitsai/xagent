@@ -19,11 +19,16 @@ from ...models.task import Task, TaskStatus
 from ...models.user import User
 from ...models.user_channel import UserChannel
 from ...services.execution_result_projection import project_execution_result_for_channel
+from ...services.managed_task_lease import (
+    ManagedTaskLease,
+    claim_managed_task_lease,
+)
 from ...services.task_execution_controller import (
     StaleTaskRunError,
     TaskControlState,
     apply_task_control_transition,
     control_state_for_status,
+    task_control_snapshot,
     task_execution_controller,
 )
 from .trace_handler import FeishuTraceHandler
@@ -130,6 +135,7 @@ class FeishuBotInstance:
         db = next(db_gen)
         claimed_task_id: int | None = None
         claimed_run_id: str | None = None
+        managed_lease: ManagedTaskLease | None = None
         try:
             user = None
             if self.channel_id:
@@ -258,20 +264,16 @@ class FeishuBotInstance:
 
             async with task_execution_controller.command(int(task.id)):
                 db.refresh(task)
-                if task.status == TaskStatus.RUNNING:
+                managed_lease = claim_managed_task_lease(db, int(task.id))
+                if managed_lease is None:
                     await self._send_text(
                         chat_id,
                         "I'm still working on the previous message. "
                         "Please wait for it to finish.",
                     )
                     return
-                run_snapshot = apply_task_control_transition(
-                    task,
-                    TaskControlState.RUNNING,
-                    status=TaskStatus.RUNNING,
-                    new_run=True,
-                )
-                db.commit()
+                db.refresh(task)
+                run_snapshot = task_control_snapshot(task)
                 claimed_task_id = int(task.id)
                 claimed_run_id = run_snapshot.run_id
 
@@ -343,6 +345,7 @@ class FeishuBotInstance:
                     task_id=actual_task_id,
                     tracking_task_id=str(task.id),
                     db_session=db,
+                    manage_task_lease=False,
                 )
 
             projection = project_execution_result_for_channel(result)
@@ -410,9 +413,13 @@ class FeishuBotInstance:
             )
         finally:
             try:
-                next(db_gen)
-            except StopIteration:
-                pass
+                try:
+                    next(db_gen)
+                except StopIteration:
+                    pass
+            finally:
+                if managed_lease is not None:
+                    await managed_lease.close()
 
     async def _download_and_register_files(
         self,

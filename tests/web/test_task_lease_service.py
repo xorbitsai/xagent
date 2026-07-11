@@ -91,6 +91,29 @@ def test_task_lease_acquire_refresh_and_release(db_session) -> None:
     assert task.lease_expires_at is None
 
 
+def test_new_run_lease_claim_rejects_a_second_claim(db_session) -> None:
+    task = _create_task(db_session)
+
+    first = acquire_task_lease(
+        db_session,
+        int(task.id),
+        runner_id="runner-a",
+        new_run=True,
+    )
+    second = acquire_task_lease(
+        db_session,
+        int(task.id),
+        runner_id="runner-a",
+        new_run=True,
+    )
+
+    assert first is not None
+    assert first.run_id
+    assert second is None
+    db_session.refresh(task)
+    assert task.run_id == first.run_id
+
+
 def test_lease_acquire_rejects_a_superseded_run(db_session) -> None:
     task = _create_task(db_session, status=TaskStatus.RUNNING)
     task.run_id = "current-run"

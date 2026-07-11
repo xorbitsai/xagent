@@ -21,6 +21,8 @@ What this test pins:
 
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
+from threading import Barrier
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -103,6 +105,31 @@ def test_isolated_acquire_returns_none_when_lease_taken(db_session) -> None:
 
     lease = acquire_task_lease_isolated(int(task.id))
     assert lease is None
+
+
+def test_new_run_claim_is_atomic_across_sessions(db_session) -> None:
+    user = _create_user(db_session)
+    task = _create_task(db_session, int(user.id))
+    task_id = int(task.id)
+    barrier = Barrier(2)
+
+    def claim(runner_id: str) -> TaskLease | None:
+        barrier.wait()
+        return acquire_task_lease_isolated(
+            task_id,
+            runner_id=runner_id,
+            new_run=True,
+        )
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        results = list(executor.map(claim, ["runner-a", "runner-b"]))
+
+    winners = [lease for lease in results if lease is not None]
+    assert len(winners) == 1
+    db_session.expire_all()
+    stored = db_session.query(Task).filter(Task.id == task_id).one()
+    assert stored.run_id == winners[0].run_id
+    assert stored.runner_id == winners[0].runner_id
 
 
 def test_isolated_acquire_closes_session_on_success() -> None:

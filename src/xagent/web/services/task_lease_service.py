@@ -81,8 +81,15 @@ def acquire_task_lease(
     *,
     runner_id: str | None = None,
     expected_run_id: str | None = None,
+    new_run: bool = False,
 ) -> TaskLease | None:
-    """Acquire the task execution lease if no live runner owns it."""
+    """Acquire the task execution lease if no live runner owns it.
+
+    ``new_run=True`` atomically requires a non-running task and assigns a new
+    run id in the same UPDATE. This is the durable claim used by channel
+    transports so another worker cannot rotate the run between a status check
+    and lease acquisition.
+    """
     runner = runner_id or get_runner_id()
     now = utc_now()
     expires_at = _expires_at(now)
@@ -106,9 +113,13 @@ def acquire_task_lease(
             runner_id=runner,
             last_heartbeat_at=now,
             lease_expires_at=expires_at,
-            run_id=case(
-                (Task.status != TaskStatus.RUNNING, candidate_run_id),
-                else_=func.coalesce(Task.run_id, candidate_run_id),
+            run_id=(
+                candidate_run_id
+                if new_run
+                else case(
+                    (Task.status != TaskStatus.RUNNING, candidate_run_id),
+                    else_=func.coalesce(Task.run_id, candidate_run_id),
+                )
             ),
             control_state=running_control_state,
             state_version=case(
@@ -123,6 +134,8 @@ def acquire_task_lease(
             ),
         )
     )
+    if new_run:
+        stmt = stmt.where(Task.status != TaskStatus.RUNNING)
     if expected_run_id is not None:
         stmt = stmt.where(Task.run_id == expected_run_id)
     result = db.execute(stmt.execution_options(synchronize_session=False))
@@ -149,6 +162,7 @@ def acquire_task_lease_isolated(
     *,
     runner_id: str | None = None,
     expected_run_id: str | None = None,
+    new_run: bool = False,
 ) -> TaskLease | None:
     """Same semantics as :func:`acquire_task_lease` but opens, commits,
     and closes its own ``SessionLocal``.
@@ -169,6 +183,7 @@ def acquire_task_lease_isolated(
             task_id,
             runner_id=runner_id,
             expected_run_id=expected_run_id,
+            new_run=new_run,
         )
     finally:
         db.close()

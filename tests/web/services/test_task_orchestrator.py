@@ -16,7 +16,9 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
+from threading import Barrier
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -37,13 +39,17 @@ from xagent.web.services.connector_runtime import (
     store_ephemeral_runtime_values,
 )
 from xagent.web.services.task_execution_controller import task_execution_controller
-from xagent.web.services.task_lease_service import get_runner_id
+from xagent.web.services.task_lease_service import (
+    acquire_task_lease_isolated,
+    get_runner_id,
+)
 from xagent.web.services.task_orchestrator import (
     TaskTurnError,
     TaskTurnNotFoundError,
     TaskTurnOrchestrator,
     TaskTurnPayload,
     TurnKind,
+    _begin_turn_atomic_sync,
     _ClaimedTurn,
     _schedule_bg,
     finish_turn,
@@ -108,6 +114,50 @@ def _store_runtime_secret_for_turn(turn_id: str) -> None:
             }
         },
     )
+
+
+def test_channel_and_web_claims_are_cross_process_exclusive(db_session) -> None:
+    user = _create_user(db_session)
+    task = _create_task(db_session, int(user.id))
+    task_id = int(task.id)
+    barrier = Barrier(2)
+
+    def claim_channel() -> str | None:
+        barrier.wait()
+        lease = acquire_task_lease_isolated(
+            task_id,
+            runner_id="channel-runner",
+            new_run=True,
+        )
+        return lease.run_id if lease is not None else None
+
+    def claim_web() -> str | None:
+        barrier.wait()
+        try:
+            claimed = _begin_turn_atomic_sync(
+                task_id,
+                int(user.id),
+                payload=TaskTurnPayload("web turn"),
+                kind=TurnKind.CREATE,
+            )
+        except TaskTurnError:
+            return None
+        return claimed.run_id
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        channel_result = executor.submit(claim_channel)
+        web_result = executor.submit(claim_web)
+        winners = [
+            run_id
+            for run_id in (channel_result.result(), web_result.result())
+            if run_id is not None
+        ]
+
+    assert len(winners) == 1
+    db_session.expire_all()
+    stored = db_session.query(Task).filter(Task.id == task_id).one()
+    assert stored.status == TaskStatus.RUNNING
+    assert stored.run_id == winners[0]
 
 
 @pytest.fixture()

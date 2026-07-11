@@ -5,7 +5,7 @@ by task_id + event_type on every checkpoint write/resume; without an index
 each lookup scans the table, which keeps growing.
 
 Revision ID: 20260711_add_trace_events_task_idx
-Revises: 20260710_add_chat_delivery_state
+Revises: 20260711_task_control_state
 Create Date: 2026-07-11 00:00:00.000000
 
 """
@@ -16,7 +16,7 @@ import sqlalchemy as sa
 from alembic import op
 
 revision: str = "20260711_add_trace_events_task_idx"
-down_revision: Union[str, None] = "20260710_add_chat_delivery_state"
+down_revision: Union[str, None] = "20260711_task_control_state"
 branch_labels: Union[str, Sequence[str], None] = None
 depends_on: Union[str, Sequence[str], None] = None
 

@@ -24,10 +24,6 @@ class FakeSoundEffectModel(BaseSoundEffectModel):
         self.calls: list[dict[str, Any]] = []
         self.close_count = 0
 
-    @property
-    def abilities(self) -> list[str]:
-        return ["generate"]
-
     async def generate_sound_effect(
         self,
         text: str,
@@ -229,3 +225,9 @@ async def test_registered_creator_reads_only_sound_effect_config(
 
     assert [tool.name for tool in tools] == ["generate_sound_effect"]
     assert tools[0].metadata.category == ToolCategory.AUDIO
+
+
+async def test_registered_creator_skips_empty_sound_effect_config() -> None:
+    tools = await create_sound_effect_tools_from_config(ToolConfig({}))
+
+    assert tools == []

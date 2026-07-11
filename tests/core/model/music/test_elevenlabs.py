@@ -115,11 +115,35 @@ async def test_validate_connection_uses_non_billed_plan_endpoint(
     close.assert_awaited_once_with()
 
 
+async def test_generate_music_normalizes_non_streaming_sdk_response_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def compose(**kwargs: object) -> bytes:
+        return b"not-an-async-stream"
+
+    fake_client = SimpleNamespace(music=SimpleNamespace(compose=compose))
+    monkeypatch.setattr(
+        ElevenLabsMusicModel,
+        "_create_async_client",
+        staticmethod(lambda api_key, base_url=None: fake_client),
+    )
+
+    with pytest.raises(RuntimeError, match="ElevenLabs music generation failed"):
+        await ElevenLabsMusicModel(api_key="test-key").generate_music(
+            prompt="Ambient score"
+        )
+
+
 async def test_list_models_reads_provider_list_and_keeps_fallbacks(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     list_models = AsyncMock(
         return_value=[
+            SimpleNamespace(
+                model_id="music_v10",
+                name="Eleven Music v10",
+                description="Future music generation",
+            ),
             SimpleNamespace(
                 model_id="music_v3",
                 name="Eleven Music v3",
@@ -142,11 +166,12 @@ async def test_list_models_reads_provider_list_and_keeps_fallbacks(
     models = await ElevenLabsMusicModel.async_list_available_models(api_key="test-key")
 
     assert [model["id"] for model in models] == [
+        "music_v10",
         "music_v3",
         "music_v2",
         "music_v1",
     ]
-    assert models[0]["name"] == "Eleven Music v3"
+    assert models[0]["name"] == "Eleven Music v10"
     assert all(model["category"] == "music" for model in models)
     assert all(model["abilities"] == ["generate"] for model in models)
     list_models.assert_awaited_once_with()
@@ -224,12 +249,10 @@ async def test_list_models_treats_none_response_as_empty_provider_catalog(
 def test_adapter_builds_independent_music_model() -> None:
     db_model = SimpleNamespace(
         model_id="music-config",
-        model_provider="elevenlabs",
+        model_provider=" ELEVENLABS ",
         model_name="music_v2",
         api_key="test-key",
         base_url=None,
-        abilities=["generate"],
-        description=None,
         timeout=75,
         max_retries=6,
     )

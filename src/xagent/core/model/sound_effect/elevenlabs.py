@@ -72,10 +72,6 @@ class ElevenLabsSoundEffectModel(BaseSoundEffectModel):
         self.max_retries = max_retries
         self._async_client: Any = None
 
-    @property
-    def abilities(self) -> list[str]:
-        return ["generate"]
-
     @staticmethod
     def _create_async_client(
         api_key: Optional[str], base_url: Optional[str] = None

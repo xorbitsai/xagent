@@ -32,7 +32,6 @@ def get_sound_effect_model_instance(db_model: Any) -> BaseSoundEffectModel:
         model_provider=str(db_model.model_provider),
         api_key=str(db_model.api_key) if db_model.api_key else None,
         base_url=str(db_model.base_url) if db_model.base_url else None,
-        abilities=list(db_model.abilities or ["generate"]),
         timeout=getattr(db_model, "timeout", 180.0) or 180.0,
         max_retries=getattr(db_model, "max_retries", 10) or 10,
     )

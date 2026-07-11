@@ -133,6 +133,16 @@ async def test_generate_music_rejects_empty_audio() -> None:
     assert result["error"] == "Music model returned no audio data"
 
 
+async def test_teardown_closes_unique_music_models_once_per_task() -> None:
+    model = FakeMusicModel()
+    tool = MusicToolCore(models={"music": model}, default_model=model)
+
+    await tool.teardown(task_id="task-1")
+    await tool.teardown(task_id="task-1")
+
+    assert model.close_count == 1
+
+
 def test_music_tool_uses_audio_category(tmp_path: Path) -> None:
     workspace = TaskWorkspace("music-schema", str(tmp_path))
     [tool] = create_music_tools(models={"music": FakeMusicModel()}, workspace=workspace)
@@ -162,3 +172,9 @@ async def test_registered_creator_reads_music_config(tmp_path: Path) -> None:
 
     assert [tool.name for tool in tools] == ["generate_music"]
     assert tools[0].metadata.category == ToolCategory.AUDIO
+
+
+async def test_registered_creator_skips_empty_music_config() -> None:
+    tools = await create_music_tools_from_config(ToolConfig({}))
+
+    assert tools == []

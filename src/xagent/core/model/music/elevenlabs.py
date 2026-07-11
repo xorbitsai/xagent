@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 from inspect import isawaitable
 from typing import Any, Literal, Optional, get_args, get_origin
 
@@ -59,6 +60,13 @@ def _music_model_name(model_id: str, name: Optional[str] = None) -> str:
         return name
     version = model_id.removeprefix("music_")
     return f"Eleven Music {version}" if version else model_id
+
+
+def _music_model_sort_key(model_id: str) -> tuple[int, int | str]:
+    match = re.fullmatch(r"music_v(\d+)", model_id)
+    if match:
+        return (1, int(match.group(1)))
+    return (0, model_id)
 
 
 class ElevenLabsMusicModel(BaseMusicModel):
@@ -268,7 +276,9 @@ class ElevenLabsMusicModel(BaseMusicModel):
 
         discovered_ids = set(provider_models) | sdk_models
         ordered = sorted(
-            discovered_ids - set(ELEVENLABS_DOCUMENTED_MUSIC_MODELS), reverse=True
+            discovered_ids - set(ELEVENLABS_DOCUMENTED_MUSIC_MODELS),
+            key=_music_model_sort_key,
+            reverse=True,
         )
         ordered.extend(ELEVENLABS_DOCUMENTED_MUSIC_MODELS)
         return [

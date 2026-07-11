@@ -5,12 +5,13 @@ from __future__ import annotations
 from typing import Any
 
 from ..model import MusicModelConfig
+from ..providers import canonical_provider_name
 from .base import BaseMusicModel
 from .elevenlabs import ElevenLabsMusicModel
 
 
 def create_music_model(config: MusicModelConfig) -> BaseMusicModel:
-    provider = config.model_provider.lower().strip()
+    provider = canonical_provider_name(config.model_provider)
     if provider != "elevenlabs":
         raise ValueError(f"Unsupported music provider: {config.model_provider}")
     return ElevenLabsMusicModel(
@@ -29,8 +30,6 @@ def get_music_model_instance(db_model: Any) -> BaseMusicModel:
         model_provider=str(db_model.model_provider),
         api_key=db_model.api_key,
         base_url=db_model.base_url,
-        abilities=list(db_model.abilities or ["generate"]),
-        description=db_model.description,
         timeout=getattr(db_model, "timeout", 180.0) or 180.0,
         max_retries=getattr(db_model, "max_retries", 10) or 10,
     )

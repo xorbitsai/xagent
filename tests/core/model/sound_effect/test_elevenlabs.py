@@ -336,7 +336,6 @@ def test_adapter_builds_independent_sound_effect_model() -> None:
         model_name=ELEVENLABS_DEFAULT_SOUND_EFFECT_MODEL,
         api_key="test-key",
         base_url=None,
-        abilities=["generate"],
         timeout=65,
         max_retries=7,
     )

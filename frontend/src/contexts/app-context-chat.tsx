@@ -208,7 +208,28 @@ const dispatchAutoOpenPreview = (
 }
 
 const OPTIMISTIC_USER_MESSAGE_PREFIX = "msg-user-optimistic"
+const USER_TURN_MESSAGE_PREFIX = "msg-user-turn"
+const USER_EVENT_MESSAGE_PREFIX = "msg-user-event"
 const USER_MESSAGE_REPLACE_WINDOW_MS = 30000
+
+const userTurnMessageId = (turnId: string): string =>
+  `${USER_TURN_MESSAGE_PREFIX}-${turnId}`
+
+const stableUserMessageId = (
+  eventData: { turn_id?: unknown } & Record<string, unknown>,
+  eventId?: unknown,
+): string | null => {
+  const turnId = eventData.turn_id
+  if (typeof turnId === "string" && turnId.trim()) {
+    return userTurnMessageId(turnId.trim())
+  }
+
+  if (typeof eventId === "string" && eventId.trim()) {
+    return `${USER_EVENT_MESSAGE_PREFIX}-${eventId.trim()}`
+  }
+
+  return null
+}
 
 const extractTextFromReactNode = (node: React.ReactNode): string => {
   if (typeof node === 'string') return node
@@ -253,7 +274,10 @@ const findOptimisticUserMessageIndex = (
     if (
       existingMessage.role !== "user" ||
       typeof existingMessage.id !== "string" ||
-      !existingMessage.id.startsWith(OPTIMISTIC_USER_MESSAGE_PREFIX)
+      (
+        !existingMessage.isOptimistic &&
+        !existingMessage.id.startsWith(OPTIMISTIC_USER_MESSAGE_PREFIX)
+      )
     ) {
       continue
     }
@@ -422,6 +446,7 @@ interface Message {
   traceEvents?: TraceEvent[]
   interactions?: Interaction[]
   isSystemNotice?: boolean
+  isOptimistic?: boolean
 }
 
 export interface Task {
@@ -741,13 +766,41 @@ function appReducer(state: AppState, action: AppAction): AppState {
         state.messages,
         messageToAdd,
       )
+
+      if (messageToAdd.role === "user") {
+        const existingUserMessageIndex = state.messages.findIndex(
+          message => message.role === "user" && message.id === messageToAdd.id,
+        )
+        if (existingUserMessageIndex >= 0) {
+          const existingMessage = state.messages[existingUserMessageIndex]
+          if (messageToAdd.isOptimistic && !existingMessage.isOptimistic) {
+            return state
+          }
+
+          const updatedMessages = state.messages.map((message, index) =>
+            index === existingUserMessageIndex
+              ? {
+                ...message,
+                ...messageToAdd,
+                isOptimistic: messageToAdd.isOptimistic ?? false,
+              }
+              : message
+          )
+          updatedMessages.sort((a, b) => {
+            return normalizeTimestampMs(a.timestamp) - normalizeTimestampMs(b.timestamp)
+          })
+          return { ...state, messages: updatedMessages, traceEvents: newTraceEvents }
+        }
+      }
+
       if (optimisticUserMessageIndex >= 0) {
         const updatedMessages = state.messages.map((message, index) =>
           index === optimisticUserMessageIndex
             ? {
               ...message,
               ...messageToAdd,
-              id: message.id,
+              id: messageToAdd.id,
+              isOptimistic: messageToAdd.isOptimistic ?? false,
             }
             : message
         )
@@ -1502,7 +1555,7 @@ export function AppProvider({
         break
 
       case "trace_event":
-        const traceEventData = message.data as any
+        const traceEventData = (message.data ?? {}) as any
 
         // Check if this has the expected structure with event_type
         // event_type can be in message.event_type (new format) or traceEventData.event_type (old format)
@@ -1609,6 +1662,10 @@ export function AppProvider({
           else if (eventType === "user_message") {
             dispatch({ type: "SET_HISTORY_LOADING", payload: false })
             const messageContent = eventData.message || eventData.content || ""
+            const userMessageId = stableUserMessageId(
+              eventData,
+              message.event_id || traceEventData.event_id,
+            )
 
             // Debug log
             console.log('🔍 User message debug:', {
@@ -1622,11 +1679,14 @@ export function AppProvider({
               timestamp: message.timestamp
             })
 
-            // Check if this is a duplicate message.
-            // Use caching so the entry expires after 30s, preventing the
-            // immediate chat/user_message duplicate pair without permanently
-            // blocking subsequent identical messages later in the session.
-            const isDuplicate = isDuplicateMessage(messageContent, 'user-message', false, true)
+            // Modern user-message events carry a stable turn_id (or at least
+            // an event_id). The reducer reconciles those identities across
+            // live delivery, optimistic rendering, and history replay. Only
+            // legacy events without either identity fall back to short-lived
+            // content-based deduplication.
+            const isDuplicate = userMessageId === null
+              ? isDuplicateMessage(messageContent, 'user-message', false, true)
+              : false
             console.log('🔍 Duplicate check:', {
               messageContent,
               isDuplicate,
@@ -1691,10 +1751,11 @@ export function AppProvider({
             })
 
             const messagePayload = {
-              id: generateMessageId("msg-user"),
+              id: userMessageId || generateMessageId("msg-user"),
               role: "user" as const,
               content: content,
               timestamp: message.timestamp,
+              isOptimistic: false,
             }
 
             console.log('📤 Message payload:', messagePayload)
@@ -4479,33 +4540,33 @@ export function AppProvider({
         dispatch({ type: "TRIGGER_TASK_UPDATE" })
       }
 
-      // The user_message trace usually arrives before the acknowledgement. If
-      // it has not, add a local copy now; the normal dedupe path reconciles the
-      // later trace without displaying a duplicate.
-      if (!isDuplicateMessage(message, 'user-message', config?.force)) {
-        let content: React.ReactNode = message
-        if (files && files.length > 0) {
-          content = (
-            <div className="space-y-2">
-              <div className="whitespace-pre-wrap max-h-60 overflow-y-auto">{message}</div>
-              <FileAttachment
-                files={files.map(f => ({ name: f.name, type: f.type, size: f.size, path: '' }))} // Basic info for optimistic render
-                variant="user-message"
-              />
-            </div>
-          )
-        }
-
-        dispatch({
-          type: "ADD_MESSAGE",
-          payload: {
-            id: generateMessageId("msg-user-optimistic"),
-            role: "user",
-            content: content,
-            timestamp: Date.now().toString(),
-          }
-        })
+      // The user_message trace usually arrives before the acknowledgement. Add
+      // a stable optimistic copy either way; the reducer keeps the persisted
+      // event when it already arrived and replaces this copy when it arrives
+      // later.
+      let content: React.ReactNode = message
+      if (files && files.length > 0) {
+        content = (
+          <div className="space-y-2">
+            <div className="whitespace-pre-wrap max-h-60 overflow-y-auto">{message}</div>
+            <FileAttachment
+              files={files.map(f => ({ name: f.name, type: f.type, size: f.size, path: '' }))} // Basic info for optimistic render
+              variant="user-message"
+            />
+          </div>
+        )
       }
+
+      dispatch({
+        type: "ADD_MESSAGE",
+        payload: {
+          id: userTurnMessageId(clientMessageId),
+          role: "user",
+          content: content,
+          timestamp: Date.now().toString(),
+          isOptimistic: true,
+        }
+      })
     }
   }, [state.taskId, sendChatMessage, wsExecuteTask, state.currentTask?.status, queuePendingMessage])
 

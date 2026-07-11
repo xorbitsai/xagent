@@ -1,5 +1,5 @@
 import React from "react"
-import { act, cleanup, render, screen, waitFor } from "@testing-library/react"
+import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react"
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest"
 
 type TestWebSocketMessage = {
@@ -17,6 +17,7 @@ type TestWebSocketMessage = {
 const webSocketOptions = vi.hoisted(() => ({
   current: null as null | { onMessage?: (message: TestWebSocketMessage) => void },
 }))
+const sendChatMessageMock = vi.hoisted(() => vi.fn())
 
 vi.mock("next/navigation", () => ({
   useRouter: () => ({ push: vi.fn(), replace: vi.fn(), refresh: vi.fn() }),
@@ -38,7 +39,7 @@ vi.mock("@/hooks/use-websocket", () => ({
     return {
       isConnected: true,
       connectionError: null,
-      sendChatMessage: vi.fn(),
+      sendChatMessage: sendChatMessageMock,
       executeTask: vi.fn(),
       pauseTask: vi.fn(),
       resumeTask: vi.fn(),
@@ -76,9 +77,11 @@ function StateProbe() {
       <div data-testid="messages">
         {JSON.stringify(
           state.messages.map((message) => ({
+            id: message.id,
             role: message.role,
             content:
               typeof message.content === "string" ? message.content : "react-node",
+            isOptimistic: message.isOptimistic,
           }))
         )}
       </div>
@@ -120,6 +123,44 @@ function SeedRunningTask() {
   return null
 }
 
+function SeedExistingTask() {
+  const { dispatch } = useApp()
+
+  React.useEffect(() => {
+    dispatch({ type: "SET_TASK_ID", payload: 1 })
+    dispatch({
+      type: "SET_CURRENT_TASK",
+      payload: {
+        id: "1",
+        title: "Test task",
+        status: "running",
+        description: "Test task",
+        createdAt: "2026-05-27T05:00:00Z",
+        updatedAt: "2026-05-27T05:00:00Z",
+      },
+    })
+  }, [dispatch])
+
+  return null
+}
+
+function SendMessageProbe() {
+  const { sendMessage } = useApp()
+
+  return (
+    <button
+      type="button"
+      onClick={() => {
+        void sendMessage("Optimistic round trip", {
+          clientMessageId: "turn-optimistic",
+        })
+      }}
+    >
+      Send message
+    </button>
+  )
+}
+
 describe("task control envelope parsing", () => {
   it("does not coerce null, boolean, or empty identifiers to integers", () => {
     const nullEnvelope = extractTaskControlEnvelope({
@@ -157,6 +198,13 @@ describe("task control envelope parsing", () => {
 describe("AppProvider websocket message routing", () => {
   beforeEach(() => {
     webSocketOptions.current = null
+    sendChatMessageMock.mockReset()
+    sendChatMessageMock.mockResolvedValue({
+      client_message_id: "turn-optimistic",
+      turn_id: "turn-optimistic",
+    })
+    ;(window as typeof window & { clearDuplicateMessageCache?: () => void })
+      .clearDuplicateMessageCache?.()
   })
 
   afterEach(() => {
@@ -221,6 +269,172 @@ describe("AppProvider websocket message routing", () => {
       )
     })
     expect(screen.getByTestId("messages").textContent).not.toContain("Searching")
+  })
+
+  it("deduplicates the same user turn when history is replayed after reconnect", async () => {
+    render(
+      <AppProvider token="token">
+        <StateProbe />
+      </AppProvider>
+    )
+
+    const onMessage = webSocketOptions.current?.onMessage
+    expect(onMessage).toBeDefined()
+    const userTurn = {
+      type: "trace_event",
+      timestamp: "2026-05-27T05:00:00Z",
+      data: {
+        event_id: "user-event-1",
+        event_type: "user_message",
+        data: {
+          message: "Repeated after reconnect",
+          turn_id: "turn-1",
+        },
+      },
+    }
+
+    act(() => {
+      onMessage?.(userTurn)
+    })
+    await waitFor(() => {
+      expect(screen.getByTestId("messages").textContent).toContain(
+        "Repeated after reconnect"
+      )
+    })
+
+    // A hot reload can reset the old content cache before the socket replays
+    // the same persisted turn.
+    act(() => {
+      ;(window as typeof window & { clearDuplicateMessageCache?: () => void })
+        .clearDuplicateMessageCache?.()
+      onMessage?.(userTurn)
+    })
+
+    await waitFor(() => {
+      const messages = JSON.parse(
+        screen.getByTestId("messages").textContent || "[]"
+      ) as Array<{ content: string }>
+      expect(messages.filter(message => message.content === "Repeated after reconnect"))
+        .toHaveLength(1)
+    })
+  })
+
+  it("keeps identical text from distinct user turns", async () => {
+    render(
+      <AppProvider token="token">
+        <StateProbe />
+      </AppProvider>
+    )
+
+    const onMessage = webSocketOptions.current?.onMessage
+    expect(onMessage).toBeDefined()
+
+    act(() => {
+      onMessage?.({
+        type: "trace_event",
+        timestamp: "2026-05-27T05:00:00Z",
+        data: {
+          event_id: "user-event-1",
+          event_type: "user_message",
+          data: { message: "Send it again", turn_id: "turn-1" },
+        },
+      })
+      onMessage?.({
+        type: "trace_event",
+        timestamp: "2026-05-27T05:00:01Z",
+        data: {
+          event_id: "user-event-2",
+          event_type: "user_message",
+          data: { message: "Send it again", turn_id: "turn-2" },
+        },
+      })
+    })
+
+    await waitFor(() => {
+      const messages = JSON.parse(
+        screen.getByTestId("messages").textContent || "[]"
+      ) as Array<{ content: string }>
+      expect(messages.filter(message => message.content === "Send it again"))
+        .toHaveLength(2)
+    })
+  })
+
+  it("reconciles an optimistic send with its persisted user turn", async () => {
+    render(
+      <AppProvider token="token">
+        <SeedExistingTask />
+        <SendMessageProbe />
+        <StateProbe />
+      </AppProvider>
+    )
+
+    await waitFor(() => {
+      expect(screen.getByTestId("task-status").textContent).toBe("running")
+    })
+
+    fireEvent.click(screen.getByRole("button", { name: "Send message" }))
+
+    await waitFor(() => {
+      const messages = JSON.parse(
+        screen.getByTestId("messages").textContent || "[]"
+      ) as Array<{ content: string; isOptimistic?: boolean }>
+      expect(messages).toEqual([
+        expect.objectContaining({
+          content: "Optimistic round trip",
+          isOptimistic: true,
+        }),
+      ])
+    })
+
+    const onMessage = webSocketOptions.current?.onMessage
+    expect(onMessage).toBeDefined()
+    act(() => {
+      onMessage?.({
+        type: "trace_event",
+        timestamp: "2026-05-27T05:00:02Z",
+        data: {
+          event_id: "user-event-optimistic",
+          event_type: "user_message",
+          data: {
+            message: "Optimistic round trip",
+            turn_id: "turn-optimistic",
+          },
+        },
+      })
+    })
+
+    await waitFor(() => {
+      const messages = JSON.parse(
+        screen.getByTestId("messages").textContent || "[]"
+      ) as Array<{ content: string; isOptimistic?: boolean }>
+      expect(messages).toEqual([
+        expect.objectContaining({
+          content: "Optimistic round trip",
+          isOptimistic: false,
+        }),
+      ])
+    })
+  })
+
+  it("does not crash on a trace event without data", () => {
+    render(
+      <AppProvider token="token">
+        <StateProbe />
+      </AppProvider>
+    )
+
+    const onMessage = webSocketOptions.current?.onMessage
+    expect(onMessage).toBeDefined()
+
+    expect(() => {
+      act(() => {
+        onMessage?.({
+          type: "trace_event",
+          event_type: "unknown_event",
+          timestamp: "2026-05-27T05:00:02Z",
+        } as TestWebSocketMessage)
+      })
+    }).not.toThrow()
   })
 
   it("handles top-level failed task completion payloads", async () => {

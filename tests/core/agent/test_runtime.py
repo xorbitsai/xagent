@@ -281,7 +281,9 @@ async def test_should_interrupt_falsey_checker_does_not_interrupt() -> None:
 
 
 @pytest.mark.asyncio
-async def test_should_interrupt_empty_string_neither_interrupts_nor_sets_reason() -> None:
+async def test_should_interrupt_empty_string_neither_interrupts_nor_sets_reason() -> (
+    None
+):
     # "" is falsey: it must not interrupt, and must not clobber interrupt_reason.
     runtime = PatternRuntime(interrupt_checker=lambda: "")
     runtime.interrupt_reason = "prior"

@@ -141,6 +141,9 @@ class AgentExecutionAdapter:
 
     async def resume(self, execution_id: str, **kwargs: Any) -> dict[str, Any] | None:
         kwargs.setdefault("workspace_id", self._workspace_id(execution_id))
+        # Carry the mid-run quota checker into the resumed run too, so a
+        # paused-and-resumed continuation is gated like a fresh run.
+        kwargs.setdefault("interrupt_checker", self.config.interrupt_checker)
         handle = self.registry.get(execution_id)
         if handle is None:
             runner, execution_type = self._build_runner()

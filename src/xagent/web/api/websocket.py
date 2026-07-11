@@ -1890,6 +1890,11 @@ async def execute_resume_background(
     lease = None
     lease_released = False
     result: Dict[str, Any] | None = None
+    # Token tracking + mid-run quota gate for the resumed segment (resume had
+    # neither before, so a resumed run escaped mid-run enforcement entirely).
+    resume_tracker = None
+    resume_tracker_db = None
+    resume_tracker_db_gen = None
     normalized_outputs: list[Dict[str, str]] = []
     output = ""
     success = False
@@ -2045,6 +2050,27 @@ async def execute_resume_background(
             task_id,
         )
 
+        # Track tokens and enforce the mid-run quota gate on the resumed segment
+        # too. Best-effort: a tracking hiccup must never block the resume.
+        try:
+            from ..tracking.task_tracker import TaskTracker
+
+            resume_tracker_db_gen = get_db()
+            resume_tracker_db = next(resume_tracker_db_gen)
+            resume_tracker = TaskTracker(
+                task_id=int(task_id), db_session=resume_tracker_db
+            )
+            await resume_tracker.start_tracking()
+            agent_service.set_interrupt_checker(
+                resume_tracker.interrupt_reason_for_quota
+            )
+        except Exception as e:  # noqa: BLE001
+            logger.warning(
+                f"execute_resume_background: token tracking unavailable "
+                f"for task {task_id}: {e}"
+            )
+            resume_tracker = None
+
         with UserContext(task_owner_user_id), turn_execution_scope(task_id):
             result = await agent_service.resume_execution_by_id(str(task_id))
 
@@ -2052,6 +2078,19 @@ async def execute_resume_background(
             raise RuntimeError(
                 f"No resumable execution checkpoint was found for task {task_id}."
             )
+
+        # If the mid-run quota gate stopped the resumed run, surface the reason
+        # the way the start gate does instead of a silent flip to PAUSED.
+        if resume_tracker is not None and isinstance(result, dict):
+            _quota_reason = getattr(resume_tracker, "quota_interrupt_reason", None)
+            if _quota_reason:
+                result = {
+                    **result,
+                    "success": False,
+                    "status": "quota_exceeded",
+                    "output": _quota_reason,
+                    "error": _quota_reason,
+                }
 
         status = str(result.get("status") or "")
         success = bool(result.get("success", False))
@@ -2221,6 +2260,19 @@ async def execute_resume_background(
             task_id,
         )
     finally:
+        # Finalize the resumed segment's tracking: drop the checker, meter the
+        # partial usage, and close the tracker's dedicated session. Best-effort.
+        if resume_tracker is not None:
+            agent_service.set_interrupt_checker(None)
+            try:
+                await resume_tracker.complete_tracking()
+            except Exception as e:  # noqa: BLE001
+                logger.warning(
+                    f"execute_resume_background: token tracking completion "
+                    f"failed for task {task_id}: {e}"
+                )
+        if resume_tracker_db is not None:
+            resume_tracker_db.close()
         await stop_task_lease_heartbeat(lease_heartbeat_task, lease_stop_event)
         if lease is not None and not lease_released:
             db_gen = get_db()

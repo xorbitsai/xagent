@@ -348,7 +348,7 @@ class TaskTracker:
             delta_details, delta_actions = self._turn_delta(usage)
             record_usage(
                 self.db_session,
-                getattr(self.task, "user_id", None),
+                self._user_id,
                 delta_details,
                 delta_actions,
             )

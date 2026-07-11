@@ -32,8 +32,14 @@ _usage_record_hook: Callable[[Any, Any, list, int], None] | None = None
 # in-flight run's live-so-far usage would push the team over a run-gated quota,
 # else None. Polled per step (each LLM reply / tool call) during a run so a
 # single long/expensive run is stopped mid-flight instead of only being metered
-# at completion. Read-only: it must not write or commit `db` (same contract
-# spirit as the metering hook), and should stay cheap since it runs every step.
+# at completion.
+#
+# CONTRACT: invoked SYNCHRONOUSLY on the event loop once per step. It MUST NOT
+# block (no synchronous network/DB round-trips per call) — blocking work stalls
+# the loop every step. Resolve/cache anything expensive out of band (the stock
+# app layer caches the user->team lookup and checks quota off in-memory
+# counters). Read-only: it must not write or commit `db` (same contract spirit
+# as the metering hook).
 _run_progress_gate_hook: Callable[[Any, Any, list, int], str | None] | None = None
 # (db, user_id) -> reason str if the team is out of storage quota, else None
 _storage_gate_hook: Callable[[Any, Any], str | None] | None = None

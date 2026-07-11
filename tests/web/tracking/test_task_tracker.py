@@ -169,6 +169,30 @@ class TestTaskTracker:
         assert tracker.quota_interrupt_reason is None  # never tripped → no reason
 
     @pytest.mark.asyncio
+    async def test_runtime_should_interrupt_drives_tracker_gate(self, db_session):
+        """End-to-end seam: the runtime's should_interrupt — the exact call the
+        pattern loop makes at each safe point — wired to the tracker's real gate
+        method fires and records the reason when a registered hook trips."""
+        from xagent.core.agent.runtime import PatternRuntime
+        from xagent.web.services import quota_hooks
+
+        task = db_session.query.return_value.filter.return_value.first.return_value
+        task.user_id = 5
+
+        quota_hooks.set_run_progress_gate_hook(lambda db, uid, dd, da: "Out of credits")
+        try:
+            tracker = TaskTracker(task_id=123, db_session=db_session)
+            await tracker.start_tracking()
+            runtime = PatternRuntime(
+                interrupt_checker=tracker.interrupt_reason_for_quota
+            )
+            assert await runtime.should_interrupt() is True
+            assert runtime.interrupt_reason == "Out of credits"
+            assert tracker.quota_interrupt_reason == "Out of credits"
+        finally:
+            quota_hooks.set_run_progress_gate_hook(None)
+
+    @pytest.mark.asyncio
     async def test_init_task_tracker_with_custom_interval(self, db_session):
         """Test TaskTracker with custom update interval."""
         tracker = TaskTracker(

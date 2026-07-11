@@ -277,6 +277,7 @@ class AgentRunner:
         streaming_handler: Any | None = None,
         extra_tools: list[Any] | None = None,
         metadata: dict[str, Any] | None = None,
+        interrupt_checker: Any | None = None,
     ) -> dict[str, Any]:
         checkpoint = await self._load_latest_checkpoint(execution_id)
         resolved_task = self._resolve_task(
@@ -297,6 +298,7 @@ class AgentRunner:
             streaming_handler=streaming_handler,
             extra_tools=extra_tools,
             metadata=metadata,
+            interrupt_checker=interrupt_checker,
         )
 
     async def inject_user_message(

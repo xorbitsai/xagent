@@ -205,13 +205,27 @@ class ElevenLabsSoundEffectModel(BaseSoundEffectModel):
             raise ValueError("ElevenLabs API key is required to list models")
 
         model = cls(api_key=resolved_api_key, base_url=base_url)
+        response: Any = None
         try:
-            response = await model._ensure_async_client().models.list()
+            try:
+                response = await model._ensure_async_client().models.list()
+            except Exception as exc:
+                safe_error = redact_sensitive_text(str(exc))
+                if (
+                    "missing_permissions" not in safe_error
+                    or "user_read" not in safe_error
+                ):
+                    raise
+                logger.warning(
+                    "Could not list ElevenLabs sound effect models because the API "
+                    "key lacks user_read; using the documented catalog: %s",
+                    safe_error,
+                )
         finally:
             await model.aclose()
 
         discovered: list[dict[str, Any]] = []
-        for raw_model in _get_field(response, "models") or response:
+        for raw_model in _get_field(response, "models") or response or []:
             model_id = _get_field(raw_model, "model_id", "id")
             if not model_id:
                 continue

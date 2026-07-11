@@ -145,9 +145,9 @@ export function ModelManagementDialog({
   const getCategoryForActiveTab = (providerId?: string): string => {
     if (activeTab !== 'audio') return activeTab
     const provider = providers.find(p => p.id === providerId)
-    if (provider?.category.includes('speech')) return 'speech'
-    if (provider?.category.includes('sound_effect')) return 'sound_effect'
-    if (provider?.category.includes('music')) return 'music'
+    if (provider?.category?.includes('speech')) return 'speech'
+    if (provider?.category?.includes('sound_effect')) return 'sound_effect'
+    if (provider?.category?.includes('music')) return 'music'
     return 'speech'
   }
 
@@ -549,7 +549,18 @@ export function ModelManagementDialog({
       : capability === 'music'
         ? 'music'
         : 'speech'
-    const abilities = category === 'speech' ? [capability] : ['generate']
+    let abilities = category === 'speech' ? [capability] : ['generate']
+    if (category === 'speech' && formData.category === 'speech') {
+      const currentAbilities = formData.abilities || []
+      const toggledAbilities = currentAbilities.includes(capability)
+        ? currentAbilities.filter(ability => ability !== capability)
+        : [...currentAbilities, capability]
+      abilities = normalizeAbilitiesForProvider(
+        category,
+        formData.model_provider,
+        toggledAbilities
+      )
+    }
 
     resetTestConnectionState()
     setHasInitializedDefaults(false)

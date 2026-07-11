@@ -242,6 +242,55 @@ async def test_list_models_uses_documented_fallback_when_provider_omits_sfx(
     close.assert_awaited_once_with()
 
 
+async def test_list_models_uses_fallback_when_key_lacks_user_read(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    list_models = AsyncMock(
+        side_effect=RuntimeError(
+            "status: missing_permissions; missing permission user_read"
+        )
+    )
+    close = AsyncMock()
+    fake_client = SimpleNamespace(
+        models=SimpleNamespace(list=list_models),
+        aclose=close,
+    )
+    monkeypatch.setattr(
+        ElevenLabsSoundEffectModel,
+        "_create_async_client",
+        staticmethod(lambda api_key, base_url=None: fake_client),
+    )
+
+    models = await ElevenLabsSoundEffectModel.async_list_available_models(
+        api_key="test-key"
+    )
+
+    assert [model["id"] for model in models] == [ELEVENLABS_DEFAULT_SOUND_EFFECT_MODEL]
+    list_models.assert_awaited_once_with()
+    close.assert_awaited_once_with()
+
+
+async def test_list_models_does_not_hide_other_provider_errors(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    list_models = AsyncMock(side_effect=RuntimeError("invalid API key"))
+    close = AsyncMock()
+    fake_client = SimpleNamespace(
+        models=SimpleNamespace(list=list_models),
+        aclose=close,
+    )
+    monkeypatch.setattr(
+        ElevenLabsSoundEffectModel,
+        "_create_async_client",
+        staticmethod(lambda api_key, base_url=None: fake_client),
+    )
+
+    with pytest.raises(RuntimeError, match="invalid API key"):
+        await ElevenLabsSoundEffectModel.async_list_available_models(api_key="test-key")
+
+    close.assert_awaited_once_with()
+
+
 def test_adapter_builds_independent_sound_effect_model() -> None:
     db_model = SimpleNamespace(
         model_id="sound-fx",

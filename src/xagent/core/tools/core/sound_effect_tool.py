@@ -125,6 +125,8 @@ The generated file is saved to the workspace and returned as file_id/file_ref.
         """Generate a sound effect and save it to the task workspace."""
         try:
             prompt = text.strip()
+            if not prompt:
+                raise ValueError("Sound effect description must not be empty")
             prompt = f"{prompt.rstrip(' .')}. {NON_SPEECH_PROMPT_SUFFIX}"
 
             model, configured_model_id = self._get_model(model_id)

@@ -113,6 +113,17 @@ async def test_generate_sound_effect_rejects_unknown_model() -> None:
     assert "is not configured" in result["error"]
 
 
+async def test_generate_sound_effect_rejects_empty_description() -> None:
+    model = FakeSoundEffectModel()
+    tool = SoundEffectToolCore(models={"sound": model})
+
+    result = await tool.generate_sound_effect(text="  ")
+
+    assert result["success"] is False
+    assert result["error"] == "Sound effect description must not be empty"
+    assert model.calls == []
+
+
 async def test_generate_sound_effect_accepts_cjk_and_adds_non_speech_constraint() -> (
     None
 ):

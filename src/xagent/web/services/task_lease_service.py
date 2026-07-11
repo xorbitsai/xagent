@@ -22,6 +22,7 @@ from ...config import (
 from ...core.agent.checkpoint import READABLE_CHECKPOINT_TYPES
 from ..models.database import get_db
 from ..models.task import Task, TaskStatus, TraceEvent
+from .task_execution_controller import control_state_for_status
 
 logger = logging.getLogger(__name__)
 
@@ -199,7 +200,7 @@ def release_task_lease(
     """Release a task lease and set its final visible status."""
     if lease is None:
         return False
-    control_state = _control_state_value(status)
+    control_state = control_state_for_status(status).value
     current_version = func.coalesce(Task.state_version, 0)
     stmt = (
         update(Task)
@@ -237,7 +238,7 @@ def release_current_runner_task_lease(
 ) -> bool:
     """Release the current runner's lease for a task."""
     runner = runner_id or get_runner_id()
-    control_state = _control_state_value(status)
+    control_state = control_state_for_status(status).value
     current_version = func.coalesce(Task.state_version, 0)
     stmt = (
         update(Task)
@@ -263,17 +264,6 @@ def release_current_runner_task_lease(
     result = db.execute(stmt.execution_options(synchronize_session=False))
     db.commit()
     return _rowcount(result) == 1
-
-
-def _control_state_value(status: TaskStatus) -> str:
-    return {
-        TaskStatus.PENDING: "idle",
-        TaskStatus.RUNNING: "running",
-        TaskStatus.PAUSED: "paused",
-        TaskStatus.WAITING_FOR_USER: "waiting_for_user",
-        TaskStatus.COMPLETED: "completed",
-        TaskStatus.FAILED: "failed",
-    }[status]
 
 
 def mark_task_paused_if_stale(db: Session, task: Task) -> bool:

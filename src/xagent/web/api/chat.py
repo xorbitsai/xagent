@@ -2194,13 +2194,10 @@ class AgentServiceManager:
 
         if manage_task_lease and db_session and tracker_task_id:
             from ..services.task_execution_controller import (
-                TaskCommand,
                 task_execution_controller,
             )
 
-            async with task_execution_controller.command(
-                int(tracker_task_id), TaskCommand.START_TURN
-            ):
+            async with task_execution_controller.command(int(tracker_task_id)):
                 lease = acquire_task_lease(db_session, int(tracker_task_id))
             if lease is None:
                 return {

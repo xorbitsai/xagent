@@ -3,6 +3,8 @@
 P1 keeps command serialization process-local. Cross-worker command transport is
 deliberately a later concern; the database state tuple written here is the
 authoritative ordering contract shared by every transport and by the frontend.
+Channel transports share this gate and state tuple but do not yet use the turn
+orchestrator or runner-lease lifecycle.
 """
 
 from __future__ import annotations
@@ -10,6 +12,7 @@ from __future__ import annotations
 import asyncio
 import enum
 from contextlib import asynccontextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass
 from typing import Any, AsyncIterator
 from uuid import uuid4
@@ -18,15 +21,6 @@ from sqlalchemy import func, update
 from sqlalchemy.orm import object_session
 
 from ..models.task import Task, TaskStatus
-
-
-class TaskCommand(str, enum.Enum):
-    START_TURN = "start_turn"
-    MESSAGE = "message"
-    PAUSE = "pause"
-    RESUME = "resume"
-    CANCEL = "cancel"
-    CHANNEL_MESSAGE = "channel_message"
 
 
 class TaskControlState(str, enum.Enum):
@@ -231,6 +225,11 @@ class _ReentrantCommandGate:
             self.lock.release()
 
 
+_command_owners: ContextVar[tuple[tuple[int, int, asyncio.Task[Any]], ...]] = (
+    ContextVar("task_execution_command_owners", default=())
+)
+
+
 class TaskExecutionController:
     """Per-task serial command gate plus versioned state transitions."""
 
@@ -238,17 +237,47 @@ class TaskExecutionController:
         self._gates: dict[int, _ReentrantCommandGate] = {}
 
     @asynccontextmanager
-    async def command(self, task_id: int, command: TaskCommand) -> AsyncIterator[None]:
-        del command  # retained for tracing/debug call sites and future queue metrics
+    async def command(self, task_id: int) -> AsyncIterator[None]:
         normalized_task_id = int(task_id)
         gate = self._gates.setdefault(normalized_task_id, _ReentrantCommandGate())
+        current = asyncio.current_task()
+        if current is None:
+            raise RuntimeError("Task execution command has no current asyncio task")
+
+        # Reentry is safe only in the same asyncio Task. Context is inherited by
+        # child Tasks, so detect the otherwise-self-deadlocking pattern before
+        # the child waits on a gate that its awaiting parent still owns.
+        inherited_owner = next(
+            (
+                owner
+                for controller_id, held_task_id, owner in _command_owners.get()
+                if controller_id == id(self) and held_task_id == normalized_task_id
+            ),
+            None,
+        )
+        if (
+            inherited_owner is not None
+            and inherited_owner is not current
+            and gate.owner is inherited_owner
+        ):
+            raise RuntimeError(
+                f"Task execution command for task {normalized_task_id} cannot be "
+                "reentered from a child asyncio task while its parent holds the gate"
+            )
+
         gate.users += 1
         acquired = False
+        owner_token = None
         try:
             await gate.acquire()
             acquired = True
+            owner_token = _command_owners.set(
+                _command_owners.get() + ((id(self), normalized_task_id, current),)
+            )
             yield
         finally:
+            if owner_token is not None:
+                _command_owners.reset(owner_token)
             if acquired:
                 gate.release()
             gate.users -= 1

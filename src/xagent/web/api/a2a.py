@@ -34,7 +34,6 @@ from ..services.a2a_protocol import (
     task_to_a2a,
 )
 from ..services.task_execution_controller import (
-    TaskCommand,
     TaskControlState,
     apply_task_control_transition,
     task_execution_controller,
@@ -343,24 +342,20 @@ async def _start_a2a_turn(
     context_id: str | None,
     task_id: int | None,
 ) -> Task:
+    async def start_unserialized() -> Task:
+        return await _start_a2a_turn_unserialized(
+            db=db,
+            agent=agent,
+            text=text,
+            message_id=message_id,
+            context_id=context_id,
+            task_id=task_id,
+        )
+
     if task_id is not None:
-        async with task_execution_controller.command(task_id, TaskCommand.MESSAGE):
-            return await _start_a2a_turn_unserialized(
-                db=db,
-                agent=agent,
-                text=text,
-                message_id=message_id,
-                context_id=context_id,
-                task_id=task_id,
-            )
-    return await _start_a2a_turn_unserialized(
-        db=db,
-        agent=agent,
-        text=text,
-        message_id=message_id,
-        context_id=context_id,
-        task_id=task_id,
-    )
+        async with task_execution_controller.command(task_id):
+            return await start_unserialized()
+    return await start_unserialized()
 
 
 async def _start_a2a_turn_unserialized(
@@ -850,7 +845,7 @@ async def cancel_task(
 ) -> Any:
     agent, _key = authed
     _require_bound_agent(agent_id, agent)
-    async with task_execution_controller.command(task_id, TaskCommand.CANCEL):
+    async with task_execution_controller.command(task_id):
         return await _cancel_task_unserialized(task_id=task_id, agent=agent, db=db)
 
 

@@ -10,7 +10,6 @@ from xagent.web.models.task import Task, TaskStatus
 from xagent.web.models.user import User
 from xagent.web.services.task_execution_controller import (
     StaleTaskRunError,
-    TaskCommand,
     TaskControlState,
     TaskExecutionController,
     apply_task_control_transition,
@@ -92,7 +91,7 @@ async def test_same_task_commands_are_fifo_serialized() -> None:
     order: list[str] = []
 
     async def first() -> None:
-        async with controller.command(7, TaskCommand.MESSAGE):
+        async with controller.command(7):
             order.append("first-enter")
             first_entered.set()
             await release_first.wait()
@@ -100,7 +99,7 @@ async def test_same_task_commands_are_fifo_serialized() -> None:
 
     async def queued(name: str) -> None:
         await first_entered.wait()
-        async with controller.command(7, TaskCommand.PAUSE):
+        async with controller.command(7):
             order.append(name)
 
     tasks = [
@@ -121,9 +120,25 @@ async def test_same_task_commands_are_fifo_serialized() -> None:
 async def test_gate_is_reentrant_for_nested_transport_and_turn_claim() -> None:
     controller = TaskExecutionController()
 
-    async with controller.command(11, TaskCommand.MESSAGE):
-        async with controller.command(11, TaskCommand.START_TURN):
+    async with controller.command(11):
+        async with controller.command(11):
             assert controller._gates[11].depth == 2
+
+    assert controller._gates == {}
+
+
+@pytest.mark.asyncio
+async def test_child_task_reentry_fails_instead_of_deadlocking() -> None:
+    controller = TaskExecutionController()
+
+    async def reenter_from_child() -> None:
+        async with controller.command(11):
+            raise AssertionError("child task must not acquire its parent's gate")
+
+    async with controller.command(11):
+        child = asyncio.create_task(reenter_from_child())
+        with pytest.raises(RuntimeError, match="reentered from a child asyncio task"):
+            await asyncio.wait_for(child, timeout=1)
 
     assert controller._gates == {}
 
@@ -136,16 +151,16 @@ async def test_cancelled_waiter_does_not_split_or_leak_the_gate() -> None:
     third_entered = asyncio.Event()
 
     async def owner() -> None:
-        async with controller.command(19, TaskCommand.MESSAGE):
+        async with controller.command(19):
             owner_entered.set()
             await release_owner.wait()
 
     async def waiter() -> None:
-        async with controller.command(19, TaskCommand.PAUSE):
+        async with controller.command(19):
             raise AssertionError("cancelled waiter must not enter")
 
     async def third() -> None:
-        async with controller.command(19, TaskCommand.RESUME):
+        async with controller.command(19):
             third_entered.set()
 
     owner_task = asyncio.create_task(owner())
@@ -171,7 +186,7 @@ async def test_different_tasks_can_progress_concurrently() -> None:
     entered: set[int] = set()
 
     async def run(task_id: int) -> None:
-        async with controller.command(task_id, TaskCommand.MESSAGE):
+        async with controller.command(task_id):
             entered.add(task_id)
             if len(entered) == 2:
                 both_entered.set()

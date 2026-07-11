@@ -20,7 +20,6 @@ from ...models.user import User
 from ...models.user_channel import UserChannel
 from ...services.execution_result_projection import project_execution_result_for_channel
 from ...services.task_execution_controller import (
-    TaskCommand,
     TaskControlState,
     apply_task_control_transition,
     control_state_for_status,
@@ -256,9 +255,7 @@ class FeishuBotInstance:
             else:
                 is_new_task = False
 
-            async with task_execution_controller.command(
-                int(task.id), TaskCommand.CHANNEL_MESSAGE
-            ):
+            async with task_execution_controller.command(int(task.id)):
                 db.refresh(task)
                 if task.status == TaskStatus.RUNNING:
                     await self._send_text(

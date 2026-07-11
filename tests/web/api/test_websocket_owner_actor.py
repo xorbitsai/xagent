@@ -530,6 +530,12 @@ async def test_resume_live_control_admin_runs_background_as_owner(db_session) ->
     agent.supports_live_control = MagicMock(return_value=True)
 
     resume_bg = AsyncMock()
+    transition = AsyncMock(
+        return_value=SimpleNamespace(
+            run_id="run-from-resume-transition",
+            status=TaskStatus.PAUSED,
+        )
+    )
     bg_mgr = MagicMock()
     bg_mgr.running_tasks.get = MagicMock(return_value=None)
 
@@ -537,6 +543,10 @@ async def test_resume_live_control_admin_runs_background_as_owner(db_session) ->
         patch("xagent.web.api.chat.get_agent_manager", return_value=mgr),
         patch("xagent.web.api.websocket.manager", ws_manager),
         patch("xagent.web.api.websocket.execute_resume_background", resume_bg),
+        patch(
+            "xagent.web.api.websocket.task_execution_controller.transition",
+            new=transition,
+        ),
         patch("xagent.web.api.websocket.background_task_manager", bg_mgr),
     ):
         await handle_resume_task(MagicMock(), int(task.id), {"user": admin})
@@ -545,6 +555,7 @@ async def test_resume_live_control_admin_runs_background_as_owner(db_session) ->
     assert captured["task_owner_user_id"] == int(owner.id)
     resume_bg.assert_called_once()
     assert resume_bg.call_args.kwargs["task_owner_user_id"] == int(owner.id)
+    assert resume_bg.call_args.kwargs["expected_run_id"] == "run-from-resume-transition"
     bg_mgr.reserve_resume.assert_called_once_with(int(task.id))
     bg_mgr.register_reserved_resume.assert_called_once()
 

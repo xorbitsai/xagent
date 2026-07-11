@@ -67,7 +67,6 @@ from ..services.managed_file_ref import (
     ensure_uploaded_file_local_path,
 )
 from ..services.task_execution_controller import (
-    TaskCommand,
     TaskControlState,
     apply_task_control_transition,
     task_execution_controller,
@@ -3067,7 +3066,7 @@ async def handle_chat_message(
 ) -> None:
     """Serialize one inbound WebSocket message against task control commands."""
 
-    async with task_execution_controller.command(task_id, TaskCommand.MESSAGE):
+    async with task_execution_controller.command(task_id):
         await _handle_chat_message_unserialized(websocket, task_id, message_data)
 
 
@@ -4958,7 +4957,7 @@ async def handle_pause_task(
 ) -> None:
     """Serialize pause against messages and resume requests for this task."""
 
-    async with task_execution_controller.command(task_id, TaskCommand.PAUSE):
+    async with task_execution_controller.command(task_id):
         await _handle_pause_task_unserialized(websocket, task_id, message_data)
 
 
@@ -5100,7 +5099,7 @@ async def handle_resume_task(
 ) -> None:
     """Serialize resume against messages and pause requests for this task."""
 
-    async with task_execution_controller.command(task_id, TaskCommand.RESUME):
+    async with task_execution_controller.command(task_id):
         await _handle_resume_task_unserialized(websocket, task_id, message_data)
 
 
@@ -5180,7 +5179,7 @@ async def _handle_resume_task_unserialized(
                     websocket,
                 )
                 return
-            await task_execution_controller.transition(
+            resume_snapshot = await task_execution_controller.transition(
                 task_id,
                 TaskControlState.RESUME_REQUESTED,
                 expected_run_id=_task_run_id(task),
@@ -5193,7 +5192,7 @@ async def _handle_resume_task_unserialized(
                         task_id=task_id,
                         agent_service=agent_service,
                         task_owner_user_id=int(task.user_id),
-                        expected_run_id=_task_run_id(task),
+                        expected_run_id=resume_snapshot.run_id,
                         previous_task=previous_task,
                     )
                 )
@@ -5207,10 +5206,10 @@ async def _handle_resume_task_unserialized(
                         task_id,
                         (
                             TaskControlState.WAITING_FOR_USER
-                            if task.status == TaskStatus.WAITING_FOR_USER
+                            if resume_snapshot.status == TaskStatus.WAITING_FOR_USER
                             else TaskControlState.PAUSED
                         ),
-                        expected_run_id=_task_run_id(task),
+                        expected_run_id=resume_snapshot.run_id,
                     )
                 )
                 raise
@@ -5219,7 +5218,7 @@ async def _handle_resume_task_unserialized(
 
         # Check if agent supports resume functionality
         if hasattr(agent_service, "resume_execution"):
-            await task_execution_controller.transition(
+            resume_snapshot = await task_execution_controller.transition(
                 task_id,
                 TaskControlState.RESUME_REQUESTED,
                 expected_run_id=_task_run_id(task),
@@ -5229,7 +5228,7 @@ async def _handle_resume_task_unserialized(
                 task_id,
                 TaskControlState.RUNNING,
                 status=TaskStatus.RUNNING,
-                expected_run_id=_task_run_id(task),
+                expected_run_id=resume_snapshot.run_id,
             )
 
             # Send resume confirmation

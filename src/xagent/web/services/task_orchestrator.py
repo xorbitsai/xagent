@@ -58,7 +58,6 @@ from ..models.task import Task, TaskStatus
 from .chat_history_service import mark_user_message_delivery_sync
 from .hot_path_cache import invalidate_task_cache
 from .task_execution_controller import (
-    TaskCommand,
     TaskControlState,
     apply_task_control_transition,
     task_execution_controller,
@@ -224,7 +223,7 @@ class TaskTurnOrchestrator:
     ) -> TurnStarted:
         """Serialize every transport's new-turn command for one task."""
 
-        async with task_execution_controller.command(task_id, TaskCommand.START_TURN):
+        async with task_execution_controller.command(task_id):
             operation = asyncio.create_task(
                 TaskTurnOrchestrator._begin_turn_unserialized(
                     task_id=task_id,

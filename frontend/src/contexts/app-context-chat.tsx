@@ -1424,6 +1424,8 @@ export function AppProvider({
       } else {
         const isOlderVersion = knownState
           && controlEnvelope.stateVersion < knownState.version
+        // Backend transitions currently advance the version whenever run_id
+        // changes. Keep this defensive guard for malformed or future emitters.
         const isDifferentRunAtSameVersion = knownState
           && controlEnvelope.stateVersion === knownState.version
           && knownState.runId !== undefined

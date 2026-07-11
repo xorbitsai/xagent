@@ -36,10 +36,7 @@ from xagent.web.services.connector_runtime import (
     pop_ephemeral_runtime_values,
     store_ephemeral_runtime_values,
 )
-from xagent.web.services.task_execution_controller import (
-    TaskCommand,
-    task_execution_controller,
-)
+from xagent.web.services.task_execution_controller import task_execution_controller
 from xagent.web.services.task_lease_service import get_runner_id
 from xagent.web.services.task_orchestrator import (
     TaskTurnError,
@@ -579,7 +576,7 @@ async def test_repeated_cancellation_keeps_turn_command_gate_until_claim_settles
         )
 
     async def contender() -> None:
-        async with task_execution_controller.command(int(task.id), TaskCommand.MESSAGE):
+        async with task_execution_controller.command(int(task.id)):
             contender_entered.set()
 
     sched = MagicMock(return_value=MagicMock())

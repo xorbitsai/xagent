@@ -13,6 +13,7 @@ from xagent.web.services.task_execution_controller import (
     TaskControlState,
     TaskExecutionController,
     apply_task_control_transition,
+    control_state_for_status,
     task_control_snapshot,
     transition_task_control_state_sync,
 )
@@ -57,6 +58,11 @@ def test_snapshot_requires_a_persisted_task_id() -> None:
 
     with pytest.raises(ValueError, match="task with no ID"):
         task_control_snapshot(task)
+
+
+def test_unknown_task_status_has_a_clear_error() -> None:
+    with pytest.raises(ValueError, match="Unsupported task status"):
+        control_state_for_status("cancelled")  # type: ignore[arg-type]
 
 
 def test_transition_does_not_flush_unrelated_pending_objects(db_session) -> None:

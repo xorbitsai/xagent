@@ -519,6 +519,33 @@ async def test_resume_admin_on_other_users_task_runs_as_owner(db_session) -> Non
 
 
 @pytest.mark.asyncio
+async def test_resume_rejection_embeds_known_control_state(db_session) -> None:
+    owner = _user(db_session, "owner")
+    task = _task(db_session, owner.id, status=TaskStatus.RUNNING)
+    task.run_id = "run-current"
+    task.state_version = 7
+    task.control_state = "running"
+    db_session.commit()
+    _captured, agent, mgr, ws_manager = _patched_manager_and_agent()
+    agent.supports_live_control = MagicMock(return_value=True)
+
+    with (
+        patch("xagent.web.api.chat.get_agent_manager", return_value=mgr),
+        patch("xagent.web.api.websocket.manager", ws_manager),
+    ):
+        await handle_resume_task(MagicMock(), int(task.id), {"user": owner})
+
+    payload = ws_manager.send_personal_message.await_args.args[0]
+    assert payload["task"] == {
+        "id": int(task.id),
+        "run_id": "run-current",
+        "state_version": 7,
+        "control_state": "running",
+        "status": "running",
+    }
+
+
+@pytest.mark.asyncio
 async def test_resume_live_control_admin_runs_background_as_owner(db_session) -> None:
     """Live-control resume schedules ``execute_resume_background``; when an
     admin resumes another user's task it must run with the OWNER's

@@ -55,6 +55,7 @@ const VERSIONED_TASK_EVENT_TYPES = new Set([
   "task_started",
   "task_waiting_for_user",
 ])
+const MAX_TRACKED_TASK_STATE_VERSIONS = 500
 
 const asMessageRecord = (value: unknown): Record<string, unknown> =>
   value && typeof value === "object" ? value as Record<string, unknown> : {}
@@ -69,20 +70,19 @@ const parseInteger = (value: unknown): number | undefined => {
 export const extractTaskControlEnvelope = (message: WebSocketMessage): TaskControlEnvelope => {
   const root = message as unknown as Record<string, unknown>
   const data = asMessageRecord(root.data)
-  const nestedData = asMessageRecord(data.data)
   const task = asMessageRecord(root.task)
   const eventType = String(root.event_type || data.event_type || "")
   const isStateEvent = VERSIONED_TASK_EVENT_TYPES.has(message.type)
     || (message.type === "trace_event" && eventType === "task_info")
   if (!isStateEvent) return { isStateEvent: false }
 
-  const rawTaskId = root.task_id ?? task.id ?? task.task_id ?? data.id ?? data.task_id ?? nestedData.id ?? nestedData.task_id
+  const rawTaskId = root.task_id ?? task.id ?? data.id
   const parsedTaskId = parseInteger(rawTaskId)
-  const rawVersion = root.state_version ?? task.state_version ?? data.state_version ?? nestedData.state_version
+  const rawVersion = root.state_version ?? task.state_version ?? data.state_version
   const parsedVersion = parseInteger(rawVersion)
-  const rawRunId = root.run_id ?? task.run_id ?? data.run_id ?? nestedData.run_id
-  const rawControlState = root.control_state ?? task.control_state ?? data.control_state ?? nestedData.control_state
-  const rawStatus = root.status ?? task.status ?? data.status ?? nestedData.status
+  const rawRunId = root.run_id ?? task.run_id ?? data.run_id
+  const rawControlState = root.control_state ?? task.control_state ?? data.control_state
+  const rawStatus = root.status ?? task.status ?? data.status
 
   return {
     isStateEvent: true,
@@ -1420,7 +1420,10 @@ export function AppProvider({
       if (controlEnvelope.stateVersion === undefined) {
         // Once the server has established the versioned protocol for a task,
         // legacy/unversioned replay events must not be allowed to roll it back.
-        if (knownState) return
+        // Error events carry information rather than a state transition, so a
+        // rare unversioned error must still reach the user.
+        const isErrorEvent = message.type === "error" || message.type === "agent_error"
+        if (knownState && !isErrorEvent) return
       } else {
         const isOlderVersion = knownState
           && controlEnvelope.stateVersion < knownState.version
@@ -1432,10 +1435,17 @@ export function AppProvider({
           && controlEnvelope.runId !== undefined
           && knownState.runId !== controlEnvelope.runId
         if (isOlderVersion || isDifferentRunAtSameVersion) return
+        taskStateVersionsRef.current.delete(controlEnvelope.taskId)
         taskStateVersionsRef.current.set(controlEnvelope.taskId, {
           version: controlEnvelope.stateVersion,
           runId: controlEnvelope.runId,
         })
+        if (taskStateVersionsRef.current.size > MAX_TRACKED_TASK_STATE_VERSIONS) {
+          const oldestTaskId = taskStateVersionsRef.current.keys().next().value
+          if (oldestTaskId !== undefined) {
+            taskStateVersionsRef.current.delete(oldestTaskId)
+          }
+        }
       }
 
       // A late event may have an old semantic type (for example

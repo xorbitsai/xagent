@@ -69,6 +69,7 @@ from ..services.managed_file_ref import (
 from ..services.task_execution_controller import (
     TaskControlState,
     apply_task_control_transition,
+    task_control_snapshot,
     task_execution_controller,
 )
 from ..services.task_lease_service import (
@@ -4780,6 +4781,7 @@ async def send_historical_data_as_stream(
                     "task_id": task_id,
                     "message": message,
                     "timestamp": datetime.now(timezone.utc).timestamp(),
+                    **task_control_snapshot(task).as_dict(),
                 }
                 if question_message:
                     status_event["question"] = question_message
@@ -5158,13 +5160,14 @@ async def _handle_resume_task_unserialized(
             )
             return
 
+        resume_control_state = task_control_snapshot(task).as_dict()
         if getattr(agent_service, "supports_live_control", lambda: False)():
             if task.status not in {TaskStatus.PAUSED, TaskStatus.WAITING_FOR_USER}:
                 await manager.send_personal_message(
                     {
                         "type": "error",
                         "message": "Task is not paused and cannot be resumed.",
-                        "task": {"id": task_id, "status": task.status.value},
+                        "task": {"id": task_id, **resume_control_state},
                     },
                     websocket,
                 )
@@ -5174,7 +5177,7 @@ async def _handle_resume_task_unserialized(
                     {
                         "type": "error",
                         "message": "Task resume is already in progress.",
-                        "task": {"id": task_id, "status": task.status.value},
+                        "task": {"id": task_id, **resume_control_state},
                     },
                     websocket,
                 )

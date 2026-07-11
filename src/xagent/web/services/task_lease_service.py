@@ -88,6 +88,7 @@ def acquire_task_lease(
     expires_at = _expires_at(now)
     candidate_run_id = expected_run_id or str(uuid.uuid4())
     current_version = func.coalesce(Task.state_version, 0)
+    running_control_state = control_state_for_status(TaskStatus.RUNNING).value
     stmt = (
         update(Task)
         .where(Task.id == task_id)
@@ -109,12 +110,12 @@ def acquire_task_lease(
                 (Task.status != TaskStatus.RUNNING, candidate_run_id),
                 else_=func.coalesce(Task.run_id, candidate_run_id),
             ),
-            control_state="running",
+            control_state=running_control_state,
             state_version=case(
                 (
                     or_(
                         Task.status != TaskStatus.RUNNING,
-                        Task.control_state != "running",
+                        Task.control_state != running_control_state,
                     ),
                     current_version + 1,
                 ),

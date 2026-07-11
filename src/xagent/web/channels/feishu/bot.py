@@ -20,6 +20,7 @@ from ...models.user import User
 from ...models.user_channel import UserChannel
 from ...services.execution_result_projection import project_execution_result_for_channel
 from ...services.task_execution_controller import (
+    StaleTaskRunError,
     TaskControlState,
     apply_task_control_transition,
     control_state_for_status,
@@ -351,13 +352,21 @@ class FeishuBotInstance:
                 task.status != projection.task_status
                 or task.control_state != projected_control_state.value
             ):
-                apply_task_control_transition(
-                    task,
-                    projected_control_state,
-                    status=projection.task_status,
-                    expected_run_id=run_snapshot.run_id,
-                )
-                db.commit()
+                try:
+                    apply_task_control_transition(
+                        task,
+                        projected_control_state,
+                        status=projection.task_status,
+                        expected_run_id=run_snapshot.run_id,
+                    )
+                    db.commit()
+                except StaleTaskRunError:
+                    db.rollback()
+                    logger.info(
+                        "Skipping stale Feishu completion for task %s run %s",
+                        task.id,
+                        run_snapshot.run_id,
+                    )
 
             output = projection.visible_text
 

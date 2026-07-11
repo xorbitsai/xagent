@@ -56,14 +56,17 @@ class TaskControlSnapshot:
 
 
 def control_state_for_status(status: TaskStatus) -> TaskControlState:
-    return {
+    control_state = {
         TaskStatus.PENDING: TaskControlState.IDLE,
         TaskStatus.RUNNING: TaskControlState.RUNNING,
         TaskStatus.PAUSED: TaskControlState.PAUSED,
         TaskStatus.WAITING_FOR_USER: TaskControlState.WAITING_FOR_USER,
         TaskStatus.COMPLETED: TaskControlState.COMPLETED,
         TaskStatus.FAILED: TaskControlState.FAILED,
-    }[status]
+    }.get(status)
+    if control_state is None:
+        raise ValueError(f"Unsupported task status: {status!r}")
+    return control_state
 
 
 def task_control_snapshot(task: Task) -> TaskControlSnapshot:

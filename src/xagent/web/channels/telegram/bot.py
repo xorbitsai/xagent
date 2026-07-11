@@ -26,6 +26,7 @@ from ...models.user import User
 from ...services.chat_history_service import persist_user_message
 from ...services.execution_result_projection import project_execution_result_for_channel
 from ...services.task_execution_controller import (
+    StaleTaskRunError,
     TaskControlState,
     apply_task_control_transition,
     control_state_for_status,
@@ -687,13 +688,21 @@ class TelegramBotInstance:
                     task.status != projection.task_status
                     or task.control_state != projected_control_state.value
                 ):
-                    apply_task_control_transition(
-                        task,
-                        projected_control_state,
-                        status=projection.task_status,
-                        expected_run_id=run_snapshot.run_id,
-                    )
-                    db.commit()
+                    try:
+                        apply_task_control_transition(
+                            task,
+                            projected_control_state,
+                            status=projection.task_status,
+                            expected_run_id=run_snapshot.run_id,
+                        )
+                        db.commit()
+                    except StaleTaskRunError:
+                        db.rollback()
+                        logger.info(
+                            "Skipping stale Telegram completion for task %s run %s",
+                            task.id,
+                            run_snapshot.run_id,
+                        )
 
                 persist_telegram_assistant_turn(
                     db=db,

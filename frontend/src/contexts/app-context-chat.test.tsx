@@ -383,6 +383,15 @@ describe("AppProvider websocket message routing", () => {
 
     act(() => {
       onMessage?.({
+        type: "task_started",
+        timestamp: "2026-05-27T05:00:02Z",
+        task_id: 1,
+        status: "running",
+        run_id: "run-1",
+        state_version: 4,
+        control_state: "running",
+      })
+      onMessage?.({
         type: "error",
         timestamp: "2026-05-27T05:00:03Z",
         message: "No live execution found to pause",

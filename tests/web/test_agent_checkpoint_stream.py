@@ -318,6 +318,55 @@ def _create_trace_handler_test_task(
     return SessionLocal, db, task
 
 
+@pytest.mark.asyncio
+async def test_paused_replay_event_embeds_known_control_state(monkeypatch) -> None:
+    SessionLocal, db, task = _create_trace_handler_test_task("paused-replay")
+    task.status = TaskStatus.PAUSED
+    task.run_id = "run-paused"
+    task.state_version = 9
+    task.control_state = "paused"
+    db.commit()
+    task_id = int(task.id)
+    user_id = int(task.user_id)
+    db.close()
+
+    def get_test_db() -> Iterator[Session]:
+        session = SessionLocal()
+        try:
+            yield session
+        finally:
+            session.close()
+
+    sent_events: list[dict] = []
+
+    async def send_personal_message(event: dict, websocket: object) -> None:
+        sent_events.append(event)
+
+    monkeypatch.setattr("xagent.web.models.database.get_db", get_test_db)
+    monkeypatch.setattr("xagent.web.api.websocket.cache_get", lambda *args: None)
+    monkeypatch.setattr(
+        "xagent.web.api.websocket.cache_set", lambda *args, **kwargs: None
+    )
+    monkeypatch.setattr(
+        "xagent.web.api.websocket.manager.send_personal_message",
+        send_personal_message,
+    )
+
+    await send_historical_data_as_stream(
+        websocket=object(),
+        task_id=task_id,
+        user=SimpleNamespace(id=user_id, is_admin=False),
+    )
+
+    paused_event = next(
+        event for event in sent_events if event.get("type") == "task_paused"
+    )
+    assert paused_event["run_id"] == "run-paused"
+    assert paused_event["state_version"] == 9
+    assert paused_event["control_state"] == "paused"
+    assert paused_event["status"] == "paused"
+
+
 def test_database_trace_handler_dedupes_user_message_turn_id() -> None:
     _, db, task = _create_trace_handler_test_task("tester")
     try:

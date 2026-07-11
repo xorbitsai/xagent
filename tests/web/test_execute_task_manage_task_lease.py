@@ -31,6 +31,11 @@ class _FakeAgentService:
     async def execute_task(self, **_kwargs):
         return {"success": True}
 
+    def set_interrupt_checker(self, _checker):
+        # execute_task_background sets the mid-run quota checker after tracking
+        # starts and clears it on completion; the double must accept both.
+        pass
+
 
 @pytest.mark.asyncio
 async def test_execute_task_acquires_and_releases_lease_when_manage_true(

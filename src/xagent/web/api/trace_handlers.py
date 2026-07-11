@@ -5,6 +5,7 @@ import logging
 from datetime import datetime, timezone
 from typing import Any, Dict, Optional
 
+from sqlalchemy import func
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
@@ -152,6 +153,18 @@ class DatabaseTraceHandler(BaseTraceHandler):
                         row.event_id,
                         self.task_id,
                         exc,
+                    )
+                    continue
+                except Exception:
+                    # E.g. a transient DB error from the blob prefetch. Fall
+                    # back to an older readable checkpoint instead of letting
+                    # the error abort loading for the whole task.
+                    logger.warning(
+                        "Skipping checkpoint trace event %s for task %s after "
+                        "decode failure",
+                        row.event_id,
+                        self.task_id,
+                        exc_info=True,
                     )
                     continue
                 snapshot = data.get("snapshot")
@@ -334,7 +347,21 @@ class DatabaseTraceHandler(BaseTraceHandler):
                     DatabaseTraceEvent.data["checkpoint_type"]
                     .as_string()
                     .in_(sorted(READABLE_CHECKPOINT_TYPES)),
-                    DatabaseTraceEvent.data["execution_id"].as_string() == execution_id,
+                    # SQL mirror of checkpoint_execution_id(): root wins,
+                    # then the flat field, then the snapshot's own id, so
+                    # legacy rows that only set one of them are not skipped.
+                    func.coalesce(
+                        func.nullif(
+                            DatabaseTraceEvent.data["root_execution_id"].as_string(),
+                            "",
+                        ),
+                        func.nullif(
+                            DatabaseTraceEvent.data["execution_id"].as_string(),
+                            "",
+                        ),
+                        DatabaseTraceEvent.data["snapshot"]["execution_id"].as_string(),
+                    )
+                    == execution_id,
                 )
                 .order_by(
                     DatabaseTraceEvent.timestamp.desc(),

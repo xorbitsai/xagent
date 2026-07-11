@@ -211,7 +211,7 @@ def _encode_checkpoint_data_v2(
     fresh copy of the whole history.
     """
 
-    if not _find_v2_encodable_payloads(data):
+    if not _has_v2_encodable_payloads(data):
         return data
 
     encoded = copy.deepcopy(data)
@@ -346,29 +346,32 @@ def _encode_ledger_payload(
     }
 
 
-def _find_v2_encodable_payloads(data: Any) -> list[EncodablePayload]:
-    """Locate every inline payload the v2 encoder should replace with refs.
+def _iter_v2_encodable_payloads(data: Any) -> Iterator[EncodablePayload]:
+    """Yield every inline payload the v2 encoder should replace with refs.
 
     The walk never descends into payloads it reports (or into existing ref
     markers): their contents get persisted as blobs, and encoding something
     nested inside a blob-bound object would corrupt the stored payload.
+    Lazily evaluated so presence checks can stop at the first hit.
     """
 
-    results: list[EncodablePayload] = []
     if not _is_readable_checkpoint_data(data):
-        return results
+        return
     snapshot = data.get("snapshot")
     if not isinstance(snapshot, dict):
-        return results
+        return
 
     root_context = snapshot.get("context")
     visited: set[int] = set()
 
-    def visit_context(node: dict[str, Any]) -> set[str]:
+    def visit_context(
+        node: dict[str, Any],
+    ) -> tuple[set[str], list[EncodablePayload]]:
         consumed: set[str] = set()
+        found: list[EncodablePayload] = []
         messages = node.get("messages")
         if isinstance(messages, list):
-            results.append(EncodablePayload(node, "messages", "messages", messages))
+            found.append(EncodablePayload(node, "messages", "messages", messages))
             consumed.add("messages")
         elif _is_message_refs_payload(messages):
             consumed.add("messages")
@@ -377,7 +380,7 @@ def _find_v2_encodable_payloads(data: Any) -> list[EncodablePayload]:
             isinstance(system_prompt, str)
             and len(system_prompt) >= SYSTEM_PROMPT_BLOB_MIN_CHARS
         ):
-            results.append(
+            found.append(
                 EncodablePayload(node, "system_prompt", "system_prompt", system_prompt)
             )
             consumed.add("system_prompt")
@@ -385,18 +388,18 @@ def _find_v2_encodable_payloads(data: Any) -> list[EncodablePayload]:
             consumed.add("system_prompt")
         metadata = node.get("metadata")
         if _should_store_checkpoint_blob_payload(metadata):
-            results.append(EncodablePayload(node, "metadata", "metadata", metadata))
+            found.append(EncodablePayload(node, "metadata", "metadata", metadata))
             consumed.add("metadata")
         elif _is_checkpoint_blob_ref_payload(metadata):
             consumed.add("metadata")
-        return consumed
+        return consumed, found
 
-    def walk(node: Any, depth: int) -> None:
+    def walk(node: Any, depth: int) -> Iterator[EncodablePayload]:
         if depth > MAX_SNAPSHOT_WALK_DEPTH:
             return
         if isinstance(node, list):
             for item in node:
-                walk(item, depth + 1)
+                yield from walk(item, depth + 1)
             return
         if not isinstance(node, dict) or "__encoding" in node:
             return
@@ -406,10 +409,11 @@ def _find_v2_encodable_payloads(data: Any) -> list[EncodablePayload]:
 
         consumed: set[str] = set()
         if node is root_context or _is_context_payload_shape(node):
-            consumed |= visit_context(node)
+            consumed, found = visit_context(node)
+            yield from found
         ledger = node.get("tool_ledger")
         if _is_ledger_payload_shape(ledger):
-            results.append(EncodablePayload(node, "tool_ledger", "tool_ledger", ledger))
+            yield EncodablePayload(node, "tool_ledger", "tool_ledger", ledger)
             consumed.add("tool_ledger")
         elif _is_ledger_refs_payload(ledger) or _is_checkpoint_blob_ref_payload(ledger):
             consumed.add("tool_ledger")
@@ -417,40 +421,51 @@ def _find_v2_encodable_payloads(data: Any) -> list[EncodablePayload]:
         for key, value in node.items():
             if key in consumed:
                 continue
-            walk(value, depth + 1)
+            yield from walk(value, depth + 1)
 
-    walk(snapshot, 0)
-    return results
+    yield from walk(snapshot, 0)
 
 
-def _find_storage_markers(data: Any) -> list[dict[str, Any]]:
-    """Collect every storage-encoding marker dict inside a checkpoint payload."""
+def _find_v2_encodable_payloads(data: Any) -> list[EncodablePayload]:
+    return list(_iter_v2_encodable_payloads(data))
 
-    markers: list[dict[str, Any]] = []
+
+def _has_v2_encodable_payloads(data: Any) -> bool:
+    return next(_iter_v2_encodable_payloads(data), None) is not None
+
+
+def _iter_storage_markers(data: Any) -> Iterator[dict[str, Any]]:
+    """Yield every storage-encoding marker dict inside a checkpoint payload.
+
+    Lazily evaluated so presence checks stop at the first marker instead of
+    walking the whole snapshot tree.
+    """
+
     if not _is_readable_checkpoint_data(data):
-        return markers
+        return
 
-    def walk(node: Any, depth: int) -> None:
+    stack: list[tuple[Any, int]] = [(data.get("snapshot"), 0)]
+    while stack:
+        node, depth = stack.pop()
         if depth > MAX_SNAPSHOT_WALK_DEPTH:
-            return
+            continue
         if isinstance(node, list):
-            for item in node:
-                walk(item, depth + 1)
-            return
+            stack.extend((item, depth + 1) for item in node)
+            continue
         if not isinstance(node, dict):
-            return
+            continue
         if node.get("__encoding") in (
             MESSAGE_REFS_ENCODING,
             CHECKPOINT_BLOB_REF_ENCODING,
             LEDGER_REFS_ENCODING,
         ):
-            markers.append(node)
-            return
-        for value in node.values():
-            walk(value, depth + 1)
+            yield node
+            continue
+        stack.extend((value, depth + 1) for value in node.values())
 
-    walk(data.get("snapshot"), 0)
-    return markers
+
+def _find_storage_markers(data: Any) -> list[dict[str, Any]]:
+    return list(_iter_storage_markers(data))
 
 
 def encode_checkpoint_messages_for_storage(
@@ -613,6 +628,9 @@ def decode_trace_event_data(
     With ``strict=False``, decode failures preserve the stored refs and attach a
     decode error marker for debug/raw API callers.
     """
+
+    if not _is_readable_checkpoint_data(data) or not _has_storage_markers(data):
+        return data
 
     # Prefetch referenced blobs in bulk; per-record ledger refs would
     # otherwise issue one query per tool call during checkpoint restore.
@@ -862,7 +880,7 @@ def _decode_marker_payload(
 
 
 def _has_storage_markers(data: Any) -> bool:
-    return bool(_find_storage_markers(data))
+    return next(_iter_storage_markers(data), None) is not None
 
 
 def _is_readable_checkpoint_data(data: Any) -> bool:

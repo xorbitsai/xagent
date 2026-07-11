@@ -1201,6 +1201,147 @@ def test_database_trace_handler_prunes_checkpoint_history(
         db.close()
 
 
+def test_loader_falls_back_to_older_row_when_prefetch_raises(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A transient blob-prefetch failure must not abort checkpoint loading."""
+    from unittest.mock import patch
+
+    import xagent.web.services.trace_message_storage as tms
+
+    SessionLocal = _session_factory()
+    db = SessionLocal()
+    try:
+        task = _create_task(db)
+        task_id = int(task.id)
+        old_messages = [{"role": "user", "content": "older inline"}]
+        now = datetime.now(timezone.utc)
+        db.add(
+            DatabaseTraceEvent(
+                task_id=task_id,
+                event_id="older-inline",
+                event_type="system_update_general",
+                timestamp=now,
+                data=_checkpoint_data("exec-prefetch", old_messages),
+            )
+        )
+        encoded = encode_checkpoint_data_for_storage(
+            db,
+            task_id=task_id,
+            data=_checkpoint_data(
+                "exec-prefetch", [{"role": "user", "content": "newest refs"}]
+            ),
+        )
+        db.add(
+            DatabaseTraceEvent(
+                task_id=task_id,
+                event_id="newest-refs",
+                event_type="system_update_general",
+                timestamp=now + timedelta(seconds=1),
+                data=encoded,
+            )
+        )
+        db.commit()
+
+        monkeypatch.setattr(
+            "xagent.web.api.trace_handlers.get_db",
+            lambda: _get_db_factory(SessionLocal),
+        )
+        # The newest row needs the prefetch (it has refs) and fails; the
+        # older inline row has no markers, never touches the prefetch, and
+        # must be returned as the fallback.
+        with patch.object(
+            tms,
+            "_load_trace_blob_lookup",
+            side_effect=RuntimeError("transient db error"),
+        ):
+            loaded = DatabaseTraceHandler(task_id)._sync_load_latest_checkpoint(
+                "exec-prefetch"
+            )
+
+        assert loaded is not None
+        assert loaded["context"]["messages"] == old_messages
+    finally:
+        db.close()
+
+
+def test_prune_matches_legacy_execution_id_shapes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Rows keyed only by root/nested execution ids must still be pruned."""
+    SessionLocal = _session_factory()
+    db = SessionLocal()
+    try:
+        task = _create_task(db)
+        task_id = int(task.id)
+        handler = DatabaseTraceHandler(task_id)
+        monkeypatch.setattr(
+            "xagent.web.api.trace_handlers.get_checkpoint_history_limit",
+            lambda: 2,
+        )
+        now = datetime.now(timezone.utc)
+
+        # Legacy row: only root_execution_id set (no flat execution_id).
+        db.add(
+            DatabaseTraceEvent(
+                task_id=task_id,
+                event_id="legacy-root-only",
+                event_type="system_update_general",
+                timestamp=now - timedelta(seconds=2),
+                data={
+                    "checkpoint_type": "agent_v2_execution_checkpoint",
+                    "root_execution_id": "exec-legacy",
+                    "snapshot": {"context": {"messages": []}},
+                },
+            )
+        )
+        # Legacy row: only the nested snapshot execution_id set.
+        db.add(
+            DatabaseTraceEvent(
+                task_id=task_id,
+                event_id="legacy-nested-only",
+                event_type="system_update_general",
+                timestamp=now - timedelta(seconds=1),
+                data={
+                    "checkpoint_type": "agent_v2_execution_checkpoint",
+                    "snapshot": {
+                        "execution_id": "exec-legacy",
+                        "context": {"messages": []},
+                    },
+                },
+            )
+        )
+        db.commit()
+
+        for index in range(2):
+            handler._save_trace_event(
+                db,
+                TraceEvent(
+                    CHECKPOINT_EVENT_TYPE,
+                    task_id=str(task_id),
+                    data=_checkpoint_data(
+                        "exec-legacy",
+                        [{"role": "user", "content": f"turn-{index}"}],
+                    ),
+                ),
+            )
+
+        remaining = [
+            row.event_id
+            for row in db.query(DatabaseTraceEvent)
+            .filter(DatabaseTraceEvent.task_id == task_id)
+            .order_by(DatabaseTraceEvent.id)
+            .all()
+        ]
+        # Both legacy-shaped rows are older than the 2 new checkpoints and
+        # must have been pruned by the coalesce predicate.
+        assert "legacy-root-only" not in remaining
+        assert "legacy-nested-only" not in remaining
+        assert len(remaining) == 2
+    finally:
+        db.close()
+
+
 def test_database_trace_handler_prune_disabled_keeps_all_checkpoints(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

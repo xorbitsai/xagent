@@ -5578,7 +5578,10 @@ def _load_command_message_delivery_status(
             )
             .first()
         )
-        return str(message.delivery_status) if message is not None else None
+        if message is None:
+            return None
+        delivery_status = getattr(message, "delivery_status", None)
+        return delivery_status if isinstance(delivery_status, str) else None
 
 
 def _load_command_task_run_id(task_id: int) -> str | None:

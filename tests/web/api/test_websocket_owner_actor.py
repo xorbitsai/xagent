@@ -240,6 +240,18 @@ async def test_deferred_chat_message_is_acked_after_durable_command_commit(
                 "files": [],
             },
         )
+        for _ in range(100):
+            db_session.expire_all()
+            stored_command = (
+                db_session.query(TaskExecutionCommand)
+                .filter_by(task_id=int(task.id), command_id="deferred-turn-1")
+                .one()
+            )
+            if stored_command.status == "pending":
+                break
+            await asyncio.sleep(0.01)
+        else:
+            raise AssertionError("deferred command claim was not released in time")
 
     accepted = [
         call.args[0]
@@ -248,11 +260,6 @@ async def test_deferred_chat_message_is_acked_after_durable_command_commit(
     ]
     assert len(accepted) == 1
     assert accepted[0]["client_message_id"] == "deferred-turn-1"
-    stored_command = (
-        db_session.query(TaskExecutionCommand)
-        .filter_by(task_id=int(task.id), command_id="deferred-turn-1")
-        .one()
-    )
     assert stored_command.status == "pending"
     assert not any(
         call.args[0].get("type") == "message_rejected"

@@ -21,7 +21,14 @@ TABLE = "task_execution_commands"
 
 def upgrade() -> None:
     inspector = sa.inspect(op.get_bind())
-    if TABLE in inspector.get_table_names():
+    tables = set(inspector.get_table_names())
+    if TABLE in tables:
+        return
+    # Base application tables are created by SQLAlchemy in production. The
+    # migration integration CLI also exercises an Alembic-only empty schema;
+    # follow the existing task-related migrations and skip until those base
+    # tables exist instead of creating invalid foreign keys.
+    if not {"tasks", "users"}.issubset(tables):
         return
     op.create_table(
         TABLE,

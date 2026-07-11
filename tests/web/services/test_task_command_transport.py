@@ -4,8 +4,12 @@ import asyncio
 from datetime import datetime, timedelta
 
 import pytest
+from sqlalchemy import inspect as sa_inspect
 
-from xagent.web.api.websocket import execute_durable_task_command
+from xagent.web.api.websocket import (
+    _load_command_message_delivery_status,
+    execute_durable_task_command,
+)
 from xagent.web.models.chat_message import TaskChatMessage
 from xagent.web.models.database import Base, get_db, get_engine, init_db
 from xagent.web.models.task import Task, TaskStatus
@@ -15,10 +19,13 @@ from xagent.web.services.task_command_transport import (
     COMMAND_COMPLETED,
     TaskCommandDeferred,
     TaskCommandKind,
+    _claim_heartbeat,
     claim_task_command,
     dispatch_one_task_command,
     enqueue_task_command,
     finish_task_command,
+    load_task_command,
+    notify_task_command_dispatcher,
     start_task_command_dispatcher,
     stop_task_command_dispatcher,
 )
@@ -328,3 +335,103 @@ async def test_dispatcher_recovers_command_that_predates_worker_start(
     stored = db_session.get(TaskExecutionCommand, enqueued.command_id)
     assert stored is not None
     assert stored.status == COMMAND_COMPLETED
+
+
+def test_load_task_command_returns_an_explicit_detached_snapshot(db_session) -> None:
+    user, task = _create_running_task(db_session)
+    task.runner_id = None
+    task.lease_expires_at = None
+    db_session.commit()
+    enqueued = enqueue_task_command(
+        db_session,
+        task_id=int(task.id),
+        actor_user_id=int(user.id),
+        command_id="detached-status",
+        kind=TaskCommandKind.PAUSE,
+        payload={"type": "pause_task"},
+    )
+
+    stored = load_task_command(enqueued.command_id)
+
+    assert stored is not None
+    assert sa_inspect(stored).detached
+    assert stored.status == "pending"
+    assert stored.error is None
+
+
+def test_legacy_delivery_status_preserves_none(db_session) -> None:
+    user, task = _create_running_task(db_session)
+    db_session.add(
+        TaskChatMessage(
+            task_id=int(task.id),
+            user_id=int(user.id),
+            role="user",
+            content="legacy",
+            message_type="user_message",
+            turn_id="legacy-delivery",
+            delivery_status=None,
+        )
+    )
+    db_session.commit()
+
+    assert (
+        _load_command_message_delivery_status(int(task.id), "legacy-delivery") is None
+    )
+
+
+@pytest.mark.asyncio
+async def test_claim_heartbeat_survives_transient_database_error(
+    monkeypatch,
+) -> None:
+    stop_event = asyncio.Event()
+    attempts = 0
+
+    def renew(_command_db_id: int, _runner_id: str) -> bool:
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            raise RuntimeError("temporary database outage")
+        stop_event.set()
+        return True
+
+    monkeypatch.setattr(
+        "xagent.web.services.task_command_transport.get_task_lease_heartbeat_seconds",
+        lambda: 0.001,
+    )
+    monkeypatch.setattr(
+        "xagent.web.services.task_command_transport.renew_task_command_claim",
+        renew,
+    )
+
+    await asyncio.wait_for(_claim_heartbeat(7, "runner-a", stop_event), timeout=0.2)
+
+    assert attempts == 2
+
+
+@pytest.mark.asyncio
+async def test_dispatcher_does_not_erase_wakeup_during_empty_claim(monkeypatch) -> None:
+    second_claim = asyncio.Event()
+    calls = 0
+
+    async def fake_dispatch(_executor, *, command_db_id=None) -> bool:
+        nonlocal calls
+        del command_db_id
+        calls += 1
+        if calls == 1:
+            notify_task_command_dispatcher()
+            return False
+        second_claim.set()
+        return False
+
+    monkeypatch.setattr(
+        "xagent.web.services.task_command_transport.dispatch_one_task_command",
+        fake_dispatch,
+    )
+
+    start_task_command_dispatcher(lambda _command: asyncio.sleep(0))
+    try:
+        await asyncio.wait_for(second_claim.wait(), timeout=0.25)
+    finally:
+        await stop_task_command_dispatcher()
+
+    assert calls >= 2

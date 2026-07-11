@@ -349,9 +349,19 @@ async def _claim_heartbeat(
             return
         except asyncio.TimeoutError:
             pass
-        if not await asyncio.to_thread(
-            renew_task_command_claim, command_db_id, runner_id
-        ):
+        try:
+            renewed = await asyncio.to_thread(
+                renew_task_command_claim, command_db_id, runner_id
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "Failed to renew task command claim %s: %s",
+                command_db_id,
+                exc,
+                exc_info=True,
+            )
+            continue
+        if not renewed:
             return
 
 
@@ -578,10 +588,13 @@ async def run_task_command_dispatcher(executor: CommandExecutor) -> None:
     _dispatcher_loop = asyncio.get_running_loop()
     _dispatcher_wakeup = asyncio.Event()
     while True:
+        # Clear before checking for work. A notify that arrives during the DB
+        # claim remains set, so an empty claim cannot erase that wakeup and
+        # sleep while work is waiting.
+        _dispatcher_wakeup.clear()
         processed = await dispatch_one_task_command(executor)
         if processed:
             continue
-        _dispatcher_wakeup.clear()
         try:
             await asyncio.wait_for(
                 _dispatcher_wakeup.wait(), timeout=DISPATCHER_IDLE_SECONDS
@@ -618,8 +631,13 @@ def load_task_command(command_db_id: int) -> TaskExecutionCommand | None:
 
     SessionLocal = get_session_local()
     with SessionLocal() as db:
-        return (
+        command = (
             db.query(TaskExecutionCommand)
             .filter(TaskExecutionCommand.id == command_db_id)
             .first()
         )
+        if command is not None:
+            # Make the session boundary explicit. Callers only read scalar
+            # command state and must never depend on a live/lazy session.
+            db.expunge(command)
+        return command

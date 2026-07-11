@@ -1361,8 +1361,9 @@ def get_default_sound_effect_model(user_id: Optional[int] = None) -> Optional[An
         from ..models.model import Model as DBModel
         from ..models.user import UserDefaultModel, UserModel
 
+        db_gen = get_db()
         try:
-            db = next(get_db())
+            db = next(db_gen)
             if user_id:
                 user_default = (
                     db.query(UserDefaultModel)
@@ -1399,6 +1400,8 @@ def get_default_sound_effect_model(user_id: Optional[int] = None) -> Optional[An
                 return get_sound_effect_model_instance(shared_defaults[0].model)
         except Exception as exc:
             logger.warning("Database query failed for sound effect model: %s", exc)
+        finally:
+            db_gen.close()
     except Exception as exc:
         logger.error("Failed to get default sound effect model: %s", exc)
     return None
@@ -1412,8 +1415,9 @@ def get_default_music_model(user_id: Optional[int] = None) -> Optional[Any]:
         from ..models.model import Model as DBModel
         from ..models.user import UserDefaultModel, UserModel
 
+        db_gen = get_db()
         try:
-            db = next(get_db())
+            db = next(db_gen)
             if user_id:
                 user_default = (
                     db.query(UserDefaultModel)
@@ -1450,6 +1454,8 @@ def get_default_music_model(user_id: Optional[int] = None) -> Optional[Any]:
                 return get_music_model_instance(shared_defaults[0].model)
         except Exception as exc:
             logger.warning("Database query failed for music model: %s", exc)
+        finally:
+            db_gen.close()
     except Exception as exc:
         logger.error("Failed to get default music model: %s", exc)
     return None

@@ -13,6 +13,8 @@ from xagent.web.services.model_service import (
     _is_model_visible_to_user,
     get_asr_models,
     get_default_model,
+    get_default_music_model,
+    get_default_sound_effect_model,
     get_image_models,
     get_music_models,
     get_sound_effect_models,
@@ -654,6 +656,26 @@ class TestModelService:
 
             assert result == {"music-default": model}
             mock_instance_factory.assert_called_once_with(db_model)
+
+    @pytest.mark.parametrize(
+        "get_default",
+        [get_default_sound_effect_model, get_default_music_model],
+    )
+    def test_audio_generation_default_closes_database_generator(self, get_default):
+        mock_db = MagicMock()
+        shared_query = mock_db.query.return_value.join.return_value.join.return_value.filter.return_value
+        shared_query.limit.return_value.all.return_value = []
+        db_gen = MagicMock()
+        db_gen.__next__.return_value = mock_db
+
+        with patch(
+            "xagent.web.models.database.get_db",
+            return_value=db_gen,
+        ):
+            result = get_default(user_id=None)
+
+        assert result is None
+        db_gen.close.assert_called_once_with()
 
     def test_embedding_fallback_skips_invisible_returns_none(self, monkeypatch):
         """System fallback returns None when no visible embedding model exists."""

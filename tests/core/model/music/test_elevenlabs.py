@@ -161,6 +161,28 @@ async def test_list_models_falls_back_when_key_lacks_list_permission(
     close.assert_awaited_once_with()
 
 
+async def test_list_models_treats_none_response_as_empty_provider_catalog(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    list_models = AsyncMock(return_value=None)
+    close = AsyncMock()
+    fake_client = SimpleNamespace(
+        models=SimpleNamespace(list=list_models),
+        aclose=close,
+    )
+    monkeypatch.setattr(
+        ElevenLabsMusicModel,
+        "_create_async_client",
+        staticmethod(lambda api_key, base_url=None: fake_client),
+    )
+
+    models = await ElevenLabsMusicModel.async_list_available_models(api_key="test-key")
+
+    assert [model["id"] for model in models][:2] == ["music_v2", "music_v1"]
+    list_models.assert_awaited_once_with()
+    close.assert_awaited_once_with()
+
+
 def test_adapter_builds_independent_music_model() -> None:
     db_model = SimpleNamespace(
         model_id="music-config",

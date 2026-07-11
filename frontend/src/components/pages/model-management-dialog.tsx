@@ -326,6 +326,10 @@ export function ModelManagementDialog({
     { value: "generate", label: t('models.abilities.generate') }
   ], [t])
 
+  const audioGenerationAbilityOptions = useMemo(() => [
+    { value: "generate", label: t('models.abilities.generate') }
+  ], [t])
+
   const speechAbilityOptions = useMemo(() => [
     { value: "asr", label: t('models.abilities.asr') },
     { value: "tts", label: t('models.abilities.tts') }
@@ -351,8 +355,9 @@ export function ModelManagementDialog({
     if (category === 'image') return imageAbilityOptions
     if (category === 'video') return videoAbilityOptions
     if (category === 'speech') return speechAbilityOptions
-    if (category === 'sound_effect') return videoAbilityOptions
-    if (category === 'music') return videoAbilityOptions
+    if (category === 'sound_effect' || category === 'music') {
+      return audioGenerationAbilityOptions
+    }
     if (category === 'rerank') return rerankAbilityOptions
     return []
   }

@@ -194,7 +194,7 @@ class ElevenLabsMusicModel(BaseMusicModel):
         try:
             try:
                 response = await model._ensure_async_client().models.list()
-                for raw_model in _get_field(response, "models") or response:
+                for raw_model in _get_field(response, "models") or response or []:
                     model_id = _get_field(raw_model, "model_id", "id")
                     if not isinstance(model_id, str):
                         continue

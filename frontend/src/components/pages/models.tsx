@@ -431,7 +431,10 @@ export function ModelsPage() {
 
   // Filter explore providers by active tab
   const exploreProviders = useMemo(() => {
-    return providers.filter(p => p.category.some(category => modelMatchesTab(category, activeTab)))
+    return providers.filter(p =>
+      Array.isArray(p.category) &&
+      p.category.some(category => modelMatchesTab(category, activeTab))
+    )
   }, [activeTab, providers])
 
   if (loading && models.length === 0) {

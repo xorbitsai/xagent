@@ -71,10 +71,12 @@ CHECKPOINT_BLOB_FIELDS: tuple[CheckpointBlobField, ...] = (
 
 @dataclass(frozen=True)
 class EncodablePayload:
-    """One inline snapshot value the v2 encoder would replace with a ref."""
+    """One inline snapshot value the v2 encoder would replace with a ref.
+
+    ``kind`` doubles as the payload's key in ``parent``.
+    """
 
     parent: dict[str, Any]
-    key: str
     kind: Literal["messages", "system_prompt", "metadata", "tool_ledger"]
     value: Any
 
@@ -219,27 +221,27 @@ def _encode_checkpoint_data_v2(
     blob_candidates: dict[tuple[str, str], BlobCandidate] = {}
     for payload in _find_v2_encodable_payloads(encoded):
         if payload.kind == "messages":
-            payload.parent[payload.key] = _encode_messages_payload(
+            payload.parent[payload.kind] = _encode_messages_payload(
                 payload.value,
                 task_id=task_id,
                 message_blobs=message_blobs,
             )
         elif payload.kind == "system_prompt":
-            payload.parent[payload.key] = _encode_blob_ref_payload(
+            payload.parent[payload.kind] = _encode_blob_ref_payload(
                 payload.value,
                 kind=CONTEXT_SYSTEM_PROMPT_KIND,
                 task_id=task_id,
                 blob_candidates=blob_candidates,
             )
         elif payload.kind == "metadata":
-            payload.parent[payload.key] = _encode_blob_ref_payload(
+            payload.parent[payload.kind] = _encode_blob_ref_payload(
                 payload.value,
                 kind=CONTEXT_METADATA_KIND,
                 task_id=task_id,
                 blob_candidates=blob_candidates,
             )
         else:
-            payload.parent[payload.key] = _encode_ledger_payload(
+            payload.parent[payload.kind] = _encode_ledger_payload(
                 payload.value,
                 task_id=task_id,
                 blob_candidates=blob_candidates,
@@ -371,7 +373,7 @@ def _iter_v2_encodable_payloads(data: Any) -> Iterator[EncodablePayload]:
         found: list[EncodablePayload] = []
         messages = node.get("messages")
         if isinstance(messages, list):
-            found.append(EncodablePayload(node, "messages", "messages", messages))
+            found.append(EncodablePayload(node, "messages", messages))
             consumed.add("messages")
         elif _is_message_refs_payload(messages):
             consumed.add("messages")
@@ -380,15 +382,13 @@ def _iter_v2_encodable_payloads(data: Any) -> Iterator[EncodablePayload]:
             isinstance(system_prompt, str)
             and len(system_prompt) >= SYSTEM_PROMPT_BLOB_MIN_CHARS
         ):
-            found.append(
-                EncodablePayload(node, "system_prompt", "system_prompt", system_prompt)
-            )
+            found.append(EncodablePayload(node, "system_prompt", system_prompt))
             consumed.add("system_prompt")
         elif _is_checkpoint_blob_ref_payload(system_prompt):
             consumed.add("system_prompt")
         metadata = node.get("metadata")
         if _should_store_checkpoint_blob_payload(metadata):
-            found.append(EncodablePayload(node, "metadata", "metadata", metadata))
+            found.append(EncodablePayload(node, "metadata", metadata))
             consumed.add("metadata")
         elif _is_checkpoint_blob_ref_payload(metadata):
             consumed.add("metadata")
@@ -413,7 +413,7 @@ def _iter_v2_encodable_payloads(data: Any) -> Iterator[EncodablePayload]:
             yield from found
         ledger = node.get("tool_ledger")
         if _is_ledger_payload_shape(ledger):
-            yield EncodablePayload(node, "tool_ledger", "tool_ledger", ledger)
+            yield EncodablePayload(node, "tool_ledger", ledger)
             consumed.add("tool_ledger")
         elif _is_ledger_refs_payload(ledger) or _is_checkpoint_blob_ref_payload(ledger):
             consumed.add("tool_ledger")

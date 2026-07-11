@@ -24,6 +24,11 @@ from ...web.models.database import get_db
 from ...web.models.task import Task
 from ...web.models.task import TraceEvent as DatabaseTraceEvent
 from ...web.models.tool_config import ToolUsage
+from ...web.services.ops_signals import (
+    CHECKPOINT_DECODE_FALLBACK,
+    clear_degradation,
+    register_degradation,
+)
 from ...web.services.trace_message_storage import (
     SQL_IN_CLAUSE_CHUNK_SIZE,
     CheckpointMessageDecodeError,
@@ -158,7 +163,15 @@ class DatabaseTraceHandler(BaseTraceHandler):
                 except Exception:
                     # E.g. a transient DB error from the blob prefetch. Fall
                     # back to an older readable checkpoint instead of letting
-                    # the error abort loading for the whole task.
+                    # the error abort loading for the whole task. Surface the
+                    # degradation on /health so a systemic decode failure is
+                    # observable instead of only a per-row warning log; the
+                    # signal self-clears on the next successful decode.
+                    register_degradation(
+                        CHECKPOINT_DECODE_FALLBACK,
+                        f"task {self.task_id}: checkpoint decode failed, "
+                        f"fell back past event {row.event_id}",
+                    )
                     logger.warning(
                         "Skipping checkpoint trace event %s for task %s after "
                         "decode failure",
@@ -167,6 +180,7 @@ class DatabaseTraceHandler(BaseTraceHandler):
                         exc_info=True,
                     )
                     continue
+                clear_degradation(CHECKPOINT_DECODE_FALLBACK)
                 snapshot = data.get("snapshot")
                 return dict(snapshot) if isinstance(snapshot, dict) else None
             return None

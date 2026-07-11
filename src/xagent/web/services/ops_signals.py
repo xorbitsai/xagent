@@ -19,6 +19,7 @@ from __future__ import annotations
 import threading
 
 GMAIL_OIDC_SERVICE_ACCOUNT_UNVERIFIED = "gmail_oidc_service_account_unverified"
+CHECKPOINT_DECODE_FALLBACK = "checkpoint_decode_fallback"
 
 _signals: dict[str, str] = {}
 _lock = threading.Lock()

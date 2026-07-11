@@ -528,3 +528,27 @@ class TestTaskTrackerIntegration:
         types = [d.get("type") for d in final_usage.details]
         assert "input" in types
         assert "output" in types
+
+
+def test_check_run_progress_gate_guards():
+    """The quota-gate seam is a no-op when no hook is registered or user_id is
+    None, and otherwise forwards to the hook and returns its reason."""
+    from xagent.web.services import quota_hooks
+
+    # No hook registered → None regardless of args.
+    quota_hooks.set_run_progress_gate_hook(None)
+    assert quota_hooks.check_run_progress_gate("db", 1, [], 0) is None
+
+    seen = []
+    quota_hooks.set_run_progress_gate_hook(
+        lambda db, uid, dd, da: (seen.append(uid), "OVER")[1]
+    )
+    try:
+        # user_id None short-circuits before the hook is called.
+        assert quota_hooks.check_run_progress_gate("db", None, [], 0) is None
+        assert seen == []
+        # Otherwise the hook runs and its reason is returned verbatim.
+        assert quota_hooks.check_run_progress_gate("db", 7, [], 3) == "OVER"
+        assert seen == [7]
+    finally:
+        quota_hooks.set_run_progress_gate_hook(None)

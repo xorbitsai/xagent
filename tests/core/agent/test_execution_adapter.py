@@ -1067,3 +1067,28 @@ async def test_execution_adapter_posts_user_message_after_restart() -> None:
         and message.content == "New message after process restart."
         for message in context_messages
     )
+
+
+@pytest.mark.asyncio
+async def test_set_interrupt_checker_propagates_to_prebuilt_adapter() -> None:
+    # The mid-run quota checker is normally installed before a run, but
+    # set_interrupt_checker must also push onto an already-built adapter — the
+    # only path that updates enforcement on an already-executing task.
+    service = AgentService(
+        name="interrupt-service",
+        id="interrupt-service",
+        pattern="react",
+        llm=cast(Any, FakeLLM([])),
+        tools=cast(Any, []),
+        tool_config=None,
+    )
+    service.allowed_skills = []
+    service._execution_adapter = service._build_execution_adapter()
+
+    def checker() -> None:
+        return None
+
+    service.set_interrupt_checker(checker)
+    assert service._execution_adapter.config.interrupt_checker is checker
+    service.set_interrupt_checker(None)
+    assert service._execution_adapter.config.interrupt_checker is None

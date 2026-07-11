@@ -185,6 +185,7 @@ async def test_execute_task_cleans_up_when_sandbox_acquire_raises(
     tracker.complete_tracking = AsyncMock()
     agent_service = _FakeAgentService()
     agent_service.execute_task = AsyncMock()  # type: ignore[method-assign]
+    agent_service.set_interrupt_checker = MagicMock()  # type: ignore[method-assign]
 
     with (
         patch(
@@ -232,6 +233,9 @@ async def test_execute_task_cleans_up_when_sandbox_acquire_raises(
     assert mock_release.call_args.kwargs["status"] == TaskStatus.FAILED
     tracker.complete_tracking.assert_awaited_once()
     mock_sbx.assert_awaited_once_with(None)
+    # The mid-run quota checker must be cleared in the finally so a reused
+    # agent_service can't keep calling this finished run's tracker.
+    agent_service.set_interrupt_checker.assert_any_call(None)
 
 
 def test_sync_workforce_run_status_running_is_idempotent(db_session) -> None:

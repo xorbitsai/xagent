@@ -85,6 +85,7 @@ app = FastAPI(
 _migration_task: asyncio.Task[None] | None = None
 _file_storage_startup_sync_task: asyncio.Task[Any] | None = None
 _trigger_dispatcher_task: asyncio.Task[Any] | None = None
+_task_command_dispatcher_task: asyncio.Task[Any] | None = None
 _sandbox_idle_sweep_task: asyncio.Task[None] | None = None
 
 FILE_STORAGE_STARTUP_SYNC_EXEMPT_PATHS = frozenset({"/health", "/ready"})
@@ -1092,6 +1093,18 @@ async def startup_event() -> None:
     else:
         logger.info("Sandbox manager not available (disabled or init failed)")
 
+    # Recover accepted-but-unfinished task commands only after the runtime,
+    # skill/template managers, tracing, and sandbox services are ready.
+    from .api.websocket import execute_durable_task_command
+    from .services.task_command_transport import start_task_command_dispatcher
+
+    global _task_command_dispatcher_task
+    _task_command_dispatcher_task = start_task_command_dispatcher(
+        execute_durable_task_command
+    )
+    app.state.task_command_dispatcher_task = _task_command_dispatcher_task
+    logger.info("Started durable task command dispatcher")
+
     # Start Telegram and FeiShu channels if enabled
     try:
         from .channels.feishu.bot import get_feishu_channel
@@ -1117,10 +1130,17 @@ async def shutdown_event() -> None:
     global \
         _file_storage_startup_sync_task, \
         _migration_task, \
+        _task_command_dispatcher_task, \
         _trigger_dispatcher_task, \
         _sandbox_idle_sweep_task
 
     flush_langfuse()
+
+    if _task_command_dispatcher_task is not None:
+        from .services.task_command_transport import stop_task_command_dispatcher
+
+        await stop_task_command_dispatcher()
+    _task_command_dispatcher_task = None
 
     if _sandbox_idle_sweep_task and not _sandbox_idle_sweep_task.done():
         logger.info("Cancelling sandbox idle sweep task...")

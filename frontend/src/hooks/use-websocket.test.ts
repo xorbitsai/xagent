@@ -102,6 +102,28 @@ describe("useWebSocket message delivery", () => {
     })
   })
 
+  it("assigns idempotency keys to pause and resume commands", async () => {
+    const { result } = renderHook(() => useWebSocket({
+      url: "ws://localhost",
+      taskId: 1,
+    }))
+
+    await waitFor(() => expect(MockWebSocket.instances).toHaveLength(1))
+    const socket = MockWebSocket.instances[0]
+    act(() => socket.open())
+
+    act(() => {
+      result.current.pauseTask()
+      result.current.resumeTask()
+    })
+
+    const pause = JSON.parse(socket.send.mock.calls[0][0])
+    const resume = JSON.parse(socket.send.mock.calls[1][0])
+    expect(pause.command_id).toBeTruthy()
+    expect(resume.command_id).toBeTruthy()
+    expect(resume.command_id).not.toBe(pause.command_id)
+  })
+
   it("allows an unacknowledged draft to retry with the same id", async () => {
     const { result } = renderHook(() => useWebSocket({
       url: "ws://localhost",

@@ -579,6 +579,7 @@ export function useWebSocket(options: UseWebSocketOptions = {}) {
       const message = {
         type: "pause_task",
         task_id: taskIdRef.current,
+        command_id: generateClientMessageId(),
       }
       socketRef.current.send(JSON.stringify(message))
     }
@@ -589,6 +590,7 @@ export function useWebSocket(options: UseWebSocketOptions = {}) {
       socketRef.current.send(JSON.stringify({
         type: "resume_task",
         task_id: taskIdRef.current,
+        command_id: generateClientMessageId(),
       }))
     }
   }, [taskId])

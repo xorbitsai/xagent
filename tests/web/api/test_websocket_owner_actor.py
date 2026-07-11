@@ -25,6 +25,7 @@ from xagent.web.api.websocket import (
 from xagent.web.models.chat_message import TaskChatMessage
 from xagent.web.models.database import Base, get_db, get_engine, init_db
 from xagent.web.models.task import Task, TaskStatus
+from xagent.web.models.task_command import TaskExecutionCommand
 from xagent.web.models.user import User
 from xagent.web.services.chat_history_service import (
     DELIVERY_DISPATCHED,
@@ -203,7 +204,7 @@ async def test_running_chat_message_is_persisted_before_resume(db_session) -> No
 
 
 @pytest.mark.asyncio
-async def test_deferred_chat_message_waits_for_real_injection_before_ack(
+async def test_deferred_chat_message_is_acked_after_durable_command_commit(
     db_session,
 ) -> None:
     owner = _user(db_session, "owner")
@@ -240,14 +241,27 @@ async def test_deferred_chat_message_waits_for_real_injection_before_ack(
             },
         )
 
+    accepted = [
+        call.args[0]
+        for call in ws_manager.send_personal_message.call_args_list
+        if call.args[0].get("type") == "message_accepted"
+    ]
+    assert len(accepted) == 1
+    assert accepted[0]["client_message_id"] == "deferred-turn-1"
+    stored_command = (
+        db_session.query(TaskExecutionCommand)
+        .filter_by(task_id=int(task.id), command_id="deferred-turn-1")
+        .one()
+    )
+    assert stored_command.status == "pending"
     assert not any(
-        call.args[0].get("type") == "message_accepted"
+        call.args[0].get("type") == "message_rejected"
         for call in ws_manager.send_personal_message.call_args_list
     )
     kwargs = resume_bg.call_args.kwargs
     assert kwargs["delivery_already_dispatched"] is False
-    assert kwargs["delivery_websocket"] is websocket
-    assert kwargs["delivery_client_message_id"] == "deferred-turn-1"
+    assert kwargs["delivery_websocket"] is None
+    assert kwargs["delivery_client_message_id"] is None
 
 
 @pytest.mark.asyncio
@@ -610,6 +624,12 @@ async def test_resume_registration_failure_cancels_coordinator(db_session) -> No
         patch("xagent.web.api.websocket.background_task_manager", bg_mgr),
     ):
         await handle_resume_task(MagicMock(), int(task.id), {"user": owner})
+        for _ in range(100):
+            if bg_handle.cancel.called:
+                break
+            await asyncio.sleep(0.01)
+        else:
+            raise AssertionError("resume command did not finish in time")
 
     bg_handle.cancel.assert_called_once()
 

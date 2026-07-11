@@ -1,10 +1,9 @@
-"""Serialized task control commands and versioned execution state.
+"""Process-local task gate and versioned execution state.
 
-P1 keeps command serialization process-local. Cross-worker command transport is
-deliberately a later concern; the database state tuple written here is the
-authoritative ordering contract shared by every transport and by the frontend.
-Channel transports share this gate and state tuple but do not yet use the turn
-orchestrator or runner-lease lifecycle.
+The durable P2 inbox lives in :mod:`task_command_transport`; after one worker
+claims a command, this controller remains the local reentrant guard around the
+state transition. The database state tuple written here is the ordering
+contract shared by every transport and by the frontend.
 """
 
 from __future__ import annotations

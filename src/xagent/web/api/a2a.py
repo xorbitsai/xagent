@@ -33,6 +33,14 @@ from ..services.a2a_protocol import (
     task_state,
     task_to_a2a,
 )
+from ..services.task_command_transport import (
+    COMMAND_COMPLETED,
+    COMMAND_FAILED,
+    TaskCommandKind,
+    dispatch_one_task_command,
+    enqueue_task_command,
+    load_task_command,
+)
 from ..services.task_execution_controller import (
     TaskControlState,
     apply_task_control_transition,
@@ -845,8 +853,52 @@ async def cancel_task(
 ) -> Any:
     agent, _key = authed
     _require_bound_agent(agent_id, agent)
-    async with task_execution_controller.command(task_id):
-        return await _cancel_task_unserialized(task_id=task_id, agent=agent, db=db)
+    task = _resolve_a2a_task(db, task_id, agent)
+    command_identity = f"cancel:{task_id}:{task.run_id or task.state_version}"
+    enqueued = enqueue_task_command(
+        db,
+        task_id=task_id,
+        actor_user_id=int(agent.user_id),
+        command_id=command_identity,
+        kind=TaskCommandKind.CANCEL,
+        payload={"agent_id": int(agent.id)},
+    )
+    if not enqueued.payload_matches:
+        raise a2a_error(
+            "invalid_request",
+            "Cancel command identity conflicts with a different request.",
+            status_code=409,
+        )
+
+    from .websocket import execute_durable_task_command
+
+    # Apply immediately when this process owns the target run. If another
+    # worker owns it, that worker's dispatcher observes the durable row and
+    # completes it; polling here preserves the synchronous A2A cancel contract.
+    await dispatch_one_task_command(
+        execute_durable_task_command,
+        command_db_id=enqueued.command_id,
+    )
+    deadline = monotonic() + 10.0
+    while True:
+        stored = await asyncio.to_thread(load_task_command, enqueued.command_id)
+        if stored is not None and stored.status == COMMAND_COMPLETED:
+            db.expire_all()
+            return a2a_json_response(task_to_a2a(_resolve_a2a_task(db, task_id, agent)))
+        if stored is not None and stored.status == COMMAND_FAILED:
+            raise a2a_error(
+                "internal_error",
+                str(stored.error or "Task cancellation failed."),
+                status_code=500,
+            )
+        if monotonic() >= deadline:
+            raise a2a_error(
+                "temporarily_unavailable",
+                "Task cancellation was accepted but is still being applied.",
+                status_code=503,
+                details={"taskId": task_id, "commandId": command_identity},
+            )
+        await asyncio.sleep(0.05)
 
 
 async def _cancel_task_unserialized(

@@ -72,6 +72,16 @@ def _patch_channel_modules_disabled(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setitem(sys.modules, "xagent.web.channels.feishu.bot", fake_feishu_bot)
 
 
+def _patch_task_command_dispatcher_disabled(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Keep LanceDB startup tests isolated from the durable DB dispatcher."""
+    monkeypatch.setattr(
+        "xagent.web.services.task_command_transport.start_task_command_dispatcher",
+        lambda _executor: None,
+    )
+
+
 @pytest.fixture
 def temp_lancedb_dir():
     """Create a temporary directory for LanceDB."""
@@ -698,6 +708,7 @@ async def test_startup_event_skips_when_auto_migrate_disabled(
     import importlib
 
     _patch_channel_modules_disabled(monkeypatch)
+    _patch_task_command_dispatcher_disabled(monkeypatch)
     web_app_module = importlib.import_module("xagent.web.app")
 
     class _FakeManager:
@@ -806,6 +817,7 @@ async def test_startup_event_triggers_background_auto_migration(
     import importlib
 
     _patch_channel_modules_disabled(monkeypatch)
+    _patch_task_command_dispatcher_disabled(monkeypatch)
     web_app_module = importlib.import_module("xagent.web.app")
 
     class _FakeManager:
@@ -915,6 +927,7 @@ async def test_startup_event_no_task_when_no_table_needs_migration(
     import importlib
 
     _patch_channel_modules_disabled(monkeypatch)
+    _patch_task_command_dispatcher_disabled(monkeypatch)
     web_app_module = importlib.import_module("xagent.web.app")
 
     class _FakeManager:

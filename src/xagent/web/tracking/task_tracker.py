@@ -73,6 +73,17 @@ class TaskTracker:
         if not self.task:
             raise ValueError(f"Task {task_id} not found")
 
+        # Cache user_id at construction: the per-step quota checker reads it every
+        # step, and `self.task` is expired after periodic_update commits
+        # (expire_on_commit), so a fresh `self.task.user_id` would trigger an
+        # implicit blocking SELECT. user_id never changes for a task.
+        self._user_id = getattr(self.task, "user_id", None)
+        # Fail-open logging in the per-step gate must not flood: log once per run.
+        self._quota_gate_warned = False
+        # Set to the gate reason if the mid-run quota gate trips, so the run's
+        # caller can surface why the run stopped instead of a silent PAUSE.
+        self.quota_interrupt_reason: str | None = None
+
     async def start_tracking(self) -> None:
         """Start tracking token usage for this task."""
         if self._is_tracking:
@@ -278,6 +289,10 @@ class TaskTracker:
         (each LLM reply / tool call). Synchronous and best-effort: it reuses the
         exact turn-delta the metering path computes, and swallows errors so a
         quota-infra hiccup fails open rather than wedging a run.
+
+        When it trips it records the reason in ``quota_interrupt_reason`` so the
+        run's caller can surface *why* the run stopped (the pattern interrupt
+        path itself would otherwise flip silently to PAUSED).
         """
         if not self._is_tracking:
             return None
@@ -285,16 +300,22 @@ class TaskTracker:
             from ..services.quota_hooks import check_run_progress_gate
 
             delta_details, delta_actions = self._turn_delta()
-            return check_run_progress_gate(
+            reason = check_run_progress_gate(
                 self.db_session,
-                getattr(self.task, "user_id", None),
+                self._user_id,
                 delta_details,
                 delta_actions,
             )
+            if reason is not None:
+                self.quota_interrupt_reason = reason
+            return reason
         except Exception as e:  # noqa: BLE001
-            logger.warning(
-                f"Quota progress gate failed open for task {self.task_id}: {e}"
-            )
+            # Runs per step; log once per run so a persistent failure can't flood.
+            if not self._quota_gate_warned:
+                self._quota_gate_warned = True
+                logger.warning(
+                    f"Quota progress gate failed open for task {self.task_id}: {e}"
+                )
             return None
 
     async def complete_tracking(self) -> TokenUsage:

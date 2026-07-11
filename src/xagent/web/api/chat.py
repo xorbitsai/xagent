@@ -2261,6 +2261,21 @@ class AgentServiceManager:
                 task=task, context=context, task_id=task_id
             )
 
+            # If a mid-run quota gate stopped the run, surface the reason the way
+            # the start gate does — a terminal quota_exceeded result carrying the
+            # reason as output — instead of the pattern-interrupt path's silent
+            # flip to PAUSED (which persists no message).
+            if tracker is not None and isinstance(result, dict):
+                quota_reason = getattr(tracker, "quota_interrupt_reason", None)
+                if quota_reason:
+                    result = {
+                        **result,
+                        "success": False,
+                        "status": "quota_exceeded",
+                        "output": quota_reason,
+                        "error": quota_reason,
+                    }
+
             logger.info("=== Task executed successfully, updating title if needed ===")
 
             # Update task title with generated task_name (clean architecture: Core provides API, Web handles DB)

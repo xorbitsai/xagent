@@ -130,11 +130,43 @@ class TestTaskTracker:
             quota_hooks.set_run_progress_gate_hook(None)
 
         assert reason == "over credits"
+        # The reason is recorded so the run's caller can surface why it stopped.
+        assert tracker.quota_interrupt_reason == "over credits"
         assert captured["user_id"] == 42
         assert captured["actions"] == 2  # only this turn's tool calls
         # Only this turn's input+output entries, not the seeded baseline one.
         assert len(captured["details"]) == 2
         assert sorted(d["tokens"] for d in captured["details"]) == [5, 10]
+
+    @pytest.mark.asyncio
+    async def test_quota_gate_caches_user_id_and_logs_once(self, db_session, caplog):
+        """F1: user_id is cached at construction (not re-read per step). F3: the
+        fail-open warning is logged once per run, not once per step."""
+        import logging
+
+        from xagent.web.services import quota_hooks
+
+        task = db_session.query.return_value.filter.return_value.first.return_value
+        task.user_id = 7
+
+        def _boom(db, user_id, dd, da):
+            raise RuntimeError("gate infra down")
+
+        quota_hooks.set_run_progress_gate_hook(_boom)
+        try:
+            tracker = TaskTracker(task_id=123, db_session=db_session)
+            assert tracker._user_id == 7  # F1: cached at construction
+            await tracker.start_tracking()
+            with caplog.at_level(logging.WARNING):
+                assert tracker.interrupt_reason_for_quota() is None
+                assert tracker.interrupt_reason_for_quota() is None
+                assert tracker.interrupt_reason_for_quota() is None
+        finally:
+            quota_hooks.set_run_progress_gate_hook(None)
+
+        warnings = [r for r in caplog.records if "failed open" in r.getMessage()]
+        assert len(warnings) == 1  # F3: one log despite three failing calls
+        assert tracker.quota_interrupt_reason is None  # never tripped → no reason
 
     @pytest.mark.asyncio
     async def test_init_task_tracker_with_custom_interval(self, db_session):

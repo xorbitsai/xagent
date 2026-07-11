@@ -159,6 +159,64 @@ async def test_execute_task_skips_lease_but_syncs_running_when_manage_false(
 
 
 @pytest.mark.asyncio
+async def test_execute_task_surfaces_mid_run_quota_reason(db_session) -> None:
+    """When the mid-run quota gate trips, the run result is reshaped to a
+    terminal quota_exceeded carrying the reason as output (mirroring the start
+    gate) instead of the pattern-interrupt path's silent flip to PAUSED."""
+    user = User(username="quota-user", password_hash="hash", is_admin=False)
+    db_session.add(user)
+    db_session.commit()
+    task = Task(
+        user_id=user.id,
+        title="quota test",
+        description="test",
+        status=TaskStatus.RUNNING,
+        execution_mode="auto",
+    )
+    db_session.add(task)
+    db_session.commit()
+
+    manager = AgentServiceManager()
+    reason = "Monthly ai_credits_per_month quota reached. Upgrade your plan."
+    tracker = MagicMock()
+    tracker.start_tracking = AsyncMock()
+    tracker.complete_tracking = AsyncMock()
+    tracker.quota_interrupt_reason = reason  # the mid-run gate tripped
+
+    agent_service = _FakeAgentService()
+    # The pattern-interrupt path returns a silent "interrupted" result.
+    agent_service.execute_task = AsyncMock(  # type: ignore[method-assign]
+        return_value={"success": False, "status": "interrupted", "error": "interrupted"}
+    )
+
+    with (
+        patch("xagent.web.api.chat.run_task_lease_heartbeat", new=AsyncMock()),
+        patch("xagent.web.api.chat.stop_task_lease_heartbeat", new=AsyncMock()),
+        patch.object(
+            manager, "_acquire_sandbox_task", new=AsyncMock(return_value=None)
+        ),
+        patch.object(manager, "_release_sandbox_task", new=AsyncMock()),
+        patch("xagent.web.api.chat.sync_workforce_run_status", return_value=False),
+        patch(
+            "xagent.web.tracking.task_tracker.TaskTracker",
+            return_value=tracker,
+        ),
+    ):
+        result = await manager.execute_task(
+            agent_service=agent_service,
+            task="hello",
+            tracking_task_id=str(task.id),
+            db_session=db_session,
+            manage_task_lease=False,
+        )
+
+    assert result["status"] == "quota_exceeded"
+    assert result["success"] is False
+    assert result["output"] == reason
+    assert result["error"] == reason
+
+
+@pytest.mark.asyncio
 async def test_execute_task_cleans_up_when_sandbox_acquire_raises(
     db_session,
 ) -> None:

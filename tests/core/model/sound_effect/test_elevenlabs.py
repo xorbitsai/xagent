@@ -36,7 +36,11 @@ async def test_generate_sound_effect_uses_sdk_and_joins_chunks(
         staticmethod(lambda api_key, base_url=None: fake_client),
     )
 
-    result = await ElevenLabsSoundEffectModel(api_key="test-key").generate_sound_effect(
+    result = await ElevenLabsSoundEffectModel(
+        api_key="test-key",
+        timeout=25,
+        max_retries=5,
+    ).generate_sound_effect(
         text="  Distant thunder over a valley  ",
         duration_seconds=4.5,
         prompt_influence=0.7,
@@ -54,6 +58,10 @@ async def test_generate_sound_effect_uses_sdk_and_joins_chunks(
             "loop": True,
             "prompt_influence": 0.7,
             "model_id": ELEVENLABS_DEFAULT_SOUND_EFFECT_MODEL,
+            "request_options": {
+                "timeout_in_seconds": 25,
+                "max_retries": 5,
+            },
             "duration_seconds": 4.5,
         }
     ]
@@ -140,6 +148,36 @@ async def test_generate_sound_effect_redacts_sdk_errors(
 
     assert "sk-elevenlabs-secret123" not in str(exc_info.value)
     assert "api_key=***t123" in str(exc_info.value)
+
+
+async def test_validate_connection_probes_account_without_model_name_match(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    list_models = AsyncMock(return_value=[])
+    close = AsyncMock()
+    fake_client = SimpleNamespace(
+        models=SimpleNamespace(list=list_models),
+        aclose=close,
+    )
+    monkeypatch.setattr(
+        ElevenLabsSoundEffectModel,
+        "_create_async_client",
+        staticmethod(lambda api_key, base_url=None: fake_client),
+    )
+
+    model = ElevenLabsSoundEffectModel(
+        model_name="future-sfx-model",
+        api_key="test-key",
+        timeout=20,
+        max_retries=2,
+    )
+    await model.validate_connection()
+    await model.aclose()
+
+    list_models.assert_awaited_once_with(
+        request_options={"timeout_in_seconds": 20, "max_retries": 2}
+    )
+    close.assert_awaited_once_with()
 
 
 async def test_list_models_discovers_sound_effect_models_from_provider(
@@ -299,6 +337,8 @@ def test_adapter_builds_independent_sound_effect_model() -> None:
         api_key="test-key",
         base_url=None,
         abilities=["generate"],
+        timeout=65,
+        max_retries=7,
     )
 
     model = get_sound_effect_model_instance(db_model)
@@ -306,3 +346,5 @@ def test_adapter_builds_independent_sound_effect_model() -> None:
     assert isinstance(model, ElevenLabsSoundEffectModel)
     assert model.model_name == ELEVENLABS_DEFAULT_SOUND_EFFECT_MODEL
     assert model.abilities == ["generate"]
+    assert model.timeout == 65
+    assert model.max_retries == 7

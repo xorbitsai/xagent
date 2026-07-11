@@ -853,16 +853,24 @@ async def test_model_connection(
                 raise ValueError(
                     "Sound effect connection testing currently supports ElevenLabs"
                 )
-            await asyncio.wait_for(
-                _validate_provider_model_listing(
-                    provider="elevenlabs-sound_effect",
+            from xagent.core.model.sound_effect import create_sound_effect_model
+
+            sound_effect_model = create_sound_effect_model(
+                SoundEffectModelConfig(
+                    id="test-model",
                     model_name=request.model_name,
+                    model_provider=provider,
                     api_key=request.api_key,
                     base_url=base_url,
-                    requested_abilities=request.abilities or ["generate"],
-                ),
-                timeout=timeout_seconds,
+                    abilities=request.abilities or ["generate"],
+                )
             )
+            try:
+                await asyncio.wait_for(
+                    sound_effect_model.validate_connection(), timeout=timeout_seconds
+                )
+            finally:
+                await sound_effect_model.aclose()
 
         elif request.category == "music":
             if provider != "elevenlabs":

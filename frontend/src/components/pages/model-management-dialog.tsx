@@ -1602,8 +1602,8 @@ export function ModelManagementDialog({
                         formData.category === 'image' ? imageAbilityOptions :
                           formData.category === 'video' ? videoAbilityOptions :
                             formData.category === 'speech' ? speechAbilityOptions :
-                              formData.category === 'sound_effect' ? videoAbilityOptions :
-                                formData.category === 'music' ? videoAbilityOptions :
+                              formData.category === 'sound_effect' ? audioGenerationAbilityOptions :
+                                formData.category === 'music' ? audioGenerationAbilityOptions :
                               rerankAbilityOptions
                   }
                   placeholder={t('models.form.abilitiesPlaceholder')}

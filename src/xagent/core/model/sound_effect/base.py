@@ -27,6 +27,10 @@ class BaseSoundEffectModel(ABC):
     def abilities(self) -> list[str]:
         """Capabilities supported by the model."""
 
+    async def validate_connection(self) -> None:
+        """Validate provider credentials without generating billed audio."""
+        return None
+
     @abstractmethod
     async def generate_sound_effect(
         self,

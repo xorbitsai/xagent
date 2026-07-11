@@ -1356,6 +1356,9 @@ def get_default_tts_model(user_id: Optional[int] = None) -> Optional[Any]:
 def get_default_sound_effect_model(user_id: Optional[int] = None) -> Optional[Any]:
     """Get the user or shared default sound effect model."""
     try:
+        from sqlalchemy import String
+        from sqlalchemy import cast as sa_cast
+
         from ...core.model.sound_effect import get_sound_effect_model_instance
         from ..models.database import get_db
         from ..models.model import Model as DBModel
@@ -1373,6 +1376,7 @@ def get_default_sound_effect_model(user_id: Optional[int] = None) -> Optional[An
                         UserDefaultModel.config_type == "sound_effect",
                         DBModel.category == "sound_effect",
                         DBModel.is_active,
+                        sa_cast(DBModel.abilities, String).contains('"generate"'),
                     )
                     .first()
                 )
@@ -1390,6 +1394,7 @@ def get_default_sound_effect_model(user_id: Optional[int] = None) -> Optional[An
                 .filter(
                     UserDefaultModel.config_type == "sound_effect",
                     DBModel.category == "sound_effect",
+                    sa_cast(DBModel.abilities, String).contains('"generate"'),
                     UserModel.is_shared.is_(True),
                     UserDefaultModel.user_id.in_(_get_visible_user_ids(db, user_id)),
                 )
@@ -1410,6 +1415,9 @@ def get_default_sound_effect_model(user_id: Optional[int] = None) -> Optional[An
 def get_default_music_model(user_id: Optional[int] = None) -> Optional[Any]:
     """Get the user or shared default music model."""
     try:
+        from sqlalchemy import String
+        from sqlalchemy import cast as sa_cast
+
         from ...core.model.music import get_music_model_instance
         from ..models.database import get_db
         from ..models.model import Model as DBModel
@@ -1427,6 +1435,7 @@ def get_default_music_model(user_id: Optional[int] = None) -> Optional[Any]:
                         UserDefaultModel.config_type == "music",
                         DBModel.category == "music",
                         DBModel.is_active,
+                        sa_cast(DBModel.abilities, String).contains('"generate"'),
                     )
                     .first()
                 )
@@ -1444,6 +1453,7 @@ def get_default_music_model(user_id: Optional[int] = None) -> Optional[Any]:
                 .filter(
                     UserDefaultModel.config_type == "music",
                     DBModel.category == "music",
+                    sa_cast(DBModel.abilities, String).contains('"generate"'),
                     UserModel.is_shared.is_(True),
                     UserDefaultModel.user_id.in_(_get_visible_user_ids(db, user_id)),
                 )

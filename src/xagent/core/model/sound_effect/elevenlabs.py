@@ -60,12 +60,16 @@ class ElevenLabsSoundEffectModel(BaseSoundEffectModel):
         model_name: str = ELEVENLABS_DEFAULT_SOUND_EFFECT_MODEL,
         api_key: Optional[str] = None,
         base_url: Optional[str] = None,
+        timeout: Optional[float] = None,
+        max_retries: Optional[int] = None,
     ) -> None:
         self.model_name = model_name
         self.api_key = api_key or os.getenv("ELEVENLABS_API_KEY")
         self.base_url = (
             base_url or os.getenv("ELEVENLABS_BASE_URL") or ELEVENLABS_DEFAULT_BASE_URL
         ).rstrip("/")
+        self.timeout = timeout
+        self.max_retries = max_retries
         self._async_client: Any = None
 
     @property
@@ -101,6 +105,14 @@ class ElevenLabsSoundEffectModel(BaseSoundEffectModel):
             self._async_client = self._create_async_client(self.api_key, self.base_url)
         return self._async_client
 
+    def _request_options(self) -> Optional[dict[str, Any]]:
+        options: dict[str, Any] = {}
+        if self.timeout is not None:
+            options["timeout_in_seconds"] = int(self.timeout)
+        if self.max_retries is not None:
+            options["max_retries"] = self.max_retries
+        return options or None
+
     @staticmethod
     def _coerce_audio_bytes(response: Any) -> bytes:
         if isinstance(response, bytes):
@@ -131,6 +143,22 @@ class ElevenLabsSoundEffectModel(BaseSoundEffectModel):
             if isawaitable(result):
                 await result
 
+    async def validate_connection(self) -> None:
+        """Probe account access without requiring a catalog model-name match."""
+        try:
+            await self._ensure_async_client().models.list(
+                request_options=self._request_options()
+            )
+        except Exception as exc:
+            safe_error = redact_sensitive_text(str(exc))
+            if "missing_permissions" not in safe_error or "user_read" not in safe_error:
+                raise
+            logger.warning(
+                "ElevenLabs key lacks user_read; generation access cannot be "
+                "validated without a billed request: %s",
+                safe_error,
+            )
+
     async def generate_sound_effect(
         self,
         text: str,
@@ -156,6 +184,9 @@ class ElevenLabsSoundEffectModel(BaseSoundEffectModel):
             "prompt_influence": prompt_influence,
             "model_id": self.model_name,
         }
+        request_options = self._request_options()
+        if request_options:
+            request_kwargs["request_options"] = request_options
         if duration_seconds is not None:
             request_kwargs["duration_seconds"] = duration_seconds
 

@@ -45,6 +45,28 @@ class FakeMusicModel(BaseMusicModel):
         self.close_count += 1
 
 
+class FailingMusicModel(FakeMusicModel):
+    async def generate_music(
+        self,
+        prompt: str,
+        music_length_seconds: Optional[float] = None,
+        force_instrumental: bool = False,
+        output_format: str = "auto",
+    ) -> MusicResult:
+        raise RuntimeError("music provider failed")
+
+
+class EmptyMusicModel(FakeMusicModel):
+    async def generate_music(
+        self,
+        prompt: str,
+        music_length_seconds: Optional[float] = None,
+        force_instrumental: bool = False,
+        output_format: str = "auto",
+    ) -> MusicResult:
+        return MusicResult(audio=b"", format="mp3")
+
+
 async def test_generate_music_saves_registered_workspace_file(tmp_path: Path) -> None:
     model = FakeMusicModel()
     workspace = TaskWorkspace("music-task", str(tmp_path))
@@ -69,6 +91,46 @@ async def test_generate_music_saves_registered_workspace_file(tmp_path: Path) ->
             "output_format": "auto",
         }
     ]
+
+
+async def test_generate_music_selects_configured_model() -> None:
+    first = FakeMusicModel("first")
+    selected = FakeMusicModel("selected")
+    tool = MusicToolCore(models={"first": first, "selected": selected})
+
+    result = await tool.generate_music(prompt="Ambient score", model_id="selected")
+
+    assert result["success"] is True
+    assert result["model_used"] == "selected"
+    assert first.calls == []
+    assert len(selected.calls) == 1
+
+
+async def test_generate_music_rejects_unknown_model() -> None:
+    tool = MusicToolCore(models={"known": FakeMusicModel()})
+
+    result = await tool.generate_music(prompt="Ambient score", model_id="unknown")
+
+    assert result["success"] is False
+    assert "is not configured" in result["error"]
+
+
+async def test_generate_music_returns_provider_failure() -> None:
+    tool = MusicToolCore(models={"music": FailingMusicModel()})
+
+    result = await tool.generate_music(prompt="Ambient score")
+
+    assert result["success"] is False
+    assert result["error"] == "music provider failed"
+
+
+async def test_generate_music_rejects_empty_audio() -> None:
+    tool = MusicToolCore(models={"music": EmptyMusicModel()})
+
+    result = await tool.generate_music(prompt="Ambient score")
+
+    assert result["success"] is False
+    assert result["error"] == "Music model returned no audio data"
 
 
 def test_music_tool_uses_audio_category(tmp_path: Path) -> None:

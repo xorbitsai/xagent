@@ -428,6 +428,36 @@ class TestModelAPI:
         assert data["status"] == "passed"
         mock_fetch.assert_awaited_once()
 
+    def test_test_connection_sound_effect_does_not_require_catalog_match(
+        self, test_db, regular_user, regular_headers
+    ):
+        """Sound-effect checks should probe auth without a billed generation."""
+        sound_effect_model = Mock()
+        sound_effect_model.validate_connection = AsyncMock(return_value=None)
+        sound_effect_model.aclose = AsyncMock(return_value=None)
+
+        with patch(
+            "xagent.core.model.sound_effect.create_sound_effect_model",
+            return_value=sound_effect_model,
+        ) as create_model:
+            response = client.post(
+                "/api/models/test-connection",
+                json={
+                    "model_provider": "elevenlabs",
+                    "model_name": "future-sfx-model",
+                    "api_key": "test-api-key",
+                    "category": "sound_effect",
+                    "abilities": ["generate"],
+                },
+                headers=regular_headers,
+            )
+
+        assert response.status_code == 200
+        assert response.json()["status"] == "passed"
+        assert create_model.call_args.args[0].model_name == "future-sfx-model"
+        sound_effect_model.validate_connection.assert_awaited_once_with()
+        sound_effect_model.aclose.assert_awaited_once_with()
+
     def test_create_model_as_admin(
         self, test_db, admin_user, admin_headers, sample_model_data
     ):

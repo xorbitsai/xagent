@@ -71,12 +71,16 @@ class ElevenLabsMusicModel(BaseMusicModel):
         model_name: str = ELEVENLABS_DEFAULT_MUSIC_MODEL,
         api_key: Optional[str] = None,
         base_url: Optional[str] = None,
+        timeout: Optional[float] = None,
+        max_retries: Optional[int] = None,
     ) -> None:
         self.model_name = model_name
         self.api_key = api_key or os.getenv("ELEVENLABS_API_KEY")
         self.base_url = (
             base_url or os.getenv("ELEVENLABS_BASE_URL") or ELEVENLABS_DEFAULT_BASE_URL
         ).rstrip("/")
+        self.timeout = timeout
+        self.max_retries = max_retries
         self._async_client: Any = None
 
     @staticmethod
@@ -106,6 +110,14 @@ class ElevenLabsMusicModel(BaseMusicModel):
             self._async_client = self._create_async_client(self.api_key, self.base_url)
         return self._async_client
 
+    def _request_options(self) -> Optional[dict[str, Any]]:
+        options: dict[str, Any] = {}
+        if self.timeout is not None:
+            options["timeout_in_seconds"] = int(self.timeout)
+        if self.max_retries is not None:
+            options["max_retries"] = self.max_retries
+        return options or None
+
     async def aclose(self) -> None:
         client = self._async_client
         self._async_client = None
@@ -119,10 +131,16 @@ class ElevenLabsMusicModel(BaseMusicModel):
 
     async def validate_connection(self) -> None:
         """Validate access with the non-billed composition-plan endpoint."""
+        request_kwargs: dict[str, Any] = {
+            "prompt": "A short instrumental music cue",
+            "music_length_ms": 3000,
+            "model_id": self.model_name,
+        }
+        request_options = self._request_options()
+        if request_options:
+            request_kwargs["request_options"] = request_options
         await self._ensure_async_client().music.composition_plan.create(
-            prompt="A short instrumental music cue",
-            music_length_ms=3000,
-            model_id=self.model_name,
+            **request_kwargs
         )
 
     async def generate_music(
@@ -146,6 +164,9 @@ class ElevenLabsMusicModel(BaseMusicModel):
             "force_instrumental": force_instrumental,
             "output_format": output_format,
         }
+        request_options = self._request_options()
+        if request_options:
+            request_kwargs["request_options"] = request_options
         if music_length_seconds is not None:
             request_kwargs["music_length_ms"] = int(music_length_seconds * 1000)
 
@@ -222,12 +243,16 @@ class ElevenLabsMusicModel(BaseMusicModel):
                         or "ElevenLabs prompt-to-music generation model",
                     }
             except Exception as exc:
-                # Restricted ElevenLabs keys can generate music without the
-                # user_read permission required by GET /v1/models. Keep the
-                # live discovery attempt, then fall back to the SDK contract.
+                safe_error = redact_sensitive_text(str(exc))
+                if (
+                    "missing_permissions" not in safe_error
+                    or "user_read" not in safe_error
+                ):
+                    raise
                 logger.warning(
-                    "Could not list ElevenLabs music models: %s",
-                    redact_sensitive_text(str(exc)),
+                    "Could not list ElevenLabs music models because the API key "
+                    "lacks user_read; using the SDK catalog: %s",
+                    safe_error,
                 )
         finally:
             await model.aclose()

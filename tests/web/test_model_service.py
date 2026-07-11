@@ -663,7 +663,10 @@ class TestModelService:
     )
     def test_audio_generation_default_closes_database_generator(self, get_default):
         mock_db = MagicMock()
-        shared_query = mock_db.query.return_value.join.return_value.join.return_value.filter.return_value
+        filter_query = (
+            mock_db.query.return_value.join.return_value.join.return_value.filter
+        )
+        shared_query = filter_query.return_value
         shared_query.limit.return_value.all.return_value = []
         db_gen = MagicMock()
         db_gen.__next__.return_value = mock_db
@@ -675,6 +678,10 @@ class TestModelService:
             result = get_default(user_id=None)
 
         assert result is None
+        assert any(
+            getattr(getattr(condition, "right", None), "value", None) == '"generate"'
+            for condition in filter_query.call_args.args
+        )
         db_gen.close.assert_called_once_with()
 
     def test_embedding_fallback_skips_invisible_returns_none(self, monkeypatch):

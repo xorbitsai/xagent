@@ -55,6 +55,30 @@ class FakeSoundEffectModel(BaseSoundEffectModel):
         self.close_count += 1
 
 
+class FailingSoundEffectModel(FakeSoundEffectModel):
+    async def generate_sound_effect(
+        self,
+        text: str,
+        duration_seconds: Optional[float] = None,
+        prompt_influence: float = 0.3,
+        loop: bool = False,
+        output_format: str = "mp3_44100_128",
+    ) -> SoundEffectResult:
+        raise RuntimeError("sound effect provider failed")
+
+
+class EmptySoundEffectModel(FakeSoundEffectModel):
+    async def generate_sound_effect(
+        self,
+        text: str,
+        duration_seconds: Optional[float] = None,
+        prompt_influence: float = 0.3,
+        loop: bool = False,
+        output_format: str = "mp3_44100_128",
+    ) -> SoundEffectResult:
+        return SoundEffectResult(audio=b"", format="mp3")
+
+
 async def test_generate_sound_effect_saves_registered_workspace_file(
     tmp_path: Path,
 ) -> None:
@@ -122,6 +146,24 @@ async def test_generate_sound_effect_rejects_empty_description() -> None:
     assert result["success"] is False
     assert result["error"] == "Sound effect description must not be empty"
     assert model.calls == []
+
+
+async def test_generate_sound_effect_returns_provider_failure() -> None:
+    tool = SoundEffectToolCore(models={"sound": FailingSoundEffectModel()})
+
+    result = await tool.generate_sound_effect(text="Rain")
+
+    assert result["success"] is False
+    assert result["error"] == "sound effect provider failed"
+
+
+async def test_generate_sound_effect_rejects_empty_audio() -> None:
+    tool = SoundEffectToolCore(models={"sound": EmptySoundEffectModel()})
+
+    result = await tool.generate_sound_effect(text="Rain")
+
+    assert result["success"] is False
+    assert result["error"] == "Sound effect model returned no audio data"
 
 
 async def test_generate_sound_effect_accepts_cjk_and_adds_non_speech_constraint() -> (

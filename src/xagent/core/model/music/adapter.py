@@ -17,6 +17,8 @@ def create_music_model(config: MusicModelConfig) -> BaseMusicModel:
         model_name=config.model_name,
         api_key=config.api_key,
         base_url=config.base_url,
+        timeout=config.timeout,
+        max_retries=config.max_retries,
     )
 
 
@@ -29,6 +31,8 @@ def get_music_model_instance(db_model: Any) -> BaseMusicModel:
         base_url=db_model.base_url,
         abilities=list(db_model.abilities or ["generate"]),
         description=db_model.description,
+        timeout=getattr(db_model, "timeout", 180.0) or 180.0,
+        max_retries=getattr(db_model, "max_retries", 10) or 10,
     )
     model = create_music_model(config)
     setattr(model, "model_id", str(db_model.model_id))

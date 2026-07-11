@@ -17,6 +17,7 @@ from xagent.web.models.task_command import TaskExecutionCommand
 from xagent.web.models.user import User
 from xagent.web.services.task_command_transport import (
     COMMAND_COMPLETED,
+    ClaimedTaskCommand,
     TaskCommandDeferred,
     TaskCommandKind,
     _claim_heartbeat,
@@ -128,6 +129,36 @@ def test_live_run_command_stays_with_owner_until_task_lease_expires(
     assert recovered is not None
     assert recovered.id == command.command_id
     assert recovered.attempt_count == 2
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("payload", "error"),
+    [
+        ({}, "Agent ID is missing or null in cancel command payload"),
+        ({"agent_id": None}, "Agent ID is missing or null in cancel command payload"),
+        ({"agent_id": "invalid"}, "Agent ID 'invalid' is invalid"),
+    ],
+)
+async def test_cancel_command_rejects_invalid_agent_id_payload(
+    db_session,
+    payload,
+    error: str,
+) -> None:
+    user, task = _create_running_task(db_session)
+    command = ClaimedTaskCommand(
+        id=1,
+        task_id=int(task.id),
+        actor_user_id=int(user.id),
+        command_id="invalid-cancel",
+        kind=TaskCommandKind.CANCEL,
+        payload=payload,
+        target_run_id=None,
+        attempt_count=1,
+    )
+
+    with pytest.raises(ValueError, match=error):
+        await execute_durable_task_command(command)
 
 
 def test_later_command_cannot_overtake_unfinished_command(db_session) -> None:

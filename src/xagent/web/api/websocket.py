@@ -5543,7 +5543,15 @@ async def execute_durable_task_command(
         from ..models.agent import Agent
         from .a2a import _cancel_task_unserialized
 
-        agent_id = int(message_data["agent_id"])
+        agent_id_value = message_data.get("agent_id")
+        if agent_id_value is None:
+            raise ValueError("Agent ID is missing or null in cancel command payload")
+        try:
+            agent_id = int(agent_id_value)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                f"Agent ID {agent_id_value!r} is invalid in cancel command payload"
+            ) from exc
         SessionLocal = get_session_local()
         with SessionLocal() as db:
             agent = db.query(Agent).filter(Agent.id == agent_id).first()

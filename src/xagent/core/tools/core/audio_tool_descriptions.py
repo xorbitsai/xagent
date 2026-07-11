@@ -210,7 +210,7 @@ Output:
 - supported (bool): Whether the selected provider supports dynamic voice listing
 - provider (str): Selected provider name
 - model_used (str): Selected model ID or "default"
-- voices (list): Voice metadata. Use voice_id from an item as the voice parameter in synthesize_speech or synthesize_speech_json.
+- voices (list): Voice metadata filtered to model IDs configured for the selected provider. Use voice_id from an item as the voice parameter in synthesize_speech or synthesize_speech_json.
 - count (int): Number of voices returned
 - supported_providers (list): Providers that currently support dynamic voice listing
 

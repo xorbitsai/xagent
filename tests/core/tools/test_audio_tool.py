@@ -256,6 +256,111 @@ async def test_list_tts_voices_returns_provider_voices() -> None:
     }
 
 
+async def test_list_tts_voices_filters_metadata_to_configured_provider_models() -> None:
+    voice_listing_tts = FakeTTS(
+        provider_name="elevenlabs",
+        abilities=["tts", "voice_listing"],
+        voices=[
+            {
+                "voice_id": "voice-1",
+                "high_quality_base_model_ids": [
+                    "eleven_v3",
+                    "eleven_flash_v2",
+                    "eleven_turbo_v2",
+                ],
+                "verified_languages": [
+                    {"language": "en", "model_id": "eleven_v3"},
+                    {"language": "de", "model_id": "eleven_flash_v2"},
+                    {"language": "fr", "model_id": "eleven_turbo_v2"},
+                    {"language": "es"},
+                    {"language": "it", "model_id": None},
+                    None,
+                    "invalid",
+                ],
+            },
+            {
+                "voice_id": "voice-2",
+                "high_quality_base_model_ids": ["eleven_turbo_v2"],
+                "verified_languages": [
+                    {"language": "fr", "model_id": "eleven_turbo_v2"}
+                ],
+            },
+            {
+                "voice_id": "voice-3",
+                "high_quality_base_model_ids": "eleven_v3",
+                "verified_languages": None,
+            },
+        ],
+    )
+    tool = AudioToolCore(
+        tts_models={
+            "eleven_v3": voice_listing_tts,
+            "eleven_flash_v2": FakeTTS(provider_name="elevenlabs"),
+            "None": FakeTTS(provider_name="elevenlabs"),
+            "chat-tts": FakeTTS(provider_name="xinference"),
+        }
+    )
+
+    result = await tool.list_tts_voices(model_id="eleven_v3")
+
+    assert result["voices"] == [
+        {
+            "voice_id": "voice-1",
+            "high_quality_base_model_ids": ["eleven_v3", "eleven_flash_v2"],
+            "verified_languages": [
+                {"language": "en", "model_id": "eleven_v3"},
+                {"language": "de", "model_id": "eleven_flash_v2"},
+            ],
+        },
+        {"voice_id": "voice-2"},
+        {"voice_id": "voice-3"},
+    ]
+
+
+async def test_list_tts_voices_keeps_default_model_metadata() -> None:
+    default_tts = FakeTTS(
+        provider_name="elevenlabs",
+        abilities=["tts", "voice_listing"],
+        voices=[
+            {
+                "voice_id": "voice-1",
+                "high_quality_base_model_ids": ["default-model", "other-model"],
+                "verified_languages": [
+                    {"language": "en", "model_id": "default-model"},
+                    {"language": "de", "model_id": "other-model"},
+                ],
+            }
+        ],
+    )
+    default_tts.model_name = "default-model"
+    tool = AudioToolCore(default_tts_model=default_tts)
+
+    result = await tool.list_tts_voices()
+
+    assert result["voices"] == [
+        {
+            "voice_id": "voice-1",
+            "high_quality_base_model_ids": ["default-model"],
+            "verified_languages": [{"language": "en", "model_id": "default-model"}],
+        }
+    ]
+
+
+def test_filter_voice_model_metadata_handles_empty_configured_set() -> None:
+    voices = AudioToolCore._filter_voice_model_metadata(
+        [
+            {
+                "voice_id": "voice-1",
+                "high_quality_base_model_ids": ["eleven_v3"],
+                "verified_languages": [{"language": "en", "model_id": "eleven_v3"}],
+            }
+        ],
+        configured_model_ids=set(),
+    )
+
+    assert voices == [{"voice_id": "voice-1"}]
+
+
 async def test_list_tts_voices_reports_dynamic_supported_providers() -> None:
     tool = AudioToolCore(
         tts_models={

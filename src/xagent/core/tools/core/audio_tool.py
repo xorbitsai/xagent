@@ -361,6 +361,70 @@ class AudioToolCore:
 
         return providers
 
+    def _get_configured_tts_model_ids(self, provider_name: str) -> set[str]:
+        """Return model IDs configured for the selected TTS provider."""
+        model_ids = {
+            model_id
+            for model_id, model in self._tts_models.items()
+            if self._get_tts_provider_name(model) == provider_name
+        }
+        if (
+            self._default_tts_model is not None
+            and self._get_tts_provider_name(self._default_tts_model) == provider_name
+        ):
+            default_model_id = getattr(self._default_tts_model, "model_name", None)
+            if default_model_id:
+                model_ids.add(str(default_model_id))
+        return model_ids
+
+    @staticmethod
+    def _filter_voice_model_metadata(
+        voices: list[dict[str, Any]],
+        configured_model_ids: set[str],
+    ) -> list[dict[str, Any]]:
+        """Remove provider model metadata for models not configured by the user."""
+        filtered_voices: list[dict[str, Any]] = []
+        for voice in voices:
+            filtered_voice = dict(voice)
+
+            if "high_quality_base_model_ids" in filtered_voice:
+                high_quality_model_ids = filtered_voice["high_quality_base_model_ids"]
+                matching_model_ids = [
+                    model_id
+                    for model_id in (
+                        high_quality_model_ids
+                        if isinstance(high_quality_model_ids, list)
+                        else []
+                    )
+                    if str(model_id) in configured_model_ids
+                ]
+                if matching_model_ids:
+                    filtered_voice["high_quality_base_model_ids"] = matching_model_ids
+                else:
+                    filtered_voice.pop("high_quality_base_model_ids")
+
+            if "verified_languages" in filtered_voice:
+                verified_languages = filtered_voice["verified_languages"]
+                matching_languages = [
+                    language
+                    for language in (
+                        verified_languages
+                        if isinstance(verified_languages, list)
+                        else []
+                    )
+                    if isinstance(language, dict)
+                    and language.get("model_id") is not None
+                    and str(language["model_id"]) in configured_model_ids
+                ]
+                if matching_languages:
+                    filtered_voice["verified_languages"] = matching_languages
+                else:
+                    filtered_voice.pop("verified_languages")
+
+            filtered_voices.append(filtered_voice)
+
+        return filtered_voices
+
     def _validate_tts_provider_kwargs(
         self,
         *,
@@ -964,6 +1028,8 @@ class AudioToolCore:
                 }
 
             voices = await tts_model.list_available_voices()
+            configured_model_ids = self._get_configured_tts_model_ids(provider_name)
+            voices = self._filter_voice_model_metadata(voices, configured_model_ids)
             return {
                 "success": True,
                 "supported": True,

@@ -28,6 +28,13 @@ _run_gate_hook: Callable[[Any, Any], str | None] | None = None
 # caller to commit them (they may be rolled back), and must NOT commit `db`
 # itself (that would prematurely persist the caller's unrelated pending state).
 _usage_record_hook: Callable[[Any, Any, list, int], None] | None = None
+# (db, user_id, delta_details, delta_actions) -> reason str if counting this
+# in-flight run's live-so-far usage would push the team over a run-gated quota,
+# else None. Polled per step (each LLM reply / tool call) during a run so a
+# single long/expensive run is stopped mid-flight instead of only being metered
+# at completion. Read-only: it must not write or commit `db` (same contract
+# spirit as the metering hook), and should stay cheap since it runs every step.
+_run_progress_gate_hook: Callable[[Any, Any, list, int], str | None] | None = None
 # (db, user_id) -> reason str if the team is out of storage quota, else None
 _storage_gate_hook: Callable[[Any, Any], str | None] | None = None
 # (user_id) -> None; +1 billable action when a run is fired by a trigger
@@ -43,6 +50,13 @@ def set_run_gate_hook(hook: Callable[[Any, Any], str | None] | None) -> None:
 def set_usage_record_hook(hook: Callable[[Any, Any, list, int], None] | None) -> None:
     global _usage_record_hook
     _usage_record_hook = hook
+
+
+def set_run_progress_gate_hook(
+    hook: Callable[[Any, Any, list, int], str | None] | None,
+) -> None:
+    global _run_progress_gate_hook
+    _run_progress_gate_hook = hook
 
 
 def set_storage_gate_hook(hook: Callable[[Any, Any], str | None] | None) -> None:
@@ -67,6 +81,14 @@ def record_usage(
     if _usage_record_hook is None or user_id is None:
         return
     _usage_record_hook(db, user_id, delta_details, delta_actions)
+
+
+def check_run_progress_gate(
+    db: Any, user_id: Any, delta_details: list, delta_actions: int
+) -> str | None:
+    if _run_progress_gate_hook is None or user_id is None:
+        return None
+    return _run_progress_gate_hook(db, user_id, delta_details, delta_actions)
 
 
 def check_storage_gate(db: Any, user_id: Any) -> str | None:

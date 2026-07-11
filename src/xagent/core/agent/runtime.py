@@ -73,6 +73,11 @@ class PatternRuntime:
         result = self.interrupt_checker()
         if inspect.isawaitable(result):
             result = await result
+        # A checker may return a string to both signal interruption AND supply
+        # the reason (e.g. a quota gate surfacing why the run was stopped); a
+        # bare truthy value keeps the previous reason-less behaviour.
+        if isinstance(result, str):
+            self.interrupt_reason = result
         if result:
             self._interrupt_requested = True
             self.request_interrupt(self.interrupt_reason)

@@ -2233,6 +2233,12 @@ class AgentServiceManager:
                     db_session=db_session,
                 )
                 await tracker.start_tracking()
+                # Enforce quota mid-run: the pattern loop polls this every step
+                # (each LLM reply / tool call) and stops the run once its live
+                # cost would push the team over quota, instead of only metering at
+                # completion. Cleared in the finally so a reused agent_service
+                # never keeps a finished run's tracker as its checker.
+                agent_service.set_interrupt_checker(tracker.interrupt_reason_for_quota)
                 logger.info(f"Started token tracking for task {tracker_task_id}")
             except Exception as e:
                 logger.warning(
@@ -2284,6 +2290,9 @@ class AgentServiceManager:
                 )
             # Complete tracking if it was started
             if tracker:
+                # Drop the mid-run quota checker before metering so a reused
+                # agent_service can't keep calling this finished run's tracker.
+                agent_service.set_interrupt_checker(None)
                 try:
                     await tracker.complete_tracking()
                     logger.info(f"Completed token tracking for task {tracker_task_id}")

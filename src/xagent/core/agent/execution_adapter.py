@@ -33,6 +33,9 @@ class AgentExecutionConfig:
     tool_parallel_enabled: bool = field(default_factory=get_tool_parallel_enabled)
     tool_max_concurrency: int = field(default_factory=get_tool_max_concurrency)
     outbound_message_handler: Any | None = None
+    # Polled per step by the pattern loop; returns a reason to interrupt the run
+    # (e.g. a mid-run quota gate). None => never interrupt from a checker.
+    interrupt_checker: Any | None = None
     conversation_history: list[dict[str, Any]] = field(default_factory=list)
     execution_context_messages: list[dict[str, Any]] = field(default_factory=list)
     recovered_skill_context: str | None = None
@@ -90,6 +93,7 @@ class AgentExecutionAdapter:
             workspace_id=self._workspace_id(execution_id),
             allowed_external_dirs=self.config.allowed_external_dirs,
             initial_messages=self._initial_messages(),
+            interrupt_checker=self.config.interrupt_checker,
         )
         if handle.task is None:
             raise RuntimeError("Execution registry did not create a task.")
@@ -128,6 +132,7 @@ class AgentExecutionAdapter:
             workspace_id=self._workspace_id(execution_id),
             allowed_external_dirs=self.config.allowed_external_dirs,
             initial_messages=self._initial_messages(),
+            interrupt_checker=self.config.interrupt_checker,
         )
         return handle.to_dict()
 

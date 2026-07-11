@@ -104,6 +104,7 @@ class AgentService:
         self._current_runner = None
         self._execution_adapter: Any | None = None
         self._outbound_message_handler: Callable[[dict[str, Any]], Any] | None = None
+        self._interrupt_checker: Callable[[], Any] | None = None
         self._conversation_history: list[dict[str, Any]] = []
         self._execution_context_messages: list[dict[str, str]] = []
         self._recovered_skill_context: str | None = None
@@ -248,6 +249,14 @@ class AgentService:
         self._outbound_message_handler = handler
         if self._execution_adapter is not None:
             self._execution_adapter.config.outbound_message_handler = handler
+
+    def set_interrupt_checker(self, checker: Callable[[], Any] | None) -> None:
+        """Register a per-step interrupt-checker (polled by the pattern loop at
+        each LLM reply / tool call). Returning truthy — or a reason string —
+        interrupts the run. Used to enforce mid-run quota; None disables it."""
+        self._interrupt_checker = checker
+        if self._execution_adapter is not None:
+            self._execution_adapter.config.interrupt_checker = checker
 
     def set_allowed_skills(self, allowed_skills: list[str] | None) -> None:
         self.allowed_skills = allowed_skills
@@ -416,6 +425,7 @@ class AgentService:
             self._execution_adapter.config.outbound_message_handler = (
                 self._outbound_message_handler
             )
+            self._execution_adapter.config.interrupt_checker = self._interrupt_checker
             self._execution_adapter.config.conversation_history = (
                 self._conversation_history
             )
@@ -473,6 +483,7 @@ class AgentService:
                 current_task_id=self._current_task_id,
                 service_id=self.id,
                 outbound_message_handler=self._outbound_message_handler,
+                interrupt_checker=self._interrupt_checker,
                 conversation_history=self._conversation_history,
                 execution_context_messages=self._execution_context_messages,
                 recovered_skill_context=self._recovered_skill_context,

@@ -257,6 +257,46 @@ class TaskTracker:
         self._is_tracking = False
         logger.info(f"Stopped periodic token updates for task {self.task_id}")
 
+    def _turn_delta(self, usage: TokenUsage | None = None) -> tuple[list, int]:
+        """This turn's (detail entries, tool-call count) over the baseline seeded
+        in start_tracking. Single source for the completion meter and the mid-run
+        gate so they can't disagree on what 'this run's usage' means."""
+        if usage is None:
+            usage = get_token_usage()
+        return (
+            usage.details[self._initial_details_len :],
+            max(0, usage.tool_calls - self._initial_tool_calls),
+        )
+
+    def interrupt_reason_for_quota(self) -> str | None:
+        """Per-step interrupt-checker: return a reason when this run's live-so-far
+        usage would push the team over a run-gated quota, so a single long or
+        expensive run is stopped mid-flight instead of only being metered at
+        completion (``complete_tracking`` still meters the partial usage on exit).
+
+        Wired as the run's ``interrupt_checker`` and polled at every safe point
+        (each LLM reply / tool call). Synchronous and best-effort: it reuses the
+        exact turn-delta the metering path computes, and swallows errors so a
+        quota-infra hiccup fails open rather than wedging a run.
+        """
+        if not self._is_tracking:
+            return None
+        try:
+            from ..services.quota_hooks import check_run_progress_gate
+
+            delta_details, delta_actions = self._turn_delta()
+            return check_run_progress_gate(
+                self.db_session,
+                getattr(self.task, "user_id", None),
+                delta_details,
+                delta_actions,
+            )
+        except Exception as e:  # noqa: BLE001
+            logger.warning(
+                f"Quota progress gate failed open for task {self.task_id}: {e}"
+            )
+            return None
+
     async def complete_tracking(self) -> TokenUsage:
         """Complete tracking and return final statistics.
 
@@ -284,8 +324,7 @@ class TaskTracker:
         try:
             from ..services.quota_hooks import record_usage
 
-            delta_details = usage.details[self._initial_details_len :]
-            delta_actions = max(0, usage.tool_calls - self._initial_tool_calls)
+            delta_details, delta_actions = self._turn_delta(usage)
             record_usage(
                 self.db_session,
                 getattr(self.task, "user_id", None),

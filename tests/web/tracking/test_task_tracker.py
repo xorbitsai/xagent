@@ -92,6 +92,51 @@ class TestTaskTracker:
         assert sorted(d["tokens"] for d in captured["details"]) == [5, 10]
 
     @pytest.mark.asyncio
+    async def test_interrupt_reason_for_quota_passes_turn_delta(self, db_session):
+        """The per-step quota gate must see the same this-turn delta the metering
+        path computes, and surface the gate's reason (or None when open)."""
+        from xagent.core.model.chat.token_context import add_tool_call_usage
+        from xagent.web.services import quota_hooks
+
+        task = db_session.query.return_value.filter.return_value.first.return_value
+        task.user_id = 42
+        task.input_tokens = 100
+        task.output_tokens = 50
+        task.llm_calls = 1
+        task.token_usage_details = [
+            {"type": "input", "tokens": 100, "model": "m", "call_type": "chat"},
+        ]
+
+        captured = {}
+
+        def _gate(db, user_id, delta_details, delta_actions):
+            captured.update(
+                user_id=user_id, details=delta_details, actions=delta_actions
+            )
+            return "over credits" if delta_actions >= 2 else None
+
+        quota_hooks.set_run_progress_gate_hook(_gate)
+        try:
+            tracker = TaskTracker(task_id=123, db_session=db_session)
+            # Before tracking starts, the checker is a no-op (fails open).
+            assert tracker.interrupt_reason_for_quota() is None
+            await tracker.start_tracking()
+            add_token_usage(
+                input_tokens=10, output_tokens=5, model="m", call_type="chat"
+            )
+            add_tool_call_usage(2)
+            reason = tracker.interrupt_reason_for_quota()
+        finally:
+            quota_hooks.set_run_progress_gate_hook(None)
+
+        assert reason == "over credits"
+        assert captured["user_id"] == 42
+        assert captured["actions"] == 2  # only this turn's tool calls
+        # Only this turn's input+output entries, not the seeded baseline one.
+        assert len(captured["details"]) == 2
+        assert sorted(d["tokens"] for d in captured["details"]) == [5, 10]
+
+    @pytest.mark.asyncio
     async def test_init_task_tracker_with_custom_interval(self, db_session):
         """Test TaskTracker with custom update interval."""
         tracker = TaskTracker(

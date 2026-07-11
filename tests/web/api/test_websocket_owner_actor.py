@@ -312,6 +312,12 @@ async def test_resume_registration_failure_preserves_dispatched_delivery(
                 "files": [],
             },
         )
+        for _ in range(100):
+            if bg_handle.cancel.called:
+                break
+            await asyncio.sleep(0.01)
+        else:
+            raise AssertionError("resume registration failure was not handled in time")
 
     bg_handle.cancel.assert_called_once()
     db_session.expire_all()

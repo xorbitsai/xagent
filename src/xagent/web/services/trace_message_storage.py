@@ -17,7 +17,10 @@ from typing import Any, Literal
 from sqlalchemy.orm import Session
 
 from ...config import get_checkpoint_encoding_v2_enabled
-from ...core.agent.checkpoint import READABLE_CHECKPOINT_TYPES
+from ...core.agent.checkpoint import (
+    READABLE_CHECKPOINT_TYPES,
+    checkpoint_execution_id,
+)
 from ..models.task import TraceCheckpointBlob, TraceMessageBlob
 
 logger = logging.getLogger(__name__)
@@ -112,14 +115,10 @@ def get_checkpoint_messages_storage_state(
     return "none"
 
 
-def get_checkpoint_storage_state(
-    data: Any,
-    *,
-    use_v2: bool | None = None,
-) -> CheckpointStorageState:
+def get_checkpoint_storage_state(data: Any) -> CheckpointStorageState:
     """Return whether all checkpoint-optimized fields are inline or refs."""
 
-    field_states = _checkpoint_storage_field_states(data, use_v2=use_v2)
+    field_states = _checkpoint_storage_field_states(data)
     has_inline = "inline" in field_states
     has_refs = "refs" in field_states
     if has_inline and has_refs:
@@ -131,17 +130,13 @@ def get_checkpoint_storage_state(
     return "none"
 
 
-def checkpoint_storage_payload_bytes(
-    data: Any,
-    *,
-    use_v2: bool | None = None,
-) -> int:
+def checkpoint_storage_payload_bytes(data: Any) -> int:
     """Measure optimized checkpoint payload bytes inside one trace event."""
 
     if not _is_readable_checkpoint_data(data):
         return 0
 
-    if _resolve_use_v2(use_v2):
+    if _resolve_use_v2(None):
         total = sum(
             len(canonical_json_bytes(payload.value))
             for payload in _find_v2_encodable_payloads(data)
@@ -250,7 +245,7 @@ def _encode_checkpoint_data_v2(
                 blob_candidates=blob_candidates,
             )
 
-    execution_id = _checkpoint_execution_id(encoded)
+    execution_id = checkpoint_execution_id(encoded)
     _upsert_message_blobs(
         db,
         task_id=task_id,
@@ -489,7 +484,7 @@ def _encode_checkpoint_messages_in_place(
         return
 
     encoded_context = data["snapshot"]["context"]
-    execution_id = _checkpoint_execution_id(data)
+    execution_id = checkpoint_execution_id(data)
     refs: list[str] = []
     blobs_by_hash: dict[str, BlobCandidate] = {}
     for message in messages:
@@ -558,15 +553,6 @@ def _checkpoint_blob_fields_to_encode(
     return fields_to_encode
 
 
-def _checkpoint_execution_id(data: dict[str, Any]) -> str:
-    return str(
-        data.get("root_execution_id")
-        or data.get("execution_id")
-        or _get_nested(data, ("snapshot", "execution_id"))
-        or ""
-    )
-
-
 def _encode_checkpoint_blob_fields_in_place(
     db: Session,
     *,
@@ -574,7 +560,7 @@ def _encode_checkpoint_blob_fields_in_place(
     data: dict[str, Any],
     fields_to_encode: list[tuple[CheckpointBlobField, Any]],
 ) -> None:
-    execution_id = _checkpoint_execution_id(data)
+    execution_id = checkpoint_execution_id(data)
 
     blobs_by_ref: dict[tuple[str, str], BlobCandidate] = {}
     refs_by_field: dict[CheckpointBlobField, str] = {}
@@ -886,12 +872,8 @@ def _is_readable_checkpoint_data(data: Any) -> bool:
     )
 
 
-def _checkpoint_storage_field_states(
-    data: Any,
-    *,
-    use_v2: bool | None = None,
-) -> list[Literal["inline", "refs"]]:
-    if _resolve_use_v2(use_v2):
+def _checkpoint_storage_field_states(data: Any) -> list[Literal["inline", "refs"]]:
+    if _resolve_use_v2(None):
         states: list[Literal["inline", "refs"]] = []
         if _find_v2_encodable_payloads(data):
             states.append("inline")
@@ -1011,7 +993,7 @@ def _should_store_checkpoint_blob_payload(value: Any) -> bool:
     return isinstance(value, dict) and bool(value)
 
 
-def _chunks(values: list[Any], size: int) -> Iterator[list[Any]]:
+def chunks(values: list[Any], size: int) -> Iterator[list[Any]]:
     for index in range(0, len(values), size):
         yield values[index : index + size]
 
@@ -1058,7 +1040,7 @@ def _load_trace_blob_lookup(
     message_data_by_hash: dict[str, Any] = {}
     if message_refs:
         chunk_size = _sql_in_clause_chunk_size(db, reserved_binds=1)
-        for refs_chunk in _chunks(sorted(message_refs), chunk_size):
+        for refs_chunk in chunks(sorted(message_refs), chunk_size):
             rows = (
                 db.query(TraceMessageBlob)
                 .filter(
@@ -1079,7 +1061,7 @@ def _load_trace_blob_lookup(
 
         for kind, blob_hashes in refs_by_kind.items():
             chunk_size = _sql_in_clause_chunk_size(db, reserved_binds=2)
-            for hash_chunk in _chunks(sorted(blob_hashes), chunk_size):
+            for hash_chunk in chunks(sorted(blob_hashes), chunk_size):
                 rows = (
                     db.query(TraceCheckpointBlob)
                     .filter(
@@ -1138,7 +1120,7 @@ def _load_messages_by_refs(
     if lookup is None:
         by_hash: dict[str, Any] = {}
         chunk_size = _sql_in_clause_chunk_size(db, reserved_binds=1)
-        for refs_chunk in _chunks(unique_refs, chunk_size):
+        for refs_chunk in chunks(unique_refs, chunk_size):
             rows = (
                 db.query(TraceMessageBlob)
                 .filter(
@@ -1259,7 +1241,7 @@ def _upsert_message_blobs(
     hashes_to_query = sorted(set(blobs_by_hash) - pending_hashes)
     existing_hashes: set[str] = set()
     chunk_size = _sql_in_clause_chunk_size(db, reserved_binds=1)
-    for hashes_chunk in _chunks(hashes_to_query, chunk_size):
+    for hashes_chunk in chunks(hashes_to_query, chunk_size):
         rows = (
             db.query(TraceMessageBlob.message_hash, TraceMessageBlob.message_bytes)
             .filter(
@@ -1344,7 +1326,7 @@ def _upsert_checkpoint_blobs(
 
         for kind, blob_hashes in refs_by_kind.items():
             chunk_size = _sql_in_clause_chunk_size(db, reserved_binds=2)
-            for hash_chunk in _chunks(sorted(blob_hashes), chunk_size):
+            for hash_chunk in chunks(sorted(blob_hashes), chunk_size):
                 rows = (
                     db.query(
                         TraceCheckpointBlob.blob_kind,

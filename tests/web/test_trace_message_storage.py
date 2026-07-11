@@ -442,6 +442,53 @@ def test_decode_trace_events_data_degrades_when_bulk_lookup_fails() -> None:
         db.close()
 
 
+def test_ledger_records_decode_without_bulk_lookup() -> None:
+    """The no-prefetch fallback resolves per-record ledger refs correctly."""
+    from unittest.mock import patch
+
+    import xagent.web.services.trace_message_storage as tms
+
+    SessionLocal = _session_factory()
+    db = SessionLocal()
+    try:
+        task = _create_task(db)
+        task_id = int(task.id)
+        tool_ledger = {
+            f"call-{index}": {
+                "tool_call_id": f"call-{index}",
+                "result": f"output-{index}",
+            }
+            for index in range(5)
+        }
+        item = encode_checkpoint_data_for_storage(
+            db,
+            task_id=task_id,
+            data=_checkpoint_data_with_large_fields(
+                "exec-ledger-fallback",
+                [{"role": "user", "content": "hello"}],
+                tool_ledger=tool_ledger,
+            ),
+        )
+        db.flush()
+        assert (
+            item["snapshot"]["pattern_state"]["tool_ledger"]["__encoding"]
+            == LEDGER_REFS_ENCODING
+        )
+
+        boom = RuntimeError("bulk lookup boom")
+        with patch.object(tms, "_load_trace_blob_lookup", side_effect=boom):
+            decoded = decode_trace_events_data(
+                db, task_id=task_id, data_items=[item], strict=False
+            )
+
+        assert decoded[0]["snapshot"]["pattern_state"]["tool_ledger"] == tool_ledger
+        assert list(decoded[0]["snapshot"]["pattern_state"]["tool_ledger"]) == list(
+            tool_ledger
+        )
+    finally:
+        db.close()
+
+
 def test_blob_lookups_respect_sqlite_bind_parameter_limit() -> None:
     SessionLocal = _session_factory()
     db = SessionLocal()
@@ -1091,7 +1138,7 @@ def test_database_trace_handler_prunes_checkpoint_history(
         )
         # Force the batched-delete loop to run multiple chunks.
         monkeypatch.setattr(
-            "xagent.web.api.trace_handlers.PRUNE_DELETE_CHUNK_SIZE",
+            "xagent.web.api.trace_handlers.SQL_IN_CLAUSE_CHUNK_SIZE",
             1,
         )
 

@@ -9,7 +9,11 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from ...config import get_checkpoint_history_limit
-from ...core.agent.checkpoint import CHECKPOINT_TYPE, READABLE_CHECKPOINT_TYPES
+from ...core.agent.checkpoint import (
+    CHECKPOINT_TYPE,
+    READABLE_CHECKPOINT_TYPES,
+    checkpoint_execution_id,
+)
 from ...core.agent.trace import BaseTraceHandler
 from ...core.agent.trace import TraceEvent as CoreTraceEvent
 from ...core.tools.adapters.vibe.connector_runtime import (
@@ -20,16 +24,14 @@ from ...web.models.task import Task
 from ...web.models.task import TraceEvent as DatabaseTraceEvent
 from ...web.models.tool_config import ToolUsage
 from ...web.services.trace_message_storage import (
+    SQL_IN_CLAUSE_CHUNK_SIZE,
     CheckpointMessageDecodeError,
+    chunks,
     decode_trace_event_data,
     encode_checkpoint_data_for_storage,
 )
 
 logger = logging.getLogger(__name__)
-
-# Keep IN-clause deletes under SQLite's bind-parameter limit (commonly 999);
-# matches SQL_IN_CLAUSE_CHUNK_SIZE in trace_message_storage.
-PRUNE_DELETE_CHUNK_SIZE = 900
 
 
 def _convert_float_to_datetime(timestamp: Any) -> datetime:
@@ -135,9 +137,7 @@ class DatabaseTraceHandler(BaseTraceHandler):
                 data: Dict[str, Any] = row.data if isinstance(row.data, dict) else {}
                 if data.get("checkpoint_type") not in READABLE_CHECKPOINT_TYPES:
                     continue
-                if str(
-                    data.get("root_execution_id") or data.get("execution_id")
-                ) != str(execution_id):
+                if checkpoint_execution_id(data) != str(execution_id):
                     continue
                 try:
                     data = decode_trace_event_data(
@@ -307,16 +307,16 @@ class DatabaseTraceHandler(BaseTraceHandler):
         Resume only reads the most recent readable checkpoint; a few older
         rows are kept so an unreadable latest can fall back. Runs in its own
         transaction after the checkpoint commit so a prune failure can never
-        take the checkpoint write down with it. Blobs are left in place:
-        they are content-deduplicated, so the surviving checkpoints keep
-        referencing them.
+        take the checkpoint write down with it. Blobs are not touched: most
+        stay referenced by the surviving checkpoints thanks to content
+        dedup, but a blob referenced only by pruned rows (e.g. a message
+        later dropped by context compaction) is orphaned until whole-task
+        deletion cleans it up.
         """
         limit = get_checkpoint_history_limit()
         if limit <= 0:
             return
-        execution_id = str(
-            data.get("execution_id") or data.get("root_execution_id") or ""
-        )
+        execution_id = checkpoint_execution_id(data)
         if not execution_id:
             return
         try:
@@ -348,8 +348,7 @@ class DatabaseTraceHandler(BaseTraceHandler):
             stale_ids = [row_id for (row_id,) in stale_rows]
             # Chunk the IN clause: a backlog from previously-disabled pruning
             # can exceed SQLite's bind-parameter limit in one statement.
-            for start in range(0, len(stale_ids), PRUNE_DELETE_CHUNK_SIZE):
-                chunk = stale_ids[start : start + PRUNE_DELETE_CHUNK_SIZE]
+            for chunk in chunks(stale_ids, SQL_IN_CLAUSE_CHUNK_SIZE):
                 db.query(DatabaseTraceEvent).filter(
                     DatabaseTraceEvent.id.in_(chunk)
                 ).delete(synchronize_session=False)

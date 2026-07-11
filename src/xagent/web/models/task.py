@@ -315,6 +315,11 @@ class TraceEvent(Base):  # type: ignore
     """Unified trace event model for consistent storage and WebSocket transmission"""
 
     __tablename__ = "trace_events"
+    # Checkpoint pruning and latest-checkpoint loading both filter by
+    # task_id + event_type on every checkpoint write/resume.
+    __table_args__ = (
+        Index("ix_trace_events_task_id_event_type", "task_id", "event_type"),
+    )
 
     id = Column(Integer, primary_key=True, index=True)
     task_id = Column(Integer, ForeignKey("tasks.id"), nullable=False)

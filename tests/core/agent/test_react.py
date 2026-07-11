@@ -3274,6 +3274,29 @@ def test_tool_call_record_from_dict_handles_null_args() -> None:
     assert record.status == "pending"
 
 
+def test_args_hash_is_stable_sha256_digest() -> None:
+    pattern = ReActPattern()
+
+    digest = pattern._args_hash({"b": 2, "a": 1})
+
+    assert len(digest) == 64
+    assert all(char in "0123456789abcdef" for char in digest)
+    # Key order must not affect the digest.
+    assert digest == pattern._args_hash({"a": 1, "b": 2})
+    assert digest != pattern._args_hash({"a": 1, "b": 3})
+
+
+def test_args_hash_survives_circular_reference_args() -> None:
+    pattern = ReActPattern()
+    circular: dict = {"query": "x"}
+    circular["self"] = circular
+
+    digest = pattern._args_hash(circular)
+
+    assert len(digest) == 64
+    assert all(char in "0123456789abcdef" for char in digest)
+
+
 @pytest.mark.asyncio
 async def test_react_pattern_reasoning_action_mode_is_explicit_placeholder() -> None:
     pattern = ReActPattern(reasoning_mode=ReActReasoningMode.REASONING_ACTION)

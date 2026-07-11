@@ -20,6 +20,21 @@ CHECKPOINT_EVENT_TYPE = TraceEventType(
 )
 
 
+def checkpoint_execution_id(data: dict[str, Any]) -> str:
+    """Canonical execution id of a checkpoint event payload.
+
+    ``_event_payload`` writes ``root_execution_id`` and ``execution_id``
+    identically today; this helper is the single place that defines the
+    precedence (root first, then the flat field, then the snapshot's own id)
+    so readers, pruning, and the storage encoder cannot drift apart.
+    """
+    snapshot = data.get("snapshot")
+    nested = snapshot.get("execution_id") if isinstance(snapshot, dict) else None
+    return str(
+        data.get("root_execution_id") or data.get("execution_id") or nested or ""
+    )
+
+
 class CheckpointPersistenceError(RuntimeError):
     """Raised when a checkpoint cannot be durably persisted."""
 

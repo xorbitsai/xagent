@@ -1,6 +1,5 @@
 import type { Metadata } from "next";
 import type { CSSProperties } from "react";
-import Script from "next/script";
 import "./globals.css";
 import { AuthProvider } from "@/contexts/auth-context";
 import { ThemeProvider } from "@/contexts/theme-context";
@@ -128,34 +127,6 @@ export default function RootLayout({
             </AuthProvider>
           </ThemeProvider>
         </I18nProvider>
-        <Script id="scrollbar-visibility-controller" strategy="afterInteractive">
-          {`
-            (() => {
-              const hideTimers = new WeakMap();
-
-              document.addEventListener("scroll", (event) => {
-                const target = event.target;
-                if (!(target instanceof HTMLElement) || !target.classList.contains("overflow-y-auto")) {
-                  return;
-                }
-
-                target.classList.add("scrolling");
-
-                const existingTimer = hideTimers.get(target);
-                if (existingTimer) {
-                  window.clearTimeout(existingTimer);
-                }
-
-                const nextTimer = window.setTimeout(() => {
-                  target.classList.remove("scrolling");
-                  hideTimers.delete(target);
-                }, 700);
-
-                hideTimers.set(target, nextTimer);
-              }, true);
-            })();
-          `}
-        </Script>
       </body>
     </html>
   );

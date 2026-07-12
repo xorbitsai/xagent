@@ -76,6 +76,8 @@ class ClaimedTaskCommand:
     payload: dict[str, Any]
     target_run_id: str | None
     attempt_count: int
+    failure_count: int = 0
+    defer_count: int = 0
 
 
 def _utc_now() -> datetime:
@@ -198,44 +200,55 @@ def enqueue_task_command(
     )
 
 
-def _claimable_query(
-    db: Session, *, runner_id: str, command_db_id: int | None
-) -> Query[Any]:
-    now = _utc_now()
+def _claim_availability_predicate(now: datetime) -> Any:
+    return or_(
+        and_(
+            TaskExecutionCommand.status == COMMAND_PENDING,
+            or_(
+                TaskExecutionCommand.claim_expires_at.is_(None),
+                TaskExecutionCommand.claim_expires_at < now,
+            ),
+        ),
+        and_(
+            TaskExecutionCommand.status == COMMAND_PROCESSING,
+            TaskExecutionCommand.claim_expires_at < now,
+        ),
+    )
+
+
+def _command_routing_predicate(runner_id: str, now: datetime) -> Any:
+    return or_(
+        TaskExecutionCommand.target_runner_id.is_(None),
+        TaskExecutionCommand.target_runner_id == runner_id,
+        Task.runner_id == runner_id,
+        Task.runner_id.is_(None),
+        Task.lease_expires_at.is_(None),
+        Task.lease_expires_at < now,
+    )
+
+
+def _unfinished_earlier_command() -> Any:
     earlier = aliased(TaskExecutionCommand)
-    unfinished_earlier = exists(
+    return exists(
         select(1).where(
             earlier.task_id == TaskExecutionCommand.task_id,
             earlier.id < TaskExecutionCommand.id,
             earlier.status.notin_(COMMAND_TERMINAL),
         )
     )
+
+
+def _claimable_query(
+    db: Session, *, runner_id: str, command_db_id: int | None
+) -> Query[Any]:
+    now = _utc_now()
     query = (
         db.query(TaskExecutionCommand)
         .join(Task, Task.id == TaskExecutionCommand.task_id)
         .filter(
-            or_(
-                and_(
-                    TaskExecutionCommand.status == COMMAND_PENDING,
-                    or_(
-                        TaskExecutionCommand.claim_expires_at.is_(None),
-                        TaskExecutionCommand.claim_expires_at < now,
-                    ),
-                ),
-                and_(
-                    TaskExecutionCommand.status == COMMAND_PROCESSING,
-                    TaskExecutionCommand.claim_expires_at < now,
-                ),
-            ),
-            ~unfinished_earlier,
-            or_(
-                TaskExecutionCommand.target_runner_id.is_(None),
-                TaskExecutionCommand.target_runner_id == runner_id,
-                Task.runner_id == runner_id,
-                Task.runner_id.is_(None),
-                Task.lease_expires_at.is_(None),
-                Task.lease_expires_at < now,
-            ),
+            _claim_availability_predicate(now),
+            ~_unfinished_earlier_command(),
+            _command_routing_predicate(runner_id, now),
         )
     )
     if command_db_id is not None:
@@ -262,17 +275,19 @@ def claim_task_command(
 
     now = _utc_now()
     expires = now + timedelta(seconds=get_task_lease_ttl_seconds())
+    routable_task = exists(
+        select(1).where(
+            Task.id == TaskExecutionCommand.task_id,
+            _command_routing_predicate(resolved_runner_id, now),
+        )
+    )
     claimed = (
         db.query(TaskExecutionCommand)
         .filter(
             TaskExecutionCommand.id == int(candidate.id),
-            or_(
-                TaskExecutionCommand.status == COMMAND_PENDING,
-                and_(
-                    TaskExecutionCommand.status == COMMAND_PROCESSING,
-                    TaskExecutionCommand.claim_expires_at < now,
-                ),
-            ),
+            _claim_availability_predicate(now),
+            ~_unfinished_earlier_command(),
+            routable_task,
         )
         .update(
             {
@@ -309,30 +324,38 @@ def claim_task_command(
         payload=payload,
         target_run_id=(str(fresh.target_run_id) if fresh.target_run_id else None),
         attempt_count=int(fresh.attempt_count or 0),
+        failure_count=int(fresh.failure_count or 0),
+        defer_count=int(fresh.defer_count or 0),
     )
 
 
-def renew_task_command_claim(command_db_id: int, runner_id: str) -> bool:
+def renew_task_command_claim(
+    command_db_id: int,
+    runner_id: str,
+    *,
+    expected_attempt_count: int | None = None,
+) -> bool:
     from ..models.database import get_session_local
 
     SessionLocal = get_session_local()
     now = _utc_now()
     with SessionLocal() as db:
-        updated = (
-            db.query(TaskExecutionCommand)
-            .filter(
-                TaskExecutionCommand.id == command_db_id,
-                TaskExecutionCommand.status == COMMAND_PROCESSING,
-                TaskExecutionCommand.claimed_by == runner_id,
+        query = db.query(TaskExecutionCommand).filter(
+            TaskExecutionCommand.id == command_db_id,
+            TaskExecutionCommand.status == COMMAND_PROCESSING,
+            TaskExecutionCommand.claimed_by == runner_id,
+        )
+        if expected_attempt_count is not None:
+            query = query.filter(
+                TaskExecutionCommand.attempt_count == expected_attempt_count
             )
-            .update(
-                {
-                    TaskExecutionCommand.claim_expires_at: now
-                    + timedelta(seconds=get_task_lease_ttl_seconds()),
-                    TaskExecutionCommand.updated_at: now,
-                },
-                synchronize_session=False,
-            )
+        updated = query.update(
+            {
+                TaskExecutionCommand.claim_expires_at: now
+                + timedelta(seconds=get_task_lease_ttl_seconds()),
+                TaskExecutionCommand.updated_at: now,
+            },
+            synchronize_session=False,
         )
         db.commit()
         return updated == 1
@@ -341,6 +364,7 @@ def renew_task_command_claim(command_db_id: int, runner_id: str) -> bool:
 async def _claim_heartbeat(
     command_db_id: int,
     runner_id: str,
+    attempt_count: int,
     stop_event: asyncio.Event,
 ) -> None:
     interval = get_task_lease_heartbeat_seconds()
@@ -352,7 +376,10 @@ async def _claim_heartbeat(
             pass
         try:
             renewed = await asyncio.to_thread(
-                renew_task_command_claim, command_db_id, runner_id
+                renew_task_command_claim,
+                command_db_id,
+                runner_id,
+                expected_attempt_count=attempt_count,
             )
         except Exception as exc:  # noqa: BLE001
             logger.warning(
@@ -371,31 +398,33 @@ def finish_task_command(
     runner_id: str,
     *,
     result: dict[str, Any] | None = None,
+    expected_attempt_count: int | None = None,
 ) -> bool:
     from ..models.database import get_session_local
 
     SessionLocal = get_session_local()
     now = _utc_now()
     with SessionLocal() as db:
-        updated = (
-            db.query(TaskExecutionCommand)
-            .filter(
-                TaskExecutionCommand.id == command_db_id,
-                TaskExecutionCommand.status == COMMAND_PROCESSING,
-                TaskExecutionCommand.claimed_by == runner_id,
+        query = db.query(TaskExecutionCommand).filter(
+            TaskExecutionCommand.id == command_db_id,
+            TaskExecutionCommand.status == COMMAND_PROCESSING,
+            TaskExecutionCommand.claimed_by == runner_id,
+        )
+        if expected_attempt_count is not None:
+            query = query.filter(
+                TaskExecutionCommand.attempt_count == expected_attempt_count
             )
-            .update(
-                {
-                    TaskExecutionCommand.status: COMMAND_COMPLETED,
-                    TaskExecutionCommand.result: result,
-                    TaskExecutionCommand.error: None,
-                    TaskExecutionCommand.claimed_by: None,
-                    TaskExecutionCommand.claim_expires_at: None,
-                    TaskExecutionCommand.completed_at: now,
-                    TaskExecutionCommand.updated_at: now,
-                },
-                synchronize_session=False,
-            )
+        updated = query.update(
+            {
+                TaskExecutionCommand.status: COMMAND_COMPLETED,
+                TaskExecutionCommand.result: result,
+                TaskExecutionCommand.error: None,
+                TaskExecutionCommand.claimed_by: None,
+                TaskExecutionCommand.claim_expires_at: None,
+                TaskExecutionCommand.completed_at: now,
+                TaskExecutionCommand.updated_at: now,
+            },
+            synchronize_session=False,
         )
         db.commit()
         return updated == 1
@@ -407,6 +436,7 @@ def fail_task_command(
     error: str,
     *,
     force_terminal: bool = False,
+    expected_attempt_count: int | None = None,
 ) -> bool:
     """Retry a failed claim, or make it terminal after bounded attempts."""
 
@@ -415,31 +445,56 @@ def fail_task_command(
     SessionLocal = get_session_local()
     now = _utc_now()
     with SessionLocal() as db:
-        command = (
+        snapshot_query = db.query(
+            TaskExecutionCommand.failure_count,
+            TaskExecutionCommand.attempt_count,
+        ).filter(
+            TaskExecutionCommand.id == command_db_id,
+            TaskExecutionCommand.status == COMMAND_PROCESSING,
+            TaskExecutionCommand.claimed_by == runner_id,
+        )
+        if expected_attempt_count is not None:
+            snapshot_query = snapshot_query.filter(
+                TaskExecutionCommand.attempt_count == expected_attempt_count
+            )
+        snapshot = snapshot_query.first()
+        if snapshot is None:
+            return False
+        observed_failure_count = int(snapshot.failure_count or 0)
+        observed_attempt_count = int(snapshot.attempt_count or 0)
+        failure_count = observed_failure_count + 1
+        terminal = force_terminal or failure_count >= MAX_COMMAND_FAILURES
+        updated = (
             db.query(TaskExecutionCommand)
             .filter(
                 TaskExecutionCommand.id == command_db_id,
                 TaskExecutionCommand.status == COMMAND_PROCESSING,
                 TaskExecutionCommand.claimed_by == runner_id,
+                TaskExecutionCommand.failure_count == observed_failure_count,
+                TaskExecutionCommand.attempt_count == observed_attempt_count,
             )
-            .first()
+            .update(
+                {
+                    TaskExecutionCommand.status: (
+                        COMMAND_FAILED if terminal else COMMAND_PENDING
+                    ),
+                    TaskExecutionCommand.failure_count: failure_count,
+                    TaskExecutionCommand.error: error[:4000],
+                    TaskExecutionCommand.claimed_by: None,
+                    TaskExecutionCommand.claim_expires_at: (
+                        None
+                        if terminal
+                        else now + timedelta(seconds=min(2**failure_count, 30))
+                    ),
+                    TaskExecutionCommand.updated_at: now,
+                    TaskExecutionCommand.completed_at: now if terminal else None,
+                },
+                synchronize_session=False,
+            )
         )
-        if command is None:
-            return False
-        failure_count = int(command.failure_count or 0) + 1
-        terminal = force_terminal or failure_count >= MAX_COMMAND_FAILURES
-        setattr(command, "status", COMMAND_FAILED if terminal else COMMAND_PENDING)
-        setattr(command, "failure_count", failure_count)
-        setattr(command, "error", error[:4000])
-        setattr(command, "claimed_by", None)
-        setattr(
-            command,
-            "claim_expires_at",
-            None if terminal else now + timedelta(seconds=min(2**failure_count, 30)),
-        )
-        setattr(command, "updated_at", now)
-        setattr(command, "completed_at", now if terminal else None)
         db.commit()
+        if updated != 1:
+            return False
     if not terminal:
         notify_task_command_dispatcher()
     return True
@@ -449,6 +504,8 @@ def defer_task_command(
     command_db_id: int,
     runner_id: str,
     reason: str,
+    *,
+    expected_attempt_count: int | None = None,
 ) -> bool:
     """Release a claim for retry without consuming the failure budget."""
 
@@ -457,40 +514,103 @@ def defer_task_command(
     SessionLocal = get_session_local()
     now = _utc_now()
     with SessionLocal() as db:
-        command = (
+        snapshot_query = db.query(
+            TaskExecutionCommand.defer_count,
+            TaskExecutionCommand.attempt_count,
+        ).filter(
+            TaskExecutionCommand.id == command_db_id,
+            TaskExecutionCommand.status == COMMAND_PROCESSING,
+            TaskExecutionCommand.claimed_by == runner_id,
+        )
+        if expected_attempt_count is not None:
+            snapshot_query = snapshot_query.filter(
+                TaskExecutionCommand.attempt_count == expected_attempt_count
+            )
+        snapshot = snapshot_query.first()
+        if snapshot is None:
+            return False
+        observed_defer_count = int(snapshot.defer_count or 0)
+        observed_attempt_count = int(snapshot.attempt_count or 0)
+        defer_count = observed_defer_count + 1
+        terminal = defer_count >= MAX_COMMAND_DEFERS
+        updated = (
             db.query(TaskExecutionCommand)
             .filter(
                 TaskExecutionCommand.id == command_db_id,
                 TaskExecutionCommand.status == COMMAND_PROCESSING,
                 TaskExecutionCommand.claimed_by == runner_id,
+                TaskExecutionCommand.defer_count == observed_defer_count,
+                TaskExecutionCommand.attempt_count == observed_attempt_count,
             )
-            .first()
+            .update(
+                {
+                    TaskExecutionCommand.status: (
+                        COMMAND_FAILED if terminal else COMMAND_PENDING
+                    ),
+                    TaskExecutionCommand.defer_count: defer_count,
+                    TaskExecutionCommand.error: (
+                        (
+                            f"Deferred command exceeded retry budget: {reason}"
+                            if terminal
+                            else reason
+                        )[:4000]
+                    ),
+                    TaskExecutionCommand.claimed_by: None,
+                    TaskExecutionCommand.claim_expires_at: (
+                        None if terminal else now + timedelta(seconds=1)
+                    ),
+                    TaskExecutionCommand.updated_at: now,
+                    TaskExecutionCommand.completed_at: now if terminal else None,
+                },
+                synchronize_session=False,
+            )
         )
-        if command is None:
-            return False
-        terminal = int(command.attempt_count or 0) >= MAX_COMMAND_DEFERS
-        setattr(command, "status", COMMAND_FAILED if terminal else COMMAND_PENDING)
-        setattr(
-            command,
-            "error",
-            (
-                f"Deferred command exceeded retry budget: {reason}"
-                if terminal
-                else reason
-            )[:4000],
-        )
-        setattr(command, "claimed_by", None)
-        setattr(
-            command,
-            "claim_expires_at",
-            None if terminal else now + timedelta(seconds=1),
-        )
-        setattr(command, "updated_at", now)
-        setattr(command, "completed_at", now if terminal else None)
         db.commit()
+        if updated != 1:
+            return False
     if not terminal:
         notify_task_command_dispatcher()
     return True
+
+
+def retry_failed_task_command(
+    db: Session,
+    command_db_id: int,
+    *,
+    target_run_id: str | None,
+    target_runner_id: str | None,
+) -> bool:
+    """Atomically reset a terminal command for an explicit client retry."""
+
+    now = _utc_now()
+    updated = (
+        db.query(TaskExecutionCommand)
+        .filter(
+            TaskExecutionCommand.id == command_db_id,
+            TaskExecutionCommand.status == COMMAND_FAILED,
+        )
+        .update(
+            {
+                TaskExecutionCommand.status: COMMAND_PENDING,
+                TaskExecutionCommand.failure_count: 0,
+                TaskExecutionCommand.defer_count: 0,
+                TaskExecutionCommand.error: None,
+                TaskExecutionCommand.result: None,
+                TaskExecutionCommand.claimed_by: None,
+                TaskExecutionCommand.claim_expires_at: None,
+                TaskExecutionCommand.target_run_id: target_run_id,
+                TaskExecutionCommand.target_runner_id: target_runner_id,
+                TaskExecutionCommand.completed_at: None,
+                TaskExecutionCommand.updated_at: now,
+            },
+            synchronize_session=False,
+        )
+    )
+    db.commit()
+    if updated == 1:
+        notify_task_command_dispatcher()
+        return True
+    return False
 
 
 def task_has_live_foreign_runner(
@@ -554,7 +674,7 @@ async def dispatch_one_task_command(
 
     stop_event = asyncio.Event()
     heartbeat = asyncio.get_running_loop().create_task(
-        _claim_heartbeat(command.id, runner_id, stop_event)
+        _claim_heartbeat(command.id, runner_id, command.attempt_count, stop_event)
     )
     try:
         result = await executor(command)
@@ -568,6 +688,7 @@ async def dispatch_one_task_command(
             command.id,
             runner_id,
             str(exc),
+            expected_attempt_count=command.attempt_count,
         )
     except TaskCommandRejected as exc:
         await asyncio.to_thread(
@@ -576,6 +697,7 @@ async def dispatch_one_task_command(
             runner_id,
             str(exc),
             force_terminal=True,
+            expected_attempt_count=command.attempt_count,
         )
     except Exception as exc:  # noqa: BLE001
         logger.exception(
@@ -584,13 +706,20 @@ async def dispatch_one_task_command(
             command.kind.value,
             command.attempt_count,
         )
-        await asyncio.to_thread(fail_task_command, command.id, runner_id, str(exc))
+        await asyncio.to_thread(
+            fail_task_command,
+            command.id,
+            runner_id,
+            str(exc),
+            expected_attempt_count=command.attempt_count,
+        )
     else:
         if not await asyncio.to_thread(
             finish_task_command,
             command.id,
             runner_id,
             result=result,
+            expected_attempt_count=command.attempt_count,
         ):
             logger.warning("Lost claim while completing task command %s", command.id)
     finally:

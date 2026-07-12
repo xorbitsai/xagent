@@ -5,10 +5,12 @@ import logging
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta
 from threading import Barrier
+from unittest.mock import AsyncMock, patch
 
 import pytest
 from sqlalchemy import inspect as sa_inspect
 
+from xagent.web.api import websocket as websocket_api
 from xagent.web.api.websocket import (
     _load_command_message_delivery_status,
     execute_durable_task_command,
@@ -35,6 +37,7 @@ from xagent.web.services.task_command_transport import (
     TaskCommandRejected,
     _claim_heartbeat,
     claim_task_command,
+    defer_task_command,
     dispatch_one_task_command,
     dispatch_task_command_promptly,
     enqueue_task_command,
@@ -42,6 +45,8 @@ from xagent.web.services.task_command_transport import (
     finish_task_command,
     load_task_command,
     notify_task_command_dispatcher,
+    renew_task_command_claim,
+    retry_failed_task_command,
     start_task_command_dispatcher,
     stop_task_command_dispatcher,
     task_has_live_foreign_runner,
@@ -202,6 +207,69 @@ def test_same_command_row_has_a_single_concurrent_claim_winner(db_session) -> No
     assert winners == [command.command_id]
 
 
+def test_stale_attempt_cannot_mutate_reclaimed_command(db_session) -> None:
+    user, task = _create_running_task(db_session)
+    task.runner_id = None
+    task.lease_expires_at = None
+    db_session.commit()
+    enqueued = enqueue_task_command(
+        db_session,
+        task_id=int(task.id),
+        actor_user_id=int(user.id),
+        command_id="reclaimed-generation",
+        kind=TaskCommandKind.PAUSE,
+        payload={"type": "pause_task"},
+    )
+    first = claim_task_command(
+        db_session,
+        runner_id="runner-a",
+        command_db_id=enqueued.command_id,
+    )
+    assert first is not None
+    row = db_session.get(TaskExecutionCommand, enqueued.command_id)
+    assert row is not None
+    row.claim_expires_at = datetime.utcnow() - timedelta(seconds=1)
+    db_session.commit()
+
+    second = claim_task_command(
+        db_session,
+        runner_id="runner-a",
+        command_db_id=enqueued.command_id,
+    )
+    assert second is not None
+    assert second.attempt_count == first.attempt_count + 1
+
+    assert not renew_task_command_claim(
+        enqueued.command_id,
+        "runner-a",
+        expected_attempt_count=first.attempt_count,
+    )
+    assert not fail_task_command(
+        enqueued.command_id,
+        "runner-a",
+        "stale failure",
+        expected_attempt_count=first.attempt_count,
+    )
+    assert not defer_task_command(
+        enqueued.command_id,
+        "runner-a",
+        "stale deferral",
+        expected_attempt_count=first.attempt_count,
+    )
+    assert not finish_task_command(
+        enqueued.command_id,
+        "runner-a",
+        expected_attempt_count=first.attempt_count,
+    )
+
+    db_session.expire_all()
+    row = db_session.get(TaskExecutionCommand, enqueued.command_id)
+    assert row is not None
+    assert row.status == "processing"
+    assert row.claimed_by == "runner-a"
+    assert row.attempt_count == second.attempt_count
+
+
 def test_live_foreign_runner_is_rechecked_before_cancel(db_session) -> None:
     _user, task = _create_running_task(db_session)
 
@@ -263,6 +331,103 @@ async def test_cancel_command_defers_on_a_live_foreign_owner(db_session) -> None
 
     with pytest.raises(TaskCommandDeferred, match="active task lease owner"):
         await execute_durable_task_command(command)
+
+
+@pytest.mark.asyncio
+async def test_cancel_command_does_not_require_persisted_actor(db_session) -> None:
+    _user, task = _create_running_task(db_session)
+    task.runner_id = None
+    task.lease_expires_at = None
+    db_session.commit()
+    command = ClaimedTaskCommand(
+        id=1,
+        task_id=int(task.id),
+        actor_user_id=None,
+        command_id="cancel-with-deleted-actor",
+        kind=TaskCommandKind.CANCEL,
+        payload={},
+        target_run_id=None,
+        attempt_count=1,
+    )
+
+    with (
+        patch.object(websocket_api, "_load_command_actor") as load_actor,
+        pytest.raises(ValueError, match="Agent ID is missing"),
+    ):
+        await execute_durable_task_command(command)
+    load_actor.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_only_terminal_command_failure_is_broadcast(db_session) -> None:
+    _user, task = _create_running_task(db_session)
+    task.runner_id = None
+    task.lease_expires_at = None
+    db_session.commit()
+    transient = ClaimedTaskCommand(
+        id=1,
+        task_id=int(task.id),
+        actor_user_id=None,
+        command_id="transient-cancel-failure",
+        kind=TaskCommandKind.CANCEL,
+        payload={},
+        target_run_id=None,
+        attempt_count=1,
+        failure_count=0,
+    )
+    terminal = ClaimedTaskCommand(
+        id=2,
+        task_id=int(task.id),
+        actor_user_id=None,
+        command_id="terminal-cancel-failure",
+        kind=TaskCommandKind.CANCEL,
+        payload={},
+        target_run_id=None,
+        attempt_count=1,
+        failure_count=MAX_COMMAND_FAILURES - 1,
+    )
+
+    with patch.object(
+        websocket_api.manager,
+        "broadcast_to_task",
+        new=AsyncMock(),
+    ) as broadcast:
+        with pytest.raises(ValueError, match="Agent ID is missing"):
+            await execute_durable_task_command(transient)
+        broadcast.assert_not_awaited()
+
+        with pytest.raises(ValueError, match="Agent ID is missing"):
+            await execute_durable_task_command(terminal)
+        broadcast.assert_awaited_once()
+        event, event_task_id = broadcast.await_args.args
+        assert event_task_id == int(task.id)
+        assert event["type"] == "agent_error"
+        assert event["command_id"] == "terminal-cancel-failure"
+
+
+@pytest.mark.asyncio
+async def test_final_command_deferral_is_broadcast(db_session) -> None:
+    _user, task = _create_running_task(db_session)
+    command = ClaimedTaskCommand(
+        id=1,
+        task_id=int(task.id),
+        actor_user_id=None,
+        command_id="terminal-cancel-defer",
+        kind=TaskCommandKind.CANCEL,
+        payload={"agent_id": 1},
+        target_run_id=None,
+        attempt_count=1,
+        defer_count=MAX_COMMAND_DEFERS - 1,
+    )
+
+    with patch.object(
+        websocket_api.manager,
+        "broadcast_to_task",
+        new=AsyncMock(),
+    ) as broadcast:
+        with pytest.raises(TaskCommandDeferred, match="active task lease owner"):
+            await execute_durable_task_command(command)
+        broadcast.assert_awaited_once()
 
 
 @pytest.mark.asyncio
@@ -385,6 +550,7 @@ async def test_deferred_handoff_retries_without_consuming_failure_budget(
     assert stored.status == "pending"
     assert stored.attempt_count == 1
     assert stored.failure_count == 0
+    assert stored.defer_count == 1
     assert stored.claim_expires_at is not None
 
     stored.claim_expires_at = datetime.utcnow() - timedelta(seconds=1)
@@ -400,6 +566,7 @@ async def test_deferred_handoff_retries_without_consuming_failure_budget(
     assert stored.status == COMMAND_COMPLETED
     assert stored.attempt_count == 2
     assert stored.failure_count == 0
+    assert stored.defer_count == 1
 
 
 @pytest.mark.asyncio
@@ -428,7 +595,7 @@ async def test_deferred_message_eventually_fails_and_unblocks_cancel(
     )
     row = db_session.get(TaskExecutionCommand, message.command_id)
     assert row is not None
-    row.attempt_count = MAX_COMMAND_DEFERS - 1
+    row.defer_count = MAX_COMMAND_DEFERS - 1
     db_session.commit()
 
     async def defer(_command):
@@ -440,6 +607,7 @@ async def test_deferred_message_eventually_fails_and_unblocks_cancel(
     assert row is not None
     assert row.status == COMMAND_FAILED
     assert row.failure_count == 0
+    assert row.defer_count == MAX_COMMAND_DEFERS
 
     cancel_claim = claim_task_command(db_session)
     assert cancel_claim is not None
@@ -475,8 +643,47 @@ async def test_real_failures_use_a_separate_bounded_budget(db_session) -> None:
     assert row.failure_count == MAX_COMMAND_FAILURES
 
 
+def test_failed_command_can_be_reset_for_explicit_retry(db_session) -> None:
+    user, task = _create_running_task(db_session)
+    enqueued = enqueue_task_command(
+        db_session,
+        task_id=int(task.id),
+        actor_user_id=int(user.id),
+        command_id="retry-terminal-command",
+        kind=TaskCommandKind.CANCEL,
+        payload={"agent_id": 1},
+    )
+    row = db_session.get(TaskExecutionCommand, enqueued.command_id)
+    assert row is not None
+    row.status = COMMAND_FAILED
+    row.failure_count = MAX_COMMAND_FAILURES
+    row.defer_count = MAX_COMMAND_DEFERS
+    row.error = "temporary cancellation failure"
+    row.completed_at = datetime.utcnow()
+    db_session.commit()
+
+    assert retry_failed_task_command(
+        db_session,
+        enqueued.command_id,
+        target_run_id="run-2",
+        target_runner_id="runner-b",
+    )
+    db_session.expire_all()
+    row = db_session.get(TaskExecutionCommand, enqueued.command_id)
+    assert row is not None
+    assert row.status == "pending"
+    assert row.failure_count == 0
+    assert row.defer_count == 0
+    assert row.error is None
+    assert row.completed_at is None
+    assert row.target_run_id == "run-2"
+    assert row.target_runner_id == "runner-b"
+
+
 @pytest.mark.asyncio
-async def test_recovery_does_not_restart_a_committed_new_turn(db_session) -> None:
+async def test_recovery_dispatches_committed_message_across_run_rotation(
+    db_session,
+) -> None:
     user, task = _create_running_task(db_session)
     task.input = "already committed"
     enqueued = enqueue_task_command(
@@ -507,6 +714,9 @@ async def test_recovery_does_not_restart_a_committed_new_turn(db_session) -> Non
     )
     row = db_session.query(TaskExecutionCommand).filter_by(id=enqueued.command_id).one()
     row.claim_expires_at = datetime.utcnow() - timedelta(seconds=1)
+    # MESSAGE commands represent user intent for the task rather than a control
+    # mutation on one run, so recovery deliberately applies them after rotation.
+    task.run_id = "run-2"
     task.lease_expires_at = datetime.utcnow() - timedelta(seconds=1)
     db_session.commit()
 
@@ -525,6 +735,7 @@ async def test_recovery_does_not_restart_a_committed_new_turn(db_session) -> Non
     command = db_session.get(TaskExecutionCommand, enqueued.command_id)
     assert command is not None
     assert command.status == COMMAND_COMPLETED
+    assert task.run_id == "run-2"
 
 
 @pytest.mark.asyncio
@@ -618,8 +829,14 @@ async def test_claim_heartbeat_survives_transient_database_error(
     stop_event = asyncio.Event()
     attempts = 0
 
-    def renew(_command_db_id: int, _runner_id: str) -> bool:
+    def renew(
+        _command_db_id: int,
+        _runner_id: str,
+        *,
+        expected_attempt_count: int | None = None,
+    ) -> bool:
         nonlocal attempts
+        assert expected_attempt_count == 3
         attempts += 1
         if attempts == 1:
             raise RuntimeError("temporary database outage")
@@ -635,7 +852,7 @@ async def test_claim_heartbeat_survives_transient_database_error(
         renew,
     )
 
-    await asyncio.wait_for(_claim_heartbeat(7, "runner-a", stop_event), timeout=0.2)
+    await asyncio.wait_for(_claim_heartbeat(7, "runner-a", 3, stop_event), timeout=0.2)
 
     assert attempts == 2
 

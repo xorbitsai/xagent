@@ -44,6 +44,7 @@ def test_upgrade_adds_durable_task_command_inbox() -> None:
             "claim_expires_at",
             "attempt_count",
             "failure_count",
+            "defer_count",
             "result",
             "error",
             "completed_at",

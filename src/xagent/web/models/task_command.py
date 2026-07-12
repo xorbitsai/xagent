@@ -55,6 +55,7 @@ class TaskExecutionCommand(Base):  # type: ignore
     claim_expires_at = Column(DateTime(timezone=True), nullable=True)
     attempt_count = Column(Integer, nullable=False, default=0, server_default="0")
     failure_count = Column(Integer, nullable=False, default=0, server_default="0")
+    defer_count = Column(Integer, nullable=False, default=0, server_default="0")
     result = Column(JSON, nullable=True)
     error = Column(Text, nullable=True)
     created_at = Column(

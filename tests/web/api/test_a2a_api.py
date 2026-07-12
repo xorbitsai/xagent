@@ -9,7 +9,13 @@ from xagent.web.api import a2a as a2a_api
 from xagent.web.models.agent import Agent
 from xagent.web.models.agent_api_key import AgentApiKey
 from xagent.web.models.task import Task, TaskStatus
+from xagent.web.models.task_command import TaskExecutionCommand
 from xagent.web.services.a2a_protocol import A2A_MAX_MESSAGE_TEXT_LENGTH
+from xagent.web.services.task_command_transport import (
+    COMMAND_FAILED,
+    MAX_COMMAND_DEFERS,
+    MAX_COMMAND_FAILURES,
+)
 from xagent.web.services.task_orchestrator import TaskTurnError
 
 from .conftest import _admin_headers, _direct_db_session, client
@@ -888,6 +894,124 @@ def test_cancel_is_idempotent_and_subscribe_rejects_terminal_task() -> None:
     assert second.json()["status"]["state"] == "TASK_STATE_CANCELED"
     assert subscribed.status_code == 400
     assert subscribed.json()["error"]["details"][0]["reason"] == "UNSUPPORTED_OPERATION"
+
+
+def test_cancel_retries_a_previous_terminal_transport_failure() -> None:
+    agent_id, full_key = _create_published_agent_with_key()
+    with patch(
+        "xagent.web.services.task_orchestrator._schedule_bg",
+        new=MagicMock(),
+    ):
+        created = client.post(
+            f"/api/a2a/agents/{agent_id}/message:send",
+            headers=_bearer(full_key),
+            json={
+                "message": {
+                    "messageId": "msg-retry-cancel",
+                    "role": "ROLE_USER",
+                    "parts": [{"text": "cancel me after a retry"}],
+                },
+                "configuration": {"returnImmediately": True},
+            },
+        )
+    assert created.status_code == 200, created.text
+    task_id = int(created.json()["task"]["id"])
+
+    db = _direct_db_session()
+    try:
+        agent = db.query(Agent).filter(Agent.id == agent_id).one()
+        task = db.query(Task).filter(Task.id == task_id).one()
+        db.add(
+            TaskExecutionCommand(
+                task_id=task_id,
+                actor_user_id=int(agent.user_id),
+                command_id=f"cancel:{task_id}:{task.run_id or task.state_version}",
+                kind="cancel",
+                payload={"agent_id": agent_id},
+                target_run_id=str(task.run_id) if task.run_id is not None else None,
+                target_runner_id=None,
+                status=COMMAND_FAILED,
+                attempt_count=1,
+                failure_count=MAX_COMMAND_FAILURES,
+                defer_count=MAX_COMMAND_DEFERS,
+                error="temporary transport failure",
+                completed_at=datetime.now(UTC),
+            )
+        )
+        db.commit()
+    finally:
+        db.close()
+
+    response = client.post(
+        f"/api/a2a/agents/{agent_id}/tasks/{task_id}:cancel",
+        headers=_bearer(full_key),
+    )
+
+    assert response.status_code == 200, response.text
+    assert response.json()["status"]["state"] == "TASK_STATE_CANCELED"
+    db = _direct_db_session()
+    try:
+        command = (
+            db.query(TaskExecutionCommand)
+            .filter(TaskExecutionCommand.task_id == task_id)
+            .one()
+        )
+        assert command.status == "completed"
+        assert command.failure_count == 0
+        assert command.defer_count == 0
+    finally:
+        db.close()
+
+
+@pytest.mark.asyncio
+async def test_cancel_does_not_overwrite_a_concurrent_completion() -> None:
+    agent_id, _full_key = _create_published_agent_with_key()
+    db = _direct_db_session()
+    try:
+        agent = db.query(Agent).filter(Agent.id == agent_id).one()
+        task = Task(
+            user_id=int(agent.user_id),
+            title="cancel completion race",
+            status=TaskStatus.RUNNING,
+            agent_id=agent_id,
+            source="a2a",
+            is_visible=False,
+            agent_config={"a2a_context_id": "ctx-cancel-race"},
+        )
+        db.add(task)
+        db.commit()
+        db.refresh(task)
+        task_id = int(task.id)
+
+        async def complete_during_cancel(_task_id: int) -> None:
+            concurrent_db = _direct_db_session()
+            try:
+                concurrent_task = (
+                    concurrent_db.query(Task).filter(Task.id == task_id).one()
+                )
+                concurrent_task.status = TaskStatus.COMPLETED
+                concurrent_task.output = "completed concurrently"
+                concurrent_db.commit()
+            finally:
+                concurrent_db.close()
+
+        with patch(
+            "xagent.web.api.websocket.background_task_manager.cancel_task",
+            new=AsyncMock(side_effect=complete_during_cancel),
+        ):
+            await a2a_api._cancel_task_unserialized(
+                task_id=task_id,
+                agent=agent,
+                db=db,
+            )
+
+        db.expire_all()
+        completed = db.query(Task).filter(Task.id == task_id).one()
+        assert completed.status == TaskStatus.COMPLETED
+        assert completed.output == "completed concurrently"
+        assert completed.error_message is None
+    finally:
+        db.close()
 
 
 def test_subscribe_stream_starts_with_wrapped_task_snapshot() -> None:

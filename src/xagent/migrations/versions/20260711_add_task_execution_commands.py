@@ -55,6 +55,7 @@ def upgrade() -> None:
         sa.Column("claim_expires_at", sa.DateTime(timezone=True), nullable=True),
         sa.Column("attempt_count", sa.Integer(), nullable=False, server_default="0"),
         sa.Column("failure_count", sa.Integer(), nullable=False, server_default="0"),
+        sa.Column("defer_count", sa.Integer(), nullable=False, server_default="0"),
         sa.Column("result", sa.JSON(), nullable=True),
         sa.Column("error", sa.Text(), nullable=True),
         sa.Column(

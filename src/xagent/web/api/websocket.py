@@ -84,6 +84,8 @@ from ..services.managed_file_ref import (
 )
 from ..services.task_command_transport import (
     COMMAND_ID_PATTERN,
+    MAX_COMMAND_DEFERS,
+    MAX_COMMAND_FAILURES,
     ClaimedTaskCommand,
     EnqueuedTaskCommand,
     TaskCommandDeferred,
@@ -5481,7 +5483,7 @@ def _load_command_actor(actor_user_id: int | None) -> User:
         return user
 
 
-async def execute_durable_task_command(
+async def _execute_durable_task_command(
     command: ClaimedTaskCommand,
 ) -> dict[str, Any] | None:
     """Apply one DB-claimed command using the existing transport adapters.
@@ -5492,19 +5494,19 @@ async def execute_durable_task_command(
     still broadcast normally.
     """
 
-    user = await asyncio.to_thread(_load_command_actor, command.actor_user_id)
     connections = manager.active_connections.get(command.task_id, [])
     websocket: Any = connections[0] if connections else _DiscardingCommandWebSocket()
     message_data = dict(command.payload)
     message_data.update(
         {
-            "user": user,
-            "user_id": int(user.id),
             "_durable_ack_sent": True,
             "_durable_attempt_count": command.attempt_count,
             "_durable_target_run_id": command.target_run_id,
         }
     )
+    if command.kind != TaskCommandKind.CANCEL:
+        user = await asyncio.to_thread(_load_command_actor, command.actor_user_id)
+        message_data.update({"user": user, "user_id": int(user.id)})
     if command.kind != TaskCommandKind.MESSAGE and command.target_run_id is not None:
         current_run_id = await asyncio.to_thread(
             _load_command_task_run_id, command.task_id
@@ -5577,6 +5579,43 @@ async def execute_durable_task_command(
         "command_id": command.command_id,
         "kind": command.kind.value,
     }
+
+
+async def _broadcast_terminal_command_error(
+    command: ClaimedTaskCommand,
+    error: BaseException,
+) -> None:
+    await manager.broadcast_to_task(
+        {
+            "type": "agent_error",
+            "message": (f"Task command {command.kind.value} failed: {error}"),
+            "task_id": command.task_id,
+            "command_id": command.command_id,
+            "timestamp": datetime.now(timezone.utc).timestamp(),
+        },
+        command.task_id,
+    )
+
+
+async def execute_durable_task_command(
+    command: ClaimedTaskCommand,
+) -> dict[str, Any] | None:
+    """Apply one command and expose only terminal transport failures to clients."""
+
+    try:
+        return await _execute_durable_task_command(command)
+    except TaskCommandDeferred as exc:
+        if command.defer_count + 1 >= MAX_COMMAND_DEFERS:
+            await _broadcast_terminal_command_error(command, exc)
+        raise
+    except TaskCommandRejected:
+        # Rejections come from handlers that already expose their durable
+        # domain-level outcome. The dispatcher makes them terminal immediately.
+        raise
+    except Exception as exc:
+        if command.failure_count + 1 >= MAX_COMMAND_FAILURES:
+            await _broadcast_terminal_command_error(command, exc)
+        raise
 
 
 def _load_command_message_delivery_status(

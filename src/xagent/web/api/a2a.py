@@ -40,6 +40,7 @@ from ..services.task_command_transport import (
     dispatch_one_task_command,
     enqueue_task_command,
     load_task_command,
+    retry_failed_task_command,
 )
 from ..services.task_execution_controller import (
     TaskControlState,
@@ -869,6 +870,17 @@ async def cancel_task(
             "Cancel command identity conflicts with a different request.",
             status_code=409,
         )
+    if enqueued.status == COMMAND_FAILED:
+        retry_failed_task_command(
+            db,
+            enqueued.command_id,
+            target_run_id=_task_run_id(task),
+            target_runner_id=(
+                str(task.runner_id)
+                if task.status == TaskStatus.RUNNING and task.runner_id is not None
+                else None
+            ),
+        )
 
     from .websocket import execute_durable_task_command
 
@@ -924,6 +936,15 @@ async def _cancel_task_unserialized(
     from .websocket import background_task_manager
 
     await background_task_manager.cancel_task(int(task.id))
+    db.expire(task)
+    db.refresh(task)
+    agent_config = (
+        dict(task.agent_config) if isinstance(task.agent_config, dict) else {}
+    )
+    if agent_config.get("a2a_state") == "TASK_STATE_CANCELED":
+        return a2a_json_response(task_to_a2a(task))
+    if task.status in _TERMINAL_STATUSES:
+        return a2a_json_response(task_to_a2a(task))
     agent_config["a2a_state"] = "TASK_STATE_CANCELED"
     setattr(task, "agent_config", agent_config)
     apply_task_control_transition(

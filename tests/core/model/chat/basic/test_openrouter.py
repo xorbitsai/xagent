@@ -6,6 +6,7 @@ import httpx
 import openai
 import pytest
 
+from xagent.core.model.chat.basic import openrouter as openrouter_module
 from xagent.core.model.chat.basic.openrouter import OpenRouterLLM
 from xagent.core.model.chat.tool_protocol import get_tool_protocol_error
 
@@ -264,11 +265,13 @@ async def test_openrouter_deepseek_retries_function_call_without_assistant_prefi
         api_key="test-key",
     )
     messages = _tool_call_history()
+    strip_spy = mocker.spy(openrouter_module, "_strip_assistant_tool_call_prefixes")
 
     result = await llm.chat(messages)
 
     assert result["content"] == "Hello World"
     assert mock_client.chat.completions.create.await_count == 2
+    assert strip_spy.call_count == 1
     first_messages = mock_client.chat.completions.create.call_args_list[0].kwargs[
         "messages"
     ]
@@ -279,6 +282,55 @@ async def test_openrouter_deepseek_retries_function_call_without_assistant_prefi
     assert retry_messages[1]["content"] == ""
     assert retry_messages[1]["tool_calls"] == messages[1]["tool_calls"]
     assert messages[1]["content"] == "I will generate the music first."
+
+
+@pytest.mark.asyncio
+async def test_openrouter_deepseek_propagates_sanitized_retry_failure(
+    mocker, monkeypatch
+):
+    monkeypatch.setenv("XAGENT_OPENROUTER_OFFICIAL_PROVIDERS_ONLY", "false")
+    mock_client = mocker.AsyncMock()
+    mock_client.chat.completions.create.side_effect = [
+        _deepseek_function_prefix_error(),
+        _deepseek_function_prefix_error(),
+    ]
+    mocker.patch(
+        "xagent.core.model.chat.basic.openai.AsyncOpenAI",
+        return_value=mock_client,
+    )
+    llm = OpenRouterLLM(
+        model_name="deepseek/deepseek-v4-flash",
+        api_key="test-key",
+    )
+
+    with pytest.raises(RuntimeError, match="Function call should not be used"):
+        await llm.chat(_tool_call_history())
+
+    assert mock_client.chat.completions.create.await_count == 2
+
+
+@pytest.mark.asyncio
+async def test_openrouter_deepseek_does_not_retry_whitespace_only_prefix(
+    mocker, monkeypatch
+):
+    monkeypatch.setenv("XAGENT_OPENROUTER_OFFICIAL_PROVIDERS_ONLY", "false")
+    mock_client = mocker.AsyncMock()
+    mock_client.chat.completions.create.side_effect = _deepseek_function_prefix_error()
+    mocker.patch(
+        "xagent.core.model.chat.basic.openai.AsyncOpenAI",
+        return_value=mock_client,
+    )
+    llm = OpenRouterLLM(
+        model_name="deepseek/deepseek-v4-flash",
+        api_key="test-key",
+    )
+    messages = _tool_call_history()
+    messages[1]["content"] = "   "
+
+    with pytest.raises(RuntimeError, match="Function call should not be used"):
+        await llm.chat(messages)
+
+    assert mock_client.chat.completions.create.await_count == 1
 
 
 @pytest.mark.asyncio

@@ -441,10 +441,6 @@ class RouterLLM(BaseLLM):
             context_window=context_window,
         )
 
-    async def _resolve(self, messages: list[dict[str, Any]]) -> BaseLLM:
-        _, downstream = await self._resolve_route(messages)
-        return downstream
-
     async def _resolve_route(
         self, messages: list[dict[str, Any]]
     ) -> tuple[str, BaseLLM]:

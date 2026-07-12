@@ -468,7 +468,7 @@ class ReActPattern(AgentPattern):
                         answer_streamer,
                     ) = await self._retry_tool_protocol_response(
                         context=context,
-                        llm=llm,
+                        llm=call_llm,
                         runtime=runtime,
                         iteration=iteration,
                         tool_schemas=tool_schemas,
@@ -701,6 +701,7 @@ class ReActPattern(AgentPattern):
         metadata = {
             "iteration": iteration,
             "phase": "tool_protocol_retry",
+            **resolved_llm_metadata(llm),
         }
         await runtime.checkpoint(
             "tool_protocol_retry",
@@ -1117,11 +1118,20 @@ class ReActPattern(AgentPattern):
         }
 
     def _compact_tool_description(self, description: str) -> str:
-        """Collapse formatting whitespace without changing description content."""
-        return " ".join(description.split())
+        """Trim redundant whitespace while preserving instructional structure."""
+        compacted_lines: list[str] = []
+        for line in description.splitlines():
+            compacted = " ".join(line.split())
+            if compacted:
+                compacted_lines.append(compacted)
+            elif compacted_lines and compacted_lines[-1]:
+                compacted_lines.append("")
+        while compacted_lines and not compacted_lines[-1]:
+            compacted_lines.pop()
+        return "\n".join(compacted_lines)
 
     def _compact_tool_json_schema(
-        self, value: Any, *, preserve_mapping_keys: bool = False
+        self, value: Any, *, named_schema_mapping: bool = False
     ) -> Any:
         """Remove presentation-only Pydantic metadata from provider schemas."""
         if isinstance(value, list):
@@ -1131,14 +1141,16 @@ class ReActPattern(AgentPattern):
 
         compacted: dict[str, Any] = {}
         for key, item in value.items():
-            if key == "title" and not preserve_mapping_keys:
+            if key == "title" and not named_schema_mapping:
                 continue
-            if key == "description" and isinstance(item, str):
+            if named_schema_mapping:
+                compacted[key] = self._compact_tool_json_schema(item)
+            elif key == "description" and isinstance(item, str):
                 compacted[key] = self._compact_tool_description(item)
             else:
                 compacted[key] = self._compact_tool_json_schema(
                     item,
-                    preserve_mapping_keys=key
+                    named_schema_mapping=key
                     in {"properties", "patternProperties", "$defs", "definitions"},
                 )
         return compacted

@@ -17,6 +17,7 @@ from xagent.core.agent import (
     ReActReasoningMode,
     ToolCallRecord,
 )
+from xagent.core.model.chat.basic.router import RouterLLM
 from xagent.core.model.chat.tool_protocol import (
     ToolProtocolViolation,
     tool_protocol_error_response,
@@ -355,7 +356,11 @@ class StreamingInvalidToolProtocolFinalAnswerLLM:
     async def chat(self, **kwargs: Any) -> Any:
         raise AssertionError("invalid tool protocol path should stay streaming")
 
-    async def stream_chat(self, **kwargs: Any) -> Any:
+    async def stream_chat(
+        self, messages: list[dict[str, Any]] | None = None, **kwargs: Any
+    ) -> Any:
+        if messages is not None:
+            kwargs["messages"] = messages
         self.stream_calls.append(kwargs)
         call_index = len(self.stream_calls) - 1
         if call_index == 0:
@@ -1128,6 +1133,47 @@ async def test_react_closes_invalid_initial_final_answer_stream_before_retry() -
         "final_answer_end",
     ]
     assert outbound.events[2]["error"] == "invalid tool protocol, retrying"
+
+
+@pytest.mark.asyncio
+async def test_react_reuses_resolved_route_for_tool_protocol_retry() -> None:
+    downstream = StreamingInvalidToolProtocolFinalAnswerLLM(
+        partial_final_before_work_tool=True
+    )
+    selected_models: list[str] = []
+    router = RouterLLM(downstream_resolver=lambda _model_id: downstream)
+    router.context_window = 1_048_576
+
+    async def select_model(_prompt: str) -> str:
+        selected = f"test/model-{len(selected_models) + 1}"
+        selected_models.append(selected)
+        return selected
+
+    router._select_model = select_model  # type: ignore[assignment]
+    pattern = ReActPattern(max_iterations=3, finalize_after_tool_result=True)
+    context = ExecutionContext(system_prompt="You are helpful.", execution_id="task-1")
+    context.add_user_message("Find an audio clip")
+    tracer = TraceEventRecorder()
+    runtime = PatternRuntime(execution_id="task-1", tracer=tracer)
+
+    result = await pattern.run(
+        context=context,
+        tools=[FakeTool()],
+        llm=router,
+        runtime=runtime,
+    )
+
+    assert result["success"] is True
+    assert selected_models == ["test/model-1", "test/model-2"]
+    retry_starts = [
+        event
+        for event in tracer.events
+        if event["event_type"] == "action_start_llm"
+        and event["data"].get("phase") == "tool_protocol_retry"
+    ]
+    assert len(retry_starts) == 1
+    assert retry_starts[0]["data"]["selected_model"] == "test/model-2"
+    assert retry_starts[0]["data"]["context_window"] == 1_048_576
 
 
 @pytest.mark.asyncio
@@ -2418,16 +2464,26 @@ def test_react_compacts_provider_tool_schema_without_losing_named_fields() -> No
                         "type": "string",
                         "description": "First line.\n\n  Second line.",
                         "default": "draft",
-                    }
+                    },
+                    "properties": {
+                        "title": "Properties",
+                        "type": "object",
+                        "properties": {
+                            "value": {
+                                "title": "Value",
+                                "type": "integer",
+                            }
+                        },
+                    },
                 },
-                "required": ["title"],
+                "required": ["title", "properties"],
             }
 
     class CompactSchemaTool:
         def __init__(self) -> None:
             class Metadata:
                 name = "compact_schema"
-                description = "Compact\n\n  redundant whitespace."
+                description = "Compact\n\n  - first   step\n  - second step."
 
             self.metadata = Metadata()
 
@@ -2436,15 +2492,21 @@ def test_react_compacts_provider_tool_schema_without_losing_named_fields() -> No
 
     schema = ReActPattern()._build_tool_schema(CompactSchemaTool())
 
-    assert schema["function"]["description"] == "Compact redundant whitespace."
+    assert schema["function"]["description"] == (
+        "Compact\n\n- first step\n- second step."
+    )
     parameters = schema["function"]["parameters"]
     assert "title" not in parameters
     assert parameters["properties"]["title"] == {
         "type": "string",
-        "description": "First line. Second line.",
+        "description": "First line.\n\nSecond line.",
         "default": "draft",
     }
-    assert parameters["required"] == ["title"]
+    assert parameters["properties"]["properties"] == {
+        "type": "object",
+        "properties": {"value": {"type": "integer"}},
+    }
+    assert parameters["required"] == ["title", "properties"]
 
 
 @pytest.mark.asyncio

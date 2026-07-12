@@ -193,9 +193,11 @@ async def test_router_dispatches_chosen_slug_through_downstream_resolver():
 
     llm._select_model = fake_select  # type: ignore[assignment]
 
-    result = await llm._resolve([{"role": "user", "content": "hi"}])
+    llm.context_window = 128_000
+    result = await llm.prepare_for_call([{"role": "user", "content": "hi"}])
     assert seen["slug"] == "anthropic/claude-opus-4.8"
-    assert result == "DOWNSTREAM_LLM"
+    assert result.model_name == "anthropic/claude-opus-4.8"
+    assert result._downstream == "DOWNSTREAM_LLM"
 
 
 async def test_router_retries_chat_without_thinking_for_tool_choice_error():
@@ -340,10 +342,12 @@ async def test_router_fallback_uses_openrouter_config(monkeypatch):
 
     llm._select_model = fake_select  # type: ignore[assignment]
 
-    result = await llm._resolve([{"role": "user", "content": "hi"}])
+    llm.context_window = 128_000
+    result = await llm.prepare_for_call([{"role": "user", "content": "hi"}])
 
     config = seen["config"]
-    assert result == "FALLBACK_LLM"
+    assert result.model_name == "deepseek/deepseek-v4-flash"
+    assert result._downstream == "FALLBACK_LLM"
     assert config.model_provider == "openrouter"
     assert config.model_name == "deepseek/deepseek-v4-flash"
     assert config.base_url == "https://openrouter.ai/api/v1"
@@ -379,10 +383,11 @@ async def test_router_routes_on_active_goal_not_scaffold(monkeypatch):
         return "openai/gpt-5.5"
 
     llm = RouterLLM(model_name="auto", downstream_resolver=lambda s: "DOWNSTREAM")
+    llm.context_window = 128_000
     llm._select_model = fake_select  # type: ignore[assignment]
 
     with goal_scope("你好"):
-        await llm._resolve(
+        await llm.prepare_for_call(
             [
                 {
                     "role": "user",

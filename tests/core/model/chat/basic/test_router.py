@@ -187,6 +187,21 @@ async def test_prepare_for_call_handles_missing_router_context_window(monkeypatc
     assert prepared.context_window == 1_048_576
 
 
+def test_profile_context_window_returns_none_when_catalog_lookup_fails(
+    monkeypatch, caplog
+):
+    def fail_service_lookup():
+        raise RuntimeError("profile catalog unavailable")
+
+    monkeypatch.setattr(
+        "xagent.core.model.chat.basic.router._get_service",
+        fail_service_lookup,
+    )
+
+    assert RouterLLM._profile_context_window("test/model") is None
+    assert "Could not resolve xrouter context window for test/model" in caplog.text
+
+
 @pytest.mark.asyncio
 async def test_router_chat_relaxes_required_tool_choice_on_openrouter_endpoint_error(
     monkeypatch,

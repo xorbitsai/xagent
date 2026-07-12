@@ -6,9 +6,15 @@ focusing on JSON and CSV workspace writes and reads.
 """
 
 import pytest
+from sqlalchemy import create_engine
+from sqlalchemy.orm import sessionmaker
 
 from xagent.core.tools.core.workspace_file_tool import WorkspaceFileOperations
 from xagent.core.workspace import DEFAULT_USER_FILE_LIST_LIMIT, TaskWorkspace
+from xagent.web.models import Base
+from xagent.web.models.task import Task
+from xagent.web.models.uploaded_file import UploadedFile
+from xagent.web.models.user import User
 
 
 class TestWorkspaceFileOperations:
@@ -369,6 +375,64 @@ class TestWorkspaceFileOperations:
         result_offset = ops.list_all_user_files(limit=2, offset=2)
         assert result_offset["limit"] == 2
         assert result_offset["offset"] == 2
+
+    def test_list_all_user_files_db_pagination(self, tmp_path):
+        """Test real uploaded-file pagination for a resolvable task workspace."""
+        engine = create_engine(
+            "sqlite:///:memory:", connect_args={"check_same_thread": False}
+        )
+        SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+        Base.metadata.create_all(bind=engine)
+        db = SessionLocal()
+        try:
+            user = User(username="pagination-user", password_hash="hash")
+            db.add(user)
+            db.flush()
+            task = Task(id=790, user_id=user.id, title="Pagination task")
+            db.add(task)
+            db.flush()
+
+            for index in range(DEFAULT_USER_FILE_LIST_LIMIT + 5):
+                path = tmp_path / "uploads" / f"file-{index:02d}.txt"
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text(str(index), encoding="utf-8")
+                db.add(
+                    UploadedFile(
+                        user_id=user.id,
+                        task_id=task.id,
+                        filename=path.name,
+                        storage_path=str(path),
+                        mime_type="text/plain",
+                        file_size=path.stat().st_size,
+                    )
+                )
+            db.commit()
+
+            workspace = TaskWorkspace(
+                id="web_task_790",
+                base_dir=str(tmp_path / "workspaces"),
+            )
+            workspace.db_session = db
+            ops = WorkspaceFileOperations(workspace)
+
+            first_page = ops.list_all_user_files(include_workspace_files=False)
+            second_page = ops.list_all_user_files(
+                include_workspace_files=False,
+                offset=DEFAULT_USER_FILE_LIST_LIMIT,
+            )
+
+            first_ids = {file_info["file_id"] for file_info in first_page["files"]}
+            second_ids = {file_info["file_id"] for file_info in second_page["files"]}
+            assert len(first_ids) == DEFAULT_USER_FILE_LIST_LIMIT
+            assert len(second_ids) == 5
+            assert first_ids.isdisjoint(second_ids)
+            assert first_page["total_count"] == DEFAULT_USER_FILE_LIST_LIMIT + 5
+            assert second_page["total_count"] == DEFAULT_USER_FILE_LIST_LIMIT + 5
+            assert first_page["limit"] == DEFAULT_USER_FILE_LIST_LIMIT
+            assert second_page["offset"] == DEFAULT_USER_FILE_LIST_LIMIT
+        finally:
+            db.close()
+            engine.dispose()
 
     def test_list_all_user_files_exclude_workspace(self, tmp_path):
         """Test list_all_user_files can exclude workspace files."""

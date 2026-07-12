@@ -86,17 +86,17 @@ class OpenRouterLLM(OpenAILLM):
     def _is_official_openrouter_client(self) -> bool:
         return self.base_url.rstrip("/") == OPENROUTER_BASE_URL
 
-    def _should_retry_deepseek_function_prefix(
+    def _deepseek_function_prefix_retry_messages(
         self,
         exc: Exception,
         messages: List[Dict[str, Any]],
-    ) -> bool:
+    ) -> List[Dict[str, Any]] | None:
         if _openrouter_model_author(self._model_name) != "deepseek":
-            return False
+            return None
         if _DEEPSEEK_FUNCTION_PREFIX_ERROR not in str(exc).lower():
-            return False
-        _, changed = _strip_assistant_tool_call_prefixes(messages)
-        return changed
+            return None
+        sanitized, changed = _strip_assistant_tool_call_prefixes(messages)
+        return sanitized if changed else None
 
     async def chat(
         self,
@@ -123,10 +123,12 @@ class OpenRouterLLM(OpenAILLM):
                 **kwargs,
             )
         except RuntimeError as exc:
-            if not self._should_retry_deepseek_function_prefix(exc, messages):
+            sanitized_messages = self._deepseek_function_prefix_retry_messages(
+                exc, messages
+            )
+            if sanitized_messages is None:
                 raise
 
-            sanitized_messages, _ = _strip_assistant_tool_call_prefixes(messages)
             logger.info(
                 "OpenRouter DeepSeek rejected function-call history with an "
                 "assistant prefix; retrying once without tool-call prefixes"
@@ -176,12 +178,12 @@ class OpenRouterLLM(OpenAILLM):
                 yield chunk
             return
         except RuntimeError as exc:
-            if has_yielded or not self._should_retry_deepseek_function_prefix(
+            sanitized_messages = self._deepseek_function_prefix_retry_messages(
                 exc, messages
-            ):
+            )
+            if has_yielded or sanitized_messages is None:
                 raise
 
-        sanitized_messages, _ = _strip_assistant_tool_call_prefixes(messages)
         logger.info(
             "OpenRouter DeepSeek rejected streaming function-call history with an "
             "assistant prefix; retrying once without tool-call prefixes"

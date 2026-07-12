@@ -56,6 +56,30 @@ async def test_prepare_llm_for_context_uses_resolved_model_window(monkeypatch) -
     }
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("context_window", [None, 128_000])
+async def test_prepare_llm_for_context_preserves_plain_llm_threshold(
+    context_window: int | None,
+) -> None:
+    class PlainLLM:
+        pass
+
+    llm = PlainLLM()
+    if context_window is not None:
+        llm.context_window = context_window
+    context = ExecutionContext()
+    context.compact_config.threshold = 12_345
+
+    prepared = await prepare_llm_for_context(
+        llm=llm,
+        messages=[{"role": "user", "content": "continue"}],
+        context=context,
+    )
+
+    assert prepared is llm
+    assert context.compact_config.threshold == 12_345
+
+
 class CancelledLLM:
     async def chat(self, **_: Any) -> str:
         raise asyncio.CancelledError

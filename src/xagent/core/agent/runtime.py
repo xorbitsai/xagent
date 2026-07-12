@@ -49,8 +49,12 @@ async def prepare_llm_for_context(
 
     context_window = getattr(prepared, "context_window", None)
     compact_config = getattr(context, "compact_config", None)
+    # Fixed-model thresholds are initialized once by AgentRunner and restored
+    # verbatim from checkpoints. Recompute only when a virtual model resolves to
+    # a concrete per-call wrapper whose window was unavailable at task start.
     if (
-        isinstance(context_window, int)
+        prepared is not llm
+        and isinstance(context_window, int)
         and context_window > 0
         and compact_config is not None
     ):

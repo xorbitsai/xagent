@@ -963,6 +963,55 @@ def test_cancel_retries_a_previous_terminal_transport_failure() -> None:
         db.close()
 
 
+def test_cancel_maps_stale_run_rejection_to_conflict() -> None:
+    agent_id, full_key = _create_published_agent_with_key()
+    with patch(
+        "xagent.web.services.task_orchestrator._schedule_bg",
+        new=MagicMock(),
+    ):
+        created = client.post(
+            f"/api/a2a/agents/{agent_id}/message:send",
+            headers=_bearer(full_key),
+            json={
+                "message": {
+                    "messageId": "msg-stale-cancel",
+                    "role": "ROLE_USER",
+                    "parts": [{"text": "rotate before cancel"}],
+                },
+                "configuration": {"returnImmediately": True},
+            },
+        )
+    assert created.status_code == 200, created.text
+    task_id = int(created.json()["task"]["id"])
+    real_dispatch = a2a_api.dispatch_one_task_command
+
+    async def rotate_then_dispatch(executor, *, command_db_id=None):
+        db = _direct_db_session()
+        try:
+            task = db.query(Task).filter(Task.id == task_id).one()
+            task.run_id = "rotated-before-cancel"
+            task.runner_id = None
+            task.lease_expires_at = None
+            db.commit()
+        finally:
+            db.close()
+        return await real_dispatch(executor, command_db_id=command_db_id)
+
+    with patch.object(
+        a2a_api,
+        "dispatch_one_task_command",
+        new=rotate_then_dispatch,
+    ):
+        response = client.post(
+            f"/api/a2a/agents/{agent_id}/tasks/{task_id}:cancel",
+            headers=_bearer(full_key),
+        )
+
+    assert response.status_code == 409, response.text
+    assert response.json()["error"]["details"][0]["reason"] == "INVALID_REQUEST"
+    assert "run changed" in response.json()["error"]["message"].lower()
+
+
 @pytest.mark.asyncio
 async def test_cancel_does_not_overwrite_a_concurrent_completion() -> None:
     agent_id, _full_key = _create_published_agent_with_key()

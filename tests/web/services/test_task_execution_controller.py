@@ -246,6 +246,31 @@ def test_transitions_keep_run_identity_and_advance_version(db_session) -> None:
         )
 
 
+def test_transition_rejects_a_stale_state_version(db_session) -> None:
+    task = _create_task(db_session)
+    running = transition_task_control_state_sync(
+        int(task.id),
+        TaskControlState.RUNNING,
+        status=TaskStatus.RUNNING,
+        new_run=True,
+    )
+
+    with pytest.raises(StaleTaskRunError, match="state changed"):
+        transition_task_control_state_sync(
+            int(task.id),
+            TaskControlState.FAILED,
+            status=TaskStatus.FAILED,
+            expected_run_id=running.run_id,
+            expected_state_version=running.state_version - 1,
+        )
+
+    db_session.expire_all()
+    stored = db_session.get(Task, int(task.id))
+    assert stored is not None
+    assert stored.status == TaskStatus.RUNNING
+    assert stored.state_version == running.state_version
+
+
 def test_concurrent_transitions_get_distinct_atomic_versions(db_session) -> None:
     task = _create_task(db_session)
     running = transition_task_control_state_sync(

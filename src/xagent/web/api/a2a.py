@@ -898,6 +898,18 @@ async def cancel_task(
             db.expire_all()
             return a2a_json_response(task_to_a2a(_resolve_a2a_task(db, task_id, agent)))
         if stored is not None and stored.status == COMMAND_FAILED:
+            rejection_reason = (
+                stored.result.get("rejection_reason")
+                if isinstance(stored.result, dict)
+                else None
+            )
+            if rejection_reason == "stale_run":
+                raise a2a_error(
+                    "invalid_request",
+                    "Task run changed before cancellation was applied; retry the request.",
+                    status_code=409,
+                    details={"taskId": task_id, "commandId": command_identity},
+                )
             raise a2a_error(
                 "internal_error",
                 str(stored.error or "Task cancellation failed."),
@@ -952,6 +964,7 @@ async def _cancel_task_unserialized(
         TaskControlState.FAILED,
         status=TaskStatus.FAILED,
         expected_run_id=_task_run_id(task),
+        expected_state_version=int(task.state_version or 0),
     )
     setattr(task, "output", None)
     setattr(task, "error_message", "Task canceled by A2A client.")

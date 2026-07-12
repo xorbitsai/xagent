@@ -40,6 +40,7 @@ COMMAND_ID_PATTERN = re.compile(r"[A-Za-z0-9._:-]{1,64}")
 MAX_COMMAND_FAILURES = 5
 MAX_COMMAND_DEFERS = 60
 DISPATCHER_IDLE_SECONDS = 0.5
+DISPATCHER_CONCURRENCY = 4
 
 
 class TaskCommandKind(str, enum.Enum):
@@ -55,6 +56,10 @@ class TaskCommandDeferred(RuntimeError):
 
 class TaskCommandRejected(RuntimeError):
     """The downstream handoff reached a durable failed state."""
+
+    def __init__(self, message: str, *, reason: str | None = None) -> None:
+        super().__init__(message)
+        self.reason = reason
 
 
 @dataclass(frozen=True)
@@ -437,6 +442,7 @@ def fail_task_command(
     *,
     force_terminal: bool = False,
     expected_attempt_count: int | None = None,
+    result: dict[str, Any] | None = None,
 ) -> bool:
     """Retry a failed claim, or make it terminal after bounded attempts."""
 
@@ -480,6 +486,7 @@ def fail_task_command(
                     ),
                     TaskExecutionCommand.failure_count: failure_count,
                     TaskExecutionCommand.error: error[:4000],
+                    TaskExecutionCommand.result: result,
                     TaskExecutionCommand.claimed_by: None,
                     TaskExecutionCommand.claim_expires_at: (
                         None
@@ -698,6 +705,9 @@ async def dispatch_one_task_command(
             str(exc),
             force_terminal=True,
             expected_attempt_count=command.attempt_count,
+            result=(
+                {"rejection_reason": exc.reason} if exc.reason is not None else None
+            ),
         )
     except Exception as exc:  # noqa: BLE001
         logger.exception(
@@ -771,24 +781,40 @@ def _consume_prompt_dispatch_result(task: asyncio.Task[bool]) -> None:
         )
 
 
-async def run_task_command_dispatcher(executor: CommandExecutor) -> None:
-    global _dispatcher_loop, _dispatcher_wakeup
-    _dispatcher_loop = asyncio.get_running_loop()
-    _dispatcher_wakeup = asyncio.Event()
+async def _run_task_command_dispatcher_worker(executor: CommandExecutor) -> None:
     while True:
+        wakeup = _dispatcher_wakeup
+        if wakeup is None:
+            return
         # Clear before checking for work. A notify that arrives during the DB
         # claim remains set, so an empty claim cannot erase that wakeup and
         # sleep while work is waiting.
-        _dispatcher_wakeup.clear()
+        wakeup.clear()
         processed = await dispatch_one_task_command(executor)
         if processed:
             continue
         try:
-            await asyncio.wait_for(
-                _dispatcher_wakeup.wait(), timeout=DISPATCHER_IDLE_SECONDS
-            )
+            await asyncio.wait_for(wakeup.wait(), timeout=DISPATCHER_IDLE_SECONDS)
         except asyncio.TimeoutError:
             pass
+
+
+async def run_task_command_dispatcher(executor: CommandExecutor) -> None:
+    """Recover queued commands without serializing unrelated tasks."""
+
+    global _dispatcher_loop, _dispatcher_wakeup
+    _dispatcher_loop = asyncio.get_running_loop()
+    _dispatcher_wakeup = asyncio.Event()
+    workers = [
+        asyncio.create_task(_run_task_command_dispatcher_worker(executor))
+        for _ in range(DISPATCHER_CONCURRENCY)
+    ]
+    try:
+        await asyncio.gather(*workers)
+    finally:
+        for worker in workers:
+            worker.cancel()
+        await asyncio.gather(*workers, return_exceptions=True)
 
 
 def start_task_command_dispatcher(executor: CommandExecutor) -> asyncio.Task[Any]:

@@ -93,6 +93,7 @@ def apply_task_control_transition(
     status: TaskStatus | None = None,
     new_run: bool = False,
     expected_run_id: str | None = None,
+    expected_state_version: int | None = None,
 ) -> TaskControlSnapshot:
     """Mutate one ORM task with a monotonic control-state transition.
 
@@ -101,9 +102,18 @@ def apply_task_control_transition(
     """
 
     current_run_id = getattr(task, "run_id", None)
+    current_state_version = int(getattr(task, "state_version", 0) or 0)
     if expected_run_id is not None and current_run_id != expected_run_id:
         raise StaleTaskRunError(
             f"task {task.id} run changed from {expected_run_id} to {current_run_id}"
+        )
+    if (
+        expected_state_version is not None
+        and current_state_version != expected_state_version
+    ):
+        raise StaleTaskRunError(
+            f"task {task.id} state changed from version "
+            f"{expected_state_version} to {current_state_version}"
         )
 
     if new_run:
@@ -133,6 +143,10 @@ def apply_task_control_transition(
         statement = update(Task).where(Task.id == int(task_id))
         if expected_run_id is not None:
             statement = statement.where(Task.run_id == expected_run_id)
+        if expected_state_version is not None:
+            statement = statement.where(
+                func.coalesce(Task.state_version, 0) == expected_state_version
+            )
         # Keep unrelated caller-owned pending objects out of this helper's
         # atomic UPDATE and refresh. ``Session.execute`` and ``refresh`` can
         # otherwise trigger another session-wide autoflush.
@@ -166,6 +180,7 @@ def transition_task_control_state_sync(
     status: TaskStatus | None = None,
     new_run: bool = False,
     expected_run_id: str | None = None,
+    expected_state_version: int | None = None,
 ) -> TaskControlSnapshot:
     from ..models.database import get_session_local
 
@@ -180,6 +195,7 @@ def transition_task_control_state_sync(
             status=status,
             new_run=new_run,
             expected_run_id=expected_run_id,
+            expected_state_version=expected_state_version,
         )
         db.commit()
         return snapshot

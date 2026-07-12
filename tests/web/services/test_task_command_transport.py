@@ -452,6 +452,33 @@ async def test_command_is_rejected_after_run_rotation(db_session) -> None:
         await execute_durable_task_command(command)
 
 
+@pytest.mark.asyncio
+async def test_stale_run_rejection_reason_is_persisted(db_session) -> None:
+    user, task = _create_running_task(db_session)
+    enqueued = enqueue_task_command(
+        db_session,
+        task_id=int(task.id),
+        actor_user_id=int(user.id),
+        command_id="stale-pause-result",
+        kind=TaskCommandKind.PAUSE,
+        payload={"type": "pause_task"},
+    )
+    task.run_id = "run-2"
+    task.runner_id = None
+    task.lease_expires_at = None
+    db_session.commit()
+
+    assert await dispatch_one_task_command(
+        execute_durable_task_command,
+        command_db_id=enqueued.command_id,
+    )
+    db_session.expire_all()
+    stored = db_session.get(TaskExecutionCommand, enqueued.command_id)
+    assert stored is not None
+    assert stored.status == COMMAND_FAILED
+    assert stored.result == {"rejection_reason": "stale_run"}
+
+
 def test_later_command_cannot_overtake_unfinished_command(db_session) -> None:
     user, task = _create_running_task(db_session)
     first = enqueue_task_command(
@@ -778,6 +805,58 @@ async def test_dispatcher_recovers_command_that_predates_worker_start(
     stored = db_session.get(TaskExecutionCommand, enqueued.command_id)
     assert stored is not None
     assert stored.status == COMMAND_COMPLETED
+
+
+@pytest.mark.asyncio
+async def test_dispatcher_recovers_unrelated_tasks_concurrently(db_session) -> None:
+    user, first_task = _create_running_task(db_session)
+    first_task.runner_id = None
+    first_task.lease_expires_at = None
+    second_task = Task(
+        user_id=user.id,
+        title="Second durable command",
+        description="Second durable command",
+        status=TaskStatus.RUNNING,
+        execution_mode="auto",
+        run_id="run-2",
+        runner_id=None,
+        lease_expires_at=None,
+    )
+    db_session.add(second_task)
+    db_session.commit()
+    first = enqueue_task_command(
+        db_session,
+        task_id=int(first_task.id),
+        actor_user_id=int(user.id),
+        command_id="slow-recovery",
+        kind=TaskCommandKind.PAUSE,
+        payload={"type": "pause_task"},
+    )
+    second = enqueue_task_command(
+        db_session,
+        task_id=int(second_task.id),
+        actor_user_id=int(user.id),
+        command_id="independent-recovery",
+        kind=TaskCommandKind.PAUSE,
+        payload={"type": "pause_task"},
+    )
+    release_first = asyncio.Event()
+    second_started = asyncio.Event()
+
+    async def execute(command):
+        if command.id == first.command_id:
+            await release_first.wait()
+        elif command.id == second.command_id:
+            second_started.set()
+        return None
+
+    start_task_command_dispatcher(execute)
+    try:
+        await asyncio.wait_for(second_started.wait(), timeout=1)
+        release_first.set()
+    finally:
+        release_first.set()
+        await stop_task_command_dispatcher()
 
 
 def test_load_task_command_returns_an_explicit_detached_snapshot(db_session) -> None:

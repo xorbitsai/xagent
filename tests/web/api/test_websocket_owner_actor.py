@@ -16,6 +16,8 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 from xagent.web.api.websocket import (
+    _handle_pause_task_unserialized,
+    _handle_resume_task_unserialized,
     background_task_manager,
     execute_resume_background,
     handle_chat_message,
@@ -32,6 +34,7 @@ from xagent.web.services.chat_history_service import (
     DELIVERY_FAILED,
     DELIVERY_PENDING,
 )
+from xagent.web.services.task_execution_controller import StaleTaskRunError
 
 
 @pytest.fixture()
@@ -145,6 +148,48 @@ async def test_chat_admin_append_to_other_users_task_claims_as_owner(
     assert len(accepted) == 1
     assert accepted[0]["client_message_id"] == "client-turn-1"
     assert accepted[0]["turn_id"] == "client-turn-1"
+
+
+@pytest.mark.asyncio
+async def test_chat_without_client_id_uses_durable_command_id_as_turn_id(
+    db_session,
+) -> None:
+    owner = _user(db_session, "owner")
+    task = _task(db_session, owner.id, status=TaskStatus.COMPLETED)
+    ws_manager = MagicMock(
+        broadcast_to_task=AsyncMock(),
+        send_personal_message=AsyncMock(),
+    )
+    begin_turn = AsyncMock()
+
+    with (
+        patch("xagent.web.api.websocket.manager", ws_manager),
+        patch(
+            "xagent.web.services.task_orchestrator.TaskTurnOrchestrator.begin_turn",
+            new=begin_turn,
+        ),
+    ):
+        await handle_chat_message(
+            MagicMock(),
+            int(task.id),
+            {"message": "server generated identity", "user": owner, "files": []},
+        )
+        for _ in range(100):
+            if begin_turn.await_count:
+                break
+            await asyncio.sleep(0.01)
+        else:
+            raise AssertionError("durable message was not dispatched in time")
+
+    db_session.expire_all()
+    command = (
+        db_session.query(TaskExecutionCommand)
+        .filter(TaskExecutionCommand.task_id == int(task.id))
+        .one()
+    )
+    assert command.command_id.startswith("message:")
+    assert command.payload["client_message_id"] == command.command_id
+    assert begin_turn.await_args.kwargs["payload"].turn_id == command.command_id
 
 
 @pytest.mark.asyncio
@@ -508,6 +553,54 @@ async def test_pause_admin_on_other_users_task_runs_as_owner(db_session) -> None
     # Built and paused as the OWNER, not the admin actor.
     assert captured["task_owner_user_id"] == int(owner.id)
     agent.pause_execution.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_durable_pause_propagates_stale_run_error(db_session) -> None:
+    owner = _user(db_session, "owner")
+    task = _task(db_session, owner.id)
+    _captured, _agent, mgr, ws_manager = _patched_manager_and_agent()
+
+    with (
+        patch("xagent.web.api.chat.get_agent_manager", return_value=mgr),
+        patch("xagent.web.api.websocket.manager", ws_manager),
+        patch(
+            "xagent.web.api.websocket.apply_task_control_transition",
+            side_effect=StaleTaskRunError("run rotated"),
+        ),
+        pytest.raises(StaleTaskRunError, match="run rotated"),
+    ):
+        await _handle_pause_task_unserialized(
+            MagicMock(),
+            int(task.id),
+            {"user": owner, "_durable_ack_sent": True},
+        )
+
+
+@pytest.mark.asyncio
+async def test_durable_resume_propagates_stale_run_error(db_session) -> None:
+    owner = _user(db_session, "owner")
+    task = _task(db_session, owner.id, status=TaskStatus.PAUSED)
+    _captured, agent, mgr, ws_manager = _patched_manager_and_agent()
+    agent.supports_live_control.return_value = True
+    bg_mgr = MagicMock()
+    bg_mgr.reserve_resume.return_value = True
+
+    with (
+        patch("xagent.web.api.chat.get_agent_manager", return_value=mgr),
+        patch("xagent.web.api.websocket.manager", ws_manager),
+        patch("xagent.web.api.websocket.background_task_manager", bg_mgr),
+        patch(
+            "xagent.web.api.websocket.task_execution_controller.transition",
+            new=AsyncMock(side_effect=StaleTaskRunError("run rotated")),
+        ),
+        pytest.raises(StaleTaskRunError, match="run rotated"),
+    ):
+        await _handle_resume_task_unserialized(
+            MagicMock(),
+            int(task.id),
+            {"user": owner, "_durable_ack_sent": True},
+        )
 
 
 @pytest.mark.asyncio

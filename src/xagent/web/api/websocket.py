@@ -83,6 +83,7 @@ from ..services.managed_file_ref import (
     DurableStorageOperationError,
 )
 from ..services.task_command_transport import (
+    COMMAND_FAILED,
     COMMAND_ID_PATTERN,
     MAX_COMMAND_DEFERS,
     MAX_COMMAND_FAILURES,
@@ -3017,7 +3018,7 @@ async def handle_chat_message(
             retry_with_new_id=True,
         )
         return
-    if enqueued.status == DELIVERY_FAILED:
+    if enqueued.status == COMMAND_FAILED:
         await _send_message_delivery(
             websocket,
             client_message_id=_client_message_id(message_data.get("client_message_id")),
@@ -3123,6 +3124,11 @@ async def _enqueue_websocket_task_command(
         for key, value in message_data.items()
         if key not in {"user", "user_id"} and not key.startswith("_durable_")
     }
+    if kind == TaskCommandKind.MESSAGE:
+        # The durable command identity is also the delivery/turn identity.
+        # This remains stable across retries even when an API client omitted
+        # or supplied an invalid client_message_id.
+        payload["client_message_id"] = resolved_command_id
     return await asyncio.to_thread(
         _enqueue_websocket_task_command_sync,
         task_id=int(task_id),
@@ -5172,6 +5178,9 @@ async def _handle_pause_task_unserialized(
             logger.info("Agent supports pause_execution, calling it...")
             pause_result = await agent_service.pause_execution()
             if pause_result is False:
+                message_data["_durable_command_error"] = (
+                    "No live execution found to pause"
+                )
                 await manager.send_personal_message(
                     _task_error_payload(
                         db,
@@ -5185,6 +5194,9 @@ async def _handle_pause_task_unserialized(
             logger.info("Agent pause_execution completed")
             db.refresh(task)
             if task.status != TaskStatus.RUNNING:
+                message_data["_durable_command_error"] = (
+                    "Task finished before the pause request was applied"
+                )
                 await manager.send_personal_message(
                     _task_error_payload(
                         db,
@@ -5218,6 +5230,9 @@ async def _handle_pause_task_unserialized(
             logger.info(f"Task {task_id} pause requested successfully")
         else:
             # If pause not supported, send error message
+            message_data["_durable_command_error"] = (
+                "Current agent does not support pause functionality"
+            )
             await manager.send_personal_message(
                 _task_error_payload(
                     db,
@@ -5232,6 +5247,7 @@ async def _handle_pause_task_unserialized(
 
     except (ValueError, KeyError, TypeError) as e:
         # Data validation error
+        message_data["_durable_command_error"] = str(e)
         logger.error(f"Data validation error pausing task {task_id}: {e}")
         await manager.send_personal_message(
             {"type": "error", "message": f"Data validation error: {str(e)}"}, websocket
@@ -5242,6 +5258,7 @@ async def _handle_pause_task_unserialized(
         await manager.send_personal_message(
             {"type": "error", "message": f"Runtime error: {str(e)}"}, websocket
         )
+        raise
     except Exception as e:
         # Other errors, re-raise
         logger.error(f"Unexpected error pausing task {task_id}: {e}")
@@ -5342,6 +5359,7 @@ async def _handle_resume_task_unserialized(
             db.close()
 
         if task is None:
+            message_data["_durable_command_error"] = "Task not found or access denied"
             await manager.send_personal_message(
                 {"type": "error", "message": "Task not found or access denied"},
                 websocket,
@@ -5351,6 +5369,9 @@ async def _handle_resume_task_unserialized(
         resume_control_state = task_control_snapshot(task).as_dict()
         if getattr(agent_service, "supports_live_control", lambda: False)():
             if task.status not in {TaskStatus.PAUSED, TaskStatus.WAITING_FOR_USER}:
+                message_data["_durable_command_error"] = (
+                    "Task is not paused and cannot be resumed."
+                )
                 await manager.send_personal_message(
                     {
                         "type": "error",
@@ -5435,6 +5456,9 @@ async def _handle_resume_task_unserialized(
             logger.info(f"Task {task_id} resumed successfully")
         else:
             # If resume not supported, send error message
+            message_data["_durable_command_error"] = (
+                "Current agent does not support resume functionality"
+            )
             await manager.send_personal_message(
                 {
                     "type": "error",
@@ -5448,6 +5472,7 @@ async def _handle_resume_task_unserialized(
 
     except (ValueError, KeyError, TypeError) as e:
         # Data validation error
+        message_data["_durable_command_error"] = str(e)
         logger.error(f"Data validation error resuming task {task_id}: {e}")
         await manager.send_personal_message(
             {"type": "error", "message": f"Data validation error: {str(e)}"}, websocket
@@ -5458,6 +5483,7 @@ async def _handle_resume_task_unserialized(
         await manager.send_personal_message(
             {"type": "error", "message": f"Runtime error: {str(e)}"}, websocket
         )
+        raise
     except Exception as e:
         # Other errors, re-raise
         logger.error(f"Unexpected error resuming task {task_id}: {e}")
@@ -5514,7 +5540,8 @@ async def _execute_durable_task_command(
         if current_run_id != command.target_run_id:
             raise TaskCommandRejected(
                 f"Task run changed before {command.kind.value} command "
-                f"{command.command_id} was applied"
+                f"{command.command_id} was applied",
+                reason="stale_run",
             )
 
     if command.kind == TaskCommandKind.MESSAGE:
@@ -5534,9 +5561,6 @@ async def _execute_durable_task_command(
             raise TaskCommandRejected(
                 f"Message {command.command_id} could not be applied"
             )
-        durable_error = message_data.get("_durable_command_error")
-        if isinstance(durable_error, str) and durable_error:
-            raise TaskCommandRejected(durable_error)
     elif command.kind == TaskCommandKind.PAUSE:
         await _handle_pause_task_unserialized(websocket, command.task_id, message_data)
     elif command.kind == TaskCommandKind.RESUME:
@@ -5574,6 +5598,9 @@ async def _execute_durable_task_command(
             )
     else:  # pragma: no cover - enum construction rejects this earlier
         raise ValueError(f"Unsupported task command kind: {command.kind}")
+    durable_error = message_data.get("_durable_command_error")
+    if isinstance(durable_error, str) and durable_error:
+        raise TaskCommandRejected(durable_error)
     return {
         "task_id": command.task_id,
         "command_id": command.command_id,

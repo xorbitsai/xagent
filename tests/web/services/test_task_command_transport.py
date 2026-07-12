@@ -334,6 +334,28 @@ async def test_cancel_command_defers_on_a_live_foreign_owner(db_session) -> None
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("kind", [TaskCommandKind.PAUSE, TaskCommandKind.RESUME])
+async def test_control_command_defers_on_a_live_foreign_owner(
+    db_session,
+    kind: TaskCommandKind,
+) -> None:
+    user, task = _create_running_task(db_session)
+    command = ClaimedTaskCommand(
+        id=1,
+        task_id=int(task.id),
+        actor_user_id=int(user.id),
+        command_id=f"misrouted-{kind.value}",
+        kind=kind,
+        payload={"type": f"{kind.value}_task"},
+        target_run_id=None,
+        attempt_count=1,
+    )
+
+    with pytest.raises(TaskCommandDeferred, match="active task lease owner"):
+        await execute_durable_task_command(command)
+
+
+@pytest.mark.asyncio
 async def test_cancel_command_does_not_require_persisted_actor(db_session) -> None:
     _user, task = _create_running_task(db_session)
     task.runner_id = None

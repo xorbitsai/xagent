@@ -97,6 +97,7 @@ from ..services.task_command_transport import (
     task_has_live_foreign_runner,
 )
 from ..services.task_execution_controller import (
+    StaleTaskRunError,
     TaskControlState,
     apply_task_control_transition,
     task_control_snapshot,
@@ -5391,14 +5392,15 @@ async def _handle_resume_task_unserialized(
                     websocket,
                 )
                 return
-            resume_snapshot = await task_execution_controller.transition(
-                task_id,
-                TaskControlState.RESUME_REQUESTED,
-                expected_run_id=_task_run_id(task),
-            )
-            previous_task = background_task_manager.running_tasks.get(task_id)
+            resume_snapshot: Any | None = None
             bg_task: asyncio.Task[None] | None = None
             try:
+                resume_snapshot = await task_execution_controller.transition(
+                    task_id,
+                    TaskControlState.RESUME_REQUESTED,
+                    expected_run_id=_task_run_id(task),
+                )
+                previous_task = background_task_manager.running_tasks.get(task_id)
                 bg_task = asyncio.create_task(
                     execute_resume_background(
                         task_id=task_id,
@@ -5413,17 +5415,18 @@ async def _handle_resume_task_unserialized(
                 if bg_task is not None:
                     bg_task.cancel()
                 background_task_manager.release_resume_reservation(task_id)
-                await asyncio.shield(
-                    task_execution_controller.transition(
-                        task_id,
-                        (
-                            TaskControlState.WAITING_FOR_USER
-                            if resume_snapshot.status == TaskStatus.WAITING_FOR_USER
-                            else TaskControlState.PAUSED
-                        ),
-                        expected_run_id=resume_snapshot.run_id,
+                if resume_snapshot is not None:
+                    await asyncio.shield(
+                        task_execution_controller.transition(
+                            task_id,
+                            (
+                                TaskControlState.WAITING_FOR_USER
+                                if resume_snapshot.status == TaskStatus.WAITING_FOR_USER
+                                else TaskControlState.PAUSED
+                            ),
+                            expected_run_id=resume_snapshot.run_id,
+                        )
                     )
-                )
                 raise
             logger.info(f"Task {task_id} v2 resume scheduled")
             return
@@ -5543,6 +5546,18 @@ async def _execute_durable_task_command(
                 f"{command.command_id} was applied",
                 reason="stale_run",
             )
+    if command.kind in {
+        TaskCommandKind.PAUSE,
+        TaskCommandKind.RESUME,
+        TaskCommandKind.CANCEL,
+    } and await asyncio.to_thread(
+        task_has_live_foreign_runner,
+        command.task_id,
+    ):
+        raise TaskCommandDeferred(
+            f"{command.kind.value.title()} command {command.command_id} is waiting "
+            "for the active task lease owner"
+        )
 
     if command.kind == TaskCommandKind.MESSAGE:
         await _handle_chat_message_unserialized(
@@ -5569,14 +5584,6 @@ async def _execute_durable_task_command(
         from ..models.agent import Agent
         from .a2a import _cancel_task_unserialized
 
-        if await asyncio.to_thread(
-            task_has_live_foreign_runner,
-            command.task_id,
-        ):
-            raise TaskCommandDeferred(
-                f"Cancel command {command.command_id} is waiting for the active "
-                "task lease owner"
-            )
         agent_id_value = message_data.get("agent_id")
         if agent_id_value is None:
             raise ValueError("Agent ID is missing or null in cancel command payload")
@@ -5591,11 +5598,14 @@ async def _execute_durable_task_command(
             agent = db.query(Agent).filter(Agent.id == agent_id).first()
             if agent is None:
                 raise ValueError(f"Agent {agent_id} not found for cancel command")
-            await _cancel_task_unserialized(
-                task_id=command.task_id,
-                agent=agent,
-                db=db,
-            )
+            try:
+                await _cancel_task_unserialized(
+                    task_id=command.task_id,
+                    agent=agent,
+                    db=db,
+                )
+            except StaleTaskRunError as exc:
+                raise TaskCommandRejected(str(exc), reason="stale_run") from exc
     else:  # pragma: no cover - enum construction rejects this earlier
         raise ValueError(f"Unsupported task command kind: {command.kind}")
     durable_error = message_data.get("_durable_command_error")

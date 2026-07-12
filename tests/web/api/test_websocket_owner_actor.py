@@ -607,6 +607,7 @@ async def test_durable_resume_propagates_stale_run_error(db_session) -> None:
             int(task.id),
             {"user": owner, "_durable_ack_sent": True},
         )
+    bg_mgr.release_resume_reservation.assert_called_once_with(int(task.id))
 
 
 @pytest.mark.asyncio

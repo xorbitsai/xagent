@@ -12,6 +12,20 @@ from xagent.core.tools.adapters.vibe.browser_use import (
 from xagent.core.workspace import TaskWorkspace
 
 
+def test_browser_debug_tools_are_opt_in() -> None:
+    default_names = {tool.name for tool in create_browser_tools(task_id="task")}
+    debug_names = {
+        tool.name
+        for tool in create_browser_tools(
+            task_id="task",
+            include_debug_tools=True,
+        )
+    }
+
+    assert "browser_list_sessions" not in default_names
+    assert "browser_list_sessions" in debug_names
+
+
 @pytest.mark.asyncio
 async def test_browser_task_session_mixin_defaults_to_no_task() -> None:
     tool = BrowserTaskSessionMixin()

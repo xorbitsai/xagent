@@ -10,7 +10,11 @@ from xagent.core.agent.pattern.final_answer_stream import (
     ToolCallStringFieldStreamer,
     _JsonStringFieldReader,
 )
-from xagent.core.agent.runtime import LLMCallInterrupted
+from xagent.core.agent.runtime import (
+    LLMCallInterrupted,
+    prepare_llm_for_context,
+    resolved_llm_metadata,
+)
 from xagent.core.model.chat.types import ChunkType, StreamChunk
 
 
@@ -22,6 +26,34 @@ class SlowLLM:
         self.started.set()
         await asyncio.sleep(60)
         return "never"
+
+
+@pytest.mark.asyncio
+async def test_prepare_llm_for_context_uses_resolved_model_window(monkeypatch) -> None:
+    monkeypatch.delenv("XAGENT_COMPACT_THRESHOLD_RATIO", raising=False)
+
+    class PreparedLLM:
+        model_name = "deepseek/deepseek-v4-flash"
+        context_window = 1_048_576
+
+    class VirtualLLM:
+        async def prepare_for_call(self, messages: list[dict[str, Any]]) -> Any:
+            assert messages[-1]["content"] == "make a podcast"
+            return PreparedLLM()
+
+    context = ExecutionContext()
+    prepared = await prepare_llm_for_context(
+        llm=VirtualLLM(),
+        messages=[{"role": "user", "content": "make a podcast"}],
+        context=context,
+    )
+
+    assert isinstance(prepared, PreparedLLM)
+    assert context.compact_config.threshold == 786_432
+    assert resolved_llm_metadata(prepared) == {
+        "selected_model": "deepseek/deepseek-v4-flash",
+        "context_window": 1_048_576,
+    }
 
 
 class CancelledLLM:

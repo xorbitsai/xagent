@@ -2,6 +2,8 @@
 
 from types import SimpleNamespace
 
+import httpx
+import openai
 import pytest
 
 from xagent.core.model.chat.basic.openrouter import OpenRouterLLM
@@ -65,6 +67,69 @@ async def test_openrouter_deepseek_rejects_serialized_tool_protocol_content(
     error = get_tool_protocol_error(result)
     assert error is not None
     assert error["code"] == "serialized_tool_call_content"
+
+
+def _deepseek_function_prefix_error() -> openai.BadRequestError:
+    return openai.BadRequestError(
+        "Error code: 400 - {'error': {'message': 'Provider returned error'}}",
+        response=httpx.Response(
+            400,
+            request=httpx.Request(
+                "POST", "https://openrouter.ai/api/v1/chat/completions"
+            ),
+        ),
+        body={
+            "error": {
+                "message": "Provider returned error",
+                "code": 400,
+                "metadata": {
+                    "provider_name": "DeepSeek",
+                    "raw": (
+                        '{"error":{"message":'
+                        '"Function call should not be used with prefix"}}'
+                    ),
+                },
+            }
+        },
+    )
+
+
+def _unrelated_bad_request() -> openai.BadRequestError:
+    return openai.BadRequestError(
+        "Error code: 400 - {'error': {'message': 'Unrelated invalid request'}}",
+        response=httpx.Response(
+            400,
+            request=httpx.Request(
+                "POST", "https://openrouter.ai/api/v1/chat/completions"
+            ),
+        ),
+        body={"error": {"message": "Unrelated invalid request", "code": 400}},
+    )
+
+
+def _tool_call_history() -> list[dict]:
+    return [
+        {"role": "user", "content": "Generate music"},
+        {
+            "role": "assistant",
+            "content": "I will generate the music first.",
+            "tool_calls": [
+                {
+                    "id": "call_music",
+                    "type": "function",
+                    "function": {
+                        "name": "generate_music",
+                        "arguments": '{"prompt":"intro"}',
+                    },
+                }
+            ],
+        },
+        {
+            "role": "tool",
+            "tool_call_id": "call_music",
+            "content": '{"success":true}',
+        },
+    ]
 
 
 @pytest.mark.asyncio
@@ -178,6 +243,118 @@ async def test_openrouter_provider_override_is_preserved(
         "provider": {"only": ["deepinfra"]},
         "trace_id": "manual",
     }
+
+
+@pytest.mark.asyncio
+async def test_openrouter_deepseek_retries_function_call_without_assistant_prefix(
+    mock_chat_completion, mocker, monkeypatch
+):
+    monkeypatch.setenv("XAGENT_OPENROUTER_OFFICIAL_PROVIDERS_ONLY", "false")
+    mock_client = mocker.AsyncMock()
+    mock_client.chat.completions.create.side_effect = [
+        _deepseek_function_prefix_error(),
+        mock_chat_completion,
+    ]
+    mocker.patch(
+        "xagent.core.model.chat.basic.openai.AsyncOpenAI",
+        return_value=mock_client,
+    )
+    llm = OpenRouterLLM(
+        model_name="deepseek/deepseek-v4-flash",
+        api_key="test-key",
+    )
+    messages = _tool_call_history()
+
+    result = await llm.chat(messages)
+
+    assert result["content"] == "Hello World"
+    assert mock_client.chat.completions.create.await_count == 2
+    first_messages = mock_client.chat.completions.create.call_args_list[0].kwargs[
+        "messages"
+    ]
+    retry_messages = mock_client.chat.completions.create.call_args_list[1].kwargs[
+        "messages"
+    ]
+    assert first_messages[1]["content"] == "I will generate the music first."
+    assert retry_messages[1]["content"] == ""
+    assert retry_messages[1]["tool_calls"] == messages[1]["tool_calls"]
+    assert messages[1]["content"] == "I will generate the music first."
+
+
+@pytest.mark.asyncio
+async def test_openrouter_deepseek_stream_retries_prefix_error_before_first_chunk(
+    mocker, monkeypatch
+):
+    monkeypatch.setenv("XAGENT_OPENROUTER_OFFICIAL_PROVIDERS_ONLY", "false")
+
+    async def empty_stream():
+        if False:
+            yield None
+
+    mock_client = mocker.AsyncMock()
+    mock_client.chat.completions.create.side_effect = [
+        _deepseek_function_prefix_error(),
+        empty_stream(),
+    ]
+    mocker.patch(
+        "xagent.core.model.chat.basic.openai.AsyncOpenAI",
+        return_value=mock_client,
+    )
+    llm = OpenRouterLLM(
+        model_name="deepseek/deepseek-v4-flash",
+        api_key="test-key",
+    )
+
+    chunks = [chunk async for chunk in llm.stream_chat(_tool_call_history())]
+
+    assert chunks == []
+    assert mock_client.chat.completions.create.await_count == 2
+    retry_messages = mock_client.chat.completions.create.call_args_list[1].kwargs[
+        "messages"
+    ]
+    assert retry_messages[1]["content"] == ""
+
+
+@pytest.mark.asyncio
+async def test_openrouter_does_not_retry_unrelated_bad_request(mocker, monkeypatch):
+    monkeypatch.setenv("XAGENT_OPENROUTER_OFFICIAL_PROVIDERS_ONLY", "false")
+    mock_client = mocker.AsyncMock()
+    mock_client.chat.completions.create.side_effect = _unrelated_bad_request()
+    mocker.patch(
+        "xagent.core.model.chat.basic.openai.AsyncOpenAI",
+        return_value=mock_client,
+    )
+    llm = OpenRouterLLM(
+        model_name="deepseek/deepseek-v4-flash",
+        api_key="test-key",
+    )
+
+    with pytest.raises(RuntimeError, match="Unrelated invalid request"):
+        await llm.chat(_tool_call_history())
+
+    assert mock_client.chat.completions.create.await_count == 1
+
+
+@pytest.mark.asyncio
+async def test_openrouter_non_deepseek_does_not_retry_function_prefix_error(
+    mocker, monkeypatch
+):
+    monkeypatch.setenv("XAGENT_OPENROUTER_OFFICIAL_PROVIDERS_ONLY", "false")
+    mock_client = mocker.AsyncMock()
+    mock_client.chat.completions.create.side_effect = _deepseek_function_prefix_error()
+    mocker.patch(
+        "xagent.core.model.chat.basic.openai.AsyncOpenAI",
+        return_value=mock_client,
+    )
+    llm = OpenRouterLLM(
+        model_name="openai/gpt-5.5",
+        api_key="test-key",
+    )
+
+    with pytest.raises(RuntimeError, match="Function call should not be used"):
+        await llm.chat(_tool_call_history())
+
+    assert mock_client.chat.completions.create.await_count == 1
 
 
 @pytest.mark.asyncio

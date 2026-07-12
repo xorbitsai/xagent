@@ -24,7 +24,12 @@ from ...language import (
     normalize_response_language_label,
     output_language_policy,
 )
-from ...runtime import LLMCallInterrupted, PatternRuntime
+from ...runtime import (
+    LLMCallInterrupted,
+    PatternRuntime,
+    prepare_llm_for_context,
+    resolved_llm_metadata,
+)
 from ..base import (
     REQUIRED_TOOL_CALL_FAILURE_REASON,
     AgentPattern,
@@ -754,6 +759,11 @@ class AutoPattern(AgentPattern):
         # Re-derive the request-scoped language before routing so stale metadata
         # cannot bias the current decision prompt.
         self._clear_response_language(context)
+        call_llm = await prepare_llm_for_context(
+            llm=llm,
+            messages=context.get_messages_for_llm(),
+            context=context,
+        )
         await runtime.compact_context_if_needed(
             context=context,
             llm=compact_llm,
@@ -783,7 +793,10 @@ class AutoPattern(AgentPattern):
                     content=retry_feedback,
                     section_title="Auto routing retry feedback",
                 )
-            metadata: dict[str, Any] = {"phase": "auto_decision"}
+            metadata: dict[str, Any] = {
+                "phase": "auto_decision",
+                **resolved_llm_metadata(call_llm),
+            }
             if attempt:
                 metadata["attempt"] = attempt + 1
             await runtime.on_llm_start(
@@ -806,7 +819,7 @@ class AutoPattern(AgentPattern):
             )
             try:
                 response = await runtime.run_streaming_llm_call(
-                    llm,
+                    call_llm,
                     messages=messages,
                     tools=decision_tools,
                     tool_choice="required",

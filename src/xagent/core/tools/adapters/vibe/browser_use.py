@@ -1118,7 +1118,10 @@ class BrowserPdfTool(BrowserTaskSessionMixin, AbstractBaseTool):
 
 
 def create_browser_tools(
-    task_id: Optional[str] = None, workspace: Optional["TaskWorkspace"] = None
+    task_id: Optional[str] = None,
+    workspace: Optional["TaskWorkspace"] = None,
+    *,
+    include_debug_tools: bool = False,
 ) -> list:
     """
     Create all browser automation tools for a task.
@@ -1126,11 +1129,13 @@ def create_browser_tools(
     Args:
         task_id: Optional task ID for session tracking
         workspace: Optional workspace for saving screenshots
+        include_debug_tools: Include browser session diagnostics. Disabled for
+            normal agent runs so debug schemas do not consume model context.
 
     Returns:
         List of browser tool instances
     """
-    return [
+    tools = [
         BrowserNavigateTool(task_id=task_id, workspace=workspace),
         BrowserClickTool(task_id=task_id),
         BrowserFillTool(task_id=task_id),
@@ -1141,5 +1146,7 @@ def create_browser_tools(
         BrowserSelectOptionTool(task_id=task_id),
         BrowserWaitForSelectorTool(task_id=task_id),
         BrowserCloseTool(task_id=task_id),
-        BrowserListSessionsTool(),  # Debug tool (no task_id needed)
     ]
+    if include_debug_tools:
+        tools.append(BrowserListSessionsTool())
+    return tools

@@ -8,7 +8,7 @@ focusing on JSON and CSV workspace writes and reads.
 import pytest
 
 from xagent.core.tools.core.workspace_file_tool import WorkspaceFileOperations
-from xagent.core.workspace import TaskWorkspace
+from xagent.core.workspace import DEFAULT_USER_FILE_LIST_LIMIT, TaskWorkspace
 
 
 class TestWorkspaceFileOperations:
@@ -320,6 +320,7 @@ class TestWorkspaceFileOperations:
 
         assert result["success"] is True
         assert result["user_id"] is None  # No user_id for test workspace
+        assert result["limit"] == DEFAULT_USER_FILE_LIST_LIMIT
         # Files will only include workspace files if include_workspace_files=True
         assert len(result["files"]) == 0  # Default is include_workspace_files=False
 

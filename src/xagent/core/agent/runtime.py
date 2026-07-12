@@ -7,6 +7,7 @@ from dataclasses import dataclass, field
 from typing import Any, Callable
 from uuid import uuid4
 
+from ...config import get_compact_threshold_ratio
 from ..agent.trace import (
     TraceAction,
     TraceCategory,
@@ -25,6 +26,51 @@ logger = logging.getLogger(__name__)
 
 class LLMCallInterrupted(Exception):
     """Raised when an active LLM call is cancelled by an execution interrupt."""
+
+
+async def prepare_llm_for_context(
+    *,
+    llm: Any,
+    messages: list[dict[str, Any]],
+    context: Any,
+) -> Any:
+    """Resolve virtual models before compaction and apply their context window.
+
+    Normal models are returned unchanged. RouterLLM exposes ``prepare_for_call``
+    and returns a one-call wrapper for the concrete xrouter selection, ensuring
+    the selected model is reused after compaction instead of routing twice.
+    """
+    prepared = llm
+    prepare = getattr(llm, "prepare_for_call", None)
+    if callable(prepare):
+        prepared = prepare(messages)
+        if inspect.isawaitable(prepared):
+            prepared = await prepared
+
+    context_window = getattr(prepared, "context_window", None)
+    compact_config = getattr(context, "compact_config", None)
+    if (
+        isinstance(context_window, int)
+        and context_window > 0
+        and compact_config is not None
+    ):
+        compact_config.threshold = max(
+            1, int(context_window * get_compact_threshold_ratio())
+        )
+
+    return prepared
+
+
+def resolved_llm_metadata(llm: Any) -> dict[str, Any]:
+    """Trace metadata for an already-resolved virtual model."""
+    metadata: dict[str, Any] = {}
+    model_name = getattr(llm, "model_name", None)
+    context_window = getattr(llm, "context_window", None)
+    if isinstance(model_name, str) and model_name:
+        metadata["selected_model"] = model_name
+    if isinstance(context_window, int) and context_window > 0:
+        metadata["context_window"] = context_window
+    return metadata
 
 
 @dataclass

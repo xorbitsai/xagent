@@ -17,7 +17,7 @@ from typing import Any, Dict, List, Optional, Union
 from pydantic import BaseModel
 
 from ...file_ref import build_workspace_file_ref, safe_asset_filename
-from ...workspace import TaskWorkspace
+from ...workspace import DEFAULT_USER_FILE_LIST_LIMIT, TaskWorkspace
 from .document_parser import DocumentCapabilities, DocumentParseArgs, parse_document
 from .file_tool import (
     EditOperation,
@@ -666,14 +666,14 @@ class WorkspaceFileOperations:
     def list_all_user_files(
         self,
         include_workspace_files: bool = True,
-        limit: int = 1000,
+        limit: int = DEFAULT_USER_FILE_LIST_LIMIT,
         offset: int = 0,
     ) -> Dict[str, Any]:
         """List all user files across all workspaces and uploaded files.
 
         Args:
             include_workspace_files: Whether to include current workspace files
-            limit: Maximum number of files to return (default: 1000)
+            limit: Maximum number of files to return (default: 50)
             offset: Number of files to skip for pagination (default: 0)
 
         Returns:

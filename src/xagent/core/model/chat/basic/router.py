@@ -297,9 +297,8 @@ class RouterLLM(BaseLLM):
         output_config: dict[str, Any] | None = None,
         **kwargs: Any,
     ) -> str | dict[str, Any]:
-        llm = await self._resolve(messages)
-        return await self._run_non_streaming_with_provider_retry(
-            llm.chat,
+        prepared = await self.prepare_for_call(messages)
+        return await prepared.chat(
             messages,
             temperature=temperature,
             max_tokens=max_tokens,
@@ -308,7 +307,7 @@ class RouterLLM(BaseLLM):
             response_format=response_format,
             thinking=thinking,
             output_config=output_config,
-            kwargs=kwargs,
+            **kwargs,
         )
 
     async def vision_chat(
@@ -323,9 +322,8 @@ class RouterLLM(BaseLLM):
         output_config: dict[str, Any] | None = None,
         **kwargs: Any,
     ) -> str | dict[str, Any]:
-        llm = await self._resolve(messages)
-        return await self._run_non_streaming_with_provider_retry(
-            llm.vision_chat,
+        prepared = await self.prepare_for_call(messages)
+        return await prepared.vision_chat(
             messages,
             temperature=temperature,
             max_tokens=max_tokens,
@@ -334,7 +332,7 @@ class RouterLLM(BaseLLM):
             response_format=response_format,
             thinking=thinking,
             output_config=output_config,
-            kwargs=kwargs,
+            **kwargs,
         )
 
     async def stream_chat(
@@ -349,7 +347,34 @@ class RouterLLM(BaseLLM):
         output_config: dict[str, Any] | None = None,
         **kwargs: Any,
     ) -> AsyncIterator[StreamChunk]:
-        llm = await self._resolve(messages)
+        prepared = await self.prepare_for_call(messages)
+        async for chunk in prepared.stream_chat(
+            messages,
+            temperature=temperature,
+            max_tokens=max_tokens,
+            tools=tools,
+            tool_choice=tool_choice,
+            response_format=response_format,
+            thinking=thinking,
+            output_config=output_config,
+            **kwargs,
+        ):
+            yield chunk
+
+    async def _run_streaming_with_provider_retry(
+        self,
+        llm: BaseLLM,
+        messages: list[dict[str, Any]],
+        *,
+        temperature: float | None,
+        max_tokens: int | None,
+        tools: list[dict[str, Any]] | None,
+        tool_choice: str | dict[str, Any] | None,
+        response_format: dict[str, Any] | None,
+        thinking: dict[str, Any] | None,
+        output_config: dict[str, Any] | None,
+        kwargs: dict[str, Any],
+    ) -> AsyncIterator[StreamChunk]:
         has_yielded = False
         current_tool_choice = tool_choice
         current_thinking = thinking
@@ -394,7 +419,35 @@ class RouterLLM(BaseLLM):
                 current_thinking = next_thinking
 
     # ---- Routing ------------------------------------------------------------
+    async def prepare_for_call(self, messages: list[dict[str, Any]]) -> BaseLLM:
+        """Resolve one xrouter decision into a reusable per-call LLM.
+
+        The returned wrapper keeps RouterLLM's compatibility retries without
+        routing a second time, and carries the selected model's context window
+        from xrouter's model profile catalog.
+        """
+        model_id, downstream = await self._resolve_route(messages)
+        context_window = self.context_window
+        if not context_window:
+            context_window = await asyncio.to_thread(
+                self._profile_context_window, model_id
+            )
+        if not context_window:
+            context_window = getattr(downstream, "context_window", None)
+        return _ResolvedRouterLLM(
+            router=self,
+            downstream=downstream,
+            selected_model=model_id,
+            context_window=context_window,
+        )
+
     async def _resolve(self, messages: list[dict[str, Any]]) -> BaseLLM:
+        _, downstream = await self._resolve_route(messages)
+        return downstream
+
+    async def _resolve_route(
+        self, messages: list[dict[str, Any]]
+    ) -> tuple[str, BaseLLM]:
         # Route on the agent's current goal (the user's request, or a DAG step's
         # objective) rather than the scaffolded sub-prompt this particular LLM
         # call happens to carry.
@@ -405,7 +458,7 @@ class RouterLLM(BaseLLM):
         logger.info("xrouter selected %s -> openrouter", model_id)
         if self._downstream_resolver is not None:
             # Reuse the user-configured OpenRouter model (credentials + base_url).
-            return self._downstream_resolver(model_id)
+            return model_id, self._downstream_resolver(model_id)
         # Fallback when no downstream resolver was injected: an OpenAI-compatible
         # client using this model's own OpenRouter credentials (or the ambient
         # OPENAI_BASE_URL / OPENAI_API_KEY env when those are unset).
@@ -423,7 +476,22 @@ class RouterLLM(BaseLLM):
             timeout=self.timeout,
             abilities=self._abilities,
         )
-        return create_base_llm(config)
+        return model_id, create_base_llm(config)
+
+    @staticmethod
+    def _profile_context_window(model_id: str) -> int | None:
+        """Read context length from xrouter's already-loaded model catalog."""
+        try:
+            profile = _get_service().profiles.get(model_id)
+            value = getattr(profile, "context_length", None)
+        except Exception as exc:  # noqa: BLE001 - metadata is best effort
+            logger.warning(
+                "Could not resolve xrouter context window for %s: %s",
+                model_id,
+                exc,
+            )
+            return None
+        return value if isinstance(value, int) and value > 0 else None
 
     async def _select_model(self, prompt: str) -> str:
         # The decision loads/embeds in-process and is CPU-bound, so run it in a
@@ -474,3 +542,117 @@ class RouterLLM(BaseLLM):
         return "\n".join(
             m["content"] for m in messages if isinstance(m.get("content"), str)
         )
+
+
+class _ResolvedRouterLLM(BaseLLM):
+    """A concrete xrouter selection reused for one logical LLM call."""
+
+    def __init__(
+        self,
+        *,
+        router: RouterLLM,
+        downstream: BaseLLM,
+        selected_model: str,
+        context_window: int | None,
+    ) -> None:
+        self._router = router
+        self._downstream = downstream
+        self._selected_model = selected_model
+        self.context_window = context_window
+        self._model_id = getattr(downstream, "model_id", None) or None
+
+    @property
+    def abilities(self) -> List[str]:
+        return self._router.abilities
+
+    @property
+    def model_name(self) -> str:
+        return self._selected_model
+
+    @property
+    def supports_thinking_mode(self) -> bool:
+        return self._router.supports_thinking_mode
+
+    @property
+    def supports_json_schema_response_format(self) -> bool:
+        return self._downstream.supports_json_schema_response_format
+
+    @property
+    def supports_json_object_response_format(self) -> bool:
+        return self._downstream.supports_json_object_response_format
+
+    async def chat(
+        self,
+        messages: list[dict[str, str]],
+        temperature: float | None = None,
+        max_tokens: int | None = None,
+        tools: list[dict[str, Any]] | None = None,
+        tool_choice: str | dict[str, Any] | None = None,
+        response_format: dict[str, Any] | None = None,
+        thinking: dict[str, Any] | None = None,
+        output_config: dict[str, Any] | None = None,
+        **kwargs: Any,
+    ) -> str | dict[str, Any]:
+        return await self._router._run_non_streaming_with_provider_retry(
+            self._downstream.chat,
+            messages,
+            temperature=temperature,
+            max_tokens=max_tokens,
+            tools=tools,
+            tool_choice=tool_choice,
+            response_format=response_format,
+            thinking=thinking,
+            output_config=output_config,
+            kwargs=kwargs,
+        )
+
+    async def vision_chat(
+        self,
+        messages: list[dict[str, Any]],
+        temperature: float | None = None,
+        max_tokens: int | None = None,
+        tools: list[dict[str, Any]] | None = None,
+        tool_choice: str | dict[str, Any] | None = None,
+        response_format: dict[str, Any] | None = None,
+        thinking: dict[str, Any] | None = None,
+        output_config: dict[str, Any] | None = None,
+        **kwargs: Any,
+    ) -> str | dict[str, Any]:
+        return await self._router._run_non_streaming_with_provider_retry(
+            self._downstream.vision_chat,
+            messages,
+            temperature=temperature,
+            max_tokens=max_tokens,
+            tools=tools,
+            tool_choice=tool_choice,
+            response_format=response_format,
+            thinking=thinking,
+            output_config=output_config,
+            kwargs=kwargs,
+        )
+
+    async def stream_chat(
+        self,
+        messages: list[dict[str, str]],
+        temperature: float | None = None,
+        max_tokens: int | None = None,
+        tools: list[dict[str, Any]] | None = None,
+        tool_choice: str | dict[str, Any] | None = None,
+        response_format: dict[str, Any] | None = None,
+        thinking: dict[str, Any] | None = None,
+        output_config: dict[str, Any] | None = None,
+        **kwargs: Any,
+    ) -> AsyncIterator[StreamChunk]:
+        async for chunk in self._router._run_streaming_with_provider_retry(
+            self._downstream,
+            messages,
+            temperature=temperature,
+            max_tokens=max_tokens,
+            tools=tools,
+            tool_choice=tool_choice,
+            response_format=response_format,
+            thinking=thinking,
+            output_config=output_config,
+            kwargs=kwargs,
+        ):
+            yield chunk

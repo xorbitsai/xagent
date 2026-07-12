@@ -1,3 +1,4 @@
+import logging
 from typing import Any, AsyncIterator, Dict, List, Optional
 
 from .....config import get_openrouter_official_providers_only
@@ -9,7 +10,10 @@ from .deepseek_tool_protocol import (
 )
 from .openai import OpenAILLM
 
+logger = logging.getLogger(__name__)
+
 OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
+_DEEPSEEK_FUNCTION_PREFIX_ERROR = "function call should not be used with prefix"
 
 _OPENROUTER_OFFICIAL_PROVIDERS_BY_AUTHOR: dict[str, tuple[str, ...]] = {
     "anthropic": ("anthropic",),
@@ -29,6 +33,25 @@ def _openrouter_model_author(model_name: str) -> str:
     if len(parts) >= 2:
         return parts[0].lower()
     return ""
+
+
+def _strip_assistant_tool_call_prefixes(
+    messages: List[Dict[str, Any]],
+) -> tuple[List[Dict[str, Any]], bool]:
+    """Remove text prefixes from historical assistant function-call messages."""
+    sanitized: List[Dict[str, Any]] = []
+    changed = False
+    for message in messages:
+        sanitized_message = dict(message)
+        if (
+            sanitized_message.get("role") == "assistant"
+            and sanitized_message.get("tool_calls")
+            and str(sanitized_message.get("content") or "").strip()
+        ):
+            sanitized_message["content"] = ""
+            changed = True
+        sanitized.append(sanitized_message)
+    return sanitized, changed
 
 
 class OpenRouterLLM(OpenAILLM):
@@ -60,9 +83,24 @@ class OpenRouterLLM(OpenAILLM):
     def _uses_deepseek_tool_protocol(self) -> bool:
         return _openrouter_model_author(self._model_name) == "deepseek"
 
+    def _is_official_openrouter_client(self) -> bool:
+        return self.base_url.rstrip("/") == OPENROUTER_BASE_URL
+
+    def _should_retry_deepseek_function_prefix(
+        self,
+        exc: Exception,
+        messages: List[Dict[str, Any]],
+    ) -> bool:
+        if _openrouter_model_author(self._model_name) != "deepseek":
+            return False
+        if _DEEPSEEK_FUNCTION_PREFIX_ERROR not in str(exc).lower():
+            return False
+        _, changed = _strip_assistant_tool_call_prefixes(messages)
+        return changed
+
     async def chat(
         self,
-        messages: List[Dict[str, str]],
+        messages: List[Dict[str, Any]],
         temperature: Optional[float] = None,
         max_tokens: Optional[int] = None,
         tools: Optional[List[Dict[str, Any]]] = None,
@@ -72,24 +110,46 @@ class OpenRouterLLM(OpenAILLM):
         output_config: Optional[Dict[str, Any]] = None,
         **kwargs: Any,
     ) -> Any:
-        response = await super().chat(
-            messages=messages,
-            temperature=temperature,
-            max_tokens=max_tokens,
-            tools=tools,
-            tool_choice=tool_choice,
-            response_format=response_format,
-            thinking=thinking,
-            output_config=output_config,
-            **kwargs,
-        )
+        try:
+            response = await super().chat(
+                messages=messages,
+                temperature=temperature,
+                max_tokens=max_tokens,
+                tools=tools,
+                tool_choice=tool_choice,
+                response_format=response_format,
+                thinking=thinking,
+                output_config=output_config,
+                **kwargs,
+            )
+        except RuntimeError as exc:
+            if not self._should_retry_deepseek_function_prefix(exc, messages):
+                raise
+
+            sanitized_messages, _ = _strip_assistant_tool_call_prefixes(messages)
+            logger.info(
+                "OpenRouter DeepSeek rejected function-call history with an "
+                "assistant prefix; retrying once without tool-call prefixes"
+            )
+            response = await super().chat(
+                messages=sanitized_messages,
+                temperature=temperature,
+                max_tokens=max_tokens,
+                tools=tools,
+                tool_choice=tool_choice,
+                response_format=response_format,
+                thinking=thinking,
+                output_config=output_config,
+                **kwargs,
+            )
+
         if not self._uses_deepseek_tool_protocol:
             return response
         return normalize_deepseek_response(response, tools=tools)
 
-    async def stream_chat(
+    async def _stream_chat_with_prefix_retry(
         self,
-        messages: List[Dict[str, str]],
+        messages: List[Dict[str, Any]],
         temperature: Optional[float] = None,
         max_tokens: Optional[int] = None,
         tools: Optional[List[Dict[str, Any]]] = None,
@@ -99,7 +159,59 @@ class OpenRouterLLM(OpenAILLM):
         output_config: Optional[Dict[str, Any]] = None,
         **kwargs: Any,
     ) -> AsyncIterator[StreamChunk]:
-        stream = super().stream_chat(
+        has_yielded = False
+        try:
+            async for chunk in super().stream_chat(
+                messages=messages,
+                temperature=temperature,
+                max_tokens=max_tokens,
+                tools=tools,
+                tool_choice=tool_choice,
+                response_format=response_format,
+                thinking=thinking,
+                output_config=output_config,
+                **kwargs,
+            ):
+                has_yielded = True
+                yield chunk
+            return
+        except RuntimeError as exc:
+            if has_yielded or not self._should_retry_deepseek_function_prefix(
+                exc, messages
+            ):
+                raise
+
+        sanitized_messages, _ = _strip_assistant_tool_call_prefixes(messages)
+        logger.info(
+            "OpenRouter DeepSeek rejected streaming function-call history with an "
+            "assistant prefix; retrying once without tool-call prefixes"
+        )
+        async for chunk in super().stream_chat(
+            messages=sanitized_messages,
+            temperature=temperature,
+            max_tokens=max_tokens,
+            tools=tools,
+            tool_choice=tool_choice,
+            response_format=response_format,
+            thinking=thinking,
+            output_config=output_config,
+            **kwargs,
+        ):
+            yield chunk
+
+    async def stream_chat(
+        self,
+        messages: List[Dict[str, Any]],
+        temperature: Optional[float] = None,
+        max_tokens: Optional[int] = None,
+        tools: Optional[List[Dict[str, Any]]] = None,
+        tool_choice: Optional[str | Dict[str, Any]] = None,
+        response_format: Optional[Dict[str, Any]] = None,
+        thinking: Optional[Dict[str, Any]] = None,
+        output_config: Optional[Dict[str, Any]] = None,
+        **kwargs: Any,
+    ) -> AsyncIterator[StreamChunk]:
+        stream = self._stream_chat_with_prefix_retry(
             messages=messages,
             temperature=temperature,
             max_tokens=max_tokens,
@@ -116,9 +228,6 @@ class OpenRouterLLM(OpenAILLM):
             return
         async for chunk in adapt_deepseek_stream(stream, tools=tools):
             yield chunk
-
-    def _is_official_openrouter_client(self) -> bool:
-        return self.base_url.rstrip("/") == OPENROUTER_BASE_URL
 
     def _prepare_extra_body(self, extra_body: Dict[str, Any]) -> Dict[str, Any]:
         if (

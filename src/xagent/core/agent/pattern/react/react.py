@@ -47,7 +47,12 @@ from ...context.enrichment import (
 )
 from ...language import final_answer_language_rule
 from ...result import tool_result_succeeded, unwrap_final_answer_content
-from ...runtime import LLMCallInterrupted, PatternRuntime
+from ...runtime import (
+    LLMCallInterrupted,
+    PatternRuntime,
+    prepare_llm_for_context,
+    resolved_llm_metadata,
+)
 from ..base import AgentPattern, PatternResult, truncate_prompt_preview
 from ..final_answer_stream import ReActFinalAnswerStreamer
 
@@ -364,6 +369,21 @@ class ReActPattern(AgentPattern):
             if interrupted is not None:
                 return interrupted
 
+            route_messages = self._messages_for_llm(
+                context,
+                has_tools=bool(tool_schemas),
+                force_final_answer=force_final_answer_now,
+                tool_names=self._schema_tool_names(tool_schemas),
+            )
+            call_llm = await prepare_llm_for_context(
+                llm=llm,
+                messages=route_messages,
+                context=context,
+            )
+            llm_metadata = {
+                "iteration": iteration,
+                **resolved_llm_metadata(call_llm),
+            }
             await runtime.compact_context_if_needed(
                 context=context,
                 llm=compact_llm,
@@ -381,7 +401,7 @@ class ReActPattern(AgentPattern):
                 context=context,
                 messages=messages,
                 tools=tool_schemas or None,
-                metadata={"iteration": iteration},
+                metadata=llm_metadata,
             )
             answer_streamer: ReActFinalAnswerStreamer | None = None
             try:
@@ -400,12 +420,12 @@ class ReActPattern(AgentPattern):
                 if tool_schemas:
                     answer_streamer = ReActFinalAnswerStreamer(runtime)
                     response = await runtime.run_streaming_llm_call(
-                        llm,
+                        call_llm,
                         on_chunk=answer_streamer.handle_chunk,
                         **llm_kwargs,
                     )
                 else:
-                    response = await runtime.stream_final_answer(llm, **llm_kwargs)
+                    response = await runtime.stream_final_answer(call_llm, **llm_kwargs)
             except LLMCallInterrupted:
                 if answer_streamer is not None:
                     await answer_streamer.fail("interrupted during LLM stream")
@@ -428,7 +448,7 @@ class ReActPattern(AgentPattern):
                 normalized,
                 force_final_answer=force_final_answer_now,
             )
-            end_metadata: dict[str, Any] = {"iteration": iteration}
+            end_metadata: dict[str, Any] = dict(llm_metadata)
             if requires_protocol_retry:
                 end_metadata.update(
                     success=False,
@@ -1085,8 +1105,8 @@ class ReActPattern(AgentPattern):
 
     def _build_tool_schema(self, tool: Any) -> dict[str, Any]:
         name = self._tool_name(tool)
-        description = self._tool_description(tool)
-        schema = self._tool_json_schema(tool)
+        description = self._compact_tool_description(self._tool_description(tool))
+        schema = self._compact_tool_json_schema(self._tool_json_schema(tool))
         return {
             "type": "function",
             "function": {
@@ -1095,6 +1115,33 @@ class ReActPattern(AgentPattern):
                 "parameters": schema,
             },
         }
+
+    def _compact_tool_description(self, description: str) -> str:
+        """Collapse formatting whitespace without changing description content."""
+        return " ".join(description.split())
+
+    def _compact_tool_json_schema(
+        self, value: Any, *, preserve_mapping_keys: bool = False
+    ) -> Any:
+        """Remove presentation-only Pydantic metadata from provider schemas."""
+        if isinstance(value, list):
+            return [self._compact_tool_json_schema(item) for item in value]
+        if not isinstance(value, dict):
+            return value
+
+        compacted: dict[str, Any] = {}
+        for key, item in value.items():
+            if key == "title" and not preserve_mapping_keys:
+                continue
+            if key == "description" and isinstance(item, str):
+                compacted[key] = self._compact_tool_description(item)
+            else:
+                compacted[key] = self._compact_tool_json_schema(
+                    item,
+                    preserve_mapping_keys=key
+                    in {"properties", "patternProperties", "$defs", "definitions"},
+                )
+        return compacted
 
     def _builtin_tool_schemas(self) -> list[dict[str, Any]]:
         return [
@@ -1680,9 +1727,15 @@ class ReActPattern(AgentPattern):
             return None
 
         messages = self._messages_for_repeated_tool_decision(context, metadata)
+        call_llm = await prepare_llm_for_context(
+            llm=llm,
+            messages=messages,
+            context=context,
+        )
         decision_tools = [self._react_decision_tool_schema()]
         llm_metadata = {
             "phase": REPEATED_TOOL_DECISION_REQUESTED_STATUS,
+            **resolved_llm_metadata(call_llm),
             **metadata,
         }
         await runtime.on_llm_start(
@@ -1693,7 +1746,7 @@ class ReActPattern(AgentPattern):
         )
         try:
             response = await runtime.run_streaming_llm_call(
-                llm,
+                call_llm,
                 messages=messages,
                 tools=decision_tools,
                 tool_choice="required",

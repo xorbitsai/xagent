@@ -23,6 +23,8 @@ from .execution_scope import validate_scope_component
 
 logger = logging.getLogger(__name__)
 
+DEFAULT_USER_FILE_LIST_LIMIT = 50
+
 # Context variable for auto-registration mode
 _auto_register = contextvars.ContextVar("_auto_register", default=False)
 
@@ -1239,14 +1241,14 @@ class TaskWorkspace:
     def list_all_user_files(
         self,
         include_workspace_files: bool = True,
-        limit: int = 1000,
+        limit: int = DEFAULT_USER_FILE_LIST_LIMIT,
         offset: int = 0,
     ) -> Dict[str, Any]:
         """List all user files across all workspaces and uploaded files.
 
         Args:
             include_workspace_files: Whether to include current workspace files
-            limit: Maximum number of files to return (default: 1000)
+            limit: Maximum number of files to return (default: 50)
             offset: Number of files to skip for pagination (default: 0)
 
         Returns:

@@ -2405,6 +2405,48 @@ async def test_react_pattern_supports_legacy_args_type_schema() -> None:
     assert parameters["required"] == ["value"]
 
 
+def test_react_compacts_provider_tool_schema_without_losing_named_fields() -> None:
+    class CompactSchemaArgs:
+        @staticmethod
+        def model_json_schema() -> dict[str, Any]:
+            return {
+                "title": "CompactSchemaArgs",
+                "type": "object",
+                "properties": {
+                    "title": {
+                        "title": "Title",
+                        "type": "string",
+                        "description": "First line.\n\n  Second line.",
+                        "default": "draft",
+                    }
+                },
+                "required": ["title"],
+            }
+
+    class CompactSchemaTool:
+        def __init__(self) -> None:
+            class Metadata:
+                name = "compact_schema"
+                description = "Compact\n\n  redundant whitespace."
+
+            self.metadata = Metadata()
+
+        def args_type(self) -> type[CompactSchemaArgs]:
+            return CompactSchemaArgs
+
+    schema = ReActPattern()._build_tool_schema(CompactSchemaTool())
+
+    assert schema["function"]["description"] == "Compact redundant whitespace."
+    parameters = schema["function"]["parameters"]
+    assert "title" not in parameters
+    assert parameters["properties"]["title"] == {
+        "type": "string",
+        "description": "First line. Second line.",
+        "default": "draft",
+    }
+    assert parameters["required"] == ["title"]
+
+
 @pytest.mark.asyncio
 async def test_react_pattern_injects_v1_memory_and_skill_context() -> None:
     llm = FakeLLM(

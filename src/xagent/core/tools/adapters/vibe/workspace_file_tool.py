@@ -8,7 +8,7 @@ Each tool instance operates within its designated workspace only.
 import logging
 from typing import TYPE_CHECKING, Any, Dict, List
 
-from .....core.workspace import TaskWorkspace
+from .....core.workspace import DEFAULT_USER_FILE_LIST_LIMIT, TaskWorkspace
 from ...core.workspace_file_tool import FileInfo, WorkspaceFileOperations
 from .base import ToolCategory
 from .function import FunctionTool
@@ -149,14 +149,14 @@ class WorkspaceFileTools(WorkspaceFileOperations):
     def list_all_user_files(
         self,
         include_workspace_files: bool = True,
-        limit: int = 1000,
+        limit: int = DEFAULT_USER_FILE_LIST_LIMIT,
         offset: int = 0,
     ) -> Dict[str, Any]:
         """List all user files across all workspaces and uploaded files.
 
         Args:
             include_workspace_files: Whether to include current workspace files
-            limit: Maximum number of files to return (default: 1000)
+            limit: Maximum number of files to return (default: 50)
             offset: Number of files to skip for pagination (default: 0)
 
         Returns:

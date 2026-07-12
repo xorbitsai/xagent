@@ -226,6 +226,12 @@ async def test_running_chat_message_is_persisted_before_resume(db_session) -> No
                 "files": [],
             },
         )
+        for _ in range(100):
+            if bg_mgr.register_reserved_resume.call_count:
+                break
+            await asyncio.sleep(0.01)
+        else:
+            raise AssertionError("durable live message was not dispatched in time")
 
     stored = (
         db_session.query(TaskChatMessage)

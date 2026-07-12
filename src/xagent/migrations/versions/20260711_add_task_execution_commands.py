@@ -54,6 +54,7 @@ def upgrade() -> None:
         sa.Column("claimed_by", sa.String(255), nullable=True),
         sa.Column("claim_expires_at", sa.DateTime(timezone=True), nullable=True),
         sa.Column("attempt_count", sa.Integer(), nullable=False, server_default="0"),
+        sa.Column("failure_count", sa.Integer(), nullable=False, server_default="0"),
         sa.Column("result", sa.JSON(), nullable=True),
         sa.Column("error", sa.Text(), nullable=True),
         sa.Column(
@@ -71,7 +72,6 @@ def upgrade() -> None:
         sa.Column("completed_at", sa.DateTime(timezone=True), nullable=True),
         sa.UniqueConstraint("task_id", "command_id", name="uq_task_command_identity"),
     )
-    op.create_index("ix_task_execution_commands_task_id", TABLE, ["task_id"])
     op.create_index(
         "ix_task_execution_commands_actor_user_id", TABLE, ["actor_user_id"]
     )

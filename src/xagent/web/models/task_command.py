@@ -11,7 +11,6 @@ from sqlalchemy import (
     Text,
     UniqueConstraint,
 )
-from sqlalchemy.orm import relationship
 from sqlalchemy.sql import func
 
 from .database import Base
@@ -32,7 +31,6 @@ class TaskExecutionCommand(Base):  # type: ignore
         Integer,
         ForeignKey("tasks.id", ondelete="CASCADE"),
         nullable=False,
-        index=True,
     )
     actor_user_id = Column(
         Integer,
@@ -56,6 +54,7 @@ class TaskExecutionCommand(Base):  # type: ignore
     claimed_by = Column(String(255), nullable=True)
     claim_expires_at = Column(DateTime(timezone=True), nullable=True)
     attempt_count = Column(Integer, nullable=False, default=0, server_default="0")
+    failure_count = Column(Integer, nullable=False, default=0, server_default="0")
     result = Column(JSON, nullable=True)
     error = Column(Text, nullable=True)
     created_at = Column(
@@ -68,6 +67,3 @@ class TaskExecutionCommand(Base):  # type: ignore
         onupdate=func.now(),
     )
     completed_at = Column(DateTime(timezone=True), nullable=True)
-
-    task = relationship("Task")
-    actor = relationship("User")

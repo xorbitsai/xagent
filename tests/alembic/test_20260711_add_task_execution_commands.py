@@ -43,12 +43,14 @@ def test_upgrade_adds_durable_task_command_inbox() -> None:
             "claimed_by",
             "claim_expires_at",
             "attempt_count",
+            "failure_count",
             "result",
             "error",
             "completed_at",
         } <= columns
         assert "ix_task_commands_status_created" in indexes
         assert "ix_task_commands_task_order" in indexes
+        assert "ix_task_execution_commands_task_id" not in indexes
 
         command.downgrade(config, DOWN_REVISION)
         assert "task_execution_commands" not in inspect(connection).get_table_names()

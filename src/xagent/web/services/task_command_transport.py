@@ -37,7 +37,8 @@ COMMAND_FAILED = "failed"
 COMMAND_TERMINAL = (COMMAND_COMPLETED, COMMAND_FAILED)
 
 COMMAND_ID_PATTERN = re.compile(r"[A-Za-z0-9._:-]{1,64}")
-MAX_COMMAND_ATTEMPTS = 5
+MAX_COMMAND_FAILURES = 5
+MAX_COMMAND_DEFERS = 60
 DISPATCHER_IDLE_SECONDS = 0.5
 
 
@@ -230,8 +231,8 @@ def _claimable_query(
             or_(
                 TaskExecutionCommand.target_runner_id.is_(None),
                 TaskExecutionCommand.target_runner_id == runner_id,
+                Task.runner_id == runner_id,
                 Task.runner_id.is_(None),
-                Task.runner_id != TaskExecutionCommand.target_runner_id,
                 Task.lease_expires_at.is_(None),
                 Task.lease_expires_at < now,
             ),
@@ -425,18 +426,16 @@ def fail_task_command(
         )
         if command is None:
             return False
-        terminal = force_terminal or (
-            int(command.attempt_count or 0) >= MAX_COMMAND_ATTEMPTS
-        )
+        failure_count = int(command.failure_count or 0) + 1
+        terminal = force_terminal or failure_count >= MAX_COMMAND_FAILURES
         setattr(command, "status", COMMAND_FAILED if terminal else COMMAND_PENDING)
+        setattr(command, "failure_count", failure_count)
         setattr(command, "error", error[:4000])
         setattr(command, "claimed_by", None)
         setattr(
             command,
             "claim_expires_at",
-            None
-            if terminal
-            else now + timedelta(seconds=min(2 ** int(command.attempt_count or 1), 30)),
+            None if terminal else now + timedelta(seconds=min(2**failure_count, 30)),
         )
         setattr(command, "updated_at", now)
         setattr(command, "completed_at", now if terminal else None)
@@ -469,20 +468,63 @@ def defer_task_command(
         )
         if command is None:
             return False
-        setattr(command, "status", COMMAND_PENDING)
-        setattr(command, "error", reason[:4000])
+        terminal = int(command.attempt_count or 0) >= MAX_COMMAND_DEFERS
+        setattr(command, "status", COMMAND_FAILED if terminal else COMMAND_PENDING)
+        setattr(
+            command,
+            "error",
+            (
+                f"Deferred command exceeded retry budget: {reason}"
+                if terminal
+                else reason
+            )[:4000],
+        )
         setattr(command, "claimed_by", None)
-        setattr(command, "claim_expires_at", now + timedelta(seconds=1))
+        setattr(
+            command,
+            "claim_expires_at",
+            None if terminal else now + timedelta(seconds=1),
+        )
         setattr(command, "updated_at", now)
+        setattr(command, "completed_at", now if terminal else None)
         db.commit()
-    notify_task_command_dispatcher()
+    if not terminal:
+        notify_task_command_dispatcher()
     return True
+
+
+def task_has_live_foreign_runner(
+    task_id: int,
+    *,
+    runner_id: str | None = None,
+) -> bool:
+    """Return whether another process currently owns the task lease."""
+
+    from ..models.database import get_session_local
+
+    SessionLocal = get_session_local()
+    resolved_runner_id = runner_id or get_runner_id()
+    now = _utc_now()
+    with SessionLocal() as db:
+        return (
+            db.query(Task.id)
+            .filter(
+                Task.id == task_id,
+                Task.runner_id.is_not(None),
+                Task.runner_id != resolved_runner_id,
+                Task.lease_expires_at.is_not(None),
+                Task.lease_expires_at >= now,
+            )
+            .first()
+            is not None
+        )
 
 
 CommandExecutor = Callable[[ClaimedTaskCommand], Awaitable[dict[str, Any] | None]]
 _dispatcher_wakeup: asyncio.Event | None = None
 _dispatcher_task: asyncio.Task[Any] | None = None
 _dispatcher_loop: asyncio.AbstractEventLoop | None = None
+_prompt_dispatch_tasks: set[asyncio.Task[bool]] = set()
 
 
 def notify_task_command_dispatcher() -> None:
@@ -565,7 +607,6 @@ async def dispatch_task_command_promptly(
     executor: CommandExecutor,
     *,
     command_db_id: int,
-    handoff_seconds: float = 0.05,
 ) -> None:
     """Kick local consumption without tying WS receive to command execution.
 
@@ -578,9 +619,27 @@ async def dispatch_task_command_promptly(
         dispatch_one_task_command(executor, command_db_id=command_db_id)
     )
     try:
-        await asyncio.wait_for(asyncio.shield(task), timeout=handoff_seconds)
+        await asyncio.wait_for(asyncio.shield(task), timeout=0.05)
     except asyncio.TimeoutError:
+        _prompt_dispatch_tasks.add(task)
+        task.add_done_callback(_consume_prompt_dispatch_result)
         return
+
+
+def _consume_prompt_dispatch_result(task: asyncio.Task[bool]) -> None:
+    """Retain and observe timed-out prompt dispatches until they finish."""
+
+    _prompt_dispatch_tasks.discard(task)
+    if task.cancelled():
+        return
+    try:
+        task.result()
+    except Exception as exc:  # noqa: BLE001
+        logger.error(
+            "Detached prompt task command dispatch failed: %s",
+            exc,
+            exc_info=(type(exc), exc, exc.__traceback__),
+        )
 
 
 async def run_task_command_dispatcher(executor: CommandExecutor) -> None:
@@ -613,17 +672,23 @@ def start_task_command_dispatcher(executor: CommandExecutor) -> asyncio.Task[Any
 
 async def stop_task_command_dispatcher() -> None:
     global _dispatcher_loop, _dispatcher_task, _dispatcher_wakeup
+    prompt_tasks = list(_prompt_dispatch_tasks)
+    for prompt_task in prompt_tasks:
+        prompt_task.cancel()
+    if prompt_tasks:
+        await asyncio.gather(*prompt_tasks, return_exceptions=True)
+    _prompt_dispatch_tasks.clear()
+
     task = _dispatcher_task
     _dispatcher_task = None
     _dispatcher_wakeup = None
     _dispatcher_loop = None
-    if task is None or task.done():
-        return
-    task.cancel()
-    try:
-        await task
-    except asyncio.CancelledError:
-        pass
+    if task is not None and not task.done():
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
 
 
 def load_task_command(command_db_id: int) -> TaskExecutionCommand | None:

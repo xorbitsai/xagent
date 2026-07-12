@@ -83,6 +83,7 @@ from ..services.managed_file_ref import (
     DurableStorageOperationError,
 )
 from ..services.task_command_transport import (
+    COMMAND_ID_PATTERN,
     ClaimedTaskCommand,
     EnqueuedTaskCommand,
     TaskCommandDeferred,
@@ -90,6 +91,7 @@ from ..services.task_command_transport import (
     TaskCommandRejected,
     dispatch_task_command_promptly,
     enqueue_task_command,
+    task_has_live_foreign_runner,
 )
 from ..services.task_execution_controller import (
     TaskControlState,
@@ -180,7 +182,7 @@ def _client_message_id(value: Any) -> str | None:
     if not isinstance(value, str):
         return None
     normalized = value.strip()
-    if not re.fullmatch(r"[A-Za-z0-9._:-]{1,64}", normalized):
+    if COMMAND_ID_PATTERN.fullmatch(normalized) is None:
         return None
     return normalized
 
@@ -3097,8 +3099,6 @@ def _enqueue_websocket_task_command_sync(
             kind=kind,
             payload=payload,
         )
-        if not result.payload_matches:
-            return result
         return result
 
 
@@ -5543,6 +5543,14 @@ async def execute_durable_task_command(
         from ..models.agent import Agent
         from .a2a import _cancel_task_unserialized
 
+        if await asyncio.to_thread(
+            task_has_live_foreign_runner,
+            command.task_id,
+        ):
+            raise TaskCommandDeferred(
+                f"Cancel command {command.command_id} is waiting for the active "
+                "task lease owner"
+            )
         agent_id_value = message_data.get("agent_id")
         if agent_id_value is None:
             raise ValueError("Agent ID is missing or null in cancel command payload")

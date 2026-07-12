@@ -1,7 +1,10 @@
 from __future__ import annotations
 
 import asyncio
+import logging
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta
+from threading import Barrier
 
 import pytest
 from sqlalchemy import inspect as sa_inspect
@@ -11,24 +14,37 @@ from xagent.web.api.websocket import (
     execute_durable_task_command,
 )
 from xagent.web.models.chat_message import TaskChatMessage
-from xagent.web.models.database import Base, get_db, get_engine, init_db
+from xagent.web.models.database import (
+    Base,
+    get_db,
+    get_engine,
+    get_session_local,
+    init_db,
+)
 from xagent.web.models.task import Task, TaskStatus
 from xagent.web.models.task_command import TaskExecutionCommand
 from xagent.web.models.user import User
 from xagent.web.services.task_command_transport import (
     COMMAND_COMPLETED,
+    COMMAND_FAILED,
+    MAX_COMMAND_DEFERS,
+    MAX_COMMAND_FAILURES,
     ClaimedTaskCommand,
     TaskCommandDeferred,
     TaskCommandKind,
+    TaskCommandRejected,
     _claim_heartbeat,
     claim_task_command,
     dispatch_one_task_command,
+    dispatch_task_command_promptly,
     enqueue_task_command,
+    fail_task_command,
     finish_task_command,
     load_task_command,
     notify_task_command_dispatcher,
     start_task_command_dispatcher,
     stop_task_command_dispatcher,
+    task_has_live_foreign_runner,
 )
 
 
@@ -131,6 +147,73 @@ def test_live_run_command_stays_with_owner_until_task_lease_expires(
     assert recovered.attempt_count == 2
 
 
+def test_reassigned_command_routes_only_to_the_current_live_owner(db_session) -> None:
+    user, task = _create_running_task(db_session)
+    command = enqueue_task_command(
+        db_session,
+        task_id=int(task.id),
+        actor_user_id=int(user.id),
+        command_id="owner-takeover",
+        kind=TaskCommandKind.CANCEL,
+        payload={"agent_id": 1},
+    )
+    task.runner_id = "runner-b"
+    task.lease_expires_at = datetime.utcnow() + timedelta(minutes=1)
+    db_session.commit()
+
+    assert claim_task_command(db_session, runner_id="runner-c") is None
+    current_owner_claim = claim_task_command(db_session, runner_id="runner-b")
+
+    assert current_owner_claim is not None
+    assert current_owner_claim.id == command.command_id
+
+
+def test_same_command_row_has_a_single_concurrent_claim_winner(db_session) -> None:
+    user, task = _create_running_task(db_session)
+    task.runner_id = None
+    task.lease_expires_at = None
+    db_session.commit()
+    command = enqueue_task_command(
+        db_session,
+        task_id=int(task.id),
+        actor_user_id=int(user.id),
+        command_id="concurrent-claim",
+        kind=TaskCommandKind.PAUSE,
+        payload={"type": "pause_task"},
+    )
+    barrier = Barrier(2)
+
+    def claim(runner_id: str) -> int | None:
+        SessionLocal = get_session_local()
+        with SessionLocal() as db:
+            barrier.wait()
+            claimed = claim_task_command(
+                db,
+                runner_id=runner_id,
+                command_db_id=command.command_id,
+            )
+            return claimed.id if claimed is not None else None
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        first = executor.submit(claim, "runner-a")
+        second = executor.submit(claim, "runner-b")
+        winners = [value for value in (first.result(), second.result()) if value]
+
+    assert winners == [command.command_id]
+
+
+def test_live_foreign_runner_is_rechecked_before_cancel(db_session) -> None:
+    _user, task = _create_running_task(db_session)
+
+    assert task_has_live_foreign_runner(int(task.id), runner_id="runner-b") is True
+    assert task_has_live_foreign_runner(int(task.id), runner_id="runner-a") is False
+
+    task.lease_expires_at = datetime.utcnow() - timedelta(seconds=1)
+    db_session.commit()
+
+    assert task_has_live_foreign_runner(int(task.id), runner_id="runner-b") is False
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("payload", "error"),
@@ -146,6 +229,9 @@ async def test_cancel_command_rejects_invalid_agent_id_payload(
     error: str,
 ) -> None:
     user, task = _create_running_task(db_session)
+    task.runner_id = None
+    task.lease_expires_at = None
+    db_session.commit()
     command = ClaimedTaskCommand(
         id=1,
         task_id=int(task.id),
@@ -158,6 +244,46 @@ async def test_cancel_command_rejects_invalid_agent_id_payload(
     )
 
     with pytest.raises(ValueError, match=error):
+        await execute_durable_task_command(command)
+
+
+@pytest.mark.asyncio
+async def test_cancel_command_defers_on_a_live_foreign_owner(db_session) -> None:
+    user, task = _create_running_task(db_session)
+    command = ClaimedTaskCommand(
+        id=1,
+        task_id=int(task.id),
+        actor_user_id=int(user.id),
+        command_id="misrouted-cancel",
+        kind=TaskCommandKind.CANCEL,
+        payload={"agent_id": 1},
+        target_run_id=None,
+        attempt_count=1,
+    )
+
+    with pytest.raises(TaskCommandDeferred, match="active task lease owner"):
+        await execute_durable_task_command(command)
+
+
+@pytest.mark.asyncio
+async def test_command_is_rejected_after_run_rotation(db_session) -> None:
+    user, task = _create_running_task(db_session)
+    task.run_id = "run-2"
+    task.runner_id = None
+    task.lease_expires_at = None
+    db_session.commit()
+    command = ClaimedTaskCommand(
+        id=1,
+        task_id=int(task.id),
+        actor_user_id=int(user.id),
+        command_id="stale-pause",
+        kind=TaskCommandKind.PAUSE,
+        payload={"type": "pause_task"},
+        target_run_id="run-1",
+        attempt_count=1,
+    )
+
+    with pytest.raises(TaskCommandRejected, match="Task run changed"):
         await execute_durable_task_command(command)
 
 
@@ -258,6 +384,7 @@ async def test_deferred_handoff_retries_without_consuming_failure_budget(
     assert stored is not None
     assert stored.status == "pending"
     assert stored.attempt_count == 1
+    assert stored.failure_count == 0
     assert stored.claim_expires_at is not None
 
     stored.claim_expires_at = datetime.utcnow() - timedelta(seconds=1)
@@ -272,6 +399,80 @@ async def test_deferred_handoff_retries_without_consuming_failure_budget(
     assert stored is not None
     assert stored.status == COMMAND_COMPLETED
     assert stored.attempt_count == 2
+    assert stored.failure_count == 0
+
+
+@pytest.mark.asyncio
+async def test_deferred_message_eventually_fails_and_unblocks_cancel(
+    db_session,
+) -> None:
+    user, task = _create_running_task(db_session)
+    task.runner_id = None
+    task.lease_expires_at = None
+    db_session.commit()
+    message = enqueue_task_command(
+        db_session,
+        task_id=int(task.id),
+        actor_user_id=int(user.id),
+        command_id="stuck-message",
+        kind=TaskCommandKind.MESSAGE,
+        payload={"type": "chat", "message": "wait forever"},
+    )
+    cancel = enqueue_task_command(
+        db_session,
+        task_id=int(task.id),
+        actor_user_id=int(user.id),
+        command_id="cancel-after-stuck-message",
+        kind=TaskCommandKind.CANCEL,
+        payload={"agent_id": 1},
+    )
+    row = db_session.get(TaskExecutionCommand, message.command_id)
+    assert row is not None
+    row.attempt_count = MAX_COMMAND_DEFERS - 1
+    db_session.commit()
+
+    async def defer(_command):
+        raise TaskCommandDeferred("checkpoint never became ready")
+
+    assert await dispatch_one_task_command(defer, command_db_id=message.command_id)
+    db_session.expire_all()
+    row = db_session.get(TaskExecutionCommand, message.command_id)
+    assert row is not None
+    assert row.status == COMMAND_FAILED
+    assert row.failure_count == 0
+
+    cancel_claim = claim_task_command(db_session)
+    assert cancel_claim is not None
+    assert cancel_claim.id == cancel.command_id
+
+
+@pytest.mark.asyncio
+async def test_real_failures_use_a_separate_bounded_budget(db_session) -> None:
+    user, task = _create_running_task(db_session)
+    task.runner_id = None
+    task.lease_expires_at = None
+    db_session.commit()
+    command = enqueue_task_command(
+        db_session,
+        task_id=int(task.id),
+        actor_user_id=int(user.id),
+        command_id="last-failure",
+        kind=TaskCommandKind.PAUSE,
+        payload={"type": "pause_task"},
+    )
+    claimed = claim_task_command(db_session, runner_id="runner-a")
+    assert claimed is not None
+    row = db_session.get(TaskExecutionCommand, command.command_id)
+    assert row is not None
+    row.failure_count = MAX_COMMAND_FAILURES - 1
+    db_session.commit()
+
+    assert fail_task_command(command.command_id, "runner-a", "still broken") is True
+    db_session.expire_all()
+    row = db_session.get(TaskExecutionCommand, command.command_id)
+    assert row is not None
+    assert row.status == COMMAND_FAILED
+    assert row.failure_count == MAX_COMMAND_FAILURES
 
 
 @pytest.mark.asyncio
@@ -466,3 +667,30 @@ async def test_dispatcher_does_not_erase_wakeup_during_empty_claim(monkeypatch) 
         await stop_task_command_dispatcher()
 
     assert calls >= 2
+
+
+@pytest.mark.asyncio
+async def test_prompt_dispatch_observes_late_task_failure(monkeypatch, caplog) -> None:
+    async def fail_after_handoff(_executor, *, command_db_id=None) -> bool:
+        del command_db_id
+        await asyncio.sleep(0.06)
+        raise RuntimeError("late dispatch failure")
+
+    async def execute(_command):
+        return None
+
+    monkeypatch.setattr(
+        "xagent.web.services.task_command_transport.dispatch_one_task_command",
+        fail_after_handoff,
+    )
+    caplog.set_level(logging.ERROR)
+
+    await dispatch_task_command_promptly(execute, command_db_id=1)
+    for _ in range(100):
+        if "Detached prompt task command dispatch failed" in caplog.text:
+            break
+        await asyncio.sleep(0.01)
+    else:
+        raise AssertionError("late prompt dispatch failure was not observed")
+
+    assert "late dispatch failure" in caplog.text

@@ -440,10 +440,12 @@ async def create_chat_task(
         pop_ephemeral_runtime_values(payload.turn_id)
         raise
 
-    # Bind files only after the turn is committed to running. This is a
-    # synchronous commit with no await before the response returns, so it
-    # lands before the background execution coroutine (scheduled inside
-    # begin_turn) gets to read the files.
+    # Bind files only after the turn is committed to running. This bind can
+    # race the background runner (begin_turn schedules it via create_task and
+    # may await further steps before returning here), but that's harmless: the
+    # runner's file query tolerates a NULL task_id (task_id == this OR IS NULL,
+    # owned by the user), so the just-uploaded files are readable whether or
+    # not this bind has landed. The bind is for durable task<->file association.
     bind_turn_files(
         file_ids=[info["file_id"] for info in file_infos],
         task_id=int(task.id),
@@ -645,7 +647,9 @@ async def append_message_to_task(
         raise
 
     # Bind files only after the turn is claimed -- a 409 above leaves them
-    # unbound and reusable. Synchronous commit, no await before returning.
+    # unbound and reusable. The bind can race the background runner, but the
+    # runner's file query tolerates a NULL task_id (see create_chat_task), so
+    # visibility doesn't depend on this commit landing first.
     bind_turn_files(
         file_ids=[info["file_id"] for info in file_infos],
         task_id=int(task.id),

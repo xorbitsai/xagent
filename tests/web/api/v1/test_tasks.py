@@ -504,6 +504,98 @@ def test_partial_file_set_is_all_or_nothing(mock_start_task):
     assert mock_start_task.call_count == 0
 
 
+def test_repeated_file_id_is_deduped(mock_start_task):
+    """The same file_id twice in one request attaches once, not twice."""
+    agent_id, full_key = _create_agent_with_key()
+
+    up = client.post(
+        "/v1/chat/files",
+        headers=_bearer(full_key),
+        files=[("files", ("dup.txt", b"content", "text/plain"))],
+    )
+    file_id = up.json()["files"][0]["file_id"]
+
+    resp = client.post(
+        "/v1/chat/tasks",
+        headers=_bearer(full_key),
+        json={
+            "agent_id": agent_id,
+            "message": {
+                "role": "user",
+                "content": "check it",
+                "files": [file_id, file_id],
+            },
+        },
+    )
+    assert resp.status_code == 202, resp.text
+
+    payload = mock_start_task.call_args.kwargs["payload"]
+    # One context line and one chip, despite the duplicate id.
+    assert payload.execution_message.count(f"file_id={file_id}") == 1
+    assert [a.get("file_id") for a in payload.attachments] == [file_id]
+
+
+def test_append_message_with_files(mock_start_task):
+    """The append route also accepts and attaches files."""
+    agent_id, full_key = _create_agent_with_key()
+
+    created = client.post(
+        "/v1/chat/tasks",
+        headers=_bearer(full_key),
+        json={
+            "agent_id": agent_id,
+            "message": {"role": "user", "content": "turn one"},
+        },
+    )
+    task_id = created.json()["task_id"]
+
+    # Append is only allowed once the task leaves RUNNING.
+    db = _direct_db_session()
+    try:
+        db.query(Task).filter(Task.id == task_id).update(
+            {"status": TaskStatus.COMPLETED}
+        )
+        db.commit()
+    finally:
+        db.close()
+
+    up = client.post(
+        "/v1/chat/files",
+        headers=_bearer(full_key),
+        files=[("files", ("turn2.txt", b"more", "text/plain"))],
+    )
+    file_id = up.json()["files"][0]["file_id"]
+
+    appended = client.post(
+        f"/v1/chat/tasks/{task_id}/messages",
+        headers=_bearer(full_key),
+        json={
+            "agent_id": agent_id,
+            "message": {
+                "role": "user",
+                "content": "look at this too",
+                "files": [file_id],
+            },
+        },
+    )
+    assert appended.status_code == 202, appended.text
+
+    payload = mock_start_task.call_args.kwargs["payload"]
+    assert payload.transcript_message == "look at this too"
+    assert file_id in payload.execution_message
+    assert any(a.get("file_id") == file_id for a in payload.attachments)
+
+    from xagent.web.models.uploaded_file import UploadedFile
+
+    db = _direct_db_session()
+    try:
+        rec = db.query(UploadedFile).filter(UploadedFile.file_id == file_id).first()
+        assert rec is not None
+        assert rec.task_id == task_id
+    finally:
+        db.close()
+
+
 def test_create_task_persists_connector_runtime_snapshot_and_context(
     mock_start_task,
 ):

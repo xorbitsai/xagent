@@ -118,11 +118,17 @@ def resolve_turn_file_infos(
 
     file_infos: List[Dict[str, Any]] = []
     missing: List[str] = []
+    seen: set[str] = set()
     for raw_file_id in file_ids:
         file_id = str(raw_file_id or "").strip()
         if not file_id:
             missing.append(str(raw_file_id))
             continue
+        # Dedup at the source so a repeated file_id doesn't produce duplicate
+        # UPLOADED FILES lines / attachment chips downstream.
+        if file_id in seen:
+            continue
+        seen.add(file_id)
 
         record = (
             db.query(UploadedFile)

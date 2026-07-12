@@ -408,49 +408,31 @@ body .hover\:\text-\[\#E6EDF3\]:hover {
   overflow-y: auto;
 }
 
-/* Native scrollbar style optimization */
+/* Native scrollbar: always visible, thin and subtle */
 .overflow-y-auto {
-  scrollbar-width: none;
-  scrollbar-color: transparent transparent;
+  scrollbar-width: thin;
+  scrollbar-color: hsl(var(--muted-foreground) / 0.3) transparent;
 }
 
 .overflow-y-auto::-webkit-scrollbar {
-  width: 6px;
+  width: 8px;
+  height: 8px;
 }
 
 .overflow-y-auto::-webkit-scrollbar-track {
   background: transparent;
-  border-radius: 3px;
 }
 
 .overflow-y-auto::-webkit-scrollbar-thumb {
-  background: transparent;
-  border-radius: 3px;
+  background: hsl(var(--muted-foreground) / 0.3);
+  border-radius: 4px;
+  border: 2px solid transparent;
+  background-clip: content-box;
 }
 
-.overflow-y-auto.scrolling,
-.overflow-y-auto:hover,
-.overflow-y-auto:focus-within {
-  scrollbar-width: thin;
-  scrollbar-color: hsl(var(--muted-foreground) / 0.35) hsl(var(--muted) / 0.18);
-}
-
-.overflow-y-auto.scrolling::-webkit-scrollbar-track,
-.overflow-y-auto:hover::-webkit-scrollbar-track,
-.overflow-y-auto:focus-within::-webkit-scrollbar-track {
-  background: hsl(var(--muted) / 0.18);
-}
-
-.overflow-y-auto.scrolling::-webkit-scrollbar-thumb,
-.overflow-y-auto:hover::-webkit-scrollbar-thumb,
-.overflow-y-auto:focus-within::-webkit-scrollbar-thumb {
-  background: hsl(var(--muted-foreground) / 0.35);
-}
-
-.overflow-y-auto.scrolling::-webkit-scrollbar-thumb:hover,
-.overflow-y-auto:hover::-webkit-scrollbar-thumb:hover,
-.overflow-y-auto:focus-within::-webkit-scrollbar-thumb:hover {
+.overflow-y-auto::-webkit-scrollbar-thumb:hover {
   background: hsl(var(--muted-foreground) / 0.5);
+  background-clip: content-box;
 }
 
 /* Ensure execution log content does not overflow */

@@ -4,7 +4,7 @@ services:
       - SANDBOX_ENABLED=true
       - SANDBOX_IMPLEMENTATION=docker
       - DOCKER_HOST=unix:///var/run/docker.sock
-      - SANDBOX_IMAGE=xprobe/xagent-sandbox:0.6.0
+      - SANDBOX_IMAGE=xprobe/xagent-sandbox:0.6.1
       - SANDBOX_CPUS=1
       - SANDBOX_MEMORY=512
       - XAGENT_SANDBOX_HOST_PROJECT_ROOT=${XAGENT_SANDBOX_HOST_PROJECT_ROOT:-${PWD}}

@@ -17,7 +17,7 @@ services:
 
   # Xagent Frontend (Next.js)
   frontend:
-    image: xprobe/xagent-frontend:0.6.0
+    image: xprobe/xagent-frontend:0.6.1
     container_name: xagent_frontend
     restart: unless-stopped
     networks:
@@ -31,7 +31,7 @@ services:
 
   # Xagent Backend (FastAPI)
   backend:
-    image: xprobe/xagent-backend:0.6.0
+    image: xprobe/xagent-backend:0.6.1
     container_name: xagent_backend
     restart: unless-stopped
     # Don't expose ports, only accessible through nginx
@@ -66,7 +66,7 @@ services:
 
   # Celery worker for triggers and KB ingestion. Agent execution stays in backend.
   worker:
-    image: xprobe/xagent-backend:0.6.0
+    image: xprobe/xagent-backend:0.6.1
     container_name: xagent_worker
     restart: unless-stopped
     command:
@@ -103,7 +103,7 @@ services:
 
   # Celery beat schedules trigger scans. It never runs agent execution.
   scheduler:
-    image: xprobe/xagent-backend:0.6.0
+    image: xprobe/xagent-backend:0.6.1
     container_name: xagent_scheduler
     restart: unless-stopped
     command:

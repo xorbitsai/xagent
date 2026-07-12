@@ -391,6 +391,7 @@ def test_upload_and_attach_files_to_task(mock_start_task):
         },
     )
     assert resp.status_code == 202, resp.text
+    task_id = resp.json()["task_id"]
 
     payload = mock_start_task.call_args.kwargs["payload"]
     # Transcript is the raw text; execution channel is file-enriched.
@@ -401,9 +402,40 @@ def test_upload_and_attach_files_to_task(mock_start_task):
     assert payload.attachments
     assert any(a.get("file_id") == file_id for a in payload.attachments)
 
+    # File is bound to the task after the turn is claimed (not before).
+    from xagent.web.models.uploaded_file import UploadedFile
 
-def test_attach_unknown_file_id_is_rejected(mock_start_task):
-    """A file_id that doesn't resolve to an owned file -> 400 invalid_input."""
+    db = _direct_db_session()
+    try:
+        rec = db.query(UploadedFile).filter(UploadedFile.file_id == file_id).first()
+        assert rec is not None
+        assert rec.task_id == task_id
+    finally:
+        db.close()
+
+
+def test_upload_rejects_unsupported_type_with_v1_envelope(mock_start_task):
+    """Unsupported extension -> 400 invalid_input in the v1 envelope.
+
+    Guards against the shared ``store_uploaded_files`` leaking its bare
+    HTTPException (a 500 {"detail": ...}) past the v1 error handler.
+    """
+    _agent_id, full_key = _create_agent_with_key()
+
+    up = client.post(
+        "/v1/chat/files",
+        headers=_bearer(full_key),
+        files=[("files", ("payload.xyz", b"junk", "application/octet-stream"))],
+    )
+    assert up.status_code == 400, up.text
+    body = up.json()
+    assert body["error"]["code"] == "invalid_input"
+    # Must be the stable v1 envelope, not FastAPI's default {"detail": ...}.
+    assert "detail" not in body
+
+
+def test_attach_unknown_file_id_is_rejected_without_orphan(mock_start_task):
+    """A bad file_id -> 400 and NO task row is created (no orphan)."""
     agent_id, full_key = _create_agent_with_key()
 
     resp = client.post(
@@ -420,6 +452,56 @@ def test_attach_unknown_file_id_is_rejected(mock_start_task):
     )
     assert resp.status_code == 400, resp.text
     assert resp.json()["error"]["code"] == "invalid_input"
+
+    # #2 regression: validation happens before task creation, so nothing is
+    # left behind. The background kickoff must never have fired either.
+    db = _direct_db_session()
+    try:
+        assert db.query(Task).filter(Task.agent_id == agent_id).count() == 0, (
+            "a bad file id must not leave an orphan task"
+        )
+    finally:
+        db.close()
+    assert mock_start_task.call_count == 0
+
+
+def test_partial_file_set_is_all_or_nothing(mock_start_task):
+    """[good, bad] -> 400; the good file is left unbound (not half-attached)."""
+    agent_id, full_key = _create_agent_with_key()
+
+    up = client.post(
+        "/v1/chat/files",
+        headers=_bearer(full_key),
+        files=[("files", ("good.txt", b"content", "text/plain"))],
+    )
+    good_id = up.json()["files"][0]["file_id"]
+
+    resp = client.post(
+        "/v1/chat/tasks",
+        headers=_bearer(full_key),
+        json={
+            "agent_id": agent_id,
+            "message": {
+                "role": "user",
+                "content": "check these",
+                "files": [good_id, "typo-id"],
+            },
+        },
+    )
+    assert resp.status_code == 400, resp.text
+    assert resp.json()["error"]["code"] == "invalid_input"
+
+    from xagent.web.models.uploaded_file import UploadedFile
+
+    db = _direct_db_session()
+    try:
+        assert db.query(Task).filter(Task.agent_id == agent_id).count() == 0
+        rec = db.query(UploadedFile).filter(UploadedFile.file_id == good_id).first()
+        assert rec is not None
+        assert rec.task_id is None, "good file must stay unbound on all-or-nothing"
+    finally:
+        db.close()
+    assert mock_start_task.call_count == 0
 
 
 def test_create_task_persists_connector_runtime_snapshot_and_context(

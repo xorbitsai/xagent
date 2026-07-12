@@ -17,11 +17,12 @@ by the WebSocket UI path so both transports share one state machine.
 import logging
 from typing import Any, NoReturn, Optional, Tuple, cast
 
-from fastapi import APIRouter, Depends, File, UploadFile
+from fastapi import APIRouter, Depends, File, HTTPException, UploadFile
 from sqlalchemy import func
 from sqlalchemy.orm import Session
 
 from ....core.tools.adapters.vibe.connector_runtime import ConnectorRuntimeError
+from ...config import is_allowed_file
 from ...models.agent import Agent
 from ...models.agent_api_key import AgentApiKey
 from ...models.database import get_db
@@ -45,6 +46,13 @@ from ...services.connector_runtime import (
     prepare_create_connector_runtime,
     store_ephemeral_runtime_values,
 )
+from ...services.file_turn import (
+    append_uploaded_files_context,
+    bind_turn_files,
+    build_uploaded_files_context,
+    normalize_attachments_for_persistence,
+    resolve_turn_file_infos,
+)
 from ...services.hot_path_cache import (
     cache_get,
     cache_set,
@@ -53,6 +61,7 @@ from ...services.hot_path_cache import (
     task_snapshot_key,
     task_steps_key,
 )
+from ...services.managed_file_ref import DurableStorageOperationError
 from ...services.task_execution_controller import (
     TaskControlState,
     apply_task_control_transition,
@@ -95,15 +104,45 @@ async def upload_task_files(
     if owner is None:
         raise V1ApiError(V1ErrorCode.INTERNAL_ERROR, 500)
 
-    result = await store_uploaded_files(
-        upload_items=list(files),
-        task_type="general",
-        task_id=None,
-        folder=None,
-        user=owner,
-        db=db,
-        single_file_mode=False,
-    )
+    # Reject unsupported types up front with a clean v1 400. ``store_uploaded_files``
+    # would otherwise raise a bare HTTPException (a 500 for unsupported type) that
+    # bypasses the v1 error envelope and leaks the internal ``task_type`` wording.
+    for uploaded in files:
+        if not is_allowed_file(uploaded.filename or "", "general"):
+            raise V1ApiError(
+                V1ErrorCode.INVALID_INPUT,
+                400,
+                message=f"Unsupported file type: {uploaded.filename}",
+            )
+
+    try:
+        result = await store_uploaded_files(
+            upload_items=list(files),
+            task_type="general",
+            task_id=None,
+            folder=None,
+            user=owner,
+            db=db,
+            single_file_mode=False,
+        )
+    except HTTPException as exc:
+        # ``store_uploaded_files`` is shared with the JWT upload route and raises
+        # bare HTTPExceptions; translate to the v1 envelope so SDK clients keep a
+        # stable {"error": {"code": ...}} shape. 503 (durable storage) stays 503 so
+        # callers can retry; 413 (too large) stays 413; other client errors -> 400.
+        if exc.status_code == 503:
+            raise V1ApiError(
+                V1ErrorCode.INTERNAL_ERROR,
+                503,
+                message="File storage is temporarily unavailable.",
+            ) from exc
+        if 400 <= exc.status_code < 500:
+            raise V1ApiError(
+                V1ErrorCode.INVALID_INPUT,
+                413 if exc.status_code == 413 else 400,
+                message="File upload rejected.",
+            ) from exc
+        raise V1ApiError(V1ErrorCode.INTERNAL_ERROR, 500) from exc
     return UploadFilesResponse(
         files=[
             UploadedFileInfo(
@@ -117,45 +156,60 @@ async def upload_task_files(
     )
 
 
-async def _build_file_turn_extras(
-    *, task_id: int, file_ids: list[str], owner_user_id: int, content: str, db: Session
-) -> Tuple[Optional[str], Optional[list[dict[str, Any]]]]:
-    """Bind ``file_ids`` to the task and build (execution_message, attachments).
+def _resolve_turn_files_or_400(
+    *,
+    file_ids: list[str],
+    owner_user_id: int,
+    db: Session,
+    task_id: Optional[int] = None,
+) -> list[dict[str, Any]]:
+    """Resolve every ``file_id`` up front (all-or-nothing) WITHOUT binding.
 
-    Mirrors the WebSocket file path so the agent sees the same
-    ``## UPLOADED FILES`` context and the transcript row carries the same
-    clickable chips. Returns ``(None, None)`` when no files were supplied.
-    Raises 400 ``invalid_input`` if file_ids were given but none resolved
-    to a file owned by this user (bad id, wrong owner, or bound elsewhere).
+    Called before the task is committed (create) or the turn is claimed
+    (append), so a bad/unowned/already-bound id fails with 400 before any
+    task row is created or mutated -- no orphan task, no binding stuck to a
+    turn that later 409s. Actual binding happens via :func:`bind_turn_files`
+    only after the turn is committed to running.
     """
     if not file_ids:
-        return None, None
-
-    from ..websocket import (
-        _append_uploaded_files_context_to_message,
-        _build_uploaded_files_context,
-        _normalize_attachments_for_persistence,
-        handle_file_upload_for_task,
-    )
-
-    upload_result = await handle_file_upload_for_task(
-        task_id,
-        [{"file_id": fid} for fid in file_ids],
-        db,
-        task_owner_id=owner_user_id,
-    )
-    file_info_list = upload_result.get("file_info_list", [])
-    if not file_info_list:
+        return []
+    try:
+        file_infos, missing = resolve_turn_file_infos(
+            file_ids=file_ids,
+            owner_user_id=owner_user_id,
+            db=db,
+            task_id=task_id,
+        )
+    except DurableStorageOperationError as exc:
+        # Transient storage fault, not a client error -- 503 so SDK can retry.
+        raise V1ApiError(
+            V1ErrorCode.INTERNAL_ERROR,
+            503,
+            message="File storage is temporarily unavailable.",
+        ) from exc
+    if missing:
         raise V1ApiError(
             V1ErrorCode.INVALID_INPUT,
             400,
-            message="None of the supplied file ids are accessible.",
+            message="These file ids are not accessible: " + ", ".join(missing),
         )
+    return file_infos
 
-    context = _build_uploaded_files_context(file_info_list)
-    execution_message = _append_uploaded_files_context_to_message(content, context)
-    attachments = _normalize_attachments_for_persistence(file_info_list) or None
-    return execution_message, attachments
+
+def _turn_payload(content: str, file_infos: list[dict[str, Any]]) -> TaskTurnPayload:
+    """Build a :class:`TaskTurnPayload`, file-enriching the execution channel.
+
+    Consolidates the payload construction shared by create and append so the
+    transcript-vs-execution split can't drift between the two entry points.
+    """
+    if not file_infos:
+        return TaskTurnPayload(transcript_message=content)
+    context = build_uploaded_files_context(file_infos)
+    return TaskTurnPayload(
+        transcript_message=content,
+        execution_message=append_uploaded_files_context(content, context),
+        attachments=normalize_attachments_for_persistence(file_infos) or None,
+    )
 
 
 def _raise_v1_connector_runtime_error(exc: ConnectorRuntimeError) -> NoReturn:
@@ -299,6 +353,16 @@ async def create_chat_task(
     if request.agent_id != agent.id:
         raise V1ApiError(V1ErrorCode.AGENT_NOT_FOUND, 404)
 
+    # Validate any attached file ids BEFORE creating the task, so a bad id
+    # fails with 400 without leaving an orphan PENDING task behind. Binding
+    # happens after the turn is claimed (below).
+    file_infos = _resolve_turn_files_or_400(
+        file_ids=request.message.files or [],
+        owner_user_id=int(agent.user_id),
+        db=db,
+        task_id=None,
+    )
+
     try:
         runtime_plan = prepare_create_connector_runtime(
             db=db,
@@ -348,18 +412,7 @@ async def create_chat_task(
     # commit, and bg coroutine scheduling under a lease lifecycle.
     # A brand-new task shouldn't ever hit busy -- but we map it
     # anyway for defense.
-    execution_message, attachments = await _build_file_turn_extras(
-        task_id=int(task.id),
-        file_ids=request.message.files or [],
-        owner_user_id=int(agent.user_id),
-        content=request.message.content,
-        db=db,
-    )
-    payload = TaskTurnPayload(
-        transcript_message=request.message.content,
-        execution_message=execution_message,
-        attachments=attachments,
-    )
+    payload = _turn_payload(request.message.content, file_infos)
     _store_connector_runtime_values_or_fail(
         db=db,
         task_id=int(task.id),
@@ -386,6 +439,17 @@ async def create_chat_task(
     except Exception:
         pop_ephemeral_runtime_values(payload.turn_id)
         raise
+
+    # Bind files only after the turn is committed to running. This is a
+    # synchronous commit with no await before the response returns, so it
+    # lands before the background execution coroutine (scheduled inside
+    # begin_turn) gets to read the files.
+    bind_turn_files(
+        file_ids=[info["file_id"] for info in file_infos],
+        task_id=int(task.id),
+        owner_user_id=int(agent.user_id),
+        db=db,
+    )
 
     # Record usage here (not in the shared auth dependency) so read-only
     # status/steps polling below doesn't count as a "call". Runtime validation
@@ -537,22 +601,22 @@ async def append_message_to_task(
     except ConnectorRuntimeError as exc:
         _raise_v1_connector_runtime_error(exc)
 
+    # Validate attached file ids before claiming the turn: an unresolvable id
+    # is a 400 that must not mutate anything, and files must not be bound to a
+    # turn that then 409s (task busy). ``task_id`` is passed so files already
+    # bound to this task re-resolve idempotently. Binding runs after the claim.
+    file_infos = _resolve_turn_files_or_400(
+        file_ids=request.message.files or [],
+        owner_user_id=int(agent.user_id),
+        db=db,
+        task_id=int(task.id),
+    )
+
     # Orchestrator does the atomic claim (status must be terminal --
     # COMPLETED or FAILED -- to be appendable, so PENDING/RUNNING both
     # 409), persists the new user message, and schedules the bg turn
     # with a single-flight guard against concurrent kickoffs.
-    execution_message, attachments = await _build_file_turn_extras(
-        task_id=int(task.id),
-        file_ids=request.message.files or [],
-        owner_user_id=int(agent.user_id),
-        content=request.message.content,
-        db=db,
-    )
-    payload = TaskTurnPayload(
-        transcript_message=request.message.content,
-        execution_message=execution_message,
-        attachments=attachments,
-    )
+    payload = _turn_payload(request.message.content, file_infos)
     _store_connector_runtime_values_or_fail(
         db=db,
         task_id=int(task.id),
@@ -579,6 +643,15 @@ async def append_message_to_task(
     except Exception:
         pop_ephemeral_runtime_values(payload.turn_id)
         raise
+
+    # Bind files only after the turn is claimed -- a 409 above leaves them
+    # unbound and reusable. Synchronous commit, no await before returning.
+    bind_turn_files(
+        file_ids=[info["file_id"] for info in file_infos],
+        task_id=int(task.id),
+        owner_user_id=int(agent.user_id),
+        db=db,
+    )
 
     # See the matching comment in create_chat_task: recorded here, not in
     # the shared auth dependency, so status polling elsewhere never counts.

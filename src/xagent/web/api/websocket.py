@@ -5,7 +5,6 @@ import json
 import logging
 import re
 import shutil
-import unicodedata
 import uuid
 from contextlib import closing
 from datetime import datetime, timedelta, timezone
@@ -55,6 +54,22 @@ from ..services.chat_history_service import (
     mark_user_message_delivery,
     mark_user_message_delivery_sync,
 )
+from ..services.file_turn import (
+    append_uploaded_files_context as _append_uploaded_files_context_to_message,
+)
+from ..services.file_turn import (
+    bind_turn_files,
+)
+from ..services.file_turn import (
+    build_uploaded_files_context as _build_uploaded_files_context,
+)
+from ..services.file_turn import (
+    normalize_attachments_for_persistence as _normalize_attachments_for_persistence,
+)
+from ..services.file_turn import (
+    normalize_filename,
+    resolve_turn_file_infos,
+)
 from ..services.hot_path_cache import (
     cache_get,
     cache_set,
@@ -64,7 +79,6 @@ from ..services.hot_path_cache import (
 )
 from ..services.managed_file_ref import (
     DurableStorageOperationError,
-    ensure_uploaded_file_local_path,
 )
 from ..services.task_execution_controller import (
     TaskControlState,
@@ -297,51 +311,6 @@ def _resolve_task_llm_ids(
     )
 
 
-def normalize_filename(filename: str) -> str:
-    """
-    Normalize filename by removing special characters and spaces.
-
-    Args:
-        filename: Original filename
-
-    Returns:
-        Normalized filename safe for file operations
-    """
-    from pathlib import Path
-
-    # Keep file extension
-    name_part = Path(filename).stem
-    extension = Path(filename).suffix
-
-    # Unicode normalize (NFD to NFC, remove diacritics)
-    name_part = unicodedata.normalize("NFC", name_part)
-
-    # Replace spaces with underscores
-    name_part = re.sub(r"\s+", "_", name_part)
-
-    # Remove special characters, keep only letters, numbers, underscores, Chinese characters
-    name_part = re.sub(r"[^\w\u4e00-\u9fff\-_.]", "", name_part)
-
-    # Remove consecutive underscores
-    name_part = re.sub(r"_+", "_", name_part)
-
-    # Remove leading and trailing underscores
-    name_part = name_part.strip("_")
-
-    # Use default name if filename is empty
-    if not name_part:
-        name_part = "file"
-
-    # Reassemble filename
-    normalized_name = name_part + extension
-
-    # Ensure filename doesn't start with a dot (hidden file)
-    if normalized_name.startswith("."):
-        normalized_name = "_" + normalized_name
-
-    return normalized_name
-
-
 def build_unique_target_path(target_dir: Any, filename: str) -> Any:
     from pathlib import Path
 
@@ -357,58 +326,6 @@ def build_unique_target_path(target_dir: Any, filename: str) -> Any:
         if not candidate.exists():
             return candidate
         counter += 1
-
-
-def _build_uploaded_files_context(
-    file_info_list: List[Dict[str, Any]], *, is_agent_builder: bool = False
-) -> str:
-    """Build stable LLM context for files already uploaded for this turn."""
-    if not file_info_list:
-        return ""
-
-    file_summaries = []
-    file_ids = []
-    for file_info in file_info_list:
-        file_id = str(file_info.get("file_id") or "").strip()
-        if not file_id:
-            continue
-        name = str(
-            file_info.get("original_name") or file_info.get("name") or "uploaded file"
-        )
-        file_ids.append(file_id)
-        file_summaries.append(f"- {name}: file_id={file_id}")
-
-    if not file_ids:
-        return ""
-
-    lines = [
-        "## UPLOADED FILES",
-        "The user has uploaded file(s) for this turn. Use these exact file_id values:",
-        *file_summaries,
-        "",
-        FILE_REF_MODEL_INSTRUCTIONS,
-    ]
-    if is_agent_builder:
-        joined_file_ids = ", ".join(f'"{file_id}"' for file_id in file_ids)
-        lines.extend(
-            [
-                "",
-                "For knowledge-base creation, call `create_knowledge_base_from_file` with:",
-                f"  file_ids = [{joined_file_ids}]",
-                "Do NOT ask the user to upload again unless these file_ids fail.",
-            ]
-        )
-    return "\n".join(lines)
-
-
-def _append_uploaded_files_context_to_message(
-    message: str, uploaded_files_context: str
-) -> str:
-    if not uploaded_files_context:
-        return message
-    if uploaded_files_context in message:
-        return message
-    return f"{message.rstrip()}\n\n{uploaded_files_context}"
 
 
 def _display_message_for_user(user_message: str, has_files: bool) -> str:
@@ -513,22 +430,6 @@ def _selected_file_refs_from_task(task: Any, db: Session) -> list[dict[str, Any]
             continue
         refs.append(_uploaded_file_ref(record))
     return refs
-
-
-def _normalize_attachments_for_persistence(
-    file_info_list: Optional[List[Dict[str, Any]]],
-) -> List[Dict[str, Any]]:
-    """Project file_info_list to the minimal shape we persist on chat rows.
-
-    Thin wrapper around the shared
-    ``core.agent.attachments.project_file_info_to_chip`` so the trace
-    callback and the persistence path can't drift on what fields the
-    browser sees (paths must never leak — the attachments column and the
-    user_message trace events both reach the UI).
-    """
-    from ...core.agent.attachments import project_file_info_to_chip
-
-    return project_file_info_to_chip(file_info_list)
 
 
 def _attachment_fingerprint(attachments: Any) -> str:
@@ -2912,13 +2813,14 @@ async def handle_file_upload_for_task(
     user: Optional[User] = None,
     task_owner_id: Optional[int] = None,
 ) -> dict:
-    """Handle file upload for task"""
+    """Handle file upload for task.
+
+    Thin transport wrapper over the shared ``services.file_turn`` pipeline:
+    resolve the requested file ids to file-info dicts, then bind the ones
+    that resolved to this task. WS keeps its lenient behavior — files that
+    don't resolve are logged and skipped, not raised.
+    """
     try:
-        from ..models.uploaded_file import UploadedFile
-
-        uploaded_files = []
-        file_info_list = []
-
         logger.info(f"📁 Starting file upload for task {task_id}, files: {len(files)}")
 
         authorized_owner_id = task_owner_id
@@ -2931,84 +2833,27 @@ async def handle_file_upload_for_task(
             )
             return {"uploaded_files": [], "file_info_list": []}
 
-        for file_info in files:
-            file_id = file_info.get("file_id")
-            if not file_id:
-                logger.warning(f"No file_id provided in file info: {file_info}")
-                continue
-
-            file_record = (
-                db.query(UploadedFile)
-                .filter(
-                    UploadedFile.file_id == file_id,
-                    UploadedFile.user_id == int(authorized_owner_id),
-                    or_(
-                        UploadedFile.task_id == int(task_id),
-                        UploadedFile.task_id.is_(None),
-                    ),
-                )
-                .first()
+        file_ids = [str(f.get("file_id")) for f in files if f.get("file_id")]
+        file_info_list, missing = resolve_turn_file_infos(
+            file_ids=file_ids,
+            owner_user_id=int(authorized_owner_id),
+            db=db,
+            task_id=int(task_id),
+        )
+        for missing_id in missing:
+            logger.warning(
+                "File record not accessible for task %s: %s", task_id, missing_id
             )
-            if not file_record:
-                logger.warning(
-                    "File record not accessible for task %s: %s",
-                    task_id,
-                    file_id,
-                )
-                continue
 
-            file_name = file_record.filename
-            file_size = file_record.file_size
-            file_type = file_record.mime_type
-            source_path = ensure_uploaded_file_local_path(file_record)
+        bind_turn_files(
+            file_ids=[info["file_id"] for info in file_info_list],
+            task_id=int(task_id),
+            owner_user_id=int(authorized_owner_id),
+            db=db,
+        )
 
-            if not source_path.exists():
-                logger.warning(f"Physical file not found: {source_path}")
-                continue
-
-            try:
-                # Use normalized filename instead of original
-                original_file_name = Path(file_name).name
-                normalized_file_name = normalize_filename(original_file_name)
-
-                # Keep the real file in the user-level uploads dir, but expose
-                # a symlink inside the task workspace's input/ directory so
-                # the agent's `list_files` tool can see it without needing
-                # additional tool calls. Without this link, `list_files`
-                # returns an empty workspace and the agent often gives up
-                # before falling back to `list_all_user_files`.
-                target_path = source_path
-                uploaded_files.append(str(target_path))
-
-                if file_record.task_id is None:
-                    file_record.task_id = task_id
-
-                db.flush()
-
-                # Build file info using normalized filename
-                file_info_list.append(
-                    {
-                        "file_id": file_record.file_id,
-                        "name": normalized_file_name,
-                        "original_name": original_file_name,
-                        "size": file_size,
-                        "type": file_type,
-                        "path": str(target_path),
-                        "workspace_path": None,
-                    }
-                )
-
-                logger.info(
-                    f"File staged: storage={target_path} "
-                    f"(original={original_file_name} normalized={normalized_file_name})"
-                )
-
-            except Exception as e:
-                logger.error(f"Error handling file {file_info.get('name')}: {e}")
-                raise
-
+        uploaded_files = [info["path"] for info in file_info_list]
         logger.info(f"🎉 File upload completed, uploaded {len(uploaded_files)} files")
-        db.commit()
         return {"uploaded_files": uploaded_files, "file_info_list": file_info_list}
 
     except Exception as e:

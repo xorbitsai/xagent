@@ -159,6 +159,29 @@ async def test_prepare_for_call_reuses_route_and_exposes_profile_context_window(
 
 
 @pytest.mark.asyncio
+async def test_prepare_for_call_handles_missing_router_context_window(monkeypatch):
+    downstream = _ScriptedChatLLM([])
+    router = RouterLLM(downstream_resolver=lambda _model_id: downstream)
+
+    async def select_model(_prompt: str) -> str:
+        return "deepseek/deepseek-v4-flash"
+
+    monkeypatch.delattr(BaseLLM, "context_window")
+    monkeypatch.setattr(router, "_select_model", select_model)
+    monkeypatch.setattr(
+        router,
+        "_profile_context_window",
+        lambda _model_id: 1_048_576,
+    )
+
+    prepared = await router.prepare_for_call(
+        [{"role": "user", "content": "make a podcast"}]
+    )
+
+    assert prepared.context_window == 1_048_576
+
+
+@pytest.mark.asyncio
 async def test_router_chat_relaxes_required_tool_choice_on_openrouter_endpoint_error(
     monkeypatch,
 ):

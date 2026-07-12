@@ -427,7 +427,7 @@ class RouterLLM(BaseLLM):
         from xrouter's model profile catalog.
         """
         model_id, downstream = await self._resolve_route(messages)
-        context_window = self.context_window
+        context_window = getattr(self, "context_window", None)
         if not context_window:
             context_window = await asyncio.to_thread(
                 self._profile_context_window, model_id

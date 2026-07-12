@@ -52,6 +52,14 @@ class MessageBody(BaseModel):
         min_length=1,
         description="The user's message text. Must be non-empty.",
     )
+    files: Optional[List[str]] = Field(
+        default=None,
+        description=(
+            "file_id values previously returned by ``POST /v1/chat/files``. "
+            "The referenced files are attached to this turn and exposed to "
+            "the agent via file references."
+        ),
+    )
 
 
 class ConnectorRuntimeRefBody(BaseModel):
@@ -104,6 +112,26 @@ class CreateTaskRequest(BaseModel):
             "validated and applied below the LLM/tool-argument layer."
         ),
     )
+
+
+class UploadedFileInfo(BaseModel):
+    """One stored file returned by ``POST /v1/chat/files``."""
+
+    file_id: str
+    filename: str
+    file_size: int
+    mime_type: Optional[str] = None
+
+
+class UploadFilesResponse(BaseModel):
+    """``POST /v1/chat/files`` -> stored file handles.
+
+    Pass the returned ``file_id`` values in a subsequent
+    ``POST /v1/chat/tasks`` (or ``.../messages``) under ``message.files``
+    to attach them to a turn.
+    """
+
+    files: List[UploadedFileInfo]
 
 
 class RuntimeKeyResponse(BaseModel):

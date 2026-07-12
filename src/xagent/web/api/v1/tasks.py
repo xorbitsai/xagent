@@ -15,9 +15,9 @@ by the WebSocket UI path so both transports share one state machine.
 """
 
 import logging
-from typing import Any, NoReturn, Tuple, cast
+from typing import Any, NoReturn, Optional, Tuple, cast
 
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, Depends, File, UploadFile
 from sqlalchemy import func
 from sqlalchemy.orm import Session
 
@@ -26,6 +26,7 @@ from ...models.agent import Agent
 from ...models.agent_api_key import AgentApiKey
 from ...models.database import get_db
 from ...models.task import Task, TaskStatus, TraceEvent
+from ...models.user import User
 from ...schemas.v1 import (
     AppendMessageRequest,
     AppendMessageResponse,
@@ -34,6 +35,8 @@ from ...schemas.v1 import (
     PublicStep,
     StepsResponse,
     TaskInfoResponse,
+    UploadedFileInfo,
+    UploadFilesResponse,
 )
 from ...services.connector_runtime import (
     persist_create_connector_runtime_context,
@@ -69,6 +72,90 @@ router = APIRouter()
 logger = logging.getLogger(__name__)
 
 _CONNECTOR_RUNTIME_SETUP_FAILED_MESSAGE = "Connector runtime setup failed."
+
+
+@router.post("/chat/files", response_model=UploadFilesResponse)
+async def upload_task_files(
+    files: list[UploadFile] = File(...),
+    authed: Tuple[Agent, AgentApiKey] = Depends(get_agent_from_api_key),
+    db: Session = Depends(get_db),
+) -> UploadFilesResponse:
+    """Store files for later attachment to a task turn.
+
+    API-key-gated counterpart to the JWT-only ``POST /api/files/upload``.
+    Files are stored unbound (``task_id`` NULL) and owned by the agent's
+    user; the returned ``file_id`` values are passed back in
+    ``message.files`` on ``POST /v1/chat/tasks`` (or ``.../messages``),
+    where they get bound to the task and exposed to the agent.
+    """
+    from ..files import store_uploaded_files
+
+    agent, _key = authed
+    owner = db.query(User).filter(User.id == agent.user_id).first()
+    if owner is None:
+        raise V1ApiError(V1ErrorCode.INTERNAL_ERROR, 500)
+
+    result = await store_uploaded_files(
+        upload_items=list(files),
+        task_type="general",
+        task_id=None,
+        folder=None,
+        user=owner,
+        db=db,
+        single_file_mode=False,
+    )
+    return UploadFilesResponse(
+        files=[
+            UploadedFileInfo(
+                file_id=f["file_id"],
+                filename=f["filename"],
+                file_size=f["file_size"],
+                mime_type=f.get("mime_type"),
+            )
+            for f in result.get("files", [])
+        ]
+    )
+
+
+async def _build_file_turn_extras(
+    *, task_id: int, file_ids: list[str], owner_user_id: int, content: str, db: Session
+) -> Tuple[Optional[str], Optional[list[dict[str, Any]]]]:
+    """Bind ``file_ids`` to the task and build (execution_message, attachments).
+
+    Mirrors the WebSocket file path so the agent sees the same
+    ``## UPLOADED FILES`` context and the transcript row carries the same
+    clickable chips. Returns ``(None, None)`` when no files were supplied.
+    Raises 400 ``invalid_input`` if file_ids were given but none resolved
+    to a file owned by this user (bad id, wrong owner, or bound elsewhere).
+    """
+    if not file_ids:
+        return None, None
+
+    from ..websocket import (
+        _append_uploaded_files_context_to_message,
+        _build_uploaded_files_context,
+        _normalize_attachments_for_persistence,
+        handle_file_upload_for_task,
+    )
+
+    upload_result = await handle_file_upload_for_task(
+        task_id,
+        [{"file_id": fid} for fid in file_ids],
+        db,
+        task_owner_id=owner_user_id,
+    )
+    file_info_list = upload_result.get("file_info_list", [])
+    if not file_info_list:
+        raise V1ApiError(
+            V1ErrorCode.INVALID_INPUT,
+            400,
+            message="None of the supplied file ids are accessible.",
+        )
+
+    context = _build_uploaded_files_context(file_info_list)
+    execution_message = _append_uploaded_files_context_to_message(content, context)
+    attachments = _normalize_attachments_for_persistence(file_info_list) or None
+    return execution_message, attachments
 
 
 def _raise_v1_connector_runtime_error(exc: ConnectorRuntimeError) -> NoReturn:
@@ -261,7 +348,18 @@ async def create_chat_task(
     # commit, and bg coroutine scheduling under a lease lifecycle.
     # A brand-new task shouldn't ever hit busy -- but we map it
     # anyway for defense.
-    payload = TaskTurnPayload(transcript_message=request.message.content)
+    execution_message, attachments = await _build_file_turn_extras(
+        task_id=int(task.id),
+        file_ids=request.message.files or [],
+        owner_user_id=int(agent.user_id),
+        content=request.message.content,
+        db=db,
+    )
+    payload = TaskTurnPayload(
+        transcript_message=request.message.content,
+        execution_message=execution_message,
+        attachments=attachments,
+    )
     _store_connector_runtime_values_or_fail(
         db=db,
         task_id=int(task.id),
@@ -443,7 +541,18 @@ async def append_message_to_task(
     # COMPLETED or FAILED -- to be appendable, so PENDING/RUNNING both
     # 409), persists the new user message, and schedules the bg turn
     # with a single-flight guard against concurrent kickoffs.
-    payload = TaskTurnPayload(transcript_message=request.message.content)
+    execution_message, attachments = await _build_file_turn_extras(
+        task_id=int(task.id),
+        file_ids=request.message.files or [],
+        owner_user_id=int(agent.user_id),
+        content=request.message.content,
+        db=db,
+    )
+    payload = TaskTurnPayload(
+        transcript_message=request.message.content,
+        execution_message=execution_message,
+        attachments=attachments,
+    )
     _store_connector_runtime_values_or_fail(
         db=db,
         task_id=int(task.id),

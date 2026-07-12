@@ -355,6 +355,73 @@ def test_create_task_records_key_usage_but_polling_does_not(mock_start_task):
         db.close()
 
 
+# ===== POST /v1/chat/files + message.files =====
+
+
+def test_upload_and_attach_files_to_task(mock_start_task):
+    """Upload via /v1/chat/files, then attach the file_id to a task turn.
+
+    Asserts the returned file_id round-trips into the turn payload: the
+    execution_message carries the file reference context (so the agent
+    sees it) while the transcript stays the raw user text.
+    """
+    agent_id, full_key = _create_agent_with_key()
+
+    up = client.post(
+        "/v1/chat/files",
+        headers=_bearer(full_key),
+        files=[("files", ("lesson_plan.txt", b"lesson content", "text/plain"))],
+    )
+    assert up.status_code == 200, up.text
+    files = up.json()["files"]
+    assert len(files) == 1
+    file_id = files[0]["file_id"]
+    assert files[0]["filename"] == "lesson_plan.txt"
+
+    resp = client.post(
+        "/v1/chat/tasks",
+        headers=_bearer(full_key),
+        json={
+            "agent_id": agent_id,
+            "message": {
+                "role": "user",
+                "content": "check this lesson plan",
+                "files": [file_id],
+            },
+        },
+    )
+    assert resp.status_code == 202, resp.text
+
+    payload = mock_start_task.call_args.kwargs["payload"]
+    # Transcript is the raw text; execution channel is file-enriched.
+    assert payload.transcript_message == "check this lesson plan"
+    assert payload.execution_message is not None
+    assert file_id in payload.execution_message
+    assert "UPLOADED FILES" in payload.execution_message
+    assert payload.attachments
+    assert any(a.get("file_id") == file_id for a in payload.attachments)
+
+
+def test_attach_unknown_file_id_is_rejected(mock_start_task):
+    """A file_id that doesn't resolve to an owned file -> 400 invalid_input."""
+    agent_id, full_key = _create_agent_with_key()
+
+    resp = client.post(
+        "/v1/chat/tasks",
+        headers=_bearer(full_key),
+        json={
+            "agent_id": agent_id,
+            "message": {
+                "role": "user",
+                "content": "check this",
+                "files": ["does-not-exist"],
+            },
+        },
+    )
+    assert resp.status_code == 400, resp.text
+    assert resp.json()["error"]["code"] == "invalid_input"
+
+
 def test_create_task_persists_connector_runtime_snapshot_and_context(
     mock_start_task,
 ):

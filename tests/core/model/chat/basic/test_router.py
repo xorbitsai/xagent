@@ -134,7 +134,11 @@ async def test_prepare_for_call_reuses_route_and_exposes_profile_context_window(
     monkeypatch,
 ):
     downstream = _ScriptedChatLLM([])
-    router = RouterLLM(downstream_resolver=lambda _model_id: downstream)
+    downstream._model_id = "configured-openrouter-model"
+    router = RouterLLM(
+        timeout=42.0,
+        downstream_resolver=lambda _model_id: downstream,
+    )
     selected: list[str] = []
 
     async def select_model(prompt: str) -> str:
@@ -153,6 +157,8 @@ async def test_prepare_for_call_reuses_route_and_exposes_profile_context_window(
     )
 
     assert prepared.model_name == "deepseek/deepseek-v4-flash"
+    assert prepared.model_id == "configured-openrouter-model"
+    assert prepared.timeout == 42.0
     assert prepared.context_window == 1_048_576
     assert await prepared.chat([{"role": "user", "content": "continue"}]) == "ok"
     assert selected == ["make a podcast"]

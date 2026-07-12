@@ -559,7 +559,14 @@ class _ResolvedRouterLLM(BaseLLM):
         self._downstream = downstream
         self._selected_model = selected_model
         self.context_window = context_window
-        self._model_id = getattr(downstream, "model_id", None) or None
+
+    @property
+    def model_id(self) -> str:
+        return self._downstream.model_id
+
+    @property
+    def timeout(self) -> float:
+        return self._router.timeout
 
     @property
     def abilities(self) -> List[str]:

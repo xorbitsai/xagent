@@ -83,9 +83,14 @@ def write_archive(bundle: MigrationBundle, archive_dir: Path) -> list[str]:
             continue
         reasons.append(f"{out_path.name}\t<- {item.source_path}\n  {item.reason}")
     if reasons:
-        (archive_dir / "REASON.txt").write_text(
-            "\n".join(reasons) + "\n", encoding="utf-8"
-        )
+        # By now the DB import has already committed; a full disk or bad
+        # permissions here must not abort the run after the fact.
+        try:
+            (archive_dir / "REASON.txt").write_text(
+                "\n".join(reasons) + "\n", encoding="utf-8"
+            )
+        except OSError:
+            pass
     return written
 
 

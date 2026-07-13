@@ -105,12 +105,20 @@ def _print_preview(preview: dict) -> None:
 
 
 def _print_report(report: "LoadReport", archive_paths: list[str]) -> None:
-    print("\nMigration complete.")
+    if report.ok:
+        print("\nMigration complete.")
+    else:
+        print("\nMigration finished with errors; some items were not imported.")
     print(f"  agent created        : {report.agent_name}")
     print(f"  skills imported      : {len(report.skills_imported)}")
     if report.skills_skipped:
         print(f"  skills skipped       : {len(report.skills_skipped)}")
     print(f"  schedules imported   : {len(report.schedules_imported)}")
+    if report.schedules_skipped:
+        print(
+            f"  schedules skipped    : {len(report.schedules_skipped)}"
+            " (already imported)"
+        )
     if report.archived:
         print(f"  archived (manual)    : {len(report.archived)}")
     if archive_paths:
@@ -127,10 +135,6 @@ def _parse_and_preview(adapter: SourceAdapter) -> MigrationBundle:
 
 
 def run(args: argparse.Namespace) -> int:
-    from ..web.models.database import get_session_local, init_db
-
-    init_db()
-
     try:
         adapters = resolve_adapters(args.source, args.source_dir)
     except ValueError as exc:
@@ -143,6 +147,20 @@ def run(args: argparse.Namespace) -> int:
         )
         return 1
 
+    if args.dry_run:
+        # Parse/preview only. The DB stack is never initialized, so a fresh
+        # install (no users yet) can still preview what a migration would do.
+        for adapter in adapters:
+            bundle = _parse_and_preview(adapter)
+            if bundle.is_empty():
+                print("  (nothing to import from this source)")
+            else:
+                print("  dry-run: no changes made.")
+        return 0
+
+    from ..web.models.database import get_session_local, init_db
+
+    init_db()
     session_local = get_session_local()
     db: Session = session_local()
     try:
@@ -154,9 +172,6 @@ def run(args: argparse.Namespace) -> int:
             bundle = _parse_and_preview(adapter)
             if bundle.is_empty():
                 print("  (nothing to import from this source)")
-                continue
-            if args.dry_run:
-                print("  dry-run: no changes made.")
                 continue
             if not args.yes and not _confirm():
                 print("  skipped.")

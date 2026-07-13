@@ -29,7 +29,14 @@ from ..bundle import (
     PersonaItem,
     ScheduleItem,
 )
-from .base import SourceAdapter, collect_skill_dirs, load_skill_dir, read_text
+from .base import (
+    SourceAdapter,
+    collect_skill_dirs,
+    load_skill_dir,
+    normalize_cron_entries,
+    parse_interval_seconds,
+    read_text,
+)
 
 # Workspace docs that Hermes archives for manual review; we do the same rather
 # than guess at a mapping. SOUL/IDENTITY are handled as persona instead.
@@ -40,9 +47,9 @@ def _parse_jsonish(text: str) -> dict[str, Any]:
     """Parse JSON, tolerating the JSON5-isms OpenClaw permits.
 
     OpenClaw's ``openclaw.json`` is JSON5 (comments, trailing commas). We try
-    strict JSON first, then fall back to the optional ``json5`` package, then a
-    minimal cleanup pass. Returns ``{}`` on total failure so a malformed config
-    degrades to "nothing to migrate" rather than crashing the run.
+    strict JSON first, then a minimal cleanup pass. Returns ``{}`` on total
+    failure so a malformed config degrades to "nothing to migrate" rather than
+    crashing the run.
     """
     text = text.strip()
     if not text:
@@ -52,14 +59,7 @@ def _parse_jsonish(text: str) -> dict[str, Any]:
         return result if isinstance(result, dict) else {}
     except json.JSONDecodeError:
         pass
-    try:
-        import json5  # type: ignore
-
-        result = json5.loads(text)
-        return result if isinstance(result, dict) else {}
-    except Exception:
-        pass
-    # Last resort: strip // and /* */ comments and trailing commas.
+    # Fall back: strip // and /* */ comments and trailing commas.
     stripped = re.sub(r"/\*.*?\*/", "", text, flags=re.DOTALL)
     stripped = re.sub(r"(?m)//.*$", "", stripped)
     stripped = re.sub(r",(\s*[}\]])", r"\1", stripped)
@@ -141,28 +141,18 @@ class OpenClawAdapter(SourceAdapter):
         schedules: list[ScheduleItem] = []
 
         # 1. Structured cron entries in openclaw.json.
-        cron = config.get("cron")
-        entries: list[Any] = []
-        if isinstance(cron, list):
-            entries = cron
-        elif isinstance(cron, dict):
-            jobs = cron.get("jobs")
-            entries = jobs if isinstance(jobs, list) else list(cron.values())
+        entries = normalize_cron_entries(config.get("cron"))
         for index, entry in enumerate(entries):
             if not isinstance(entry, dict):
                 continue
             prompt = entry.get("prompt") or entry.get("task") or ""
             expr = entry.get("schedule") or entry.get("cron") or entry.get("expression")
-            interval = entry.get("interval_seconds") or entry.get("intervalSeconds")
-            interval_seconds = (
-                int(interval) if isinstance(interval, int) and interval > 0 else None
-            )
             schedules.append(
                 ScheduleItem(
                     name=str(entry.get("name") or f"openclaw-cron-{index + 1}"),
                     prompt=str(prompt),
                     cron_expression=str(expr) if expr else None,
-                    interval_seconds=interval_seconds,
+                    interval_seconds=parse_interval_seconds(entry),
                     timezone=(
                         str(entry["timezone"]) if entry.get("timezone") else None
                     ),

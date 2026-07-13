@@ -33,7 +33,14 @@ from xagent.core.tracing.langfuse import reset_langfuse_client
 # ==========================================
 
 
-if not hasattr(pathlib.Path, "_flavour") and hasattr(pathlib.PosixPath, "_flavour"):
+# On Windows this would shadow WindowsPath._flavour (Path precedes
+# PureWindowsPath in WindowsPath's MRO) and break every Path() call with
+# NotImplementedError, so it only applies on POSIX.
+if (
+    os.name != "nt"
+    and not hasattr(pathlib.Path, "_flavour")
+    and hasattr(pathlib.PosixPath, "_flavour")
+):
     pathlib.Path._flavour = pathlib.PosixPath._flavour
 
 # Load environment variables - try .env first, fallback to example.env

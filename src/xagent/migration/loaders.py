@@ -7,20 +7,22 @@ inherits the same validation and storage the product uses everywhere else:
 * persona   -> a new ``Agent`` (persona text becomes ``instructions``)
 * skills    -> personal ``UserSkill`` rows (same writer as Skill Hub imports)
 * schedules -> scheduled ``AgentTrigger`` rows when an interval is known;
-               cron-expression jobs are archived pending the cron engine
-               (see :data:`CRON_UNSUPPORTED_REASON`).
+               cron-expression jobs and natural-language heartbeat lines are
+               archived pending the cron engine (see
+               :data:`CRON_UNSUPPORTED_REASON` /
+               :data:`HEARTBEAT_UNSUPPORTED_REASON`).
 """
 
 from __future__ import annotations
 
-import hashlib
+import re
 from dataclasses import dataclass, field
 from typing import Any
 
 from sqlalchemy.orm import Session
 
 from ..web.models.agent import Agent
-from ..web.models.skill import UserSkill, UserSkillFile
+from ..web.models.skill import UserSkill
 from ..web.models.user import User
 from .bundle import ArchivedItem, MigrationBundle
 
@@ -33,6 +35,19 @@ CRON_UNSUPPORTED_REASON = (
     "recreate this job as an interval-based trigger, or wait for cron support."
 )
 
+# HEARTBEAT.md lines carry a schedule in free text ("Check HN each morning").
+# We cannot reliably turn that into an interval, so they are archived with a
+# reason that says so instead of the cron-expression one.
+HEARTBEAT_UNSUPPORTED_REASON = (
+    "Natural-language schedules (HEARTBEAT.md) cannot be translated into a "
+    "trigger automatically; recreate this line as an interval-based trigger."
+)
+
+# Skill Hub requires names matching [A-Za-z0-9_-]+; source directory names may
+# contain anything the filesystem allows, so runs of other characters collapse
+# to a single dash before insert.
+_INVALID_SKILL_NAME_CHARS = re.compile(r"[^A-Za-z0-9_-]+")
+
 
 @dataclass
 class LoadReport:
@@ -42,8 +57,14 @@ class LoadReport:
     skills_imported: list[str] = field(default_factory=list)
     skills_skipped: list[str] = field(default_factory=list)
     schedules_imported: list[str] = field(default_factory=list)
+    schedules_skipped: list[str] = field(default_factory=list)
     archived: list[str] = field(default_factory=list)
     errors: list[str] = field(default_factory=list)
+
+    @property
+    def ok(self) -> bool:
+        """True when every artifact loaded cleanly (a partial import is not ok)."""
+        return not self.errors
 
 
 class MigrationLoader:
@@ -118,9 +139,11 @@ class MigrationLoader:
                     name=skill.name,
                     files=skill.files,
                     slug=skill.slug,
-                    version=skill.version,
                 )
-            except Exception as exc:  # pragma: no cover - defensive per-skill
+            except Exception as exc:
+                # Reset the session so one bad skill cannot poison every
+                # subsequent write in this run with PendingRollbackError.
+                self.db.rollback()
                 report.errors.append(f"skill {skill.name!r}: {exc}")
                 continue
             if imported_name is None:
@@ -134,18 +157,22 @@ class MigrationLoader:
         name: str,
         files: dict[str, bytes],
         slug: str | None,
-        version: str | None,
     ) -> str | None:
         """Insert one personal skill, honoring the conflict strategy.
 
-        Returns the stored name, or ``None`` when a conflict caused a skip.
+        The actual write is delegated to Skill Hub's ``_write_personal_skill``
+        so migration inherits its name validation, path-traversal checks and
+        total-size budget. Returns the stored name, or ``None`` when a
+        conflict caused a skip.
         """
+        from ..web.api.skill_hub import _write_personal_skill
+
+        target_name = _normalize_skill_name(name)
         existing = (
             self.db.query(UserSkill)
-            .filter(UserSkill.user_id == self.user_id, UserSkill.name == name)
+            .filter(UserSkill.user_id == self.user_id, UserSkill.name == target_name)
             .first()
         )
-        target_name = name
         if existing is not None:
             if self.skill_conflict == "skip":
                 return None
@@ -153,35 +180,22 @@ class MigrationLoader:
                 self.db.delete(existing)
                 self.db.flush()
             elif self.skill_conflict == "rename":
-                target_name = self._unique_skill_name(name)
+                target_name = self._unique_skill_name(target_name)
 
-        skill_row = UserSkill(
-            user_id=self.user_id,
+        _write_personal_skill(
+            db=self.db,
+            user=self.user,
             name=target_name,
+            files=files,
             origin="imported",
-            clawhub_slug=slug,
-            clawhub_version=version,
-            created_by_user_id=self.user_id,
-            updated_by_user_id=self.user_id,
+            clawhub_slug=slug[:128] if slug else None,
         )
-        self.db.add(skill_row)
-        self.db.flush()
-        for path, content in sorted(files.items()):
-            self.db.add(
-                UserSkillFile(
-                    skill_id=skill_row.id,
-                    path=path,
-                    content=content,
-                    size_bytes=len(content),
-                    sha256=hashlib.sha256(content).hexdigest(),
-                    media_type=_guess_media_type(path),
-                )
-            )
-        self.db.commit()
         return target_name
 
     def _unique_skill_name(self, desired: str) -> str:
-        candidate = f"{desired}-imported"
+        # Leave room for the suffix inside UserSkill.name's 100-char column.
+        base = desired[:80]
+        candidate = f"{base}-imported"
         suffix = 2
         while (
             self.db.query(UserSkill.id)
@@ -189,7 +203,7 @@ class MigrationLoader:
             .first()
             is not None
         ):
-            candidate = f"{desired}-imported-{suffix}"
+            candidate = f"{base}-imported-{suffix}"
             suffix += 1
         return candidate
 
@@ -201,17 +215,31 @@ class MigrationLoader:
         from ..web.services.triggers import create_agent_trigger
 
         for schedule in bundle.schedules:
-            # The scheduler only understands intervals today. A job that only
-            # carries a cron expression is archived rather than mis-scheduled.
+            # The scheduler only understands intervals today. Cron-expression
+            # jobs and natural-language heartbeat lines are archived (each with
+            # its own reason) rather than mis-scheduled.
             if schedule.interval_seconds is None:
+                reason = (
+                    HEARTBEAT_UNSUPPORTED_REASON
+                    if schedule.natural_language
+                    else CRON_UNSUPPORTED_REASON
+                )
                 bundle.archived.append(
                     ArchivedItem(
                         name=schedule.name,
-                        reason=CRON_UNSUPPORTED_REASON,
+                        reason=reason,
                         content=(schedule.prompt or "").encode("utf-8"),
                         source_path=schedule.source_path,
                     )
                 )
+                continue
+            trigger_name = schedule.name[:200]
+            interval = int(schedule.interval_seconds)
+            prompt = schedule.prompt or None
+            if self._trigger_exists(
+                name=trigger_name, interval=interval, prompt=prompt
+            ):
+                report.schedules_skipped.append(schedule.name)
                 continue
             try:
                 create_agent_trigger(
@@ -219,14 +247,44 @@ class MigrationLoader:
                     user_id=self.user_id,
                     agent_id=int(agent.id),
                     trigger_type="scheduled",
-                    name=schedule.name[:200],
-                    config={"interval_seconds": int(schedule.interval_seconds)},
-                    prompt_template=schedule.prompt or None,
+                    name=trigger_name,
+                    config={"interval_seconds": interval},
+                    prompt_template=prompt,
                 )
-            except Exception as exc:  # pragma: no cover - defensive per-schedule
+            except Exception as exc:
+                # Same session hygiene as the skill path above.
+                self.db.rollback()
                 report.errors.append(f"schedule {schedule.name!r}: {exc}")
                 continue
             report.schedules_imported.append(schedule.name)
+
+    def _trigger_exists(self, *, name: str, interval: int, prompt: str | None) -> bool:
+        """True when an earlier migration run already created this trigger.
+
+        Agents are renamed per run, so the lookup goes by the user's triggers
+        rather than the agent's -- otherwise every re-run would add another
+        independently-firing copy of the same source job.
+        """
+        from ..web.models.trigger import AgentTrigger
+
+        candidates = (
+            self.db.query(AgentTrigger)
+            .filter(
+                AgentTrigger.user_id == self.user_id,
+                AgentTrigger.type == "scheduled",
+                AgentTrigger.name == name,
+            )
+            .all()
+        )
+        for candidate in candidates:
+            raw_config = candidate.config
+            config: dict[str, Any] = raw_config if isinstance(raw_config, dict) else {}
+            if (
+                config.get("interval_seconds") == interval
+                and (candidate.prompt_template or None) == prompt
+            ):
+                return True
+        return False
 
     # -- archive -----------------------------------------------------------
 
@@ -235,14 +293,12 @@ class MigrationLoader:
             report.archived.append(item.name)
 
 
-def _guess_media_type(path: str) -> str | None:
-    """Reuse the Skill-library media-type guess, tolerating import failure."""
-    try:
-        from ..skills.library import guess_media_type
-
-        return guess_media_type(path)
-    except Exception:  # pragma: no cover - fallback only
-        return None
+def _normalize_skill_name(name: str) -> str:
+    """Map a source directory name onto Skill Hub's naming rule."""
+    cleaned = _INVALID_SKILL_NAME_CHARS.sub("-", name).strip("-_")[:100]
+    if not cleaned:
+        raise ValueError(f"skill name {name!r} has no usable characters")
+    return cleaned
 
 
 def as_dict(report: LoadReport) -> dict[str, Any]:
@@ -252,6 +308,8 @@ def as_dict(report: LoadReport) -> dict[str, Any]:
         "skills_imported": report.skills_imported,
         "skills_skipped": report.skills_skipped,
         "schedules_imported": report.schedules_imported,
+        "schedules_skipped": report.schedules_skipped,
         "archived": report.archived,
         "errors": report.errors,
+        "ok": report.ok,
     }

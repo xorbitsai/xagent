@@ -15,9 +15,15 @@ from typing import Iterator
 
 import pytest
 
+from xagent.migration.adapters.base import load_skill_dir
 from xagent.migration.adapters.hermes import HermesAdapter
 from xagent.migration.adapters.openclaw import OpenClawAdapter
-from xagent.migration.loaders import CRON_UNSUPPORTED_REASON, MigrationLoader
+from xagent.migration.bundle import MigrationBundle, ScheduleItem, SkillItem
+from xagent.migration.loaders import (
+    CRON_UNSUPPORTED_REASON,
+    HEARTBEAT_UNSUPPORTED_REASON,
+    MigrationLoader,
+)
 from xagent.migration.runner import build_preview, write_archive
 
 
@@ -133,6 +139,17 @@ def test_malformed_openclaw_config_does_not_crash(tmp_path: Path) -> None:
     bundle = OpenClawAdapter(root=root).parse()
     assert bundle.persona is not None
     assert bundle.schedules == []
+
+
+def test_openclaw_config_with_utf8_bom_parses(tmp_path: Path) -> None:
+    """Files written on Windows often carry a BOM; it must not nuke the config."""
+    root = tmp_path / "openclaw"
+    root.mkdir()
+    (root / "openclaw.json").write_bytes(
+        b'\xef\xbb\xbf{"agents": {"defaults": {"name": "Clawbot"}}}'
+    )
+    bundle = OpenClawAdapter(root=root).parse()
+    assert bundle.agent_name == "Clawbot"
 
 
 def test_build_preview_splits_importable_and_archived(openclaw_home: Path) -> None:
@@ -261,3 +278,135 @@ def test_write_archive_persists_items(tmp_path: Path, openclaw_home: Path) -> No
     assert written
     assert (archive_dir / "REASON.txt").exists()
     assert (archive_dir / "TOOLS.md").read_bytes() == b"legacy tool notes"
+
+
+def test_loader_one_bad_skill_does_not_poison_the_run(db_session) -> None:
+    """A failing skill is reported, and everything after it still imports."""
+    user = _make_user(db_session)
+    bundle = MigrationBundle(source="hermes", source_root="x")
+    bundle.skills = [
+        # No SKILL.md -> rejected by the Skill Hub writer's validation.
+        SkillItem(name="broken", files={"notes.md": b"n"}, source_path="x"),
+        SkillItem(
+            name="good",
+            files={"SKILL.md": b"---\ndescription: d\n---\n"},
+            source_path="x",
+        ),
+    ]
+    bundle.schedules = [ScheduleItem(name="tick", prompt="tick", interval_seconds=60)]
+
+    report = MigrationLoader(db_session, user=user).load(bundle)
+
+    assert len(report.errors) == 1
+    assert "broken" in report.errors[0]
+    assert report.skills_imported == ["good"]
+    assert report.schedules_imported == ["tick"]
+    assert not report.ok
+
+
+def test_loader_normalizes_skill_names_to_hub_rules(db_session) -> None:
+    from xagent.web.models.skill import UserSkill
+
+    user = _make_user(db_session)
+    bundle = MigrationBundle(source="hermes", source_root="x")
+    bundle.skills = [
+        SkillItem(
+            name="my skill!",
+            files={"SKILL.md": b"---\ndescription: d\n---\n"},
+            source_path="x",
+        ),
+    ]
+
+    report = MigrationLoader(db_session, user=user).load(bundle)
+
+    assert report.skills_imported == ["my-skill"]
+    names = {
+        s.name for s in db_session.query(UserSkill).filter(UserSkill.user_id == user.id)
+    }
+    assert names == {"my-skill"}
+
+
+def test_rerunning_migration_does_not_duplicate_triggers(
+    db_session, hermes_home: Path
+) -> None:
+    from xagent.web.models.trigger import AgentTrigger
+
+    user = _make_user(db_session)
+    MigrationLoader(db_session, user=user).load(HermesAdapter(root=hermes_home).parse())
+    report2 = MigrationLoader(db_session, user=user).load(
+        HermesAdapter(root=hermes_home).parse()
+    )
+
+    triggers = (
+        db_session.query(AgentTrigger).filter(AgentTrigger.user_id == user.id).all()
+    )
+    assert len(triggers) == 1
+    assert report2.schedules_imported == []
+    assert report2.schedules_skipped == ["tick"]
+
+
+def test_heartbeat_schedules_archived_with_their_own_reason(
+    db_session, openclaw_home: Path
+) -> None:
+    user = _make_user(db_session)
+    bundle = OpenClawAdapter(root=openclaw_home).parse()
+
+    MigrationLoader(db_session, user=user).load(bundle)
+
+    reasons = {a.name: a.reason for a in bundle.archived}
+    assert reasons["brief"] == CRON_UNSUPPORTED_REASON
+    assert reasons["heartbeat-1"] == HEARTBEAT_UNSUPPORTED_REASON
+
+
+def test_load_skill_dir_skips_hidden_files(tmp_path: Path) -> None:
+    skill_dir = tmp_path / "skill"
+    _write(skill_dir / "SKILL.md", "---\ndescription: d\n---\n")
+    _write(skill_dir / ".DS_Store", "junk")
+    _write(skill_dir / ".git" / "config", "junk")
+
+    item = load_skill_dir("skill", skill_dir)
+
+    assert item is not None
+    assert set(item.files) == {"SKILL.md"}
+
+
+def test_load_skill_dir_skips_symlinks(tmp_path: Path) -> None:
+    outside = tmp_path / "outside.txt"
+    outside.write_text("secret", encoding="utf-8")
+    skill_dir = tmp_path / "skill"
+    _write(skill_dir / "SKILL.md", "---\ndescription: d\n---\n")
+    try:
+        (skill_dir / "leak.txt").symlink_to(outside)
+    except OSError:
+        pytest.skip("symlinks not available on this platform/user")
+
+    item = load_skill_dir("skill", skill_dir)
+
+    assert item is not None
+    assert set(item.files) == {"SKILL.md"}
+
+
+def test_dry_run_never_initializes_the_db(
+    openclaw_home: Path, monkeypatch, capsys
+) -> None:
+    """A fresh install (no users yet) must still be able to preview."""
+    import argparse
+
+    from xagent.migration import cli
+
+    def _boom(*args: object, **kwargs: object) -> None:
+        raise AssertionError("dry-run must not initialize the DB")
+
+    monkeypatch.setattr("xagent.web.models.database.init_db", _boom)
+    args = argparse.Namespace(
+        source="openclaw",
+        source_dir=openclaw_home,
+        username=None,
+        skill_conflict="skip",
+        dry_run=True,
+        yes=False,
+    )
+
+    assert cli.run(args) == 0
+    out = capsys.readouterr().out
+    assert "dry-run: no changes made." in out

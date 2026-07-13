@@ -20,7 +20,14 @@ from pathlib import Path
 from typing import Any
 
 from ..bundle import MigrationBundle, PersonaItem, ScheduleItem
-from .base import SourceAdapter, collect_skill_dirs, load_skill_dir, read_text
+from .base import (
+    SourceAdapter,
+    collect_skill_dirs,
+    load_skill_dir,
+    normalize_cron_entries,
+    parse_interval_seconds,
+    read_text,
+)
 
 
 class HermesAdapter(SourceAdapter):
@@ -67,13 +74,7 @@ class HermesAdapter(SourceAdapter):
             bundle.warnings.append(f"Could not parse {jobs_path}; skipping cron jobs.")
             return []
 
-        if isinstance(data, dict):
-            jobs = data.get("jobs")
-            entries = jobs if isinstance(jobs, list) else list(data.values())
-        elif isinstance(data, list):
-            entries = data
-        else:
-            entries = []
+        entries = normalize_cron_entries(data)
 
         schedules: list[ScheduleItem] = []
         for index, entry in enumerate(entries):
@@ -85,17 +86,10 @@ class HermesAdapter(SourceAdapter):
                     name=str(entry.get("name") or f"hermes-cron-{index + 1}"),
                     prompt=str(entry.get("prompt") or ""),
                     cron_expression=str(expr) if expr else None,
-                    interval_seconds=self._interval(entry),
+                    interval_seconds=parse_interval_seconds(entry),
                     timezone=str(entry["timezone"]) if entry.get("timezone") else None,
                     deliver=str(entry["deliver"]) if entry.get("deliver") else None,
                     source_path=str(jobs_path),
                 )
             )
         return schedules
-
-    @staticmethod
-    def _interval(entry: dict[str, Any]) -> int | None:
-        value = entry.get("interval_seconds") or entry.get("intervalSeconds")
-        if isinstance(value, int) and value > 0:
-            return value
-        return None

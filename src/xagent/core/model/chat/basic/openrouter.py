@@ -38,7 +38,7 @@ def _openrouter_model_author(model_name: str) -> str:
 def _strip_assistant_tool_call_prefixes(
     messages: List[Dict[str, Any]],
 ) -> tuple[List[Dict[str, Any]], bool]:
-    """Remove text prefixes from historical assistant function-call messages."""
+    """Remove assistant prefixes that DeepSeek cannot combine with tools."""
     sanitized: List[Dict[str, Any]] = []
     changed = False
     for message in messages:
@@ -51,7 +51,46 @@ def _strip_assistant_tool_call_prefixes(
             sanitized_message["content"] = ""
             changed = True
         sanitized.append(sanitized_message)
+
+    # A non-blocking ``send_message`` control call records its result and may
+    # leave a standalone assistant progress message at the end of older
+    # checkpoints. OpenRouter treats that trailing assistant turn as prefix
+    # completion, which DeepSeek rejects when tools are also present. The tool
+    # result already contains the same progress text, so dropping only trailing
+    # assistant-only turns preserves the tool chain and avoids replaying stale
+    # progress as a generation prefix.
+    has_completed_tool_chain = any(
+        message.get("role") == "assistant" and message.get("tool_calls")
+        for message in sanitized
+    ) and any(message.get("role") == "tool" for message in sanitized)
+    if has_completed_tool_chain:
+        while (
+            sanitized
+            and sanitized[-1].get("role") == "assistant"
+            and not sanitized[-1].get("tool_calls")
+        ):
+            sanitized.pop()
+            changed = True
     return sanitized, changed
+
+
+def _force_single_required_deepseek_tool(
+    tools: Optional[List[Dict[str, Any]]],
+    tool_choice: Optional[str | Dict[str, Any]],
+) -> Optional[str | Dict[str, Any]]:
+    """Turn DeepSeek's ambiguous single-tool requirement into a named choice."""
+    if tool_choice != "required" or not tools or len(tools) != 1:
+        return tool_choice
+    function = tools[0].get("function")
+    if not isinstance(function, dict):
+        return tool_choice
+    name = function.get("name")
+    if not isinstance(name, str) or not name:
+        return tool_choice
+    return {
+        "type": "function",
+        "function": {"name": name},
+    }
 
 
 class OpenRouterLLM(OpenAILLM):
@@ -110,6 +149,8 @@ class OpenRouterLLM(OpenAILLM):
         output_config: Optional[Dict[str, Any]] = None,
         **kwargs: Any,
     ) -> Any:
+        if self._uses_deepseek_tool_protocol:
+            tool_choice = _force_single_required_deepseek_tool(tools, tool_choice)
         try:
             response = await super().chat(
                 messages=messages,
@@ -213,6 +254,8 @@ class OpenRouterLLM(OpenAILLM):
         output_config: Optional[Dict[str, Any]] = None,
         **kwargs: Any,
     ) -> AsyncIterator[StreamChunk]:
+        if self._uses_deepseek_tool_protocol:
+            tool_choice = _force_single_required_deepseek_tool(tools, tool_choice)
         stream = self._stream_chat_with_prefix_retry(
             messages=messages,
             temperature=temperature,

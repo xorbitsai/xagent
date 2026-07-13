@@ -1390,8 +1390,6 @@ class ReActPattern(AgentPattern):
                 result={"message": message, "status": "sent"},
                 tool_call_id=tool_call.get("id"),
             )
-            if message:
-                context.add_assistant_message(message)
             return {
                 "success": True,
                 "status": "message_sent",
@@ -1931,6 +1929,9 @@ class ReActPattern(AgentPattern):
             f"{REACT_DECISION_TOOL_CALL} only when a specific missing fact, source, "
             "verification, or work step remains; the next normal ReAct turn will "
             "choose and call the actual work tool from the full available tool set. "
+            "In the tool arguments, write reason and missing_verification before "
+            "action so you assess completion before committing to the decision. "
+            "Use an empty missing_verification only when no work remains. "
             "Do not call work tools in this decision. Do not put user-facing final "
             "answer text in this decision; the next normal ReAct step will produce "
             "the final answer if you choose final_answer. Treat the completed-call "
@@ -1953,6 +1954,22 @@ class ReActPattern(AgentPattern):
                 "parameters": {
                     "type": "object",
                     "properties": {
+                        "reason": {
+                            "type": "string",
+                            "description": (
+                                "Assess whether every requested work result already "
+                                "exists. Write this assessment before choosing action."
+                            ),
+                        },
+                        "missing_verification": {
+                            "type": "string",
+                            "description": (
+                                "When action is tool_call, the specific missing "
+                                "fact, source, verification, or work step that "
+                                "requires another tool call. Empty only when no work "
+                                "remains."
+                            ),
+                        },
                         "action": {
                             "type": "string",
                             "enum": [
@@ -1960,24 +1977,14 @@ class ReActPattern(AgentPattern):
                                 REACT_DECISION_TOOL_CALL,
                             ],
                             "description": (
-                                "final_answer when current context is sufficient; "
-                                "tool_call when one more work-tool call is needed."
-                            ),
-                        },
-                        "reason": {
-                            "type": "string",
-                            "description": "Brief reason for this decision.",
-                        },
-                        "missing_verification": {
-                            "type": "string",
-                            "description": (
-                                "When action is tool_call, the specific missing "
-                                "fact, source, verification, or work step that "
-                                "requires another tool call."
+                                "Choose final_answer only when the preceding "
+                                "assessment found no missing work; otherwise choose "
+                                "tool_call."
                             ),
                         },
                     },
-                    "required": ["action", "reason"],
+                    "required": ["reason", "missing_verification", "action"],
+                    "additionalProperties": False,
                 },
             },
         }
@@ -1996,10 +2003,13 @@ class ReActPattern(AgentPattern):
                 REACT_DECISION_TOOL_CALL,
             }:
                 return None
+            missing_verification = str(args.get("missing_verification") or "")
+            if action == REACT_DECISION_FINAL_ANSWER and missing_verification.strip():
+                action = REACT_DECISION_TOOL_CALL
             return {
                 "action": action,
                 "reason": str(args.get("reason") or ""),
-                "missing_verification": str(args.get("missing_verification") or ""),
+                "missing_verification": missing_verification,
             }
         return None
 

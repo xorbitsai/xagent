@@ -133,6 +133,30 @@ def _tool_call_history() -> list[dict]:
     ]
 
 
+def _tool_call_history_with_trailing_progress() -> list[dict]:
+    messages = _tool_call_history()
+    messages[1]["content"] = ""
+    messages.append(
+        {
+            "role": "assistant",
+            "content": "Still working on the generated audio.",
+        }
+    )
+    return messages
+
+
+def _single_tool_schema(name: str = "select_execution_pattern") -> list[dict]:
+    return [
+        {
+            "type": "function",
+            "function": {
+                "name": name,
+                "parameters": {"type": "object", "properties": {}},
+            },
+        }
+    ]
+
+
 @pytest.mark.asyncio
 async def test_openrouter_official_provider_pinning_disabled_by_default(
     mock_chat_completion, mocker, monkeypatch
@@ -247,6 +271,91 @@ async def test_openrouter_provider_override_is_preserved(
 
 
 @pytest.mark.asyncio
+async def test_openrouter_deepseek_names_the_only_required_tool(mocker, monkeypatch):
+    monkeypatch.setenv("XAGENT_OPENROUTER_OFFICIAL_PROVIDERS_ONLY", "false")
+    tool_call = SimpleNamespace(
+        id="call_route",
+        type="function",
+        function=SimpleNamespace(
+            name="select_execution_pattern",
+            arguments="{}",
+        ),
+    )
+    response = SimpleNamespace(
+        choices=[
+            SimpleNamespace(
+                message=SimpleNamespace(
+                    content="",
+                    tool_calls=[tool_call],
+                )
+            )
+        ],
+        usage=None,
+        model_dump=lambda: {"id": "openrouter-deepseek-route"},
+    )
+    mock_client = mocker.AsyncMock()
+    mock_client.chat.completions.create.return_value = response
+    mocker.patch(
+        "xagent.core.model.chat.basic.openai.AsyncOpenAI",
+        return_value=mock_client,
+    )
+    llm = OpenRouterLLM(
+        model_name="deepseek/deepseek-v4-flash",
+        api_key="test-key",
+    )
+
+    await llm.chat(
+        [{"role": "user", "content": "Route this request"}],
+        tools=_single_tool_schema(),
+        tool_choice="required",
+    )
+
+    call_kwargs = mock_client.chat.completions.create.call_args.kwargs
+    assert call_kwargs["tool_choice"] == {
+        "type": "function",
+        "function": {"name": "select_execution_pattern"},
+    }
+
+
+@pytest.mark.asyncio
+async def test_openrouter_deepseek_stream_names_the_only_required_tool(
+    mocker, monkeypatch
+):
+    monkeypatch.setenv("XAGENT_OPENROUTER_OFFICIAL_PROVIDERS_ONLY", "false")
+
+    async def empty_stream():
+        if False:
+            yield None
+
+    mock_client = mocker.AsyncMock()
+    mock_client.chat.completions.create.return_value = empty_stream()
+    mocker.patch(
+        "xagent.core.model.chat.basic.openai.AsyncOpenAI",
+        return_value=mock_client,
+    )
+    llm = OpenRouterLLM(
+        model_name="deepseek/deepseek-v4-flash",
+        api_key="test-key",
+    )
+
+    chunks = [
+        chunk
+        async for chunk in llm.stream_chat(
+            [{"role": "user", "content": "Route this request"}],
+            tools=_single_tool_schema(),
+            tool_choice="required",
+        )
+    ]
+
+    assert chunks == []
+    call_kwargs = mock_client.chat.completions.create.call_args.kwargs
+    assert call_kwargs["tool_choice"] == {
+        "type": "function",
+        "function": {"name": "select_execution_pattern"},
+    }
+
+
+@pytest.mark.asyncio
 async def test_openrouter_deepseek_retries_function_call_without_assistant_prefix(
     mock_chat_completion, mocker, monkeypatch
 ):
@@ -282,6 +391,41 @@ async def test_openrouter_deepseek_retries_function_call_without_assistant_prefi
     assert retry_messages[1]["content"] == ""
     assert retry_messages[1]["tool_calls"] == messages[1]["tool_calls"]
     assert messages[1]["content"] == "I will generate the music first."
+
+
+@pytest.mark.asyncio
+async def test_openrouter_deepseek_retries_without_trailing_assistant_progress(
+    mock_chat_completion, mocker, monkeypatch
+):
+    monkeypatch.setenv("XAGENT_OPENROUTER_OFFICIAL_PROVIDERS_ONLY", "false")
+    mock_client = mocker.AsyncMock()
+    mock_client.chat.completions.create.side_effect = [
+        _deepseek_function_prefix_error(),
+        mock_chat_completion,
+    ]
+    mocker.patch(
+        "xagent.core.model.chat.basic.openai.AsyncOpenAI",
+        return_value=mock_client,
+    )
+    llm = OpenRouterLLM(
+        model_name="deepseek/deepseek-v4-flash",
+        api_key="test-key",
+    )
+    messages = _tool_call_history_with_trailing_progress()
+
+    result = await llm.chat(messages)
+
+    assert result["content"] == "Hello World"
+    assert mock_client.chat.completions.create.await_count == 2
+    retry_messages = mock_client.chat.completions.create.call_args_list[1].kwargs[
+        "messages"
+    ]
+    assert retry_messages[-1]["role"] == "tool"
+    assert all(
+        message.get("content") != "Still working on the generated audio."
+        for message in retry_messages
+    )
+    assert messages[-1]["content"] == "Still working on the generated audio."
 
 
 @pytest.mark.asyncio

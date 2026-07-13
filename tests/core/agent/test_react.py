@@ -2847,6 +2847,51 @@ async def test_react_pattern_final_answer_clears_trailing_pending_before_checkpo
     assert final_checkpoint["pattern_state"]["pending_tool_calls"] == []
 
 
+def test_react_decision_schema_assesses_work_before_choosing_action() -> None:
+    schema = ReActPattern()._react_decision_tool_schema()
+    parameters = schema["function"]["parameters"]
+
+    assert list(parameters["properties"]) == [
+        "reason",
+        "missing_verification",
+        "action",
+    ]
+    assert parameters["required"] == [
+        "reason",
+        "missing_verification",
+        "action",
+    ]
+    assert parameters["additionalProperties"] is False
+
+
+def test_react_decision_does_not_finalize_with_missing_work() -> None:
+    response = {
+        "tool_calls": [
+            {
+                "id": "decision_contradictory",
+                "function": {
+                    "name": "react_decision",
+                    "arguments": json.dumps(
+                        {
+                            "reason": "One more audio clip must be synthesized.",
+                            "missing_verification": "Synthesize the final audio clip.",
+                            "action": "final_answer",
+                        }
+                    ),
+                },
+            }
+        ]
+    }
+
+    decision = ReActPattern()._parse_react_decision(response)
+
+    assert decision == {
+        "action": "tool_call",
+        "reason": "One more audio clip must be synthesized.",
+        "missing_verification": "Synthesize the final audio clip.",
+    }
+
+
 @pytest.mark.asyncio
 async def test_react_pattern_accepts_plain_text_response() -> None:
     llm = FakeLLM(responses=["Direct answer"])
@@ -2932,6 +2977,11 @@ async def test_react_pattern_send_message_without_response_continues() -> None:
     tool_messages = context.get_messages_by_role("tool")
     assert len(tool_messages) == 1
     assert tool_messages[0].metadata["tool_name"] == "send_message"
+    next_call_messages = llm.calls[1]["messages"]
+    assert next_call_messages[-1]["role"] == "tool"
+    assert all(
+        message.get("content") != "Still working" for message in next_call_messages
+    )
     assert pattern.tool_ledger["call_message"].status == "completed"
 
 

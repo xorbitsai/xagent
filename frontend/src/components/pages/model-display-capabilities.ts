@@ -14,16 +14,21 @@ export function getProviderDisplayCapabilities(
   const capabilities = new Set<string>()
 
   models.forEach((model) => {
-    if (activeTab === "audio" && model.category === "sound_effect") {
+    const isSoundEffect =
+      activeTab === "audio" && model.category === "sound_effect"
+    const isMusic = activeTab === "audio" && model.category === "music"
+
+    if (isSoundEffect) {
       capabilities.add("sound_effect")
-      return
-    }
-    if (activeTab === "audio" && model.category === "music") {
+    } else if (isMusic) {
       capabilities.add("music")
-      return
     }
 
-    model.abilities?.forEach((ability) => capabilities.add(ability))
+    model.abilities?.forEach((ability) => {
+      if (ability !== "generate" || (!isSoundEffect && !isMusic)) {
+        capabilities.add(ability)
+      }
+    })
   })
 
   return Array.from(capabilities)

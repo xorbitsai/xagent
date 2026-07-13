@@ -233,32 +233,33 @@ class ElevenLabsTTS(BaseTTS):
 
     async def aclose(self) -> None:
         """Delete temporary voice clones and close cached ElevenLabs SDK clients."""
-        client = self._client
-        async_client = self._async_client
-        self._client = None
-        self._async_client = None
+        async with self._voice_clone_lock:
+            client = self._client
+            async_client = self._async_client
+            self._client = None
+            self._async_client = None
 
-        if async_client is not None and self._cloned_voice_ids:
-            deleted_voice_ids: set[str] = set()
-            for voice_id in set(self._cloned_voice_ids.values()):
-                try:
-                    await async_client.voices.delete(voice_id)
-                    deleted_voice_ids.add(voice_id)
-                except Exception as exc:
-                    logger.warning(
-                        "Failed to delete temporary ElevenLabs voice clone %s: %s",
-                        voice_id,
-                        redact_sensitive_text(str(exc)),
-                    )
-            if deleted_voice_ids:
-                self._cloned_voice_ids = {
-                    cache_key: voice_id
-                    for cache_key, voice_id in self._cloned_voice_ids.items()
-                    if voice_id not in deleted_voice_ids
-                }
+            if async_client is not None and self._cloned_voice_ids:
+                deleted_voice_ids: set[str] = set()
+                for voice_id in set(self._cloned_voice_ids.values()):
+                    try:
+                        await async_client.voices.delete(voice_id)
+                        deleted_voice_ids.add(voice_id)
+                    except Exception as exc:
+                        logger.warning(
+                            "Failed to delete temporary ElevenLabs voice clone %s: %s",
+                            voice_id,
+                            redact_sensitive_text(str(exc)),
+                        )
+                if deleted_voice_ids:
+                    self._cloned_voice_ids = {
+                        cache_key: voice_id
+                        for cache_key, voice_id in self._cloned_voice_ids.items()
+                        if voice_id not in deleted_voice_ids
+                    }
 
-        await self._close_client(async_client)
-        await self._close_client(client)
+            await self._close_client(async_client)
+            await self._close_client(client)
 
     async def __aenter__(self) -> "ElevenLabsTTS":
         return self

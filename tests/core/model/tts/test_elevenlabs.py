@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock
@@ -271,6 +272,50 @@ async def test_aclose_deletes_temporary_voice_clones() -> None:
         "voice-1",
         "voice-2",
     }
+    assert tts._cloned_voice_ids == {}
+
+
+async def test_aclose_waits_for_inflight_temporary_voice_clone(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    reference_audio = tmp_path / "reference.wav"
+    reference_audio.write_bytes(b"reference-audio")
+    create_started = asyncio.Event()
+    allow_create = asyncio.Event()
+
+    async def create(**kwargs: object) -> SimpleNamespace:
+        create_started.set()
+        await allow_create.wait()
+        return SimpleNamespace(voice_id="inflight-voice")
+
+    delete = AsyncMock()
+    fake_client = SimpleNamespace(
+        voices=SimpleNamespace(
+            ivc=SimpleNamespace(create=create),
+            delete=delete,
+        )
+    )
+    monkeypatch.setattr(
+        ElevenLabsTTS,
+        "_create_async_client",
+        staticmethod(lambda api_key, base_url=None: fake_client),
+    )
+
+    tts = ElevenLabsTTS(api_key="test-key")
+    clone_task = asyncio.create_task(
+        tts._get_or_create_cloned_voice(str(reference_audio))
+    )
+    await create_started.wait()
+
+    close_task = asyncio.create_task(tts.aclose())
+    await asyncio.sleep(0)
+    assert close_task.done() is False
+
+    allow_create.set()
+    assert await clone_task == "inflight-voice"
+    await close_task
+
+    delete.assert_awaited_once_with("inflight-voice")
     assert tts._cloned_voice_ids == {}
 
 

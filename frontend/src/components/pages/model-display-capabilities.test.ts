@@ -26,6 +26,18 @@ describe("getProviderDisplayCapabilities", () => {
     ).toEqual(["generate"])
   })
 
+  it("keeps non-generate abilities on sound effect and music models", () => {
+    expect(
+      getProviderDisplayCapabilities(
+        [
+          { category: "sound_effect", abilities: ["generate", "edit"] },
+          { category: "music", abilities: ["generate", "tts"] },
+        ],
+        "audio",
+      ),
+    ).toEqual(["sound_effect", "edit", "music", "tts"])
+  })
+
   it("deduplicates repeated provider capabilities", () => {
     expect(
       getProviderDisplayCapabilities(

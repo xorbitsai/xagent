@@ -618,14 +618,12 @@ def test_get_task_returns_token_usage_grouped_by_actual_model(test_db, user1_hea
             "model_name": "gpt-4.1",
             "input_tokens": 100,
             "output_tokens": 25,
-            "total_tokens": 125,
         },
         {
             "model_id": "compact",
             "model_name": "gpt-4.1-mini",
             "input_tokens": 20,
             "output_tokens": 5,
-            "total_tokens": 25,
         },
     ]
 

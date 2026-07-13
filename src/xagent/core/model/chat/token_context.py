@@ -270,7 +270,7 @@ def aggregate_token_usage_by_model(details: Any) -> List[Dict[str, Any]]:
         target["total_tokens"] += aggregate["total_tokens"]
         del grouped[key]
 
-    return sorted(
+    sorted_groups = sorted(
         grouped.values(),
         key=lambda item: (
             -item["total_tokens"],
@@ -278,6 +278,15 @@ def aggregate_token_usage_by_model(details: Any) -> List[Dict[str, Any]]:
             item["model_id"].casefold(),
         ),
     )
+    return [
+        {
+            "model_id": item["model_id"],
+            "model_name": item["model_name"],
+            "input_tokens": item["input_tokens"],
+            "output_tokens": item["output_tokens"],
+        }
+        for item in sorted_groups
+    ]
 
 
 def add_token_usage(

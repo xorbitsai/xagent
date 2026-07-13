@@ -25,7 +25,6 @@ interface ModelTokenUsage {
   model_name: string;
   input_tokens: number;
   output_tokens: number;
-  total_tokens: number;
 }
 
 const compactTokenFormatters: Record<Locale, Intl.NumberFormat> = {
@@ -52,7 +51,7 @@ function normalizeTokenCount(value: number): number {
 export function formatTokenCount(value: number, locale: Locale = 'en'): string {
   return compactTokenFormatters[locale]
     .format(normalizeTokenCount(value))
-    .toLocaleLowerCase(locale);
+    .toLowerCase();
 }
 
 export function formatExactTokenCount(value: number, locale: Locale = 'en'): string {
@@ -103,6 +102,24 @@ export function TokenUsageDisplay({ taskId, isRunning, className }: TokenUsageDi
 
   if (!usage) return null;
 
+  const attributedModelCount = usage.model_usage.filter((model) => Boolean(model.model_id)).length;
+  const unattributedUsageCount = usage.model_usage.length - attributedModelCount;
+  const modelUsageLabel = attributedModelCount === 0
+    ? t('chatPage.tokenUsage.unattributedCount', { count: unattributedUsageCount })
+    : unattributedUsageCount > 0
+      ? t(
+          attributedModelCount === 1
+            ? 'chatPage.tokenUsage.oneModelWithUnattributed'
+            : 'chatPage.tokenUsage.modelsWithUnattributed',
+          { count: attributedModelCount, unattributed: unattributedUsageCount },
+        )
+      : t(
+          attributedModelCount === 1
+            ? 'chatPage.tokenUsage.oneModel'
+            : 'chatPage.tokenUsage.models',
+          { count: attributedModelCount },
+        );
+
   return (
     <div className={`inline-flex flex-wrap items-center gap-x-3 gap-y-1 rounded-xl border bg-card/80 px-3 py-2 text-xs sm:text-sm ${className || ""}`}>
       <span className="flex items-center gap-1.5 whitespace-nowrap">
@@ -135,14 +152,7 @@ export function TokenUsageDisplay({ taskId, isRunning, className }: TokenUsageDi
               type="button"
               className="flex items-center gap-1 whitespace-nowrap rounded-md px-1.5 py-0.5 text-muted-foreground transition-colors hover:bg-muted hover:text-foreground"
             >
-              <span>
-                {t(
-                  usage.model_usage.length === 1
-                    ? 'chatPage.tokenUsage.oneModel'
-                    : 'chatPage.tokenUsage.models',
-                  { count: usage.model_usage.length },
-                )}
-              </span>
+              <span>{modelUsageLabel}</span>
               <ChevronDown className="h-3.5 w-3.5" />
             </button>
           </PopoverTrigger>
@@ -161,8 +171,8 @@ export function TokenUsageDisplay({ taskId, isRunning, className }: TokenUsageDi
               <span className="text-right text-muted-foreground">
                 {t('chatPage.tokenUsage.outputShort')}
               </span>
-              {usage.model_usage.map((model, index) => (
-                <React.Fragment key={JSON.stringify([model.model_id, model.model_name, index])}>
+              {usage.model_usage.map((model) => (
+                <React.Fragment key={JSON.stringify([model.model_id, model.model_name])}>
                   <span className="min-w-0" title={model.model_name || model.model_id}>
                     <span className="block truncate font-medium">
                       {model.model_name || model.model_id || t('chatPage.tokenUsage.unknownModel')}

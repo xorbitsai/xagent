@@ -3,6 +3,7 @@ import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/re
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest"
 
 const apiRequestMock = vi.hoisted(() => vi.fn())
+const i18nMock = vi.hoisted(() => ({ locale: "en" as "en" | "zh" }))
 
 vi.mock("@/lib/api-wrapper", () => ({
   apiRequest: apiRequestMock,
@@ -16,7 +17,7 @@ vi.mock("@/lib/utils", () => ({
 
 vi.mock("@/contexts/i18n-context", () => ({
   useI18n: () => ({
-    locale: "en",
+    locale: i18nMock.locale,
     t: (key: string, vars?: Record<string, string | number>) => {
       const message = {
         "chatPage.tokenUsage.input": "Input tokens",
@@ -25,14 +26,18 @@ vi.mock("@/contexts/i18n-context", () => ({
         "chatPage.tokenUsage.outputShort": "Output",
         "chatPage.tokenUsage.oneModel": "{count} model",
         "chatPage.tokenUsage.models": "{count} models",
+        "chatPage.tokenUsage.oneModelWithUnattributed": "{count} model + {unattributed} unattributed",
+        "chatPage.tokenUsage.modelsWithUnattributed": "{count} models + {unattributed} unattributed",
+        "chatPage.tokenUsage.unattributedCount": "{count} unattributed",
         "chatPage.tokenUsage.byModel": "Usage by model",
         "chatPage.tokenUsage.model": "Model",
         "chatPage.tokenUsage.unknownModel": "Unknown model",
         "chatPage.tokenUsage.unattributed": "Unattributed",
       }[key] ?? key
-      return vars?.count !== undefined
-        ? message.replace("{count}", String(vars.count))
-        : message
+      return Object.entries(vars ?? {}).reduce(
+        (result, [name, value]) => result.replaceAll(`{${name}}`, String(value)),
+        message,
+      )
     },
   }),
 }))
@@ -46,6 +51,7 @@ import {
 describe("TokenUsageDisplay", () => {
   beforeEach(() => {
     apiRequestMock.mockReset()
+    i18nMock.locale = "en"
   })
 
   afterEach(() => {
@@ -68,6 +74,25 @@ describe("TokenUsageDisplay", () => {
     },
   )
 
+  it("uses the active locale when rendering token counts", async () => {
+    i18nMock.locale = "zh"
+    apiRequestMock.mockResolvedValue(
+      new Response(
+        JSON.stringify({
+          input_tokens: 2_755_525,
+          output_tokens: 0,
+          total_tokens: 2_755_525,
+          llm_calls: 1,
+        }),
+        { status: 200, headers: { "Content-Type": "application/json" } },
+      ),
+    )
+
+    render(<TokenUsageDisplay taskId={6} isRunning={false} />)
+
+    expect(await screen.findByText("275.55万")).toHaveAttribute("title", "2,755,525")
+  })
+
   it("shows aggregate counts and exposes each model in a popover", async () => {
     apiRequestMock.mockResolvedValue(
       new Response(
@@ -82,14 +107,12 @@ describe("TokenUsageDisplay", () => {
               model_name: "deepseek/deepseek-v4-pro",
               input_tokens: 2_700_000,
               output_tokens: 35_000,
-              total_tokens: 2_735_000,
             },
             {
               model_id: "compact",
               model_name: "deepseek/deepseek-v4-flash",
               input_tokens: 55_525,
               output_tokens: 2_499,
-              total_tokens: 58_024,
             },
           ],
         }),
@@ -120,7 +143,7 @@ describe("TokenUsageDisplay", () => {
     expect(screen.getByText("55.53k")).toHaveAttribute("title", "55,525")
   })
 
-  it("uses the singular label and renders the unknown-model fallback", async () => {
+  it("uses the singular label and renders an id-only model without a sub-label", async () => {
     apiRequestMock.mockResolvedValue(
       new Response(
         JSON.stringify({
@@ -130,11 +153,10 @@ describe("TokenUsageDisplay", () => {
           llm_calls: 1,
           model_usage: [
             {
-              model_id: "",
+              model_id: "router:model-only",
               model_name: "",
               input_tokens: 12,
               output_tokens: 3,
-              total_tokens: 15,
             },
           ],
         }),
@@ -149,24 +171,24 @@ describe("TokenUsageDisplay", () => {
     expect(screen.queryByRole("button", { name: "1 models" })).not.toBeInTheDocument()
     fireEvent.click(modelsButton)
 
-    expect(await screen.findByText("Unknown model")).toBeInTheDocument()
+    expect(await screen.findByText("router:model-only")).toBeInTheDocument()
+    expect(screen.queryByText("Unattributed")).not.toBeInTheDocument()
   })
 
-  it("labels name-only model usage as unattributed", async () => {
+  it("counts and labels unknown model usage as unattributed", async () => {
     apiRequestMock.mockResolvedValue(
       new Response(
         JSON.stringify({
-          input_tokens: 30,
-          output_tokens: 0,
-          total_tokens: 30,
+          input_tokens: 12,
+          output_tokens: 3,
+          total_tokens: 15,
           llm_calls: 1,
           model_usage: [
             {
               model_id: "",
-              model_name: "shared-name",
-              input_tokens: 30,
-              output_tokens: 0,
-              total_tokens: 30,
+              model_name: "",
+              input_tokens: 12,
+              output_tokens: 3,
             },
           ],
         }),
@@ -176,8 +198,43 @@ describe("TokenUsageDisplay", () => {
 
     render(<TokenUsageDisplay taskId={10} isRunning={false} />)
 
-    fireEvent.click(await screen.findByRole("button", { name: /^1 model$/ }))
-    expect(await screen.findByText("shared-name")).toBeInTheDocument()
+    fireEvent.click(await screen.findByRole("button", { name: /^1 unattributed$/ }))
+    expect(await screen.findByText("Unknown model")).toBeInTheDocument()
+  })
+
+  it("separates attributed models from name-only usage in the trigger count", async () => {
+    apiRequestMock.mockResolvedValue(
+      new Response(
+        JSON.stringify({
+          input_tokens: 50,
+          output_tokens: 0,
+          total_tokens: 50,
+          llm_calls: 2,
+          model_usage: [
+            {
+              model_id: "main",
+              model_name: "shared-name",
+              input_tokens: 20,
+              output_tokens: 0,
+            },
+            {
+              model_id: "",
+              model_name: "shared-name",
+              input_tokens: 30,
+              output_tokens: 0,
+            },
+          ],
+        }),
+        { status: 200, headers: { "Content-Type": "application/json" } },
+      ),
+    )
+
+    render(<TokenUsageDisplay taskId={11} isRunning={false} />)
+
+    fireEvent.click(
+      await screen.findByRole("button", { name: /^1 model \+ 1 unattributed$/ }),
+    )
+    expect(await screen.findAllByText("shared-name")).toHaveLength(2)
     expect(screen.getByText("Unattributed")).toBeInTheDocument()
   })
 

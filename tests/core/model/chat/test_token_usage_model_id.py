@@ -169,14 +169,12 @@ def test_aggregate_token_usage_by_model_prefers_model_id_and_sorts_by_total():
             "model_name": "shared-name",
             "input_tokens": 100,
             "output_tokens": 25,
-            "total_tokens": 125,
         },
         {
             "model_id": "compact-model",
             "model_name": "shared-name",
             "input_tokens": 20,
             "output_tokens": 5,
-            "total_tokens": 25,
         },
     ]
 
@@ -195,7 +193,6 @@ def test_aggregate_token_usage_by_model_keeps_legacy_unattributed_tokens():
             "model_name": "",
             "input_tokens": 12,
             "output_tokens": 3,
-            "total_tokens": 15,
         }
     ]
 
@@ -224,7 +221,6 @@ def test_aggregate_token_usage_by_model_merges_unique_legacy_name_group():
             "model_name": "gpt-4o",
             "input_tokens": 150,
             "output_tokens": 30,
-            "total_tokens": 180,
         }
     ]
 
@@ -252,21 +248,18 @@ def test_aggregate_token_usage_by_model_keeps_ambiguous_legacy_name_group():
             "model_name": "shared-name",
             "input_tokens": 30,
             "output_tokens": 0,
-            "total_tokens": 30,
         },
         {
             "model_id": "main-model",
             "model_name": "shared-name",
             "input_tokens": 20,
             "output_tokens": 0,
-            "total_tokens": 20,
         },
         {
             "model_id": "compact-model",
             "model_name": "shared-name",
             "input_tokens": 10,
             "output_tokens": 0,
-            "total_tokens": 10,
         },
     ]
 
@@ -301,13 +294,11 @@ async def test_openrouter_auto_usage_is_attributed_to_each_selected_model():
             "model_name": "deepseek/deepseek-v4-flash",
             "input_tokens": 100,
             "output_tokens": 50,
-            "total_tokens": 150,
         },
         {
             "model_id": "router:anthropic/claude-opus-4.8",
             "model_name": "anthropic/claude-opus-4.8",
             "input_tokens": 20,
             "output_tokens": 10,
-            "total_tokens": 30,
         },
     ]

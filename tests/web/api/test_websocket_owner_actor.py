@@ -136,6 +136,12 @@ async def test_chat_admin_append_to_other_users_task_claims_as_owner(
                 "files": [],
             },
         )
+        for _ in range(100):
+            if begin_turn.await_count:
+                break
+            await asyncio.sleep(0.01)
+        else:
+            raise AssertionError("durable admin message was not dispatched in time")
 
     begin_turn.assert_awaited_once()
     assert begin_turn.await_args.kwargs["task_owner_user_id"] == int(owner.id)

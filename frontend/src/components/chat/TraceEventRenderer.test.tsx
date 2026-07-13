@@ -14,6 +14,7 @@ vi.mock("@/contexts/i18n-context", () => ({
     t: (key: string, vars?: Record<string, string | number>) => {
       if (vars?.tool) return `${key}:${vars.tool}`
       if (vars?.worker) return `${key}:${vars.worker}`
+      if (vars && "count" in vars) return `${key}:${vars.count}`
       return key
     },
   }),
@@ -533,8 +534,30 @@ describe("TraceEventRenderer", () => {
       />,
     )
 
-    fireEvent.click(screen.getByText("chatPage.executionPlan.dagSection"))
+    fireEvent.click(screen.getByText("chatPage.executionPlan.dagSectionOne:1"))
     expect(onOpenExecutionPlan).toHaveBeenCalledOnce()
+
+    rerender(
+      <TraceEventRenderer
+        onOpenExecutionPlan={onOpenExecutionPlan}
+        events={[
+          {
+            event_id: "dag-execution",
+            event_type: "dag_execution",
+            timestamp: 1000,
+            data: {
+              phase: "executing",
+              steps: [
+                { id: "1", task: "Create audio", dependencies: [] },
+                { id: "2", task: "Edit audio", dependencies: ["1"] },
+              ],
+            },
+          },
+        ]}
+      />,
+    )
+
+    expect(screen.getByText("chatPage.executionPlan.dagSectionOther:2")).toBeInTheDocument()
   })
 
   it("stops running process spinners when the parent task has failed", () => {

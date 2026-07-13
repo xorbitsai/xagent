@@ -568,7 +568,46 @@ describe("TaskConversationPanel", () => {
     expect(screen.getByText("Context compacted (56860→449 tokens)")).toBeInTheDocument()
   })
 
-  it("does not show a task-level execution plan action without DAG planning events", () => {
+  it("scopes the execution plan action to the DAG turn instead of task actions", () => {
+    appState.messages = [
+      {
+        id: "user-react",
+        role: "user",
+        content: "Use tools",
+        timestamp: 1000,
+      },
+      {
+        id: "result-react",
+        role: "assistant",
+        content: "Done",
+        timestamp: 1500,
+        isResult: true,
+      },
+      {
+        id: "user-dag",
+        role: "user",
+        content: "Create a plan",
+        timestamp: 2000,
+      },
+    ] as any
+    appState.traceEvents = [
+      {
+        event_id: "react-start",
+        event_type: "react_task_start",
+        step_id: "react-step",
+        timestamp: 1100,
+        data: {},
+      },
+      {
+        event_id: "dag-execution",
+        event_type: "dag_execution",
+        timestamp: 2100,
+        data: {
+          phase: "executing",
+          steps: [{ id: "dag-step", task: "Create output", dependencies: [] }],
+        },
+      },
+    ] as any
     appState.currentTask = {
       id: "42",
       title: "Task",
@@ -581,6 +620,7 @@ describe("TaskConversationPanel", () => {
 
     render(<TaskConversationPanel mode="page" />)
 
+    expect(screen.getAllByTitle("chatPage.executionPlan.tooltip")).toHaveLength(1)
     expect(screen.queryByTitle("chatPage.executionPlan.title")).not.toBeInTheDocument()
   })
 

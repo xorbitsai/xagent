@@ -1391,6 +1391,34 @@ export function TraceEventRenderer({ events, taskStatus, onOpenExecutionPlan }: 
     [events],
   );
 
+  const executionPlanStepCount = useMemo(() => {
+    for (let index = events.length - 1; index >= 0; index -= 1) {
+      const data = events[index].data;
+      if (!data || typeof data !== 'object') continue;
+
+      const record = data as Record<string, unknown>;
+      const planCandidates = [record, record.plan_data, record.current_plan, record.plan];
+      for (const candidate of planCandidates) {
+        if (!candidate || typeof candidate !== 'object') continue;
+        const planSteps = (candidate as Record<string, unknown>).steps;
+        if (Array.isArray(planSteps) && planSteps.length > 0) {
+          return planSteps.length;
+        }
+      }
+    }
+
+    return steps.length > 0 ? steps.length : null;
+  }, [events, steps.length]);
+
+  const executionPlanLabel = executionPlanStepCount === null
+    ? t('chatPage.executionPlan.dagSection')
+    : t(
+      executionPlanStepCount === 1
+        ? 'chatPage.executionPlan.dagSectionOne'
+        : 'chatPage.executionPlan.dagSectionOther',
+      { count: executionPlanStepCount },
+    );
+
   const getFileNameFromPath = (path?: string) => {
     if (!path) return '';
     const parts = path.split('/');
@@ -1459,7 +1487,7 @@ export function TraceEventRenderer({ events, taskStatus, onOpenExecutionPlan }: 
           <div className="flex min-w-0 items-center gap-2">
             <GitMerge className="h-4 w-4 shrink-0 text-muted-foreground" />
             <span className="truncate text-sm font-medium text-foreground">
-              {t('chatPage.executionPlan.dagSection', { count: steps.length })}
+              {executionPlanLabel}
             </span>
           </div>
           <span className="flex shrink-0 items-center text-xs font-medium text-muted-foreground">

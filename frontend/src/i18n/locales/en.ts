@@ -262,7 +262,9 @@ const en = {
     executionPlan: {
       title: "Execution Plan",
       tooltip: "Click to view execution plan",
-      dagSection: "DAG execution · {count} steps",
+      dagSection: "DAG execution",
+      dagSectionOne: "DAG execution · {count} step",
+      dagSectionOther: "DAG execution · {count} steps",
       view: "View plan",
     },
     aiOutput: {

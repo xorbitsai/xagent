@@ -205,7 +205,7 @@ describe("AgentBuilder admin cross-user MCP list", () => {
 
   it("locks the builder read-only and hides Save when can_edit is false", async () => {
     installApi(99, { canEdit: false }) // admin opening a read-only agent
-    render(<AgentBuilder agentId={AGENT_ID} />)
+    const { container } = render(<AgentBuilder agentId={AGENT_ID} />)
 
     // Read-only badge appears once the agent detail loads.
     await screen.findByText("builds.editor.header.readOnly")
@@ -213,6 +213,13 @@ describe("AgentBuilder admin cross-user MCP list", () => {
     expect(screen.queryByText("builds.editor.header.update")).toBeNull()
     expect(screen.queryByText("builds.editor.header.create")).toBeNull()
     expect(screen.queryByText("builds.editor.header.publish")).toBeNull()
+
+    // The form is actually locked, not just badge-swapped: native fields are
+    // disabled via the fieldset and the instructions editor drops contentEditable.
+    expect(screen.getByPlaceholderText("builds.configForm.name.placeholder")).toBeDisabled()
+    const editor = container.querySelector('div[role="textbox"]')
+    expect(editor).not.toBeNull()
+    expect(editor).toHaveAttribute("contenteditable", "false")
   })
 
   it("does not fire the owner-scoped fetch if unmounted before the agent load resolves", async () => {

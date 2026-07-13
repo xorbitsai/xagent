@@ -391,6 +391,7 @@ export function AgentBuilder({ agentId }: AgentBuilderProps) {
     if (!editor) return;
 
     const handleClick = (e: MouseEvent) => {
+      if (readOnly) return;
       const target = e.target as HTMLElement;
       const deleteBtn = target.closest('.file-chip-delete');
       if (deleteBtn) {
@@ -408,7 +409,7 @@ export function AgentBuilder({ agentId }: AgentBuilderProps) {
 
     editor.addEventListener('click', handleClick);
     return () => editor.removeEventListener('click', handleClick);
-  }, []);
+  }, [readOnly]);
 
   // Sync state -> DOM
   useEffect(() => {
@@ -1641,6 +1642,7 @@ export function AgentBuilder({ agentId }: AgentBuilderProps) {
               </div>
               <Select
                 value={modelConfig.general?.toString() || ""}
+                disabled={readOnly}
                 onValueChange={(value) => setModelConfig(prev => ({
                   ...prev,
                   general: value ? Number(value) : null
@@ -1683,6 +1685,7 @@ export function AgentBuilder({ agentId }: AgentBuilderProps) {
                   </div>
                   <Select
                     value={modelConfig.small_fast?.toString() || ""}
+                    disabled={readOnly}
                     onValueChange={(value) => setModelConfig(prev => ({
                       ...prev,
                       small_fast: value ? Number(value) : null
@@ -1702,6 +1705,7 @@ export function AgentBuilder({ agentId }: AgentBuilderProps) {
                   </div>
                   <Select
                     value={modelConfig.visual?.toString() || ""}
+                    disabled={readOnly}
                     onValueChange={(value) => setModelConfig(prev => ({
                       ...prev,
                       visual: value ? Number(value) : null
@@ -1721,6 +1725,7 @@ export function AgentBuilder({ agentId }: AgentBuilderProps) {
                   </div>
                   <Select
                     value={modelConfig.compact?.toString() || ""}
+                    disabled={readOnly}
                     onValueChange={(value) => setModelConfig(prev => ({
                       ...prev,
                       compact: value ? Number(value) : null

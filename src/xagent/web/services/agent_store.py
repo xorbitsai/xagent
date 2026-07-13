@@ -76,11 +76,7 @@ def _assert_can_set_visibility(
         raise PermissionError(
             "Only team admins can set an agent to admins-only visibility"
         )
-    if (
-        visibility is not None
-        and current_visibility == "admins"
-        and not is_team_admin
-    ):
+    if visibility is not None and current_visibility == "admins" and not is_team_admin:
         raise PermissionError(
             "Only team admins can change the visibility of an admins-only agent"
         )

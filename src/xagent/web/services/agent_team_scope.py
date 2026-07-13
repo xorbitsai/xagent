@@ -62,9 +62,7 @@ def owned_agent_clause(
     if scope.is_team_admin:
         team_clause = Agent.team_id == scope.team_id
     else:
-        team_clause = and_(
-            Agent.team_id == scope.team_id, Agent.visibility == "team"
-        )
+        team_clause = and_(Agent.team_id == scope.team_id, Agent.visibility == "team")
     return or_(
         and_(Agent.team_id.is_(None), Agent.user_id == user_id),
         team_clause,

@@ -120,9 +120,11 @@ def team_of_admin_and_member(db):
     db.flush()
     admins = {int(admin.id)}
     ats.set_agent_team_scope_hook(
-        lambda _db, uid: AgentTeamScope(team_id=200, is_team_admin=uid in admins)
-        if uid in {int(admin.id), int(member.id)}
-        else None
+        lambda _db, uid: (
+            AgentTeamScope(team_id=200, is_team_admin=uid in admins)
+            if uid in {int(admin.id), int(member.id)}
+            else None
+        )
     )
     yield admin, member
     ats.set_agent_team_scope_hook(None)
@@ -155,7 +157,9 @@ def test_member_cannot_set_visibility_admins(db, team_of_admin_and_member):
         user_id=int(member.id), name="Mine", description=None, instructions=None
     )
     with pytest.raises(PermissionError):
-        store.update_agent_fields(int(member.id), int(agent.id), {"visibility": "admins"})
+        store.update_agent_fields(
+            int(member.id), int(agent.id), {"visibility": "admins"}
+        )
 
 
 def test_admin_can_create_admins_only_agent(db, team_of_admin_and_member):
@@ -399,9 +403,7 @@ def test_run_path_team_member_can_load_team_agent(db, two_users_one_team_via_sco
         visibility="admins",
         status=AgentStatus.PUBLISHED,
     )
-    assert (
-        _load_agent_for_task_create(db, member, int(team_agent.id)) is not None
-    )
+    assert _load_agent_for_task_create(db, member, int(team_agent.id)) is not None
     assert _load_agent_for_task_create(db, member, int(secret.id)) is None
 
 
@@ -419,9 +421,11 @@ def two_users_one_team_via_scope(db):
     db.flush()
     admins = {int(admin.id)}
     ats.set_agent_team_scope_hook(
-        lambda _db, uid: AgentTeamScope(team_id=300, is_team_admin=uid in admins)
-        if uid in {int(admin.id), int(member.id)}
-        else None
+        lambda _db, uid: (
+            AgentTeamScope(team_id=300, is_team_admin=uid in admins)
+            if uid in {int(admin.id), int(member.id)}
+            else None
+        )
     )
     yield admin, member
     ats.set_agent_team_scope_hook(None)

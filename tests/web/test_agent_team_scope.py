@@ -44,9 +44,9 @@ def test_scope_is_none_without_hook():
 
 def test_scope_uses_hook_when_installed():
     ats.set_agent_team_scope_hook(
-        lambda db, uid: AgentTeamScope(team_id=42, is_team_admin=False)
-        if uid == 7
-        else None
+        lambda db, uid: (
+            AgentTeamScope(team_id=42, is_team_admin=False) if uid == 7 else None
+        )
     )
     try:
         assert ats.get_agent_team_scope(None, 7).team_id == 42
@@ -94,9 +94,11 @@ def two_users_one_team(db):
     db.flush()
     # Both users resolve to the same team scope (id 100).
     ats.set_agent_team_scope_hook(
-        lambda _db, uid: AgentTeamScope(team_id=100, is_team_admin=False)
-        if uid in {a.id, b.id}
-        else None
+        lambda _db, uid: (
+            AgentTeamScope(team_id=100, is_team_admin=False)
+            if uid in {a.id, b.id}
+            else None
+        )
     )
     yield a, b
     ats.set_agent_team_scope_hook(None)

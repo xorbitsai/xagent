@@ -563,6 +563,73 @@ def test_web_task_detail_cache_reuses_response_until_task_changes(
         set_cache_backend_for_testing(None)
 
 
+def test_get_task_returns_token_usage_grouped_by_actual_model(test_db, user1_headers):
+    from xagent.web.models.task import Task
+
+    create_resp = client.post(
+        "/api/chat/task/create",
+        json={"title": "model-usage-test", "description": "desc"},
+        headers=user1_headers,
+    )
+    assert create_resp.status_code == 200
+    task_id = create_resp.json()["task_id"]
+
+    db = next(get_db())
+    try:
+        task = db.query(Task).filter(Task.id == task_id).one()
+        task.input_tokens = 120
+        task.output_tokens = 30
+        task.total_tokens = 150
+        task.token_usage_details = [
+            {
+                "type": "input",
+                "tokens": 100,
+                "model": "gpt-4.1",
+                "model_id": "main",
+            },
+            {
+                "type": "output",
+                "tokens": 25,
+                "model": "gpt-4.1",
+                "model_id": "main",
+            },
+            {
+                "type": "input",
+                "tokens": 20,
+                "model": "gpt-4.1-mini",
+                "model_id": "compact",
+            },
+            {
+                "type": "output",
+                "tokens": 5,
+                "model": "gpt-4.1-mini",
+                "model_id": "compact",
+            },
+        ]
+        db.commit()
+    finally:
+        db.close()
+
+    response = client.get(f"/api/chat/task/{task_id}", headers=user1_headers)
+    assert response.status_code == 200
+    assert response.json()["model_usage"] == [
+        {
+            "model_id": "main",
+            "model_name": "gpt-4.1",
+            "input_tokens": 100,
+            "output_tokens": 25,
+            "total_tokens": 125,
+        },
+        {
+            "model_id": "compact",
+            "model_name": "gpt-4.1-mini",
+            "input_tokens": 20,
+            "output_tokens": 5,
+            "total_tokens": 25,
+        },
+    ]
+
+
 def test_get_task_llm_ids_preserves_stored_id_when_model_missing(test_db):
     ensure_system_initialized()
     from xagent.web.models.task import Task, TaskStatus

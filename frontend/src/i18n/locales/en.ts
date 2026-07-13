@@ -271,6 +271,15 @@ const en = {
     tokenUsage: {
       input: "Input tokens",
       output: "Output tokens",
+      inputShort: "Input",
+      outputShort: "Output",
+      inputColumn: "Input",
+      outputColumn: "Output",
+      oneModel: "{count} model",
+      models: "{count} models",
+      byModel: "Usage by model",
+      model: "Model",
+      unknownModel: "Unknown model",
     },
     contextUsage: {
       tooltip: "Context window {pct}% ({used}/{total} tokens)",

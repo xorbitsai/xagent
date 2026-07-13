@@ -1,8 +1,61 @@
 """Token-usage details carry model_id, disambiguating identically-named models."""
 
+from typing import Any
+
+import pytest
+
 from xagent.core.model import ChatModelConfig
 from xagent.core.model.chat.basic.adapter import create_base_llm
-from xagent.core.model.chat.token_context import TokenContextManager, add_token_usage
+from xagent.core.model.chat.basic.base import BaseLLM
+from xagent.core.model.chat.basic.router import RouterLLM
+from xagent.core.model.chat.token_context import (
+    TokenContextManager,
+    add_token_usage,
+    aggregate_token_usage_by_model,
+)
+
+
+class _UsageReportingLLM(BaseLLM):
+    def __init__(self, model_name: str, input_tokens: int, output_tokens: int) -> None:
+        self._reported_model_name = model_name
+        self._model_id = f"router:{model_name}"
+        self._input_tokens = input_tokens
+        self._output_tokens = output_tokens
+
+    @property
+    def abilities(self) -> list[str]:
+        return ["chat"]
+
+    @property
+    def model_name(self) -> str:
+        return self._reported_model_name
+
+    @property
+    def supports_thinking_mode(self) -> bool:
+        return False
+
+    async def chat(
+        self,
+        messages: list[dict[str, Any]],
+        temperature: float | None = None,
+        max_tokens: int | None = None,
+        tools: list[dict[str, Any]] | None = None,
+        tool_choice: str | dict[str, Any] | None = None,
+        response_format: dict[str, Any] | None = None,
+        thinking: dict[str, Any] | None = None,
+        output_config: dict[str, Any] | None = None,
+        **kwargs: Any,
+    ) -> str:
+        del messages, temperature, max_tokens, tools, tool_choice
+        del response_format, thinking, output_config, kwargs
+        add_token_usage(
+            input_tokens=self._input_tokens,
+            output_tokens=self._output_tokens,
+            model=self.model_name,
+            model_id=self.model_id,
+            call_type="chat",
+        )
+        return "ok"
 
 
 def test_create_base_llm_stamps_model_id():
@@ -80,3 +133,110 @@ def test_cached_input_tokens_helper():
     assert _cached_input_tokens(OpenAIUsage()) == 25  # openai/dashscope field
     assert _cached_input_tokens(NoCache()) == 0
     assert _cached_input_tokens(None) == 0
+
+
+def test_aggregate_token_usage_by_model_prefers_model_id_and_sorts_by_total():
+    details = [
+        {
+            "type": "input",
+            "tokens": 100,
+            "model": "shared-name",
+            "model_id": "main-model",
+        },
+        {
+            "type": "output",
+            "tokens": 25,
+            "model": "shared-name",
+            "model_id": "main-model",
+        },
+        {
+            "type": "input",
+            "tokens": 20,
+            "model": "shared-name",
+            "model_id": "compact-model",
+        },
+        {
+            "type": "output",
+            "tokens": 5,
+            "model": "shared-name",
+            "model_id": "compact-model",
+        },
+    ]
+
+    assert aggregate_token_usage_by_model(details) == [
+        {
+            "model_id": "main-model",
+            "model_name": "shared-name",
+            "input_tokens": 100,
+            "output_tokens": 25,
+            "total_tokens": 125,
+        },
+        {
+            "model_id": "compact-model",
+            "model_name": "shared-name",
+            "input_tokens": 20,
+            "output_tokens": 5,
+            "total_tokens": 25,
+        },
+    ]
+
+
+def test_aggregate_token_usage_by_model_keeps_legacy_unattributed_tokens():
+    details = [
+        {"type": "input", "tokens": "12"},
+        {"type": "output", "tokens": 3},
+        {"type": "other", "tokens": 99},
+        "invalid",
+    ]
+
+    assert aggregate_token_usage_by_model(details) == [
+        {
+            "model_id": "",
+            "model_name": "",
+            "input_tokens": 12,
+            "output_tokens": 3,
+            "total_tokens": 15,
+        }
+    ]
+
+
+@pytest.mark.asyncio
+async def test_openrouter_auto_usage_is_attributed_to_each_selected_model():
+    selected_models = iter(["deepseek/deepseek-v4-flash", "anthropic/claude-opus-4.8"])
+    token_counts = {
+        "deepseek/deepseek-v4-flash": (100, 50),
+        "anthropic/claude-opus-4.8": (20, 10),
+    }
+
+    def resolve(model_name: str) -> BaseLLM:
+        return _UsageReportingLLM(model_name, *token_counts[model_name])
+
+    router = RouterLLM(model_name="auto", downstream_resolver=resolve)
+    router.context_window = 128_000
+
+    async def select_model(_prompt: str) -> str:
+        return next(selected_models)
+
+    router._select_model = select_model  # type: ignore[method-assign]
+
+    with TokenContextManager() as manager:
+        await router.chat([{"role": "user", "content": "first"}])
+        await router.chat([{"role": "user", "content": "second"}])
+        model_usage = aggregate_token_usage_by_model(manager.get_usage().details)
+
+    assert model_usage == [
+        {
+            "model_id": "router:deepseek/deepseek-v4-flash",
+            "model_name": "deepseek/deepseek-v4-flash",
+            "input_tokens": 100,
+            "output_tokens": 50,
+            "total_tokens": 150,
+        },
+        {
+            "model_id": "router:anthropic/claude-opus-4.8",
+            "model_name": "anthropic/claude-opus-4.8",
+            "input_tokens": 20,
+            "output_tokens": 10,
+            "total_tokens": 30,
+        },
+    ]

@@ -271,6 +271,15 @@ const zh = {
     tokenUsage: {
       input: "输入tokens",
       output: "输出tokens",
+      inputShort: "输入",
+      outputShort: "输出",
+      inputColumn: "输入",
+      outputColumn: "输出",
+      oneModel: "{count} 个模型",
+      models: "{count} 个模型",
+      byModel: "各模型用量",
+      model: "模型",
+      unknownModel: "未知模型",
     },
     contextUsage: {
       tooltip: "上下文窗口 {pct}%（{used}/{total} tokens）",

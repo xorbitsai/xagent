@@ -31,6 +31,7 @@ from ...core.model.chat.basic.base import BaseLLM
 from ...core.model.chat.basic.deepseek import DeepSeekLLM
 from ...core.model.chat.basic.openai import OpenAILLM
 from ...core.model.chat.basic.zhipu import ZhipuLLM
+from ...core.model.chat.token_context import aggregate_token_usage_by_model
 from ...core.model.providers import is_placeholder_api_key
 from ...core.tools.adapters.vibe.selection_spec import should_load_mcp_server_configs
 from ...core.workspace import scoped_user_root
@@ -3337,6 +3338,7 @@ async def get_task(
                 "output_tokens": task.output_tokens or 0,
                 "total_tokens": task.total_tokens or 0,
                 "llm_calls": task.llm_calls or 0,
+                "model_usage": aggregate_token_usage_by_model(task.token_usage_details),
                 "agent_id": task.agent_id,
                 "agent_name": agent_name,
                 "agent_logo_url": agent_logo_url,

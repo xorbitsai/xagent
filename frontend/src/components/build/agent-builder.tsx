@@ -1456,8 +1456,8 @@ export function AgentBuilder({ agentId }: AgentBuilderProps) {
           <Label>{t("builds.configForm.logo.label")}</Label>
           <div className="flex items-center gap-4">
             <div
-              className="h-16 w-16 rounded-lg border border-dashed border-muted-foreground/50 flex items-center justify-center bg-background overflow-hidden cursor-pointer hover:bg-muted/50 transition-colors"
-              onClick={() => fileInputRef.current?.click()}
+              className={`h-16 w-16 rounded-lg border border-dashed border-muted-foreground/50 flex items-center justify-center bg-background overflow-hidden transition-colors ${readOnly ? "cursor-default" : "cursor-pointer hover:bg-muted/50"}`}
+              onClick={readOnly ? undefined : () => fileInputRef.current?.click()}
             >
               {logoFile ? (
                 <img src={URL.createObjectURL(logoFile)} alt="Logo" className="h-full w-full object-cover" />

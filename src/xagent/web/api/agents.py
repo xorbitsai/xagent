@@ -578,7 +578,9 @@ async def get_agent(
             # — those are the same agents the list endpoint now links to.
             if is_admin_user(current_user) or any(
                 int(item.agent.id) == agent_id
-                for item in list_accessible_agents(db, current_user)
+                for item in list_accessible_agents(
+                    db, current_user, purpose="agent_list"
+                )
             ):
                 response = store.get_agent_response_for_admin(agent_id)
                 readonly = response is not None

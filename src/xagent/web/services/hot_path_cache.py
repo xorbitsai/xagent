@@ -230,11 +230,24 @@ def web_task_history_key(task_id: int) -> str:
     return f"task:web:history:{task_id}"
 
 
-def agent_list_key(user_id: int) -> str:
+def agent_list_key(
+    user_id: int, team_id: int | None = None, is_team_admin: bool = False
+) -> str:
+    if team_id is not None:
+        return f"agent:list:team:{team_id}:{'a' if is_team_admin else 'm'}"
     return f"agent:list:{user_id}"
 
 
-def agent_detail_key(user_id: int, agent_id: int) -> str:
+def agent_detail_key(
+    user_id: int,
+    agent_id: int,
+    team_id: int | None = None,
+    is_team_admin: bool = False,
+) -> str:
+    if team_id is not None:
+        return (
+            f"agent:detail:team:{team_id}:{'a' if is_team_admin else 'm'}:{agent_id}"
+        )
     return f"agent:detail:{user_id}:{agent_id}"
 
 
@@ -275,10 +288,24 @@ def invalidate_task_cache(task_id: int) -> None:
     )
 
 
-def invalidate_agent_cache(user_id: int, agent_id: int | None = None) -> None:
-    cache_delete(agent_list_key(user_id))
+def invalidate_agent_cache(
+    user_id: int, agent_id: int | None = None, team_id: int | None = None
+) -> None:
+    if team_id is not None:
+        cache_delete(
+            agent_list_key(user_id, team_id, True),
+            agent_list_key(user_id, team_id, False),
+        )
+    else:
+        cache_delete(agent_list_key(user_id))
     if agent_id is not None:
-        cache_delete(agent_detail_key(user_id, agent_id))
+        if team_id is not None:
+            cache_delete(
+                agent_detail_key(user_id, agent_id, team_id, True),
+                agent_detail_key(user_id, agent_id, team_id, False),
+            )
+        else:
+            cache_delete(agent_detail_key(user_id, agent_id))
 
 
 def invalidate_model_cache(user_id: int | None = None) -> None:

@@ -42,6 +42,18 @@ class Agent(Base):  # type: ignore
 
     id = Column(Integer, primary_key=True, index=True)
     user_id = Column(Integer, ForeignKey("users.id"), nullable=False, index=True)
+    # SaaS-overlay team ownership. No DB ForeignKey: the ``teams`` table is a
+    # SaaS-only overlay table and does not exist in standalone xagent. When the
+    # SaaS agent-team-scope hook is not installed this stays NULL and agents
+    # remain purely user-owned.
+    team_id = Column(Integer, nullable=True, index=True)
+    # Team-internal visibility. "team" (default) = every team member; "admins"
+    # = only team admins (and the team API key) can see/manage/run it. Only a
+    # team admin may switch this. Standalone xagent (no team-scope hook) ignores
+    # it. Distinct from external share_enabled/widget exposure.
+    visibility = Column(
+        String(20), nullable=False, default="team", server_default="team"
+    )
     name = Column(String(200), nullable=False)
     description = Column(Text, nullable=True)
     instructions = Column(Text, nullable=True)  # System prompt/instructions

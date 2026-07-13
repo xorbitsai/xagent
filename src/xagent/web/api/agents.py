@@ -5,7 +5,7 @@ import os
 import secrets
 import uuid
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Literal, Optional
 
 from fastapi import APIRouter, Body, Depends, HTTPException, Request
 from pydantic import BaseModel, Field
@@ -37,6 +37,7 @@ from ..services.agent_management import (
     TemplateNotFoundError,
 )
 from ..services.agent_store import AgentStore, new_widget_key
+from ..services.agent_team_scope import get_agent_team_scope, owned_agent_clause
 from ..services.api_keys import AgentApiKeyService, KeyRotationConflict
 from ..services.llm_utils import UserAwareModelStorage
 from ..services.workforce_access import get_visible_agent_ids
@@ -76,6 +77,7 @@ class AgentCreateRequest(BaseModel):
     logo_base64: Optional[str] = Field(
         None, description="Logo image as base64 data URL"
     )
+    visibility: Optional[Literal["team", "admins"]] = None
 
 
 class AgentUpdateRequest(BaseModel):
@@ -97,6 +99,9 @@ class AgentUpdateRequest(BaseModel):
     logo_base64: Optional[str] = None
     widget_enabled: Optional[bool] = None
     allowed_domains: Optional[List[str]] = None
+    visibility: Optional[Literal["team", "admins"]] = Field(
+        None, description="Team visibility: 'team' or 'admins' (team admins only)"
+    )
 
 
 class AgentResponse(BaseModel):
@@ -115,6 +120,7 @@ class AgentResponse(BaseModel):
     suggested_prompts: List[str]
     logo_url: Optional[str]
     status: str
+    visibility: str
     published_at: Optional[str]
     created_at: str
     updated_at: str
@@ -137,6 +143,7 @@ class AgentListItem(BaseModel):
     description: Optional[str]
     logo_url: Optional[str]
     status: str
+    visibility: str = "team"
     created_at: str
     updated_at: str
     widget_enabled: bool
@@ -371,7 +378,9 @@ def _get_owned_agent_or_404(agent_id: int, current_user: User, db: Session) -> A
         db.query(Agent)
         .filter(
             Agent.id == agent_id,
-            Agent.user_id == current_user.id,
+            owned_agent_clause(
+                int(current_user.id), get_agent_team_scope(db, int(current_user.id))
+            ),
             Agent.origin != AgentOrigin.WORKFORCE_GENERATED_MANAGER.value,
         )
         .first()
@@ -515,6 +524,7 @@ async def create_agent(
             skills=agent_data.skills,
             tool_categories=agent_data.tool_categories,
             suggested_prompts=agent_data.suggested_prompts,
+            visibility=agent_data.visibility,
         )
 
         # Save logo if provided
@@ -533,6 +543,8 @@ async def create_agent(
 
     except HTTPException:
         raise
+    except PermissionError as e:
+        raise HTTPException(status_code=403, detail=str(e))
     except Exception as e:
         logger.error(f"Failed to create agent: {e}")
         db.rollback()
@@ -612,7 +624,11 @@ async def update_agent(
     try:
         store = AgentStore(db)
         user_id = int(current_user.id)
-        agent = store.get_owned_agent(user_id, agent_id)
+        # Resolve team scope once and reuse it for the read, the name check,
+        # and the write, instead of re-resolving (extra TeamMember query) and
+        # re-SELECTing the agent inside each store call.
+        team_scope = get_agent_team_scope(db, user_id)
+        agent = store.get_owned_agent(user_id, agent_id, team_scope)
 
         if not agent:
             raise HTTPException(status_code=404, detail="Agent not found")
@@ -636,7 +652,10 @@ async def update_agent(
         if agent_data.name is not None:
             # Check for duplicate name (excluding current agent)
             if store.agent_name_exists(
-                user_id, agent_data.name, exclude_agent_id=agent_id
+                user_id,
+                agent_data.name,
+                exclude_agent_id=agent_id,
+                team_scope=team_scope,
             ):
                 raise HTTPException(
                     status_code=400, detail="Agent with this name already exists"
@@ -667,6 +686,8 @@ async def update_agent(
                 updates["widget_key"] = new_widget_key()
         if agent_data.allowed_domains is not None:
             updates["allowed_domains"] = agent_data.allowed_domains
+        if agent_data.visibility is not None:
+            updates["visibility"] = agent_data.visibility
 
         # Handle logo
         if agent_data.logo_base64 is not None:
@@ -679,13 +700,24 @@ async def update_agent(
             updates["logo_url"] = logo_url
 
         if updates:
-            agent = store.update_agent_fields(user_id, agent_id, updates) or agent
+            agent = (
+                store.update_agent_fields(
+                    user_id,
+                    agent_id,
+                    updates,
+                    team_scope=team_scope,
+                    agent=agent,
+                )
+                or agent
+            )
 
         logger.info(f"Updated agent {agent_id} for user {current_user.id}")
         return AgentResponse.model_validate(store.agent_to_response_dict(agent))
 
     except HTTPException:
         raise
+    except PermissionError as e:
+        raise HTTPException(status_code=403, detail=str(e))
     except Exception as e:
         logger.error(f"Failed to update agent {agent_id}: {e}")
         db.rollback()

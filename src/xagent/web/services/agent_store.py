@@ -12,6 +12,11 @@ from ...core.utils.type_check import ensure_list
 from ..models.agent import Agent, AgentOrigin, AgentStatus
 from ..models.agent_api_key import AgentApiKey
 from ..models.task import Task
+from .agent_team_scope import (
+    get_agent_team_scope,
+    owned_agent_clause,
+    team_id_of,
+)
 from .hot_path_cache import (
     agent_detail_key,
     agent_list_key,
@@ -38,7 +43,47 @@ _AGENT_UPDATE_FIELDS = {
     "share_enabled",
     "share_token",
     "share_updated_at",
+    "visibility",
 }
+
+
+# Sentinel so callers can pass an already-resolved scope (even a real ``None``)
+# and skip the second team-scope lookup within a single write method.
+_UNRESOLVED = object()
+
+
+_VALID_VISIBILITIES = {"team", "admins"}
+
+
+def _assert_can_set_visibility(
+    team_scope: Any,
+    visibility: str | None,
+    current_visibility: str | None = None,
+) -> None:
+    """Guard visibility writes: value-domain (#14) + admins-only gate (#8/#9).
+
+    - Unknown values raise ``ValueError`` (store-layer domain check, not just
+      the API Pydantic Literal).
+    - Setting ``admins`` requires a resolved team scope with admin rights;
+      no scope (standalone / legacy) is fail-closed, not fail-open (#8).
+    - A team admin is also required to change an agent that is *currently*
+      admins-only, so a non-admin cannot downgrade it (#9).
+    """
+    is_team_admin = bool(team_scope and getattr(team_scope, "is_team_admin", False))
+    if visibility is not None and visibility not in _VALID_VISIBILITIES:
+        raise ValueError(f"Unsupported agent visibility: {visibility}")
+    if visibility == "admins" and not is_team_admin:
+        raise PermissionError(
+            "Only team admins can set an agent to admins-only visibility"
+        )
+    if (
+        visibility is not None
+        and current_visibility == "admins"
+        and not is_team_admin
+    ):
+        raise PermissionError(
+            "Only team admins can change the visibility of an admins-only agent"
+        )
 
 
 def clean_tool_categories(categories: Any) -> list[str]:
@@ -71,6 +116,7 @@ class AgentStore:
             "suggested_prompts": ensure_list(agent.suggested_prompts) or [],
             "logo_url": agent.logo_url,
             "status": agent.status.value,
+            "visibility": agent.visibility,
             "published_at": agent.published_at.isoformat()
             if agent.published_at
             else None,
@@ -91,6 +137,7 @@ class AgentStore:
             "description": agent.description,
             "logo_url": agent.logo_url,
             "status": agent.status.value,
+            "visibility": agent.visibility,
             "created_at": agent.created_at.isoformat(),
             "updated_at": agent.updated_at.isoformat()
             if agent.updated_at
@@ -104,14 +151,19 @@ class AgentStore:
         }
 
     def list_agent_items(self, user_id: int) -> list[dict[str, Any]]:
-        cache_key = agent_list_key(user_id)
+        team_scope = get_agent_team_scope(self.db, user_id)
+        cache_key = agent_list_key(
+            user_id,
+            team_id_of(team_scope),
+            bool(team_scope and team_scope.is_team_admin),
+        )
         cached = cache_get(cache_key)
         if isinstance(cached, list):
             return cached
 
         agents = (
             self.db.query(Agent)
-            .filter(Agent.user_id == user_id)
+            .filter(owned_agent_clause(user_id, team_scope))
             .filter(Agent.origin != AgentOrigin.WORKFORCE_GENERATED_MANAGER.value)
             .order_by(Agent.created_at.desc())
             .all()
@@ -121,12 +173,18 @@ class AgentStore:
         return response
 
     def get_agent_response(self, user_id: int, agent_id: int) -> dict[str, Any] | None:
-        cache_key = agent_detail_key(user_id, agent_id)
+        team_scope = get_agent_team_scope(self.db, user_id)
+        cache_key = agent_detail_key(
+            user_id,
+            agent_id,
+            team_id_of(team_scope),
+            bool(team_scope and team_scope.is_team_admin),
+        )
         cached = cache_get(cache_key)
         if isinstance(cached, dict):
             return cached
 
-        agent = self.get_owned_agent(user_id, agent_id)
+        agent = self.get_owned_agent(user_id, agent_id, team_scope)
         if agent is None:
             return None
 
@@ -134,12 +192,16 @@ class AgentStore:
         cache_set(cache_key, response)
         return response
 
-    def get_owned_agent(self, user_id: int, agent_id: int) -> Agent | None:
+    def get_owned_agent(
+        self, user_id: int, agent_id: int, team_scope: Any = _UNRESOLVED
+    ) -> Agent | None:
+        if team_scope is _UNRESOLVED:
+            team_scope = get_agent_team_scope(self.db, user_id)
         return (
             self.db.query(Agent)
             .filter(
                 Agent.id == agent_id,
-                Agent.user_id == user_id,
+                owned_agent_clause(user_id, team_scope),
                 Agent.origin != AgentOrigin.WORKFORCE_GENERATED_MANAGER.value,
             )
             .first()
@@ -165,10 +227,17 @@ class AgentStore:
         return self.agent_to_response_dict(agent)
 
     def agent_name_exists(
-        self, user_id: int, name: str, *, exclude_agent_id: int | None = None
+        self,
+        user_id: int,
+        name: str,
+        *,
+        exclude_agent_id: int | None = None,
+        team_scope: Any = _UNRESOLVED,
     ) -> bool:
+        if team_scope is _UNRESOLVED:
+            team_scope = get_agent_team_scope(self.db, user_id)
         query = self.db.query(Agent.id).filter(
-            Agent.user_id == user_id,
+            owned_agent_clause(user_id, team_scope),
             Agent.name == name,
             Agent.origin != AgentOrigin.WORKFORCE_GENERATED_MANAGER.value,
         )
@@ -197,6 +266,7 @@ class AgentStore:
         share_enabled: bool = False,
         share_token: str | None = None,
         share_updated_at: datetime | None = None,
+        visibility: str | None = None,
     ) -> Agent:
         agent = self.add_agent(
             user_id=user_id,
@@ -217,10 +287,12 @@ class AgentStore:
             share_enabled=share_enabled,
             share_token=share_token,
             share_updated_at=share_updated_at,
+            visibility=visibility,
         )
         self.db.commit()
         self.db.refresh(agent)
-        invalidate_agent_cache(user_id, int(agent.id))
+        # add_agent already stamped agent.team_id from the resolved scope.
+        invalidate_agent_cache(user_id, int(agent.id), agent.team_id)
         return agent
 
     def add_agent(
@@ -244,14 +316,18 @@ class AgentStore:
         share_enabled: bool = False,
         share_token: str | None = None,
         share_updated_at: datetime | None = None,
+        visibility: str | None = None,
     ) -> Agent:
         if status == AgentStatus.PUBLISHED and published_at is None:
             published_at = datetime.now(timezone.utc)
         # Widget-enabled agents always carry an embed credential; agents
         # created disabled get one when the widget is first enabled.
+        team_scope = get_agent_team_scope(self.db, user_id)
+        _assert_can_set_visibility(team_scope, visibility)
         widget_key = new_widget_key() if widget_enabled else None
         agent = Agent(
             user_id=user_id,
+            team_id=team_id_of(team_scope),
             name=name,
             description=description,
             instructions=instructions,
@@ -270,17 +346,32 @@ class AgentStore:
             share_enabled=share_enabled,
             share_token=share_token,
             share_updated_at=share_updated_at,
+            visibility=visibility or "team",
         )
         self.db.add(agent)
         self.db.flush()
         return agent
 
     def update_agent_fields(
-        self, user_id: int, agent_id: int, updates: dict[str, Any]
+        self,
+        user_id: int,
+        agent_id: int,
+        updates: dict[str, Any],
+        *,
+        team_scope: Any = _UNRESOLVED,
+        agent: Agent | None = None,
     ) -> Agent | None:
-        agent = self.get_owned_agent(user_id, agent_id)
+        if team_scope is _UNRESOLVED:
+            team_scope = get_agent_team_scope(self.db, user_id)
+        if agent is None:
+            agent = self.get_owned_agent(user_id, agent_id, team_scope)
         if agent is None:
             return None
+
+        if "visibility" in updates:
+            _assert_can_set_visibility(
+                team_scope, updates.get("visibility"), agent.visibility
+            )
 
         unknown_fields = set(updates) - _AGENT_UPDATE_FIELDS
         if unknown_fields:
@@ -295,11 +386,12 @@ class AgentStore:
 
         self.db.commit()
         self.db.refresh(agent)
-        invalidate_agent_cache(user_id, agent_id)
+        invalidate_agent_cache(user_id, agent_id, team_id_of(team_scope))
         return agent
 
     def delete_agent(self, user_id: int, agent_id: int) -> Agent | None:
-        agent = self.get_owned_agent(user_id, agent_id)
+        team_scope = get_agent_team_scope(self.db, user_id)
+        agent = self.get_owned_agent(user_id, agent_id, team_scope)
         if agent is None:
             return None
 
@@ -309,11 +401,12 @@ class AgentStore:
         )
         self.db.delete(agent)
         self.db.commit()
-        invalidate_agent_cache(user_id, agent_id)
+        invalidate_agent_cache(user_id, agent_id, team_id_of(team_scope))
         return agent
 
     def publish_agent(self, user_id: int, agent_id: int) -> Agent | None:
-        agent = self.get_owned_agent(user_id, agent_id)
+        team_scope = get_agent_team_scope(self.db, user_id)
+        agent = self.get_owned_agent(user_id, agent_id, team_scope)
         if agent is None:
             return None
         if agent.status == AgentStatus.PUBLISHED:
@@ -323,11 +416,12 @@ class AgentStore:
         agent.published_at = datetime.now(timezone.utc)  # type: ignore[assignment]
         self.db.commit()
         self.db.refresh(agent)
-        invalidate_agent_cache(user_id, agent_id)
+        invalidate_agent_cache(user_id, agent_id, team_id_of(team_scope))
         return agent
 
     def unpublish_agent(self, user_id: int, agent_id: int) -> Agent | None:
-        agent = self.get_owned_agent(user_id, agent_id)
+        team_scope = get_agent_team_scope(self.db, user_id)
+        agent = self.get_owned_agent(user_id, agent_id, team_scope)
         if agent is None:
             return None
         if agent.status != AgentStatus.PUBLISHED:
@@ -337,5 +431,5 @@ class AgentStore:
         agent.published_at = None  # type: ignore[assignment]
         self.db.commit()
         self.db.refresh(agent)
-        invalidate_agent_cache(user_id, agent_id)
+        invalidate_agent_cache(user_id, agent_id, team_id_of(team_scope))
         return agent

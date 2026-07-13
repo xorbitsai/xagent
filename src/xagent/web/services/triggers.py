@@ -27,6 +27,7 @@ from ..models.background_job import BackgroundJob, BackgroundJobType
 from ..models.task import Task, TaskStatus
 from ..models.trigger import AgentTrigger, TriggerRun, TriggerRunStatus, TriggerType
 from ..models.user_oauth import UserOAuth
+from .agent_team_scope import get_agent_team_scope, owned_agent_clause
 from .background_jobs import create_background_job, enqueue_background_job
 from .connector_runtime import (
     persist_create_connector_runtime_context,
@@ -423,7 +424,12 @@ def _unregister_trigger_binding(
 
 def get_owned_agent(db: Session, *, user_id: int, agent_id: int) -> Agent | None:
     return (
-        db.query(Agent).filter(Agent.id == agent_id, Agent.user_id == user_id).first()
+        db.query(Agent)
+        .filter(
+            Agent.id == agent_id,
+            owned_agent_clause(user_id, get_agent_team_scope(db, user_id)),
+        )
+        .first()
     )
 
 
@@ -434,12 +440,16 @@ def get_owned_trigger(
     agent_id: int,
     trigger_id: int,
 ) -> AgentTrigger | None:
+    # Visibility follows the trigger's agent, not its creator: a teammate/team
+    # admin who can manage the (co-owned) agent can also read/update/delete
+    # triggers others created on it. Confirm the caller manages the agent first.
+    if get_owned_agent(db, user_id=user_id, agent_id=agent_id) is None:
+        return None
     return (
         db.query(AgentTrigger)
         .filter(
             AgentTrigger.id == trigger_id,
             AgentTrigger.agent_id == agent_id,
-            AgentTrigger.user_id == user_id,
         )
         .first()
     )

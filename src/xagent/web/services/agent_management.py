@@ -194,7 +194,7 @@ class AgentManagementService:
             raise KeyRotationConflict(str(exc)) from exc
 
         self.db.refresh(agent)
-        invalidate_agent_cache(user_id, int(agent.id))
+        invalidate_agent_cache(user_id, int(agent.id), agent.team_id)
 
         key_resp: APIKeyGenerateResponse | None = None
         if staged_key is not None:

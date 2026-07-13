@@ -10,6 +10,7 @@ from sqlalchemy.orm import Session
 
 from ..models.agent import Agent, AgentOrigin, AgentStatus
 from ..models.user import User
+from .agent_team_scope import get_agent_team_scope, owned_agent_clause
 from .workforce_access import get_visible_agent_ids
 
 AgentAccessLevel = Literal["owner", "policy"]
@@ -99,7 +100,8 @@ def list_accessible_agents(
     excluded = _normalize_excluded_agent_ids(exclude_agent_ids)
     items_by_id: dict[int, AccessibleAgent] = {}
 
-    owned_query = db.query(Agent).filter(Agent.user_id == int(user.id))
+    team_scope = get_agent_team_scope(db, int(user.id))
+    owned_query = db.query(Agent).filter(owned_agent_clause(int(user.id), team_scope))
     if excluded:
         owned_query = owned_query.filter(Agent.id.notin_(excluded))
     if not include_private_workforce_manager_agents:
@@ -113,7 +115,11 @@ def list_accessible_agents(
         visible_agent_ids = get_visible_agent_ids(db, user, purpose)
         if not visible_agent_ids:
             return _sort_by_created_desc(list(items_by_id.values()))
-        policy_query = db.query(Agent).filter(Agent.id.in_(visible_agent_ids))
+        # Admins-only agents surface only through the owned clause (team admin);
+        # the policy/published path must never leak them to non-admins.
+        policy_query = db.query(Agent).filter(
+            Agent.id.in_(visible_agent_ids), Agent.visibility != "admins"
+        )
 
     if excluded:
         policy_query = policy_query.filter(Agent.id.notin_(excluded))

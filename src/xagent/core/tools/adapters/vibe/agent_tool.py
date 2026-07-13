@@ -603,13 +603,21 @@ class CreateAgentTool(AbstractBaseTool):
         self, requested_name: str, db: Any
     ) -> tuple[str, Optional[str]]:
         from .....web.models.agent import Agent
+        from .....web.services.agent_team_scope import (
+            get_agent_team_scope,
+            owned_agent_clause,
+        )
 
         normalized_name = requested_name.strip()[:MAX_AGENT_NAME_LENGTH].rstrip()
 
         existing_names = {
             name
             for (name,) in db.query(Agent.name)
-            .filter(Agent.user_id == self._user_id)
+            .filter(
+                owned_agent_clause(
+                    self._user_id, get_agent_team_scope(db, self._user_id)
+                )
+            )
             .all()
         }
 

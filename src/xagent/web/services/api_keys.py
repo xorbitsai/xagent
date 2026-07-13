@@ -26,6 +26,7 @@ from ..schemas.user_api_key import (
     PersonalAPIKeyMetadata,
     PersonalAPIKeyRevokeResponse,
 )
+from .agent_team_scope import get_agent_team_scope, owned_agent_clause
 
 logger = logging.getLogger(__name__)
 
@@ -182,13 +183,14 @@ class AgentApiKeyService:
     #
     # Unlike the rotate/get/revoke trio above -- which enforce "at most one
     # active key" by construction -- these let a caller hold any number of
-    # simultaneously-active keys per agent. All are scoped by an inner join
-    # on ``Agent.user_id`` so a caller can never list/mutate another user's
-    # keys, mirroring ``_get_owned_agent_or_404`` in ``api/agents.py``.
+    # simultaneously-active keys per agent. All are scoped by
+    # ``owned_agent_clause`` so a caller can only list/mutate keys for agents
+    # they own or co-own within their team, mirroring
+    # ``_get_owned_agent_or_404`` in ``api/agents.py``.
 
     def _owned_agents_query(self, user_id: int) -> Any:
         return self.db.query(Agent.id).filter(
-            Agent.user_id == user_id,
+            owned_agent_clause(user_id, get_agent_team_scope(self.db, user_id)),
             Agent.origin != AgentOrigin.WORKFORCE_GENERATED_MANAGER.value,
         )
 

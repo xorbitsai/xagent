@@ -167,7 +167,7 @@ class TestCreateAgentTool:
                 assert "test_agent" in result["markdown_link"]
                 assert "agent://" in result["markdown_link"]
                 mock_invalidate_agent_cache.assert_called_once_with(
-                    user_id, result["agent_id"]
+                    user_id, result["agent_id"], None
                 )
 
                 # Verify agent was created in database (use a fresh session)
@@ -1110,7 +1110,7 @@ class TestUpdateAgentTool:
                     }
                 )
                 mock_invalidate_agent_cache.assert_called_once_with(
-                    user.id, existing_agent.id
+                    user.id, existing_agent.id, None
                 )
 
             # Verify result

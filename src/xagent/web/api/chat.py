@@ -51,6 +51,7 @@ from ..sandbox_keys import (
 )
 from ..schemas.chat import TaskCreateRequest, TaskCreateResponse
 from ..services.agent_access import list_accessible_published_agents
+from ..services.agent_team_scope import get_agent_team_scope, owned_agent_clause
 from ..services.chat_history_service import (
     get_latest_waiting_question,
     load_task_transcript,
@@ -136,8 +137,19 @@ def _load_agent_for_task_create(
         return None
     if is_workforce_generated_manager_agent(agent):
         return None
-    if int(agent.user_id) == int(user.id):
-        return agent
+    # Team-scoped ownership: teammates may run a team-visible agent, and an
+    # admins-only agent stays hidden from non-admins. Falls back to the
+    # published-visibility path below when the caller does not own it.
+    owned = (
+        db.query(Agent)
+        .filter(
+            Agent.id == agent_id,
+            owned_agent_clause(int(user.id), get_agent_team_scope(db, int(user.id))),
+        )
+        .first()
+    )
+    if owned is not None:
+        return owned
     if not _is_published_agent(agent):
         return None
     visible_agent_ids = {
@@ -170,8 +182,19 @@ def _load_agent_for_task_runtime(
         ):
             return agent
         return None
-    if int(agent.user_id) == int(task.user_id):
-        return agent
+    # Team-scoped ownership keyed on the task owner: a teammate's task may run
+    # a team-visible agent; admins-only stays hidden from non-admins.
+    task_user_id = int(task.user_id)
+    owned = (
+        db.query(Agent)
+        .filter(
+            Agent.id == task_agent_id,
+            owned_agent_clause(task_user_id, get_agent_team_scope(db, task_user_id)),
+        )
+        .first()
+    )
+    if owned is not None:
+        return owned
     if (
         workforce_runtime is not None
         and workforce_runtime.manager_agent_id == task_agent_id

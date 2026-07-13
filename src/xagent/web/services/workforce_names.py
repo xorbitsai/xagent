@@ -6,6 +6,7 @@ from sqlalchemy.orm import Session
 from xagent.web.models.agent import Agent
 
 from ..models.workforce import Workforce
+from .agent_team_scope import get_agent_team_scope, owned_agent_clause
 from .workforce_snapshot import normalize_text
 
 
@@ -69,7 +70,7 @@ def agent_name_exists(
 ) -> bool:
     normalized_name = normalize_text(name, "name", required=True)
     query = db.query(Agent.id).filter(
-        Agent.user_id == user_id,
+        owned_agent_clause(user_id, get_agent_team_scope(db, user_id)),
         func.lower(cast(Any, Agent.name)) == normalized_name.lower(),
     )
     if exclude_agent_id is not None:

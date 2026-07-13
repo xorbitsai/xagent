@@ -225,9 +225,11 @@ async def list_triggers(
 ) -> list[TriggerResponse]:
     user_id = int(current_user.id)
     _agent_or_404(db, user_id=user_id, agent_id=agent_id)
+    # The agent is already confirmed manageable above; list all its triggers
+    # regardless of which teammate created them.
     rows = (
         db.query(AgentTrigger)
-        .filter(AgentTrigger.user_id == user_id, AgentTrigger.agent_id == agent_id)
+        .filter(AgentTrigger.agent_id == agent_id)
         .order_by(AgentTrigger.created_at.desc(), AgentTrigger.id.desc())
         .all()
     )

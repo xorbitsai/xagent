@@ -1486,3 +1486,21 @@ def test_non_admin_cannot_read_other_users_agent_detail():
 
     resp = client.get(f"/api/agents/{agent_id}", headers=carol)
     assert resp.status_code == 404
+
+
+def test_policy_shared_non_admin_reads_agent_detail_read_only():
+    """非管理员通过 policy 只读共享，可读详情且被锁为只读（不再 404）。"""
+    _admin_headers()
+    _register_second_user("bob", "bobpass1")
+    bob_id = _user_id("bob")
+
+    agent_id = _create_agent_row(user_id=bob_id, name="Bob Shared")
+    # carol 不拥有该 agent，但 policy 把它列进了 carol 的可见列表。
+    carol = _register_second_user("carol", "carolpass1")
+    set_workforce_policy(_VisibleAgentPolicy({agent_id}))
+
+    resp = client.get(f"/api/agents/{agent_id}", headers=carol)
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["readonly"] is True
+    assert body["can_edit"] is False

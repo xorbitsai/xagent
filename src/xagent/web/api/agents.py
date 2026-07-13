@@ -572,9 +572,16 @@ async def get_agent(
         store = AgentStore(db)
         response = store.get_agent_response(int(current_user.id), agent_id)
         readonly = False
-        if response is None and is_admin_user(current_user):
-            response = store.get_agent_response_for_admin(agent_id)
-            readonly = response is not None
+        if response is None:
+            # Owner path missed. Admins may read any agent; other users may read
+            # agents shared to them read-only via policy (e.g. workforce policies)
+            # — those are the same agents the list endpoint now links to.
+            if is_admin_user(current_user) or any(
+                int(item.agent.id) == agent_id
+                for item in list_accessible_agents(db, current_user)
+            ):
+                response = store.get_agent_response_for_admin(agent_id)
+                readonly = response is not None
         if response is None:
             raise HTTPException(status_code=404, detail="Agent not found")
         result = AgentResponse.model_validate(response)

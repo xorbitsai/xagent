@@ -1,7 +1,7 @@
 "use client"
 
 import React, { useCallback, useEffect, useMemo, useRef, useState } from "react"
-import { FolderOpen, GitMerge, Loader2 } from "lucide-react"
+import { FolderOpen, Loader2 } from "lucide-react"
 import dagre from "dagre"
 import { ChatInput } from "@/components/chat/ChatInput"
 import { ChatMessage } from "@/components/chat/ChatMessage"
@@ -159,6 +159,11 @@ export function TaskConversationPanel({
   const messagesEndRef = useRef<HTMLDivElement>(null)
   const containerRef = useRef<HTMLDivElement>(null)
   const anyPreviewOpen = mode === "page" && (state.filePreview.isOpen || dagPreviewOpen)
+
+  const openDagPreview = useCallback(() => {
+    closeFilePreview()
+    setDagPreviewOpen(true)
+  }, [closeFilePreview])
 
   const handleSend = async (message: string, config?: any, filesToSend?: File[]) => {
     await (onSend ?? sendMessage)(message, config, filesToSend || files)
@@ -638,6 +643,7 @@ export function TaskConversationPanel({
                         interactions={item.interactions}
                         interactionsActive={item.id === activeWaitingMessageId}
                         showEmptyStatus={item.showEmptyStatus}
+                        onOpenExecutionPlan={showDagPreview ? openDagPreview : undefined}
                       />
                     )
                   })}
@@ -653,6 +659,7 @@ export function TaskConversationPanel({
                       taskStatus={state.currentTask?.status}
                       interactions={state.currentTask?.status === "waiting_for_user" ? waitingInteractions : undefined}
                       interactionsActive={state.currentTask?.status === "waiting_for_user"}
+                      onOpenExecutionPlan={showDagPreview ? openDagPreview : undefined}
                     />
                   )}
                 </>
@@ -667,22 +674,6 @@ export function TaskConversationPanel({
             {showTaskActions && (
               <div className="mb-4 flex flex-col gap-2 sm:flex-row sm:items-center sm:gap-3">
                 <div className="flex flex-wrap items-center gap-2">
-                  {showDagPreview && state.currentTask?.isDag !== false && (
-                    <Button
-                      type="button"
-                      variant="outline"
-                      className="h-auto rounded-xl bg-card/80 px-3 py-2 text-sm"
-                      onClick={() => {
-                        closeFilePreview()
-                        setDagPreviewOpen(true)
-                      }}
-                      title={t("chatPage.executionPlan.title")}
-                    >
-                      <GitMerge className="w-3.5 h-3.5 mr-1" />
-                      {t("chatPage.executionPlan.title")}
-                    </Button>
-                  )}
-
                   {showTaskFiles && (
                     <TaskFileManager taskId={state.taskId} onPreview={(fileId, fileName) => openFilePreview(fileId, fileName)}>
                       <Button type="button" variant="outline" className="h-auto rounded-xl bg-card/80 px-3 py-2 text-sm" title={t("files.header.title")}>

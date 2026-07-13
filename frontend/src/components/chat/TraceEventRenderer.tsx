@@ -12,6 +12,7 @@ import {
   Copy,
   Search,
   FileText,
+  GitMerge,
   Check,
   Shield,
   MessageSquare,
@@ -145,6 +146,7 @@ interface ProcessedStep {
 interface TraceEventRendererProps {
   events: TraceEvent[];
   taskStatus?: string;
+  onOpenExecutionPlan?: () => void;
 }
 
 function getTraceData(event: TraceEvent): NonNullable<TraceEvent['data']> {
@@ -1348,7 +1350,7 @@ function StepItem({ step, index, onOpenTerminal, onViewDetail, onFileClick, onAg
 }
 
 // Main TraceEventRenderer Component
-export function TraceEventRenderer({ events, taskStatus }: TraceEventRendererProps) {
+export function TraceEventRenderer({ events, taskStatus, onOpenExecutionPlan }: TraceEventRendererProps) {
   const { t } = useI18n();
   const processStatus = resolveTraceProcessStatus({
     taskStatus,
@@ -1375,6 +1377,19 @@ export function TraceEventRenderer({ events, taskStatus }: TraceEventRendererPro
     }
     return null;
   }, [events]);
+
+  const hasExecutionPlan = useMemo(
+    () => events.some((event) => {
+      const eventType = event.event_type || '';
+      return eventType === 'dag_execution'
+        || eventType === 'dag_execute_start'
+        || eventType === 'dag_execute_end'
+        || eventType === 'dag_plan_start'
+        || eventType === 'dag_plan_end'
+        || eventType.startsWith('dag_step_');
+    }),
+    [events],
+  );
 
   const getFileNameFromPath = (path?: string) => {
     if (!path) return '';
@@ -1434,6 +1449,25 @@ export function TraceEventRenderer({ events, taskStatus }: TraceEventRendererPro
 
   return (
     <div className="space-y-4">
+      {hasExecutionPlan && onOpenExecutionPlan && (
+        <button
+          type="button"
+          className="flex w-full items-center justify-between gap-3 rounded-lg border border-border/50 bg-muted/20 px-3 py-2 text-left transition-colors hover:border-border hover:bg-muted/40 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2"
+          onClick={onOpenExecutionPlan}
+          title={t('chatPage.executionPlan.tooltip')}
+        >
+          <div className="flex min-w-0 items-center gap-2">
+            <GitMerge className="h-4 w-4 shrink-0 text-muted-foreground" />
+            <span className="truncate text-sm font-medium text-foreground">
+              {t('chatPage.executionPlan.dagSection', { count: steps.length })}
+            </span>
+          </div>
+          <span className="flex shrink-0 items-center text-xs font-medium text-muted-foreground">
+            {t('chatPage.executionPlan.view')}
+            <ChevronRight className="ml-1 h-3.5 w-3.5" />
+          </span>
+        </button>
+      )}
       {skillSelection && (
         <div className="bg-muted/30 border border-border/50 rounded-lg p-3 flex items-center gap-2">
           <Cpu className="w-4 h-4 text-primary" />

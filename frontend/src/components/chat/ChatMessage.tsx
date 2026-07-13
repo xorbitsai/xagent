@@ -73,6 +73,7 @@ export interface ChatMessageProps {
   interactions?: any[];
   interactionsActive?: boolean;
   showEmptyStatus?: boolean;
+  onOpenExecutionPlan?: () => void;
   onSendInteraction?: (message: string, files?: File[], metadata?: any) => Promise<void> | void;
 }
 
@@ -280,6 +281,7 @@ export function ChatMessage({
   interactions,
   interactionsActive = true,
   showEmptyStatus = true,
+  onOpenExecutionPlan,
   onSendInteraction,
 }: ChatMessageProps) {
   const { t, tDynamic } = useI18n();
@@ -365,7 +367,11 @@ export function ChatMessage({
     <div className="w-full space-y-2 animate-fade-in group">
       {shouldShowProcess && !isUser && (
         <div className={cn("pl-7")}>
-          <TraceEventRenderer events={traceEvents} taskStatus={resolvedProcessStatus} />
+          <TraceEventRenderer
+            events={traceEvents}
+            taskStatus={resolvedProcessStatus}
+            onOpenExecutionPlan={onOpenExecutionPlan}
+          />
         </div>
       )}
 

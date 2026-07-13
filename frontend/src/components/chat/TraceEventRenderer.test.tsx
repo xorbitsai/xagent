@@ -497,6 +497,46 @@ describe("TraceEventRenderer", () => {
     expect(screen.getByText(/traceEventRenderer.executeTool:web_search/)).toBeInTheDocument()
   })
 
+  it("shows the execution plan action only in a process with DAG execution events", () => {
+    const onOpenExecutionPlan = vi.fn()
+    const { rerender } = render(
+      <TraceEventRenderer
+        onOpenExecutionPlan={onOpenExecutionPlan}
+        events={[
+          {
+            event_id: "react-start",
+            event_type: "react_task_start",
+            step_id: "step-1",
+            timestamp: 1000,
+            data: {},
+          },
+        ]}
+      />,
+    )
+
+    expect(screen.queryByTitle("chatPage.executionPlan.tooltip")).not.toBeInTheDocument()
+
+    rerender(
+      <TraceEventRenderer
+        onOpenExecutionPlan={onOpenExecutionPlan}
+        events={[
+          {
+            event_id: "dag-execution",
+            event_type: "dag_execution",
+            timestamp: 1000,
+            data: {
+              phase: "executing",
+              steps: [{ id: "1", task: "Create audio", dependencies: [] }],
+            },
+          },
+        ]}
+      />,
+    )
+
+    fireEvent.click(screen.getByText("chatPage.executionPlan.dagSection"))
+    expect(onOpenExecutionPlan).toHaveBeenCalledOnce()
+  })
+
   it("stops running process spinners when the parent task has failed", () => {
     const { container } = render(
       <TraceEventRenderer

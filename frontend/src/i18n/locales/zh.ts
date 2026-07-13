@@ -273,8 +273,6 @@ const zh = {
       output: "输出tokens",
       inputShort: "输入",
       outputShort: "输出",
-      inputColumn: "输入",
-      outputColumn: "输出",
       oneModel: "{count} 个模型",
       models: "{count} 个模型",
       byModel: "各模型用量",

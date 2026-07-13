@@ -33,10 +33,16 @@ const compactTokenFormatter = new Intl.NumberFormat('en-US', {
   compactDisplay: 'short',
   maximumFractionDigits: 2,
 });
+const exactTokenFormatter = new Intl.NumberFormat('en-US');
 
 export function formatTokenCount(value: number): string {
   const normalized = Number.isFinite(value) ? Math.max(0, Math.trunc(value)) : 0;
   return compactTokenFormatter.format(normalized).toLowerCase();
+}
+
+export function formatExactTokenCount(value: number): string {
+  const normalized = Number.isFinite(value) ? Math.max(0, Math.trunc(value)) : 0;
+  return exactTokenFormatter.format(normalized);
 }
 
 export function TokenUsageDisplay({ taskId, isRunning, className }: TokenUsageDisplayProps) {
@@ -83,13 +89,11 @@ export function TokenUsageDisplay({ taskId, isRunning, className }: TokenUsageDi
 
   if (!usage) return null;
 
-  const exactTokens = (value: number) => value.toLocaleString();
-
   return (
     <div className={`inline-flex flex-wrap items-center gap-x-3 gap-y-1 rounded-xl border bg-card/80 px-3 py-2 text-xs sm:text-sm ${className || ""}`}>
       <span className="flex items-center gap-1.5 whitespace-nowrap">
         <Sparkles className="w-4 h-4 text-indigo-500" />
-        <span className="font-medium text-foreground" title={exactTokens(usage.input_tokens)}>
+        <span className="font-medium text-foreground" title={formatExactTokenCount(usage.input_tokens)}>
           {formatTokenCount(usage.input_tokens)}
         </span>
         <span
@@ -100,7 +104,7 @@ export function TokenUsageDisplay({ taskId, isRunning, className }: TokenUsageDi
         </span>
       </span>
       <span className="flex items-center gap-1.5 whitespace-nowrap">
-        <span className="font-medium text-foreground" title={exactTokens(usage.output_tokens)}>
+        <span className="font-medium text-foreground" title={formatExactTokenCount(usage.output_tokens)}>
           {formatTokenCount(usage.output_tokens)}
         </span>
         <span
@@ -138,10 +142,10 @@ export function TokenUsageDisplay({ taskId, isRunning, className }: TokenUsageDi
             <div className="grid grid-cols-[minmax(0,1fr)_5rem_5rem] gap-x-4 gap-y-2 p-3 text-xs">
               <span className="text-muted-foreground">{t('chatPage.tokenUsage.model')}</span>
               <span className="text-right text-muted-foreground">
-                {t('chatPage.tokenUsage.inputColumn')}
+                {t('chatPage.tokenUsage.inputShort')}
               </span>
               <span className="text-right text-muted-foreground">
-                {t('chatPage.tokenUsage.outputColumn')}
+                {t('chatPage.tokenUsage.outputShort')}
               </span>
               {usage.model_usage.map((model) => (
                 <React.Fragment key={`${model.model_id}:${model.model_name}`}>
@@ -155,10 +159,10 @@ export function TokenUsageDisplay({ taskId, isRunning, className }: TokenUsageDi
                       </span>
                     )}
                   </span>
-                  <span className="text-right tabular-nums" title={exactTokens(model.input_tokens)}>
+                  <span className="text-right tabular-nums" title={formatExactTokenCount(model.input_tokens)}>
                     {formatTokenCount(model.input_tokens)}
                   </span>
-                  <span className="text-right tabular-nums" title={exactTokens(model.output_tokens)}>
+                  <span className="text-right tabular-nums" title={formatExactTokenCount(model.output_tokens)}>
                     {formatTokenCount(model.output_tokens)}
                   </span>
                 </React.Fragment>

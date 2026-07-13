@@ -200,6 +200,77 @@ def test_aggregate_token_usage_by_model_keeps_legacy_unattributed_tokens():
     ]
 
 
+def test_aggregate_token_usage_by_model_merges_unique_legacy_name_group():
+    details = [
+        {"type": "input", "tokens": 100, "model": "gpt-4o"},
+        {"type": "output", "tokens": 20, "model": "gpt-4o"},
+        {
+            "type": "input",
+            "tokens": 50,
+            "model": "gpt-4o",
+            "model_id": "openai:gpt-4o",
+        },
+        {
+            "type": "output",
+            "tokens": 10,
+            "model": "gpt-4o",
+            "model_id": "openai:gpt-4o",
+        },
+    ]
+
+    assert aggregate_token_usage_by_model(details) == [
+        {
+            "model_id": "openai:gpt-4o",
+            "model_name": "gpt-4o",
+            "input_tokens": 150,
+            "output_tokens": 30,
+            "total_tokens": 180,
+        }
+    ]
+
+
+def test_aggregate_token_usage_by_model_keeps_ambiguous_legacy_name_group():
+    details = [
+        {"type": "input", "tokens": 30, "model": "shared-name"},
+        {
+            "type": "input",
+            "tokens": 20,
+            "model": "shared-name",
+            "model_id": "main-model",
+        },
+        {
+            "type": "input",
+            "tokens": 10,
+            "model": "shared-name",
+            "model_id": "compact-model",
+        },
+    ]
+
+    assert aggregate_token_usage_by_model(details) == [
+        {
+            "model_id": "",
+            "model_name": "shared-name",
+            "input_tokens": 30,
+            "output_tokens": 0,
+            "total_tokens": 30,
+        },
+        {
+            "model_id": "main-model",
+            "model_name": "shared-name",
+            "input_tokens": 20,
+            "output_tokens": 0,
+            "total_tokens": 20,
+        },
+        {
+            "model_id": "compact-model",
+            "model_name": "shared-name",
+            "input_tokens": 10,
+            "output_tokens": 0,
+            "total_tokens": 10,
+        },
+    ]
+
+
 @pytest.mark.asyncio
 async def test_openrouter_auto_usage_is_attributed_to_each_selected_model():
     selected_models = iter(["deepseek/deepseek-v4-flash", "anthropic/claude-opus-4.8"])

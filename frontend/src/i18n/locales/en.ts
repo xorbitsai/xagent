@@ -273,8 +273,6 @@ const en = {
       output: "Output tokens",
       inputShort: "Input",
       outputShort: "Output",
-      inputColumn: "Input",
-      outputColumn: "Output",
       oneModel: "{count} model",
       models: "{count} models",
       byModel: "Usage by model",

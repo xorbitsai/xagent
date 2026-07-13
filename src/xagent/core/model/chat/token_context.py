@@ -210,9 +210,10 @@ def aggregate_token_usage_by_model(details: Any) -> List[Dict[str, Any]]:
     """Aggregate persisted token detail entries by the actual model used.
 
     ``model_id`` is preferred as the identity because different configured
-    models can share a provider-facing name. Legacy entries without either an
-    id or name are retained as an unattributed group rather than silently
-    dropping tokens from the breakdown.
+    models can share a provider-facing name. A legacy name-only group is
+    merged into an id-backed group only when that name identifies exactly one
+    configured model. Entries without either an id or name are retained as an
+    unattributed group rather than silently dropping tokens from the breakdown.
     """
     if not isinstance(details, list):
         return []
@@ -251,6 +252,23 @@ def aggregate_token_usage_by_model(details: Any) -> List[Dict[str, Any]]:
             aggregate["model_name"] = model_name
         aggregate[f"{token_type}_tokens"] += tokens
         aggregate["total_tokens"] += tokens
+
+    id_keys_by_name: Dict[str, List[tuple[str, str]]] = {}
+    for key, aggregate in grouped.items():
+        if key[0] == "id" and aggregate["model_name"]:
+            id_keys_by_name.setdefault(aggregate["model_name"], []).append(key)
+
+    for key, aggregate in list(grouped.items()):
+        if key[0] != "name":
+            continue
+        matching_id_keys = id_keys_by_name.get(aggregate["model_name"], [])
+        if len(matching_id_keys) != 1:
+            continue
+        target = grouped[matching_id_keys[0]]
+        target["input_tokens"] += aggregate["input_tokens"]
+        target["output_tokens"] += aggregate["output_tokens"]
+        target["total_tokens"] += aggregate["total_tokens"]
+        del grouped[key]
 
     return sorted(
         grouped.values(),

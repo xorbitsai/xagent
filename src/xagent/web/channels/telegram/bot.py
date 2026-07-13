@@ -51,8 +51,13 @@ from .utils import (
 logger = logging.getLogger(__name__)
 
 
+class TelegramVoiceTranscriptionError(RuntimeError):
+    """Raised when a Telegram voice prompt cannot be transcribed."""
+
+
 class TelegramBotInstance:
     queue_flush_delay_seconds = 1.0
+    voice_transcription_timeout_seconds = 180.0
     stop_text_aliases = {"/stop", "/pause", "stop", "pause", "停止", "暂停"}
 
     def __init__(
@@ -167,6 +172,7 @@ class TelegramBotInstance:
                     if message.document
                     or message.photo
                     or message.audio
+                    or message.voice
                     or message.video
                     else "Unknown"
                 )
@@ -344,10 +350,120 @@ class TelegramBotInstance:
             files.append(message.photo[-1])
         elif message.audio:
             files.append(message.audio)
+        elif message.voice:
+            files.append(message.voice)
         elif message.video:
             files.append(message.video)
 
         return text, files
+
+    def _resolve_voice_asr_model(self, db: Session, user: User) -> Any | None:
+        from fastapi import HTTPException
+
+        from ....core.model.asr.adapter import get_asr_model_instance
+        from ...api.model import _resolve_asr_model_for_transcription
+
+        try:
+            db_model = _resolve_asr_model_for_transcription(db, user)
+        except HTTPException as exc:
+            if exc.status_code == 404:
+                return None
+            raise
+        return get_asr_model_instance(db_model)
+
+    @staticmethod
+    def _audio_format_from_file_info(file_info: dict[str, Any]) -> str | None:
+        mime_type = str(file_info.get("type") or "").lower()
+        if mime_type.startswith("audio/"):
+            subtype = mime_type.split("/", 1)[1].split(";", 1)[0].strip()
+            if subtype:
+                return "mp3" if subtype == "mpeg" else subtype
+
+        suffix = Path(str(file_info.get("name") or "")).suffix.lower().lstrip(".")
+        if suffix in {"oga", "opus"}:
+            return "ogg"
+        return suffix or None
+
+    async def _transcribe_uploaded_voice_files(
+        self,
+        voice_file_ids: list[str],
+        uploaded_info: list[dict[str, Any]],
+        asr_model: Any,
+    ) -> dict[str, str]:
+        uploaded_by_source_id = {
+            str(info.get("telegram_file_id")): info
+            for info in uploaded_info
+            if info.get("telegram_file_id")
+        }
+        transcripts: dict[str, str] = {}
+
+        for voice_file_id in voice_file_ids:
+            file_info = uploaded_by_source_id.get(voice_file_id)
+            if file_info is None:
+                raise TelegramVoiceTranscriptionError(
+                    "Telegram voice input was not downloaded"
+                )
+
+            try:
+                result = await asyncio.wait_for(
+                    asr_model.transcribe(
+                        audio=str(file_info["path"]),
+                        format=self._audio_format_from_file_info(file_info),
+                    ),
+                    timeout=self.voice_transcription_timeout_seconds,
+                )
+            except asyncio.TimeoutError as exc:
+                raise TelegramVoiceTranscriptionError(
+                    "Telegram voice transcription timed out"
+                ) from exc
+            except Exception as exc:
+                logger.error(
+                    "Failed to transcribe Telegram voice input %s: %s",
+                    voice_file_id,
+                    exc,
+                )
+                raise TelegramVoiceTranscriptionError(
+                    "Telegram voice transcription failed"
+                ) from exc
+
+            transcript = str(result).strip()
+            if not transcript:
+                raise TelegramVoiceTranscriptionError(
+                    "Telegram voice transcription returned empty text"
+                )
+            transcripts[voice_file_id] = transcript
+
+        return transcripts
+
+    @staticmethod
+    def _compose_prompt_text(
+        message_contents: list[tuple[types.Message, str, list]],
+        voice_transcripts: dict[str, str],
+    ) -> str:
+        prompt_parts: list[str] = []
+        for message, message_text, _files in message_contents:
+            if message_text:
+                prompt_parts.append(message_text)
+            voice = getattr(message, "voice", None)
+            if voice is not None:
+                transcript = voice_transcripts.get(str(voice.file_id))
+                if transcript:
+                    prompt_parts.append(transcript)
+        return "\n".join(prompt_parts)
+
+    @staticmethod
+    async def _close_voice_asr_model(asr_model: Any) -> None:
+        from inspect import isawaitable
+
+        close = getattr(asr_model, "aclose", None)
+        if not callable(close):
+            return
+        try:
+            result = close()
+            if isawaitable(result):
+                await result
+        except Exception:
+            logger.warning("Failed to close Telegram voice ASR model", exc_info=True)
 
     async def _download_and_register_files(
         self,
@@ -407,11 +523,13 @@ class TelegramBotInstance:
 
                 await self.bot.download_file(tg_file.file_path, destination=target_path)
 
-                mime_type, _ = mimetypes.guess_type(str(target_path))
+                mime_type = getattr(f, "mime_type", None)
+                if not mime_type:
+                    mime_type, _ = mimetypes.guess_type(str(target_path))
                 if not mime_type:
                     mime_type = "application/octet-stream"
 
-                file_size = getattr(f, "file_size", target_path.stat().st_size)
+                file_size = getattr(f, "file_size", None) or target_path.stat().st_size
 
                 file_record = UploadedFileStore(db).create_from_local_path(
                     local_path=target_path,
@@ -436,6 +554,7 @@ class TelegramBotInstance:
                         "path": str(target_path),
                         "type": mime_type,
                         "size": file_size,
+                        "telegram_file_id": str(file_id),
                     }
                 )
                 logger.info(
@@ -451,24 +570,23 @@ class TelegramBotInstance:
     async def _process_user_messages_batch(
         self, user_id: int, messages: list[types.Message]
     ) -> None:
-        combined_text = ""
-        combined_files = []
+        message_contents: list[tuple[types.Message, str, list]] = []
+        files = []
 
         # We'll use the last message for answering
         last_message = messages[-1]
 
         for msg in messages:
-            text, files = await self._extract_message_content(msg)
-            if text:
-                if combined_text:
-                    combined_text += "\n" + text
-                else:
-                    combined_text = text
-            if files:
-                combined_files.extend(files)
+            message_text, message_files = await self._extract_message_content(msg)
+            message_contents.append((msg, message_text, message_files))
+            files.extend(message_files)
 
-        text = combined_text
-        files = combined_files
+        text = self._compose_prompt_text(message_contents, {})
+        voice_file_ids = [
+            str(voice.file_id)
+            for msg in messages
+            if (voice := getattr(msg, "voice", None)) is not None
+        ]
 
         if not text and not files:
             return
@@ -478,6 +596,7 @@ class TelegramBotInstance:
         claimed_task_id: int | None = None
         claimed_run_id: str | None = None
         managed_lease: ManagedTaskLease | None = None
+        voice_asr_model: Any | None = None
         try:
             db_gen = get_db()
             db = next(db_gen)
@@ -510,6 +629,16 @@ class TelegramBotInstance:
 
                 if self._consume_user_stop_request(user_id):
                     return
+
+                if voice_file_ids:
+                    voice_asr_model = self._resolve_voice_asr_model(db, user)
+                    if voice_asr_model is None:
+                        await last_message.answer(
+                            "I couldn't understand that voice message because no "
+                            "speech recognition model is configured. Configure an "
+                            "ASR model or send the request as text."
+                        )
+                        return
 
                 active_task_id = self.active_tasks.get(user_id)
                 task = None
@@ -584,6 +713,7 @@ class TelegramBotInstance:
                     db.commit()
                     return
 
+                uploaded_info: list[dict[str, Any]] = []
                 if files:
                     uploaded_info = await self._download_and_register_files(
                         files=files,
@@ -592,26 +722,55 @@ class TelegramBotInstance:
                         user_id=int(user.id),  # type: ignore
                         db=db,
                     )
+                    if voice_file_ids and not uploaded_info:
+                        raise TelegramVoiceTranscriptionError(
+                            "Telegram voice input was not downloaded"
+                        )
                     if uploaded_info:
+                        voice_transcripts: dict[str, str] = {}
+                        if voice_file_ids:
+                            voice_transcripts = (
+                                await self._transcribe_uploaded_voice_files(
+                                    voice_file_ids,
+                                    uploaded_info,
+                                    voice_asr_model,
+                                )
+                            )
+                            await self._close_voice_asr_model(voice_asr_model)
+                            voice_asr_model = None
+
+                        text = self._compose_prompt_text(
+                            message_contents,
+                            voice_transcripts,
+                        )
+                        voice_file_id_set = set(voice_file_ids)
+                        regular_uploaded_info = [
+                            info
+                            for info in uploaded_info
+                            if str(info.get("telegram_file_id"))
+                            not in voice_file_id_set
+                        ]
                         file_info_list = [
                             f"[{info['name']}](file://{info['file_id']})"
-                            for info in uploaded_info
+                            for info in regular_uploaded_info
                         ]
-                        if text:
+                        if text and file_info_list:
                             text += f"\n\n{' '.join(file_info_list)}"
-                        else:
+                        elif file_info_list:
                             text = " ".join(file_info_list)
                         if is_new_task:
                             task.description = text  # type: ignore
-                            if not task.title:
-                                title_str = (
-                                    text if len(text) <= 50 else f"{text[:50]}..."
-                                )
-                                task.title = title_str  # type: ignore
+                            if voice_file_ids or not task.title:
+                                title = text if len(text) <= 50 else f"{text[:50]}..."
+                                task.title = title  # type: ignore[assignment]
                             db.commit()
 
                         context["state"] = context.get("state", {})
                         context["state"]["file_info"] = uploaded_info
+                        context["file_info"] = uploaded_info
+                        context["uploaded_files"] = [
+                            str(info["path"]) for info in uploaded_info
+                        ]
 
                 if self._consume_user_stop_request(user_id):
                     apply_task_control_transition(
@@ -799,10 +958,18 @@ class TelegramBotInstance:
                         claimed_task_id,
                         exc_info=True,
                     )
-            await last_message.answer(
-                "Sorry, an error occurred while processing your request."
-            )
+            if isinstance(e, TelegramVoiceTranscriptionError):
+                await last_message.answer(
+                    "I couldn't transcribe that voice message. Please try again "
+                    "or send the request as text."
+                )
+            else:
+                await last_message.answer(
+                    "Sorry, an error occurred while processing your request."
+                )
         finally:
+            if voice_asr_model is not None:
+                await self._close_voice_asr_model(voice_asr_model)
             if managed_lease is not None:
                 await managed_lease.close()
             self.user_preparing_executions.discard(user_id)

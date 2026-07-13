@@ -1,8 +1,12 @@
 import asyncio
+from types import SimpleNamespace
 
 import pytest
 
-from xagent.web.channels.telegram.bot import TelegramBotInstance
+from xagent.web.channels.telegram.bot import (
+    TelegramBotInstance,
+    TelegramVoiceTranscriptionError,
+)
 
 
 def make_bot() -> TelegramBotInstance:
@@ -13,6 +17,155 @@ def make_bot() -> TelegramBotInstance:
     bot.user_preparing_executions = set()
     bot.user_stop_events = {}
     return bot
+
+
+@pytest.mark.asyncio
+async def test_extract_message_content_includes_voice_message() -> None:
+    bot = make_bot()
+    voice = SimpleNamespace(file_id="voice-file-id")
+    message = SimpleNamespace(
+        text=None,
+        caption=None,
+        document=None,
+        photo=None,
+        audio=None,
+        voice=voice,
+        video=None,
+    )
+
+    text, files = await bot._extract_message_content(message)  # type: ignore[arg-type]
+
+    assert text == ""
+    assert files == [voice]
+
+
+@pytest.mark.asyncio
+async def test_extract_message_content_keeps_regular_audio_as_attachment() -> None:
+    bot = make_bot()
+    audio = SimpleNamespace(file_id="audio-file-id")
+    message = SimpleNamespace(
+        text=None,
+        caption=None,
+        document=None,
+        photo=None,
+        audio=audio,
+        voice=None,
+        video=None,
+    )
+
+    text, files = await bot._extract_message_content(message)  # type: ignore[arg-type]
+
+    assert text == ""
+    assert files == [audio]
+
+
+def test_compose_prompt_text_replaces_voice_with_transcript_in_message_order() -> None:
+    voice = SimpleNamespace(file_id="voice-file-id")
+    voice_message = SimpleNamespace(voice=voice)
+    text_message = SimpleNamespace(voice=None)
+
+    prompt = TelegramBotInstance._compose_prompt_text(
+        [
+            (voice_message, "", [voice]),
+            (text_message, "请直接回答这个问题", []),
+        ],
+        {"voice-file-id": "今晚有世界杯比赛吗？"},
+    )
+
+    assert prompt == "今晚有世界杯比赛吗？\n请直接回答这个问题"
+
+
+@pytest.mark.parametrize(
+    ("file_info", "expected"),
+    [
+        ({"name": "voice.oga", "type": "audio/ogg"}, "ogg"),
+        ({"name": "voice.mp3", "type": "audio/mpeg"}, "mp3"),
+        ({"name": "voice.opus", "type": ""}, "ogg"),
+    ],
+)
+def test_audio_format_from_file_info(file_info: dict[str, str], expected: str) -> None:
+    assert TelegramBotInstance._audio_format_from_file_info(file_info) == expected
+
+
+@pytest.mark.asyncio
+async def test_transcribe_uploaded_voice_files_uses_registered_input_file() -> None:
+    bot = make_bot()
+
+    class FakeASR:
+        def __init__(self) -> None:
+            self.calls: list[dict[str, str | None]] = []
+
+        async def transcribe(self, *, audio: str, format: str | None = None) -> str:
+            self.calls.append({"audio": audio, "format": format})
+            return "今晚有世界杯比赛吗？"
+
+    asr = FakeASR()
+    uploaded_info = [
+        {
+            "file_id": "workspace-file-id",
+            "telegram_file_id": "voice-file-id",
+            "name": "voice-file-id.oga",
+            "path": "/workspace/input/voice-file-id.oga",
+            "type": "audio/ogg",
+            "size": 123,
+        }
+    ]
+
+    transcripts = await bot._transcribe_uploaded_voice_files(
+        ["voice-file-id"],
+        uploaded_info,
+        asr,
+    )
+
+    assert transcripts == {"voice-file-id": "今晚有世界杯比赛吗？"}
+    assert asr.calls == [
+        {"audio": "/workspace/input/voice-file-id.oga", "format": "ogg"}
+    ]
+    assert uploaded_info[0]["file_id"] == "workspace-file-id"
+
+
+@pytest.mark.asyncio
+async def test_transcribe_uploaded_voice_files_rejects_empty_result() -> None:
+    bot = make_bot()
+
+    class EmptyASR:
+        async def transcribe(self, *, audio: str, format: str | None = None) -> str:
+            return "  "
+
+    with pytest.raises(
+        TelegramVoiceTranscriptionError,
+        match="returned empty text",
+    ):
+        await bot._transcribe_uploaded_voice_files(
+            ["voice-file-id"],
+            [
+                {
+                    "telegram_file_id": "voice-file-id",
+                    "name": "voice.oga",
+                    "path": "/workspace/input/voice.oga",
+                    "type": "audio/ogg",
+                }
+            ],
+            EmptyASR(),
+        )
+
+
+def test_resolve_voice_asr_model_returns_none_when_unconfigured(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from fastapi import HTTPException
+
+    bot = make_bot()
+
+    def no_asr_model(*_args, **_kwargs):  # type: ignore[no-untyped-def]
+        raise HTTPException(status_code=404, detail="No ASR model is configured")
+
+    monkeypatch.setattr(
+        "xagent.web.api.model._resolve_asr_model_for_transcription",
+        no_asr_model,
+    )
+
+    assert bot._resolve_voice_asr_model(object(), object()) is None  # type: ignore[arg-type]
 
 
 @pytest.mark.asyncio
